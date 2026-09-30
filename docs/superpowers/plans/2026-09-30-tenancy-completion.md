@@ -1,0 +1,17890 @@
+# Tenancy Completion Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** No app code can read or write another tenant's rows, jobs or events without a declaration `describe` lists. This closes the four doors C-2 left open: events tenanted by convention, platform tables readable and writable from a transaction, tenant types with no identity of their own, and capability tokens that can be parked. It is sub-project S1 of the pre-publish follow-ups (LEDGER 2026-09-30 items 2, 3, 4, 5, 6, 7, 11, 12).
+
+**Architecture:**
+- **Tenant identity.** `Tenant` gains a required `const NAME`. It is rendered wherever a scope type is named and mixed into every scoped fingerprint through one core `const fn`. Two tenant types sharing a `NAME` in one app are refused at mount.
+- **Dispatch and the 401.** `JobScope::open` asserts the scope type it opens, inside the dispatcher's `catch_unwind`. The 401 tells the author to change the stance in place, keeping the route's other flags.
+- **Capability tokens.** `CrossTenant<'g>` and `TenantAdmission<'g>` borrow the `Group` that minted them and are not `Clone`, so neither can be parked in a `static`.
+- **Platform tables.** `EventRow` and `SchemaVersion` join `JobRow` as `PlatformOwned`: app writes are a named compile error, and so is any `Tx`/`ScopedTx` read of the three, through a sealed readability trait on the scope type. `Snapshot` keeps reading everything.
+- **Event tenancy.** An event declares `global` or `scoped_by = S`. A scoped emit is a new record tag `0x0b` whose tenant rides apart from the app's key. `EventRow` gains `scope`, and `PROTO_VERSION` goes to 5. A tenant feed is built only from a `ScopedTx`. One delivery predicate, `row.scope == subscription.scope`, serves both tail delivery and resume validation.
+- **Close-out.** A sim oracle proves realtime tenancy under the full fault matrix, and `describe` lists each event's `scoped_by`.
+
+**Tech Stack:**
+- Rust: `charpente-core` records and tables, and the `syn`/`quote` proc macros.
+- The deterministic simulator (`run_universes_swarm_with!`, `SimSource`, the full fault matrix).
+- trybuild compile-fail pins; `guide-examples`' doc gates (`doc_truth`, `describe_contract`, the compiled GUIDE blocks).
+- `cargo-mutants` 27.1.0 through `scripts/mutants.sh`.
+
+**Spec:** `docs/superpowers/specs/2026-09-30-tenancy-completion-design.md` (commit `e749823`, approved by Noah on 2026-09-30). Read it first; the plan argues from it. Where this plan differs, the difference is listed under "Spec amendments" below, and Task 1 writes those into the spec.
+
+**Base:** `main` after sub-projects S4 (redb 4.3.0, the open fence dropped), S2 (`Group::stage`'s TABLE-alias refusal, `migrate_schema`'s batch-size-0 refusal, the drift-probe text) and S3 (give-ups, reopen budget, ceilings, the mutants baseline, test deadlines) have landed. Line numbers in this plan are cited **at `e749823`** and are for orientation only. S2 and S3 edit `Group::stage`, `migrate_schema` and several test files, so an implementer re-locates every site **by symbol** before editing. Task 1 records the base sha it ran on.
+
+**Working directory for mid-flight state:** `.superpowers/sdd/2026-09-30-tenancy-completion/` (gitignored). Put these there:
+- `progress.md`;
+- one gate log per task (`gate-task-N.log`);
+- the coverage baselines (Task 1) and each later comparison;
+- mutation outputs;
+- every reviewer's report.
+
+**A reviewer writes its full report to a file there before returning a summary**, because deliveries have been lost in flight before.
+
+## Spec amendments (Task 1 appends these to the spec, verbatim, under a new "## Amendments (implementation plan)" heading)
+
+- **A1 — `#[event(global)]` lands first as a no-op; the bare-`#[event]` refusal lands with `scoped_by`.** Spec §6 refuses a bare `#[event]` and tells the reader to write `global` or `scoped_by = S`. The refusal lands in the same commit that makes `scoped_by` work (Task 11). Task 1 accepts `global`, sweeps it onto every event, and proves the sweep with a grep. This is the same shape as the job-tenancy plan's A1.
+- **A2 — a table's tenant name reaches the uniqueness check through `Row::SCOPE_NAME`.** `Row` gains `const SCOPE_NAME: Option<&'static str> = None`, and `#[table(scoped_by = S)]` sets it to `Some(S::NAME)`. `Schema::table` records it in `TableOps` beside the scope's `TypeId`, so `App::open` can collect every table's tenant without naming `S`.
+- **A3 — a tenant feed is `tx.subscription::<Ev>()` → `TenantFeed<S>` → `.into()`.** The SSE handler's declared return type stays `Result<Subscription, ApiError>`, which the route macro checks. `TenantFeed<S>` carries `S` in its type, so `.and::<Ev2>()` is bounded by `Ev2::Scope = S`. The conversion into `Subscription` is the last step. `Subscription::and` on a tenant-carrying subscription is a named assert, because the predicate could never deliver the added global event.
+- **A4 — in-tree tenant `NAME`s equal the type's identifier.** FNV-1a is streaming. So "fold, then `#scoped_by\0` + NAME + `\0`" equals today's "fold, then `#scoped_by\0` + rendered path + `\0`" whenever the NAME equals the path's rendering. Every existing single-ident scoped fingerprint pin therefore stays byte-identical. Task 4 proves this at base before changing the macro. Fixtures whose two tenant types share an identifier get different NAMEs in Task 3, and their fingerprints move by design.
+- **A5 — no cross-tenant emit (`emit_in`) is added.** A rollup that must notify a tenant enqueues a scoped job there with `enqueue_in`, and that job's `run` emits. This follows spec §12's refused list.
+- **A6 — Task 4 executes before Task 3.** They consume nothing from each other. Task 3's refusal text says a tenant's NAME "is inside every scoped job's and event's fingerprint", and its GUIDE step extends the §6 residual that Task 4 writes. So Task 4 runs first, and the job half of that text is true on the commit that lands it. The event half becomes true at Task 11, a forward reference inside this plan that the fixed text accepts. The numbering stays, so every cross-reference keeps its meaning.
+- **A7 — macro output names a tenant through `::charpente::tenant::tenant_name::<S>()`.** The contract's `<S as ::charpente::core::db::Tenant>::NAME` adds a second, unhoused E0277 ("the trait bound `Team: Tenant` is not satisfied … consider adding one") to every "scope type has no `Tenant` impl" diagnostic, measured in a scratch proc-macro crate. `<S as ::charpente::TenantScope>::NAME` is E0576. Instead, `tenant.rs` gains `#[doc(hidden)] pub const fn tenant_name<S: TenantScope>() -> &'static str { S::NAME }`. The value is `S::NAME` and it is still a const expression. Its bound is the one the three macros' `__charpente_assert_tenant_scope` const asserts carried, so those asserts are deleted, and a missing impl gets exactly one error per site, the house one. The three missing-impl fixtures keep their error counts (1, 1, 2). `#[event(scoped_by)]` (Task 11) uses the same helper.
+- **A8 — a compile-time refusal quotes a scope path as written.** `#[job]`'s and `#[table]`'s "`global` and `scoped_by = …`" refusals and `#[route]`'s undeclared-capability refusal run at expansion time, where `Tenant::NAME` does not exist. With the macro's `scope_name` last-segment helper deleted (Task 2), they render the path through a new `fingerprint::path_as_written`, built from `render`'s words: `crate::tenancy::Org` and `Wrap<Desk>`, never `Org` and `Wrap`. A single-identifier path renders as before, so no existing pin moves. `#[event]`'s refusal (Task 11) uses the same renderer.
+- **A9 — the capability tokens borrow what their `Group` borrows, not the `Group` itself.** Spec §5's `-> CrossTenant<'_>` / `-> TenantAdmission<'_>` ties a token to `&self`, which keeps the group shared-borrowed. Every site that mints and then stages in the same group (the dispatcher, the request path, the drift probe, every operator helper, GUIDE §16's `seed`; 22 mint sites) would then be E0502. They are written `impl<'a> Group<'a> { fn cross_tenant_cap(&self) -> CrossTenant<'a>; fn tenant_admission(&self) -> TenantAdmission<'a>; }`. A token then lives no longer than the group's `&'a mut Db`, so it cannot enter a `static` or a `thread_local!` (E0521), and cloning a `&CrossTenant` only copies the reference (E0308). *Residual, true of both forms:* operator code that `Box::leak`s its `Db` can mint a `'static` token. That is the operator building a bypass on purpose, with the standing `Db::snapshot` already gives it (DECISIONS §12). Spec §2 ruling 4 reads: a handler cannot park a token, and `main` cannot without leaking the `Db`. Task 7 Step 5 re-measures the `&self` form on the real tree.
+- **A10 — P5 exactly as the re-review built it is refused at mount, and the dispatch assert closes the rest.** `JobDef { scope_type: TypeId::of::<Board>(), ..File::def() }` keeps `File`'s NAME `Desk` for a type that is not `Desk`. Beside any other `Desk`-scoped mount, Task 3's uniqueness check refuses it before anything is enqueued. The P5 shape that survives mount has a `scoped_by` and `scope_type` that agree with each other but not with its glue, and `JobScope::open`'s assert (Task 5) closes it. `JobScope` carries the job's name as a third private field (`job`), because spec §7's message names the job. *Stated residual (spec §7):* a `JobDef` whose glue and `scope_type` lie the same way is undetectable. It is also not a tenancy breach: `Group::stage` held the enqueuer to that same type.
+- **A11 — item 12 closes the class of refusal, not two instances.** A fix clause that restates an attribute from the author's own declaration drops the author's other arguments. Spec §7 names the 401 and `undeclared_capability`. A sweep of every `crates/*/src/**/*.rs` literal that spells an attribute found five more, and Task 6 fixes all seven:
+  - `#[route]`'s neither-stance refusal, which drops `cross_tenant` and `emits(…)`;
+  - `#[job]`'s no-tenancy refusal, which drops `cross_tenant` and `retry(…)`; a dropped `retry` silently resets the policy;
+  - `#[table]`'s no-tenancy refusal, which drops `version = N`;
+  - `emits(…)` on a non-stream route;
+  - `NoTenant`'s job line in charpente-core.
+
+  The rule: a refusal names the word to add or change and says to keep the rest. Where it names the site, it writes an elided attribute. Task 6's class sweep reports 12 restated literal lines at its base and must report 0 after. `#[event]`'s bare refusal (Task 11) is written in the same shape from the start.
+- **A12 — the dispatcher reads its job row through an admission-gated door, `Tx::get_job`.** `Dispatcher::run_due_into` re-reads the job row inside `group.stage`, where the batch's own overlay must be visible and no snapshot exists (`dispatch.rs:411-418` says why). Core's crate-private readers do not reach the `charpente` crate. So `Tx` gains `pub fn get_job(&self, id: Id<JobRow>, admission: &TenantAdmission<'_>) -> io::Result<Option<JobRow>>`, sealed exactly as `settle_job` is: only a `Group` mints the admission. Four operator-side test reads that already hold an admission move onto it.
+- **A13 — a transaction's read of a `Row` whose `TABLE` borrows a platform table's name is refused at build, like the write.** A typed bound covers `JobRow`/`EventRow`/`SchemaVersion` themselves, but not an app's hand-written `Row` with `TABLE = "charpente.jobs"` and `Scope = Unscoped`, the door C-2's FR-C1 closed for writes. `Tx`'s four `View` methods evaluate `const { refuse_platform_read(R::TABLE) }`, the read twin of `put`'s `refuse_platform_table`. This is a post-monomorphization E0080 that `cargo build`/`cargo test` report and `cargo check` does not, FR-C2a's accepted limitation, now for reads too.
+- **A14 — DESIGN §2's group-commit visibility pin moves to core.** `enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch` (`crates/charpente/tests/group_commit.rs`) reads `JobRow`/`EventRow` from handlers, which Task 9 makes compile errors. The property still exists where the dispatcher reads the queue inside a batch. So Task 9 deletes that test and its routes, pins the job half in `crates/charpente-core/tests/group_commit.rs` through `Tx::get_job`, and states the emit half in DESIGN §2: no transaction can read an emit any more.
+- **A15 — one quoted `View` declaration line re-pins.** Spec §3 keeps `View`'s existing diagnostics for scoped tables byte-identical. The message, the label, both `help:` blocks, every `note:` and the error count are identical. The line rustc quotes from `View::scan`'s declaration cannot be, because the bound sits on it. So `compile_fail/scoped_read_from_bare_tx.stderr`'s `fn scan<R: UnscopedRow>(…)` becomes `fn scan<R: UnscopedRow + ReadableBy<Self>>(…)`, the only `.stderr` in the tree that quotes a `View` declaration.
+- **A16 — resume validation refuses, by name, a cursor on a row of another tenancy.** When `row.scope != sub.scope` (another tenant's event on a tenant feed, a global event on a tenant feed, or a tenant's event on a global subscription), the resume gets a 409 checked after the seq check and before the reshape check: `cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; re-sync current state through reads, then reconnect without a cursor`. It names no tenant and no event. Validation still does not refuse a cursor on a same-tenancy row the feed does not admit (another event type, another app key), which payload-shapes spec §3 pins. So no global feed's behaviour, and no global baseline, moves. `Subscription::admits` stays the one predicate: delivery uses it to skip, and validation uses it to gate the reshape refusal. This makes spec §9's "a resume across the boundary is refused, not misdelivered" exact.
+- **A17 — `Subscription.entries` and `SubEntry` become crate-private (Task 11).** With them `pub`, a handler admitted to `Team` 1 could push an `Org`-scoped event's `SubEntry` into its own feed. Delivery would then admit `Org` 1's rows of that event: same name, same shape, same raw id. The typed bounds and the NAME-mixing fingerprint never see a hand-pushed entry, and exit criterion 1 forbids that read. The one out-of-crate user, `realtime.rs`'s failing-encoder test, moves into a `#[cfg(test)]` module in `kernel/tail.rs`. A compile-fail fixture pins the privacy. `Subscription.key` and `.cursor` stay public: a key is an app filter (spec §2.3), and the tenant rides in the private `scope`.
+
+## Global Constraints
+
+- **Commits.**
+  - Commit directly on `main` (CLAUDE.md "Workflow").
+  - **No `Co-Authored-By` trailers.** CLAUDE.md is the user's instruction and it overrides the harness's attribution reminder.
+  - Before each commit, re-check `git status` and `git log -1`: another session may be writing this tree. Stage named paths only, never `git add -A`.
+- **Every commit green.** Tasks are ordered so that no commit leaves the workspace red. Each compile-forced change fixes every site in the same commit.
+- **Execution order: 1, 2, 4, 3, 5, 6, …, 14** (A6). Every other task runs in its number's order.
+- **The gate is three commands, counted:**
+  1. `cargo fmt --all --check`
+  2. `cargo clippy --workspace --all-targets -- -D warnings`
+  3. `cargo test --workspace --no-fail-fast 2>&1 | tee <log>`
+
+  Green means three things:
+  - `grep -c "^test result:" <log>` equals `grep -c "^test result: ok" <log>`;
+  - `grep -c FAILED <log>` is 0;
+  - neither count was inferred from the absence of `FAILED`.
+
+  The baseline count of `test result:` lines is **measured at the base by Task 1**, not assumed. It was 87 at `89bd4e6`, and S2–S4 may change it. This plan adds no test file, so the count Task 1 measures holds to Task 14. A task that adds one must update CLAUDE.md's exhaustive list in the same commit (`doc_inventory` fails otherwise).
+- **Two markers are filled at execution, never guessed.** `<the commit's date>` is the date of the commit that lands the text. `N` in a universe count or a commit message is the value measured in that task's timing or gate step.
+- **The full suite exceeds the 600 s tool ceiling.**
+  - **Implementers** run the per-package, per-file commands each task lists, in the foreground.
+  - **The controller** runs the full workspace gate in the background (`run_in_background`) and polls the log file, never a pipe through `tail`, before it marks a task done.
+  - A subagent that backgrounds `cargo test` can park forever, so dispatches must say "foreground only".
+- **zsh, not bash.**
+  - `${PIPESTATUS[0]}` is empty here; use `${pipestatus[1]}`.
+  - An unquoted `$var` does not word-split.
+  - Quote globs (`'*.rs'`).
+  - `echo ====` is a zsh error; use `echo '----'`.
+  - `timeout` does not exist on this machine; bound a run with perl `alarm` if needed.
+- **Error text is product surface (hard rule 5).** Every message below is fixed wording, pinned byte-exact by a test that spells it out independently of the product's `format!`. Do not "improve" a message without changing its pin and its GUIDE quote in the same commit.
+- **Docs in the same commit as the behaviour (hard rule 6).**
+  - `docs/GUIDE.md`'s ```rust blocks are compiled by `crates/guide-examples/build.rs`, **each block as its own module**, so every block must carry its own `use`s and types. Check them alone with `cargo build -p guide-examples`.
+  - A ` ```text` block preceded by `<!-- pinned -->` is checked by `crates/guide-examples/tests/doc_truth.rs`. **Every non-blank pinned line's fragments must appear in some `.rs` under `crates/` or `examples/`.** A fragment is the text between `<lowercase placeholder>`s, trimmed, 16 or more characters. The check applies Rust's literal rules: a `\` + newline continuation vanishes, `\"` becomes `"`, and `\n` becomes a newline.
+  - Comment lines are not part of that corpus. A pinning test's literal is, on purpose.
+  - `PINNED_FLOOR` is a floor, raised in the same commit as each new pinned block.
+- **Red before green (spec §9, hard rule 3).** Every behavioural test is run and seen failing *before* its implementation lands, and the red output is quoted in the task report. A compile error is not a behavioural red.
+  - Where the spec names the pre-change behaviour, write the test against it first.
+  - Otherwise, prove it red by mutation after the fact. The task names the mutation, and a mutation is reverted and checked with `git diff` before commit.
+- **Byte identity is measured, not assumed.** Task 1 records the coverage baselines at the base. Tasks 2–9, 11 and 12 must reproduce them exactly. Task 10 is the one expected to move the universes that emit inside a tenant scope. It names which tests' coverage may move, and every other baseline must still reproduce. A moved baseline elsewhere is a finding. Stop, and adjudicate it before touching an oracle (memory `pinned-seed-names-a-universe`).
+- **trybuild pins.** Regenerate `.stderr` files with `TRYBUILD=overwrite` and review the diff line by line. A moved line number is expected. A changed diagnostic is a finding unless the task changes that diagnostic. `charpente-macros`' trybuild pins quote std's `panic!` source line, which rustc prints only with the `rust-src` component (`57e804d`). Keep `rust-src` installed locally.
+- **Sim failures are findings.** A property failure is a finding: stop, pin the seed, and adjudicate before weakening anything. A timeout is not a catch, and a green replay of one seed proves nothing about a rate or a floor.
+- **Mutation runs.**
+  - Commit before any mutation run.
+  - Never share `CARGO_TARGET_DIR` across worktrees.
+  - `charpente test --mutants` judges mutants with the core+sim suites unless `--test-package <crate>` is given, whatever `--file` says. `--test-package` is repeatable and replaces the default set.
+  - Validate each `--re` against `cargo mutants --list` for its function first.
+  - `exclude_re` is a substring match. No `.cargo/mutants.toml` entry may be added: a new survivor is a property to write (CLAUDE.md).
+- **Confidentiality.** This repo is intended to become public. Examples stay generic (`Org`, `Shop`, `Desk`, invoices, incidents).
+- **The statuspage and helpdesk experiments stay unmigrated** (spec §11). Nothing edits them.
+
+## Review Focus
+
+These are the inputs the spec implies but does not spell out that are most likely to bite someone using this. Each one's test is added to the task that owns the code.
+
+1. **Tenant 0 is a real tenant for an event.** `scope: Some(0)` must survive the `0x0b` record, `EventRow`, a follower's `Db::apply_shipped` and the delivery predicate. A tenant-0 feed receives tenant 0's events, and a global subscription receives none of them: presence, not value, as with `0x0a`. Owner: Task 10:
+   - `scoped_emit_bytes_are_pinned_with_tenant_zero`;
+   - `a_scoped_event_row_roundtrips_its_tenant_zero_included`;
+   - `a_shipped_scoped_emit_materializes_with_its_scope_tenant_zero_included`;
+   - `a_tenant_feed_receives_only_its_own_tenants_events_tenant_zero_included`.
+2. **A global event emitted inside a scope.** `(*tx).emit(ev)` from a handler's `ScopedTx`, or from a scoped job's `run`, is recorded `0x09` with no tenant. It reaches global subscribers and never a tenant feed. Owner: Task 10, `a_scoped_jobs_emits_are_its_tenants_and_its_deref_emits_are_global`. Task 11 keeps it compiling once the bounds land, through a global twin of the event.
+3. **A tenant feed widened after `.into()`, or by a pushed entry.** `Subscription::and::<G>()` on a subscription that carries a tenant could never deliver `G`. It is refused by a named assert (A3), never left as a silently empty entry. A hand-pushed `SubEntry` cannot be written at all (A17). Owners:
+   - Task 10: `a_tenant_feed_widened_after_into_is_refused_by_name`, and `a_tenant_feeds_and_adds_without_the_widening_assert` for the legitimate path;
+   - Task 11: `subscription_entries_are_crate_private`.
+4. **A generic tenant type gives every instantiation one `NAME`.** `impl<B> Tenant for Wrap<B> { const NAME = "Wrap"; }`, mounted as two instantiations, is refused at mount naming both full type names. Mounted once, it renders its NAME everywhere, never `` `B>` ``. The positive control is one tenant type named through a table, a `public(S)` route and a scoped job, which mounts cleanly. Owners:
+   - Task 3: `two_instantiations_of_one_generic_tenant_type_are_refused_naming_both` and `one_tenant_type_named_through_a_table_a_route_and_a_job_mounts`;
+   - Task 2: the generic 401 and stage-refusal renderings.
+5. **A follower, or a peer on the old protocol, meets a `0x0b` record.** A follower applying a shipped `0x0b` materializes the same `EventRow.scope`. A peer on protocol 4 is refused by name at the handshake rather than sent a tag it cannot decode. Replication, restore and replay all apply through `decode_record`, the only tag decoder in the tree. Owner: Task 10, `a_shipped_scoped_emit_materializes_with_its_scope_tenant_zero_included` and `hello_declaring_protocol_version_4_is_refused_by_name`.
+
+## File map
+
+| File | Responsibility | Tasks |
+|---|---|---|
+| `crates/charpente-core/src/db.rs` | `Tenant::NAME`; `scoped_fingerprint`; the scope renderings in `enter_scope` and `Group::stage`; the tokens `CrossTenant<'g>`/`TenantAdmission<'g>` and their four signatures; `PLATFORM_TABLES`, `refuse_platform_table`/`refuse_platform_read`, `put_schema_version`, `get_job`; `View for Tx` through crate-private readers; tag `0x0b`, `Effect::Emit`/`Emit.scope`, the emit family, `ScopedTx::event_key` removed; `Event::Scope`, `push_emit` | 2, 3, 4, 7, 8, 9, 10, 11 |
+| `crates/charpente-core/src/table.rs` | `Row::SCOPE_NAME`, `TableOps`' tenant fields; `NoTenant`'s job line (A11); `ScopeReadableBy`/`ReadableBy`, the `Operator` seal, `View`'s bounds; `NoEventTenant`/`UnscopedEvent`; `materialize_event`'s scope | 2, 3, 6, 8, 9, 10, 11 |
+| `crates/charpente-core/src/{event,migration,job}.rs` | `EventRow`/`SchemaVersion` become `PlatformOwned`; `EventRow.scope` and its codec | 8, 9, 10 |
+| `crates/charpente-macros/src/{table,job,route,event,fingerprint,lib}.rs` | `SCOPE_NAME`, `tenant_name` emission (A7), `path_as_written` (A8); the scoped job fingerprint; the refusal class (A11); `#[event(global \| scoped_by)]` and its refusal; `<'_>` in generated glue | 1, 2, 3, 4, 6, 7, 11 |
+| `crates/charpente/src/tenant.rs` | `tenant_name` (A7); `Scoped::scope`'s `&Ctx<'_>`; module doc | 2, 4, 5, 7 |
+| `crates/charpente/src/http/{app,router,mod}.rs` | `note_tenant` and the mount-time uniqueness; `PublicScope.type_name`; the 401 (NAME, then A11); `Ctx<'g>`, `Stance<'g>`; `Subscription.scope`, `admits`, the widening assert, `Subscribe`/`TenantFeed<S>`, the bounds, crate-private `entries` (A17) | 2, 3, 6, 7, 10, 11 |
+| `crates/charpente/src/kernel/{dispatch,mod,tail}.rs` | `JobDef.scope_type_name`; `JobScope`'s assert (Task 5); `JobGlue`'s `<'_>`; `get_job` (A12); `validate_subscribe`'s tenancy 409 (A16) and one predicate; tail delivery through `admits` | 2, 3, 4, 5, 7, 9, 10, 11 |
+| `crates/charpente/src/{describe,lib,serve,launch}.rs`, `crates/charpente/src/repl/mod.rs`, `crates/charpente-cli/src/genclient.rs` | `EventDef`/`EventInfo.scoped_by` and NAME rendering; `Subscribe`'s re-export; `PROTO_VERSION` 5; hand-written defs | 2, 3, 10, 11, 12 |
+| `crates/charpente-macros/tests/compile_{fail,pass}/` | every new compile error's pin and the re-pins (reviewed line by line) | 1, 2, 6, 7, 8, 9, 11 |
+| tests: `crates/charpente/tests/{kernel,tenant,realtime,describe,replication,group_commit,transactions,archive,http,typed_tables}.rs`, `crates/charpente-core/tests/{engine,group_commit,materialize,migrate_apply,migrations}.rs`, `crates/charpente-tsgen/tests/common/mod.rs`, `crates/charpente-cli/tests/describe.rs`, `crates/edge-harness/tests/tenant_wire.rs`, `examples/invoicing/tests/describe_golden.rs`, `crates/guide-examples/tests/doc_truth.rs` | oracles, pins, goldens, `PINNED_FLOOR` | all |
+| `examples/invoicing/src/{routes,jobs}.rs`, `examples/invoicing/src/bin/tenant_node.rs`, `crates/{sim-fixture,ts-fixture-app,bench-harness}/src/lib.rs`, `crates/charpente-cli/templates/lib.rs` | the `#[event(global)]` sweep; `const NAME`; `DocCreated`'s tenancy | 1, 2, 10, 11 |
+| `docs/GUIDE.md`, `DESIGN.md`, `DECISIONS.md` (:328), `README.md`, `PLAN.md`, `docs/LEDGER.md`, the job-tenancy and default-secure specs, this plan's spec | spec §10, amendments A1–A17, the record | all |
+
+No new test files, so the `test result:` count Task 1 measures holds to Task 14, and CLAUDE.md's exhaustive list and `doc_inventory` stay as they are. New trybuild fixtures are globbed by `tests/trybuild.rs`. Task 13's oracle lives in `crates/charpente/tests/realtime.rs`, beside the tenant-feed property it extends (spec §9 names `tenant.rs`, but that property is in `realtime.rs`).
+
+---
+
+### Task 1: Baselines recorded; `#[event(global)]` accepted as a no-op and swept onto every event
+
+**Files:**
+- Create `.superpowers/sdd/2026-09-30-tenancy-completion/baselines.sh` (gitignored working
+  file; the coverage-baseline driver every later task runs).
+- Modify `crates/charpente-macros/src/event.rs`: the module doc's first paragraph; add
+  `EventArgs`, `ACCEPTED_FORMS` and `impl Parse for EventArgs`.
+- Modify `crates/charpente-macros/src/lib.rs`: the `event` attribute entry (lines 238–253 at
+  e749823), which today refuses any argument.
+- Modify every `#[event]` attribute site, 32 in Rust (lines at e749823):
+  - `crates/sim-fixture/src/lib.rs:20`
+  - `crates/charpente-cli/templates/lib.rs:27`
+  - `crates/bench-harness/src/lib.rs:45`
+  - `crates/ts-fixture-app/src/lib.rs:330,339`
+  - `crates/charpente/tests/group_commit.rs:2012`
+  - `crates/charpente/tests/tenant.rs:167`
+  - `crates/charpente/tests/archive.rs:35`
+  - `crates/charpente/tests/describe.rs:87,95`
+  - `crates/charpente/tests/kernel.rs:3059`
+  - `crates/charpente/tests/http.rs:1072`
+  - `crates/charpente/tests/realtime.rs:45,50,63,68,74,86,93,100,2839,2937`
+  - `crates/charpente-macros/tests/compile_fail/route_duplicate_emits_name.rs:15`
+  - `crates/charpente-macros/tests/compile_fail/route_duplicate_emits_clause.rs:16,21`
+  - `crates/charpente-macros/tests/compile_fail/route_emits_on_non_sse.rs:15`
+  - `crates/charpente-macros/tests/compile_pass/route_emits_on_sse.rs:22,27`
+  - `crates/charpente-macros/tests/compile_pass/route_public_scope.rs:37`
+  - `examples/invoicing/src/routes.rs:26`, `examples/invoicing/src/jobs.rs:70`,
+    `examples/invoicing/src/bin/tenant_node.rs:103`
+- Modify the six compiled `#[event]` blocks in `docs/GUIDE.md` (lines 523, 3719, 3724, 3772,
+  3911, 4237 at e749823: §4's `InvoiceFinalized`; §11's `HTTPEvent`, `InvoicePDFSent`,
+  `NoteAdded` (registering), `Ping` (the SSE route), `Ping` (testing a tail)).
+- Create `crates/charpente-macros/tests/compile_pass/event_global_forms.rs`.
+- Create `crates/charpente-macros/tests/compile_fail/event_duplicate_global.rs`,
+  `event_unknown_word.rs` and their `.stderr` files.
+- Test: `crates/charpente/tests/realtime.rs` (the global event fingerprint pin),
+  `examples/invoicing/tests/describe_golden.rs` (the invoicing events' fingerprint pin).
+- Docs:
+  - `docs/GUIDE.md` §11 ("`#[event]`"), §9 (a new `#[event]` catalog entry);
+  - `DESIGN.md` §3's **Events** bullet (line 643 at e749823);
+  - the spec, which gets the plan's amendments.
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `#[event(...)]` accepts the one word `global`, at most once, with an optional trailing
+    comma. `global` expands to nothing. A bare `#[event]` still compiles; Task 11 refuses it
+    (amendment A1).
+  - Refusals, fixed text:
+    - "`global` given twice — write it once"
+    - "an event declares `global` — write `#[event(global)]`; its name derives from the type"
+      (any other argument; replaces "write `#[event]` with no arguments; the name derives from
+      the type", which no fixture or doc pinned).
+  - Every `#[event]` in `crates/`, `examples/` and `docs/GUIDE.md` says `global`.
+  - `baselines.sh` and eleven `cov-<label>-base.txt` recordings, which Tasks 2–9, 11 and 12
+    reproduce and Task 10 reproduces except `realtime-tenant` (Task 10 Step 8).
+  - The pins `a_global_events_fingerprint_is_the_bare_events_fingerprint` (realtime.rs) and
+    `the_invoicing_events_fingerprints_do_not_move` (describe_golden.rs), which Task 11 must
+    keep green (its fingerprint change is for scoped events only).
+
+The baselines, and why each is here:
+
+| label | test | why the plan could move it |
+|---|---|---|
+| `tenant` | `tenant.rs` `every_scoped_read_returns_only_its_own_tenants_rows` (base `0x7E4A_0001`) | scoped tables under `Tenant::NAME` (2, 3), tokens (7), platform tables (8, 9) |
+| `kernel` | `kernel.rs` `kernel_jobs_are_exactly_once_under_the_fault_matrix`, re-based `CHARPENTE_BASE_SEED=0x3E7A0927` | jobs + a scoped indexed table (2, 5, 9) |
+| `job-tenancy` | `kernel.rs` `job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from` (`0x70B5_0001`) | scoped job fingerprints (4, byte identity by A4), `JobScope` (5), the 401 (6), tokens (7) |
+| `realtime-flagship` | `realtime.rs` `reconnecting_client_misses_nothing_under_the_fault_matrix` (`0x2EB2_0001`) | global emits, keyed feeds, the delivery predicate (10) |
+| `realtime-shapes` | `realtime.rs` `a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix` (`0x2EB2_5A10`) | resume validation (10) |
+| `realtime-follower` | `realtime.rs` `follower_tails_and_the_failover_resume_divergence_property` (`0x2EB2_0002`) | replicated events, `PROTO_VERSION` (10) |
+| `realtime-tenant` | `realtime.rs` `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing` (`0x2EB2_5C09`) | the only swarm that emits inside a tenant scope: Task 10 moves it by design |
+| `archive-scoped` | `archive.rs` `archive_converges_with_a_scoped_table` | scoped rows + global emits + schema rows through the archive (8, 10) |
+| `migrations` | `charpente-core` `migrations.rs` `migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin` (`0x2EB7_2000`) | the schema-version door (8) |
+| `migrations-scoped` | `migrations.rs` `migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninterrupted_twin` (`0x2EB7_5000`) | the same, for a scoped table (8) |
+| `invoicing` | `charpente test --sim --dir examples/invoicing --universes 32 --jobs 1 --master-seed 0x7e4ac0de --format json` | the demo the launch run replays: global keyed emits must stay `0x09` (10), global event fingerprints (11) |
+
+- [ ] **Step 1: Write the baseline driver and record every baseline, before any change**
+
+Confirm the base: `git rev-parse --short HEAD` prints the plan's base commit (the tip after
+S2, S3 and S4 landed — write it into `progress.md`), and `git status --short` is empty.
+
+Write the driver with a quoted heredoc (the quote on `EOF` keeps `$` and `\` literal):
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+mkdir -p $D
+cat > $D/baselines.sh <<'EOF'
+#!/bin/zsh
+# Coverage baselines for the tenancy-completion plan (its Task 1). From the
+# repo root:
+#   zsh .superpowers/sdd/2026-09-30-tenancy-completion/baselines.sh <suffix> <label>...
+# Suffix `base` records. Any other suffix records beside it and compares with
+# the base: a moved line, a red run or an empty recording exits 1.
+set -u
+unset CHARPENTE_SEED CHARPENTE_BASE_SEED
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+suffix=$1
+shift
+fail=0
+
+report() {
+  local label=$1 rc=$2 ok=$3
+  local lines=$(wc -l <$D/cov-$label-$suffix.txt | tr -d ' ')
+  print -r -- "$label: exit $rc, passing-test lines $ok, recorded lines $lines"
+  if [[ $rc -ne 0 || $ok -ne 1 || $lines -eq 0 ]]; then
+    print -r -- "  $label: RED OR EMPTY — read $D/cov-$label-$suffix.log"
+    fail=1
+  fi
+  if [[ $suffix != base ]]; then
+    if diff $D/cov-$label-base.txt $D/cov-$label-$suffix.txt >$D/cov-$label-$suffix.diff; then
+      print -r -- "  $label: reproduces the base"
+    else
+      print -r -- "  $label: MOVED — see $D/cov-$label-$suffix.diff"
+      fail=1
+    fi
+  fi
+}
+
+swarm() {
+  local label=$1 pkg=$2 file=$3 name=$4 rebase=$5
+  local log=$D/cov-$label-$suffix.log
+  local rc
+  if [[ -n $rebase ]]; then
+    CHARPENTE_BASE_SEED=$rebase cargo test -p $pkg --test $file -- $name --exact --nocapture >$log 2>&1
+  else
+    cargo test -p $pkg --test $file -- $name --exact --nocapture >$log 2>&1
+  fi
+  rc=$?
+  grep -E '^charpente-sim|^  [^ ]' $log >$D/cov-$label-$suffix.txt
+  report $label $rc "$(grep -c '^test result: ok. 1 passed' $log)"
+}
+
+invoicing_sim() {
+  local log=$D/cov-invoicing-$suffix.log
+  local rc
+  cargo run -q -p charpente-cli -- test --sim --dir examples/invoicing --universes 32 \
+    --jobs 1 --master-seed 0x7e4ac0de --format json >$D/cov-invoicing-$suffix.txt 2>$log
+  rc=$?
+  report invoicing $rc 1
+}
+
+for label in "$@"; do
+  case $label in
+    tenant) swarm tenant charpente tenant every_scoped_read_returns_only_its_own_tenants_rows '' ;;
+    kernel) swarm kernel charpente kernel kernel_jobs_are_exactly_once_under_the_fault_matrix 0x3E7A0927 ;;
+    job-tenancy) swarm job-tenancy charpente kernel job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from '' ;;
+    realtime-flagship) swarm realtime-flagship charpente realtime reconnecting_client_misses_nothing_under_the_fault_matrix '' ;;
+    realtime-shapes) swarm realtime-shapes charpente realtime a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix '' ;;
+    realtime-follower) swarm realtime-follower charpente realtime follower_tails_and_the_failover_resume_divergence_property '' ;;
+    realtime-tenant) swarm realtime-tenant charpente realtime a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing '' ;;
+    archive-scoped) swarm archive-scoped charpente archive archive_converges_with_a_scoped_table '' ;;
+    migrations) swarm migrations charpente-core migrations migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin '' ;;
+    migrations-scoped) swarm migrations-scoped charpente-core migrations migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninterrupted_twin '' ;;
+    invoicing) invoicing_sim ;;
+    *) print -r -- "unknown label: $label"; fail=1 ;;
+  esac
+done
+exit $fail
+EOF
+zsh -n $D/baselines.sh && print -r -- 'driver parses'
+```
+
+Expected: `driver parses`. (The driver was dry-run against a stub `cargo` when this plan was
+drafted: a matching run prints `reproduces the base`, a changed line prints `MOVED` and exits 1,
+a red run prints `RED OR EMPTY` and exits 1, an unknown label exits 1.)
+
+Record the base. One call per test binary, so each stays under the 600 s tool ceiling; every
+call is foreground:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh base tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh base kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh base realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh base archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh base migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh base invoicing; print -r -- "exit ${?}"
+for f in $D/cov-*-base.txt; do print -r -- "$f: $(wc -l <$f | tr -d ' ') lines"; done
+```
+
+Expected: every call prints `exit 0`; every label prints `exit 0, passing-test lines 1`; each
+swarm recording holds the "N swarm universes from base seed" header, the "coverage over N
+universes:" header, its key lines and the "N of N universes reached a verdict" line; the
+invoicing recording is one JSON document with a `"coverage"` object. An empty recording means
+the grep missed the runner's format: read the `.log` and fix the pattern before going on. Every
+later comparison is this driver with another suffix, and **a `MOVED` line is a finding**: stop
+and adjudicate before touching an oracle (memory `pinned-seed-names-a-universe`).
+
+Then add the two fingerprint pins. In `crates/charpente/tests/realtime.rs`, directly after
+`an_events_fingerprint_follows_its_fields_not_its_name`:
+
+```rust
+/// Tenancy-completion spec §6 and amendment A1: a `global` event's
+/// fingerprint is exactly the fold a bare `#[event]` computed, so no stored
+/// row of an existing event changes shape when its declaration gains
+/// `global`, and the scoped fingerprint the plan's Task 11 adds leaves global
+/// events alone. The literals are FNV-1a over charpente's own rendering —
+/// `"n\0WireU64\0"` and `"a\0WireU64\0b\0WireU64\0"` — and were run green at
+/// the plan's base, before any event said `global`.
+#[test]
+fn a_global_events_fingerprint_is_the_bare_events_fingerprint() {
+    assert_eq!(<Ping as Event>::FINGERPRINT, 0x9caf_3f93_9b10_65e1);
+    assert_eq!(<Pong as Event>::FINGERPRINT, 0x9caf_3f93_9b10_65e1);
+    assert_eq!(
+        <shapes_v1::Swapped as Event>::FINGERPRINT,
+        0x26f3_bd60_2fcd_ef46
+    );
+}
+```
+
+In `examples/invoicing/tests/describe_golden.rs`, add to the imports:
+
+```rust
+use charpente::Event;
+use invoicing::jobs::ReceiptSent;
+use invoicing::routes::InvoiceFinalized;
+```
+
+and after `fixture_app`:
+
+```rust
+/// Tenancy-completion spec §11: `examples/invoicing`'s two events are global,
+/// and their stored rows must not change shape when they say so — the launch
+/// run replays this demo's log. The literals are FNV-1a over charpente's own
+/// rendering of each field list (`"invoice\0Id < Invoice >\0"` and
+/// `"invoice\0Id < Invoice >\0amount_cents\0WireI64\0"`), run green at the
+/// plan's base, before either event said `global`.
+#[test]
+fn the_invoicing_events_fingerprints_do_not_move() {
+    assert_eq!(
+        <InvoiceFinalized as Event>::FINGERPRINT,
+        0x7034_25fd_804c_6200
+    );
+    assert_eq!(<ReceiptSent as Event>::FINGERPRINT, 0x133d_31e7_fc9e_acca);
+}
+```
+
+Run both at the base (nothing else changed yet):
+
+```zsh
+cargo test -p charpente --test realtime -- a_global_events_fingerprint_is_the_bare_events_fingerprint --exact
+cargo test -p invoicing --test describe_golden -- the_invoicing_events_fingerprints_do_not_move --exact
+```
+
+Expected: both PASS. They are characterization pins: they must hold before and after. The
+literals were computed from `fingerprint.rs`'s `fold` (its own FNV-1a reproduces the
+job-tenancy pins `0x766b_8ba4_18db_4d08` and `0x7e72_9c20_6b79_cbad`). If one fails here, the
+literal is wrong, not the code: stop and report the printed value; do not edit it in.
+
+- [ ] **Step 2: Write the failing macro fixtures**
+
+`crates/charpente-macros/tests/compile_pass/event_global_forms.rs`:
+
+```rust
+// `#[event(global)]` (tenancy-completion spec §6, amendment A1): the one
+// tenancy word an event takes today, at most once, with an optional trailing
+// comma. It expands to nothing: a `global` event is what a bare `#[event]`
+// was, so its NAME, its fingerprint and its stored bytes are unchanged.
+// trybuild runs `main`, so its assertions are part of the pin.
+use charpente::wire::WireU64;
+use charpente::{Event, event};
+
+#[event]
+struct Bare {
+    n: WireU64,
+}
+
+#[event(global)]
+struct Declared {
+    n: WireU64,
+}
+
+#[event(global,)]
+struct TrailingComma {
+    n: WireU64,
+}
+
+fn main() {
+    assert_eq!(Declared::NAME, "declared");
+    assert_eq!(TrailingComma::NAME, "trailing_comma");
+    assert_eq!(
+        <Declared as Event>::FINGERPRINT,
+        <Bare as Event>::FINGERPRINT,
+        "`global` changes nothing the fingerprint hashes"
+    );
+    assert_eq!(
+        <TrailingComma as Event>::FINGERPRINT,
+        <Bare as Event>::FINGERPRINT
+    );
+}
+```
+
+The bare `#[event]` on `Bare` is the control: it is the one bare attribute the Step 5 sweep
+must leave, and Step 5's script skips this file by name. Task 11 refuses the bare form and
+removes `Bare` from this fixture.
+
+`crates/charpente-macros/tests/compile_fail/event_duplicate_global.rs`:
+
+```rust
+// A tenancy word is a declaration, so a repeat is always a typo or a bad
+// merge — refused by name rather than last-write-wins, the call `#[table]`,
+// `#[job]` and `#[route]` already make. The struct is never expanded (the
+// arguments are refused first), so its `u64` field is never checked.
+use charpente::event;
+
+#[event(global, global)]
+struct Twice {
+    n: u64,
+}
+
+fn main() {}
+```
+
+`crates/charpente-macros/tests/compile_fail/event_unknown_word.rs`:
+
+```rust
+// An event names itself (its NAME is the type's snake_case) and declares its
+// tenancy; any other argument is refused with the accepted form, not ignored.
+use charpente::event;
+
+#[event(name = "renamed")]
+struct Renamed {
+    n: u64,
+}
+
+fn main() {}
+```
+
+- [ ] **Step 3: Run the fixtures and record why each is red**
+
+```zsh
+cargo test -p charpente-macros --test trybuild 2>&1 | tee .superpowers/sdd/2026-09-30-tenancy-completion/task1-red.log | grep -E "^test |mismatch|error" | head -40
+```
+
+Expected red, quoted in the report:
+- `event_global_forms.rs` fails to compile with "write `#[event]` with no arguments; the name
+  derives from the type", pointing at `Declared` (today every argument is refused, at the
+  struct's ident);
+- `event_duplicate_global.rs` and `event_unknown_word.rs` have no `.stderr` yet; trybuild
+  prints the actual error — today's "write `#[event]` with no arguments …" text for both, which
+  is the wrong text for each.
+
+- [ ] **Step 4: Implement the parser**
+
+In `crates/charpente-macros/src/event.rs`, replace the module doc's first sentence
+("`#[event]` (DESIGN.md §6, realtime spec): turns a struct into a typed realtime event —") with:
+
+```rust
+//! `#[event(global)]` (DESIGN.md §6, realtime spec, tenancy-completion spec
+//! §6): turns a struct into a typed realtime event —
+```
+
+and keep the rest of the doc. Change the `use` block to:
+
+```rust
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::parse::{Parse, ParseStream};
+use syn::spanned::Spanned;
+use syn::{Data, DeriveInput, Error, Fields, Ident, Token};
+```
+
+and add, after it:
+
+```rust
+const ACCEPTED_FORMS: &str =
+    "an event declares `global` — write `#[event(global)]`; its name derives from the type";
+
+/// The attribute's arguments. `global` is its one word, read only to refuse a
+/// repeat or anything else: it expands to nothing, because a `global` event is
+/// what a bare `#[event]` was (tenancy-completion amendment A1). The plan's
+/// Task 11 adds `scoped_by = <Type>` and refuses the bare form.
+pub(crate) struct EventArgs;
+
+impl Parse for EventArgs {
+    fn parse(input: ParseStream) -> syn::Result<EventArgs> {
+        let mut global = false;
+        while !input.is_empty() {
+            let word: Ident = input
+                .parse()
+                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+            if word != "global" {
+                return Err(Error::new(word.span(), ACCEPTED_FORMS));
+            }
+            if global {
+                return Err(Error::new(word.span(), "`global` given twice — write it once"));
+            }
+            global = true;
+            if input.is_empty() {
+                break;
+            }
+            input
+                .parse::<Token![,]>()
+                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+        }
+        Ok(EventArgs)
+    }
+}
+```
+
+In `crates/charpente-macros/src/lib.rs`, replace the `event` entry (the whole function, lines
+238–253 at e749823) with:
+
+```rust
+#[proc_macro_attribute]
+pub fn event(args: TokenStream, input: TokenStream) -> TokenStream {
+    let event::EventArgs = parse_macro_input!(args as event::EventArgs);
+    let input = parse_macro_input!(input as DeriveInput);
+    match event::expand(input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+```
+
+`Error` stays imported in `lib.rs` (the `table` entry uses it). `name = "renamed"` fails at
+`name` (an ident, not `global`), so `event_unknown_word` gets the accepted-forms text at `name`.
+This parser was built in a scratch proc-macro crate against syn 2.0.118 on rustc 1.95.0 while
+the plan was drafted: `#[event]`, `#[event(global)]` and `#[event(global,)]` compiled, and rustc
+printed
+
+```text
+error: `global` given twice — write it once
+ --> user/src/main.rs:2:17
+  |
+2 | #[event(global, global)]
+  |                 ^^^^^^
+error: an event declares `global` — write `#[event(global)]`; its name derives from the type
+ --> user/src/main.rs:4:9
+  |
+4 | #[event(name = "renamed")]
+  |         ^^^^
+```
+
+(`#[event(global = 1)]` points at `=`, `#[event("x")]` at the literal, both with the
+accepted-forms text.)
+
+- [ ] **Step 5: Sweep `global` onto every event**
+
+Exact sweep (quoted heredoc; the pattern is anchored to a whole attribute line, `[ \t]` rather
+than `\s` so it can never swallow the newline):
+
+```zsh
+python3 - <<'EOF'
+import pathlib, re, subprocess
+files = subprocess.run(['git', 'ls-files', 'crates', 'examples', 'docs/GUIDE.md'],
+                       capture_output=True, text=True, check=True).stdout.split()
+skip = {'crates/charpente-macros/tests/compile_pass/event_global_forms.rs'}
+pat = re.compile(r'^([ \t]*)#\[event\][ \t]*$', re.M)
+total = 0
+for f in files:
+    if f in skip or not (f.endswith('.rs') or f == 'docs/GUIDE.md'):
+        continue
+    p = pathlib.Path(f)
+    text = p.read_text()
+    new, n = pat.subn(r'\1#[event(global)]', text)
+    if n:
+        p.write_text(new)
+        print(f'{f}: {n}')
+        total += n
+print('total', total)
+EOF
+```
+
+Expected at e749823: 20 files listed and `total 38` (32 Rust sites in 19 files from this
+task's file list, plus GUIDE's 6). The spec's §11 counts (≈95 in tests, 26 in GUIDE) count
+every mention of `#[event`; the other mentions are prose, comments and error texts naming the
+attribute (GUIDE 3107, 3108 and 3873 at e749823 quote texts the code emits), and they stay as
+written, the way prose says `#[job]`. If S2–S4 added an event, the total is higher by exactly
+those sites and the proof greps below are the authority. `event_global_forms.rs` is untracked
+until Step 8, so `git ls-files` does not list it; the `skip` entry is belt and braces.
+
+Prove the sweep complete:
+
+```zsh
+grep -rnE '^[[:space:]]*#\[event\][[:space:]]*$' --include='*.rs' crates examples
+grep -nE '^#\[event\][[:space:]]*$' docs/GUIDE.md
+grep -rnE '^[[:space:]]*#\[event\(global\)\][[:space:]]*$' --include='*.rs' crates examples | wc -l
+```
+
+Expected: the first prints exactly one line, `crates/charpente-macros/tests/compile_pass/
+event_global_forms.rs:9:#[event]` (the deliberate bare control); the second prints nothing; the
+third prints `33` (the 32 swept sites plus the fixture's `Declared`). `crates/charpente/src/
+http/mod.rs:292` mentions `#[event]` inside a string and is not an attribute line, so the
+anchored pattern never matched it. `crates/charpente-cli/templates/lib.rs` is what
+`charpente new` writes (`include_str!`); `crates/charpente-cli/tests/new.rs`'s
+`a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_the_sim` builds and
+sims the scaffold, so the sweep is checked there.
+
+- [ ] **Step 6: Run the task's tests, and pin the new stderr**
+
+```zsh
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild
+git status --short crates/charpente-macros/tests/
+cargo test -p charpente-macros --test trybuild
+```
+
+Review each generated `.stderr` line by line against `event.rs` before keeping it. Expected:
+- `event_duplicate_global.stderr`: "`global` given twice — write it once" (the contract and
+  the fix in one line), at `tests/compile_fail/event_duplicate_global.rs:7:17`, carets under
+  the second `global` (the site);
+- `event_unknown_word.stderr`: "an event declares `global` — write `#[event(global)]`; its
+  name derives from the type", at `tests/compile_fail/event_unknown_word.rs:5:9`, carets under
+  `name`.
+
+Each file is exactly one `error:` block; a second diagnostic (an unresolved import, a missing
+`Codec`) means the fixture is wrong, not the macro.
+
+No existing `.stderr` may change: the swept fixtures' diagnostics point at `#[route(...)]`
+lines, which moved neither line nor column. `git status --short crates/charpente-macros/tests/`
+must list only the two new `.stderr` files, the three new `.rs` files and the five swept
+fixtures. Then the plain run passes.
+
+- [ ] **Step 7: Docs**
+
+`docs/GUIDE.md` §11, "`#[event]`": after the first code block (`HTTPEvent`/`InvoicePDFSent`),
+before "`#[event]` derives five things", insert:
+
+> An event declares its tenancy. Every event in this guide is `#[event(global)]`: its type is
+> not tied to a tenant. The word changes nothing about the event — its `NAME`, its fingerprint
+> and its stored bytes are exactly what a bare `#[event]` produced — and it may be written
+> once. §16 covers events inside a tenant.
+
+`docs/GUIDE.md` §9: add this subsection immediately before "### Router mount conflict":
+
+````markdown
+### `#[event]` declaration violations (`charpente-macros/src/event.rs`, compile time)
+
+```text
+`global` given twice — write it once
+an event declares `global` — write `#[event(global)]`; its name derives from the type
+#[event] applies to structs — enums and unions cannot be events
+#[event] structs cannot be generic — an event is one concrete payload shape; make `Baz` non-generic
+#[event] needs named fields — `Baz` must be a braced struct
+```
+
+The first refuses the tenancy word given twice. Any other argument — `#[event(name = "x")]`,
+say — hits the second: an event's `NAME` is its type's snake_case, never an argument (§11).
+The last three are the struct-shape checks `#[table]` and `#[job]` make.
+````
+
+`DESIGN.md` §3, the **Events** bullet: `` `#[event]` structs; `` becomes
+`` `#[event(global)]` structs; ``. Task 11 rewrites the bullet.
+
+Append the plan's "Spec amendments" section to
+`docs/superpowers/specs/2026-09-30-tenancy-completion-design.md`, verbatim, under a new
+`## Amendments (implementation plan)` heading, and change its **Status** line to:
+
+> **Status:** approved by Noah 2026-09-30; spec of record for the plan
+> `docs/superpowers/plans/2026-09-30-tenancy-completion.md`.
+
+
+- [ ] **Step 8: Gate, the baselines re-run, and commit**
+
+Per-package, foreground, appended to one log, then counted:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/gate-task-1.log
+: > $L
+cargo fmt --all --check 2>&1 | tee -a $L; print -r -- "fmt exit ${pipestatus[1]}"
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a $L | grep -E '^(warning|error)' | head; print -r -- "clippy exit ${pipestatus[1]}"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente --test realtime --test http --test describe --test tenant --test kernel --test group_commit --test archive --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p sim-fixture -p ts-fixture-app -p bench-harness --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente-cli --test new --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo build -p guide-examples 2>&1 | tee -a $L | tail -2
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+print -r -- "result lines $(grep -c '^test result:' $L), ok lines $(grep -c '^test result: ok' $L), FAILED lines $(grep -c FAILED $L)"
+```
+
+Expected: `fmt exit 0`, `clippy exit 0`; the two `result` counts equal, `FAILED lines 0`. State
+the counts in the report; never infer them from the absence of `FAILED`.
+
+Re-run every baseline on the swept tree. `global` expands to nothing, so all eleven must
+reproduce:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task1 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task1 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task1 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task1 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task1 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task1 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label `reproduces the base`, every call `exit 0`. A `MOVED` here means `global`
+changed an expansion: a bug in Step 4, not a baseline to re-record.
+
+The controller runs the full workspace gate (background, counted) before marking the task done.
+Re-check `git status` and `git log -1` (another session may be writing this tree), then:
+
+```zsh
+git add crates/charpente-macros crates/sim-fixture/src/lib.rs crates/charpente-cli/templates/lib.rs \
+  crates/bench-harness/src/lib.rs crates/ts-fixture-app/src/lib.rs \
+  crates/charpente/tests/group_commit.rs crates/charpente/tests/tenant.rs crates/charpente/tests/archive.rs \
+  crates/charpente/tests/describe.rs crates/charpente/tests/kernel.rs crates/charpente/tests/http.rs \
+  crates/charpente/tests/realtime.rs examples/invoicing/src/routes.rs examples/invoicing/src/jobs.rs \
+  examples/invoicing/src/bin/tenant_node.rs examples/invoicing/tests/describe_golden.rs \
+  docs/GUIDE.md DESIGN.md docs/superpowers/specs/2026-09-30-tenancy-completion-design.md
+git status --short
+git commit -m "feat(tenancy-completion): #[event(global)] accepted and swept onto every event (<N> sites); global event fingerprints pinned; <M> coverage baselines recorded at <base sha> and reproduced after the sweep"
+```
+
+`git status --short` after the add must show nothing unstaged under the paths this task touched.
+No `Co-Authored-By` trailer (CLAUDE.md).
+
+---
+
+### Task 2: `Tenant::NAME`; every scope rendering says the name
+
+**Files:**
+- Modify `crates/charpente-core/src/db.rs`:
+  - `trait Tenant` (~1476): `const NAME` as its first item, plus a doc paragraph;
+  - `Tx.opened_scope` (~878) and `Tx::enter_scope`'s one-scope assert (~1497–1518);
+  - `EnqueuedTenant.scope_name`'s doc (~587);
+  - `Tx::push_enqueue` (~1026), `Tx::enqueue_in` (~1084), `ScopedTx::enqueue`/`enqueue_keyed` (~1699–1708);
+  - `Group::stage`'s scope-type refusal (~3774–3797) and the comment above the loop (~3716–3733);
+  - `DeclaredTenancy`'s doc (~359).
+- Modify `crates/charpente-core/src/table.rs`: `Row::SCOPE_NAME`, after `FINGERPRINT` (~347).
+- Modify `crates/charpente/src/tenant.rs`:
+  - add `tenant_name` (A7);
+  - `TenantScope`'s `on_unimplemented` note and the doc paragraph naming the const assert.
+- Modify `crates/charpente/src/http/app.rs`:
+  - `Ctx::anonymous_scope` (~137–175);
+  - add `Tenant` to the `charpente_core::db::{…}` import (rustfmt keeps it on one line).
+- Modify docs only (no code change):
+  - `crates/charpente/src/http/router.rs`: `PublicScope.name`'s doc;
+  - `crates/charpente/src/kernel/dispatch.rs`: `JobDef.scoped_by`'s doc;
+  - `crates/charpente/src/describe.rs`: `RouteInfo.public_scope`'s and `JobInfo.scoped_by`'s docs.
+- Modify `crates/charpente-macros/src/fingerprint.rs`: add `path_as_written` and its unit test (A8).
+- Modify `crates/charpente-macros/src/lib.rs`: the table's "`global` and `scoped_by`" refusal quotes the path through `path_as_written` (A8).
+- Modify `crates/charpente-macros/src/table.rs`: emit `SCOPE_NAME`; delete `tenant_scope_assert` (A7).
+- Modify `crates/charpente-macros/src/route.rs`:
+  - delete `scope_name`;
+  - `public_scope_tokens` returns one emission;
+  - `undeclared_capability`'s stance quotes the path through `path_as_written`.
+- Modify `crates/charpente-macros/src/job.rs`:
+  - `JobDef.scoped_by` is emitted through `tenant_name`;
+  - delete the scoped arm's `tenant_scope_assert` (A7);
+  - `global_and_scoped_by` quotes the path through `path_as_written`.
+- The sweep (Step 4) adds `const NAME` to every `impl Tenant`. At e749823 that is 57 sites (census: Step 4's regex, dry-run, read-only), and Step 1 adds 7 more:
+  - 25 impls in 23 `crates/charpente-macros/tests/compile_fail/*.rs`;
+  - 8 impls in `compile_pass/*.rs`;
+  - `crates/charpente-core/tests/engine.rs` ×3;
+  - `crates/charpente/tests/`: `tenant.rs` ×4, `kernel.rs` ×4, `archive.rs` ×2, and one each in `describe.rs`, `realtime.rs`, `typed_tables.rs`, `replication.rs`;
+  - `examples/invoicing/src/bin/tenant_node.rs`;
+  - 6 in `docs/GUIDE.md`'s ```rust blocks (~1452, ~1994, ~6010, ~6095, ~6297, ~6473).
+- Tests:
+  - `crates/charpente/tests/{kernel,tenant,describe,typed_tables}.rs`;
+  - `crates/charpente-core/tests/engine.rs`;
+  - `crates/charpente-macros/src/fingerprint.rs` (unit).
+- Re-pin, by `TRYBUILD=overwrite`:
+  - every `compile_fail/*.stderr` whose `.rs` gained a line before a reported span (at most the 23);
+  - `table_scoped_by_missing_tenant_scope.stderr`, `job_scoped_by_missing_tenant_scope.stderr` and `route_public_scope_missing_tenant_scope.stderr`. In these three the note gains its `const NAME` line, and (A7) moves the "required by a bound in" note to `tenant_name`.
+- Docs:
+  - `docs/GUIDE.md`:
+    - §5: the sentence after the rule-3 401 block;
+    - §6: the scope-type refusal's lead-in and its pinned block (~1767–1783);
+    - §13: the route and job field sentence (~4501–4502);
+    - §16: the declaring example's comment, a new bullet, the one-scope text block (~6180) and its parenthesis, the rendered `TenantScope` note (~6213–6226), and the `public_scope` paragraph (~6379–6383);
+  - `DESIGN.md`: §3's **Scope** bullet (~569–571), and §7's `describe` field list (~1401, ~1414).
+
+**Interfaces:**
+- Consumes: nothing from this plan (Task 1 swept `#[event(global)]` only).
+- Produces:
+  - `pub trait Tenant: Sized + 'static { const NAME: &'static str; type Who: ?Sized; type Error; fn authorize(…); }`. `NAME` has no default.
+  - `Row::SCOPE_NAME: Option<&'static str> = None`. `#[table(scoped_by = S)]` sets it to `Some(S::NAME)`.
+  - (A7) `#[doc(hidden)] pub const fn charpente::tenant::tenant_name<S: TenantScope>() -> &'static str`.
+  - Every value that names a scope is now `S::NAME`: `PublicScope.name`, `JobDef.scoped_by`, `describe`'s `public_scope` and `scoped_by`, `EnqueuedTenant.scope_name`, and `DeclaredTenancy`'s name half.
+  - `crate::fingerprint::path_as_written(&syn::Path) -> String`, internal to the macros (A8).
+  - Refusal texts: `Group::stage`'s scope-type refusal (Step 3), `enter_scope`'s one-scope assert (Step 3), and the `TenantScope` note (Step 6). The 401 keeps its text; its scope now renders `S::NAME`.
+- Byte identity. Every in-tree NAME equals its identifier, and no fingerprint changes in this task, so every Task 1 baseline must reproduce exactly.
+
+- [ ] **Step 1: Write the rendering tests against today's code**
+
+Each test compiles at the task's base. Its tenant types carry no `NAME` yet: Step 4's sweep adds one, and Step 5 renames the three that must differ from their identifier. Each test is red today, because today's text renders a last path segment. A scratch crate built against e749823 printed every base-state line quoted in Step 2.
+
+`crates/charpente/tests/kernel.rs`, inside `mod scoped_jobs`, after `a_job_name_registered_under_two_declarations_panics_naming_both` (the module's last test):
+
+```rust
+    // ------------------------------- a scope type renders as its NAME
+    //
+    // Tenancy-completion spec §4 and the job-tenancy final re-review's NB1.
+    // The scope-type refusal named each side by a last path segment, which
+    // failed three ways: two types spelled `Org` in two modules read as a
+    // contradiction; a generic scope type rendered as `Desk>`; and a
+    // hand-built `JobDef` was not among the causes. Each side now renders
+    // its tenant type's `NAME`.
+
+    /// Two tenant types spelled `Org`, in two modules, with two NAMEs.
+    pub mod billing {
+        use super::*;
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                panic!("a job has no principal — billing::Org::authorize is never asked")
+            }
+        }
+    }
+
+    pub mod crm {
+        use super::*;
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                panic!("a job has no principal — crm::Org::authorize is never asked")
+            }
+        }
+    }
+
+    /// A generic scope type: its one impl gives every instantiation one NAME.
+    pub struct Wrap<B>(std::marker::PhantomData<B>);
+
+    impl<B: 'static> Tenant for Wrap<B> {
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Wrap<B>>) -> Result<(), ApiError> {
+            panic!("a job has no principal — Wrap::authorize is never asked")
+        }
+    }
+
+    #[job(scoped_by = billing::Org)]
+    pub struct Invoice {
+        pub n: u64,
+    }
+
+    impl Invoice {
+        fn run(self, _tx: &mut ScopedTx<'_, '_, billing::Org>) -> Result<(), JobError> {
+            let _ = self.n;
+            Ok(())
+        }
+    }
+
+    /// Copies `Invoice`'s `NAME` and `FINGERPRINT` under `crm::Org`.
+    struct CrmInvoice {
+        n: u64,
+    }
+
+    impl Codec for CrmInvoice {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+        fn decode(input: &mut &[u8]) -> std::io::Result<CrmInvoice> {
+            Ok(CrmInvoice {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Job for CrmInvoice {
+        const NAME: &'static str = "Invoice";
+        const FINGERPRINT: u64 = <Invoice as Job>::FINGERPRINT;
+        type Scope = crm::Org;
+    }
+
+    /// Copies `File`'s `NAME` and `FINGERPRINT` under `Wrap<Desk>`.
+    struct WrapFile {
+        n: u64,
+    }
+
+    impl Codec for WrapFile {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+        fn decode(input: &mut &[u8]) -> std::io::Result<WrapFile> {
+            Ok(WrapFile {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Job for WrapFile {
+        const NAME: &'static str = "File";
+        const FINGERPRINT: u64 = <File as Job>::FINGERPRINT;
+        type Scope = Wrap<Desk>;
+    }
+
+    /// The scope-type refusal (`Group::stage`), spelled out here rather than
+    /// taken from the product's `format!`, so the comparison pins the words.
+    fn scope_type_refusal(
+        job: &str,
+        enqueued: &str,
+        declared: &str,
+        shape: u64,
+        id: u64,
+    ) -> String {
+        format!(
+            "job \"{job}\" was enqueued in a `{enqueued}` tenant, but this binary mounts {job} as \
+             `scoped_by = {declared}` with another scope type under the same shape ({shape:#x}) \
+             — a job row records its tenant's id and not its type, so tenant {id} would be read \
+             as the mounted declaration's type, not the one it was enqueued in; either a type \
+             standing in for {job}'s #[job] was enqueued (a hand-written `impl Job`, or a \
+             #[job] whose `scoped_by` spells another scope type the same way), or a \
+             hand-written `JobDef` mounts {job} under a `scope_type` its #[job] does not \
+             declare; the transaction was refused and nothing was written, so a retry cannot \
+             succeed — enqueue the mounted {job} from a `{declared}` scope, give the other type \
+             its own name, or mount {job} as its #[job] declares it (GUIDE §6)"
+        )
+    }
+
+    /// Enqueues `job` inside tenant `tenant` of its own scope type through
+    /// the operator path, and returns the stage's refusal.
+    fn refused_in<S: Tenant, J: Job<Scope = S>>(
+        db: &mut Db,
+        tenant: u64,
+        job: J,
+    ) -> std::io::Error {
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        let staged = group.stage(|tx| {
+            tx.admit_scope(Id::<S>::from_raw(tenant), &admission)
+                .enqueue(job);
+            Ok::<(), std::io::Error>(())
+        });
+        group.commit().unwrap();
+        match staged {
+            Err(TxError::Io(e)) => e,
+            Err(other) => panic!("expected the stage refusal, got {other:?}"),
+            Ok(()) => panic!(
+                "a \"{}\" row enqueued in a tenant of another scope type reached the store",
+                J::NAME
+            ),
+        }
+    }
+
+    /// NB1 (a): `billing::Org` and `crm::Org` are both spelled `Org`, and
+    /// the refusal names them apart.
+    #[test]
+    fn a_stand_in_under_a_same_spelled_scope_type_is_refused_naming_both_tenant_names() {
+        let sim = Sim::with_faults(0x5C0B_00FA, FaultConfig::none());
+        let mut app = only_jobs_app(&sim, jobs![Invoice]);
+        let db = app.db_for_tests();
+        let err = refused_in(db, 21, CrmInvoice { n: 1 });
+        assert_eq!(
+            err.to_string(),
+            scope_type_refusal(
+                "Invoice",
+                "CrmOrg",
+                "BillingOrg",
+                <Invoice as Job>::FINGERPRINT,
+                21
+            )
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+    }
+
+    /// NB1 (b): a generic scope type renders its NAME, never a cut of its
+    /// `type_name` (`Desk>`).
+    #[test]
+    fn a_stand_in_under_a_generic_scope_type_is_refused_by_the_generic_types_name() {
+        let (_sim, mut app) = desk_app(0x5C0B_00FB);
+        let db = app.db_for_tests();
+        let err = refused_in(db, 17, WrapFile { n: 7 });
+        assert_eq!(
+            err.to_string(),
+            scope_type_refusal("File", "Wrap", "Desk", <File as Job>::FINGERPRINT, 17)
+        );
+    }
+
+    /// NB1 (c), the re-review's P6. A hand-built `JobDef` whose `scope_type`
+    /// is not its `#[job]`'s refuses the honest enqueue. So the `JobDef` is
+    /// named among the causes, and "mount it as its #[job] declares it" among
+    /// the fixes. The app mounts no table: a table that named `Desk` would
+    /// meet the mount-time tenant-name check first (Task 3).
+    #[test]
+    fn a_jobdef_whose_scope_type_is_not_its_jobs_is_named_as_a_cause() {
+        let sim = Sim::with_faults(0x5C0B_00FC, FaultConfig::none());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(vec![JobDef {
+            scope_type: TypeId::of::<Board>(),
+            ..<File as JobEntry>::def()
+        }]);
+        let db = app.db_for_tests();
+        let err = refused_in(db, 13, File { n: 7 });
+        assert_eq!(
+            err.to_string(),
+            scope_type_refusal("File", "Desk", "Desk", <File as Job>::FINGERPRINT, 13)
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+    }
+```
+
+`crates/charpente/tests/tenant.rs`, at the end of the file:
+
+```rust
+// ------------------------------------- a scope type renders as its NAME
+
+/// Two tenant types spelled `Org`, in two modules, with two NAMEs
+/// (tenancy-completion spec §4). `authorize` answers `Ok` for everyone:
+/// every test below is about a caller with no credential, and `authorize`
+/// is never asked about one.
+mod billing {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+mod crm {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+/// A generic tenant type: its one impl gives every instantiation one NAME.
+mod wrapped {
+    use std::marker::PhantomData;
+
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Wrap<B>(PhantomData<B>);
+
+    impl<B: 'static> Tenant for Wrap<B> {
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Wrap<B>>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    pub struct Alpha;
+}
+
+/// Declared `public(billing::Org)`, but it opens `crm::Org`. Rule 3 applies
+/// to a caller with no credential, and the 401 must tell the two `Org`s
+/// apart. Path-parameter-free: `Id<S>` is a wire type only for `S: Row`.
+#[route(POST "/crm-leads", public(billing::Org))]
+fn write_crm_lead(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<crm::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+/// Opens a tenant of a generic tenant type on a plain `public` route.
+#[route(POST "/wrapped", public)]
+fn write_wrapped(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<wrapped::Wrap<wrapped::Alpha>>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+fn rendering_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![write_crm_lead, write_wrapped]);
+    (sim, app)
+}
+
+/// Spec §4 and the re-review's NB1 (a), at the 401: the route's stance and
+/// the scope it opened are two different types spelled `Org`.
+#[test]
+fn the_401_tells_two_tenant_types_spelled_alike_apart_by_their_names() {
+    let (_sim, mut app) = rendering_app(0x7E4A_1710);
+    let refused = app.handle(Request::new(Method::Post, "/crm-leads"));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `POST /crm-leads` is declared `public(BillingOrg)` and \
+         opened the tenant scope `CrmOrg` for a caller with no credential; only a route \
+         declared `public(CrmOrg)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `#[route(POST \"/crm-leads\", public(CrmOrg))]`"
+    );
+}
+
+/// Spec §4 and NB1 (b), at the 401: a generic tenant type renders its NAME,
+/// never a cut of its `type_name` (`Alpha>`).
+#[test]
+fn the_401_names_a_generic_tenant_type_by_its_name() {
+    let (_sim, mut app) = rendering_app(0x7E4A_1711);
+    let refused = app.handle(Request::new(Method::Post, "/wrapped"));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `POST /wrapped` is declared `public` and opened the tenant \
+         scope `Wrap` for a caller with no credential; only a route declared `public(Wrap)` \
+         admits one. Send \"Authorization: Bearer <token>\" or the charpente_session cookie, \
+         or, if every caller may act inside this tenant here, declare \
+         `#[route(POST \"/wrapped\", public(Wrap))]`"
+    );
+}
+```
+
+`crates/charpente/tests/describe.rs`, after `to_human_carries_public_scope_and_scoped_by`:
+
+```rust
+/// A tenant type whose NAME is not its identifier (tenancy-completion spec
+/// §4, §8), so a listing that cut a path at its last segment would read
+/// `Org` here. It is mounted by its own app, so `capability_app`'s golden is
+/// untouched.
+mod renamed {
+    pub struct Org;
+
+    impl charpente::Tenant for Org {
+        type Who = charpente::auth::Principal;
+        type Error = charpente::http::ApiError;
+        fn authorize(
+            _tx: &charpente::Tx,
+            _who: &charpente::auth::Principal,
+            _scope: charpente::Id<Org>,
+        ) -> Result<(), charpente::http::ApiError> {
+            Ok(())
+        }
+    }
+}
+
+#[route(GET "/workspace/ledger", public(renamed::Org))]
+fn workspace_ledger(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<renamed::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(tx.scope().raw()))
+}
+
+#[job(scoped_by = renamed::Org)]
+struct Audit {
+    day: u64,
+}
+
+impl Audit {
+    fn run(self, tx: &mut ScopedTx<'_, '_, renamed::Org>) -> Result<(), JobError> {
+        let _ = (self.day, tx.scope());
+        Ok(())
+    }
+}
+
+/// `describe` names a route's `public_scope` and a job's `scoped_by` by the
+/// tenant type's `NAME`. That is the identity the fingerprint mixes, not a
+/// spelling of the type's path.
+#[test]
+fn describe_names_a_tenant_scope_by_its_tenant_types_name() {
+    let sim = Sim::with_faults(0x2EC2_0003, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![workspace_ledger])
+    .mount_jobs(jobs![Audit]);
+    let c = app.describe();
+    let route = c
+        .routes
+        .iter()
+        .find(|r| r.name == "workspace_ledger")
+        .unwrap();
+    assert_eq!(route.public_scope, Some("Workspace"));
+    let job = c.jobs.iter().find(|j| j.name == "Audit").unwrap();
+    assert_eq!(job.scoped_by, Some("Workspace"));
+}
+```
+
+`crates/charpente-core/tests/engine.rs`, after `an_opened_then_admitted_second_tenant_is_the_same_violation`:
+
+```rust
+/// Tenancy-completion spec §4. The one-scope contract's text names each
+/// tenant by its type's `NAME` and its id, then its full `type_name`, so two
+/// scope types spelled alike never print as one. Both scopes are admitted:
+/// `admit_scope` asks no `authorize`, so `AUDITED_SCOPES` is untouched.
+#[test]
+fn a_second_scope_names_both_tenants_by_name_and_type() {
+    let sim = Sim::with_faults(0x7F00_0008, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = group.stage(|tx| {
+            {
+                let _first = tx.admit_scope(Id::<TestOrg>::from_raw(1), &admission);
+            }
+            let _second = tx.admit_scope(Id::<AuditOrg>::from_raw(2), &admission);
+            Ok::<(), io::Error>(())
+        });
+    }))
+    .expect_err("a second tenant on one transaction is a contract violation");
+    let msg = panicked
+        .downcast_ref::<String>()
+        .map_or_else(String::new, String::clone);
+    assert_eq!(
+        msg,
+        format!(
+            "contract: a transaction opens ONE tenant scope (spec §8) — this one already \
+             opened `TestOrg` 1 ({}) and is now asked for `AuditOrg` 2 ({}); run the second \
+             tenant's work in its own transaction",
+            std::any::type_name::<TestOrg>(),
+            std::any::type_name::<AuditOrg>()
+        )
+    );
+}
+```
+
+- [ ] **Step 2: Run them, and record why each is red**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test kernel -- scoped_jobs::a_stand_in_under scoped_jobs::a_jobdef_whose_scope_type 2>&1 | tee $D/task2-red-kernel.log | grep -E "^test |left:|right:"
+cargo test -p charpente --test tenant -- the_401_ 2>&1 | tee $D/task2-red-tenant.log | grep -E "^test |left:|right:"
+cargo test -p charpente --test describe -- describe_names_a_tenant_scope_by 2>&1 | tee $D/task2-red-describe.log | grep -E "^test |left:|right:"
+cargo test -p charpente-core --test engine -- a_second_scope_names_both 2>&1 | tee $D/task2-red-engine.log | grep -E "^test |left:|right:"
+```
+
+Expected: all seven FAIL. The `the_401_` filter also runs the existing `an_anonymous_subscriber_that_opens_a_scope_gets_the_401_naming_the_stream`, which passes. Quote each `left:` in the task report. A scratch copy of e749823 with this step applied printed exactly these base texts:
+- `a_stand_in_under_a_same_spelled_scope_type_…`: `left` is ``job "Invoice" was enqueued in a `Org` tenant, but this binary mounts Invoice as `scoped_by = Org` under the same shape (0x…), so it would run in `Org` 21, not in the tenant it was enqueued in — …`` (NB1 a).
+- `a_stand_in_under_a_generic_scope_type_…`: ``… enqueued in a `Desk>` tenant, but this binary mounts File as `scoped_by = Desk` …`` (NB1 b).
+- `a_jobdef_whose_scope_type_is_not_its_jobs_…`: ``… enqueued in a `Desk` tenant, but this binary mounts File as `scoped_by = Desk` under the same shape (0xaac8d6b201d1f744), so it would run in `Desk` 13, not in the tenant it was enqueued in — a type standing in for File's #[job] was enqueued: …``. No `JobDef` cause, and its first fix is the step the caller just took (NB1 c).
+- `the_401_tells_two_tenant_types_spelled_alike_…`: ``… is declared `public(Org)` and opened the tenant scope `Org` … declare `#[route(POST "/crm-leads", public(Org))]` ``.
+- `the_401_names_a_generic_tenant_type_…`: ``… opened the tenant scope `Alpha>` … only a route declared `public(Alpha>)` …``.
+- `describe_names_a_tenant_scope_by_…`: `left: Some("Org")`, `right: Some("Workspace")`.
+- `a_second_scope_names_both_…`: `left` is ``contract: a transaction opens ONE tenant scope (spec §8) — this one already opened engine::TestOrg(1) and is now asked for engine::AuditOrg(2); …``.
+
+- [ ] **Step 3: Core — `Tenant::NAME`, `Row::SCOPE_NAME`, the one-scope assert, the enqueue family, the stage refusal**
+
+In `crates/charpente-core/src/db.rs`, add this as the first item of `pub trait Tenant`:
+
+```rust
+    /// This tenant type's identity: persisted inside every scoped job's and
+    /// scoped event's fingerprint, and rendered wherever a scope type is
+    /// named. Renaming it is a change of identity, as renaming a table's
+    /// `TABLE` is.
+    const NAME: &'static str;
+```
+
+In `Tenant`'s trait doc, add this paragraph after the one that ends "(ruling R2, amended by R45)…carries the house diagnostic.":
+
+```rust
+///
+/// A tenant type names itself with `NAME`, as a table does with `TABLE`.
+/// That is a declared identity, never the compiler's printer: `type_name`
+/// cuts a generic at the wrong place and cannot tell two types spelled alike
+/// apart (tenancy-completion spec §4). No two tenant types of one app may
+/// share a `NAME`.
+```
+
+Replace `Tx`'s `opened_scope` field and its doc:
+
+```rust
+    /// The tenant scope this transaction opened, as
+    /// `(TypeId::of::<S>(), S::NAME, type_name::<S>(), scope.raw())`. A
+    /// transaction opens ONE scope (spec §8). `enter_scope` asserts against
+    /// this: it compares the `TypeId` and the id, and prints the other two.
+    opened_scope: Option<(TypeId, &'static str, &'static str, u64)>,
+```
+
+In `enter_scope`, replace the `let opening = …;` line and the `if let Some(prev)` block:
+
+```rust
+        let opening = (
+            TypeId::of::<S>(),
+            S::NAME,
+            std::any::type_name::<S>(),
+            scope.raw(),
+        );
+        if let Some(prev) = self.opened_scope {
+            assert!(
+                (prev.0, prev.3) == (opening.0, opening.3),
+                "contract: a transaction opens ONE tenant scope (spec §8) — this one already \
+                 opened `{}` {} ({}) and is now asked for `{}` {} ({}); run the second \
+                 tenant's work in its own transaction",
+                prev.1,
+                prev.3,
+                prev.2,
+                opening.1,
+                opening.3,
+                opening.2
+            );
+        }
+```
+
+`EnqueuedTenant.scope_name`'s doc: replace "`type_name::<J::Scope>()`, for the refusal's text only." with "The scope type's `Tenant::NAME`, for the refusal's text only."
+
+Replace `push_enqueue`'s doc and head:
+
+```rust
+    /// The one body of the enqueue family (job-tenancy spec §5–§6). `scope`
+    /// is the tenant a scoped job runs in, with its tenant type's `NAME` for
+    /// `Group::stage`'s refusal; it is `None` for a `global` job. The public
+    /// methods' bounds decide which. This asserts that they agree with the
+    /// job's own declaration, so a scoped job is never written without its
+    /// tenant and a global one never with one (hard rule 4).
+    fn push_enqueue<J: Job>(
+        &mut self,
+        scope: Option<(u64, &'static str)>,
+        key: Option<String>,
+        job: J,
+    ) {
+        assert_eq!(
+            scope.is_some(),
+            TypeId::of::<J::Scope>() != TypeId::of::<crate::table::Unscoped>(),
+            "contract: job \"{}\" was enqueued with tenant {:?}, but a scoped job carries \
+             its tenant and a global one none — the enqueue family's bounds guarantee this, so \
+             reaching here is a platform bug",
+            J::NAME,
+            scope.map(|(id, _)| id)
+        );
+```
+
+and its `scope:` field initializer:
+
+```rust
+            scope: scope.map(|(id, name)| EnqueuedTenant {
+                id,
+                scope_type: TypeId::of::<J::Scope>(),
+                scope_name: name,
+            }),
+```
+
+In `enqueue_in`, the body's last line becomes `self.push_enqueue(Some((scope.raw(), S::NAME)), None, job);`.
+
+`ScopedTx::enqueue` and `enqueue_keyed` gain `where S: Tenant`, which `S::NAME` needs. The impl block is `impl<'a, S: 'static> ScopedTx<'_, 'a, S>`, but every `ScopedTx` is built by `enter_scope<S: Tenant>`, so the bound narrows nothing a caller can hold:
+
+```rust
+    pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J)
+    where
+        S: Tenant,
+    {
+        let scope = (self.scope.raw(), S::NAME);
+        self.tx.push_enqueue(Some(scope), None, job);
+    }
+
+    /// `enqueue`, with `Tx::enqueue_keyed`'s idempotency key.
+    pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J)
+    where
+        S: Tenant,
+    {
+        let scope = (self.scope.raw(), S::NAME);
+        self.tx.push_enqueue(Some(scope), Some(key.into()), job);
+    }
+```
+
+In `DeclaredTenancy`'s doc, replace "the `scoped_by` scope's name (as `JobDef.scoped_by` and `describe` spell it)" with "the `scoped_by` scope type's `Tenant::NAME` (`JobDef.scoped_by`, as `describe` lists it)".
+
+In `Group::stage`, replace the whole scope-type arm, from `if let (Some(tenant), Some((declared, declared_type))) = (scope, scoped_by)` to its closing brace, `rsplit` included:
+
+```rust
+            if let (Some(tenant), Some((declared, declared_type))) = (scope, scoped_by)
+                && tenant.scope_type != declared_type
+            {
+                // Each side is named by its tenant type's `NAME`
+                // (tenancy-completion spec §4). A last path segment read two
+                // types spelled alike as one, and a generic as `B>`. The two
+                // NAMEs are equal when the mounted `JobDef` names one type and
+                // carries another's `scope_type`. That is why the text says
+                // "with another scope type", and why it lists that cause.
+                let enqueued = tenant.scope_name;
+                return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
+                    format!(
+                        "job \"{name}\" was enqueued in a `{enqueued}` tenant, but this binary \
+                         mounts {name} as `scoped_by = {declared}` with another scope type under \
+                         the same shape ({shape:#x}) — a job row records its tenant's id and not \
+                         its type, so tenant {} would be read as the mounted declaration's type, \
+                         not the one it was enqueued in; either a type standing in for {name}'s \
+                         #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose \
+                         `scoped_by` spells another scope type the same way), or a hand-written \
+                         `JobDef` mounts {name} under a `scope_type` its #[job] does not declare; \
+                         the transaction was refused and nothing was written, so a retry cannot \
+                         succeed — enqueue the mounted {name} from a `{declared}` scope, give the \
+                         other type its own name, or mount {name} as its #[job] declares it \
+                         (GUIDE §6)",
+                        tenant.id
+                    ),
+                )))));
+            }
+```
+
+Every continuation line of that literal ends in a space before its `\`. Step 1's pins will fail on a missing space. In the comment above the loop, after "This is the only place both types are known (job-tenancy final review N1).", add: "A hand-built `JobDef` whose `scope_type` is not its `#[job]`'s trips the same check on the honest enqueue, so the refusal names that cause too (final re-review NB1)."
+
+In `crates/charpente-core/src/table.rs`, inside `pub trait Row`, after `const FINGERPRINT`:
+
+```rust
+    /// The `Tenant::NAME` of `Scope`, for a row scoped by a tenant type.
+    /// `#[table(scoped_by = Org)]` sets `Some(Org::NAME)`. Every other row
+    /// keeps `None`: `#[table(global)]` and the platform's hand-written rows
+    /// alike. A constant, because this crate cannot bound `Scope: Tenant`: an
+    /// unscoped row's scope is `Unscoped`. It has a default, unlike `Scope`,
+    /// because associated-const defaults are stable.
+    const SCOPE_NAME: Option<&'static str> = None;
+```
+
+Nothing compiles yet: every `impl Tenant` lacks `NAME` (E0046). Step 4 is the half of this step that the compiler forces.
+
+- [ ] **Step 4: Sweep `const NAME` onto every `impl Tenant`**
+
+From the repo root, exactly:
+
+```zsh
+python3 - <<'EOF'
+import pathlib
+import re
+
+PAT = re.compile(
+    r'^(?P<indent>\s*)impl(?:<[^{]*?>)?\s+(?:(?:::)?charpente(?:_core)?::(?:db::)?)?'
+    r'Tenant\s+for\s+(?P<ty>[A-Za-z_][A-Za-z0-9_]*)(?:<[^{]*>)?\s*\{\s*$'
+)
+
+
+def sweep(lines, in_scope):
+    out, n = [], 0
+    for i, line in enumerate(lines):
+        out.append(line)
+        m = PAT.match(line)
+        if not (m and in_scope(i)):
+            continue
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if "const NAME" in nxt:
+            continue
+        out.append(m["indent"] + "    const NAME: &'static str = \"" + m["ty"] + "\";")
+        n += 1
+    return out, n
+
+
+def rust_fence_lines(lines):
+    inside, fence = [], None
+    for line in lines:
+        s = line.strip()
+        if s.startswith("```"):
+            fence = None if fence is not None else s
+            inside.append(False)
+        else:
+            inside.append(fence is not None and fence.startswith("```rust"))
+    return inside
+
+
+total = 0
+for root in ["crates", "examples"]:
+    for path in sorted(pathlib.Path(root).rglob("*.rs")):
+        if "target" in path.parts:
+            continue
+        lines = path.read_text().split("\n")
+        out, n = sweep(lines, lambda i: True)
+        if n:
+            path.write_text("\n".join(out))
+            print(f"{path}: {n}")
+            total += n
+
+guide = pathlib.Path("docs/GUIDE.md")
+lines = guide.read_text().split("\n")
+inside = rust_fence_lines(lines)
+out, n = sweep(lines, lambda i: inside[i])
+guide.write_text("\n".join(out))
+print(f"{guide}: {n}")
+total += n
+print("total", total)
+EOF
+```
+
+Expected output:
+- `docs/GUIDE.md: 6`;
+- `crates/charpente/tests/kernel.rs: 7` and `crates/charpente/tests/tenant.rs: 7` (4 each at base, plus Step 1's 3);
+- `crates/charpente/tests/describe.rs: 2`;
+- `crates/charpente-core/tests/engine.rs: 3`;
+- `total 64`.
+
+If S2–S4 landed an `impl Tenant` since e749823, the total is higher by exactly those. GUIDE's ~6222 is inside a `text` block (the rendered diagnostic), and must not be counted: a GUIDE count of 7 is a bug in the fence tracking.
+
+Prove the sweep complete:
+
+```zsh
+python3 - <<'EOF'
+import pathlib
+import re
+
+ANY = re.compile(r"\bimpl\b[^;]*\bTenant\s+for\b")
+bad = []
+
+
+def check(name, lines, in_scope):
+    for i, line in enumerate(lines):
+        if ANY.search(line) and in_scope(i) and "{Self}" not in line:
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if "const NAME: &'static str = " not in nxt:
+                bad.append(f"{name}:{i + 1}: {line.strip()}")
+
+
+for root in ["crates", "examples"]:
+    for path in sorted(pathlib.Path(root).rglob("*.rs")):
+        if "target" not in path.parts:
+            check(path, path.read_text().split("\n"), lambda i: True)
+lines = pathlib.Path("docs/GUIDE.md").read_text().split("\n")
+inside, fence = [], None
+for line in lines:
+    s = line.strip()
+    if s.startswith("```"):
+        fence = None if fence is not None else s
+        inside.append(False)
+    else:
+        inside.append(fence is not None and fence.startswith("```rust"))
+check("docs/GUIDE.md", lines, lambda i: inside[i])
+print("\n".join(bad) or "every impl Tenant declares its NAME")
+EOF
+```
+
+Expected: `every impl Tenant declares its NAME`. `\bTenant` does not match `NoTenant`, `NotATenant` or `NoJobTenant`. The `{Self}` filter skips `TenantScope`'s own note, which Step 6 edits by hand.
+
+- [ ] **Step 5: Give Step 1's three renamed tenant types their NAMEs**
+
+The sweep gave every new type its identifier. Three exist to make a NAME differ from it:
+
+```zsh
+python3 - <<'EOF'
+import pathlib
+
+OLD = "const NAME: &'static str = \"Org\";"
+for path, module, name in [
+    ("crates/charpente/tests/kernel.rs", "\n    pub mod billing {\n", "BillingOrg"),
+    ("crates/charpente/tests/kernel.rs", "\n    pub mod crm {\n", "CrmOrg"),
+    ("crates/charpente/tests/tenant.rs", "\nmod billing {\n", "BillingOrg"),
+    ("crates/charpente/tests/tenant.rs", "\nmod crm {\n", "CrmOrg"),
+    ("crates/charpente/tests/describe.rs", "\nmod renamed {\n", "Workspace"),
+]:
+    p = pathlib.Path(path)
+    text = p.read_text()
+    assert text.count(module) == 1, (path, module)
+    hit = text.index(OLD, text.index(module))
+    new = OLD.replace('"Org"', f'"{name}"')
+    p.write_text(text[:hit] + new + text[hit + len(OLD):])
+    print(f"{path}: {module.strip()} -> {name}")
+EOF
+git diff -U3 crates/charpente/tests/kernel.rs crates/charpente/tests/tenant.rs crates/charpente/tests/describe.rs | grep -B4 -E '^\+.*const NAME.*"(BillingOrg|CrmOrg|Workspace)"'
+grep -c 'const NAME: &.static str = "Org";' crates/charpente/tests/tenant.rs crates/charpente/tests/kernel.rs
+```
+
+Expected (the scratch run printed exactly this):
+- five `->` lines;
+- five diff hunks, each showing a renamed `const NAME` directly under its own `impl Tenant for Org {`, inside the module the script named (`billing` → `"BillingOrg"`, `crm` → `"CrmOrg"`, `renamed` → `"Workspace"`);
+- `tenant.rs:2` and `kernel.rs:1`. These are the `Org`s that keep `"Org"`: `tenant.rs`'s own `Org` and `statuspage::Org` (never mounted in one `App`, so Task 3 does not refuse them), and `kernel.rs`'s top-level `Org`.
+
+- [ ] **Step 6: Platform — `tenant_name`, the note, the 401 and the field docs**
+
+(A7) In `crates/charpente/src/tenant.rs`, add after the blanket `impl … TenantScope for T {}`:
+
+```rust
+/// A tenant type's `NAME`, read through the platform's bound.
+/// `#[table(scoped_by = S)]`, `#[route(…, public(S))]` and
+/// `#[job(scoped_by = S)]` read `S`'s identity through this, not through
+/// `<S as Tenant>::NAME`. Through this, a scope type with no `Tenant` impl
+/// gets `TenantScope`'s diagnostic above and nothing else. The bare
+/// projection adds rustc's own "the trait bound `S: Tenant` is not
+/// satisfied" beside it. This bound is the one those macros' const asserts
+/// carried, so it replaces them (tenancy-completion spec §4). It is a
+/// `const fn`, so `SCOPE_NAME`, `PublicScope` and a job's `FINGERPRINT` stay
+/// constants.
+#[doc(hidden)]
+pub const fn tenant_name<S: TenantScope>() -> &'static str {
+    S::NAME
+}
+```
+
+`TenantScope`'s attribute becomes:
+
+```rust
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is used as a tenant scope but has no `Tenant` impl",
+    label = "no `impl Tenant for {Self}`",
+    note = "a tenant scope needs a name and the app's own membership check; add:\n\
+            impl Tenant for {Self} {{\n    \
+            const NAME: &'static str = \"{Self}\";\n    \
+            type Who = Principal;\n    \
+            type Error = ApiError;\n    \
+            fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> {{ … }}\n\
+            }}"
+)]
+```
+
+In `TenantScope`'s doc, replace "because `#[table(scoped_by = Org)]`'s const assert names it (`::charpente::TenantScope`)" with "because `tenant_name` is bounded on it, and `#[table(scoped_by = Org)]`, `public(Org)` and `#[job(scoped_by = Org)]` all emit that".
+
+In `crates/charpente/tests/tenant.rs`, `Org`'s doc: replace "A scope type owes nothing but `authorize`" with "A scope type owes its `NAME` and `authorize`".
+
+In `crates/charpente/src/http/app.rs`, add `Tenant` to the `charpente_core::db::{…}` import. `Ctx::anonymous_scope`'s signature becomes `pub(crate) fn anonymous_scope<S: Tenant>(&self) -> ApiError`. Replace
+
+```rust
+        // The last path segment, as `decode_body` renders a type.
+        let scope = std::any::type_name::<S>()
+            .rsplit("::")
+            .next()
+            .unwrap_or("the scope type");
+```
+
+with
+
+```rust
+        // The tenant type's identity (tenancy-completion spec §4). A last
+        // path segment read two types spelled alike as one, and a generic as
+        // `B>`.
+        let scope = S::NAME;
+```
+
+The one caller, `Scoped::scope` (`ctx.anonymous_scope::<S>()`), holds `S: TenantScope`, so it does not change. Two other `rsplit`s stay: `decode_body`'s (`http/mod.rs:~466`) and `Id`'s `Debug` (`table.rs:~115`). They render a body type and an id, not a scope.
+
+Field docs (text only):
+- `router.rs`, `PublicScope.name`: replace "The scope type's last path segment, as the macro's refusals render it." with "The scope type's `Tenant::NAME`, which `describe` lists and the 401 renders (tenancy-completion spec §4)."
+- `dispatch.rs`, `JobDef.scoped_by`: replace "`#[job(scoped_by = Org)]` — the scope type's last path segment, as `describe` lists it;" with "`#[job(scoped_by = Org)]` — the scope type's `Tenant::NAME`, as `describe` lists it and the refusals render it;".
+- `describe.rs`: in `RouteInfo.public_scope`'s and `JobInfo.scoped_by`'s docs, replace "by the scope type's name" with "by the tenant type's `Tenant::NAME`".
+
+- [ ] **Step 7: Macros — `path_as_written`, `SCOPE_NAME`, and the NAME through `tenant_name`**
+
+`crates/charpente-macros/src/fingerprint.rs`. At the end of the module doc, add: "`path_as_written` quotes a path back into a compile-time refusal, from the same rendering." After `render`, add:
+
+```rust
+/// A path as its author wrote it — `crate::tenancy::Org`, `Wrap<Desk>` — for a
+/// compile-time refusal that quotes an attribute back (tenancy-completion
+/// plan amendment A8). These are `render`'s words, with a space only between
+/// two words that are both identifiers or literals, so the result reads as
+/// source. It is never a tenant's identity: that is `Tenant::NAME`, a
+/// constant of the compiled type, which expansion cannot read.
+pub(crate) fn path_as_written(path: &syn::Path) -> String {
+    let wordlike = |c: char| c.is_alphanumeric() || c == '_';
+    let mut words = Vec::new();
+    render(path.to_token_stream(), &mut words);
+    let mut out = String::new();
+    for word in words {
+        if out.ends_with(wordlike) && word.starts_with(wordlike) {
+            out.push(' ');
+        }
+        out.push_str(&word);
+    }
+    out
+}
+```
+
+and add to its `tests` module:
+
+```rust
+    /// A8: a refusal quotes the scope path whole, as written. The last
+    /// segment alone (`Org`, `Wrap`) is what `route::scope_name` printed,
+    /// and it could not tell `billing::Org` from `crm::Org`.
+    #[test]
+    fn a_path_is_quoted_as_written_not_cut_at_its_last_segment() {
+        let cases: [(syn::Path, &str); 4] = [
+            (parse_quote!(Org), "Org"),
+            (parse_quote!(crate::tenancy::Org), "crate::tenancy::Org"),
+            (parse_quote!(Wrap<Desk>), "Wrap<Desk>"),
+            (parse_quote!(G<&'static str>), "G<&'static str>"),
+        ];
+        for (path, written) in cases {
+            assert_eq!(path_as_written(&path), written);
+        }
+    }
+```
+
+(A scratch copy of `render` plus this function passes all four cases on rustc 1.95.0 with syn 2.)
+
+`crates/charpente-macros/src/lib.rs`, in `parse_table_args`: the `global` + `scoped_by` refusal replaces its `let scope = &path.segments.last()….ident;` binding with `let scope = crate::fingerprint::path_as_written(path);`. The format string is unchanged. `table_global_and_scoped_by.stderr` is unchanged, because its path is `Org`.
+
+`crates/charpente-macros/src/table.rs`. Replace the comment above `scope_ty`, `scope_ty` itself and `tenant_scope_assert` with:
+
+```rust
+    // `#[table(scoped_by = Org)]`: `type Scope` names the app's scope type
+    // instead of `Unscoped`, and `SCOPE_NAME` carries its `Tenant::NAME`
+    // (tenancy-completion plan amendment A2). The NAME is read through
+    // `::charpente::tenant::tenant_name`. Its `TenantScope` bound forces
+    // `Org` to carry a name and the app's own membership check, with the
+    // house diagnostic and no second error. That bound is the whole of what
+    // the former const assert did.
+    let (scope_ty, scope_name) = match &scoped_by {
+        Some(path) => (
+            quote! { #path },
+            quote! {
+                ::std::option::Option::Some(::charpente::tenant::tenant_name::<#path>())
+            },
+        ),
+        None => (
+            quote! { ::charpente::core::table::Unscoped },
+            quote! { ::std::option::Option::None },
+        ),
+    };
+```
+
+In the emitted `impl ::charpente::core::table::Row`, add after `type Scope = #scope_ty;`:
+
+```rust
+            const SCOPE_NAME: ::std::option::Option<&'static str> = #scope_name;
+```
+
+and delete the `#tenant_scope_assert` line after `#migration_assert`.
+
+`crates/charpente-macros/src/route.rs`. Delete `fn scope_name` and its doc. In `undeclared_capability`, replace `Some(path) => format!(", public({})", scope_name(path)),` with `Some(path) => format!(", public({})", crate::fingerprint::path_as_written(path)),`. Replace `public_scope_tokens` and its doc with:
+
+```rust
+/// `public(Scope)`'s emission: the `PublicScope` the `Route` carries. `name`
+/// is read through `::charpente::tenant::tenant_name`. Its `TenantScope`
+/// bound refuses a scope type with no membership check, with the same
+/// diagnostic `#[table(scoped_by = …)]` gives, spanned at the path inside
+/// `public(...)`.
+fn public_scope_tokens(args: &RouteArgs) -> TokenStream {
+    let Some(path) = &args.public_scope else {
+        return quote! { ::std::option::Option::None };
+    };
+    quote! {
+        ::std::option::Option::Some(::charpente::http::PublicScope {
+            name: ::charpente::tenant::tenant_name::<#path>(),
+            type_id: ::std::any::TypeId::of::<#path>,
+        })
+    }
+}
+```
+
+Make the same two changes in both `expand_http` (~468) and `expand_sse` (~791):
+- `let (public_scope, tenant_scope_assert) = public_scope_tokens(&args);` becomes `let public_scope = public_scope_tokens(&args);`;
+- delete the `#tenant_scope_assert` line from the emitted `quote!`.
+
+`crates/charpente-macros/src/job.rs`. Replace `global_and_scoped_by`'s doc and body:
+
+```rust
+/// `global` and `scoped_by` on one job, reported at whichever came second.
+/// Quotes the scope path as written (plan amendment A8): a tenant type's
+/// `NAME` is a constant of the compiled type, which expansion cannot read.
+fn global_and_scoped_by(path: &syn::Path) -> String {
+    format!(
+        "`global` and `scoped_by = {}` on one job — a job is one or the other; drop one",
+        crate::fingerprint::path_as_written(path)
+    )
+}
+```
+
+In `expand`, the tenancy `match` binds three things, not four: `let (scope_ty, scoped_by_name, run_call) = match tenancy {`.
+- The `Global` arm drops its second element, `quote! {}`.
+- The `ScopedBy` arm:
+  - drops `let scope_name = crate::route::scope_name(path);`;
+  - drops its `const _: () = { … __charpente_assert_tenant_scope … };` element;
+  - its name element becomes `quote! { ::std::option::Option::Some(::charpente::tenant::tenant_name::<#path>()) }`.
+
+Delete `#tenant_scope_assert` from the emitted `quote!` (it follows `#input`). The scoped glue still calls `scope.open::<#path>(tx)`, whose `TenantScope` bound remains that fixture's second error.
+
+Then:
+
+```zsh
+cargo fmt --all
+git diff --stat
+cargo check --workspace --all-targets 2>&1 | grep -E "^(error|warning)" | sort | uniq -c
+```
+
+Expected: `cargo fmt` changes nothing in this plan's code blocks. They are rustfmt's output, checked in a scratch copy at e749823. The `check` line prints nothing.
+
+- [ ] **Step 8: `SCOPE_NAME`'s test, and mutation proofs for this task's new-API tests**
+
+`crates/charpente/tests/typed_tables.rs`, after `table_macro_emits_the_declared_scope_type`:
+
+```rust
+/// A tenant type whose `NAME` is not its identifier. A macro that emitted the
+/// path's last segment instead of the NAME would read `Org` below.
+mod renamed {
+    pub struct Org;
+
+    impl charpente::Tenant for Org {
+        const NAME: &'static str = "Workspace";
+        type Who = charpente::auth::Principal;
+        type Error = charpente::http::ApiError;
+
+        fn authorize(
+            _tx: &charpente::Tx,
+            _who: &charpente::auth::Principal,
+            _scope: charpente::core::table::Id<Org>,
+        ) -> Result<(), charpente::http::ApiError> {
+            Ok(())
+        }
+    }
+}
+
+#[charpente::table(scoped_by = renamed::Org)]
+struct RenamedWidget {
+    id: charpente::core::table::Id<RenamedWidget>,
+}
+
+/// Tenancy-completion spec §4, plan amendment A2: `#[table(scoped_by = S)]`
+/// carries `S`'s `Tenant::NAME` as `Row::SCOPE_NAME`. A table with no tenant
+/// carries the trait's default, `None`, and so do the platform's hand-written
+/// rows.
+#[test]
+fn table_macro_emits_its_tenants_name() {
+    use charpente::core::table::Row;
+    assert_eq!(<ScopedWidget as Row>::SCOPE_NAME, Some("Org"));
+    assert_eq!(<RenamedWidget as Row>::SCOPE_NAME, Some("Workspace"));
+    assert_eq!(<Invoice as Row>::SCOPE_NAME, None);
+    assert_eq!(<JobRow as Row>::SCOPE_NAME, None);
+}
+```
+
+Both tests use this task's new API, so each is proved red by a named mutation after the fact. First save the implementation:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff crates/charpente-macros/src/table.rs crates/charpente-macros/src/fingerprint.rs > $D/task2-impl-macros.patch
+```
+
+1. In `table.rs`'s `Some(path) =>` arm, replace the `tenant_name` call with `stringify!(#path)`, which emits the path's spelling instead of the NAME. Run `cargo test -p charpente --test typed_tables -- table_macro_emits_its_tenants_name`. Expected: FAIL, `left: Some("renamed :: Org")`, `right: Some("Workspace")` (printed so in the scratch copy).
+2. In `path_as_written`, return only the last word: insert `return words.last().cloned().unwrap_or_default();` right after `render(…)`. Run `cargo test -p charpente-macros --lib -- a_path_is_quoted_as_written`. Expected: FAIL at the `crate::tenancy::Org` case, `left: "Org"`, `right: "crate::tenancy::Org"` (printed so in the scratch copy; the mutation also warns `unreachable statement`).
+
+After each mutation, restore with `git checkout crates/charpente-macros/src/table.rs crates/charpente-macros/src/fingerprint.rs && git apply $D/task2-impl-macros.patch`. Check that `git diff --stat crates/charpente-macros/src` shows Step 7's diff again, and rerun the test green.
+
+- [ ] **Step 9: Re-pin the scope-type refusal's two existing tests, and the trybuild fixtures**
+
+In `crates/charpente/tests/kernel.rs`, two tests pin the old text: `a_stand_in_enqueued_in_another_scope_types_tenant_is_refused_by_name` and `a_job_whose_scoped_by_spells_another_type_alike_is_refused_by_name`. Run both first, and quote the red: `left` carries the new wording, `right` the old. Then replace each one's `format!(…)` argument to `assert_eq!`, and only that, with a call to Step 1's helper:
+- in the first: `scope_type_refusal("File", "Board", "Desk", <File as Job>::FINGERPRINT, 13)`;
+- in the second: `scope_type_refusal("File", "Board", "Desk", <File as Job>::FINGERPRINT, 14)`.
+
+Everything else in both tests stays. `Board` and `Desk` are each type's NAME, and each NAME is the identifier, so only the wording moves. In the second test, `spelled_alike::File`'s enqueue side is now `tenant_name::<Desk>()` through the alias, which is `Board::NAME`, so it still reads `Board`. Five tests now share one spelling of the text, so Task 4 changes it in one place.
+
+trybuild:
+
+```zsh
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild
+git diff --stat crates/charpente-macros/tests/
+git diff crates/charpente-macros/tests/compile_fail/table_scoped_by_missing_tenant_scope.stderr crates/charpente-macros/tests/compile_fail/job_scoped_by_missing_tenant_scope.stderr crates/charpente-macros/tests/compile_fail/route_public_scope_missing_tenant_scope.stderr
+cargo test -p charpente-macros --test trybuild
+```
+
+Review every changed `.stderr` line by line. The scratch copy changed exactly 26 files, and the check below classifies them:
+
+```zsh
+for f in $(git diff --name-only -- crates/charpente-macros/tests/); do
+  a=$(git show HEAD:$f | sed -E 's/[0-9]+//g'); b=$(sed -E 's/[0-9]+//g' $f)
+  if [ "$a" = "$b" ]; then echo "digits-only $f"; else echo "TEXT $f"; fi
+done | sort
+```
+
+Expected: 21 `digits-only` lines and 5 `TEXT` lines.
+- The 21 are fixtures whose `.rs` gained a `const NAME` line before a reported span. Only line numbers move, each by exactly 1 per inserted line above it.
+- 3 `TEXT` are the missing-tenant fixtures (`table_scoped_by_…`, `job_scoped_by_…`, `route_public_scope_missing_tenant_scope.stderr`):
+  - the note reads `a tenant scope needs a name and the app's own membership check; add:`, and the impl's first line is `const NAME: &'static str = "Org";`;
+  - (A7) the first error's `note: required by a bound in` names `` `charpente::tenant::tenant_name` `` at `$WORKSPACE/crates/charpente/src/tenant.rs`. It quotes `pub const fn tenant_name<S: TenantScope>() -> &'static str {` with the caret under `TenantScope`, in place of the old site `__charpente_assert_tenant_scope` at the attribute;
+  - in the job and route fixtures, that error's trailing `= note: this error originates in the attribute macro `table`` loses its "which comes from the expansion of the attribute macro `job`/`route`" tail;
+  - the error count is unchanged: 1, 2 and 1 (`grep -c '^error'`). The job fixture's second error is `JobScope::open`'s, as before;
+  - the message and the label, `` `Org` is used as a tenant scope but has no `Tenant` impl `` / ``no `impl Tenant for Org` ``, are byte-identical.
+- 2 `TEXT` are `scoped_tx_enqueue_of_a_global_job.stderr` and `scoped_tx_enqueues_another_scopes_job.stderr`. They quote `ScopedTx::enqueue`'s signature line, which Step 3's `where S: Tenant` leaves without its trailing ` {`. Nothing else in them changes but line numbers.
+- `job_global_and_scoped_by.stderr`, `table_global_and_scoped_by.stderr` and `route_public_scope_undeclared_capability.stderr` carry no text change: their paths are single identifiers, which A8 renders as before.
+
+Any other `TEXT` file is a finding. The final `cargo test` line is green.
+
+- [ ] **Step 10: Docs**
+
+`docs/GUIDE.md` §5, the sentence after the rule-3 401 block: "the scope is the type's own name." becomes "the scope is its tenant type's `NAME` (§16)." The pinned block itself is byte-identical, because the example's `Org` is `Org`'s NAME.
+
+§6, the scope-type refusal. In the paragraph above it, replace "`<scope>` is the enqueuing job's scope type and `<declared>` the mounted one's, by their last path segments; `<id>` is the tenant id:" with:
+
+> `<scope>` is the enqueuing job's tenant type's `NAME` and `<declared>` the mounted one's (§16); `<id>` is the tenant id. The two NAMEs can be equal. A hand-built `JobDef` that names one type and carries another's `scope_type` is refused here on the honest enqueue, which is why the text says "with another scope type" and lists that cause:
+
+Replace the pinned block's one line with:
+
+```text
+job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` with another scope type under the same shape (<shape>) — a job row records its tenant's id and not its type, so tenant <id> would be read as the mounted declaration's type, not the one it was enqueued in; either a type standing in for <job>'s #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose `scoped_by` spells another scope type the same way), or a hand-written `JobDef` mounts <job> under a `scope_type` its #[job] does not declare; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
+```
+
+Once Step 3's format string has its `\` continuations joined, every fragment of 16 or more characters is a substring of it. `PINNED_FLOOR` does not change, because no block is added.
+
+§13, the route and job field lists (~4501–4502):
+- "the tenant scope it admits every caller to if it is declared `public(Org)`" becomes "the tenant scope it admits every caller to if it is declared `public(Org)`, by that tenant type's `NAME`";
+- "the tenant scope it acts in if it is `scoped_by`" becomes "the tenant scope it acts in if it is `scoped_by`, by its `NAME`".
+
+§16, "Declaring a scope and a scoped table":
+- The example's doc comment "The scope type. It owes exactly one thing — `authorize`." becomes "The scope type. It owes two things: its `NAME` and `authorize`."
+- Directly above the swept `const NAME: &'static str = "Org";` line, add:
+
+  ```rust
+      /// Its identity: persisted inside every scoped job's fingerprint and
+      /// printed wherever a scope is named. Renaming it is a change of
+      /// identity, like renaming a table.
+  ```
+
+- The lead-in "Three things that fall out of that, worth stating plainly:" becomes "Four things …". After its first bullet ("**`scoped_by` without an `impl Tenant` does not compile**, at the struct."), add:
+
+  > - **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs. A generic tenant impl gives every instantiation one NAME.
+
+§16, "One scope per transaction". The text block becomes:
+
+```text
+contract: a transaction opens ONE tenant scope (spec §8) — this one already opened `Org` 1 (myapp::Org) and is now asked for `Org` 2 (myapp::Org); run the second tenant's work in its own transaction
+```
+
+and its parenthesis, "(The scope type prints as `std::any::type_name` renders it, module path included.)", becomes "(Each tenant prints as its type's `NAME` and its id, then its type as `std::any::type_name` renders it, module path included.)" The block is not pinned: a format string's `{}` never matches it.
+
+§16, "The compile errors". The `scoped_by`-with-no-membership-check block's note becomes:
+
+```text
+  = note: a tenant scope needs a name and the app's own membership check; add:
+          impl Tenant for Org {
+              const NAME: &'static str = "Org";
+              type Who = Principal;
+              type Error = ApiError;
+              fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> { … }
+          }
+```
+
+§16, "Reading across every tenant": in the paragraph beginning "The same dump carries the other two tenancy declarations beside it", "in JSON as a name or `null`" becomes "in JSON as the tenant type's `NAME` or `null`".
+
+`DESIGN.md` §3, **Scope**: "The scope type owes exactly one thing, an `impl Tenant` with its own `authorize`;" becomes:
+
+> The scope type owes an `impl Tenant` with two items: `NAME`, its identity, rendered wherever a scope is named (spec 2026-09-30-tenancy-completion §4), and its own `authorize`;
+
+§7, the `describe` field list:
+- "(`public_scope`, a type name or `null`)" becomes "(`public_scope`, the tenant type's `NAME` or `null`)";
+- "**`scoped_by`, the scope type a job acts in or `null`**" becomes "**`scoped_by`, the `NAME` of the tenant type a job acts in, or `null`**".
+
+```zsh
+cargo build -p guide-examples
+cargo test -p guide-examples --test doc_truth --test describe_contract
+```
+
+Expected: both green. If `doc_truth` names a missing fragment, the guide and the product string disagree. Fix the guide to match the string.
+
+- [ ] **Step 11: Run the task's tests, and measure byte identity**
+
+```zsh
+cargo test -p charpente --test kernel -- scoped_jobs::
+cargo test -p charpente --test tenant -- the_401_ statuspage public_scope anonymous
+cargo test -p charpente --test describe
+cargo test -p charpente --test typed_tables
+cargo test -p charpente-core --test engine -- scope
+cargo test -p charpente-macros --lib
+```
+
+Expected: all pass, Step 1's seven tests included.
+
+For byte identity, run Task 1's six `baselines.sh` calls with the suffix `task2`:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task2 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task2 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task2 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task2 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task2 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task2 invoicing; print -r -- "exit ${?}"
+```
+
+Each label must print `reproduces the base`, and each call `exit 0`.
+
+Expected: one `identical` line per baseline, and no `DIFFERS`. This task writes no byte differently: every in-tree NAME equals its identifier, no fingerprint is touched, and `enter_scope`'s tuple lives in memory only. A difference is a finding: stop.
+
+- [ ] **Step 12: Gate and commit**
+
+Run per package, in the foreground, into one log:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/gate-task-2.log
+: > $L
+cargo fmt --all --check && echo 'fmt ok' | tee -a $L
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a $L | grep -cE "^(warning|error)"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente --lib --test kernel --test tenant --test describe --test typed_tables --test realtime --test archive --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente-cli --test describe --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+grep -c "^test result:" $L; grep -c "^test result: ok" $L; grep -c "FAILED" $L
+```
+
+Expected:
+- `fmt ok`;
+- the clippy count prints `0`;
+- the two `test result` counts are equal;
+- the `FAILED` count prints `0` (and exits 1, which is the pass).
+
+`replication.rs` changes only by its swept `const NAME`. Clippy compiled it, and the controller's counted workspace gate (Global Constraints) runs it. That gate's count equals Task 1's measured base.
+
+```zsh
+git status --short
+git add crates/charpente-core/src/db.rs crates/charpente-core/src/table.rs \
+  crates/charpente-core/tests/engine.rs \
+  crates/charpente/src/tenant.rs crates/charpente/src/http/app.rs crates/charpente/src/http/router.rs \
+  crates/charpente/src/kernel/dispatch.rs crates/charpente/src/describe.rs \
+  crates/charpente/tests/kernel.rs crates/charpente/tests/tenant.rs crates/charpente/tests/describe.rs \
+  crates/charpente/tests/typed_tables.rs crates/charpente/tests/archive.rs \
+  crates/charpente/tests/realtime.rs crates/charpente/tests/replication.rs \
+  crates/charpente-macros/src/fingerprint.rs crates/charpente-macros/src/lib.rs \
+  crates/charpente-macros/src/table.rs crates/charpente-macros/src/route.rs \
+  crates/charpente-macros/src/job.rs \
+  crates/charpente-macros/tests/compile_fail crates/charpente-macros/tests/compile_pass \
+  examples/invoicing/src/bin/tenant_node.rs docs/GUIDE.md DESIGN.md
+git status --short
+git commit -m "feat(tenancy): Tenant::NAME is a tenant type's identity — <N> impls swept to their identifier; Row::SCOPE_NAME; every scope rendering (the stage refusal, now naming a hand-built JobDef as a cause, the 401, the one-scope assert, PublicScope, JobDef, describe) says the NAME; NB1 a/b/c pinned red-first; <M> .stderr re-pinned; <K>/<K> baselines identical"
+```
+
+The second `git status --short` shows nothing staged-but-unlisted and nothing left unstaged from this task.
+
+---
+
+### Task 3: One `NAME`, one tenant type — two types under one name, or an empty name, refused at mount
+
+*(Execution order, amendment A6: this task runs after Task 4. Its Step 9 adds one clause to the §6 residual that Task 4 wrote. Nothing else here depends on Task 4, and the tests pass in either order.)*
+
+**Files:**
+- Modify `crates/charpente-core/src/db.rs`:
+  - `TableOps`: three fields;
+  - `Schema::table`: fills them;
+  - add `Schema::table_tenants`;
+  - `Tenant`'s doc: one clause.
+- Modify `crates/charpente-core/src/table.rs`: `Row::SCOPE_NAME`'s doc, one sentence.
+- Modify `crates/charpente/src/http/app.rs`:
+  - the `App.tenants` field;
+  - `App::open`;
+  - add `App::note_tenant`;
+  - `App::mount` and `App::mount_jobs`.
+- Modify `crates/charpente/src/http/router.rs`: `PublicScope.type_name`.
+- Modify `crates/charpente/src/kernel/dispatch.rs`: `JobDef.scope_type_name`.
+- Modify the macros:
+  - `crates/charpente-macros/src/route.rs`: emit `PublicScope.type_name`;
+  - `crates/charpente-macros/src/job.rs`: emit `JobDef.scope_type_name`.
+- Modify the hand-built `JobDef` literals, which the new field makes a compile error until filled: `crates/charpente/src/launch.rs` (~437) and `crates/charpente/src/serve.rs` (~757, ~846).
+- Tests: `crates/charpente/tests/tenant.rs`, a new section at the end, plus its imports.
+- Modify `crates/guide-examples/tests/doc_truth.rs`: `PINNED_FLOOR` goes up by one.
+- Docs:
+  - `docs/GUIDE.md`:
+    - §16: a new pinned block, and a clause on Task 2's NAME bullet;
+    - §6: a clause on Task 4's residual bullet;
+  - `DESIGN.md` §3's **Scope** bullet.
+
+**Interfaces:**
+- Consumes:
+  - from Task 2: `Tenant::NAME`, `Row::SCOPE_NAME`, the NAME-valued `PublicScope.name` and `JobDef.scoped_by`, and `tenant.rs`'s `mod wrapped` (`Wrap<B>`, `Alpha`);
+  - from Task 4: the GUIDE §6 residual bullet only.
+- Produces:
+  - `App::note_tenant(&mut self, name: &'static str, type_id: TypeId, type_name: &'static str)`, private to `http::app`. Task 11 calls it from `mount_events` for a scoped event. It is the only place the two texts live.
+  - `JobDef.scope_type_name: &'static str`, which Task 11's `EventDef.scope_type_name` mirrors.
+  - `PublicScope.type_name: fn() -> &'static str`.
+  - `Schema::table_tenants(&self) -> Vec<(&'static str, TypeId, &'static str)>`.
+  - `TableOps { scope_name, scope_type, scope_type_name }`.
+  - The two refusal texts, fixed by the contract.
+- Renames (A4's "fixtures whose two tenant types share an identifier"): none. At e749823, the one test binary with two same-identifier tenant types is `tenant.rs`, with its `Org` and `statuspage::Org`, and no `App` there mounts both. `kernel.rs`'s `spelled_alike` is an alias of `Board`, not a second type. Step 7 checks this mechanically: every suite that mounts an `App` runs, and a missed collision panics with the pinned text. Nothing pinned moves in this task.
+- Byte identity: nothing this task adds is recorded. The map is in memory, and `type_name` is display only. Every Task 1 baseline must reproduce.
+
+- [ ] **Step 1: Write the tests against Task 4's commit**
+
+In `crates/charpente/tests/tenant.rs`:
+- add `use charpente::kernel::JobError;`;
+- add `job, jobs` to the `use charpente::{…}` list;
+- in Task 2's `mod wrapped`, add `pub struct Gamma;` after `pub struct Alpha;`;
+- at the end of the file, add:
+
+```rust
+// --------------------------------------------- one NAME, one tenant type
+
+/// Two tenant types that both follow the convention, `NAME` = identifier, and
+/// so both claim `"Org"` (tenancy-completion spec §4). An app that names both,
+/// through any two of its mount paths, is refused before it serves.
+mod twins {
+    pub mod north {
+        use charpente::auth::Principal;
+        use charpente::http::ApiError;
+        use charpente::{Id, Tenant, Tx};
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "Org";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                Ok(())
+            }
+        }
+    }
+
+    pub mod south {
+        use charpente::auth::Principal;
+        use charpente::http::ApiError;
+        use charpente::{Id, Tenant, Tx};
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "Org";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A tenant type whose `NAME` names nothing.
+mod nameless {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        const NAME: &'static str = "";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+#[table(scoped_by = twins::north::Org)]
+struct NorthBill {
+    id: Id<NorthBill>,
+    cents: u64,
+}
+
+#[table(scoped_by = twins::south::Org)]
+struct SouthLead {
+    id: Id<SouthLead>,
+    cents: u64,
+}
+
+#[table(scoped_by = nameless::Org)]
+struct Unnamed {
+    id: Id<Unnamed>,
+    cents: u64,
+}
+
+#[route(POST "/south-leads", public(twins::south::Org))]
+fn open_south_lead(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<twins::south::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+#[job(scoped_by = twins::south::Org)]
+struct Nurture {
+    n: u64,
+}
+
+impl Nurture {
+    fn run(self, tx: &mut ScopedTx<'_, '_, twins::south::Org>) -> Result<(), JobError> {
+        let _ = (self.n, tx.scope());
+        Ok(())
+    }
+}
+
+/// One generic tenant impl, two instantiations: one NAME, `"Wrap"`, for two
+/// types. The Review Focus case.
+#[table(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaNote {
+    id: Id<AlphaNote>,
+    cents: u64,
+}
+
+#[table(scoped_by = wrapped::Wrap<wrapped::Gamma>)]
+struct GammaNote {
+    id: Id<GammaNote>,
+    cents: u64,
+}
+
+/// `public(Wrap<Alpha>)`: every caller may act inside the `Wrap<Alpha>` it
+/// opens. It writes the table and enqueues the job that name the same type.
+#[route(POST "/alpha-notes", public(wrapped::Wrap<wrapped::Alpha>))]
+fn open_alpha_note(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let mut tx = tx.scope::<wrapped::Wrap<wrapped::Alpha>>(Id::from_raw(1), ctx)?;
+    tx.put(&AlphaNote {
+        id: Id::from_raw(1),
+        cents: 5,
+    });
+    tx.enqueue(AlphaDigest { n: 1 });
+    Ok(WireU64(1))
+}
+
+#[job(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaDigest {
+    n: u64,
+}
+
+impl AlphaDigest {
+    fn run(self, tx: &mut ScopedTx<'_, '_, wrapped::Wrap<wrapped::Alpha>>) -> Result<(), JobError> {
+        let _ = (self.n, tx.scan::<AlphaNote>()?);
+        Ok(())
+    }
+}
+
+fn identity_app(sim: &Sim, schema: Schema) -> App {
+    App::open(
+        Box::new(sim.disk()),
+        schema,
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+}
+
+/// Runs an app's mount calls and returns what they panicked with.
+fn mount_refusal(build: impl FnOnce() -> App) -> String {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(build());
+    }))
+    .expect_err("the app mounted two tenant types under one NAME, or a nameless one");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "a panic payload that is not a String".to_string())
+}
+
+/// The uniqueness refusal, spelled out here rather than taken from the
+/// product's `format!`, so the comparison pins the words.
+fn two_named(name: &str, first: &str, second: &str) -> String {
+    format!(
+        "two tenant types are named \"{name}\": {first} and {second} — a tenant's NAME is its \
+         identity (it is inside every scoped job's and event's fingerprint), so give each type \
+         its own `const NAME` in its `impl Tenant`"
+    )
+}
+
+/// The two twins' full `type_name`s, in the order a refusal names them.
+fn north_then_south() -> (&'static str, &'static str) {
+    (
+        std::any::type_name::<twins::north::Org>(),
+        std::any::type_name::<twins::south::Org>(),
+    )
+}
+
+/// Two scoped tables. `App::open` notes them in `TABLE` order, so the first
+/// type named is `NorthBill`'s.
+#[test]
+fn two_tenant_types_under_one_name_are_refused_when_their_tables_open() {
+    let sim = Sim::with_faults(0x7E4A_1712, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(
+            &sim,
+            Schema::new().table::<NorthBill>().table::<SouthLead>(),
+        )
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+/// A scoped table, then a `public(S)` route of the other type.
+#[test]
+fn a_public_route_naming_a_second_tenant_type_under_one_name_is_refused_at_mount() {
+    let sim = Sim::with_faults(0x7E4A_1713, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(&sim, Schema::new().table::<NorthBill>()).mount(routes![open_south_lead])
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+/// A scoped table, then a scoped job of the other type.
+#[test]
+fn a_scoped_job_naming_a_second_tenant_type_under_one_name_is_refused_at_mount() {
+    let sim = Sim::with_faults(0x7E4A_1714, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(&sim, Schema::new().table::<NorthBill>()).mount_jobs(jobs![Nurture])
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+#[test]
+fn a_tenant_type_with_an_empty_name_is_refused_when_its_table_opens() {
+    let sim = Sim::with_faults(0x7E4A_1715, FaultConfig::none());
+    let refusal = mount_refusal(|| identity_app(&sim, Schema::new().table::<Unnamed>()));
+    assert_eq!(
+        refusal,
+        format!(
+            "tenant type {} has an empty NAME — give its `impl Tenant` a `const NAME` that \
+             names it",
+            std::any::type_name::<nameless::Org>()
+        )
+    );
+}
+
+/// Review Focus: a generic tenant impl gives every instantiation one NAME.
+/// An app that mounts two instantiations mounts two tenant types under
+/// `"Wrap"`, and the refusal names both in full, since their NAME cannot
+/// tell them apart.
+#[test]
+fn two_instantiations_of_one_generic_tenant_type_are_refused_naming_both() {
+    let sim = Sim::with_faults(0x7E4A_1716, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(
+            &sim,
+            Schema::new().table::<AlphaNote>().table::<GammaNote>(),
+        )
+    });
+    assert_eq!(
+        refusal,
+        two_named(
+            "Wrap",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>(),
+            std::any::type_name::<wrapped::Wrap<wrapped::Gamma>>()
+        )
+    );
+}
+
+/// The positive control. One tenant type, `Wrap<Alpha>`, named through every
+/// mount path that exists: a scoped table (`App::open`), a `public(S)` route
+/// (`mount`) and a scoped job (`mount_jobs`). The app mounts, serves, and
+/// renders the type as `"Wrap"`. A check that refused any second sighting,
+/// not only a second type, would fail here.
+#[test]
+fn one_tenant_type_named_through_a_table_a_route_and_a_job_mounts() {
+    let sim = Sim::with_faults(0x7E4A_1717, FaultConfig::none());
+    let mut app = identity_app(&sim, Schema::new().table::<AlphaNote>())
+        .mount(routes![open_alpha_note])
+        .mount_jobs(jobs![AlphaDigest]);
+    let c = app.describe();
+    let route = c
+        .routes
+        .iter()
+        .find(|r| r.name == "open_alpha_note")
+        .unwrap();
+    assert_eq!(route.public_scope, Some("Wrap"));
+    let job = c.jobs.iter().find(|j| j.name == "AlphaDigest").unwrap();
+    assert_eq!(job.scoped_by, Some("Wrap"));
+    let served = app.handle(Request::new(Method::Post, "/alpha-notes"));
+    assert_eq!(served.status, 200, "{}", body_text(&served));
+}
+```
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test tenant -- under_one_name empty_name two_instantiations one_tenant_type_named 2>&1 | tee $D/task3-red.log | grep -E "^test |panicked at|the app mounted"
+```
+
+Expected (a scratch copy printed this):
+- five FAIL, each panicking in `mount_refusal` with `the app mounted two tenant types under one NAME, or a nameless one: ()`:
+  - `two_tenant_types_under_one_name_are_refused_when_their_tables_open`;
+  - `a_public_route_naming_a_second_tenant_type_under_one_name_is_refused_at_mount`;
+  - `a_scoped_job_naming_a_second_tenant_type_under_one_name_is_refused_at_mount`;
+  - `a_tenant_type_with_an_empty_name_is_refused_when_its_table_opens`;
+  - `two_instantiations_of_one_generic_tenant_type_are_refused_naming_both`.
+
+  Nothing refuses yet: every app mounted and served.
+- `one_tenant_type_named_through_a_table_a_route_and_a_job_mounts` PASSES. It is the positive control, and green is its correct state before and after this task. Step 6's mutation 1 is what proves it can fail.
+
+- [ ] **Step 2: Core — `TableOps` carries each table's tenant type, and `Schema` lists them**
+
+In `crates/charpente-core/src/db.rs`, in `struct TableOps`, replace
+
+```rust
+    // `IndexDef<R>` is generic per-`Row`, so no `&'static [&'static str]` of
+    // names exists to borrow — projected once at registration time instead.
+    index_names: Vec<&'static str>,
+}
+```
+
+with
+
+```rust
+    // `IndexDef<R>` is generic per-`Row`, so no `&'static [&'static str]` of
+    // names exists to borrow — projected once at registration time instead.
+    index_names: Vec<&'static str>,
+    // `Row::SCOPE_NAME`, with the scope type's `TypeId` and `type_name`:
+    // what `App::open` needs to refuse two tenant types under one `NAME`
+    // (tenancy-completion spec §4, plan amendment A2). The name is
+    // `Some` only for a `#[table(scoped_by = …)]` row. The `type_name` is for
+    // the refusal's text only and is never recorded.
+    scope_name: Option<&'static str>,
+    scope_type: TypeId,
+    scope_type_name: &'static str,
+}
+```
+
+In `Schema::table`, replace
+
+```rust
+                scoped: crate::table::row_is_scoped::<R>(),
+                index_names: R::INDEXES.iter().map(|d| d.name).collect(),
+            },
+```
+
+with
+
+```rust
+                scoped: crate::table::row_is_scoped::<R>(),
+                index_names: R::INDEXES.iter().map(|d| d.name).collect(),
+                scope_name: R::SCOPE_NAME,
+                scope_type: TypeId::of::<R::Scope>(),
+                scope_type_name: std::any::type_name::<R::Scope>(),
+            },
+```
+
+After `Schema::table_names`, add:
+
+```rust
+    /// Every registered table's tenant type, as `(NAME, TypeId, type_name)`,
+    /// in `TABLE` order: the tables `App::open` checks for two tenant types
+    /// under one `NAME` (tenancy-completion spec §4). Only
+    /// `#[table(scoped_by = …)]` rows carry a `NAME`
+    /// (`Row::SCOPE_NAME`). A hand-written scoped `Row` keeps `None`, and
+    /// is not listed.
+    pub fn table_tenants(&self) -> Vec<(&'static str, TypeId, &'static str)> {
+        self.tables
+            .values()
+            .filter_map(|ops| {
+                ops.scope_name
+                    .map(|name| (name, ops.scope_type, ops.scope_type_name))
+            })
+            .collect()
+    }
+```
+
+`Tenant`'s doc (the paragraph Task 2 added) ends "No two tenant types of one app may share a `NAME`." It becomes "No two tenant types of one app may share a `NAME`: `App` refuses them, and an empty `NAME`, when it mounts them."
+
+In `crates/charpente-core/src/table.rs`, in `Row::SCOPE_NAME`'s doc, after "alike.", add: "`Schema::table` records it, and `App::open` refuses two tenant types under one name (tenancy-completion spec §4, plan amendment A2)."
+
+- [ ] **Step 3: Every mount path carries its tenant type's `type_name`**
+
+In `crates/charpente/src/http/router.rs`, in `pub struct PublicScope`, replace
+
+```rust
+    pub type_id: fn() -> TypeId,
+}
+```
+
+with
+
+```rust
+    pub type_id: fn() -> TypeId,
+    /// The scope type's `type_name`, for `App`'s tenant-name refusal only.
+    /// A fn pointer, like `type_id`.
+    pub type_name: fn() -> &'static str,
+}
+```
+
+In `crates/charpente-macros/src/route.rs`, in `public_scope_tokens` (Task 2's form), replace
+
+```rust
+            type_id: ::std::any::TypeId::of::<#path>,
+        })
+```
+
+with
+
+```rust
+            type_id: ::std::any::TypeId::of::<#path>,
+            type_name: ::std::any::type_name::<#path>,
+        })
+```
+
+In `crates/charpente/src/kernel/dispatch.rs`, in `pub struct JobDef`, replace
+
+```rust
+    pub scope_type: TypeId,
+    /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
+```
+
+with
+
+```rust
+    pub scope_type: TypeId,
+    /// `type_name::<J::Scope>()`, for `App`'s tenant-name refusal only (it
+    /// names the type a `scoped_by` NAME stands for); never recorded.
+    pub scope_type_name: &'static str,
+    /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
+```
+
+In `crates/charpente-macros/src/job.rs`, in the emitted `JobDef { … }` literal, replace
+
+```rust
+                    scope_type: ::std::any::TypeId::of::<
+                        <#name as ::charpente::core::db::Job>::Scope,
+                    >(),
+```
+
+with
+
+```rust
+                    scope_type: ::std::any::TypeId::of::<
+                        <#name as ::charpente::core::db::Job>::Scope,
+                    >(),
+                    scope_type_name: ::std::any::type_name::<
+                        <#name as ::charpente::core::db::Job>::Scope,
+                    >(),
+```
+
+In the three hand-built `JobDef` literals (`launch.rs` once, `serve.rs` twice), replace
+
+```rust
+            scope_type: std::any::TypeId::of::<charpente_core::table::Unscoped>(),
+```
+
+with
+
+```rust
+            scope_type: std::any::TypeId::of::<charpente_core::table::Unscoped>(),
+            scope_type_name: std::any::type_name::<charpente_core::table::Unscoped>(),
+```
+
+A `JobDef` built with `..<J as JobEntry>::def()` (Task 2's NB1 test, and Task 5's P4/P5 fixtures) inherits the field.
+
+```zsh
+grep -rn "JobDef {" crates examples --include='*.rs' | grep -v "pub struct JobDef\|/target/"
+cargo check --workspace --all-targets 2>&1 | grep -E "^(error|warning)" | sort | uniq -c
+```
+
+Expected:
+- The `grep` prints 7 lines (the scratch copy's):
+  - two signatures: `job.rs`'s `fn def() -> ::charpente::kernel::JobDef {` and `kernel.rs`'s `fn file_def_declared_global() -> JobDef {`;
+  - Task 2's NB1 literal in `kernel.rs`, which ends in `..<File as JobEntry>::def()`;
+  - four literals that now carry the field: the macro's, `launch.rs`'s and `serve.rs`'s two.
+- `cargo check` prints nothing. A `JobDef` literal the `grep` missed is an E0063 naming `scope_type_name`: add the field there.
+
+- [ ] **Step 4: `App` collects its tenant types, and refuses a second one under a seen `NAME`**
+
+In `crates/charpente/src/http/app.rs`, replace the end of `pub struct App` and the start of its `impl`:
+
+```rust
+    oidc: Option<Arc<OidcVerifier>>,
+}
+
+impl App {
+```
+
+with
+
+```rust
+    oidc: Option<Arc<OidcVerifier>>,
+    /// Every tenant type this app names, by `NAME`: its `TypeId`, and its
+    /// `type_name` for the refusal's text. Filled by `App::open` from the
+    /// schema's scoped tables, by `mount` from `public(S)` routes, and by
+    /// `mount_jobs` from scoped jobs, through `note_tenant`, which refuses a
+    /// second type under a seen `NAME` (tenancy-completion spec §4).
+    tenants: BTreeMap<&'static str, (TypeId, &'static str)>,
+}
+
+impl App {
+```
+
+In `App::open`, collect the schema's tenant types before `Db::open` takes the schema. Replace
+
+```rust
+    ) -> io::Result<App> {
+        let mut db = Db::open(
+```
+
+with
+
+```rust
+    ) -> io::Result<App> {
+        let table_tenants = schema.table_tenants();
+        let mut db = Db::open(
+```
+
+and replace the function's closing `Ok(App { … })`:
+
+```rust
+        Ok(App {
+            db: Some(db),
+            entropy,
+            config,
+            router: Router::new(),
+            job_defs: vec![sweep],
+            // No platform events to seed: the built-in surface emits none.
+            event_defs: Vec::new(),
+            cron_entries: vec![sweep::platform_cron_entry()],
+            oidc: None,
+        })
+    }
+```
+
+with the following. It builds the `App`, notes each table's tenant type, and adds `note_tenant` directly after `open`:
+
+```rust
+        let mut app = App {
+            db: Some(db),
+            entropy,
+            config,
+            router: Router::new(),
+            job_defs: vec![sweep],
+            // No platform events to seed: the built-in surface emits none.
+            event_defs: Vec::new(),
+            cron_entries: vec![sweep::platform_cron_entry()],
+            oidc: None,
+            tenants: BTreeMap::new(),
+        };
+        for (name, type_id, type_name) in table_tenants {
+            app.note_tenant(name, type_id, type_name);
+        }
+        Ok(app)
+    }
+
+    /// Records one tenant type this app names, and refuses a second type
+    /// under a `NAME` already seen, or an empty `NAME`, by name, before the
+    /// app serves (tenancy-completion spec §4). A tenant's `NAME` is its
+    /// identity: it is mixed into every scoped job's fingerprint, so two types
+    /// under one `NAME` are one tenant to every shape check. This is the one
+    /// place both texts live. `App::open`, `mount` and `mount_jobs` call it,
+    /// and `mount_events` does for scoped events.
+    fn note_tenant(&mut self, name: &'static str, type_id: TypeId, type_name: &'static str) {
+        assert!(
+            !name.is_empty(),
+            "tenant type {type_name} has an empty NAME — give its `impl Tenant` a `const NAME` \
+             that names it"
+        );
+        let (seen, seen_name) = *self.tenants.entry(name).or_insert((type_id, type_name));
+        assert!(
+            seen == type_id,
+            "two tenant types are named \"{name}\": {seen_name} and {type_name} — a tenant's \
+             NAME is its identity (it is inside every scoped job's and event's fingerprint), so \
+             give each type its own `const NAME` in its `impl Tenant`"
+        );
+    }
+```
+
+The empty-`NAME` check runs first, so an empty `NAME` is never a key. `entry(…).or_insert(…)` returns the type already under `name`, or the one just inserted. So the second assert refuses only a different `TypeId` under a seen `NAME`: the same type named again, through a route or a job, passes. The first type named is the first in the text.
+
+Replace `mount`:
+
+```rust
+    pub fn mount(mut self, routes: Vec<Route>) -> App {
+        self.router.mount(routes);
+        self
+    }
+```
+
+with
+
+```rust
+    pub fn mount(mut self, routes: Vec<Route>) -> App {
+        for scope in routes.iter().filter_map(|route| route.public_scope) {
+            self.note_tenant(scope.name, (scope.type_id)(), (scope.type_name)());
+        }
+        self.router.mount(routes);
+        self
+    }
+```
+
+In `mount_jobs`, note each scoped job's tenant type before the duplicate-name loop. Replace
+
+```rust
+            .collect();
+        for def in defs {
+            assert!(
+                !self.job_defs.iter().any(|d| d.name == def.name),
+```
+
+with
+
+```rust
+            .collect();
+        for def in &defs {
+            if let Some(name) = def.scoped_by {
+                self.note_tenant(name, def.scope_type, def.scope_type_name);
+            }
+        }
+        for def in defs {
+            assert!(
+                !self.job_defs.iter().any(|d| d.name == def.name),
+```
+
+`scoped_by` is `None` for a `global` job, so it adds nothing. Test-only `JobDef`s that erase `scoped_by` (`kernel.rs`'s `file_def_declared_global`) add nothing either.
+
+- [ ] **Step 5: Run the tests**
+
+```zsh
+cargo test -p charpente --test tenant -- under_one_name empty_name two_instantiations one_tenant_type_named
+cargo fmt --all --check && echo 'fmt ok'
+```
+
+Expected: 6 passed, and `fmt ok`. Every code block in this task is rustfmt's output.
+
+- [ ] **Step 6: Prove each operand red by mutation**
+
+Save the implementation first: `git diff crates/charpente/src/http/app.rs > $D/task3-app.patch`. Apply each mutation to `app.rs` alone, run Step 5's `cargo test` line, and record which tests fail. Then restore with `git checkout crates/charpente/src/http/app.rs && git apply $D/task3-app.patch`. The scratch copy printed exactly these failure sets:
+
+1. `seen == type_id` → `seen != type_id`: 5 fail, including the positive control `one_tenant_type_named_through_a_table_a_route_and_a_job_mounts`, and every refusal test except the empty-NAME one. That one still passes, because its assert runs first.
+2. In `App::open`, replace `app.note_tenant(name, type_id, type_name);` with `let _ = (name, type_id, type_name);`: 5 fail, every test except the positive control. The route and job tests fail because `NorthBill`'s `Org` is never noted.
+3. In `mount`, replace `self.note_tenant(scope.name, (scope.type_id)(), (scope.type_name)());` with `let _ = scope;`: only `a_public_route_naming_a_second_tenant_type_…` fails.
+4. In `mount_jobs`, replace `self.note_tenant(name, def.scope_type, def.scope_type_name);` with `let _ = name;`: only `a_scoped_job_naming_a_second_tenant_type_…` fails.
+5. `!name.is_empty(),` → `!name.is_empty() || true,`: only `a_tenant_type_with_an_empty_name_…` fails.
+6. In the uniqueness text, swap `{seen_name} and {type_name}` to `{type_name} and {seen_name}`: the 4 two-type refusal tests fail, which pins the order. The empty-NAME test and the positive control pass.
+
+After the last restore, check that `git diff --stat crates/charpente/src/http/app.rs` shows Step 4's diff, and rerun Step 5 green.
+
+- [ ] **Step 7: The census — no existing app names two tenant types under one `NAME`**
+
+Every app in the tree mounts through `App::open`, `mount` and `mount_jobs`, so a collision nobody listed would now panic with the pinned text. Only these places hold a tenant type at all (census of `impl Tenant` at e749823):
+- `crates/charpente/tests/`;
+- `examples/invoicing` (one `Org`);
+- the GUIDE blocks, which are compiled and never mounted;
+- the trybuild fixtures, which are compiled only.
+
+So run every suite that mounts one of those:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/task3-census.log
+: > $L
+cargo test -p charpente --lib --test kernel --test tenant --test describe --test typed_tables --test realtime --test archive --test auth --test http --test transactions --test wire --test group_commit --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente --test replication --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+grep -c "^test result:" $L; grep -c "^test result: ok" $L; grep -c "two tenant types are named" $L
+```
+
+Expected:
+- the two `test result` counts are equal;
+- the last count is `0`.
+
+In the scratch copy all 13 binaries were green, with a count of `0`. The two charpente lines took 2 min 47 s and 3 min 40 s of wall time; `replication` has a line of its own to keep each under the 600 s tool ceiling. Step 1's refusal tests print no panic here, because they pass and `cargo test` captures a passing test's output. If a suite panics with the uniqueness text, that fixture shares a `NAME` across two types in one app. Give one type its own `const NAME` (A4's exception), list it in the task report, and re-pin whatever of its fingerprints moves.
+
+- [ ] **Step 8: Byte identity**
+
+Run Task 1's six `baselines.sh` calls with the suffix `task3`:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task3 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task3 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task3 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task3 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task3 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task3 invoicing; print -r -- "exit ${?}"
+```
+
+Each label must print `reproduces the base`, and each call `exit 0`.
+
+Expected: every baseline `identical`. This task records nothing: the map lives in `App`'s memory, and the `type_name`s are display only.
+
+- [ ] **Step 9: Docs**
+
+`docs/GUIDE.md` §16. The bullet list "Four things that fall out of that" is followed by `### Who reaches a tenant: membership or declaration`. Between the two, insert:
+
+````markdown
+**One `NAME`, one tenant type.** The app refuses to mount two tenant types under one
+`NAME`, or a tenant type whose `NAME` is empty, before it serves. It collects every tenant
+type it names: its scoped tables at `App::open`, its `public(S)` routes at `mount`, and its
+scoped jobs at `mount_jobs`. `<name>` is the shared `NAME`; `<type>` and `<other type>` are
+the two types as `std::any::type_name` renders them, the one named first first:
+
+<!-- pinned -->
+```text
+two tenant types are named "<name>": <type> and <other type> — a tenant's NAME is its identity (it is inside every scoped job's and event's fingerprint), so give each type its own `const NAME` in its `impl Tenant`
+tenant type <type> has an empty NAME — give its `impl Tenant` a `const NAME` that names it
+```
+
+The usual cause is two types spelled alike in two modules, such as `billing::Org` and
+`crm::Org`: both follow the convention, so both claim `"Org"`. The other is a generic tenant
+impl mounted at two instantiations, such as `Wrap<Alpha>` and `Wrap<Gamma>`, whose one impl
+gives both one `NAME`. The same type named through a table, a route and a job is one tenant
+type, and mounts.
+````
+
+§16, Task 2's bullet "**A tenant type names itself.**": "need two NAMEs." becomes "need two NAMEs, and the app refuses to mount them under one (below)."
+
+§6, the second bullet of Task 4's residual: "giving a type another type's `NAME` declares it that tenant." becomes "giving a type another type's `NAME` declares it that tenant, and one app cannot mount both (§16)."
+
+`DESIGN.md` §3, **Scope**: "`scoped_by` without one is a compile error at the struct." becomes "`scoped_by` without one is a compile error at the struct, and two tenant types under one `NAME`, or an empty `NAME`, are refused when the app mounts them."
+
+`crates/guide-examples/tests/doc_truth.rs`: `const PINNED_FLOOR: usize = 28;` becomes `29`. Read it first: if an earlier task moved it, add one to what is there.
+
+```zsh
+cargo test -p guide-examples --test doc_truth --test describe_contract
+grep -c '<!-- pinned -->' docs/GUIDE.md
+```
+
+Expected:
+- both tests green;
+- the marker count one higher than before this step (30 in the scratch copy, where one of the hits is prose).
+
+The block's fragments are substrings of `note_tenant`'s two joined format strings. The scratch copy proved `doc_truth` reads both lines: breaking one word in each made it name GUIDE lines 6101 and 6102. The uniqueness text's "and event's" becomes true for events at Task 11 (A6).
+
+- [ ] **Step 10: Gate and commit**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/gate-task-3.log
+: > $L
+cargo fmt --all --check && echo 'fmt ok' | tee -a $L
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a $L | grep -cE "^(warning|error)"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente-cli --test describe --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cat $D/task3-census.log >> $L
+grep -c "^test result:" $L; grep -c "^test result: ok" $L; grep -c "FAILED" $L
+```
+
+Expected:
+- `fmt ok`;
+- clippy prints `0`;
+- the two `test result` counts are equal;
+- `FAILED` prints `0`.
+
+The census log from Step 7 carries charpente's binaries and invoicing's.
+
+```zsh
+git status --short
+git add crates/charpente-core/src/db.rs crates/charpente-core/src/table.rs \
+  crates/charpente/src/http/app.rs crates/charpente/src/http/router.rs \
+  crates/charpente/src/kernel/dispatch.rs crates/charpente/src/launch.rs crates/charpente/src/serve.rs \
+  crates/charpente-macros/src/route.rs crates/charpente-macros/src/job.rs \
+  crates/charpente/tests/tenant.rs crates/guide-examples/tests/doc_truth.rs \
+  docs/GUIDE.md DESIGN.md
+git status --short
+git commit -m "feat(tenancy): an app refuses two tenant types under one NAME, or an empty NAME, when it mounts them — App::open notes its scoped tables, mount its public(S) routes, mount_jobs its scoped jobs, through one note_tenant; a generic tenant impl at two instantiations refused naming both; positive control through all three paths; <M> mutations each red; census: <N> suites green, no fixture renamed; <K>/<K> baselines identical"
+```
+
+---
+
+### Task 4: `scoped_fingerprint` — a scoped job's shape carries its tenant's `NAME`
+
+*(Execution order, amendment A6: this task runs before Task 3. Its code, tests and docs assume Task 3 has not landed. Nothing here consumes Task 3, and Task 3 consumes nothing from here except the one GUIDE clause in its Step 9.)*
+
+**Files:**
+- Modify `crates/charpente-core/src/db.rs`:
+  - add `pub const fn scoped_fingerprint` after `trait Tenant`, and its unit test in `mod tests`;
+  - `pending_job_shape_refusal`'s foreign line (~3118–3124);
+  - `Group::stage`'s scope-type cause (the refusal Task 2 wrote) and the comment above its loop;
+  - `Job::FINGERPRINT`'s doc (~99–108).
+- Modify `crates/charpente-macros/src/job.rs`: the `FINGERPRINT` emission (~298–302) and the module doc (~7–9).
+- Modify `crates/charpente-macros/src/fingerprint.rs`: delete `compute_job` (~42–67), and delete its test `a_scoped_jobs_fingerprint_mixes_its_scope_and_a_global_ones_does_not` (~163–180, with its doc comment).
+- Modify docs only:
+  - `crates/charpente/src/kernel/dispatch.rs`: `JobDef.scope_type`'s doc;
+  - `crates/charpente/src/tenant.rs`: the module doc's residual (~41–46).
+- Tests:
+  - `crates/charpente/tests/kernel.rs` (`mod scoped_jobs`):
+    - the A4 pin, P2, P3 and the residual;
+    - the `spelled_alike` test, rewritten;
+    - the `scope_type_refusal` helper's cause clause;
+    - three foreign-shape pins: `a_job_that_gains_scoped_by_…`'s literal, `receipt_refusal` and `count_up_line`;
+  - `crates/charpente/tests/replication.rs`: `ping_refusal`.
+- Docs:
+  - `docs/GUIDE.md`:
+    - §6: the foreign-shape pinned block (~1709), the tenancy-shape paragraph (~1711–1717), the "Presence is not the whole" paragraph (~1768–1778), the scope-type pinned block's cause, and the residual (~1786–1802);
+    - §12 (~4361–4363);
+    - §16: Task 2's NAME bullet;
+  - `DESIGN.md`: §3's Jobs bullet (~628–641) and §6's Queue bullet (~1271–1274).
+
+**Interfaces:**
+- Consumes, from Task 2:
+  - `Tenant::NAME`;
+  - (A7) `charpente::tenant::tenant_name`;
+  - in `kernel.rs`'s `mod scoped_jobs`: the `scope_type_refusal` helper, `billing`/`crm` (`"BillingOrg"`/`"CrmOrg"`) and `spelled_alike`.
+- Produces:
+  - `pub const fn charpente_core::db::scoped_fingerprint(fold: u64, tenant: &str) -> u64`. Task 11 emits a scoped event's `FINGERPRINT` through it, with the tenant's name from `tenant_name` (A7);
+  - the foreign-shape refusal's restore clause, which now names the tenant type's `NAME`;
+  - the scope-type refusal's `#[job]` cause, which now names another tenant type with the same `NAME`.
+- Byte identity. Every in-tree `scoped_by` path on a `#[job]` is one identifier: `Desk`, `Org` or `Shop` (census by grep at e749823; the compile-fail fixtures add `Team`). Every in-tree NAME is its identifier (A4). So no pre-existing job's fingerprint changes, Step 1 pins that through the macro, and every Task 1 baseline must reproduce. Three fingerprints move by design:
+  - `spelled_alike::File`, 0xaac8_d6b2_01d1_f744 → 0x29b7_f8fb_f0ec_8fa5, because its tenant type's NAME is `Board`;
+  - Task 2's `Invoice`, whose path is `billing::Org`;
+  - `describe.rs`'s `Audit`, whose path is `renamed::Org`.
+
+  Neither of the last two is pinned by value: `Invoice` is compared through `<Invoice as Job>::FINGERPRINT`.
+
+- [ ] **Step 1: Pin a scoped job's fingerprint through the macro, before the macro changes (A4)**
+
+In `crates/charpente/tests/kernel.rs`, at the end of `mod scoped_jobs` (after Task 2's `a_jobdef_whose_scope_type_is_not_its_jobs_is_named_as_a_cause`):
+
+```rust
+    // --------------------- a scoped job's fingerprint mixes its tenant's NAME
+    //
+    // Tenancy-completion spec §4, plan amendment A4, and the job-tenancy final
+    // re-review's P2 and P3. A scoped job's fingerprint mixes its tenant
+    // type's `NAME`, not the rendering of its `scoped_by` path. Every
+    // in-tree NAME is its type's identifier, and FNV-1a is streaming, so a
+    // job whose path is that identifier keeps its fingerprint byte for byte.
+    // Two tenant types with two NAMEs now fingerprint apart, even where their
+    // paths are spelled alike.
+
+    /// A4 through the macro. `File` (`{ n: u64 }`, `scoped_by = Desk`) has
+    /// today's literal before `#[job]` mixes its tenant's NAME, and after.
+    /// `Desk`'s NAME is its identifier, so no byte a `Desk`-scoped job
+    /// records moves.
+    #[test]
+    fn a_scoped_jobs_fingerprint_is_unchanged_where_its_tenants_name_is_its_path() {
+        assert_eq!(<File as Job>::FINGERPRINT, 0xaac8_d6b2_01d1_f744);
+    }
+```
+
+```zsh
+cargo test -p charpente --test kernel -- scoped_jobs::a_scoped_jobs_fingerprint_is_unchanged
+```
+
+Expected: PASS. This is a characterization pin. It must be green before Step 4 and after it. The one change that would turn it red is the one A4 rules out: a fingerprint that mixed anything but `"Desk"` after the fold (a `type_name`, or the path's module prefix).
+
+- [ ] **Step 2: `scoped_fingerprint`, proved against today's literal before the macro calls it**
+
+In `crates/charpente-core/src/db.rs`, directly after `pub trait Tenant { … }`:
+
+```rust
+/// A scoped job's fingerprint (tenancy-completion spec §4): the payload's field
+/// fold `fold`, which is `#[job]`'s fingerprint for a `global` job (FNV-1a over
+/// `name\0<type tokens>\0` per field), continued over `#scoped_by\0`, the tenant
+/// type's `NAME` and `\0`. FNV-1a is streaming, so this is one hash over the
+/// concatenated bytes. A tenant type whose `NAME` is the `scoped_by` path's one
+/// identifier therefore fingerprints exactly as the path's rendering did (plan
+/// amendment A4). A `const fn`, so `#[job]` can emit `FINGERPRINT` as a constant
+/// over `Tenant::NAME`, which macro expansion cannot read. No identifier begins
+/// with `#`, so no field list can produce the suffix.
+pub const fn scoped_fingerprint(fold: u64, tenant: &str) -> u64 {
+    const fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+        let mut i = 0;
+        while i < bytes.len() {
+            hash ^= bytes[i] as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            i += 1;
+        }
+        hash
+    }
+    mix(mix(mix(fold, b"#scoped_by\0"), tenant.as_bytes()), b"\0")
+}
+```
+
+In `mod tests` at the end of `db.rs`, after `use super::*;`:
+
+```rust
+    /// Plan amendment A4, proved before `#[job]` calls `scoped_fingerprint`.
+    /// Continuing a field fold over `#scoped_by\0` + NAME + `\0` reproduces
+    /// the one-pass hash the macro computes today over the path's rendering,
+    /// wherever NAME is that one identifier. The literals are today's:
+    /// `0xaac8_d6b2_01d1_f744` is `kernel.rs`'s `scoped_jobs::File`
+    /// (`{ n: u64 }`, `scoped_by = Desk`), which that suite pins through the
+    /// macro, and `0xdeec_7a41_f1a3_46af` is a `{ n: u64 }` job
+    /// `scoped_by = Org` (job-tenancy final re-review, P1's `Report`).
+    #[test]
+    fn a_scoped_fingerprint_continues_the_field_fold_through_the_tenant_name() {
+        let fold = crate::migration::fnv1a_hash(b"n\0u64\0");
+        assert_eq!(fold, 0x2515_f249_2b16_f628);
+        assert_eq!(scoped_fingerprint(fold, "Desk"), 0xaac8_d6b2_01d1_f744);
+        assert_eq!(scoped_fingerprint(fold, "Org"), 0xdeec_7a41_f1a3_46af);
+        assert_eq!(
+            scoped_fingerprint(fold, "Org"),
+            crate::migration::fnv1a_hash(b"n\0u64\0#scoped_by\0Org\0")
+        );
+        assert_ne!(
+            scoped_fingerprint(fold, "Org"),
+            scoped_fingerprint(fold, "Team")
+        );
+        const IN_A_CONST: u64 = scoped_fingerprint(0x2515_f249_2b16_f628, "Desk");
+        assert_eq!(IN_A_CONST, 0xaac8_d6b2_01d1_f744);
+    }
+```
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente-core --lib -- a_scoped_fingerprint_continues
+git diff crates/charpente-core/src/db.rs > $D/task4-core.patch
+```
+
+Expected: PASS, while `#[job]` still computes `compute_job`'s one-pass hash. That is A4's proof: the continued fold reproduces the literal the macro emits today, for `File` (Step 1) and for any `{ n: u64 }` job `scoped_by = Org`. An independent FNV-1a in Python gives the same values:
+- 0x2515f2492b16f628 (the fold);
+- 0xaac8d6b201d1f744 (`Desk`);
+- 0xdeec7a41f1a346af (`Org`);
+- 0xec0639db20e81bb8 (`Team`).
+
+The test is green on arrival, so prove each operand red by mutation. Mutate the last line of `scoped_fingerprint` and run the test. Then restore with `git checkout crates/charpente-core/src/db.rs && git apply $D/task4-core.patch`, and check `git diff --stat` shows this step's diff again:
+1. Drop the trailing NUL: `mix(mix(fold, b"#scoped_by\0"), tenant.as_bytes())`. Expected: FAIL at the `"Desk"` literal.
+2. Ignore `fold`: `mix(mix(mix(0xcbf29ce484222325, b"#scoped_by\0"), tenant.as_bytes()), b"\0")`. Expected: FAIL at the `"Desk"` literal.
+3. Drop the NAME: `mix(mix(mix(fold, b"#scoped_by\0"), b""), b"\0")`. Expected: FAIL at the `"Desk"` literal.
+
+A scratch copy printed `left: 14355595984785138092`, `left: 2077947822304627953` and `left: 4035127763024975867` respectively. Each was against `right: 12306318592094172996`, which is 0xaac8_d6b2_01d1_f744.
+
+- [ ] **Step 3: P2, P3 and the residual, red first**
+
+In `mod scoped_jobs`, after Step 1's test:
+
+```rust
+    /// Scoped by `Org`, which this module's `use` makes `billing::Org`.
+    mod report_v1 {
+        use super::billing::Org;
+        use charpente::kernel::JobError;
+        use charpente::{ScopedTx, job};
+
+        #[job(scoped_by = Org)]
+        pub struct Report {
+            pub n: u64,
+        }
+
+        impl Report {
+            fn run(self, _tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+                let _ = self.n;
+                Ok(())
+            }
+        }
+    }
+
+    /// v1 after a refactor turned its `use billing::Org;` into
+    /// `use crm::Org;`. The path still reads `Org`; nothing else changed.
+    mod report_v2 {
+        use super::crm::Org;
+        use charpente::kernel::JobError;
+        use charpente::{ScopedTx, job};
+
+        #[job(scoped_by = Org)]
+        pub struct Report {
+            pub n: u64,
+        }
+
+        impl Report {
+            fn run(self, _tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+                let _ = self.n;
+                Ok(())
+            }
+        }
+    }
+
+    /// Enqueues `job` inside tenant `tenant` of its own scope type through
+    /// the operator path, as a seed or an admin step would.
+    fn enqueue_admitted<S: Tenant, J: Job<Scope = S>>(db: &mut Db, tenant: u64, job: J) {
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx| {
+                tx.admit_scope(Id::<S>::from_raw(tenant), &admission)
+                    .enqueue(job);
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().unwrap();
+    }
+
+    /// The foreign-shape startup refusal, spelled out here rather than taken
+    /// from the product's `format!`, so the comparison pins the words.
+    fn foreign_shape(name: &str, recorded: u64, compiled: u64) -> String {
+        format!(
+            "1 Pending \"{name}\" job(s) (ids 0) were enqueued under a different shape of \
+             {name} (recorded {recorded:#x}; this binary {compiled:#x}) — this binary will not \
+             decode them; run the binary that enqueued them until they are Done or Dead, then \
+             deploy this one, or restore whichever of {name}'s fields, its \
+             `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give the \
+             new shape its own #[job] type under a new name (GUIDE §6)"
+        )
+    }
+
+    /// The re-review's P3. Both binaries mount `Report`, and the refactor
+    /// above keeps its path `Org`. `Report`'s tenant type now has another
+    /// NAME, so the new binary refuses to start over the row the old one
+    /// enqueued in `billing::Org` 25, instead of running it in `crm::Org` 25.
+    #[test]
+    fn a_row_whose_job_moved_to_a_tenant_type_of_another_name_is_refused_at_startup() {
+        let sim = Sim::with_faults(0x5C0B_00F9, FaultConfig::none());
+        let open = |defs: Vec<JobDef>| {
+            App::open(
+                Box::new(sim.disk()),
+                Schema::new(),
+                Box::new(sim.entropy()),
+                AppConfig::default(),
+            )
+            .unwrap()
+            .mount_jobs(defs)
+        };
+        let mut old = open(jobs![report_v1::Report]);
+        enqueue_admitted(old.db_for_tests(), 25, report_v1::Report { n: 1 });
+        sim.restart();
+        drop(old);
+        let err = match Kernel::new(open(jobs![report_v2::Report]), Box::new(sim.clock())) {
+            Ok(_) => panic!(
+                "the kernel started over a \"Report\" row enqueued in `billing::Org` 25, which \
+                 it would run in `crm::Org` 25"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            foreign_shape(
+                "Report",
+                <report_v1::Report as Job>::FINGERPRINT,
+                <report_v2::Report as Job>::FINGERPRINT
+            )
+        );
+        assert!(
+            charpente::core::db::Refusal::of(&err).is_some(),
+            "a refusal, not an IO failure"
+        );
+    }
+
+    /// The re-review's P2, its `#[job]` half. A binary that mounts no `File`
+    /// enqueues `spelled_alike::File`, whose `scoped_by` path reads `Desk` and
+    /// names `Board`, in `Board` 23. No stage check sees a name its binary does
+    /// not mount, so nothing refuses that. The next binary mounts the real
+    /// `File`, whose tenant type's NAME is `Desk`, not `Board`. So the row's
+    /// shape is foreign, and the kernel refuses to start instead of running
+    /// it in `Desk` 23.
+    #[test]
+    fn a_row_enqueued_under_a_tenant_type_of_another_name_is_refused_at_startup() {
+        let sim = Sim::with_faults(0x5C0B_00F8, FaultConfig::none());
+        let mut before = only_jobs_app(&sim, vec![]);
+        enqueue_admitted(before.db_for_tests(), 23, spelled_alike::File { n: 1 });
+        sim.restart();
+        drop(before);
+        let err = match Kernel::new(only_jobs_app(&sim, jobs![File]), Box::new(sim.clock())) {
+            Ok(_) => panic!(
+                "the kernel started over a \"File\" row enqueued in `Board` 23, which it would \
+                 run in `Desk` 23"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            foreign_shape(
+                "File",
+                <spelled_alike::File as Job>::FINGERPRINT,
+                <File as Job>::FINGERPRINT
+            )
+        );
+    }
+
+    /// The residual, stated (GUIDE §6). A tenant type's `NAME` is its
+    /// identity, so two tenant types with one `NAME` are one tenant to the
+    /// fingerprint, whatever their paths. `App` refuses to mount both in one
+    /// app (Task 3). Across a deploy, giving a type another's `NAME` declares
+    /// it that tenant.
+    mod shared_name {
+        use charpente::auth::Principal;
+        use charpente::http::ApiError;
+        use charpente::kernel::JobError;
+        use charpente::{Id, ScopedTx, Tenant, Tx, job};
+
+        pub mod first {
+            use super::*;
+
+            pub struct Org;
+
+            impl Tenant for Org {
+                const NAME: &'static str = "Shared";
+                type Who = Principal;
+                type Error = ApiError;
+                fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                    Ok(())
+                }
+            }
+        }
+
+        pub mod second {
+            use super::*;
+
+            pub struct Org;
+
+            impl Tenant for Org {
+                const NAME: &'static str = "Shared";
+                type Who = Principal;
+                type Error = ApiError;
+                fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                    Ok(())
+                }
+            }
+        }
+
+        pub mod v1 {
+            use super::*;
+
+            #[job(scoped_by = first::Org)]
+            pub struct Note {
+                pub n: u64,
+            }
+
+            impl Note {
+                fn run(self, _tx: &mut ScopedTx<'_, '_, first::Org>) -> Result<(), JobError> {
+                    let _ = self.n;
+                    Ok(())
+                }
+            }
+        }
+
+        pub mod v2 {
+            use super::*;
+
+            #[job(scoped_by = second::Org)]
+            pub struct Note {
+                pub n: u64,
+            }
+
+            impl Note {
+                fn run(self, _tx: &mut ScopedTx<'_, '_, second::Org>) -> Result<(), JobError> {
+                    let _ = self.n;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Two paths spelled apart (`first::Org`, `second::Org`) and one `NAME`:
+    /// the fingerprint follows the NAME. It is the path's rendering that no
+    /// longer counts.
+    #[test]
+    fn two_tenant_types_sharing_a_name_fingerprint_alike() {
+        let shared = <shared_name::v1::Note as Job>::FINGERPRINT;
+        assert_eq!(shared, <shared_name::v2::Note as Job>::FINGERPRINT);
+        assert_eq!(
+            shared,
+            charpente::core::db::scoped_fingerprint(
+                charpente::core::migration::fnv1a_hash(b"n\0u64\0"),
+                "Shared"
+            )
+        );
+    }
+```
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test kernel -- scoped_jobs::a_row_ scoped_jobs::two_tenant_types 2>&1 | tee $D/task4-red.log | grep -E "^test |^the kernel|left:|right:"
+```
+
+Expected: all three FAIL. Quote them in the task report. A scratch copy printed:
+- P3, `a_row_whose_job_moved_to_a_tenant_type_of_another_name_…`: ``the kernel started over a "Report" row enqueued in `billing::Org` 25, which it would run in `crm::Org` 25``. Today both `Report`s fingerprint the path `Org`.
+- P2, `a_row_enqueued_under_a_tenant_type_of_another_name_…`: ``the kernel started over a "File" row enqueued in `Board` 23, which it would run in `Desk` 23``.
+- `two_tenant_types_sharing_a_name_fingerprint_alike`: `left: 6724896407645592289`, `right: 7075951808074694477`. Today the paths `first::Org` and `second::Org` render apart.
+
+- [ ] **Step 4: `#[job]` emits the scoped fingerprint through `scoped_fingerprint`**
+
+In `crates/charpente-macros/src/job.rs`, in `expand`, replace
+
+```rust
+    let scoped_path = match tenancy {
+        Tenancy::Global => None,
+        Tenancy::ScopedBy(path) => Some(path),
+    };
+    let fingerprint = crate::fingerprint::compute_job(&field_idents, &field_types, scoped_path);
+```
+
+with
+
+```rust
+    // A `global` job's fingerprint is its field fold's hash. A scoped job's
+    // continues that fold over its tenant type's `NAME`, in
+    // `charpente_core::db::scoped_fingerprint` (tenancy-completion spec §4):
+    // a constant the compiler evaluates, because expansion cannot read `NAME`.
+    // `tenant_name`'s bound is the one `JobDef.scoped_by` already carries at
+    // this span, so a scope type with no `Tenant` impl gains no error.
+    let fold = crate::fingerprint::compute(&field_idents, &field_types);
+    let fingerprint = match tenancy {
+        Tenancy::Global => quote! { #fold },
+        Tenancy::ScopedBy(path) => quote! {
+            ::charpente::core::db::scoped_fingerprint(
+                #fold,
+                ::charpente::tenant::tenant_name::<#path>(),
+            )
+        },
+    };
+```
+
+The emitted item is unchanged: `const FINGERPRINT: u64 = #fingerprint;`. A `global` job's `#fold` is the same suffixed literal that `compute_job` gave it.
+
+In the module doc, replace "the payload's structural fingerprint (`fingerprint::compute_job`, which mixes in `scoped_by`), the scope type" with "the payload's structural fingerprint (`fingerprint::compute`, continued over the tenant type's `NAME` by `charpente_core::db::scoped_fingerprint` for a `scoped_by` job), the scope type".
+
+In `crates/charpente-macros/src/fingerprint.rs`, delete two things. Step 2's core test and Step 1's pin replace them:
+- `compute_job`, with its doc comment ("A job's fingerprint (job-tenancy spec §6). …");
+- its test `a_scoped_jobs_fingerprint_mixes_its_scope_and_a_global_ones_does_not`, with the three-line doc comment above its `#[test]` ("Spec §6: `global` is the bare fold, … the two differ.").
+
+```zsh
+cargo test -p charpente --test kernel -- scoped_jobs:: 2>&1 | grep -E "^test .*FAILED|test result|left:|right:"
+```
+
+Expected:
+- Step 1's pin, NB1 a/b/c and Step 3's residual PASS.
+- Step 3's P2 and P3 now FAIL on the restore clause alone. `left` carries "or restore File's old fields and its `global`/`scoped_by` declaration and give"; `right` carries "or restore whichever of File's fields, …". The shapes differ now, so the kernel refuses.
+- `a_job_whose_scoped_by_spells_another_type_alike_is_refused_by_name` FAILS at its first assert, because `spelled_alike::File`'s fingerprint is no longer `File`'s. Step 5 rewrites it.
+- The three foreign-shape pins pass: their text changes only in Step 5.
+
+- [ ] **Step 5: The texts — the restore clause names the NAME, and the scope-type cause names a shared NAME**
+
+From the repo root, exactly. Each old string occurs once, and the script asserts that:
+
+```zsh
+python3 - <<'PYEOF'
+import pathlib
+
+EDITS = [
+    ("crates/charpente-core/src/db.rs",
+     r'''                     deploy this one, or restore {name}'s old fields and its \
+                     `global`/`scoped_by` declaration and give the new shape its own #[job] type \
+                     under a new name (GUIDE §6)",
+''',
+     r'''                     deploy this one, or restore whichever of {name}'s fields, its \
+                     `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and \
+                     give the new shape its own #[job] type under a new name (GUIDE §6)",
+'''),
+    ("crates/charpente/tests/kernel.rs",
+     r'''                 then deploy this one, or restore Reconcile's old fields and its \
+                 `global`/`scoped_by` declaration and give the new shape its own #[job] type \
+                 under a new name (GUIDE §6)"
+''',
+     r'''                 then deploy this one, or restore whichever of Reconcile's fields, its \
+                 `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give \
+                 the new shape its own #[job] type under a new name (GUIDE §6)"
+'''),
+    ("crates/charpente/tests/kernel.rs",
+     r'''         one, or restore SendReceipt's old fields and its `global`/`scoped_by` declaration and \
+         give the new shape its own #[job] type under a new name (GUIDE §6)",
+''',
+     r'''         one, or restore whichever of SendReceipt's fields, its `global`/`scoped_by` \
+         declaration or its tenant type's `NAME` changed, and give the new shape its own \
+         #[job] type under a new name (GUIDE §6)",
+'''),
+    ("crates/charpente/tests/kernel.rs",
+     r'''         restore CountUp's old fields and its `global`/`scoped_by` declaration and give the new \
+         shape its own #[job] type under a new name (GUIDE §6)",
+''',
+     r'''         restore whichever of CountUp's fields, its `global`/`scoped_by` declaration or its \
+         tenant type's `NAME` changed, and give the new shape its own #[job] type under a new \
+         name (GUIDE §6)",
+'''),
+    ("crates/charpente/tests/replication.rs",
+     r'''         restore ping's old fields and its `global`/`scoped_by` declaration and give the new \
+         shape its own #[job] type under a new name (GUIDE §6)",
+''',
+     r'''         restore whichever of ping's fields, its `global`/`scoped_by` declaration or its \
+         tenant type's `NAME` changed, and give the new shape its own #[job] type under a new \
+         name (GUIDE §6)",
+'''),
+    ("crates/charpente-core/src/db.rs",
+     r'''                         #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose \
+                         `scoped_by` spells another scope type the same way), or a hand-written \
+                         `JobDef` mounts {name} under a `scope_type` its #[job] does not declare; \
+''',
+     r'''                         #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose \
+                         `scoped_by` names another tenant type with the same `NAME`), or a \
+                         hand-written `JobDef` mounts {name} under a `scope_type` its #[job] does \
+                         not declare; \
+'''),
+    ("crates/charpente/tests/kernel.rs",
+     r'''             #[job] whose `scoped_by` spells another scope type the same way), or a \
+''',
+     r'''             #[job] whose `scoped_by` names another tenant type with the same `NAME`), or a \
+'''),
+]
+
+for path, old, new in EDITS:
+    p = pathlib.Path(path)
+    text = p.read_text()
+    assert text.count(old) == 1, (path, old[:60], text.count(old))
+    p.write_text(text.replace(old, new))
+    print(f"{path}: 1")
+PYEOF
+```
+
+Expected: seven `: 1` lines:
+- `db.rs` twice (the foreign line and the scope-type cause);
+- `kernel.rs` four times (the three foreign pins, and `scope_type_refusal`'s cause);
+- `replication.rs` once.
+
+The new product texts, joined:
+- foreign line: "… then deploy this one, or restore whichever of {name}'s fields, its `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give the new shape its own #[job] type under a new name (GUIDE §6)";
+- scope-type cause: "(a hand-written `impl Job`, or a #[job] whose `scoped_by` names another tenant type with the same `NAME`)".
+
+In `kernel.rs`, replace the whole `a_job_whose_scoped_by_spells_another_type_alike_is_refused_by_name` test, from its `#[test]` to its closing brace, with:
+
+```rust
+    /// The alias no longer fingerprints as `File`: its tenant type's NAME is
+    /// `Board`, so its shape is another shape, and the stage's shape check
+    /// refuses it before the scope-type check is reached.
+    #[test]
+    fn a_job_whose_scoped_by_spells_another_type_alike_is_refused_as_another_shape() {
+        assert_eq!(
+            <spelled_alike::File as Job>::FINGERPRINT,
+            0x29b7_f8fb_f0ec_8fa5,
+            "the fingerprint mixes `Board`'s NAME, not the path `Desk` (tenancy-completion \
+             spec §4)"
+        );
+        let (_sim, mut app) = desk_app(0x5C0B_00F6);
+        let db = app.db_for_tests();
+        let err = refused_in_board(db, 14, spelled_alike::File { n: 8 });
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "job \"File\" was enqueued under a different shape of File than this binary \
+                 mounts (enqueued 0x29b7f8fbf0ec8fa5; this binary {:#x}) — two #[job] types \
+                 share the name File; the transaction was refused and nothing was written, so a \
+                 retry cannot succeed — enqueue the mounted type, or give the other type its own \
+                 name (GUIDE §6)",
+                <File as Job>::FINGERPRINT
+            )
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+        assert!(db.drain_enqueued().is_empty());
+    }
+```
+
+Also replace `mod spelled_alike`'s doc sentence "The fingerprint hashes the path as written, so it is `File`'s." with "The fingerprint mixes the tenant type's NAME, `Board`, so it is not `File`'s (tenancy-completion spec §4)."
+
+```zsh
+cargo test -p charpente --test kernel 2>&1 | grep -E "FAILED|test result"
+cargo test -p charpente --test replication -- foreign 2>&1 | grep -E "FAILED|test result"
+cargo test -p charpente-macros 2>&1 | grep -E "FAILED|test result"
+```
+
+Expected: all green. In the scratch copy, `kernel` was 79/79 and `replication`'s `foreign` filter 8/8. `trybuild` passes with no `TRYBUILD=overwrite`, and `job_scoped_by_missing_tenant_scope.stderr` keeps its 2 errors. The new `tenant_name::<Org>()` in `FINGERPRINT` reports at the same span, with the same bound, as the one in `JobDef.scoped_by`, and rustc prints it once. A third error there is a finding.
+
+- [ ] **Step 6: Docs**
+
+In `crates/charpente-core/src/db.rs`:
+- `Job::FINGERPRINT`'s doc: after "computes it from the fields (the helper `#[table]` uses).", add "A `#[job(scoped_by = Org)]` job's continues that fold over `Org`'s `Tenant::NAME` (`scoped_fingerprint`), so its tenant's identity is part of its shape."
+- The comment above `Group::stage`'s loop: replace "or a `#[job]` whose `scoped_by`\n        // path spells another type alike, which the fingerprint cannot tell\n        // apart)" with "or a `#[job]` whose `scoped_by`\n        // names another tenant type with the same `NAME`, which the\n        // fingerprint cannot tell apart)".
+
+In `crates/charpente/src/kernel/dispatch.rs`, `JobDef.scope_type`'s doc: replace "or a `#[job]` whose `scoped_by` path spells another type the same way, enqueued in that type's tenant (job-tenancy final review N1)." with "or a `#[job]` whose `scoped_by` names another tenant type with the same `NAME`, enqueued in that type's tenant (job-tenancy final review N1; tenancy-completion spec §4)."
+
+In `crates/charpente/src/tenant.rs`'s module doc, replace the sentences from "That check holds within one binary:" through "state that residual and the drain that avoids it." with:
+
+```rust
+//! That check holds within one
+//! binary. Across binaries, a job's fingerprint carries its tenant type's
+//! `NAME`, so a Pending row enqueued under a tenant type of another `NAME` is
+//! refused at startup as a foreign shape. What still runs unchecked, in the type
+//! the dispatching binary declares, is a row whose shape matches: one a
+//! hand-written `impl Job` enqueued from a binary that did not mount the job, or
+//! one enqueued under another tenant type with the same `NAME`, which is that
+//! tenant by declaration. GUIDE §6 and DESIGN.md §3's Jobs bullet state that
+//! residual and the drain that avoids it.
+```
+
+(Re-wrap to the surrounding paragraph. `cargo fmt` leaves comments alone.)
+
+`docs/GUIDE.md` §6, the foreign-shape pinned block (~1709): replace "then deploy this one, or restore <job>'s old fields and its `global`/`scoped_by` declaration and give the new shape its own #[job] type under a new name (GUIDE §6)" with "then deploy this one, or restore whichever of <job>'s fields, its `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give the new shape its own #[job] type under a new name (GUIDE §6)".
+
+§6, the paragraph after that block, from "A job's tenancy is part of its shape." through "for what to do before such a deploy.", becomes:
+
+> A job's tenancy is part of its shape. A `scoped_by` job's fingerprint continues its fields' fold over its tenant type's `NAME` (§16), so moving a job between `global` and `scoped_by`, or to a tenant type with another `NAME`, is refused the same way. A deploy therefore never hands a row enqueued with no tenant to a scoped `run`, one enqueued in a tenant to a global one, or one enqueued in a tenant of one `NAME` to a job of another. Respelling the `scoped_by` path is not a shape change while it names a type of the same `NAME`: see below, after the scope-type refusal, for what that leaves unchecked.
+
+§6, in the paragraph beginning "Presence is not the whole of a tenant.", replace from "The fingerprint cannot tell two scope types apart either:" through "a tenant nothing opened or named for it." with:
+
+> The fingerprint tells two scope types apart only by their `NAME`s. A `#[job(scoped_by = Desk)]` in a module that says `use super::Board as Desk;` fingerprints with `Board`'s `NAME`, so it is refused as another shape. But a `#[job]` whose `scoped_by` names another tenant type with the same `NAME` fingerprints alike, and a hand-written `impl Job` can copy both constants under any `type Scope`. Enqueued inside a tenant of that other type, either would run the mounted job in the same id of the type it declares, a tenant nothing opened or named for it.
+
+§6, the scope-type pinned block: replace "(a hand-written `impl Job`, or a #[job] whose `scoped_by` spells another scope type the same way)" with "(a hand-written `impl Job`, or a #[job] whose `scoped_by` names another tenant type with the same `NAME`)".
+
+§6, the residual. Replace the text from "This one has no startup twin" through "the first way through a shape change below." with:
+
+> This one has no startup twin, because a row carries no type to compare, only the `NAME` its fingerprint mixes. The check runs where both types are known, at the enqueue, in a binary that mounts the job. At startup the dispatching binary compares a Pending row's shape, so a row whose job named a tenant type of another `NAME` is refused there by the foreign-shape refusal above. That covers the refactor that turns a job module's `use billing::Org;` into `use crm::Org;`, whenever the two types' NAMEs differ. What a later binary that mounts the name dispatches unchecked, in the scope type it declares, is a row whose shape matches:
+>
+> - a row a hand-written `impl Job` enqueued from a binary that did not mount the job name, copying the job's `NAME` and `FINGERPRINT` under another `type Scope`;
+> - a row enqueued under a tenant type with the same `NAME` as the mounted one. A `NAME` is the tenant's identity, so this is the same tenant by declaration: giving a type another type's `NAME` declares it that tenant.
+>
+> Where the recorded shape matches the mounted one, neither is refused, at startup or at dispatch. So before a deploy that mounts a scoped job the running binary does not mount, drain that job: run the binary that enqueued its Pending rows until every one is Done or Dead, the first way through a shape change below.
+
+§12 (~4361–4363): "A job's `scoped_by` path is fingerprinted the same way, as written, so moving a job between `global` and `scoped_by`, or respelling its path, is a shape change, and a path that keeps its spelling but comes to name another type is not (§6)." becomes "A `scoped_by` job's fingerprint also carries its tenant type's `NAME` (§16), not its path: moving a job between `global` and `scoped_by`, or to a tenant type with another `NAME`, is a shape change, and respelling the path, to the same type or to another with the same `NAME`, is not (§6)."
+
+§16, Task 2's bullet "**A tenant type names itself.**": after "`describe` (§13).", add "A scoped job's fingerprint mixes it (§6), so moving a job to a tenant type of another `NAME` is a shape change, and renaming a `NAME` is one for every scoped job of that type."
+
+`DESIGN.md` §3, the Jobs bullet. Replace the text from "So is an enqueue in a tenant of another scope type" through "before the deploy (final review N1, NB2)." with:
+
+> So is an enqueue in a tenant of another scope type than the mounted job declares (`JobDef.scope_type`, a `TypeId`). A row records a tenant id and not its type, and the fingerprint carries only the tenant type's `NAME`. So a stand-in copying `NAME` and `FINGERPRINT`, or a `#[job]` whose `scoped_by` names another tenant type with the same `NAME`, would otherwise run the job in the same id of the declared type. The check needs both types, so it runs at enqueue only. Across binaries the fingerprint carries the tenant's `NAME` (spec 2026-09-30-tenancy-completion §4). So a Pending row enqueued under a tenant type of another `NAME` is refused at startup as a foreign shape; that includes the refactor that turns a job module's `use billing::Org` into `use crm::Org`. A row whose shape matches has no type to check when a later binary that mounts the name dispatches it, in the scope type that binary declares. That is either a row a hand-written `impl Job` enqueued from a binary that did not mount the name, or one enqueued under another tenant type with the same `NAME`, which is that tenant by declaration. Nothing refuses either, so the operator drains such a job (runs the binary that enqueued its Pending rows until they are Done or Dead) before a deploy that mounts a scoped job the running binary does not (final review N1, NB2).
+
+`DESIGN.md` §6, the Queue bullet: "A scoped job's fingerprint also covers its `scoped_by` path as spelled, so moving a job between `global` and `scoped_by`, or respelling its path, is refused like a change of fields; a path that keeps its spelling but comes to name another type is not (§3's Jobs bullet)." becomes "A scoped job's fingerprint also carries its tenant type's `NAME`, so moving a job between `global` and `scoped_by`, or to a tenant type of another `NAME`, is refused like a change of fields; respelling its path to a type of the same `NAME` is not (§3's Jobs bullet)."
+
+```zsh
+grep -rn -B1 -A1 "spell" docs/GUIDE.md DESIGN.md crates/charpente/src crates/charpente-core/src crates/charpente-macros/src | grep -i "fingerprint\|scoped_by"
+cargo build -p guide-examples
+cargo test -p guide-examples --test doc_truth --test describe_contract
+```
+
+Expected:
+- The `grep` prints exactly 4 lines, down from 20 before this step (both counts measured in the scratch copy). The 4 are:
+  - `tenant.rs`'s `TenantScope` doc (Task 2's `tenant_name` sentence, beside "spelled out");
+  - GUIDE §6's and §12's new sentences;
+  - DESIGN §6's new sentence.
+- Every line the step removed claimed that a fingerprint follows a `scoped_by` path's spelling. A fifth line is a claim this task made false: rewrite it to the `NAME`.
+- Both test binaries are green. The two changed pinned blocks' fragments are substrings of Step 5's product strings, and `PINNED_FLOOR` does not change.
+
+- [ ] **Step 7: Run the task's tests, and measure byte identity**
+
+```zsh
+cargo test -p charpente --test kernel
+cargo test -p charpente --test replication -- foreign
+cargo test -p charpente-core --lib
+cargo test -p charpente-macros
+```
+
+Expected: all pass.
+
+Byte identity. Run Task 1's six `baselines.sh` calls with the suffix `task4`:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task4 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task4 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task4 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task4 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task4 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task4 invoicing; print -r -- "exit ${?}"
+```
+
+Each label must print `reproduces the base`, and each call `exit 0`.
+
+Expected: every baseline `identical`, and no `DIFFERS`. The one this task could move is `kernel.rs`'s `job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from` swarm, whose `Shop`-scoped jobs record their fingerprint in every enqueue. `Shop`'s NAME is `"Shop"`, so its bytes are unchanged, and Step 1 is the same claim for `Desk`. A `DIFFERS` is a finding: stop.
+
+- [ ] **Step 8: Gate and commit**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/gate-task-4.log
+: > $L
+cargo fmt --all --check && echo 'fmt ok' | tee -a $L
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a $L | grep -cE "^(warning|error)"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente --lib --test kernel --test tenant --test describe --test typed_tables --test realtime --test archive --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p charpente-cli --test describe --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $L | grep "^test result"
+grep -c "^test result:" $L; grep -c "^test result: ok" $L; grep -c "FAILED" $L
+```
+
+Expected:
+- `fmt ok`;
+- clippy prints `0`;
+- the two `test result` counts are equal (35 in the scratch copy);
+- `FAILED` prints `0`.
+
+`replication.rs` changed only in `ping_refusal`, which Step 7's `foreign` filter ran. The controller's counted workspace gate runs the rest.
+
+```zsh
+git status --short
+git add crates/charpente-core/src/db.rs \
+  crates/charpente-macros/src/job.rs crates/charpente-macros/src/fingerprint.rs \
+  crates/charpente/src/kernel/dispatch.rs crates/charpente/src/tenant.rs \
+  crates/charpente/tests/kernel.rs crates/charpente/tests/replication.rs \
+  docs/GUIDE.md DESIGN.md
+git status --short
+git commit -m "feat(tenancy): a scoped job's fingerprint continues its field fold over its tenant type's NAME (scoped_fingerprint), byte-identical wherever NAME is the path's identifier (A4, pinned through the macro); P2's #[job] half and P3 refused at startup as a foreign shape, red first; the restore clause names the NAME; the residual is a hand-written impl Job or a shared NAME; <K>/<K> baselines identical"
+```
+
+---
+
+### Task 5: `JobScope::open` asserts the scope type it opens (closes P4, P5)
+
+**Files:**
+- Modify `crates/charpente/src/kernel/dispatch.rs`:
+  - the `charpente_core::db` import (`:9-11`);
+  - `JobDef.scoped_by`'s doc (`:73-81`, last sentence only; Task 2 rewrote its first);
+  - `JobScope`'s doc, struct and `open` (`:110-131`);
+  - the scope-presence comment in `run_due_into` (`:301-313`);
+  - the `JobScope` literal (`:326-329`).
+- Modify `crates/charpente/src/tenant.rs`: one clause in the module doc.
+- Test: `crates/charpente/tests/kernel.rs`, `mod scoped_jobs`. After
+  `a_job_name_registered_under_two_declarations_panics_naming_both`, add:
+  - the `Pinned` table, the `Pin` job, `hand_built_app`, `attempts_until_rest`,
+    `retried_then_dead`;
+  - three tests.
+- Docs:
+  - `docs/GUIDE.md` §6, after the pinned block that begins `job "<job>" was enqueued in a`;
+  - `DESIGN.md` §3's Jobs bullet.
+- Modify `crates/guide-examples/tests/doc_truth.rs`: `PINNED_FLOOR` rises by one.
+
+**Interfaces:**
+- Consumes:
+  - Task 2's `Tenant::NAME` (`<S as Tenant>::NAME`, `<Board as Tenant>::NAME`) and
+    `JobDef.scoped_by == Some(<S as Tenant>::NAME)` for a macro-built def;
+  - Task 3's mount-time uniqueness check, fed by `App::mount_jobs` from each `JobDef`'s
+    `(scoped_by, scope_type)`. Its text begins `two tenant types are named "{name}"` (contract).
+- Produces:
+  - `JobScope` gains three private fields, `job: &'static str`, `scope_type: TypeId` and
+    `scope_name: Option<&'static str>`, copied from the mounted `JobDef` (`name`,
+    `scope_type`, `scoped_by`) in `run_due_into`. (`job` is not in the interface contract. Spec §7 requires the assert's message to name the job, and `JobScope` carries no name today.)
+  - `JobScope::open<'t, 'a, S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S>`:
+    **the signature line is byte-identical**, because
+    `compile_fail/job_scoped_by_missing_tenant_scope.stderr` quotes it. Its body first
+    asserts `TypeId::of::<S>() == self.scope_type`, with this fixed text (hard rule 5):
+
+    ```text
+    contract: the glue mounted for job "{job}" opened its tenant {id} as `{S::NAME}`, but that `JobDef` declares `{declared}` with a `scope_type` that is not `{S::NAME}` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken from another job, or another type's `TypeId`); this attempt wrote nothing, and every retry fails the same way — mount {job} through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)
+    ```
+
+    `{declared}` is `scoped_by = <scope_name>`, or `global` for `None`, in the idiom the
+    presence assert at `dispatch.rs:323-324` already uses. The assert runs inside the glue's
+    `catch_unwind` (`dispatch.rs:330-341`). So a failure is an attempt whose `last_error` is
+    `handler panicked: ` followed by that text. It retries and dead-letters, and never stops
+    the kernel.
+
+- [ ] **Step 1: Write the tests**
+
+In `crates/charpente/tests/kernel.rs`, inside `mod scoped_jobs`, directly after
+`a_job_name_registered_under_two_declarations_panics_naming_both` (the module's last test),
+add:
+
+```rust
+    // --------------------------- a hand-built `JobDef` whose glue disagrees
+    //
+    // Tenancy-completion spec §7, item 4 (job-tenancy final-fix re-review 2,
+    // P4 and P5). `JobDef`'s fields are public, so a hand-built one can pair a
+    // glue with a `scope_type` that glue does not open. `Group::stage` holds
+    // the enqueuer to `scope_type`, and the glue opens the row's tenant as
+    // whatever type it names, so the two can disagree only at dispatch.
+    // `JobScope::open` asserts they agree, inside the glue's `catch_unwind`:
+    // an attempt that retries and dead-letters, never a kernel stop.
+
+    /// A table in `Board`'s tenants, so a job that runs in one leaves a row
+    /// these tests can look for.
+    #[table(scoped_by = Board)]
+    pub struct Pinned {
+        pub id: Id<Pinned>,
+        pub note: u64,
+    }
+
+    /// A `Board` job whose payload decodes exactly as `File`'s does, so its
+    /// glue, swapped into `File`'s `JobDef`, runs a `File` row in `Board`.
+    #[job(scoped_by = Board)]
+    pub struct Pin {
+        pub n: u64,
+    }
+
+    impl Pin {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Board>) -> Result<(), JobError> {
+            tx.put(&Pinned {
+                id: Id::from_raw(self.n),
+                note: self.n,
+            });
+            Ok(())
+        }
+    }
+
+    /// An app that mounts one hand-built `JobDef` and both tenants' tables.
+    fn hand_built_app(sim: &Sim, def: JobDef) -> App {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Filed>().table::<Pinned>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(vec![def])
+    }
+
+    /// Runs the queue until it is empty, each attempt at its own due time,
+    /// and returns what every attempt came to.
+    fn attempts_until_rest(dispatcher: &mut Dispatcher, db: &mut Db) -> Vec<(&'static str, u32)> {
+        let mut seen = Vec::new();
+        loop {
+            dispatcher.note_enqueued(db.drain_enqueued());
+            let Some(now) = dispatcher.next_deadline() else {
+                return seen;
+            };
+            seen.push(match dispatcher.run_due(db, now).unwrap() {
+                JobOutcome::Done { .. } => ("done", 0),
+                JobOutcome::Retried { attempts, .. } => ("retried", attempts),
+                JobOutcome::Dead { attempts, .. } => ("dead", attempts),
+            });
+        }
+    }
+
+    /// Every attempt a `File` row gets under `File`'s own retry policy, the
+    /// last one dead-lettering it.
+    fn retried_then_dead() -> Vec<(&'static str, u32)> {
+        let max = <File as Job>::RETRY.max;
+        (1..max).map(|n| ("retried", n)).chain([("dead", max)]).collect()
+    }
+
+    /// P4. `File`'s `JobDef` with `Pin`'s glue. `File` enqueued in `Desk` 31
+    /// is accepted, since the def's `scope_type` is `Desk`'s, and the glue
+    /// would open `Board` 31, a tenant nothing opened or named for it.
+    #[test]
+    fn a_jobdef_carrying_another_jobs_glue_dead_letters_before_it_writes_in_another_scope_type() {
+        let sim = Sim::with_faults(0x7C05_0501, FaultConfig::none());
+        let def = JobDef {
+            glue: <Pin as JobEntry>::def().glue,
+            ..<File as JobEntry>::def()
+        };
+        let mut app = hand_built_app(&sim, def);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 31, File { n: 31 });
+        let attempts = attempts_until_rest(&mut dispatcher, db);
+
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            snap.scan_raw(Pinned::TABLE, true).unwrap(),
+            Vec::<(u64, u64, Vec<u8>)>::new(),
+            "no row in any Board tenant: the job was enqueued in Desk 31, and Board 31 is a \
+             tenant nothing opened or named for it"
+        );
+        assert_eq!(
+            attempts,
+            retried_then_dead(),
+            "an attempt, retried and then dead-lettered — never a kernel stop"
+        );
+        let row = snap.scan::<JobRow>().unwrap().remove(0);
+        assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(31)));
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(
+                "handler panicked: contract: the glue mounted for job \"File\" opened its \
+                 tenant 31 as `Board`, but that `JobDef` declares `scoped_by = Desk` with a \
+                 `scope_type` that is not `Board` — a hand-built `JobDef` whose `glue` or \
+                 `scope_type` disagrees with its #[job] (a glue taken from another job, or \
+                 another type's `TypeId`); this attempt wrote nothing, and every retry fails \
+                 the same way — mount File through `jobs![…]`, which builds its `JobDef` from \
+                 its #[job] (GUIDE §6)"
+            )
+        );
+    }
+
+    /// P5, in the form that survives mount: `File`'s glue under a `JobDef`
+    /// whose `scoped_by` and `scope_type` both name `Board`. They agree with
+    /// each other and not with the glue. `Group::stage` holds the enqueuer to
+    /// `Board`, so a "File" enqueued in `Board` 13 is accepted, and `File`'s
+    /// glue would open `Desk` 13, a tenant nothing opened or named for it.
+    #[test]
+    fn a_jobdef_naming_a_scope_type_its_glue_does_not_open_dead_letters_before_it_writes() {
+        let sim = Sim::with_faults(0x7C05_0502, FaultConfig::none());
+        let def = JobDef {
+            scoped_by: Some(<Board as Tenant>::NAME),
+            scope_type: TypeId::of::<Board>(),
+            ..<File as JobEntry>::def()
+        };
+        let mut app = hand_built_app(&sim, def);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx| {
+                tx.admit_scope(Id::<Board>::from_raw(13), &admission)
+                    .enqueue(BoardFile { n: 13 });
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().unwrap();
+        let attempts = attempts_until_rest(&mut dispatcher, db);
+
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            snap.scan_raw(Filed::TABLE, true).unwrap(),
+            Vec::<(u64, u64, Vec<u8>)>::new(),
+            "no row in any Desk tenant: the job was enqueued in Board 13, and Desk 13 is a \
+             tenant nothing opened or named for it"
+        );
+        assert_eq!(
+            attempts,
+            retried_then_dead(),
+            "an attempt, retried and then dead-lettered — never a kernel stop"
+        );
+        let row = snap.scan::<JobRow>().unwrap().remove(0);
+        assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(13)));
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(
+                "handler panicked: contract: the glue mounted for job \"File\" opened its \
+                 tenant 13 as `Desk`, but that `JobDef` declares `scoped_by = Board` with a \
+                 `scope_type` that is not `Desk` — a hand-built `JobDef` whose `glue` or \
+                 `scope_type` disagrees with its #[job] (a glue taken from another job, or \
+                 another type's `TypeId`); this attempt wrote nothing, and every retry fails \
+                 the same way — mount File through `jobs![…]`, which builds its `JobDef` from \
+                 its #[job] (GUIDE §6)"
+            )
+        );
+    }
+
+    /// P5 exactly as the re-review built it: `File`'s `JobDef` with only its
+    /// `scope_type` swapped to `Board`'s. That names `Desk` for a type that
+    /// is not `Desk`, beside `Filed`'s `Desk`, so the app is refused at mount
+    /// (Task 3) before anything can be enqueued. The prefix is the one the
+    /// plan's contract fixes; the rest of the text is Task 3's pin.
+    #[test]
+    #[should_panic(expected = "two tenant types are named \"Desk\"")]
+    fn the_re_reviews_p5_jobdef_is_refused_at_mount() {
+        let sim = Sim::with_faults(0x7C05_0503, FaultConfig::none());
+        let _ = hand_built_app(
+            &sim,
+            JobDef {
+                scope_type: TypeId::of::<Board>(),
+                ..<File as JobEntry>::def()
+            },
+        );
+    }
+```
+
+Notes for the implementer:
+- `n` is odd in both runtime tests on purpose. An even `File` enqueues a `Stamp` and a `Tally`
+  from its `run`, and `hand_built_app` mounts neither.
+- `BoardFile` (`kernel.rs:808-827`) copies `<File as Job>::FINGERPRINT`, so it survives Task 4's
+  fingerprint change unmodified.
+- `Board` is `#[table(scoped_by = Board)]`-capable because its `impl Tenant` has
+  `Who = Principal, Error = ApiError`.
+
+- [ ] **Step 2: Run them before any implementation, and record the red**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test kernel -- scoped_jobs:: 2>&1 | tee $D/task5-red.log | grep -E "^test |panicked at|left:|right:|^test result"
+```
+
+Expected (quote each in the task report):
+- `a_jobdef_carrying_another_jobs_glue_dead_letters_before_it_writes_in_another_scope_type`:
+  FAIL at its first assertion. `left` is one `(31, 31, …)` row: `Pin`'s glue ran `File`'s row
+  in `Board` 31. This is P4 reproduced.
+- `a_jobdef_naming_a_scope_type_its_glue_does_not_open_dead_letters_before_it_writes`: FAIL at
+  its first assertion. `left` is one `(13, 13, …)` row: `File`'s glue ran in `Desk` 13 a job
+  enqueued in `Board` 13. This is P5 reproduced in its surviving form.
+- `the_re_reviews_p5_jobdef_is_refused_at_mount`: PASS, since Task 3 refuses it. Then prove
+  the pass is not vacuous. Change that test's `TypeId::of::<Board>()` to
+  `TypeId::of::<Desk>()`, run it alone, and see `test did not panic as expected`. Then revert
+  it, and check `git diff crates/charpente/tests/kernel.rs` shows only Step 1's additions.
+  - If it FAILS at base with a different panic text, Task 3 does not feed `JobDef`s into the
+    uniqueness map as the contract says. Stop and report; do not weaken the expectation.
+- Every other `scoped_jobs::` test passes.
+
+- [ ] **Step 3: Implement**
+
+In `crates/charpente/src/kernel/dispatch.rs`:
+
+Add `Tenant` to the core import:
+
+```rust
+use charpente_core::db::{
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, Tenant, TenantAdmission, Tx, TxError,
+};
+```
+
+In `JobDef.scoped_by`'s doc, replace its last sentence ("A hand-written `JobDef` that
+contradicts its own `#[job]` is therefore refused at the first enqueue, not at dispatch.") with:
+
+```rust
+    /// A hand-built `JobDef` whose tenancy contradicts its own `#[job]` is
+    /// therefore refused at the first enqueue; one whose glue opens another
+    /// scope type than `scope_type` is refused at dispatch, as an attempt, by
+    /// `JobScope::open`.
+```
+
+Replace `JobScope`'s doc, the struct and its `impl` (`:110-131`) with:
+
+```rust
+/// The tenant a scoped job was enqueued in, handed to its glue by the
+/// dispatcher and by nothing else (job-tenancy spec §5). Its fields are
+/// private and it has no public constructor, so a glue, generated or
+/// hand-written, can open only the tenant id its row carries, and only as
+/// the scope type the mounted `JobDef` declares: `open` takes the type from
+/// its caller and asserts it is `JobDef.scope_type`, the type `Group::stage`
+/// held the enqueuer's to (tenancy-completion spec §7).
+pub struct JobScope<'j> {
+    id: u64,
+    admission: &'j TenantAdmission,
+    /// The mounted `JobDef`'s `name`, `scope_type` and `scoped_by`, copied
+    /// at dispatch: what `open` holds the glue's scope type to, and what its
+    /// refusal names.
+    job: &'static str,
+    scope_type: TypeId,
+    scope_name: Option<&'static str>,
+}
+
+impl JobScope<'_> {
+    /// Opens the enqueuer's tenant id, as scope type `S`, on the job's
+    /// transaction, by the dispatcher's admission. No `authorize` runs: a job
+    /// has no principal. Its authority is its enqueuer's, who was either
+    /// inside this tenant or declared `cross_tenant` to name it.
+    ///
+    /// # Panics
+    ///
+    /// When `S` is not the mounted `JobDef.scope_type`: a hand-built `JobDef`
+    /// whose glue opens another scope type than the one it declares. The
+    /// panic is inside the dispatcher's `catch_unwind`, so it is an attempt
+    /// (it retries, then dead-letters), and it comes before `admit_scope`, so
+    /// nothing runs in either tenant. A `JobDef` whose glue and `scope_type`
+    /// name the same other type passes, and cannot be told apart here; it
+    /// still runs in the tenant it was enqueued in, because `Group::stage`
+    /// held the enqueuer to that same type.
+    pub fn open<'t, 'a, S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S> {
+        assert!(
+            TypeId::of::<S>() == self.scope_type,
+            "contract: the glue mounted for job \"{job}\" opened its tenant {id} as \
+             `{opened}`, but that `JobDef` declares `{declared}` with a `scope_type` that is \
+             not `{opened}` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees \
+             with its #[job] (a glue taken from another job, or another type's `TypeId`); \
+             this attempt wrote nothing, and every retry fails the same way — mount {job} \
+             through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)",
+            job = self.job,
+            id = self.id,
+            opened = <S as Tenant>::NAME,
+            declared = self
+                .scope_name
+                .map_or_else(|| "global".to_string(), |name| format!("scoped_by = {name}")),
+        );
+        tx.admit_scope(Id::from_raw(self.id), self.admission)
+    }
+}
+```
+
+In `run_due_into`, the comment above the presence assert (`:301-313`) ends with four lines,
+from `// refusal (\`Db::pending_job_shape_refusal\`) names a Pending row` to
+`// refuses an enqueue under any type but \`def.scope_type\`.`. Replace those four lines with:
+
+```rust
+            // refusal (`Db::pending_job_shape_refusal`) names a Pending row
+            // that disagrees before dispatch starts. The scope TYPE is not
+            // checkable here, since the row records none: `Group::stage`
+            // refuses an enqueue under any type but `def.scope_type`, and
+            // `JobScope::open` asserts the glue opens exactly that type —
+            // inside the `catch_unwind` below, so a hand-built `JobDef` whose
+            // glue disagrees is an attempt, not a kernel stop.
+```
+
+Replace the `JobScope` literal (`:326-329`) with:
+
+```rust
+            let scope = row.scope.map(|id| JobScope {
+                id,
+                admission: &admission,
+                job: def.name,
+                scope_type: def.scope_type,
+                scope_name: def.scoped_by,
+            });
+```
+
+In `crates/charpente/src/tenant.rs`'s module doc, after "since the row records the tenant's id
+and not its type." insert: "`JobScope::open` holds a mounted job's glue to that same type at
+dispatch." Keep the rest of the paragraph as it is.
+
+The assert's arguments are formatted only on failure: `assert!` builds its message lazily, so
+the `map_or_else` allocation is off the dispatch path.
+
+- [ ] **Step 4: Run, green**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test kernel -- scoped_jobs:: 2>&1 | tee $D/task5-green.log | grep -E "^test |^test result"
+cargo test -p charpente --test kernel 2>&1 | tee $D/task5-kernel.log | grep -E "^test result|FAILED"
+cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task5-trybuild.log | grep -E "^test result|mismatch|FAILED"
+git diff --stat crates/charpente-macros/tests/
+```
+
+Expected:
+- every `scoped_jobs::` test passes, the three new ones included;
+- `kernel` is green;
+- trybuild is green with **no** `.stderr` touched. `job_scoped_by_missing_tenant_scope.stderr`
+  quotes `open`'s signature line, which Step 3 kept byte-identical. If it moved, the signature
+  line was edited: restore it.
+
+Each runtime test prints five `thread '…' panicked at crates/charpente/src/kernel/dispatch.rs`
+lines on stderr, one per attempt. That is the default hook reporting a caught panic, the same as
+`panicking_handler_is_absorbed_into_the_retry_path`, and not a failure.
+
+- [ ] **Step 5: Prove each assert operand red by mutation**
+
+Save the implementation first, so each mutation reverts exactly (`git checkout -p` is
+interactive and unavailable here):
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff crates/charpente/src/kernel/dispatch.rs > $D/task5-dispatch.patch
+```
+
+Apply each mutation alone and run
+`cargo test -p charpente --test kernel -- scoped_jobs:: 2>&1 | tee $D/task5-mutation-<k>.log | grep -E "^test |left:|^test result"`.
+Quote the named failures. Then restore:
+
+```zsh
+git checkout crates/charpente/src/kernel/dispatch.rs && git apply $D/task5-dispatch.patch
+git diff --stat crates/charpente/src/kernel/dispatch.rs
+```
+
+The diff must be exactly Step 3's again. The mutations:
+
+1. **Left operand**: `TypeId::of::<S>() == self.scope_type` becomes
+   `self.scope_type == self.scope_type`. Expected: the P4 and P5 tests FAIL at their first
+   assertion, with the same rows as Step 2's red. Every other `scoped_jobs::` test passes.
+2. **Right operand**: it becomes `TypeId::of::<S>() == TypeId::of::<S>()`. Expected: exactly
+   mutation 1's failures.
+3. **Polarity**: `==` becomes `!=`. Expected:
+   - every legitimate scoped-job test FAILS, starting with
+     `a_scoped_job_runs_in_its_enqueuers_tenant_tenant_zero_included` (its rows are `Retried`,
+     not `Done`);
+   - so do P4 and P5, because their glues now pass.
+4. **The copy**: in the `JobScope` literal, `scope_type: def.scope_type` becomes
+   `scope_type: TypeId::of::<()>()`. Expected: every legitimate scoped-job test FAILS as in 3.
+   P4 and P5 still dead-letter.
+5. **The rendering**: `scope_name: def.scoped_by` becomes `scope_name: None`. Expected: P4
+   and P5 FAIL at their `last_error` assertion, with `declares \`global\`` in `left`.
+
+Mutations 1 and 2 are the operand proofs (memory `prove-the-operands-not-just-the-branch`).
+Each alone would leave the other operand unpinned. None of the five is expected green. If one
+is, print the dispatched rows and `last_error` under it before concluding anything (memory
+`green-mutation-proves-nothing`).
+
+- [ ] **Step 6: Byte identity against Task 1's baselines**
+
+The assert passes in every legitimate universe, and it adds no disk operation and no entropy
+draw. So every baseline Task 1 recorded must reproduce exactly. Run Task 1's six
+`baselines.sh` calls with the suffix `task5`:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task5 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task5 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task5 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task5 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task5 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task5 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label `reproduces the base`, every call `exit 0`. `tenant`, `kernel`,
+`job-tenancy` and `realtime-tenant` exercise this code path. A moved baseline is a finding:
+stop (Global Constraints).
+
+- [ ] **Step 7: Docs**
+
+**`docs/GUIDE.md` §6.** Find the pinned block whose text begins `job "<job>" was enqueued in a`
+(the scope-type refusal). Directly after that block's closing fence, before the paragraph that
+begins "This one has no startup twin", insert:
+
+````markdown
+One door is left inside a binary, and it is a hand-built `JobDef`. Its fields are public,
+so `JobDef { glue: <another job's glue>, ..<File as JobEntry>::def() }` mounts a glue that
+opens a different scope type than `scope_type` names, and so does a `JobDef` whose
+`scoped_by` and `scope_type` both name a type its glue does not open. `Group::stage` holds
+the enqueuer to `scope_type`, and a scoped job's glue opens its row's tenant through
+`JobScope::open`, which asserts that the type it opens is `scope_type`. The assert runs
+inside the attempt, so the job retries and then dead-letters, and nothing runs in either
+tenant. Its `last_error`, for `File`'s `JobDef` carrying a `Board` job's glue, is:
+
+<!-- pinned -->
+```text
+handler panicked: contract: the glue mounted for job "File" opened its tenant 31 as `Board`, but that `JobDef` declares `scoped_by = Desk` with a `scope_type` that is not `Board` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken from another job, or another type's `TypeId`); this attempt wrote nothing, and every retry fails the same way — mount File through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)
+```
+
+A `JobDef` whose glue and `scope_type` name the same other type passes the assert. Nothing
+can tell it apart, and it does not cross a tenant: `Group::stage` held the enqueuer to
+that same type, so the job runs in the tenant it was enqueued in, only with another job's
+code. `jobs![…]` builds every `JobDef` from its `#[job]`, and it is the way to mount one.
+````
+
+**`DESIGN.md` §3, the Jobs bullet.** Find the sentence that names `JobDef.scope_type` (it
+contains `` (`JobDef.scope_type`, a `TypeId`) ``). Directly after that sentence, insert:
+
+> A hand-built `JobDef` (its fields are public) can still pair a glue with a `scope_type` that glue does not open; `JobScope::open` asserts the type the glue opens is `JobDef.scope_type`, inside the glue's `catch_unwind`, so that job's every attempt fails by name and it dead-letters with nothing written (spec 2026-09-30-tenancy-completion §7).
+
+**`crates/guide-examples/tests/doc_truth.rs`.** Raise `PINNED_FLOOR` by exactly one from its
+value at the commit this task starts from (28 at `e749823`; Tasks 1-4 may have raised it —
+read it, add one). §6 gained one pinned block.
+
+```zsh
+cargo build -p guide-examples
+cargo test -p guide-examples --test doc_truth
+```
+
+Expected: both green. If `doc_truth` names a missing fragment in the new block, the GUIDE and
+the P4 test's literal disagree. Fix the GUIDE to match the literal, never the reverse.
+
+- [ ] **Step 8: Gate and commit**
+
+Foreground, one command per tool call:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo fmt --all --check; echo "fmt exit $?"
+cargo clippy --workspace --all-targets -- -D warnings; echo "clippy exit $?"
+cargo test -p charpente --no-fail-fast --test kernel 2>&1 | tee $D/gate-task-5.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --lib 2>&1 | tee -a $D/gate-task-5.log | grep -E "^test result|FAILED"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $D/gate-task-5.log | grep -E "^test result|FAILED"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $D/gate-task-5.log | grep -E "^test result|FAILED"
+grep -c "^test result:" $D/gate-task-5.log
+grep -c "^test result: ok" $D/gate-task-5.log
+```
+
+Green means:
+- `fmt exit 0` and `clippy exit 0` (no pipe, so `$?` is the tool's own status);
+- the two counts are equal;
+- `grep -c FAILED $D/gate-task-5.log` prints `0`. That `grep` exits 1 when it prints `0`, so
+  read the printed count, not its status.
+
+The controller then runs the full workspace gate and counts it against the base count (no new
+test file). Re-check `git status --short` and `git log -1` first. Then:
+
+```zsh
+git add crates/charpente/src/kernel/dispatch.rs crates/charpente/src/tenant.rs \
+  crates/charpente/tests/kernel.rs crates/guide-examples/tests/doc_truth.rs \
+  docs/GUIDE.md DESIGN.md
+git commit -m "fix(tenancy): JobScope::open asserts the scope type it opens — a hand-built JobDef whose glue or scope_type disagrees with its #[job] dead-letters by name before any write (P4, P5 closed; P5's literal form refused at mount by the NAME check); <N> mutations red, baselines identical"
+```
+
+---
+
+### Task 6: The 401 keeps the route's other flags, and so does every refusal of its class
+
+> Extended by amendment A11. The 401 part is as
+> the contract has it. The class adds five refusals, found by the sweep in Step 5, which
+> writes the same way: name the word to add or change, and keep the rest.
+
+**Files:**
+- Modify `crates/charpente/src/http/app.rs`: `Ctx::anonymous_scope`, meaning its doc and its
+  non-`auth` `format!` (`:133-174` at `e749823`, re-located after Task 2 by the fragment
+  `if every caller may act inside this tenant`).
+- Modify `crates/charpente-macros/src/route.rs`: `undeclared_capability` and its doc
+  (`:194-220`, re-located by name). Whatever Task 2 left in its `stance` computation goes
+  with it.
+- The class (A11):
+  - `crates/charpente-macros/src/route.rs`, `expand`: the neither-stance refusal's `format!`
+    (`:268-277`) and the emits-on-a-non-stream refusal's literal (`:282-285`).
+  - `crates/charpente-macros/src/job.rs`, `expand`: the no-tenancy refusal's `format!`
+    (`:261-267`).
+  - `crates/charpente-macros/src/lib.rs`, `table`: the no-tenancy refusal's `format!`
+    (`:32-37`).
+  - `crates/charpente-core/src/table.rs`, `NoTenant`'s `#[diagnostic::on_unimplemented]`
+    `note` (`:388-393`): its job case.
+- Tests:
+  - `crates/charpente/tests/tenant.rs`:
+    - the literals of (a) `an_anonymous_caller_on_a_plain_public_route_that_opens_a_scope_gets_the_named_401`,
+      (g) `an_anonymous_subscriber_that_opens_a_scope_gets_the_401_naming_the_stream`,
+      (f) `public_scope_for_one_scope_type_does_not_admit_another`, and
+      `statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_write`;
+    - (g)'s doc;
+    - a new route `write_memo_cross`, mounted in `memo_app`, and a new test.
+  - `crates/charpente/tests/kernel.rs`: `job_tenancy::PEEK_REFUSED` (`:4792-4800`).
+  - `crates/charpente-macros/tests/compile_fail/`:
+    - create `route_emits_undeclared_capability.rs` and its `.stderr`;
+    - re-pin `across_tenants_without_capability.stderr`, `enqueue_in_without_capability.stderr`
+      and `route_public_scope_undeclared_capability.stderr`;
+    - reword the header comments of `enqueue_in_without_capability.rs` and
+      `route_public_scope_undeclared_capability.rs`, keeping each one's line count so no
+      `.stderr` line number moves.
+    - The class (A11):
+      - create `route_neither_stance_keeps_its_flags.rs` and
+        `global_job_reads_a_scoped_table.rs`, with their `.stderr`;
+      - re-pin `helpdesk_route_neither_auth_nor_public.stderr`, `job_bare.stderr`,
+        `statuspage_job_no_tenancy.stderr`, `helpdesk_table_no_tenancy.stderr`,
+        `table_bare.stderr`, `route_emits_on_non_sse.stderr`,
+        `scoped_read_from_bare_tx.stderr`, `scoped_write_from_bare_tx.stderr` and
+        `unscoped_row_impl_from_an_app.stderr`.
+  - `crates/charpente-macros/tests/compile_pass/route_emits_on_sse.rs`: one comment line
+    quotes the old emits fix.
+- Docs:
+  - `docs/GUIDE.md`:
+    - §5's pinned rule-3 block and the sentence after it;
+    - §9's `undeclared_capability` catalog line;
+    - §16's first capability bullet;
+    - for the class, the pinned blocks of §2 (tables), §5 (routes) and §6 (jobs); §9's
+      table, route, emits and job catalog lines, and the prose after the table catalog; §16's
+      rendered E0277.
+  - `DESIGN.md` §8's Multi-tenancy bullet.
+  - `docs/superpowers/specs/2026-09-27-job-tenancy-design.md` §4 and §5, with dated
+    superseded lines.
+  - `docs/superpowers/specs/2026-09-16-default-secure-surfaces-design.md` is left as history.
+    Its quoted refusals were not updated when job-tenancy changed them either (its §2
+    `create_agent` line still lacks `public(Org)`).
+
+**Interfaces:**
+- Consumes (Task 2): `anonymous_scope` binds `method`, `pattern`, `declared` and `scope`, with
+  `scope == <S as Tenant>::NAME` and `declared` being `public`, or `public(<PublicScope.name>)`.
+  In-tree `NAME`s equal the type identifiers (A4), so every literal below renders the type's
+  identifier.
+- Produces (fixed wording, hard rule 5):
+  - The rule-3 401, non-`auth` arm:
+
+    ```text
+    authentication required — `{method} {pattern}` is declared `{declared}` and opened the tenant scope `{scope}` for a caller with no credential; only a route declared `public({scope})` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public({scope})` in place of `{declared}` in this route's `#[route(…)]` attribute, keeping its other flags
+    ```
+
+    The `auth` arm (the drift probe's text) is unchanged: it suggests no attribute.
+  - `#[route]`'s `undeclared_capability`:
+
+    ```text
+    `{name}` takes `cap: &CrossTenant`, but its `#[route({method} "{path}", …)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Add `cross_tenant` to that attribute's flags, keeping the others, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
+    ```
+
+  Neither text restates an attribute, so no flag, present or future, can drop out of a pasted
+  fix. That is the amendment to job-tenancy spec §4's mandated text that spec §7 (item 12)
+  makes.
+  - The class (A11). `Org` stays the example tenant, as it is in every other refusal in these
+    files. `…` marks an elided attribute.
+    - `#[route]`'s neither-stance refusal:
+
+      ```text
+      `{name}` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route({method} "{path}", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
+      ```
+
+    - `#[job]`'s no-tenancy refusal:
+
+      ```text
+      `{name}` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+      ```
+
+    - `#[table]`'s no-tenancy refusal:
+
+      ```text
+      `{name}` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.
+      ```
+
+    - `emits(…)` on a non-stream route:
+
+      ```text
+      emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...), or change this route's method to `SSE`, keeping its path and flags
+      ```
+
+    - The last line of `NoTenant`'s note (`{Self}` is the scope type, rendered by rustc):
+
+      ```text
+      in a job, write `scoped_by = {Self}` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives
+      ```
+
+- [ ] **Step 1: Write the pins with the new text, and the new cases**
+
+In `crates/charpente/tests/tenant.rs`:
+
+After `write_team_memo`, add:
+
+```rust
+/// Declares `cross_tenant` beside plain `public`. Tenancy-completion spec §7,
+/// item 12: rule 3's 401 must not tell the author to drop that flag — its fix
+/// used to quote `#[route(POST "/memo-cross/:org", public(Org))]`, which does
+/// not compile beside the `cap` argument below.
+#[route(POST "/memo-cross/:org", public, cross_tenant)]
+fn write_memo_cross(
+    tx: &mut Tx,
+    org: Id<Org>,
+    cap: &CrossTenant,
+    ctx: &Ctx,
+) -> Result<WireU64, ApiError> {
+    memo_write(tx, org, ctx)?;
+    Ok(WireU64(
+        tx.across_tenants::<Org>(cap).scan::<Memo>()?.len() as u64,
+    ))
+}
+```
+
+In `memo_app`'s `routes![…]`, add `write_memo_cross,` after `write_team_memo,`.
+
+Replace (a)'s `error_text` literal with:
+
+```rust
+        "authentication required — `POST /memo-public/:org` is declared `public` and opened \
+         the tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
+```
+
+Replace (g)'s doc comment and its assertions from `assert_eq!(refused.status, …)` on with:
+
+```rust
+/// Oracle 2 (g). Rule 3 on a stream: the site in the 401 is the word the
+/// route was declared with, `SSE`, not the `GET` it is served on. The route
+/// also declares `emits(MemoNoted)`, and the author's fix keeps it: the 401
+/// names the stance to change in place and restates no attribute
+/// (tenancy-completion spec §7, item 12).
+```
+
+```rust
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    let text = error_text(&refused);
+    assert_eq!(
+        text,
+        "authentication required — `SSE /memo-feed/:org` is declared `public` and opened the \
+         tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
+    );
+    assert!(
+        !text.contains("#[route(SSE"),
+        "the fix restates no attribute, so `emits(MemoNoted)` cannot drop out of it: {text}"
+    );
+    assert_eq!(authorize_calls(), Vec::<String>::new());
+```
+
+Replace (f)'s `error_text` literal with:
+
+```rust
+        "authentication required — `POST /memo-team/:team` is declared `public(Org)` and \
+         opened the tenant scope `Team` for a caller with no credential; only a route \
+         declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `public(Team)` in place of `public(Org)` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
+```
+
+After (f), add:
+
+```rust
+/// Item 12. On a `public, cross_tenant` route the 401 names the stance to
+/// change and keeps the route's other flags, so the `cross_tenant` its `cap`
+/// argument needs survives the author's fix.
+#[test]
+fn the_401_on_a_cross_tenant_route_keeps_the_flag_in_its_fix() {
+    let (_sim, mut app) = memo_app(0x7C06_0601);
+    reset_counters();
+    let refused = app.handle(Request::new(
+        Method::Post,
+        format!("/memo-cross/{ADMITTED}"),
+    ));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    let text = error_text(&refused);
+    assert_eq!(
+        text,
+        "authentication required — `POST /memo-cross/:org` is declared `public` and opened \
+         the tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
+    );
+    assert!(
+        !text.contains("#[route(POST"),
+        "the fix restates no attribute, so `cross_tenant` cannot drop out of it: {text}"
+    );
+    assert_eq!(authorize_calls(), Vec::<String>::new());
+    assert_eq!(bodies_entered(), 0, "nothing below the scope line ran");
+    assert_eq!(app.db().last_applied(), None, "and nothing was written");
+}
+```
+
+Replace the statuspage test's `error_text` literal (the one GUIDE §5's pinned block quotes)
+with:
+
+```rust
+        "authentication required — `POST /orgs/:org/incidents` is declared `public` and \
+         opened the tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
+```
+
+In `crates/charpente/tests/kernel.rs`, `mod job_tenancy`, replace `PEEK_REFUSED` and its doc
+with:
+
+```rust
+    /// Rule 3's anonymous-scope 401 for the plain-`public` route, spelled out
+    /// rather than taken from the product's `format!` (job-tenancy Task 3;
+    /// its fix clause is tenancy-completion spec §7's, item 12).
+    const PEEK_REFUSED: &str = "authentication required — `POST /shop/peek` is declared \
+                                `public` and opened the tenant scope `Shop` for a caller with \
+                                no credential; only a route declared `public(Shop)` admits \
+                                one. Send \"Authorization: Bearer <token>\" or the \
+                                charpente_session cookie, or, if every caller may act inside \
+                                this tenant here, declare `public(Shop)` in place of `public` \
+                                in this route's `#[route(…)]` attribute, keeping its other \
+                                flags";
+```
+
+Every `\`-continued line above keeps a space before its `\` wherever two words join. A Rust
+`\`-newline removes the newline and the next line's leading whitespace, and nothing else.
+
+Create `crates/charpente-macros/tests/compile_fail/route_emits_undeclared_capability.rs`:
+
+```rust
+// The capability refusal on a stream route that declares `emits(...)`
+// (tenancy-completion spec §7, item 12). The fix names the one flag to add
+// and restates no attribute, so pasting it cannot drop `emits(IncidentOpened)`
+// from the route. Everything the refused handler names is named by path: a
+// refused route emits nothing, so an import would come back as an unused-import
+// warning in the pin below.
+use charpente::{event, route};
+
+#[event(global)]
+struct IncidentOpened {
+    n: charpente::wire::WireU64,
+}
+
+#[route(SSE "/incidents", public, emits(IncidentOpened))]
+fn incidents(
+    tx: &mut charpente::Tx,
+    cap: &charpente::CrossTenant,
+    ctx: &charpente::http::Ctx,
+    cursor: Option<charpente::http::Cursor>,
+) -> Result<charpente::http::Subscription, charpente::http::ApiError> {
+    let _ = (tx, cap, ctx);
+    Ok(charpente::http::Subscription::of::<IncidentOpened>().cursor(cursor))
+}
+
+fn main() {}
+```
+
+**The class (A11): one fixture per refusal whose author's attribute carries the argument a
+restated fix would drop.** Three already exist at `e749823`, and each one's re-pin in Step 4
+is the evidence:
+- `job_bare.rs`: `RetryOnly` is `#[job(retry(max = 3, backoff = "10s"))]` and
+  `CapabilityOnly` is `#[job(cross_tenant)]`.
+- `helpdesk_table_no_tenancy.rs`: `#[table(version = 2)]`.
+- `route_emits_on_non_sse.rs`: `#[route(GET "/x", public, emits(NoteAdded))]`.
+
+Create the two that are missing.
+
+Create `crates/charpente-macros/tests/compile_fail/route_neither_stance_keeps_its_flags.rs`.
+The header is exactly six lines, so the attribute sits on line 14, where Step 4's expected
+`.stderr` puts it:
+
+```rust
+// The neither-stance refusal on a route that already declares other flags
+// (tenancy-completion spec §7, item 12's class). The fix names the words to
+// add and restates no attribute, so it cannot drop `cross_tenant` or
+// `emits(IncidentOpened)`. Everything the refused handler names is named by
+// path: a refused route emits nothing, so an import would come back as an
+// unused-import warning in the pin below.
+use charpente::{event, route};
+
+#[event(global)]
+struct IncidentOpened {
+    n: charpente::wire::WireU64,
+}
+
+#[route(SSE "/incidents", cross_tenant, emits(IncidentOpened))]
+fn incidents(
+    tx: &mut charpente::Tx,
+    cap: &charpente::CrossTenant,
+    ctx: &charpente::http::Ctx,
+    cursor: Option<charpente::http::Cursor>,
+) -> Result<charpente::http::Subscription, charpente::http::ApiError> {
+    let _ = (tx, cap, ctx);
+    Ok(charpente::http::Subscription::of::<IncidentOpened>().cursor(cursor))
+}
+
+fn main() {}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/global_job_reads_a_scoped_table.rs`
+(`const NAME` is Task 2's required item):
+
+```rust
+// The scoped-table refusal inside a `global` job that carries other
+// arguments (tenancy-completion spec §7, item 12's class). The note's job
+// case names the word to change and restates no attribute, so a pasted fix
+// keeps `cross_tenant` and `retry(...)`. A restated `#[job(scoped_by = Org)]`
+// reset this job's retry policy to the default without a word.
+use charpente::auth::Principal;
+use charpente::http::ApiError;
+use charpente::kernel::JobError;
+use charpente::{CrossTenant, Id, Tenant, Tx, View, job, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Invoice {
+    id: Id<Invoice>,
+    total: u32,
+}
+
+#[job(global, cross_tenant, retry(max = 10, backoff = "1m"))]
+struct Rollup {}
+
+impl Rollup {
+    fn run(self, tx: &mut Tx, cap: &CrossTenant) -> Result<(), JobError> {
+        let _ = cap;
+        let _ = tx.scan::<Invoice>()?;
+        Ok(())
+    }
+}
+
+fn main() {}
+```
+
+**The class sweep.** A working file for this task, not a test the workspace keeps. It lists
+every source literal line in `crates/*/src/**/*.rs` that spells an attribute, and classifies
+each line three ways:
+- **elided**: it names the site as `…)]`;
+- **generic**: out of the class, for the reason printed beside it;
+- **RESTATED**: one of the author's attributes spelled out as a fix.
+
+Comment lines and real attribute lines are skipped. Write it:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cat > $D/task6-class-sweep.py <<'EOF'
+import pathlib, re
+
+hit = re.compile(r"#\[(route|job|table|event|row_shape)\(")
+attribute_line = re.compile(r"^#\[.*\]$")
+# Out of class, each with its reason: a description of a declaration, a
+# grammar or vocabulary example, or an attribute that takes no other argument.
+GENERIC = {
+    "is a tenant-scoped table (`#[table(scoped_by = {Self})]`)": "describes the table's declaration",
+    "is a tenant-scoped job (`#[job(scoped_by = {Self})]`)": "describes the job's declaration",
+    "its #[table(version = ...)] did not": "names the version argument; the fix is to bump it",
+    "e.g. `#[job(scoped_by = Org, retry(max = 3": "ACCEPTED_FORMS: every word, then examples",
+    "or `#[job(global, cross_tenant)]`\";": "ACCEPTED_FORMS: every word, then examples",
+    "write `#[row_shape(version = 1)]`": "fires on an empty #[row_shape], which takes only version",
+    "write `#[event(global)]`; its name derives from the type": "Task 1: an event takes no other argument",
+    "write `#[route(METHOD": "grammar template; fires before any flag is read",
+    r'#[route(GET \"/notes/:id\", auth)]': "grammar example (method-less or non-literal path)",
+    r'`#[route(GET \"/path\", auth)]`': "FLAGS: the vocabulary, then examples",
+    r'`#[route(GET \"/path\", public)]`': "FLAGS: the vocabulary, then examples",
+    r'`#[route(GET \"/orgs/:org/status\", public(Org))]`': "FLAGS: the vocabulary, then examples",
+    r'`#[route(SSE \"/path\", emits(NoteAdded, NoteRemoved))]`': "FLAGS: the vocabulary, then examples",
+    'add `emits(...)` to that route: `#[route(SSE "/path", emits(Ev, …))]`': "names the one flag to add",
+}
+seen, restated = set(), 0
+for path in sorted(pathlib.Path("crates").glob("*/src/**/*.rs")):
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        s = line.strip()
+        if s.startswith("//") or attribute_line.match(s) or not hit.search(s):
+            continue
+        why = next((w for g, w in GENERIC.items() if g in s and not seen.add(g)), None)
+        if why is None and "…)]" in s:
+            kind = "elided  "
+        elif why is not None:
+            kind = "generic "
+        else:
+            kind, restated = "RESTATED", restated + 1
+        print(f"{kind} {path}:{n}: {s[:100]}" + (f"  [{why}]" if why else ""))
+print(f"restated: {restated}")
+print(f"allowlist entries that matched nothing: {sorted(set(GENERIC) - seen)}")
+EOF
+```
+
+- [ ] **Step 2: Run them before any implementation, and record the red**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test tenant 2>&1 | tee $D/task6-red-tenant.log | grep -E "^test |left:|right:|^test result"
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task6-red-trybuild.log | grep -E "^test result|wip|mismatch"
+for f in route_emits_undeclared_capability route_neither_stance_keeps_its_flags global_job_reads_a_scoped_table; do
+  cp crates/charpente-macros/tests/compile_fail/$f.stderr $D/task6-red-$f.stderr
+  echo "--- $f"; head -1 crates/charpente-macros/tests/compile_fail/$f.stderr
+done
+grep -n "in a job" $D/task6-red-global_job_reads_a_scoped_table.stderr
+git status --short crates/charpente-macros/tests/compile_fail/
+python3 $D/task6-class-sweep.py | tee $D/task6-red-class-sweep.log | grep -E "^RESTATED|^restated|^allowlist"
+cargo test -p charpente --test kernel -- job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from --exact 2>&1 | tee $D/task6-red-job-tenancy.log | grep -E "^test result|a 401 no stripped request|CHARPENTE_SEED"
+```
+
+Expected (quote each in the task report):
+- `tenant`: (a), (f), (g), the statuspage test and
+  `the_401_on_a_cross_tenant_route_keeps_the_flag_in_its_fix` FAIL. Each `left` ends
+  `declare \`#[route(… \"…\", public(…))]\``, the restated attribute. For the new test it is
+  `#[route(POST \"/memo-cross/:org\", public(Org))]`: `cross_tenant` dropped, which is item 12
+  reproduced. For (g) it is `#[route(SSE \"/memo-feed/:org\", public(Org))]`: `emits(MemoNoted)`
+  dropped. Every other `tenant` test passes.
+- trybuild: the new `route_emits_undeclared_capability.stderr` is written at base. It reads
+  ``… `#[route(SSE "/incidents", public)]` does not declare `cross_tenant` — … Write
+  `#[route(SSE "/incidents", public, cross_tenant)]`, …``, `emits(IncidentOpened)` dropped.
+  This is the macro half of item 12 reproduced.
+- trybuild, the class: the two other new `.stderr` are written at base with today's texts.
+  - `route_neither_stance_keeps_its_flags.stderr`'s first line:
+    ``error: `incidents` declares neither `auth` nor `public` — … write `#[route(SSE "/incidents", auth)]` to require a principal …``.
+    `cross_tenant` and `emits(IncidentOpened)` are both dropped.
+  - `global_job_reads_a_scoped_table.stderr`'s `grep` prints the note line
+    ``in a job, declare `#[job(scoped_by = Org)]` and read through the `ScopedTx` its `run` receives``,
+    for a job declared `global, cross_tenant, retry(max = 10, backoff = "1m")`.
+  - `git status --short` lists exactly the three new `.stderr` and the three new `.rs` as
+    untracked (`??`), and no modified (`M`) file: no existing pin moved.
+  - The loop's `cp` kept each base `.stderr` in `$D/` as the red evidence, before Step 4
+    overwrites it.
+- The class sweep (the script Step 1 wrote, run now at base): `restated: 12` and
+  `allowlist entries that matched nothing: []`. The 12 are:
+  - the 401's `declare \`#[route(…, public(…))]\`` line (`app.rs`);
+  - `NoTenant`'s job line (`table.rs`);
+  - two `#[job]` lines;
+  - two `#[table]` lines;
+  - two `undeclared_capability` lines;
+  - three neither-stance lines;
+  - the emits line.
+
+  If Task 1's event text differs from the wording this plan gives it, the last list is not
+  empty: read that line and update its allowlist entry to Task 1's wording. An event takes no other argument,
+  so it is out of the class.
+- the job-tenancy swarm FAILS with `a 401 no stripped request should meet: authentication
+  required — \`POST /shop/peek\` …` and a `CHARPENTE_SEED=` repro line. The swarm pins the
+  401's text through `PEEK_REFUSED`. Record the seed it prints, then keep going: Step 4 turns
+  it green, and that seed must replay green then (`CHARPENTE_SEED=0x… cargo test -p charpente
+  --test kernel -- job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from --exact`).
+
+- [ ] **Step 3: Implement**
+
+In `crates/charpente/src/http/app.rs`, in `Ctx::anonymous_scope`'s doc, replace "Names the
+contract, the site, and both fixes, the caller's and the author's (hard rule 5) — except on an
+`auth` route, where the author has no fix to make." with:
+
+```rust
+    /// Rule 3's refusal: a caller with no credential reached a scope line
+    /// that its route did not declare `public(S)` for. Names the contract,
+    /// the site, and both fixes, the caller's and the author's (hard rule 5)
+    /// — except on an `auth` route, where the author has no fix to make. The
+    /// author's fix names the change, `public(S)` in place of the route's
+    /// stance, and restates no attribute: a restated one dropped whatever
+    /// else the route declared (`cross_tenant`, `emits(…)`, any later flag),
+    /// so a pasted fix either stopped compiling or silently lost a
+    /// declaration (tenancy-completion spec §7, item 12).
+```
+
+(Keep the doc's first two lines, which Step 3 repeats above, once.) Then replace the non-`auth`
+arm's final expression, the `ApiError::AnonymousScope(format!(…))` whose text ends
+``declare `#[route({method} \"{pattern}\", public({scope}))]` ``, with:
+
+```rust
+        ApiError::AnonymousScope(format!(
+            "authentication required — `{method} {pattern}` is declared `{declared}` and \
+             opened the tenant scope `{scope}` for a caller with no credential; only a route \
+             declared `public({scope})` admits one. Send \"Authorization: Bearer <token>\" or \
+             the charpente_session cookie, or, if every caller may act inside this tenant \
+             here, declare `public({scope})` in place of `{declared}` in this route's \
+             `#[route(…)]` attribute, keeping its other flags"
+        ))
+```
+
+It uses the four locals the arm already binds after Task 2 (`method`, `pattern`, `declared`,
+`scope`). If Task 2 renamed any, use its names; the text is what is fixed.
+
+In `crates/charpente-macros/src/route.rs`, replace `undeclared_capability` and its doc
+comment whole with:
+
+```rust
+/// The refusal for a handler that takes the capability token on a route
+/// that never declared it — the compile error tenant-scoping spec §3 calls
+/// for. Names the contract, the site (the argument's own span, and the route
+/// by its method and path) and the fix (hard rule 5). The fix names the one
+/// flag to add and restates no attribute, so the route's other flags — its
+/// stance, `emits(…)`, any later one — cannot drop out of a pasted fix
+/// (tenancy-completion spec §7, item 12). Shared by both route flavors so the
+/// two cannot drift.
+fn undeclared_capability(name: &str, args: &RouteArgs, pat: &PatType) -> Error {
+    let method = &args.method;
+    let path = args.path.value();
+    Error::new(
+        pat.span(),
+        format!(
+            "`{name}` takes `cap: &CrossTenant`, but its `#[route({method} \"{path}\", …)]` \
+             does not declare `cross_tenant` — enumerating a scoped table across every \
+             tenant (`tx.across_tenants`) and fanning a job out into a tenant the route \
+             names (`tx.enqueue_in`) are one declared capability, and `charpente describe` \
+             lists every route that declared it. Add `cross_tenant` to that attribute's \
+             flags, keeping the others, or drop the `cap` argument and read or enqueue in \
+             one tenant through `tx.scope::<Org>(org, ctx)?`"
+        ),
+    )
+}
+```
+
+If Task 2 kept a last-segment helper whose only caller was `undeclared_capability`'s `stance`,
+clippy now reports it as dead code; delete it. `cargo clippy -p charpente-macros
+--all-targets -- -D warnings` is the check.
+
+Reword two fixture header comments. The number of lines stays the same, so no `.stderr` line
+number moves.
+- `compile_fail/enqueue_in_without_capability.rs`: in its third line, "and `#[route]` refuses
+  the argument, reconstructing the attribute to write." becomes "and `#[route]` refuses the
+  argument, naming the one flag to add.".
+- `compile_fail/route_public_scope_undeclared_capability.rs`: its first four lines become:
+
+```rust
+// The capability refusal (tenant-scoping spec §3) names the one flag to add
+// and restates no attribute, so a `public(Org)` route's stance cannot drop
+// out of the fix (tenancy-completion spec §7). `CrossTenant` and `WireU64`
+// are named by path for `across_tenants_without_capability.rs`'s reason.
+```
+
+**The class (A11).** Each text keeps its elided attribute (`#[route({method} \"{path}\", …)]`,
+`#[job(…)]`, `#[table(…)]`) on one source line, so Step 5's sweep sees it whole.
+
+In `crates/charpente-macros/src/route.rs`, `expand`, replace the neither-stance refusal's
+`return Err(…)` (the `format!` that begins "`{name}` declares neither") with:
+
+```rust
+        return Err(Error::new(
+            args.path.span(),
+            format!(
+                "`{name}` declares neither `auth` nor `public` — a route says which callers \
+                 reach it. Add one of these to the flags of its \
+                 `#[route({method} \"{path}\", …)]`, keeping any it already has: `auth` to \
+                 require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous \
+                 callers, or `public(Org)` to also let every caller act inside the `Org` tenant \
+                 it opens. None is the default."
+            ),
+        ));
+```
+
+In the same function, the emits refusal's second argument becomes:
+
+```rust
+            "emits(...) applies to SSE routes only — a plain route returns one response, \
+             not a stream of events; drop emits(...), or change this route's method to `SSE`, \
+             keeping its path and flags",
+```
+
+In `crates/charpente-macros/src/job.rs`, `expand`, the no-tenancy refusal's `format!` becomes
+the following. The comment above it stays; it already says "the fix is a word the attribute
+lacks".
+
+```rust
+            format!(
+                "`{name_str}` declares no tenancy — a job says which. Add one of these to its \
+                 `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it \
+                 acts inside one tenant (it is enqueued from inside that tenant's scope, and its \
+                 `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no \
+                 tenant (the only kind cron can schedule). Neither is the default."
+            ),
+```
+
+In `crates/charpente-macros/src/lib.rs`, `table`, the no-tenancy refusal's `format!` becomes:
+
+```rust
+            format!(
+                "`{name}` declares no tenancy — a table says which. Add one of these to its \
+                 `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every \
+                 row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot \
+                 read it), or `global` if its rows belong to no tenant. Neither is the default."
+            ),
+```
+
+In `crates/charpente-core/src/table.rs`, `NoTenant`'s `note` becomes:
+
+```rust
+    note = "open the tenant scope first — in a handler, `{Self}`'s own `Tenant::authorize` runs \
+            there for a credentialed caller:\n    \
+            let tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
+            tx.scan::<{R}>()?\n\
+            in a job, write `scoped_by = {Self}` in place of `global` in its `#[job(…)]`, \
+            keeping its other arguments, and read through the `ScopedTx` its `run` receives"
+```
+
+Its `message` and `label` are unchanged. The `\n    \` continuations are the existing ones:
+a `\` at a line's end drops the newline and the next line's leading spaces, so each `\n    `
+keeps its four spaces, and the note's layout is unchanged.
+
+In `crates/charpente-macros/tests/compile_pass/route_emits_on_sse.rs`, the third line
+``// error prescribes verbatim ("make this `#[route(SSE \"…\")]`"). It proves`` becomes:
+
+```rust
+// error prescribes ("change this route's method to `SSE`"). It proves
+```
+
+- [ ] **Step 4: Run, and review every pin**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test tenant 2>&1 | tee $D/task6-green-tenant.log | grep -E "^test result|FAILED"
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task6-trybuild-overwrite.log | grep -E "^test result"
+git diff --stat crates/charpente-macros/tests/compile_fail/
+git diff crates/charpente-macros/tests/compile_fail/
+cat crates/charpente-macros/tests/compile_fail/route_emits_undeclared_capability.stderr
+cat crates/charpente-macros/tests/compile_fail/route_neither_stance_keeps_its_flags.stderr
+diff $D/task6-red-global_job_reads_a_scoped_table.stderr crates/charpente-macros/tests/compile_fail/global_job_reads_a_scoped_table.stderr
+cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task6-trybuild.log | grep -E "^test result|mismatch"
+cargo test -p charpente --test kernel -- job_tenancy:: 2>&1 | tee $D/task6-green-job-tenancy.log | grep -E "^test result|FAILED"
+```
+
+Expected:
+- `tenant`: every test passes, the new one included.
+- Changed `.stderr` files, and only these:
+  - `across_tenants_without_capability.stderr`, `enqueue_in_without_capability.stderr` and
+    `route_public_scope_undeclared_capability.stderr`. Their first line becomes the new text
+    for `revenue` / `GET "/admin/revenue"`, `apply_everywhere` / `POST "/admin/apply/:org"`
+    and `revenue` / `GET "/orgs/:org/revenue"`. The span lines (`cap: &charpente::CrossTenant`,
+    and their line numbers) are unchanged.
+  - `route_emits_undeclared_capability.stderr` (new) reads, in full:
+
+    ```text
+    error: `incidents` takes `cap: &CrossTenant`, but its `#[route(SSE "/incidents", …)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Add `cross_tenant` to that attribute's flags, keeping the others, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
+      --> tests/compile_fail/route_emits_undeclared_capability.rs:17:5
+       |
+    17 |     cap: &charpente::CrossTenant,
+       |     ^^^
+    ```
+
+    It must have no warning. If it shows an unused-import or dead-code warning, name the
+    offending item by path and regenerate.
+  - The class (A11). Only the first line of each error changes (for the `NoTenant` pins,
+    only the note's `in a job, …` line). Spans, carets and line numbers stay.
+    - `helpdesk_route_neither_auth_nor_public.stderr`'s first line becomes exactly:
+
+      ```text
+      error: `create_agent` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(POST "/agents/:id", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
+      ```
+
+    - `route_neither_stance_keeps_its_flags.stderr` (new) reads, in full:
+
+      ```text
+      error: `incidents` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(SSE "/incidents", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
+        --> tests/compile_fail/route_neither_stance_keeps_its_flags.rs:14:13
+         |
+      14 | #[route(SSE "/incidents", cross_tenant, emits(IncidentOpened))]
+         |             ^^^^^^^^^^^^
+      ```
+
+    - `job_bare.stderr`: all three errors (`Bare`, `RetryOnly`, `CapabilityOnly`) and
+      `statuspage_job_no_tenancy.stderr` (`NotifySubscribers`). Each first line is
+      ``error: `<Name>` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.``
+      Under `RetryOnly` and `CapabilityOnly`, the span line still shows
+      `#[job(retry(max = 3, backoff = "10s"))]` and `#[job(cross_tenant)]`. The fix above it
+      no longer says to replace them.
+    - `helpdesk_table_no_tenancy.stderr` (`Ticket`, span `#[table(version = 2)]`) and
+      `table_bare.stderr` (`W`). Each first line is
+      ``error: `<Name>` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.``
+    - `route_emits_on_non_sse.stderr`'s first line:
+      ``error: emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...), or change this route's method to `SSE`, keeping its path and flags``.
+    - `scoped_read_from_bare_tx.stderr`, `scoped_write_from_bare_tx.stderr`,
+      `unscoped_row_impl_from_an_app.stderr` and `global_job_reads_a_scoped_table.stderr` (new).
+      The note's last line reads
+      ``in a job, write `scoped_by = Org` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives``.
+      The rest of each file is byte-identical to its base.
+      - The new file has one error, E0277, at `tx.scan::<Invoice>()`, and is shaped like
+        `scoped_read_from_bare_tx.stderr` (the message, the label, the `help:` chains and the
+        note).
+      - It has no warning.
+      - Compare it with `$D/task6-red-global_job_reads_a_scoped_table.stderr`: `diff` shows
+        only the note line.
+  - Any other changed `.stderr` is a finding. Read it before accepting it.
+- Each changed `.stderr` is read line by line against its source text: the `format!` in
+  `route.rs`, `job.rs` or `lib.rs`, or the `note` in `table.rs`. For a capability pin it
+  must name:
+  - the contract: one declared capability, listed by `describe`;
+  - the site: the handler, the `cap` argument's span, the route's method and path;
+  - the fix: add `cross_tenant`, keeping the others, or drop `cap`.
+
+  A class pin names the contract (a route says which callers reach it; a job or a table says
+  which tenancy), the site (the item's name and the span rustc prints) and the fix (the words
+  to add or change, keeping the rest). In a pin's `error:` and `note:` lines, every
+  `#[route(`, `#[job(` or `#[table(` has an argument list that ends `…)]`. The source lines
+  rustc quotes under `|` are the author's own and are exempt. Step 5 checks the texts
+  mechanically.
+- `job_tenancy::` green. `CHARPENTE_SEED=<the seed Step 2 recorded> cargo test -p charpente
+  --test kernel -- job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from --exact`
+  passes.
+
+- [ ] **Step 5: The class, swept**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+python3 $D/task6-class-sweep.py | tee $D/task6-class-sweep.log
+```
+
+Expected: `restated: 0` and `allowlist entries that matched nothing: []`. Quote the listing in
+the task report. It must show these lines, and the controller checks the verdicts against
+them:
+
+| Hit (by content; line numbers are Task 5's tree) | Kind | Verdict |
+|---|---|---|
+| `app.rs`, the 401: ``in this route's `#[route(…)]` attribute, keeping its other flags`` | elided | in the class, fixed (contract) |
+| `app.rs`, `not a stream route — only \`#[route(SSE …)]\` returns` | elided | out: describes which routes stream, and fixes nothing |
+| `db.rs`, `drift_msg`: `its #[table(version = ...)] did not` | generic | out: names the argument, and the fix is "bump the version" |
+| `table.rs`, `NoTenant`'s `message`: ``(`#[table(scoped_by = {Self})]`)`` | generic | out: describes the table's declaration |
+| `table.rs`, `NoTenant`'s `note`: ``in its `#[job(…)]`, `` | elided | in the class, fixed (A11) |
+| `table.rs`, `NoJobTenant`'s `message`: ``(`#[job(scoped_by = {Self})]`)`` | generic | out: describes the job's declaration; its note's fixes are code |
+| `job.rs`, `ACCEPTED_FORMS` (two lines) | generic | out: lists every word, then two examples; fires on a word it does not recognise |
+| `job.rs`, the no-tenancy refusal: ``its `#[job(…)]`, `` | elided | in the class, fixed (A11) |
+| `lib.rs`, the table no-tenancy refusal: ``its `#[table(…)]`, `` | elided | in the class, fixed (A11) |
+| `lib.rs`, `parse_version`: ``write `#[row_shape(version = 1)]` `` | generic | out: fires only on an empty `#[row_shape]`, which takes only `version` |
+| `lib.rs`, `event` (Task 1's text): ``write `#[event(global)]` `` | generic | out: an event takes no other argument (Task 11's bare-event refusal stays out on the same condition) |
+| `route.rs`, the method-less parse error: ``write `#[route(METHOD "/path", …`` and its `e.g.` line | generic | out: a grammar template with placeholders, which fires before any flag is read |
+| `route.rs`, the non-literal path: ``e.g. #[route(GET "/notes/:id", auth)]`` | generic | out: an example |
+| `route.rs`, `FLAGS` (four lines) | generic | out: its first clause is the vocabulary, spanned at the unknown word; the attributes after it are examples on `"/path"` |
+| `route.rs`, `undeclared_capability`: ``its `#[route({method} "{path}", …)]` `` | elided | in the class, fixed (contract) |
+| `route.rs`, the neither-stance refusal: ``its `#[route({method} "{path}", …)]`, `` | elided | in the class, fixed (A11) |
+| `charpente-tsgen/src/runtime.rs`, the generated client's comment: ``add `emits(...)` to that route: `#[route(SSE "/path", emits(Ev, …))]` `` | generic | out: names the one flag to add; the attribute is an example |
+
+The emits-on-a-non-stream refusal has no hit after Step 3, because its fix no longer spells an
+attribute. It is in the class, fixed (A11).
+
+Refusals that name only a word (`ONE_OR_THE_OTHER`, `PUBLIC_SCOPE_ARITY`, every "given twice",
+`global and scoped_by … drop one`, the three `emits(...)` list refusals) never spell an
+attribute, so they cannot restate one. The sweep does not list them.
+
+- [ ] **Step 6: Prove each operand red by mutation, and the sweep able to go red**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff crates/charpente/src/http/app.rs crates/charpente-macros/src/route.rs \
+  crates/charpente-macros/src/job.rs crates/charpente-macros/src/lib.rs \
+  crates/charpente-core/src/table.rs > $D/task6-impl.patch
+```
+
+Apply each alone, run the named command, and quote the failure. Restore each with
+`git checkout crates/charpente/src/http/app.rs crates/charpente-macros/src/route.rs crates/charpente-macros/src/job.rs crates/charpente-macros/src/lib.rs crates/charpente-core/src/table.rs && git apply $D/task6-impl.patch`,
+and check `git diff --stat` shows Step 3's diff again.
+
+1. In the 401's fix clause, ``in place of `{declared}` `` becomes ``in place of `public` ``. Run
+   `cargo test -p charpente --test tenant`. Expected: (f) FAILS (its `left` says ``in place of
+   `public` `` for a route declared `public(Org)`). (a), (g), the statuspage test and the
+   cross-tenant test pass, since for them `declared` *is* `public`. So only (f) pins this
+   operand, and it does.
+2. ``declare `public({scope})` in place`` becomes ``declare `{declared}` in place``. Run the
+   same. Expected: every rule-3 test FAILS: (a), (g), the statuspage test and the new test with
+   ``declare `public` in place of `public` ``, and (f) with ``declare `public(Org)` in place of
+   `public(Org)` ``.
+3. In `undeclared_capability`, `{method}` becomes the literal `GET`. Run
+   `cargo test -p charpente-macros --test trybuild`. Expected: a mismatch on
+   `enqueue_in_without_capability.stderr` (`POST`) and on
+   `route_emits_undeclared_capability.stderr` (`SSE`). The two `GET` pins still match, so they
+   alone would not have caught it.
+4. In the neither-stance refusal, `{method}` becomes the literal `GET`. Run the trybuild test.
+   Expected: a mismatch on `helpdesk_route_neither_auth_nor_public.stderr` (`POST`) and on
+   `route_neither_stance_keeps_its_flags.stderr` (`SSE`).
+5. In the same refusal, `\"{path}\"` becomes `\"/path\"`. Run the trybuild test. Expected: a
+   mismatch on the same two pins (`"/agents/:id"`, `"/incidents"`).
+6. The sweep can go red. Put `#[job]`'s old `format!` back (the one Step 3 replaced, which
+   begins "`{name_str}` declares no tenancy — a job says which: write"). Run
+   `python3 $D/task6-class-sweep.py | grep -E "^RESTATED|^restated"`. Expected: two `RESTATED`
+   lines in `job.rs` and `restated: 2`. Then run the trybuild test. Expected: a mismatch on
+   `job_bare.stderr` and `statuspage_job_no_tenancy.stderr`.
+
+The job, table, emits and `NoTenant` texts interpolate nothing but the item's name (rustc fills
+`{Self}`/`{R}`). The names are already pinned distinctly: `Bare`, `RetryOnly` and
+`CapabilityOnly`; `Ticket` and `W`; `Invoice` and `Org`. So they have no further operand to
+invert.
+
+Do not run `TRYBUILD=overwrite` under a mutation: it would rewrite the pins to the mutant's
+text.
+
+- [ ] **Step 7: Byte identity**
+
+A 401 writes nothing, and the swarms' `PEEK_REFUSED` comparison takes the same branch as
+before. Every other text changed here is compile-time. So Task 1's baselines reproduce. Run
+Task 1's six `baselines.sh` calls with the suffix `task6`:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task6 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task6 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task6 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task6 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task6 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task6 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label `reproduces the base`, every call `exit 0`. A moved baseline is a
+finding: stop.
+
+- [ ] **Step 8: Docs**
+
+**`docs/GUIDE.md` §5, "A route's stance, and who reaches a tenant".** Replace the pinned
+block's one line with:
+
+```text
+authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags
+```
+
+In the paragraph after it, replace the sentence that begins "Both fixes are there:" with:
+
+> Both fixes are there: the caller's (send a credential) and the author's (declare the tenant public, if that really is the policy). The author's names the change to make where the stance is written and restates no attribute, so a route's other flags, `cross_tenant` or `emits(…)`, stay as they are.
+
+**§9, "`#[route]` argument-convention violations".** Replace the catalog line that begins
+`` `revenue` takes `cap: &CrossTenant`, but `` with exactly
+`across_tenants_without_capability.stderr`'s new first line, without its `error: ` prefix:
+
+```text
+`revenue` takes `cap: &CrossTenant`, but its `#[route(GET "/admin/revenue", …)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Add `cross_tenant` to that attribute's flags, keeping the others, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
+```
+
+**§16, "Reading across every tenant: the `cross_tenant` capability".** In the first bullet,
+replace "— it reconstructs the attribute you should have written." with "— it names the route by
+its method and path and tells you to add `cross_tenant` to that attribute, keeping its other
+flags."
+
+**The class (A11) in `docs/GUIDE.md`.** Each replacement is the new `.stderr` first line
+without `error: `, with the pinned blocks' placeholders kept where they stand today.
+- **§2, "What the macro rejects", the pinned block.** Its first line becomes:
+
+  ```text
+  `<table>` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.
+  ```
+
+- **§5, "What `#[route]` rejects", the pinned block.** Its first line becomes:
+
+  ```text
+  `<handler>` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(<method> "<path>", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
+  ```
+
+- **§6, "What `#[job]` rejects", the pinned block.** Its first line becomes:
+
+  ```text
+  `<job>` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+  ```
+
+- **§9, "`#[table]` tenancy and shape violations".** The catalog's first line becomes §2's
+  new line above, `<table>` kept. In the prose after the block, "In order: No tenancy
+  declared — write `scoped_by = …` or `global`." becomes "In order: No tenancy declared —
+  add `scoped_by = …` or `global` to the attribute, keeping its other arguments."
+- **§9, "`#[route]` argument-convention violations".**
+  - The catalog's first line becomes §5's new line above, placeholders kept.
+  - The line that begins `emits(...) applies to SSE routes only` becomes:
+
+    ```text
+    emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...), or change this route's method to `SSE`, keeping its path and flags
+    ```
+
+- **§9, "`#[job]` tenancy, retry-syntax and shape violations".** The catalog's first line
+  becomes `statuspage_job_no_tenancy.stderr`'s new first line without `error: `:
+
+  ```text
+  `NotifySubscribers` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+  ```
+
+- **§16, "The compile errors, so you recognize them", the rendered E0277 for a scoped read on
+  a bare `Tx`.** Its note's last line becomes:
+
+  ```text
+             in a job, write `scoped_by = Org` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives
+  ```
+
+  This keeps the block's existing indentation of that line. The block is not a
+  `<!-- pinned -->` one: `scoped_read_from_bare_tx.stderr` pins the text.
+
+The three pinned blocks change a line each; none is added or removed. `doc_truth` checks each
+new line fragment by fragment against the unescaped source:
+- §5's line splits at `<handler>`, `<method>` and `<path>`, and the `", …)]`, keeping …`
+  tail matches `route.rs` after its `\"{path}\"`;
+- §2's line and §6's line split at `<table>` and `<job>`.
+
+**`DESIGN.md` §8, the Multi-tenancy bullet.** Replace "A caller with no credential at a scope
+line its route did not declare `public(Org)` for gets a named 401 (spec
+2026-09-27-job-tenancy §4)." with:
+
+> A caller with no credential at a scope line its route did not declare `public(Org)` for gets a named 401 (spec 2026-09-27-job-tenancy §4), whose fix names the stance to change in place and restates no attribute, so a route's other flags survive it. Every declaration refusal names its fix the same way: the words to add or change, keeping the rest (spec 2026-09-30-tenancy-completion §7).
+
+**`docs/superpowers/specs/2026-09-27-job-tenancy-design.md` §4.**
+- Directly after the ```` ```text ```` block that holds the rule-3 401 (it begins
+  `authentication required — \`POST /orgs/:org/incidents\``), add:
+
+  > **Superseded <this commit's date>** by `2026-09-30-tenancy-completion-design.md` §7 (item 12): the author's fix no longer restates the attribute, which dropped a route's `cross_tenant` and `emits(…)`. It now ends `declare \`public(Org)\` in place of \`public\` in this route's \`#[route(…)]\` attribute, keeping its other flags` (GUIDE §5 pins the text).
+
+- After the first text block of §4, the one whose second line begins `a route flag is`, add:
+
+  > **Superseded <this commit's date>** by the same §7: `undeclared_capability` renders no stance. It names the route by method and path and tells the author to add `cross_tenant` to that attribute, keeping its other flags (GUIDE §9). This block's first line, the neither-stance refusal, no longer restates the attribute either: it says to add `auth`, `public` or `public(Org)` to the flags of `#[route(POST "/agents/:id", …)]`, keeping any it already has (GUIDE §5 pins the text).
+
+**Same spec, §5.**
+- After the ```` ```text ```` block whose first line begins `` `NotifySubscribers` declares no
+  tenancy ``, add:
+
+  > **Superseded <this commit's date>** by `2026-09-30-tenancy-completion-design.md` §7 (item 12's class): the first line no longer restates the attribute, which dropped a job's `cross_tenant` and `retry(…)`. It says to add `scoped_by = Org` or `global` to its `#[job(…)]`, keeping any arguments it already has (GUIDE §6 pins the text).
+
+- After the ```` ```text ```` block that begins `= note: open the tenant scope first`, add:
+
+  > **Superseded <this commit's date>** by the same §7: the job case reads `in a job, write \`scoped_by = Org\` in place of \`global\` in its \`#[job(…)]\`, keeping its other arguments, and read through the \`ScopedTx\` its \`run\` receives`.
+
+`<this commit's date>` is filled at execution with the commit's date, as the job-tenancy plan's
+`2026-09-2x` was.
+
+`PINNED_FLOOR` does not change, because no pinned block is added or removed.
+
+```zsh
+cargo build -p guide-examples
+cargo test -p guide-examples --test doc_truth
+```
+
+Expected: both green. If `doc_truth` names a missing fragment in §5's block, the statuspage
+literal and the GUIDE disagree. Fix the GUIDE to match the literal, never the reverse.
+
+- [ ] **Step 9: Gate and commit**
+
+Foreground, one command per tool call:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo fmt --all --check; echo "fmt exit $?"
+cargo clippy --workspace --all-targets -- -D warnings; echo "clippy exit $?"
+cargo test -p charpente-core --no-fail-fast --lib 2>&1 | tee $D/gate-task-6.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test tenant 2>&1 | tee -a $D/gate-task-6.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test kernel 2>&1 | tee -a $D/gate-task-6.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --lib 2>&1 | tee -a $D/gate-task-6.log | grep -E "^test result|FAILED"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $D/gate-task-6.log | grep -E "^test result|FAILED"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $D/gate-task-6.log | grep -E "^test result|FAILED"
+grep -c "^test result:" $D/gate-task-6.log
+grep -c "^test result: ok" $D/gate-task-6.log
+```
+
+Green means fmt and clippy exit 0, the two counts are equal, and `grep -c FAILED
+$D/gate-task-6.log` prints `0`. Then the controller's full gate. Re-check `git status --short`
+and `git log -1`. Then:
+
+```zsh
+git add crates/charpente/src/http/app.rs crates/charpente-macros/src/route.rs \
+  crates/charpente/tests/tenant.rs crates/charpente/tests/kernel.rs \
+  crates/charpente-macros/tests/compile_fail/route_emits_undeclared_capability.rs \
+  crates/charpente-macros/tests/compile_fail/route_emits_undeclared_capability.stderr \
+  crates/charpente-macros/tests/compile_fail/across_tenants_without_capability.stderr \
+  crates/charpente-macros/tests/compile_fail/enqueue_in_without_capability.rs \
+  crates/charpente-macros/tests/compile_fail/enqueue_in_without_capability.stderr \
+  crates/charpente-macros/tests/compile_fail/route_public_scope_undeclared_capability.rs \
+  crates/charpente-macros/tests/compile_fail/route_public_scope_undeclared_capability.stderr \
+  crates/charpente-macros/src/job.rs crates/charpente-macros/src/lib.rs \
+  crates/charpente-core/src/table.rs \
+  crates/charpente-macros/tests/compile_fail/route_neither_stance_keeps_its_flags.rs \
+  crates/charpente-macros/tests/compile_fail/route_neither_stance_keeps_its_flags.stderr \
+  crates/charpente-macros/tests/compile_fail/global_job_reads_a_scoped_table.rs \
+  crates/charpente-macros/tests/compile_fail/global_job_reads_a_scoped_table.stderr \
+  crates/charpente-macros/tests/compile_fail/helpdesk_route_neither_auth_nor_public.stderr \
+  crates/charpente-macros/tests/compile_fail/job_bare.stderr \
+  crates/charpente-macros/tests/compile_fail/statuspage_job_no_tenancy.stderr \
+  crates/charpente-macros/tests/compile_fail/helpdesk_table_no_tenancy.stderr \
+  crates/charpente-macros/tests/compile_fail/table_bare.stderr \
+  crates/charpente-macros/tests/compile_fail/route_emits_on_non_sse.stderr \
+  crates/charpente-macros/tests/compile_fail/scoped_read_from_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/scoped_write_from_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/unscoped_row_impl_from_an_app.stderr \
+  crates/charpente-macros/tests/compile_pass/route_emits_on_sse.rs \
+  docs/GUIDE.md DESIGN.md docs/superpowers/specs/2026-09-27-job-tenancy-design.md
+git status --short
+git commit -m "fix(tenancy): a refusal's fix names the words to add or change and keeps the rest — the 401, #[route]'s capability and stance refusals, #[job]'s and #[table]'s tenancy refusals, emits on a non-stream and the scoped-table note's job case no longer restate an attribute, so cross_tenant, emits(...), retry(...) and version survive a pasted fix (item 12 and its class, A11); class sweep <R0> restated -> 0; <N> pins re-pinned, 3 fixtures added, 6 mutations red, baselines identical"
+```
+
+`git status --short` after `git add` must show nothing unstaged under `crates/` or `docs/`
+except files other writers own. The class sweep's `$D/task6-class-sweep.py` sits under
+`.superpowers/`, which is gitignored.
+
+---
+
+### Task 7: `CrossTenant<'g>` / `TenantAdmission<'g>`: tied to their `Group`, not `Clone`
+
+> **Amendment A9.** The two mint methods return
+> `CrossTenant<'a>` / `TenantAdmission<'a>`, where `'a` is the lifetime parameter of `impl<'a>
+> Group<'a>`, not `'_` (the `&self` borrow). Everything else is the contract's Task 7 block
+> verbatim. Step 5's mutation 5 re-measures the contract form on the real tree before the
+> commit.
+
+**Files:**
+- Modify `crates/charpente-core/src/db.rs`:
+  - `CrossTenant` and its doc, and `Group::cross_tenant_cap` (`:1724-1755` at `e749823`);
+  - `TenantAdmission` and its doc, and `Group::tenant_admission` (`:1757-1790`);
+  - the four token-taking signatures, each with its destructure: `Tx::settle_job` (`:940-941`),
+    `Tx::enqueue_in` (`:1084-1090`), `Tx::admit_scope` (`:1565-1570`) and `Tx::across_tenants`
+    (`:1801-1802`).
+- Modify `crates/charpente/src/http/app.rs`:
+  - `Ctx<'g>` and its doc (`:75-100`), `impl<'g> Ctx<'g>`, `Ctx::cap`,
+    `Ctx::public_admission`;
+  - `Declared::admitted` and `Stance<'g>` (`:265-287`);
+  - `build_ctx` (`:942-993`);
+  - the two `cap.clone()` in `stage_or_subscribe` (`:902`, `:919`).
+- Modify `crates/charpente/src/http/router.rs`: `Glue` and `SubGlue` (`:15`, `:22`).
+- Modify `crates/charpente/src/tenant.rs`: `Scoped::scope`, the trait and the impl
+  (`:98-131`), and one clause in the module doc.
+- Modify `crates/charpente/src/kernel/dispatch.rs`: `JobGlue` (`:107-108`) and the
+  `JobScope.admission` field (as Task 5 left it).
+- Modify `crates/charpente-macros/src/job.rs` (`:342-345`, `:417-422`) and
+  `crates/charpente-macros/src/route.rs` (`:514-519`, the SSE glue's matching
+  `ctx: &::charpente::http::Ctx` at `:860`): generated signatures spell `<'_>`.
+- Create in `crates/charpente-macros/tests/`:
+  - `compile_fail/capability_tokens_are_not_clone.rs` and its `.stderr`;
+  - `compile_fail/capability_tokens_cannot_be_parked.rs` and its `.stderr`;
+  - `compile_pass/capability_tokens_keep_their_elided_spelling.rs`.
+- Re-pin `compile_fail/cross_tenant_token_cannot_be_forged.stderr` and
+  `compile_fail/tenant_admission_cannot_be_forged.stderr` (their note quotes the struct
+  declaration).
+- Docs:
+  - `docs/GUIDE.md` §5 (the `ctx` bullet of the argument convention) and §16 (the capability's
+    properties; "Where the guarantee stops");
+  - `DESIGN.md` §3's Routes bullet and §8's Multi-tenancy bullet.
+
+**Interfaces:**
+- Consumes: nothing from Tasks 5-6 but Task 5's `JobScope` fields (one field's type changes
+  here).
+- Produces (contract, with the A9 amendment):
+  - `pub struct CrossTenant<'g>(std::marker::PhantomData<&'g ()>);` and
+    `pub struct TenantAdmission<'g>(std::marker::PhantomData<&'g ()>);`. Neither derives
+    `Clone`/`Copy`, and the fields stay private.
+  - `impl<'a> Group<'a> { pub fn cross_tenant_cap(&self) -> CrossTenant<'a>; pub fn
+    tenant_admission(&self) -> TenantAdmission<'a>; }`.
+  - `Tx::settle_job(&mut self, row: &JobRow, admission: &TenantAdmission<'_>)`,
+    `Tx::enqueue_in<S: Tenant>(&mut self, scope: Id<S>, job: impl Job<Scope = S>, cap:
+    &CrossTenant<'_>)`, `Tx::admit_scope<S: Tenant>(&mut self, scope: Id<S>, admission:
+    &TenantAdmission<'_>) -> ScopedTx<'_, 'a, S>`, `Tx::across_tenants<S: 'static>(&self,
+    cap: &CrossTenant<'_>) -> AllTenants<'_, 'a, S>`.
+  - `pub struct Ctx<'g>`; `Ctx::cap(&self) -> Option<&CrossTenant<'g>>`.
+  - `http::Glue = fn(&mut Tx, &Ctx<'_>, &[String], &[u8]) -> …`, `http::SubGlue` likewise,
+    `kernel::JobGlue = fn(&mut Tx, &[u8], Option<&CrossTenant<'_>>, Option<JobScope<'_>>) ->
+    …`, and `Scoped::scope(&mut self, scope: Id<S>, ctx: &Ctx<'_>)`.
+  - Handler, job and helper **source is unchanged**: `ctx: &Ctx` and `cap: &CrossTenant` elide.
+    The workspace enables neither `elided_lifetimes_in_paths` nor `rust_2018_idioms` (see the
+    Global Constraints), so that spelling is lint-clean. Platform signatures spell `<'_>`/`<'g>`:
+    `mismatched_lifetime_syntaxes` (warn-by-default, an error under clippy `-D warnings`)
+    refuses a hidden lifetime in an accessor's *output*.
+  - No record, no draw and no disk operation changes, so every Task 1 baseline must reproduce.
+
+- [ ] **Step 1: Write the compile-fail fixtures, in the spelling an app would use**
+
+Both are written with no lifetime on the token types, so they compile against today's
+`Clone + 'static` tokens (that is the red) and are refused once the tokens are tied.
+
+Create `crates/charpente-macros/tests/compile_fail/capability_tokens_are_not_clone.rs`:
+
+```rust
+// Neither capability token is `Clone` (tenancy-completion spec §5), so there
+// is no owned token to keep beyond the request or group that minted it. A
+// handler is handed `&CrossTenant`: `cap.clone()` only copies the reference,
+// so it is not a token of the handler's own. Operator code holds an owned
+// `TenantAdmission` and cannot copy it either.
+use charpente::http::ApiError;
+use charpente::wire::WireU64;
+use charpente::{CrossTenant, Db, Tx, route};
+
+#[route(GET "/admin/revenue", public, cross_tenant)]
+fn revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
+    let owned: CrossTenant = cap.clone();
+    let _ = (tx, owned);
+    Ok(WireU64(0))
+}
+
+fn copy_the_admission(db: &mut Db) -> std::io::Result<()> {
+    let group = db.begin_group()?;
+    let admission = group.tenant_admission();
+    let _copy = admission.clone();
+    group.commit().map_err(|failure| failure.error)
+}
+
+fn main() {
+    let _ = copy_the_admission;
+}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/capability_tokens_cannot_be_parked.rs`:
+
+```rust
+// A capability token lives no longer than the `Db` borrow of the `Group`
+// that minted it (tenancy-completion spec §5), so operator code holding a
+// `Db` cannot park one past its group: not in a `static`, not in a
+// `thread_local!`, both of which need `'static`. The types are spelled with
+// no lifetime, as an app would write them; a static's elided lifetime is
+// `'static`. One function per case: borrowck reports one error per region
+// that must outlive `'static`, so two cases in one function would be one.
+use std::cell::RefCell;
+use std::sync::OnceLock;
+
+use charpente::{CrossTenant, Db, TenantAdmission};
+
+static PARKED_CAP: OnceLock<CrossTenant> = OnceLock::new();
+static PARKED_ADMISSION: OnceLock<TenantAdmission> = OnceLock::new();
+
+thread_local! {
+    static HELD_CAP: RefCell<Option<CrossTenant>> = const { RefCell::new(None) };
+    static HELD_ADMISSION: RefCell<Option<TenantAdmission>> = const { RefCell::new(None) };
+}
+
+fn park_the_capability(db: &mut Db) -> std::io::Result<()> {
+    let group = db.begin_group()?;
+    let _ = PARKED_CAP.set(group.cross_tenant_cap());
+    group.commit().map_err(|failure| failure.error)
+}
+
+fn park_the_admission(db: &mut Db) -> std::io::Result<()> {
+    let group = db.begin_group()?;
+    let _ = PARKED_ADMISSION.set(group.tenant_admission());
+    group.commit().map_err(|failure| failure.error)
+}
+
+fn hold_the_capability(db: &mut Db) -> std::io::Result<()> {
+    let group = db.begin_group()?;
+    HELD_CAP.with(|held| *held.borrow_mut() = Some(group.cross_tenant_cap()));
+    group.commit().map_err(|failure| failure.error)
+}
+
+fn hold_the_admission(db: &mut Db) -> std::io::Result<()> {
+    let group = db.begin_group()?;
+    HELD_ADMISSION.with(|held| *held.borrow_mut() = Some(group.tenant_admission()));
+    group.commit().map_err(|failure| failure.error)
+}
+
+fn main() {
+    let _ = (
+        park_the_capability,
+        park_the_admission,
+        hold_the_capability,
+        hold_the_admission,
+    );
+}
+```
+
+Create `crates/charpente-macros/tests/compile_pass/capability_tokens_keep_their_elided_spelling.rs`:
+
+```rust
+// Tying the capability tokens and `Ctx` to their group (tenancy-completion
+// spec §5) changes no source an app writes: handlers still take `ctx: &Ctx`
+// and `cap: &CrossTenant`, a helper that passes `ctx` on still compiles, a
+// job's `run` still takes `cap: &CrossTenant`, and operator code still mints
+// a token and then stages with it in the same group. The one spelling that
+// changes is a helper returning a borrow out of a `Ctx`, which names that
+// borrow (`subject_of`); left elided it is E0106. trybuild runs `main`.
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx, Cursor, RouteDef, Subscription};
+use charpente::kernel::{JobEntry, JobError};
+use charpente::wire::WireU64;
+use charpente::{
+    CrossTenant, Db, Id, Scoped, ScopedTx, Tenant, TenantAdmission, Tx, event, job, route, table,
+};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Memo {
+    id: Id<Memo>,
+    text: String,
+}
+
+#[event(global)]
+struct MemoNoted {
+    n: WireU64,
+}
+
+/// A helper that takes `ctx` and passes it on, as handlers share bodies.
+fn memo_count(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(WireU64(tx.scan::<Memo>()?.len() as u64))
+}
+
+/// A helper that returns a borrow out of a `Ctx` names which borrow.
+fn subject_of<'c>(ctx: &'c Ctx) -> Option<&'c str> {
+    ctx.principal().map(Principal::subject)
+}
+
+#[route(GET "/orgs/:org/memos", auth)]
+fn memos(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _ = subject_of(ctx);
+    memo_count(tx, org, ctx)
+}
+
+#[route(GET "/orgs/:org/everything", public, cross_tenant)]
+fn everything(
+    tx: &mut Tx,
+    org: Id<Org>,
+    cap: &CrossTenant,
+    ctx: &Ctx,
+) -> Result<WireU64, ApiError> {
+    let _ = (org, ctx.cap().is_some());
+    Ok(WireU64(
+        tx.across_tenants::<Org>(cap).scan::<Memo>()?.len() as u64,
+    ))
+}
+
+#[route(SSE "/orgs/:org/feed", auth, emits(MemoNoted))]
+fn feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, org, subject_of(ctx));
+    Ok(Subscription::of::<MemoNoted>().cursor(cursor))
+}
+
+#[job(global, cross_tenant)]
+struct Sweep {}
+
+impl Sweep {
+    fn run(self, tx: &mut Tx, cap: &CrossTenant) -> Result<(), JobError> {
+        for org in [1, 2] {
+            tx.enqueue_in(Id::<Org>::from_raw(org), Touch { n: org }, cap);
+        }
+        Ok(())
+    }
+}
+
+#[job(scoped_by = Org, cross_tenant)]
+struct Touch {
+    n: u64,
+}
+
+impl Touch {
+    fn run(self, tx: &mut ScopedTx<'_, '_, Org>, cap: &CrossTenant) -> Result<(), JobError> {
+        let _ = tx.across_tenants::<Org>(cap).scan::<Memo>()?;
+        tx.put(&Memo {
+            id: Id::from_raw(self.n),
+            text: String::new(),
+        });
+        Ok(())
+    }
+}
+
+/// Operator code: mints both tokens from a group, then stages with them in
+/// that same group, the shape the dispatcher and the request path share.
+fn seed(db: &mut Db, org: Id<Org>) -> std::io::Result<()> {
+    let mut group = db.begin_group()?;
+    let admission = group.tenant_admission();
+    let cap = group.cross_tenant_cap();
+    let staged = group.stage(|tx| {
+        let before = tx.across_tenants::<Org>(&cap).scan::<Memo>()?.len() as u64;
+        tx.admit_scope::<Org>(org, &admission).put(&Memo {
+            id: Id::from_raw(before),
+            text: "seeded".to_string(),
+        });
+        Ok::<(), std::io::Error>(())
+    });
+    group.commit().map_err(|failure| failure.error)?;
+    staged.map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
+/// A helper that hands the admission on, as `tenant.rs`'s `transact_admitted`
+/// does: `&TenantAdmission` in a function type's arguments, elided.
+fn with_admission(db: &mut Db, f: fn(&mut Tx, &TenantAdmission)) -> std::io::Result<()> {
+    let mut group = db.begin_group()?;
+    let admission = group.tenant_admission();
+    let staged = group.stage(|tx| {
+        f(tx, &admission);
+        Ok::<(), std::io::Error>(())
+    });
+    group.commit().map_err(|failure| failure.error)?;
+    staged.map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
+fn main() {
+    assert!(everything::route().cross_tenant);
+    assert!(!memos::route().cross_tenant);
+    assert!(!feed::route().cross_tenant);
+    assert!(<Sweep as JobEntry>::def().cross_tenant);
+    assert!(<Touch as JobEntry>::def().cross_tenant);
+    let _ = (seed, with_admission);
+}
+```
+
+- [ ] **Step 2: Run them before any implementation, and record the red**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task7-red.log | grep -E "capability_tokens|Expected test case to fail|^test result"
+```
+
+Expected (quote in the task report):
+- `capability_tokens_are_not_clone.rs` and `capability_tokens_cannot_be_parked.rs`: each
+  reports that it was expected to fail to compile but compiled. That is the hole: at this
+  commit, a handler clones its `&CrossTenant` into an owned token, and operator code parks
+  either token in a `static` or a `thread_local!`.
+- `capability_tokens_keep_their_elided_spelling.rs` passes, and must keep passing through
+  Step 3 unchanged.
+- The trybuild test FAILS overall because of the two compile-fail cases. No `.stderr` exists
+  for them yet. Do not run `TRYBUILD=overwrite` here, because at this commit there is nothing
+  for it to write.
+
+- [ ] **Step 3: Implement**
+
+**`crates/charpente-core/src/db.rs`.** Replace the `CrossTenant` doc's last paragraph ("`Clone`
+because the platform hands the same request's token to the `Ctx` and to the handler argument;
+cloning widens nothing, since holding one at all IS the capability."), the struct, and its
+`impl<'a> Group<'a>` block with:
+
+```rust
+/// Tied to the `Group` that minted it, and not `Clone` (tenancy-completion
+/// spec §5): `'g` is that group's borrow of the `Db`, so a token cannot
+/// outlive the borrow — not into a `static` or a `thread_local!`, both of
+/// which need `'static`, and not into the `Db`'s next group, which needs the
+/// `Db` back. The platform keeps the one token in the request's `Ctx` and
+/// hands the handler `&CrossTenant`, which it can neither copy into a token
+/// of its own nor keep. Only a `Db` borrowed for `'static` — a leaked one —
+/// mints a `'static` token: that is the operator, whose standing
+/// `Db::snapshot` already is (ruling R48), building a bypass on purpose.
+pub struct CrossTenant<'g>(std::marker::PhantomData<&'g ()>);
+
+impl<'a> Group<'a> {
+    /// Mints the token the platform hands a route or job that declared
+    /// `cross_tenant`. See `CrossTenant`: this is the only constructor, and
+    /// it takes a `&Group` because that is a handle a handler never has.
+    ///
+    /// The token borrows what the group borrows (`'a`, the `Db`), not the
+    /// group itself: every holder mints first and then stages in the same
+    /// group, which a token borrowing `&self` would forbid.
+    pub fn cross_tenant_cap(&self) -> CrossTenant<'a> {
+        CrossTenant(std::marker::PhantomData)
+    }
+}
+```
+
+In `TenantAdmission`'s doc, replace its last paragraph ("`Clone` for `CrossTenant`'s reason:
+holding one at all is the admission, so a copy widens nothing."), the struct, and its `impl<'a>
+Group<'a>` block with:
+
+```rust
+/// Tied to its `Group` and not `Clone`, exactly as `CrossTenant` is: a
+/// `public(S)` route's admission stays in that request's `Ctx`, the
+/// dispatcher's lives for one job run, and an operator's for the `Db`
+/// borrow its group holds — none of them in a `static` or a
+/// `thread_local!`.
+pub struct TenantAdmission<'g>(std::marker::PhantomData<&'g ()>);
+
+impl<'a> Group<'a> {
+    /// Mints the admission `Tx::admit_scope` takes. The only constructor;
+    /// see `TenantAdmission`. Borrows what the group borrows, as
+    /// `cross_tenant_cap` does, for the same reason.
+    pub fn tenant_admission(&self) -> TenantAdmission<'a> {
+        TenantAdmission(std::marker::PhantomData)
+    }
+}
+```
+
+The four signatures, each with the destructure on its first line:
+
+```rust
+    pub fn settle_job(&mut self, row: &JobRow, admission: &TenantAdmission<'_>) {
+        let TenantAdmission(_) = admission;
+```
+
+```rust
+    pub fn enqueue_in<S: Tenant>(
+        &mut self,
+        scope: Id<S>,
+        job: impl Job<Scope = S>,
+        cap: &CrossTenant<'_>,
+    ) {
+        let CrossTenant(_) = cap;
+```
+
+```rust
+    pub fn admit_scope<S: Tenant>(
+        &mut self,
+        scope: Id<S>,
+        admission: &TenantAdmission<'_>,
+    ) -> ScopedTx<'_, 'a, S> {
+        let TenantAdmission(_) = admission;
+```
+
+```rust
+    pub fn across_tenants<S: 'static>(&self, cap: &CrossTenant<'_>) -> AllTenants<'_, 'a, S> {
+        let CrossTenant(_) = cap;
+```
+
+The rest of each body is unchanged. `enqueue_in` keeps the job in argument position (job-tenancy
+A13). `cap`'s elided lifetime is late-bound, so `tx.enqueue_in::<Org>(scope, job, cap)` still
+names exactly one parameter.
+
+**`crates/charpente/src/http/app.rs`.** `Ctx`'s doc gains a second paragraph, and its struct
+header and two fields become:
+
+```rust
+/// Per-request context handed to handlers: the authenticated principal (if
+/// any) and one fresh entropy-derived token for session/key creation. `now`
+/// and `session_ttl` are the clock reading `handle_or_subscribe` took for
+/// this request and the app's configured TTL — both needed to mint
+/// `expires_at`.
+///
+/// `'g` is the request's group: `Ctx` holds the tokens minted from it (the
+/// `CrossTenant` of a `cross_tenant` route, the `TenantAdmission` of a
+/// `public(S)` route), so neither it nor anything borrowed out of it
+/// outlives that group (tenancy-completion spec §5). Handlers write
+/// `ctx: &Ctx`; the lifetime is elided.
+pub struct Ctx<'g> {
+```
+
+```rust
+    cap: Option<CrossTenant<'g>>,
+```
+
+```rust
+    stance: Stance<'g>,
+```
+
+`impl Ctx {` becomes `impl<'g> Ctx<'g> {`. `cap` and `public_admission` become:
+
+```rust
+    pub fn cap(&self) -> Option<&CrossTenant<'g>> {
+        self.cap.as_ref()
+    }
+```
+
+```rust
+    pub(crate) fn public_admission<S: 'static>(&self) -> Option<&TenantAdmission<'g>> {
+```
+
+(`public_admission`'s body is unchanged.) `Declared::admitted` and `Stance` become:
+
+```rust
+    /// Mints the admission for a `public(S)` route, and only for one.
+    fn admitted<'g>(self, group: &Group<'g>) -> Stance<'g> {
+```
+
+```rust
+struct Stance<'g> {
+```
+
+```rust
+    public: Option<(PublicScope, TenantAdmission<'g>)>,
+```
+
+`build_ctx`'s header and its last two parameters become:
+
+```rust
+fn build_ctx<'g>(
+```
+
+```rust
+    cap: Option<CrossTenant<'g>>,
+    stance: Stance<'g>,
+) -> Result<Ctx<'g>, ApiError> {
+```
+
+In `stage_or_subscribe`, both `build_ctx` calls pass `cap,` where they passed `cap.clone(),`.
+Each match arm's closure moves `cap` once, as it already moves `stance`.
+
+**`crates/charpente/src/http/router.rs`:**
+
+```rust
+pub type Glue = fn(&mut Tx, &Ctx<'_>, &[String], &[u8]) -> Result<Response, ApiError>;
+```
+
+```rust
+pub type SubGlue =
+    fn(&mut Tx, &Ctx<'_>, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
+```
+
+Let `cargo fmt` decide the line breaks.
+
+**`crates/charpente/src/tenant.rs`.** In both the trait declaration and the impl of
+`Scoped::scope`, `ctx: &Ctx,` becomes `ctx: &Ctx<'_>,`. In the module doc, "the seal
+`CrossTenant` already carries" becomes "the seal `CrossTenant` already carries, and its tie to
+the `Group` that minted it".
+
+**`crates/charpente/src/kernel/dispatch.rs`:**
+
+```rust
+pub type JobGlue =
+    fn(&mut Tx, &[u8], Option<&CrossTenant<'_>>, Option<JobScope<'_>>) -> Result<(), JobError>;
+```
+
+and in `JobScope`, `admission: &'j TenantAdmission,` becomes
+`admission: &'j TenantAdmission<'j>,`. `run_due_into` compiles unchanged: it mints `cap` and
+`admission` before `group.stage`, and under A9 neither borrows the group.
+
+**`crates/charpente-macros/src/job.rs`.** In the scoped arm, `quote! { ,
+&::charpente::CrossTenant }` becomes `quote! { , &::charpente::CrossTenant<'_> }`. In the
+generated glue, `cap: ::std::option::Option<&::charpente::CrossTenant>,` becomes `cap:
+::std::option::Option<&::charpente::CrossTenant<'_>>,`.
+
+**`crates/charpente-macros/src/route.rs`.** In both generated glue functions (`expand_http`'s
+and `expand_sse`'s), `ctx: &::charpente::http::Ctx,` becomes `ctx:
+&::charpente::http::Ctx<'_>,`.
+
+Generated code spells the lifetime so that an app enabling `elided_lifetimes_in_paths` gets no
+lint from glue it did not write. The in-tree test-module glue in `serve.rs`/`launch.rs` keeps
+the elided form, which is the same spelling an app writes.
+
+Then:
+
+```zsh
+cargo check --workspace --all-targets 2>&1 | tee .superpowers/sdd/2026-09-30-tenancy-completion/task7-check.log | grep -E "^(error|warning)" ; echo "check exit ${pipestatus[1]}"
+```
+
+Expected: `check exit 0`, with no `error` or `warning` lines. Every test file, fixture crate and
+example compiles with its source unchanged. If a `warning: hiding a lifetime that's elided
+elsewhere is confusing` appears, a platform accessor returns a hidden lifetime: spell it
+`<'g>`/`<'_>` as above.
+
+- [ ] **Step 4: Run, and review every pin**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task7-trybuild-overwrite.log | grep -E "^test result"
+git diff --stat crates/charpente-macros/tests/compile_fail/
+for f in capability_tokens_are_not_clone capability_tokens_cannot_be_parked; do
+  echo "--- $f"; cat crates/charpente-macros/tests/compile_fail/$f.stderr
+done
+git diff crates/charpente-macros/tests/compile_fail/
+cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task7-trybuild.log | grep -E "^test result|mismatch"
+```
+
+Expected:
+- `capability_tokens_are_not_clone.stderr`, two errors:
+  - `error[E0308]: mismatched types` at `let owned: CrossTenant = cap.clone();`, "expected
+    `CrossTenant<'_>`, found `&CrossTenant<'_>`", with rustc's note "`…CrossTenant<'_>` does
+    not implement `Clone`, so `&…CrossTenant<'_>` was cloned instead". The note names the
+    contract (not `Clone`), the site, and why the clone is not a token.
+  - `error[E0599]: no method named \`clone\` found for struct \`TenantAdmission<…>\``, at
+    `admission.clone()`.
+- `capability_tokens_cannot_be_parked.stderr`: four `error[E0521]: borrowed data escapes outside
+  of function`, one per function, each at the `set`/`with` line, each saying "argument requires
+  that `'1` must outlive `'static`". Say so in the task report: this is rustc's own lifetime
+  diagnostic, so it names the site and the violated bound, and GUIDE §16 carries the contract
+  and the fix.
+  - Neither new `.stderr` may carry a path into std's sources: no `$RUST/…` note line. The
+    `OnceLock::set`-with-`.clone()` form produced one in the scratch run ("method defined
+    here"); the fixture's `let owned: CrossTenant = …` form does not. Such a line pins a
+    toolchain's std line numbers, the fragility CI met in `57e804d`. If one appears, restate
+    the case so rustc has no std method to point at.
+- `cross_tenant_token_cannot_be_forged.stderr` and `tenant_admission_cannot_be_forged.stderr`:
+  still `error[E0423]: cannot initialize a tuple struct which contains private fields`. Only
+  the note's quoted declaration changes, to `pub struct CrossTenant<'g>(std::marker::PhantomData<&'g ()>);`
+  (resp. `TenantAdmission`), with the carets under the private field.
+- No other `.stderr` changes. Any other changed file is a finding: read it before accepting it.
+- `compile_pass/capability_tokens_keep_their_elided_spelling.rs` passes, and so does every
+  other `compile_pass` case, with no source changed.
+
+- [ ] **Step 5: Prove each property red by mutation**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff crates/charpente-core/src/db.rs > $D/task7-db.patch
+```
+
+Apply each mutation to `db.rs` alone, and run
+`cargo test -p charpente-macros --test trybuild 2>&1 | tee $D/task7-mutation-<k>.log | grep -E "mismatch|Expected test case|^test result"`.
+Never run it with `TRYBUILD=overwrite` under a mutation. Restore with
+`git checkout crates/charpente-core/src/db.rs && git apply $D/task7-db.patch`, then
+`git diff --stat crates/charpente-core/src/db.rs`.
+
+1. Put `#[derive(Clone)]` back on `CrossTenant`. Expected: a mismatch on
+   `capability_tokens_are_not_clone.stderr`, because its E0308 is gone (the handler now owns a
+   clone). The E0599 remains.
+2. `#[derive(Clone)]` on `TenantAdmission` instead. Expected: the same file mismatches, this
+   time with its E0599 gone.
+3. `cross_tenant_cap(&self) -> CrossTenant<'static>`. Expected: a mismatch on
+   `capability_tokens_cannot_be_parked.stderr`, because its two capability errors are gone and
+   the two admission errors remain.
+4. `tenant_admission(&self) -> TenantAdmission<'static>`. Expected: the same file mismatches,
+   with the admission half gone.
+5. **The contract's form, re-measured on the real tree.** Apply both
+   `cross_tenant_cap(&self) -> CrossTenant<'_>` and `tenant_admission(&self) ->
+   TenantAdmission<'_>`, then run instead:
+
+   ```zsh
+   cargo check --workspace --all-targets 2>&1 | tee $D/task7-mutation-5.log | grep -E "^error\[E0502\]|^ *--> " 
+   ```
+
+   Expected: E0502 "cannot borrow … as mutable because it is also borrowed as immutable" at
+   `kernel/dispatch.rs` (`run_due_into`'s `group.stage`), at `http/app.rs`
+   (`stage_or_subscribe`'s two `group.stage`s and the probe's), and at the test helpers that
+   mint then stage. Quote the count. This is A9's evidence on the tree itself.
+
+- [ ] **Step 6: Byte identity**
+
+Types only: no record, no draw, no disk operation changes. Run Task 1's six `baselines.sh`
+calls with the suffix `task7`:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task7 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task7 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task7 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task7 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task7 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task7 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label `reproduces the base`, every call `exit 0`.
+
+- [ ] **Step 7: Docs**
+
+**`docs/GUIDE.md` §5, "The `#[route]` argument convention".** The `ctx` bullet ("Then,
+optionally, a trailing argument named exactly `ctx`, typed `&Ctx` (session access — see
+Sessions below).") becomes:
+
+```markdown
+- Then, optionally, a trailing argument named exactly `ctx`, typed `&Ctx`
+  (session access — see Sessions below). `Ctx` borrows from the request's
+  group (`Ctx<'g>`), and `&Ctx` elides that, so a handler never names it. A
+  helper that returns something borrowed out of a `Ctx` must say which
+  borrow: `fn subject_of<'c>(ctx: &'c Ctx) -> Option<&'c str>`. Left elided,
+  it is `error[E0106]: missing lifetime specifier`.
+```
+
+**§16, "Reading across every tenant: the `cross_tenant` capability".** "Four properties make
+this a capability rather than an escape hatch:" becomes "Five properties make this a capability
+rather than an escape hatch:". After the "**You cannot forge the token.**" bullet, insert:
+
+```markdown
+- **You cannot keep the token.** It is tied to the group the request or job
+  runs in (`CrossTenant<'g>`) and is not `Clone`. A handler is handed
+  `&CrossTenant`; `cap.clone()` only copies that reference (rustc says so:
+  "`CrossTenant<'_>` does not implement `Clone`, so `&CrossTenant<'_>` was
+  cloned instead"), so there is no token of its own to park. Operator code
+  that mints one from `Db::begin_group` cannot park it either: a `static`
+  or a `thread_local!` needs `'static`, and the token lives only as long as
+  the group's borrow of the `Db` —
+  `error[E0521]: borrowed data escapes outside of function`.
+```
+
+**§16, "Where the guarantee stops".**
+- In the paragraph ending "…and `Db::begin_group` can mint the `CrossTenant` token.", replace
+  that sentence end with "…and `Db::begin_group` can mint the `CrossTenant` token, for the
+  length of that group's borrow."
+- In the operator paragraph after the `seed` example, after "`TenantAdmission(())` is
+  `error[E0423]`.", insert: "Nor can anyone keep one: like `CrossTenant`, a `TenantAdmission`
+  borrows what its group borrows and is not `Clone`, so it goes out of reach with the group's
+  borrow of the `Db`, and a `static` or `thread_local!` refuses it."
+
+**`DESIGN.md` §3, the Routes bullet.** After the sentence that begins "(tenant-scoping spec §3):
+the kernel mints a `CrossTenant` token for a route that declared", append this sentence to the
+end of that sentence's paragraph:
+
+> Both capability tokens, `CrossTenant<'g>` and `TenantAdmission<'g>`, borrow what the `Group` that minted them borrows and are not `Clone`, so neither can be parked in a `static` or a `thread_local!` past its group (spec 2026-09-30-tenancy-completion §5).
+
+**`DESIGN.md` §8, the Multi-tenancy bullet.** In "…and can mint a `CrossTenant` through
+`begin_group`.", append ", for the length of that group's borrow of the `Db`" before the period.
+
+```zsh
+cargo build -p guide-examples
+cargo test -p guide-examples --no-fail-fast
+```
+
+Expected: both green. Every GUIDE ```rust block still compiles unchanged, §16's `seed` example
+included, because it mints then stages. `PINNED_FLOOR` does not change.
+
+- [ ] **Step 8: Gate and commit**
+
+Every crate compiles against the new types, so the implementer's gate covers each package.
+Foreground, one command per tool call:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo fmt --all --check; echo "fmt exit $?"
+cargo clippy --workspace --all-targets -- -D warnings; echo "clippy exit $?"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --lib 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test tenant 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test kernel 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test http 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test describe 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $D/gate-task-7.log | grep -E "^test result|FAILED"
+grep -c "^test result:" $D/gate-task-7.log
+grep -c "^test result: ok" $D/gate-task-7.log
+```
+
+Green means:
+- fmt and clippy exit 0;
+- the two counts are equal;
+- `grep -c FAILED $D/gate-task-7.log` prints `0`.
+
+The controller's full workspace gate follows, because every other suite also compiled against
+the new types in Step 3's `cargo check`. Re-check `git status --short` and `git log -1`. Then:
+
+```zsh
+git add crates/charpente-core/src/db.rs crates/charpente/src/http/app.rs \
+  crates/charpente/src/http/router.rs crates/charpente/src/tenant.rs \
+  crates/charpente/src/kernel/dispatch.rs \
+  crates/charpente-macros/src/job.rs crates/charpente-macros/src/route.rs \
+  crates/charpente-macros/tests/compile_fail/capability_tokens_are_not_clone.rs \
+  crates/charpente-macros/tests/compile_fail/capability_tokens_are_not_clone.stderr \
+  crates/charpente-macros/tests/compile_fail/capability_tokens_cannot_be_parked.rs \
+  crates/charpente-macros/tests/compile_fail/capability_tokens_cannot_be_parked.stderr \
+  crates/charpente-macros/tests/compile_pass/capability_tokens_keep_their_elided_spelling.rs \
+  crates/charpente-macros/tests/compile_fail/cross_tenant_token_cannot_be_forged.stderr \
+  crates/charpente-macros/tests/compile_fail/tenant_admission_cannot_be_forged.stderr \
+  docs/GUIDE.md DESIGN.md
+git commit -m "feat(tenancy): CrossTenant<'g> and TenantAdmission<'g> borrow what their Group borrows and are not Clone — neither can be cloned by a handler or parked in a static or thread_local; Ctx<'g>; handler source unchanged; <N> trybuild pins, 5 mutations red (the contract's &self form: <M> E0502 on the tree), baselines identical"
+```
+
+---
+
+### Task 8: Platform tables — `EventRow` and `SchemaVersion` sealed against app writes; the schema door
+
+Spec §3 (items 11 and 2's write half). `JobRow` has been the platform's since C-2
+(`job.rs:105` at e749823). This task makes `EventRow` and `SchemaVersion` the platform's the same
+way: `type Scope = PlatformOwned`, both names in `PLATFORM_TABLES`, and a refusal that names the
+matched table and its write path. Today `tx.put(&EventRow { .. })` forges an event into any
+tenant's feed, and `tx.put(&SchemaVersion { .. })` claims a table migrated whose rows never ran
+the migration. The platform's own writes keep their doors:
+- apply still materializes event rows from emit effects;
+- first-write adoption still inserts into the overlay directly (`Group::stage`, db.rs:3799-3856
+  at e749823);
+- `migrate_table`'s two writes move to a crate-private `Tx::put_schema_version`, and a test pins
+  that its record is byte-identical to the one `tx.put` wrote.
+
+Reads are untouched here; Task 9 seals them.
+
+Storage does not move. `row_is_scoped` (table.rs:757 at e749823) already treats `PlatformOwned`
+as `Unscoped`, so every table keeps its bare `u64` key, and every Task 1 baseline must reproduce.
+
+**Files:**
+- Modify `crates/charpente-core/src/event.rs`: `impl Row for EventRow`'s `type Scope` and the
+  comment above it.
+- Modify `crates/charpente-core/src/migration.rs`: `impl Row for SchemaVersion`'s `type Scope`,
+  with a comment.
+- Modify `crates/charpente-core/src/db.rs`:
+  - `PLATFORM_TABLES` (`:826` at e749823) and its doc;
+  - `is_platform_table` becomes `platform_table`, returning the index;
+  - `refuse_platform_table` (`:849`) becomes one text per table;
+  - `Tx::put`'s doc;
+  - `Tx::put_schema_version` (new, `pub(crate)`, after `settle_job`);
+  - `Db::migrate_table`'s two `tx.put(&crate::migration::SchemaVersion {` (`:3517`, `:3558`);
+  - `mod tests`: `refusal_text` and `each_platform_table_name_is_refused_by_its_own_text`.
+- Modify `crates/charpente-core/src/table.rs`:
+  - `PlatformOwned`'s doc (`:298-310`);
+  - `AppWritable`'s doc and two new notes (`:451-476`);
+  - `unscoped_open_err`'s doc (`:697-699`, "`EventRow::Scope` is `Unscoped` at compile time");
+  - `row_is_scoped`'s doc (`:755-756`).
+- Test:
+  - `crates/charpente-core/tests/migrations.rs`: `schema_version_puts` and
+    `migrate_schema_records_each_schema_version_as_an_unscoped_put` (new);
+  - `crates/charpente-core/tests/migrate_apply.rs`: `schema_version_record` and `ship` (new),
+    and `migrate_put_overwrites_without_indexing_then_close_out_rebuilds` ships its two
+    schema-version rows (`:100`, `:144`);
+  - `crates/charpente-core/tests/engine.rs`: `an_ordinary_table_is_unscoped_by_default` (`:463`)
+    takes `Widget`, and `the_platform_tables_are_platform_owned` (new).
+- Create in `crates/charpente-macros/tests/compile_fail/`, each with its `.stderr`:
+  `event_row_written_on_bare_tx.rs`, `schema_version_written_on_bare_tx.rs`,
+  `event_row_table_name_borrowed.rs`, `schema_version_table_name_borrowed.rs`.
+- Re-pin in `compile_fail/`:
+  - `job_row_forged_on_bare_tx.stderr`, `job_row_deleted_on_bare_tx.stderr`,
+    `job_row_redirected_on_bare_tx.stderr`, `job_row_untenanted_on_bare_tx.stderr`
+    (`AppWritable`'s two new notes);
+  - `job_row_table_name_borrowed.stderr` (the quoted `panic!` block moves into a `match` arm).
+- Docs:
+  - `docs/GUIDE.md` §3 (`:404`), §6 ("Job rows are the platform's", both pinned blocks), §10's
+    list of panics (`:3236`), and §16 (the tail of "The compile errors", and "Where the
+    guarantee stops");
+  - `DESIGN.md` §3's **Jobs** bullet and §8's Multi-tenancy bullet.
+
+  `PINNED_FLOOR` does not change: two pinned blocks grow, and no block is added.
+
+**Interfaces:**
+- Consumes:
+  - Task 2: `Tenant::NAME` (every new fixture's `impl Tenant` carries `const NAME`).
+  - Task 7: `TenantAdmission<'g>` (unchanged here; `settle_job` sits beside the new door).
+  - Task 1: `baselines.sh` and the eleven `cov-*-base.txt` recordings.
+- Produces:
+  - `EventRow::Scope = PlatformOwned`, `SchemaVersion::Scope = PlatformOwned`.
+  - `const PLATFORM_TABLES: [&str; 3] = [JobRow::TABLE, EventRow::TABLE, SchemaVersion::TABLE]`,
+    `const fn platform_table(table: &str) -> Option<usize>` (private to db.rs, and Task 9's
+    `refuse_platform_read` uses it).
+  - `pub(crate) fn Tx::put_schema_version(&mut self, row: &SchemaVersion)`.
+  - `#[cfg(test)] fn refusal_text(refuse: fn(&str), table: &str) -> Option<String>` in db.rs's
+    `mod tests`, which Task 9 reuses.
+  - Refusal texts, fixed:
+    - `refuse_platform_table`, jobs (unchanged, byte for byte): "this Row's TABLE is
+      \"charpente.jobs\", the platform's job queue — job rows are the platform's: only the
+      enqueue family writes one, because the dispatcher runs a job in the tenant its row names;
+      give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`,
+      `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)"
+    - events: "this Row's TABLE is \"charpente.events\", the platform's event log — event rows
+      are the platform's: only an emit writes one, because every subscription's feed is read
+      from them; give this table a name of its own, and publish an event by emitting it
+      (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+    - schema versions: "this Row's TABLE is \"charpente.schema_versions\", the platform's
+      migration record — schema-version rows are the platform's: only a table's first write and
+      `Db::migrate_schema` write one, because the migration gate trusts them for each table's
+      version and a migration's resume point; give this table a name of its own, and change a
+      table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which
+      the kernel migrates at startup"
+    - `AppWritable`'s two new notes (the jobs note is unchanged):
+      - "event rows are the platform's: only an emit writes one, because every subscription's
+        feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a
+        tenant, with `emit` on the `ScopedTx` of the tenant it belongs to"
+      - "schema-version rows are the platform's: only a table's first write and
+        `Db::migrate_schema` write one, because the migration gate trusts them for each table's
+        version and a migration's resume point — to change a table's version, declare it with
+        `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup"
+
+  Every text above is one line; the wrapping here is this plan's, not the string's.
+
+- [ ] **Step 1: Pin the four write refusals, and see them compile at the Task 7 commit**
+
+Create `crates/charpente-macros/tests/compile_fail/event_row_written_on_bare_tx.rs`:
+
+```rust
+// Event rows are the platform's (tenancy-completion spec §3). Every
+// subscription's feed is read from `charpente.events`, so a handler that
+// could put an `EventRow` would publish, into any tenant's feed, an event no
+// emit made, and one that could delete one would unpublish another tenant's.
+// Both writes are refused; emitting is the only way to make an event row.
+// The row arrives as a parameter because how it was built is not the point:
+// the write is.
+use charpente::core::event::EventRow;
+use charpente::{Id, Tx};
+
+fn forge(tx: &mut Tx, row: &EventRow) {
+    tx.put(row);
+}
+
+fn unpublish(tx: &mut Tx, id: Id<EventRow>) {
+    tx.delete::<EventRow>(id);
+}
+
+fn main() {
+    let _ = (forge, unpublish);
+}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/schema_version_written_on_bare_tx.rs`:
+
+```rust
+// Schema-version rows are the platform's (tenancy-completion spec §3). The
+// migration gate trusts `charpente.schema_versions` for each table's version
+// and a migration's resume point, so a handler that could put one would mark
+// a table migrated whose rows never ran the migration, and one that could
+// delete one would erase the record the gate holds a table's rows against.
+// Both writes are refused; only a table's first write and
+// `Db::migrate_schema` write a schema-version row.
+use charpente::core::migration::SchemaVersion;
+use charpente::{Id, Tx};
+
+fn claim_migrated(tx: &mut Tx, row: &SchemaVersion) {
+    tx.put(row);
+}
+
+fn forget(tx: &mut Tx, id: Id<SchemaVersion>) {
+    tx.delete::<SchemaVersion>(id);
+}
+
+fn main() {
+    let _ = (claim_migrated, forget);
+}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/event_row_table_name_borrowed.rs`:
+
+```rust
+// Event rows are the platform's by TABLE NAME, not only by type
+// (tenancy-completion spec §3), as job rows are
+// (job_row_table_name_borrowed.rs): apply routes a record's effect by table
+// name, so any `Row` whose `TABLE` is "charpente.events" writes the rows every
+// subscription's feed is read from. Each app-facing write refuses such a type
+// in a `const` block, so the error is a post-monomorphization one: `cargo
+// build` and `cargo test` report it (and trybuild builds here, since this
+// suite has pass cases), `cargo check` does not, and it fires for the writes
+// the binary can reach — which is why `main` mounts both routes, as an app
+// does. The rows carry whatever bytes the handler chooses.
+use std::io;
+
+use charpente::auth::Principal;
+use charpente::core::table::{IndexDef, Row, Unscoped};
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Scoped, Tenant, Tx, route, routes, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+struct Feed {
+    id: Id<Feed>,
+    bytes: Vec<u8>,
+}
+
+impl Row for Feed {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "charpente.events";
+    const INDEXES: &'static [IndexDef<Feed>] = &[];
+    fn id(&self) -> Id<Feed> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Feed> {
+        Ok(Feed {
+            id: Id::from_raw(0),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+struct OrgFeed {
+    id: Id<OrgFeed>,
+    bytes: Vec<u8>,
+}
+
+impl Row for OrgFeed {
+    type Scope = Org;
+    const TABLE: &'static str = "charpente.events";
+    const INDEXES: &'static [IndexDef<OrgFeed>] = &[];
+    fn id(&self) -> Id<OrgFeed> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<OrgFeed> {
+        Ok(OrgFeed {
+            id: Id::from_raw(0),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+#[route(POST "/feed/:event", public)]
+fn publish(tx: &mut Tx, event: Id<Feed>) -> Result<(), ApiError> {
+    tx.put(&Feed {
+        id: event,
+        bytes: Vec::new(),
+    });
+    tx.delete::<Feed>(Id::from_raw(event.raw() + 1));
+    Ok(())
+}
+
+#[route(POST "/orgs/:org/feed/:event", auth)]
+fn publish_in(tx: &mut Tx, org: Id<Org>, event: Id<OrgFeed>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.put(&OrgFeed {
+        id: event,
+        bytes: Vec::new(),
+    });
+    tx.delete::<OrgFeed>(Id::from_raw(event.raw() + 1));
+    Ok(())
+}
+
+fn main() {
+    let _ = routes![publish, publish_in];
+}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/schema_version_table_name_borrowed.rs`, the
+same shape for the migration record:
+
+```rust
+// Schema-version rows are the platform's by TABLE NAME, not only by type
+// (tenancy-completion spec §3), as job rows are
+// (job_row_table_name_borrowed.rs): apply routes a record's effect by table
+// name, and a Put on "charpente.schema_versions" is what the migration gate
+// reads a table's version and resume point from — so any `Row` with that
+// `TABLE` could skip a table's migration. Each app-facing write refuses such
+// a type in a `const` block, a post-monomorphization error that `cargo build`
+// and `cargo test` report and `cargo check` does not, for the writes the
+// binary can reach — which is why `main` mounts both routes, as an app does.
+use std::io;
+
+use charpente::auth::Principal;
+use charpente::core::table::{IndexDef, Row, Unscoped};
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Scoped, Tenant, Tx, route, routes, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+struct Versions {
+    id: Id<Versions>,
+    bytes: Vec<u8>,
+}
+
+impl Row for Versions {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "charpente.schema_versions";
+    const INDEXES: &'static [IndexDef<Versions>] = &[];
+    fn id(&self) -> Id<Versions> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Versions> {
+        Ok(Versions {
+            id: Id::from_raw(0),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+struct OrgVersions {
+    id: Id<OrgVersions>,
+    bytes: Vec<u8>,
+}
+
+impl Row for OrgVersions {
+    type Scope = Org;
+    const TABLE: &'static str = "charpente.schema_versions";
+    const INDEXES: &'static [IndexDef<OrgVersions>] = &[];
+    fn id(&self) -> Id<OrgVersions> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<OrgVersions> {
+        Ok(OrgVersions {
+            id: Id::from_raw(0),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+#[route(POST "/versions/:row", public)]
+fn adopt(tx: &mut Tx, row: Id<Versions>) -> Result<(), ApiError> {
+    tx.put(&Versions {
+        id: row,
+        bytes: Vec::new(),
+    });
+    tx.delete::<Versions>(Id::from_raw(row.raw() + 1));
+    Ok(())
+}
+
+#[route(POST "/orgs/:org/versions/:row", auth)]
+fn adopt_in(tx: &mut Tx, org: Id<Org>, row: Id<OrgVersions>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.put(&OrgVersions {
+        id: row,
+        bytes: Vec::new(),
+    });
+    tx.delete::<OrgVersions>(Id::from_raw(row.raw() + 1));
+    Ok(())
+}
+
+fn main() {
+    let _ = routes![adopt, adopt_in];
+}
+```
+
+Run at the Task 7 commit (foreground):
+
+```zsh
+cargo test -p charpente-macros --test trybuild 2>&1 | grep -E "event_row_|schema_version_|Expected test case to fail"
+```
+
+Expected, the red to quote in the report: all four files compile, and trybuild says of each
+"Expected test case to fail to compile, but it succeeded." Today `EventRow` and `SchemaVersion`
+are `Unscoped`, so both `WritableRow` and the name check admit them. Every other case still
+passes.
+
+- [ ] **Step 2: Pin the refusal texts, and see the unit test fail at the Task 7 commit**
+
+`refuse_platform_table` is a `const fn`, and in an app its `panic!` is a build error. Called at
+run time, the same `panic!` unwinds with the same text, so a unit test can read each table's
+refusal directly. Today its only oracle is the E0080 trybuild pin: 13 of the 17 MISSED mutants
+in the job-tenancy T9 mutation run were in it and `is_platform_table` (LEDGER, "T9-R9, the
+`--test-package` trap").
+
+In `crates/charpente-core/src/db.rs`, `mod tests`, after `a_refusal_debugs_as_its_bare_text`:
+
+```rust
+    /// The text `refuse` panics with for `table`, or `None` when it admits
+    /// the table. The refusals are `const fn`s whose `panic!` is a build
+    /// error in an app; called here at run time, the same `panic!` unwinds
+    /// with the same text.
+    fn refusal_text(refuse: fn(&str), table: &str) -> Option<String> {
+        std::panic::catch_unwind(|| refuse(table))
+            .err()
+            .map(|payload| match payload.downcast::<&'static str>() {
+                Ok(text) => (*text).to_string(),
+                Err(payload) => *payload
+                    .downcast::<String>()
+                    .expect("a refusal panics with its text"),
+            })
+    }
+
+    /// Spec §3: each platform table's write refusal names that table and its
+    /// one write path, and a name that is not a platform table's, however
+    /// close, is admitted. Literals spelled apart from the source's
+    /// continuation lines, so a reflowed literal that changed a word is red.
+    #[test]
+    fn each_platform_table_name_is_refused_by_its_own_text() {
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.jobs").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows \
+                 are the platform's: only the enqueue family writes one, because the \
+                 dispatcher runs a job in the tenant its row names; give this table a name of \
+                 its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, \
+                 or `tx.enqueue_in` from a `cross_tenant` route or job)"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.events").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.events\", the platform's event log — event \
+                 rows are the platform's: only an emit writes one, because every \
+                 subscription's feed is read from them; give this table a name of its own, \
+                 and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` \
+                 of the tenant it belongs to)"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.schema_versions").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.schema_versions\", the platform's migration \
+                 record — schema-version rows are the platform's: only a table's first write \
+                 and `Db::migrate_schema` write one, because the migration gate trusts them \
+                 for each table's version and a migration's resume point; give this table a \
+                 name of its own, and change a table's version by declaring it \
+                 (`#[table(version = N)]` with its `TableMigration`), which the kernel \
+                 migrates at startup"
+            )
+        );
+        for table in [
+            "Invoice",
+            "charpente",
+            "charpente.job",
+            "charpente.jobs2",
+            "charpente.event",
+            "Charpente.Jobs",
+            "",
+        ] {
+            assert_eq!(
+                refusal_text(refuse_platform_table, table),
+                None,
+                "{table:?} is not a platform table's name, so an app may use it"
+            );
+        }
+    }
+```
+
+Run at the Task 7 commit:
+
+```zsh
+cargo test -p charpente-core --lib each_platform_table_name_is_refused_by_its_own_text
+```
+
+Expected, the red to quote: it fails at the second `assert_eq!`, with `left: None` and `right:
+Some("this Row's TABLE is \"charpente.events\", …")`. The jobs text passes: it is today's.
+
+- [ ] **Step 3: Pin the schema-version record, and see it GREEN at the Task 7 commit**
+
+This test pins bytes that must not move. It is green before the door exists, and must stay
+green after it. Its red comes from the mutations in Step 9.
+
+In `crates/charpente-core/tests/migrations.rs`, after
+`migration_commits_exactly_one_migrate_put_per_row_across_overlapping_scopes`, add:
+
+```rust
+/// Every `SchemaVersion` Put in `frames`, as `(tag, table, row bytes)`. It
+/// walks every effect of a migration record: an unscoped (`0x00`) or scoped
+/// (`0x05`) Put, or a `MigratePut` (`0x04` unscoped, `0x07` scoped). A
+/// migration record carries nothing else, so any other tag is a loud panic
+/// rather than a misread field boundary (`count_migrate_puts`' rule).
+fn schema_version_puts(frames: &[(u64, Vec<u8>)]) -> Vec<(u8, String, Vec<u8>)> {
+    let mut puts = Vec::new();
+    for (seq, payload) in frames {
+        let input = &mut &payload[..];
+        let n = u32::decode(input).unwrap();
+        for _ in 0..n {
+            let tag = u8::decode(input).unwrap();
+            match tag {
+                0x00 | 0x05 => {
+                    let table = String::decode(input).unwrap();
+                    if tag == 0x05 {
+                        let _scope = u64::decode(input).unwrap();
+                    }
+                    let row = Vec::<u8>::decode(input).unwrap();
+                    if table == SchemaVersion::TABLE {
+                        puts.push((tag, table, row));
+                    }
+                }
+                0x04 => {
+                    let _table = String::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                }
+                0x07 => {
+                    let _table = String::decode(input).unwrap();
+                    let _scope = u64::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                }
+                other => panic!(
+                    "schema_version_puts: record {seq} carries effect tag {other:#04x}, which a \
+                     migration record never does"
+                ),
+            }
+        }
+        assert!(
+            input.is_empty(),
+            "schema_version_puts: record {seq} has {} bytes left after its {n} effects — a \
+             tag's field layout above disagrees with db.rs's wire format",
+            input.len()
+        );
+    }
+    puts
+}
+
+/// `SchemaVersion` is the platform's (tenancy-completion spec §3): `Tx::put`
+/// refuses it, and `Db::migrate_table` writes its watermark and close-out
+/// through the crate-private `Tx::put_schema_version`. That door must write
+/// the record `tx.put` wrote before it existed: an unscoped (`0x00`) Put of
+/// the row's codec bytes, one per migration batch and one at the close-out.
+/// Green before the door existed; it pins that nothing moved.
+#[test]
+fn migrate_schema_records_each_schema_version_as_an_unscoped_put() {
+    let sim = Sim::with_faults(0x2EB7_6001, FaultConfig::none());
+    seed_scoped_v1(&sim, 4, &[0, 1, 2]);
+    let schema = Schema::new()
+        .table::<ScopedWidgetV2>()
+        .migration::<ScopedWidgetV2>("ScopedWidget");
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig {
+            migration_batch_size: 5,
+            ..cfg()
+        },
+        schema,
+    )
+    .unwrap();
+    let before = db.last_applied().map_or(0, |s| s + 1);
+    db.migrate_schema().unwrap();
+
+    // Twelve rows in (scope, id) order, five per batch: each batch's
+    // watermark is its last row, then the close-out bumps the version.
+    let expected: Vec<(u8, String, Vec<u8>)> = [
+        (1, Some((1, 0)), Some(2)),
+        (1, Some((2, 1)), Some(2)),
+        (1, Some((2, 3)), Some(2)),
+        (2, None, None),
+    ]
+    .into_iter()
+    .map(|(version, migrating_through, migrating_to)| {
+        let mut bytes = Vec::new();
+        Row::encode_row(
+            &SchemaVersion {
+                id: schema_version_id("ScopedWidget"),
+                table: "ScopedWidget".to_string(),
+                version,
+                fingerprint: 0x8282,
+                migrating_through,
+                migrating_to,
+            },
+            &mut bytes,
+        );
+        (0x00, "charpente.schema_versions".to_string(), bytes)
+    })
+    .collect();
+    let frames = db.read_log(before, usize::MAX).unwrap();
+    assert_eq!(
+        schema_version_puts(&frames),
+        expected,
+        "migrate_schema's schema-version writes moved: each must be the unscoped Put `tx.put` \
+         wrote, byte for byte"
+    );
+}
+```
+
+Run at the Task 7 commit:
+
+```zsh
+cargo test -p charpente-core --test migrations migrate_schema_records_each_schema_version_as_an_unscoped_put
+```
+
+Expected: `1 passed`. If it fails here, the expected rows are wrong, not the code: `tx.put` is
+still the writer. Stop and report the diff. Do not adjust the code to fit the test.
+
+- [ ] **Step 4: Ship `migrate_apply.rs`'s schema-version rows, and see it green at the Task 7 commit**
+
+`migrate_put_overwrites_without_indexing_then_close_out_rebuilds` writes its migration marker and
+its close-out with `tx.put(&SchemaVersion { … })` (`:100`, `:144` at e749823), which stops
+compiling in Step 5. They become hand-encoded `0x00` records shipped through
+`Db::apply_shipped`, the way `migrations.rs`'s `scoped_widget_adoption_record` (`:1063`) builds
+one. `apply_shipped` is the follower apply path, one of the three the design requires to rebuild
+identically, so the test's property does not change.
+
+In the module doc, replace:
+
+```text
+//! own `--cfg test` compilation. `Tx::migrate_put` is `pub(crate)` and so
+//! unreachable from here, so the one migration record is hand-encoded (the
+//! frozen tag-4 wire shape) and driven through the public `Db::apply_shipped`
+```
+
+with:
+
+```text
+//! own `--cfg test` compilation. `Tx::migrate_put` is `pub(crate)` and so
+//! unreachable from here, and `SchemaVersion` is the platform's, so `Tx::put`
+//! refuses it: the migration records are hand-encoded (the frozen tag-4
+//! `MigratePut` and tag-0 Put wire shapes) and driven through the public `Db::apply_shipped`
+```
+
+After `migrate_put_record`, add:
+
+```rust
+// A one-effect unscoped Put (`0x00`) of a `SchemaVersion` row, hand-encoded
+// to the frozen wire shape (`db::encode_record`): `[n=1: u32 le][tag=0]
+// [table: u32 len + bytes][row: u32 len + bytes]`. `SchemaVersion` is the
+// platform's, so `Tx::put` refuses it; this ships the row the way a follower
+// receives the migration executor's.
+fn schema_version_record(row: &SchemaVersion) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    row.encode_row(&mut bytes);
+    let mut out = Vec::new();
+    1u32.encode(&mut out);
+    out.push(0);
+    (SchemaVersion::TABLE.len() as u32).encode(&mut out);
+    out.extend_from_slice(SchemaVersion::TABLE.as_bytes());
+    (bytes.len() as u32).encode(&mut out);
+    out.extend_from_slice(&bytes);
+    out
+}
+
+// Applies one hand-encoded record at the next log position, through the
+// follower apply path.
+fn ship(db: &mut Db, record: Vec<u8>) {
+    let next = db.last_applied().map_or(0, |l| l + 1);
+    db.apply_shipped(&[(next, record)]).unwrap();
+}
+```
+
+In `migrate_put_overwrites_without_indexing_then_close_out_rebuilds`, replace everything from
+`// Seed: one Widget keyed "old"` down to the end of the `apply_shipped` call (`:93-118`) with:
+
+```rust
+    // Seed: one Widget keyed "old", and the in-flight migration marker for
+    // its table (migrating_to Some, version still at the old value). The
+    // marker is the platform's row, so it is shipped, not put.
+    db.transact(|tx: &mut Tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(7),
+            key: "old".to_string(),
+        });
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    ship(
+        &mut db,
+        schema_version_record(&SchemaVersion {
+            id: schema_version_id("Widget"),
+            table: "Widget".to_string(),
+            version: 1,
+            fingerprint: 0,
+            migrating_through: Some((0, 7)),
+            migrating_to: Some(2),
+        }),
+    );
+
+    // Apply the decode-free migration write: row 7's bytes become "new".
+    ship(
+        &mut db,
+        migrate_put_record("Widget", 7, &widget_bytes(7, "new")),
+    );
+```
+
+and replace the close-out's `db.transact(…)` (`:141-154`) with:
+
+```rust
+    // Close out the migration: a SchemaVersion Put clearing migrating_to and
+    // bumping the version. This must rebuild Widget's indexes at apply.
+    ship(
+        &mut db,
+        schema_version_record(&SchemaVersion {
+            id: schema_version_id("Widget"),
+            table: "Widget".to_string(),
+            version: 2,
+            fingerprint: 0,
+            migrating_through: None,
+            migrating_to: None,
+        }),
+    );
+```
+
+The Widget put stays a `tx.put`: `Widget` is the app's table.
+
+```zsh
+cargo test -p charpente-core --test migrate_apply
+```
+
+Expected at the Task 7 commit: `2 passed`. The marker used to share the Widget's record, and now
+has a record of its own. The property is about apply, so that makes no difference.
+
+- [ ] **Step 5: Core — the two scopes, `PLATFORM_TABLES`, the refusals, and the schema door**
+
+These edits land together: once `SchemaVersion` is `PlatformOwned`, core's own
+`tx.put(&crate::migration::SchemaVersion { … })` in `migrate_table` stops compiling.
+
+`crates/charpente-core/src/event.rs`. Replace the comment and the first line of the impl:
+
+```rust
+// Manual impl: core cannot use the #[table] macro (macros depend on core).
+impl Row for EventRow {
+    type Scope = crate::table::Unscoped;
+```
+
+with:
+
+```rust
+// Manual impl: core cannot use the #[table] macro (macros depend on core).
+// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code writes one — `Tx::put`/`Tx::delete` refuse it at compile time, since
+// every subscription's feed is read from these rows. Apply writes one per
+// emit effect, and nothing else does (tenancy-completion spec §3).
+impl Row for EventRow {
+    type Scope = crate::table::PlatformOwned;
+```
+
+`crates/charpente-core/src/migration.rs`. Replace:
+
+```rust
+impl Row for SchemaVersion {
+    type Scope = crate::table::Unscoped;
+```
+
+with:
+
+```rust
+// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code writes one — `Tx::put`/`Tx::delete` refuse it at compile time, since
+// the migration gate trusts these rows for each table's version and a
+// migration's resume point. First-write adoption (`Group::stage`) and the
+// migration executor (`Tx::put_schema_version`) write them (tenancy-completion
+// spec §3).
+impl Row for SchemaVersion {
+    type Scope = crate::table::PlatformOwned;
+```
+
+`crates/charpente-core/src/db.rs`. Replace everything from the doc comment above
+`PLATFORM_TABLES` through the end of `refuse_platform_table` (`:816-860` at e749823) with:
+
+```rust
+/// The tables only the platform writes, by name: the job queue, the event
+/// log and the migration record. Each one's own type is refused by
+/// `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a record's
+/// effect by TABLE NAME, so any other `Row` whose `TABLE` borrows one of
+/// these would write rows the platform trusts: the dispatcher a job's
+/// tenant, every subscription its feed, the migration gate a table's
+/// version. The app-facing writes (`Tx::put`/`delete`, `ScopedTx::put`/
+/// `delete`) refuse such a type in a `const` block. That refusal is a
+/// post-monomorphization error: `cargo build` and `cargo test` report it at
+/// the app's call site, and `cargo check`, which never monomorphizes, does
+/// not. No binary that performs the write can be built. Sealing another
+/// platform table is its name here, its `type Scope = PlatformOwned`, and an
+/// arm of its own in `refuse_platform_table` and under `AppWritable`.
+const PLATFORM_TABLES: [&str; 3] = [
+    JobRow::TABLE,
+    EventRow::TABLE,
+    crate::migration::SchemaVersion::TABLE,
+];
+
+/// Which of `PLATFORM_TABLES` `table` names, by index, or `None` for a table
+/// of the app's own. A whole-name match: `charpente.jobs2` is not
+/// `charpente.jobs`.
+const fn platform_table(table: &str) -> Option<usize> {
+    let table = table.as_bytes();
+    let mut i = 0;
+    while i < PLATFORM_TABLES.len() {
+        let name = PLATFORM_TABLES[i].as_bytes();
+        if name.len() == table.len() {
+            let mut j = 0;
+            while j < name.len() && name[j] == table[j] {
+                j += 1;
+            }
+            if j == name.len() {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `PLATFORM_TABLES`' refusal, evaluated in a `const` block per written row
+/// type, so it fails the build rather than a request. Each text names the
+/// table it matched and the one way that table's rows are written.
+const fn refuse_platform_table(table: &str) {
+    match platform_table(table) {
+        None => {}
+        Some(0) => panic!(
+            "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
+             platform's: only the enqueue family writes one, because the dispatcher runs a job \
+             in the tenant its row names; give this table a name of its own, and run a job by \
+             enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
+             `cross_tenant` route or job)"
+        ),
+        Some(1) => panic!(
+            "this Row's TABLE is \"charpente.events\", the platform's event log — event rows are \
+             the platform's: only an emit writes one, because every subscription's feed is read \
+             from them; give this table a name of its own, and publish an event by emitting it \
+             (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+        ),
+        Some(2) => panic!(
+            "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+             — schema-version rows are the platform's: only a table's first write and \
+             `Db::migrate_schema` write one, because the migration gate trusts them for each \
+             table's version and a migration's resume point; give this table a name of its \
+             own, and change a table's version by declaring it (`#[table(version = N)]` with \
+             its `TableMigration`), which the kernel migrates at startup"
+        ),
+        Some(_) => panic!(
+            "PLATFORM_TABLES names a table refuse_platform_table has no text for — give it an \
+             arm of its own"
+        ),
+    }
+}
+```
+
+The jobs arm's literal is today's, line for line, so its text is unchanged. GUIDE §6 pins it,
+and so does `job_row_table_name_borrowed.stderr`'s message line.
+
+In `Tx::put`'s doc, replace:
+
+```text
+    /// The same bound refuses a platform row (`JobRow`), and the `const`
+    /// block refuses any other row type whose `TABLE` borrows a platform
+    /// table's name (`PLATFORM_TABLES`).
+```
+
+with:
+
+```text
+    /// The same bound refuses a platform row (`JobRow`, `EventRow`,
+    /// `SchemaVersion`), and the `const` block refuses any other row type
+    /// whose `TABLE` borrows a platform table's name (`PLATFORM_TABLES`).
+```
+
+After `settle_job`, add:
+
+```rust
+    /// The migration executor's write of a table's schema-version row: its
+    /// watermark while a migration runs, and its close-out when it ends
+    /// (`Db::migrate_table`). `Tx::put` refuses `SchemaVersion` at compile
+    /// time, because the migration gate trusts these rows for each table's
+    /// version and a migration's resume point. This is `put`'s body without
+    /// that bound, and crate-private, so no app code reaches it. Its record is
+    /// the one `tx.put` wrote before the seal, byte for byte (`migrations.rs`,
+    /// `migrate_schema_records_each_schema_version_as_an_unscoped_put`).
+    pub(crate) fn put_schema_version(&mut self, row: &crate::migration::SchemaVersion) {
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        self.effects
+            .overlay
+            .entry(crate::migration::SchemaVersion::TABLE)
+            .or_default()
+            .insert((UNSCOPED, row.id.raw()), Some(bytes));
+    }
+```
+
+In `Db::migrate_table` (re-locate by symbol: S2 edited `migrate_schema`, its caller), the two
+writes change door:
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+old = "tx.put(&crate::migration::SchemaVersion {"
+new = "tx.put_schema_version(&crate::migration::SchemaVersion {"
+assert s.count(old) == 2, f"expected migrate_table's two schema-version puts, found {s.count(old)}"
+s = s.replace(old, new)
+open(p, "w").write(s)
+EOF
+grep -c "put_schema_version(&crate::migration::SchemaVersion {" crates/charpente-core/src/db.rs
+grep -rn "put(&crate::migration::SchemaVersion\|put(&SchemaVersion" crates/charpente-core/src
+```
+
+Expected: `2`, then no output.
+
+`crates/charpente-core/src/table.rs`. Replace `PlatformOwned`'s doc (`:298-310` at e749823)
+with:
+
+```rust
+/// The scope marker of the platform's tables: `charpente.jobs`, whose rows
+/// the dispatcher trusts for a job's tenant (job-tenancy spec §6),
+/// `charpente.events`, which every subscription's feed is read from, and
+/// `charpente.schema_versions`, which the migration gate trusts for each
+/// table's version (tenancy-completion spec §3). Keyed like `Unscoped`, by
+/// bare id, and read like it (`NoTenant` holds, so `View` reads it). What it
+/// withholds is the write: `Tx::put`/`Tx::delete` bound `R: WritableRow`,
+/// which a row of this scope fails, by name. Only the platform writes one:
+/// the enqueue family and the dispatcher's `Tx::settle_job` a job row, apply
+/// an event row, first-write adoption and `Tx::put_schema_version` a
+/// schema-version row.
+///
+/// `#[doc(hidden)]` so rustc's "the trait is implemented for" hint under
+/// `NoTenant`'s diagnostic keeps naming `Unscoped` alone: this is not a
+/// scope an app table can take. Sealing another platform table is its
+/// `type Scope = PlatformOwned`, its name in `db.rs`'s `PLATFORM_TABLES`,
+/// and its own text there and under `AppWritable`.
+```
+
+In `AppWritable`'s doc, replace:
+
+```text
+/// Job rows are the platform's because the dispatcher trusts `JobRow.scope`
+/// for the tenant a scoped job runs in: a row that app code could write would
+/// run a job in any tenant, with no principal and no declaration (job-tenancy
+/// final review C1). SEALED by `AppOwned`, which only `Unscoped` carries.
+```
+
+with:
+
+```text
+/// Job rows are the platform's because the dispatcher trusts `JobRow.scope`
+/// for the tenant a scoped job runs in: a row that app code could write would
+/// run a job in any tenant, with no principal and no declaration (job-tenancy
+/// final review C1). Event rows are the platform's because every
+/// subscription's feed is read from them, so a forged one reaches another
+/// tenant's subscriber. Schema-version rows are the platform's because the
+/// migration gate trusts them, so a forged one skips a table's migration
+/// (tenancy-completion spec §3). One bound refuses all three row types, and
+/// rustc cannot pick a note by type, so the diagnostic carries one note per
+/// table, each naming its own. SEALED by `AppOwned`, which only `Unscoped`
+/// carries.
+```
+
+and in its attribute, after the jobs `note = "…tx.enqueue_in::<Org>(scope, job, cap);"`, add
+two notes, so the attribute ends:
+
+```rust
+            tx.enqueue_in::<Org>(scope, job, cap);",
+    note = "event rows are the platform's: only an emit writes one, because every \
+            subscription's feed is read from them — to publish an event, emit it with \
+            `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant \
+            it belongs to",
+    note = "schema-version rows are the platform's: only a table's first write and \
+            `Db::migrate_schema` write one, because the migration gate trusts them for each \
+            table's version and a migration's resume point — to change a table's version, \
+            declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel \
+            migrates at startup"
+)]
+pub trait AppWritable<R>: sealed::AppOwned {}
+```
+
+rustc renders each `note =` as its own `= note:` line (checked in scratch on rustc 1.95.0).
+
+In `unscoped_open_err`'s doc, replace:
+
+```text
+/// open is unreachable by this disagreement (`EventRow::Scope` is
+/// `Unscoped` at compile time and its only writer, `materialize_event`,
+```
+
+with:
+
+```text
+/// open is unreachable by this disagreement (`EventRow::Scope` is
+/// `PlatformOwned`, keyed as `Unscoped` is, and its only writer, `materialize_event`,
+```
+
+In `row_is_scoped`'s doc, replace:
+
+```text
+/// `PlatformOwned` is keyed exactly as `Unscoped` is: it seals writes, not
+/// the key, so `charpente.jobs` stores byte-identically to before the seal.
+```
+
+with:
+
+```text
+/// `PlatformOwned` is keyed exactly as `Unscoped` is: it seals writes, not
+/// the key, so `charpente.jobs`, `charpente.events` and
+/// `charpente.schema_versions` store byte-identically to before the seal.
+```
+
+```zsh
+cargo check -p charpente-core
+```
+
+Expected: exit 0.
+
+- [ ] **Step 6: `engine.rs` — the stand-in, and a type-level pin**
+
+`an_ordinary_table_is_unscoped_by_default` uses `SchemaVersion` as its stand-in, which is no
+longer `Unscoped`. Replace it and its doc (`:454-466` at e749823) with:
+
+```rust
+/// Task 2 (tenant scoping): `Row::Scope` defaults every existing table to
+/// `Unscoped`, byte-identically. `engine.rs` has no `#[table]` type of its
+/// own to test against (`#[table]` emits `::charpente::` paths and core
+/// cannot depend on that crate), so this uses this file's hand-written
+/// `Widget` as the stand-in the brief's comment calls for ("any existing
+/// #[table] type in the test module works here"). It used `JobRow`, then
+/// `SchemaVersion`, until each became the platform's (`PlatformOwned`).
+#[test]
+fn an_ordinary_table_is_unscoped_by_default() {
+    fn assert_unscoped<R: Row<Scope = Unscoped>>() {}
+    assert_unscoped::<Widget>();
+}
+
+/// The platform's three tables share the scope that seals them
+/// (tenancy-completion spec §3). A type-level pin: it stops compiling, not
+/// running, if one of them goes back to `Unscoped`. The refusal an app meets
+/// is pinned by the `job_row_*`, `event_row_*` and `schema_version_*`
+/// compile-fail fixtures in `charpente-macros`.
+#[test]
+fn the_platform_tables_are_platform_owned() {
+    fn assert_platform<R: Row<Scope = PlatformOwned>>() {}
+    assert_platform::<JobRow>();
+    assert_platform::<EventRow>();
+    assert_platform::<SchemaVersion>();
+}
+```
+
+In the imports, add `use charpente_core::event::EventRow;` after the `engine` import, and add
+`PlatformOwned` to the `charpente_core::table::{…}` list. `a_job_row_is_still_read_through_view`
+stays as it is until Task 9.
+
+- [ ] **Step 7: Run core**
+
+```zsh
+cargo test -p charpente-core --lib each_platform_table_name_is_refused_by_its_own_text
+cargo test -p charpente-core --test migrations migrate_schema_records_each_schema_version_as_an_unscoped_put
+cargo test -p charpente-core --test migrate_apply
+cargo test -p charpente-core --test engine
+```
+
+Expected: all green. The first was red in Step 2, the next two were green at the Task 7 commit
+and still are. That means `put_schema_version` wrote Step 3's bytes.
+
+- [ ] **Step 8: Regenerate the trybuild pins, and review every line**
+
+```zsh
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild
+git status --short crates/charpente-macros/tests
+```
+
+Expected `git status`: exactly four new `.stderr` files beside Step 1's four new `.rs` files, and
+five modified `.stderr` files. Any other file listed is a finding: stop.
+- New: `event_row_written_on_bare_tx.stderr`, `schema_version_written_on_bare_tx.stderr`,
+  `event_row_table_name_borrowed.stderr`, `schema_version_table_name_borrowed.stderr`.
+- Modified: the four typed `job_row_*_on_bare_tx.stderr` and `job_row_table_name_borrowed.stderr`.
+
+Review the new files against the contract, the site and the fix (hard rule 5):
+- `event_row_written_on_bare_tx.stderr`: two `error[E0277]: \`EventRow\` rows are the
+  platform's, and app code cannot write them`, one at `tx.put(row)` and one at
+  `tx.delete::<EventRow>(id)`. Each has the label "`EventRow` is written only by the platform"
+  and the three notes: jobs, events, schema versions. It also has
+  `= note: required for \`EventRow\` to implement \`WritableRow\`` and the bound in
+  `Tx::<'a>::put`/`delete`.
+- `schema_version_written_on_bare_tx.stderr`: the same two errors for `SchemaVersion`.
+- `event_row_table_name_borrowed.stderr`: four `error[E0080]: evaluation panicked: this Row's
+  TABLE is "charpente.events", the platform's event log — …`. They are, in order,
+  `Tx::<'_>::put::<Feed>`, `Tx::<'_>::delete::<Feed>`, `ScopedTx::<'_, '_, Org>::put::<OrgFeed>`
+  and `ScopedTx::<'_, '_, Org>::delete::<OrgFeed>`, each with its `the above error was
+  encountered while instantiating` note at the fixture's call line.
+- `schema_version_table_name_borrowed.stderr`: the same four for `Versions`/`OrgVersions`, with
+  the schema-versions text.
+
+Review the re-pins by `git diff`:
+- Each of the four typed `job_row_*` files gains exactly two lines, after the jobs note's last
+  line `tx.enqueue_in::<Org>(scope, job, cap);`:
+
+  ```text
+     = note: event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
+     = note: schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
+  ```
+
+  Nothing else in those files moves.
+- `job_row_table_name_borrowed.stderr`: the four `error[E0080]: evaluation panicked: this Row's
+  TABLE is "charpente.jobs", …` lines are unchanged, as is every `note:` line. Only the quoted
+  `panic!(…)` source block under `::: $WORKSPACE/crates/charpente-core/src/db.rs` changes, four
+  times: it now opens `Some(0) => panic!(`, and its indentation follows the `match` arm.
+
+`crates/charpente-macros/tests/trybuild.rs` globs the directory, so there is no list to update.
+
+```zsh
+cargo test -p charpente-macros --test trybuild
+```
+
+Expected: green.
+
+- [ ] **Step 9: Prove red by mutation**
+
+Commit nothing yet. Save the implementation:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff crates/charpente-core/src > $D/task8-impl.patch
+```
+
+Apply each mutation alone, run its command, record the red, then restore with
+`git checkout crates/charpente-core/src && git apply $D/task8-impl.patch`:
+1. `event.rs`: `type Scope = crate::table::Unscoped;`. Run
+   `cargo test -p charpente-macros --test trybuild`. Expected: `event_row_written_on_bare_tx`
+   reports "Expected test case to fail to compile, but it succeeded". `engine.rs` stops
+   compiling too: that is the type-level pin, and it is not the red to quote.
+2. `migration.rs`: `type Scope = crate::table::Unscoped;`. Same command. Expected:
+   `schema_version_written_on_bare_tx` compiles and is reported the same way.
+3. `refuse_platform_table`: the `Some(1)` arm becomes `Some(1) => {}`. Run
+   `cargo test -p charpente-core --lib each_platform_table_name_is_refused_by_its_own_text`.
+   Expected: red at the events assertion (`left: None`). The trybuild run reports
+   `event_row_table_name_borrowed` compiling.
+4. The `Some(2)` arm becomes `Some(2) => {}`. Same unit test. Expected: red at the
+   schema-versions assertion.
+5. `platform_table`: `if name.len() == table.len() {` becomes `if name.len() <= table.len() {`.
+   Same unit test. Expected: red in the loop, on `"charpente.jobs2"`: `left:
+   Some("this Row's TABLE is \"charpente.jobs\", …")`, `right: None`.
+6. `put_schema_version`: encode `&crate::migration::SchemaVersion { fingerprint: row.fingerprint
+   ^ 1, ..row.clone() }` in place of `row`. Run
+   `cargo test -p charpente-core --test migrations migrate_schema_records_each_schema_version_as_an_unscoped_put`.
+   Expected: red at its `assert_eq!` ("migrate_schema's schema-version writes moved: …"), with
+   four differing row byte vectors.
+7. `put_schema_version`: add `self.effects.scoped_tables.insert(crate::migration::SchemaVersion::TABLE);`
+   before the overlay insert. Same test. Expected: red at `db.migrate_schema().unwrap()`. The
+   record now carries a scoped Put (`0x05`), and apply refuses it: `record decode: table
+   "charpente.schema_versions" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect
+   carries scope 0 (tag 0x05/0x06) — …`.
+
+Mutations 6 and 7 were run when this plan was drafted, on a copy of e749823 with this task
+applied, and failed exactly as above. Its trybuild overwrite produced exactly Step 8's file
+set and diffs.
+
+Every mutation must be red. A green one is an unpinned property: stop and report it, and do not
+weaken the mutation. Then run `git diff --stat crates/charpente-core/src` and confirm it matches
+the saved patch.
+
+- [ ] **Step 10: Docs**
+
+Each `old` below must match exactly once. If one does not, an earlier task reworded it. Stop and
+re-locate by the quoted sentence; never force the edit.
+
+```zsh
+python3 - <<'EOF'
+edits = {
+"docs/GUIDE.md": [
+("""`Db::open` registers one table of its own before yours — the platform's job
+queue, `charpente.jobs` — so registering that table yourself hits the same
+panic.""",
+"""`Db::open` registers three tables of its own before yours — the job queue
+`charpente.jobs`, the event log `charpente.events` and the migration record
+`charpente.schema_versions` — so registering any of them yourself hits the same
+panic. They are the platform's: no transaction writes one (§6, "Job rows are the
+platform's")."""),
+("""`Db::open`, including registering `Session`, `ApiKey`, or `charpente.jobs`
+yourself (`App::open`/`Db::open` already register those).""",
+"""`Db::open`, including registering `Session`, `ApiKey`, or one of the platform's
+tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`) yourself
+(`App::open`/`Db::open` already register those)."""),
+("""enqueue family creates a job row, and only the dispatcher settles one. There is no
+app-side cancel either: a job runs until it is Done or Dead. rustc prints this, with your
+row type in place of `<row>`:""",
+"""enqueue family creates a job row, and only the dispatcher settles one. There is no
+app-side cancel either: a job runs until it is Done or Dead. The platform's two other
+tables are sealed against writes the same way. The event log (`EventRow`, §11) is what
+every subscription's feed is read from, so only an emit writes an event row. The
+migration record (`SchemaVersion`, §12) is what the migration gate trusts for each table's
+version, so only a table's first write and `Db::migrate_schema` write one. rustc prints
+this for a write of any of the three, with your row type in place of `<row>`, and one note
+per table, since one bound refuses all three:"""),
+("""or from a `cross_tenant` route or job, naming the tenant:
+    tx.enqueue_in::<Org>(scope, job, cap);
+```""",
+"""or from a `cross_tenant` route or job, naming the tenant:
+    tx.enqueue_in::<Org>(scope, job, cap);
+event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
+schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
+```"""),
+("""The seal is on the table's name as well as its type, because apply routes a write by
+table name. A hand-written `Row` whose `TABLE` is `"charpente.jobs"` fails to build at
+each write the binary can reach, and rustc names the call site. It is a
+post-monomorphization error, so `cargo build` and `cargo test` report it, and `cargo
+check` does not:""",
+"""The seal is on the table's name as well as its type, because apply routes a write by
+table name. A hand-written `Row` whose `TABLE` is one of the three names fails to build
+at each write the binary can reach, and rustc names the call site and the table. It is a
+post-monomorphization error, so `cargo build` and `cargo test` report it, and `cargo
+check` does not:"""),
+("""cross_tenant` route or job)
+```""",
+"""cross_tenant` route or job)
+this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
+this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
+```"""),
+("""`tx.put` or `tx.delete` of a `JobRow` does not compile (§6, "Job rows are the
+platform's"). So a bare `Tx` cannot move a job into another tenant, forge one
+there, or cancel one there.""",
+"""`tx.put` or `tx.delete` of a `JobRow` does not compile (§6, "Job rows are the
+platform's"). So a bare `Tx` cannot move a job into another tenant, forge one
+there, or cancel one there. Nor is there one through the event log: `tx.put` or
+`tx.delete` of an `EventRow` does not compile either (§6), so no handler publishes,
+into a tenant's feed, an event no emit made there."""),
+("""are built on them; what is sealed is *writing* a job row (§6).""",
+"""are built on them; what is sealed is *writing* one — a job row, an event row or a
+schema-version row (§6)."""),
+],
+"DESIGN.md": [
+("""`Tx::settle_job`, which takes a `TenantAdmission` only a `Group` mints.""",
+"""`Tx::settle_job`, which takes a `TenantAdmission` only a `Group` mints. The event log and
+  the migration record are sealed against writes the same way (spec
+  2026-09-30-tenancy-completion §3): `EventRow` and `SchemaVersion` are `PlatformOwned` and
+  named in `PLATFORM_TABLES`, so an app can forge neither an event into a tenant's feed nor a
+  table's version past its migration. Apply writes an event row from an emit effect, and the
+  migration executor writes schema-version rows through the crate-private
+  `Tx::put_schema_version`, whose record is the one `tx.put` wrote."""),
+("""open; what is sealed is writing a job row (§3's Jobs bullet).""",
+"""open; what is sealed is writing one — a job row, an event row or a schema-version row
+  (§3's Jobs bullet)."""),
+],
+}
+for path, pairs in edits.items():
+    s = open(path).read()
+    for old, new in pairs:
+        n = s.count(old)
+        assert n == 1, f"{path}: expected 1 match, found {n}: {old[:70]!r}"
+        s = s.replace(old, new)
+    open(path, "w").write(s)
+print("docs edited")
+EOF
+grep -c "charpente.schema_versions\", the platform's migration record" docs/GUIDE.md
+```
+
+Expected: `docs edited`, then `1`.
+
+Two of the old strings deserve a note:
+- The sixth (`cross_tenant\` route or job)` followed by a closing fence) is the tail of §6's
+  second pinned block. It is unique because the job-queue refusal is quoted once in GUIDE.
+- The DESIGN §3 match (`…only a \`Group\` mints.`) sits mid-bullet. The appended sentences keep
+  the bullet's two-space continuation indent.
+
+`PINNED_FLOOR` does not change. Both pinned blocks in §6 grew by lines, and `doc_truth` checks
+every ≥16-character fragment of the new lines against the corpus (the new literals in `db.rs`
+and `table.rs`).
+
+```zsh
+cargo build -p guide-examples
+cargo test -p guide-examples --no-fail-fast
+```
+
+Expected: both green, `doc_truth` included.
+
+- [ ] **Step 11: Baselines**
+
+Storage did not move, and no fault stream changed, so every Task 1 baseline must reproduce.
+Foreground, one call per test binary:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task8 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task8 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task8 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task8 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task8 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task8 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label prints `reproduces the base`, and every call prints `exit 0`. The two
+`migrations*` labels are the ones this task could move: their executor now writes through
+`put_schema_version`. A moved line anywhere is a finding: stop.
+
+- [ ] **Step 12: Gate and commit**
+
+Foreground, one command per tool call:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo fmt --all --check; echo "fmt exit $?"
+cargo clippy --workspace --all-targets -- -D warnings; echo "clippy exit $?"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --lib 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test kernel 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test realtime 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test archive 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test replication 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test describe 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente-sim --no-fail-fast 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p charpente-cli --no-fail-fast --test restore 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $D/gate-task-8.log | grep -E "^test result|FAILED"
+grep -c "^test result:" $D/gate-task-8.log
+grep -c "^test result: ok" $D/gate-task-8.log
+grep -c FAILED $D/gate-task-8.log
+```
+
+Green means:
+- fmt and clippy exit 0;
+- the two counts are equal;
+- the last command prints `0`. It exits 1 when it matches nothing. That is the green case here,
+  not a broken check.
+
+The packages that store events or schema versions (archive, replication, restore) and the ones
+that migrate at startup (kernel, invoicing) are in the list for that reason. The controller's
+full workspace gate follows.
+
+Re-check `git status --short` and `git log -1`. Then:
+
+```zsh
+git add crates/charpente-core/src/event.rs crates/charpente-core/src/migration.rs \
+  crates/charpente-core/src/db.rs crates/charpente-core/src/table.rs \
+  crates/charpente-core/tests/migrations.rs crates/charpente-core/tests/migrate_apply.rs \
+  crates/charpente-core/tests/engine.rs \
+  crates/charpente-macros/tests/compile_fail/event_row_written_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/event_row_written_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/schema_version_written_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/schema_version_written_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/event_row_table_name_borrowed.rs \
+  crates/charpente-macros/tests/compile_fail/event_row_table_name_borrowed.stderr \
+  crates/charpente-macros/tests/compile_fail/schema_version_table_name_borrowed.rs \
+  crates/charpente-macros/tests/compile_fail/schema_version_table_name_borrowed.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_forged_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_deleted_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_redirected_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_untenanted_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_table_name_borrowed.stderr \
+  docs/GUIDE.md DESIGN.md
+git commit -m "feat(tenancy): EventRow and SchemaVersion are the platform's — PlatformOwned, in PLATFORM_TABLES, each refusal names its table and write path; migrate_table writes through Tx::put_schema_version, record byte-identical (pinned); 4 new compile-fail pins, <N> re-pinned; <M>/7 mutations red; <K> of <K> gate lines ok; 11 baselines reproduce"
+```
+
+---
+
+### Task 9: Platform tables — a transaction does not read them
+
+Spec §3, "App reads". After Task 8 no app code writes a platform table, but any transaction still
+reads one. `tx.scan::<JobRow>()` returns every tenant's job payloads and the tenant each one runs
+in. `tx.scan_from::<EventRow>(…)` returns every tenant's events. Both compile in any handler, and
+through a `ScopedTx`'s explicit deref. This task makes each an unsatisfied bound whose text names
+the table and the operator's path, `db.snapshot()`. `Snapshot` keeps reading every table.
+
+The trait shape is the contract's with one change, which the appendix "Evidence for Task 9's read seal"
+measures: `PlatformOwned`'s impl is written for a sealed
+`Operator` reader marker, which only `Snapshot` carries, rather than for `Snapshot` directly.
+Written the contract's way, rustc prints `the trait bound PlatformOwned: Tenant is not
+satisfied` in place of the text.
+
+Three things read a platform table through a `Tx` today, and each moves:
+- The dispatcher reads its batch's job rows inside `group.stage`
+  (`crates/charpente/src/kernel/dispatch.rs:268`, `:424` at e749823). It moves to a new
+  admission-gated door, `Tx::get_job` (A12). Four operator-side test reads that
+  already hold an admission move with it (`crates/charpente/tests/kernel.rs:3656`, `:3663`;
+  `crates/charpente/tests/replication.rs:8027`, `:8233`).
+- The job-tenancy oracle reads the queue inside its admitted group
+  (`crates/charpente/tests/kernel.rs:4695`). It moves to `db.snapshot()`, taken just before the
+  group, over the same committed image.
+- `enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch`
+  (`crates/charpente/tests/group_commit.rs:2010-2129`, seed `0x60C1_0007`) pins DESIGN §2's
+  group-commit visibility sentence through two handlers that scan `JobRow` and `EventRow`.
+  Those handlers can no longer exist. The property still exists at the platform level, where
+  the dispatcher reads the queue inside a batch, so it is re-pinned in
+  `crates/charpente-core/tests/group_commit.rs` through `Tx::get_job`, and DESIGN §2's
+  sentence is rewritten (amendment A14).
+
+A hand-written `Row` whose `TABLE` borrows a platform name, with `Scope = Unscoped`, would still
+meet `View`'s bounds. So `Tx`'s four `View` reads also evaluate `refuse_platform_read(R::TABLE)`
+in a `const` block, the read twin of Task 8's write refusal (amendment A13).
+
+Byte identity: reads draw nothing from the fault stream, and no record changes. Every Task 1
+baseline must reproduce. `job-tenancy` is the one to watch, because its oracle's read moves.
+
+**Files:**
+- Modify `crates/charpente-core/src/table.rs`:
+  - `mod sealed`: `ReadScope` and `Operator` (new), and the module doc;
+  - `ScopeReadableBy`, its three impls, the seal impls and `ReadableBy` (new, before `View`);
+  - `View`: its doc, and each method's bound gains `+ ReadableBy<Self>`;
+  - `impl View for Snapshot` becomes `impl Snapshot { pub(crate) fn get_any/scan_any/scan_by_any/scan_from_any }`
+    plus a `View` impl that delegates to them;
+  - the docs of `PlatformOwned` and `WritableRow`.
+- Modify `crates/charpente-core/src/db.rs`:
+  - the `crate::table` import gains `ReadableBy`;
+  - `refuse_platform_read` (new, after `refuse_platform_table`);
+  - `Tx::get_any` (new, private) and `Tx::get_job` (new, `pub`), after `put_schema_version`;
+  - `impl View for Tx<'_>` (`:1234-1315` at e749823): the bounds, a `const` refusal per method,
+    and the snapshot reads through `*_any`;
+  - `mod tests`: `each_platform_table_name_is_refused_for_a_read_by_its_own_text`.
+- Modify `crates/charpente-core/src/job.rs`: `JobRow`'s doc and the comment above its `Row` impl.
+- Modify `crates/charpente-core/src/event.rs` and `crates/charpente-core/src/migration.rs`: the
+  comments Task 8 wrote above each `Row` impl ("no app code writes one" becomes "reads or writes").
+- Modify `crates/charpente/src/kernel/dispatch.rs`: both `tx.get(Id::<JobRow>::from_raw(id))?`
+  become `tx.get_job(Id::from_raw(id), &admission)?`, and two comments.
+- Test:
+  - `crates/charpente-core/tests/group_commit.rs`: `Ping` (new job), and
+    `an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits` and
+    `the_dispatchers_job_read_sees_a_settle_staged_earlier_in_its_batch` (new);
+  - `crates/charpente-core/tests/engine.rs`: `a_job_row_is_still_read_through_view` becomes
+    `a_platform_row_is_read_through_a_snapshot`;
+  - `crates/charpente/tests/kernel.rs`: `:3656`, `:3663` move to `get_job`, and
+    `job_tenancy::jobs_stay_in_their_tenant` reads the queue through `db.snapshot()`;
+  - `crates/charpente/tests/replication.rs`: `:8027`, `:8233` move to `get_job`;
+  - `crates/charpente/tests/group_commit.rs`: the "Step 5b.2" section (`Tick`, `QuietJob`, four
+    routes and the test) is deleted, with its now-unused imports.
+- Create in `crates/charpente-macros/tests/`, each compile-fail file with its `.stderr`:
+  - compile-fail: `job_row_read_on_bare_tx.rs`, `event_row_read_on_bare_tx.rs`,
+    `schema_version_read_on_bare_tx.rs`, `platform_rows_read_through_a_scoped_deref.rs`,
+    `platform_table_names_borrowed_for_reads.rs`;
+  - compile-pass: `view_reads_the_apps_own_tables.rs`.
+- Modify in `compile_fail/`:
+  - `job_row_table_name_borrowed.rs`: its routes build the row they forge instead of reading
+    it. A read's E0277 is a type-check error, and it would stop the build before the four
+    post-monomorphization E0080s the file pins.
+  - `job_row_redirected_on_bare_tx.rs` and `job_row_untenanted_on_bare_tx.rs`: the header
+    comments. Their read now fails too, and they keep it on purpose.
+- Re-pin in `compile_fail/`: `scoped_read_from_bare_tx.stderr` (the quoted `View::scan` line
+  only, amendment A15), `job_row_redirected_on_bare_tx.stderr` and
+  `job_row_untenanted_on_bare_tx.stderr` (a read error before the write error),
+  `job_row_table_name_borrowed.stderr` (line numbers and the two quoted `put` lines only).
+- Modify `crates/guide-examples/tests/doc_truth.rs`: `PINNED_FLOOR` rises by two, from the value
+  it holds when this task starts, with a line in its doc comment. It was 28 at e749823, and
+  Tasks 2-8 may have raised it, so the Step 11 script reads it rather than assuming it.
+- Docs:
+  - `docs/GUIDE.md`:
+    - §3 (the platform's three tables are registered by `Db::open`);
+    - §4 (`Tx implements View`);
+    - §6 ("Job rows are the platform's");
+    - §16: the introduction's parenthetical, "The compile errors" (a rendered read error and
+      the paragraph's tail), and "Where the guarantee stops". There the platform-tables
+      paragraph is replaced by one that says the guarantee covers them, with two new pinned
+      blocks (the bound's text and the borrowed-name read refusals) and the Sessions/API-keys
+      ruling (spec §2 ruling 6: app-owned `#[table(global)]`, unsealed).
+  - `DESIGN.md`:
+    - §2 (the group-commit visibility paragraph);
+    - §3's **Jobs** bullet;
+    - §8's Multi-tenancy bullet: "Three limits" becomes "Two limits", and the platform-tables
+      limit becomes the boundary sentence plus the Sessions/API-keys ruling.
+
+**Interfaces:**
+- Consumes:
+  - Task 8: `PlatformOwned` on all three tables, `platform_table`, `refusal_text`,
+    `put_schema_version`.
+  - Task 7: `TenantAdmission<'g>`, `Group::tenant_admission`; `settle_job`'s
+    `let TenantAdmission(_) = admission;`.
+  - Task 2: `Tenant::NAME` (every new fixture's `impl Tenant` carries `const NAME`).
+  - Task 1: the baselines.
+- Produces:
+  - `pub trait ScopeReadableBy<V: ?Sized, R>: sealed::ReadScope {}`, implemented for
+    `Unscoped` (every `V`), every `S: Tenant` (every `V`), and `PlatformOwned` for
+    `V: sealed::Operator` (only `Snapshot` is one).
+  - `pub trait ReadableBy<V: ?Sized>: Row {}`, with the single blanket
+    `impl<R: Row, V: ?Sized> ReadableBy<V> for R where R::Scope: ScopeReadableBy<V, R> {}`.
+  - `View`'s four methods: `R: UnscopedRow + ReadableBy<Self>`.
+  - `pub(crate) fn Snapshot::{get_any, scan_any, scan_by_any, scan_from_any}`, bounded
+    `R: UnscopedRow` only.
+  - `pub fn Tx::get_job(&self, id: Id<JobRow>, admission: &TenantAdmission<'_>) -> io::Result<Option<JobRow>>`.
+  - The read diagnostic, fixed:
+    - message: "`{R}` is one of the platform's tables, and a transaction does not read it"
+    - label: "`{R}` is read through `Db::snapshot`, never through a transaction"
+    - note: "the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the
+      migration record (`SchemaVersion`) — are the platform's own state, and the first two hold
+      every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db`
+      reads them through a snapshot:\n    db.snapshot()?.scan::<{R}>()?"
+    - note: "a route that shows a job's progress or an event's history reads a table of the
+      app's own, written in the same transaction as the enqueue or the emit, or subscribes to
+      the events"
+  - `refuse_platform_read`'s texts, fixed:
+    - jobs: "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction
+      does not read the platform's tables, because the queue holds every tenant's job payloads
+      and the tenant each one runs in; give this table a name of its own, and read the queue
+      through `db.snapshot()` from code that holds the `Db`"
+    - events: "this Row's TABLE is \"charpente.events\", the platform's event log — a
+      transaction does not read the platform's tables, because the log holds every tenant's
+      events; give this table a name of its own, and read the log through `db.snapshot()` from
+      code that holds the `Db`, or subscribe to its events"
+    - schema versions: "this Row's TABLE is \"charpente.schema_versions\", the platform's
+      migration record — a transaction does not read the platform's tables, because the record
+      is the migration gate's own state; give this table a name of its own, and read the record
+      through `db.snapshot()` from code that holds the `Db`"
+
+  Every text above is one line.
+
+- [ ] **Step 1: Pin the read refusals and their positive control, and see the refusals compile at the Task 8 commit**
+
+Create `crates/charpente-macros/tests/compile_fail/job_row_read_on_bare_tx.rs`:
+
+```rust
+// The job queue is the platform's to read as well as to write
+// (tenancy-completion spec §3). It holds every tenant's job payloads and the
+// tenant each job runs in, so a handler that could scan it would list another
+// tenant's work, and one that could `get` a row would read a payload it was
+// never handed. Both reads are refused, and the note names the operator's
+// path: a snapshot, from code that holds the `Db`.
+use charpente::core::job::JobRow;
+use charpente::http::ApiError;
+use charpente::{Id, Tx, View, route};
+
+#[route(GET "/jobs", public)]
+fn list_jobs(tx: &mut Tx) -> Result<(), ApiError> {
+    let _every_tenants_jobs = tx.scan::<JobRow>()?;
+    Ok(())
+}
+
+#[route(GET "/jobs/:job", public)]
+fn peek_job(tx: &mut Tx, job: Id<JobRow>) -> Result<(), ApiError> {
+    let _row = tx.get(job)?;
+    Ok(())
+}
+
+fn main() {}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/event_row_read_on_bare_tx.rs`:
+
+```rust
+// The event log is the platform's to read (tenancy-completion spec §3). It
+// holds every tenant's events, so a handler that could page through it would
+// read another tenant's feed with no subscription. A subscription is the
+// app's read of its events; the log itself is refused, whichever `View` read
+// names it. (`EventRow` declares no index: the bound refuses the `scan_by`
+// before that could matter.)
+use charpente::core::event::EventRow;
+use charpente::http::ApiError;
+use charpente::{Id, Tx, View, route};
+
+#[route(GET "/activity/:after", public)]
+fn activity(tx: &mut Tx, after: Id<EventRow>) -> Result<(), ApiError> {
+    let _page = tx.scan_from::<EventRow>(after.raw() + 1, 50)?;
+    Ok(())
+}
+
+#[route(GET "/events/:event", public)]
+fn one_event(tx: &mut Tx, event: Id<EventRow>) -> Result<(), ApiError> {
+    let _row = tx.get::<EventRow>(event)?;
+    Ok(())
+}
+
+#[route(GET "/events/paid", public)]
+fn paid_events(tx: &mut Tx) -> Result<(), ApiError> {
+    let _paid = tx.scan_by::<EventRow>("name", &"InvoicePaid".to_string())?;
+    Ok(())
+}
+
+fn main() {}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/schema_version_read_on_bare_tx.rs`:
+
+```rust
+// The migration record is the platform's to read (tenancy-completion spec
+// §3): it is the migration gate's own state, which the kernel rewrites at
+// startup, and a handler that branched on it would read a version the gate
+// may be about to change. Both reads are refused.
+use charpente::core::migration::{SchemaVersion, schema_version_id};
+use charpente::http::ApiError;
+use charpente::{Tx, View, route};
+
+#[route(GET "/schema", public)]
+fn schema(tx: &mut Tx) -> Result<(), ApiError> {
+    let _versions = tx.scan::<SchemaVersion>()?;
+    let _invoices = tx.get(schema_version_id("Invoice"))?;
+    Ok(())
+}
+
+fn main() {}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/platform_rows_read_through_a_scoped_deref.rs`:
+
+```rust
+// Opening a tenant's scope does not open the platform's tables
+// (tenancy-completion spec §3). A `ScopedTx` reaches a bare `Tx` through its
+// explicit deref, for the app's global tables
+// (compile_pass/scoped_read_through_scoped_tx.rs), and there the platform's
+// three are refused exactly as on a bare `Tx`.
+use charpente::auth::Principal;
+use charpente::core::event::EventRow;
+use charpente::core::job::JobRow;
+use charpente::core::migration::SchemaVersion;
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Scoped, Tenant, Tx, View, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[route(GET "/orgs/:org/platform", auth)]
+fn platform(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<(), ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    let _jobs = (*tx).scan::<JobRow>()?;
+    let _event = (*tx).get::<EventRow>(Id::from_raw(0))?;
+    let _versions = (*tx).scan::<SchemaVersion>()?;
+    Ok(())
+}
+
+fn main() {}
+```
+
+Create `crates/charpente-macros/tests/compile_fail/platform_table_names_borrowed_for_reads.rs`:
+
+```rust
+// Amendment A13: the read seal is on the table's name as well as its type, as
+// the write seal is (job_row_table_name_borrowed.rs). An app `Row` whose
+// `TABLE` borrows a platform table's name, with `Scope = Unscoped`, meets
+// `View`'s bounds, so `Tx`'s reads refuse it in a `const` block. That is a
+// post-monomorphization error, which `cargo build` and `cargo test` report
+// and `cargo check` does not, for the reads the binary can reach — which is
+// why `main` mounts every route. One route per `View` read, so each read's
+// refusal is pinned.
+use std::io;
+
+use charpente::core::table::{Codec, IndexDef, Row, Unscoped};
+use charpente::http::ApiError;
+use charpente::{Id, Tx, View, route, routes};
+
+struct Queue {
+    id: Id<Queue>,
+    bytes: Vec<u8>,
+}
+
+fn queue_by_bytes(row: &Queue, out: &mut Vec<u8>) {
+    row.bytes.encode(out);
+}
+
+impl Row for Queue {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "charpente.jobs";
+    const INDEXES: &'static [IndexDef<Queue>] = &[IndexDef {
+        name: "by_bytes",
+        key: queue_by_bytes,
+    }];
+    fn id(&self) -> Id<Queue> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Queue> {
+        Ok(Queue {
+            id: Id::from_raw(0),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+struct Feed {
+    id: Id<Feed>,
+    bytes: Vec<u8>,
+}
+
+impl Row for Feed {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "charpente.events";
+    const INDEXES: &'static [IndexDef<Feed>] = &[];
+    fn id(&self) -> Id<Feed> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Feed> {
+        Ok(Feed {
+            id: Id::from_raw(0),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+struct Versions {
+    id: Id<Versions>,
+    bytes: Vec<u8>,
+}
+
+impl Row for Versions {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "charpente.schema_versions";
+    const INDEXES: &'static [IndexDef<Versions>] = &[];
+    fn id(&self) -> Id<Versions> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Versions> {
+        Ok(Versions {
+            id: Id::from_raw(0),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+#[route(GET "/queue", public)]
+fn queue(tx: &mut Tx) -> Result<(), ApiError> {
+    let _all = tx.scan::<Queue>()?;
+    Ok(())
+}
+
+#[route(GET "/queue/empty", public)]
+fn empty_payloads(tx: &mut Tx) -> Result<(), ApiError> {
+    let _empty = tx.scan_by::<Queue>("by_bytes", &Vec::<u8>::new())?;
+    Ok(())
+}
+
+#[route(GET "/feed/:event", public)]
+fn feed(tx: &mut Tx, event: Id<Feed>) -> Result<(), ApiError> {
+    let _one = tx.get(event)?;
+    Ok(())
+}
+
+#[route(GET "/versions", public)]
+fn versions(tx: &mut Tx) -> Result<(), ApiError> {
+    let _page = tx.scan_from::<Versions>(0, 10)?;
+    Ok(())
+}
+
+fn main() {
+    let _ = routes![queue, empty_payloads, feed, versions];
+}
+```
+
+Create `crates/charpente-macros/tests/compile_pass/view_reads_the_apps_own_tables.rs`:
+
+```rust
+// Positive control for the platform-table read seal (tenancy-completion spec
+// §3): it refuses the platform's three tables and nothing else. Code generic
+// over the reader — GUIDE §2's `invoices_for_org`, every `#[index]`
+// accessor — still reads an app's global table through a `Tx` and a
+// `Snapshot` alike; a scoped route still reads a global table through its
+// `ScopedTx`'s deref; and a snapshot, the operator's read, still reads all
+// three platform tables.
+use charpente::auth::Principal;
+use charpente::core::event::EventRow;
+use charpente::core::job::JobRow;
+use charpente::core::migration::SchemaVersion;
+use charpente::http::{ApiError, Ctx};
+use charpente::{Db, Id, Scoped, Tenant, Tx, View, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[table(global)]
+struct Invoice {
+    id: Id<Invoice>,
+    #[index]
+    org: Id<Org>,
+    amount_cents: i64,
+}
+
+fn invoices_for_org(view: &impl View, org: Id<Org>) -> std::io::Result<Vec<Invoice>> {
+    Invoice::by_org(view, &org)
+}
+
+fn in_a_handler(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<Vec<Invoice>, ApiError> {
+    let mut invoices = invoices_for_org(&*tx, org)?;
+    let tx = tx.scope::<Org>(org, ctx)?;
+    invoices.extend((*tx).scan::<Invoice>()?);
+    Ok(invoices)
+}
+
+fn as_the_operator(db: &Db, org: Id<Org>) -> std::io::Result<usize> {
+    let snap = db.snapshot()?;
+    let invoices = invoices_for_org(&snap, org)?;
+    let jobs = snap.scan::<JobRow>()?;
+    let events = snap.scan_from::<EventRow>(0, 100)?;
+    let versions = snap.scan::<SchemaVersion>()?;
+    Ok(invoices.len() + jobs.len() + events.len() + versions.len())
+}
+
+fn main() {
+    let _ = (in_a_handler, as_the_operator);
+}
+```
+
+Run at the Task 8 commit:
+
+```zsh
+cargo test -p charpente-macros --test trybuild 2>&1 | grep -E "_read_on_bare_tx|read_through_a_scoped_deref|borrowed_for_reads|view_reads_the_apps_own_tables|Expected test case to fail"
+```
+
+Expected, the red to quote: each of the five compile-fail files compiles, and trybuild says of
+each "Expected test case to fail to compile, but it succeeded". A transaction reads every
+platform table today. `view_reads_the_apps_own_tables.rs` passes. It is green before and after
+this task by design: it is the over-refusal guard.
+
+- [ ] **Step 2: Pin the read texts and the job reads inside a batch**
+
+Both tests below name API this task adds, so they cannot run red first. Their red is Step 10's
+mutations.
+
+In `crates/charpente-core/src/db.rs`, `mod tests`, after Task 8's
+`each_platform_table_name_is_refused_by_its_own_text`:
+
+```rust
+    /// Amendment A13: a `Row` that borrows a platform table's name is refused
+    /// for a read as for a write, and each table's text names that table and
+    /// the operator's path. Literals spelled apart from the source's.
+    #[test]
+    fn each_platform_table_name_is_refused_for_a_read_by_its_own_text() {
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.jobs").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a \
+                 transaction does not read the platform's tables, because the queue holds \
+                 every tenant's job payloads and the tenant each one runs in; give this table \
+                 a name of its own, and read the queue through `db.snapshot()` from code that \
+                 holds the `Db`"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.events").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.events\", the platform's event log — a \
+                 transaction does not read the platform's tables, because the log holds every \
+                 tenant's events; give this table a name of its own, and read the log through \
+                 `db.snapshot()` from code that holds the `Db`, or subscribe to its events"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.schema_versions").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.schema_versions\", the platform's migration \
+                 record — a transaction does not read the platform's tables, because the \
+                 record is the migration gate's own state; give this table a name of its own, \
+                 and read the record through `db.snapshot()` from code that holds the `Db`"
+            )
+        );
+        for table in ["Invoice", "charpente.jobs2", "charpente.event", "Charpente.Events", ""] {
+            assert_eq!(
+                refusal_text(refuse_platform_read, table),
+                None,
+                "{table:?} is not a platform table's name, so an app may read it"
+            );
+        }
+    }
+```
+
+In `crates/charpente-core/tests/group_commit.rs`: add `Job` to the
+`charpente_core::db::{…}` import, add `use charpente_core::job::{JobRow, JobStatus};`, and append:
+
+```rust
+/// A job with no payload, for the two tests below, which read the job queue
+/// inside a batch the way the dispatcher does.
+struct Ping;
+
+impl Codec for Ping {
+    fn encode(&self, _out: &mut Vec<u8>) {}
+    fn decode(_input: &mut &[u8]) -> io::Result<Ping> {
+        Ok(Ping)
+    }
+}
+
+impl Job for Ping {
+    const NAME: &'static str = "ping";
+    const FINGERPRINT: u64 = 0x7C00_0900;
+    type Scope = Unscoped;
+}
+
+/// DESIGN §2: the group overlay carries rows only. An enqueue is a log effect
+/// that becomes a `JobRow` at APPLY, with the id the `next_job_id` counter
+/// assigns there, so a transaction staged behind it in the same batch cannot
+/// see it — and no transaction can look, except the dispatcher's
+/// `Tx::get_job`. This was pinned from two handlers that scanned the queue
+/// and the event log (`charpente/tests/group_commit.rs`, seed `0x60C1_0007`)
+/// until no transaction could read either (tenancy-completion spec §3).
+#[test]
+fn an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits() {
+    let mut db = fresh_db(0x7C00_0901);
+    let mut g = db.begin_group().expect("group");
+    let admission = g.tenant_admission();
+    g.stage(|tx| {
+        tx.enqueue(Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("the enqueue stages");
+    let seen = g
+        .stage(|tx| {
+            tx.get_job(Id::from_raw(0), &admission)
+                .map_err(|e| e.to_string())
+        })
+        .expect("the read stages");
+    assert!(
+        seen.is_none(),
+        "an enqueue staged earlier in this batch must be invisible to a later sibling: job rows \
+         materialize at apply, so no staged transaction can see one — got {:?}",
+        seen.map(|row| (row.id.raw(), row.name))
+    );
+    assert_eq!(g.len(), 1, "the enqueue is the batch's one record; the read stages none");
+    g.commit().expect("commit");
+    let jobs = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(
+        jobs.iter()
+            .map(|row| (row.id.raw(), row.name.as_str(), row.status))
+            .collect::<Vec<_>>(),
+        vec![(0, "ping", JobStatus::Pending)],
+        "the job DID materialize at apply, once the batch committed"
+    );
+}
+
+/// The dispatcher's failure stage reads a job row again after an earlier
+/// stage of the same batch may have settled it (dispatch.rs, the
+/// retry-policy read), so `Tx::get_job` reads what `View::get` reads: this
+/// transaction's writes, then the group's, then the snapshot.
+#[test]
+fn the_dispatchers_job_read_sees_a_settle_staged_earlier_in_its_batch() {
+    let mut db = fresh_db(0x7C00_0902);
+    db.transact(|tx| {
+        tx.enqueue(Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("the enqueue commits");
+    let mut g = db.begin_group().expect("group");
+    let admission = g.tenant_admission();
+    g.stage(|tx| {
+        let mut row = tx
+            .get_job(Id::from_raw(0), &admission)
+            .map_err(|e| e.to_string())?
+            .expect("the committed enqueue materialized job 0");
+        row.attempts = 1;
+        row.last_error = Some("the relay timed out".to_string());
+        tx.settle_job(&row, &admission);
+        Ok::<_, String>(())
+    })
+    .expect("the settle stages");
+    let seen = g
+        .stage(|tx| {
+            tx.get_job(Id::from_raw(0), &admission)
+                .map_err(|e| e.to_string())
+        })
+        .expect("the read stages")
+        .expect("job 0 exists");
+    assert_eq!(
+        (seen.attempts, seen.last_error.as_deref()),
+        (1, Some("the relay timed out")),
+        "a job read inside a batch must see the settle an earlier stage of that batch made"
+    );
+    g.commit().expect("commit");
+}
+```
+
+Seeds `0x7C00_0901` and `0x7C00_0902` appear nowhere else in the tree
+(`git grep -n "0x7C00_09"` is empty at e749823). Both tests run with `FaultConfig::none()`
+(`fresh_db`), so the seed names the store and nothing else.
+
+- [ ] **Step 3: Core — the read seal (`table.rs`)**
+
+In `mod sealed`, after `pub trait Writable {}`, add:
+
+```rust
+    /// `ScopeReadableBy`'s seal: the scope types the read seal is about.
+    pub trait ReadScope {}
+    /// The readers a platform table admits. `Snapshot` alone carries it.
+    pub trait Operator {}
+```
+
+and in the module's doc, replace:
+
+```text
+/// one that will ever carry `AppOwned` is `Unscoped`, and the only rows that
+/// will ever carry `NotScoped` or `Writable` are the ones whose own
+/// `Row::Scope` earns it.
+```
+
+with:
+
+```text
+/// one that will ever carry `AppOwned` is `Unscoped`, the only ones that will
+/// ever carry `ReadScope` are those two and the app's `Tenant` types, the only
+/// reader that will ever carry `Operator` is `Snapshot`, and the only rows
+/// that will ever carry `NotScoped` or `Writable` are the ones whose own
+/// `Row::Scope` earns it.
+```
+
+Immediately before `View`'s doc comment (`/// Read access to UNSCOPED table state`), add:
+
+```rust
+/// Which readers `V` may read a row of scope `Self` through `View`: the read
+/// half of the seal `PlatformOwned` describes (tenancy-completion spec §3).
+/// An app's own table is readable by every `View`: `Unscoped` for a global
+/// one, and every `S: Tenant` for a scoped one, whose rows `View`'s
+/// `UnscopedRow` bound refuses instead, so that `NoTenant`'s one diagnostic
+/// stays the one rustc prints for a scoped read. A platform table is readable
+/// by a `Snapshot` alone: a `Tx`, and so a handler, a job and a `ScopedTx`'s
+/// deref, cannot name one.
+///
+/// The platform impl is written for the sealed `Operator` reader marker, not
+/// for `Snapshot` directly, and that is load-bearing for the diagnostic. When
+/// only one impl could apply (the tenant blanket), rustc blames its nested
+/// `PlatformOwned: Tenant` and never shows this text; when two could, it
+/// reports this trait. The tenancy-completion plan's Task 9 quotes both.
+///
+/// SEALED by `ReadScope`, which only the scope types above carry.
+#[diagnostic::on_unimplemented(
+    message = "`{R}` is one of the platform's tables, and a transaction does not read it",
+    label = "`{R}` is read through `Db::snapshot`, never through a transaction",
+    note = "the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and \
+            the migration record (`SchemaVersion`) — are the platform's own state, and the \
+            first two hold every tenant's rows, so neither a handler nor a job reads them; \
+            code that holds the `Db` reads them through a snapshot:\n    \
+            db.snapshot()?.scan::<{R}>()?",
+    note = "a route that shows a job's progress or an event's history reads a table of the \
+            app's own, written in the same transaction as the enqueue or the emit, or \
+            subscribes to the events"
+)]
+pub trait ScopeReadableBy<V: ?Sized, R>: sealed::ReadScope {}
+
+impl<V: ?Sized, R> ScopeReadableBy<V, R> for Unscoped {}
+
+impl<V: ?Sized, R, S: crate::db::Tenant> ScopeReadableBy<V, R> for S {}
+
+impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}
+
+impl sealed::ReadScope for Unscoped {}
+impl sealed::ReadScope for PlatformOwned {}
+impl<S: crate::db::Tenant> sealed::ReadScope for S {}
+impl sealed::Operator for Snapshot {}
+
+/// A row the reader `V` may read through `View`, derived from `Row::Scope` by
+/// the one blanket impl below, as `UnscopedRow` is, so there is no second
+/// source of truth. `View`'s four methods bound `R: ReadableBy<Self>`. Code
+/// generic over the reader alone, like every `#[index]` accessor, needs
+/// nothing more, because an app's table is readable by every `View`. Code
+/// generic over the row type as well names it:
+/// `fn all<R: UnscopedRow + ReadableBy<Snapshot>>(snap: &Snapshot)`.
+///
+/// It needs no seal of its own: an app's `impl ReadableBy<Tx<'_>> for Alias
+/// {}` conflicts with the blanket impl (E0119).
+pub trait ReadableBy<V: ?Sized>: Row {}
+
+impl<R: Row, V: ?Sized> ReadableBy<V> for R where R::Scope: ScopeReadableBy<V, R> {}
+```
+
+Replace `View`'s doc comment and declaration, through the trait's closing brace, with:
+
+```rust
+/// Read access to UNSCOPED table state — implemented by `Snapshot` (reads
+/// outside transactions) and `Tx` (reads inside one, which also see the
+/// transaction's own writes). The `#[table]` accessors are generated
+/// against this trait.
+///
+/// Every method bounds `R: UnscopedRow`, so this trait is the whole read
+/// surface for tables that have no tenant, and none of the surface for
+/// tables that do. A scoped table is read through `Snapshot`'s
+/// `get_scoped`/`scan_scoped`/`scan_from_scoped`/`scan_by_scoped`, or — the
+/// one an app writes — `ScopedTx`, which `Tx::open_scope` hands back once the
+/// app's own `Tenant::authorize` has passed. `Tx`'s own scope-taking
+/// primitives are private to `db.rs`; `ScopedTx` is their only caller.
+///
+/// Every method also bounds `R: ReadableBy<Self>`, which an app's own table
+/// meets for every reader, and a platform table (`JobRow`, `EventRow`,
+/// `SchemaVersion`) for `Snapshot` alone: a transaction does not read the
+/// platform's tables (tenancy-completion spec §3). `Tx` reads its snapshot
+/// through `Snapshot`'s crate-private `get_any` and its siblings, which carry
+/// no `ReadableBy` bound, rather than through this trait.
+pub trait View {
+    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>>;
+
+    /// Every row, in id order. A `Vec` for now; iterators when a real
+    /// workload shows the allocation matters.
+    fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
+
+    /// Exact-match secondary index lookup, in id order. Called through the
+    /// typed accessors `#[table]` generates (`Invoice::by_org(...)`).
+    fn scan_by<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>>;
+
+    /// Rows with `id >= from_id`, in id order, at most `limit` — the
+    /// realtime cursor read (`charpente.events` through a `Snapshot`, and any
+    /// app table). A `Vec` for now; see `scan`'s note.
+    fn scan_from<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>>;
+}
+```
+
+`Snapshot`'s `View` impl becomes four crate-private readers with unchanged bodies, and a `View`
+impl that delegates to them. This is a mechanical move (re-locate by symbol; S4 may have touched
+these bodies, and the script keeps whatever they are):
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/table.rs"
+s = open(p).read()
+start = s.index("impl View for Snapshot {\n")
+end = s.index("\n}\n", start) + 3
+block = s[start:end]
+renames = [
+    ("    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {\n",
+     "    pub(crate) fn get_any<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {\n"),
+    ("    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {\n",
+     "    pub(crate) fn scan_any<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {\n"),
+    ("    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {\n",
+     "    pub(crate) fn scan_by_any<R: UnscopedRow>(\n        &self,\n        index_name: &str,\n        key: &impl Codec,\n    ) -> io::Result<Vec<R>> {\n"),
+    ("    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {\n",
+     "    pub(crate) fn scan_from_any<R: UnscopedRow>(\n        &self,\n        from_id: u64,\n        limit: usize,\n    ) -> io::Result<Vec<R>> {\n"),
+    ("            let row = self.get(id)?.unwrap_or_else(|| {\n",
+     "            let row = self.get_any(id)?.unwrap_or_else(|| {\n"),
+]
+for old, new in renames:
+    assert block.count(old) == 1, f"Snapshot's View impl no longer has: {old.strip()}"
+    block = block.replace(old, new)
+doc = (
+    "/// `View`'s four reads without its `ReadableBy` bound, crate-private: the\n"
+    "/// bodies `Snapshot`'s `View` impl delegates to, and the snapshot reads\n"
+    "/// `Tx`'s `View` impl and `Tx::get_job` are built on. A `Tx` read generic\n"
+    "/// over `R: ReadableBy<Tx>` cannot prove `R: ReadableBy<Snapshot>`, so it\n"
+    "/// could not call `View` on its snapshot, and `get_job` reads `JobRow`,\n"
+    "/// which only these reach from inside a transaction.\n"
+)
+block = block.replace("impl View for Snapshot {\n", doc + "impl Snapshot {\n", 1)
+view = '''
+impl View for Snapshot {
+    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        self.get_any(id)
+    }
+
+    fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>> {
+        self.scan_any()
+    }
+
+    fn scan_by<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
+        self.scan_by_any(index_name, key)
+    }
+
+    fn scan_from<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>> {
+        self.scan_from_any(from_id, limit)
+    }
+}
+'''
+s = s[:start] + block + view + s[end:]
+open(p, "w").write(s)
+print("Snapshot readers split")
+EOF
+grep -n "pub(crate) fn \(get\|scan\|scan_by\|scan_from\)_any" crates/charpente-core/src/table.rs
+```
+
+Expected: `Snapshot readers split`, then four lines.
+
+In `PlatformOwned`'s doc (Task 8's text), replace:
+
+```text
+/// table's version (tenancy-completion spec §3). Keyed like `Unscoped`, by
+/// bare id, and read like it (`NoTenant` holds, so `View` reads it). What it
+/// withholds is the write: `Tx::put`/`Tx::delete` bound `R: WritableRow`,
+/// which a row of this scope fails, by name. Only the platform writes one:
+```
+
+with:
+
+```text
+/// table's version (tenancy-completion spec §3). Keyed like `Unscoped`, by
+/// bare id. What it withholds is the transaction. `Tx::put`/`Tx::delete`
+/// bound `R: WritableRow`, which a row of this scope fails, by name.
+/// `View`'s reads bound `R: ReadableBy<Self>`, which it meets for `Snapshot`
+/// alone (`ScopeReadableBy`). `NoTenant` still holds for it, so a `Tx` read
+/// gets `ScopeReadableBy`'s text and never `NoTenant`'s. Only the platform
+/// writes one:
+```
+
+In `WritableRow`'s doc, replace:
+
+```text
+/// seal `PlatformOwned` describes; reads keep `View`'s `UnscopedRow`, so a
+/// transaction still reads `JobRow`. Sealed for `UnscopedRow`'s reason.
+```
+
+with:
+
+```text
+/// seal `PlatformOwned` describes; the read half is `ReadableBy`. Sealed for
+/// `UnscopedRow`'s reason.
+```
+
+- [ ] **Step 4: Core — `Tx`'s reads, the name refusal, and `Tx::get_job` (`db.rs`)**
+
+In the `use crate::table::{…}` import, add `ReadableBy` after `IndexDef`.
+
+After `refuse_platform_table`, add:
+
+```rust
+/// The read twin of `refuse_platform_table` (tenancy-completion amendment A13):
+/// `Tx`'s four `View` reads evaluate it in a `const` block per read row type.
+/// `View`'s `ReadableBy` bound refuses the platform's own row types; this
+/// refuses any other `Row` whose `TABLE` borrows one of their names, which a
+/// bound on the row type cannot see. Post-monomorphization, like the write
+/// refusal: `cargo build` and `cargo test` report it, and `cargo check` does
+/// not.
+const fn refuse_platform_read(table: &str) {
+    match platform_table(table) {
+        None => {}
+        Some(0) => panic!(
+            "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+             does not read the platform's tables, because the queue holds every tenant's job \
+             payloads and the tenant each one runs in; give this table a name of its own, and \
+             read the queue through `db.snapshot()` from code that holds the `Db`"
+        ),
+        Some(1) => panic!(
+            "this Row's TABLE is \"charpente.events\", the platform's event log — a transaction \
+             does not read the platform's tables, because the log holds every tenant's events; \
+             give this table a name of its own, and read the log through `db.snapshot()` from \
+             code that holds the `Db`, or subscribe to its events"
+        ),
+        Some(2) => panic!(
+            "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+             — a transaction does not read the platform's tables, because the record is the \
+             migration gate's own state; give this table a name of its own, and read the record \
+             through `db.snapshot()` from code that holds the `Db`"
+        ),
+        Some(_) => panic!(
+            "PLATFORM_TABLES names a table refuse_platform_read has no text for — give it an arm \
+             of its own"
+        ),
+    }
+}
+```
+
+`impl View for Tx<'_>` gains the bounds, a refusal per method, and reads its snapshot through the
+`*_any` readers. `View::get`'s body moves, unchanged, into a private `Tx::get_any`, which
+`Tx::get_job` shares. Re-locate by symbol; the script keeps the bodies as they are:
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+start = s.index("impl View for Tx<'_> {\n")
+end = s.index("\n}\n", start) + 3
+block = s[start:end]
+get_sig = "    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {\n"
+g0 = block.index(get_sig)
+g1 = block.index("\n    }\n", g0) + len("\n    }\n")
+old_get = block[g0:g1]
+assert old_get.count("None => self.snapshot.get(id),") == 1, "View::get's snapshot fallback moved"
+get_any = (
+    "    /// `View::get`'s read without `View`'s bounds: this transaction's own\n"
+    "    /// writes, then the group's, then the snapshot. Private: `View::get`\n"
+    "    /// (after its refusals) and `Tx::get_job` are its only callers.\n"
+    + old_get.replace(get_sig, "    fn get_any<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {\n")
+    .replace("None => self.snapshot.get(id),", "None => self.snapshot.get_any(id),")
+)
+new_get = (
+    "    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>> {\n"
+    "        const { refuse_platform_read(R::TABLE) };\n"
+    "        self.get_any(id)\n"
+    "    }\n"
+)
+block = block.replace(old_get, new_get)
+pairs = [
+    ("    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {\n",
+     "    fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>> {\n"
+     "        const { refuse_platform_read(R::TABLE) };\n"),
+    ("    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {\n",
+     "    fn scan_by<R: UnscopedRow + ReadableBy<Self>>(\n        &self,\n        index_name: &str,\n        key: &impl Codec,\n    ) -> io::Result<Vec<R>> {\n"
+     "        const { refuse_platform_read(R::TABLE) };\n"),
+    ("    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {\n",
+     "    fn scan_from<R: UnscopedRow + ReadableBy<Self>>(\n        &self,\n        from_id: u64,\n        limit: usize,\n    ) -> io::Result<Vec<R>> {\n"
+     "        const { refuse_platform_read(R::TABLE) };\n"),
+    ("self.snapshot.scan_by::<R>(index_name, key)?", "self.snapshot.scan_by_any::<R>(index_name, key)?"),
+]
+for old, new in pairs:
+    assert block.count(old) == 1, f"Tx's View impl no longer has: {old.strip()}"
+    block = block.replace(old, new)
+assert block.count("self.snapshot.scan::<R>()?") == 2, "scan and scan_from read the snapshot's scan"
+block = block.replace("self.snapshot.scan::<R>()?", "self.snapshot.scan_any::<R>()?")
+s = s[:start] + block + s[end:]
+anchor = "    pub(crate) fn put_schema_version(&mut self, row: &crate::migration::SchemaVersion) {\n"
+a0 = s.index(anchor)
+a1 = s.index("\n    }\n", a0) + len("\n    }\n")
+get_job = '''
+    /// The dispatcher's read of a job row inside its batch: the row a due
+    /// job's attempt runs, and again in the failure stage, which must see what
+    /// an earlier stage of the same batch settled (dispatch.rs, the
+    /// retry-policy read). `View` refuses `JobRow` on a `Tx` at compile time,
+    /// because the queue holds every tenant's payloads and tenants, and
+    /// `Group` exposes no snapshot, so this is the one door. It reads exactly
+    /// as `View::get` does: this transaction's writes, then the group's, then
+    /// the snapshot.
+    ///
+    /// It takes a `TenantAdmission`, which only a `Group` mints, for
+    /// `settle_job`'s reason: no handler and no job's glue holds one, so no
+    /// app code can call this. Operator code that holds a `Group` can.
+    pub fn get_job(
+        &self,
+        id: Id<JobRow>,
+        admission: &TenantAdmission<'_>,
+    ) -> io::Result<Option<JobRow>> {
+        let TenantAdmission(_) = admission;
+        self.get_any(id)
+    }
+
+'''
+s = s[:a1] + get_job + get_any + s[a1:]
+open(p, "w").write(s)
+print("Tx reads sealed")
+EOF
+grep -c "const { refuse_platform_read(R::TABLE) };" crates/charpente-core/src/db.rs
+grep -n "self.snapshot.\(get\|scan\|scan_by\|scan_from\)\(::<R>\)\?(" crates/charpente-core/src/db.rs
+```
+
+Expected: `Tx reads sealed`, then `4`, then no output: no `Tx` read reaches its snapshot through
+`View`. `Tx::get_any` and `Tx::get_job` land after `put_schema_version`, in the
+`impl<'a> Tx<'a>` block.
+
+The three row types' comments say what is now sealed. Each `old` is Task 8's text or e749823's
+(`job.rs`). If an earlier task respelled one, make the same change to the text as it stands:
+
+```zsh
+python3 - <<'EOF'
+edits = {
+    "crates/charpente-core/src/job.rs": [
+("""/// Every transaction can read one (`tx.get`, `tx.scan`), and none can write
+/// one: only the enqueue family creates a job row and only the dispatcher
+/// settles it (`Tx::settle_job`), because the dispatcher opens the tenant
+/// `scope` names without asking anyone.
+""",
+"""/// No transaction reads or writes one (tenancy-completion spec §3). Only the
+/// enqueue family creates a job row, and only the dispatcher reads one inside
+/// a batch (`Tx::get_job`) and settles it (`Tx::settle_job`), because it
+/// opens the tenant `scope` names without asking anyone. Code that holds the
+/// `Db` reads the queue through a snapshot.
+"""),
+("""// `PlatformOwned`, not `Unscoped`: keyed and read as an unscoped table, but
+// no app code can write one — `Tx::put`/`Tx::delete` refuse it at compile
+// time, since the dispatcher trusts `scope` for the tenant a job runs in.
+""",
+"""// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code reads or writes one — `View`'s reads on a `Tx` and `Tx::put`/
+// `Tx::delete` refuse it at compile time, since the queue holds every
+// tenant's payloads and the dispatcher trusts `scope` for the tenant a job
+// runs in.
+"""),
+    ],
+    "crates/charpente-core/src/event.rs": [
+("""// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code writes one — `Tx::put`/`Tx::delete` refuse it at compile time, since
+// every subscription's feed is read from these rows. Apply writes one per
+// emit effect, and nothing else does (tenancy-completion spec §3).
+""",
+"""// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code reads or writes one through a transaction — `View`'s reads on a `Tx`
+// and `Tx::put`/`Tx::delete` refuse it at compile time, since the log holds
+// every tenant's events and every subscription's feed is read from them.
+// Apply writes one per emit effect, nothing else does, and a `Snapshot`
+// reads them (tenancy-completion spec §3).
+"""),
+    ],
+    "crates/charpente-core/src/migration.rs": [
+("""// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code writes one — `Tx::put`/`Tx::delete` refuse it at compile time, since
+// the migration gate trusts these rows for each table's version and a
+// migration's resume point. First-write adoption (`Group::stage`) and the
+// migration executor (`Tx::put_schema_version`) write them (tenancy-completion
+// spec §3).
+""",
+"""// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code reads or writes one through a transaction — `View`'s reads on a `Tx`
+// and `Tx::put`/`Tx::delete` refuse it at compile time, since the migration
+// gate trusts these rows for each table's version and a migration's resume
+// point. First-write adoption (`Group::stage`) and the migration executor
+// (`Tx::put_schema_version`) write them, and a `Snapshot` reads them
+// (tenancy-completion spec §3).
+"""),
+    ],
+}
+for path, pairs in edits.items():
+    s = open(path).read()
+    for old, new in pairs:
+        assert s.count(old) == 1, f"{path}: {old[:70]}"
+        s = s.replace(old, new)
+    open(path, "w").write(s)
+print("row docs updated")
+EOF
+```
+
+```zsh
+cargo check -p charpente-core
+```
+
+Expected: exit 0. Nothing inside core reads a platform table through a `Tx`: every such read is
+`self.snapshot()?…` or `snap.…`, checked with `grep -n "SchemaVersion\|EventRow\|JobRow"
+crates/charpente-core/src/db.rs` when this plan was drafted.
+
+- [ ] **Step 5: The dispatcher and the operator's test reads move to `Tx::get_job`**
+
+Six sites read a job row through `tx.get(Id::<JobRow>::from_raw(…))?` inside a group that
+already minted an admission. They are the whole set: `git grep -n "Id::<JobRow>"` at e749823
+finds exactly these six. The sweep:
+
+```zsh
+python3 - <<'EOF'
+import re
+pat = re.compile(r"\.get\(Id::<JobRow>::from_raw\(([^()]*)\)\)\?")
+expect = {
+    "crates/charpente/src/kernel/dispatch.rs": 2,
+    "crates/charpente/tests/kernel.rs": 2,
+    "crates/charpente/tests/replication.rs": 2,
+}
+for path, n in expect.items():
+    s = open(path).read()
+    s, k = pat.subn(r".get_job(Id::from_raw(\1), &admission)?", s)
+    assert k == n, f"{path}: expected {n} job reads, replaced {k}"
+    open(path, "w").write(s)
+print("6 job reads moved")
+EOF
+cargo fmt --all
+git grep -n "Id::<JobRow>" -- crates examples
+git grep -c "get_job(Id::from_raw(" -- crates/charpente/src/kernel/dispatch.rs crates/charpente/tests/kernel.rs crates/charpente/tests/replication.rs
+```
+
+Expected: `6 job reads moved`; the first grep prints nothing (it exits 1: nothing matched is the
+green case); the second prints `2` for each of the three files. Every site's `admission` is the
+one its group minted a few lines above, the same token its `settle_job` takes.
+
+In `dispatch.rs`, two comments now describe the new door (each `old` must match once; stop if
+not):
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente/src/kernel/dispatch.rs"
+s = open(p).read()
+pairs = [
+("""        // `Tx::settle_job` takes, so the dispatcher's two job-row writes (the
+        // Done mark and the failure record) are ones no app code can make.
+""",
+"""        // `Tx::settle_job` takes, so the dispatcher's two job-row writes (the
+        // Done mark and the failure record) are ones no app code can make. It
+        // is also the token `Tx::get_job` takes, the one read of a job row
+        // inside a batch: no transaction reads the queue otherwise
+        // (tenancy-completion spec §3).
+"""),
+("""                // `row.name` through `tx` here is strictly MORE correct
+                // anyway — `tx` sees this batch's own earlier writes through
+""",
+"""                // `row.name` through `tx.get_job` here is strictly MORE correct
+                // anyway — it sees this batch's own earlier writes through
+"""),
+]
+for old, new in pairs:
+    assert s.count(old) == 1, old[:60]
+    s = s.replace(old, new)
+open(p, "w").write(s)
+print("dispatch comments updated")
+EOF
+```
+
+- [ ] **Step 6: The oracle reads the queue through a snapshot, the handler-level pin moves to core, and the fixtures stop reading**
+
+**`crates/charpente/tests/kernel.rs`, `job_tenancy::jobs_stay_in_their_tenant`.** Replace:
+
+```rust
+        admitted_read(db, |group, admission| {
+            let mut seen = Seen::default();
+            let jobs = group
+                .stage(|tx| tx.scan::<JobRow>().map_err(|e| e.to_string()))
+                .map_err(staged)?;
+            for row in jobs {
+```
+
+with:
+
+```rust
+        // The job queue is the platform's, and no transaction reads it
+        // (tenancy-completion spec §3), so the oracle reads it the operator's
+        // way, through a snapshot. Taken just before the group begins, it is
+        // the image the group's own snapshot holds: nothing commits in
+        // between, since the oracle holds `db`.
+        let jobs = db
+            .snapshot()
+            .and_then(|snap| snap.scan::<JobRow>())
+            .map_err(|e| e.to_string())?;
+        admitted_read(db, |group, admission| {
+            let mut seen = Seen::default();
+            for row in jobs {
+```
+
+and in `admitted_read`'s doc, replace:
+
+```text
+    /// stage reads the group's one snapshot, so the job rows and every
+    /// shop's rows are a single image, and a stage that writes nothing
+```
+
+with:
+
+```text
+    /// stage reads the group's one snapshot, so every shop's rows are one
+    /// image, the one `jobs_stay_in_their_tenant`'s snapshot of the queue saw
+    /// just before, and a stage that writes nothing
+```
+
+The error text does not change on any path. `begin_group`'s first action is the same
+`store.snapshot()` that `Db::snapshot` makes (`db.rs:2787-2796`, `:2809-2811` at e749823), and
+both old and new map an IO error by `e.to_string()`. Reads draw nothing from the sim's fault
+stream, so the universes are the same universes. Step 12's `job-tenancy` baseline is the check.
+
+**`crates/charpente/tests/group_commit.rs`.** Delete the "Step 5b.2" section and the imports
+only it used:
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente/tests/group_commit.rs"
+s = open(p).read()
+start = s.index("// --------------------------------- Step 5b.2: enqueues/emits invisible mid-batch\n")
+end = s.index("// ======================================================================\n// T8b")
+section = s[start:end]
+for must in ["fn enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch()",
+             "struct QuietJob", "fn job_count(", "fn event_count(", "struct Tick"]:
+    assert must in section, must
+s = s[:start] + s[end:]
+for old, new in [
+    ("use charpente::{Schema, Tx, event, job, jobs, route, routes, table};\n",
+     "use charpente::{Schema, Tx, job, jobs, route, routes, table};\n"),
+    ("use charpente_core::event::EventRow;\n", ""),
+]:
+    assert s.count(old) == 1, old
+    s = s.replace(old, new)
+open(p, "w").write(s)
+print("section deleted")
+EOF
+grep -n "EventRow\|event\b\|0x60C1_0007" crates/charpente/tests/group_commit.rs
+```
+
+Expected: `section deleted`, then no output from the grep. At e749823 the section held the only
+uses of `event` and `EventRow` in this file; `JobRow`, `WireU64`, `jobs!` and `routes!` are
+still used elsewhere in it. If Task 1 respelled the `use charpente::{…}` line (it sweeps
+`#[event]` attributes, not imports), fix the first pair's `old` to the line as it stands.
+
+**`crates/charpente-core/tests/engine.rs`.** Replace `a_job_row_is_still_read_through_view` and
+its doc (`:468-478` at e749823) with:
+
+```rust
+/// The platform's tables are read through a `Snapshot` and nothing else
+/// (tenancy-completion spec §3). Each is still an `UnscopedRow`, keyed by
+/// bare id, and `ReadableBy<Snapshot>` holds for it, which §8's oracles and
+/// every operator read rely on. That a `Tx` read of one does not compile is
+/// pinned by the `*_read_on_bare_tx` compile-fail fixtures in
+/// `charpente-macros`, and that `Tx::put`/`delete` refuse it by the
+/// `*_written_on_bare_tx` and `job_row_*` ones.
+#[test]
+fn a_platform_row_is_read_through_a_snapshot() {
+    fn assert_readable<
+        R: charpente_core::table::UnscopedRow + charpente_core::table::ReadableBy<Snapshot>,
+    >() {
+    }
+    assert_readable::<JobRow>();
+    assert_readable::<EventRow>();
+    assert_readable::<SchemaVersion>();
+}
+```
+
+**`crates/charpente-macros/tests/compile_fail/job_row_table_name_borrowed.rs`.** Its two routes
+read the row they forge with `tx.get(job)?`. That read is now a type-check error, which would
+stop the build before the four post-monomorphization E0080s this file pins. Replace the whole
+file with the version below. The only changes are the header's last sentences, the imports
+(`JobStatus` in, `View` out), `forged`, and the two routes' first lines:
+
+```rust
+// Job rows are the platform's by TABLE NAME, not only by type (job-tenancy
+// final review C1): apply routes a record's effect by table name, so any
+// `Row` whose `TABLE` is "charpente.jobs" writes rows the dispatcher trusts.
+// A borrowed-name row forged and cancelled jobs at 79ae1c0. Each app-facing
+// write refuses such a type in a `const` block, so the error is a
+// post-monomorphization one: `cargo build` and `cargo test` report it (and
+// trybuild builds here, since this suite has pass cases), `cargo check`
+// does not, and it fires for the writes the binary can reach — which is why
+// `main` mounts both routes, as an app does. A write nothing reaches is
+// never compiled into the binary, so it can never run either. The routes
+// build the row they forge rather than read it: no transaction reads the
+// queue (job_row_read_on_bare_tx.rs), and a read's type-check error would
+// stop the build before any of these four.
+use std::io;
+
+use charpente::auth::Principal;
+use charpente::core::job::{JobRow, JobStatus};
+use charpente::core::table::{IndexDef, Row, Unscoped};
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Scoped, Tenant, Tx, route, routes, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+struct Queue(JobRow);
+
+impl Row for Queue {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "charpente.jobs";
+    const INDEXES: &'static [IndexDef<Queue>] = &[];
+    fn id(&self) -> Id<Queue> {
+        Id::from_raw(self.0.id.raw())
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.0.encode_row(out)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Queue> {
+        JobRow::decode_row(bytes).map(Queue)
+    }
+}
+
+struct OrgQueue(JobRow);
+
+impl Row for OrgQueue {
+    type Scope = Org;
+    const TABLE: &'static str = "charpente.jobs";
+    const INDEXES: &'static [IndexDef<OrgQueue>] = &[];
+    fn id(&self) -> Id<OrgQueue> {
+        Id::from_raw(self.0.id.raw())
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.0.encode_row(out)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<OrgQueue> {
+        JobRow::decode_row(bytes).map(OrgQueue)
+    }
+}
+
+// The row a handler would forge: which job, and which tenant it runs in, are
+// the handler's choice.
+fn forged(id: u64) -> JobRow {
+    JobRow {
+        id: Id::from_raw(id),
+        name: "CloseIncident".into(),
+        payload: Vec::new(),
+        key: None,
+        status: JobStatus::Pending,
+        attempts: 0,
+        due_at: 0,
+        last_error: None,
+        shape: None,
+        scope: Some(13),
+    }
+}
+
+#[route(POST "/jobs/:job/requeue", public)]
+fn requeue(tx: &mut Tx, job: Id<JobRow>) -> Result<(), ApiError> {
+    tx.put(&Queue(forged(job.raw())));
+    tx.delete::<Queue>(Id::from_raw(job.raw() + 1));
+    Ok(())
+}
+
+#[route(POST "/orgs/:org/jobs/:job/requeue", auth)]
+fn requeue_in(tx: &mut Tx, org: Id<Org>, job: Id<JobRow>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.put(&OrgQueue(forged(job.raw())));
+    tx.delete::<OrgQueue>(Id::from_raw(job.raw() + 1));
+    Ok(())
+}
+
+fn main() {
+    let _ = routes![requeue, requeue_in];
+}
+```
+
+**`job_row_redirected_on_bare_tx.rs` and `job_row_untenanted_on_bare_tx.rs`.** Their read now
+fails too, and they keep it on purpose: the attack they record is read, modify, write, and both
+doors are shut. Only the header comments change:
+
+```zsh
+python3 - <<'EOF'
+d = "crates/charpente-macros/tests/compile_fail/"
+pairs = {
+    "job_row_redirected_on_bare_tx.rs": (
+        "// moved an org-1 job into org 9 at 79ae1c0. The read still compiles; the\n"
+        "// write is refused, and the note says how a job gets its tenant.\n",
+        "// moved an org-1 job into org 9 at 79ae1c0. The read is refused too (no\n"
+        "// transaction reads the platform's tables), and so is the write, each\n"
+        "// with a note that names its fix.\n"),
+    "job_row_untenanted_on_bare_tx.rs": (
+        "// again at every restart. The write is refused, so the row cannot be made.\n",
+        "// again at every restart. The read and the write are both refused, so the\n"
+        "// row can be neither found nor made.\n"),
+}
+for name, (old, new) in pairs.items():
+    s = open(d + name).read()
+    assert s.count(old) == 1, name
+    open(d + name, "w").write(s.replace(old, new))
+print("headers updated")
+EOF
+```
+
+- [ ] **Step 7: Build everything**
+
+```zsh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings; echo "clippy exit $?"
+```
+
+Expected: `clippy exit 0`. The workspace compiles against the sealed `View`. If an error reads
+"is one of the platform's tables, and a transaction does not read it", it is a `Tx`-side read
+of a platform table that Steps 5-6 did not list. That is a finding: stop and report the site.
+Do not route it through `get_job` or a snapshot on your own judgement.
+
+- [ ] **Step 8: Run what the seal touched**
+
+```zsh
+cargo test -p charpente-core --lib each_platform_table_name_is_refused
+cargo test -p charpente-core --test group_commit
+cargo test -p charpente-core --test engine a_platform_row_is_read_through_a_snapshot
+cargo test -p charpente --test kernel a_retried_pending_job_still_refuses_and_a_dead_one_does_not
+cargo test -p charpente --test kernel job_tenancy::
+cargo test -p charpente --test replication foreign
+cargo test -p charpente --test group_commit
+```
+
+Expected: all green. The first line runs both refusal-text tests (write and read). The group
+commit file's two new tests pass. The `foreign` filter runs the eight replication tests around the two `get_job` sites there. `kernel.rs`'s dispatcher suites exercise `get_job` through
+`run_due_into` on every job they run.
+
+- [ ] **Step 9: Pin the compile errors and review every changed `.stderr`**
+
+```zsh
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild 2>&1 | grep -E "^test result"
+git status --short crates/charpente-macros/tests
+```
+
+Expected: `test result: ok. 1 passed`. The status lists exactly these, and nothing else:
+- new: the five compile-fail `.rs` and their five `.stderr`, and
+  `compile_pass/view_reads_the_apps_own_tables.rs`;
+- modified: `job_row_redirected_on_bare_tx.rs`/`.stderr`, `job_row_untenanted_on_bare_tx.rs`/
+  `.stderr`, `job_row_table_name_borrowed.rs`/`.stderr`, and `scoped_read_from_bare_tx.stderr`.
+
+Review each one. This is the step where a wrong diagnostic becomes a pinned one:
+
+```zsh
+grep -h "^error" crates/charpente-macros/tests/compile_fail/*_read_on_bare_tx.stderr crates/charpente-macros/tests/compile_fail/platform_rows_read_through_a_scoped_deref.stderr | sort | uniq -c
+grep -c "^error\[E0080\]" crates/charpente-macros/tests/compile_fail/platform_table_names_borrowed_for_reads.stderr
+git diff crates/charpente-macros/tests/compile_fail/scoped_read_from_bare_tx.stderr
+```
+
+Expected, in order:
+
+```text
+   4 error[E0277]: `EventRow` is one of the platform's tables, and a transaction does not read it
+   3 error[E0277]: `JobRow` is one of the platform's tables, and a transaction does not read it
+   3 error[E0277]: `SchemaVersion` is one of the platform's tables, and a transaction does not read it
+4
+```
+
+That is one error per read in the four fixtures, and the four E0080s are one per `View` read. The
+`scoped_read_from_bare_tx.stderr` diff is one line, the quoted declaration (amendment A15). Every
+other line of that pin, its message, label and notes, is byte-identical:
+
+```text
+-   |     fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>>;
++   |     fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
+```
+
+In each new E0277, check the shape the Evidence section recorded:
+- the message and label name the row;
+- `= help: the trait \`ScopeReadableBy<Tx<'_>, JobRow>\` is not implemented for …PlatformOwned`;
+- both notes, the first ending in `db.snapshot()?.scan::<JobRow>()?` (the row's own name) on its
+  own indented line;
+- `required by a bound in \`charpente::View::scan\`` (or `get`, `scan_by`, `scan_from`), quoting
+  the new declaration.
+
+A `PlatformOwned: Tenant` line in place of the text means `PlatformOwned`'s impl lost the
+`Operator` marker (see the appendix "Evidence for Task 9's read seal"). Stop.
+
+`job_row_redirected_on_bare_tx.stderr` and `job_row_untenanted_on_bare_tx.stderr` each gain one
+E0277 at the top, for `tx.get(job)`. Their existing write error is unchanged except its line
+number, which moves by the one line each header comment gained. In
+`job_row_table_name_borrowed.stderr`, the four E0080 messages are unchanged. Only line numbers and
+the two quoted `tx.put(…)` lines move (`tx.put(&Queue(forged(job.raw())));` and its `OrgQueue`
+twin), with their `^` underlines.
+
+Then:
+
+```zsh
+cargo test -p charpente-macros --test trybuild 2>&1 | grep -E "^test result"
+```
+
+Expected: `test result: ok. 1 passed`.
+
+- [ ] **Step 10: Mutation-prove the seal, its text, and the batch reads**
+
+Commit nothing yet. Each mutation is applied by a script, measured, and reverted with
+`git checkout -- <file>`. After each revert, `git status --short` must show only this task's
+uncommitted work. Trybuild's output is colored, so each trybuild command strips the escape codes
+with `perl` before `grep`.
+
+**N1: widen the platform's read impl to every reader.** This is the seal itself.
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/table.rs"
+s = open(p).read()
+old = "impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}\n"
+assert s.count(old) == 1
+open(p, "w").write(s.replace(old, "impl<V: ?Sized, R> ScopeReadableBy<V, R> for PlatformOwned {}\n"))
+EOF
+cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
+git checkout -- crates/charpente-core/src/table.rs
+```
+
+Expected (measured on a scratch copy):
+
+```text
+test tests/compile_fail/event_row_read_on_bare_tx.rs [should fail to compile] ... error
+Expected test case to fail to compile, but it succeeded.
+test tests/compile_fail/job_row_read_on_bare_tx.rs [should fail to compile] ... error
+Expected test case to fail to compile, but it succeeded.
+test tests/compile_fail/job_row_redirected_on_bare_tx.rs [should fail to compile] ... mismatch
+test tests/compile_fail/job_row_untenanted_on_bare_tx.rs [should fail to compile] ... mismatch
+test tests/compile_fail/platform_rows_read_through_a_scoped_deref.rs [should fail to compile] ... error
+Expected test case to fail to compile, but it succeeded.
+test tests/compile_fail/schema_version_read_on_bare_tx.rs [should fail to compile] ... error
+Expected test case to fail to compile, but it succeeded.
+```
+
+`platform_table_names_borrowed_for_reads.rs` stays green under N1. Its rows are `Unscoped`, so
+the `const` refusal, not the bound, is what stops them. N3 below is its mutation.
+
+**N2: drop `ReadableBy` from one read, `scan_by`.** It is dropped from the trait and both impls,
+so core still compiles.
+
+```zsh
+python3 - <<'EOF'
+old = "fn scan_by<R: UnscopedRow + ReadableBy<Self>>("
+for p, n in [("crates/charpente-core/src/table.rs", 2), ("crates/charpente-core/src/db.rs", 1)]:
+    s = open(p).read()
+    assert s.count(old) == n, (p, s.count(old))
+    open(p, "w").write(s.replace(old, "fn scan_by<R: UnscopedRow>("))
+EOF
+cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
+git checkout -- crates/charpente-core/src/table.rs crates/charpente-core/src/db.rs
+```
+
+Expected: exactly `test tests/compile_fail/event_row_read_on_bare_tx.rs [should fail to compile]
+... mismatch`. Its third error, `paid_events`'s `scan_by`, is gone: 2 errors where 3 are pinned.
+`scan_by` is the read only that fixture pins. `scan`, `get` and `scan_from` are each pinned by
+two or more fixtures.
+
+**N3: delete `Tx::get`'s name refusal.**
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+old = ("    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>> {\n"
+       "        const { refuse_platform_read(R::TABLE) };\n")
+assert s.count(old) == 1
+open(p, "w").write(s.replace(old, old.split("\n")[0] + "\n"))
+EOF
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | tee $D/task9-n3.log | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
+grep -c "^error\[E0080\]" $D/task9-n3.log
+git checkout -- crates/charpente-core/src/db.rs
+```
+
+Expected: exactly `platform_table_names_borrowed_for_reads.rs … mismatch`, and `7`: the
+four pinned E0080s plus three actual. `feed`'s `tx.get(event)` of the borrowed-name `Feed` now
+compiles.
+
+**N4: silence the events arm of `refuse_platform_read`.**
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+f = s.index("const fn refuse_platform_read(table: &str) {")
+a = s.index("        Some(1) => panic!(\n", f)
+b = s.index("        ),\n", a) + len("        ),\n")
+open(p, "w").write(s[:a] + "        Some(1) => {}\n" + s[b:])
+EOF
+cargo test -p charpente-core --lib each_platform_table_name_is_refused_for_a_read 2>&1 | grep -E "^  left|^ right|^test result"
+cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
+git checkout -- crates/charpente-core/src/db.rs
+```
+
+Expected: `left: None`, and `right: Some("this Row's TABLE is \"charpente.events\", the
+platform's event log — a transaction does not read the platform's tables, …")`, then `test result:
+FAILED. 0 passed; 1 failed`. Then exactly
+`platform_table_names_borrowed_for_reads.rs … mismatch`.
+
+**N5: `Tx::get_job` skips the batch's overlays.**
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+f = s.index("    pub fn get_job(")
+a = s.index("        self.get_any(id)\n", f)
+open(p, "w").write(s[:a] + "        self.snapshot.get_any(id)\n" + s[a + len("        self.get_any(id)\n"):])
+EOF
+cargo test -p charpente-core --test group_commit 2>&1 | grep -E "\.\.\. FAILED|^  left|^ right|^test result"
+cargo test -p charpente --test kernel 2>&1 | grep -E "^test result"
+git checkout -- crates/charpente-core/src/db.rs
+```
+
+Expected:
+
+```text
+test the_dispatchers_job_read_sees_a_settle_staged_earlier_in_its_batch ... FAILED
+  left: (0, None)
+ right: (1, Some("the relay timed out"))
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; …
+test result: ok. 72 passed; 0 failed; …
+```
+
+The `kernel` count is whatever the file holds when this task runs; 72 was measured at e749823 plus
+Tasks 8 and 9. It passing is a finding for the record, not a failure. The dispatcher suites do not
+notice a job read that ignores its batch, so the core test is this property's only oracle.
+Record that in the commit message.
+
+**N6: an enqueue becomes visible to its batch.** This is the property the re-pinned
+invisibility test exists for. The mutation stages a placeholder job row into the overlay
+beside the enqueue:
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+old = "    pub fn enqueue<J: UnscopedJob>(&mut self, job: J) {\n        self.push_enqueue(None, None, job);\n    }\n"
+new = '''    pub fn enqueue<J: UnscopedJob>(&mut self, job: J) {
+        let mut bytes = Vec::new();
+        JobRow {
+            id: Id::from_raw(0),
+            name: J::NAME.to_string(),
+            payload: Vec::new(),
+            key: None,
+            status: crate::job::JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+            shape: None,
+            scope: None,
+        }
+        .encode_row(&mut bytes);
+        self.effects
+            .overlay
+            .entry(JobRow::TABLE)
+            .or_default()
+            .insert((UNSCOPED, 0), Some(bytes));
+        self.push_enqueue(None, None, job);
+    }
+'''
+assert s.count(old) == 1, "Tx::enqueue's body moved: re-derive the mutation"
+open(p, "w").write(s.replace(old, new))
+EOF
+cargo test -p charpente-core --test group_commit an_enqueue_is_invisible 2>&1 | grep -E "\.\.\. FAILED|got Some|^test result"
+git checkout -- crates/charpente-core/src/db.rs
+```
+
+Expected: `an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits ... FAILED`, the
+panic text ending `— got Some((0, "ping"))`, and `test result: FAILED. 0 passed; 1 failed`. If
+`Tx::enqueue`'s body is no longer the one-line delegation (an earlier task may have changed it),
+put the same eight-field `JobRow` and overlay insert before whatever it now does.
+
+Then confirm the tree is back:
+
+```zsh
+git diff --stat
+cargo test -p charpente-core --test group_commit 2>&1 | grep -E "^test result"
+```
+
+Expected: the diff stat is this task's work only, and `test result: ok. 9 passed` (or the file's
+count at that point, with both new tests passing).
+
+- [ ] **Step 11: Docs — GUIDE §3, §4, §6, §16, DESIGN §2, §3, §8, and the pinned floor**
+
+Each `old` is its text at e749823 with Task 8 applied. If an earlier task respelled a passage,
+make the same change to the text as it stands, and say so in the commit. The two new pinned blocks
+quote the fixed texts from **Interfaces**, with `<row>` for the row type.
+
+```zsh
+python3 - <<'EOF'
+import re
+F = "`" * 3  # a literal fence here would end this plan's code block
+READ_BLOCK = "<!-- pinned -->\n" + F + """text
+`<row>` is one of the platform's tables, and a transaction does not read it
+`<row>` is read through `Db::snapshot`, never through a transaction
+the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+    db.snapshot()?.scan::<<row>>()?
+a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+""" + F + "\n"
+NAME_BLOCK = "<!-- pinned -->\n" + F + """text
+this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+this Row's TABLE is "charpente.events", the platform's event log — a transaction does not read the platform's tables, because the log holds every tenant's events; give this table a name of its own, and read the log through `db.snapshot()` from code that holds the `Db`, or subscribe to its events
+this Row's TABLE is "charpente.schema_versions", the platform's migration record — a transaction does not read the platform's tables, because the record is the migration gate's own state; give this table a name of its own, and read the record through `db.snapshot()` from code that holds the `Db`
+""" + F + "\n"
+RENDERED = """A read of one of the platform's tables, on a bare `Tx` or through a `ScopedTx`'s deref
+("Where the guarantee stops", below):
+
+""" + F + """text
+error[E0277]: `JobRow` is one of the platform's tables, and a transaction does not read it
+  --> src/admin.rs:12:26
+   |
+12 |     let jobs = tx.scan::<JobRow>()?;
+   |                   ----   ^^^^^^ `JobRow` is read through `Db::snapshot`, never through a transaction
+   |
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+               db.snapshot()?.scan::<JobRow>()?
+   = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+""" + F + "\n\n"
+edits = {
+    "docs/GUIDE.md": [
+# §3
+("""panic. They are the platform's: no transaction writes one (§6, "Job rows are the
+platform's").
+""",
+"""panic. They are the platform's: no transaction reads or writes one (§6, "Job rows are
+the platform's"; §16, "Where the guarantee stops"), and code that holds the `Db` reads
+them through `db.snapshot()`.
+"""),
+# §4
+("""`scan`, `scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as
+it does on a `Snapshot`. On `Ok`, every buffered write, enqueue, and emit
+""",
+"""`scan`, `scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as
+it does on a `Snapshot`, for every table of the app's own. The platform's own
+tables are read through a `Snapshot` alone (§16, "Where the guarantee stops").
+On `Ok`, every buffered write, enqueue, and emit
+"""),
+# §6
+("""the dispatcher opens it without asking anyone, so no app code writes a job row. A
+transaction reads the queue like any other table (`tx.get::<JobRow>`, `tx.scan::<JobRow>()`,
+as §8's oracles do), but `tx.put` or `tx.delete` of a `JobRow` does not compile. Only the
+""",
+"""the dispatcher opens it without asking anyone, so no app code writes a job row. The
+queue holds every tenant's payloads, so no app code reads one either: `tx.get`, `tx.scan`,
+`tx.put` and `tx.delete` of a `JobRow` do not compile, and §8's oracles read the queue
+through `db.snapshot()` (the read's text is in §16, "Where the guarantee stops"). Only the
+"""),
+("""tables are sealed against writes the same way. The event log""",
+"""tables are sealed the same way, against reads and writes. The event log"""),
+# §16 introduction
+("""and not a leak. (What that guarantee does *not* cover — an operator holding the
+`Db`, and the platform's own job queue and event log, which any transaction can read
+across every tenant — is "Where the guarantee stops" below, and it is a boundary, not an
+oversight.)
+""",
+"""and not a leak. (What that guarantee does *not* cover — an operator holding the
+`Db` — is "Where the guarantee stops" below, and it is a boundary, not an oversight.
+The platform's own job queue and event log, which hold every tenant's rows, are inside
+it: no transaction reads them.)
+"""),
+# §16 "The compile errors": the rendered read error
+("""
+There is no one-line way out of any of them.""",
+"""
+""" + RENDERED + """There is no one-line way out of any of them."""),
+# §16 "The compile errors": the tail
+("""`tx.delete` of an `EventRow` does not compile either (§6), so no handler publishes,
+into a tenant's feed, an event no emit made there.
+""",
+"""`tx.delete` of an `EventRow` does not compile either (§6), so no handler publishes,
+into a tenant's feed, an event no emit made there. Nor does any transaction read the job
+queue, the event log or the migration record, so no handler pages through another
+tenant's jobs or events: `ScopeReadableBy`, the marker that read's message hangs on, is
+sealed like `NoTenant`, and `ReadableBy`, the trait `View` bounds on, has one blanket impl
+that an app's own impl conflicts with.
+"""),
+    ],
+    "DESIGN.md": [
+# §2
+("""**The overlay carries rows only, and that is the one user-visible semantic group commit
+changed.** Enqueues, emits and migrate-puts are not in it, so a transaction batched *behind*
+a sibling's `enqueue` or `emit` does not see it — where before batching it would have, since
+each transaction applied before the next took its snapshot. `JobRow` and `EventRow`
+materialize at APPLY from the log record's enqueue/emit sections, never from anything
+`Group::stage` merges. Read-your-own-writes across a batch therefore means rows, not queue
+and event effects. Pinned by
+`enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch`
+(`crates/charpente/tests/group_commit.rs`, seed `0x60C1_0007`), which also asserts all four
+requests land in one batch — the property exists only across a batch.
+""",
+"""**The overlay carries rows only.** Enqueues, emits and migrate-puts are not in it, so a
+transaction batched *behind* a sibling's `enqueue` or `emit` does not see it — where before
+batching it would have, since each transaction applied before the next took its snapshot.
+`JobRow` and `EventRow` materialize at APPLY from the log record's enqueue/emit sections,
+never from anything `Group::stage` merges. Read-your-own-writes across a batch therefore
+means rows, not queue and event effects. This was the one semantic group commit changed
+that an app could see, and it no longer can: no transaction reads the platform's tables
+(§3's Jobs bullet). Inside the platform it still holds, and the dispatcher's
+`Tx::get_job` reads through the same overlay. Pinned by
+`an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits`
+(`crates/charpente-core/tests/group_commit.rs`, seed `0x7C00_0901`).
+"""),
+# §3 Jobs bullet
+("""**Job rows are the
+  platform's to write, and every transaction's to read**, because""",
+"""**Job rows are the
+  platform's to write and to read**, because"""),
+("""  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. An enqueue whose
+""",
+"""  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. No transaction reads
+  any of the three either (spec 2026-09-30-tenancy-completion §3): `View`'s reads bound
+  `R: ReadableBy<Self>`, which a platform table meets for a `Snapshot` alone; a
+  hand-written `Row` borrowing one of the names fails to build at each reachable `Tx`
+  read; and the dispatcher's in-batch read of a job row is `Tx::get_job`, which takes
+  the same `TenantAdmission` as `settle_job`. An enqueue whose
+"""),
+# §8 Multi-tenancy: the platform tables are no longer a limit
+("""  And the platform's own tables are not scoped: the job queue and the event log are read
+  through `get`/`scan` by any transaction, across every tenant — a job's payload and, for a
+  scoped job, its tenant id; an event's payload and its `key`, which inside a scope is the
+  tenant's id. The dispatcher and the sim oracles are built on those reads, so they stay
+  open; what is sealed is writing one — a job row, an event row or a schema-version row
+  (§3's Jobs bullet). A route that exposes either
+  table must filter by its own scope before it answers — for a job row, by the job (its
+  `name`, whose `scoped_by` names the scope type) as well as its tenant id, since two scope
+  types can share a raw id.
+""",
+"""  The platform's own tables are inside the boundary, not a limit on it: no transaction
+  reads or writes the job queue, the event log or the migration record (§3's Jobs bullet),
+  so no handler or job reaches another tenant's jobs or events through them, and the
+  operator and the sim oracles read them through `Db::snapshot`. `Session` and `ApiKey`
+  stay app-owned `#[table(global)]` tables (spec 2026-09-30-tenancy-completion §2): they
+  carry no tenant data, and revocation is `tx.delete::<ApiKey>(id)` by design.
+"""),
+    ],
+}
+for path, pairs in edits.items():
+    s = open(path).read()
+    for old, new in pairs:
+        assert s.count(old) == 1, f"{path}: {s.count(old)} x {old[:70]!r}"
+        s = s.replace(old, new)
+    if path == "DESIGN.md":
+        for old, new in [("**Three limits travel with it", "**Two limits travel with it"),
+                         ("**Two limits travel with it", "**One limit travels with it")]:
+            if s.count(old) == 1:
+                s = s.replace(old, new)
+                break
+        else:
+            raise SystemExit("DESIGN §8: no limits count to lower")
+    open(path, "w").write(s)
+
+# §16 "Where the guarantee stops": the platform-tables paragraph is replaced.
+p = "docs/GUIDE.md"
+s = open(p).read()
+a = s.index("**Nor does it cover the platform's own tables.**")
+b = s.index('"Realtime").\n', a) + len('"Realtime").\n')
+assert s.count("**Nor does it cover the platform's own tables.**") == 1
+assert "no transaction reads" not in s[a:b]
+s = s[:a] + """**It covers the platform's own tables too.** The job queue (`JobRow`) holds every tenant's
+job payloads and the tenant each job runs in, the event log (`EventRow`) holds every
+tenant's events, and the migration record (`SchemaVersion`) is the migration gate's own
+state. No transaction reads one, whether a handler's or a job's, on a bare `Tx` or through
+a `ScopedTx`'s deref, and none writes one (§6). rustc prints this for a read of any of the
+three, with your row type in place of `<row>`:
+
+""" + READ_BLOCK + """
+So an admin job list or an activity feed is a table of the app's own, written in the same
+transaction as the enqueue or the emit and scoped like any other, or, for a live feed, a
+`Subscription` (§11). Operator code reads the platform's tables through `db.snapshot()`, as
+§8's oracles do, since whoever holds the `Db` holds every tenant already. The one
+transaction that reads a job row is the dispatcher's own: `Tx::get_job` takes the
+`TenantAdmission` only a `Group` mints, which no handler or job holds.
+
+The read seal is on the table's name as well as its type, as the write seal is. A
+hand-written `Row` whose `TABLE` is one of the three names fails to build at each `Tx` read
+the binary can reach, reported by `cargo build` and not `cargo check`:
+
+""" + NAME_BLOCK + """
+**Sessions and API keys are the app's own.** `Session` and `ApiKey` (§5) are ordinary
+`#[table(global)]` tables that `App::open` registers for you, and a handler reads and
+writes them like any other global table. They carry no tenant data, and revoking a key is
+`tx.delete::<ApiKey>(id)`, an ordinary write, by design.
+""" + s[b:]
+open(p, "w").write(s)
+
+# The pinned floor rises by the two blocks above.
+p = "crates/guide-examples/tests/doc_truth.rs"
+s = open(p).read()
+m = re.search(r"\nconst PINNED_FLOOR: usize = (\d+);\n", s)
+n = int(m.group(1))
+s = s.replace(
+    m.group(0),
+    f"\n/// {n + 2} with tenancy-completion's platform-table read note and borrowed-name read\n"
+    f"/// refusals (2026-09-30).\nconst PINNED_FLOOR: usize = {n + 2};\n",
+)
+open(p, "w").write(s)
+print(f"docs updated; PINNED_FLOOR {n} -> {n + 2}")
+EOF
+git grep -n "any transaction can read\|every transaction's to read\|reads the queue like any other table\|Nor does it cover the platform" -- docs/GUIDE.md DESIGN.md README.md
+```
+
+Expected: `docs updated; PINNED_FLOOR 28 -> 30` (or the floor Tasks 2-8 left, plus two). The grep
+prints nothing: no stale claim that a transaction reads a platform table is left. Then:
+
+```zsh
+cargo build -p guide-examples 2>&1 | tail -1
+cargo test -p guide-examples --test doc_truth 2>&1 | grep -E "^test |^test result"
+```
+
+Expected: the build finishes. `doc_truth`'s tests pass. The two new blocks' every line has a
+fragment of at least 16 characters that appears in `table.rs`'s `on_unimplemented` or in
+`refuse_platform_read`'s literals. `    db.snapshot()?.scan::<<row>>()?` has one:
+`db.snapshot()?.scan::<`, the text before the `<row>` placeholder. The pinned count is the new
+floor.
+
+- [ ] **Step 12: Baselines**
+
+No record, no store key and no fault-stream draw changed, so every Task 1 baseline must reproduce.
+`job-tenancy` is the one to watch: its oracle now reads the queue through a snapshot taken
+just before the group, not inside it (Step 6). Foreground, one call per test binary:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task9 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task9 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task9 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task9 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task9 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task9 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label prints `reproduces the base`, and every call prints `exit 0`. A moved line
+anywhere is a finding: stop. In particular, do not "fix" `job-tenancy` by moving the snapshot
+back inside the group. That read no longer compiles.
+
+- [ ] **Step 13: Gate and commit**
+
+Foreground, one command per tool call:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo fmt --all --check; echo "fmt exit $?"
+cargo clippy --workspace --all-targets -- -D warnings; echo "clippy exit $?"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --lib 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test kernel 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test group_commit 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test replication 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test realtime 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test tenant 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente --no-fail-fast --test archive 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p charpente-sim --no-fail-fast 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+cargo test -p sim-fixture --no-fail-fast 2>&1 | tee -a $D/gate-task-9.log | grep -E "^test result|FAILED"
+grep -c "^test result:" $D/gate-task-9.log
+grep -c "^test result: ok" $D/gate-task-9.log
+grep -c FAILED $D/gate-task-9.log
+```
+
+Green means:
+- fmt and clippy exit 0;
+- the two counts are equal;
+- the last command prints `0`. It exits 1 when it matches nothing. That is the green case here,
+  not a broken check.
+
+Why these packages:
+- `kernel`, `replication` and `group_commit` hold the moved reads.
+- `realtime`, `tenant` and `archive` read the event log and scoped tables through snapshots.
+- `invoicing` and `sim-fixture` are apps built on `View`'s generic reads, the over-refusal risk.
+  At e749823 plus Tasks 8 and 9 in a scratch copy, these six packages plus `ts-fixture-app`
+  counted 44 of 44 `test result: ok`.
+
+The controller's full workspace gate follows.
+
+Re-check `git status --short` and `git log -1`. Then:
+
+```zsh
+git add crates/charpente-core/src/table.rs crates/charpente-core/src/db.rs \
+  crates/charpente-core/src/job.rs crates/charpente-core/src/event.rs \
+  crates/charpente-core/src/migration.rs \
+  crates/charpente-core/tests/group_commit.rs crates/charpente-core/tests/engine.rs \
+  crates/charpente/src/kernel/dispatch.rs \
+  crates/charpente/tests/kernel.rs crates/charpente/tests/replication.rs \
+  crates/charpente/tests/group_commit.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_read_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_read_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/event_row_read_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/event_row_read_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/schema_version_read_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/schema_version_read_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/platform_rows_read_through_a_scoped_deref.rs \
+  crates/charpente-macros/tests/compile_fail/platform_rows_read_through_a_scoped_deref.stderr \
+  crates/charpente-macros/tests/compile_fail/platform_table_names_borrowed_for_reads.rs \
+  crates/charpente-macros/tests/compile_fail/platform_table_names_borrowed_for_reads.stderr \
+  crates/charpente-macros/tests/compile_pass/view_reads_the_apps_own_tables.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_table_name_borrowed.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_table_name_borrowed.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_redirected_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_redirected_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_untenanted_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_untenanted_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/scoped_read_from_bare_tx.stderr \
+  crates/guide-examples/tests/doc_truth.rs docs/GUIDE.md DESIGN.md
+git commit -m "feat(tenancy): a transaction does not read the platform's tables — View's reads bound R: ReadableBy<Self>, which JobRow/EventRow/SchemaVersion meet for Snapshot alone, text names the table and db.snapshot(); a borrowed TABLE name is refused per Tx read (A13); the dispatcher reads its batch's job rows through admission-gated Tx::get_job; the group-commit visibility pin moves to core (A14, seed 0x7C00_0901); scoped-read pin changes one quoted line (A15); 5 compile-fail + 1 compile-pass new, <N> re-pinned; <M>/6 mutations red (N5: kernel suites blind, core test is the only oracle); <K> of <K> gate lines ok; 11 baselines reproduce"
+```
+
+---
+
+### Task 10: Events: tenancy leaves the key — tag `0x0b`, `EventRow.scope`, protocol 5, the tenant feed, one delivery predicate
+
+**Files:**
+- Modify `crates/charpente-core/src/db.rs`:
+  - the module doc's record-format list (lines 14–29 at e749823);
+  - `struct Emit` (new), replacing `TxEffects.emits`' tuple;
+  - `Effect::Emit.scope`;
+  - `encode_record` / `decode_record`;
+  - the apply arm's `Effect::Emit` (2096 at e749823);
+  - `Tx::push_emit` (new, private), `Tx::emit` / `Tx::emit_keyed`;
+  - the `Tenant` trait's doc (1466–1475 at e749823);
+  - `ScopedTx::event_key` (deleted), `ScopedTx::emit`, `ScopedTx::emit_keyed` (new);
+  - the unit tests that push or expect emits (`effects_fixture`, `record_roundtrip_is_canonical`, `keyed_emit_roundtrips`, `a_pre_shape_enqueue_and_emit_decode_with_no_shape`, `shaped_enqueue_and_emit_bytes_are_pinned`), `decode_refuses_unknown_tags`, and the new `scoped_emit_bytes_are_pinned_with_tenant_zero`.
+- Modify `crates/charpente-core/src/event.rs`: `EventRow.scope`, its codec, its tests.
+- Modify `crates/charpente-core/src/table.rs`: `Writer::materialize_event(…, scope)` (1416 at e749823).
+- Modify `crates/charpente/src/repl/mod.rs`: `PROTO_VERSION` 4 → 5.
+- Modify `crates/charpente/src/http/mod.rs`: `Subscription` (its private `scope`, `admits`, `and`'s widening assert), `sub_entry`/`push_entry` (new, private), `TenantFeed<S>`, `Subscribe<S>`, the unit tests.
+- Modify `crates/charpente/src/lib.rs`: `pub use http::Subscribe;`.
+- Modify `crates/charpente/src/kernel/tail.rs`: `deliver_unit`'s filter (140–147 at e749823).
+- Modify `crates/charpente/src/kernel/mod.rs`: `validate_subscribe` (952–1057 at e749823).
+- Modify `crates/charpente/tests/realtime.rs`: the tenant section (4586–5390 at e749823), `Client`, `decode_event_row`, `failing_feed_glue`, the imports.
+- Modify `crates/charpente/tests/replication.rs`: the Hello version tests (2694–2791 at e749823) and `a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name` (3172–3219 at e749823), which ships tag 11 as "a tag this binary does not know" and now ships 12.
+- Modify `crates/charpente/tests/tenant.rs` (the three `memo_feed*` handlers, the `Org` doc at 44–49), `crates/charpente/tests/kernel.rs` (the `Org` doc at 2179–2184), `crates/charpente-macros/tests/compile_pass/route_public_scope.rs` (its `feed`), `examples/invoicing/src/bin/tenant_node.rs` (`create_doc`'s comment, `feed`), `crates/edge-harness/tests/tenant_wire.rs` (the doc at 429–431).
+- Test: `crates/charpente-core/tests/materialize.rs`, and every file above.
+- Docs: `docs/GUIDE.md` §11 and §16; `DESIGN.md` §3, §4, §5, §6, §8; `PLAN.md`'s M2 paragraph; `crates/guide-examples/tests/doc_truth.rs` (`PINNED_FLOOR` +2).
+
+**Interfaces:**
+- Consumes:
+  - Task 2's `Tenant::NAME`: every `impl Tenant` this task adds states `const NAME` first, equal to the type's identifier (amendment A4).
+  - Task 7's `Ctx<'g>`: handlers keep writing `ctx: &Ctx`.
+  - Task 8's `EventRow::Scope = PlatformOwned` and Task 9's read seal: every `EventRow` read this task writes is on a `Snapshot` (`db.snapshot()`, `kernel.app().db().snapshot()`), never on a `Tx`.
+  - Task 1's baselines: `realtime-tenant` moves here; the other ten reproduce.
+- Produces (spec §6, amendment A16):
+  - `struct Emit { event: &'static str, payload: Vec<u8>, key: Option<String>, shape: u64, scope: Option<u64> }` — private to `db.rs`.
+  - Tag `0x0b [event][payload][key: Option<String>][shape: u64 le][scope: u64 le]`, written exactly when `Emit.scope` is `Some`, including `Some(0)`. `0x09` is unchanged byte for byte. `0x0c` is the next free tag.
+  - `Effect::Emit { event, payload, key, shape: Option<u64>, scope: Option<u64> }`; tags `0x03` and `0x09` decode with `scope: None`.
+  - `pub scope: Option<u64>` on `EventRow`, the last field, encoded after `shape` and only when `Some`; asserted `scope.is_some()` ⇒ `shape.is_some()`.
+  - `Writer::materialize_event(&mut self, seq: u64, name: &str, payload: &[u8], key: Option<&str>, shape: Option<u64>, scope: Option<u64>) -> io::Result<u64>`.
+  - `ScopedTx::emit(&mut self, event)` records `key: None, scope: Some(id)`; `ScopedTx::emit_keyed(&mut self, key, event)` records `key: Some(key), scope: Some(id)`. `ScopedTx::event_key` is deleted. `Tx::emit`/`Tx::emit_keyed` record `scope: None`, as before.
+  - `PROTO_VERSION = 5`.
+  - `pub struct Subscription { pub entries, pub key, pub cursor, pub(crate) scope: Option<u64> }` and `pub(crate) fn admits(&self, name: &str, key: Option<&str>, scope: Option<u64>) -> bool`, the one predicate `deliver_unit` and `validate_subscribe` both ask.
+  - `pub struct TenantFeed<S>` (`charpente::http`) with `and`, `key`, `cursor`; `impl<S> From<TenantFeed<S>> for Subscription`.
+  - `pub trait Subscribe<S> { fn subscription<Ev: Event + serde::Serialize>(&self) -> TenantFeed<S>; }`, `impl<S: Tenant> Subscribe<S> for ScopedTx<'_, '_, S>`, re-exported as `charpente::Subscribe`.
+  - Texts, fixed wording, pinned byte-exact:
+    - `Subscription::and: event "{name}" is added to a tenant feed after .into() — Subscription::and adds global events, and a tenant feed receives only its own tenant's events, so this one could never arrive; add the tenant's events with TenantFeed::and before .into(), and serve global events on a subscription of their own`
+    - `cursor {id}.{seq} sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; re-sync current state through reads, then reconnect without a cursor` (a 409; it names no tenant and no event)
+    - `TenantFeed::and: event "{name}" is already in this subscription — …`, the duplicate-name text with its method named; `Subscription::and`'s own duplicate text stays byte-identical.
+    - `row decode: {n} bytes after an EventRow's payload — the shape and the tenant scope after it are 8 bytes each, present or absent, so the stored row is corrupt` (replaces "…a shape is 8 bytes or absent…")
+    - `EventRow {id}: a tenant scope is encoded after the shape, so a scoped row must carry one — only tag 0x0b writes a scope, and 0x0b always carries the shape`
+  - For Task 11: the sites Task 10 leaves untyped on purpose. These are `realtime.rs`'s `literal_feed` and `global_feed` (`Subscription::of::<OrgPing>()`), `emit_global_ping_in_scope` and `NotifyOrg::run`'s `(*tx)`/`(**tx)` emits of `OrgPing`, and `widened_feed`'s `.and::<Pong>()`, which stays because `Pong` is global. They also include the core test's `OrgEvent` and `TestEvent`, `http::tests`'s `UnitPing`/`UnitPong`/`UnitOrg`, `tenant.rs`'s `MemoNoted`, `tenant_node.rs`'s `DocCreated`, `route_public_scope.rs`'s `IncidentOpened`, and GUIDE §11's compiled tenant-feed block's `NoteAdded`. Task 10's raw-id limit sentences (GUIDE §11 and §16, DESIGN §8, PLAN.md) are true at Task 10, and Task 11 rewrites each one. For Task 13: `Client::in_tenant`, `tenancy_409`, `tenancy_app`.
+
+**Coverage baselines.** Only `realtime-tenant` may move. Its workload is the only swarm that emits inside a tenant scope (`emit_scoped_ping`), so every one of its emit records changes bytes (tag `0x0b`, eight more bytes, the event renamed `org_ping`), and its oracle changes (Step 6). Every other baseline must reproduce, each for a stated reason:
+- `tenant`: `MemoNoted` is never emitted; its feeds only subscribe.
+- `kernel`, `job-tenancy`, `migrations`, `migrations-scoped`: nothing emits.
+- `realtime-flagship`, `realtime-shapes`, `realtime-follower`: every emit is on a bare `Tx` (`0x09`, unchanged), and the scope column their `Client` gains is `None` on every row they read, so `matches` answers as before.
+- `archive-scoped`: it emits `Ping` on the bare `Tx` after its temporary `ScopedTx` (archive.rs 8268 at e749823).
+- `invoicing`: `emit_keyed` on a bare `Tx` only (routes.rs:254, jobs.rs:46). Its `tenant_node` bin, which does emit inside a scope, is not in the sim app.
+
+A `MOVED` on any of those ten is a finding: stop.
+
+- [ ] **Step 1: Move the tenant section of `realtime.rs` onto its own event, at the Task 9 commit**
+
+Every emit inside a scope in `crates/charpente/tests/realtime.rs` moves from the flagship's `Ping` to a new event, `OrgPing`, so the flagship keeps `Ping` as its global event and Task 11 can declare `OrgPing`'s tenancy on one line. This step changes no behaviour: the tenant feed is still keyed by `event_key` here, and Step 6 switches it.
+
+After `impl Tenant for Org` in the tenant section, add:
+
+```rust
+/// The tenant section's own event: every emit inside a scope in this file is
+/// an `OrgPing`, and `Ping` stays the flagship's global event. It has
+/// `Ping`'s shape and its own type, so that its tenancy can be declared on it
+/// (tenancy-completion Task 11) without touching the flagship.
+#[event(global)]
+struct OrgPing {
+    n: WireU64,
+}
+```
+
+Beside `const PING_ONLY`, add:
+
+```rust
+const ORG_PING_ONLY: &[&str] = &["org_ping"];
+```
+
+In `decode_event_row`, before the `other =>` arm, add:
+
+```rust
+        "org_ping" => Ok((
+            "org_ping",
+            serde_json::to_string(&OrgPing::decode(&mut &row.payload[..])?)
+                .expect("OrgPing serializes"),
+        )),
+```
+
+and change its refusal text to `"ledger scan found event name {other:?} — this workload only ever emits ping/pong/org_ping"`.
+
+Exact edits, each one site:
+- `emit_scoped_ping`: `tx.emit(Ping { n: body.n });` → `tx.emit(OrgPing { n: body.n });`
+- `scoped_feed`: `emits(Ping)` → `emits(OrgPing)`; `Subscription::of::<Ping>()` → `Subscription::of::<OrgPing>()`.
+- `literal_feed`: the same two edits.
+- `emit_leaky_ping`: `Ping { n: body.n }` → `OrgPing { n: body.n }`.
+- `scoped_realtime_workload` and `scoped_twin_run`: `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` → `Client::new(ORG_PING_ONLY, Some(SCOPED_TENANT_A_KEY))`.
+- `scoped_key_oracle`: `if *name != "ping"` → `if *name != "org_ping"`.
+- `a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event`: its three expected vectors' `"ping"` → `"org_ping"` (Step 2 replaces this test).
+
+Run the section's deterministic tests:
+
+```zsh
+cargo test -p charpente --test realtime -- a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event the_scoped_oracle_catches_an_emit_that_drops_the_scope_key scoped_realtime_frame_traces_replay_identically_for_the_same_seed
+```
+
+Expected: 3 passed. Do not run the swarm `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing` here: its bytes moved (a longer event name), and Step 8 measures it once, at the end.
+
+- [ ] **Step 2: Write the tests that are red at the Task 9 commit**
+
+In `crates/charpente/tests/replication.rs`, after `hello_declaring_protocol_version_3_is_refused_by_name` (copy that test's `Msg::Hello` literal exactly as it stands if S2–S4 or Tasks 2–9 added a field):
+
+```rust
+/// PROTO_VERSION 5 (tenancy completion, spec §6): a version-4 binary cannot
+/// read the scoped emit tag `0x0b`, nor an `EventRow`'s trailing tenant, so
+/// it is refused at Hello, by name, before a single frame ships — not at its
+/// first scoped emit.
+#[test]
+fn hello_declaring_protocol_version_4_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_0006 ^ 4, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: 4,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest: 0,
+        },
+    )
+    .unwrap();
+    match reply {
+        Msg::Refuse { message } => assert_eq!(
+            message,
+            "replication protocol version mismatch: this node speaks protocol version 5, but \
+             the peer's Hello declared version 4 — upgrade the older binary so both speak the \
+             expected version 5"
+        ),
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+```
+
+In `crates/charpente/tests/realtime.rs`:
+
+Imports: `use charpente::kernel::{…}` gains `JobError`; `use charpente::{…}` gains `ScopedTx`, `job` and `jobs`.
+
+After `literal_feed`, add the routes, the job and the app:
+
+```rust
+/// The explicit deref inside a scope: a global event, recorded with no
+/// tenant (`0x09`) although the transaction holds one (spec §6, "A global
+/// event emitted from inside a scope is `(*tx).emit(ev)`").
+#[route(POST "/global-ping-in-scope", public(Org))]
+fn emit_global_ping_in_scope(
+    tx: &mut Tx,
+    body: ScopedEmitBody,
+    ctx: &Ctx,
+) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
+    (*tx).emit(OrgPing { n: body.n });
+    Ok(())
+}
+
+/// Hands the tenant a scoped job whose `run` emits both ways.
+#[route(POST "/notify", public(Org))]
+fn enqueue_notify(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
+    tx.enqueue(NotifyOrg { n: body.n.0 });
+    Ok(())
+}
+
+/// A scoped job's `run` holds `&mut ScopedTx`: its `tx.emit` is its tenant's
+/// event, and its `(**tx).emit` is a global one.
+#[job(scoped_by = Org)]
+struct NotifyOrg {
+    n: u64,
+}
+
+impl NotifyOrg {
+    fn run(self, tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+        tx.emit(OrgPing {
+            n: WireU64(self.n),
+        });
+        (**tx).emit(OrgPing {
+            n: WireU64(self.n + 1),
+        });
+        Ok(())
+    }
+}
+
+/// A global subscription with no key: every global `org_ping`, and no event
+/// recorded in a tenant, tenant 0 included — `None` is not `Some(0)`.
+#[route(SSE "/global-feed", public, emits(OrgPing))]
+fn global_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<OrgPing>().cursor(cursor))
+}
+
+/// The tenancy tests' app: default retention (nothing here may fall behind
+/// it), the scoped and global emit routes, the three feeds, and the scoped
+/// job.
+fn tenancy_app(sim: &Sim) -> App {
+    App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![
+        emit_scoped_ping,
+        emit_global_ping_in_scope,
+        enqueue_notify,
+        scoped_feed,
+        literal_feed,
+        global_feed
+    ])
+    .mount_jobs(jobs![NotifyOrg])
+}
+
+/// Pushes `requests` at one instant and runs the kernel until it idles past
+/// the source's deadline: every request serviced, and every commit's rows
+/// offered to every tail, however the kernel interleaves them. (`run_script`'s
+/// fixed 16 steps cannot promise that for four tails and three commits.)
+fn run_to_idle(
+    kernel: &mut Kernel,
+    sim: &Sim,
+    requests: Vec<Request>,
+) -> (RecordedResponses, SinkHandles) {
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    for request in requests {
+        source.push_at(t, request);
+    }
+    let (responses, sinks) = (source.responses(), source.sinks());
+    kernel
+        .run(&mut source)
+        .expect("no step may fail — nothing a subscriber does stops the node");
+    (responses, sinks)
+}
+
+fn org_emit(path: &str, org: u64, n: u64) -> Request {
+    Request::new(Method::Post, path).json(&ScopedEmitBody {
+        org: WireU64(org),
+        n: WireU64(n),
+    })
+}
+
+/// Each delivered frame as `"<name> <json>"`.
+fn delivered(handle: &SimSinkHandle) -> Vec<String> {
+    handle
+        .frames()
+        .iter()
+        .map(|f| format!("{} {}", f.name, f.json))
+        .collect()
+}
+
+/// The cross-tenancy 409 (amendment A16), spelled out here rather than taken
+/// from the product. It names no tenant and no event: the refusal must not
+/// tell a subscriber what another tenant's row is.
+fn tenancy_409(row: &EventRow) -> String {
+    format!(
+        "cursor {} sits on an event outside this feed's tenancy — a cursor resumes only the \
+         feed that delivered it, and this feed never delivers that event; re-sync current \
+         state through reads, then reconnect without a cursor",
+        cursor_of(row)
+    )
+}
+```
+
+Replace `a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event` (its seed stays) with:
+
+```rust
+/// Spec §6, "Delivering", and exit criterion 1, over two tenants, tenant 0
+/// among them. Four subscribers: each tenant's feed, a global feed keyed with
+/// the decimal id tenancy used to be spelled as, and a global feed with no
+/// key. Three emits: one in each tenant, and one global emit made inside
+/// tenant 1's scope. The oracle is two-sided — each feed must carry exactly
+/// its own events — because a one-sided "A never sees B" passes vacuously
+/// when a scoped emit reaches nobody. Tenant 0 is a tenant: the global feed
+/// with no key receives none of its event, since `None` is not `Some(0)`.
+#[test]
+fn a_tenant_feed_receives_only_its_own_tenants_events_tenant_zero_included() {
+    let sim = Sim::with_faults(0x2EB1_1005, FaultConfig::none());
+    let mut kernel = Kernel::new(tenancy_app(&sim), Box::new(sim.clock())).unwrap();
+    let (responses, sinks) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/scoped-feed/0"),
+            Request::new(Method::Get, "/scoped-feed/1"),
+            Request::new(Method::Get, "/literal-feed/0"),
+            Request::new(Method::Get, "/global-feed"),
+            org_emit("/scoped-ping", 0, 9),
+            org_emit("/scoped-ping", 1, 7),
+            org_emit("/global-ping-in-scope", 1, 5),
+        ],
+    );
+    assert_eq!(statuses(&responses), vec![200; 7]);
+    let handles = sinks.lock().expect("sinks lock");
+    assert_eq!(handles.len(), 4, "four subscribes opened four sinks");
+    assert_eq!(
+        delivered(&handles[0]),
+        vec![r#"org_ping {"n":"9"}"#],
+        "tenant 0's feed: its own event — not tenant 1's, not the global one"
+    );
+    assert_eq!(
+        delivered(&handles[1]),
+        vec![r#"org_ping {"n":"7"}"#],
+        "tenant 1's feed: its own event — the global emit made in its scope is not its event"
+    );
+    assert_eq!(
+        delivered(&handles[2]),
+        Vec::<String>::new(),
+        "a global feed keyed \"0\" receives nothing: a key is an app filter, and tenant 0's \
+         event is recorded in tenant 0 with no key"
+    );
+    assert_eq!(
+        delivered(&handles[3]),
+        vec![r#"org_ping {"n":"5"}"#],
+        "a global feed with no key receives the global event only — tenant 0's event is \
+         recorded Some(0), and None is not Some(0)"
+    );
+}
+
+/// Spec §6: a scoped job's `run` holds `&mut ScopedTx`, so its `tx.emit` is
+/// recorded in its tenant, with no key, and its `(**tx).emit` is recorded
+/// with no tenant — reaching global subscribers and never the tenant's feed.
+/// Tenant 0 again.
+#[test]
+fn a_scoped_jobs_emits_are_its_tenants_and_its_deref_emits_are_global() {
+    let sim = Sim::with_faults(0x2EB1_1006, FaultConfig::none());
+    let mut kernel = Kernel::new(tenancy_app(&sim), Box::new(sim.clock())).unwrap();
+    let (responses, sinks) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/scoped-feed/0"),
+            Request::new(Method::Get, "/global-feed"),
+            org_emit("/notify", 0, 40),
+        ],
+    );
+    assert_eq!(statuses(&responses), vec![200; 3]);
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 16)
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.key.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![("org_ping", None), ("org_ping", None)],
+        "neither of the job's emits carries a key: the tenant is not a key"
+    );
+    let handles = sinks.lock().expect("sinks lock");
+    assert_eq!(
+        delivered(&handles[0]),
+        vec![r#"org_ping {"n":"40"}"#],
+        "tenant 0's feed: the job's own emit"
+    );
+    assert_eq!(
+        delivered(&handles[1]),
+        vec![r#"org_ping {"n":"41"}"#],
+        "the global feed: the job's deref emit, and not its tenant's"
+    );
+}
+
+/// Amendment A16, spec §9's "a resume across the boundary is refused, not
+/// misdelivered". A cursor names a row of the feed that delivered it; a
+/// cursor on a row of another tenancy — another tenant's event, a global
+/// event on a tenant feed, a tenant's event on a global feed — is one this
+/// feed never delivered, so it is refused by name rather than resumed. The
+/// two controls resume, and each delivers exactly its own tenancy's later
+/// rows.
+#[test]
+fn a_cursor_from_another_tenancy_is_refused_not_resumed() {
+    let sim = Sim::with_faults(0x2EB1_1007, FaultConfig::none());
+    let mut kernel = Kernel::new(tenancy_app(&sim), Box::new(sim.clock())).unwrap();
+    let (responses, _) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            org_emit("/scoped-ping", 0, 10),
+            org_emit("/scoped-ping", 1, 11),
+            org_emit("/global-ping-in-scope", 1, 12),
+            org_emit("/scoped-ping", 0, 13),
+            org_emit("/global-ping-in-scope", 0, 14),
+        ],
+    );
+    assert_eq!(statuses(&responses), vec![200; 5]);
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 16)
+        .unwrap();
+    assert_eq!(rows.len(), 5, "every emit is one row");
+
+    let (responses, sinks) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(
+                Method::Get,
+                format!("/scoped-feed/0?cursor={}", cursor_of(&rows[1])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/scoped-feed/0?cursor={}", cursor_of(&rows[2])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/global-feed?cursor={}", cursor_of(&rows[0])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/scoped-feed/0?cursor={}", cursor_of(&rows[0])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/global-feed?cursor={}", cursor_of(&rows[2])),
+            ),
+        ],
+    );
+    let responses = responses.lock().unwrap().clone();
+    assert_eq!(
+        responses.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![409, 409, 409, 200, 200],
+        "three cursors from another tenancy refused, two of the feed's own resumed: {:?}",
+        responses
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+    );
+    for (i, row) in [(0, &rows[1]), (1, &rows[2]), (2, &rows[0])] {
+        assert_eq!(error_text(&responses[i].1), tenancy_409(row));
+    }
+    let handles = sinks.lock().unwrap();
+    assert_eq!(handles.len(), 2, "only the two resumed subscribes opened sinks");
+    assert_eq!(
+        frames_of(&handles[0]),
+        vec![(
+            rows[3].id.raw(),
+            rows[3].seq,
+            "org_ping".to_string(),
+            r#"{"n":"13"}"#.to_string()
+        )],
+        "tenant 0's feed resumes past its own row to its own next row — not tenant 1's, not \
+         the global ones"
+    );
+    assert_eq!(
+        frames_of(&handles[1]),
+        vec![(
+            rows[4].id.raw(),
+            rows[4].seq,
+            "org_ping".to_string(),
+            r#"{"n":"14"}"#.to_string()
+        )],
+        "the global feed resumes past a global row to the next global row — not tenant 0's"
+    );
+}
+```
+
+Run them at the Task 9 commit plus Step 1:
+
+```zsh
+cargo test -p charpente --test replication -- hello_declaring_protocol_version_4_is_refused_by_name --exact
+cargo test -p charpente --test realtime -- a_tenant_feed_receives_only_its_own_tenants_events_tenant_zero_included a_scoped_jobs_emits_are_its_tenants_and_its_deref_emits_are_global a_cursor_from_another_tenancy_is_refused_not_resumed
+```
+
+Expected: all four FAIL. Quote each panic in the report:
+- the Hello test: "expected Refuse, got …" — version 4 is today's own version, so nothing refuses it;
+- `a_tenant_feed_receives_only…`: at the literal-feed assertion, left `["org_ping {\"n\":\"9\"}"]`, right `[]` — today tenancy IS the key `"0"`, so a global feed keyed `"0"` receives tenant 0's event (the two tenant feeds already pass, which is why the literal and global assertions are the discriminators);
+- `a_scoped_jobs_emits…`: at the rows assertion, left `[("org_ping", Some("0")), ("org_ping", None)]` — the scoped emit carries the tenant as a key;
+- `a_cursor_from_another_tenancy…`: at the statuses assertion, left `[200, 200, 200, 200, 200]` — today a cursor on another tenant's row is resumed.
+
+`a_tenant_feed_widened_after_into_is_refused_by_name` (Step 6) and the core record tests (Step 3) need the new API to compile; each is proved red by mutation in Step 7.
+
+- [ ] **Step 3: The record, the row and its materialization**
+
+`crates/charpente-core/src/db.rs`, the module doc: replace the lines from "`0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`" through "`Some(0)` is `0x0a`." (lines 16–29 at e749823) with:
+
+```rust
+//! `0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
+//! scoped enqueue, for a `#[job(scoped_by = …)]` job (job-tenancy spec §6),
+//! `0x0b [event][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
+//! scoped emit, an event emitted on a `ScopedTx` (tenancy-completion spec §6)
+//! — strings and byte fields length-prefixed per the `Codec` layout; `0x0c` is
+//! the next free tag. `0x02`/`0x03` (the same without the shape) still
+//! decode, with the shape unknown, and are never written — `TxEffects` holds
+//! a bare shape, so a shapeless enqueue or emit cannot be represented.
+//! `0x05`/`0x06`/`0x07`, `0x0a` and `0x0b` are the ONLY tags that carry a
+//! scope. A table effect's is chosen by the table's own `Row::Scope`, not by
+//! the scope value (tenant 0 is a legal tenant, so a scoped table's records
+//! always use `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at
+//! scope 0). A scoped enqueue is `0x0a` rather than a widened `0x08` for the
+//! same reason, chosen by the job's own `Job::Scope` through the enqueue
+//! family; a scoped emit is `0x0b` rather than a widened `0x09`, chosen by the
+//! `ScopedTx` it was emitted on. The same presence-not-value rule applies to
+//! both: an enqueue or emit carrying `Some(0)` is `0x0a` or `0x0b`. An emit's
+//! tenant is never folded into its key, which stays the app's own filter.
+```
+
+`enum Effect`: the comment above `Enqueue` keeps its text; `Emit` becomes:
+
+```rust
+    // `scope`: `Some` exactly for `0x0b`, the scoped emit (tenancy-completion
+    // spec §6) — presence, not value, as for `Enqueue` above.
+    Emit {
+        event: String,
+        payload: Vec<u8>,
+        key: Option<String>,
+        shape: Option<u64>,
+        scope: Option<u64>,
+    },
+```
+
+After `struct EnqueuedTenant`, add:
+
+```rust
+/// One buffered emit. `shape` is bare because a shapeless emit cannot be
+/// represented (payload-shapes amendment A2). `scope` is the tenant of the
+/// `ScopedTx` it was emitted on, `None` for an emit on a bare `Tx`: presence,
+/// not value, selects tag `0x0b`, so `Some(0)` is tenant 0. It is never
+/// folded into `key`, which stays the app's own filter (tenancy-completion
+/// spec §2.3).
+struct Emit {
+    event: &'static str,
+    payload: Vec<u8>,
+    key: Option<String>,
+    shape: u64,
+    scope: Option<u64>,
+}
+```
+
+`struct TxEffects`: replace the two comment lines and the field
+
+```rust
+    // The emit shape is a bare `u64`, so a shapeless emit cannot be
+    // represented (payload-shapes amendment A2).
+    emits: Vec<(&'static str, Vec<u8>, Option<String>, u64)>,
+```
+
+with `emits: Vec<Emit>,`.
+
+`encode_record`: replace the emit loop with
+
+```rust
+    for Emit {
+        event,
+        payload,
+        key,
+        shape,
+        scope,
+    } in &effects.emits
+    {
+        out.push(if scope.is_some() { 11 } else { 9 });
+        encode_bytes(event.as_bytes(), &mut out);
+        encode_bytes(payload, &mut out);
+        key.encode(&mut out);
+        shape.encode(&mut out);
+        if let Some(tenant) = scope {
+            tenant.encode(&mut out);
+        }
+    }
+```
+
+`decode_record`: arms `3` and `9` gain `scope: None,` after `shape`; after arm `10` add
+
+```rust
+            11 => Effect::Emit {
+                event: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
+                scope: Some(u64::decode(input)?),
+            },
+```
+
+The apply arm (`Db::apply`'s `Effect::Emit`, 2096 at e749823):
+
+```rust
+                    Effect::Emit {
+                        event,
+                        payload,
+                        key,
+                        shape,
+                        scope,
+                    } => {
+                        w.materialize_event(seq, event, payload, key.as_deref(), *shape, *scope)?;
+                    }
+```
+
+`impl Tx`: directly after `push_enqueue`, add
+
+```rust
+    /// The one body `Tx::emit`, `Tx::emit_keyed` and `ScopedTx`'s two emits
+    /// share. `scope` is the emitting `ScopedTx`'s tenant, `None` on a bare
+    /// `Tx`; it is recorded beside `key`, never in it.
+    fn push_emit<Ev: Event>(&mut self, scope: Option<u64>, key: Option<String>, event: Ev) {
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.effects.emits.push(Emit {
+            event: Ev::NAME,
+            payload,
+            key,
+            shape: Ev::FINGERPRINT,
+            scope,
+        });
+    }
+```
+
+and replace `Tx::emit` and `Tx::emit_keyed` with
+
+```rust
+    pub fn emit<Ev: Event>(&mut self, event: Ev) {
+        self.push_emit(None, None, event);
+    }
+
+    /// Emits with an opaque app key (a user's subject, a room) — the
+    /// exact-match filter `Subscription::key` matches against. Mirrors
+    /// `enqueue_keyed`. A tenant is not a key: an event of a tenant is
+    /// emitted on the `ScopedTx`, which records the tenant beside the key.
+    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
+        self.push_emit(None, Some(key.into()), event);
+    }
+```
+
+The `Tenant` trait's doc: replace the sentence "The one thing it does read off a scope is its decimal form, as the subscription key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering out, never resolving in." (it spans 1473–1475 at e749823; Task 2 may have rewrapped it, so re-locate it by text) with:
+
+```rust
+/// What it records of a scope is its raw id — beside a scoped enqueue
+/// (`0x0a`) and a scoped emit (`0x0b`), apart from any app key
+/// (tenancy-completion spec §6) — recording out, never resolving in.
+```
+
+`impl ScopedTx`: delete `event_key` with its whole doc comment, and replace `emit` with
+
+```rust
+    /// `Tx::emit`, recorded in this tenant: the row carries the tenant's id
+    /// in a field of its own (tag `0x0b`), with no key, so only a feed of
+    /// this tenant receives it (tenancy-completion spec §6). A transaction
+    /// that had to be admitted to reach a tenant's rows cannot hand that
+    /// tenant's event to a subscription outside it, and no string names the
+    /// tenant.
+    ///
+    /// This shadows the `Tx::emit` the `DerefMut` would otherwise reach. An
+    /// emit that genuinely belongs to no tenant is written `(*tx).emit(…)` in
+    /// a handler that owns its `ScopedTx`, and `(**tx).emit(…)` in a scoped
+    /// job's `run`, which holds `&mut ScopedTx` — the explicit deref an
+    /// unscoped table access takes. It is recorded with no tenant.
+    pub fn emit<Ev: Event>(&mut self, event: Ev) {
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), None, event);
+    }
+
+    /// `emit`, with the app's own key beside the tenant: a tenant feed
+    /// narrowed by `.key(…)` receives it. The key is the app's filter, never
+    /// the tenant. This shadows `Tx::emit_keyed`, as `emit` shadows
+    /// `Tx::emit`.
+    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), Some(key.into()), event);
+    }
+```
+
+The `db.rs` unit tests:
+- `effects_fixture`: the emit push becomes
+  ```rust
+          effects.emits.push(Emit {
+              event: "invoice_finalized",
+              payload: vec![7],
+              key: None,
+              shape: 0xE7E7,
+              scope: None,
+          });
+  ```
+- `record_roundtrip_is_canonical`, `keyed_emit_roundtrips`, `a_pre_shape_enqueue_and_emit_decode_with_no_shape` and `shaped_enqueue_and_emit_bytes_are_pinned`: every expected `Effect::Emit { … }` gains `scope: None`.
+- `keyed_emit_roundtrips`' two pushes become
+  ```rust
+          effects.emits.push(Emit {
+              event: "invoice_finalized",
+              payload: vec![1],
+              key: Some("org-7".to_string()),
+              shape: 0xE7E7,
+              scope: None,
+          });
+          effects.emits.push(Emit {
+              event: "ping",
+              payload: vec![2],
+              key: None,
+              shape: 0x9196,
+              scope: None,
+          });
+  ```
+- `shaped_enqueue_and_emit_bytes_are_pinned`' emit push becomes
+  ```rust
+          effects.emits.push(Emit {
+              event: "pong",
+              payload: vec![9],
+              key: None,
+              shape: 0x1112_1314_1516_1718,
+              scope: None,
+          });
+  ```
+  and its pinned bytes do not change: this is the proof that a global emit stays `0x09` byte for byte.
+- `decode_refuses_unknown_tags`: its doc becomes "`0x0c`, the next free tag: `0x0b` is the scoped emit.", and `11` becomes `12` in both the push and the expected text.
+- After `scoped_enqueue_bytes_are_pinned_with_tenant_zero`, add:
+
+```rust
+    /// Tenancy-completion spec §6, the `0x0a` precedent: the scoped emit,
+    /// pinned as literal bytes. It is the `0x09` layout under tag `0x0b`,
+    /// plus the tenant as eight little-endian bytes, at tenant 0, because
+    /// presence and not value selects the tag. A keyed scoped emit carries
+    /// the app's key where `0x09` carries it and the tenant after the shape,
+    /// apart from the key. A global emit in the same record is still `0x09`,
+    /// byte for byte, with nothing after its shape.
+    #[test]
+    fn scoped_emit_bytes_are_pinned_with_tenant_zero() {
+        let mut effects = TxEffects::default();
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![9],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: Some(0),
+        });
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![8],
+            key: Some("r".to_string()),
+            shape: 0x1112_1314_1516_1718,
+            scope: Some(0x0102),
+        });
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![7],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: None,
+        });
+        assert_eq!(
+            encode_record(&effects),
+            vec![
+                3, 0, 0, 0, // three effects
+                11, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 9, 0, // scoped, no key
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape
+                0, 0, 0, 0, 0, 0, 0, 0, // its tenant: 0, a real tenant
+                11, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 8, // scoped, keyed
+                1, 1, 0, 0, 0, b'r', // the app's key "r", where 0x09 carries a key
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape
+                0x02, 0x01, 0, 0, 0, 0, 0, 0, // its tenant, apart from the key
+                9, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 7, 0, // global emit
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape, nothing after
+            ]
+        );
+        assert_eq!(
+            decode_record(&encode_record(&effects)).unwrap(),
+            vec![
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![9],
+                    key: None,
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: Some(0),
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![8],
+                    key: Some("r".into()),
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: Some(0x0102),
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![7],
+                    key: None,
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: None,
+                },
+            ]
+        );
+    }
+```
+
+`crates/charpente-core/src/event.rs`. The struct doc's "`key` is the opaque scoping key from `Tx::emit_keyed` (e.g. an org id) — later realtime tasks filter subscriptions on it." becomes "`key` is the app's opaque filter from `emit_keyed` (a user's subject, a room), never a tenant, which is `scope`." The `shape` field doc's last sentence becomes "Encoded after `payload` and only when `Some`, so a row written before this field existed decodes unchanged: the payload before it is length-prefixed, and only `scope` below can follow it (payload-shapes spec §2)." After `shape`, add:
+
+```rust
+    /// The tenant of the `ScopedTx` the event was emitted on, from the
+    /// record's `0x0b` tag. `None` for an emit on a bare `Tx` (`0x09`) and for
+    /// a row applied from a pre-shape record. Encoded after `shape`, and only
+    /// when `Some`. A scoped row always has a shape, because only `0x0b`
+    /// writes a scope, so every row written before this field existed decodes
+    /// unchanged. `Some(0)` is tenant 0: presence, not value
+    /// (tenancy-completion spec §6, the `JobRow.scope` precedent).
+    pub scope: Option<u64>,
+```
+
+`encode_row`: after the `shape` block, add
+
+```rust
+        if let Some(scope) = self.scope {
+            assert!(
+                self.shape.is_some(),
+                "EventRow {}: a tenant scope is encoded after the shape, so a scoped row must \
+                 carry one — only tag 0x0b writes a scope, and 0x0b always carries the shape",
+                self.id.raw()
+            );
+            scope.encode(out);
+        }
+```
+
+`decode_row`: replace the `let shape = match input.len() { … };` block with
+
+```rust
+        let (shape, scope) = match input.len() {
+            0 => (None, None),
+            8 => (Some(u64::decode(input)?), None),
+            16 => (Some(u64::decode(input)?), Some(u64::decode(input)?)),
+            n => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "row decode: {n} bytes after an EventRow's payload — the shape and the \
+                         tenant scope after it are 8 bytes each, present or absent, so the \
+                         stored row is corrupt"
+                    ),
+                ));
+            }
+        };
+```
+
+and add `scope,` after `shape,` in the returned literal. In the tests: every `EventRow { … }` literal gains `scope: None,`; `event_row_roundtrips` gains `assert_eq!(back.scope, row.scope);`; `a_torn_event_row_shape_is_a_named_decode_error`'s expected text becomes
+
+```rust
+            "row decode: 3 bytes after an EventRow's payload — the shape and the tenant scope \
+             after it are 8 bytes each, present or absent, so the stored row is corrupt"
+```
+
+and after it add:
+
+```rust
+    /// Tenancy-completion spec §6: a scoped row carries its tenant after its
+    /// shape, and tenant 0 round-trips as `Some(0)`, never as "no tenant".
+    /// The global row is the control: its bytes end at the shape.
+    #[test]
+    fn a_scoped_event_row_roundtrips_its_tenant_zero_included() {
+        let row = |scope| EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: Some("room-9".into()),
+            payload: vec![1, 2, 3],
+            shape: Some(0xFEED),
+            scope,
+        };
+        let mut global = Vec::new();
+        row(None).encode_row(&mut global);
+        for scope in [Some(0), Some(7)] {
+            let mut bytes = Vec::new();
+            row(scope).encode_row(&mut bytes);
+            assert_eq!(bytes.len(), global.len() + 8, "the tenant is eight more bytes");
+            let back = EventRow::decode_row(&bytes).unwrap();
+            assert_eq!((back.key.as_deref(), back.scope), (Some("room-9"), scope));
+        }
+        assert_eq!(EventRow::decode_row(&global).unwrap().scope, None);
+    }
+
+    /// A tear inside the tenant is named like a tear inside the shape.
+    #[test]
+    fn a_torn_event_row_scope_is_a_named_decode_error() {
+        let row = EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: None,
+            payload: vec![1, 2, 3],
+            shape: Some(0xFEED),
+            scope: Some(3),
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        bytes.truncate(bytes.len() - 5);
+        let err = EventRow::decode_row(&bytes)
+            .err()
+            .expect("11 bytes where a shape and a scope should be");
+        assert_eq!(
+            err.to_string(),
+            "row decode: 11 bytes after an EventRow's payload — the shape and the tenant scope \
+             after it are 8 bytes each, present or absent, so the stored row is corrupt"
+        );
+    }
+
+    /// Negative space (hard rule 4): the tail is positional, so a scope with
+    /// no shape before it would decode as a shape. The encoder refuses to
+    /// write one.
+    #[test]
+    #[should_panic(expected = "EventRow 3: a tenant scope is encoded after the shape, so a \
+                               scoped row must carry one — only tag 0x0b writes a scope, and \
+                               0x0b always carries the shape")]
+    fn a_scope_without_a_shape_is_refused_at_encode() {
+        let row = EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: None,
+            payload: vec![],
+            shape: None,
+            scope: Some(3),
+        };
+        row.encode_row(&mut Vec::new());
+    }
+```
+
+`crates/charpente-core/src/table.rs`, `materialize_event`: its doc gains "`scope` is the record's tenant for a scoped emit (`0x0b`), carried into the row unchanged."; its signature gains `scope: Option<u64>,` after `shape: Option<u64>,`; the `EventRow` literal gains `scope,` after `shape,`.
+
+`crates/charpente-core/tests/materialize.rs`: the imports become
+
+```rust
+use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Tenant, Tx};
+use charpente_core::event::EventRow;
+use charpente_core::job::{JobRow, JobStatus};
+use charpente_core::table::{Codec, Id, Unscoped, View};
+```
+
+and after `impl Event for TestEvent` add
+
+```rust
+/// The tenant the scoped-emit test opens; it admits everyone.
+struct TestOrg;
+impl Tenant for TestOrg {
+    const NAME: &'static str = "TestOrg";
+    type Who = str;
+    type Error = io::Error;
+    fn authorize(_tx: &Tx, _who: &str, _scope: Id<TestOrg>) -> Result<(), io::Error> {
+        Ok(())
+    }
+}
+
+/// The event emitted inside `TestOrg`'s scope: its own type beside
+/// `TestEvent`, so the plan's Task 11 can declare its scope without touching
+/// the test's body.
+struct OrgEvent {
+    n: u32,
+}
+impl Codec for OrgEvent {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.n.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<OrgEvent> {
+        Ok(OrgEvent {
+            n: u32::decode(input)?,
+        })
+    }
+}
+impl Event for OrgEvent {
+    const NAME: &'static str = "org_event";
+    const FINGERPRINT: u64 = 0x7E57_000B;
+}
+```
+
+After `a_shipped_scoped_enqueue_materializes_with_its_scope_tenant_zero_included`, add:
+
+```rust
+/// Tenancy-completion spec §6, the `0x0a` precedent. A shipped record
+/// carrying the scoped emit tag `0x0b`, applied the way a follower, a restore
+/// and a replay all apply one, materializes an `EventRow` whose `scope` is
+/// the record's and whose key is untouched. Tenant 0 comes through as
+/// `Some(0)`, and the `0x09` emits beside it as `None`.
+#[test]
+fn a_shipped_scoped_emit_materializes_with_its_scope_tenant_zero_included() {
+    let sim = Sim::with_faults(0x608, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let effects: [(u8, Option<&str>, Option<u64>); 4] = [
+        (1, None, Some(0)),
+        (2, Some("room-9"), Some(7)),
+        (3, None, None),
+        (4, Some("room-9"), None),
+    ];
+    let mut record = Vec::new();
+    4u32.encode(&mut record);
+    for (payload, key, scope) in effects {
+        record.push(if scope.is_some() { 11 } else { 9 });
+        "test_event".to_string().encode(&mut record);
+        vec![payload].encode(&mut record);
+        key.map(str::to_string).encode(&mut record);
+        0x7E57_000Au64.encode(&mut record);
+        if let Some(scope) = scope {
+            scope.encode(&mut record);
+        }
+    }
+    let seq = db.last_applied().map_or(0, |s| s + 1);
+    db.apply_shipped(&[(seq, record)]).unwrap();
+    let rows: Vec<EventRow> = db.snapshot().unwrap().scan_from(0, 16).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.payload.clone(), r.key.clone(), r.shape, r.scope))
+            .collect::<Vec<_>>(),
+        vec![
+            (vec![1], None, Some(0x7E57_000A), Some(0)),
+            (vec![2], Some("room-9".to_string()), Some(0x7E57_000A), Some(7)),
+            (vec![3], None, Some(0x7E57_000A), None),
+            (vec![4], Some("room-9".to_string()), Some(0x7E57_000A), None),
+        ],
+        "each row carries its record's tenant beside its key; tenant 0 is Some(0), not None"
+    );
+}
+
+/// Tenancy-completion spec §6 and §2.3: an emit on a `ScopedTx` records the
+/// tenant in the row's own field and leaves the key the app's — `emit` with
+/// no key, `emit_keyed` with the app's — and the explicit deref emits a
+/// global event, with no tenant, although the transaction holds one. Tenant
+/// 0 comes through as `Some(0)`.
+#[test]
+fn a_scoped_emit_records_its_tenant_apart_from_its_key() {
+    let sim = Sim::with_faults(0x609, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    db.transact(|tx: &mut Tx| -> Result<(), io::Error> {
+        let mut scoped = tx.open_scope(Id::<TestOrg>::from_raw(0), "member")?;
+        scoped.emit(OrgEvent { n: 1 });
+        scoped.emit_keyed("room-9", OrgEvent { n: 2 });
+        (*scoped).emit(TestEvent { n: 3 });
+        (*scoped).emit_keyed("room-9", TestEvent { n: 4 });
+        Ok(())
+    })
+    .unwrap();
+    let rows: Vec<EventRow> = db.snapshot().unwrap().scan_from(0, 16).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.key.as_deref(), r.scope))
+            .collect::<Vec<_>>(),
+        vec![
+            ("org_event", None, Some(0)),
+            ("org_event", Some("room-9"), Some(0)),
+            ("test_event", None, None),
+            ("test_event", Some("room-9"), None),
+        ],
+        "the tenant rides its own field, tenant 0 included; the key is the app's alone"
+    );
+}
+```
+
+Run the core:
+
+```zsh
+cargo test -p charpente-core --lib 2>&1 | tee .superpowers/sdd/2026-09-30-tenancy-completion/task10-core-lib.log | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente-core --test materialize --test engine --test group_commit 2>&1 | grep -E "^test result|FAILED|panicked"
+```
+
+Expected: every `test result: ok`. The new tests pass here; Step 7 proves each red by mutation.
+
+- [ ] **Step 4: Protocol 5, and the unknown-tag fixture moves to 12**
+
+`crates/charpente/src/repl/mod.rs`:
+
+```rust
+/// The wire protocol version this binary speaks; carried in every `Hello`
+/// and checked against the peer's (spec §5's version-mismatch surface).
+/// Bumps whenever a message body's shape changes — tenant-scoping's
+/// `ScopedSnapshotRows` (tag 14) made it 2; payload shapes' `0x08`/`0x09`
+/// record tags made it 3; job tenancy's `0x0a` scoped enqueue made it 4;
+/// event tenancy's `0x0b` scoped emit makes it 5, so a version-4 binary is
+/// refused at Hello rather than at its first scoped emit. The same change
+/// reaches a follower a second way: `JobRow`'s row codec gained a trailing
+/// `scope` at 4 and `EventRow`'s at 5, and seeding ships platform table rows,
+/// so an older follower would also meet a scoped row's 16-byte tail, which
+/// its decoder calls corrupt.
+pub const PROTO_VERSION: u8 = 5;
+```
+
+`crates/charpente/tests/replication.rs`:
+- `hello_declaring_protocol_version_2_is_refused_by_name` and `hello_declaring_protocol_version_3_is_refused_by_name`: their expected text's "protocol version 4" and "expected version 4" become "protocol version 5" and "expected version 5". The version-2 doc's "(Protocol 4 since job tenancy; the version-3 test follows.)" becomes "(Protocol 5 since event tenancy; the version-3 and version-4 tests follow.)"; the version-3 doc gains "(Protocol 5 since event tenancy; the version-4 test follows.)".
+- `a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name` ships `vec![1u8, 0, 0, 0, 11]` as "a tag this binary does not know", and `0x0b` is now the scoped emit: a one-byte `0x0b` record would fail on its missing event name, not on its tag. The frame becomes `vec![1u8, 0, 0, 0, 12]`, the expected text `"unknown effect tag 12"`, and the doc's "tag 11 (`0x0b`), one past job tenancy's `0x0a` (scoped enqueue)" becomes "tag 12 (`0x0c`), one past event tenancy's `0x0b` (scoped emit)"; its "(job tenancy's `0x0a` collided with the prior tag-10 fixture and moved it here, DESIGN §4)" becomes "(job tenancy's `0x0a` moved the fixture from 10 to 11, and event tenancy's `0x0b` from 11 to 12, DESIGN §4)", and "the tag-11 one" becomes "the tag-12 one".
+
+```zsh
+cargo test -p charpente --test replication 2>&1 | tee .superpowers/sdd/2026-09-30-tenancy-completion/task10-replication.log | grep -E "^test result|FAILED|panicked"
+```
+
+Expected: all green, the version-4 Hello test included. The bump changes one `Hello` byte's value, not its length, and Hello travels on the simulated network, never the disk, so every pinned replication seed must still reproduce its asserted reason; a pinned-seed failure is a finding.
+
+- [ ] **Step 5: The platform — the tenant feed and the one predicate**
+
+`crates/charpente/src/http/mod.rs`. Imports:
+
+```rust
+use std::collections::BTreeMap;
+use std::io;
+use std::marker::PhantomData;
+
+use charpente_core::db::{Event, ScopedTx, Tenant};
+use charpente_core::table::Id;
+```
+
+Replace `Subscription`'s doc, struct and whole `impl Subscription` with:
+
+```rust
+/// What an SSE route handler returns: which event types to tail (compile-
+/// checked — names never appear as strings in app code), an optional
+/// exact-match app key, the resume cursor (the handler passes through, or
+/// clamps, what the platform extracted from the request), and — private —
+/// the tenancy it delivers: `None` for a global subscription
+/// (`Subscription::of`), the tenant for a tenant feed (`Subscribe`). No app
+/// code can set or read it, so no string ever names a tenant.
+pub struct Subscription {
+    pub entries: Vec<SubEntry>,
+    pub key: Option<String>,
+    pub cursor: Option<Cursor>,
+    pub(crate) scope: Option<u64>,
+}
+
+/// `Ev`'s delivery entry, captured statically.
+fn sub_entry<Ev: Event + serde::Serialize>() -> SubEntry {
+    SubEntry {
+        name: Ev::NAME,
+        encode_json: ev_json::<Ev>,
+        fingerprint: Ev::FINGERPRINT,
+    }
+}
+
+/// Adds `Ev`'s entry, refusing a second of one `NAME`: delivery matches a
+/// row to the first entry of its name, so a second could never be delivered
+/// — two `#[event]` types in different modules with the same type identifier
+/// share a `NAME`. `method` names the caller in the refusal.
+fn push_entry<Ev: Event + serde::Serialize>(entries: &mut Vec<SubEntry>, method: &str) {
+    assert!(
+        !entries.iter().any(|e| e.name == Ev::NAME),
+        "{method}: event \"{}\" is already in this subscription — an event appears once, and \
+         two #[event] types sharing a NAME (the type's snake_case) would leave the second \
+         undeliverable; give the other type its own name (GUIDE §11, \"Changing an event\")",
+        Ev::NAME
+    );
+    entries.push(sub_entry::<Ev>());
+}
+
+impl Subscription {
+    /// A global subscription: it delivers events emitted on a bare `Tx`, and
+    /// never an event recorded in a tenant. A tenant's feed is
+    /// `tx.subscription::<Ev>()` on its `ScopedTx` (`Subscribe`).
+    pub fn of<Ev: Event + serde::Serialize>() -> Subscription {
+        Subscription {
+            entries: vec![sub_entry::<Ev>()],
+            key: None,
+            cursor: None,
+            scope: None,
+        }
+    }
+
+    /// Adds another global event type. Panics if one of that `NAME` is
+    /// already here, and panics on a tenant feed: a tenant feed receives only
+    /// events recorded in its tenant, so an event added after `.into()` could
+    /// never arrive. The tenant's own events go on `TenantFeed::and`, before
+    /// the conversion.
+    pub fn and<Ev: Event + serde::Serialize>(mut self) -> Subscription {
+        assert!(
+            self.scope.is_none(),
+            "Subscription::and: event \"{}\" is added to a tenant feed after .into() — \
+             Subscription::and adds global events, and a tenant feed receives only its own \
+             tenant's events, so this one could never arrive; add the tenant's events with \
+             TenantFeed::and before .into(), and serve global events on a subscription of \
+             their own",
+            Ev::NAME
+        );
+        push_entry::<Ev>(&mut self.entries, "Subscription::and");
+        self
+    }
+
+    /// An exact-match app filter (a user's subject, a room) — the handler
+    /// owns access control; the platform never parses the key. A key is not
+    /// a tenant: a tenant feed is built from its scope (`Subscribe`), and
+    /// delivery compares tenancy on its own (`admits`).
+    pub fn key(mut self, key: impl Into<String>) -> Subscription {
+        self.key = Some(key.into());
+        self
+    }
+
+    pub fn cursor(mut self, cursor: Option<Cursor>) -> Subscription {
+        self.cursor = cursor;
+        self
+    }
+
+    /// The one predicate that says what this subscription delivers
+    /// (tenancy-completion spec §6, "Delivering"): a name it carries, exactly
+    /// its tenancy (`None` is not `Some(0)`), and its key if it has one.
+    /// `deliver_unit` skips every row it refuses, and `validate_subscribe`
+    /// asks it before refusing a reshaped cursor. The shape check stays
+    /// separate because a row this admits but cannot decode ends the tail
+    /// rather than being skipped.
+    pub(crate) fn admits(&self, name: &str, key: Option<&str>, scope: Option<u64>) -> bool {
+        self.entries.iter().any(|e| e.name == name)
+            && scope == self.scope
+            && (self.key.is_none() || self.key.as_deref() == key)
+    }
+}
+
+/// A tenant's feed under construction: `tx.subscription::<Ev>()` on a
+/// `ScopedTx<S>` (`Subscribe`), narrowed with `.and`, `.key` and `.cursor`,
+/// and converted with `.into()` into the handler's `Subscription`, which
+/// carries the tenant (amendment A3). `S` says whose tenant it is; the id
+/// itself is in the `Subscription`, where no app code can read or set it.
+pub struct TenantFeed<S> {
+    sub: Subscription,
+    tenant: PhantomData<fn() -> S>,
+}
+
+impl<S> TenantFeed<S> {
+    /// Adds another of the tenant's event types. It pushes to the feed's own
+    /// entries, never through `Subscription::and`, which refuses a tenant
+    /// feed; a second event of one `NAME` is refused as it is there.
+    pub fn and<Ev: Event + serde::Serialize>(mut self) -> TenantFeed<S> {
+        push_entry::<Ev>(&mut self.sub.entries, "TenantFeed::and");
+        self
+    }
+
+    /// `Subscription::key`: the app's own filter, within the tenant.
+    pub fn key(mut self, key: impl Into<String>) -> TenantFeed<S> {
+        self.sub.key = Some(key.into());
+        self
+    }
+
+    pub fn cursor(mut self, cursor: Option<Cursor>) -> TenantFeed<S> {
+        self.sub.cursor = cursor;
+        self
+    }
+}
+
+impl<S> From<TenantFeed<S>> for Subscription {
+    fn from(feed: TenantFeed<S>) -> Subscription {
+        feed.sub
+    }
+}
+
+/// Builds a tenant's feed from the scope that admitted the subscriber
+/// (tenancy-completion spec §6, "Subscribing"): `tx.subscription::<Ev>()` on
+/// a `ScopedTx<S>`. A trait so the platform crate can give the core's
+/// `ScopedTx` this method; `use charpente::Subscribe` brings it into scope.
+pub trait Subscribe<S> {
+    fn subscription<Ev: Event + serde::Serialize>(&self) -> TenantFeed<S>;
+}
+
+impl<S: Tenant> Subscribe<S> for ScopedTx<'_, '_, S> {
+    fn subscription<Ev: Event + serde::Serialize>(&self) -> TenantFeed<S> {
+        TenantFeed {
+            sub: Subscription {
+                entries: vec![sub_entry::<Ev>()],
+                key: None,
+                cursor: None,
+                scope: Some(self.scope().raw()),
+            },
+            tenant: PhantomData,
+        }
+    }
+}
+```
+
+(The trait-on-a-core-type shape — `impl<S: Tenant> Subscribe<S> for ScopedTx<'_, '_, S>`, called as `tx.subscription::<Ping>().and::<Pong>().key("k").into()` into `Result<Subscription, _>` — was compiled and run in a scratch crate on rustc 1.95.0 while this plan was drafted; it printed `["ping", "pong"] Some("k") Some(0) 0`.)
+
+In the unit `mod tests`, add:
+
+```rust
+    use std::marker::PhantomData;
+
+    use crate::event;
+    use crate::wire::WireU64;
+
+    #[event(global)]
+    struct UnitPing {
+        n: WireU64,
+    }
+
+    #[event(global)]
+    struct UnitPong {
+        n: WireU64,
+    }
+
+    /// A scope type for `TenantFeed<S>`, which bounds nothing on `S`.
+    struct UnitOrg;
+
+    fn unit_sub(key: Option<&str>, scope: Option<u64>) -> Subscription {
+        Subscription {
+            entries: vec![sub_entry::<UnitPing>()],
+            key: key.map(str::to_string),
+            cursor: None,
+            scope,
+        }
+    }
+
+    /// Tenancy-completion spec §6, "Delivering": the one predicate delivery
+    /// and resume validation both ask. Every clause is exercised alone, and
+    /// tenant 0 is a tenant.
+    #[test]
+    fn admits_is_the_name_and_the_tenant_and_the_key() {
+        let global = unit_sub(None, None);
+        assert!(global.admits("unit_ping", None, None));
+        assert!(
+            global.admits("unit_ping", Some("k"), None),
+            "a feed with no key passes every key"
+        );
+        assert!(!global.admits("unit_pong", None, None), "a name it does not carry");
+        assert!(
+            !global.admits("unit_ping", None, Some(0)),
+            "tenant 0's row is not global: None is not Some(0)"
+        );
+        let tenant_zero = unit_sub(None, Some(0));
+        assert!(tenant_zero.admits("unit_ping", None, Some(0)));
+        assert!(
+            !tenant_zero.admits("unit_ping", None, None),
+            "a global row never reaches a tenant feed"
+        );
+        assert!(!tenant_zero.admits("unit_ping", None, Some(1)), "another tenant's row");
+        let keyed = unit_sub(Some("k"), Some(7));
+        assert!(keyed.admits("unit_ping", Some("k"), Some(7)));
+        assert!(
+            !keyed.admits("unit_ping", None, Some(7)),
+            "a keyed feed never receives an unkeyed row"
+        );
+        assert!(!keyed.admits("unit_ping", Some("j"), Some(7)));
+        assert!(
+            !keyed.admits("unit_ping", Some("k"), Some(8)),
+            "the right key in the wrong tenant"
+        );
+    }
+
+    /// `TenantFeed::and` adds to its inner entries directly, so
+    /// `Subscription::and`'s widening assert never fires for it.
+    #[test]
+    fn a_tenant_feeds_and_adds_without_the_widening_assert() {
+        let feed = TenantFeed::<UnitOrg> {
+            sub: unit_sub(None, Some(0)),
+            tenant: PhantomData,
+        }
+        .and::<UnitPong>()
+        .key("k");
+        let sub: Subscription = feed.into();
+        assert_eq!(
+            sub.entries.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec!["unit_ping", "unit_pong"]
+        );
+        assert_eq!((sub.key.as_deref(), sub.scope), (Some("k"), Some(0)));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "TenantFeed::and: event \"unit_ping\" is already in this subscription — an \
+                    event appears once, and two #[event] types sharing a NAME (the type's \
+                    snake_case) would leave the second undeliverable; give the other type its \
+                    own name (GUIDE §11, \"Changing an event\")"
+    )]
+    fn a_tenant_feed_refuses_two_events_of_one_name() {
+        let _ = TenantFeed::<UnitOrg> {
+            sub: unit_sub(None, Some(0)),
+            tenant: PhantomData,
+        }
+        .and::<UnitPing>();
+    }
+```
+
+`crates/charpente/src/lib.rs`, after `pub use tenant::{Scoped, TenantScope};`:
+
+```rust
+// Re-exported at the root so a tenant-feed handler writes
+// `use charpente::Subscribe;` beside `Scoped`, the other trait a scoped
+// handler brings into scope.
+pub use http::Subscribe;
+```
+
+`crates/charpente/src/kernel/tail.rs`, `deliver_unit`: the doc's "read up to `TAIL_BATCH_EVENTS` rows from `next_id`, filter, push" becomes "read up to `TAIL_BATCH_EVENTS` rows from `next_id`, filter (`Subscription::admits`: a name it carries, its tenancy, its key), push". In the row loop, replace the key check and the entry lookup (lines 142–147 at e749823) with:
+
+```rust
+        // The one predicate resume validation asks too (`validate_subscribe`).
+        if !tail.sub.admits(&row.name, row.key.as_deref(), row.scope) {
+            continue;
+        }
+        let entry = tail
+            .sub
+            .entries
+            .iter()
+            .find(|e| e.name == row.name)
+            .expect("admits matched this row's name to one of the subscription's entries");
+```
+
+`crates/charpente/src/kernel/mod.rs`, `validate_subscribe`. Its doc's "and if the row is one this subscription would deliver (a name it carries, a key it passes), it must not be one this binary refuses to decode (checked third — payload-shapes spec §3)." becomes "the retained row must be of the subscription's own tenancy (checked third — a cursor resumes only the feed that delivered it, amendment A16); and if the row is one this subscription would deliver (`Subscription::admits`), it must not be one this binary refuses to decode (checked fourth — payload-shapes spec §3)." In the body, replace everything from the comment "// The row the client last saw is one this binary refuses to" through the `if let Some(entry) = … && row.shape != Some(entry.fingerprint)` condition's opening brace with:
+
+```rust
+            // A cursor names a row of the feed that delivered it. A row of
+            // another tenancy — another tenant's event, a global event on a
+            // tenant feed, a tenant's event on a global subscription — is one
+            // this feed never delivers, so resuming from it would resume a
+            // feed this subscriber never had. Refused by name, naming no
+            // tenant and no event (amendment A16). A row of the feed's own
+            // tenancy that it does not admit, another name or another key, is
+            // not refused: it is never delivered either way (payload-shapes
+            // spec §3).
+            if row.scope != sub.scope {
+                return Err(Response::error(
+                    409,
+                    &format!(
+                        "cursor {} sits on an event outside this feed's tenancy — a cursor \
+                         resumes only the feed that delivered it, and this feed never delivers \
+                         that event; re-sync current state through reads, then reconnect \
+                         without a cursor",
+                        cursor.wire()
+                    ),
+                ));
+            }
+            // The row the client last saw is one this binary refuses to
+            // decode. Resuming past it would skip the very event the
+            // `charpente.reshaped` frame named — the frame carries this id, so
+            // a client that ignored it reconnects exactly here.
+            if sub.admits(&row.name, row.key.as_deref(), row.scope)
+                && let Some(entry) = sub.entries.iter().find(|e| e.name == row.name)
+                && row.shape != Some(entry.fingerprint)
+            {
+```
+
+The body of that `if` (the reshaped 409) is unchanged.
+
+```zsh
+cargo test -p charpente --lib 2>&1 | tee .superpowers/sdd/2026-09-30-tenancy-completion/task10-lib.log | grep -E "^test result|FAILED|panicked"
+```
+
+Expected: green, the three new `http::tests` included. The integration suites do not compile until Step 6.
+
+- [ ] **Step 6: Move every call site onto the tenant feed**
+
+`crates/charpente/tests/realtime.rs`.
+
+Imports: `SubEntry` leaves the `charpente::http` list, and the root list becomes
+
+```rust
+use charpente::{
+    DbConfig, Id, Schema, Scoped, ScopedTx, Subscribe, Tenant, Tx, Wire as WireDerive, job, jobs,
+    route, routes, table,
+};
+```
+
+`failing_feed_glue` can no longer build a `Subscription` by literal (its `scope` is private). Its body becomes, byte-identical in what it returns:
+
+```rust
+    let mut sub = Subscription::of::<NoteAdded>().cursor(cursor);
+    sub.entries[0].encode_json =
+        |_: &[u8]| -> io::Result<String> { Err(io::Error::other("encode exploded")) };
+    Ok(sub)
+```
+
+The tenant section's header comment (the block under `// ===… tenant-scoped event emission`) becomes:
+
+```rust
+// ============================================= tenant-scoped event emission
+//
+// Tenancy-completion spec §6, "one tenancy mechanism, not two": an event
+// emitted inside `ScopedTx<Org>(B)` is recorded in tenant B, in the row's own
+// field and apart from any app key, and a tenant feed built from
+// `ScopedTx<Org>(A)` delivers only rows recorded in A (exit criterion 1). A
+// key is the app's filter and never a tenant: a global subscription keyed
+// with a tenant's decimal id — what tenancy was before — receives nothing of
+// that tenant's.
+```
+
+In `impl Tenant for Org`'s `authorize` doc, "This property is about the platform's key derivation, not the app's membership check" becomes "This property is about where the platform records a tenant, not the app's membership check". In `pick_scoped_emit`'s doc, "so the oracle has a source of truth that is not the key" becomes "so the oracle has a source of truth that is not the row".
+
+`emit_scoped_ping`'s doc becomes:
+
+```rust
+/// The shape spec §1 prescribes: one `scope()` line, and every effect below it
+/// — reads, writes, and emits — bounded to that tenant. The emit is recorded
+/// in the tenant (tag `0x0b`), with no key of the app's.
+```
+
+`scoped_feed` becomes:
+
+```rust
+/// The subscriber half of the same mechanism (amendment A3): the feed is
+/// built from the scope that admitted the subscriber, so it carries that
+/// tenant and delivers only events recorded in it. No string names the
+/// tenant on either side.
+#[route(SSE "/scoped-feed/:org", public(Org), emits(OrgPing))]
+fn scoped_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<OrgPing>().cursor(cursor).into())
+}
+```
+
+`literal_feed`'s doc becomes:
+
+```rust
+/// A global subscription keyed with a string spelled like a tenant's decimal
+/// id — the key `ScopedTx::event_key` used to attach. A key is an app filter
+/// and never a tenant, so this feed receives no event recorded in a tenant,
+/// whatever it is keyed with (tenancy-completion spec §2.3).
+```
+
+After `global_feed`, add:
+
+```rust
+/// A tenant feed widened after `.into()` — the shape `Subscription::and`
+/// refuses by name, since delivery compares a row's tenancy with the feed's
+/// and a global event is never recorded in a tenant.
+#[route(SSE "/widened-feed/:org", public(Org))]
+fn widened_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    let feed: Subscription = tx.subscription::<OrgPing>().cursor(cursor).into();
+    Ok(feed.and::<Pong>())
+}
+```
+
+After `a_cursor_from_another_tenancy_is_refused_not_resumed`, add:
+
+```rust
+/// A tenant feed widened after `.into()` could never deliver what `.and`
+/// adds: delivery compares a row's tenancy with the feed's, and
+/// `Subscription::and` adds global events. So the handler that writes it
+/// panics by name, with the fix, the way a duplicate `NAME` does.
+/// `TenantFeed::and`, the tenant's own way to add an event, never trips it
+/// (`http::tests::a_tenant_feeds_and_adds_without_the_widening_assert`).
+#[test]
+#[should_panic(
+    expected = "Subscription::and: event \"pong\" is added to a tenant feed after .into() — \
+                Subscription::and adds global events, and a tenant feed receives only its own \
+                tenant's events, so this one could never arrive; add the tenant's events with \
+                TenantFeed::and before .into(), and serve global events on a subscription of \
+                their own"
+)]
+fn a_tenant_feed_widened_after_into_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_1008, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![widened_feed]);
+    let _ = app.handle_or_subscribe(
+        Request::new(Method::Get, "/widened-feed/1"),
+        sim.now().as_nanos(),
+    );
+}
+```
+
+In `a_scoped_jobs_emits_are_its_tenants_and_its_deref_emits_are_global`, the rows assertion becomes:
+
+```rust
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.key.as_deref(), r.scope))
+            .collect::<Vec<_>>(),
+        vec![("org_ping", None, Some(0)), ("org_ping", None, None)],
+        "the job's own emit is recorded in tenant 0 with no key; its deref emit is global — \
+         tag 0x09, no tenant"
+    );
+```
+
+`Client`. Before `struct Client`, add
+
+```rust
+/// `Client::ledger`'s shape: event id to (event name, app key, recorded
+/// tenant, the exact JSON a delivery would carry).
+type Ledger = BTreeMap<u64, (&'static str, Option<String>, Option<u64>, String)>;
+```
+
+and in the struct, after `mode_key`, add
+
+```rust
+    /// The tenant this client's feed was opened in, `None` for a global
+    /// subscription. A row is this client's only if its recorded tenant is
+    /// exactly this: presence, not value, so tenant 0 is `Some(0)`.
+    mode_scope: Option<u64>,
+```
+
+and the `ledger` field's type becomes `Ledger`. `Client::new` gains `mode_scope: None,`. After `new`, add
+
+```rust
+    /// This client, subscribed to a tenant feed of `tenant` rather than to a
+    /// global subscription.
+    fn in_tenant(mut self, tenant: u64) -> Client {
+        self.mode_scope = Some(tenant);
+        self
+    }
+```
+
+`matches` becomes
+
+```rust
+    fn matches(&self, name: &str, key: &Option<String>, scope: Option<u64>) -> bool {
+        self.mode_names.contains(&name)
+            && self.mode_scope == scope
+            && (self.mode_key.is_none() || self.mode_key == key.as_deref())
+    }
+```
+
+`first_unaccounted`'s loop becomes `for (id, (name, key, scope, _)) in self.ledger.range(lo..self.next_scan_id) { if self.matches(name, key, *scope) && !self.verified.contains(id) {`; `diverged_ledger_entry`'s loop pattern becomes `(&id, (_, _, _, recorded))`; `sync_ledger`'s insert becomes `self.ledger.insert(row.id.raw(), (name, row.key, row.scope, json));`. `try_match` becomes
+
+```rust
+    fn try_match(&self, id: u64, name: &str, json: &str) -> MatchOutcome {
+        match self.ledger.get(&id) {
+            Some((exp_name, key, scope, exp_json)) if *exp_name == name && exp_json == json => {
+                // Content matches the ledger row at this id exactly — but a
+                // delivered frame is only legitimate if that row ALSO
+                // satisfies this subscription's own filter. Over-delivery
+                // (a leaked wrong-name, wrong-tenant or wrong-key row) carries
+                // genuine content at its own id, so content equality alone
+                // would silently Match it; this closes that direction.
+                if !self.matches(exp_name, key, *scope) {
+                    let violation = if !self.mode_names.contains(exp_name) {
+                        format!(
+                            "name {exp_name:?} is not in the subscribed set {:?}",
+                            self.mode_names
+                        )
+                    } else if self.mode_scope != *scope {
+                        format!(
+                            "its recorded tenant {scope:?} is not the subscription's {:?}",
+                            self.mode_scope
+                        )
+                    } else {
+                        format!(
+                            "key {key:?} does not match the subscribed key {:?}",
+                            self.mode_key
+                        )
+                    };
+                    return MatchOutcome::Mismatch(format!(
+                        "over-delivery at event id {id}: delivered frame name {name:?} \
+                         violates this subscription's filter — {violation}"
+                    ));
+                }
+                MatchOutcome::Matched
+            }
+            Some((exp_name, _, _, exp_json)) => MatchOutcome::Mismatch(format!(
+                "content mismatch at event id {id}: expected ({exp_name}, {exp_json}) but \
+                 received ({name}, {json})"
+            )),
+            None => MatchOutcome::Pending,
+        }
+    }
+```
+
+In `absorb`, the durable-corruption arm's guard becomes
+
+```rust
+                // A cut that returned the log to the client's exact cursor
+                // position can also re-mint that id and seq as a row of
+                // another tenancy (the same loss, a different emit), which
+                // validation refuses by tenancy rather than by seq
+                // (amendment A16). Same cause, same prune.
+                409 if (text.contains("diverged from this node's timeline")
+                    || text.contains("outside this feed's tenancy"))
+                    && durable_corruption_fired(sim) =>
+```
+
+with its body unchanged. Neither change moves the flagship, the shapes swarm or the follower: all three read only global rows through global subscriptions (`mode_scope` and every row's `scope` are `None`), and none can meet the tenancy 409.
+
+The sibling's header (the block under `// ===… the scoped sibling under the full fault matrix`): its first paragraph becomes
+
+```rust
+// Hard rule 3 for `ScopedTx::emit` and the tenant feed. The unit properties
+// above run one kernel under `FaultConfig::none()`, and the tenant an emit
+// records is DURABLE — `db.rs` stores it in `EventRow.scope`, ships it by
+// replication, and compares it when a subscriber resumes. A crash between
+// emit and durability, a WAL replay, a retention gap and a dropped tail must
+// all preserve it, and none of those happen in a universe with no faults in
+// it.
+```
+
+its second ("A SIBLING of …") is unchanged, and its third becomes
+
+```rust
+// **What this sibling can prove that the flagship structurally cannot.** The
+// flagship's `Client` checks every delivered frame against `charpente.events`
+// — the very row whose `scope` column is the thing in question — so an emit
+// that records the WRONG tenant writes it into the oracle's own ground truth,
+// and the oracle agrees with it: a `ScopedTx::emit` recording a constant
+// tenant lands every tenant's event in tenant A, and a `Client` of tenant A's
+// feed then expects them all, receives them all and settles. The
+// discriminator added here is that each event's payload carries the tenant
+// that emitted it, independently of the row (`SCOPED_N_STRIDE`), so
+// `scoped_tenant_oracle` can compare the durable tenant against the emitting
+// scope instead of against itself.
+```
+
+Delete `SCOPED_TENANT_A_KEY` and its doc. Replace `ScopedLedger` and its doc with
+
+```rust
+/// `Client::trace`'s shape: the frames a subscriber actually received. Named
+/// because the twin helper below hands it back beside the ledger.
+type ScopedTrace = Vec<(u64, &'static str, String)>;
+```
+
+(deleting the old `ScopedTrace` line with it). `declared_org`'s doc becomes "The tenant a delivered or stored `org_ping` payload declares, read back out of the JSON rather than out of the row."
+
+Replace `scoped_key_oracle` with
+
+```rust
+/// The sibling's own oracle, on top of everything `Client` already checks
+/// (strictly-increasing ids, no missing own-tenant backlog, no over-delivery
+/// against the ledger's own recorded tenant). Both arms compare the durable
+/// row against the tenant the PAYLOAD declares, which is the only thing in
+/// this file that does not take `EventRow.scope` at its word.
+///
+/// Delivery first, because that is the leak the property is named for; the
+/// ledger arm behind it catches the same corruption one layer earlier, at the
+/// row, including for events the subscriber never asked for. The meta-test
+/// fires both arms separately.
+fn scoped_tenant_oracle(
+    ledger: &Ledger,
+    trace: &[(u64, &'static str, String)],
+    subscriber: u64,
+) -> Result<(), String> {
+    for (id, name, json) in trace {
+        if *name == "charpente.gap" {
+            continue;
+        }
+        let org = declared_org(json)?;
+        if org != subscriber {
+            return Err(format!(
+                "cross-tenant delivery: a feed of tenant {subscriber} received event id {id}, \
+                 which was emitted inside ScopedTx<Org>({org})"
+            ));
+        }
+    }
+    for (id, (name, key, scope, json)) in ledger {
+        if *name != "org_ping" {
+            continue;
+        }
+        let org = declared_org(json)?;
+        if (key.as_deref(), *scope) != (None, Some(org)) {
+            return Err(format!(
+                "event id {id} was emitted inside ScopedTx<Org>({org}) but its durable row \
+                 reads EventRow.scope {scope:?} and EventRow.key {key:?}, not Some({org}) and \
+                 None — the tenant did not survive commit, replay and readback apart from the \
+                 app's key, so a tenant feed resuming on it gets another tenant's backlog or \
+                 loses its own"
+            ));
+        }
+    }
+    Ok(())
+}
+```
+
+Replace `emit_leaky_ping` (doc and body) with
+
+```rust
+/// The naive victim, as a route rather than a core mutation so it can sit in
+/// the suite permanently. It opens a real scope and emits through
+/// `ScopedTx::emit`, but in tenant A whatever tenant the request names —
+/// exactly what a `ScopedTx::emit` recording a constant tenant produces, and
+/// the direction that LEAKS: tenant B's event is recorded in tenant A, so
+/// tenant A's feed receives it and the row agrees with the delivery. Only the
+/// payload (`SCOPED_N_STRIDE`) says otherwise, which is the oracle's point.
+#[route(POST "/leaky-ping", public(Org))]
+fn emit_leaky_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(SCOPED_TENANT_A), ctx)?;
+    tx.emit(OrgPing { n: body.n });
+    Ok(())
+}
+```
+
+`scoped_realtime_workload`: its doc's sentence "`Client` is reused verbatim — keyed to `SCOPED_TENANT_A_KEY`, its `matches`/`first_unaccounted` already demand every A-keyed ledger row above the floor be received, and its `try_match` already rejects a delivered row whose key is not A's — and `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have." becomes "`Client` is reused — in tenant A (`Client::in_tenant`), its `matches`/`first_unaccounted` demand every tenant-A ledger row above the floor be received, and its `try_match` rejects a delivered row recorded in another tenancy — and `scoped_tenant_oracle` adds the payload-versus-row arms `Client` cannot have." Its first line becomes
+
+```rust
+    let mut client = Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
+```
+
+the oracle call becomes `scoped_tenant_oracle(&client.ledger, &client.trace, SCOPED_TENANT_A)?;`, and the coverage block from `let mut saw_a = false;` through the `tenant:foreign-backlog-not-delivered` cover becomes
+
+```rust
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for (id, (_, _, scope, _)) in &client.ledger {
+        match *scope {
+            None => {
+                return Err(format!(
+                    "event id {id} carries no tenant at all — every emit in this workload goes \
+                     through `ScopedTx::emit`, so a row with no tenant means the scope was \
+                     dropped on the way to the log"
+                ));
+            }
+            Some(SCOPED_TENANT_A) => saw_a = true,
+            Some(_) => saw_b = true,
+        }
+    }
+    if saw_a && saw_b {
+        sim.cover("tenant:both-tenants-emitted");
+    }
+    if !client.verified.is_empty() {
+        sim.cover("tenant:own-backlog-verified");
+    }
+    // The "and none of tenant B's" half, made non-vacuous: a row of another
+    // tenant sat in the very window `settled()` scanned and was never
+    // delivered. Without this the property could settle over universes where
+    // B's rows all aged out before the subscriber was ever exposed to them.
+    let received: BTreeSet<u64> = client.trace.iter().map(|&(id, ..)| id).collect();
+    let lo = client.floor.min(client.next_scan_id);
+    if client
+        .ledger
+        .range(lo..client.next_scan_id)
+        .any(|(id, (_, _, scope, _))| *scope != Some(SCOPED_TENANT_A) && !received.contains(id))
+    {
+        sim.cover("tenant:foreign-backlog-not-delivered");
+    }
+```
+
+`scoped_twin_run`: its doc's "one subscriber keyed to tenant A" becomes "one tenant-A feed"; its return type becomes `(Ledger, ScopedTrace)`; its client becomes `Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A)`.
+
+Replace `the_scoped_oracle_catches_an_emit_that_drops_the_scope_key` with
+
+```rust
+/// The fireability proof for `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing`
+/// (Task 8's discipline): the property's own oracle, run over data a naive
+/// emit produced, must go RED and NAME the offence — and over the correct
+/// emit on the same bytes must pass. Without the control half, "the oracle
+/// rejected something" would not distinguish a working discriminator from an
+/// oracle that rejects everything.
+///
+/// The victim is `emit_leaky_ping`: a real `ScopedTx::emit`, in tenant A
+/// whatever tenant the request names — the leak direction, and exactly the
+/// shape a `ScopedTx::emit` recording a constant tenant produces.
+#[test]
+fn the_scoped_oracle_catches_an_emit_recorded_in_the_wrong_tenant() {
+    // ---- control: the correct route, on these exact bytes ----
+    let (ledger, trace) = scoped_twin_run("/scoped-ping");
+    assert_eq!(
+        ledger.len(),
+        2,
+        "both tenants must have committed an event, or the control proves nothing: {ledger:?}"
+    );
+    assert_eq!(
+        trace.len(),
+        1,
+        "tenant A's feed must have received exactly its own event: {trace:?}"
+    );
+    scoped_tenant_oracle(&ledger, &trace, SCOPED_TENANT_A)
+        .expect("the correct scoped emit must pass the property's own oracle");
+
+    // ---- victim: the same bytes, the naive emit ----
+    let (ledger, trace) = scoped_twin_run("/leaky-ping");
+    assert_eq!(ledger.len(), 2, "same two events: {ledger:?}");
+    assert_eq!(
+        trace.len(),
+        2,
+        "the leak itself: tenant A's feed received BOTH tenants' events"
+    );
+
+    let err = scoped_tenant_oracle(&ledger, &trace, SCOPED_TENANT_A)
+        .expect_err("the delivery arm must reject a cross-tenant frame");
+    assert!(err.contains("cross-tenant delivery"), "{err}");
+    assert!(
+        err.contains(&format!("ScopedTx<Org>({SCOPED_TENANT_B})")),
+        "the failure must name the tenant whose event leaked: {err}"
+    );
+
+    // The ledger arm, fired on its own: the corruption is in the durable row
+    // whatever the subscriber happened to receive.
+    let err = scoped_tenant_oracle(&ledger, &[], SCOPED_TENANT_A)
+        .expect_err("the ledger arm must reject a row whose tenant is not its emitting scope");
+    assert!(err.contains("EventRow.scope"), "{err}");
+    assert!(
+        err.contains(&format!("ScopedTx<Org>({SCOPED_TENANT_B})")),
+        "the failure must name the emitting scope: {err}"
+    );
+}
+```
+
+`crates/charpente/tests/tenant.rs`: the root import list gains `Subscribe`; each of `memo_feed`, `memo_feed_open` and `memo_feed_auth` ends
+
+```rust
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<MemoNoted>().cursor(cursor).into())
+```
+
+and the `Org` doc's last sentence ("…and the platform never DERIVES a scope — it only renders one, as the subscription key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing `emit_keyed` ruling, DESIGN.md §6).") becomes "…and the platform never DERIVES a scope — it only records one, beside a scoped job or event (the standing `emit_keyed` ruling, DESIGN.md §6)."
+
+`crates/charpente/tests/kernel.rs`, the swarm `Org`'s doc (2179–2184 at e749823): the same replacement of its last sentence.
+
+`crates/charpente-macros/tests/compile_pass/route_public_scope.rs`: the root import becomes `use charpente::{CrossTenant, Id, Scoped, Subscribe, Tx, event, route, table};` and `feed`'s body becomes
+
+```rust
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<IncidentOpened>().cursor(cursor).into())
+```
+
+`examples/invoicing/src/bin/tenant_node.rs`: the root import gains `Subscribe`; `create_doc`'s comment becomes
+
+```rust
+    // `ScopedTx::emit`, so the event is recorded in this tenant, apart from
+    // any key (tenancy-completion spec §6).
+```
+
+and `feed` (doc and body) becomes
+
+```rust
+/// One tenant's event feed, built from the scope the subscriber just proved
+/// membership of: it carries that tenant, and delivers only events recorded
+/// in it.
+#[route(SSE "/orgs/:org/feed", auth)]
+fn feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<DocCreated>().cursor(cursor).into())
+}
+```
+
+`crates/edge-harness/tests/tenant_wire.rs`, the doc of `a_tenants_feed_never_receives_another_tenants_events_over_sse` becomes
+
+```rust
+/// SSE: two live subscriptions on one node, one per tenant. Every event is
+/// emitted through `ScopedTx::emit`, so it is recorded in its tenant; each
+/// feed is built from the scope its own subscriber proved membership of.
+```
+
+Then prove no `event_key` survives in code, and format:
+
+```zsh
+cargo fmt --all
+git grep -n "event_key" -- crates examples
+git status --short
+```
+
+Expected: the grep prints only `crates/charpente/tests/realtime.rs`'s `literal_feed` doc line (it names the deleted method on purpose); `git status --short` lists only this task's files.
+
+- [ ] **Step 7: Run, then prove red by mutation**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test realtime -- --skip a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing 2>&1 | tee $D/task10-realtime.log | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --test tenant --test kernel --test http 2>&1 | tee $D/task10-others.log | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente-core 2>&1 | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --lib 2>&1 | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente-macros --test trybuild 2>&1 | grep -E "^test result|FAILED"
+cargo test -p invoicing 2>&1 | grep -E "^test result|FAILED"
+```
+
+Expected: every line `test result: ok`, the four new realtime tests, the rewritten fireability test and the replay test `scoped_realtime_frame_traces_replay_identically_for_the_same_seed` included. The tenant swarm is skipped here; Step 8 runs it under the baseline driver.
+
+Save the implementation, so each mutation reverts exactly:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff -- crates/charpente-core/src crates/charpente/src > $D/task10-impl.patch
+git diff -- crates/charpente-core/src crates/charpente/src | shasum > $D/task10-impl.sha
+cat $D/task10-impl.sha
+```
+
+Apply each mutation alone, run the named tests, and quote the failure. Restore after each with
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git checkout -- crates/charpente-core/src crates/charpente/src && git apply $D/task10-impl.patch
+git diff -- crates/charpente-core/src crates/charpente/src | shasum | diff - $D/task10-impl.sha && print -r -- restored
+```
+
+and do not start the next mutation until it prints `restored`. A mutation that stays green is a finding: print what the mutated code does (the rows, the frames) before concluding anything from it.
+
+1. `encode_record`: `if scope.is_some() { 11 } else { 9 }` becomes `9`. Run `cargo test -p charpente-core --lib -- scoped_emit_bytes_are_pinned_with_tenant_zero`. Expected: the encode assertion fails at the first effect's tag, 9 where 11 is pinned.
+2. `decode_record` arm `11`: `scope: Some(u64::decode(input)?)` becomes `scope: { u64::decode(input)?; None }`. Run the test above and `cargo test -p charpente-core --test materialize -- a_shipped_scoped_emit_materializes_with_its_scope_tenant_zero_included`. Expected: the decode assertion fails at `scope: None` for `Some(0)`; the materialize test fails with every scope `None`.
+3. The apply arm passes `None` instead of `*scope`. Run the materialize test above and `cargo test -p charpente --test realtime -- a_tenant_feed_receives_only_its_own_tenants_events_tenant_zero_included`. Expected: the materialize test fails with every scope `None`; the realtime test fails at tenant 0's feed, left `[]` — every row is global, so no tenant feed receives anything.
+4. `EventRow::encode_row`: delete `scope.encode(out);` (keep the assert). Run `cargo test -p charpente-core --lib -- a_scoped_event_row_roundtrips_its_tenant_zero_included`. Expected: fails "the tenant is eight more bytes".
+5. `EventRow::decode_row`'s `16` arm returns `(Some(u64::decode(input)?), { u64::decode(input)?; None })`. Run the same test. Expected: fails at `(Some("room-9"), Some(0))` against `(Some("room-9"), None)` — the tenant-0 red.
+6. `EventRow::encode_row`: delete the `assert!`. Run `cargo test -p charpente-core --lib -- a_scope_without_a_shape_is_refused_at_encode`. Expected: "note: test did not panic as expected".
+7. `ScopedTx::emit` records no tenant: `self.tx.push_emit(Some(scope), None, event)` becomes `self.tx.push_emit(None, None, event)`. Run `cargo test -p charpente-core --test materialize -- a_scoped_emit_records_its_tenant_apart_from_its_key` and the realtime test of mutation 3. Expected: the materialize test fails at `("org_event", None, None)` for `Some(0)`; the realtime test fails at tenant 0's feed, left `[]`.
+8. `ScopedTx::emit` keys by the tenant, as before this task: `self.tx.push_emit(Some(scope), Some(scope.to_string()), event)`. Run the materialize test of mutation 7 and `cargo test -p charpente --test realtime -- a_scoped_jobs_emits_are_its_tenants_and_its_deref_emits_are_global`. Expected: the materialize test fails at `("org_event", Some("0"), Some(0))`; the realtime test fails at its rows assertion, `("org_ping", Some("0"), Some(0))`. `a_tenant_feed_receives_only…` stays green under this mutation (its tenant feeds carry no key); that is why the key half is pinned at the row.
+9. `Subscription::admits`: delete `&& scope == self.scope`. Run `cargo test -p charpente --lib -- admits_is_the_name_and_the_tenant_and_the_key` and the realtime test of mutation 3. Expected: the unit test fails at "tenant 0's row is not global: None is not Some(0)"; the realtime test fails at tenant 0's feed, which now receives tenant 1's and the global event too, in id order: left `["org_ping {\"n\":\"9\"}", "org_ping {\"n\":\"7\"}", "org_ping {\"n\":\"5\"}"]`.
+10. `deliver_unit`: replace the `admits` check and the `expect`ed lookup with the filter this task replaced:
+    ```rust
+            if tail.sub.key.is_some() && tail.sub.key.as_deref() != row.key.as_deref() {
+                continue;
+            }
+            let Some(entry) = tail.sub.entries.iter().find(|e| e.name == row.name) else {
+                continue;
+            };
+    ```
+    Run the realtime tests of mutations 3 and 8. Expected: both fail at their tenant feed, which receives every `org_ping` row — delivery no longer asks the predicate.
+11. `validate_subscribe`: delete the `if row.scope != sub.scope { … }` block. Run `cargo test -p charpente --test realtime -- a_cursor_from_another_tenancy_is_refused_not_resumed`. Expected: fails at the statuses assertion, left `[200, 200, 200, 200, 200]`.
+12. `validate_subscribe`: the reshape gate's `sub.admits(&row.name, row.key.as_deref(), row.scope)` becomes `true`. Run `cargo test -p charpente --test realtime -- another_keys_reshaped_event_neither_ends_nor_refuses_this_tail`. Expected: fails "neither subscribe is refused", left `[200, 409]` — a cursor on another key's reshaped row is refused although the feed never delivers it, so validation's reshape gate does ask the predicate.
+13. `Subscription::and`: delete the widening `assert!`. Run `cargo test -p charpente --test realtime -- a_tenant_feed_widened_after_into_is_refused_by_name`. Expected: "note: test did not panic as expected".
+14. `TenantFeed::and`: its body becomes `self.sub = self.sub.and::<Ev>(); self`. Run `cargo test -p charpente --lib -- a_tenant_feeds_and_adds_without_the_widening_assert`. Expected: panics with the widening text, `Subscription::and: event "unit_pong" is added to a tenant feed after .into() — …`.
+15. `Subscribe::subscription` for `ScopedTx`: `scope: Some(self.scope().raw())` becomes `scope: None`. Run the realtime test of mutation 3. Expected: fails at tenant 0's feed, left `["org_ping {\"n\":\"5\"}"]` — the "tenant feed" is a global one.
+
+After mutation 15's restore prints `restored`, run `git status --short` and confirm the tree holds exactly this task's edits.
+
+- [ ] **Step 8: Byte identity, and the tenant swarm re-measured**
+
+The ten baselines this task must not move:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task10 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task10 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task10 realtime-flagship realtime-shapes realtime-follower; print -r -- "exit ${?}"
+zsh $D/baselines.sh task10 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task10 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task10 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label `reproduces the base`, every call `exit 0`. A `MOVED` here is a finding (this task's Coverage baselines paragraph says why each must hold): stop and report the diff.
+
+The one that moves, twice:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task10 realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task10b realtime-tenant; print -r -- "exit ${?}"
+diff $D/cov-realtime-tenant-task10.txt $D/cov-realtime-tenant-task10b.txt && print -r -- 'reproduced identically'
+cat $D/cov-realtime-tenant-task10.txt
+```
+
+Expected: both runs print `exit 0, passing-test lines 1` for the test and `MOVED` against the pre-task base, so each call prints `exit 1` — by design, for this label only; the diff prints `reproduced identically`; the recording shows every required key (`tenant:both-tenants-emitted`, `tenant:own-backlog-verified`, `tenant:foreign-backlog-not-delivered`, `realtime:resume-backlog`, `realtime:stall-drop`, `fault:subscriber_stall`) and its verdict line. Two runs that differ are a determinism finding: stop.
+
+The floors (`SCOPED_BOTH_TENANTS_FLOOR` 75, `SCOPED_OWN_BACKLOG_FLOOR` 78, `SCOPED_FOREIGN_SKIPPED_FLOOR` 80, `SCOPED_RESUME_BACKLOG_FLOOR` 125 at e749823):
+- A measured count at or above its floor: leave the floor alone (a floor is a minimum; raising one that is not failing is a separate decision).
+- A measured count below its floor (the run printed `passing-test lines 0` and the log names the floor): lower that floor to exactly the measured count, and extend the doc comment above `SCOPED_BOTH_TENANTS_FLOOR` with a second table headed "**Re-measured 2026-09-30** (tenancy completion Task 10: every emit is now recorded under tag `0x0b` with its tenant, and the event is `org_ping`, so every universe's bytes moved)" listing `| key | was | now |` for all four keys. Then re-run `zsh $D/baselines.sh task10c realtime-tenant` and confirm `passing-test lines 1` and a recording identical to `task10`'s.
+- A count more than 15% below its floor is not a number to lower: it is a coverage loss. Stop and report the four counts.
+
+Re-base the one label that moved, so Tasks 11 and 12 reproduce the new bytes:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+mv $D/cov-realtime-tenant-base.txt $D/cov-realtime-tenant-base-pre-task10.txt
+cp $D/cov-realtime-tenant-task10.txt $D/cov-realtime-tenant-base.txt
+```
+
+and write both the old and new counts into `progress.md`.
+
+- [ ] **Step 9: The wire oracle over real TCP**
+
+`tenant_node`'s feed changed, and `a_tenants_feed_never_receives_another_tenants_events_over_sse` is `#[ignore]`d, so no gate runs it. Build the release binaries first (foreground; if the tool ceiling cuts a cold build, re-run the same command — cargo resumes), then the test:
+
+```zsh
+cargo build --release -p invoicing -p charpente-cli --bins
+cargo build --release -p invoicing --example seed_foreign_job
+cargo test -p edge-harness --test tenant_wire -- a_tenants_feed_never_receives_another_tenants_events_over_sse --exact --ignored 2>&1 | tee .superpowers/sdd/2026-09-30-tenancy-completion/task10-tenant-wire.log | grep -E "^test |test result"
+```
+
+Expected: `test result: ok. 1 passed`. Each tenant's feed, over real SSE, still receives exactly its own tenant's events.
+
+- [ ] **Step 10: Docs**
+
+`docs/GUIDE.md` §11.
+
+(a) Replace everything from the heading "### Emitting: `tx.emit` and `tx.emit_keyed`" up to (not including) the paragraph beginning "One contract rides along with the `Serialize` derive" with:
+
+````markdown
+### Emitting: `tx.emit` and `tx.emit_keyed`
+
+```rust,ignore
+pub fn emit<Ev: Event>(&mut self, event: Ev)
+pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev)
+```
+
+Both buffer into the transaction's effects exactly like `enqueue`/`enqueue_keyed` —
+nothing is visible to a subscriber until the transaction's one log record commits.
+`emit_keyed`'s key is an app filter (a user's subject, a room name — whatever a
+`Subscription` should be allowed to narrow on); the platform never parses it, only
+exact-matches it at delivery (`Subscription::key`, below). The match rule is exact on
+both sides: an *unkeyed* subscription (no `.key(...)`) receives every event of its
+types, keyed or not; a *keyed* subscription receives only events whose key is an exact
+match — which means a keyed subscription does **not** receive `tx.emit` (unkeyed)
+events, since no key equals the absence of one. A key is not a tenant: which tenant an
+event belongs to is recorded by the scope it was emitted in (next), never spelled as a
+string.
+
+### Emitting inside a tenant, and the tenant feed
+
+Inside a tenant scope you do not choose. `tx.emit` and `tx.emit_keyed` on a `ScopedTx`
+— the handle `tx.scope::<Org>(org, ctx)?` returns — record the scope's tenant in the
+event's own row, apart from any key, so a transaction that had to be admitted to reach a
+tenant's rows cannot hand that tenant's event to anyone outside it:
+
+```rust,ignore
+// on ScopedTx<'_, '_, S>:
+pub fn emit<Ev: Event>(&mut self, event: Ev)                                // recorded in this tenant
+pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev)  // the same, plus the app's key
+```
+
+A tenant's feed is built from the same scope: `tx.subscription::<Ev>()` on the
+`ScopedTx` (the `charpente::Subscribe` trait) returns a `TenantFeed` carrying that
+tenant, and `.into()` makes it the handler's `Subscription`:
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::wire::WireU64;
+use charpente::{Id, Scoped, Subscribe, Tenant, Tx, Wire, event, route, table};
+use serde::{Deserialize, Serialize};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("member:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
+                "not a member of org {}",
+                scope.raw()
+            )))
+        }
+    }
+}
+
+#[event(global)]
+struct NoteAdded {
+    n: WireU64,
+}
+
+#[derive(Wire, Serialize, Deserialize)]
+struct NoteBody {
+    n: WireU64,
+}
+
+/// Recorded in `org`: the row carries the tenant, apart from any key.
+#[route(POST "/orgs/:org/notes", auth)]
+fn add_note(tx: &mut Tx, org: Id<Org>, body: NoteBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.emit(NoteAdded { n: body.n });
+    Ok(())
+}
+
+/// `org`'s feed: the scope that admitted the subscriber builds it, so it
+/// delivers only events recorded in `org`.
+#[route(SSE "/orgs/:org/feed", auth, emits(NoteAdded))]
+fn feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<NoteAdded>().cursor(cursor).into())
+}
+```
+
+Delivery compares tenancy exactly. A tenant's feed receives only the events recorded in
+its own tenant — never another tenant's, never a global one — and a global subscription
+(`Subscription::of`) never receives an event recorded in a tenant, tenant 0 included,
+whatever key it narrows on. Nothing in the app spells a tenant as a string, on either
+side. `.key(...)` still narrows a tenant feed further, by the app's own key.
+
+An emit that genuinely belongs to no tenant is written `(*tx).emit(…)` — the same
+explicit deref an unscoped table access takes — and `(**tx).emit(…)` in a scoped job's
+`run`, which holds `&mut ScopedTx`. It is recorded with no tenant and reaches global
+subscriptions only. A tenant feed carries only the events `TenantFeed::and` added before
+`.into()`: `Subscription::and` adds global events, so on a tenant feed it panics rather
+than build a subscription that could never deliver what it names:
+
+<!-- pinned -->
+```text
+Subscription::and: event "<name>" is added to a tenant feed after .into() — Subscription::and adds global events, and a tenant feed receives only its own tenant's events, so this one could never arrive; add the tenant's events with TenantFeed::and before .into(), and serve global events on a subscription of their own
+```
+
+The recorded tenant is the scope's raw id. Until an event type declares the scope type it
+belongs to, two *different* scope types sharing a raw id share a tenant in the event log:
+a feed opened in `OrgA` 1 receives an `Ev` emitted in `OrgB` 1. An app with more than one
+scope type gives each scope type's feeds event types of their own.
+
+This is the realtime face of tenant scoping, and it is documented here rather than twice:
+§16 covers the mechanism it belongs to — declaring `scoped_by`, writing the scope's
+`authorize`, and the cross-tenant capability — and points back here for the emit and
+subscribe shapes above.
+````
+
+(b) In the compiled "SSE route" block, `feed`'s doc comment "A real handler would narrow `.key(...)` to the caller's own org, read off `ctx.session()` exactly like any other route's access control — the platform enforces nothing about the key beyond the exact-match filter." becomes "A real handler would narrow `.key(...)` to the caller's own subject, read off `ctx.session()` exactly like any other route's access control — the platform enforces nothing about the key beyond the exact-match filter. A tenant's feed is built from its scope instead ("Emitting inside a tenant", above)."
+
+(c) The `impl Subscription` API block becomes
+
+```rust,ignore
+impl Subscription {
+    pub fn of<Ev: Event + serde::Serialize>() -> Subscription;      // a global subscription
+    pub fn and<Ev: Event + serde::Serialize>(self) -> Subscription; // another global event
+    pub fn key(self, key: impl Into<String>) -> Subscription;
+    pub fn cursor(self, cursor: Option<Cursor>) -> Subscription;
+}
+
+pub trait Subscribe<S> {                        // for ScopedTx<'_, '_, S>; `use charpente::Subscribe`
+    fn subscription<Ev: Event + serde::Serialize>(&self) -> TenantFeed<S>;
+}
+
+impl<S> TenantFeed<S> {                         // charpente::http::TenantFeed
+    pub fn and<Ev: Event + serde::Serialize>(self) -> TenantFeed<S>;
+    pub fn key(self, key: impl Into<String>) -> TenantFeed<S>;
+    pub fn cursor(self, cursor: Option<Cursor>) -> TenantFeed<S>;
+}
+// impl<S> From<TenantFeed<S>> for Subscription: a tenant feed ends `.into()`.
+```
+
+and the paragraph after it gains, as its last sentence: "A `Subscription` from `of` is global; one converted from a `TenantFeed` carries its tenant, which no app code can set or read."
+
+(d) "Cursor semantics": after the **Diverged** bullet and before **Reshaped**, add
+
+```markdown
+- **Another tenancy** — the retained row at that id is an event of another tenancy than
+  this subscription's: another tenant's event on a tenant feed, a global event on a
+  tenant feed, or a tenant's event on a global subscription. A cursor resumes only the
+  feed that delivered it, so this one is refused rather than resumed, and the refusal
+  names no tenant and no event (below).
+```
+
+After the **Reshaped** bullet, before the "Three of these four named errors" paragraph, add (the marker must sit at column 0, which is why this block is not inside the bullet):
+
+````markdown
+The tenancy refusal, exactly:
+
+<!-- pinned -->
+```text
+cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; re-sync current state through reads, then reconnect without a cursor
+```
+````
+
+and "Three of these four named errors end with the identical fix" becomes "Four of these five named errors end with the identical fix".
+
+(e) "Delivery": "filters by the subscription's names and key," becomes "filters by the subscription's names, its tenancy and its key — one predicate, the one resume validation asks too —".
+
+(f) "Changing an event": after "A cursor on a foreign row of an event the subscription does not carry, or one its key filter excludes, is not refused: the subscription would never deliver that row anyway." add "A cursor on a row of another tenancy is refused either way ("Cursor semantics", above): no feed of this subscription's tenancy ever delivered it."
+
+`docs/GUIDE.md` §16.
+
+(g) "What a `ScopedTx` gives you": the block's two lines
+
+```rust,ignore
+    pub fn emit<Ev: Event>(&mut self, event: Ev);      // keyed by the scope — §11
+    pub fn event_key(&self) -> String;                 // the scope's decimal id
+```
+
+become
+
+```rust,ignore
+    pub fn emit<Ev: Event>(&mut self, event: Ev);                                // recorded in this tenant — §11
+    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev);  // the same, plus the app's key
+```
+
+and after the block's closing fence add: "`use charpente::Subscribe;` adds `tx.subscription::<Ev>()`, the tenant feed (§11)."
+
+(h) If the bullet "**The scope type is never inspected.**" still says "the one thing the platform reads off a scope is its decimal form, as a subscription key (below)" (Task 2 may have rewritten it), that clause becomes "what the platform records of a scope is its raw id, beside a scoped job or event (below)".
+
+(i) "### Realtime: one mechanism, not two": its body (both paragraphs) becomes
+
+```markdown
+`tx.emit` on a `ScopedTx` records the scope's tenant in the event's row, apart from any
+key, and a tenant feed — `tx.subscription::<Ev>()` on the handle — delivers only rows
+recorded in its own tenant. A tenant's feed therefore never receives another tenant's
+event or a global one, and a global subscription never receives a tenant's, for the
+same reason its queries cannot cross: the app did not have to remember a second rule,
+and it never spells a tenant as a string. §11 ("Emitting inside a tenant, and the tenant
+feed") carries the code for both sides.
+
+**The limit that travels with it, until an event declares its scope type:** the row
+records the scope's *raw id*. Two **different scope types** sharing a raw id therefore
+share a tenant in the event log, so a feed opened in `OrgA` 1 receives an event of the
+same type emitted in `OrgB` 1. An app with more than one scope type gives each scope
+type's feeds event types of their own.
+```
+
+(j) If Task 8/9's rewrite of "**Nor does it cover the platform's own tables.**" still carries "an event's payload and its `key`, which for an emit inside a scope is that tenant's id", that becomes "an event's payload, its app key and its recorded tenant (`scope`)"; and if it still carries "the event rows whose `key` is its `tx.event_key()`, which has the subscription key's limit when an app has more than one scope type (§16, "Realtime")", that becomes "the event rows whose `scope` is the id of the tenant it opened, which has the raw-id limit when an app has more than one scope type (§16, "Realtime")".
+
+Prove GUIDE clean of the old mechanism:
+
+```zsh
+grep -n "event_key\|decimal id\|scope's key\|keyed by the scope" docs/GUIDE.md
+```
+
+Expected: no output.
+
+`crates/guide-examples/tests/doc_truth.rs`: GUIDE gains two pinned blocks, so `PINNED_FLOOR` rises by exactly 2 from the value Task 9 left (read it with `grep -n "const PINNED_FLOOR" crates/guide-examples/tests/doc_truth.rs`), and its doc comment's history gains, before the closing period, "; <that value + 2, as a number> with event tenancy's widened-tenant-feed panic and its cross-tenancy cursor 409 (2026-09-30)".
+
+`DESIGN.md`.
+
+§3, the **Events** bullet: after "…makes "unregistered event at delivery" inexpressible rather than an error case." add "An event emitted on a `ScopedTx` is recorded in that tenant (§4's `0x0b`), and a tenant feed — `tx.subscription::<Ev>()` on the same handle — delivers only events recorded in its tenant (§6, §8)."
+
+§4, **Record payload**: after "(a `#[job(scoped_by = …)]` job's tenant, spec 2026-09-27-job-tenancy §6)," insert "scoped emit `0x0b [event][payload][key: Option<String>][shape: u64][scope: u64]` (an event emitted on a `ScopedTx`, its tenant beside the app's key, spec 2026-09-30-tenancy-completion §6),". Replace "`0x0b` is the next free tag." with "The scoped emit is a new tag rather than a widened `0x09` for the same reason, chosen by presence and never by the tenant's value, so tenant 0 is `0x0b` too and a global emit stays `0x09` byte for byte; its `EventRow` carries the tenant as a trailing `scope`, absent for every other row. `0x0c` is the next free tag."
+
+§5: "`PROTO_VERSION` is 4 — a message body's shape changing is what bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags made it 3, job tenancy's `0x0a` made it 4, and a `Hello` declaring an older version is refused by name." becomes "`PROTO_VERSION` is 5 — a message body's shape changing is what bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags made it 3, job tenancy's `0x0a` made it 4, event tenancy's `0x0b` made it 5, and a `Hello` declaring an older version is refused by name."
+
+§6, the **Realtime** bullet: from its first sentence through "…and a subscription keyed to one tenant never receives another's event." becomes
+
+```markdown
+- **Realtime.** `tx.emit(event)`/`tx.emit_keyed(key, event)` writes a typed event into the
+  committing log record alongside the transaction's other effects — `key` is an opaque
+  app filter (a user's subject, a room), carried but never interpreted inside the
+  deterministic boundary, and never a tenant. Inside a tenant scope the tenant is not the
+  app's to remember: `ScopedTx::emit`/`emit_keyed` record the scope's tenant in the
+  event's own field (record tag `0x0b`, §4), apart from the key, so tenancy has one
+  mechanism rather than two that can disagree. A tenant feed is built from the same scope
+  (`tx.subscription::<Ev>()`, below), and one predicate, `Subscription::admits` — a name
+  the subscription carries, exactly its tenancy, a key it passes — decides delivery and
+  gates resume validation alike: a tenant's feed never receives another tenant's event or
+  a global one, and a global subscription never receives a tenant's.
+```
+
+and in the same bullet `(`EventRow { id, seq, name, key, payload }`)` becomes `(`EventRow { id, seq, name, key, payload, shape, scope }`)`.
+
+§6, the cursor bullet: after "…the same shape as replication's diverged-`Hello` refusal (§5)." add "A cursor on a row of another tenancy than the subscription's is refused by name too: a cursor resumes only the feed that delivered it."
+
+§6, the subscription-surface bullet: "`.key(...)` is an optional exact-match filter," becomes "`.key(...)` is an optional exact-match app filter,", and after the sentence ending "…not the platform's)." add "A tenant's feed is `tx.subscription::<Ev>()` on its `ScopedTx` (the `Subscribe` trait): a `TenantFeed<S>` carrying the tenant, which no app code can set or read, converted with `.into()`; `Subscription::and` refuses by name to widen one after the conversion."
+
+§8, multi-tenancy: "Realtime is the same mechanism rather than a second one — `emit` inside a scope is `emit_keyed` with the scope's key (§6), which retires `emit_keyed`'s hand-rolled scoping key as the stopgap it was." becomes "Realtime is the same mechanism rather than a second one — an emit inside a scope records the scope's tenant beside the event (§6), a tenant feed is built from the scope, and delivery compares the two exactly; `emit_keyed`'s key stays the app's own filter and is never a tenant." The first limit, "The subscription key is the scope's decimal id, so two DIFFERENT scope types sharing a raw id share a key — an app with more than one scope type keys its subscriptions per scope type as well.", becomes "An event row records its tenant's raw id, so two DIFFERENT scope types sharing a raw id share a tenant in the event log — an app with more than one scope type gives each scope type's feeds event types of their own." If Task 8/9's platform-tables sentence still says "an event's payload and its `key`, which inside a scope is the tenant's id", that becomes "an event's payload, its app key and its recorded tenant".
+
+`PLAN.md` (the M2 tenant-scoping paragraph, 158–182 at e749823):
+- "Realtime is the same mechanism rather than a second one: `emit` inside a scope is keyed by the scope." becomes "Realtime is the same mechanism rather than a second one: an emit inside a scope records the scope's tenant, apart from any app key, and a tenant feed built from the scope receives only its tenant's events."
+- "a scope-keyed realtime sibling" becomes "a tenant-feed realtime sibling".
+- "The subscription key is the scope's decimal id, so two different scope types sharing a raw id share a key." becomes "An event row records its tenant's raw id, so two different scope types sharing a raw id share a tenant in the event log."
+
+Prove the design docs clean:
+
+```zsh
+grep -n "event_key\|scope's decimal id\|keyed by the scope\|scope-keyed" DESIGN.md PLAN.md README.md
+cargo build -p guide-examples 2>&1 | tail -2
+cargo test -p guide-examples --no-fail-fast 2>&1 | grep -E "^test result|FAILED|panicked"
+```
+
+Expected: the grep prints nothing; the build succeeds (the new compiled block included); every `test result: ok`, `doc_truth` counting the two new pinned blocks at the raised floor.
+
+- [ ] **Step 11: Gate and commit**
+
+Foreground, per package, appended to one log, then counted:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/gate-task-10.log
+: > $L
+cargo fmt --all --check 2>&1 | tee -a $L; print -r -- "fmt exit ${pipestatus[1]}"
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a $L | grep -E '^(warning|error)' | head; print -r -- "clippy exit ${pipestatus[1]}"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente --lib --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente --test realtime --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente --test replication --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente --test tenant --test kernel --test http --test archive --test describe --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente-macros --test trybuild --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo build -p guide-examples 2>&1 | tee -a $L | tail -2
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+print -r -- "result lines $(grep -c '^test result:' $L), ok lines $(grep -c '^test result: ok' $L), FAILED lines $(grep -c FAILED $L)"
+```
+
+Expected: `fmt exit 0`, `clippy exit 0`; the two `result` counts equal; `FAILED lines 0`. The realtime run includes the re-measured tenant swarm. State the counts in the report; never infer them from the absence of `FAILED`. No test file was added, so CLAUDE.md's lists do not change.
+
+The controller runs the full workspace gate (background, counted) before marking the task done. Re-check `git status` and `git log -1` (another session may be writing this tree), then:
+
+```zsh
+git add crates/charpente-core/src/db.rs crates/charpente-core/src/event.rs crates/charpente-core/src/table.rs \
+  crates/charpente-core/tests/materialize.rs crates/charpente/src/http/mod.rs crates/charpente/src/lib.rs \
+  crates/charpente/src/kernel/tail.rs crates/charpente/src/kernel/mod.rs crates/charpente/src/repl/mod.rs \
+  crates/charpente/tests/realtime.rs crates/charpente/tests/replication.rs crates/charpente/tests/tenant.rs \
+  crates/charpente/tests/kernel.rs crates/charpente-macros/tests/compile_pass/route_public_scope.rs \
+  examples/invoicing/src/bin/tenant_node.rs crates/edge-harness/tests/tenant_wire.rs \
+  crates/guide-examples/tests/doc_truth.rs docs/GUIDE.md DESIGN.md PLAN.md
+git status --short
+git commit -m "feat(tenancy-completion): an event records its tenant apart from its key — tag 0x0b, EventRow.scope, PROTO_VERSION 5; the tenant feed (Subscribe, TenantFeed) and one predicate (Subscription::admits) for delivery and resume; a cursor from another tenancy is refused by name, and a tenant feed widened after .into() panics by name; <M> of 15 mutations red; realtime-tenant re-measured over 128 universes twice, identical (<floors kept | floor was→now>); the ten other baselines reproduced"
+```
+
+`git status --short` after the add must show nothing unstaged under this task's paths. No `Co-Authored-By` trailer (CLAUDE.md).
+
+---
+
+### Task 11: Events declare their tenancy — `#[event(global | scoped_by = Org)]`, the bare refusal, the emit and subscribe bounds, the scoped fingerprint
+
+**Files:**
+- Modify `crates/charpente-core/src/db.rs`:
+  - `pub trait Event` (118–129 at `e749823`): its doc and `type Scope`;
+  - the `use crate::table::{…}` list (52–55): add `UnscopedEvent`;
+  - `Tx::push_emit` (new, private), which replaces the emit body Task 10 left;
+  - `Tx::emit` / `Tx::emit_keyed` (1094–1110), bounded on `UnscopedEvent`;
+  - `ScopedTx::emit` / `ScopedTx::emit_keyed` (Task 10's), bounded on `Event<Scope = S>`.
+- Modify `crates/charpente-core/src/table.rs`: `sealed::NotScopedEvent`, `NoEventTenant` and `UnscopedEvent` (new). They go after `impl<J: crate::db::Job> UnscopedJob for J …` (543).
+- Modify `crates/charpente-macros/src/event.rs`:
+  - the module doc, `ACCEPTED_FORMS`, `EventArg`, `EventArgs` and `global_and_scoped_by` (new);
+  - `expand`'s signature, the bare refusal, the `TenantScope` assert, `type Scope`, the fingerprint and the `EventDef` fields.
+- Modify `crates/charpente-macros/src/lib.rs`: `pub fn event` (239–253 at `e749823`, as Task 1 left it).
+- Modify `crates/charpente/src/describe.rs`: `EventDef` gains `scoped_by`, `scope_type` and `scope_type_name`.
+- Modify `crates/charpente/src/http/app.rs`: `mount_events` feeds the tenant census, and its doc.
+- Modify `crates/charpente/src/http/mod.rs`:
+  - `Subscription::of` / `Subscription::and` (226, 242) are bounded on `UnscopedEvent`;
+  - Task 10's `Subscribe::subscription` (trait and impl) and `TenantFeed::and` are bounded on `Event<Scope = S>`;
+  - `struct SubEntry` (206) and `Subscription.entries` (220) become `pub(crate)`.
+- Modify `crates/charpente/src/kernel/tail.rs`: a new `#[cfg(test)] mod tests` that holds the failing-encoder test moved out of `realtime.rs`.
+- Add `type Scope = Unscoped;` to the four hand-written `impl Event` blocks at `e749823`:
+  - `crates/charpente-core/tests/materialize.rs:49`;
+  - `crates/charpente/tests/transactions.rs:70`;
+  - `crates/charpente/tests/realtime.rs:1246`;
+  - `crates/charpente/src/serve.rs:1268`.
+
+  Add `type Scope` also to every hand `impl Event` Task 10 added: the core test's `OrgEvent` and `TestEvent`, and `http::tests`' `UnitPing`/`UnitPong`/`UnitOrg` (Task 10 leaves them for this task). The compiler names each one (E0046).
+- The `EventDef` literal at `crates/charpente/tests/describe.rs:823` gains the three new fields.
+- Declare `scoped_by` on the tree's scoped events. These are every event emitted through a `ScopedTx` or subscribed through a tenant feed:
+  - `crates/charpente/tests/tenant.rs:167`, `MemoNoted`;
+  - `crates/charpente/tests/realtime.rs`: Task 10's `OrgPing`. Its global uses take the twin `global_twin::OrgPing`;
+  - `crates/charpente-macros/tests/compile_pass/route_public_scope.rs:37`, `IncidentOpened`;
+  - `examples/invoicing/src/bin/tenant_node.rs:103`, `DocCreated`;
+  - `docs/GUIDE.md` §11: Task 10's compiled tenant-feed block's `NoteAdded`.
+- Test:
+  - `crates/charpente/tests/tenant.rs`: modules `noted_global`, `noted_org`, `noted_team`, `noted_billing` (over Task 2's `billing::Org`, `NAME` "BillingOrg") and `accounts`, plus three tests;
+  - `crates/charpente/tests/realtime.rs`: `Team`, `team_scoped::OrgPing`, three routes, and `a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered`. Delete `FailingFeed`, `failing_feed_glue`, `NoteAdded`, `NoteBody`, `emit_note` and `an_unencodable_event_fails_its_tail_not_the_node`; they move to `kernel/tail.rs`;
+  - Task 1's `a_global_events_fingerprint_is_the_bare_events_fingerprint` and `the_invoicing_events_fingerprints_do_not_move` are consumed, and stay green, unedited.
+- In `crates/charpente-macros/tests/`, each compile-fail file with its `.stderr`:
+  - create compile-fail: `event_bare.rs`, `event_global_and_scoped_by.rs`, `event_duplicate_scoped_by.rs`, `event_scoped_by_missing_tenant_scope.rs`, `scoped_event_emitted_on_bare_tx.rs`, `scoped_event_emitted_keyed_on_bare_tx.rs`, `scoped_tx_emit_of_a_global_event.rs`, `scoped_tx_emits_another_scopes_event.rs`, `global_subscription_of_a_scoped_event.rs`, `tenant_feed_of_another_scopes_event.rs`, `unscoped_event_impl_from_an_app.rs`, `no_event_tenant_impl_from_an_app.rs`, `subscription_entries_are_crate_private.rs`;
+  - replace Task 1's compile-fail `event_unknown_word.rs`, and re-pin its `.stderr`;
+  - create compile-pass: `scoped_event_emitted_inside_its_scope.rs`;
+  - modify Task 1's compile-pass `event_global_forms.rs`, which drops its bare `Bare` control.
+
+  Exactly one existing `.stderr` changes: `event_unknown_word.stderr`, whose source and accepted-forms text change here. Task 1's `event_duplicate_global.stderr` must not move. No other existing fixture uses the event bounds or the event parser's texts.
+- Modify `crates/guide-examples/tests/doc_truth.rs`: `PINNED_FLOOR` rises by 2.
+- Docs:
+  - `docs/GUIDE.md` §9 (Task 1's `#[event]` subsection, replaced), §11 (`#[event]`: Task 1's paragraph replaced; a new subsection "An event's tenancy"; the "Emitting" and "The SSE route" signature blocks; Task 10's raw-id sentence) and §16 (the intro list, `ScopedTx`'s block, the compile errors, the sealed pairs, "Realtime", Task 10's raw-id sentence);
+  - `DESIGN.md` §3's **Events** bullet and §8 (Task 10's raw-id sentence);
+  - `PLAN.md` (Task 10's raw-id sentence);
+  - `README.md` (the example, `:64-68`, `:146-148`).
+
+No new test file, so CLAUDE.md's lists and `doc_inventory` stay as they are. The failing-encoder test moves from `charpente`'s `realtime` binary to its lib unit tests. Both already print a `test result:` line, so the workspace count is unchanged. trybuild globs the new fixtures.
+
+**Interfaces:**
+- Consumes:
+  - Task 1:
+    - every `#[event]` in `crates/`, `examples/` and `docs/GUIDE.md` reads `#[event(global)]`, and `#[event(global)]` parses as a no-op; Task 11 replaces that parser;
+    - the pins `a_global_events_fingerprint_is_the_bare_events_fingerprint` (`realtime.rs`: `Ping`, `Pong`, `shapes_v1::Swapped`) and `the_invoicing_events_fingerprints_do_not_move` (`describe_golden.rs`);
+    - the fixtures `event_duplicate_global`, `event_unknown_word` and `event_global_forms`;
+    - `baselines.sh` and its eleven `cov-<label>-base.txt` recordings.
+  - Task 2: `Tenant::NAME`. Every in-tree `impl Tenant` states it, with NAME equal to the identifier (A4). Also `TenantScope`'s note, A8's `crate::fingerprint::path_as_written` and A7's `::charpente::tenant::tenant_name`.
+  - Task 3: `App::note_tenant` and its two refusal texts.
+  - Task 4: `charpente_core::db::scoped_fingerprint(fold: u64, tenant: &str) -> u64`, a `const fn`, which a scoped job's `FINGERPRINT` already calls.
+  - Task 7: `Ctx<'g>`, with handler source unchanged. Every handler and fixture here spells `ctx: &Ctx`, and Step 5's in-crate glue spells `_ctx: &Ctx` as `serve.rs`'s does. Both elide lint-clean. Nothing here names `CrossTenant` or `TenantAdmission`.
+  - Task 10:
+    - `Emit { event, payload, key, shape, scope }` in `TxEffects.emits`, and `EventRow.scope`;
+    - `ScopedTx::emit` / `ScopedTx::emit_keyed`, which record `scope: Some(id)` and never put the tenant in `key`;
+    - `pub trait Subscribe<S>` and `pub struct TenantFeed<S>`, with `.and`, `.key`, `.cursor` and `From<TenantFeed<S>> for Subscription`;
+    - `Subscription`'s `pub(crate) scope`, and `Subscription::admits`;
+    - `ScopedTx::event_key` deleted;
+    - `realtime.rs`'s `#[event(global)] struct OrgPing`, and the sites Task 10 left using it as a global event (listed under Step 6).
+- Produces (spec §6, contract "Events"):
+  - `trait Event: Codec { const NAME: &'static str; const FINGERPRINT: u64; type Scope: 'static; }`, with no default for `Scope`.
+  - In `charpente_core::table`:
+    - `pub trait NoEventTenant<Ev>: sealed::NotATenant {}`, implemented for `Unscoped` only;
+    - `pub trait UnscopedEvent: Event + sealed::NotScopedEvent {}`, blanket-implemented where `Ev::Scope: NoEventTenant<Ev>`.
+  - `Tx::emit<Ev: UnscopedEvent>(&mut self, event: Ev)` and `Tx::emit_keyed<Ev: UnscopedEvent>(&mut self, key: impl Into<String>, event: Ev)`.
+  - `ScopedTx::emit<Ev: Event<Scope = S>>(&mut self, event: Ev)` and `ScopedTx::emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev)`.
+  - `Subscription::of<Ev: UnscopedEvent + serde::Serialize>() -> Subscription` and `Subscription::and<Ev: UnscopedEvent + serde::Serialize>(self) -> Subscription`.
+  - `Subscribe::<S>::subscription<Ev: Event<Scope = S> + serde::Serialize>(&self) -> TenantFeed<S>` and `TenantFeed::<S>::and<Ev: Event<Scope = S> + serde::Serialize>(self) -> TenantFeed<S>`.
+  - `EventDef { name, payload, register_types, scoped_by: Option<&'static str>, scope_type: TypeId, scope_type_name: &'static str }`. `scoped_by` is `Some(<S as Tenant>::NAME)` or `None`. Task 12's `describe` reads `scoped_by`.
+  - `App::mount_events` puts each scoped event's tenant into the Task 3 census.
+  - `Subscription.entries` and `SubEntry` are `pub(crate)`. Only `Subscription::of`/`and` and a tenant feed's `subscription`/`and` add an entry.
+  - A scoped event's `FINGERPRINT` is `scoped_fingerprint(<the field fold, as a u64 literal>, <S as Tenant>::NAME)`. A global event's is the unchanged literal.
+  - Fixed texts (spec §6; DECISIONS §13's family, `#[job]`'s shape; the fix-clause wording is Task 6's family, A11):
+    - bare: "`{Name}` declares no tenancy — an event says which, and neither is the default: add `global` or `scoped_by = <Tenant>` to this attribute's arguments, keeping its others. `scoped_by = <Tenant>` if it belongs to one tenant (it is emitted from inside that tenant's scope, and only that tenant's feed receives it); `global` if it belongs to no tenant (it is emitted on a bare `Tx`, and only a global `Subscription::of` feed receives it)."
+    - "`global` and `scoped_by = {Scope}` on one event — an event is one or the other; drop one", where `{Scope}` is the path as written (A8);
+    - "`global` given twice — write it once" (Task 1's text, unchanged) and "`scoped_by` given twice — write it once";
+    - `ACCEPTED_FORMS`: "an event declares `global` or `scoped_by = <Tenant>` and nothing else (its name derives from the type) — e.g. `#[event(global)]` or `#[event(scoped_by = Org)]`". It replaces Task 1's text. An event takes no other argument, so the examples cannot drop one;
+    - `NoEventTenant`'s message, label and note, given in full in Step 3.
+
+- [ ] **Step 1: Pin the bare form, and see it compile at Task 10's commit**
+
+Create `crates/charpente-macros/tests/compile_fail/event_bare.rs`:
+
+```rust
+// Neither `global` nor `scoped_by` (tenancy-completion spec §6, DECISIONS
+// §13): an event's tenancy is a required choice, and absence is a compile
+// error naming both answers. Spanned at the attribute, as `#[job]`'s and
+// `#[table]`'s refusals are. `WireU64` is named by path because a refused
+// struct is not emitted, so an import of it would sit unused in the pin.
+use charpente::event;
+
+#[event]
+struct NoteAdded {
+    note: charpente::wire::WireU64,
+}
+
+fn main() {}
+```
+
+Run it at Task 10's commit, before anything else in this task changes:
+
+```zsh
+cargo test -p charpente-macros --test trybuild 2>&1 | grep -E "event_bare|Expected test case to fail"
+```
+
+Expected, and this is the red to quote in the report: `event_bare.rs` compiles, and trybuild reports that it expected the case to fail. The bare form is still accepted, and only Task 1's sweep keeps it out of the tree (amendment A1).
+
+- [ ] **Step 2: Run Task 1's global fingerprint pins at Task 10's commit**
+
+This task's byte-identity claim (spec §6: "Global emits stay `0x09`, byte-identical, so nothing in `examples/invoicing` changes on disk") rests on one fact: a `global` event's `FINGERPRINT` is the value a bare `#[event]` computed. Every emit record carries it. Task 1 pinned it, with literals computed independently of the macro:
+
+| event | fold hashed | FNV-1a | pinned by (Task 1) |
+|---|---|---|---|
+| `realtime.rs`'s `Ping`, `Pong` | `"n\0WireU64\0"` | `0x9caf_3f93_9b10_65e1` | `a_global_events_fingerprint_is_the_bare_events_fingerprint` |
+| invoicing's `InvoiceFinalized` | `"invoice\0Id < Invoice >\0"` | `0x7034_25fd_804c_6200` | `the_invoicing_events_fingerprints_do_not_move` |
+| invoicing's `ReceiptSent` | `"invoice\0Id < Invoice >\0amount_cents\0WireI64\0"` | `0x133d_31e7_fc9e_acca` | the same |
+
+Task 11 adds no pin of its own for global events. It runs Task 1's, unedited, before and after:
+
+```zsh
+cargo test -p charpente --test realtime -- a_global_events_fingerprint_is_the_bare_events_fingerprint --exact
+cargo test -p invoicing --test describe_golden -- the_invoicing_events_fingerprints_do_not_move --exact
+```
+
+Expected: both pass at Task 10's commit. Step 9 runs them again after this task, and they must still pass without an edit. A red here, before any change, means a task between 1 and 10 moved a global fingerprint: stop and report it. It is not Task 11's to fix.
+
+- [ ] **Step 3: Core — the event's scope, the sealed pair, and the emit family**
+
+`crates/charpente-core/src/db.rs`. Replace `pub trait Event` and its doc (118–129 at `e749823`) with:
+
+```rust
+/// A realtime event (DESIGN.md §6). Emits materialize into `charpente.events`
+/// at apply, the same way enqueues materialize `JobRow` — subscribers read
+/// through the ranged scan (`View::scan_from`), not the log directly.
+/// `#[event(global)]` and `#[event(scoped_by = Org)]` derive it; a hand-written
+/// impl states all three items below.
+pub trait Event: Codec {
+    const NAME: &'static str;
+    /// The payload's structural fingerprint, as for `Job::FINGERPRINT`:
+    /// recorded beside every emit. Delivery decodes a stored event only
+    /// under the shape it was written with (payload-shapes spec §3). For a
+    /// `#[event(scoped_by = Org)]` event it also covers the tenant's
+    /// `Tenant::NAME` (`scoped_fingerprint`), so a change of tenancy is a
+    /// change of shape.
+    const FINGERPRINT: u64;
+    /// The tenant scope type a `#[event(scoped_by = Org)]` event belongs to,
+    /// or `Unscoped` for a `#[event(global)]` one (tenancy-completion spec
+    /// §6). No default, for `Job::Scope`'s reason: a hand-written impl states
+    /// it, or it would slip past the emit and subscribe bounds unseen.
+    /// `'static` because `push_emit` compares it by `TypeId`.
+    type Scope: 'static;
+}
+```
+
+In the `use crate::table::{…}` list (52–55), add `UnscopedEvent` beside `UnscopedJob`.
+
+**The emit family.** Task 10 left four methods that push an `Emit { event, payload, key, shape, scope }`: `Tx::emit`, `Tx::emit_keyed`, `ScopedTx::emit` and `ScopedTx::emit_keyed`. They push it through a private helper or inline. Replace that helper, or the four inline pushes, with one private body. Put it in `impl<'a> Tx<'a>`, directly after `enqueue_in`:
+
+```rust
+    /// The one body of the emit family (tenancy-completion spec §6). `scope`
+    /// is the tenant a scoped event belongs to, and `None` for a `global`
+    /// one. The public methods' bounds decide which, and this asserts that
+    /// they agree with the event's own declaration. A scoped event is never
+    /// recorded without its tenant, where every global feed would receive it,
+    /// and a global one never with one (hard rule 4) — `push_enqueue`'s
+    /// assert, for the other effect that carries a tenant.
+    fn push_emit<Ev: Event>(&mut self, scope: Option<u64>, key: Option<String>, event: Ev) {
+        assert_eq!(
+            scope.is_some(),
+            TypeId::of::<Ev::Scope>() != TypeId::of::<crate::table::Unscoped>(),
+            "contract: event \"{}\" was emitted with tenant {scope:?}, but a scoped event \
+             carries its tenant and a global one none — the emit family's bounds guarantee \
+             this, so reaching here is a platform bug",
+            Ev::NAME
+        );
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.effects.emits.push(Emit {
+            event: Ev::NAME,
+            payload,
+            key,
+            shape: Ev::FINGERPRINT,
+            scope,
+        });
+    }
+```
+
+If Task 10's helper asserts anything this body does not (an empty-key check, say), keep that assert in `push_emit` verbatim and quote it in the task report. The field names are the contract's `Emit`. If Task 10 spelled them differently, the compiler names each one.
+
+Replace `Tx::emit` and `Tx::emit_keyed` with:
+
+```rust
+    /// Emits a `global` event into this transaction's record (tag `0x09`). A
+    /// `#[event(scoped_by = Org)]` event does not compile here: it belongs to
+    /// a tenant, and a bare `Tx` names none (`NoEventTenant`'s note says
+    /// where to emit it instead).
+    pub fn emit<Ev: UnscopedEvent>(&mut self, event: Ev) {
+        self.push_emit(None, None, event);
+    }
+
+    /// `emit`, with an app key: an exact-match narrowing filter that
+    /// `Subscription::key` selects on (a per-user feed, say). Never a tenant.
+    /// A tenant is an event's declared scope, recorded apart from any key
+    /// (tenancy-completion spec §2.3).
+    pub fn emit_keyed<Ev: UnscopedEvent>(&mut self, key: impl Into<String>, event: Ev) {
+        self.push_emit(None, Some(key.into()), event);
+    }
+```
+
+In `impl<'a, S: 'static> ScopedTx<'_, 'a, S>`, replace `emit` and `emit_keyed` (Task 10's) with:
+
+```rust
+    /// Emits an event scoped by this tenant's type, recorded with this tenant
+    /// (tag `0x0b`), so only this tenant's feed receives it
+    /// (tenancy-completion spec §6). This shadows `Tx::emit` the way
+    /// `enqueue` shadows `Tx::enqueue`. A `global` event emitted inside a
+    /// scope is written `(*tx).emit(event)` in a handler that owns its
+    /// `ScopedTx`, and `(**tx).emit(event)` in a scoped job's `run`, which
+    /// holds `&mut ScopedTx`.
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev) {
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), None, event);
+    }
+
+    /// `emit`, with `Tx::emit_keyed`'s app key. The tenant is still this
+    /// scope, recorded beside the key, never in it.
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev) {
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), Some(key.into()), event);
+    }
+```
+
+`crates/charpente-core/src/table.rs`. Add `pub trait NotScopedEvent {}` to `mod sealed`, after `NotScopedJob`. After `impl<J: crate::db::Job> UnscopedJob for J where J::Scope: NoJobTenant<J> {}`, add:
+
+```rust
+/// The event twin of `NoJobTenant` (tenancy-completion spec §6). `Unscoped`
+/// implements it for every event type, and no other scope type implements
+/// it at all. It carries the refusal for a `#[event(scoped_by = …)]` event
+/// used where no tenant is named: `Tx::emit`/`Tx::emit_keyed` on a bare `Tx`,
+/// or a global `Subscription::of`/`and`. It hangs on the SCOPE type for
+/// `NoTenant`'s reason: an associated-type mismatch cannot carry a custom
+/// diagnostic. `{Ev}` puts the event's name in the text, as `{J}` puts the
+/// job's.
+///
+/// SEALED by `NotATenant`, the same seal, and `UnscopedEvent` below by its
+/// own. Either one alone would leave the other as a one-line, orphan-legal
+/// opt-out (`impl NoEventTenant<Noted> for Org {}`, or
+/// `impl UnscopedEvent for Noted {}`).
+#[diagnostic::on_unimplemented(
+    message = "`{Ev}` is a tenant-scoped event (`#[event(scoped_by = {Self})]`), and a bare `Tx` \
+               or a global `Subscription` names no tenant",
+    label = "`{Ev}` is scoped by `{Self}`",
+    note = "emit it and subscribe to it inside the tenant it belongs to:\n    \
+            let mut tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
+            tx.emit(event);\n\
+            and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):\n    \
+            Ok(tx.subscription::<{Ev}>().cursor(cursor).into())\n\
+            a job that emits it takes `scoped_by = {Self}` in place of `global` among its \
+            `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its \
+            `run` receives"
+)]
+pub trait NoEventTenant<Ev>: sealed::NotATenant {}
+
+impl<Ev> NoEventTenant<Ev> for Unscoped {}
+
+/// `UnscopedEvent`'s seal, derived from `Event::Scope` by the same condition
+/// `UnscopedEvent` uses, so the seal admits exactly the events the bound
+/// admits.
+impl<Ev: crate::db::Event> sealed::NotScopedEvent for Ev where Ev::Scope: NoEventTenant<Ev> {}
+
+/// An event with no tenant: exactly the `Event`s whose `Scope` is
+/// `Unscoped`, derived from `Event::Scope` as `UnscopedJob` is from
+/// `Job::Scope`. It bounds `Tx::emit`, `Tx::emit_keyed`, `Subscription::of`
+/// and `Subscription::and`. So a scoped event at any of them is an
+/// unsatisfied bound whose text names the fix. It never becomes an event
+/// recorded in no tenant, or a global feed that names a tenant's event.
+/// Sealed for `UnscopedRow`'s reason.
+pub trait UnscopedEvent: crate::db::Event + sealed::NotScopedEvent {}
+
+impl<Ev: crate::db::Event> UnscopedEvent for Ev where Ev::Scope: NoEventTenant<Ev> {}
+```
+
+The diagnostic's shape was checked on rustc 1.95.0 in a standalone crate, with the same seal, blanket impl and bounds. `Subscription::of::<Noted>()` printed `` error[E0277]: `Noted` is a tenant-scoped event (`#[event(scoped_by = Org)]`), and a bare `Tx` or a global `Subscription` names no tenant ``, labelled `` `Noted` is scoped by `Org` ``, with "required by a bound in `Subscription::of`". A `TenantFeed<Org>::and::<Teamed>()` printed `` error[E0271]: type mismatch resolving `<Teamed as Event>::Scope == Org` ``. `impl<S> TenantFeed<S> { fn and<Ev: Event<Scope = S>>(self) … }` compiled with no `S: 'static` bound.
+
+- [ ] **Step 4: The macro — the words, the refusals, the scope, the fingerprint and the def**
+
+`crates/charpente-macros/src/event.rs`. Replace everything above `fn snake_case` with the following. That covers the module doc, the imports, Task 1's parser (whatever form it took) and `expand`. `snake_case` and `mod tests` are unchanged.
+
+```rust
+//! `#[event(global | scoped_by = Org)]` (DESIGN.md §6, realtime spec,
+//! tenancy-completion spec §6): exactly one of the two words, once. Turns a
+//! struct into a typed realtime event:
+//! - a field-wise `Codec` impl (mirrors `#[job]`'s payload codec);
+//! - `impl Event`, carrying the name (snake_case of the type name), the
+//!   payload's structural fingerprint (`fingerprint::compute`, continued with
+//!   the tenant's `NAME` by `scoped_fingerprint` for a scoped event) and the
+//!   scope type;
+//! - a `Serialize` derive emitted through the `::charpente::serde` re-export
+//!   (with `#[serde(crate = "::charpente::serde")]` redirecting serde_derive's
+//!   generated code off the ambient `::serde` path), so app crates emitting
+//!   events stay single-dep;
+//! - a `Wire` derive: the payload is exactly the JSON a subscriber receives,
+//!   so it is a wire type, which is also why a bare `u64` field is a compile
+//!   error here (TS-codegen spec §1);
+//! - an `EventEntry` impl, so `events![]` can collect the type.
+//!
+//! Two registries, deliberately. DELIVERY has none: `Subscription::of` and a
+//! tenant feed's `subscription` capture encoders statically at the subscribe
+//! site, so "unregistered event at delivery" stays inexpressible (realtime
+//! spec §3). DESCRIBE has one, filled by `events![]` and read by
+//! `App::describe` and by `App::mount_events`' tenant census (TS-codegen spec
+//! §2, tenancy-completion spec §4). Errors name the accepted forms (hard
+//! rule 5).
+
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::parse::{Parse, ParseStream};
+use syn::spanned::Spanned;
+use syn::{Data, DeriveInput, Error, Fields, Ident, Token};
+
+use crate::job::Tenancy;
+
+const ACCEPTED_FORMS: &str = "an event declares `global` or `scoped_by = <Tenant>` and nothing \
+     else (its name derives from the type) — e.g. `#[event(global)]` or \
+     `#[event(scoped_by = Org)]`";
+
+// ---------------------------------------------------------------- args
+
+/// One word of the attribute. `#[job]`'s `JobArg` without the job-only
+/// words, parsed one at a time for the same reason: a word repeated is a typo
+/// or a bad merge, never an override.
+enum EventArg {
+    Global(proc_macro2::Span),
+    ScopedBy(proc_macro2::Span, syn::Path),
+}
+
+impl Parse for EventArg {
+    fn parse(input: ParseStream) -> syn::Result<EventArg> {
+        let ident: Ident = input
+            .parse()
+            .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+        match ident.to_string().as_str() {
+            "global" => Ok(EventArg::Global(ident.span())),
+            "scoped_by" => {
+                input
+                    .parse::<Token![=]>()
+                    .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+                let path: syn::Path = input
+                    .parse()
+                    .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+                Ok(EventArg::ScopedBy(ident.span(), path))
+            }
+            _ => Err(Error::new(ident.span(), ACCEPTED_FORMS)),
+        }
+    }
+}
+
+pub(crate) struct EventArgs {
+    /// `global` or `scoped_by = Org`. `None` only while parsing: `expand`
+    /// refuses an event that gave neither, by name, before anything else.
+    pub tenancy: Option<Tenancy>,
+}
+
+impl Parse for EventArgs {
+    fn parse(input: ParseStream) -> syn::Result<EventArgs> {
+        let mut global: Option<proc_macro2::Span> = None;
+        let mut scoped_by: Option<syn::Path> = None;
+        while !input.is_empty() {
+            match input.parse::<EventArg>()? {
+                EventArg::Global(span) => {
+                    if global.is_some() {
+                        return Err(Error::new(span, "`global` given twice — write it once"));
+                    }
+                    if let Some(path) = &scoped_by {
+                        return Err(Error::new(span, global_and_scoped_by(path)));
+                    }
+                    global = Some(span);
+                }
+                EventArg::ScopedBy(span, path) => {
+                    if scoped_by.is_some() {
+                        return Err(Error::new(span, "`scoped_by` given twice — write it once"));
+                    }
+                    if global.is_some() {
+                        return Err(Error::new(span, global_and_scoped_by(&path)));
+                    }
+                    scoped_by = Some(path);
+                }
+            }
+            if input.is_empty() {
+                break;
+            }
+            input
+                .parse::<Token![,]>()
+                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+        }
+        Ok(EventArgs {
+            tenancy: match (global, scoped_by) {
+                (_, Some(path)) => Some(Tenancy::ScopedBy(path)),
+                (Some(_), None) => Some(Tenancy::Global),
+                (None, None) => None,
+            },
+        })
+    }
+}
+
+/// `global` and `scoped_by` on one event, reported at whichever came second.
+/// It quotes the scope path as written, through the renderer `job.rs`'s
+/// `global_and_scoped_by` uses (A8), because the two refusals are one text
+/// family. It is its own function because GUIDE §6 pins the job text, and
+/// `doc_truth` needs that literal in `job.rs`.
+fn global_and_scoped_by(path: &syn::Path) -> String {
+    format!(
+        "`global` and `scoped_by = {}` on one event — an event is one or the other; drop one",
+        crate::fingerprint::path_as_written(path)
+    )
+}
+
+// ---------------------------------------------------------------- expand
+
+pub(crate) fn expand(args: EventArgs, input: DeriveInput) -> syn::Result<TokenStream> {
+    let name = &input.ident;
+    let name_str = name.to_string();
+
+    let Some(tenancy) = &args.tenancy else {
+        // Spanned at the attribute, as `#[job]`'s and `#[table]`'s
+        // neither-refusals are: the fix is a word the attribute lacks, so
+        // there is no token inside it to point at.
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "`{name_str}` declares no tenancy — an event says which, and neither is the \
+                 default: add `global` or `scoped_by = <Tenant>` to this attribute's \
+                 arguments, keeping its others. `scoped_by = <Tenant>` if it belongs to one \
+                 tenant (it is emitted from inside that tenant's scope, and only that tenant's \
+                 feed receives it); `global` if it belongs to no tenant (it is emitted on a \
+                 bare `Tx`, and only a global `Subscription::of` feed receives it)."
+            ),
+        ));
+    };
+
+    if !input.generics.params.is_empty() {
+        return Err(Error::new(
+            input.generics.span(),
+            format!(
+                "#[event] structs cannot be generic — an event is one concrete payload shape; make `{name_str}` non-generic"
+            ),
+        ));
+    }
+    let Data::Struct(data) = &input.data else {
+        return Err(Error::new(
+            input.span(),
+            "#[event] applies to structs — enums and unions cannot be events",
+        ));
+    };
+    let Fields::Named(fields) = &data.fields else {
+        return Err(Error::new(
+            input.span(),
+            format!("#[event] needs named fields — `{name_str}` must be a braced struct"),
+        ));
+    };
+
+    let field_idents: Vec<_> = fields
+        .named
+        .iter()
+        .map(|f| f.ident.clone().expect("named fields have idents"))
+        .collect();
+    let field_types: Vec<_> = fields.named.iter().map(|f| f.ty.clone()).collect();
+    let fold = crate::fingerprint::compute(&field_idents, &field_types);
+
+    let event_name = snake_case(&name_str);
+
+    // A `global` event's fingerprint is the bare fold, the value `#[event]`
+    // computed before events declared a tenancy, so every existing global
+    // event keeps its shape and every global emit record keeps its bytes. A
+    // scoped event's continues that fold with its tenant's `NAME`, through the
+    // `scoped_fingerprint` a scoped job uses (tenancy-completion spec §4,
+    // §6). A change of an event's tenancy, or of its tenant's identity, is
+    // then a change of shape that delivery refuses by name. Two same-named
+    // events scoped by two tenant types never share a shape, even where the
+    // two types' raw ids coincide. `tenant_name`'s `TenantScope` bound is
+    // the house diagnostic for a scope type with no `Tenant` impl (A7): a
+    // scoped event's tenant is opened by `tx.scope::<Org>(…, ctx)` on both
+    // sides, which needs the app's own membership check.
+    let (scope_ty, fingerprint, scoped_by_name) = match tenancy {
+        Tenancy::Global => (
+            quote! { ::charpente::core::table::Unscoped },
+            quote! { #fold },
+            quote! { ::std::option::Option::None },
+        ),
+        Tenancy::ScopedBy(path) => (
+            quote! { #path },
+            quote! {
+                ::charpente::core::db::scoped_fingerprint(
+                    #fold,
+                    ::charpente::tenant::tenant_name::<#path>(),
+                )
+            },
+            quote! {
+                ::std::option::Option::Some(::charpente::tenant::tenant_name::<#path>())
+            },
+        ),
+    };
+
+    Ok(quote! {
+        #[derive(::charpente::Wire, ::charpente::serde::Serialize)]
+        #[serde(crate = "::charpente::serde")]
+        #input
+
+        impl ::charpente::core::table::Codec for #name {
+            fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
+                #(::charpente::core::table::Codec::encode(&self.#field_idents, out);)*
+            }
+
+            fn decode(input: &mut &[u8]) -> ::std::io::Result<Self> {
+                #(let #field_idents =
+                    <#field_types as ::charpente::core::table::Codec>::decode(input)?;)*
+                ::std::result::Result::Ok(Self { #(#field_idents,)* })
+            }
+        }
+
+        impl ::charpente::core::db::Event for #name {
+            const NAME: &'static str = #event_name;
+            const FINGERPRINT: u64 = #fingerprint;
+            type Scope = #scope_ty;
+        }
+
+        impl ::charpente::describe::EventEntry for #name {
+            fn def() -> ::charpente::describe::EventDef {
+                ::charpente::describe::EventDef {
+                    name: #event_name,
+                    payload: <#name as ::charpente::wire::Wire>::WIRE_NAME,
+                    register_types: |reg| <#name as ::charpente::wire::Wire>::register(reg),
+                    scoped_by: #scoped_by_name,
+                    scope_type: ::std::any::TypeId::of::<
+                        <#name as ::charpente::core::db::Event>::Scope,
+                    >(),
+                    scope_type_name: ::std::any::type_name::<
+                        <#name as ::charpente::core::db::Event>::Scope,
+                    >(),
+                }
+            }
+        }
+    })
+}
+```
+
+`crate::job::Tenancy` is already `pub(crate)` (`job.rs:26-30` at `e749823`), so the two macros share one enum. `crate::fingerprint::path_as_written` is A8's renderer, which Task 2 adds. The three other macros stopped emitting their `__charpente_assert_tenant_scope` const asserts in Task 2 (A7), and `#[event]` never gains one: `tenant_name`'s bound carries the diagnostic.
+
+Step 9's expectation for `event_scoped_by_missing_tenant_scope` names what changes in the pin.
+
+`crates/charpente-macros/src/lib.rs`. Replace `pub fn event`, as Task 1 left it, with:
+
+```rust
+#[proc_macro_attribute]
+pub fn event(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as event::EventArgs);
+    let input = parse_macro_input!(input as DeriveInput);
+    match event::expand(args, input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+```
+
+Task 1's entry destructures a unit `event::EventArgs` and calls `event::expand(input)`. The entry above passes the parsed arguments, and `EventArgs` above is now the only parser. Task 1's unit struct, its `ACCEPTED_FORMS` and its `impl Parse` were all replaced with the rest of `event.rs`. The module-level doc on line 1 of `lib.rs` ("`#[table]` turns a struct into a typed row; `#[route]` turns a function into a typed HTTP handler") does not name `#[event]`'s words, so it needs no change.
+
+- [ ] **Step 5: The platform — `EventDef`, the subscribe bounds, the mount census**
+
+`crates/charpente/src/describe.rs`. Add `use std::any::TypeId;` beside `use std::time::Duration;`. `EventDef` (147–151 at `e749823`) becomes:
+
+```rust
+pub struct EventDef {
+    pub name: &'static str,
+    pub payload: &'static str,
+    pub register_types: fn(&mut TypeRegistry),
+    /// `#[event(scoped_by = Org)]`: the tenant this event belongs to, by its
+    /// scope type's `Tenant::NAME`; `None` for a `global` event
+    /// (tenancy-completion spec §6, §8). `describe` lists it, and
+    /// `App::mount_events` puts it into the app's tenant census.
+    pub scoped_by: Option<&'static str>,
+    /// `TypeId::of::<<Ev as Event>::Scope>()`. The census refuses two tenant
+    /// types under one `NAME` by comparing these (spec §4).
+    pub scope_type: TypeId,
+    /// `std::any::type_name` of the same type, for the census's refusal text
+    /// only. Never persisted, never compared: the compiler's printer is not
+    /// an identity (spec §1).
+    pub scope_type_name: &'static str,
+}
+```
+
+`crates/charpente/src/http/mod.rs`. Add `use charpente_core::table::UnscopedEvent;` beside `use charpente_core::table::Id;`. Then:
+- `pub fn of<Ev: Event + serde::Serialize>() -> Subscription` becomes `pub fn of<Ev: UnscopedEvent + serde::Serialize>() -> Subscription`.
+- `pub fn and<Ev: Event + serde::Serialize>(mut self) -> Subscription` becomes `pub fn and<Ev: UnscopedEvent + serde::Serialize>(mut self) -> Subscription`. Keep the rest of the body, including Task 10's A3 assert.
+- `of`'s doc gains, as its first paragraph:
+
+```rust
+    /// A global feed: the event types it names are `#[event(global)]`, which
+    /// is the bound. A `#[event(scoped_by = Org)]` event here is the
+    /// `NoEventTenant` refusal. It belongs to a tenant, and this feed names
+    /// none. Its feed is built on that tenant's `ScopedTx`
+    /// (`tx.subscription::<Ev>()`, `Subscribe`).
+```
+
+- In Task 10's `pub trait Subscribe<S>`, the method becomes `fn subscription<Ev: Event<Scope = S> + serde::Serialize>(&self) -> TenantFeed<S>;`. Its `impl<S> Subscribe<S> for ScopedTx<'_, '_, S>` method signature changes the same way, and its body is unchanged. The trait's doc gains: "`Ev` is an event scoped by this tenant's type. A global event, or one scoped by another type, is rustc's E0271 here, never an entry the feed's tenant could not match."
+- In Task 10's `impl<S> TenantFeed<S>`, `and` becomes `pub fn and<Ev: Event<Scope = S> + serde::Serialize>(self) -> TenantFeed<S>`, with an unchanged body.
+
+`ev_json<Ev: Event + serde::Serialize>` keeps plain `Event`, because both kinds of feed use it.
+
+`crates/charpente/src/http/app.rs`, `mount_events`. Its doc gains a second paragraph after the first:
+
+```rust
+    /// A scoped event's tenant type joins the app's tenant census here, as a
+    /// scoped table's does at `App::open` and a scoped job's at `mount_jobs`
+    /// (tenancy-completion spec §4). Two types under one `Tenant::NAME`, or
+    /// an empty `NAME`, are refused at this call, before the app serves.
+```
+
+In its loop, after the empty-payload `assert!` and before `self.event_defs.push(def);`:
+
+```rust
+            if let Some(scope_name) = def.scoped_by {
+                self.note_tenant(scope_name, def.scope_type, def.scope_type_name);
+            }
+```
+
+`note_tenant` is Task 3's insertion helper. Its refusals are Task 3's texts, so `mount_events` adds none of its own. A `global` event names no tenant, so it adds nothing.
+
+**The entries seal** (A17). `crates/charpente/src/http/mod.rs`:
+- `pub struct SubEntry {` becomes `pub(crate) struct SubEntry {`. Its fields keep their `pub`, which now reaches no further than the crate. Its doc gains this last paragraph:
+
+```rust
+/// Crate-private (tenancy-completion spec §6): an app never builds one. Each
+/// is made by a typed builder that bounds the event's declared tenancy, so a
+/// feed's entries are exactly the events its tenancy admits.
+```
+
+- In `pub struct Subscription`, `pub entries: Vec<SubEntry>,` becomes `pub(crate) entries: Vec<SubEntry>,`. `key` and `cursor` stay `pub`: a key is an app filter and never a tenant (spec §2.3), and a cursor is the client's. The struct's doc gains this last paragraph:
+
+```rust
+/// Its entries are crate-private (tenancy-completion spec §6). Only
+/// `Subscription::of`/`and` and a tenant feed's `subscription`/`and` add
+/// one, each bounded by the event's declared tenancy. A public list would
+/// let a handler admitted to one tenant push an entry naming another tenant
+/// type's event, its `NAME` and `FINGERPRINT` copied from the type, and read
+/// that tenant's rows wherever the two types' raw ids coincide.
+```
+
+Every in-crate reader is unaffected: `kernel/tail.rs`'s delivery, `kernel/mod.rs`'s resume validation, `http/app.rs`'s emits probe, and `http::tests`. At `e749823` the only reader outside the crate is `crates/charpente/tests/realtime.rs`'s failing-encoder test (`grep -rn 'SubEntry\|\.entries\b' --include='*.rs' crates examples`, which also matches unrelated `.entries` fields and methods in `transactions.rs`, `group_commit.rs` and `cron.rs`). That test moves into the crate, where a hand-built entry is still expressible.
+
+In `crates/charpente/tests/realtime.rs`, delete these items as Task 10 left them, with their docs:
+- `struct FailingFeed`, `fn failing_feed_glue` and `impl RouteDef for FailingFeed`;
+- the `#[event(global)] struct NoteAdded`, `struct NoteBody` and `fn emit_note` that only that test used;
+- the test `an_unencodable_event_fails_its_tail_not_the_node`.
+
+Remove `SubEntry` from the `use charpente::http::{…}` list, and every other name the compiler then reports unused. At `e749823` those are `Route`, `RouteDef` and `RouteGlue`, which only `FailingFeed` used. In the two docs that name the moved stub, `Poisoned`'s and `a_real_events_serialize_failure_fails_its_tail_not_the_node`'s:
+- "not `FailingFeed`'s hand-built stub" becomes "not the hand-built stub `kernel/tail.rs`'s unit test uses";
+- "rather than `FailingFeed`'s hand-built stub" becomes "rather than the hand-built stub in `kernel/tail.rs`'s unit test";
+- "The same `charpente.error` frame `an_unencodable_event_…` pins" becomes "The same `charpente.error` frame `kernel/tail.rs`'s `an_unencodable_event_fails_its_tail_not_the_node` pins".
+
+In `crates/charpente/src/kernel/tail.rs`, append the module. The test is the same as before: same seed, same two scripts, same frame, same "the node keeps serving". Routes and event are hand-built, for the reason `serve.rs`'s in-crate SSE tests give: the macros emit `::charpente` paths meant for app crates.
+
+```rust
+#[cfg(test)]
+mod tests {
+    //! Tenancy-completion spec §6 made `Subscription.entries` crate-private,
+    //! so this is the one place a `SubEntry` is still built by hand. The test
+    //! needs exactly that: an encoder that fails whatever the payload, with
+    //! no shape check and no field ever read. Moved here from
+    //! `tests/realtime.rs` unchanged in substance. That suite's
+    //! `a_real_events_serialize_failure_fails_its_tail_not_the_node` covers
+    //! the other case, a real `#[event]` whose field refuses to serialize.
+
+    use std::io;
+
+    use charpente_core::db::{Event, Tx};
+    use charpente_core::event::EventRow;
+    use charpente_core::table::{Codec, Unscoped, View};
+    use charpente_sim::{FaultConfig, Sim};
+
+    use crate::Schema;
+    use crate::http::{
+        ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Response, Route, RouteGlue,
+        SubEntry, Subscription,
+    };
+    use crate::kernel::{Kernel, SimSource};
+    use crate::wire::{TypeSchema, Wire};
+
+    const SEC: u64 = 1_000_000_000;
+
+    struct NoteAdded {
+        n: u64,
+    }
+
+    impl Codec for NoteAdded {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+
+        fn decode(input: &mut &[u8]) -> io::Result<NoteAdded> {
+            Ok(NoteAdded {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Event for NoteAdded {
+        const NAME: &'static str = "note_added";
+        const FINGERPRINT: u64 = 0x7E57_0A0D;
+        // A global event: it belongs to no tenant.
+        type Scope = Unscoped;
+    }
+
+    fn emit_note_glue(
+        tx: &mut Tx,
+        _ctx: &Ctx,
+        captures: &[String],
+        _body: &[u8],
+    ) -> Result<Response, ApiError> {
+        let n: u64 = captures[0].parse().expect("the test sends a numeric n");
+        tx.emit(NoteAdded { n });
+        Ok(Response::json(200, &n))
+    }
+
+    fn failing_feed_glue(
+        _tx: &mut Tx,
+        _ctx: &Ctx,
+        _captures: &[String],
+        cursor: Option<Cursor>,
+    ) -> Result<Subscription, ApiError> {
+        Ok(Subscription {
+            entries: vec![SubEntry {
+                name: NoteAdded::NAME,
+                encode_json: |_: &[u8]| -> io::Result<String> {
+                    Err(io::Error::other("encode exploded"))
+                },
+                fingerprint: NoteAdded::FINGERPRINT,
+            }],
+            key: None,
+            cursor,
+            scope: None,
+        })
+    }
+
+    fn routes() -> Vec<Route> {
+        vec![
+            Route {
+                method: Method::Post,
+                pattern: "/note/:n",
+                auth: false,
+                public_scope: None,
+                cross_tenant: false,
+                name: "emit_note",
+                glue: RouteGlue::Http(emit_note_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
+            },
+            Route {
+                method: Method::Get,
+                pattern: "/feed-failing",
+                auth: false,
+                public_scope: None,
+                cross_tenant: false,
+                name: "failing_feed",
+                glue: RouteGlue::Sse(failing_feed_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
+            },
+        ]
+    }
+
+    /// Pushes `requests` at one instant and steps the kernel 16 times, every
+    /// step required to succeed: nothing a subscriber does stops the node.
+    fn run(kernel: &mut Kernel, sim: &Sim, requests: Vec<Request>) -> SimSource {
+        let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+        let t = sim.now().as_nanos();
+        for request in requests {
+            source.push_at(t, request);
+        }
+        for _ in 0..16 {
+            if let Err(e) = kernel.step(&mut source) {
+                panic!("no step may fail — nothing a subscriber does stops the node: {e}");
+            }
+        }
+        source
+    }
+
+    /// Payload-shapes spec §3/§6.5: an encode failure fails its own tail,
+    /// never the node. The stream ends with `charpente.error`, naming the
+    /// event and the row, and the node keeps serving.
+    #[test]
+    fn an_unencodable_event_fails_its_tail_not_the_node() {
+        let sim = Sim::with_faults(0x2EB2_FA11, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(routes());
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+        let source = run(
+            &mut kernel,
+            &sim,
+            vec![
+                Request::new(Method::Get, "/feed-failing"),
+                Request::new(Method::Post, "/note/1"),
+            ],
+        );
+        let rows: Vec<EventRow> = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan_from(0, 8)
+            .unwrap();
+        let sinks = source.sinks();
+        let frames: Vec<(u64, u64, String, String)> = sinks.lock().unwrap()[0]
+            .frames()
+            .iter()
+            .map(|f| (f.id, f.seq, f.name.to_string(), f.json.clone()))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![(
+                rows[0].id.raw(),
+                rows[0].seq,
+                "charpente.error".to_string(),
+                format!(
+                    r#"{{"event":"note_added","id":{},"error":"encode exploded"}}"#,
+                    rows[0].id.raw()
+                ),
+            )],
+            "one terminal error frame naming the event and the row"
+        );
+
+        let source = run(&mut kernel, &sim, vec![Request::new(Method::Post, "/note/2")]);
+        let statuses: Vec<u16> = source
+            .responses()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(statuses, vec![200], "the node keeps serving");
+    }
+}
+```
+
+The `Route` literal is `serve.rs`'s `sse_routes` shape at `e749823`. If a task between 1 and 10 added a `Route` field, the compiler names it (E0063): copy that field's value from `serve.rs`'s literal as it then stands. `Subscription`'s fields are the contract's (Task 10's `scope: Option<u64>`, `pub(crate)`). `sinks()` and `responses()` hand back shared handles (`kernel/mod.rs`, `SimSource`), so reading them after the steps sees every frame and status the steps recorded. That is how `realtime.rs`'s `run_script` returns them.
+
+Run it where it now lives, and prove the old binary no longer has it:
+
+```zsh
+cargo test -p charpente --lib -- kernel::tail::tests::an_unencodable_event_fails_its_tail_not_the_node --exact
+cargo test -p charpente --test realtime -- an_unencodable_event --list 2>/dev/null | grep -c ': test'
+```
+
+Expected: `1 passed`, then `0`. The `grep -c` prints `0` and exits 1 on no match. The printed `0` is the result.
+
+- [ ] **Step 6: The tree — hand impls, the hand `EventDef`, and the scoped events**
+
+**Hand-written events.** In each of the four `impl Event` blocks at `e749823`, add `type Scope = Unscoped;` after `const FINGERPRINT`, with the comment `// A global event: it belongs to no tenant.`:
+- `crates/charpente-core/tests/materialize.rs:49` (`TestEvent`), which already imports `Unscoped`;
+- `crates/charpente/tests/transactions.rs:70` (`InvoiceFinalized`), which already imports `Unscoped`;
+- `crates/charpente/tests/realtime.rs:1246` (`Quoted`). Its `use charpente_core::table::{Codec, Row, View};` becomes `use charpente_core::table::{Codec, Row, Unscoped, View};`;
+- `crates/charpente/src/serve.rs:1268` (`Ping`, in `mod tests`), which already imports `Unscoped` (`serve.rs:656`).
+
+Task 10 added more hand impls. Each takes `type Scope` by what its test does with it:
+- The core test's `OrgEvent`, which Task 10 emits on a `ScopedTx<TestOrg>`, takes `type Scope = TestOrg;`. Its hand-written `FINGERPRINT` literal stays as written: only `#[event]` computes a scoped fingerprint, and a hand-written impl states its own, as a hand-written `Row` does.
+- `http::tests`' `UnitPing`, `UnitPong` and `UnitOrg` each take `Unscoped` if the test uses the type as a global event, and the tenant type if it emits the type on a `ScopedTx` or names it through `Subscribe`/`TenantFeed::and`. A test that builds a `Subscription` by struct literal in the crate (`admits_is_the_name_and_the_tenant_and_the_key` does) is not bounded, so it never forces a choice. If `UnitOrg` is a tenant type rather than an event, it takes nothing.
+
+The compiler names every hand impl missing `Scope` (E0046) and every wrong one (E0271/E0277). A hand impl one test uses on both sides takes the twin rule below.
+
+**The hand `EventDef`.** In `crates/charpente/tests/describe.rs`, `mounting_an_event_whose_payload_names_no_type_panics` (823), the literal gains:
+
+```rust
+                scoped_by: None,
+                scope_type: std::any::TypeId::of::<charpente::core::table::Unscoped>(),
+                scope_type_name: std::any::type_name::<charpente::core::table::Unscoped>(),
+```
+
+**The scoped events.** An event is used on the scoped side when:
+- it is emitted through a `ScopedTx` (`tx.emit`/`tx.emit_keyed` after a `tx.scope::<S>` or `admit_scope::<S>` line, or in a scoped job's `run`); or
+- it is named in `tx.subscription::<…>()` or `TenantFeed::and::<…>()`.
+
+It is used on the global side when it is emitted on a bare `Tx` (including `(*tx)`/`(**tx)`), or named in `Subscription::of`/`and`. After Step 3, Task 1's `global` makes every scoped-side site rustc's E0271 ("expected `S`, found `Unscoped`"). Declaring the event `scoped_by` instead makes every global-side site the `NoEventTenant` refusal. So there are two rules:
+- An event used on one side only is declared for that side.
+- An event used on both sides cannot be both, so the minority side takes a **twin**: the same fields and the same identifier, in its own module, declared for that side. The same identifier gives the same `NAME`. The same fields give the same fold, so the twin's records are the same length, and a global twin's fingerprint is exactly the old global one. The twin is imported under an alias wherever a route's `emits(...)` names it, because `emits` takes an identifier (`route.rs:43`, `emits: Vec<Ident>`), not a path. After Task 11, an app gets a global and a scoped event under one `NAME` only this way: two types with one identifier in two modules. So a test that pins "rows of one `NAME` never cross the tenancy line" still pins a case an app can reach.
+
+At `e749823` plus Task 10, the sites are:
+
+1. `crates/charpente/tests/tenant.rs:167`. `MemoNoted` is named only in the three tenant feeds `memo_feed`, `memo_feed_open` and `memo_feed_auth`:
+
+```rust
+/// Scoped by `Org`: the three feeds below build it on `Org`'s `ScopedTx`, so
+/// each carries the one org its scope line admitted (tenancy-completion spec
+/// §6).
+#[event(scoped_by = Org)]
+struct MemoNoted {
+    n: WireU64,
+}
+```
+
+2. `crates/charpente-macros/tests/compile_pass/route_public_scope.rs:37`. `IncidentOpened` is named only in `feed`'s tenant feed. Its attribute becomes `#[event(scoped_by = Org)]`. `Org` there is `use tenancy::Org;`, and its `impl Tenant` carries Task 2's `const NAME: &'static str = "Org";`.
+
+3. `examples/invoicing/src/bin/tenant_node.rs:103`. `DocCreated` is emitted in `create_doc`'s scope and named in `feed`'s tenant feed:
+
+```rust
+/// Scoped by `Org`: `create_doc` emits it on its org's `ScopedTx`, and only
+/// that org's `feed` receives it (tenancy-completion spec §6). The wire
+/// oracle (`edge-harness`'s `tenant_wire`) checks exactly that over TCP.
+#[event(scoped_by = Org)]
+struct DocCreated {
+    doc: Id<Doc>,
+    /// The tenant-unique marker the wire oracle keys on. Both tenants use the
+    /// same document ids on purpose, so the id alone cannot say which tenant
+    /// a frame came from — the text can.
+    text: String,
+}
+```
+
+4. `crates/charpente/tests/realtime.rs`. `Ping` stays `#[event(global)]`, because the flagship emits it globally. Task 10 gave the scoped workload its own `#[event(global)] struct OrgPing` (Task 10 Step 6), used at every scoped emit and in every tenant feed. That is the majority side, so `OrgPing` flips. Its attribute becomes `#[event(scoped_by = Org)]`, and its doc gains:
+
+```rust
+/// Scoped by `Org` (tenancy-completion spec §6): emitted only on an org's
+/// `ScopedTx`, and received only by that org's feed. Its fields and `NAME`
+/// are Task 10's, so every record is Task 10's length. Only the 8-byte shape
+/// moves, because `scoped_fingerprint` mixes in `Org`'s `NAME`.
+```
+
+   Task 10 also used `OrgPing` on the global side, on purpose, to show at run time that a global row and a tenant's row of one name never cross: `literal_feed` and `global_feed` (`Subscription::of::<OrgPing>()`), `emit_global_org_ping`, and `NotifyOrg::run`'s `(*tx)`/`(**tx).emit(OrgPing …)`. Those take the global twin. Directly after `OrgPing`'s declaration, add:
+
+```rust
+/// `OrgPing`'s global twin (tenancy-completion spec §6). `OrgPing` is scoped
+/// by `Org`, so it can no longer be emitted on a bare `Tx` or named in a
+/// global feed. The tests that pin "a global row and a tenant's row of one
+/// name never cross" need one of each. After typing, the only way an app
+/// gets that pair is two types with one identifier in two modules, which is
+/// this. It keeps the identifier, so its `NAME` is `"org_ping"`. Its fields
+/// are `OrgPing`'s, so its fingerprint is the bare fold Task 10's global
+/// `OrgPing` had, and every record these sites write keeps Task 10's bytes.
+/// Imported under an alias because `emits(...)` takes an identifier, not a
+/// path.
+mod global_twin {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(global)]
+    pub struct OrgPing {
+        pub n: WireU64,
+    }
+}
+use global_twin::OrgPing as GlobalOrgPing;
+```
+
+   The twin's field list must be `OrgPing`'s, whatever Task 10 declared. `n: WireU64` above is `Ping`'s, which Task 10 copied. If `OrgPing` has other fields, copy them, or the twin's global rows stop being Task 10's bytes. Then, at each global-side site, `OrgPing` becomes `GlobalOrgPing`:
+   - `literal_feed`'s and `global_feed`'s `emits(OrgPing)` and `Subscription::of::<OrgPing>()`;
+   - `emit_global_org_ping`'s `tx.emit(OrgPing { … })`;
+   - `NotifyOrg::run`'s `(**tx).emit(OrgPing { … })`, and any `(*tx).emit(OrgPing { … })`.
+
+   `widened_feed`'s `.and::<Pong>()` names the global `Pong`. If `widened_feed` is a global feed, it is unchanged. If it is a tenant feed (`tx.subscription::<OrgPing>().and::<Pong>()`), the `.and::<Pong>()` is E0271: a tenant feed names its own tenant's events only, and a global `Pong` there is now `tenant_feed_of_another_scopes_event`'s compile error. In that case its test pinned at run time that a tenant feed never delivers a global row. Keep that pin with the twin rule, mirrored: a `mod org_twin { #[event(scoped_by = Org)] pub struct Pong { pub n: WireU64 } }`, imported `as OrgPong`, in the feed's `.and::<…>()` and its `emits(...)`, while the global `Pong`'s emits stay as they are. Record which case held in the report.
+
+   Oracles that build a `Ping`/`OrgPing` value only to serialize an expected frame are unaffected: the twins' JSON is identical.
+
+5. `docs/GUIDE.md` §11, Task 10's compiled tenant-feed block. Its `NoteAdded` is emitted inside a scope and named in `tx.subscription::<NoteAdded>()`, so its attribute becomes `#[event(scoped_by = Org)]`. If that block also emits or subscribes `NoteAdded` globally, apply the twin rule inside the block.
+
+Then:
+
+```zsh
+cargo check --workspace --all-targets 2>&1 | grep -E "^(error|warning)" | sort | uniq -c
+cargo build -p guide-examples 2>&1 | grep -E "^(error|warning)" | sort | uniq -c
+```
+
+Expected: no output from either. A remaining E0271 or E0277 names a site Task 10 added that this list missed, and the two rules above apply to it. A remaining E0046 is a hand impl without `Scope`. List every such extra site in the task report, and stage its file by name in Step 12.
+
+- [ ] **Step 7: The behavioural tests — the scoped fingerprint, and the mount census**
+
+In `crates/charpente/tests/tenant.rs`:
+- add `Event` and `events` to the `use charpente::{…}` list (29–32);
+- append this section at the end of the file:
+
+```rust
+// ----------------------------------------- event tenancy (spec §4, §6)
+
+/// Three events with one `NAME` ("noted") and one field list: a global one,
+/// one scoped by `Org`, one scoped by `Team`. Only their declarations
+/// differ, so only their fingerprints can tell their rows apart.
+mod noted_global {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(global)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+mod noted_org {
+    use super::Org;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(scoped_by = Org)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+mod noted_team {
+    use super::Team;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(scoped_by = Team)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+/// Scoped by Task 2's `billing::Org`, whose `NAME` ("BillingOrg") is not its
+/// identifier. Every other tenant type here follows A4 (`NAME` equals the
+/// identifier), so this is the one case that tells "mixes the tenant's
+/// `NAME`" from "mixes the scope path's last segment", which is `Org` here.
+mod noted_billing {
+    use super::billing::Org;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(scoped_by = Org)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+/// Tenancy-completion spec §4, §6: a scoped event's fingerprint is its
+/// fields' fold continued by `scoped_fingerprint` with its tenant's `NAME`.
+/// A `global` event and its `scoped_by` twin never share a shape. Nor do two
+/// same-named events scoped by two tenant types whose raw ids may coincide,
+/// which is what closes DESIGN §8's shared-raw-id limit for events. The
+/// literals are FNV-1a over `"n\0WireU64\0"`, then continued over
+/// `"#scoped_by\0Org\0"` and `"#scoped_by\0Team\0"`. They were computed
+/// independently of the macro. The `scoped_fingerprint` lines pin the
+/// operands, the fold and the `NAME`, and not only that the values differ.
+/// The `billing` lines pin that the operand is the `NAME`, not a spelling
+/// of the path, in the fingerprint and in the def that `describe` and the
+/// tenant census read.
+#[test]
+fn a_scoped_events_fingerprint_mixes_its_tenants_name() {
+    use charpente::describe::EventEntry;
+
+    let global = <noted_global::Noted as Event>::FINGERPRINT;
+    let org = <noted_org::Noted as Event>::FINGERPRINT;
+    let team = <noted_team::Noted as Event>::FINGERPRINT;
+    let billing = <noted_billing::Noted as Event>::FINGERPRINT;
+    assert_eq!(global, 0x9caf_3f93_9b10_65e1, "a global event's is the bare fold");
+    assert_eq!(org, 0xeb60_a110_53ba_40dc);
+    assert_eq!(team, 0x4874_6e82_94a2_6e7d);
+    assert_eq!(
+        org,
+        charpente::core::db::scoped_fingerprint(global, <Org as Tenant>::NAME),
+        "the fold continued by the tenant's NAME, and nothing else"
+    );
+    assert_eq!(
+        billing,
+        charpente::core::db::scoped_fingerprint(global, "BillingOrg"),
+        "billing::Org's NAME, never the `Org` its path is spelled with"
+    );
+    assert_ne!(billing, org, "billing::Org and Org are two tenants");
+    assert_eq!(
+        <noted_billing::Noted as EventEntry>::def().scoped_by,
+        Some("BillingOrg"),
+        "the def names the tenant by NAME too"
+    );
+    assert_eq!(
+        (
+            <noted_global::Noted as Event>::NAME,
+            <noted_org::Noted as Event>::NAME,
+            <noted_team::Noted as Event>::NAME,
+            <noted_billing::Noted as Event>::NAME
+        ),
+        ("noted", "noted", "noted", "noted"),
+        "one NAME: only the fingerprint tells the four apart"
+    );
+}
+
+/// An `Org` of another module, under the root `Org`'s `NAME`. This is what an
+/// app gets when two modules each declare a tenant type and both follow the
+/// identifier convention. Named through an event beside the root `Org`, it
+/// must be refused at mount like the table, route and job cases Task 3 pins.
+/// (Not `billing`: Task 2's `billing::Org` in this file is named
+/// "BillingOrg" on purpose, and a second module of that name would clash.)
+mod accounts {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::wire::WireU64;
+    use charpente::{Id, Tenant, Tx, event, table};
+
+    #[table(global)]
+    pub struct Org {
+        pub id: Id<Org>,
+        pub name: String,
+    }
+
+    impl Tenant for Org {
+        const NAME: &'static str = "Org";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    #[event(scoped_by = Org)]
+    pub struct InvoiceNoted {
+        pub n: WireU64,
+    }
+}
+
+/// Tenancy-completion spec §4: an event's scope joins the mount-time tenant
+/// census. `memo_app` already names the root `Org` (`Memo`'s scope, and its
+/// `public(Org)` routes). `accounts::InvoiceNoted` names `accounts::Org` under
+/// the same `NAME`. The two types would share every scoped fingerprint's
+/// tenant half, so the app is refused at this call, before it serves, by
+/// name, with both full type names. The literal is Task 3's pinned text,
+/// spelled out here.
+#[test]
+#[should_panic(
+    expected = "two tenant types are named \"Org\": tenant::Org and tenant::accounts::Org — a \
+                tenant's NAME is its identity (it is inside every scoped job's and event's \
+                fingerprint), so give each type its own `const NAME` in its `impl Tenant`"
+)]
+fn an_event_scoped_by_a_second_type_under_one_name_is_refused_at_mount() {
+    let (_sim, app) = memo_app(0x7E4A_E7E1);
+    let _ = app.mount_events(events![accounts::InvoiceNoted]);
+}
+
+/// The control: one tenant type, named through a table (`Memo`), the
+/// `public(Org)` routes and a scoped event (`MemoNoted`), is one tenant and
+/// mounts. Without it, a census that refused every scoped event would pass
+/// the test above.
+#[test]
+fn an_event_scoped_by_the_apps_own_tenant_type_mounts() {
+    let (_sim, app) = memo_app(0x7E4A_E7E2);
+    let app = app.mount_events(events![MemoNoted]);
+    let events: Vec<&str> = app.describe().events.iter().map(|e| e.name).collect();
+    assert_eq!(events, vec!["memo_noted"]);
+}
+```
+
+The collision test's text assumes that Task 3 names the type already in the census first and the newcomer second. `memo_app`'s `App::open` registers `Memo`'s `Org`, so that is `tenant::Org` first. If Task 3's pinned order is the other way, swap the two names, and say so in the report. `accounts::Org` is local to this file, because Task 3's same-`NAME` fixtures, wherever they live, are not reachable from an integration test binary.
+
+**The shared-raw-id property, end to end.** The fingerprint test above pins values. This one pins what the scoped fingerprint is FOR, spec §6's "Two scope types sharing a raw id no longer collide". `Org` 1 and `Team` 1 share a raw id, and their two events share a `NAME`. So `Team`'s row matches `Org` 1's feed on name and on scope, and only its shape tells it apart. In `crates/charpente/tests/realtime.rs`, after the last item of Task 10's scoped section, add:
+
+```rust
+// ======================= two tenant types, one raw id (spec §6)
+
+/// A second tenant type. Its raw ids coincide with `Org`'s, since both are
+/// plain `u64`s an app picks, which is the case DESIGN §8 named as a limit
+/// before events declared their tenant.
+#[table(global)]
+struct Team {
+    id: Id<Team>,
+    name: String,
+}
+
+impl Tenant for Team {
+    const NAME: &'static str = "Team";
+    type Who = Principal;
+    type Error = ApiError;
+
+    /// Always allows: the routes below are `public(Team)`, and this property
+    /// is about delivery, not membership.
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+/// `Team`'s event under `OrgPing`'s identifier: the same `NAME`
+/// (`"org_ping"`) and the same field fold. Only the tenant `NAME` its
+/// fingerprint carries tells its rows from `OrgPing`'s.
+mod team_scoped {
+    use super::Team;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(scoped_by = Team)]
+    pub struct OrgPing {
+        pub n: WireU64,
+    }
+}
+
+#[derive(WireDerive, Serialize, Deserialize)]
+struct SharedRawBody {
+    tenant: WireU64,
+    n: WireU64,
+}
+
+#[route(POST "/shared-raw/org-ping", public(Org))]
+fn shared_raw_org_ping(tx: &mut Tx, body: SharedRawBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.tenant.0), ctx)?;
+    tx.emit(OrgPing { n: body.n });
+    Ok(())
+}
+
+#[route(POST "/shared-raw/team-ping", public(Team))]
+fn shared_raw_team_ping(tx: &mut Tx, body: SharedRawBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Team>(Id::from_raw(body.tenant.0), ctx)?;
+    tx.emit(team_scoped::OrgPing { n: body.n });
+    Ok(())
+}
+
+#[route(SSE "/shared-raw/org-feed/:org", public(Org), emits(OrgPing))]
+fn shared_raw_org_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<OrgPing>().cursor(cursor).into())
+}
+
+/// Tenancy-completion spec §6: "Two scope types sharing a raw id no longer
+/// collide: the event's fingerprint mixes its tenant's NAME, so a row emitted
+/// under the other type is a foreign shape." Here, `Team` 1's row matches
+/// `Org` 1's feed on name and on raw scope. The feed gets `Org`'s own ping,
+/// and then, at `Team`'s row, the `charpente.reshaped` end that
+/// payload-shapes spec §3 gives any foreign shape: `Team`'s payload is never
+/// decoded into `Org`'s feed. The end itself is the residual cost, and
+/// `mount_events`' refusal of two events with one name rules it out for an
+/// app that mounts every event it emits. With the two fingerprints equal (a
+/// scoped event hashing only its fields), this feed delivered `Team`'s
+/// `{"n":"7"}` as `Org`'s.
+#[test]
+fn a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered() {
+    let sim = Sim::with_faults(0x2EB1_1B0B, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![
+        shared_raw_org_ping,
+        shared_raw_team_ping,
+        shared_raw_org_feed
+    ]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/shared-raw/org-feed/1"),
+            Request::new(Method::Post, "/shared-raw/org-ping").json(&SharedRawBody {
+                tenant: WireU64(1),
+                n: WireU64(9),
+            }),
+            Request::new(Method::Post, "/shared-raw/team-ping").json(&SharedRawBody {
+                tenant: WireU64(1),
+                n: WireU64(7),
+            }),
+        ],
+    );
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 8)
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.scope))
+            .collect::<Vec<_>>(),
+        vec![("org_ping", Some(1)), ("org_ping", Some(1))],
+        "the colliding case: one NAME, one raw tenant id, two tenant types"
+    );
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![
+            (
+                rows[0].id.raw(),
+                rows[0].seq,
+                "org_ping".to_string(),
+                r#"{"n":"9"}"#.to_string()
+            ),
+            reshaped_frame(&rows[1]),
+        ],
+        "Org 1's own ping, then the foreign-shape end at Team 1's row; never Team's payload"
+    );
+    assert_ne!(
+        rows[0].shape, rows[1].shape,
+        "only the tenant NAME inside each fingerprint tells the two rows apart"
+    );
+}
+```
+
+`EventRow.scope` is Task 10's field. `Subscribe` is in the `use charpente::{…}` list because Task 10's tenant feeds use it; if it is not, add it. `run_script`, `frames_of` and `reshaped_frame` are the file's helpers (`realtime.rs:344`, `:403`, `:417` at `e749823`). The frames assertion comes before the shape assertion on purpose. Under Step 9's mutations 1 and 2 the two shapes are equal, and the red must show the leak, a delivered `{"n":"7"}`, rather than the setup check. Its three routes name `Org` and `Team`, two tenant types under two `NAME`s, so Task 3's census admits the app.
+
+Run:
+
+```zsh
+cargo test -p charpente --test realtime -- a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered --exact
+```
+
+Expected: `1 passed`. Its red is Step 9's mutation 1: this test needs `scoped_by`, which does not exist before this task. The same holds for the three tenant tests above: they are proved red by Step 9's mutations 1–6 and 12.
+
+- [ ] **Step 8: The fixtures**
+
+Each compile-fail fixture opens with a comment saying what it pins, as the existing ones do. Wherever an import would go unused in a refused item, the fixture names the type by path instead (`across_tenants_without_capability.rs`'s reason): an unused-import warning would otherwise sit in the pin. Every `impl Tenant` carries Task 2's `const NAME` first.
+
+`compile_fail/event_global_and_scoped_by.rs`:
+
+```rust
+// An event is `global` or `scoped_by`, never both (tenancy-completion spec
+// §6), reported at whichever came second: `#[job]`'s rule, in its text
+// family.
+use charpente::event;
+
+#[event(global, scoped_by = Org)]
+struct GlobalFirst {}
+
+#[event(scoped_by = Org, global)]
+struct ScopedFirst {}
+
+fn main() {}
+```
+
+`compile_fail/event_duplicate_scoped_by.rs` (Task 1's `event_duplicate_global.rs` already pins `global` twice, and stays as it is):
+
+```rust
+// A declaration repeated is a typo or a bad merge, never an override
+// (tenancy-completion spec §6; `#[job]`'s and `#[table]`'s precedent), even
+// when both name the same tenant. `event_duplicate_global.rs` pins the
+// `global` half of the rule.
+use charpente::event;
+
+#[event(scoped_by = Org, scoped_by = Org)]
+struct ScopedTwice {}
+
+fn main() {}
+```
+
+`compile_fail/event_unknown_word.rs`. This replaces Task 1's file of the same name, whose one case (`name = "renamed"`) is the third below:
+
+```rust
+// Any word `#[event]` does not take hits the accepted-forms message, which
+// names the only two it does. That covers a job's words, which an event
+// has no use for; a `scoped_by` with no type; and a name, which an event
+// derives from its type.
+use charpente::event;
+
+#[event(global, cross_tenant)]
+struct CapabilityWord {}
+
+#[event(scoped_by)]
+struct MissingScope {}
+
+#[event(name = "renamed")]
+struct Renamed {}
+
+fn main() {}
+```
+
+`compile_fail/event_scoped_by_missing_tenant_scope.rs`:
+
+```rust
+// `#[event(scoped_by = Org)]` puts `Org` in a tenant scope's place, so `Org`
+// must carry the app's own membership check. It is the same `TenantScope`
+// assert that `#[table(scoped_by = …)]`, `#[job(scoped_by = …)]` and
+// `public(Org)` emit, with the same diagnostic.
+use charpente::{Id, event, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+#[event(scoped_by = Org)]
+struct Noted {
+    n: charpente::wire::WireU64,
+}
+
+fn main() {}
+```
+
+`compile_fail/scoped_event_emitted_on_bare_tx.rs`:
+
+```rust
+// A scoped event emitted on a bare `Tx` (tenancy-completion spec §6). The
+// `Tx` names no tenant, so the event would reach no tenant's feed, and as a
+// global row it would reach every global one. The `NoEventTenant` note says
+// where to emit it instead.
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Tenant, Tx, event, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[event(scoped_by = Org)]
+struct IncidentOpened {
+    incident: charpente::wire::WireU64,
+}
+
+#[route(POST "/orgs/:org/incidents", auth)]
+fn open_incident(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<(), ApiError> {
+    let _ = (org, ctx);
+    let event = IncidentOpened {
+        incident: charpente::wire::WireU64(7),
+    };
+    tx.emit(event);
+    Ok(())
+}
+
+fn main() {}
+```
+
+`compile_fail/scoped_event_emitted_keyed_on_bare_tx.rs`:
+
+```rust
+// `emit_keyed` is `emit` plus an app key (tenancy-completion spec §2.3), and
+// a key is never a tenant. So a scoped event on a bare `Tx` is refused here
+// exactly as under `emit`, whatever the key says. Before this spec, a key
+// holding the tenant's id was how an app scoped an event by hand.
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Tenant, Tx, event, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[event(scoped_by = Org)]
+struct IncidentOpened {
+    incident: charpente::wire::WireU64,
+}
+
+#[route(POST "/orgs/:org/incidents", auth)]
+fn open_incident(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<(), ApiError> {
+    let _ = ctx;
+    let event = IncidentOpened {
+        incident: charpente::wire::WireU64(7),
+    };
+    tx.emit_keyed(org.raw().to_string(), event);
+    Ok(())
+}
+
+fn main() {}
+```
+
+`compile_fail/scoped_tx_emit_of_a_global_event.rs`:
+
+```rust
+// A global event emitted through a `ScopedTx` without the deref
+// (tenancy-completion spec §6) is an E0271. It is never silently recorded in
+// this tenant, where no global feed would receive it. `ScopedTx::emit`
+// shadows `Tx::emit`, and Rust does not fall through the deref when the
+// inherent method's bound fails. The fix is `(*tx).emit(SystemNotice {})`,
+// and GUIDE §11 shows it.
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Scoped, Tenant, Tx, event, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[event(global)]
+struct SystemNotice {}
+
+#[route(POST "/orgs/:org/notice", auth)]
+fn notice(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.emit(SystemNotice {});
+    Ok(())
+}
+
+fn main() {}
+```
+
+`compile_fail/scoped_tx_emits_another_scopes_event.rs`:
+
+```rust
+// A `ScopedTx<Org>` emits `Org`'s events only (tenancy-completion spec §6).
+// An event scoped by another type would be recorded under an `Org` id, where
+// no `Team` feed could ever match it. This is rustc's own E0271, pinned so
+// GUIDE §11 can name it.
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx};
+use charpente::{Id, Scoped, Tenant, Tx, event, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+#[table(global)]
+struct Team {
+    id: Id<Team>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+impl Tenant for Team {
+    const NAME: &'static str = "Team";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[event(scoped_by = Team)]
+struct RotaChanged {}
+
+#[route(POST "/orgs/:org/rota", auth)]
+fn rota(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.emit(RotaChanged {});
+    Ok(())
+}
+
+fn main() {}
+```
+
+`compile_fail/global_subscription_of_a_scoped_event.rs`:
+
+```rust
+// A global `Subscription` names no tenant (tenancy-completion spec §6), so
+// `Subscription::of` and `.and` take global events only. A scoped event
+// there is the `NoEventTenant` refusal, and its note names the tenant feed.
+// Before this spec, such a feed received every tenant's rows of the type.
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::{Id, Tenant, Tx, event, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[event(scoped_by = Org)]
+struct IncidentOpened {
+    incident: charpente::wire::WireU64,
+}
+
+#[event(global)]
+struct SystemNotice {}
+
+#[route(SSE "/incidents", public)]
+fn incidents(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<IncidentOpened>().cursor(cursor))
+}
+
+#[route(SSE "/everything", public)]
+fn everything(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<SystemNotice>()
+        .and::<IncidentOpened>()
+        .cursor(cursor))
+}
+
+fn main() {}
+```
+
+`compile_fail/tenant_feed_of_another_scopes_event.rs`:
+
+```rust
+// A tenant feed carries its tenant's type (tenancy-completion spec §6,
+// amendment A3): on a `ScopedTx<Org>`, `tx.subscription::<Ev>()` and its
+// `.and::<Ev2>()` take events scoped by `Org` only. An event scoped by
+// another type, or a global one, could never match the feed's tenant. Each
+// is rustc's own E0271, never an entry that silently receives nothing.
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::{Id, Scoped, Subscribe, Tenant, Tx, event, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+#[table(global)]
+struct Team {
+    id: Id<Team>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+impl Tenant for Team {
+    const NAME: &'static str = "Team";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[event(scoped_by = Org)]
+struct IncidentOpened {}
+
+#[event(scoped_by = Team)]
+struct RotaChanged {}
+
+#[event(global)]
+struct SystemNotice {}
+
+#[route(SSE "/orgs/:org/feed", auth)]
+fn feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx
+        .subscription::<IncidentOpened>()
+        .and::<RotaChanged>()
+        .cursor(cursor)
+        .into())
+}
+
+#[route(SSE "/orgs/:org/notices", auth)]
+fn notices(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<SystemNotice>().cursor(cursor).into())
+}
+
+fn main() {}
+```
+
+`compile_fail/unscoped_event_impl_from_an_app.rs`:
+
+```rust
+// The event twin of `unscoped_job_impl_from_an_app.rs` (tenancy-completion
+// spec §6). `UnscopedEvent` is the bound `Tx::emit`, `Tx::emit_keyed`,
+// `Subscription::of` and `Subscription::and` actually name, so sealing
+// `NoEventTenant` alone would leave the same one-line opt-out one level up.
+// The event below is hand-written, as an app may write one. `Event::Scope`
+// has no default, so it states its tenant, and `impl UnscopedEvent for
+// Noted {}` is orphan-legal (`Noted` is local). Unsealed, that line would let
+// a scoped event be emitted on a bare `Tx`, recorded with no tenant, and
+// delivered to every global feed. Sealed, the impl is refused with the note
+// that says where to emit it.
+use charpente::auth::Principal;
+use charpente::core::table::{Codec, UnscopedEvent};
+use charpente::http::ApiError;
+use charpente::{Event, Id, Tenant, Tx, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+struct Noted;
+
+impl Codec for Noted {
+    fn encode(&self, _out: &mut Vec<u8>) {}
+    fn decode(_input: &mut &[u8]) -> std::io::Result<Noted> {
+        Ok(Noted)
+    }
+}
+
+impl Event for Noted {
+    const NAME: &'static str = "noted";
+    const FINGERPRINT: u64 = 0x7E57_0B0B;
+    type Scope = Org;
+}
+
+impl UnscopedEvent for Noted {}
+
+fn emit(tx: &mut Tx) {
+    tx.emit(Noted);
+}
+
+fn main() {
+    let _ = emit;
+}
+```
+
+`compile_fail/no_event_tenant_impl_from_an_app.rs`:
+
+```rust
+// The event twin of `no_job_tenant_impl_from_an_app.rs` (tenancy-completion
+// spec §6). `UnscopedEvent` holds exactly when the event's scope type
+// implements `NoEventTenant<Event>`. The impl below is legal under the orphan
+// rules, since `Org` is local. So without a seal it is one safe line that
+// lets a scoped event be emitted on a bare `Tx`. The seal is the same
+// `NotATenant` that `NoTenant` and `NoJobTenant` carry, and it keeps that a
+// compile error.
+use charpente::auth::Principal;
+use charpente::core::table::NoEventTenant;
+use charpente::http::ApiError;
+use charpente::{Id, Tenant, Tx, event, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+#[event(scoped_by = Org)]
+struct Noted {
+    n: charpente::wire::WireU64,
+}
+
+impl NoEventTenant<Noted> for Org {}
+
+fn emit(tx: &mut Tx) {
+    tx.emit(Noted {
+        n: charpente::wire::WireU64(1),
+    });
+}
+
+fn main() {
+    let _ = emit;
+}
+```
+
+`compile_fail/subscription_entries_are_crate_private.rs`:
+
+```rust
+// A feed's entries are the platform's (tenancy-completion spec §6). Only
+// `Subscription::of`/`and` and a tenant feed's `subscription`/`and` add one,
+// each bounded by the event's declared tenancy. Were the list public, a
+// handler admitted to one tenant could push an entry naming another tenant
+// type's event, its NAME and FINGERPRINT copied from the type, and read
+// that tenant's rows wherever the two types' raw ids coincide. Both doors
+// are pinned shut: the entry type, and the field. The sibling of
+// `principal_is_read_only_to_an_app.rs`. `SubEntry` is named by path, so a
+// refused import cannot also sit in the pin as an unused one.
+use charpente::http::Subscription;
+
+fn widen(mut feed: Subscription, entry: charpente::http::SubEntry) -> Subscription {
+    feed.entries.push(entry);
+    feed
+}
+
+fn main() {
+    let _ = widen;
+}
+```
+
+`compile_pass/event_global_forms.rs` (Task 1's) loses its bare control, which Task 1 left for this task to remove. Replace the file with:
+
+```rust
+// `#[event(global)]` (tenancy-completion spec §6, amendment A1): an event's
+// global tenancy, written once, with an optional trailing comma. `global`
+// changes nothing the fingerprint hashes: a global event's is the bare field
+// fold, FNV-1a over `"n\0WireU64\0"`. That is the value a bare `#[event]`
+// computed before this spec refused the bare form (`event_bare.rs`).
+// trybuild runs `main`, so its assertions are part of the pin.
+use charpente::wire::WireU64;
+use charpente::{Event, event};
+
+#[event(global)]
+struct Declared {
+    n: WireU64,
+}
+
+#[event(global,)]
+struct TrailingComma {
+    n: WireU64,
+}
+
+fn main() {
+    assert_eq!(Declared::NAME, "declared");
+    assert_eq!(TrailingComma::NAME, "trailing_comma");
+    assert_eq!(
+        <Declared as Event>::FINGERPRINT,
+        0x9caf_3f93_9b10_65e1,
+        "`global` changes nothing the fingerprint hashes"
+    );
+    assert_eq!(<TrailingComma as Event>::FINGERPRINT, 0x9caf_3f93_9b10_65e1);
+}
+```
+
+The literal replaces the comparison with `Bare`. It is the same value, `realtime.rs`'s `Ping` pin (Task 1), for the same field list.
+
+`compile_pass/scoped_event_emitted_inside_its_scope.rs`:
+
+```rust
+// The shapes a scoped event is written in (tenancy-completion spec §6):
+// - declared `scoped_by`, with the tenant's path bare or qualified;
+// - emitted, keyed or not, inside its tenant's scope, from a handler and from
+//   a scoped job's `run`;
+// - a global event emitted beside it through the deref;
+// - a tenant feed of two scoped events, narrowed by an app key;
+// - a global feed beside it.
+// trybuild runs `main`, so its assertions are part of the pin.
+use charpente::describe::EventEntry;
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::kernel::JobError;
+use charpente::wire::WireU64;
+use charpente::{Event, Id, Scoped, ScopedTx, Subscribe, Tx, event, job, route};
+use std::any::TypeId;
+
+mod tenancy {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx, table};
+
+    #[table(global)]
+    pub struct Org {
+        pub id: Id<Org>,
+        pub name: String,
+    }
+
+    impl Tenant for Org {
+        const NAME: &'static str = "Org";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+use tenancy::Org;
+
+#[event(scoped_by = Org)]
+struct IncidentOpened {
+    incident: WireU64,
+}
+
+/// The same fields and the same tenant as `IncidentOpened`, spelled through
+/// the qualified path. One tenant is one shape, however its path is written.
+#[event(scoped_by = tenancy::Org)]
+struct IncidentClosed {
+    incident: WireU64,
+}
+
+#[event(global)]
+struct SystemNotice {
+    n: WireU64,
+}
+
+#[job(scoped_by = Org)]
+struct Notify {
+    incident: u64,
+}
+
+impl Notify {
+    fn run(self, tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+        tx.emit(IncidentOpened {
+            incident: WireU64(self.incident),
+        });
+        // `run` holds `&mut ScopedTx`, so the global deref is `**`.
+        (**tx).emit(SystemNotice {
+            n: WireU64(self.incident),
+        });
+        Ok(())
+    }
+}
+
+#[route(POST "/orgs/:org/incidents/close", auth)]
+fn close(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<(), ApiError> {
+    let id = WireU64(7);
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.emit(IncidentOpened { incident: id });
+    tx.emit_keyed(format!("user:{}", id.0), IncidentClosed { incident: id });
+    (*tx).emit(SystemNotice { n: id });
+    tx.enqueue(Notify { incident: id.0 });
+    Ok(())
+}
+
+#[route(SSE "/orgs/:org/feed", auth, emits(IncidentOpened, IncidentClosed))]
+fn feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx
+        .subscription::<IncidentOpened>()
+        .and::<IncidentClosed>()
+        .key("user:7")
+        .cursor(cursor)
+        .into())
+}
+
+#[route(SSE "/notices", public, emits(SystemNotice))]
+fn notices(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<SystemNotice>().cursor(cursor))
+}
+
+fn main() {
+    let opened = <IncidentOpened as EventEntry>::def();
+    assert_eq!(opened.scoped_by, Some("Org"));
+    assert_eq!(opened.scope_type, TypeId::of::<Org>());
+    let closed = <IncidentClosed as EventEntry>::def();
+    assert_eq!(closed.scoped_by, Some("Org"), "a qualified path names the same tenant");
+    assert_eq!(closed.scope_type, TypeId::of::<Org>());
+    let notice = <SystemNotice as EventEntry>::def();
+    assert_eq!(notice.scoped_by, None);
+    assert_eq!(
+        notice.scope_type,
+        TypeId::of::<charpente::core::table::Unscoped>()
+    );
+    assert_eq!(
+        <IncidentOpened as Event>::FINGERPRINT,
+        <IncidentClosed as Event>::FINGERPRINT,
+        "one tenant is one shape, however its path is spelled"
+    );
+}
+```
+
+- [ ] **Step 9: Run, review every pin, and prove red by mutation**
+
+Run each command in the foreground:
+
+```zsh
+cargo test -p charpente-macros --lib
+cargo test -p charpente --test tenant -- a_scoped_events_fingerprint_mixes_its_tenants_name an_event_scoped_by
+cargo test -p charpente --test realtime -- a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered a_global_events_fingerprint_is_the_bare_events_fingerprint
+cargo test -p charpente --lib -- kernel::tail::tests
+cargo test -p invoicing --test describe_golden -- the_invoicing_events_fingerprints_do_not_move --exact
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild
+git status --short crates/charpente-macros/tests/
+git diff --stat crates/charpente-macros/tests/
+cargo test -p charpente-macros --test trybuild
+```
+
+Expected:
+- All green. Task 1's two global pins pass unedited.
+- `git status` shows 27 new files: the 13 new compile-fail `.rs`/`.stderr` pairs and `compile_pass/scoped_event_emitted_inside_its_scope.rs`. It shows exactly four modified files:
+  - `compile_fail/event_unknown_word.rs` and `.stderr` (replaced);
+  - `compile_pass/event_global_forms.rs` (`Bare` removed);
+  - `compile_pass/route_public_scope.rs` (Step 6).
+- In `git diff --stat`, any other changed `.stderr` is a finding. Read it before accepting it. `event_duplicate_global.stderr` above all must not move: it is the pin that Task 1's text and span survived the new parser.
+- Read each new or re-pinned `.stderr` against its source string:
+  - `event_bare`: the bare refusal naming `NoteAdded`, at `#[event]`, with the note "this error originates in the attribute macro `event`". The text is Step 4's `format!`, rendered, and contains "add `global` or `scoped_by = <Tenant>` to this attribute's arguments, keeping its others".
+  - `event_global_and_scoped_by`: "`global` and `scoped_by = Org` on one event — an event is one or the other; drop one" twice, first at `scoped_by`, then at `global`.
+  - `event_duplicate_scoped_by`: "`scoped_by` given twice — write it once" at the second `scoped_by`.
+  - `event_unknown_word`: the new accepted-forms message ("an event declares `global` or `scoped_by = <Tenant>` and nothing else …") three times: at `cross_tenant`, at the end of `scoped_by`, and at `name`. Record in the report where rustc spans the missing `= <Tenant>`. The re-pin replaces Task 1's one error, "an event declares `global` — write `#[event(global)]`; its name derives from the type" at `name`, which is expected and is this task's change.
+  - `event_scoped_by_missing_tenant_scope`:
+    - exactly one error, the house E0277, "required by a bound in `tenant_name`" (A7). A second error is a finding.
+  - `scoped_event_emitted_on_bare_tx`: E0277, labelled "`IncidentOpened` is scoped by `Org`". The message, label and full note are Step 3's. The note's job line reads "takes `scoped_by = Org` in place of `global` among its `#[job(…)]` arguments, keeping the others". The file ends with "required by a bound in `Tx::<'a>::emit`".
+  - `scoped_event_emitted_keyed_on_bare_tx`: the same diagnostic, "required by a bound in `Tx::<'a>::emit_keyed`".
+  - `scoped_tx_emit_of_a_global_event`: E0271 "type mismatch resolving `<SystemNotice as Event>::Scope == Org`". Its note "expected this to be `Org`" points at `#[event(global)]`, and it is "required by a bound in `ScopedTx::<'_, 'a, S>::emit`".
+  - `scoped_tx_emits_another_scopes_event`: E0271 for `<RotaChanged as Event>::Scope == Org`, whose note points at the `Team` in `#[event(scoped_by = Team)]`.
+  - `global_subscription_of_a_scoped_event`: two E0277s with Step 3's text, "required by a bound in `Subscription::of`" and "…`Subscription::and`".
+  - `tenant_feed_of_another_scopes_event`: two E0271s. One is for `<RotaChanged as Event>::Scope == Org`, "required by a bound in `TenantFeed::<S>::and`". The other is for `<SystemNotice as Event>::Scope == Org`, "required by a bound in `Subscribe::subscription`".
+  - `unscoped_event_impl_from_an_app`: E0277 with Step 3's text at `impl UnscopedEvent for Noted {}`, "required for `Noted` to implement `table::sealed::NotScopedEvent`", and rustc's "`UnscopedEvent` is a \"sealed trait\"" note.
+  - `no_event_tenant_impl_from_an_app`: E0277 "the trait bound `Org: table::sealed::NotATenant` is not satisfied" at `impl NoEventTenant<Noted> for Org {}`, with the sealed-trait note naming `Unscoped` and `PlatformOwned`.
+  - `subscription_entries_are_crate_private`: exactly two errors. E0603 "struct `SubEntry` is private" at the path in `widen`'s signature, with rustc's "the struct `SubEntry` is defined here" note. E0616 "field `entries` of struct `Subscription` is private" at `feed.entries`. A scratch crate with the same visibilities printed exactly these two on rustc 1.95.0.
+
+Commit nothing yet. Save the implementation, then apply each mutation alone, run the named test, and quote the failure. Restore each with `git checkout -- <file>` and `git apply` of the saved patch. After each restore, check that `git diff --stat` matches the saved patch's:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff crates/charpente-core/src/db.rs crates/charpente-core/src/table.rs \
+  crates/charpente-macros/src/event.rs crates/charpente/src/http/app.rs \
+  crates/charpente/src/http/mod.rs > $D/task11-impl.patch
+```
+
+1. `event.rs`: the scoped arm's fingerprint emits the bare fold (`quote! { #fold }` in place of the `scoped_fingerprint(…)` call). Run:
+   - `cargo test -p charpente --test tenant -- a_scoped_events_fingerprint_mixes_its_tenants_name`. Expected: it fails at `org`'s literal, `left: 11290312694035408353` (`0x9caf3f939b1065e1`), `right: 16960733288173551836` (`0xeb60a11053ba40dc`).
+   - `cargo test -p charpente --test realtime -- a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered`. Expected: it fails at the frames assertion. Its left side holds `(…, "org_ping", "{\"n\":\"7\"}")` where the right holds the reshaped frame: `Team` 1's payload delivered as `Org` 1's. Quote both sides. This is the behavioural red, the leak the scoped fingerprint closes.
+2. `event.rs`: the NAME operand is `""` (`scoped_fingerprint(#fold, "")`). Expected: the same two tests fail as in 1: the literal, and the delivered `{"n":"7"}`, because both tenants' fingerprints are now `scoped_fingerprint(fold, "")`. The trybuild compile-pass case stays green, because both `IncidentOpened`s move together. That is why the other two tests exist.
+3. `event.rs`: `scoped_by_name` is `None` in the scoped arm. Run `cargo test -p charpente-macros --test trybuild`. Expected: `scoped_event_emitted_inside_its_scope` fails at run time on `assert_eq!(opened.scoped_by, Some("Org"))`. Then run `cargo test -p charpente --test tenant -- an_event_scoped_by_a_second_type`. Expected: it fails with "test did not panic as expected", because the census never hears of the event.
+4. `app.rs`: delete the `note_tenant` call in `mount_events`. Expected: `an_event_scoped_by_a_second_type_under_one_name_is_refused_at_mount` fails with "test did not panic as expected".
+5. `app.rs`: pass `std::any::TypeId::of::<()>()` in place of `def.scope_type`. Expected: `an_event_scoped_by_the_apps_own_tenant_type_mounts` panics with Task 3's two-types text, naming `tenant::Org` twice. This pins the `TypeId` operand.
+6. `app.rs`: pass `def.name` in place of `def.scope_type_name`. Expected: the collision test fails with "panic did not contain expected string", its payload naming `invoice_noted` (the event's own name) in place of `tenant::accounts::Org`. This pins the display operand.
+7. `db.rs`: in `push_emit`'s assert, `!=` becomes `==`. Run `cargo test -p charpente --test transactions`. Expected: every test that emits panics with "contract: event \"invoice_finalized\" was emitted with tenant None, but a scoped event carries its tenant and a global one none — …". The assert is live on the global path.
+8. `db.rs`: `ScopedTx::emit` passes `None` for the scope. Run `cargo test -p charpente --test realtime -- scoped shared_raw`. Expected: the scoped workload's tests and the shared-raw test panic with the same contract text, naming "org_ping" and `None`. The assert is live on the scoped path. Name each failing test in the report.
+9. `table.rs`: drop `+ sealed::NotScopedEvent` from `UnscopedEvent`'s supertraits. Run `cargo test -p charpente-macros --test trybuild`. Expected: `unscoped_event_impl_from_an_app` compiles, and trybuild reports it expected a failure. The seal is load-bearing, not decoration.
+10. `http/mod.rs`: `pub(crate) entries` and `pub(crate) struct SubEntry` go back to `pub`. Run `cargo test -p charpente-macros --test trybuild`. Expected: `subscription_entries_are_crate_private` compiles, and trybuild reports it expected a failure. Nothing else in the workspace notices, which is why the fixture exists.
+11. `http/mod.rs`: in Task 10's `Subscription::admits`, drop the `scope == self.scope` conjunct. Run the tests that hold Step 6's converted global-side sites (`literal_feed`, `global_feed`, `emit_global_org_ping`, `NotifyOrg`), and name each in the report. Expected: each is red, with a frame delivered, or a `charpente.reshaped` end, where it expected none. This mutation proves the twin conversion kept those tests' bite. A test that stays green lost it: stop and report it before going on. `http/mod.rs` is in the saved patch, so the restore brings the predicate back with the rest.
+
+12. `event.rs`: in the scoped arm's fingerprint, pass the scope path's last segment as a string in place of `<#path as ::charpente::core::db::Tenant>::NAME`. Insert `let last = path.segments.last().expect("a path has a segment").ident.to_string();` at the top of the arm, and use `#last` in the `scoped_fingerprint` call. Run `cargo test -p charpente --test tenant -- a_scoped_events_fingerprint_mixes_its_tenants_name`. Expected: it fails at the `billing` assertion, "billing::Org's NAME, never the `Org` its path is spelled with". Every A4 case, and the shared-raw-id test (`Org` and `Team` spell differently), stays green. That is why the `billing` case exists. Apply the same substitution to `scoped_by_name` instead, and the same test fails at "the def names the tenant by NAME too".
+
+After the last restore, prove the tree is the saved implementation: `git diff crates/charpente-core/src/db.rs crates/charpente-core/src/table.rs crates/charpente-macros/src/event.rs crates/charpente/src/http/app.rs crates/charpente/src/http/mod.rs | diff - $D/task11-impl.patch && echo restored` prints `restored`.
+
+- [ ] **Step 10: Byte identity**
+
+Two claims, both measured:
+- **Global events keep their bytes.** Task 1's two pins (Step 2) are green before and after this task. A global emit is still tag `0x09` with its old fingerprint. `global_twin::OrgPing` has Task 10's global `OrgPing`'s `NAME`, fields and fingerprint. So no global emit anywhere writes a different byte.
+- **Scoped events keep their record lengths.** Every scoped event in the tree changes fingerprint here. Before this task no event's fingerprint mixed a tenant. So `MemoNoted`, `OrgPing`, `IncidentOpened` (compile-pass), `DocCreated` and GUIDE §11's `NoteAdded` all move from `compute(fields)` to `scoped_fingerprint(compute(fields), "Org")`. For the three `n: WireU64` events (`MemoNoted`, `OrgPing`, `IncidentOpened`) that is `0x9caf3f939b1065e1` → `0xeb60a11053ba40dc`. No test at `e749823` pins one of those values as a literal: `grep -rn 'as Event>::FINGERPRINT' crates examples --include='*.rs'` finds only symbolic uses, which move with the type. Each `0x0b` record keeps its length (same `NAME`, same payload, an 8-byte shape), and no sim decision reads a record's content. So the scoped universes should reproduce Task 10's coverage exactly. Measure it; a moved baseline is a finding.
+
+  Before changing anything, check Task 10's own `0x0b` pins: `grep -rn '0x0b\|FINGERPRINT' crates/charpente/tests crates/charpente/src/http crates/charpente/src/kernel --include='*.rs'`. A pin spelled `<Ev as Event>::FINGERPRINT` moves by itself. One spelled as a hex literal over a macro-derived scoped event moves by design: re-derive it with `scoped_fingerprint`, and list it in the task report. A hand-written event's literal (`OrgEvent`'s) does not move.
+
+Re-run every Task 1 baseline through Task 1's driver, one call per test binary, each in the foreground:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+zsh $D/baselines.sh task11 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task11 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task11 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task11 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task11 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task11 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label prints `exit 0, passing-test lines 1` and `reproduces the base`, and every call prints `exit 0`. `realtime-tenant`'s base is the recording Task 10 Step 10 re-based after it moved that universe by design. If Task 10 kept that recording under its own suffix, not as `cov-realtime-tenant-base.txt`, the driver's `MOVED` for this one label is a comparison against the wrong file. Diff by hand against Task 10's (`diff $D/cov-realtime-tenant-<task-10 suffix>.txt $D/cov-realtime-tenant-task11.txt && print -r -- identical`), and quote which file was the reference. Every other label compares with Task 1's base directly.
+
+A `MOVED` line against the right reference is a finding: stop and adjudicate it (memory `pinned-seed-names-a-universe`) before touching any oracle. `invoicing` has no reason to move: `DocCreated` lives in `src/bin/tenant_node.rs`, outside the library the app's sim drives, and both of the library's events are global.
+
+- [ ] **Step 11: Docs**
+
+Task 10 rewrote §11's "Emitting" and §16's "Realtime" for tag `0x0b` and the tenant feed. The edits below sit on top of that text. Wherever this step gives a whole block, the block replaces whatever Task 10 left there. Wherever it gives a sentence, it names the sentence it replaces or follows.
+
+**`docs/GUIDE.md` §11, "`#[event]`".** The code block keeps Task 1's `#[event(global)]`. Delete Task 1's paragraph after it, the quoted one that begins "An event declares its tenancy. Every event in this guide is `#[event(global)]`" and ends "§16 covers events inside a tenant.". The new subsection below replaces it: after this task the guide has scoped events, so "every event in this guide is global" would be false. In the paragraph after that:
+- "`#[event]` derives five things a plain struct doesn't have:" becomes "An `#[event(...)]` says which tenancy the event has (next subsection), and derives five things a plain struct doesn't have:".
+- "It also derives `Event::FINGERPRINT`, a structural fingerprint of the payload's fields (§12's helper), recorded beside every emit;" becomes "It also derives `Event::Scope`, the tenant type the event belongs to (`Unscoped` for a global one), and `Event::FINGERPRINT`, a structural fingerprint of the payload's fields (§12's helper) that a scoped event continues with its tenant's `NAME`, recorded beside every emit;".
+
+**§11, a new subsection directly after "`#[event]`", before "Registering events":**
+
+````markdown
+### An event's tenancy: `global` or `scoped_by`
+
+An event says which tenancy it has, and neither is the default:
+- `#[event(global)]` belongs to no tenant. It is emitted on a bare `Tx` (from inside a scope, through the explicit deref `(*tx).emit(…)`), and only a global `Subscription::of` feed receives it.
+- `#[event(scoped_by = Org)]` belongs to one tenant. It is emitted only on that tenant's `ScopedTx`, which records the tenant beside the event, and only that tenant's feed receives it. That feed is built from the same `ScopedTx` the subscriber's scope line returned.
+
+A bare `#[event]` is a compile error naming both. The two sides are checked against each other by type, so no string names a tenant anywhere in the app:
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::wire::WireU64;
+use charpente::{Id, Scoped, Subscribe, Tenant, Tx, Wire, event, route, table};
+use serde::{Deserialize, Serialize};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("org:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
+                "not a member of org {}",
+                scope.raw()
+            )))
+        }
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Invoice {
+    id: Id<Invoice>,
+    paid: bool,
+}
+
+/// Belongs to one org: only that org's feed receives it.
+#[event(scoped_by = Org)]
+struct InvoicePaid {
+    invoice: Id<Invoice>,
+}
+
+/// Belongs to no org: every global feed receives it.
+#[event(global)]
+struct MaintenanceScheduled {
+    minutes: WireU64,
+}
+
+#[derive(Wire, Serialize, Deserialize)]
+struct MaintenanceBody {
+    minutes: WireU64,
+}
+
+#[route(POST "/orgs/:org/invoices/:id/pay", auth)]
+fn pay(tx: &mut Tx, org: Id<Org>, id: Id<Invoice>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    let mut invoice = tx.get(id)?.ok_or(ApiError::NotFound)?;
+    invoice.paid = true;
+    tx.put(&invoice);
+    tx.emit(InvoicePaid { invoice: id }); // recorded with this org
+    Ok(())
+}
+
+#[route(POST "/maintenance", auth)]
+fn schedule_maintenance(tx: &mut Tx, body: MaintenanceBody) -> Result<(), ApiError> {
+    tx.emit(MaintenanceScheduled {
+        minutes: body.minutes,
+    }); // recorded with no org
+    Ok(())
+}
+
+/// One org's feed. The scope line admits the subscriber, and the feed built
+/// from what it returns carries that org: it receives this org's
+/// `InvoicePaid` rows and nothing else.
+#[route(SSE "/orgs/:org/feed", auth, emits(InvoicePaid))]
+fn org_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<InvoicePaid>().cursor(cursor).into())
+}
+
+#[route(SSE "/maintenance/feed", public, emits(MaintenanceScheduled))]
+fn maintenance_feed(
+    tx: &mut Tx,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<MaintenanceScheduled>().cursor(cursor))
+}
+```
+
+Every mismatch is a compile error, never a feed that silently receives nothing:
+- A scoped event on a bare `Tx` (`tx.emit`, `tx.emit_keyed`), or in a global feed (`Subscription::of`, `.and`), names no tenant. rustc prints the note below.
+- A global event through `ScopedTx::emit` is E0271, expected `Org`, found `Unscoped`. A global event emitted from inside a scope is written `(*tx).emit(ev)` in a handler, and `(**tx).emit(ev)` in a scoped job's `run`, which holds `&mut ScopedTx`.
+- An event scoped by another type, through `ScopedTx::emit`, `tx.subscription::<Ev>()` or its `.and::<Ev2>()`, is E0271, expected `Org`. So is a global event on a tenant feed.
+
+The tenant rides the record beside the event, apart from any app key. `tx.emit_keyed(key, ev)` inside a scope records both, and `.key(…)` on either kind of feed narrows it further by that app key (a per-user feed, say). A key never names a tenant.
+
+A scoped event's fingerprint continues its fields' fold with its tenant's `Tenant::NAME` (§16). So moving an event between `global` and `scoped_by`, or between two tenant types, is a change of shape, handled like any other ("Changing an event", below). Two same-named events scoped by two tenant types never share a shape. So where the two types' raw ids coincide, one's row is never delivered to the other's feed. It meets that feed as a foreign shape, which ends the feed with `charpente.reshaped` rather than decoding. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets this.
+
+What `#[event]` rejects, all compile errors naming the contract and the fix. The first is the one every event meets once, and the next three are its neighbours (§9 lists the rest):
+
+<!-- pinned -->
+```text
+`<event>` declares no tenancy — an event says which, and neither is the default: add `global` or `scoped_by = <Tenant>` to this attribute's arguments, keeping its others. `scoped_by = <Tenant>` if it belongs to one tenant (it is emitted from inside that tenant's scope, and only that tenant's feed receives it); `global` if it belongs to no tenant (it is emitted on a bare `Tx`, and only a global `Subscription::of` feed receives it).
+`global` and `scoped_by = <scope>` on one event — an event is one or the other; drop one
+`global` given twice — write it once
+`scoped_by` given twice — write it once
+```
+
+A scoped event where no tenant is named is an unsatisfied bound. rustc prints this note with your event and scope in place of `<event>` and `<scope>` (§16 shows it rendered):
+
+<!-- pinned -->
+```text
+`<event>` is a tenant-scoped event (`#[event(scoped_by = <scope>)]`), and a bare `Tx` or a global `Subscription` names no tenant
+emit it and subscribe to it inside the tenant it belongs to:
+    let mut tx = tx.scope::<<scope>>(scope, ctx)?;
+    tx.emit(event);
+and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):
+    Ok(tx.subscription::<<event>>().cursor(cursor).into())
+a job that emits it takes `scoped_by = <scope>` in place of `global` among its `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its `run` receives
+```
+````
+
+**§11, "Emitting".** The `rust,ignore` signature block that opens it becomes:
+
+```rust,ignore
+impl Tx<'_> {
+    pub fn emit<Ev: UnscopedEvent>(&mut self, event: Ev);                            // a global event
+    pub fn emit_keyed<Ev: UnscopedEvent>(&mut self, key: impl Into<String>, event: Ev);
+}
+impl<S> ScopedTx<'_, '_, S> {
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev);                        // an event scoped by S
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev);
+}
+```
+
+After that block, add this sentence as its own paragraph: "`UnscopedEvent` is exactly the events declared `global`. It is sealed, so `impl UnscopedEvent for InvoicePaid {}` is itself refused (§16)."
+
+**§11, "The SSE route and `Subscription`".** The `rust,ignore` block that lists `impl Subscription` (with Task 10's tenant-feed signatures beside it) becomes:
+
+```rust,ignore
+impl Subscription {                                    // a global feed
+    pub fn of<Ev: UnscopedEvent + serde::Serialize>() -> Subscription;
+    pub fn and<Ev: UnscopedEvent + serde::Serialize>(self) -> Subscription;
+    pub fn key(self, key: impl Into<String>) -> Subscription;
+    pub fn cursor(self, cursor: Option<Cursor>) -> Subscription;
+}
+pub trait Subscribe<S> {                               // on ScopedTx<'_, '_, S>: a tenant feed
+    fn subscription<Ev: Event<Scope = S> + serde::Serialize>(&self) -> TenantFeed<S>;
+}
+impl<S> TenantFeed<S> {
+    pub fn and<Ev: Event<Scope = S> + serde::Serialize>(self) -> TenantFeed<S>;
+    pub fn key(self, key: impl Into<String>) -> TenantFeed<S>;
+    pub fn cursor(self, cursor: Option<Cursor>) -> TenantFeed<S>;
+}
+impl<S> From<TenantFeed<S>> for Subscription { /* … */ }
+```
+
+If Task 10 spelled `TenantFeed`'s `key`/`cursor` signatures differently, keep Task 10's spelling. Only the `of`, `and` and `subscription` bounds are this task's.
+
+**§9: Task 1's subsection is replaced.** Task 1 added "### `#[event]` declaration violations (`charpente-macros/src/event.rs`, compile time)" directly before "### Router mount conflict". Replace that whole subsection, heading to the end of its closing paragraph, with:
+
+````markdown
+### `#[event]` declaration violations (`charpente-macros/src/event.rs`, compile time)
+
+```text
+`NoteAdded` declares no tenancy — an event says which, and neither is the default: add `global` or `scoped_by = <Tenant>` to this attribute's arguments, keeping its others. `scoped_by = <Tenant>` if it belongs to one tenant (it is emitted from inside that tenant's scope, and only that tenant's feed receives it); `global` if it belongs to no tenant (it is emitted on a bare `Tx`, and only a global `Subscription::of` feed receives it).
+`global` and `scoped_by = Org` on one event — an event is one or the other; drop one
+`global` given twice — write it once
+`scoped_by` given twice — write it once
+an event declares `global` or `scoped_by = <Tenant>` and nothing else (its name derives from the type) — e.g. `#[event(global)]` or `#[event(scoped_by = Org)]`
+#[event] applies to structs — enums and unions cannot be events
+#[event] structs cannot be generic — an event is one concrete payload shape; make `Baz` non-generic
+#[event] needs named fields — `Baz` must be a braced struct
+```
+
+The first is the one every event meets: an event declares its tenancy, and a bare
+`#[event]` names both answers. The next three refuse both tenancies at once, or a word
+given twice. Anything else the attribute does not recognise hits the accepted-forms
+message. That includes a job's words (`cross_tenant`, `retry(...)`), a `scoped_by` with
+no type, and a name: an event's `NAME` is its type's snake_case, never an argument
+(§11). The last three are the struct-shape checks `#[table]` and `#[job]` make. A scoped
+event emitted on a bare `Tx`, or named in a global `Subscription`, is a trait-bound error
+rather than a macro one; §11 pins its note.
+````
+
+**§16, the introduction's bullet list.** After the `#[job(scoped_by = Org)]` bullet, add:
+
+> - `#[event(scoped_by = Org)]` on every event that belongs to one tenant, and `#[event(global)]` on every event that belongs to none. A scoped event is emitted on its tenant's `ScopedTx`, and only that tenant's feed, built on the same handle, receives it (§11).
+
+**§16, "What a `ScopedTx` gives you".** In the `rust,ignore` block, the `emit` line or lines, as Task 10 left them, become:
+
+```rust,ignore
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev);                          // records this tenant — §11
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev);
+```
+
+In the block after it, `(*tx).emit(SystemNotice {}); // an event that genuinely belongs to no tenant` becomes `(*tx).emit(SystemNotice {}); // an #[event(global)]: it belongs to no tenant`.
+
+**§16, "The compile errors, so you recognize them".** After the scoped-job block, add:
+
+````markdown
+A scoped event emitted on a bare `Tx`:
+
+```text
+error[E0277]: `IncidentOpened` is a tenant-scoped event (`#[event(scoped_by = Org)]`), and a bare `Tx` or a global `Subscription` names no tenant
+  --> src/incidents.rs:37:13
+   |
+37 |     tx.emit(event);
+   |        ---- ^^^^^ `IncidentOpened` is scoped by `Org`
+   |
+   = note: emit it and subscribe to it inside the tenant it belongs to:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.emit(event);
+           and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):
+               Ok(tx.subscription::<IncidentOpened>().cursor(cursor).into())
+           a job that emits it takes `scoped_by = Org` in place of `global` among its `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its `run` receives
+```
+````
+
+Copy the header, the span lines and the label from `scoped_event_emitted_on_bare_tx.stderr` as it was pinned, and rename the fixture path to `src/incidents.rs`, as the section's other blocks do. Trim rustc's `help:` chains, as the section's opening says. The block above shows the expected shape; the `.stderr` is the authority on the exact bytes.
+
+In the paragraph after the blocks, "The job pair, `NoJobTenant` and `UnscopedJob`, is sealed the same way." becomes "The job pair, `NoJobTenant` and `UnscopedJob`, and the event pair, `NoEventTenant` and `UnscopedEvent`, are sealed the same way."
+
+**§16, "Realtime".** Append this paragraph to the section as Task 10 left it:
+
+> The declaration is what makes it one mechanism. An event declared `scoped_by = Org` compiles only where an `Org` tenant is named: its `emit` on a `ScopedTx<Org>`, and its feed from the same handle. So a tenant's event cannot be emitted into no tenant, and a global feed cannot name one. §11 shows each refusal.
+
+**`DESIGN.md` §3, the Events bullet.** Replace it with:
+
+> - **Events.** `#[event(global)]` or `#[event(scoped_by = Org)]` structs. Neither tenancy is the default, and a bare `#[event]` is a compile error naming both. `tx.emit(...)` is typed, and subscribers (server-side and client-side codegen) consume typed streams off the log. A global event is emitted on a bare `Tx` (`Tx::emit`/`emit_keyed` take global events only) and tailed by `Subscription::of`. A scoped event is emitted only on its tenant's `ScopedTx`, which records the tenant beside it (§6). It is tailed only by that tenant's feed, `tx.subscription::<Ev>()` on the same handle. Every mismatch is an unsatisfied bound. A scoped event on a bare `Tx` or in a global `Subscription` names the fix (`NoEventTenant`, sealed with `UnscopedEvent`). A global or other-tenant event on a `ScopedTx` or a tenant feed is E0271. A scoped event's fingerprint continues its fields' fold with its tenant's `Tenant::NAME`, so a change of tenancy is a change of shape (spec 2026-09-30-tenancy-completion §4, §6). An event payload is itself a wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`. `events![…]`/`App::mount_events` register the type for `describe`, and its scope for the mount-time tenant census. Delivery deliberately has NO registry: `Subscription::of::<Ev>()` and `tx.subscription::<Ev>()` capture their encoders statically at the subscribe site, which is what makes "unregistered event at delivery" inexpressible rather than an error case.
+
+**Task 10's raw-id limit sentences.** Task 10 Step 11 wrote one sentence in each of four places. Each says a tenant feed matches its tenant by raw id alone, so two tenant types whose ids coincide share each other's same-named events. That is true at Task 10, and this task closes it. Find each with:
+
+```zsh
+grep -n 'raw id' docs/GUIDE.md DESIGN.md PLAN.md
+```
+
+Compare the hits against the four sentences Task 10 Step 11 quotes, and replace each with the text for its file below. A hit that is not one of Task 10's sentences stays.
+- GUIDE §11 (the tenant-feed part of "The SSE route and `Subscription`"): "A tenant feed matches its tenant by type as well as by id. Its events are declared `scoped_by` that type, and each one's fingerprint carries the type's `Tenant::NAME`. So where two tenant types' raw ids coincide, one type's events never reach the other's feed. A same-named event of the other type meets the feed as a foreign shape and ends it with `charpente.reshaped`, never decoded. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets that."
+- GUIDE §16 ("Realtime", or wherever Task 10 put it): "Two tenant types whose raw ids coincide no longer share events: an event names its tenant type (`#[event(scoped_by = Org)]`), and its fingerprint carries that type's `Tenant::NAME` (§11)."
+- DESIGN §8: "Closed by declaration (spec 2026-09-30-tenancy-completion §6). An event names its tenant type, the emit and subscribe bounds check it, and a scoped event's fingerprint mixes the type's `Tenant::NAME`. So a raw id two tenant types share never carries one's events into the other's feed. A same-named event of the other type is a foreign shape there: it ends that tail (payload-shapes spec §3) and is never decoded."
+- `PLAN.md`: "Closed by the tenancy-completion plan's Task 11: an event declares its tenant type, and a scoped event's fingerprint mixes that type's `Tenant::NAME`."
+
+**`README.md`.**
+- In "What it looks like", after `SendReceipt`, add:
+
+  ```rust
+  #[event(scoped_by = Org)]
+  struct InvoiceFinalized {
+      invoice: Id<Invoice>,
+  }
+  ```
+
+- The emit line's comment becomes `// realtime event, same transaction; only this org's feed receives it`.
+- "the route says `auth`, the table says which tenant owns its rows, the job says it acts inside that tenant, and a route, table or job that says none of this does not compile." becomes "the route says `auth`, the table says which tenant owns its rows, the job says it acts inside that tenant, the event says which tenant's feed carries it, and a route, table, job or event that says none of this does not compile."
+- "a table and a job say `scoped_by` or `global`, and none is a default." becomes "a table, a job and an event say `scoped_by` or `global`, and none is a default."
+
+**`crates/guide-examples/tests/doc_truth.rs`.** Read the floor Task 10 committed (`grep -n "const PINNED_FLOOR" crates/guide-examples/tests/doc_truth.rs`) and add 2 for §11's two new pinned blocks. The commit message records both values. It was 28 at `e749823`.
+
+```zsh
+cargo build -p guide-examples
+cargo test -p guide-examples
+```
+
+Expected: both green. If `doc_truth` names a fragment of the `NoEventTenant` block, the pinned line and the `on_unimplemented` source disagree. Fix the guide line to match the source, never the source to match the guide. If the checker splits `::<<event>>` or `::<<scope>>` differently than intended, the line of source text it cannot find says so. Then write that line so the placeholder stands alone, and record the change in the task report.
+
+- [ ] **Step 12: Gate and commit**
+
+Run each command in the foreground, and never in the background:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/gate-task-11.log
+cargo fmt --all --check && echo "fmt: clean"
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee $D/clippy-task-11.log | grep -cE "^(warning|error)"
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente-macros --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --lib --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --test http --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --test realtime --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --test tenant --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --test describe --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --test transactions --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p invoicing --test describe_golden --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p edge-harness --test tenant_wire --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+grep -c "^test result:" $L
+grep -c "^test result: ok" $L
+grep -c FAILED $L
+```
+
+Expected:
+- `fmt: clean`;
+- clippy's count is `0`;
+- the two `test result` counts are equal and non-zero, and the report states the number;
+- the `FAILED` count is `0`. `grep -c` prints `0` and exits 1 on no match; the printed `0` is the result.
+
+`tenant_wire` runs `tenant_node` over real TCP, so it is the wire check that `DocCreated`'s feed still carries exactly its org's frames under the new declaration. `--lib` carries the moved failing-encoder test, and `http` carries Task 10's global-feed sites if any live there. The controller then runs the full workspace gate in the background and counts it against Task 1's measured baseline. This task adds no test file, so the count is unchanged.
+
+Re-check `git status` and `git log -1`: another session may be writing this tree. Stage every path this task names by name. Stage the two fixture directories whole, after `git status --short` confirms they hold only this task's 27 new files and the four modified ones Step 9 lists:
+
+```zsh
+git status --short
+git add crates/charpente-core/src/db.rs crates/charpente-core/src/table.rs \
+  crates/charpente-macros/src/event.rs crates/charpente-macros/src/lib.rs \
+  crates/charpente/src/describe.rs crates/charpente/src/http/app.rs crates/charpente/src/http/mod.rs \
+  crates/charpente/src/serve.rs crates/charpente/src/kernel/tail.rs \
+  crates/charpente-core/tests/materialize.rs crates/charpente/tests/transactions.rs \
+  crates/charpente/tests/realtime.rs crates/charpente/tests/tenant.rs crates/charpente/tests/describe.rs \
+  examples/invoicing/src/bin/tenant_node.rs examples/invoicing/tests/describe_golden.rs \
+  crates/charpente-macros/tests/compile_fail crates/charpente-macros/tests/compile_pass \
+  crates/guide-examples/tests/doc_truth.rs docs/GUIDE.md DESIGN.md README.md PLAN.md
+git commit -m "feat(event-tenancy): #[event(global | scoped_by = Org)] — a scoped event is emitted and tailed only inside its tenant, a bare #[event] is refused naming both words; NoEventTenant/UnscopedEvent sealed; Subscription.entries crate-private; scoped fingerprints mix the tenant's NAME, so a shared raw id no longer carries one tenant type's event into another's feed; mount_events joins the tenant census; <N> fixtures pinned; <M>/12 mutations red; <K> of 11 baselines reproduced (realtime-tenant against <reference>); PINNED_FLOOR <old> → <new>"
+```
+
+Add any site Step 6 found beyond this list (Task 10's additions) to the `git add` by name. The message's `<…>` slots are filled with measured values, never predicted ones. There are no trailers.
+
+---
+
+### Task 12: `describe` names each event's tenant — `EventInfo.scoped_by` replaces `keyed`
+
+**Files:**
+- Modify `crates/charpente/src/describe.rs`: `EventInfo` (120–134 at `e749823`), `event_info` (302–308) and `to_human`'s events line (436).
+- Modify `crates/charpente-cli/src/genclient.rs`: the mirror's `EventInfo` (310–314), `into_event` (481–487) and `EVERY_SHAPE`'s `events` (624).
+- Modify `crates/charpente-tsgen/tests/common/mod.rs`: the two `EventInfo` literals (164–173).
+- Test:
+  - `crates/charpente/tests/describe.rs`:
+    - the capability section gains `LedgerPosted`, and `capability_app` mounts events;
+    - `AuditPosted`, scoped by Task 2's `renamed::Org` (`NAME` "Workspace");
+    - three new tests;
+    - `events_render_in_name_order_and_report_keyed_false` and `to_human_pins_the_events_section` are re-pinned;
+    - the golden is re-pinned;
+  - `examples/invoicing/tests/describe_golden.rs`: the golden;
+  - `crates/charpente-cli/tests/describe.rs`: `GOLDEN`.
+- Modify `crates/charpente/tests/realtime.rs`: `feed_keyed`'s doc comment (207 at `e749823`), which cites `EventInfo.keyed`.
+- Docs:
+  - `docs/GUIDE.md` §11 ("Registering events": the JSON entry and the sentence after it), §13 (the introduction and the JSON, via `describe_contract`);
+  - `DESIGN.md` §7's **Introspection** bullet.
+
+**Interfaces:**
+- Consumes: Task 11's `EventDef.scoped_by: Option<&'static str>`, and Task 2's `renamed::Org` in `crates/charpente/tests/describe.rs`, whose `NAME` is not its identifier.
+- Produces (spec §8):
+  - `EventInfo { name, payload, scoped_by: Option<&'static str> }`. `scoped_by` is in `keyed`'s old position, last, so the JSON order is `name`, `payload`, `scoped_by`.
+  - JSON renders it as the tenant type's `NAME` or `null`.
+  - The human dump's events line is `  <name> payload=<payload> scoped_by=<NAME|none>`. `none` follows `fingerprint=none`'s and the jobs line's `scoped_by=none` precedent.
+  - `charpente-tsgen` reads no `EventInfo` field (`grep -rn "EventInfo\|keyed" crates/charpente-tsgen/src` is empty at `e749823`), so the generated TS client is unchanged. Only tsgen's test fixtures build `EventInfo` literals.
+
+Byte identity: `describe` is a pure registry walk (DESIGN §7). This task changes no record, no fingerprint and no sim path, so no coverage baseline has a reason to move. The frame still requires Tasks 2–9, 11 and 12 to reproduce Task 1's baselines, so Step 7 re-runs all eleven through `baselines.sh`. Expected: every one reproduces, `realtime-tenant` against the same reference Task 11 used.
+
+- [ ] **Step 1: Write the tests**
+
+In `crates/charpente/tests/describe.rs`, capability section, after `Reconcile`'s impl, add:
+
+```rust
+/// An event that belongs to one org (tenancy-completion spec §6).
+/// `describe` names the tenant it belongs to, and that is the inventory
+/// "which feeds can carry this org's events".
+#[event(scoped_by = Org)]
+struct LedgerPosted {
+    cents: WireU64,
+}
+```
+
+`capability_app` gains `.mount_events(events![WidgetAdded, LedgerPosted])` after its `.mount_jobs(…)`. `WidgetAdded` is `global`: it is the floor for the `None` half. Both tenant names in this app are the one `Org`, so Task 11's census admits it.
+
+Replace `events_render_in_name_order_and_report_keyed_false` with:
+
+```rust
+/// The events list is sorted by event name, NOT registration order — the
+/// fixture registers `events![WidgetRemoved, WidgetAdded]`, so registration
+/// order is the exact reverse of what this asserts. Delete
+/// `v.sort_unstable_by_key(...)` in `describe()` and this reddens (as does
+/// `contract_json_shape_is_pinned`); an `assert!(is_sorted)` on a
+/// one-event fixture would not.
+///
+/// `scoped_by` is pinned `None` here, for both events: both are
+/// `#[event(global)]`. The scoped half is
+/// `describe_names_every_scoped_event`'s.
+#[test]
+fn events_render_in_name_order_and_report_their_tenancy() {
+    let c = fixture_app().describe();
+    let rendered: Vec<(&str, &str, Option<&str>)> = c
+        .events
+        .iter()
+        .map(|e| (e.name, e.payload, e.scoped_by))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            ("widget_added", "WidgetAdded", None),
+            ("widget_removed", "WidgetRemoved", None),
+        ]
+    );
+}
+```
+
+In `to_human_pins_the_events_section`, the literal becomes:
+
+```rust
+            "events:\n  widget_added payload=WidgetAdded scoped_by=none\n  \
+             widget_removed payload=WidgetRemoved scoped_by=none\n"
+```
+
+After `to_human_carries_public_scope_and_scoped_by`, add:
+
+```rust
+/// Tenancy-completion spec §8: `describe` names the tenant each event
+/// belongs to, by its tenant type's `NAME`, where it used to carry a `keyed`
+/// that was always `false`. `WidgetAdded`'s `None` is the floor: without it,
+/// a field that always said "Org" would pass.
+#[test]
+fn describe_names_every_scoped_event() {
+    let c = capability_app().describe();
+    let events: Vec<(&str, Option<&str>)> =
+        c.events.iter().map(|e| (e.name, e.scoped_by)).collect();
+    assert_eq!(
+        events,
+        vec![("ledger_posted", Some("Org")), ("widget_added", None)]
+    );
+}
+
+/// The human dump carries it, after the payload, as the tenant's `NAME` or
+/// `none`.
+#[test]
+fn to_human_carries_an_events_scoped_by() {
+    let out = charpente::describe::to_human(&capability_app().describe());
+    assert!(
+        out.contains(
+            "events:\n  ledger_posted payload=LedgerPosted scoped_by=Org\n  \
+             widget_added payload=WidgetAdded scoped_by=none\n"
+        ),
+        "{out}"
+    );
+}
+
+/// Scoped by Task 2's `renamed::Org`, whose `NAME` is "Workspace" and whose
+/// identifier is `Org`. It is the event half of
+/// `describe_names_a_tenant_scope_by_its_tenant_types_name`. Every other
+/// scoped event here follows A4 (`NAME` equals the identifier), so only this
+/// one tells "renders the tenant's `NAME`" from "renders the type's last
+/// path segment". Mounted by its own app, like that test's route and job, so
+/// `capability_app`'s golden is untouched.
+#[event(scoped_by = renamed::Org)]
+struct AuditPosted {
+    day: WireU64,
+}
+
+#[test]
+fn describe_names_an_events_tenant_by_its_tenant_types_name() {
+    let sim = Sim::with_faults(0x2EC2_000A, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_events(events![AuditPosted]);
+    let c = app.describe();
+    let events: Vec<(&str, Option<&str>)> =
+        c.events.iter().map(|e| (e.name, e.scoped_by)).collect();
+    assert_eq!(events, vec![("audit_posted", Some("Workspace"))]);
+    let out = charpente::describe::to_human(&c);
+    assert!(
+        out.contains("  audit_posted payload=AuditPosted scoped_by=Workspace\n"),
+        "{out}"
+    );
+}
+```
+
+`renamed::Org` is Task 2's type in this file, `NAME` "Workspace", placed after `to_human_carries_public_scope_and_scoped_by`. Put `AuditPosted` and its test directly after Task 2's `describe_names_a_tenant_scope_by_its_tenant_types_name`. Its seed, `0x2EC2_000A`, is unused in this file at `e749823` (`0001`, `0002` and `0007`–`0009` are taken) and by Task 2 (`0003`). Under `FaultConfig::none()` the seed decides nothing, so a clash would be harmless. It is kept distinct anyway, so a printed seed names one test.
+
+- [ ] **Step 2: Run them at Task 11's commit, and record the red**
+
+```zsh
+cargo test -p charpente --test describe 2>&1 | grep -E "^error\[E" | sort | uniq -c
+```
+
+Expected: E0609 "no field `scoped_by` on type `&EventInfo`", once per use. A compile error is the honest red for a field that does not exist yet. Step 5 then proves the tests red against a wrong value.
+
+- [ ] **Step 3: Implement**
+
+`crates/charpente/src/describe.rs`. `EventInfo`'s `keyed` field and its doc become:
+
+```rust
+    /// `#[event(scoped_by = Org)]`: the tenant this event belongs to, by its
+    /// tenant type's `Tenant::NAME`; `None` for a `#[event(global)]` one
+    /// (tenancy-completion spec §8). It says which feeds can carry the event:
+    /// a scoped event reaches only its own tenant's feed, and a global one
+    /// only `Subscription::of` feeds. It replaces `keyed`, which was always
+    /// `false`. An app key is a call-site filter no static contract can know,
+    /// while an event's tenancy is a declaration on its type.
+    pub scoped_by: Option<&'static str>,
+```
+
+In `event_info`, `keyed: false,` becomes `scoped_by: def.scoped_by,`. In `to_human`, the events line becomes:
+
+```rust
+        writeln!(
+            out,
+            "  {} payload={} scoped_by={}",
+            e.name,
+            e.payload,
+            e.scoped_by.unwrap_or("none")
+        )
+        .unwrap();
+```
+
+`crates/charpente-cli/src/genclient.rs`:
+- in the mirror's `struct EventInfo`, `keyed: bool,` becomes `scoped_by: Option<String>,`;
+- in `into_event`, `keyed: e.keyed,` becomes `scoped_by: e.scoped_by.map(leak),`;
+- `EVERY_SHAPE`'s `"events"` line becomes two entries, one name and one `null`, so the round trip covers both spellings:
+
+```rust
+      "events": [{ "name": "widget_added", "payload": "WidgetAdded", "scoped_by": "Org" },
+                 { "name": "widget_viewed", "payload": "WidgetView", "scoped_by": null }],
+```
+
+The mirror uses plain `Option<String>`, as its `public_scope` and `JobInfo.scoped_by` already do. So a missing field reads as `None` there too. Making the mirror strict about optional fields is its own change, and not this one.
+
+`crates/charpente-tsgen/tests/common/mod.rs`: both `EventInfo` literals' `keyed: false,` become `scoped_by: None,`.
+
+`crates/charpente/tests/realtime.rs`, `feed_keyed`'s doc: "the key is a per-emit call-site value the contract cannot know (same reason `EventInfo.keyed` is always false), so a keyed feed declares the same two types the unkeyed one does." becomes "the key is a per-emit call-site value the contract cannot know, so a keyed feed declares the same two types the unkeyed one does." If Task 10 rewrote that comment, remove whatever of it still cites `EventInfo.keyed`.
+
+- [ ] **Step 4: Re-pin the goldens by substitution, and count it**
+
+Each golden gains nothing and loses nothing except one line per event, rewritten in place. The rewrite is one mechanical substitution, which is then counted and checked by the tests that own it. It is not overwritten from output, so a golden cannot quietly absorb an unrelated change:
+
+```zsh
+for f in docs/GUIDE.md examples/invoicing/tests/describe_golden.rs \
+         crates/charpente-cli/tests/describe.rs crates/charpente/tests/describe.rs; do
+  perl -pi -e 's/"keyed": false/"scoped_by": null/g' "$f"
+done
+git diff --numstat docs/GUIDE.md examples/invoicing/tests/describe_golden.rs \
+  crates/charpente-cli/tests/describe.rs crates/charpente/tests/describe.rs
+grep -rn '"keyed"\|keyed=\|\.keyed[^_a-z]\|keyed: bool\|keyed: false\|`keyed`\|payload, keyed' \
+  --include='*.rs' --include='*.md' crates examples docs/GUIDE.md DESIGN.md README.md
+```
+
+Expected numstat:
+- `3 3` for `docs/GUIDE.md`: §13's two golden lines, and §11's inline `{"name": "note_added", …}` entry, which Step 6 rewrites around;
+- `2 2` each for `describe_golden.rs` and the CLI's `describe.rs`;
+- `crates/charpente/tests/describe.rs` shows its two golden lines on top of Steps 1 and 3's edits. Read that file's diff hunk by hunk to separate them.
+
+Every golden event is `global` (Task 1 swept them, and invoicing's two stay global), so every rewritten value is `null`. A test failing on a `null` that should be a name means that assumption broke: read it, and never patch the value in.
+
+The final `grep` matches 25 lines at `e749823`. Here it prints only the lines Step 6 rewrites: DESIGN §7's two lines (1412–1413 at `e749823`) and GUIDE §11's "`keyed` is always `false`" line. After Step 6 it prints nothing.
+
+- [ ] **Step 5: Run, then prove red by mutation**
+
+```zsh
+cargo test -p charpente --test describe
+cargo test -p invoicing --test describe_golden
+cargo test -p charpente-cli --bin charpente genclient
+cargo test -p charpente-cli --test describe
+cargo test -p charpente-tsgen
+cargo test -p ts-fixture-app
+cargo test -p guide-examples --test describe_contract
+```
+
+Expected: all green, and `ts-fixture-app`'s staleness diff unmoved. The TS client reads no `EventInfo` field.
+
+Save the implementation with `git diff crates/charpente/src/describe.rs crates/charpente-cli/src/genclient.rs > .superpowers/sdd/2026-09-30-tenancy-completion/task12-impl.patch`. Apply each mutation alone, and restore it with `git checkout -- <file>` and `git apply` of the patch:
+1. `event_info`: `scoped_by: None`. Expected: `describe_names_every_scoped_event` fails on `ledger_posted` (left `None`, right `Some("Org")`), and `to_human_carries_an_events_scoped_by` fails on its first line.
+2. `to_human`: print `e.payload` in `scoped_by`'s place. Expected: both human tests fail, `to_human_pins_the_events_section` on `scoped_by=WidgetAdded`. This pins the renderer's operand, not only its presence.
+3. `genclient.rs` `into_event`: `scoped_by: None`. Expected: `round_trip_preserves_every_shape` fails, because the parsed contract loses `widget_added`'s `"Org"`.
+4. `event_info`: `scoped_by: def.scoped_by.map(|_| def.scope_type_name.rsplit("::").next().unwrap())`, which renders the type's last path segment instead of its `NAME`. Expected: `describe_names_an_events_tenant_by_its_tenant_types_name` fails, left `Some("Org")`, right `Some("Workspace")`. Every A4 test stays green, which is why `AuditPosted` exists.
+
+- [ ] **Step 6: Docs**
+
+**`docs/GUIDE.md` §11, "Registering events".** After Step 4 the entry reads `{"name": "note_added", "payload": "NoteAdded", "scoped_by": null}`. The sentence after it, "`keyed` is always `false`, and honestly so: `tx.emit` versus `tx.emit_keyed` is a *call-site* choice, not a property of the event type, so nothing static can know it.", becomes:
+
+> `scoped_by` is `null` because `NoteAdded` is `global`. For an `#[event(scoped_by = Org)]` it names the tenant type by its `Tenant::NAME` (`"Org"`). An event's tenancy is a declaration on its type, so the contract states it. An app key is a call-site choice (`tx.emit_keyed`), so the contract lists no keys.
+
+**§13, the introduction.** "every registered event (name, payload type — §11)" becomes "every registered event (name, payload type, and the tenant it belongs to if it is `scoped_by` — §11)". The JSON block was re-pinned in Step 4, and `describe_contract` checks it against a freshly built invoicing app.
+
+**`DESIGN.md` §7, Introspection.** "`events` — every `#[event]` type registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`, sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site choice, so nothing static can know it)" becomes "`events` — every `#[event]` type registered with `mount_events(events![…])` as `EventInfo { name, payload, scoped_by }`, sorted by event name (`scoped_by` is the tenant type's `Tenant::NAME` for a `#[event(scoped_by = Org)]` event and `null` for a global one; an app key is a call-site filter, so the contract lists no keys)".
+
+```zsh
+cargo build -p guide-examples
+cargo test -p guide-examples
+grep -rn '"keyed"\|keyed=\|\.keyed[^_a-z]\|keyed: bool\|keyed: false\|`keyed`\|payload, keyed' \
+  --include='*.rs' --include='*.md' crates examples docs/GUIDE.md DESIGN.md README.md
+```
+
+Expected: both green, and the `grep` prints nothing.
+
+- [ ] **Step 7: Gate and commit**
+
+Run each command in the foreground:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+L=$D/gate-task-12.log
+cargo fmt --all --check && echo "fmt: clean"
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee $D/clippy-task-12.log | grep -cE "^(warning|error)"
+cargo test -p charpente --test describe --no-fail-fast 2>&1 | tee $L | grep -E "^test result|FAILED|panicked"
+cargo test -p invoicing --test describe_golden --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente-cli --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente-tsgen --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p ts-fixture-app --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep -E "^test result|FAILED|panicked"
+grep -c "^test result:" $L
+grep -c "^test result: ok" $L
+grep -c FAILED $L
+```
+
+Expected:
+- `fmt: clean`;
+- clippy's count is `0`;
+- the two `test result` counts are equal and non-zero, and the report states the number;
+- the `FAILED` count is `0`.
+
+Then the baselines, one call per test binary, each in the foreground:
+
+```zsh
+zsh $D/baselines.sh task12 tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task12 kernel job-tenancy; print -r -- "exit ${?}"
+zsh $D/baselines.sh task12 realtime-flagship realtime-shapes realtime-follower realtime-tenant; print -r -- "exit ${?}"
+zsh $D/baselines.sh task12 archive-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task12 migrations migrations-scoped; print -r -- "exit ${?}"
+zsh $D/baselines.sh task12 invoicing; print -r -- "exit ${?}"
+```
+
+Expected: every label `reproduces the base`, and every call `exit 0`. For `realtime-tenant`, compare against the reference Task 11 Step 10 named, by hand if it is not the driver's `base`. A `MOVED` line is a finding: this task touches no sim path, so it means the tree holds something besides this task's diff.
+
+`crates/charpente-cli/tests/ctl.rs`'s `promote_against_a_dead_port_exits_2_with_the_connect_message` is a known ephemeral-port flake. If it alone is red, run it alone five times, and report it as the flake only if all five pass. The controller then runs the full workspace gate and counts it against Task 1's baseline.
+
+Re-check `git status` and `git log -1`. Then:
+
+```zsh
+git add crates/charpente/src/describe.rs crates/charpente-cli/src/genclient.rs \
+  crates/charpente-tsgen/tests/common/mod.rs \
+  crates/charpente/tests/describe.rs crates/charpente/tests/realtime.rs \
+  examples/invoicing/tests/describe_golden.rs crates/charpente-cli/tests/describe.rs \
+  docs/GUIDE.md DESIGN.md
+git commit -m "feat(event-tenancy): describe names each event's tenant — EventInfo.scoped_by (a NAME or null) replaces keyed, which was always false; <N> golden lines re-pinned by substitution; <M>/4 mutations red"
+```
+
+---
+
+### Task 13: Oracle — realtime tenancy under the fault matrix
+
+**Files:**
+- Modify: `crates/charpente/tests/realtime.rs`. Append one module, `mod tenancy_feeds`, at the
+  end of the file. Nothing above it changes.
+- Nothing else. The task adds no public API, so it has no doc to change (hard rule 6). The
+  suite count does not move: the tests land in an existing `--test` target.
+
+Why `realtime.rs`, and not `tenant.rs` or a new file:
+- `realtime.rs` already holds the machinery a reconnecting SSE client needs:
+  `push_subscribe`, `stall_closure`, `assert_strictly_increasing`, the `SETTLE_*`/`EPOCHS`
+  constants, `reshaped_frame`/`reshaped_409`, `statuses`, `frames_of` and `error_text`.
+  `tenant.rs` has none of it: no sink, no cursor, no stall.
+- The existing tenant-feed property and its unit twin already live in `realtime.rs`, not
+  `tenant.rs` as spec §9 says.
+- A new test file changes the workspace's `test result:` count, CLAUDE.md's exhaustive list,
+  and `doc_inventory`'s gate. It buys nothing the module does not.
+- A module gives the new names their own namespace. `tenancy_feeds::Shop`, its three `Note`
+  types and its routes cannot collide with the file's `Org`, `NoteAdded`, `emit_note`, or the
+  `global_feed` Task 10 adds. The flagship and the scoped sibling keep their bytes (R56).
+
+**Interfaces:**
+- Consumes:
+  - Task 2: `Tenant::NAME`. `Shop` and `Desk` declare `"Shop"` and `"Desk"`, per the
+    convention that an in-tree NAME is the type's identifier.
+  - Task 3: tenant-NAME uniqueness at mount. `Shop` and `Desk` are two NAMEs, so an app that
+    mounts both opens.
+  - Task 10:
+    - `EventRow.scope: Option<u64>`.
+    - `ScopedTx::emit` records `scope: Some(id)` and `key: None`.
+    - `pub trait Subscribe<S>` re-exported at the crate root, and `TenantFeed<S>` with
+      `.cursor(c)` and `From<TenantFeed<S>> for Subscription`.
+    - `Subscription::admits` gating delivery.
+    - A16's named tenancy 409.
+  - Task 11:
+    - `#[event(global)]` and `#[event(scoped_by = S)]`.
+    - The bounds: `Tx::emit` takes a global event, `ScopedTx<S>::emit` takes `Scope = S`, and
+      `Subscription::of` takes a global event.
+    - The scoped `FINGERPRINT`, which mixes `S::NAME`.
+- Produces:
+  - The swarm property `tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix`,
+    with base `0x5C0B_0001`, its universe count N (Step 4), and its measured floors (Step 5).
+  - Its coverage keys:
+    - `tenancy:every-shop-delivered`
+    - `tenancy:global-delivered`
+    - `tenancy:global-passed-a-scoped-row`
+    - `tenancy:shop-passed-another-shops-row`
+    - `tenancy:shop-passed-a-global-row`
+    - `tenancy:resume-refused-on-another-shops-row`
+    - `tenancy:resume-refused-on-the-other-kinds-row`
+    - `tenancy:mixed-record-delivered`
+  - The replay check `tenancy_feeds::the_tenancy_workload_replays_identically_for_the_same_seed`.
+  - Four fault-free pins on the real kernel:
+    - `the_three_notes_share_a_name_and_differ_only_in_tenancy`
+    - `each_feed_receives_exactly_its_own_notes_on_a_fault_free_node`
+    - `a_resume_from_a_row_outside_the_feeds_tenancy_is_refused_by_name`
+    - `a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape`
+  - The replay-faithfulness check
+    `replaying_the_tail_with_the_products_scope_rule_is_the_kernels_own_delivery`.
+  - Six named victims, all prefixed `tenancy_feeds::the_oracle_names_`.
+  - Task 14 quotes the base, N, the floors and the fresh-base counts.
+
+The property, stated once. Three shops (0, 1 and 2) emit scoped `note`s, and the app emits
+global `note`s: the same NAME and the same fields, told apart by tenancy only. Four feeds
+reconnect through the full fault matrix: the global feed and one feed per shop.
+1. *Global receives no scoped row.* Every frame the global feed accepts carries
+   `origin: GLOBAL_ORIGIN` in its own payload.
+2. *A shop feed's delivered set is exactly that shop's rows.* No frame carries another origin,
+   and every row of the feed's own origin in `[floor, scanned)` was delivered and verified
+   against the store. Membership is checked, not a high-water mark, so an interior skip fails.
+   `floor` moves only on a bare subscribe. Retention is at its default (65,536), so nothing
+   ages out and no gap excuses anything.
+3. *A resume from a row outside a feed's tenancy is refused by name* (A16). Each round, each
+   feed may send a probe: a resume whose cursor is the newest scanned row of another shop, or
+   of the other kind. The probe must be answered with A16's 409, exactly. Accepted, or refused
+   under any other text, it is a finding.
+
+The payload names the emitting tenant (`origin`), independently of `EventRow.scope`. So the
+oracle never takes the column under test at its word. The sibling's `SCOPED_N_STRIDE` exists
+for the same reason. The ledger arm then checks the durable row's own `scope` and `shape`
+against that payload.
+
+- [ ] **Step 0: Re-locate what this task consumes**
+
+Every symbol below is read, not assumed. Run from the repo root:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+R=crates/charpente/tests/realtime.rs
+for sym in '^fn push_subscribe(' '^fn stall_closure(' '^fn assert_strictly_increasing(' \
+    '^fn reshaped_frame(' '^fn reshaped_409(' '^fn error_text(' '^fn statuses(' \
+    '^fn frames_of(' '^const EPOCHS: u32' '^const ROUNDS_PER_EPOCH: u32' \
+    '^const SETTLE_ATTEMPTS: u32' '^const SETTLE_BOOT_TRIES: u32' '^const SETTLE_CYCLE_EVERY: u32' \
+    '^mod tenancy_feeds'; do
+  print -r -- "$(grep -c -E "$sym" $R)  $sym"
+done
+grep -c "^pub trait Subscribe<S>" crates/charpente/src/http/mod.rs
+grep -n "Subscribe" crates/charpente/src/lib.rs
+grep -c "pub scope: Option<u64>" crates/charpente-core/src/event.rs
+grep -c "sits on an event outside this feed's tenancy" crates/charpente/src/kernel/mod.rs
+grep -c "ceiling:" crates/charpente-sim/src/lib.rs
+```
+
+Expected:
+- `1` for each of the thirteen helpers and constants, and `0` for `^mod tenancy_feeds`.
+- `1` for the `Subscribe` trait, and a `pub use` line naming `Subscribe` in `lib.rs`.
+- `1` for `EventRow.scope`.
+- `1` for A16's text, Task 10's tenancy 409. `0` means Task 10 did not land as this plan
+  wrote it: stop and report.
+- For `ceiling:`: `0` means the runner has no ceiling arm (e749823). A positive count means S3
+  added one: Step 5 then also pins `universe:gave-up` as a ceiling.
+
+A helper whose count is not `1` was renamed by an earlier task. Find it by what it does, use
+its new name below, and say so in the task report.
+
+Then check that nothing moved under the two functions this module copies. Each copy has to
+keep its source's fault classification:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+R=crates/charpente/tests/realtime.rs
+for f in settle_boot realtime_workload; do
+  git show e749823:$R | sed -n "/^fn $f(/,/^}/p" > $D/t13-$f-e749823.rs
+  sed -n "/^fn $f(/,/^}/p" $R > $D/t13-$f-now.rs
+  diff $D/t13-$f-e749823.rs $D/t13-$f-now.rs > $D/t13-$f.diff; print -r -- "$f: diff exit $?"
+done
+```
+
+- `settle_boot: diff exit 0` is expected. If it is `1`, S3 or S4 changed how a boot failure is
+  classified. Apply the same change to `tenancy_settle_boot` below, and quote the diff in the
+  report.
+- For `realtime_workload`, read the diff. Only its open, `Kernel::new`, `push_subscribe`,
+  `kernel.run` and settle arms matter here. The same arms in `tenancy_universe` below must
+  classify identically: a store-bricked arm or a give-up S3 added there is copied. A change to
+  `Client` is not this module's concern.
+- In both diffs, a changed `App::open` call in `realtime_app` means `open_tenancy` below takes
+  the same shape.
+
+- [ ] **Step 1: Write the module: the world, the oracle, the workload and the property**
+
+Append to the end of `crates/charpente/tests/realtime.rs`:
+
+```rust
+// ============================================= tenancy under the full fault matrix
+//
+// Tenancy-completion spec §9, the realtime oracle (plan Task 13). A tenant feed
+// is built from its scope (`tx.subscription::<Ev>()`), a scoped event records
+// its tenant apart from its key (`EventRow.scope`), and ONE predicate says what
+// a tail delivers (`Subscription::admits`). Three shops emit scoped notes, the
+// app emits global ones, and four feeds reconnect through the fault matrix:
+//
+// 1. a global subscription receives no scoped row;
+// 2. a shop's feed receives exactly that shop's rows. This is set equality,
+//    checked by membership, so an interior skip cannot pass;
+// 3. a resume whose cursor sits on a row outside the feed's tenancy is refused
+//    by name. It is never positioned past and never misdelivered.
+//
+// Its own module, base seed and workload (R56): the flagship and the scoped
+// sibling keep their bytes. The three notes share one NAME and one field list,
+// so no name or key filter can tell them apart. Only tenancy can, so only
+// tenancy is under test.
+mod tenancy_feeds {
+    use super::*;
+    use charpente::Subscribe;
+
+    // ------------------------------------------------------------- tenants
+
+    /// A tenant type. It is a `#[table]` only so `Id<Shop>` can be a route
+    /// path parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`). No
+    /// `Schema` registers it, and nothing reads it.
+    #[table(global)]
+    pub(crate) struct Shop {
+        id: Id<Shop>,
+        name: String,
+    }
+
+    impl Tenant for Shop {
+        const NAME: &'static str = "Shop";
+        type Who = Principal;
+        type Error = ApiError;
+
+        /// Never asked. Every scoped route here declares `public(Shop)`, and
+        /// the declaration admits (job-tenancy spec §4, rule 1).
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Shop>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    /// A second tenant type whose ids are the same raw numbers as `Shop`'s.
+    /// That is the one way two rows can agree on `EventRow.scope` and still
+    /// belong to two tenants. Only `two_tenant_types_app` mounts it.
+    pub(crate) struct Desk;
+
+    impl Tenant for Desk {
+        const NAME: &'static str = "Desk";
+        type Who = Principal;
+        type Error = ApiError;
+
+        /// Never asked, for the reason `Shop::authorize` gives.
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Desk>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    // -------------------------------------------------------------- events
+    //
+    // Three events, one `NAME` (`note`, the snake_case of `Note`) and one field
+    // list: a global one, one scoped by `Shop`, one scoped by `Desk`. What tells
+    // them apart is tenancy alone. That is the recorded `EventRow.scope`, and
+    // the fingerprint, which for a scoped event mixes its tenant type's `NAME`
+    // (spec §4). `origin` is the emitter's own word for the tenant it emitted
+    // in: a shop id, or `GLOBAL_ORIGIN`. The oracle reads it instead of
+    // `EventRow.scope`, which is the column under test. Items are `pub(crate)`
+    // so a scoped event's `type Scope` never names a type less visible than the
+    // event itself.
+
+    mod global_note {
+        use charpente::event;
+        use charpente::wire::WireU64;
+
+        #[event(global)]
+        pub(crate) struct Note {
+            pub(crate) origin: WireU64,
+            pub(crate) n: WireU64,
+        }
+    }
+
+    mod shop_note {
+        use super::Shop;
+        use charpente::event;
+        use charpente::wire::WireU64;
+
+        #[event(scoped_by = Shop)]
+        pub(crate) struct Note {
+            pub(crate) origin: WireU64,
+            pub(crate) n: WireU64,
+        }
+    }
+
+    mod desk_note {
+        use super::Desk;
+        use charpente::event;
+        use charpente::wire::WireU64;
+
+        #[event(scoped_by = Desk)]
+        pub(crate) struct Note {
+            pub(crate) origin: WireU64,
+            pub(crate) n: WireU64,
+        }
+    }
+
+    const GLOBAL_FP: u64 = <global_note::Note as Event>::FINGERPRINT;
+    const SHOP_FP: u64 = <shop_note::Note as Event>::FINGERPRINT;
+    const DESK_FP: u64 = <desk_note::Note as Event>::FINGERPRINT;
+
+    // ----------------------------------------------------------- the world
+
+    /// This property's own base seed (R56).
+    const TENANCY_BASE: u64 = 0x5C0B_0001;
+    /// The `origin` a global note carries. No shop id here reaches it.
+    const GLOBAL_ORIGIN: u64 = 1_000;
+    /// The tenants. Shop 0 is one on purpose: `Some(0)` is a tenant and `None`
+    /// is none, and a rule that reads the one as the other is a named victim.
+    const SHOPS: [u64; 3] = [0, 1, 2];
+    const GLOBAL_FEED: &str = "/tenancy/global";
+    const SHOP_FEEDS: [&str; 3] = ["/tenancy/feed/0", "/tenancy/feed/1", "/tenancy/feed/2"];
+    /// Every feed, global first. `Universe::clients` and the twin's sinks
+    /// follow this order.
+    const FEEDS: [Feed; 4] = [Feed::Global, Feed::Shop(0), Feed::Shop(1), Feed::Shop(2)];
+
+    /// Floors, each the exact count measured at `TENANCY_BASE` over the
+    /// property's universe count. Plan Task 13 Step 5 wrote them from two
+    /// consecutive batches that agreed key for key. No margin is subtracted:
+    /// a drop is a finding, not a number to lower.
+    const TENANCY_EVERY_SHOP_FLOOR: u64 = 1;
+    const TENANCY_GLOBAL_DELIVERED_FLOOR: u64 = 1;
+    const TENANCY_GLOBAL_PASSED_FLOOR: u64 = 1;
+    const TENANCY_SHOP_PASSED_SHOP_FLOOR: u64 = 1;
+    const TENANCY_SHOP_PASSED_GLOBAL_FLOOR: u64 = 1;
+    const TENANCY_REFUSED_SAME_KIND_FLOOR: u64 = 1;
+    const TENANCY_REFUSED_OTHER_KIND_FLOOR: u64 = 1;
+    const TENANCY_RESUME_BACKLOG_FLOOR: u64 = 1;
+
+    /// One emit request. `/tenancy/announce` ignores `shop`, and
+    /// `/tenancy/desk-note` reads it as the desk's id.
+    #[derive(WireDerive, Serialize, Deserialize)]
+    struct TenancyEmit {
+        shop: WireU64,
+        n: WireU64,
+    }
+
+    // -------------------------------------------------------------- routes
+
+    /// A shop's note. One `scope()` line, and the emit below it is that shop's.
+    #[route(POST "/tenancy/note", public(Shop))]
+    fn tenancy_note(tx: &mut Tx, body: TenancyEmit, ctx: &Ctx) -> Result<(), ApiError> {
+        let mut tx = tx.scope::<Shop>(Id::from_raw(body.shop.0), ctx)?;
+        tx.emit(shop_note::Note {
+            origin: body.shop,
+            n: body.n,
+        });
+        Ok(())
+    }
+
+    /// The app's own announcement, in no tenant.
+    #[route(POST "/tenancy/announce", public)]
+    fn tenancy_announce(tx: &mut Tx, body: TenancyEmit) -> Result<(), ApiError> {
+        tx.emit(global_note::Note {
+            origin: WireU64(GLOBAL_ORIGIN),
+            n: body.n,
+        });
+        Ok(())
+    }
+
+    /// A shop's note and a global announcement in ONE record. The result is
+    /// two rows with one seq, one scoped and one not, and only the scope column
+    /// tells them apart. The global emit goes through the explicit deref, the
+    /// idiom spec §6 keeps.
+    #[route(POST "/tenancy/note-and-announce", public(Shop))]
+    fn tenancy_note_and_announce(
+        tx: &mut Tx,
+        body: TenancyEmit,
+        ctx: &Ctx,
+    ) -> Result<(), ApiError> {
+        let mut tx = tx.scope::<Shop>(Id::from_raw(body.shop.0), ctx)?;
+        tx.emit(shop_note::Note {
+            origin: body.shop,
+            n: body.n,
+        });
+        (*tx).emit(global_note::Note {
+            origin: WireU64(GLOBAL_ORIGIN),
+            n: WireU64(body.n.0 + 1),
+        });
+        Ok(())
+    }
+
+    /// A desk's note: the same NAME and fields as a shop's, under another
+    /// tenant type whose ids share the shops' raw numbers.
+    #[route(POST "/tenancy/desk-note", public(Desk))]
+    fn tenancy_desk_note(tx: &mut Tx, body: TenancyEmit, ctx: &Ctx) -> Result<(), ApiError> {
+        let mut tx = tx.scope::<Desk>(Id::from_raw(body.shop.0), ctx)?;
+        tx.emit(desk_note::Note {
+            origin: body.shop,
+            n: body.n,
+        });
+        Ok(())
+    }
+
+    /// A shop's feed, built from the scope (A3). No key names the tenant.
+    #[route(SSE "/tenancy/feed/:shop", public(Shop))]
+    fn tenancy_shop_feed(
+        tx: &mut Tx,
+        shop: Id<Shop>,
+        ctx: &Ctx,
+        cursor: Option<Cursor>,
+    ) -> Result<Subscription, ApiError> {
+        let tx = tx.scope::<Shop>(shop, ctx)?;
+        Ok(tx.subscription::<shop_note::Note>().cursor(cursor).into())
+    }
+
+    /// The global feed: the same NAME, the global event.
+    #[route(SSE "/tenancy/global", public)]
+    fn tenancy_global_feed(
+        tx: &mut Tx,
+        ctx: &Ctx,
+        cursor: Option<Cursor>,
+    ) -> Result<Subscription, ApiError> {
+        let _ = (tx, ctx);
+        Ok(Subscription::of::<global_note::Note>().cursor(cursor))
+    }
+
+    /// `realtime_app`'s store, at the DEFAULT event retention (65,536).
+    /// Nothing ages out in a universe here, so no `charpente.gap` and no
+    /// retention 409 can excuse a missing row. `checkpoint_every: 2` matches
+    /// the flagship, so the durable-corruption window is as narrow as there.
+    fn open_tenancy(sim: &Sim) -> io::Result<App> {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig {
+                body_cap: 1 << 20,
+                db: DbConfig {
+                    wal: WalConfig {
+                        dir: "wal".to_string(),
+                        segment_bytes: 4096,
+                    },
+                    store_path: "tables.redb".to_string(),
+                    checkpoint_every: 2,
+                    ..DbConfig::default()
+                },
+                ..AppConfig::default()
+            },
+        )
+    }
+
+    fn tenancy_app(sim: &Sim) -> io::Result<App> {
+        Ok(open_tenancy(sim)?.mount(routes![
+            tenancy_note,
+            tenancy_announce,
+            tenancy_note_and_announce,
+            tenancy_shop_feed,
+            tenancy_global_feed
+        ]))
+    }
+
+    /// `Shop` and `Desk` in one app: two tenant NAMEs, so Task 3's uniqueness
+    /// check admits it.
+    fn two_tenant_types_app(sim: &Sim) -> io::Result<App> {
+        Ok(open_tenancy(sim)?.mount(routes![tenancy_note, tenancy_desk_note, tenancy_shop_feed]))
+    }
+
+    // --------------------------------------------------------------- feeds
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Feed {
+        Global,
+        Shop(u64),
+    }
+
+    impl Feed {
+        /// The `origin` every row this feed delivers must carry.
+        fn origin(self) -> u64 {
+            match self {
+                Feed::Global => GLOBAL_ORIGIN,
+                Feed::Shop(s) => s,
+            }
+        }
+
+        /// The tenant this feed's subscription carries, spelled as
+        /// `EventRow.scope` spells it.
+        fn scope(self) -> Option<u64> {
+            match self {
+                Feed::Global => None,
+                Feed::Shop(s) => Some(s),
+            }
+        }
+
+        fn path(self) -> &'static str {
+            match self {
+                Feed::Global => GLOBAL_FEED,
+                Feed::Shop(s) => SHOP_FEEDS[s as usize],
+            }
+        }
+
+        fn fingerprint(self) -> u64 {
+            match self {
+                Feed::Global => GLOBAL_FP,
+                Feed::Shop(_) => SHOP_FP,
+            }
+        }
+
+        fn label(self) -> String {
+            match self {
+                Feed::Global => "the global feed".to_string(),
+                Feed::Shop(s) => format!("shop {s}'s feed"),
+            }
+        }
+
+        /// The half of the property a leak on this feed breaks.
+        fn rule(self) -> &'static str {
+            match self {
+                Feed::Global => "a global subscription receives no scoped row",
+                Feed::Shop(_) => "a tenant's feed receives only its own tenant's scoped rows",
+            }
+        }
+
+        /// Whether a row of `origin` belongs to another tenant of this feed's
+        /// own kind (another shop's, on a shop feed), as opposed to the other
+        /// kind.
+        fn same_kind(self, origin: u64) -> bool {
+            matches!(self, Feed::Shop(s) if origin != s && origin != GLOBAL_ORIGIN)
+        }
+    }
+
+    /// "inside shop 2", or "as a global event".
+    fn emitted(origin: u64) -> String {
+        if origin == GLOBAL_ORIGIN {
+            "as a global event".to_string()
+        } else {
+            format!("inside shop {origin}")
+        }
+    }
+
+    /// The origin a delivered note's own payload declares.
+    fn origin_of(json: &str) -> Option<u64> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        v.get("origin")?.as_str()?.parse().ok()
+    }
+
+    /// A `Response::error` body's `error` text, or the raw body if it is not
+    /// one. A probe's answer is read, never assumed well-formed.
+    fn response_text(body: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(body).to_string())
+    }
+
+    /// A16's refusal. It is spelled out here rather than taken from the
+    /// product, so a comparison pins the wording.
+    fn tenancy_409(cursor: Cursor) -> String {
+        format!(
+            "cursor {} sits on an event outside this feed's tenancy — a cursor resumes only \
+             the feed that delivered it, and this feed never delivers that event; re-sync \
+             current state through reads, then reconnect without a cursor",
+            cursor.wire()
+        )
+    }
+
+    // -------------------------------------------------------------- ledger
+
+    /// One scanned row: what `charpente.events` durably holds at that id.
+    #[derive(Clone, Debug)]
+    struct Noted {
+        seq: u64,
+        /// The emitting tenant, as the payload declares it.
+        origin: u64,
+        /// `EventRow.scope` and `EventRow.shape` as recorded: under test.
+        scope: Option<u64>,
+        shape: Option<u64>,
+        /// The exact JSON a delivery of this row carries.
+        json: String,
+    }
+
+    /// Why a check failed.
+    /// - A `Finding` is this property's subject and is never excused.
+    /// - A `Mismatch` compares a delivery with the ledger. The ledger goes
+    ///   stale in exactly one sanctioned way: durable corruption cut a scanned
+    ///   event above the checkpoint horizon, and its id was re-minted (the
+    ///   cases `Client::diverged_ledger_entry` lists). So a mismatch is probed
+    ///   before it is reported.
+    #[derive(Debug)]
+    enum Fail {
+        Finding(String),
+        Mismatch(String),
+    }
+
+    /// Every row scanned so far, shared by the four feeds: one store, one
+    /// truth.
+    #[derive(Default)]
+    struct Ledger {
+        rows: BTreeMap<u64, Noted>,
+        next_scan_id: u64,
+    }
+
+    impl Ledger {
+        /// Reads every row committed since the last scan and checks what each
+        /// one recorded. A scan that fails on an injected fault is skipped, and
+        /// the next one picks its rows up. Ids are dense and nothing ages out
+        /// at the default retention, so a scan's first row is `next_scan_id`
+        /// itself.
+        fn sync(&mut self, db: &Db) -> Result<(), Fail> {
+            let from = self.next_scan_id;
+            let rows = match db
+                .snapshot()
+                .and_then(|snap| snap.scan_from::<EventRow>(from, 4096))
+            {
+                Ok(rows) => rows,
+                Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+                Err(e) => {
+                    return Err(Fail::Finding(format!(
+                        "ledger scan failed non-injected: {e}"
+                    )));
+                }
+            };
+            if let Some(first) = rows.first()
+                && first.id.raw() != from
+            {
+                return Err(Fail::Finding(format!(
+                    "the ledger scan from id {from} returned id {} first — event ids are dense \
+                     and nothing ages out at the default retention, so no id may be missing",
+                    first.id.raw()
+                )));
+            }
+            for row in &rows {
+                let noted = decode_note(row)?;
+                check_recorded(row.id.raw(), &noted).map_err(Fail::Finding)?;
+                self.next_scan_id = row.id.raw() + 1;
+                self.rows.insert(row.id.raw(), noted);
+            }
+            Ok(())
+        }
+
+        /// `Client::diverged_ledger_entry`, over this ledger. It returns the
+        /// first scanned id whose stored content changed, or that the store
+        /// rolled back past. It is called only on an error path, so a passing
+        /// universe pays no extra disk op and its fault schedule does not move.
+        fn diverged_entry(&self, db: &Db) -> Option<(u64, String, String)> {
+            let snap = db.snapshot().ok()?;
+            let next_event_id = snap.next_event_id().ok()?;
+            for (&id, noted) in &self.rows {
+                match snap.get::<EventRow>(Id::from_raw(id)).ok()? {
+                    Some(row) => {
+                        let stored = decode_note(&row).ok()?;
+                        if stored.json != noted.json {
+                            return Some((id, noted.json.clone(), stored.json));
+                        }
+                    }
+                    // A recorded id at or above `next_event_id` is one the
+                    // store has rolled back past. An absent id below it cannot
+                    // occur at the default retention, and is not excused here.
+                    None if id >= next_event_id => {
+                        return Some((
+                            id,
+                            noted.json.clone(),
+                            format!("ABSENT — store rolled back to next_event_id {next_event_id}"),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+            None
+        }
+    }
+
+    /// A stored row as this workload wrote it: a note whose payload decodes
+    /// under the shared field list. All three `Note` types encode alike.
+    fn decode_note(row: &EventRow) -> Result<Noted, Fail> {
+        let id = row.id.raw();
+        if row.name != "note" {
+            return Err(Fail::Finding(format!(
+                "event id {id} is named {:?} — this workload emits only notes",
+                row.name
+            )));
+        }
+        let note = global_note::Note::decode(&mut &row.payload[..]).map_err(|e| {
+            Fail::Finding(format!("event id {id} is a note whose payload does not decode: {e}"))
+        })?;
+        Ok(Noted {
+            seq: row.seq,
+            origin: note.origin.0,
+            scope: row.scope,
+            shape: row.shape,
+            json: serde_json::to_string(&note).expect("a note serializes"),
+        })
+    }
+
+    /// The ledger arm. The durable row must record the tenant and the shape
+    /// its payload says it was emitted with. It catches a wrong tenant at the
+    /// row, whether or not any feed was ever exposed to that row.
+    fn check_recorded(id: u64, noted: &Noted) -> Result<(), String> {
+        let (scope, shape) = if noted.origin == GLOBAL_ORIGIN {
+            (None, GLOBAL_FP)
+        } else {
+            (Some(noted.origin), SHOP_FP)
+        };
+        if noted.scope != scope {
+            return Err(format!(
+                "event id {id} is a note emitted {}, but its durable EventRow.scope reads {:?}, \
+                 not {scope:?} — the tenant did not survive commit, replay and readback",
+                emitted(noted.origin),
+                noted.scope
+            ));
+        }
+        if noted.shape != Some(shape) {
+            let recorded = match noted.shape {
+                Some(s) => format!("{s:#x}"),
+                None => "none".to_string(),
+            };
+            return Err(format!(
+                "event id {id} is a note emitted {}, but its recorded shape is {recorded}, not \
+                 {shape:#x} — a scoped event's fingerprint mixes its tenant's NAME, a global \
+                 one's does not",
+                emitted(noted.origin)
+            ));
+        }
+        Ok(())
+    }
+
+    // --------------------------------------------------------- feed client
+
+    /// One feed's reconnecting subscriber, across one universe.
+    struct FeedClient {
+        feed: Feed,
+        /// Ids below this are forfeit: a bare subscribe's `next_event_id` at
+        /// push time. Nothing else moves it. Nothing ages out, and a timeline
+        /// cut gives the universe up.
+        floor: u64,
+        /// Delivered frames not yet compared with the ledger, oldest first.
+        pending: VecDeque<(u64, &'static str, String)>,
+        /// Every delivered id the ledger confirmed. This is the delivered set,
+        /// and it is compared by membership.
+        verified: BTreeSet<u64>,
+        cursor: Option<Cursor>,
+        need_subscribe: bool,
+        handle: Option<SimSinkHandle>,
+        frames_consumed: usize,
+        last_id: Option<u64>,
+        /// Probes refused by A16's name: from another shop's row, and from a
+        /// row of the other kind.
+        refused_same_kind: u64,
+        refused_other_kind: u64,
+        /// Every frame accepted, terminal ones included: the replay oracle.
+        trace: Vec<(u64, &'static str, String)>,
+    }
+
+    impl FeedClient {
+        fn new(feed: Feed) -> FeedClient {
+            FeedClient {
+                feed,
+                floor: 0,
+                pending: VecDeque::new(),
+                verified: BTreeSet::new(),
+                cursor: None,
+                need_subscribe: true,
+                handle: None,
+                frames_consumed: 0,
+                last_id: None,
+                refused_same_kind: 0,
+                refused_other_kind: 0,
+                trace: Vec::new(),
+            }
+        }
+
+        /// The missing half of set equality: the first scanned row of this
+        /// feed's own origin, at or above its floor, that was never verified
+        /// as delivered. `take_frames`'s leak check is the other half.
+        fn first_undelivered(&self, ledger: &Ledger) -> Option<u64> {
+            let lo = self.floor.min(ledger.next_scan_id);
+            ledger
+                .rows
+                .range(lo..ledger.next_scan_id)
+                .find(|&(id, noted)| {
+                    noted.origin == self.feed.origin() && !self.verified.contains(id)
+                })
+                .map(|(&id, _)| id)
+        }
+
+        fn settled(&self, ledger: &Ledger) -> bool {
+            self.pending.is_empty() && self.first_undelivered(ledger).is_none()
+        }
+
+        fn unsettled_report(&self, ledger: &Ledger) -> String {
+            format!(
+                "{} never caught up: ledger scanned below id {}, floor {}, {} frame(s) \
+                 unverified, first own row never delivered {:?}, cursor id {:?}",
+                self.feed.label(),
+                ledger.next_scan_id,
+                self.floor,
+                self.pending.len(),
+                self.first_undelivered(ledger),
+                self.cursor.map(|c| c.id)
+            )
+        }
+
+        /// Takes the frames this feed's sink accepted since the last call.
+        /// The leak check reads the frame's own payload, so it needs no
+        /// ledger and is never excused. A terminal frame is always a finding
+        /// here, because every row a feed admits carries that feed's own
+        /// shape.
+        fn take_frames(&mut self, ledger: &Ledger, frames: &[EventFrame]) -> Result<(), String> {
+            let label = self.feed.label();
+            for frame in frames {
+                self.trace.push((frame.id, frame.name, frame.json.clone()));
+                if frame.name == "charpente.gap" {
+                    return Err(format!(
+                        "{label} got charpente.gap with event retention at its default — \
+                         nothing ages out in this workload: {}",
+                        frame.json
+                    ));
+                }
+                if frame.name == ERROR_FRAME {
+                    return Err(format!(
+                        "{label} ended on {ERROR_FRAME} at event id {}: {} — every note in this \
+                         workload decodes under its own shape",
+                        frame.id, frame.json
+                    ));
+                }
+                if frame.name == RESHAPED_FRAME {
+                    let row = match ledger.rows.get(&frame.id) {
+                        Some(noted) => format!("a note emitted {}", emitted(noted.origin)),
+                        None => "a row the ledger has not scanned".to_string(),
+                    };
+                    return Err(format!(
+                        "tenancy leak: {label} ended on {RESHAPED_FRAME} at event id {}, {row} — \
+                         every note this feed admits carries this feed's own shape, so a \
+                         terminal frame here is a row outside this feed's tenancy that the \
+                         platform admitted",
+                        frame.id
+                    ));
+                }
+                let Some(origin) = origin_of(&frame.json) else {
+                    return Err(format!(
+                        "{label} received event id {} whose payload is not a note: {}",
+                        frame.id, frame.json
+                    ));
+                };
+                if origin != self.feed.origin() {
+                    return Err(format!(
+                        "tenancy leak: {label} received event id {}, a note emitted {} — {}",
+                        frame.id,
+                        emitted(origin),
+                        self.feed.rule()
+                    ));
+                }
+                assert_strictly_increasing(frame.id, &mut self.last_id)?;
+                self.pending
+                    .push_back((frame.id, frame.name, frame.json.clone()));
+                self.cursor = Some(Cursor {
+                    id: frame.id,
+                    seq: frame.seq,
+                });
+            }
+            Ok(())
+        }
+
+        /// Compares every pending frame the ledger has scanned. A frame the
+        /// ledger has not reached waits for a later scan.
+        fn drain(&mut self, ledger: &Ledger) -> Result<(), Fail> {
+            while let Some((id, name, json)) = self.pending.front() {
+                let Some(noted) = ledger.rows.get(id) else {
+                    break;
+                };
+                if *name != "note" || noted.json != *json {
+                    return Err(Fail::Mismatch(format!(
+                        "content mismatch at event id {id}: the store holds (note, {}) but {} \
+                         received ({name}, {json})",
+                        noted.json,
+                        self.feed.label()
+                    )));
+                }
+                let id = *id;
+                self.pending.pop_front();
+                self.verified.insert(id);
+            }
+            Ok(())
+        }
+
+        fn connected(&mut self, handle: SimSinkHandle, was_bare: bool, boundary: u64) {
+            self.need_subscribe = false;
+            if was_bare {
+                self.floor = self.floor.max(boundary);
+            }
+            self.handle = Some(handle);
+            self.frames_consumed = 0;
+        }
+
+        fn count_refusal(&mut self, origin: u64) {
+            if self.feed.same_kind(origin) {
+                self.refused_same_kind += 1;
+            } else {
+                self.refused_other_kind += 1;
+            }
+        }
+
+        /// A probe's cursor: the newest scanned row outside this feed's
+        /// tenancy. When `same_kind` asks for it (a shop feed only), that is
+        /// another shop's row; otherwise a row of the other kind. Whichever
+        /// exists is the fallback. Returns the cursor and the row's origin.
+        fn foreign_cursor(&self, ledger: &Ledger, same_kind: bool) -> Option<(Cursor, u64)> {
+            let own = self.feed.origin();
+            let newest = |wanted: &dyn Fn(u64) -> bool| {
+                ledger
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|(_, noted)| wanted(noted.origin))
+                    .map(|(&id, noted)| (Cursor { id, seq: noted.seq }, noted.origin))
+            };
+            newest(&|o: u64| o != own && self.feed.same_kind(o) == same_kind)
+                .or_else(|| newest(&|o: u64| o != own))
+        }
+    }
+
+    // ------------------------------------------------------------ universe
+
+    /// What one pushed request was, in push order. That is the order the
+    /// kernel answers in.
+    enum Pushed {
+        /// A feed's own (re)subscribe. `boundary` is `next_event_id` read just
+        /// before the push, which is exactly where a bare subscribe starts.
+        Subscribe {
+            client: usize,
+            was_bare: bool,
+            boundary: u64,
+        },
+        /// A resume from a row outside the feed's tenancy, which must be
+        /// refused by name. It queues no stall closure, because a refused
+        /// resume opens no sink.
+        Probe {
+            client: usize,
+            cursor: Cursor,
+            origin: u64,
+        },
+        Emit,
+    }
+
+    /// How a feed's own subscribe was answered.
+    enum Answer {
+        Connected,
+        Retry,
+        Cut,
+        Refused,
+    }
+
+    /// The flagship's classification. A diverged 409 after durable corruption
+    /// is a cut. The flagship prunes its one client's ledger there. Four feeds
+    /// share this ledger, so this universe gives up instead: a cut is a
+    /// universe that no longer adjudicates set equality.
+    fn read_answer(status: u16, raw: &str, durable_fired: bool) -> Answer {
+        if status == 200 {
+            return Answer::Connected;
+        }
+        if status == 409 && raw.contains("diverged from this node's timeline") && durable_fired {
+            return Answer::Cut;
+        }
+        if is_fault_fallout(raw) {
+            return Answer::Retry;
+        }
+        Answer::Refused
+    }
+
+    /// How a probe was answered.
+    /// - `Refused`: by A16's name.
+    /// - `Unanswered`: fault fallout; nothing is counted.
+    /// - `Cut`: durable corruption took the probe's row off this node's
+    ///   timeline, and the universe gives up.
+    #[derive(Debug, PartialEq)]
+    enum ProbeAnswer {
+        Refused,
+        Unanswered,
+        Cut,
+    }
+
+    /// The third property's verdict on one probe's answer.
+    fn probe_verdict(
+        feed: Feed,
+        cursor: Cursor,
+        origin: u64,
+        status: u16,
+        raw: &str,
+        text: &str,
+        durable_fired: bool,
+    ) -> Result<ProbeAnswer, String> {
+        if status == 409 && text == tenancy_409(cursor) {
+            return Ok(ProbeAnswer::Refused);
+        }
+        let asked = format!(
+            "{} resumed from cursor {} — event id {}, a note emitted {} —",
+            feed.label(),
+            cursor.wire(),
+            cursor.id,
+            emitted(origin)
+        );
+        if status == 200 {
+            return Err(format!(
+                "{asked} and was accepted: a cursor on a row outside this feed's tenancy is \
+                 refused by name, never resumed past"
+            ));
+        }
+        match read_answer(status, raw, durable_fired) {
+            Answer::Cut => Ok(ProbeAnswer::Cut),
+            Answer::Retry => Ok(ProbeAnswer::Unanswered),
+            Answer::Connected | Answer::Refused => Err(format!(
+                "{asked} and was answered {status}: {text} — a cursor on a row outside this \
+                 feed's tenancy is refused as outside it, by that name and no other"
+            )),
+        }
+    }
+
+    fn cut_reason(feed: Feed, text: &str) -> String {
+        format!(
+            "{} was answered 409: {text} — durable corruption cut an event this ledger scanned \
+             off this node's timeline, so the feeds' delivered sets can no longer be compared \
+             with it and nothing here adjudicates",
+            feed.label()
+        )
+    }
+
+    /// The next unclaimed sink. Only a 200 subscribe opens one, and sinks are
+    /// recorded in answer order.
+    fn take_sink(sinks: &SinkHandles, taken: &mut usize) -> SimSinkHandle {
+        let handle = sinks
+            .lock()
+            .expect("sink handles lock poisoned by an earlier panic")
+            .get(*taken)
+            .cloned()
+            .expect("every 200 subscribe opened exactly one sink, in answer order");
+        *taken += 1;
+        handle
+    }
+
+    type TenancyTrace = Vec<(usize, u64, &'static str, String)>;
+
+    struct Universe {
+        ledger: Ledger,
+        clients: Vec<FeedClient>,
+    }
+
+    impl Universe {
+        fn new() -> Universe {
+            Universe {
+                ledger: Ledger::default(),
+                clients: FEEDS.iter().map(|&feed| FeedClient::new(feed)).collect(),
+            }
+        }
+
+        /// A fresh kernel carries no tail over.
+        fn disconnect_all(&mut self) {
+            for client in &mut self.clients {
+                client.need_subscribe = true;
+                client.handle = None;
+            }
+        }
+
+        /// Pushes one round, in this order:
+        /// 1. Every feed without a live tail resubscribes from its cursor.
+        /// 2. In an epoch round, each feed draws once, and one draw in four
+        ///    sends a probe.
+        /// 3. In an epoch round, the emits.
+        /// A settle round pushes the subscribes only.
+        fn push_round(
+            &self,
+            sim: &Sim,
+            kernel: &Kernel,
+            source: &mut SimSource,
+            t: &mut u64,
+            epoch: bool,
+        ) -> Result<Vec<Pushed>, String> {
+            let mut pushed = Vec::new();
+            for (client, c) in self.clients.iter().enumerate() {
+                if !c.need_subscribe {
+                    continue;
+                }
+                let (was_bare, boundary) =
+                    push_subscribe(sim, kernel, source, c.feed.path(), c.cursor, *t)?;
+                pushed.push(Pushed::Subscribe {
+                    client,
+                    was_bare,
+                    boundary,
+                });
+                *t += SEC;
+            }
+            if !epoch {
+                return Ok(pushed);
+            }
+            for (client, c) in self.clients.iter().enumerate() {
+                let draw = sim.entropy().next_u64();
+                if !draw.is_multiple_of(4) {
+                    continue;
+                }
+                let same_kind = (draw >> 2).is_multiple_of(2);
+                let Some((cursor, origin)) = c.foreign_cursor(&self.ledger, same_kind) else {
+                    continue;
+                };
+                source.push_at(
+                    *t,
+                    Request::new(
+                        Method::Get,
+                        format!("{}?cursor={}", c.feed.path(), cursor.wire()),
+                    ),
+                );
+                pushed.push(Pushed::Probe {
+                    client,
+                    cursor,
+                    origin,
+                });
+                *t += SEC;
+            }
+            let n_emits = 1 + sim.entropy().next_u64() % 4;
+            for _ in 0..n_emits {
+                let e = sim.entropy();
+                let pick = e.next_u64() % 8;
+                let shop = SHOPS[(e.next_u64() % 3) as usize];
+                let n = WireU64(e.next_u64() % 1000);
+                let (route, body) = match pick {
+                    0 | 1 => (
+                        "/tenancy/announce",
+                        TenancyEmit {
+                            shop: WireU64(GLOBAL_ORIGIN),
+                            n,
+                        },
+                    ),
+                    2 => (
+                        "/tenancy/note-and-announce",
+                        TenancyEmit {
+                            shop: WireU64(shop),
+                            n,
+                        },
+                    ),
+                    _ => (
+                        "/tenancy/note",
+                        TenancyEmit {
+                            shop: WireU64(shop),
+                            n,
+                        },
+                    ),
+                };
+                source.push_at(*t, Request::new(Method::Post, route).json(&body));
+                pushed.push(Pushed::Emit);
+                *t += SEC;
+            }
+            Ok(pushed)
+        }
+
+        /// Scans the ledger and drains every feed against it. `Ok(true)` means
+        /// the universe gave up, and every caller returns at once:
+        /// `Sim::give_up` is terminal for the universe.
+        fn sync_and_drain(&mut self, sim: &Sim, db: &Db) -> Result<bool, String> {
+            let checked = match self.ledger.sync(db) {
+                Ok(()) => self
+                    .clients
+                    .iter_mut()
+                    .try_for_each(|c| c.drain(&self.ledger)),
+                Err(fail) => Err(fail),
+            };
+            match checked {
+                Ok(()) => Ok(false),
+                Err(Fail::Finding(e)) => Err(e),
+                Err(Fail::Mismatch(e)) => match self.ledger.diverged_entry(db) {
+                    Some((id, recorded, stored)) => {
+                        sim.give_up(format!(
+                            "ledger diverged at event id {id}: recorded {recorded} when scanned, \
+                             store now holds {stored} — this node's timeline no longer holds \
+                             the recorded event (durable corruption cut it above the checkpoint \
+                             horizon) and any row now at this id is a re-mint, so nothing here \
+                             adjudicates delivery ({e})"
+                        ));
+                        Ok(true)
+                    }
+                    None => Err(e),
+                },
+            }
+        }
+
+        /// Absorbs one round. `responses` is what the kernel recorded for this
+        /// round's `pushed`, in the same order. A crash can cut its tail short,
+        /// and the zip then stops early.
+        fn absorb(
+            &mut self,
+            sim: &Sim,
+            db: &Db,
+            pushed: &[Pushed],
+            responses: &[(u16, Vec<u8>)],
+            sinks: &SinkHandles,
+            sinks_taken: &mut usize,
+        ) -> Result<(), String> {
+            if self.sync_and_drain(sim, db)? {
+                return Ok(());
+            }
+            let fired = durable_corruption_fired(sim);
+            for (p, (status, body)) in pushed.iter().zip(responses) {
+                let raw = String::from_utf8_lossy(body).to_string();
+                let text = response_text(body);
+                match *p {
+                    Pushed::Emit => {
+                        if *status != 200 && !is_fault_fallout(&raw) {
+                            return Err(format!("unexpected emit response {status}: {text}"));
+                        }
+                    }
+                    Pushed::Subscribe {
+                        client,
+                        was_bare,
+                        boundary,
+                    } => match read_answer(*status, &raw, fired) {
+                        Answer::Connected => {
+                            let handle = take_sink(sinks, sinks_taken);
+                            self.clients[client].connected(handle, was_bare, boundary);
+                        }
+                        Answer::Retry => {}
+                        Answer::Cut => {
+                            sim.give_up(cut_reason(self.clients[client].feed, &text));
+                            return Ok(());
+                        }
+                        Answer::Refused => {
+                            return Err(format!(
+                                "unexpected subscribe response {status} for {}: {text}",
+                                self.clients[client].feed.label()
+                            ));
+                        }
+                    },
+                    Pushed::Probe {
+                        client,
+                        cursor,
+                        origin,
+                    } => {
+                        let feed = self.clients[client].feed;
+                        match probe_verdict(feed, cursor, origin, *status, &raw, &text, fired)? {
+                            ProbeAnswer::Refused => self.clients[client].count_refusal(origin),
+                            ProbeAnswer::Unanswered => {}
+                            ProbeAnswer::Cut => {
+                                sim.give_up(cut_reason(feed, &text));
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            for c in &mut self.clients {
+                let Some(handle) = c.handle.clone() else {
+                    continue;
+                };
+                let frames = handle.frames();
+                c.take_frames(&self.ledger, &frames[c.frames_consumed..])?;
+                c.frames_consumed = frames.len();
+                if handle.closed() {
+                    // Our stall closure is the only source of `Full`, and a
+                    // live kernel drops a tail for nothing else here.
+                    sim.cover("realtime:stall-drop");
+                    sim.cover("fault:subscriber_stall");
+                    c.need_subscribe = true;
+                    c.handle = None;
+                }
+            }
+            self.sync_and_drain(sim, db).map(|_| ())
+        }
+
+        fn settled(&self) -> bool {
+            self.clients.iter().all(|c| c.settled(&self.ledger))
+        }
+
+        fn unsettled_report(&self) -> String {
+            self.clients
+                .iter()
+                .filter(|c| !c.settled(&self.ledger))
+                .map(|c| c.unsettled_report(&self.ledger))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn trace(&self) -> TenancyTrace {
+            self.clients
+                .iter()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    c.trace
+                        .iter()
+                        .map(move |(id, name, json)| (i, *id, *name, json.clone()))
+                })
+                .collect()
+        }
+
+        /// Coverage, credited once per universe that reached a verdict, so each
+        /// count reads as a number of universes. Every key is a way this
+        /// property could go quietly vacuous.
+        fn credit(&self, sim: &Sim) {
+            let next = self.ledger.next_scan_id;
+            let passed = |c: &FeedClient| -> Vec<u64> {
+                let lo = c.floor.min(next);
+                self.ledger
+                    .rows
+                    .range(lo..next)
+                    .map(|(_, noted)| noted.origin)
+                    .collect()
+            };
+            let seqs = |c: &FeedClient| -> BTreeSet<u64> {
+                c.verified
+                    .iter()
+                    .filter_map(|id| self.ledger.rows.get(id).map(|noted| noted.seq))
+                    .collect()
+            };
+            let global = &self.clients[0];
+            let shops = &self.clients[1..];
+            if shops.iter().all(|c| !c.verified.is_empty()) {
+                sim.cover("tenancy:every-shop-delivered");
+            }
+            if !global.verified.is_empty() {
+                sim.cover("tenancy:global-delivered");
+            }
+            // At a verdict every own row in a feed's window was delivered, and
+            // no other row ever was. So a foreign row in the window is one the
+            // feed was exposed to and did not receive: the "receives none"
+            // half, made non-vacuous.
+            if passed(global).iter().any(|&o| o != GLOBAL_ORIGIN) {
+                sim.cover("tenancy:global-passed-a-scoped-row");
+            }
+            if shops
+                .iter()
+                .any(|c| passed(c).iter().any(|&o| c.feed.same_kind(o)))
+            {
+                sim.cover("tenancy:shop-passed-another-shops-row");
+            }
+            if shops
+                .iter()
+                .any(|c| passed(c).contains(&GLOBAL_ORIGIN))
+            {
+                sim.cover("tenancy:shop-passed-a-global-row");
+            }
+            if shops.iter().any(|c| c.refused_same_kind > 0) {
+                sim.cover("tenancy:resume-refused-on-another-shops-row");
+            }
+            if self.clients.iter().any(|c| c.refused_other_kind > 0) {
+                sim.cover("tenancy:resume-refused-on-the-other-kinds-row");
+            }
+            let global_seqs = seqs(global);
+            if shops.iter().any(|c| !seqs(c).is_disjoint(&global_seqs)) {
+                sim.cover("tenancy:mixed-record-delivered");
+            }
+        }
+    }
+
+    /// `settle_boot` over `tenancy_app`. It is copied rather than
+    /// parameterized so the flagship's function keeps its bytes (R56). Every
+    /// word of `settle_boot`'s rationale applies unchanged.
+    fn tenancy_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
+        for try_n in 0..SETTLE_BOOT_TRIES {
+            if try_n > 0 && try_n.is_multiple_of(SETTLE_CYCLE_EVERY) {
+                sim.restart();
+            }
+            let app = match tenancy_app(sim) {
+                Ok(app) => app,
+                Err(e) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("settle open failed non-injected: {e}"));
+                    }
+                    continue;
+                }
+            };
+            match Kernel::new(app, Box::new(sim.clock())) {
+                Ok(kernel) => return Ok(Some(kernel)),
+                Err(e) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("settle Kernel::new failed non-injected: {e}"));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// One universe. It has `realtime_workload`'s shape:
+    /// - `EPOCHS` crash-bounded sessions of `ROUNDS_PER_EPOCH` rounds each;
+    /// - then a settle phase that reconnects every feed until each has caught
+    ///   up, or the universe gives up for the flagship's two reasons.
+    /// Every arm that classifies a fault is the flagship's. On success it
+    /// returns every feed's frame trace, the replay check's oracle.
+    fn tenancy_universe(sim: &mut Sim) -> Result<TenancyTrace, String> {
+        let mut u = Universe::new();
+
+        for _epoch in 0..EPOCHS {
+            // A give-up already recorded means this universe adjudicated
+            // nothing. Carrying on can only turn it into a failure.
+            if sim.gave_up().is_some() {
+                return Ok(u.trace());
+            }
+            let entropy = sim.entropy();
+            sim.crash_disk_after(64 + entropy.next_u64() % 512);
+            let app = match tenancy_app(sim) {
+                Ok(app) => app,
+                Err(e) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("open failed non-injected: {e}"));
+                    }
+                    sim.restart();
+                    continue;
+                }
+            };
+            let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+                Ok(k) => k,
+                Err(e) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("Kernel::new failed non-injected: {e}"));
+                    }
+                    sim.restart();
+                    continue;
+                }
+            };
+            u.disconnect_all();
+
+            let mut source =
+                SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 2000 * SEC);
+            let sinks = source.sinks();
+            let responses = source.responses();
+            let mut resp_idx = 0usize;
+            let mut sinks_taken = 0usize;
+            let mut t = sim.now().as_nanos();
+
+            for _round in 0..ROUNDS_PER_EPOCH {
+                // `push_subscribe` reads `next_event_id` off the live `Db`, so
+                // a latched store fails it: classified as `kernel.run` is.
+                let pushed = match u.push_round(sim, &kernel, &mut source, &mut t, true) {
+                    Ok(pushed) => pushed,
+                    Err(e) if is_fault_fallout(&e) => {
+                        sim.restart();
+                        u.disconnect_all();
+                        break;
+                    }
+                    Err(e) => return Err(format!("push_subscribe failed non-injected: {e}")),
+                };
+                let run_result = kernel.run(&mut source);
+                let new_responses = {
+                    let guard = responses
+                        .lock()
+                        .expect("responses lock poisoned by an earlier panic");
+                    guard[resp_idx..].to_vec()
+                };
+                resp_idx += new_responses.len();
+                u.absorb(
+                    sim,
+                    kernel.app().db(),
+                    &pushed,
+                    &new_responses,
+                    &sinks,
+                    &mut sinks_taken,
+                )?;
+                if let Err(e) = run_result {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("kernel.run failed non-injected: {e}"));
+                    }
+                    sim.restart();
+                    u.disconnect_all();
+                    break;
+                }
+                // Below the `run_result` check, as in `realtime_workload`: a
+                // failure observed before a give-up outranks it.
+                if sim.gave_up().is_some() {
+                    return Ok(u.trace());
+                }
+            }
+        }
+
+        // Settle, as in `realtime_workload`. No emits and no probes: boot a
+        // node through the remaining faults and let every feed catch up. The
+        // retries add chances to RECEIVE and nothing else. `verified` grows
+        // only through `drain`, which matches a frame the server delivered, so
+        // no attempt count can excuse a row that was skipped.
+        let mut clean_attempts = 0u32;
+        let mut rolled_back: Option<(u64, String, String)> = None;
+        for _attempt in 0..SETTLE_ATTEMPTS {
+            if sim.gave_up().is_some() {
+                return Ok(u.trace());
+            }
+            if u.settled() {
+                break;
+            }
+            let Some(mut kernel) = tenancy_settle_boot(sim)? else {
+                sim.restart();
+                continue;
+            };
+            u.disconnect_all();
+
+            let mut source =
+                SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 2000 * SEC);
+            let sinks = source.sinks();
+            let responses = source.responses();
+            let mut sinks_taken = 0usize;
+            let mut t = sim.now().as_nanos();
+
+            let pushed = match u.push_round(sim, &kernel, &mut source, &mut t, false) {
+                Ok(pushed) => pushed,
+                Err(e) if is_fault_fallout(&e) => {
+                    sim.restart();
+                    continue;
+                }
+                Err(e) => return Err(format!("settle push_subscribe failed non-injected: {e}")),
+            };
+            let run_result = kernel.run(&mut source);
+            let new_responses = responses
+                .lock()
+                .expect("responses lock poisoned by an earlier panic")
+                .clone();
+            u.absorb(
+                sim,
+                kernel.app().db(),
+                &pushed,
+                &new_responses,
+                &sinks,
+                &mut sinks_taken,
+            )?;
+            if let Err(e) = run_result {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle kernel.run failed non-injected: {e}"));
+                }
+                sim.restart();
+                u.disconnect_all();
+            } else {
+                clean_attempts += 1;
+                if rolled_back.is_none() && !u.settled() {
+                    rolled_back = u.ledger.diverged_entry(kernel.app().db());
+                }
+            }
+            if sim.gave_up().is_some() {
+                return Ok(u.trace());
+            }
+        }
+
+        if !u.settled() {
+            // The flagship's two give-ups, for its reasons: a scanned row the
+            // store has rolled back past can never be delivered, and zero clean
+            // attempts means there was no node to catch up FROM.
+            if let Some((id, recorded, stored)) = rolled_back {
+                sim.give_up(format!(
+                    "ledger id {id} is behind this node's timeline: recorded {recorded} when \
+                     scanned, store now says {stored} — this node's timeline no longer holds \
+                     the recorded event (durable corruption cut it above the checkpoint \
+                     horizon), so it can never be delivered and nothing here adjudicates ({})",
+                    u.unsettled_report()
+                ));
+                return Ok(u.trace());
+            }
+            if clean_attempts == 0 {
+                sim.give_up(format!(
+                    "no settle attempt completed without fault fallout over {SETTLE_ATTEMPTS} \
+                     attempts — there was no node to catch up from ({})",
+                    u.unsettled_report()
+                ));
+                return Ok(u.trace());
+            }
+            return Err(u.unsettled_report());
+        }
+        u.credit(sim);
+        Ok(u.trace())
+    }
+
+    /// Tenancy-completion spec §9, the realtime property. The base is pinned
+    /// because the floors are rates measured at it. Fresh bases are the
+    /// correctness sweep (plan Task 13 Step 7, Task 14 Step 5).
+    #[test]
+    fn every_feed_receives_exactly_its_own_scope_under_the_fault_matrix() {
+        run_universes_swarm_with!(
+            TENANCY_BASE,
+            128,
+            |_cfg: &mut FaultConfig| {},
+            |sim: &mut Sim| tenancy_universe(sim).map(|_trace| ()),
+            require: [
+                "tenancy:every-shop-delivered",
+                "tenancy:global-delivered",
+                "tenancy:global-passed-a-scoped-row",
+                "tenancy:shop-passed-another-shops-row",
+                "tenancy:shop-passed-a-global-row",
+                "tenancy:resume-refused-on-another-shops-row",
+                "tenancy:resume-refused-on-the-other-kinds-row",
+                "tenancy:mixed-record-delivered",
+                "realtime:resume-backlog",
+                "realtime:stall-drop",
+                "fault:subscriber_stall"
+            ],
+            floor: [
+                ("tenancy:every-shop-delivered", TENANCY_EVERY_SHOP_FLOOR),
+                ("tenancy:global-delivered", TENANCY_GLOBAL_DELIVERED_FLOOR),
+                ("tenancy:global-passed-a-scoped-row", TENANCY_GLOBAL_PASSED_FLOOR),
+                (
+                    "tenancy:shop-passed-another-shops-row",
+                    TENANCY_SHOP_PASSED_SHOP_FLOOR
+                ),
+                ("tenancy:shop-passed-a-global-row", TENANCY_SHOP_PASSED_GLOBAL_FLOOR),
+                (
+                    "tenancy:resume-refused-on-another-shops-row",
+                    TENANCY_REFUSED_SAME_KIND_FLOOR
+                ),
+                (
+                    "tenancy:resume-refused-on-the-other-kinds-row",
+                    TENANCY_REFUSED_OTHER_KIND_FLOOR
+                ),
+                ("realtime:resume-backlog", TENANCY_RESUME_BACKLOG_FLOOR)
+            ]
+        );
+    }
+
+    /// The floors are exact measurements, and that means something only if
+    /// the batch is reproducible. The second seed is the flagship's style of
+    /// "any other seed".
+    #[test]
+    fn the_tenancy_workload_replays_identically_for_the_same_seed() {
+        for seed in [0x5C0B_5EED, 0x0BAD_5C0B_0BAD_5C0B] {
+            charpente_sim::checks::replays_identically(seed, tenancy_universe).unwrap();
+        }
+    }
+}
+```
+
+Notes for the implementer, each checked against the code the module copies:
+- `realtime:stall-drop` and `fault:subscriber_stall` are required but not floored. Their rate
+  belongs to a fault axis the flagship already pins, and a second exact pin would turn one
+  finding into two failing properties. This is the sibling's documented reason.
+- `mixed-record-delivered` is required but not floored. It is a shape check, "one record, two
+  tenancies, each delivered to its own feed", not a rate.
+- `realtime:resume-backlog` is floored. A batch that stopped resuming with backlog waiting
+  would still settle, vacuously.
+- `probe_verdict` has seven parameters. Clippy's `too_many_arguments` fires above seven, so it
+  is clean, and so is `absorb`: six parameters plus `self`.
+- If rustfmt re-wraps anything, take its layout: `cargo fmt` is the gate.
+
+- [ ] **Step 2: Write the fault-free twin, its control and the replay helpers**
+
+Inside `mod tenancy_feeds`, after `the_tenancy_workload_replays_identically_for_the_same_seed`:
+
+```rust
+    // ------------------------------------------------- the fault-free twin
+
+    /// `(route, shop, n)`, pushed in order at one instant after the four bare
+    /// subscribes. There is one record per request, with ids in emit order:
+    /// 0 shop 0 · 1 global · 2 shop 1 · 3 shop 2 and 4 global (one record, one
+    /// seq) · 5 shop 1 · 6 shop 0 · 7 shop 1.
+    const TWIN_SCRIPT: [(&str, u64, u64); 7] = [
+        ("/tenancy/note", 0, 10),
+        ("/tenancy/announce", GLOBAL_ORIGIN, 11),
+        ("/tenancy/note", 1, 12),
+        ("/tenancy/note-and-announce", 2, 13),
+        ("/tenancy/note", 1, 15),
+        ("/tenancy/note", 0, 16),
+        ("/tenancy/note", 1, 17),
+    ];
+
+    /// Steps the kernel until nothing is ready, at most 256 times. Each
+    /// subscribe is its own batch and each tail delivers in its own step, so a
+    /// fixed step count would tie these tests to the batching.
+    fn run_quiet(
+        kernel: &mut Kernel,
+        sim: &Sim,
+        requests: Vec<Request>,
+    ) -> (RecordedResponses, SinkHandles) {
+        let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+        let t = sim.now().as_nanos();
+        for request in requests {
+            source.push_at(t, request);
+        }
+        let (responses, sinks) = (source.responses(), source.sinks());
+        for _ in 0..256 {
+            match kernel
+                .step(&mut source)
+                .expect("no step may fail on a fault-free node")
+            {
+                Step::Worked => {}
+                Step::Idle { .. } => return (responses, sinks),
+            }
+        }
+        panic!("the kernel was still working after 256 steps");
+    }
+
+    /// One fault-free node: the four feeds subscribed bare, in `FEEDS` order,
+    /// then `TWIN_SCRIPT`. Returns the node (still serving, for the resume
+    /// tests), every stored row, and each feed's frames in `FEEDS` order.
+    fn twin() -> (Sim, Kernel, Vec<EventRow>, Vec<Vec<EventFrame>>) {
+        let sim = Sim::with_faults(0x5C0B_7317, FaultConfig::none());
+        let mut kernel = Kernel::new(tenancy_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+        let mut requests: Vec<Request> = FEEDS
+            .iter()
+            .map(|feed| Request::new(Method::Get, feed.path()))
+            .collect();
+        for (route, shop, n) in TWIN_SCRIPT {
+            requests.push(Request::new(Method::Post, route).json(&TenancyEmit {
+                shop: WireU64(shop),
+                n: WireU64(n),
+            }));
+        }
+        let (responses, sinks) = run_quiet(&mut kernel, &sim, requests);
+        assert_eq!(
+            statuses(&responses),
+            vec![200; 11],
+            "four subscribes and seven emits, each answered 200"
+        );
+        let frames: Vec<Vec<EventFrame>> = sinks
+            .lock()
+            .expect("sinks lock")
+            .iter()
+            .map(|h| h.frames())
+            .collect();
+        assert_eq!(frames.len(), 4, "four subscribes opened four sinks");
+        let rows: Vec<EventRow> = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan_from(0, 64)
+            .unwrap();
+        assert_eq!(rows.len(), 8, "seven requests wrote eight notes");
+        (sim, kernel, rows, frames)
+    }
+
+    /// The oracle's ledger over the twin's store, scanned and checked.
+    fn synced(kernel: &Kernel) -> Ledger {
+        let mut ledger = Ledger::default();
+        ledger
+            .sync(kernel.app().db())
+            .expect("the twin's rows record what their payloads say");
+        assert_eq!(ledger.next_scan_id, 8);
+        ledger
+    }
+
+    /// Frames as comparable tuples. `EventFrame` has no `PartialEq`.
+    fn project(frames: &[EventFrame]) -> Vec<(u64, u64, &'static str, String)> {
+        frames
+            .iter()
+            .map(|f| (f.id, f.seq, f.name, f.json.clone()))
+            .collect()
+    }
+
+    fn cursor_at(rows: &[EventRow], index: usize) -> Cursor {
+        Cursor {
+            id: rows[index].id.raw(),
+            seq: rows[index].seq,
+        }
+    }
+
+    fn resume(feed: Feed, cursor: Cursor) -> Request {
+        Request::new(
+            Method::Get,
+            format!("{}?cursor={}", feed.path(), cursor.wire()),
+        )
+    }
+
+    /// What a feed admits, as a function of the feed's tenant and the row's.
+    /// The product has one rule: `Subscription::admits`'s scope clause, which
+    /// is also A16's check on a resume. The others are the victims the oracle
+    /// must name.
+    type ScopeRule = fn(Option<u64>, Option<u64>) -> bool;
+
+    /// The product's rule: `row.scope == subscription.scope`.
+    fn scope_equal(feed: Option<u64>, row: Option<u64>) -> bool {
+        feed == row
+    }
+
+    /// The scope clause dropped.
+    fn scope_blind(_feed: Option<u64>, _row: Option<u64>) -> bool {
+        true
+    }
+
+    /// Tenant 0 read as no tenant.
+    fn zero_is_no_tenant(feed: Option<u64>, row: Option<u64>) -> bool {
+        feed.filter(|&s| s != 0) == row.filter(|&s| s != 0)
+    }
+
+    /// The fail-closed direction: a tenant feed admits nothing.
+    fn tenants_admit_nothing(feed: Option<u64>, row: Option<u64>) -> bool {
+        feed.is_none() && row.is_none()
+    }
+
+    /// `deliver_unit` (kernel/tail.rs) over `rows`, with the scope clause
+    /// replaced by `rule`:
+    /// - a row the rule does not admit is skipped;
+    /// - an admitted row of another shape ends the tail on
+    ///   `charpente.reshaped`;
+    /// - every other admitted row is delivered.
+    /// Every row here is a note and no feed is keyed, so the name and key
+    /// clauses always pass.
+    fn replay_tail(rows: &[EventRow], feed: Feed, rule: ScopeRule) -> Vec<EventFrame> {
+        let mut frames = Vec::new();
+        for row in rows {
+            if !rule(feed.scope(), row.scope) {
+                continue;
+            }
+            if row.shape != Some(feed.fingerprint()) {
+                frames.push(EventFrame {
+                    id: row.id.raw(),
+                    seq: row.seq,
+                    name: RESHAPED_FRAME,
+                    json: reshaped_frame(row).3,
+                });
+                break;
+            }
+            let note = global_note::Note::decode(&mut &row.payload[..]).expect("a twin row decodes");
+            frames.push(EventFrame {
+                id: row.id.raw(),
+                seq: row.seq,
+                name: "note",
+                json: serde_json::to_string(&note).expect("a note serializes"),
+            });
+        }
+        frames
+    }
+
+    /// `validate_subscribe` (kernel/mod.rs) from its seq check on, over
+    /// `rows`, with A16's tenancy comparison replaced by `rule`:
+    /// - a cursor on a row the rule does not admit is refused by A16's name;
+    /// - an admitted row of another shape is refused as reshaped;
+    /// - anything else resumes at the next id.
+    fn replay_resume(
+        rows: &[EventRow],
+        feed: Feed,
+        cursor: Cursor,
+        rule: ScopeRule,
+    ) -> Result<u64, (u16, String)> {
+        let row = rows
+            .iter()
+            .find(|r| r.id.raw() == cursor.id)
+            .expect("the cursor names a twin row");
+        if !rule(feed.scope(), row.scope) {
+            return Err((409, tenancy_409(cursor)));
+        }
+        if row.shape != Some(feed.fingerprint()) {
+            return Err((409, reshaped_409(row, feed.fingerprint())));
+        }
+        Ok(cursor.id + 1)
+    }
+
+    /// The three notes are one NAME and one field list, with three
+    /// fingerprints. Tenancy is the only difference, and the fingerprint sees
+    /// it.
+    #[test]
+    fn the_three_notes_share_a_name_and_differ_only_in_tenancy() {
+        assert_eq!(<global_note::Note as Event>::NAME, "note");
+        assert_eq!(<shop_note::Note as Event>::NAME, "note");
+        assert_eq!(<desk_note::Note as Event>::NAME, "note");
+        assert_ne!(GLOBAL_FP, SHOP_FP, "a scoped event's fingerprint mixes its tenant's NAME");
+        assert_ne!(SHOP_FP, DESK_FP, "two tenant types, two fingerprints for one field list");
+        assert_ne!(GLOBAL_FP, DESK_FP);
+    }
+
+    /// The control every victim below is measured against. On a fault-free
+    /// node each feed receives exactly its own notes, the rows record their
+    /// tenants, and the oracle passes on those bytes.
+    #[test]
+    fn each_feed_receives_exactly_its_own_notes_on_a_fault_free_node() {
+        let (_sim, kernel, rows, frames) = twin();
+        assert_eq!(
+            rows.iter().map(|r| r.scope).collect::<Vec<_>>(),
+            vec![Some(0), None, Some(1), Some(2), None, Some(1), Some(0), Some(1)],
+            "a shop's note records its shop, tenant 0 included; a global note records none"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.shape).collect::<Vec<_>>(),
+            vec![
+                Some(SHOP_FP),
+                Some(GLOBAL_FP),
+                Some(SHOP_FP),
+                Some(SHOP_FP),
+                Some(GLOBAL_FP),
+                Some(SHOP_FP),
+                Some(SHOP_FP),
+                Some(SHOP_FP)
+            ]
+        );
+        assert_eq!(
+            rows[3].seq, rows[4].seq,
+            "note-and-announce is one record: its two rows share a seq"
+        );
+        assert_ne!(rows[2].seq, rows[3].seq);
+        let expected: [&[(u64, &str)]; 4] = [
+            &[
+                (1, r#"{"origin":"1000","n":"11"}"#),
+                (4, r#"{"origin":"1000","n":"14"}"#),
+            ],
+            &[
+                (0, r#"{"origin":"0","n":"10"}"#),
+                (6, r#"{"origin":"0","n":"16"}"#),
+            ],
+            &[
+                (2, r#"{"origin":"1","n":"12"}"#),
+                (5, r#"{"origin":"1","n":"15"}"#),
+                (7, r#"{"origin":"1","n":"17"}"#),
+            ],
+            &[(3, r#"{"origin":"2","n":"13"}"#)],
+        ];
+        let ledger = synced(&kernel);
+        for (i, feed) in FEEDS.iter().enumerate() {
+            let got: Vec<(u64, &str, &str)> = frames[i]
+                .iter()
+                .map(|f| (f.id, f.name, f.json.as_str()))
+                .collect();
+            let want: Vec<(u64, &str, &str)> = expected[i]
+                .iter()
+                .map(|&(id, json)| (id, "note", json))
+                .collect();
+            assert_eq!(got, want, "{}", feed.label());
+            let mut client = FeedClient::new(*feed);
+            client
+                .take_frames(&ledger, &frames[i])
+                .expect("the kernel's own delivery passes the oracle");
+            client
+                .drain(&ledger)
+                .expect("every delivered frame matches the store");
+            assert!(client.settled(&ledger), "{}", client.unsettled_report(&ledger));
+        }
+    }
+
+    /// The replay is evidence only if, under the product's own rule, it IS the
+    /// kernel's delivery, frame for frame, on every feed.
+    #[test]
+    fn replaying_the_tail_with_the_products_scope_rule_is_the_kernels_own_delivery() {
+        let (_sim, _kernel, rows, frames) = twin();
+        for (i, feed) in FEEDS.iter().enumerate() {
+            assert_eq!(
+                project(&replay_tail(&rows, *feed, scope_equal)),
+                project(&frames[i]),
+                "{}",
+                feed.label()
+            );
+        }
+    }
+```
+
+Run them:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test realtime -- tenancy_feeds::the_three_notes tenancy_feeds::each_feed tenancy_feeds::replaying_the_tail 2>&1 | tee $D/t13-step2.log | grep -E "^test |^test result"
+```
+
+Expected: `test result: ok. 3 passed`. Tasks 10 and 11 have landed, so these pins pass on arrival. Step 6's mutations M1–M7 prove each one red.
+
+Until Step 3 lands, rustc may warn about `Desk`, `tenancy_desk_note`, `two_tenant_types_app`, `DESK_FP` (outside the identity test), `tenants_admit_nothing`, `zero_is_no_tenant`, `scope_blind` and `replay_resume`. Step 3 uses each one. The gate in Step 8 is the one that must be warning-free.
+
+If a JSON literal differs, read why before changing it. `WireU64` serializes as a decimal string, and field order is declaration order (`origin`, then `n`). So a different literal means a different product, not a typo.
+
+- [ ] **Step 3: Write the named victims, the resume pins and the tenant-type pin**
+
+Inside `mod tenancy_feeds`, after Step 2's tests:
+
+```rust
+    // ---------------------------------------------------- the named victims
+
+    /// The text a terminal frame on a feed produces, spelled out.
+    fn reshaped_leak(feed: &str, id: u64, what: &str) -> String {
+        format!(
+            "tenancy leak: {feed} ended on charpente.reshaped at event id {id}, a note emitted \
+             {what} — every note this feed admits carries this feed's own shape, so a terminal \
+             frame here is a row outside this feed's tenancy that the platform admitted"
+        )
+    }
+
+    /// Victim: `admits` with its scope clause dropped. Every feed is named. A
+    /// cross-kind row ends the tail on a shape the feed does not carry, and a
+    /// same-kind row arrives as content whose payload names another shop. The
+    /// control is the product's rule on the same bytes.
+    #[test]
+    fn the_oracle_names_a_scope_blind_delivery_on_every_feed() {
+        let (_sim, kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let expected = [
+            (Feed::Global, reshaped_leak("the global feed", 0, "inside shop 0")),
+            (Feed::Shop(0), reshaped_leak("shop 0's feed", 1, "as a global event")),
+            (
+                Feed::Shop(1),
+                "tenancy leak: shop 1's feed received event id 0, a note emitted inside shop 0 \
+                 — a tenant's feed receives only its own tenant's scoped rows"
+                    .to_string(),
+            ),
+            (
+                Feed::Shop(2),
+                "tenancy leak: shop 2's feed received event id 0, a note emitted inside shop 0 \
+                 — a tenant's feed receives only its own tenant's scoped rows"
+                    .to_string(),
+            ),
+        ];
+        for (feed, text) in expected {
+            FeedClient::new(feed)
+                .take_frames(&ledger, &replay_tail(&rows, feed, scope_equal))
+                .expect("the control: the product's rule on these bytes passes");
+            let err = FeedClient::new(feed)
+                .take_frames(&ledger, &replay_tail(&rows, feed, scope_blind))
+                .expect_err("a scope-blind rule must fail the oracle");
+            assert_eq!(err, text);
+        }
+    }
+
+    /// Victim: a rule that reads tenant 0 as no tenant. It is named on exactly
+    /// the two feeds it touches. Shops 1 and 2 still pass on the same bytes, so
+    /// the oracle blames the confusion, not the workload.
+    #[test]
+    fn the_oracle_names_a_rule_that_reads_tenant_zero_as_no_tenant() {
+        let (_sim, kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let expected = [
+            (Feed::Global, Some(reshaped_leak("the global feed", 0, "inside shop 0"))),
+            (Feed::Shop(0), Some(reshaped_leak("shop 0's feed", 1, "as a global event"))),
+            (Feed::Shop(1), None),
+            (Feed::Shop(2), None),
+        ];
+        for (feed, text) in expected {
+            let verdict = FeedClient::new(feed)
+                .take_frames(&ledger, &replay_tail(&rows, feed, zero_is_no_tenant));
+            match text {
+                None => verdict.expect("a feed tenant 0 never reaches still passes"),
+                Some(text) => assert_eq!(verdict.expect_err("tenant 0 read as none"), text),
+            }
+        }
+    }
+
+    /// Victim, the fail-closed direction: tenant feeds admit nothing. Nothing
+    /// arrives, so the leak check cannot see it. Set equality's missing half
+    /// must, and it names the first row that never came.
+    #[test]
+    fn the_oracle_names_a_tenant_feed_that_receives_none_of_its_own_rows() {
+        let (_sim, kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let mut global = FeedClient::new(Feed::Global);
+        global
+            .take_frames(&ledger, &replay_tail(&rows, Feed::Global, tenants_admit_nothing))
+            .unwrap();
+        global.drain(&ledger).unwrap();
+        assert!(
+            global.settled(&ledger),
+            "the control: this rule leaves the global feed whole: {}",
+            global.unsettled_report(&ledger)
+        );
+        let frames = replay_tail(&rows, Feed::Shop(1), tenants_admit_nothing);
+        assert!(frames.is_empty(), "shop 1 receives nothing under this rule");
+        let mut shop = FeedClient::new(Feed::Shop(1));
+        shop.take_frames(&ledger, &frames).unwrap();
+        shop.drain(&ledger).unwrap();
+        assert!(!shop.settled(&ledger));
+        assert_eq!(
+            shop.unsettled_report(&ledger),
+            "shop 1's feed never caught up: ledger scanned below id 8, floor 0, 0 frame(s) \
+             unverified, first own row never delivered Some(2), cursor id None"
+        );
+    }
+
+    /// Victim: an interior skip. Shop 1's real frames, with id 5 removed, are
+    /// strictly increasing, and each one matches the store. Only membership
+    /// sees the hole; a high-water mark would not.
+    #[test]
+    fn the_oracle_names_an_interior_skip_on_a_shop_feed() {
+        let (_sim, kernel, _, frames) = twin();
+        let ledger = synced(&kernel);
+        let skipped: Vec<EventFrame> = frames[2].iter().filter(|f| f.id != 5).cloned().collect();
+        assert_eq!(skipped.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2, 7]);
+        let mut shop = FeedClient::new(Feed::Shop(1));
+        shop.take_frames(&ledger, &skipped)
+            .expect("each remaining frame is shop 1's own, in order");
+        shop.drain(&ledger)
+            .expect("each remaining frame matches the store");
+        assert_eq!(
+            shop.unsettled_report(&ledger),
+            "shop 1's feed never caught up: ledger scanned below id 8, floor 0, 0 frame(s) \
+             unverified, first own row never delivered Some(5), cursor id Some(7)"
+        );
+    }
+
+    /// Victim: a durable row that recorded the wrong tenant or the wrong
+    /// shape. The ledger arm names it at the row, whether or not any feed ever
+    /// read that row.
+    #[test]
+    fn the_oracle_names_a_row_that_recorded_the_wrong_tenant_or_shape() {
+        let (_sim, kernel, _, _) = twin();
+        let ledger = synced(&kernel);
+        for (id, noted) in &ledger.rows {
+            check_recorded(*id, noted)
+                .expect("the control: every twin row records its own tenant and shape");
+        }
+        let with = |id: u64, scope: Option<u64>, shape: Option<u64>| Noted {
+            scope,
+            shape,
+            ..ledger.rows[&id].clone()
+        };
+        let cases = [
+            (
+                2,
+                with(2, Some(2), Some(SHOP_FP)),
+                "event id 2 is a note emitted inside shop 1, but its durable EventRow.scope \
+                 reads Some(2), not Some(1) — the tenant did not survive commit, replay and \
+                 readback"
+                    .to_string(),
+            ),
+            (
+                0,
+                with(0, None, Some(SHOP_FP)),
+                "event id 0 is a note emitted inside shop 0, but its durable EventRow.scope \
+                 reads None, not Some(0) — the tenant did not survive commit, replay and \
+                 readback"
+                    .to_string(),
+            ),
+            (
+                1,
+                with(1, Some(0), Some(GLOBAL_FP)),
+                "event id 1 is a note emitted as a global event, but its durable \
+                 EventRow.scope reads Some(0), not None — the tenant did not survive commit, \
+                 replay and readback"
+                    .to_string(),
+            ),
+            (
+                1,
+                with(1, None, Some(SHOP_FP)),
+                format!(
+                    "event id 1 is a note emitted as a global event, but its recorded shape is \
+                     {SHOP_FP:#x}, not {GLOBAL_FP:#x} — a scoped event's fingerprint mixes its \
+                     tenant's NAME, a global one's does not"
+                ),
+            ),
+            (
+                5,
+                with(5, Some(1), None),
+                format!(
+                    "event id 5 is a note emitted inside shop 1, but its recorded shape is \
+                     none, not {SHOP_FP:#x} — a scoped event's fingerprint mixes its tenant's \
+                     NAME, a global one's does not"
+                ),
+            ),
+        ];
+        for (id, noted, text) in cases {
+            assert_eq!(check_recorded(id, &noted), Err(text));
+        }
+    }
+
+    /// The third property on the real kernel (A16). Four resumes are refused by
+    /// name and open no tail:
+    /// - from another shop's row;
+    /// - from a global row, on a shop feed;
+    /// - from a shop's row, on the global feed;
+    /// - from the global half of a mixed record, on another shop's feed.
+    /// A resume from the feed's own row is the control. The replay helper and
+    /// the oracle's verdict are checked against the kernel's own answers.
+    #[test]
+    fn a_resume_from_a_row_outside_the_feeds_tenancy_is_refused_by_name() {
+        let (sim, mut kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let probes = [
+            (Feed::Shop(1), 0usize),
+            (Feed::Shop(1), 1),
+            (Feed::Global, 3),
+            (Feed::Shop(0), 4),
+        ];
+        let mut requests: Vec<Request> = probes
+            .iter()
+            .map(|&(feed, index)| resume(feed, cursor_at(&rows, index)))
+            .collect();
+        requests.push(resume(Feed::Shop(1), cursor_at(&rows, 2)));
+        requests.push(resume(Feed::Global, cursor_at(&rows, 1)));
+        let (responses, sinks) = run_quiet(&mut kernel, &sim, requests);
+        assert_eq!(statuses(&responses), vec![409, 409, 409, 409, 200, 200]);
+        let recorded = responses.lock().unwrap().clone();
+        for (i, &(feed, index)) in probes.iter().enumerate() {
+            let cursor = cursor_at(&rows, index);
+            let text = error_text(&recorded[i].1);
+            assert_eq!(
+                text,
+                format!(
+                    "cursor {index}.{} sits on an event outside this feed's tenancy — a cursor \
+                     resumes only the feed that delivered it, and this feed never delivers that \
+                     event; re-sync current state through reads, then reconnect without a \
+                     cursor",
+                    rows[index].seq
+                ),
+                "{} from row {index}",
+                feed.label()
+            );
+            assert_eq!(tenancy_409(cursor), text, "the oracle's copy of A16's text");
+            assert_eq!(
+                replay_resume(&rows, feed, cursor, scope_equal),
+                Err((409, text.clone())),
+                "the replay agrees with the kernel"
+            );
+            let raw = String::from_utf8_lossy(&recorded[i].1).to_string();
+            let origin = ledger.rows[&cursor.id].origin;
+            assert_eq!(
+                probe_verdict(feed, cursor, origin, 409, &raw, &text, false),
+                Ok(ProbeAnswer::Refused)
+            );
+        }
+        assert_eq!(replay_resume(&rows, Feed::Shop(1), cursor_at(&rows, 2), scope_equal), Ok(3));
+        assert_eq!(replay_resume(&rows, Feed::Global, cursor_at(&rows, 1), scope_equal), Ok(2));
+        let handles = sinks.lock().unwrap();
+        assert_eq!(handles.len(), 2, "a refused resume opens no tail");
+        let ids = |h: &SimSinkHandle| h.frames().iter().map(|f| f.id).collect::<Vec<_>>();
+        assert_eq!(ids(&handles[0]), vec![5, 7], "shop 1 resumes past its own row 2");
+        assert_eq!(ids(&handles[1]), vec![4], "the global feed resumes past its own row 1");
+    }
+
+    /// Victim: A16's check made scope-blind.
+    /// - From another shop's row, which carries this feed's shape, the resume
+    ///   is accepted.
+    /// - From a global row, it is refused under the wrong name, as reshaped.
+    /// The oracle names both. The product's rule is the control.
+    #[test]
+    fn the_oracle_names_a_resume_a_scope_blind_check_lets_through() {
+        let (_sim, _kernel, rows, _) = twin();
+        let (same, other) = (cursor_at(&rows, 0), cursor_at(&rows, 1));
+        for (cursor, origin) in [(same, 0), (other, GLOBAL_ORIGIN)] {
+            let (status, text) = replay_resume(&rows, Feed::Shop(1), cursor, scope_equal)
+                .expect_err("the control: the product's rule refuses it");
+            assert_eq!(
+                probe_verdict(Feed::Shop(1), cursor, origin, status, &text, &text, false),
+                Ok(ProbeAnswer::Refused)
+            );
+        }
+        assert_eq!(replay_resume(&rows, Feed::Shop(1), same, scope_blind), Ok(1));
+        assert_eq!(
+            probe_verdict(Feed::Shop(1), same, 0, 200, "", "", false),
+            Err(format!(
+                "shop 1's feed resumed from cursor 0.{} — event id 0, a note emitted inside shop \
+                 0 — and was accepted: a cursor on a row outside this feed's tenancy is refused \
+                 by name, never resumed past",
+                rows[0].seq
+            ))
+        );
+        let reshaped = reshaped_409(&rows[1], SHOP_FP);
+        assert_eq!(
+            replay_resume(&rows, Feed::Shop(1), other, scope_blind),
+            Err((409, reshaped.clone()))
+        );
+        assert_eq!(
+            probe_verdict(Feed::Shop(1), other, GLOBAL_ORIGIN, 409, &reshaped, &reshaped, false),
+            Err(format!(
+                "shop 1's feed resumed from cursor 1.{} — event id 1, a note emitted as a global \
+                 event — and was answered 409: {reshaped} — a cursor on a row outside this \
+                 feed's tenancy is refused as outside it, by that name and no other",
+                rows[1].seq
+            ))
+        );
+    }
+
+    /// Two tenant types share raw id 1 and the NAME `note`. The fingerprint
+    /// mixes each type's `NAME` (spec §6: "a row emitted under the other type
+    /// is a foreign shape"). So a `Shop(1)` feed:
+    /// - never decodes `Desk(1)`'s note: its tail ends on `charpente.reshaped`
+    ///   at that row;
+    /// - refuses a resume from that row as reshaped.
+    /// Both rows record the same raw scope. Nothing but the fingerprint tells
+    /// them apart.
+    #[test]
+    fn a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape() {
+        let sim = Sim::with_faults(0x5C0B_DE51, FaultConfig::none());
+        let mut kernel =
+            Kernel::new(two_tenant_types_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+        let emit = |route: &str, n: u64| {
+            Request::new(Method::Post, route).json(&TenancyEmit {
+                shop: WireU64(1),
+                n: WireU64(n),
+            })
+        };
+        let (responses, sinks) = run_quiet(
+            &mut kernel,
+            &sim,
+            vec![
+                Request::new(Method::Get, Feed::Shop(1).path()),
+                emit("/tenancy/note", 20),
+                emit("/tenancy/desk-note", 21),
+                emit("/tenancy/note", 22),
+            ],
+        );
+        assert_eq!(statuses(&responses), vec![200; 4]);
+        let rows: Vec<EventRow> = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan_from(0, 8)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|r| r.scope).collect::<Vec<_>>(),
+            vec![Some(1); 3],
+            "Shop(1) and Desk(1) record the same raw tenant id"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.shape).collect::<Vec<_>>(),
+            vec![Some(SHOP_FP), Some(DESK_FP), Some(SHOP_FP)]
+        );
+        assert_eq!(
+            frames_of(&sinks.lock().unwrap()[0]),
+            vec![
+                (
+                    0,
+                    rows[0].seq,
+                    "note".to_string(),
+                    r#"{"origin":"1","n":"20"}"#.to_string()
+                ),
+                reshaped_frame(&rows[1]),
+            ],
+            "shop 1's feed gets its own note, then ends at desk 1's, never decoding it"
+        );
+        let (responses, sinks) = run_quiet(
+            &mut kernel,
+            &sim,
+            [1, 0, 2]
+                .into_iter()
+                .map(|index| resume(Feed::Shop(1), cursor_at(&rows, index)))
+                .collect(),
+        );
+        assert_eq!(statuses(&responses), vec![409, 200, 200]);
+        assert_eq!(
+            error_text(&responses.lock().unwrap()[0].1),
+            reshaped_409(&rows[1], SHOP_FP)
+        );
+        let handles = sinks.lock().unwrap();
+        assert_eq!(frames_of(&handles[0]), vec![reshaped_frame(&rows[1])]);
+        assert_eq!(frames_of(&handles[1]), vec![]);
+    }
+```
+
+Overlap with earlier tasks. Two pins here sit beside pins Tasks 10 and 11 add on their own
+`Org` fixture:
+- `a_cursor_from_another_tenancy_is_refused_not_resumed` (Task 10);
+- `a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered` (Task 11).
+
+This module's two pins stay anyway. They tie the oracle's own helpers (`tenancy_409`,
+`replay_resume`, `probe_verdict`) to the kernel's answers on the oracle's own fixture, and the
+tenant-type pin also covers the resume half. If a helper drifts from the kernel, these fail;
+the earlier tasks' pins cannot.
+
+Run the victims and pins:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test realtime -- tenancy_feeds:: --skip every_feed_receives --skip replays_identically 2>&1 | tee $D/t13-step3.log | grep -E "^test |^test result"
+```
+
+Expected: `test result: ok. 11 passed`. That is Step 2's three, plus six `the_oracle_names_…`
+victims, plus the two resume and tenant-type pins.
+
+A victim that passes proves nothing on its own: it asserts the oracle's Err. So quote, in the
+report, one victim's text as the test saw it:
+`cargo test -p charpente --test realtime -- tenancy_feeds::the_oracle_names_a_scope_blind_delivery_on_every_feed --nocapture`
+prints nothing on success. To see the text, temporarily change that test's `Feed::Shop(2)`
+expectation string by one character, run it, and quote the `left`/`right` panic. Then revert
+the test, and check that `git diff --stat` shows only `realtime.rs` with Step 1–3's additions.
+
+- [ ] **Step 4: Run the property at its base, time it, and set N**
+
+Time in CPU time, not wall clock: the laptop may sleep mid-run, and wall clock cannot detect
+that. Time the flagship the same way beside it:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test realtime --no-run
+/usr/bin/time -p cargo test -p charpente --test realtime -- tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix --exact --nocapture 2>&1 | tee $D/t13-swarm-128.log | grep -E "^test result|reached a verdict|^user|^sys"
+/usr/bin/time -p cargo test -p charpente --test realtime -- reconnecting_client_misses_nothing_under_the_fault_matrix --exact 2>&1 | tee $D/t13-flagship-timing.log | grep -E "^test result|^user|^sys"
+```
+
+Expected:
+- `test result: ok. 1 passed` for both.
+- The new property prints `charpente-sim [realtime]: N of 128 universes reached a verdict, K
+  gave up`.
+- Every floor is still `1` here, so the batch checks `require:` and nothing more.
+
+The rule for N:
+- Keep 128, the realtime properties' standard, if the new batch's user+sys time is at most
+  twice the flagship's.
+- Otherwise use 64. Never go below 64. If 64 is still over twice, stop and report: the fix is
+  a lighter round (fewer emits, or fewer probes), not fewer universes.
+- If K is above one universe in ten, stop and report it with the count. A property that
+  mostly gives up adjudicates little, and the fix belongs to the controller (the workload or
+  the budget), not to this step.
+
+Record both timings, K and the chosen N in `$D/progress.md`. If N changes, edit the one
+literal `128` in the swarm invocation.
+
+If a `require:` key does not fire, the batch fails. The fix is the workload, never the key
+list. Print which key did not fire, and how often each fired, from the coverage block in the
+log.
+
+If a universe fails, stop. Paste the printed `CHARPENTE_SEED=… cargo test …` line into the
+report, replay it with `--nocapture`, and quote which oracle message fired.
+- A "tenancy leak", or an `EventRow.scope` / shape message, is a bug in Tasks 10–12: a finding
+  for the controller.
+- Any other message: read the universe's fault schedule before deciding whether the oracle or
+  the platform is wrong. Report both readings.
+- Do not loosen the oracle, and do not add a give-up to make a failure go away. A give-up is
+  for a universe that adjudicated nothing, never for one that adjudicated wrongly.
+
+- [ ] **Step 5: Measure the floors, twice, and write them**
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+for run in 1 2; do
+  cargo test -p charpente --test realtime -- tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix --exact --nocapture 2>&1 | tee $D/t13-floors-$run.log | grep -E "^test result|reached a verdict"
+done
+```
+
+Then write each floor as the exact count the two batches agree on. The script refuses if the
+batches differ in any key, the universe count or the verdict line:
+
+```zsh
+python3 - <<'EOF'
+import pathlib, re
+D = pathlib.Path('.superpowers/sdd/2026-09-30-tenancy-completion')
+R = pathlib.Path('crates/charpente/tests/realtime.rs')
+FLOORS = {
+    'TENANCY_EVERY_SHOP_FLOOR': 'tenancy:every-shop-delivered',
+    'TENANCY_GLOBAL_DELIVERED_FLOOR': 'tenancy:global-delivered',
+    'TENANCY_GLOBAL_PASSED_FLOOR': 'tenancy:global-passed-a-scoped-row',
+    'TENANCY_SHOP_PASSED_SHOP_FLOOR': 'tenancy:shop-passed-another-shops-row',
+    'TENANCY_SHOP_PASSED_GLOBAL_FLOOR': 'tenancy:shop-passed-a-global-row',
+    'TENANCY_REFUSED_SAME_KIND_FLOOR': 'tenancy:resume-refused-on-another-shops-row',
+    'TENANCY_REFUSED_OTHER_KIND_FLOOR': 'tenancy:resume-refused-on-the-other-kinds-row',
+    'TENANCY_RESUME_BACKLOG_FLOOR': 'realtime:resume-backlog',
+}
+def batch(log):
+    text = (D / log).read_text()
+    block = re.search(r'coverage over (\d+) universes:\n((?:  \S+: \d+\n)+)', text)
+    assert block, f'{log}: no coverage block'
+    counts = {k: int(v) for k, v in re.findall(r'^  (\S+): (\d+)$', block.group(2), re.M)}
+    verdict = re.search(r'\d+ of \d+ universes reached a verdict, \d+ gave up', text)
+    assert verdict, f'{log}: no verdict line'
+    return block.group(1), counts, verdict.group(0)
+first, second = batch('t13-floors-1.log'), batch('t13-floors-2.log')
+assert first == second, f'the two batches disagree:\n{first}\n{second}'
+universes, counts, verdict = first
+src = R.read_text()
+for const, key in FLOORS.items():
+    count = counts.get(key, 0)
+    assert count > 0, f'{key} never fired: the require list should have failed the batch'
+    old = f'    const {const}: u64 = 1;\n'
+    assert src.count(old) == 1, f'{const}: expected exactly one "= 1" definition'
+    src = src.replace(old, f'    const {const}: u64 = {count};\n')
+    print(f'{const} = {count}  ({key})')
+R.write_text(src)
+print(f'universes {universes}; {verdict}; universe:gave-up {counts.get("universe:gave-up", 0)}')
+EOF
+grep -n "const TENANCY_.*_FLOOR: u64 = 1;" crates/charpente/tests/realtime.rs
+```
+
+Expected:
+- Eight `CONST = count` lines, then the verdict line.
+- The final grep prints nothing (it exits 1): no floor is left at `1`, unless a key truly
+  measured exactly 1. The script's own line shows which is the case.
+
+If Step 0 found a `ceiling:` arm, add `universe:gave-up` to the invocation at the gave-up count
+this script printed, in the syntax S3's `ceiling:` doc shows. Then re-run the batch once:
+
+```zsh
+cargo test -p charpente --test realtime -- tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix --exact --nocapture 2>&1 | tee $D/t13-floors-3.log | grep -E "^test result|reached a verdict"
+```
+
+Expected: `test result: ok. 1 passed`, with the same verdict line. Put the eight counts in the
+report and in `$D/progress.md`. Task 14's LEDGER entry quotes them.
+
+- [ ] **Step 6: Fresh bases**
+
+Re-base the property on fresh seeds. There `require:` and `floor:` are skipped by design, so
+each run is a correctness sweep only:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+for base in 0x5C0B_A001 0x5C0B_B002 0x5C0B_C003; do
+  CHARPENTE_BASE_SEED=$base cargo test -p charpente --test realtime -- tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix --exact --nocapture 2>&1 | tee $D/t13-fresh-$base.log | grep -E "^test result|reached a verdict|CHARPENTE_SEED"
+done
+```
+
+Expected: three `test result: ok. 1 passed` lines, each with its verdict line: 3N fresh
+universes in all. A failing universe follows Step 4's procedure. A seed that exposes a real
+bug is pinned as a regression test, with its reason asserted, before anything else.
+
+- [ ] **Step 7: Gate and commit**
+
+Foreground, per package:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo fmt --all --check; echo "fmt exit $?"
+cargo clippy -p charpente --all-targets -- -D warnings 2>&1 | tee $D/clippy-task-13.log; echo "clippy exit ${pipestatus[1]}"
+cargo test -p charpente --test realtime --no-fail-fast 2>&1 | tee $D/gate-task-13.log; echo "test exit ${pipestatus[1]}"
+grep -c "^test result:" $D/gate-task-13.log; grep -c "^test result: ok" $D/gate-task-13.log
+```
+
+Expected: `fmt exit 0`, `clippy exit 0`, `test exit 0`, then `1` and `1`. The workspace count
+does not move: every test lands in the existing `realtime` target.
+
+If the `realtime` run nears the 600 s tool ceiling, split it rather than backgrounding it:
+- `-- tenancy_feeds::` to `$D/gate-task-13a.log`;
+- `-- --skip tenancy_feeds::` to `$D/gate-task-13b.log`.
+
+Count `test result: ok` across both logs: 2 of 2.
+
+Re-check `git status` and `git log -1`: another session may have committed. Then:
+
+```zsh
+git status --short
+git add crates/charpente/tests/realtime.rs
+git commit -m "test(tenancy): realtime tenancy under the fault matrix — a global feed receives no scoped row, a shop's feed exactly its own rows, and a resume from outside a feed's tenancy is refused by name (base 0x5C0B_0001, N universes, K gave up; floors F; 3N fresh over 0x5C0B_A001/B002/C003); six named victims, the replay-faithfulness check, and the tenant-zero and two-tenant-type pins"
+```
+
+Fill in the message's slots with measured values:
+- N: the chosen universe count.
+- K: the gave-up count from Step 5.
+- F: the eight floor counts as `key=count`.
+- 3N: the fresh total.
+
+No other file may be staged.
+
+- [ ] **Step 8: Prove the property has teeth, by product mutation, on the committed tree**
+
+The test is committed, so a mutation abandoned mid-run cannot pass for working code. Each
+mutation below edits one production file that Tasks 10–12 wrote; re-locate each by its
+symbol. Apply one mutation at a time, run the module, and quote the failing test names with
+the oracle's message. Revert with `git checkout -- <that file>`, then confirm
+`git status --short` is empty before the next one.
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+k=M1   # the mutation's number from the table
+cargo test -p charpente --test realtime -- tenancy_feeds:: 2>&1 | tee $D/t13-$k.log | grep -E "^test .*FAILED|panicked|tenancy leak|EventRow.scope|recorded shape|was accepted|answered|^test result"
+```
+
+| # | File, symbol | Mutation | Must go red, and say |
+|---|---|---|---|
+| M1 | `crates/charpente/src/http/mod.rs`, `Subscription::admits` | its scope clause (`scope == self.scope`) → `true` | `each_feed_receives_exactly_its_own_notes_on_a_fault_free_node` (the global feed's frames are a reshaped frame at id 0), `replaying_the_tail_…` (the kernel no longer equals the product-rule replay), and the swarm with `tenancy leak: …` |
+| M2 | `crates/charpente/src/kernel/tail.rs`, `deliver_unit` | the `admits` call's scope argument `row.scope` → `tail.sub.scope` (the subscription's own tenant, so the clause always holds) | the same three as M1. This shows the delivery call site reads the row's scope |
+| M3 | `crates/charpente/src/kernel/mod.rs`, `validate_subscribe` | delete A16's tenancy refusal (the `row.scope != sub.scope` block) | `a_resume_from_a_row_outside_the_feeds_tenancy_is_refused_by_name` (statuses become `[200; 6]`), and the swarm with `… and was accepted: a cursor on a row outside this feed's tenancy is refused by name, never resumed past` |
+| M4 | `crates/charpente-core/src/db.rs`, `ScopedTx::emit` | record `scope: None` in place of the tenant's id | the twin tests at `synced` (`event id 0 is a note emitted inside shop 0, but its durable EventRow.scope reads None, not Some(0) — …`) and the swarm with the same arm |
+| M5 | same | record `scope: Some(0)` for every tenant | `event id 2 is a note emitted inside shop 1, but its durable EventRow.scope reads Some(0), not Some(1) — …`, and the swarm |
+| M6 | `crates/charpente-core/src/event.rs`, `EventRow`'s `Codec::decode` | read the trailing scope as it does, then bind `scope: None` | the ledger arm on readback (`… reads None, not Some(0) — the tenant did not survive commit, replay and readback`) |
+| M7 | `crates/charpente-core/src/db.rs`, the record encoder's emit arm (Task 10's `0x0b` choice) | add the guard `if s != 0` where the arm matches `Some(s)` to write `0x0b`, so tenant 0 is written as a global `0x09` record | `each_feed_…` at `synced`: `event id 0 is a note emitted inside shop 0, but its durable EventRow.scope reads None, not Some(0) — …` |
+| M8 | Task 11's scoped-fingerprint emission (`tenant_name`, A7) | pass `""` in place of `S::NAME` | `the_three_notes_share_a_name_and_differ_only_in_tenancy` (`SHOP_FP == DESK_FP`) and `a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape` (shop 1's feed decodes desk 1's note) |
+
+One case needs more than a green or red reading.
+- **A green run under any mutation is ambiguous.** The test may be vacuous, or the mutation
+  inert. Print what the mutated build did before concluding either. Add a temporary
+  `eprintln!("{:?}", rows.iter().map(|r| (r.id.raw(), r.scope, r.shape)).collect::<Vec<_>>())`
+  to `twin()`, run `each_feed_…` with `--nocapture`, quote the output, and revert.
+
+Finally, confirm the tree is exactly the commit:
+
+```zsh
+git status --short; git diff HEAD --stat; git log -1 --format=%h
+```
+
+Expected: empty, empty, and Step 7's commit. Record M1–M8's results, each with its failing
+test names and quoted message, in `$D/progress.md`. Task 14 carries them into the LEDGER.
+
+---
+
+### Task 14: Close-out — DECISIONS:328, the docs sweep, the mutation run, hand inversions, fresh seeds, the counted gate, the record
+
+**Files:**
+- Modify:
+  - `DECISIONS.md`: §12's "What an app is told, and where" paragraph (lines 325–333 at
+    e749823).
+  - `README.md`:
+    - the "What it looks like" snippet gains the event's declaration;
+    - two sentences name events beside routes, tables and jobs (spec §10: "README, if it names
+      … the tenancy limits").
+  - Any doc or doc comment the sweep (Step 2) finds stale. Each fix is a miss by the task that
+    owns the phrase, fixed with that task's specified text and recorded in the LEDGER as a
+    finding against it.
+  - `PLAN.md`:
+    - M3 sub-project 3's closing sentence;
+    - M2's two present-tense event-key sentences, if Tasks 10–11 left them;
+    - the After-launch header, paragraph and table.
+  - `docs/superpowers/specs/2026-09-30-tenancy-completion-design.md`: the Status line.
+  - `docs/LEDGER.md`: a new entry.
+- Test files only if Step 3 finds a MISSED mutant: write the property that kills it, in the
+  owning task's suite, and commit it on its own.
+- `.cargo/mutants.toml` and `crates/guide-examples/tests/mutants_exclusions.rs` do not change.
+  No exclusion may be added.
+
+**Interfaces:**
+- Consumes:
+  - Tasks 1–13 as landed.
+  - The plan's base commit, which Task 1 Step 1 wrote into `$D/progress.md`.
+  - Task 1's workspace `test result:` baseline.
+  - Task 13's base, N, gave-up count, floors, fresh total, and its M1–M8 results.
+- Produces:
+  - DECISIONS §12's corrected remedy.
+  - A stale-phrase sweep with zero hits.
+  - The mutation table.
+  - The hand-inversion table.
+  - The fresh-seed totals.
+  - The counted gate.
+  - The record: PLAN, the spec's Status, the LEDGER entry, and memory.
+
+`D=.superpowers/sdd/2026-09-30-tenancy-completion` in every command below.
+
+- [ ] **Step 1: DECISIONS.md:328 — the fan-out, and the tenant type's name (spec §7 item 7)**
+
+The decision does not change; its wording does. At e749823 the paragraph says the job "runs in
+the tenant its enqueuer opened". Two things are missing from it:
+- the declared fan-out, `Tx::enqueue_in`;
+- any statement of how a job's tenant *type* is identified across two binaries.
+
+LEDGER 2026-09-30 item 7 calls the second "the cross-binary residual". The text at e749823 has
+no residual sentence to replace, so this step adds a pointer to the mechanism that now answers
+it: spec §2 ruling 2 and §4, the declared `Tenant::NAME` inside the fingerprint. The note
+follows the paragraph's existing *(Corrected …)* style, and is dated by the commit that makes
+it:
+
+```zsh
+python3 - <<'EOF'
+import datetime, pathlib
+p = pathlib.Path('DECISIONS.md')
+s = p.read_text()
+old = """job declares `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened; operator
+code that must act inside one tenant — seeding, a test oracle — opens it with a
+`TenantAdmission` minted from a `Group`, the seal `CrossTenant` already carries, which is the
+operator's standing made explicit rather than an exception to the guarantee. *(Corrected
+2026-09-27, job-tenancy spec: the earlier remedy named a `Ctx` that no code outside a handler
+holds.)*"""
+date = datetime.date.today().isoformat()
+new = f"""job declares `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened, or that its
+fan-out named. Which tenant *type* that is travels inside the job's fingerprint as the type's
+declared `Tenant::NAME`: a binary that mounts the job under a tenant type of another `NAME`
+meets the foreign-shape refusal at startup, by name, and two binaries whose tenant types share
+a `NAME` share a tenant by declaration, as two structs sharing a `TABLE` share a table
+(tenancy-completion spec §2 ruling 2, §4). Operator code that must act inside one tenant —
+seeding, a test oracle — opens it with a `TenantAdmission` minted from a `Group`, the seal
+`CrossTenant` already carries, which is the operator's standing made explicit rather than an
+exception to the guarantee. *(Corrected 2026-09-27, job-tenancy spec: the earlier remedy named
+a `Ctx` that no code outside a handler holds.)* *(Corrected {date}, tenancy-completion spec §7
+item 7: the remedy named only the tenant the enqueuer opened, leaving out a declared fan-out's
+`Tx::enqueue_in`, and did not say how a job's tenant type is identified across two binaries.
+The decision is unchanged.)*"""
+assert s.count(old) == 1, 'DECISIONS §12 paragraph not found verbatim: read it before editing by hand'
+p.write_text(s.replace(old, new))
+print(f'DECISIONS §12 corrected, dated {date}')
+EOF
+grep -c "or that its\$" DECISIONS.md; grep -c "tenancy-completion spec §7" DECISIONS.md; grep -c "runs in the tenant its enqueuer opened;" DECISIONS.md
+```
+
+Expected:
+- The script prints its date. Its assert fires only if an earlier task edited this paragraph;
+  then read the paragraph and apply the same two changes by hand.
+- The three greps print `1`, `1` and `0`.
+
+Before writing, check the sentence against the code: the refusal it cites must exist.
+`grep -n "or its tenant type's" crates/charpente-core/src/*.rs crates/charpente/src/**/*.rs`
+must find Task 4's added cause in the foreign-shape refusal (spec §4: "Its text gains the
+cause 'or its tenant type's `NAME`'"). If it finds nothing, stop: the sentence would describe a
+refusal that does not exist.
+
+- [ ] **Step 2: README's example declares its event's tenant, and the stale-phrase sweep**
+
+README is prose and is not compiled. `claims_census` reads its figures, and dates are
+structural there, so the date below is not a claim.
+
+```zsh
+python3 - <<'EOF'
+import datetime, pathlib
+p = pathlib.Path('README.md')
+s = p.read_text()
+date = datetime.date.today().isoformat()
+edits = [
+    ("""#[job(scoped_by = Org)]
+struct SendReceipt {
+    invoice: Id<Invoice>,
+}
+""", """#[job(scoped_by = Org)]
+struct SendReceipt {
+    invoice: Id<Invoice>,
+}
+
+#[event(scoped_by = Org)]
+struct InvoiceFinalized {
+    invoice: Id<Invoice>,
+}
+"""),
+    ("""    tx.emit(InvoiceFinalized { invoice: id }); // realtime event, same transaction
+""", """    tx.emit(InvoiceFinalized { invoice: id }); // realtime event, same transaction; only this org's feeds see it
+"""),
+    ("""says `auth`, the table says which tenant owns its rows, the job says it acts inside that
+tenant, and a route, table or job that says none of this does not compile.""",
+     """says `auth`, the table says which tenant owns its rows, the job says it acts inside that
+tenant, the event says whose feeds receive it, and a route, table, job or event that says
+none of this does not compile."""),
+    ("""a route says `auth`, `public` or `public(Org)`, a table and a
+job say `scoped_by` or `global`, and none is a default.""",
+     f"""a route says `auth`, `public` or `public(Org)`, a table, a
+job and (since {date}) an event say `scoped_by` or `global`, and none is a default."""),
+]
+for old, new in edits:
+    assert s.count(old) == 1, f'README text not found verbatim:\n{old}'
+    s = s.replace(old, new)
+p.write_text(s)
+print('README: 4 edits')
+EOF
+```
+
+Then sweep. The script normalizes every tracked file in scope before searching:
+- it strips comment markers and string-continuation backslashes;
+- it joins wrapped lines;
+- it drops backticks and asterisks;
+- it collapses whitespace and lowercases.
+
+So a phrase wrapped across a line, inside a doc comment or inside a string literal is still
+one phrase.
+
+Scope: `crates/**` and `examples/**` (`.rs`, `.md`, `.stderr`, `.ts`, `.toml`), plus every
+tracked Markdown file except these, which are records of history:
+- `docs/LEDGER.md`;
+- `docs/superpowers/**` and `docs/experiments/**`;
+- `PLAN.md` (Step 7 handles its two history-bearing sentences).
+
+Every phrase must count zero. Current docs say what the code does, and history lives in the
+LEDGER. A negative mention ("never the last segment") counts as a hit too: rephrase it so the
+dead mechanism is not named.
+
+```zsh
+python3 - <<'EOF'
+import pathlib, re, subprocess, sys
+
+SUFFIXES = ('.rs', '.md', '.stderr', '.ts', '.toml')
+EXCLUDED = ('docs/LEDGER.md', 'PLAN.md')
+EXCLUDED_DIRS = ('docs/superpowers/', 'docs/experiments/')
+
+def in_scope(path):
+    if not path.endswith(SUFFIXES) or path in EXCLUDED or path.startswith(EXCLUDED_DIRS):
+        return False
+    if '/target/' in path or 'node_modules' in path:
+        return False
+    return path.startswith(('crates/', 'examples/')) or path.endswith('.md')
+
+files = [p for p in subprocess.run(['git', 'ls-files'], capture_output=True, text=True,
+                                    check=True).stdout.split('\n') if p and in_scope(p)]
+
+COMMENT = re.compile(r'^\s*(///|//!|//)\s?')
+def normalized(text):
+    lines = []
+    for line in text.split('\n'):
+        line = COMMENT.sub('', line).strip()
+        if line.endswith('\\'):
+            line = line[:-1]
+        lines.append(line)
+    joined = ' '.join(lines).replace('`', '').replace('*', '')
+    return re.sub(r'\s+', ' ', joined).lower()
+
+# phrase (normalized) -> the task whose docs step owns it
+PHRASES = {
+    'event_key': 'Task 10',
+    'keyed with the scope': 'Task 10',
+    'keyed by this tenant': 'Task 10',
+    "scope's decimal id": 'Tasks 10-11',
+    "scope's own key": 'Task 10',
+    'per scope type as well': 'Tasks 10-11',
+    'share a key': 'Tasks 10-11',
+    'share a subscription key': 'Tasks 10-11',
+    'scope a tenant feed by emitting': 'Task 10',
+    'is emit_keyed with': 'Task 10',
+    "with the scope's key": 'Task 10',
+    'must filter by its own scope': 'Task 9',
+    'a route that exposes either table': 'Task 9',
+    "the platform's own tables are not scoped": 'Task 9',
+    "nor does it cover the platform's own tables": 'Task 9',
+    'cloning widens nothing': 'Task 7',
+    'copy widens nothing': 'Task 7',
+    'keyed is always false': 'Task 12',
+    'eventinfo.keyed': 'Task 12',
+    'keyed: bool': 'Task 12',
+    'keyed: false': 'Task 12',
+    'keyed: e.keyed': 'Task 12',
+    'keyed={}': 'Task 12',
+    '"keyed"': 'Task 12',
+    'proto_version is 4': 'Task 10',
+    'proto_version: u8 = 4': 'Task 10',
+    'last path segment': 'Task 2',
+    'last segment': 'Task 2',
+    'as spelled': 'Task 4',
+    'keeps its spelling': 'Task 4',
+    'a route, table or job that says none of this': 'Task 14 Step 2',
+    'a table and a job say scoped_by or global': 'Task 14 Step 2',
+}
+
+texts = {p: pathlib.Path(p).read_text() for p in files}
+norm = {p: normalized(t) for p, t in texts.items()}
+bad = 0
+for phrase, owner in PHRASES.items():
+    hits = [(p, n.count(phrase)) for p, n in norm.items() if phrase in n]
+    total = sum(c for _, c in hits)
+    bad += total
+    print(f'{total:3d}  {phrase!r}  [{owner}]  ' + ', '.join(f'{p}:{c}' for p, c in hits))
+
+def count(path, pattern):
+    return len(re.findall(pattern, texts.get(path, pathlib.Path(path).read_text())))
+
+checks = []
+# A bare #[event] attribute outside the fixture that pins its refusal (Task 11).
+bare = sum(len(re.findall(r'(?m)^\s*#\[event\]\s*$', t)) for p, t in texts.items()
+           if p.endswith('.rs') and not p.startswith('crates/charpente-macros/tests/compile_fail/'))
+guide_rust = '\n'.join(re.findall(r'```rust\n(.*?)```', texts['docs/GUIDE.md'], re.S))
+bare += len(re.findall(r'(?m)^\s*#\[event\]\s*$', guide_rust))
+checks.append(('bare #[event] outside the refusal fixture [Tasks 1, 11]', bare, 0))
+checks.append(('derive(Clone) on CrossTenant / TenantAdmission [Task 7]',
+               count('crates/charpente-core/src/db.rs',
+                     r'#\[derive\([^)]*\bClone\b[^)]*\)\]\s*(?:#\[[^\]]*\]\s*)*pub struct (?:CrossTenant|TenantAdmission)\b'), 0))
+checks.append(('fn scope_name( in charpente-macros [Task 2]',
+               sum(t.count('fn scope_name(') for p, t in texts.items()
+                   if p.startswith('crates/charpente-macros/src/')), 0))
+checks.append(('rsplit("::") in db.rs and app.rs [Task 2]',
+               count('crates/charpente-core/src/db.rs', r'rsplit\("::"\)')
+               + count('crates/charpente/src/http/app.rs', r'rsplit\("::"\)'), 0))
+checks.append(('PROTO_VERSION = 5 [Task 10]',
+               count('crates/charpente/src/repl/mod.rs', r'pub const PROTO_VERSION: u8 = 5;'), 1))
+checks.append(('EventInfo.scoped_by [Task 12]',
+               count('crates/charpente/src/describe.rs',
+                     r"pub struct EventInfo\s*\{[^}]*\bscoped_by: Option<&'static str>"), 1))
+for name, got, want in checks:
+    print(f'{got:3d}  {name}  (want {want})')
+    if got != want:
+        bad += 1
+print(f'{len(files)} files swept; {len(PHRASES)} phrases; {len(checks)} checks')
+sys.exit(1 if bad else 0)
+EOF
+echo "sweep exit $?"
+```
+
+Expected:
+- every phrase line reads `0`;
+- the six checks read `0 0 0 0 1 1`, each matching its `want`;
+- `sweep exit 0`.
+
+This script was run read-only at e749823. Its phrase half counted 97 hits across 23 files, and
+its six checks read `34 2 1 2 0 0`. That run is the evidence that each phrase, and each
+check's pattern, detects the state it exists to catch.
+
+On a non-zero line:
+- The hit is a doc Tasks 2–12 missed. Its owner is in brackets.
+- Fix it with the text that task's docs step specifies. Where that task gave no text for this
+  file, rewrite the sentence to say what the code now does, without the phrase.
+- A hit inside code (a `keyed` field, an `rsplit`, a `derive(Clone)`) is not a doc miss. It is
+  the owning task's change left undone. Stop and report it to the controller; do not finish
+  another task's code change here.
+- Re-run until `sweep exit 0`, and list every fix, with its owner, for the LEDGER.
+
+Then the guide gates, because GUIDE and README may have moved:
+
+```zsh
+cargo build -p guide-examples 2>&1 | tee $D/t14-guide-build.log; echo "build exit ${pipestatus[1]}"
+cargo test -p guide-examples --no-fail-fast 2>&1 | tee $D/t14-guide-tests.log; echo "test exit ${pipestatus[1]}"
+grep -c "^test result:" $D/t14-guide-tests.log; grep -c "^test result: ok" $D/t14-guide-tests.log
+```
+
+Expected:
+- `build exit 0` and `test exit 0`, with the two counts equal. The suites are `claims_census`
+  (README's figures), `doc_truth` (pinned blocks), `doc_inventory`, `describe_contract`,
+  `hook_census` and `mutants_exclusions`.
+- If `doc_truth` counts fewer pinned blocks than its `PINNED_FLOOR`, a sweep fix removed a
+  pinned block. Restore it, and rephrase outside the block.
+
+Commit the docs before the mutation run, so the run mutates a committed tree:
+
+```zsh
+git status --short
+git add DECISIONS.md README.md
+git commit -m "docs(tenancy-completion): DECISIONS §12's remedy names the fan-out and the tenant NAME (corrected, decision unchanged); README's example declares its event's tenant; the stale-phrase sweep reads zero (P phrases, 6 checks, F docs fixed that Tasks 2–12 missed)"
+```
+
+Replace P with the phrase count the script printed, and F with the number of fixes. If F > 0,
+add each fixed file to the `git add` line by name. No file outside the fixes may be staged.
+
+- [ ] **Step 3: The mutation run (spec §9: "0 unresolved MISSED beyond the argued-equivalent list")**
+
+`git status --short` must be empty. First fix the base, and check it:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+T1=$(git log -1 --format=%H --grep='^feat(tenancy-completion): #\[event(global)\]')
+BASE=$(git rev-parse --verify "$T1^")
+print -r -- "base $BASE"; grep -n -i "base" $D/progress.md | head -5
+git merge-base --is-ancestor $BASE HEAD && git log --oneline $BASE..HEAD | wc -l
+```
+
+`BASE` is the parent of Task 1's commit, found by the subject Task 1's commit step uses. The
+`grep` shows the base Task 1 Step 1 wrote into `progress.md`, and the two must name the same
+commit. If they differ, or `T1` is empty, stop and ask the controller. Never set it from
+memory.
+
+Expected: a count of S1's commits. That is the thirteen task commits and Task 14's docs
+commit, plus any killer-test or fix commit.
+
+**Completeness first.** Every mutant cargo-mutants can place in a line S1 changed must fall
+inside some target below:
+
+```zsh
+unset CARGO_TARGET_DIR
+git diff $BASE HEAD -- ':(glob)crates/*/src/**' > $D/s1-src.diff
+cargo mutants --list --in-diff $D/s1-src.diff > $D/s1-in-diff.txt; wc -l < $D/s1-in-diff.txt
+rm -f $D/mut-list-*.txt
+cargo mutants --list --file crates/charpente-core/src/db.rs --re 'scoped_fingerprint|ScopedTx|emit|encode_record|decode_record|apply_batch|put_schema_version|migrate_table|migrate_schema|cross_tenant_cap|tenant_admission|CrossTenant|TenantAdmission|enter_scope|open_scope|admit_scope|stage' > $D/mut-list-db.txt
+cargo mutants --list --file crates/charpente-core/src/db.rs --re 'is_platform_table|refuse_platform_table|refuse_platform_read' > $D/mut-list-db-platform.txt
+cargo mutants --list --file crates/charpente-core/src/event.rs > $D/mut-list-event.txt
+cargo mutants --list --file crates/charpente-core/src/table.rs > $D/mut-list-table.txt
+cargo mutants --list --file crates/charpente-core/src/migration.rs > $D/mut-list-migration.txt
+cargo mutants --list --file crates/charpente/src/http/mod.rs --re 'Subscription|TenantFeed|Subscribe|admits' > $D/mut-list-subscription.txt
+cargo mutants --list --file crates/charpente/src/kernel/tail.rs --re 'deliver_unit' > $D/mut-list-tail.txt
+cargo mutants --list --file crates/charpente/src/kernel/mod.rs --re 'validate_subscribe|refuse_foreign_pending_jobs' > $D/mut-list-resume.txt
+cargo mutants --list --file crates/charpente/src/kernel/dispatch.rs --re 'JobScope|run_due_into' > $D/mut-list-dispatch.txt
+cargo mutants --list --file crates/charpente/src/http/app.rs > $D/mut-list-app.txt
+cargo mutants --list --file crates/charpente/src/tenant.rs > $D/mut-list-tenant.txt
+cargo mutants --list --file crates/charpente/src/describe.rs > $D/mut-list-describe.txt
+cargo mutants --list --file crates/charpente-cli/src/genclient.rs > $D/mut-list-genclient.txt
+cargo mutants --list --file 'crates/charpente-tsgen/src/*.rs' > $D/mut-list-tsgen.txt
+cargo mutants --list --file crates/charpente-macros/src/event.rs --file crates/charpente-macros/src/fingerprint.rs > $D/mut-list-macros-event.txt
+cargo mutants --list --file crates/charpente-macros/src/job.rs --file crates/charpente-macros/src/route.rs --file crates/charpente-macros/src/table.rs > $D/mut-list-macros-rest.txt
+wc -l $D/mut-list-*.txt
+python3 - <<'EOF'
+import pathlib
+D = pathlib.Path('.superpowers/sdd/2026-09-30-tenancy-completion')
+wanted = {l for l in (D / 's1-in-diff.txt').read_text().splitlines() if l.strip()}
+covered = set()
+for p in sorted(D.glob('mut-list-*.txt')):
+    lines = {l for l in p.read_text().splitlines() if l.strip()}
+    assert lines, f'{p.name} lists nothing: its --file or --re matches nothing'
+    covered |= lines
+missing = sorted(wanted - covered)
+print(f'in-diff {len(wanted)}, covered {len(wanted & covered)}, uncovered {len(missing)}')
+for m in missing:
+    print('  UNCOVERED', m)
+EOF
+```
+
+Expected:
+- No list is empty; the script's assert names any that is.
+- `uncovered 0`. For each `UNCOVERED` line, widen its file's target: add the function to that
+  target's `--re`, or add a target for a file no target names. Re-list until `uncovered 0`.
+  A mutant outside every target was never mutated.
+- Put the line counts in the report.
+
+**Then run each target.** Read the verb's output, never cargo-mutants' exit code. Every
+`--file` outside core and sim names the packages whose suites exercise it (CLAUDE.md's
+`--test-package` trap). The db platform target adds `charpente-macros`, whose trybuild E0080
+fixtures are those functions' only oracle (LEDGER 2026-09-30, T9-R9). Runs with two or more
+packages pass `--timeout 2600` (T9-R4). `CARGO_TARGET_DIR` stays unset: the verb refuses
+`--jobs > 1` under an inherited one, and a shared target dir can leave a mutant's build
+looking fresh. The controller runs each line in the background and waits on its log.
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+unset CARGO_TARGET_DIR
+scripts/mutants.sh --file crates/charpente-core/src/db.rs --re 'scoped_fingerprint|ScopedTx|emit|encode_record|decode_record|apply_batch|put_schema_version|migrate_table|migrate_schema|cross_tenant_cap|tenant_admission|CrossTenant|TenantAdmission|enter_scope|open_scope|admit_scope|stage' --test-package charpente-core --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-db.log
+scripts/mutants.sh --file crates/charpente-core/src/db.rs --re 'is_platform_table|refuse_platform_table|refuse_platform_read' --test-package charpente-core --test-package charpente-macros --timeout 2600 2>&1 | tee $D/mutants-db-platform.log
+scripts/mutants.sh --file crates/charpente-core/src/event.rs --test-package charpente-core --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-event.log
+scripts/mutants.sh --file crates/charpente-core/src/table.rs --test-package charpente-core --test-package charpente --test-package charpente-macros --timeout 2600 2>&1 | tee $D/mutants-table.log
+scripts/mutants.sh --file crates/charpente-core/src/migration.rs --test-package charpente-core --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-migration.log
+scripts/mutants.sh --file crates/charpente/src/http/mod.rs --re 'Subscription|TenantFeed|Subscribe|admits' --test-package charpente 2>&1 | tee $D/mutants-subscription.log
+scripts/mutants.sh --file crates/charpente/src/kernel/tail.rs --re 'deliver_unit' --test-package charpente 2>&1 | tee $D/mutants-tail.log
+scripts/mutants.sh --file crates/charpente/src/kernel/mod.rs --re 'validate_subscribe|refuse_foreign_pending_jobs' --test-package charpente 2>&1 | tee $D/mutants-resume.log
+scripts/mutants.sh --file crates/charpente/src/kernel/dispatch.rs --re 'JobScope|run_due_into' --test-package charpente 2>&1 | tee $D/mutants-dispatch.log
+scripts/mutants.sh --file crates/charpente/src/http/app.rs --test-package charpente 2>&1 | tee $D/mutants-app.log
+scripts/mutants.sh --file crates/charpente/src/tenant.rs --test-package charpente 2>&1 | tee $D/mutants-tenant.log
+scripts/mutants.sh --file crates/charpente/src/describe.rs --test-package charpente --test-package charpente-cli --timeout 2600 2>&1 | tee $D/mutants-describe.log
+scripts/mutants.sh --file crates/charpente-cli/src/genclient.rs --test-package charpente-cli --test-package charpente-tsgen --timeout 2600 2>&1 | tee $D/mutants-genclient.log
+scripts/mutants.sh --file 'crates/charpente-tsgen/src/*.rs' --test-package charpente-tsgen --test-package ts-fixture-app --timeout 2600 2>&1 | tee $D/mutants-tsgen.log
+scripts/mutants.sh --file crates/charpente-macros/src/event.rs --file crates/charpente-macros/src/fingerprint.rs --test-package charpente-macros --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-macros-event.log
+scripts/mutants.sh --file crates/charpente-macros/src/job.rs --file crates/charpente-macros/src/route.rs --file crates/charpente-macros/src/table.rs --test-package charpente-macros --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-macros-rest.log
+```
+
+Any target Step 3's completeness pass widened is run in its widened form. A whole-file target
+may be long: `http/app.rs` and `describe.rs` hold pre-S1 code too. That is the price of
+completeness, and a MISSED mutant in pre-S1 code is still reported. It is labelled pre-S1 by
+`git blame`, and the controller decides whether it belongs to this work.
+
+The target is zero unresolved MISSED and zero unresolved TIMEOUT. A timeout is not a catch:
+rerun it with a larger `--timeout`, or show it caught in the log.
+- **A MISSED mutant is a one-sided property.** Before writing a test for it, print what the
+  mutated build does. A mutant goes uncaught either because no test looks, or because it is
+  truly inert. The second is an equivalence argument, and it goes to the controller. Otherwise
+  write the test that kills it in the owning task's suite, commit it alone
+  (`test(tenancy-completion): <what it pins> — kills <file:line:col> <mutation>`), and re-run
+  that target.
+- **The two argued-equivalent survivors,** M-c and M-d (`apply_batch`'s migration close-out,
+  LEDGER 2026-09-30 T9-R10/R11), are expected in the db run if their lines are still in
+  `apply_batch`.
+  - Their equivalence argument rested on one fact: only a forged `SchemaVersion` row, or
+    `migration_batch_size: 0` over an idle table, distinguishes them.
+  - S2 refuses `migration_batch_size: 0` (LEDGER item 10). Task 8 seals
+    `charpente.schema_versions` against app writes (item 11).
+  - So re-argue them. Name the inputs that remain: the operator path through the `Group`, and
+    nothing an app can write. State whether any reaches the difference.
+  - They stay visible survivors. Do not add a `.cargo/mutants.toml` entry.
+- **Clean before any later build.** The runs leave builds of mutated code behind. Clean every
+  package they built, so no later step can test a mutant by accident:
+  `cargo clean -p charpente-core -p charpente -p charpente-macros -p charpente-cli -p charpente-tsgen -p ts-fixture-app`.
+
+Record one row per run, in the LEDGER's table shape: Run | File, `--re` | Commit |
+`--test-package` | Total | Caught | Missed | Unviable | Timeout.
+
+- [ ] **Step 4: Hand inversions, in an isolated worktree, each operand separately**
+
+These are the new refusals and checks, each inverted by hand on the committed tree. Each one
+runs in its own worktree with its own target dir. A mutation in the main tree could be
+abandoned mid-run and read afterwards as working code, and a shared target dir can carry a
+mutated artifact past a clean `git diff`.
+
+```zsh
+MAIN=$PWD
+D=$MAIN/.superpowers/sdd/2026-09-30-tenancy-completion
+git worktree add ../charpente-s1-inversions HEAD
+cd ../charpente-s1-inversions
+export CARGO_TARGET_DIR=$PWD/target
+```
+
+Apply each inversion alone. Run the named command with `2>&1 | tee $D/inv-<n>.log`, and quote
+the failing tests' names and the first line of each failure. Restore with
+`git checkout -- <file>`, and confirm `git status --short` is empty before the next row. Each
+file and symbol is re-located by symbol, because Tasks 2–13 wrote them.
+
+Where a row says "the Task N pin of X", the implementer quotes the test's real name from the
+failure output. Several rows turn a compile-fail fixture into a passing build. trybuild
+reports that as the fixture's mismatch, which is a behavioural red for that oracle.
+
+| # | Task | File, symbol | Inversion | Must fail |
+|---|---|---|---|---|
+| 1 | 2 | `crates/charpente-core/src/db.rs`, `Group::stage`'s tenancy refusal | render `std::any::type_name::<S>()` where it renders the tenant's `NAME` | `cargo test -p charpente --test kernel` — `a_stand_in_under_a_same_spelled_scope_type_is_refused_naming_both_tenant_names` and `…_generic_scope_type_…` |
+| 2 | 2 | `crates/charpente/src/http/app.rs`, the 401's rendering (`anonymous_scope`) | the tenant `NAME` → `""` | `cargo test -p charpente --test tenant` — the 401 pins |
+| 3 | 2 | `crates/charpente-core/src/db.rs`, `enter_scope`'s one-scope assert | drop the `NAME` from its text, keeping `type_name` | `a_second_scope_names_both_tenants_by_name_and_type` |
+| 4 | 3 | the uniqueness check (Task 3's helper) | its `TypeId` comparison `!=` → `==` | Task 3's same-name refusal pin, and every app that mounts one tenant twice |
+| 5 | 3 | same | the empty-`NAME` test → `false` | Task 3's empty-name pin |
+| 6 | 3 | `App::open`'s feed of tables into the check | delete it | Task 3's table-side refusal pin |
+| 7 | 3 | `mount`'s feed of `public(S)` routes | delete it | Task 3's route-side refusal pin |
+| 8 | 3 | `mount_jobs`'s feed | delete it | Task 3's job-side refusal pin |
+| 9 | 11 | `mount_events`'s feed | delete it | `an_event_scoped_by_a_second_type_under_one_name_is_refused_at_mount` |
+| 10 | 4 | `scoped_fingerprint` (core) | return the fold unchanged (drop the tenant bytes) | Task 4's P2/P3 pins (`cargo test -p charpente --test kernel`), `a_scoped_events_fingerprint_mixes_its_tenants_name`, and `tenancy_feeds::the_three_notes_share_a_name_and_differ_only_in_tenancy` |
+| 11 | 4 | same | drop the `#scoped_by\0` prefix, keeping the name | the byte-identity pins A4 keeps (every existing scoped fingerprint literal) |
+| 12 | 5 | `crates/charpente/src/kernel/dispatch.rs`, `JobScope::open`'s assert | `==` → `!=` | every `scoped_jobs` test: each scoped job dead-letters on its first run |
+| 13 | 5 | same | the left operand `TypeId::of::<S>()` → the `JobScope`'s own `scope_type` (so it compares with itself) | `a_jobdef_naming_a_scope_type_its_glue_does_not_open_dead_letters_before_it_writes` and `a_jobdef_carrying_another_jobs_glue_dead_letters_before_it_writes_in_another_scope_type` |
+| 14 | 5 | `run_due_into`, where `JobScope` receives the def's `scope_type` | pass `TypeId::of::<charpente::core::table::Unscoped>()` | every `scoped_jobs` test |
+| 15 | 6 | the 401's text (Task 6) | restore the old whole-attribute fix text | Task 6's pins on the `cross_tenant` and `emits(…)` routes |
+| 16 | 7 | `crates/charpente-core/src/db.rs`, `CrossTenant` | add `#[derive(Clone)]` | `cargo test -p charpente-macros --test trybuild` — the "token cloned" fixture now compiles |
+| 17 | 7 | same, `TenantAdmission` | add `#[derive(Clone)]` | same suite, its fixture |
+| 18 | 7 | `Group::cross_tenant_cap` | return `CrossTenant<'static>` | the "parked in a static" fixture |
+| 19 | 8 | `PLATFORM_TABLES` | drop `charpente.events` | `each_platform_table_name_is_refused_by_its_own_text`, and its E0080 fixture |
+| 20 | 8 | same | drop `charpente.schema_versions` | the same test and fixture |
+| 21 | 8 | `EventRow`'s `Row` impl | `type Scope = PlatformOwned` → `Unscoped` | trybuild — the `tx.put(EventRow)` fixture now compiles |
+| 22 | 8 | `SchemaVersion`'s `Row` impl | the same | the `tx.put(SchemaVersion)` fixture |
+| 23 | 8 | `put_schema_version` | encode `version ^ 1` | `migrate_schema_records_each_schema_version_as_an_unscoped_put` (byte-equal record) |
+| 24 | 9 | the read seal (`ScopeReadableBy` for `PlatformOwned`) | widen the `Snapshot`-only impl to every reader | trybuild — each `tx.scan`/`tx.get` of a platform-table fixture now compiles |
+| 25 | 9 | `View`'s `scan` bound | drop `+ ReadableBy<Self>` | the `tx.scan` fixture |
+| 26 | 10 | `crates/charpente/src/http/mod.rs`, `Subscription::admits` | the name clause → `true` | `admits_is_the_name_and_the_tenant_and_the_key` |
+| 27 | 10 | same | the scope clause → `true` (Task 13's M1) | the same test, and `tenancy_feeds::each_feed_receives_exactly_its_own_notes_on_a_fault_free_node` |
+| 28 | 10 | same | the key clause → `true` | `admits_is_the_name_and_the_tenant_and_the_key`, and the flagship's keyed mode (`reconnecting_client_misses_nothing_under_the_fault_matrix`) |
+| 29 | 10 | `kernel/tail.rs`, `deliver_unit`'s `admits` call | scope argument `row.scope` → `tail.sub.scope` (Task 13's M2) | `tenancy_feeds::each_feed_…`, and `a_tenant_feed_receives_only_its_own_tenants_events_tenant_zero_included` |
+| 30 | 10 | `kernel/mod.rs`, `validate_subscribe`, A16's comparison | its left operand `row.scope` → `sub.scope` (it never refuses) | `a_cursor_from_another_tenancy_is_refused_not_resumed` and `tenancy_feeds::a_resume_from_a_row_outside_the_feeds_tenancy_is_refused_by_name` |
+| 31 | 10 | same | its right operand `sub.scope` → `None` (every tenant feed's own cursor is refused) | Task 10's own-cursor control resumes, and the sibling swarm (`unexpected subscribe response 409 …`) |
+| 32 | 10 | same, the reshape gate's `admits` call | its scope argument → `sub.scope` | **expected GREEN: equivalent under A16.** A16's check guarantees `row.scope == sub.scope` there. Print the resume test's statuses to show it, and record the row as equivalent, not missed |
+| 33 | 10 | `crates/charpente-core/src/db.rs`, `ScopedTx::emit` | record `scope: None` (Task 13's M4) | `a_scoped_emit_records_its_tenant_apart_from_its_key`, and `tenancy_feeds::each_feed_…` |
+| 34 | 10 | same | record `key: Some(<the tenant id as a string>)` (the removed mechanism) | `a_scoped_emit_records_its_tenant_apart_from_its_key` |
+| 35 | 10 | `ScopedTx::emit_keyed` | record `key: None` | Task 10's keyed-scoped-emit pin |
+| 36 | 10 | the record encoder's emit arm | choose `0x0b` only for a tenant other than 0 (Task 13's M7) | `scoped_emit_bytes_are_pinned_with_tenant_zero`, and `tenancy_feeds::each_feed_…` |
+| 37 | 10 | same | write `scope` before `shape` | `scoped_emit_bytes_are_pinned_with_tenant_zero` |
+| 38 | 10 | `EventRow`'s decode | bind `scope: None` after reading it (Task 13's M6) | `a_scoped_event_row_roundtrips_its_tenant_zero_included` |
+| 39 | 10 | `repl::PROTO_VERSION` | `5` → `4` | the version pin Task 10 adds (quote its name). If `cargo test -p charpente --no-fail-fast` stays green, that is a finding: a protocol bump nothing pins |
+| 40 | 11 | `#[event]`'s parser | accept a bare `#[event]` as `global` | trybuild — the bare-event fixture |
+| 41 | 11 | `Tx::emit`'s bound | `Ev: UnscopedEvent` → `Ev: Event` | trybuild — the "scoped event through `Tx::emit`" fixture |
+| 42 | 11 | `ScopedTx::emit`'s bound | `Event<Scope = S>` → `Event` | trybuild — the "global event through `ScopedTx::emit`" fixture |
+| 43 | 11 | `Subscription::of`'s bound | `UnscopedEvent` → `Event` | trybuild — `Subscription::of::<Scoped>()` |
+| 44 | 11 | `TenantFeed::and`'s bound | `Event<Scope = S>` → `Event` | trybuild — the scope-mixing `.and()` fixture |
+| 45 | 11 | the scoped `FINGERPRINT` emission | pass `""` for `S::NAME` (Task 13's M8) | `a_scoped_events_fingerprint_mixes_its_tenants_name`, and `tenancy_feeds::a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape` |
+| 46 | 12 | `describe`'s event info | `scoped_by` → `None` | `describe_names_an_events_tenant_by_its_tenant_types_name`, `examples/invoicing`'s `describe_golden`, and `guide-examples`' `describe_contract` |
+
+Commands, by suite:
+- trybuild: `cargo test -p charpente-macros --test trybuild`
+- kernel: `cargo test -p charpente --test kernel`
+- tenant: `cargo test -p charpente --test tenant`
+- realtime: `cargo test -p charpente --test realtime`
+- charpente unit tests: `cargo test -p charpente --lib`
+- core: `cargo test -p charpente-core --no-fail-fast`
+- describe: `cargo test -p charpente --test describe`, `cargo test -p invoicing --test describe_golden` and `cargo test -p guide-examples --test describe_contract`
+
+A row's "must fail" names what must go red. Other suites may go red too, and that is fine.
+
+A green result under any row except 32 is ambiguous: the test may be vacuous, or the inversion
+inert. Print the observable behaviour (the status, the row's scope, the frames) before
+concluding either. Operand rows (13, 26–31) prove each input to a check is read, not only that
+the check exists.
+
+Then clean up, one git-native step at a time. Nothing is copied out: the logs were written to
+`$D` in the main tree.
+
+```zsh
+cd "$MAIN"
+git worktree remove ../charpente-s1-inversions
+```
+
+The worktree's `target/` is multi-GB, and removing it can outrun the default two-minute tool
+timeout. Run it with a longer timeout rather than splitting it into `rm -rf`.
+
+- [ ] **Step 5: Fresh seeds over every property S1 touches, CI's replay pins, and the RED-first pin**
+
+`CHARPENTE_BASE_SEED` skips `require:` and `floor:`: these runs are evidence about failures,
+never about coverage. The list is every swarm whose workload S1 changed, or whose bytes it
+moved. Re-locate each name first: a task may have renamed one (Task 10 migrates the scoped
+sibling). `grep -n "fn <name>" <file>` must print exactly one line for each.
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+props=(
+  "charpente realtime tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix"
+  "charpente realtime a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing"
+  "charpente realtime reconnecting_client_misses_nothing_under_the_fault_matrix"
+  "charpente realtime a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix"
+  "charpente realtime follower_tails_and_the_failover_resume_divergence_property"
+  "charpente tenant every_scoped_read_returns_only_its_own_tenants_rows"
+  "charpente kernel job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from"
+  "charpente kernel kernel_jobs_are_exactly_once_under_the_fault_matrix"
+  "charpente kernel a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix"
+  "charpente replication follower_converges_to_the_primary_fingerprint"
+  "charpente archive archive_converges_with_a_scoped_table"
+  "charpente-core migrations migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin"
+  "charpente-core migrations migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninterrupted_twin"
+)
+for p in $props; do
+  parts=(${=p})
+  print -r -- "$(grep -c "fn ${parts[3]##*::}(" crates/${parts[1]}/tests/${parts[2]}.rs)  ${parts[3]}"
+done
+```
+
+Expected: `1` beside every name. A `0` means the name moved. Use the new name, and say so. The
+`${=p}` split is load-bearing: zsh does not word-split an unquoted `$p`.
+
+Then the batches. They are long, so the controller runs them in the background, one base at a
+time:
+
+```zsh
+for base in 0x5100_F001 0x5100_F002 0x5100_F003; do
+  for p in $props; do
+    parts=(${=p})
+    log=$D/fresh-${parts[2]}-${parts[3]//:/_}-$base.log
+    CHARPENTE_BASE_SEED=$base cargo test -p ${parts[1]} --test ${parts[2]} -- ${parts[3]} --exact --nocapture > $log 2>&1
+    print -r -- "$(grep -c '^test result: ok. 1 passed' $log) $(grep -o '[0-9]* of [0-9]* universes reached a verdict, [0-9]* gave up' $log | head -1)  ${parts[3]} @ $base"
+  done
+done
+```
+
+Expected: each of the 39 lines starts with `1`. Then total the universes for the LEDGER:
+
+```zsh
+python3 - <<'EOF'
+import pathlib, re
+D = pathlib.Path('.superpowers/sdd/2026-09-30-tenancy-completion')
+total = verdicts = gave = 0
+for log in sorted(D.glob('fresh-*-0x5100_F00*.log')):
+    m = re.search(r'(\d+) of (\d+) universes reached a verdict, (\d+) gave up', log.read_text())
+    assert m, f'{log.name}: no verdict line (a non-swarm test, or a run that died)'
+    v, n, g = map(int, m.groups())
+    verdicts += v; total += n; gave += g
+    print(f'{n:5d} {v:5d} {g:3d}  {log.name}')
+print(f'fresh universes {total}, verdicts {verdicts}, gave up {gave}')
+EOF
+```
+
+A failing universe is pinned as a regression test, with its reason asserted, before anything
+else happens. Paste its `CHARPENTE_SEED=…` line into the report.
+
+**CI's replay pins**, exactly as `.github/workflows/ci.yml` lists them at this commit. Read the
+file; do not copy the lines from this plan. Each must be green.
+
+**The RED-first pin.** `0xe2d97275c15cc087` is the kernel swarm's live RED-first
+reproduction. S1 changed that workload's bytes: Task 2 added `Tenant::NAME`, and Task 9 moved
+its platform-table reads. A moved op schedule is what defanged its predecessors. So re-verify
+its meaning the way it was first proven, in a scratch worktree with its own target dir:
+1. Delete the `is_fault_fallout` classification in `kernel_workload`'s checker arm, and replay
+   the seed. It must be RED.
+2. Restore the classification, and replay again. It must be GREEN.
+
+If it is GREEN with the classification deleted, the pin no longer reaches the arm. Report it;
+do not fix it silently. The re-pin procedure is in the `ci.yml` comment above that line: a
+10,000-universe batch at base `0x577d39b752d077c7`. Remove the worktree as in Step 4.
+
+- [ ] **Step 6: The counted gate, CI's other steps, the TS gate and the guide gates**
+
+The controller runs the workspace gate in the background: it can outlast the 600 s tool
+ceiling. First clean what the mutation runs built (Step 3), so the gate cannot test a leftover
+mutant. Then run each stage on its own, reading each status separately (zsh `pipestatus`):
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+LOG=$D/gate-final.log
+cargo clean -p charpente-core -p charpente -p charpente-macros -p charpente-cli -p charpente-tsgen -p ts-fixture-app
+cargo fmt --all --check; echo "fmt exit $?"
+cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee $D/gate-final-clippy.log; echo "clippy exit ${pipestatus[1]}"
+cargo test --workspace --no-fail-fast 2>&1 | tee $LOG; echo "test exit ${pipestatus[1]}"
+grep -c "^test result:" $LOG; grep -c "^test result: ok" $LOG; grep -c FAILED $LOG
+```
+
+The expected count is Task 1's measured baseline plus the test files S1 added:
+
+```zsh
+git diff --diff-filter=A --name-only $BASE HEAD -- ':(glob)crates/*/tests/*.rs' ':(glob)examples/*/tests/*.rs'
+```
+
+Expected:
+- `fmt exit 0`, `clippy exit 0` and `test exit 0`.
+- The two counts are equal, and both equal that expected number. Task 13 added no test file.
+  Any file this `git diff` lists must also appear in CLAUDE.md's exhaustive list, which
+  `doc_inventory` enforces.
+- `0` for FAILED. A `grep -c` that finds nothing prints `0` and exits 1, so read the numbers,
+  not the exit status.
+
+**CI's other steps**, exactly as `.github/workflows/ci.yml` lists them at this commit, each
+expected green:
+- `cargo check -p charpente-core`;
+- `cargo publish --workspace --dry-run --no-verify`;
+- the ignored bench passthrough guard;
+- the two ignored launch guards;
+- the replay pins, already run in Step 5.
+
+**The TS gate** (ci.yml's `ts-client` job). `EventInfo` changed shape (Task 12), and the
+generated client is the codegen's oracle:
+
+```zsh
+(cd ts-fixture && npm ci)
+cargo build -p charpente-cli
+./target/debug/charpente check-client --dir crates/ts-fixture-app --out ts-fixture/src/generated/client.ts; echo "check-client exit $?"
+cargo test -p ts-fixture-app --test samples --no-fail-fast 2>&1 | tee $D/gate-final-ts-samples.log; echo "samples exit ${pipestatus[1]}"
+(cd ts-fixture && npm run check && npm run test); echo "npm exit $?"
+```
+
+Expected: every exit `0`. Invoke the pinned binaries through `npm run`, never a bare `npx`.
+
+**The guide gates**: `cargo build -p guide-examples`, and `cargo test -p guide-examples
+--no-fail-fast` inside the workspace run, with its lines among the counted ones.
+
+- [ ] **Step 7: The record**
+
+All four edits are made by one script. It asserts every anchor, so a moved line is refused
+rather than guessed. It computes the date, the commit range and the plan's path:
+
+```zsh
+python3 - <<'EOF'
+import datetime, pathlib, re, subprocess
+D = pathlib.Path('.superpowers/sdd/2026-09-30-tenancy-completion')
+date = datetime.date.today().isoformat()
+def git(*args):
+    return subprocess.run(['git', *args], capture_output=True, text=True, check=True).stdout.strip()
+plans = sorted(pathlib.Path('docs/superpowers/plans').glob('*tenancy-completion*.md'))
+assert len(plans) == 1, f'expected one tenancy-completion plan, found {plans}'
+first = git('log', '--reverse', '--format=%h', '--grep=^feat(tenancy-completion): #\\[event(global)\\]', '-1')
+last = git('log', '-1', '--format=%h', '--grep=^test(tenancy): realtime tenancy under the fault matrix')
+assert first and last, f'Task 1 ({first!r}) or Task 13 ({last!r}) commit not found by subject'
+
+# PLAN.md, M3 sub-project 3
+plan = pathlib.Path('PLAN.md')
+s = plan.read_text()
+old = "`public` or `public(Org)`, says who reaches a tenant)."
+assert s.count(old) == 1, 'PLAN.md: M3 (3) anchor moved'
+s = s.replace(old, old + f""" Its pre-publish follow-ups closed {date}
+   (spec `docs/superpowers/specs/2026-09-30-tenancy-completion-design.md`): a tenant type's
+   `NAME` is its identity, an event declares `global` or `scoped_by` and a tenant's feed is
+   built from its scope, app code neither reads nor writes the platform's own tables, and the
+   capability tokens cannot outlive the `Group` that minted them.""")
+
+# PLAN.md, M2's present-tense event-key sentences: history now, if Tasks 10-11 left them
+for old, new in [
+    ("Realtime is the same mechanism rather than a second\n  one: `emit` inside a scope is keyed by the scope.",
+     "Realtime was the same mechanism rather than a second\n  one: `emit` inside a scope was keyed by the scope (since M3's tenancy completion a scoped\n  event records its tenant in a field of its own)."),
+    ("**Two limits travel with it.** The subscription key is the scope's decimal id, so two\n  different scope types sharing a raw id share a key.",
+     f"**Two limits travelled with it.** The subscription key was the scope's decimal id, so two\n  different scope types sharing a raw id shared a key (closed {date} by M3's tenancy\n  completion: a scoped event records its tenant apart from its key, and its fingerprint mixes\n  its tenant type's `NAME`)."),
+]:
+    n = s.count(old)
+    assert n in (0, 1), 'PLAN.md: an M2 sentence appears twice'
+    print(f'PLAN.md M2 sentence {"rewritten" if n else "already rewritten by an earlier task"}: {old[:40]!r}')
+    s = s.replace(old, new)
+
+# PLAN.md, After launch
+old = "one from M3's job-tenancy fix, each with the trigger that reopens it"
+assert s.count(old) == 1, 'PLAN.md: After-launch header moved'
+s = s.replace(old, "one from M3's job-tenancy fix, two from M3's tenancy completion, each with the trigger that reopens it")
+old = "The job-tenancy one was deferred on 2026-09-27 by the\njob-tenancy spec's §12."
+assert s.count(old) == 1, 'PLAN.md: After-launch paragraph moved'
+s = s.replace(old, old + " The tenancy-completion two were deferred on 2026-09-30\nby that spec's §12.")
+row = "| **`enqueue_keyed_in`** — a keyed declared fan-out (job-tenancy spec §12) |"
+i = s.index(row)
+j = s.index('\n', i) + 1
+s = s[:j] + (
+    "| **A cross-tenant subscription** — one feed over every tenant's events (tenancy-completion spec §12) "
+    "| The first app that needs a feed across tenants. It arrives as a declared capability `describe` lists "
+    "(DECISIONS §11), the shape `cross_tenant` already gives reads. |\n"
+    "| **A tenant's own jobs and events, read through `ScopedTx`** — for a job-status or activity view "
+    "(tenancy-completion spec §12) | The first app with a job-status or activity view. Until then an app keeps "
+    "its own table of what it enqueued and emitted, and the platform's tables stay the operator's. |\n"
+) + s[j:]
+plan.write_text(s)
+
+# the spec's Status line
+spec = pathlib.Path('docs/superpowers/specs/2026-09-30-tenancy-completion-design.md')
+t = spec.read_text()
+t, n = re.subn(r'\*\*Status:\*\*.*$',
+               f'**Status:** Implemented {date} (commits `{first}`..`{last}`); plan `{plans[0]}`.',
+               t, count=1, flags=re.M)
+assert n == 1, 'spec: no Status line'
+spec.write_text(t)
+print(f'PLAN.md and the spec updated: {date}, {first}..{last}, {plans[0]}')
+EOF
+grep -c "two from M3's tenancy completion" PLAN.md; grep -c "A cross-tenant subscription" PLAN.md; grep -n "^\*\*Date:\*\*" docs/superpowers/specs/2026-09-30-tenancy-completion-design.md
+```
+
+Expected: `1`, `1`, and the Date line now reads `… **Status:** Implemented <date> (commits
+…); plan …`.
+
+Task 1's subject is the one D1's Task 1 commit uses (`feat(tenancy-completion):
+#[event(global)] …`), and Task 13's is Step 7's above. If either grep finds nothing, the
+subject differs. Read `git log --oneline $BASE..HEAD` and pass the two shas by hand.
+
+**`docs/LEDGER.md`** gets a new entry at the end, in the C-2 entry's house style
+(2026-09-30):
+- **Heading:** `## <date> — tenancy completion: a tenant type's NAME is its identity, an event
+  declares its tenant, the platform's tables are sealed, and the capability tokens cannot
+  outlive their Group`.
+- **Why:** LEDGER 2026-09-30 items 2, 3, 4, 5, 6, 7, 11 and 12, and the doors each left open.
+- **Shipped:** one line per task, with its commit sha.
+- **Noah, read this:** DECISIONS.md §12 was edited, wording only; the decision is unchanged.
+  Quote the new sentence and its correction note, as the C-2 record did for line 256.
+- **The resume refusal:** A16, and what a cursor on another tenancy's row now gets.
+- **Stated, not changed (spec §2 rulings 5 and 6):**
+  - `Principal: Clone` stays. `Ctx::principal()` is its only public producer, and nothing accepts a caller-supplied one.
+  - `Session`, `ApiKey` and the kernel's `CronRow` (`kernel/cron.rs`, schedule name, interval and next due) stay app-owned `#[table(global)]` tables. None holds tenant data.
+- **CI (exit criterion 4):** CI runs on the merged tip only after Noah pushes. Record that the run is pending on that push, and record its result in a one-line follow-up once it lands.
+- **Seeds and universes:**
+  - Task 13's base `0x5C0B_0001`, its N, and how N was set (both CPU timings).
+  - Its verdict line, its gave-up count, and its eight floors.
+  - Its fresh total.
+  - Step 5's table (Commit | Property | Bases | Universes | Gave up) and its totals.
+  - `0xe2d97275c15cc087`'s RED-first re-verification.
+  - Task 1's coverage baselines: which reproduced byte-identically through Tasks 2–12, and
+    which moved in Task 10 by design.
+  - Every seed pinned in this work, with its reason.
+- **Mutants:** Step 3's table, one row per run, with the completeness line (in-diff N,
+  covered N, uncovered 0) and the M-c/M-d re-argument.
+- **Hand inversions:** Step 4's table with each row's result (row 32 recorded as equivalent),
+  and Task 13's M1–M8.
+- **Docs:** the sweep's phrase count and every fix it forced, with its owning task.
+- **Gate:** counted `C of C`, with CI's other steps, the TS gate and the guide gates named.
+- **Follow-ups:**
+  - the two deferred items, now in PLAN's After-launch table;
+  - Task 10's sibling property: whether it is now redundant with
+    `tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix`
+    (Noah's call, stated here, not acted on);
+  - anything Steps 3–5 left open.
+
+Update memory `charpente-m1-progress.md`: S1 (tenancy completion) is closed, with its date and
+commit range. Say what remains before 0.1.0 as the LEDGER's pre-publish list now stands.
+Pushing and publishing are Noah's calls.
+
+- [ ] **Step 8: Commit**
+
+```zsh
+git status --short
+git add PLAN.md docs/superpowers/specs/2026-09-30-tenancy-completion-design.md docs/LEDGER.md
+git commit -m "ledger(tenancy-completion): S1 closed — a tenant type's NAME is its identity, an event declares its tenant, the platform's tables are sealed and the tokens cannot outlive their Group; mutants: M unresolved MISSED beyond M-c/M-d over U in-diff mutants; H of H hand inversions red (row 32 equivalent); V fresh universes, G gave up; the workspace gate counted C of C"
+```
+
+Fill in the message's slots from Steps 3–6:
+- M: unresolved MISSED;
+- U: in-diff mutants;
+- H: hand inversions;
+- V: fresh universes, and G: those that gave up;
+- C: the gate count.
+
+Step 2's docs commit and any killer-test commits from Step 3 were made on their own, before
+this one. `git status --short` must show only the three files above.
+
+Do not push. Pushing and publishing are Noah's calls.
+
+---
+
+## Appendix: measured evidence behind the amendments
+
+The scratch crates and logs quoted here live in this session's scratchpad (`scratchpad/D2`, `D3`, `D4`). The quotes below are the record; the scratchpad may be gone by the time a task runs.
+
+### A9: a token tied to `&self` (spec §5's form) on the tree's three mint-then-stage shapes
+
+```text
+error[E0502]: cannot borrow `*group` as mutable because it is also borrowed as immutable
+ --> src/bin/self_tied.rs:5:5        (the dispatcher shape: mint cap, then group.stage)
+error[E0502]: cannot borrow `g` as mutable because it is also borrowed as immutable
+  --> src/bin/self_tied.rs:10:15     (transact_admitted: mint admission, then g.stage)
+error[E0502]: cannot borrow `group` as mutable because it is also borrowed as immutable
+  --> src/bin/self_tied.rs:17:17     (admitted_read: mint admission, then f(&mut group, &admission))
+```
+
+With `CrossTenant<'a>` / `TenantAdmission<'a>` the same model crate compiles every shape. Parking either token in a `static` (`OnceLock`) or a `thread_local!` is E0521 ("argument requires that `'1` must outlive `'static`"). `cap.clone()` on a `&CrossTenant` is E0308, with rustc's note "`CrossTenant<'_>` does not implement `Clone`, so `&CrossTenant<'_>` was cloned instead". A leaked `Db` mints a `'static` token in either form.
+
+### A7: `<S as Tenant>::NAME` in macro output
+
+A scratch proc-macro crate emitting the contract's form beside the existing `__charpente_assert_tenant_scope` const assert printed, for one missing impl, the house error *and* `error[E0277]: the trait bound \`Team: Tenant\` is not satisfied … help: this trait has no implementations, consider adding one`. Two uses at one span dedupe into that one extra error, one per fixture. `<S as ::charpente::TenantScope>::NAME` is `E0576 cannot find method or associated constant \`NAME\` in trait \`TenantScope\``. With `tenant_name::<S>()` a missing impl gets exactly the house error, its "required by a bound in" note moved to `tenant_name`.
+
+### Evidence for Task 9's read seal (rustc 1.95.0)
+
+Two scratch workspaces reproduce `charpente-core`'s shapes (`Row` with `type Scope`, `Unscoped`,
+`PlatformOwned`, `NoTenant`/`UnscopedRow` with their seals, `Tenant`, `Snapshot`, `Tx<'a>`,
+`ScopedTx` with its `Deref` and inherent `scan<R: Row<Scope = S>>`, a `View` with `get` and
+`scan`), in a core crate and a downstream app crate whose `Org: Tenant`. An `old` feature builds
+e749823's `View` for the diff.
+
+**Contract shapes (`coh/`):** `ScopeReadableBy<V: ?Sized, R>: sealed::ReadScope` with
+`#[diagnostic::on_unimplemented]`, impls for `Unscoped` (every `V`), every `S: Tenant` (every
+`V`) and `impl<R> ScopeReadableBy<Snapshot, R> for PlatformOwned`; blanket
+`impl<R: Row, V: ?Sized> ReadableBy<V> for R where R::Scope: ScopeReadableBy<V, R>`; `View`'s
+methods `R: UnscopedRow + ReadableBy<Self>`.
+- It compiles (coherence accepts the three impls), and the downstream `Org: Tenant` works.
+- A generic `fn regions(view: &impl View)` reading an `Unscoped` row, and the `#[index]`
+  accessor's shape (`fn by_name(view: &impl View) -> … { view.scan::<Self>() }`), compile
+  (`coh/logs/contract-ok.log`, exit 0).
+- The scoped read on a bare `Tx` keeps its one `NoTenant` diagnostic.
+- **The platform read loses its text** (`coh/logs/contract-tx_jobrow.log`):
+
+```text
+error[E0277]: the trait bound `core_x::table::PlatformOwned: Tenant` is not satisfied
+  --> app/examples/tx_jobrow.rs:5:15
+   |
+ 5 |     tx.scan::<JobRow>()
+   |        ----   ^^^^^^ the trait `Tenant` is not implemented for `core_x::table::PlatformOwned`
+   |        |
+   |        required by a bound introduced by this call
+   |
+   = note: required for `core_x::table::PlatformOwned` to implement `ScopeReadableBy<Tx<'_>, JobRow>`
+   = note: required for `JobRow` to implement `ReadableBy<Tx<'_>>`
+note: required by a bound in `core_x::table::View::scan`
+  --> core/src/lib.rs:72:34
+   |
+72 |         fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
+   |                                  ^^^^^^^^^^^^^^^^ required by this bound in `View::scan`
+```
+
+  Through a `ScopedTx` deref it is worse: rustc adds `` help: the trait `Tenant` is implemented
+  for `Org` `` (`coh/logs/contract-scoped_deref_jobrow.log`).
+
+**A projection variant was tried and rejected** (`fin/`: the blanket reads through
+`<R::Scope as sealed::Owned>::Owner` after a `NoTenant<R>` bound, and there is no tenant impl). The platform read gets the text, but the
+two existing "seal opt-out" pins gain a second error: `no_tenant_impl_from_an_app` gains
+`` the trait bound `Org: table::sealed::Owned` is not satisfied ``, and
+`unscoped_row_impl_from_an_app` gains a second `NoTenant` error at the `tx.scan` line
+(`fin/logs/new-no_tenant_impl.log`, `fin/logs/new-unscoped_row_impl.log`: 2 errors each, 1 at
+e749823's shapes).
+
+**`#[diagnostic::do_not_recommend]` was tried and rejected** (`fin5/`: the contract's literal
+`impl<R> ScopeReadableBy<Snapshot, R> for PlatformOwned {}`, with the attribute on the tenant
+blanket). `tx.scan::<JobRow>()` then prints the text, and helpfully adds "but trait
+`ScopeReadableBy<Snapshot, JobRow>` is implemented for it … expected `Snapshot`, found `Tx<'_>`"
+(`fin5/logs/new-tx_jobrow.log`). But the attribute also hides the tenant blanket where it is the
+right answer. A table scoped by a type with no `impl Tenant` (`fin5/app/examples/missing_tenant.rs`,
+`Scope = Loose`), read on a bare `Tx`, gets `NoTenant`'s error and then:
+
+```text
+error[E0277]: `Note` is one of the platform's tables, and a transaction does not read it
+  --> app/examples/missing_tenant.rs:13:15
+   |
+13 |     tx.scan::<Note>()
+   |               ^^^^ `Note` is read through `Db::snapshot`, never a transaction
+```
+
+That is false (hard rule 5). The shapes below print `` the trait bound `Loose: Tenant` is not
+satisfied `` there instead (`fin3/logs/new-missing_tenant.log`), which is true and agrees with the
+`#[table]` macro's own "has no `Tenant` impl" error that such an app also gets. No in-tree
+fixture reads a table whose scope type lacks `impl Tenant` (checked:
+`table_scoped_by_missing_tenant_scope.rs`, `job_scoped_by_missing_tenant_scope.rs` and
+`route_public_scope_missing_tenant_scope.rs` make no `View` call), so no pin moves either way.
+
+**The shapes this draft uses (`fin3/`):** the contract's,
+with PlatformOwned's impl written `impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for
+PlatformOwned {}` and `impl sealed::Operator for Snapshot {}`.
+
+- It compiles; `Org: Tenant` downstream works; the generic `&impl View` helper over an app table
+  and the `#[index]` accessor shape compile (`fin3/logs/new-ok.log`, exit 0).
+- **The platform read carries the text, one error** (`fin3/logs/new-tx_jobrow.log`; the scratch
+  message and note are placeholders for Task 9's real ones):
+
+```text
+error[E0277]: `JobRow` is one of the platform's tables, and a transaction does not read it
+  --> app/examples/tx_jobrow.rs:5:15
+   |
+ 5 |     tx.scan::<JobRow>()
+   |        ----   ^^^^^^ `JobRow` is read through `Db::snapshot`, never a transaction
+   |        |
+   |        required by a bound introduced by this call
+   |
+   = help: the trait `ScopeReadableBy<Tx<'_>, JobRow>` is not implemented for `charpente_core::table::PlatformOwned`
+   = note: the platform's tables hold every tenant's rows; code that holds the `Db` reads them through a snapshot:
+               let snap = db.snapshot()?;
+               snap.scan::<JobRow>()?
+help: the trait `ScopeReadableBy<V, R>` is implemented for `charpente_core::table::PlatformOwned`
+  --> core/src/lib.rs:64:5
+   |
+64 |     impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `JobRow` to implement `ReadableBy<Tx<'_>>`
+note: required by a bound in `charpente_core::table::View::scan`
+  --> core/src/lib.rs:88:34
+   |
+88 |         fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
+   |                                  ^^^^^^^^^^^^^^^^ required by this bound in `View::scan`
+```
+
+  The same through `(*tx).get::<JobRow>(…)` on a `ScopedTx` (`fin3/logs/new-scoped_deref_jobrow.log`),
+  with `View::get` in the last note.
+- **The existing `NoTenant` diagnostic is unchanged and not joined by a second error.** `diff`
+  of the e749823 shapes (`--features old`) against these, errors only
+  (`fin3/logs/{old,new}-tx_scoped.log`; the `old` build's scratch-only dead-code warnings are
+  dropped from this quote):
+
+```text
+38c18
+<   --> core/src/lib.rs:82:20
+---
+>   --> core/src/lib.rs:88:20
+40c20
+< 82 |         fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>>;
+---
+> 88 |         fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
+```
+
+  The only change is the quoted `View::scan` declaration (and its line number). The two seal
+  opt-out shapes (`no_tenant_impl`, `unscoped_row_impl`) diff empty: 1 error each, as at e749823.
+- **Opt-outs are refused.** An app's `impl<'a> ScopeReadableBy<Tx<'a>, Peek> for PlatformOwned {}`
+  is `` error[E0119]: conflicting implementations … upstream crates may add a new impl of trait
+  `charpente_core::db::Tenant` for type `charpente_core::table::PlatformOwned` ``; an app's
+  `impl<'a> ReadableBy<Tx<'a>> for Peek {}` (Peek's `Scope = PlatformOwned`) is
+  `` error[E0119]: conflicting implementations of trait `ReadableBy<Tx<'_>>` for type `Peek` ``
+  (`fin3/logs/new-bypass_{scope_readable,readable_by}.log`), with no seal on `ReadableBy`.
+- **A borrowed name read through a `Tx`** (`Scope = Unscoped`, `TABLE = "charpente.jobs"`,
+  `tx.scan::<Queue>()` reached from `main`) is `error[E0080]: evaluation panicked: <text>` with
+  `` note: the above error was encountered while instantiating `fn <Tx<'_> as View>::scan::<Queue>` ``
+  (`fin3/logs/new-alias_read.log`), once `View for Tx` carries the `const` block (amendment A13).
+- **Stated consequence, no in-tree site:** a helper generic over the ROW type as well as the
+  reader must name `ReadableBy`: `fn all<R: UnscopedRow>(snap: &Snapshot) { snap.scan::<R>() }`
+  stops compiling (rustc suggests `where <R as Row>::Scope: Tenant`, which is not the fix);
+  `fn all<R: UnscopedRow + ReadableBy<Snapshot>>(…)` and
+  `fn any_view<V: View, R: UnscopedRow + ReadableBy<V>>(…)` compile
+  (`fin2/logs/new-generic_r.log`, `fin3/logs/new-generic_r_bound.log`). No in-tree code is
+  generic over the row type: `git grep -n "UnscopedRow" e749823 -- crates examples` outside
+  `table.rs`/`db.rs` hits compile-fail fixtures, one `engine.rs` assertion
+  (`a_job_row_is_still_read_through_view`, which Task 9 rewrites) and a comment in
+  `charpente-macros/src/table.rs`; the `#[table]` `by_<field>` accessor is generic over the
+  reader only (`view: &impl ::charpente::core::table::View`), with the row `Self`.
