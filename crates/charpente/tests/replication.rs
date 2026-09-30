@@ -382,20 +382,12 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
         }
         match reopen(sim, node) {
             Ok(()) => return Ok(()),
+            // Fallout first: DESIGN §4's compacted-log refusal ("cannot be rebuilt
+            // from the log alone") is excused only here, when an injected fault
+            // inside `Store::open` caused it and the refusal carries that text.
+            // A bare refusal is a failure — under redb 4.3.0 the crash model
+            // cannot brick the store.
             Err(e) if is_fault_fallout(&e) => last = e, // open faulted; retry, cycling periodically
-            // The designed unrestorable-locally hard error: a crash bricked the
-            // store AND checkpoint GC already compacted the log past 0, so
-            // rebuild-from-WAL is impossible and the named fix is "restore from
-            // a replica or backup" — the path T7's promote/backup provides.
-            // Until then this node is honestly dead: inconclusive, not a bug.
-            Err(e) if e.contains("cannot be rebuilt from the log alone") => {
-                sim.cover("repl:inconclusive:store-bricked");
-                return Err(format!(
-                    "{INCONCLUSIVE}: {} store bricked below a compacted log — the restore \
-                     path (T7) is the fix: {e}",
-                    node.name
-                ));
-            }
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
     }
@@ -1041,7 +1033,9 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// because all five cover the same key; splitting them is the named next step.
 /// (That step has since landed — every one of those five now covers its own
 /// `repl:inconclusive:*` cause key, and all 89 of this property's give-ups are
-/// `:recover-exhausted`.)
+/// `:recover-exhausted`. The store-bricked producer is gone since redb 4.3.0:
+/// the crash model cannot brick the store, so that refusal now fails unless an
+/// injected fault caused it.)
 ///
 /// **Why this floor sits ON its measurement while the four added in
 /// oracle-density task 3 sit 2 SEs below theirs.** The two conventions answer
@@ -5235,16 +5229,16 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             // Corruption at or below the durable horizon: not a torn tail — the
             // local copy is bricked and the fix is restore. Surface it (the
             // caller reseeds from the survivor) rather than retry into the same
-            // durable bytes forever.
-            Err(e) if e.contains("restore this node from a replica or backup") => {
+            // durable bytes forever. DESIGN §4's compacted-log refusal names the
+            // same fix but is not this: it goes on to the fallout arm (an injected
+            // fault inside `Store::open`, carrying its injected text) or fails —
+            // under redb 4.3.0 the crash model cannot brick the store.
+            Err(e)
+                if e.contains("restore this node from a replica or backup")
+                    && !e.contains("cannot be rebuilt from the log alone") =>
+            {
                 return Err(format!(
                     "{RESTORE_NEEDED}: {} corrupted below the horizon",
-                    node.name
-                ));
-            }
-            Err(e) if e.contains("cannot be rebuilt from the log alone") => {
-                return Err(format!(
-                    "{RESTORE_NEEDED}: {} store bricked below a compacted log",
                     node.name
                 ));
             }

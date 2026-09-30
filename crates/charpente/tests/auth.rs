@@ -262,12 +262,56 @@ fn spawn_auth_node(
 /// subject), 0xe5d5ca79d05e9df (primary bitrots its WAL and forks the
 /// timeline; follower refuses — working as designed), 0xf728659274ee045c
 /// (primary refuses to ship a frame that failed read-back verification).
+///
+/// DESIGN §4's compacted-log refusal ("cannot be rebuilt from the log alone")
+/// also names "restore this node" but is NOT one of these: callers check fault
+/// fallout for it (an injected fault inside `Store::open`, carrying its
+/// injected text) and otherwise fail — under redb 4.3.0 the crash model cannot
+/// brick the store.
 fn needs_restore(text: &str) -> bool {
-    text.contains("restore this node from a replica or backup")
-        || text.contains("cannot be rebuilt from the log alone")
+    (text.contains("restore this node from a replica or backup")
         || text.contains("refusing to guess")
         || text.contains("forked timeline")
-        || text.contains("re-seed the follower")
+        || text.contains("re-seed the follower"))
+        && !text.contains("cannot be rebuilt from the log alone")
+}
+
+/// `recover_auth_node`'s arms run `needs_restore`, then fault fallout, then
+/// fail. The compacted-log refusal must reach the second (injected cause) or
+/// the third (none), never the first — and the first must still take what it
+/// exists for. No auth workload reaches that refusal at its pinned base (none
+/// in 5 batches, 2026-09-30), so this is the arm's oracle.
+#[test]
+fn the_compacted_log_refusal_is_fallout_or_a_failure_never_an_unrestorable_skip() {
+    let refusal = |cause: &str| {
+        format!(
+            "table store cannot open ({cause}) and the log is compacted to seq 3 — the records \
+             below the store's last checkpoint no longer exist locally, so the store cannot be \
+             rebuilt from the log alone; restore this node from a replica or backup, or widen \
+             DbConfig::retain_segments (DESIGN §4)"
+        )
+    };
+    let injected = refusal("table store (redb): I/O error: injected read error");
+    assert!(!needs_restore(&injected), "{injected}");
+    assert!(
+        is_fault_fallout(&injected),
+        "an injected cause is fallout: {injected}"
+    );
+    let bare = refusal(
+        "table store (redb): DB corrupted: File truncated below stored layout: file_len=4096, \
+         layout_len=8192",
+    );
+    assert!(!needs_restore(&bare), "{bare}");
+    assert!(
+        !is_fault_fallout(&bare),
+        "no injected cause, so it fails: {bare}"
+    );
+    assert!(needs_restore(
+        "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
+         corruption of acknowledged records, not a torn tail, and truncating it would silently \
+         lose data; restore this node from a replica or backup (DESIGN §2)"
+    ));
+    assert!(needs_restore("the follower refuses a forked timeline"));
 }
 
 /// The witness boot gate's 503 (M2 sub-project 0b task 5): this workload

@@ -3710,6 +3710,56 @@ fn rt_recover_exhausted_key(last: &str) -> &'static str {
     }
 }
 
+/// A local copy this property has no restore rig for: corruption at or below
+/// the durable horizon, or a log directory gapped past guessing. NOT DESIGN
+/// §4's compacted-log refusal, although it names the same "restore this node"
+/// fix: `recover_rt_node` sends that one on to its fault-fallout arm (an
+/// injected fault inside `Store::open`, carrying its injected text) and
+/// otherwise fails, because under redb 4.3.0 the crash model cannot brick the
+/// store.
+fn local_copy_unrestorable(e: &str) -> bool {
+    (e.contains("restore this node from a replica or backup") || e.contains("refusing to guess"))
+        && !e.contains("cannot be rebuilt from the log alone")
+}
+
+/// `recover_rt_node`'s arms run `local_copy_unrestorable`, then fault fallout,
+/// then fail. The compacted-log refusal must reach the second (injected cause)
+/// or the third (none), never the first — and the first must still take what
+/// it exists for. No realtime workload reaches that refusal at its pinned base
+/// (none in 20 batches, 2026-09-30), so this is the arm's oracle.
+#[test]
+fn the_compacted_log_refusal_is_fallout_or_a_failure_never_an_unrestorable_skip() {
+    let refusal = |cause: &str| {
+        format!(
+            "table store cannot open ({cause}) and the log is compacted to seq 3 — the records \
+             below the store's last checkpoint no longer exist locally, so the store cannot be \
+             rebuilt from the log alone; restore this node from a replica or backup, or widen \
+             DbConfig::retain_segments (DESIGN §4)"
+        )
+    };
+    let injected = refusal("table store (redb): I/O error: injected read error");
+    assert!(!local_copy_unrestorable(&injected), "{injected}");
+    assert!(
+        is_fault_fallout(&injected),
+        "an injected cause is fallout: {injected}"
+    );
+    let bare = refusal(
+        "table store (redb): DB corrupted: File truncated below stored layout: file_len=4096, \
+         layout_len=8192",
+    );
+    assert!(!local_copy_unrestorable(&bare), "{bare}");
+    assert!(
+        !is_fault_fallout(&bare),
+        "no injected cause, so it fails: {bare}"
+    );
+    assert!(local_copy_unrestorable(
+        "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
+         corruption of acknowledged records, not a torn tail, and truncating it would silently \
+         lose data; restore this node from a replica or backup (DESIGN §2)"
+    ));
+    assert!(local_copy_unrestorable("refusing to guess across a gap"));
+}
+
 fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
     sim.cover("restart");
     node.recoveries += 1;
@@ -3733,11 +3783,7 @@ fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
                 return Ok(());
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
-            Err(e)
-                if e.contains("restore this node from a replica or backup")
-                    || e.contains("cannot be rebuilt from the log alone")
-                    || e.contains("refusing to guess") =>
-            {
+            Err(e) if local_copy_unrestorable(&e) => {
                 sim.cover("rt:inconclusive:local-unrestorable");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} local copy unrestorable (no restore rig in this \
