@@ -160,14 +160,20 @@ once per round, and it fires only if the round runs past the drawn op count, so 
 calibrated to its workload's op volume: under 4.3.0 a round issues 57-90% of 4.1.0's disk ops
 (mean, per workload), and at a fixed base the 4.1.0 ranges fired 24-86% fewer crashes. Each
 range was re-sized on 2026-09-30 by counting every round's ops with the countdown disarmed, at
-both versions and two bases, then scaling (A, B) until that measured distribution predicts
-4.1.0's crash count plus one standard deviation at the batch's base (`scoped_realtime_workload`
-without the margin: with it the batch crashed 10% more often than under 4.1.0 and fell below
-its exact `realtime:resume-backlog` floor). A uniform scale by the mean op ratio alone
-restores only 71-98% of the rate (per workload), because 4.3.0's saving sits in the long
-rounds. Every batch's `fault:crash` is back at or above its 4.1.0 count at its base. A redb
-upgrade that changes the IO shape again re-opens this calibration, as it re-opens the latch
-census (§4).
+both versions and two bases. The goal is `fault:crash` at or above its 4.1.0 count with every
+floor still holding, and the rule is set per workload. Each range is scaled until that
+measured distribution predicts 4.1.0's crash count plus one standard deviation at the batch's
+base — except `scoped_realtime_workload`, which takes no margin: with the margin it crashed
+10% more often than under 4.1.0 (124 against 113) and its exact `realtime:resume-backlog`
+floor fell to 122 of 125, while without it the batch crashes 117 times and the floor holds. A
+uniform scale by the mean op ratio alone restores only 71-98% of the rate (per workload),
+because 4.3.0's saving sits in the long rounds. Every batch's `fault:crash` is back at or
+above its 4.1.0 count at its base. Where a property's hard case had depended on 4.1.0's IO
+shape, the workload now reaches it by construction: the receipt-upgrade property needs v1 to
+die while a receipt is durable but not yet run, a window 4.1.0 widened by writing store pages
+inside it, so `receipt_upgrade_universe` holds its first receipt Pending for one retry
+(kernel.rs). An oracle's reach must not depend on a dependency's IO shape. A redb upgrade that
+changes the IO shape again re-opens this calibration, as it re-opens the latch census (§4).
 
 **The same split a second time: the directory barrier.** `SimDisk::sync_dir` rolls
 `sync_error` off `keyed_stream(seed, "host-dir-faults:{host}")` — and off a global

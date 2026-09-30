@@ -135,6 +135,54 @@ mod receipt_v2 {
     }
 }
 
+/// The old binary `receipt_upgrade_universe` runs: receipt_v1's shape (same
+/// NAME, same FINGERPRINT — a retry policy is not part of a job's shape), whose
+/// handler turns invoice 0's first attempt away, so that receipt stays durable
+/// and Pending for one backoff while v1 serves the receipts behind it. Why the
+/// window is held open: `receipt_upgrade_universe`'s doc.
+mod receipt_v1_deferring {
+    use charpente::kernel::JobError;
+    use charpente::{Tx, job};
+    use charpente_core::job::{JobRow, JobStatus};
+    use charpente_core::table::{Codec, View};
+
+    #[job(global, retry(max = 3, backoff = "2s"))]
+    pub struct SendReceipt {
+        pub invoice: u64,
+    }
+
+    impl SendReceipt {
+        fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+            if self.invoice != 0 {
+                return Ok(());
+            }
+            let first_attempt = tx.scan::<JobRow>()?.into_iter().any(|r| {
+                r.name == "SendReceipt"
+                    && r.status == JobStatus::Pending
+                    && r.attempts == 0
+                    && SendReceipt::decode(&mut &r.payload[..])
+                        .is_ok_and(|p| p.invoice == self.invoice)
+            });
+            if first_attempt {
+                return Err(JobError::app("deferred to its retry"));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn the_deferring_old_binary_enqueues_the_v1_shape() {
+    assert_eq!(
+        receipt_v1_deferring::SendReceipt::NAME,
+        receipt_v1::SendReceipt::NAME
+    );
+    assert_eq!(
+        <receipt_v1_deferring::SendReceipt as Job>::FINGERPRINT,
+        <receipt_v1::SendReceipt as Job>::FINGERPRINT
+    );
+}
+
 #[test]
 fn a_jobs_fingerprint_follows_its_fields_not_its_name() {
     assert_eq!(receipt_v1::SendReceipt::NAME, receipt_v2::SendReceipt::NAME);
@@ -3432,6 +3480,17 @@ fn receipts_app(sim: &Sim, v2: bool) -> std::io::Result<App> {
     .mount_jobs(defs))
 }
 
+fn deferring_v1_receipts_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![enqueue_receipt])
+    .mount_jobs(jobs![receipt_v1_deferring::SendReceipt]))
+}
+
 /// The refusal text, spelled out from the spec's wording rather than taken
 /// from the product's `format!`, so the byte-exact comparison pins the words.
 fn receipt_refusal(ids: &[u64], recorded: &str) -> String {
@@ -4101,11 +4160,27 @@ fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption()
 /// same store. The kernel refuses exactly when a durable Pending receipt
 /// carries the old shape, naming exactly those ids — it never starts over one
 /// and never refuses over none.
+///
+/// The hard case is v1 dying, by a crash or an injected fault, while a receipt
+/// is durable but has not run, so the window between a receipt's enqueue and
+/// its run has to cover a real share of v1's disk ops, and that share has to
+/// come from this workload rather than from a dependency's IO shape. Under
+/// redb 4.1.0 every commit wrote its store pages right after its WAL sync,
+/// inside that window: a crash after v1's boot found a Pending receipt 39% of
+/// the time (92 of 234, pooled over six bases). redb 4.3.0 buffers those pages
+/// until a checkpoint and the share fell to 21% (58 of 271), which left
+/// `shapes:job-refused-after-crash` at 8 of its 14. So v1 runs
+/// `receipt_v1_deferring`: invoice 0, the first receipt of every run, fails its
+/// first attempt and waits out a 2 s backoff, Pending, while the receipts behind
+/// it are enqueued and run — 34% (94 of 277). The backoff sets the window's
+/// width: at 5 s so many runs end with invoice 0 still Pending that
+/// `shapes:job-drained` falls under its floor (109), and at 1 s
+/// `shapes:job-refused-after-crash` sits exactly on its floor.
 fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
     sim.crash_disk_after(22 + entropy.next_u64() % 174);
-    match receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
+    match deferring_v1_receipts_app(sim).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
         Ok(mut kernel) => {
             let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
             let base = sim.now().as_nanos();
@@ -4226,7 +4301,9 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
 /// The floors below are exact counts, so the batch must replay: one universe
 /// run twice from one seed gives the same coverage and the same durable
 /// state. The seed's universe reaches a verdict, so the replay covers the
-/// property's own outcome.
+/// property's own outcome. It reaches it through the held-open window: its five
+/// receipts are Done, invoice 0 after one turned-away attempt (re-verified
+/// 2026-09-30, when the deferral landed).
 #[test]
 fn job_shape_upgrades_replay_identically_for_the_same_seed() {
     charpente_sim::checks::replays_identically(0x5A9E_0611, |sim: &mut Sim| {
