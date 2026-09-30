@@ -15,7 +15,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          # rust-src is load-bearing for charpente-macros' trybuild pins: a const-eval
+          # panic's diagnostic quotes std's `panic!` source line only when rust-src is
+          # installed, and prints "= note: the failure occurred here" when it is not
+          # (job_row_table_name_borrowed.stderr, run 36708487381). The pins are generated
+          # with it, so CI has it too.
+          components: rustfmt, clippy, rust-src
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       # Carries the nondeterminism deny-list (clippy.toml) — hard rule 1.
