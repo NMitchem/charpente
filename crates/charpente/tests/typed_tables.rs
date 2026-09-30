@@ -434,6 +434,7 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
     };
     let mut submitted: Vec<Vec<u8>> = Vec::new();
     let mut acked = 0usize;
+    let mut checked = false;
 
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
@@ -541,6 +542,7 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
                     sim.restart();
                     continue;
                 }
+                checked = true;
             }
             Err(_) => {
                 sim.restart();
@@ -584,6 +586,12 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
         }
         sim.restart();
     }
+    if !checked {
+        sim.give_up(
+            "the store was never checked against the model: every round's recovery or check \
+             hit a fault",
+        );
+    }
     Ok(())
 }
 
@@ -601,6 +609,40 @@ fn tables_and_log_survive_the_fault_matrix() {
             "crash:dropped",
             "restart",
         ]
+    );
+}
+
+/// A universe in which no round ever checked the store against the model
+/// adjudicated nothing, so it gives up rather than passing (LEDGER
+/// 2026-09-30, follow-up 9). Every disk op faults here, so no round's
+/// recovery ever succeeds.
+#[test]
+fn a_universe_that_never_checks_the_store_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x7AB1_0901, FaultConfig::none());
+    assert_eq!(tables_workload(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x7AB1_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert_eq!(tables_workload(&mut sim), Ok(()));
+    let reason = sim
+        .gave_up()
+        .expect("a universe that never checked the store must give up, not pass");
+    assert!(
+        reason.contains("the store was never checked against the model"),
+        "and it must be THIS give-up: {reason}"
     );
 }
 

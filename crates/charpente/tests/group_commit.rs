@@ -2415,15 +2415,29 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
         // The round-boundary check. Without it a loss here is erased by any
         // later round that pushes the count back above the watermark — see
         // `verify_watermark`'s doc for the measurement.
-        if let Verify::Excused = verify_watermark(sim, watermark)? {
-            return Ok(());
+        // `Unreachable` here is not a give-up: the next round's check, or the
+        // coda, still adjudicates the same watermark.
+        match verify_watermark(sim, watermark)? {
+            Verify::Excused => return Ok(()),
+            Verify::Unreachable => sim.cover("oracle:round-unreachable"),
+            Verify::Checked => {}
         }
     }
 
     // The final coda, kept alongside the per-round checks exactly as
     // `kernel_workload` keeps its own (`kernel.rs:1393` and again at the
     // end): the last round's writes have no round boundary after them.
-    verify_watermark(sim, watermark)?;
+    match verify_watermark(sim, watermark)? {
+        Verify::Checked => {}
+        // The durable-corruption excuse stays a pass: the fault it excuses
+        // fired and is on record under its own fire-time key
+        // (`durable_corruption_fired`), unlike a check that never ran.
+        Verify::Excused => {}
+        Verify::Unreachable => sim.give_up(
+            "the final coda never verified the watermark: all 8 reopens hit injected faults, \
+             so the last round's acked requests were never checked",
+        ),
+    }
     Ok(())
 }
 
@@ -2473,5 +2487,67 @@ fn contended_request_bursts_survive_the_fault_matrix() {
             "crash:torn",
             "restart"
         ]
+    );
+}
+
+/// A universe whose final coda never verified the watermark adjudicated
+/// nothing about its last round, so it gives up rather than passing (LEDGER
+/// 2026-09-30, follow-up 9). Every disk op faults here, so every reopen dies
+/// to injected faults.
+#[test]
+fn a_coda_that_never_verifies_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x60C1_0901, FaultConfig::none());
+    assert_eq!(burst_workload(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x60C1_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert_eq!(burst_workload(&mut sim), Ok(()));
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose coda never verified must give up, not pass");
+    assert!(
+        reason.contains("the final coda never verified the watermark"),
+        "and it must be THIS give-up: {reason}"
+    );
+}
+
+/// The give-up is the coda's alone. Seed `0x15d7721641ce58b3` (universe of the
+/// pinned base `0x60C1_0009`) finds a round boundary's check unreachable and
+/// then verifies at the coda, so it adjudicated its property and must not be
+/// counted as a give-up: a give-up at the per-round call would be sticky and
+/// throw that verdict away.
+#[test]
+fn an_unreachable_round_check_before_a_verified_coda_is_a_verdict() {
+    const SEED: u64 = 0x15d7_7216_41ce_58b3;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    assert_eq!(burst_workload(&mut sim), Ok(()));
+    assert!(
+        sim.coverage().contains_key("oracle:round-unreachable"),
+        "this universe must still find a round boundary's check unreachable, or it no \
+         longer pins the scenario: {:?}",
+        sim.coverage()
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "the coda verified, so this universe reached a verdict"
     );
 }

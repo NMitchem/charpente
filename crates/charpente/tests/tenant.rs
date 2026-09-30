@@ -950,9 +950,9 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     }
 
     // Final recovery: the last round's writes get the oracle too. Under
-    // persistent injected faults an open may legitimately never succeed
-    // (the oracle already ran at every successful open above), so an
-    // injected failure ends the universe rather than failing it.
+    // persistent injected faults an open may legitimately never succeed, so
+    // an injected failure ends the universe rather than failing it — as a
+    // give-up, since the last round's writes were never checked.
     for _attempt in 0..8 {
         let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), ledger_schema()) {
             Ok(db) => db,
@@ -975,6 +975,10 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
             Err(msg) => Err(msg),
         };
     }
+    sim.give_up(
+        "the final recovery never ran the oracle: all 8 attempts hit injected faults, so the \
+         last round's writes were never checked",
+    );
     Ok(())
 }
 
@@ -999,6 +1003,40 @@ fn every_scoped_read_returns_only_its_own_tenants_rows() {
         |_cfg: &mut FaultConfig| {},
         tenant_universe,
         require: ["tenant:multi_tenant_write", "tenant:crash_mid_batch"]
+    );
+}
+
+/// A universe whose final recovery never ran the oracle adjudicated nothing
+/// about its last round, so it gives up rather than passing (LEDGER
+/// 2026-09-30, follow-up 9). Every disk op faults here, so every attempt dies
+/// to injected faults.
+#[test]
+fn a_final_recovery_that_never_runs_the_oracle_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x7E4A_0901, FaultConfig::none());
+    assert_eq!(tenant_universe(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x7E4A_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert_eq!(tenant_universe(&mut sim), Ok(()));
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose final recovery never ran the oracle must give up, not pass");
+    assert!(
+        reason.contains("the final recovery never ran the oracle"),
+        "and it must be THIS give-up: {reason}"
     );
 }
 

@@ -1363,7 +1363,8 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     }
 
     // Final verification (step-4 convention): injected-fault failures skip,
-    // anything else is real.
+    // anything else is real, and a universe in which every attempt was
+    // skipped gives up.
     for _attempt in 0..8 {
         let app = match open_crash_app(sim) {
             Ok(app) => app,
@@ -1396,7 +1397,11 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             Err(msg) => return Err(msg),
         }
     }
-    Ok(responses) // every attempt died to injected faults; earlier rounds verified every reachable prefix
+    sim.give_up(
+        "the final verification never ran: all 8 attempts hit injected faults, so the last \
+         round's acked requests were never checked",
+    );
+    Ok(responses)
 }
 
 fn http_workload(sim: &mut Sim) -> Result<(), String> {
@@ -1417,6 +1422,40 @@ fn http_requests_survive_the_fault_matrix() {
             "crash:dropped",
             "restart",
         ]
+    );
+}
+
+/// A universe whose final verification never ran adjudicated nothing about
+/// its last round, so it gives up rather than passing (LEDGER 2026-09-30,
+/// follow-up 9). Every disk op faults here, so every attempt dies to injected
+/// faults.
+#[test]
+fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x4770_0901, FaultConfig::none());
+    assert_eq!(http_workload(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x4770_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert!(http_workload_traced(&mut sim).is_ok());
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose final verification never ran must give up, not pass");
+    assert!(
+        reason.contains("the final verification never ran"),
+        "and it must be THIS give-up: {reason}"
     );
 }
 

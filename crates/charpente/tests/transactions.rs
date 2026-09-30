@@ -744,8 +744,8 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
     // WAL's read-only final recovery it needs a long fault-free streak of
     // writes; under persistent injected faults it may legitimately never
     // succeed (seed 0x4cea828a65f0f1eb). Injected-fault failures skip the
-    // final check — the oracle still runs at every successful open across
-    // the universe set — but any other open error is a real bug.
+    // final check, and a universe in which every attempt was skipped gives
+    // up; any other open error is a real bug.
     for _attempt in 0..8 {
         let db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
@@ -826,7 +826,11 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             Err(msg) => Err(msg),
         };
     }
-    Ok(()) // every attempt died to injected faults; earlier rounds verified every reachable prefix
+    sim.give_up(
+        "the final verification never ran: all 8 attempts hit injected faults, so the last \
+         round's commits were never checked",
+    );
+    Ok(())
 }
 
 #[test]
@@ -845,6 +849,40 @@ fn transactions_survive_the_fault_matrix() {
             "batch:multi_record",
             "batch:multi_record_faulted",
         ]
+    );
+}
+
+/// A universe whose final verification never ran adjudicated nothing about
+/// its last round, so it gives up rather than passing (LEDGER 2026-09-30,
+/// follow-up 9). Every disk op faults here, so every attempt dies to injected
+/// faults.
+#[test]
+fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x7A00_0901, FaultConfig::none());
+    assert_eq!(tx_workload(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x7A00_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert_eq!(tx_workload(&mut sim), Ok(()));
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose final verification never ran must give up, not pass");
+    assert!(
+        reason.contains("the final verification never ran"),
+        "and it must be THIS give-up: {reason}"
     );
 }
 
