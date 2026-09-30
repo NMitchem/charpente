@@ -42,11 +42,13 @@ pub(crate) fn compute(field_idents: &[syn::Ident], field_types: &[Type]) -> u64 
 
 /// A job's fingerprint (job-tenancy spec §6). A `global` job's is exactly
 /// `compute`'s, so no job changes shape by declaring `global`. A `scoped_by`
-/// job's is the same fold followed by `#scoped_by\0<path tokens>\0`, so a
-/// change of tenancy is a change of shape, which the Pending-shape refusal
-/// names. No identifier begins with `#`, so no field list can produce the
-/// suffix. `cross_tenant` is not mixed in, because it changes neither the
-/// stored bytes nor decode.
+/// job's is the same fold followed by `#scoped_by\0<path tokens>\0`, so moving
+/// a job between `global` and `scoped_by`, or respelling its path, is a change
+/// of shape, which the Pending-shape refusal names. The tokens are the path as
+/// spelled, so a path that keeps its spelling but comes to name another type
+/// is not (GUIDE §6 states that residual). No identifier begins with `#`, so
+/// no field list can produce the suffix. `cross_tenant` is not mixed in,
+/// because it changes neither the stored bytes nor decode.
 pub(crate) fn compute_job(
     field_idents: &[syn::Ident],
     field_types: &[Type],

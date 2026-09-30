@@ -1709,10 +1709,12 @@ opening, a completed switchover), and `promote` checks before it changes anythin
 <n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore <job>'s old fields and its `global`/`scoped_by` declaration and give the new shape its own #[job] type under a new name (GUIDE §6)
 ```
 
-A job's tenancy is part of its shape. `scoped_by` is fingerprinted with the fields, so
-moving a job between `global` and `scoped_by`, or between two scope types, is refused the
-same way. A deploy therefore never hands a row enqueued with no tenant to a scoped `run`,
-or one enqueued in a tenant to a global one.
+A job's tenancy is part of its shape. `scoped_by` is fingerprinted with the fields, as
+it is spelled, so moving a job between `global` and `scoped_by`, or respelling its
+`scoped_by` path, is refused the same way. A deploy therefore never hands a row enqueued
+with no tenant to a scoped `run`, or one enqueued in a tenant to a global one. A path that
+keeps its spelling but comes to name another type is not a shape change, and nothing
+refuses it: see below, after the scope-type refusal, for what to do before such a deploy.
 
 At most five ids are listed, then `…`. A job enqueued before shapes were recorded reads
 `recorded none — enqueued before job shapes were tagged`, and it is refused the same way:
@@ -1781,9 +1783,22 @@ job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as 
 ```
 
 This one has no startup twin, because a row carries no type to compare. The check runs
-where both types are known, at the enqueue, in a binary that mounts the job. A row that a
-binary which did not mount that job name enqueued is dispatched, by the next binary that
-does, in the scope type that binary declares.
+where both types are known, at the enqueue, in a binary that mounts the job. So a Pending
+row enqueued by any other binary is dispatched, by the next binary that mounts the name, in
+the scope type that binary declares, and nothing checks the type. That covers two cases:
+
+- a row enqueued by a binary that did not mount the job name at all;
+- a row enqueued by a binary that mounted it under a `scoped_by` path spelled the same way
+  but naming another type. This one needs no stand-in, only a refactor: a job module whose
+  `use billing::Org;` becomes `use crm::Org;` keeps the path `Org` and so keeps the
+  fingerprint, and a job enqueued in `billing::Org` 25 before the deploy runs in `crm::Org`
+  25 after it.
+
+Where the recorded shape matches the mounted one, neither is refused, at startup or at
+dispatch. So before a deploy that mounts a scoped job the running binary does not mount,
+or that makes a scoped job's `scoped_by` path name another type, drain that job: run the
+binary that enqueued its Pending rows until every one is Done or Dead, the first way
+through a shape change below.
 
 There are two ways through a shape change:
 
@@ -4343,8 +4358,9 @@ its type, not the type's definition.
 The tokens are hashed as written, rendered by charpente itself with one space between
 tokens: `Vec<u8>` and `std::vec::Vec<u8>` are different shapes to it, so respelling a
 field's type is a shape change, and a compiler upgrade never is.
-A job's `scoped_by` path is fingerprinted the same way, as written, so a change of a
-job's tenancy is a shape change (§6).
+A job's `scoped_by` path is fingerprinted the same way, as written, so moving a job
+between `global` and `scoped_by`, or respelling its path, is a shape change, and a path
+that keeps its spelling but comes to name another type is not (§6).
 A change inside a type a field holds — a new variant on an enum, a field added to a
 nested struct — leaves the fingerprint unchanged, for tables and for
 `#[event]`/`#[job]` payloads alike (§6, §11). Such a

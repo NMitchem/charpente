@@ -631,8 +631,15 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   tenant id and not its type, and the fingerprint hashes the `scoped_by` path as spelled, so
   a stand-in copying `NAME` and `FINGERPRINT`, or a `#[job]` whose path spells another type
   alike, would otherwise run the job in the same id of the declared type. The check needs
-  both types, so it runs at enqueue only; a row enqueued by a binary that did not mount the
-  name has no type to check when a later binary that does dispatches it (final review N1).
+  both types, so it runs at enqueue only. A Pending row enqueued by any other binary has no
+  type to check when a later binary that mounts the name dispatches it, in the scope type
+  that binary declares. The enqueuing binary may not have mounted the name at all, or it may
+  have mounted it under a `scoped_by` path spelled alike but naming another type: a refactor
+  that turns a job module's `use billing::Org` into `use crm::Org` keeps the fingerprint,
+  so the job's Pending rows run in the same ids of `crm::Org`. Where the shape matches,
+  nothing refuses either case, so the operator drains such a job (runs the binary that
+  enqueued its Pending rows until they are Done or Dead) before the deploy (final review
+  N1, NB2).
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log. An event payload is itself a
   wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
@@ -830,8 +837,12 @@ creation — is discarded at `Db::open` and rebuilt by replaying the WAL
 from scratch; the log is the only source of truth. "Cannot open" includes redb panicking
 at open: redb 4.1.0 asserts (page_manager.rs:231/:257) instead of erroring when a crash
 leaves the store file's length disagreeing with its durable header's layout — an unsynced
-`set_len` drops at crash while the header god-page write survives (sim-found; the crash
-model is exactly ALICE's unordered-writeback). `Store::open` converts an open-time panic
+`set_len` drops at crash while the header god-page write survives (`:231`), or a crash
+tears a data-page write inside an unsynced `set_len` extension that drops, and the
+surviving sectors leave a file length that is not a whole number of pages: redb
+recalculates its layout from that length, rounded down to whole pages, and asserts the
+two equal (`:257`) (both sim-found; the crash model is exactly ALICE's
+unordered-writeback). `Store::open` converts an open-time panic
 into an open failure so the discard path covers it; the fence is scoped to open — a redb
 panic during operation still propagates. Reported upstream; drop the fence when redb
 returns `Err` for this state. That rebuild holds only while the log still retains seq 0:
@@ -1257,8 +1268,10 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   `#[job]` item; handler panics are absorbed into the same path). At-least-once execution
   plus idempotency-key observability is the framing M1's external-effect handlers need; v0
   handlers are pure state and don't need it yet. Every enqueue records the payload type's
-  structural fingerprint (§3). A scoped job's fingerprint also covers its `scoped_by`, so a
-  change of tenancy is refused like a change of fields. The kernel refuses to dispatch while a Pending job of a
+  structural fingerprint (§3). A scoped job's fingerprint also covers its `scoped_by` path
+  as spelled, so moving a job between `global` and `scoped_by`, or respelling its path, is
+  refused like a change of fields; a path that keeps its spelling but comes to name another
+  type is not (§3's Jobs bullet). The kernel refuses to dispatch while a Pending job of a
   mounted type carries another shape, naming the job, its ids and both shapes. It checks at
   startup and wherever its write gate opens, and `promote` checks before its durable flip.
   A switchover is never refused at the hand-off, which is the primary's point of no return

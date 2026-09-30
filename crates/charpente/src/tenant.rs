@@ -38,7 +38,12 @@
 //! `Tx::put`/`Tx::delete` refuse it; the dispatcher settles one through
 //! `Tx::settle_job`), and `Group::stage` refuses an enqueue inside a tenant of
 //! another scope type than the job's mounted `#[job]` declares, since the row
-//! records the tenant's id and not its type; operator code that must act inside one tenant — seeding, a test oracle —
+//! records the tenant's id and not its type. That check holds within one
+//! binary: a Pending row enqueued by another binary (one that did not mount the
+//! job, or mounted it under a `scoped_by` path spelled alike but naming another
+//! type) runs, unchecked, in the type the dispatching binary declares. GUIDE §6
+//! and DESIGN.md §3's Jobs bullet state that residual and the drain that avoids
+//! it. Operator code that must act inside one tenant — seeding, a test oracle —
 //! opens it with a `TenantAdmission` minted from a `Group` (`Tx::admit_scope`),
 //! the seal `CrossTenant` already carries, which is the operator's standing
 //! made explicit rather than an exception to the guarantee. *(Corrected
