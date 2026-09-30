@@ -238,6 +238,40 @@ fn body_cap_is_a_413_before_decoding() {
     );
 }
 
+/// The other side of the cap: a body of exactly `body_cap` bytes is decoded
+/// and handled, not refused. The test above sends `body_cap + 1`, so without
+/// this one the cap check could refuse at `>=` and stay green (the T9 mutation
+/// run found `>` to `>=` MISSED; ruling T9-R8).
+#[test]
+fn a_body_of_exactly_body_cap_bytes_is_handled_not_refused() {
+    let sim = Sim::with_faults(0xB0DC_A964, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            body_cap: 64,
+            ..AppConfig::default()
+        },
+    )
+    .unwrap()
+    .mount(note_routes());
+    let note = |text: String| {
+        Request::new(Method::Post, "/notes").json(&CreateNote {
+            id: Id::from_raw(1),
+            text,
+        })
+    };
+    let bare = note(String::new()).body.len();
+    let at_cap = note("x".repeat(64 - bare));
+    assert_eq!(at_cap.body.len(), 64, "the body sits exactly at the cap");
+    let resp = app.handle(at_cap);
+    // The unmutated build answers 200 with the created id (observed first,
+    // then pinned): the handler ran, so the body was not refused.
+    assert_eq!(resp.status, 200, "{}", body_text(&resp));
+    assert_eq!(body_text(&resp), "\"1\"");
+}
+
 /// repl T3: `TxError::NotPrimary` maps to 421, naming the primary; reads are
 /// unaffected by the gate.
 #[test]
