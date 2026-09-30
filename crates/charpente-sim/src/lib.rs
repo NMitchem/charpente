@@ -656,8 +656,9 @@ impl Sim {
     /// rounds 2 and 3 still run, so their verdict is thrown away silently.
     /// In a loop, `give_up` and `return`/`break` out belong on the same arm.
     ///
-    /// Also marks `universe:gave-up` coverage, so a give-up *rate* is floorable
-    /// with the existing `floor:` machinery and needs no new wiring.
+    /// Also marks `universe:gave-up` coverage, so a give-up *rate* can be
+    /// capped with the swarm runners' `ceiling:` (a `floor:` on it would bound
+    /// give-ups from below, which guards nothing).
     pub fn give_up(&self, reason: impl Into<String>) {
         let mut guard = self.world.lock();
         if guard.gave_up.is_none() {
@@ -1702,17 +1703,31 @@ fn ambient_base_seed() -> u64 {
 /// universe, and accumulating sometimes-coverage across the batch. Add
 /// `require: [...]` to assert each named key was covered at least once in the
 /// batch — call as `run_universes_swarm!(N, f)` or `run_universes_swarm!(N,
-/// f, require: ["key", ...])`. `run_universes!`/`run_one` are a separate,
-/// frozen runner — this one is new. Set `CHARPENTE_SEED=0x…` to replay one
+/// f, require: ["key", ...])` — and `ceiling: [("key", N), ...]` after it to
+/// fail the batch when a key that must stay rare was covered more than N
+/// times (see `run_universes_swarm_with!`). `run_universes!`/`run_one` are a
+/// separate, frozen runner — this one is new. Set `CHARPENTE_SEED=0x…` to replay one
 /// universe (its config re-derives from the seed; the coverage requirement
 /// check is skipped, since one universe can't be expected to hit everything).
 #[macro_export]
 macro_rules! run_universes_swarm {
     ($universes:expr, $f:expr) => {
-        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[], $f)
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[], &[], $f)
     };
     ($universes:expr, $f:expr, require: [$($key:expr),* $(,)?]) => {
-        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[$($key),*], $f)
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[$($key),*], &[], $f)
+    };
+    ($universes:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     ceiling: [$(($ckey:expr, $max:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $universes,
+            &[$($key),*],
+            &[$(($ckey, $max)),*],
+            $f,
+        )
     };
 }
 
@@ -1722,6 +1737,7 @@ pub fn run_universes_swarm_in(
     file: &str,
     universes: u64,
     require: &[&str],
+    ceilings: &[(&str, u64)],
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
     // Ambient base, no config override — delegates to the `_with` runner
@@ -1736,6 +1752,7 @@ pub fn run_universes_swarm_in(
         universes,
         require,
         &[],
+        ceilings,
         |_cfg: &mut FaultConfig| {},
         f,
     );
@@ -1752,7 +1769,13 @@ pub fn run_universes_swarm_in(
 /// `run_universes_swarm_with!(base, N, adjust, f)`, with `require: [...]`, or
 /// with `require: [...], floor: [("key", N), ...]` — a floor is `require:`'s
 /// at-least-once generalized to an at-least-N measured rate, for a property
-/// whose oracle can decay toward vacuous without ever reaching zero.
+/// whose oracle can decay toward vacuous without ever reaching zero. A
+/// `ceiling: [("key", N), ...]` after either is the same check turned around:
+/// the batch fails when the key was covered more than N times. Its use is
+/// `("universe:gave-up", N)`, since a give-up is reported and never failed, so
+/// without a cap a property can drift toward adjudicating nothing with every
+/// batch green. Like floors and requires, ceilings are skipped under
+/// `CHARPENTE_SEED` and `CHARPENTE_BASE_SEED`.
 #[macro_export]
 macro_rules! run_universes_swarm_with {
     ($base:expr, $universes:expr, $adjust:expr, $f:expr) => {
@@ -1761,6 +1784,7 @@ macro_rules! run_universes_swarm_with {
             file!(),
             $base,
             $universes,
+            &[],
             &[],
             &[],
             $adjust,
@@ -1774,6 +1798,7 @@ macro_rules! run_universes_swarm_with {
             $base,
             $universes,
             &[$($key),*],
+            &[],
             &[],
             $adjust,
             $f,
@@ -1789,6 +1814,38 @@ macro_rules! run_universes_swarm_with {
             $universes,
             &[$($key),*],
             &[$(($fkey, $min)),*],
+            &[],
+            $adjust,
+            $f,
+        )
+    };
+    ($base:expr, $universes:expr, $adjust:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     ceiling: [$(($ckey:expr, $max:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_with_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $base,
+            $universes,
+            &[$($key),*],
+            &[],
+            &[$(($ckey, $max)),*],
+            $adjust,
+            $f,
+        )
+    };
+    ($base:expr, $universes:expr, $adjust:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     floor: [$(($fkey:expr, $min:expr)),* $(,)?],
+     ceiling: [$(($ckey:expr, $max:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_with_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $base,
+            $universes,
+            &[$($key),*],
+            &[$(($fkey, $min)),*],
+            &[$(($ckey, $max)),*],
             $adjust,
             $f,
         )
@@ -1804,6 +1861,7 @@ pub fn run_universes_swarm_with_in(
     universes: u64,
     require: &[&str],
     floors: &[(&str, u64)],
+    ceilings: &[(&str, u64)],
     adjust: impl Fn(&mut FaultConfig),
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
@@ -1842,16 +1900,16 @@ pub fn run_universes_swarm_with_in(
     let rebased = std::env::var("CHARPENTE_BASE_SEED")
         .ok()
         .map(|v| parse_seed("CHARPENTE_BASE_SEED", &v));
-    let (base, require, floors) = match rebased {
+    let (base, require, floors, ceilings) = match rebased {
         Some(b) => {
             eprintln!(
                 "charpente-sim [{test_file}]: re-basing {base:#018x} -> {b:#018x} under \
-                 CHARPENTE_BASE_SEED — coverage requirements and floors skipped (they are \
-                 rates measured at the pinned base)"
+                 CHARPENTE_BASE_SEED — coverage requirements, floors and ceilings skipped \
+                 (they are rates measured at the pinned base)"
             );
-            (b, &[][..], &[][..])
+            (b, &[][..], &[][..], &[][..])
         }
-        None => (base, require, floors),
+        None => (base, require, floors, ceilings),
     };
     eprintln!(
         "charpente-sim [{test_file}]: {universes} swarm universes from base seed {base:#018x}"
@@ -1902,6 +1960,26 @@ pub fn run_universes_swarm_with_in(
          that state less often than when the number was taken, and why is the finding. \
          Investigate before touching it — lowering a floor to match is how a real oracle \
          becomes decorative with the suite still green."
+    );
+    // `floor:` turned around, for a key that must stay rare. On
+    // `universe:gave-up` it is the one guard on a verdict rate: a give-up is
+    // reported, never failed, so without a cap a property can drift toward
+    // adjudicating nothing with every batch still green.
+    let above: Vec<String> = ceilings
+        .iter()
+        .filter_map(|(key, max)| {
+            let seen = coverage.get(*key).copied().unwrap_or(0);
+            (seen > *max).then(|| format!("{key}: {seen} over a cap of {max}"))
+        })
+        .collect();
+    assert!(
+        above.is_empty(),
+        "sim coverage ceiling failed in {test_file}: {above:?} over {universes} universes. \
+         A ceiling caps a key that must stay rare: it rose because the property reaches that \
+         state more often than when the cap was set, and why is the finding. On \
+         universe:gave-up it means fewer universes reached a verdict. Investigate before \
+         touching it — raising a cap to match is how a property stops adjudicating with the \
+         suite still green."
     );
 }
 
@@ -2694,6 +2772,7 @@ mod tests {
                 "swarm_meta.rs",
                 1,
                 &[],
+                &[],
                 |_sim: &mut Sim| -> Result<(), String> { panic!("boom") },
             );
         }))
@@ -2715,6 +2794,7 @@ mod tests {
                 4,
                 &[],
                 &[("rare:key", 3)],
+                &[],
                 |_cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
                     // Covered in the FIRST universe only: 1 seen against a
@@ -2744,12 +2824,71 @@ mod tests {
             4,
             &[],
             &[("common:key", 4)],
+            &[],
             |_cfg: &mut FaultConfig| {},
             |sim: &mut Sim| {
                 sim.cover("common:key");
                 Ok(())
             },
         );
+    }
+
+    #[test]
+    fn a_give_up_rate_above_its_ceiling_fails_the_batch_naming_key_count_and_cap() {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_universes_swarm_with_in(
+                "charpente-sim",
+                "swarm_meta.rs",
+                0x5100_0003,
+                4,
+                &[],
+                &[],
+                &[("universe:gave-up", 0)],
+                |_cfg: &mut FaultConfig| {},
+                |sim: &mut Sim| {
+                    sim.give_up("this workload adjudicates nothing");
+                    Ok(())
+                },
+            );
+        }))
+        .expect_err("a key above its ceiling must fail the batch");
+        let msg = panic_message(&*payload);
+        assert!(
+            msg.contains("sim coverage ceiling failed in swarm_meta"),
+            "{msg}"
+        );
+        assert!(msg.contains("universe:gave-up: 4 over a cap of 0"), "{msg}");
+    }
+
+    #[test]
+    fn a_ceiling_that_holds_does_not_fail_the_batch() {
+        let batch = |cap: u64, give_up: bool| {
+            run_universes_swarm_with_in(
+                "charpente-sim",
+                "swarm_meta.rs",
+                0x5100_0004,
+                4,
+                &[],
+                &[],
+                &[("universe:gave-up", cap)],
+                |_cfg: &mut FaultConfig| {},
+                |sim: &mut Sim| {
+                    if give_up {
+                        sim.give_up("this workload adjudicates nothing");
+                    }
+                    Ok(())
+                },
+            )
+        };
+        // A key never marked counts as zero, which a cap of zero allows.
+        batch(0, false);
+        // At the cap is not above it...
+        batch(4, true);
+        // ...and one under it is.
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch(3, true)))
+            .expect_err("4 give-ups against a cap of 3 must fail the batch");
+        let msg = panic_message(&*payload);
+        assert!(msg.contains("universe:gave-up: 4 over a cap of 3"), "{msg}");
     }
 
     #[test]
@@ -2760,6 +2899,7 @@ mod tests {
                 "swarm_meta.rs",
                 4,
                 &["never:happens"],
+                &[],
                 |_sim: &mut Sim| Ok(()),
             );
         }))

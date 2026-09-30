@@ -2406,9 +2406,14 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
 - A workload that gives up and then returns `Err` is still a **failure**.
   Failures outrank give-ups.
 - It also marks the coverage key `universe:gave-up` — once per universe, not
-  once per call — so a give-up *rate* is something you can put a
-  `require`/floor on like any other sometimes-key, and it cross-checks the
-  reported count exactly.
+  once per call — so a give-up *rate* is counted like any other sometimes-key,
+  and it cross-checks the reported count exactly. The platform's own swarm
+  suites cap it: `ceiling: [("universe:gave-up", N)]` on
+  `run_universes_swarm!`/`run_universes_swarm_with!` fails the batch when more
+  than N universes gave up, naming the key, the count and the cap. A give-up is
+  reported and never failed, so without a cap a property can drift toward
+  adjudicating nothing with every batch green; a floor on the key would bound
+  give-ups from below, which guards nothing.
 - If your workload already funnels give-ups through a wrapper (the
   `Err("universe-inconclusive: …")` idiom the platform's own suites use), put
   the `sim.give_up(e)` call there, beside the `sim.cover(...)` mark. Keep
@@ -2939,17 +2944,18 @@ be tested rather than assumed:
 
 ```text
 charpente-sim [realtime]: re-basing 0x000000002eb20001 -> 0x00000000a11ce001 under
-  CHARPENTE_BASE_SEED — coverage requirements and floors skipped (they are rates
-  measured at the pinned base)
+  CHARPENTE_BASE_SEED — coverage requirements, floors and ceilings skipped (they
+  are rates measured at the pinned base)
 ```
 
 Like `CHARPENTE_SEED`, it takes hex with or without `0x`, and `_` separators
 are ignored, so a base copied from the source as written (`0x2EB2_5A10`) works
 as is; a value that is not hex panics naming the variable it was read from.
 
-Floors and `require:` keys are skipped under the override, for the reason the
-floor's own panic text gives: they are rates measured AT a base, so evaluating
-them somewhere else compares against a denominator that was never taken there.
+Floors, ceilings and `require:` keys are skipped under the override, for the
+reason the floor's own panic text gives: they are rates measured AT a base, so
+evaluating them somewhere else compares against a denominator that was never
+taken there.
 What the mode tests is the property's own assertions, which are untouched.
 
 **A correctness oracle should pass at every base.** If it passes at its pinned
