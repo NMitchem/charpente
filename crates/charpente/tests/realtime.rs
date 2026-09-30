@@ -2194,6 +2194,13 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     // `first_unaccounted` keeps naming it however many attempts follow. The
     // budgets bound how long the client may keep trying; they do not touch
     // what counts as caught up.
+    // No subscriber stalls in the settle. A stall is a fault this property
+    // excuses, so one that drops a clean attempt's tail leaves that attempt
+    // adjudicating nothing, and when it was the only clean attempt the
+    // universe failed "client never caught up" on no evidence (seed
+    // 0xfddd6c7112629074, pinned below). The epochs above keep exercising
+    // stall-drop and resume.
+    sim.quiesce_subscriber_stalls();
     // How many settle attempts ran all the way through `kernel.run` without
     // fault fallout. Zero means this universe never observed the platform
     // delivering anything, so it cannot testify about a missed event.
@@ -2258,6 +2265,7 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
             client.current_handle = None;
         } else {
             clean_attempts += 1;
+            sim.cover("realtime:settle-clean");
             // Only when this clean run still left the client behind: a settled client
             // breaks out at the top of the next iteration and never reaches here, so
             // no universe that catches up pays for this probe.
@@ -2378,6 +2386,45 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
         reason.contains("there was no node to catch up from"),
         "and it must be THIS give-up — no settle attempt ever ran cleanly — rather than \
          some unrelated cause that happens to keep the test green: {reason}"
+    );
+}
+
+/// Seed `0xfddd6c7112629074` (base `0x5E1F0002`, universe 70), S4's Finding D
+/// (2026-09-30). The settle phase's one clean attempt resumed from cursor 19
+/// and an injected subscriber stall dropped its tail before id 20 arrived;
+/// the other eleven attempts never booted a node. The property
+/// excuses a stall, so that universe adjudicated nothing, yet it failed "client
+/// never caught up": a harness gap, not lost delivery. The settle now runs with
+/// stalls quiesced, so that attempt delivers the backlog and the universe
+/// passes. With `quiesce_subscriber_stalls` removed it fails "client never
+/// caught up" again.
+#[test]
+fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
+    const SEED: u64 = 0xfddd_6c71_1262_9074;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    assert!(
+        cfg.subscriber_stall > 0.0,
+        "this universe must inject stalls, or it no longer pins the scenario"
+    );
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let trace = realtime_workload(&mut sim).unwrap_or_else(|e| {
+        panic!("a stall in the settle is excused, so it must not fail the universe: {e}")
+    });
+    assert_eq!(sim.gave_up(), None, "and the universe reached a verdict");
+    assert_eq!(
+        sim.coverage().get("realtime:settle-clean"),
+        Some(&1),
+        "the verdict must rest on one clean settle attempt, the one a stall dropped, or this \
+         seed no longer pins the scenario: {:?}",
+        sim.coverage()
+    );
+    assert!(
+        trace.iter().any(|(id, _, _)| *id == 20),
+        "id 20, the first matching id the failure named as unaccounted, must arrive: {trace:?}"
     );
 }
 
@@ -5116,8 +5163,9 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     }
 
     // Settle, identical in shape and rationale to the flagship's: no new
-    // emits, boot a node through the remaining faults, let the client
-    // reconnect and catch up on its own tenant's backlog.
+    // emits, no subscriber stalls, boot a node through the remaining faults,
+    // let the client reconnect and catch up on its own tenant's backlog.
+    sim.quiesce_subscriber_stalls();
     // Same counter, same reason, as `realtime_workload` above: zero clean
     // attempts means this universe never observed a delivery and cannot
     // testify about a missed one.

@@ -430,6 +430,10 @@ struct State {
     /// skipped without drawing. False for the whole of every universe that
     /// never calls it, so those replay exactly as before.
     disk_faults_off: bool,
+    /// Set by `Sim::quiesce_subscriber_stalls`: `Sim::subscriber_stall` reads
+    /// 0.0 from then on. False for the whole of every universe that never
+    /// calls it.
+    stalls_off: bool,
 }
 
 impl State {
@@ -598,6 +602,7 @@ impl Sim {
                     gave_up: None,
                     hosts: BTreeMap::new(),
                     disk_faults_off: false,
+                    stalls_off: false,
                 }),
             }),
         }
@@ -608,13 +613,28 @@ impl Sim {
     }
 
     /// This universe's sampled `subscriber_stall` rate — the one extended
-    /// field with no internal consumption site (see the field's doc). A
+    /// field with no internal consumption site (see the field's doc) — or 0.0
+    /// once `quiesce_subscriber_stalls` has been called. A
     /// workload reads this to drive its own `SimSink` stall closure (`charpente`'s
     /// `SimSink` lives outside this crate and has no `Sim` reference of its
     /// own) at this universe's rate, and marks `fault:subscriber_stall`
     /// coverage itself when the roll actually fires.
     pub fn subscriber_stall(&self) -> f64 {
+        if self.world.lock().stalls_off {
+            return 0.0;
+        }
         self.world.cfg.subscriber_stall
+    }
+
+    /// Ends subscriber-stall injection for the rest of this universe:
+    /// `subscriber_stall` reads 0.0 from here on, so a stall closure keyed on
+    /// it and built after this call never refuses a send and draws nothing.
+    /// For a settle phase whose verdict rests on a delivery completing: a
+    /// stall there is a fault the property excuses, so it would turn the
+    /// verdict into no verdict. The disk-fault counterpart is
+    /// `quiesce_disk_faults`; a universe that never calls this is unchanged.
+    pub fn quiesce_subscriber_stalls(&self) {
+        self.world.lock().stalls_off = true;
     }
 
     /// Marks a named event for sometimes-coverage accounting. Workload-side
@@ -2728,6 +2748,25 @@ mod tests {
             },
         );
         assert_eq!(sim.subscriber_stall(), 0.42);
+    }
+
+    #[test]
+    fn quiesce_subscriber_stalls_ends_the_rate_for_the_rest_of_the_universe() {
+        let sim = Sim::with_faults(
+            0x2EB2_0002,
+            FaultConfig {
+                subscriber_stall: 0.42,
+                ..FaultConfig::none()
+            },
+        );
+        assert_eq!(
+            sim.subscriber_stall(),
+            0.42,
+            "the control: the rate is live"
+        );
+        sim.quiesce_subscriber_stalls();
+        assert_eq!(sim.subscriber_stall(), 0.0);
+        assert_eq!(sim.subscriber_stall(), 0.0, "and it stays off");
     }
 
     #[test]

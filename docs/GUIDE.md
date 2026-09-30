@@ -2467,6 +2467,15 @@ not fallout to classify. Network and object-store faults are untouched, and a
 restart still power-cycles: unsynced writes and directory entries collapse under
 the crash model as usual (`crash_apply`, `crash_torn`, `dir_entry_loss`).
 
+A realtime workload's settle phase has the same need for a different fault. The
+subscriber-stall rate is the one fault axis the sim does not inject itself: a
+workload reads `sim.subscriber_stall()` and drives its own sink's stall closure
+at that rate. `sim.quiesce_subscriber_stalls()` makes that accessor read 0.0 for
+the rest of the universe, so a stall closure built after it never refuses a send
+and draws nothing. Call it before a phase whose verdict rests on a delivery
+completing. A stall there is a fault the property excuses, so a stall that drops
+the only clean attempt's tail leaves the universe with no verdict at all.
+
 ### The checkers
 
 `charpente_sim::checks` ships six reusable oracles — reach for these
