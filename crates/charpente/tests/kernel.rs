@@ -2506,10 +2506,18 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         // restored). Re-pinned 2026-09-24: its predecessor 0xe653f43924f17fe8
         // was already GREEN with the classification deleted before payload
         // shapes landed, and payload shapes' 8-byte enqueue/emit growth renamed
-        // the universes again. The oldest seed is kept: it is still this
-        // suite's CHARPENTE_SEED replay pin in .github/workflows/ci.yml, and it
-        // still exercises Kernel::build's drain-id fix (dispatch.rs's "job in
-        // the heap is not Pending" assert).
+        // the universes again. Re-pinned 2026-09-30: redb 4.3.0's IO shape and
+        // the re-sized crash countdowns renamed them once more and left
+        // 0xe2d97275c15cc087 GREEN with the classification deleted. The live
+        // reproduction is now 0x0f34c969dfd340b0 (base 0x577d001a, universe
+        // 122, the only one of 10,240 scanned with the classification deleted):
+        // a countdown crash lands inside the checker's own reads, so it is RED
+        // with the classification deleted ("table store (redb): I/O error:
+        // simulated crash") and GREEN with it restored. The same day showed
+        // 0x348270b38f166529 GREEN with Kernel::build's drain-id fix removed
+        // too, so ci.yml's drain-id replay pin moved to 0xf4e437494b4b8551, a
+        // universe in which no fault fires at all: with the fix removed it
+        // trips dispatch.rs's "job 0 in the heap is not Pending" assert.
         match exactly_once_holds(&mut app).and_then(|()| tenants_never_see_each_other(&mut app)) {
             Ok(populated) => cover_multi_tenant(sim, &populated),
             Err(msg) => {

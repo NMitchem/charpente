@@ -2325,9 +2325,9 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0xbb93400e0bc80ca4` (base `0xA11CE002`, universe 6).
+/// Seed `0xdec436b030427fc6` (base `0xA11CE002`, universe 124).
 ///
-/// **This pin was re-found once already, and that is worth knowing before
+/// **This pin has been re-found twice, and that is worth knowing before
 /// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
 /// this property (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). The
 /// directory-barrier stream split later that day re-rolled every universe one
@@ -2337,7 +2337,11 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// universe whose settle loop ends with zero clean attempts, and the assertion
 /// below now pins the give-up REASON rather than merely its presence: a future
 /// re-roll that happens to land on some *other* give-up can no longer keep this
-/// test quietly green while testing nothing.
+/// test quietly green while testing nothing. Its successor `0xbb93400e0bc80ca4`
+/// stopped reproducing when redb 4.3.0 changed the store's IO shape and the
+/// crash countdowns were re-sized (2026-09-30); this one was re-found the same
+/// way, and with the zero-clean-attempts give-up removed it fails "client never
+/// caught up", which is the regression.
 ///
 /// The scenario: every one of `SETTLE_ATTEMPTS` attempts ends with `settle_boot`
 /// returning `None`. The node never booted once, so the client never had a single
@@ -2351,7 +2355,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// give up rather than report a miss it never had the chance to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0xbb93_400e_0bc8_0ca4;
+    const SEED: u64 = 0xdec4_36b0_3042_7fc6;
     // Reconstruct this universe exactly as the swarm runner derives it.
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -2377,16 +2381,25 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
     );
 }
 
-/// Seed `0xb247eceae0daf689` (base `0x9C4177E3`). A durable, acked event is
-/// destroyed by `bit_flip` above the store's checkpoint horizon, recovery cuts
-/// there, and the next emit re-mints its id with other content. The drain
-/// probe classifies that correctly as a give-up in the first round after the
-/// restart; the universe must END there. Carrying on let retention collect the
-/// diverged row, after which the probe could no longer see the divergence and
-/// the stale frame came back as a hard failure.
+/// Seed `0x6617ca6405d1b99e` (base `0x5E1F000D`, universe 127). A durable, acked
+/// event is destroyed by `bit_flip` above the store's checkpoint horizon,
+/// recovery cuts there, and the next emit re-mints its id with other content.
+/// The drain probe classifies that correctly as a give-up in the first round
+/// after the restart; the universe must END there. Carrying on let retention
+/// collect the diverged row, after which the probe could no longer see the
+/// divergence and the stale frame came back as a hard failure.
+///
+/// Re-found 2026-09-30 (the original `0xb247eceae0daf689` stopped reproducing
+/// when redb 4.3.0 changed the store's IO shape and the crash countdowns were
+/// re-sized) by the whole reason, not just the give-up: with every `gave_up()`
+/// stop in `realtime_workload` removed, this universe fails "content mismatch
+/// at event id 0: expected (pong, {"n":"647"}) but received (ping,
+/// {"n":"697"})". It was the only universe of 13,312 scanned where carrying on
+/// turns the give-up into that failure; the other diverged-ledger give-ups
+/// stayed give-ups either way.
 #[test]
 fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
-    const SEED: u64 = 0xb247_ecea_e0da_f689;
+    const SEED: u64 = 0x6617_ca64_05d1_b99e;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
@@ -2403,8 +2416,8 @@ fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
         .gave_up()
         .expect("the divergence must be RECORDED as a give-up");
     assert!(
-        reason.contains("ledger diverged at event id 3"),
-        "and it must be THIS give-up, the divergence at id 3: {reason}"
+        reason.contains("ledger diverged at event id 0"),
+        "and it must be THIS give-up, the divergence at id 0: {reason}"
     );
     assert!(
         reason.contains("durable corruption cut it above the checkpoint horizon"),

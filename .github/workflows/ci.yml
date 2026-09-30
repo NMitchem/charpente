@@ -55,7 +55,12 @@ jobs:
       # at their own literals and are not evidence about the pin. Debug because this pin is a debug
       # replay (the two above are the release mode-skew pair), and debug artifacts are already warm
       # from `cargo test --workspace`, so the marginal cost is one test.
-      - run: CHARPENTE_SEED=0x348270b38f166529 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
+      # Re-pinned 2026-09-30 to 0xf4e437494b4b8551: under redb 4.3.0 and the re-sized crash
+      # countdowns, 0x348270b38f166529 stayed GREEN with Kernel::build's drain-id fix removed, so
+      # it no longer exercised it. The new seed fires no fault at all (it depends on the
+      # workload's shape, not the fault stream): with the fix removed it trips dispatch.rs's
+      # "job 0 in the heap is not Pending" assert, and it is GREEN with the fix restored.
+      - run: CHARPENTE_SEED=0xf4e437494b4b8551 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
       # The seed that can actually FAIL if that classification regresses — added 2026-08-19.
       # The pin above no longer reaches the is_fault_fallout arm: T7's group-commit rewrite moved
       # the op schedule, and T9 re-verified on 2026-08-15 that deleting the classification leaves
@@ -70,7 +75,12 @@ jobs:
       # deleted (already so before payload shapes renamed the universes again). Its replacement,
       # from a 10,000-universe batch at base 0x577d39b752d077c7, is RED with it deleted (the
       # checker's scan_by_scoped hits an injected read error) and GREEN with it restored.
-      - run: CHARPENTE_SEED=0xe2d97275c15cc087 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
+      # Re-pinned 2026-09-30: redb 4.3.0's IO shape and the re-sized crash countdowns left
+      # 0xe2d97275c15cc087 GREEN with the classification deleted. 0x0f34c969dfd340b0 (base
+      # 0x577d001a, universe 122; the only one of 10,240 scanned) is RED with it deleted (a
+      # countdown crash lands inside the checker's own reads: "table store (redb): I/O error:
+      # simulated crash") and GREEN with it restored.
+      - run: CHARPENTE_SEED=0x0f34c969dfd340b0 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
       # The passthrough guard, in DEBUG with --ignored — added 2026-08-20. It is `#[ignore]`d
       # because it needs a real disk, so `cargo test --workspace` above lists it as "ignored" and
       # runs nothing: until this line existed the fix it guards was enforced by a `scripts/bench.sh

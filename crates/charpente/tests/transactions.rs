@@ -1056,13 +1056,24 @@ fn harness_catches_apply_before_sync() {
 /// Hard rule 3: a crash during initial store creation left durable garbage
 /// redb rejects on every open (bad magic, InvalidData) — without the
 /// rebuild-from-WAL path in Db::open this universe bricks permanently.
+///
+/// The seed was `0x1f733f8d9eebf822` until 2026-09-30, when redb 4.3.0 and the
+/// re-sized crash countdowns left it reaching `Db::open`'s discard only through
+/// an injected fsync failure, never through garbage. `0xf79c40a51bb93ae8` was
+/// re-found by its reason (a temporary print of the discard's cause, 20,000
+/// seeds from base `0x1F730000`): its second discard is "Not a redb database:
+/// magic number mismatch", a store whose creation never became durable. With
+/// the discard-and-rebuild removed, the same universe fails "final recovery
+/// failed with a non-injected error: … magic number mismatch" on every later
+/// open. `fresh_store_creation_crash_is_discarded_and_rebuilt` below builds the
+/// same state directly and checks it at each step.
 #[test]
 fn regression_store_bricked_by_creation_crash() {
-    let mut sim = Sim::new(0x1f733f8d9eebf822);
+    let mut sim = Sim::new(0xf79c_40a5_1bb9_3ae8);
     assert_eq!(
         tx_workload(&mut sim),
         Ok(()),
-        "seed 0x1f733f8d9eebf822 no longer recovers a store bricked at creation"
+        "seed 0xf79c40a51bb93ae8 no longer recovers a store bricked at creation"
     );
 }
 
@@ -1454,13 +1465,13 @@ fn unopenable_store_with_full_wal_still_rebuilds() {
     mangled_store_len_recovers(|len| len - 4096);
 }
 
-/// Companion to `regression_store_bricked_by_creation_crash` below: that
+/// Companion to `regression_store_bricked_by_creation_crash` above: that
 /// test's pinned seed exercises the scenario through `tx_workload`'s much
-/// larger fuzz surface (3 rounds of commits/checkpoints/crashes) and was
-/// never itself re-verified to still land on a genuinely bricked store —
-/// T1's extra `sync_dir` barriers and this task's own extra `disk.list` in
-/// the rebuild-rule check both shift exactly the crash-timing that seed
-/// depends on. This test instead constructs the scenario directly and
+/// larger fuzz surface (3 rounds of commits/checkpoints/crashes), and any
+/// change that moves crash timing renames its universe — T1's extra
+/// `sync_dir` barriers, this task's own extra `disk.list` in the rebuild-rule
+/// check, and redb 4.3.0's IO shape all did (it was re-found by its cause on
+/// 2026-09-30; see its doc). This test instead constructs the scenario directly and
 /// self-verifies it at each step: an independent `Store::open` on the
 /// post-crash disk confirms the store really is bricked *before* asking
 /// `Db::open` to prove it discards and rebuilds — so this test cannot
