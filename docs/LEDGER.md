@@ -6118,3 +6118,141 @@ the final review triaged them (CAN WAIT); and Mn3 (rustc's sealed-trait help lis
 `PlatformOwned` in two pinned `.stderr` files), which FR-N1 deferred.
 
 **Next.** The 0.1.0 publish, which is Noah's call, then M3 sub-project 5, the launch run.
+
+## 2026-09-30 — redb 4.3.0: the open fence and its panic hook are gone, the crash countdowns are re-sized to the new IO shape, and every pin is re-found by its reason
+
+**Why.** Follow-ups 8, 15 and 18 of the job-tenancy entry above. DESIGN §4 already said what
+to do: "drop the fence when redb returns `Err` for this state". redb 4.3.0 does, for both
+torn-open states. This is sub-project S4 of landing that entry's 19 follow-ups before the
+0.1.0 publish (S1 tenancy completion, S2 error text and schema safety, S3 test and instrument
+quality, S4 this). Workspace `.superpowers/sdd/2026-09-30-publish-readiness/`
+(`s4-brief.md`, `s4-report.md`, `s4-review.md`, `s4-logs/`, `s4-cov/`). Branch `s4-redb`,
+merged at dfa9c40.
+
+**Shipped.**
+- **redb 4.1.0 → 4.3.0, fence dropped** (61f85c9).
+  - `Store::open`'s `catch_unwind` fence and `IN_OPEN_FENCE` guard are deleted, and so is
+    `install_open_fence_hook` with its "Db::open rebuilds it" line. That was follow-up 15:
+    the text was wrong for a compacted log, and nothing is muted any more.
+  - The hook census now requires **no** installer, with a vacuity guard on the walk's size.
+  - edge-harness `open_fence.rs` became `unopenable_store.rs` (the F1 printed-output
+    oracle). charpente-sim's `open_fence.rs` is deleted, so there are 86 test binaries, not 87.
+  - engine.rs pins both torn shapes as named `Corrupted` errors. They were RED under
+    4.1.0 with the fence ("assertion failed: storage.raw_file_len()? >= header.layout().len()"
+    and the `1056768`/`1058304` pair). A new test pins that a panic inside `Store::open`
+    propagates.
+  - The group_commit pre-batching trace fixture was re-captured at the pre-batching code
+    (2286c60). The redb citations were re-read for 4.3.0 (c069133).
+- **Finding A, the store-bricked give-up is gone** (b39f0da). This was follow-up 18.
+  - Under 4.3.0 the bricked-store state is unreachable by construction. So the give-up
+    arm, its classifier, both pins (`0x3252300b37ab3e88`, `0x5b24d7f5e5947edd`) and the
+    partial-match test are deleted, and a future occurrence fails loudly.
+  - The four wider "cannot be rebuilt from the log alone" arms (replication ×2, realtime,
+    auth) are now fault fallout first, then a failure. An injected cause stays fallout; a
+    bare refusal fails.
+  - Measured with a temporary print: 15,325 refusals per replication suite run, all with
+    an injected cause. Each rewritten arm was proven by hand inversion.
+  - The platform refusal stays pinned deterministically by transactions.rs
+    `unopenable_store_with_compacted_wal_is_a_named_hard_error` and edge `unopenable_store`.
+- **Finding B, the crash countdowns re-sized** (6638f86).
+  - 4.3.0 writes no unsynced store pages, so the store's crash surface is checkpoint writes
+    and file growth. DESIGN §1 now says so, and says torn-store shapes are held by
+    engine.rs's and transactions.rs's hand-built tests.
+  - Each `crash_disk_after(A + rand % B)` range was scaled by the factor at which the
+    measured 4.3.0 round-length distribution gives 4.1.0's crash count plus 1σ, at two
+    bases. Across the 12 sites the factor ranged 0.49–0.86.
+  - `fault:crash` met or beat 4.1.0 at every table base (11/11), and at 8/11 at a second
+    base (three batches short by 1–4).
+  - One exception, accepted: `scoped_realtime_workload` takes no margin (51+%410). With the
+    margin, `realtime:resume-backlog` fell to 122 of its exact floor 125.
+- **Finding C, the receipt-upgrade window held open by the workload** (17a4cd0, then
+  0da63de).
+  - Under 4.1.0 the window was wide only because redb happened to write store pages inside
+    it, and 4.3.0 closed it.
+  - The fix: v1 writes an app-owned `ReceiptGate` row with invoice 0's receipt, and a
+    dedicated opener receipt, enqueued behind it, deletes the row. So invoice 0 is turned
+    away exactly once, one backoff.
+  - The first version read `charpente.jobs` from a job handler, which S1 will make a
+    compile error, so it was rewritten.
+  - The v2 side checks that a settled invoice 0 ran after exactly one turned-away attempt.
+    Three hand inversions went RED.
+  - Floors at `0x5A9E_0600`: 40/14/115 → **49/17/117**, from two cmp-identical batches.
+- **Pins re-found by their reason** (c89da35, ab5c4ca). Each was re-found with the reason
+  proved RED under inversion:
+  - realtime `0xbb93400e0bc80ca4` → `0xdec436b030427fc6`, and `0xb247eceae0daf689` →
+    `0x6617ca6405d1b99e`;
+  - ci.yml's classification pin `0xe2d97275c15cc087` → `0x0f34c969dfd340b0` (the old one
+    was defanged, green with the classification deleted);
+  - ci.yml's drain-id pin `0x348270b38f166529` → `0xf4e437494b4b8551`;
+  - the creation-crash regression `0x1f733f8d9eebf822` → `0xf79c40a51bb93ae8`. The old
+    seed reached the discard only through an injected fsync failure. The test now asserts
+    the reason through a pass-through `DiscardWitness`: at least one discard must be
+    creation garbage.
+- **A quiet replication phase that is actually quiet** (53a89e8). The new
+  `Sim::quiesce_disk_faults()` ends injected read, write, sync and directory-barrier
+  errors, misdirected writes and restart bit flips. A later restart still collapses
+  unsynced writes and directory entries. The quiet-universe byte comparison now runs on a
+  fault-free tail instead of classifying its fault away, which would have dropped
+  `repl:fingerprint-compared` below its floor. Nine hand inversions went RED.
+- **Floors re-measured** (822c1a2). Only floors the upgrade moved were changed, against a
+  4.1.0 control at the same base. Each moved floor is set on its new count by its own
+  convention, and none was lowered. Examples: replication `CONVERGED_FLOOR` 164 → 253
+  (give-ups 92 → 3); archive `CONV_SCOPED_SUBSTANTIAL_FLOOR` 160 → 237. Every exact floor
+  was proven to sit on its count (+1 is RED). The CLI give-up split went 32/32 → 37/27.
+  The full table is in `s4-report.md`, "Floors".
+- **Census and checks.**
+  - The pinned-seed census covered 410 `Sim` construction sites: every fault-on literal
+    seed reaches its reason, claims none, or cannot see redb.
+  - The latch census re-walk found the same five sites, plus one drift (follow-up 20).
+  - Cross-build-mode: 13 of 13 batches are identical between debug and release. Without
+    the release override, 7 of 7 diverge, so the override stays.
+  - F1 was re-checked against its 2026-09-22 repro with no hook: 0 `panicked at`.
+- **Review fixes** (272e03e, 6624ea0, ab5c4ca): the Cargo.toml override rationale, GUIDE
+  §8's quiesce text, and the creation-crash pin's reason.
+
+**Review.** An independent opus review re-ran every load-bearing claim and got the same
+numbers. Verdict: MERGE AFTER FIXES, 0 Critical, 0 Important, 4 Minor. M1, M2 and M4 are the
+fix commits above; M3 is DECISIONS.md, below.
+
+**Gate.**
+- At 0da63de the implementer's partitioned gate was 86 of 86 `test result: ok`, 1,542 tests.
+  The controller's counted gate agreed: 86 of 86.
+- At ab5c4ca the controller re-ran the partitions the fixes touch: transactions and
+  guide-examples, 9 of 9, with fmt and clippy clean.
+- On main at dfa9c40, the merge, the controller's counted gate: fmt and clippy clean, 86 of
+  86 `test result: ok`, 0 FAILED, 1,542 tests (`main-dfa9c40-gate.log`).
+
+**Noah, read this: DECISIONS §7 trigger (b) was read, and the controller recorded it as not
+firing.** The upgrade was the trigger's test case. The fence cost nothing to maintain,
+because it is gone, and the latch census worked as designed. The real cost was re-tuning the
+fault model to a new IO shape, which any change to the storage IO path pays, our own engine's
+included. The paragraph is marked as a status-quo reading, revisable. §7's two stale lines
+(the fence as a live gap; `redb = "4.1.0"`) are annotated, not rewritten.
+
+**Follow-ups.**
+20. **`write_best_effort` drift** (DESIGN §4): charpente latches where redb carries on. It is
+    conservative (restart and recover) and reachable only past the 1 GiB cache. DESIGN §4
+    records it, and no code is owed.
+21. **`Db::open` treats any `Store::open` error as unopenable.**
+    - On a compacted log, a transient IO error inside `Store::open` yields "restore this node
+      from a replica or backup" for what a restart would fix. On an uncompacted log it
+      discards a healthy store and rebuilds it.
+    - The review showed the first case live with an injected fsync failure.
+    - Pre-existing. Hard rule 5 and "let errors bubble" settle the direction: only bytes
+      redb rejects (`Corrupted`, magic mismatch) are unopenable, and everything else
+      bubbles.
+    - Proposed as S5, before S1; the bounded design was put to Noah 2026-09-30.
+22. **Realtime flagship Finding D**, `CHARPENTE_SEED=0xfddd6c7112629074` (base `0x5E1F0002`,
+    u70). "client never caught up": the one clean settle attempt was stall-dropped by an
+    injected subscriber stall. It is 1 in 8,192 at a fresh base and unreachable at the pinned
+    base. Assigned to S3.
+*FYI:* redb 4.2.0's changelog lists "Fix crashes while growing or resizing the database file
+that could leave it permanently unopenable", which is the upstream fix for what the fence
+guarded. NEIGHBORS.md:68's dated "v4.1.0" health check is left as history. The review
+noticed that a sim failure's repro line prints a seed unpadded (`0xf34c969dfd340b0`). The
+`seed:` line in the same block prints it padded, so a grep for the pinned form finds the
+block, and no change is owed.
+
+**Next.** S2 and S3 merge on top of this. Then S5 (follow-up 21), then S1 (plan f54bd4a,
+awaiting Noah's review). S1 re-rolls the same pinned batches, so it re-measures the floors
+set here.

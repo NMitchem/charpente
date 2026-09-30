@@ -114,7 +114,8 @@ premise re-examination at M2 start). The harness precondition is met, but the ur
 case is gone: redb coupling is confined to `table.rs` (one file, 170 call sites — the
 measure that produces that number is recorded at the end of this entry; deferral does not
 compound the swap cost); redb is healthy and its known gaps are fenced and pinned
-(the open-time panic fence, both mode-skew profile overrides, the 0a latch); and the moat
+(the open-time panic fence, both mode-skew profile overrides, the 0a latch — as of
+2026-08-06; the fence has been gone since redb 4.3.0, see the trigger (b) read below); and the moat
 NEIGHBORS defines — determinism + the compile-time oracle — already exists, while the
 engine is invisible to the adopters the wager needs. Building a performance-shaped engine
 with no benchmark showing redb as a bottleneck fails §6's measure-first discipline — and
@@ -161,6 +162,26 @@ untouched and Noah's to sign off — what changed is that the ambiguity which ma
 judgment call is gone, so the deferral simply stands. Triggers (b) and (c) are untouched by
 this re-read.
 
+**Trigger (b) read 2026-09-30; it does not fire, and the deferral stands.** (Recorded by
+the controller while landing the upgrade; a status-quo reading, not Noah's own hand —
+revisable.) The redb 4.1.0 → 4.3.0 upgrade (docs/LEDGER.md, "2026-09-30 — redb 4.3.0") is
+this trigger's first test. The fence cost nothing to maintain, because it no longer exists:
+4.3.0 returns `StorageError::Corrupted` for both torn-open states 4.1.0 asserted on, so the
+open-time panic fence, its panic hook and the hook census's one exception were deleted, as
+DESIGN §4 had said to do. The latch's five-site census review ran as designed. It re-walked
+`cached_file.rs`, found the same five latching sites, and caught the one drift the upgrade
+brought: a `write_best_effort` route on which charpente latches and redb does not, which is
+conservative and reachable only past the 1 GiB cache (DESIGN §4). Both profile overrides
+stay, and the release one was re-proved necessary: without it, 7 of 7 pinned-base batches
+diverge between release and debug. What the upgrade did cost was re-tuning the
+fault model to a new IO shape. 4.3.0 buffers non-durable commits' pages and fsyncs the file
+on every extension, which re-rolled every store-touching universe, shrank the crash
+countdowns' reach until they were re-sized, made one pinned scenario unreachable, and
+narrowed one property's refusal window until its workload held the window open by
+construction. Any change to the storage IO path carries that cost, our own engine's
+included, so it argues neither way on the swap; this trigger names the fence, and the cost
+is recorded here as evidence for the next upgrade rather than as a firing.
+
 **The call-site measure, defined 2026-09-04 (tenant-scoping spec §10).** This entry quoted
 "~30 call sites" from 2026-08-06 onward and the figure was stale; two independent
 recounts during the tenant-scoping design disagreed (46 and 64) because each used a
@@ -186,7 +207,8 @@ is 29 `redb::` paths plus the file's single `use redb::{…}` importing seven na
 
 **The one-file claim in the paragraph above still holds exactly.** `grep -rln 'redb::'
 --include='*.rs' crates/ examples/` returns only `crates/charpente-core/src/table.rs`, and
-only `charpente-core/Cargo.toml` names the dependency (`redb = "4.1.0"`). What the recount
+only `charpente-core/Cargo.toml` names the dependency (`redb = "4.1.0"` then, `"4.3.0"`
+since 2026-09-30; re-checked that day, the claim still holds). What the recount
 changes is the *size* of the confined surface, not its confinement — and it argues neither
 way on the deferral, which rests on the build triggers, not on the call count.
 
