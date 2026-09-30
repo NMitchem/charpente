@@ -253,7 +253,7 @@ sub-project.
 
 **The guarantee is "a scoped query cannot silently cross tenants."** `across_tenants` is
 not silent: it is named at the call site, its capability is declared in the route or job
-attribute (`#[route(…, cross_tenant)]` / `#[job(cross_tenant)]`), the token
+attribute (`#[route(…, cross_tenant)]` / `#[job(…, cross_tenant)]`), the token
 (`CrossTenant`) is unforgeable from a handler because its only constructor is
 `Group::cross_tenant_cap` and `begin_group` lives on `Db`, and every row comes back paired
 with its scope — `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` — so a cross-tenant result

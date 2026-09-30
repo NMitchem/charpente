@@ -210,10 +210,11 @@ fn undeclared_capability(name: &str, args: &RouteArgs, pat: &PatType) -> Error {
         format!(
             "`{name}` takes `cap: &CrossTenant`, but `#[route({method} \"{path}\"{stance})]` \
              does not declare `cross_tenant` — enumerating a scoped table across every \
-             tenant is a declared capability, and `charpente describe` lists every route \
-             that declared it. Write `#[route({method} \"{path}\"{stance}, cross_tenant)]`, \
-             or drop the `cap` argument and read one tenant through \
-             `tx.scope::<Org>(org, ctx)?`"
+             tenant (`tx.across_tenants`) and fanning a job out into a tenant the route \
+             names (`tx.enqueue_in`) are one declared capability, and `charpente describe` \
+             lists every route that declared it. Write \
+             `#[route({method} \"{path}\"{stance}, cross_tenant)]`, or drop the `cap` \
+             argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`"
         ),
     )
 }

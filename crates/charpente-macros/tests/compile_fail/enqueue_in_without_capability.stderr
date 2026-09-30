@@ -1,4 +1,4 @@
-error: `apply_everywhere` takes `cap: &CrossTenant`, but `#[route(POST "/admin/apply/:org", auth)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(POST "/admin/apply/:org", auth, cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
+error: `apply_everywhere` takes `cap: &CrossTenant`, but `#[route(POST "/admin/apply/:org", auth)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Write `#[route(POST "/admin/apply/:org", auth, cross_tenant)]`, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
   --> tests/compile_fail/enqueue_in_without_capability.rs:38:5
    |
 38 |     cap: &charpente::CrossTenant,

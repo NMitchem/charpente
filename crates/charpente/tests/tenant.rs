@@ -512,12 +512,21 @@ fn the_drift_probe_meets_the_three_rules_as_a_request_does() {
         ),
         "{public}"
     );
-    let auth = app.subscription_event_names("memo_feed_auth").unwrap_err();
-    assert!(
-        auth.contains(
-            "`SSE /memo-feed-auth/:org` is declared `auth` and opened the tenant scope `Org`"
-        ),
-        "{auth}"
+    // Byte-exact: an `auth` route already requires a credential, so its
+    // refusal must not suggest opening it to every caller with `public(Org)`.
+    assert_eq!(
+        app.subscription_event_names("memo_feed_auth"),
+        Err(
+            "route `memo_feed_auth`'s subscribe handler returned App(AnonymousScope(\
+             \"authentication required — `SSE /memo-feed-auth/:org` is declared `auth` and \
+             opened the tenant scope `Org` for a caller with no credential; the route requires \
+             a credential, so a request without one is refused before its handler runs, and a \
+             caller that presents none, as the emits(...) drift probe does, cannot run it — \
+             leave this route out of the drift test\")) under the emits(...) drift probe, so \
+             what it subscribes to cannot be read — a handler that rejects a credential-free \
+             request with `\"0\"` for every :param is not probeable"
+                .to_string()
+        )
     );
 }
 

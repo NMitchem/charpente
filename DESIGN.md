@@ -1656,14 +1656,15 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   unscoped shape of a scoped table refuses the record **by name** rather than misreading it.
   Enumerating every tenant is possible and **declared, never silent**:
   `#[route(…, cross_tenant)]` / `#[job(…, cross_tenant)]` mint the `CrossTenant` token
-  `Tx::across_tenants::<S>(cap)` requires, rows come back paired with their scope
+  `Tx::across_tenants::<S>(cap)` requires (and `Tx::enqueue_in` requires for a fan-out
+  into a named tenant), rows come back paired with their scope
   (`Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>`), and `charpente describe` lists every
   route and job that declared it — an inventory, not a grep — beside each route's `public_scope` and each job's `scoped_by`. That is a capability, not an
   escape hatch on a guarantee (DECISIONS §11).
   The operator acts inside one tenant with a `TenantAdmission` minted from a `Group`
   (`Tx::admit_scope`), sealed the way `CrossTenant` is. No `authorize` runs, because the
   operator has no principal and already holds the store (DECISIONS §12).
-  **Two limits travel with it, documented rather than engineered around.** The subscription
+  **Three limits travel with it, documented rather than engineered around.** The subscription
   key is the scope's decimal id, so two DIFFERENT scope types sharing a raw id share a key —
   an app with more than one scope type keys its subscriptions per scope type as well. And
   the guarantee's boundary is the typed surface handed to handlers and jobs: whoever holds
@@ -1673,6 +1674,12 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   whoever holds the data directory — an operator, not a request (DECISIONS §12, ratified
   2026-09-05; the `App::mount` notch that would make even the operator path enumerable is
   recorded there as available and unbuilt, under §11's trigger).
+  And the platform's own tables are not scoped: the job queue and the event log are read
+  through `get`/`scan` by any transaction, across every tenant — a job's payload and, for a
+  scoped job, its tenant id; an event's payload and its `key`, which inside a scope is the
+  tenant's id. The dispatcher and the sim oracles are built on those reads, so they stay
+  open; what is sealed is writing a job row (§3's Jobs bullet). A route that exposes either
+  table must filter by its own scope before it answers.
   Out of scope and staying out: nested scopes, cross-tenant writes in one transaction,
   platform-derived tenancy, and forced retrofitting of existing tables. API-key
   scopes/permissions are subject-only in v1 — this feature answers *which tenant*, never

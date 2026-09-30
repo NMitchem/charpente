@@ -132,7 +132,8 @@ impl Ctx {
 
     /// Rule 3's refusal: a caller with no credential reached a scope line
     /// that its route did not declare `public(S)` for. Names the contract,
-    /// the site, and both fixes, the caller's and the author's (hard rule 5).
+    /// the site, and both fixes, the caller's and the author's (hard rule 5)
+    /// — except on an `auth` route, where the author has no fix to make.
     pub(crate) fn anonymous_scope<S>(&self) -> ApiError {
         let Stance {
             method,
@@ -140,16 +141,29 @@ impl Ctx {
             auth,
             public,
         } = &self.stance;
-        let declared = match public {
-            Some((scope, _)) => format!("public({})", scope.name),
-            None if *auth => "auth".to_string(),
-            None => "public".to_string(),
-        };
         // The last path segment, as `decode_body` renders a type.
         let scope = std::any::type_name::<S>()
             .rsplit("::")
             .next()
             .unwrap_or("the scope type");
+        if *auth {
+            // `build_ctx` refuses a request to an `auth` route that carries no
+            // credential before its handler runs, so only a caller that does
+            // not enforce `auth` (the emits(...) drift probe) gets here.
+            // Suggesting `public(S)` would tell the author to open the route
+            // to every caller so that a test can read it.
+            return ApiError::AnonymousScope(format!(
+                "authentication required — `{method} {pattern}` is declared `auth` and opened \
+                 the tenant scope `{scope}` for a caller with no credential; the route requires \
+                 a credential, so a request without one is refused before its handler runs, \
+                 and a caller that presents none, as the emits(...) drift probe does, cannot \
+                 run it — leave this route out of the drift test"
+            ));
+        }
+        let declared = match public {
+            Some((scope, _)) => format!("public({})", scope.name),
+            None => "public".to_string(),
+        };
         ApiError::AnonymousScope(format!(
             "authentication required — `{method} {pattern}` is declared `{declared}` and \
              opened the tenant scope `{scope}` for a caller with no credential; only a route \

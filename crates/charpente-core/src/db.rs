@@ -1697,13 +1697,16 @@ impl<'a, S> std::ops::DerefMut for ScopedTx<'_, 'a, S> {
     }
 }
 
-// ------------------------------------------------------- cross-tenant read
+// ------------------------------------------------------- cross-tenant reach
 
-/// The capability a route or job declares with `cross_tenant` (spec §3):
-/// naming a tenant is always allowed, enumerating without naming one is
-/// declared. `Tx::across_tenants` takes one, so a handler that was not
-/// handed a token cannot enumerate — and because the declaration is on the
-/// route, `charpente describe` can list every endpoint that can.
+/// The capability a route or job declares with `cross_tenant` (spec §3,
+/// job-tenancy spec §2 R5): naming a tenant from inside it is always
+/// allowed; reaching tenants from outside every one is declared. That reach
+/// is two doors, and both take this token: enumerating a scoped table across
+/// every tenant (`Tx::across_tenants`) and fanning a scoped job out into a
+/// tenant the caller names (`Tx::enqueue_in`). A handler that was not handed
+/// a token can do neither — and because the declaration is on the route or
+/// the job, `charpente describe` can list every endpoint that can.
 ///
 /// Unforgeable from a handler, which is what keeps that listing an inventory
 /// rather than a hint: the struct's field is private and
@@ -1731,13 +1734,15 @@ impl<'a> Group<'a> {
 
 /// Proof that the operator, or a route's `public(S)` declaration, admitted
 /// this transaction into one tenant — `Tx::admit_scope`'s argument
-/// (job-tenancy spec §3, §4, §7).
+/// (job-tenancy spec §3, §4, §7), and `Tx::settle_job`'s, the one write of
+/// a job row outside the enqueue family.
 ///
 /// Holders: the operator, through a `Group`; the platform, which mints
 /// one per request for a route declared `public(S)` and keeps it private in
 /// that request's `Ctx`, so `tx.scope::<S>` admits by the declaration; and
-/// the dispatcher, which mints one per job run and hands a scoped job's glue
-/// a `JobScope` that opens only the tenant id its row carries.
+/// the dispatcher, which mints one per job run, hands a scoped job's glue
+/// a `JobScope` that opens only the tenant id its row carries, and settles
+/// the row with it.
 ///
 /// Sealed exactly as `CrossTenant` is, and for the same reason: its field is
 /// private and `Group::tenant_admission` is the only constructor, and a

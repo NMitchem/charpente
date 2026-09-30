@@ -3071,7 +3071,7 @@ emits(...) must name at least one #[event] type — write `emits(NoteAdded, Note
 emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
 `auth` given twice — write it once
 `cross_tenant` given twice — write it once
-`revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue", public)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", public, cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
+`revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue", public)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", public, cross_tenant)]`, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
 `emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
@@ -3995,6 +3995,12 @@ means telling you, not undoing it. And because the probe feeds a fixed token rat
 drawing entropy (it must not perturb your app's entropy stream), a credential minted
 that way is the same one every run. Move the write off the subscribe path, or leave that
 route out of the drift test.
+
+The probe presents no credential and does not enforce `auth`, so an `auth` stream route is
+probeable, unless its handler opens a tenant scope. Then the scope line refuses the probe
+exactly as it refuses any caller without a credential (§5's rule 3), and the probe's error
+says the route requires a credential, so the probe cannot run it. Leave that route out of
+the drift test too; widening it to `public(Org)` so a test can read it is not the fix.
 
 ### Cursor semantics
 
@@ -5924,7 +5930,9 @@ declaration: the route's own `public(Org)`, or the `cross_tenant` fan-out that
 enqueued the job — had to hand back. A job's handle is its enqueuer's because no
 app code can write the job row that carries its tenant (§6). A scoped read attempted on a bare `Tx` is a compile error, not a 500
 and not a leak. (What that guarantee does *not* cover — an operator holding the
-`Db` — is the last subsection here, and it is a boundary, not an oversight.)
+`Db`, and the platform's own job queue and event log, which any transaction can read
+across every tenant — is "Where the guarantee stops" below, and it is a boundary, not an
+oversight.)
 
 The shape of an app that uses it:
 
@@ -6389,6 +6397,16 @@ word with no `authorize` on the path (replication seeding, the archive and
 `restore` are built on them), and `Db::begin_group` can mint the `CrossTenant`
 token. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
+
+**Nor does it cover the platform's own tables.** The job queue (`JobRow`) and the event
+log (`EventRow`) are unscoped platform tables, and any transaction reads them with
+`tx.get` and `tx.scan` across every tenant: a job's payload and, for a scoped job, the
+tenant id it runs in; an event's payload and its `key`, which for an emit inside a scope
+is that tenant's id. Those reads stay open, because the dispatcher and §8's sim oracles
+are built on them; what is sealed is *writing* a job row (§6). So a route that exposes
+either table — an admin job list, an activity feed built on `scan` rather than a
+`Subscription` — must filter by its own scope before it answers: keep the job rows whose
+`scope` is the tenant it opened, and the event rows whose `key` is its `tx.event_key()`.
 
 **Code outside a handler never takes a scope on its own word.** A job declares
 `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened or its fan-out
