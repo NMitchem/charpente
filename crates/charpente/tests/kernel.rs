@@ -2203,6 +2203,14 @@ fn loop_replays_identically_for_the_same_seed() {
 use charpente_core::log::WalConfig;
 use charpente_sim::run_universes_swarm;
 
+/// How many reopens a workload's final check gets before the universe gives
+/// up. Every attempt either adjudicates or dies to injected fault fallout, so
+/// a larger budget costs time only in universes that would otherwise have
+/// concluded nothing (LEDGER 2026-09-30, follow-up 1: 8 -> 64 rescued most of those
+/// universes, and every rescued one passed). Shared by `kernel_workload` and
+/// `job_tenancy_universe`, whose give-up rates are capped by `ceiling:`.
+const FINAL_REOPENS: u32 = 64;
+
 fn crash_config() -> AppConfig {
     AppConfig {
         body_cap: 1 << 20,
@@ -2639,7 +2647,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
 
     // Final quiet verification (step-4/5 convention): reopen until injected
     // faults relent, then check the invariant one last time.
-    for _attempt in 0..8 {
+    for _attempt in 0..FINAL_REOPENS {
         match kernel_crash_app(sim) {
             // Same classify-and-reopen treatment as the round loop above: the
             // checker's own reads can hit an armed crash too.
@@ -2662,24 +2670,38 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         }
     }
     // A universe that adjudicated nothing gives up; it does not pass.
-    sim.give_up(
-        "the final check never ran: 8 reopens in a row hit injected faults, so the last \
-         round's jobs were never adjudicated",
-    );
+    sim.give_up(format!(
+        "the final check never ran: {FINAL_REOPENS} reopens in a row hit injected faults, so \
+         the last round's jobs were never adjudicated"
+    ));
     Ok(())
 }
 
+/// The give-up cap. This base is ambient, so the count moves batch to batch,
+/// and the cap is a margin, not a measurement: over 10 fresh batches (redb
+/// 4.3.0, 64 reopens) it gave up 6-16 times, mean 10.8, and the cap is twice
+/// that maximum, about 7 standard deviations above the mean. With 8 reopens
+/// the same batches gave up 48-64 times, so a return to that rate fails here.
+/// Pinning the base instead would re-baseline every universe this property
+/// examines.
+const KERNEL_GAVE_UP_CEILING: u64 = 32;
+
 #[test]
 fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
-    run_universes_swarm!(256, kernel_workload, require: [
-        "job:done",
-        "job:retried",
-        "cron:tick",
-        "fault:crash",
-        "crash:torn",
-        "restart",
-        "tenant:multi_tenant_write",
-    ]);
+    run_universes_swarm!(
+        256,
+        kernel_workload,
+        require: [
+            "job:done",
+            "job:retried",
+            "cron:tick",
+            "fault:crash",
+            "crash:torn",
+            "restart",
+            "tenant:multi_tenant_write",
+        ],
+        ceiling: [("universe:gave-up", KERNEL_GAVE_UP_CEILING)]
+    );
 }
 
 #[test]
@@ -5043,7 +5065,7 @@ mod job_tenancy {
             sim.restart();
         }
 
-        for _attempt in 0..8 {
+        for _attempt in 0..FINAL_REOPENS {
             match shop_app(sim) {
                 Ok(mut app) => match jobs_stay_in_their_tenant(app.db_for_tests()) {
                     Ok(seen) => {
@@ -5058,12 +5080,16 @@ mod job_tenancy {
             }
         }
         // A universe that adjudicated nothing gives up; it does not pass.
-        sim.give_up(
-            "the final check never ran: 8 reopens in a row hit injected faults, so the last \
-             round's jobs were never adjudicated",
-        );
+        sim.give_up(format!(
+            "the final check never ran: {FINAL_REOPENS} reopens in a row hit injected faults, \
+             so the last round's jobs were never adjudicated"
+        ));
         Ok(())
     }
+
+    /// The give-up cap, exact at the pinned base: 16 of 256 universes gave up
+    /// in two identical batches (redb 4.3.0, 64 reopens; 49 with 8).
+    const JOB_TENANCY_GAVE_UP_CEILING: u64 = 16;
 
     /// Job-tenancy spec §9 item 4. A fixed base, like every permanent swarm
     /// property here. N was set by timing one batch (Step 3): the commit and
@@ -5081,7 +5107,8 @@ mod job_tenancy {
                 "tenant:job_fan_out",
                 "tenant:anonymous_refused",
                 "job:retried",
-            ]
+            ],
+            ceiling: [("universe:gave-up", JOB_TENANCY_GAVE_UP_CEILING)]
         );
     }
 
