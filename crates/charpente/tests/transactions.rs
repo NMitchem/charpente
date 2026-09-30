@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use charpente::{Db, DbConfig, Event, Job, Schema, Seeder, TxError, View, table};
 use charpente_core::event::EventRow;
-use charpente_core::io::{Disk, Entropy};
+use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Row, Snapshot, Store, Unscoped};
@@ -540,6 +540,13 @@ fn is_injected(text: &str) -> bool {
 /// One universe: recover → verify against the oracle → mixed commits and
 /// aborts → random checkpoint → crash, everything seeded.
 fn tx_workload(sim: &mut Sim) -> Result<(), String> {
+    tx_workload_on(sim, &|sim: &Sim| -> Box<dyn Disk> { Box::new(sim.disk()) })
+}
+
+/// `tx_workload` over the disk `disk` makes for each `Db::open`. The only other
+/// maker is `DiscardWitness`, which issues no disk op of its own, so a universe
+/// run through it is the same universe.
+fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result<(), String> {
     let entropy = sim.entropy();
     let cfg = DbConfig {
         wal: WalConfig {
@@ -554,7 +561,7 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(43 + entropy.next_u64() % 346);
-        let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
+        let mut db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(_) => {
                 sim.restart();
@@ -740,7 +747,7 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
     // final check — the oracle still runs at every successful open across
     // the universe set — but any other open error is a real bug.
     for _attempt in 0..8 {
-        let db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
+        let db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(e) => {
                 if is_injected(&e.to_string()) {
@@ -1067,14 +1074,144 @@ fn harness_catches_apply_before_sync() {
 /// failed with a non-injected error: … magic number mismatch" on every later
 /// open. `fresh_store_creation_crash_is_discarded_and_rebuilt` below builds the
 /// same state directly and checks it at each step.
+///
+/// The test asserts its reason as well as its outcome: a `DiscardWitness`
+/// watches `Db::open` and records why each discard happened, and at least one
+/// must be creation garbage. The previous seed kept passing on `Ok(())` alone
+/// after it had stopped reaching garbage, and nothing noticed.
 #[test]
 fn regression_store_bricked_by_creation_crash() {
     let mut sim = Sim::new(0xf79c_40a5_1bb9_3ae8);
+    let seen = Arc::new(Mutex::new(StoreSeen::default()));
+    let witness = seen.clone();
+    let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
+        Box::new(DiscardWitness {
+            inner: sim.disk(),
+            seen: witness.clone(),
+        })
+    });
     assert_eq!(
-        tx_workload(&mut sim),
+        result,
         Ok(()),
         "seed 0xf79c40a51bb93ae8 no longer recovers a store bricked at creation"
     );
+    let discards = seen.lock().expect("witness lock").discards.clone();
+    assert!(
+        discards.contains(&Discard::Garbage),
+        "seed 0xf79c40a51bb93ae8 no longer reaches Db::open's discard through creation garbage \
+         (a non-empty store without redb's magic number); its discards were {discards:?}. A \
+         seed names a universe, not a scenario: re-find one that reaches this reason (hard \
+         rule 3)"
+    );
+}
+
+/// redb's magic number (`MAGICNUMBER`, redb 4.3.0 `header.rs`): the nine bytes
+/// `Database::new` reads at offset 0 of a non-empty file before it will open it.
+/// A file shorter than nine bytes is compared as zeros.
+const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+
+/// Why `Db::open` discarded the store, judged from the bytes redb itself read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Discard {
+    /// A non-empty file without redb's magic number: a creation that never
+    /// became durable ("Not a redb database: magic number mismatch").
+    Garbage,
+    /// Anything else, e.g. a store with its magic number refused because an
+    /// injected fault hit its open.
+    Other,
+}
+
+#[derive(Default)]
+struct StoreSeen {
+    /// The store file's length and magic-number check, as redb read them
+    /// since `tables.redb` was last opened.
+    len: Option<u64>,
+    magic: Option<bool>,
+    discards: Vec<Discard>,
+}
+
+/// A pass-through `Disk` that watches `Db::open` discard `tables.redb`. It
+/// records the file's length and its first nine bytes as redb reads them, and
+/// classifies each removal of the file. It issues no disk op of its own. An
+/// inspection that did would tick the crash countdown and draw latency, and
+/// so rename the universe it is watching.
+struct DiscardWitness {
+    inner: charpente_sim::SimDisk,
+    seen: Arc<Mutex<StoreSeen>>,
+}
+
+impl Disk for DiscardWitness {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let file = self.inner.open(path)?;
+        if path != "tables.redb" {
+            return Ok(file);
+        }
+        let mut seen = self.seen.lock().expect("witness lock");
+        seen.len = None;
+        seen.magic = None;
+        Ok(Box::new(StoreWitness {
+            inner: file,
+            seen: self.seen.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        if path == "tables.redb" {
+            let mut seen = self.seen.lock().expect("witness lock");
+            let garbage = match seen.len {
+                Some(len) if len > 0 => len < REDB_MAGIC.len() as u64 || seen.magic == Some(false),
+                _ => false,
+            };
+            seen.discards.push(if garbage {
+                Discard::Garbage
+            } else {
+                Discard::Other
+            });
+        }
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct StoreWitness {
+    inner: Box<dyn File>,
+    seen: Arc<Mutex<StoreSeen>>,
+}
+
+impl File for StoreWitness {
+    fn len(&self) -> io::Result<u64> {
+        let len = self.inner.len()?;
+        self.seen.lock().expect("witness lock").len = Some(len);
+        Ok(len)
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)?;
+        if offset == 0 && out.len() >= REDB_MAGIC.len() {
+            self.seen.lock().expect("witness lock").magic =
+                Some(out[..REDB_MAGIC.len()] == REDB_MAGIC);
+        }
+        Ok(())
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.inner.sync()
+    }
 }
 
 /// Builds a committed, gracefully-closed store, then durably resizes its file
