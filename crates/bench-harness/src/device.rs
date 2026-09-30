@@ -241,8 +241,14 @@ mod tests {
     /// Keyed on the artifact rather than the rate, because a rate assertion
     /// here would be a machine-speed assertion. The old shape leaves a
     /// ONE-BYTE file however fast the machine is; the new one leaves at least
-    /// `MIN_MEASURED_OPS` frames, because `timed_loop` refuses below that
-    /// floor. So this cannot pass for the wrong reason in either direction.
+    /// two frames however slow it is, because `timed_loop` runs one warmup op
+    /// and one timed op before it can look at the clock again.
+    ///
+    /// That is also why a refused rate is accepted here. On a disk slower
+    /// than `MIN_MEASURED_OPS` syncs a second — a CI runner under the lib
+    /// suite's parallel IO did 4, twice (2026-09-12, 2026-09-30) — `timed_loop`
+    /// refuses the RATE by name, as it must, and the file it leaves still
+    /// shows the SHAPE. Any other error still fails the test.
     #[test]
     fn a_bracket_sample_appends_rather_than_rewriting_one_block() {
         let dir = std::env::temp_dir().join(format!(
@@ -253,8 +259,14 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.to_str().expect("utf-8 scratch path");
 
-        let rate = device_bracket_sample(path).expect("bracket sample");
-        assert!(rate > 0.0, "rate: {rate}");
+        match device_bracket_sample(path) {
+            Ok(rate) => assert!(rate > 0.0, "rate: {rate}"),
+            Err(e) => assert!(
+                e.to_string()
+                    .starts_with("INVALID: the device bracket loop completed only"),
+                "bracket sample: {e}"
+            ),
+        }
 
         let biggest = std::fs::read_dir(&dir)
             .expect("read scratch dir")
@@ -265,12 +277,12 @@ mod tests {
             .expect("the bracket wrote a file");
         std::fs::remove_dir_all(&dir).ok();
 
-        let floor = crate::measure::MIN_MEASURED_OPS * FRAME_BYTES as u64;
+        let floor = 2 * FRAME_BYTES as u64;
         assert!(
-            biggest > floor,
+            biggest >= floor,
             "the bracket must APPEND: its file is {biggest} bytes, but a loop that \
-             completed at least MIN_MEASURED_OPS frames of {FRAME_BYTES} bytes must \
-             leave more than {floor}. A one-byte file means the bracket is still \
+             ran a warmup op and a timed op, each appending a {FRAME_BYTES}-byte frame, \
+             must leave at least {floor}. A one-byte file means the bracket is still \
              rewriting offset 0, which measures a shape ~4% slower than the WAL \
              append it is used to bound"
         );
