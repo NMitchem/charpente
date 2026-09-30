@@ -72,7 +72,8 @@ pub struct DbConfig {
     /// time-based: v0 has no transactional wall-time source (DESIGN §6).
     pub event_retention: u64,
     /// Rows per transaction while a table migrates (spec §3) — bounds one
-    /// migration commit's WAL record size.
+    /// migration commit's WAL record size. At least 1: `migrate_schema`
+    /// refuses 0 by name when a table is due to migrate.
     pub migration_batch_size: u64,
 }
 
@@ -3467,6 +3468,19 @@ impl Db {
                     ))));
                 };
                 cursor = step.to_version;
+            }
+            // `migrate_table` closes out on its first empty batch, and a batch
+            // of 0 rows is always empty, so a size of 0 would bump the version
+            // over rows it never rewrote.
+            if self.cfg.migration_batch_size == 0 {
+                return Err(io::Error::other(Refusal(format!(
+                    "table \"{table}\" is due to migrate from persisted version {from} to \
+                     compiled version {compiled_version}, but DbConfig::migration_batch_size is \
+                     0: a batch of 0 commits no rows, and the migration would then mark the \
+                     table migrated with rows still at version {from} — set \
+                     migration_batch_size to at least 1 (the default is {})",
+                    DbConfig::default().migration_batch_size
+                ))));
             }
             self.migrate_table(
                 table,

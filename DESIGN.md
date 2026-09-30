@@ -782,8 +782,9 @@ using one new effect kind, `MigratePut(table, id, bytes)`, applied everywhere (l
 crash-replay, follower apply) by overwriting the row's stored bytes without decoding the old
 value and leaving indexes untouched — the second decode-under-the-wrong-version path
 (`Writer::replace_row`'s index-upkeep decode) never sees a mid-migration row. The executor
-batches `DbConfig::migration_batch_size` rows (default 1000) per transaction over a bounded
-range read, committing each batch's rewrites and its watermark advance
+batches `DbConfig::migration_batch_size` rows (at least 1, default 1000; 0 is refused by
+name before anything is written, since an empty batch is the close-out signal) per
+transaction over a bounded range read, committing each batch's rewrites and its watermark advance
 (`migrating_through`) together so a crash between them is impossible by construction; the
 closing transaction clears the watermark and bumps `(version, fingerprint)` to the target —
 the single moment a table is considered migrated, and the moment its apply trigger rebuilds

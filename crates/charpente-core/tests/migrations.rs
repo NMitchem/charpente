@@ -9,7 +9,7 @@
 
 use std::io;
 
-use charpente_core::db::{Db, DbConfig, Schema, TxError};
+use charpente_core::db::{Db, DbConfig, Refusal, Schema, TxError};
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
@@ -746,6 +746,98 @@ fn in_flight_target_refusal_and_rejection_mid_chain_are_pinned_verbatim() {
          one table; finish the interrupted migration with the binary that started it, or \
          restore"
     );
+}
+
+/// `migration_batch_size: 0` over a table with rows. The executor's first
+/// batch is empty whatever the table holds, and an empty batch is its
+/// close-out signal, so before this refusal it bumped the persisted version
+/// over rows still at version 1: `migrate_schema` returned `Ok`, and every
+/// later read of the table failed to decode, durably. The refusal comes
+/// before anything is written, so the version stays at 1 and a batch size of
+/// at least 1 migrates every row.
+#[test]
+fn a_zero_migration_batch_size_is_refused_by_name_before_the_version_moves() {
+    let sim = Sim::with_faults(0x2EB7_0016, FaultConfig::none());
+    seed_v1(&sim, 5);
+    let schema = || {
+        Schema::new()
+            .table::<Widget2>()
+            .migration::<Widget2>("Widget")
+    };
+    // (version, migrating_through, migrating_to)
+    let persisted = |db: &Db| {
+        let sv: Option<SchemaVersion> = db
+            .snapshot()
+            .unwrap()
+            .get(schema_version_id("Widget"))
+            .unwrap();
+        sv.map(|v| (v.version, v.migrating_through, v.migrating_to))
+    };
+
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig {
+            migration_batch_size: 0,
+            ..cfg()
+        },
+        schema(),
+    )
+    .unwrap();
+    let err = match db.migrate_schema() {
+        Err(err) => err,
+        Ok(()) => panic!(
+            "migrate_schema returned Ok with migration_batch_size 0: the persisted version is \
+             now {:?}, and scan::<Widget2>() gives {:?}",
+            persisted(&db),
+            db.snapshot()
+                .unwrap()
+                .scan::<Widget2>()
+                .map(|rows| rows.len())
+        ),
+    };
+    assert_eq!(
+        err.to_string(),
+        "table \"Widget\" is due to migrate from persisted version 1 to compiled version 2, \
+         but DbConfig::migration_batch_size is 0: a batch of 0 commits no rows, and the \
+         migration would then mark the table migrated with rows still at version 1 — set \
+         migration_batch_size to at least 1 (the default is 1000)"
+    );
+    assert!(Refusal::of(&err).is_some(), "a refusal, not an IO failure");
+    assert_eq!(
+        persisted(&db),
+        Some((1, None, None)),
+        "the version did not move"
+    );
+    drop(db);
+
+    let mut db = Db::open(Box::new(sim.disk()), cfg(), schema()).unwrap();
+    db.migrate_schema().unwrap();
+    assert_eq!(persisted(&db), Some((2, None, None)));
+    let mut rows: Vec<Widget2> = db.snapshot().unwrap().scan().unwrap();
+    rows.sort_by_key(|r| r.id.raw());
+    assert_eq!(
+        rows.into_iter()
+            .map(|r| (r.id.raw(), r.count, r.label))
+            .collect::<Vec<_>>(),
+        (0..5)
+            .map(|i| (i, i as u32, "migrated".to_string()))
+            .collect::<Vec<_>>()
+    );
+    drop(db);
+
+    // Refused only when a migration is due: with nothing behind, a size of 0
+    // has nothing to do and `migrate_schema` is the no-op it always was.
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig {
+            migration_batch_size: 0,
+            ..cfg()
+        },
+        schema(),
+    )
+    .unwrap();
+    db.migrate_schema().unwrap();
+    assert_eq!(persisted(&db), Some((2, None, None)));
 }
 
 // ------------------------------------------------------------ Step 5

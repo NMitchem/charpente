@@ -434,7 +434,9 @@ built-in `charpente.events` table the same way: each checkpoint deletes all
 but the newest `event_retention` event rows (`Db::event_floor()` reports the
 smallest id still retained). `migration_batch_size` caps how many rows one
 schema-migration transaction rewrites at a time, bounding a single migration
-commit's WAL record size.
+commit's WAL record size. It must be at least 1: a batch of 0 rewrites nothing,
+so `migrate_schema` refuses by name, before writing anything, when a table is due
+to migrate and the size is 0.
 
 ### Recovery, behaviorally
 
@@ -4461,7 +4463,7 @@ registered chain to the compiled version 2, and admits (every open runs this che
 every node — refusing by name instead is the barrier, below). The rewrite is a separate
 step, `migrate_schema`, which the kernel calls right after open, before it serves
 anything, on a single node or a primary: it reads existing rows in batches
-(`DbConfig::migration_batch_size`, default 1000), applies `migrate` to each, and commits
+(`DbConfig::migration_batch_size`, at least 1, default 1000), applies `migrate` to each, and commits
 the rewritten batch plus a resumable watermark in one transaction. A crash mid-migration
 is exactly resumption — the next start picks up from the watermark and finishes; no row
 is transformed twice, none skipped. Once every row has moved, one
