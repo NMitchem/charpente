@@ -5070,6 +5070,15 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
 /// Returns the frame trace, so the replay check has an oracle.
 fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    // Ledger ids this node's timeline no longer holds, each with the
+    // `next_event_id` that proved it. `push_subscribe` already reads that
+    // counter, which only advances on commit, so a recorded id at or above it
+    // is one a recovery cut away: on a single node, only durable corruption
+    // above the checkpoint horizon does that. Read off a value already in
+    // hand, so no disk op is added. The flagship's probe cannot see this case
+    // when the id is re-minted for the other tenant: no frame ever
+    // mismatches, and retention can collect the row before the settle.
+    let mut rolled_back_ids: BTreeMap<u64, u64> = BTreeMap::new();
 
     for _epoch in 0..EPOCHS {
         // A give-up already recorded means this universe adjudicated
@@ -5115,6 +5124,9 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             if client.need_subscribe {
                 match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
                     Ok(info) => {
+                        for (&id, _) in client.ledger.range(info.1..) {
+                            rolled_back_ids.entry(id).or_insert(info.1);
+                        }
                         subscribe = Some(info);
                         t += SEC;
                     }
@@ -5199,7 +5211,12 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
 
         let subscribe =
             match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
-                Ok(info) => info,
+                Ok(info) => {
+                    for (&id, _) in client.ledger.range(info.1..) {
+                        rolled_back_ids.entry(id).or_insert(info.1);
+                    }
+                    info
+                }
                 Err(e) if is_fault_fallout(&e) => {
                     sim.restart();
                     continue;
@@ -5253,6 +5270,34 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
                  holds the recorded event (durable corruption cut it above the \
                  checkpoint horizon), so it can never be delivered and nothing here \
                  adjudicates ({})",
+                client.unsettled_report()
+            ));
+            return Ok(client.trace);
+        }
+        // Every id still owed is one this node lost to durable corruption (see
+        // `rolled_back_ids`), so none of them can ever be delivered.
+        let lo = client.floor.min(client.next_scan_id);
+        let owed: Vec<u64> = client
+            .ledger
+            .range(lo..client.next_scan_id)
+            .filter(|(id, (name, key, _))| {
+                client.matches(name, key) && !client.verified.contains(id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if durable_corruption_fired(sim)
+            && client.pending.is_empty()
+            && !owed.is_empty()
+            && owed.iter().all(|id| rolled_back_ids.contains_key(id))
+        {
+            let id = owed[0];
+            sim.give_up(format!(
+                "ledger id {id} left this node's timeline: recorded {} when scanned, and a later \
+                 read found the store's next_event_id at {}, so the store no longer holds it — \
+                 durable corruption cut it at recovery above the checkpoint horizon and the id \
+                 was re-minted, so it can never be delivered and nothing here adjudicates ({})",
+                client.ledger[&id].2,
+                rolled_back_ids[&id],
                 client.unsettled_report()
             ));
             return Ok(client.trace);
@@ -5429,6 +5474,45 @@ const SCOPED_BOTH_TENANTS_FLOOR: u64 = 83;
 const SCOPED_OWN_BACKLOG_FLOOR: u64 = 81;
 const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 98;
 const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
+
+/// Seed `0x20851976ea4bae36` (base `0x5E1F0013`), found 2026-09-30 by S3's
+/// fresh-base scan. A misdirected write moved event id 5's WAL frame (seq 8,
+/// tenant A) off its offset, so the next recovery cut the log there, and the
+/// following emits re-minted id 5 for tenant B. The client's ledger had
+/// already recorded the old id 5 and its resume never saw the re-mint (tenant
+/// B's rows are filtered), so the flagship's drain-error probe never ran, and
+/// by the settle retention had collected the row the probe would have read.
+/// The universe failed "client never caught up" on an event its own node had
+/// lost to a durable-corruption fault the property excuses. It now gives up,
+/// because a `next_event_id` read after that recovery showed the store behind
+/// the recorded id.
+#[test]
+fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_gives_up() {
+    const SEED: u64 = 0x2085_1976_ea4b_ae36;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let result = scoped_realtime_workload(&mut sim);
+    assert!(
+        result.is_ok(),
+        "an event lost to durable corruption must not fail the universe: {:?}",
+        result.err()
+    );
+    let reason = sim
+        .gave_up()
+        .expect("and it must be RECORDED as a give-up, not counted as a pass");
+    assert!(
+        reason.contains("ledger id 5 left this node's timeline"),
+        "and it must be THIS give-up, for id 5: {reason}"
+    );
+    assert!(
+        durable_corruption_fired(&sim),
+        "excused only because durable corruption fired"
+    );
+}
 
 /// Floors pinned at an exact measurement are only meaningful if the batch is
 /// reproducible, which is the same claim the flagship's own replay check
