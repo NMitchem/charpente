@@ -3389,9 +3389,20 @@ fn mixed_shape_resumes_replay_identically_for_the_same_seed() {
 /// check (neither moves a draw). Each floor is the exact count: a drop is a
 /// finding, not a number to lower. `fault:subscriber_stall` is required, not
 /// floored, like every fault axis here; it reads 2 at this base.
-const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 11;
-const SHAPES_RESHAPED_409_FLOOR: u64 = 52;
-const SHAPES_V2_DELIVERED_FLOOR: u64 = 42;
+///
+/// **Re-measured 2026-09-30**, same base and count, two identical batches,
+/// for redb 4.3.0 and the crash countdown re-sized to its disk-op volume
+/// (DESIGN §1, "countdowns"; `fault:crash` 71 under 4.1.0, 84 now). No floor
+/// fell; each is set to its new count.
+///
+/// | key | was | now |
+/// |---|---|---|
+/// | `shapes:reshaped-frame` | 11 | 19 |
+/// | `shapes:reshaped-409` | 52 | 66 |
+/// | `shapes:v2-delivered` | 42 | 56 |
+const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 19;
+const SHAPES_RESHAPED_409_FLOOR: u64 = 66;
+const SHAPES_V2_DELIVERED_FLOOR: u64 = 56;
 
 /// `shapes_verdict`'s stall arm, both sides, called directly. The sink is
 /// dropped before every verdict, so the tail is closed the way the terminal
@@ -5347,9 +5358,28 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
 /// that is not failing is a separate decision from repairing one that is.
 /// Counts reproduced identically across two consecutive batches before these
 /// numbers were taken, the same discipline the original measurement states.
-const SCOPED_BOTH_TENANTS_FLOOR: u64 = 75;
-const SCOPED_OWN_BACKLOG_FLOOR: u64 = 78;
-const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 80;
+///
+/// **Re-measured 2026-09-30**, same base, two identical batches, for redb
+/// 4.3.0 and the crash countdown re-sized to its disk-op volume. This workload
+/// takes the re-size without the calibration margin (DESIGN §1, "countdowns":
+/// with it, `realtime:resume-backlog` fell to 122). The "floor" column is the
+/// floor as it stood: the 2026-09-07 directory-barrier split set two of them
+/// to 78 and 125 without updating the table above. The "4.1.0" column is the
+/// count at the parent commit. The paragraph above left non-failing floors
+/// alone during a repair. This time a dependency's IO shape re-rolled every
+/// universe, so each floor whose count the upgrade moved is set on its new
+/// count. `realtime:resume-backlog` reads 126 at both versions; it did not
+/// move, so its floor stays. None fell.
+///
+/// | key | floor | 4.1.0 | now | new floor |
+/// |---|---|---|---|---|
+/// | `tenant:both-tenants-emitted` | 75 | 76 | 83 | 83 |
+/// | `tenant:own-backlog-verified` | 78 | 78 | 81 | 81 |
+/// | `tenant:foreign-backlog-not-delivered` | 80 | 87 | 98 | 98 |
+/// | `realtime:resume-backlog` | 125 | 126 | 126 | 125 |
+const SCOPED_BOTH_TENANTS_FLOOR: u64 = 83;
+const SCOPED_OWN_BACKLOG_FLOOR: u64 = 81;
+const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 98;
 const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
 
 /// Floors pinned at an exact measurement are only meaningful if the batch is

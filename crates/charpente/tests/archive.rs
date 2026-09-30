@@ -7264,9 +7264,35 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// column. Barrier movement is now non-perturbing; other workload and IO-shape
 /// changes still re-roll, so a future panic here is still usually mechanical and
 /// upstream rather than a decayed oracle — just no longer from a `sync_dir`.
-const CONV_RESTORED_FLOOR: u64 = 213;
-const CONV_SUBSTANTIAL_FLOOR: u64 = 181;
-const CONV_CHAINED_FLOOR: u64 = 166;
+///
+/// **Re-measured 2026-09-30, same bases, for redb 4.3.0** — an IO-shape change
+/// of exactly that kind. Its non-durable commits stay in its own write buffer
+/// rather than reaching the file (DESIGN §1, "The store's crash surface"), so
+/// every universe re-rolled. Two identical batches at each base; the "4.1.0"
+/// column is a control run of the parent commit, and it reproduces "measures
+/// now" above exactly. Every floor is set on its new count, in both tables.
+/// That is the "separate decision" the table above deferred: the whole matrix
+/// moved at once, and a floor left up to 77 below its count would tolerate the
+/// old give-up rate coming back. The two `chained` counts fell against 4.1.0
+/// but stay above their floors, so no floor is lowered. The unscoped base's
+/// 22 universes without a verdict are `nothing_published` 4,
+/// `verify_never_read_cleanly` 15 and `restore_never_completed` 3; the scoped
+/// base's 20 are 6 and 14 and 0.
+///
+/// | floor | was | 4.1.0 | now |
+/// |---|---|---|---|
+/// | `CONV_RESTORED_FLOOR` | 213 | 213 | 234 |
+/// | `CONV_SUBSTANTIAL_FLOOR` | 181 | 187 | 235 |
+/// | `CONV_CHAINED_FLOOR` | 166 | 176 | 170 |
+/// | `CONV_SCOPED_RESTORED_FLOOR` | 211 | 217 | 236 |
+/// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 160 | 172 | 237 |
+/// | `CONV_SCOPED_CHAINED_FLOOR` | 153 | 163 | 161 |
+///
+/// `restored_substantial` can exceed `restored`: it is covered once the
+/// manifest's frontier is known, before the restore and its verification run.
+const CONV_RESTORED_FLOOR: u64 = 234;
+const CONV_SUBSTANTIAL_FLOOR: u64 = 235;
+const CONV_CHAINED_FLOOR: u64 = 170;
 
 /// `archive_converges_with_a_scoped_table`'s own base and floors. Separate
 /// numbers because they are rates against a different workload — one extra row
@@ -7297,10 +7323,13 @@ const CONV_CHAINED_FLOOR: u64 = 166;
 /// `CONV_RESTORED_FLOOR`'s doc performs for the unscoped base.
 /// `tenant:restored-multi-tenant` fired 244 times, so the `require:` key is a
 /// real floor rather than a decoration.
+///
+/// Re-measured 2026-09-30 for redb 4.3.0 with the three above; the table and
+/// the reason are at `CONV_RESTORED_FLOOR`.
 const ARCHIVE_SCOPED_CONVERGENCE_BASE: u64 = 0xA2C0_5C09;
-const CONV_SCOPED_RESTORED_FLOOR: u64 = 211;
-const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 160; // 164 before the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
-const CONV_SCOPED_CHAINED_FLOOR: u64 = 153;
+const CONV_SCOPED_RESTORED_FLOOR: u64 = 236;
+const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 237; // 164, then 160 after the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
+const CONV_SCOPED_CHAINED_FLOOR: u64 = 161;
 
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that

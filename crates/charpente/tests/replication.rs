@@ -1105,7 +1105,16 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// as this comment predicted it would; the reach it measures is unchanged in
 /// kind (164 of 256 against 166). Barrier movement can no longer move this
 /// number again.
-const CONVERGED_FLOOR: u64 = 164;
+///
+/// **164 -> 253 on 2026-09-30, for redb 4.3.0**, two identical batches. The
+/// count at the parent commit under redb 4.1.0 is still 164 (a control run),
+/// so the move is the dependency's. Its non-durable commits stay in its own
+/// write buffer rather than reaching the file (DESIGN §1, "The store's crash
+/// surface"), so far fewer store IOs are exposed to injected faults. The
+/// give-ups fell from 92 to 3, all three `:recover-exhausted:injected`. The
+/// floor is set on the new count, keeping this constant's convention, so a
+/// return to the old give-up rate is now red.
+const CONVERGED_FLOOR: u64 = 253;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
 /// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on
@@ -1398,7 +1407,15 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 /// unrecoverable and with a fault-triggered wedge the retry cannot clear. The
 /// evidence gathered so far does not separate those, and this floor does not
 /// depend on which it is: the count it pins moved 145 → 149 under that same 10×.
-const SEEDED_CONVERGED_FLOOR: u64 = 129;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 190 of
+/// 256 (the parent commit under redb 4.1.0 measures 144, a control run). The
+/// give-ups fell 111 → 28, all `:recover-exhausted:injected`, and
+/// `repl:seed-base-zero` rose 1 → 38: universes that used to give up now
+/// finish with a primary too small to move its base. 190 + 28 + 38 = 256. At
+/// p = 190/256 = 0.742 one SE is 7.0, so 190 − 2·7.0 = 176.0 → 176, the same
+/// convention; it tolerates a 7.4% relative fall.
+const SEEDED_CONVERGED_FLOOR: u64 = 176;
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
     let mut p = spawn_node_with_schema(
@@ -4156,7 +4173,14 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
 /// **A drop below this is a finding, not a number to lower.** The likeliest
 /// cause is the reduced-oracle path growing: more universes reaching
 /// `repl:switchover-inconclusive`, where only `assert_one_writable` runs.
-const SWITCHOVER_CONVERGED_FLOOR: u64 = 57;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 103 of
+/// 256 (the parent commit under redb 4.1.0 measures 74, a control run). The
+/// give-ups fell 50 → 1, and the rescued universes split between this key and
+/// `repl:switchover-inconclusive` (124 → 144), as the retry-budget experiment
+/// above predicts. At p = 103/256 = 0.402 one SE is 7.85, so 103 − 2·7.85 =
+/// 87.3 → 87; it tolerates a 15.5% relative fall.
+const SWITCHOVER_CONVERGED_FLOOR: u64 = 87;
 
 /// The result of one switchover attempt's drain.
 enum DrainResult {
@@ -4465,7 +4489,14 @@ fn failover_preserves_everything_the_follower_acked() {
 /// (`p` still a live primary, `f` never recovered, `f` holding a position) is
 /// what most often denies this oracle its universe; a fall here means that gate
 /// closed more often, and why is the question.
-const FAILOVER_PREFIX_FLOOR: u64 = 35;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 51 of 128
+/// (the parent commit under redb 4.1.0 measures 42, a control run). The 33
+/// `:recover-exhausted` give-ups are gone. The staging gate now takes most of
+/// what they freed (52 → 75 `:failover-staging-gate`), and 77 give up in all.
+/// At p = 51/128 = 0.398 one SE is 5.54, so 51 − 2·5.54 = 39.9 → 39; it
+/// tolerates a 23.5% relative fall.
+const FAILOVER_PREFIX_FLOOR: u64 = 39;
 
 fn failover_universe(sim: &mut Sim) -> Result<(), String> {
     let cfg = no_gc_cfg();
@@ -5940,7 +5971,16 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
 /// `:survivor-faulted` at 87% of the give-ups, the thing to check first is
 /// whether the fault matrix got harsher on the survivor — that alone can retire
 /// this oracle without a single test going red.
-const SURVIVOR_PROMISE_FLOOR: u64 = 22;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 36 of 128
+/// (the parent commit under redb 4.1.0 measures 30, a control run). The give-ups
+/// fell 94 → 90. Every cause but `:survivor-faulted` and one
+/// `:request-no-response` is gone, and `:survivor-faulted` rose 81 → 90. That
+/// fits universes that used to end on another cause now running on to the
+/// survivor's faults (inferred from the totals, not traced per universe). At
+/// p = 36/128 = 0.281 one SE is 5.09, so 36 − 2·5.09 =
+/// 25.8 → 25; it tolerates a 30.6% relative fall.
+const SURVIVOR_PROMISE_FLOOR: u64 = 25;
 
 fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     let db_cfg = horizon_db_cfg();

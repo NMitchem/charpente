@@ -4339,9 +4339,20 @@ fn job_shape_upgrades_replay_identically_for_the_same_seed() {
 /// stream. That is live here — at three fresh bases the refused count read
 /// 34, 39 and 46 — so a stream-shifting change is expected to re-measure
 /// these, with the new numbers in hand.
-const RECEIPT_REFUSED_FLOOR: u64 = 40;
-const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 14;
-const RECEIPT_DRAINED_FLOOR: u64 = 115;
+///
+/// **Re-measured 2026-09-30**, same base and count, two identical batches,
+/// for redb 4.3.0 and the workload that now holds its first receipt Pending
+/// for one retry (`receipt_upgrade_universe`'s doc says why). No floor fell;
+/// each is set to its new count.
+///
+/// | key | was | now |
+/// |---|---|---|
+/// | `shapes:job-refused` | 40 | 48 |
+/// | `shapes:job-refused-after-crash` | 14 | 18 |
+/// | `shapes:job-drained` | 115 | 117 |
+const RECEIPT_REFUSED_FLOOR: u64 = 48;
+const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 18;
+const RECEIPT_DRAINED_FLOOR: u64 = 117;
 
 // ------------------------------------------ job tenancy under the fault matrix
 
