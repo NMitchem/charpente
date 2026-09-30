@@ -135,16 +135,36 @@ mod receipt_v2 {
     }
 }
 
+/// The deferring old binary's gate, an app table: present from invoice 0's
+/// enqueue until the receipt enqueued behind it runs (`receipt_v1_deferring`).
+#[table(global)]
+struct ReceiptGate {
+    id: Id<ReceiptGate>,
+    invoice: u64,
+}
+
 /// The old binary `receipt_upgrade_universe` runs: receipt_v1's shape (same
-/// NAME, same FINGERPRINT — a retry policy is not part of a job's shape), whose
-/// handler turns invoice 0's first attempt away, so that receipt stays durable
-/// and Pending for one backoff while v1 serves the receipts behind it. Why the
-/// window is held open: `receipt_upgrade_universe`'s doc.
+/// NAME, same FINGERPRINT — a retry policy is not part of a job's shape).
+/// `enqueue_gated_receipt` enqueues invoice 0's receipt together with a
+/// `ReceiptGate` row and, behind it, a receipt for `OPENS_THE_GATE`. Invoice
+/// 0's first attempt finds the gate and is turned away; the opener deletes the
+/// gate; invoice 0's retry, one backoff later, runs. So that receipt stays
+/// durable and Pending for one backoff while v1 serves the receipts behind it.
+/// The handler reads only the app's own table, never `charpente.jobs`. Why the
+/// window is held open, and why the order holds: `receipt_upgrade_universe`'s
+/// doc.
 mod receipt_v1_deferring {
+    use super::ReceiptGate;
     use charpente::kernel::JobError;
     use charpente::{Tx, job};
-    use charpente_core::job::{JobRow, JobStatus};
-    use charpente_core::table::{Codec, View};
+    use charpente_core::table::{Id, View};
+
+    /// The receipt that opens the gate. No invoice carries this number.
+    pub const OPENS_THE_GATE: u64 = u64::MAX;
+
+    pub fn gate() -> Id<ReceiptGate> {
+        Id::from_raw(0)
+    }
 
     #[job(global, retry(max = 3, backoff = "2s"))]
     pub struct SendReceipt {
@@ -153,17 +173,13 @@ mod receipt_v1_deferring {
 
     impl SendReceipt {
         fn run(self, tx: &mut Tx) -> Result<(), JobError> {
-            if self.invoice != 0 {
+            if self.invoice == OPENS_THE_GATE {
+                tx.delete(gate());
                 return Ok(());
             }
-            let first_attempt = tx.scan::<JobRow>()?.into_iter().any(|r| {
-                r.name == "SendReceipt"
-                    && r.status == JobStatus::Pending
-                    && r.attempts == 0
-                    && SendReceipt::decode(&mut &r.payload[..])
-                        .is_ok_and(|p| p.invoice == self.invoice)
-            });
-            if first_attempt {
+            // A turned-away attempt's writes are discarded with it, so the
+            // attempt this gate defers can never be the one that clears it.
+            if tx.get(gate())?.is_some_and(|g| g.invoice == self.invoice) {
                 return Err(JobError::app("deferred to its retry"));
             }
             Ok(())
@@ -3488,15 +3504,42 @@ fn receipts_app(sim: &Sim, v2: bool) -> std::io::Result<App> {
     .mount_jobs(defs))
 }
 
-fn deferring_v1_receipts_app(sim: &Sim) -> std::io::Result<App> {
-    Ok(App::open(
+/// The deferring old binary's enqueue path (`receipt_v1_deferring`): invoice
+/// 0's receipt, its gate and the receipt that opens the gate commit in one
+/// transaction, in that order.
+#[route(POST "/receipt", public)]
+fn enqueue_gated_receipt(tx: &mut Tx, body: ReceiptBody) -> Result<(), ApiError> {
+    let invoice = body.invoice.0;
+    tx.enqueue(receipt_v1_deferring::SendReceipt { invoice });
+    if invoice == 0 {
+        tx.put(&ReceiptGate {
+            id: receipt_v1_deferring::gate(),
+            invoice,
+        });
+        tx.enqueue(receipt_v1_deferring::SendReceipt {
+            invoice: receipt_v1_deferring::OPENS_THE_GATE,
+        });
+    }
+    Ok(())
+}
+
+/// `receipt_upgrade_universe`'s two binaries. Both declare `ReceiptGate`, as a
+/// deploy that changes a job's fields keeps the app's tables; only the old one
+/// mounts the gated route and the deferring handler.
+fn gated_receipts_app(sim: &Sim, v2: bool) -> std::io::Result<App> {
+    let app = App::open(
         Box::new(sim.disk()),
-        Schema::new(),
+        Schema::new().table::<ReceiptGate>(),
         Box::new(sim.entropy()),
         AppConfig::default(),
-    )?
-    .mount(routes![enqueue_receipt])
-    .mount_jobs(jobs![receipt_v1_deferring::SendReceipt]))
+    )?;
+    Ok(if v2 {
+        app.mount(routes![enqueue_receipt])
+            .mount_jobs(jobs![receipt_v2::SendReceipt])
+    } else {
+        app.mount(routes![enqueue_gated_receipt])
+            .mount_jobs(jobs![receipt_v1_deferring::SendReceipt])
+    })
 }
 
 /// The refusal text, spelled out from the spec's wording rather than taken
@@ -4178,17 +4221,34 @@ fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption()
 /// the time (92 of 234, pooled over six bases). redb 4.3.0 buffers those pages
 /// until a checkpoint and the share fell to 21% (58 of 271), which left
 /// `shapes:job-refused-after-crash` at 8 of its 14. So v1 runs
-/// `receipt_v1_deferring`: invoice 0, the first receipt of every run, fails its
-/// first attempt and waits out a 2 s backoff, Pending, while the receipts behind
-/// it are enqueued and run — 34% (94 of 277). The backoff sets the window's
-/// width: at 5 s so many runs end with invoice 0 still Pending that
-/// `shapes:job-drained` falls under its floor (109), and at 1 s
-/// `shapes:job-refused-after-crash` sits exactly on its floor.
+/// `receipt_v1_deferring`, which holds invoice 0's receipt, the first of every
+/// run, durable and Pending for one 2 s backoff while the receipts behind it
+/// are enqueued and run: 33% (91 of 273).
+///
+/// The hold is an app table, `ReceiptGate`, and its order follows from the
+/// dispatcher's. One transaction enqueues invoice 0's receipt, writes the
+/// gate, and enqueues the receipt that opens it, in that order, so the opener
+/// has the higher id. A fresh enqueue is due at 0 and the dispatcher runs jobs
+/// in (due, id) order, so invoice 0 runs first, finds the gate and is turned
+/// away. Its failure record puts it at now + 2 s (`RetryPolicy::backoff_nanos`
+/// after one attempt). The opener, still due at 0, runs next and deletes the
+/// gate, so invoice 0's retry finds it gone and runs. A turned-away attempt's
+/// writes are discarded, so invoice 0 cannot clear its own gate. The v2 side
+/// checks the construction: an invoice 0 that has settled is Done after
+/// exactly one turned-away attempt. The gate has an opener of its own, rather
+/// than being cleared by whichever receipt comes after invoice 0, because
+/// about one run in six enqueues invoice 0 alone (`1 + entropy % 6`). There, a
+/// gate that waits for another receipt is never cleared, and invoice 0 is
+/// turned away until it dead-letters.
+///
+/// The backoff sets the window's width. At 5 s so many runs end with invoice 0
+/// still Pending that `shapes:job-drained` falls to 112; at 1 s
+/// `shapes:job-refused` falls to 41.
 fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
     sim.crash_disk_after(22 + entropy.next_u64() % 174);
-    match deferring_v1_receipts_app(sim).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
+    match gated_receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
         Ok(mut kernel) => {
             let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
             let base = sim.now().as_nanos();
@@ -4211,7 +4271,7 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     }
     sim.restart();
     for _ in 0..64 {
-        let mut app = match receipts_app(sim, true) {
+        let mut app = match gated_receipts_app(sim, true) {
             Ok(app) => app,
             Err(e) if is_fault_fallout(&e.to_string()) => {
                 sim.restart();
@@ -4234,6 +4294,21 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
             }
             Err(e) => return Err(format!("job scan failed non-injected: {e}")),
         };
+        // The held-open window is this workload's construction, so it is
+        // checked rather than assumed: once invoice 0's receipt settles, it
+        // ran on its second attempt, having been turned away exactly once.
+        if let Some(r) = receipts.iter().find(|r| {
+            receipt_v1_deferring::SendReceipt::decode(&mut &r.payload[..])
+                .is_ok_and(|p| p.invoice == 0)
+        }) && r.status != JobStatus::Pending
+            && (r.status != JobStatus::Done || r.attempts != 1)
+        {
+            return Err(format!(
+                "invoice 0's receipt settled {:?} after {} attempt(s); its gate holds it \
+                 Pending for exactly one turned-away attempt",
+                r.status, r.attempts
+            ));
+        }
         let pending: Vec<u64> = receipts
             .iter()
             .filter(|r| r.status == JobStatus::Pending)
@@ -4309,9 +4384,11 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
 /// The floors below are exact counts, so the batch must replay: one universe
 /// run twice from one seed gives the same coverage and the same durable
 /// state. The seed's universe reaches a verdict, so the replay covers the
-/// property's own outcome. It reaches it through the held-open window: its five
-/// receipts are Done, invoice 0 after one turned-away attempt (re-verified
-/// 2026-09-30, when the deferral landed).
+/// property's own outcome. It reaches it through the held-open window: its
+/// receipts for invoices 0-4 and the gate's opener are all Done, invoice 0
+/// after one turned-away attempt. Re-verified 2026-09-30, first when the
+/// deferral landed and again when `ReceiptGate` replaced its read of
+/// `charpente.jobs`.
 #[test]
 fn job_shape_upgrades_replay_identically_for_the_same_seed() {
     charpente_sim::checks::replays_identically(0x5A9E_0611, |sim: &mut Sim| {
@@ -4342,16 +4419,20 @@ fn job_shape_upgrades_replay_identically_for_the_same_seed() {
 ///
 /// **Re-measured 2026-09-30**, same base and count, two identical batches,
 /// for redb 4.3.0 and the workload that now holds its first receipt Pending
-/// for one retry (`receipt_upgrade_universe`'s doc says why). No floor fell;
-/// each is set to its new count.
+/// for one retry (`receipt_upgrade_universe`'s doc says why). None is below
+/// its redb 4.1.0 value, and each is set to its new count. The hold first read
+/// `charpente.jobs` from the job's own transaction. It now uses an app table,
+/// `ReceiptGate`, because a job's `Tx` is not to read the platform's tables.
+/// That added one receipt per run and re-rolled the batch, which is the last
+/// column.
 ///
-/// | key | was | now |
-/// |---|---|---|
-/// | `shapes:job-refused` | 40 | 48 |
-/// | `shapes:job-refused-after-crash` | 14 | 18 |
-/// | `shapes:job-drained` | 115 | 117 |
-const RECEIPT_REFUSED_FLOOR: u64 = 48;
-const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 18;
+/// | key | 4.1.0 | job-row hold | `ReceiptGate` |
+/// |---|---|---|---|
+/// | `shapes:job-refused` | 40 | 48 | 49 |
+/// | `shapes:job-refused-after-crash` | 14 | 18 | 17 |
+/// | `shapes:job-drained` | 115 | 117 | 117 |
+const RECEIPT_REFUSED_FLOOR: u64 = 49;
+const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 17;
 const RECEIPT_DRAINED_FLOOR: u64 = 117;
 
 // ------------------------------------------ job tenancy under the fault matrix
