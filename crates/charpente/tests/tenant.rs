@@ -808,7 +808,8 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     let cfg = ledger_cfg();
 
     for _round in 0..3u64 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(43 + entropy.next_u64() % 340);
         let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), ledger_schema()) {
             Ok(db) => db,
             Err(e) => {

@@ -1279,7 +1279,8 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     let mut responses = Vec::new();
 
     for _round in 0..3 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(44 + entropy.next_u64() % 353);
         let mut app = match open_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {

@@ -2962,27 +2962,18 @@ fn an_opened_then_admitted_second_tenant_is_the_same_violation() {
     });
 }
 
-/// F1 mechanism (no child process — see `crates/edge-harness/tests/
-/// open_fence.rs` for the printed-output oracle, which needs one).
-/// `Store::open`'s `IN_OPEN_FENCE` thread-local must clear on EVERY exit
-/// path, including the one where `catch_unwind` actually caught a real redb
-/// panic — a leaked `true` here would silently swallow the next genuine
-/// panic on this thread forever, which is worse than F1 itself.
-#[test]
-fn open_fence_flag_clears_after_catching_a_real_redb_open_panic() {
-    assert!(
-        !charpente_core::table::in_open_fence(),
-        "must start clear: nothing has entered the fence on this thread yet"
-    );
-
+/// A store gracefully closed, then its file length mangled by hand into one
+/// of the two crash shapes redb 4.1.0 asserted on at open (DESIGN §4). The
+/// mangle goes through the sim's `File` and is synced, so the store's next
+/// open sees exactly the durable bytes a crash would have left.
+fn open_a_store_mangled_to(mangle: impl Fn(u64) -> u64) -> Result<io::Result<Store>, String> {
     let sim = Sim::with_faults(0x0FEE_1234, FaultConfig::none());
     let disk = sim.disk();
     {
         let store = Store::open(&disk, "probe.redb").unwrap();
         // Enough committed data that redb's durable header records a
-        // nontrivial layout, then a graceful close so header layout == file
-        // length (same shape as crates/charpente/tests/transactions.rs's
-        // `unopenable_store_with_compacted_wal_is_a_named_hard_error`).
+        // nontrivial layout, then a graceful close (the drop at the end of
+        // this block), so the header's layout length equals the file length.
         store
             .import(|w| {
                 for i in 0..500u64 {
@@ -2993,32 +2984,135 @@ fn open_fence_flag_clears_after_catching_a_real_redb_open_panic() {
             .unwrap();
         store.checkpoint().unwrap();
     }
-    assert!(
-        !charpente_core::table::in_open_fence(),
-        "the ordinary successful open above must also leave the flag clear"
-    );
-
-    // Truncate past the durable header's recorded layout so redb's open-time
-    // assert (page_manager.rs:231) fires — the exact condition the fence
-    // exists to catch.
     let file = disk.open("probe.redb").unwrap();
     let len = file.len().unwrap();
-    file.set_len(len - 4096).unwrap();
+    assert_eq!(len % 4096, 0, "a gracefully closed store is whole pages");
+    file.set_len(mangle(len)).unwrap();
     file.sync().unwrap();
     drop(file);
+    // The test's own catch_unwind, not Store::open's: the point is that no
+    // panic occurs at all, so none may reach this frame either.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Store::open(&disk, "probe.redb")
+    }))
+    .map_err(|panic| {
+        panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string())
+    })
+}
 
-    let err = match Store::open(&disk, "probe.redb") {
-        Ok(_) => panic!("the corrupted store must fail to open"),
-        Err(e) => e,
+/// The file SHORTER than the durable header's layout: an unsynced `set_len`
+/// extension dropped while the header recording it survived (redb 4.1.0's
+/// `page_manager.rs:231` assert). redb 4.3.0 refuses it with `Corrupted`, so
+/// `Store::open` returns an ordinary `Err` naming redb's corruption and
+/// `Db::open`'s discard-and-rebuild path (or its compacted-log refusal) takes
+/// it from there with no panic fence in between.
+#[test]
+fn a_store_truncated_below_its_layout_fails_to_open_by_name_without_panicking() {
+    let err = match open_a_store_mangled_to(|len| len - 4096) {
+        Err(panic) => panic!("Store::open panicked instead of returning Err: {panic}"),
+        Ok(Ok(_)) => panic!("a store truncated below its layout must not open"),
+        Ok(Err(e)) => e.to_string(),
     };
     assert!(
-        err.to_string().contains("panicked at open"),
-        "the fence must still convert redb's open-time assert into a named \
-         io::Error: {err}"
+        err.contains("table store (redb): DB corrupted: File truncated below stored layout"),
+        "the open failure must name redb's own corruption verdict: {err}"
     );
+}
+
+/// A sub-page tail past the layout: a crash tore a data-page write inside a
+/// dropped `set_len` extension, and the surviving sectors left a length that
+/// is not a whole number of pages (redb 4.1.0's `page_manager.rs:257`
+/// assert). Built by hand: the graceful close leaves whole pages, and the
+/// tail is added after it.
+#[test]
+fn a_store_with_a_sub_page_tail_fails_to_open_by_name_without_panicking() {
+    let err = match open_a_store_mangled_to(|len| len + 1536) {
+        Err(panic) => panic!("Store::open panicked instead of returning Err: {panic}"),
+        Ok(Ok(_)) => panic!("a store with a sub-page tail must not open"),
+        Ok(Err(e)) => e.to_string(),
+    };
     assert!(
-        !charpente_core::table::in_open_fence(),
-        "the flag must clear even though the fence just caught a REAL panic \
-         — this is the guard's teeth, not merely the fence's"
+        err.contains(
+            "table store (redb): DB corrupted: File length does not correspond to a valid \
+             region layout"
+        ),
+        "the open failure must name redb's own corruption verdict: {err}"
+    );
+}
+
+/// A `Disk` whose file panics on its first use, standing in for any panic
+/// raised inside `Store::open` — redb's own, or the backend's.
+struct PanickyDisk;
+
+impl Disk for PanickyDisk {
+    fn open(&self, _path: &str) -> io::Result<Box<dyn File>> {
+        Ok(Box::new(PanickyFile))
+    }
+
+    fn remove(&self, _path: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn list(&self, _prefix: &str) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn sync_dir(&self, _prefix: &str) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PanickyFile;
+
+const PANICKY_FILE: &str = "deliberate panic inside Store::open";
+
+impl File for PanickyFile {
+    fn len(&self) -> io::Result<u64> {
+        panic!("{PANICKY_FILE}");
+    }
+
+    fn read_at(&self, _offset: u64, _out: &mut [u8]) -> io::Result<()> {
+        panic!("{PANICKY_FILE}");
+    }
+
+    fn write_at(&self, _offset: u64, _data: &[u8]) -> io::Result<()> {
+        panic!("{PANICKY_FILE}");
+    }
+
+    fn set_len(&self, _len: u64) -> io::Result<()> {
+        panic!("{PANICKY_FILE}");
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        panic!("{PANICKY_FILE}");
+    }
+}
+
+/// The other side of the two tests above: with redb returning `Err` for the
+/// crash shapes, `Store::open` has no panic fence, so a panic inside it is a
+/// real failure and propagates to the caller as a panic. An `Err` here would
+/// mean something is converting panics again — and `Db::open`'s discard path
+/// would swallow that `Err` unprinted, which is how a genuine bug would hide.
+#[test]
+fn a_panic_inside_store_open_propagates_as_a_panic() {
+    let outcome = std::panic::catch_unwind(|| Store::open(&PanickyDisk, "probe.redb").is_ok());
+    let payload = match outcome {
+        Ok(opened) => panic!(
+            "Store::open returned (opened: {opened}) instead of propagating the panic inside it"
+        ),
+        Err(payload) => payload,
+    };
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert_eq!(
+        msg, PANICKY_FILE,
+        "the propagated panic must be the one raised inside"
     );
 }

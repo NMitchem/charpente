@@ -503,6 +503,13 @@ fn run_one_at_a_time_universe_is_deterministic_and_unbatched() {
 /// looking exactly like a batching bug.
 ///
 /// T6 does NOT need to author this test; it needs to keep it green.
+///
+/// Re-captured once since, for redb 4.3.0, which stopped writing a
+/// non-durable commit's pages to the file: at `7f42487` itself (the unbatched
+/// kernel) with only redb bumped, by `capture_pre_batching_trace` — and that
+/// capture is byte-identical to the batched kernel's trace under 4.3.0. The
+/// identity was re-proved against pre-batching code, not re-baselined
+/// against the code it polices.
 #[test]
 fn a_never_contended_universe_traces_identically_to_the_pre_batching_fixture() {
     let expected = include_str!("fixtures/pre-batching-trace.txt");
@@ -2326,7 +2333,8 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
     let mut watermark: u64 = 0;
 
     for _round in 0..4 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 768);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(47 + entropy.next_u64() % 568);
         let app = match App::open(
             Box::new(sim.disk()),
             Schema::new().table::<Hit>(),

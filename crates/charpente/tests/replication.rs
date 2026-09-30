@@ -382,20 +382,12 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
         }
         match reopen(sim, node) {
             Ok(()) => return Ok(()),
+            // Fallout first: DESIGN §4's compacted-log refusal ("cannot be rebuilt
+            // from the log alone") is excused only here, when an injected fault
+            // inside `Store::open` caused it and the refusal carries that text.
+            // A bare refusal is a failure — under redb 4.3.0 the crash model
+            // cannot brick the store.
             Err(e) if is_fault_fallout(&e) => last = e, // open faulted; retry, cycling periodically
-            // The designed unrestorable-locally hard error: a crash bricked the
-            // store AND checkpoint GC already compacted the log past 0, so
-            // rebuild-from-WAL is impossible and the named fix is "restore from
-            // a replica or backup" — the path T7's promote/backup provides.
-            // Until then this node is honestly dead: inconclusive, not a bug.
-            Err(e) if e.contains("cannot be rebuilt from the log alone") => {
-                sim.cover("repl:inconclusive:store-bricked");
-                return Err(format!(
-                    "{INCONCLUSIVE}: {} store bricked below a compacted log — the restore \
-                     path (T7) is the fix: {e}",
-                    node.name
-                ));
-            }
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
     }
@@ -792,6 +784,12 @@ fn assert_bytes_identical(sim: &Sim, mut p: Node, mut f: Node) -> Result<(), Str
         sim.cover("repl:fingerprint-skipped-grouping");
         return Ok(());
     }
+    // "Quiet" above is a fact about the past: the universe's FaultConfig would
+    // still roll faults on the checkpoint, close and reads below, and one did
+    // (seed 0xd609e4dde8a4008f: an injected fsync failure in this checkpoint,
+    // reported as a failure). Stop them, so the comparison runs on a fault-free
+    // tail and any error in it is a real failure.
+    sim.quiesce_disk_faults();
     for n in [&mut p, &mut f] {
         n.db.as_mut()
             .expect("quiet universe: db live")
@@ -1041,7 +1039,9 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// because all five cover the same key; splitting them is the named next step.
 /// (That step has since landed — every one of those five now covers its own
 /// `repl:inconclusive:*` cause key, and all 89 of this property's give-ups are
-/// `:recover-exhausted`.)
+/// `:recover-exhausted`. The store-bricked producer is gone since redb 4.3.0:
+/// the crash model cannot brick the store, so that refusal now fails unless an
+/// injected fault caused it.)
 ///
 /// **Why this floor sits ON its measurement while the four added in
 /// oracle-density task 3 sit 2 SEs below theirs.** The two conventions answer
@@ -1105,7 +1105,16 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// as this comment predicted it would; the reach it measures is unchanged in
 /// kind (164 of 256 against 166). Barrier movement can no longer move this
 /// number again.
-const CONVERGED_FLOOR: u64 = 164;
+///
+/// **164 -> 253 on 2026-09-30, for redb 4.3.0**, two identical batches. The
+/// count at the parent commit under redb 4.1.0 is still 164 (a control run),
+/// so the move is the dependency's. Its non-durable commits stay in its own
+/// write buffer rather than reaching the file (DESIGN §1, "The store's crash
+/// surface"), so far fewer store IOs are exposed to injected faults. The
+/// give-ups fell from 92 to 3, all three `:recover-exhausted:injected`. The
+/// floor is set on the new count, keeping this constant's convention, so a
+/// return to the old give-up rate is now red.
+const CONVERGED_FLOOR: u64 = 253;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
 /// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on
@@ -1398,7 +1407,15 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 /// unrecoverable and with a fault-triggered wedge the retry cannot clear. The
 /// evidence gathered so far does not separate those, and this floor does not
 /// depend on which it is: the count it pins moved 145 → 149 under that same 10×.
-const SEEDED_CONVERGED_FLOOR: u64 = 129;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 190 of
+/// 256 (the parent commit under redb 4.1.0 measures 144, a control run). The
+/// give-ups fell 111 → 28, all `:recover-exhausted:injected`, and
+/// `repl:seed-base-zero` rose 1 → 38: universes that used to give up now
+/// finish with a primary too small to move its base. 190 + 28 + 38 = 256. At
+/// p = 190/256 = 0.742 one SE is 7.0, so 190 − 2·7.0 = 176.0 → 176, the same
+/// convention; it tolerates a 7.4% relative fall.
+const SEEDED_CONVERGED_FLOOR: u64 = 176;
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
     let mut p = spawn_node_with_schema(
@@ -4156,7 +4173,14 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
 /// **A drop below this is a finding, not a number to lower.** The likeliest
 /// cause is the reduced-oracle path growing: more universes reaching
 /// `repl:switchover-inconclusive`, where only `assert_one_writable` runs.
-const SWITCHOVER_CONVERGED_FLOOR: u64 = 57;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 103 of
+/// 256 (the parent commit under redb 4.1.0 measures 74, a control run). The
+/// give-ups fell 50 → 1, and the rescued universes split between this key and
+/// `repl:switchover-inconclusive` (124 → 144), as the retry-budget experiment
+/// above predicts. At p = 103/256 = 0.402 one SE is 7.85, so 103 − 2·7.85 =
+/// 87.3 → 87; it tolerates a 15.5% relative fall.
+const SWITCHOVER_CONVERGED_FLOOR: u64 = 87;
 
 /// The result of one switchover attempt's drain.
 enum DrainResult {
@@ -4465,7 +4489,14 @@ fn failover_preserves_everything_the_follower_acked() {
 /// (`p` still a live primary, `f` never recovered, `f` holding a position) is
 /// what most often denies this oracle its universe; a fall here means that gate
 /// closed more often, and why is the question.
-const FAILOVER_PREFIX_FLOOR: u64 = 35;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 51 of 128
+/// (the parent commit under redb 4.1.0 measures 42, a control run). The 33
+/// `:recover-exhausted` give-ups are gone. The staging gate now takes most of
+/// what they freed (52 → 75 `:failover-staging-gate`), and 77 give up in all.
+/// At p = 51/128 = 0.398 one SE is 5.54, so 51 − 2·5.54 = 39.9 → 39; it
+/// tolerates a 23.5% relative fall.
+const FAILOVER_PREFIX_FLOOR: u64 = 39;
 
 fn failover_universe(sim: &mut Sim) -> Result<(), String> {
     let cfg = no_gc_cfg();
@@ -5235,16 +5266,16 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             // Corruption at or below the durable horizon: not a torn tail — the
             // local copy is bricked and the fix is restore. Surface it (the
             // caller reseeds from the survivor) rather than retry into the same
-            // durable bytes forever.
-            Err(e) if e.contains("restore this node from a replica or backup") => {
+            // durable bytes forever. DESIGN §4's compacted-log refusal names the
+            // same fix but is not this: it goes on to the fallout arm (an injected
+            // fault inside `Store::open`, carrying its injected text) or fails —
+            // under redb 4.3.0 the crash model cannot brick the store.
+            Err(e)
+                if e.contains("restore this node from a replica or backup")
+                    && !e.contains("cannot be rebuilt from the log alone") =>
+            {
                 return Err(format!(
                     "{RESTORE_NEEDED}: {} corrupted below the horizon",
-                    node.name
-                ));
-            }
-            Err(e) if e.contains("cannot be rebuilt from the log alone") => {
-                return Err(format!(
-                    "{RESTORE_NEEDED}: {} store bricked below a compacted log",
                     node.name
                 ));
             }
@@ -5940,7 +5971,16 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
 /// `:survivor-faulted` at 87% of the give-ups, the thing to check first is
 /// whether the fault matrix got harsher on the survivor — that alone can retire
 /// this oracle without a single test going red.
-const SURVIVOR_PROMISE_FLOOR: u64 = 22;
+///
+/// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 36 of 128
+/// (the parent commit under redb 4.1.0 measures 30, a control run). The give-ups
+/// fell 94 → 90. Every cause but `:survivor-faulted` and one
+/// `:request-no-response` is gone, and `:survivor-faulted` rose 81 → 90. That
+/// fits universes that used to end on another cause now running on to the
+/// survivor's faults (inferred from the totals, not traced per universe). At
+/// p = 36/128 = 0.281 one SE is 5.09, so 36 − 2·5.09 =
+/// 25.8 → 25; it tolerates a 30.6% relative fall.
+const SURVIVOR_PROMISE_FLOOR: u64 = 25;
 
 fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     let db_cfg = horizon_db_cfg();

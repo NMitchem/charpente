@@ -32,12 +32,14 @@ charpente = { path = "crates/charpente", version = "0.1.0" }
 disallowed_methods = "deny"
 disallowed_types = "deny"
 
-# The seed-replay promise is cross-build-mode (DESIGN §1): redb-4.1.0's open path
-# walks pages only under debug_assertions, drawing sim IO rolls debug-only and
-# skewing every downstream draw (seed 0xff159ed76d2806e4; root cause in the
-# 2026-07-15 mode-skew investigation). Forcing them on in release keeps both
-# modes on one stream — and keeps redb's own asserts live in production, per
-# hard rule 4's assertions-stay-on ethos. Revisit when M2's engine replaces redb.
+# The seed-replay promise is cross-build-mode (DESIGN §1): redb's open path walks
+# pages only under debug_assertions (`Database::new` -> `mark_allocated_page_for_debug`,
+# in 4.1.0 and still in 4.3.0), drawing sim IO rolls debug-only and skewing every
+# downstream draw (seed 0xff159ed76d2806e4; root cause in the 2026-07-15 mode-skew
+# investigation). Re-proved for 4.3.0 on 2026-09-30: without this override, 7 of 7
+# pinned-base batches diverge between release and debug. Forcing them on in release
+# keeps both modes on one stream — and keeps redb's own asserts live in production,
+# per hard rule 4's assertions-stay-on ethos. Revisit when M2's engine replaces redb.
 [profile.release.package.redb]
 debug-assertions = true
 

@@ -2447,6 +2447,21 @@ adjudicated the property and **90** did not. It is a real measurement from
 and it means 70% of that property's universes prove nothing — which was
 invisible before the split was printed, and is the entire reason it is.
 
+### A fault-free tail for an end-of-universe check
+
+A check that runs at the end of a universe — a checkpoint, a graceful close, a
+byte comparison of two nodes' files — does IO, and the universe's
+`FaultConfig` still applies to it. "No fault has fired so far" is a fact about
+the past: the check's own fsync can still draw an injected failure. Call
+`sim.quiesce_disk_faults()` first. For the rest of the universe, on every disk,
+it disarms any pending crash countdown, and no injected read, write, sync or
+directory-barrier error, misdirected write or restart bit flip fires after it.
+Each skipped roll draws nothing, so a universe that never calls it
+replays exactly as before. After it, an error in the check is a real failure,
+not fallout to classify. Network and object-store faults are untouched, and a
+restart still power-cycles: unsynced writes and directory entries collapse under
+the crash model as usual (`crash_apply`, `crash_torn`, `dir_entry_loss`).
+
 ### The checkers
 
 `charpente_sim::checks` ships six reusable oracles — reach for these
@@ -3339,9 +3354,10 @@ kernel stopped: the store handle is dead after a disk IO failure (redb refuses e
 The second is the **store latch**, and it is worth understanding because the
 message is reassuring on purpose. redb keeps its own independent "this handle
 is broken" flag: any error from its storage backend sets it, after which every
-later redb call fails with "close and re-open the database". The reachable
+later redb call fails with "close and re-open the database". The usual
 trigger is the store's own checkpoint fsync — store applies commit at
-`Durability::None`, so the checkpoint is the only store sync charpente makes.
+`Durability::None`, so the checkpoint is the only store sync charpente asks for
+(redb itself also fsyncs the file after growing it).
 charpente observes that same condition at its own disk boundary and folds it
 into `Db::poisoned()`, so the kernel stops exactly as it does for engine
 poison.

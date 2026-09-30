@@ -135,6 +135,70 @@ mod receipt_v2 {
     }
 }
 
+/// The deferring old binary's gate, an app table: present from invoice 0's
+/// enqueue until the receipt enqueued behind it runs (`receipt_v1_deferring`).
+#[table(global)]
+struct ReceiptGate {
+    id: Id<ReceiptGate>,
+    invoice: u64,
+}
+
+/// The old binary `receipt_upgrade_universe` runs: receipt_v1's shape (same
+/// NAME, same FINGERPRINT — a retry policy is not part of a job's shape).
+/// `enqueue_gated_receipt` enqueues invoice 0's receipt together with a
+/// `ReceiptGate` row and, behind it, a receipt for `OPENS_THE_GATE`. Invoice
+/// 0's first attempt finds the gate and is turned away; the opener deletes the
+/// gate; invoice 0's retry, one backoff later, runs. So that receipt stays
+/// durable and Pending for one backoff while v1 serves the receipts behind it.
+/// The handler reads only the app's own table, never `charpente.jobs`. Why the
+/// window is held open, and why the order holds: `receipt_upgrade_universe`'s
+/// doc.
+mod receipt_v1_deferring {
+    use super::ReceiptGate;
+    use charpente::kernel::JobError;
+    use charpente::{Tx, job};
+    use charpente_core::table::{Id, View};
+
+    /// The receipt that opens the gate. No invoice carries this number.
+    pub const OPENS_THE_GATE: u64 = u64::MAX;
+
+    pub fn gate() -> Id<ReceiptGate> {
+        Id::from_raw(0)
+    }
+
+    #[job(global, retry(max = 3, backoff = "2s"))]
+    pub struct SendReceipt {
+        pub invoice: u64,
+    }
+
+    impl SendReceipt {
+        fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+            if self.invoice == OPENS_THE_GATE {
+                tx.delete(gate());
+                return Ok(());
+            }
+            // A turned-away attempt's writes are discarded with it, so the
+            // attempt this gate defers can never be the one that clears it.
+            if tx.get(gate())?.is_some_and(|g| g.invoice == self.invoice) {
+                return Err(JobError::app("deferred to its retry"));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn the_deferring_old_binary_enqueues_the_v1_shape() {
+    assert_eq!(
+        receipt_v1_deferring::SendReceipt::NAME,
+        receipt_v1::SendReceipt::NAME
+    );
+    assert_eq!(
+        <receipt_v1_deferring::SendReceipt as Job>::FINGERPRINT,
+        <receipt_v1::SendReceipt as Job>::FINGERPRINT
+    );
+}
+
 #[test]
 fn a_jobs_fingerprint_follows_its_fields_not_its_name() {
     assert_eq!(receipt_v1::SendReceipt::NAME, receipt_v2::SendReceipt::NAME);
@@ -1507,8 +1571,8 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
 // follow-up, progress.md line 238 / spec §4.5). `Db::poisoned()` reflected
 // only APPLY-side poison: the engine's "a durable record failed to apply"
 // flag and its WAL's fsyncgate flag (`engine.rs`'s `poisoned()`). redb has a
-// SECOND, independent poison of its own — `CheckedBackend` (redb 4.1.0
-// `cached_file.rs:121`) sets `io_failed` on ANY backend error (read, write,
+// SECOND, independent poison of its own — `CheckedBackend` (redb 4.3.0
+// `cached_file.rs:128`) sets `io_failed` on ANY backend error (read, write,
 // set_len, sync_data) and every later backend op then returns
 // `StorageError::PreviousIo`, "Previous I/O error occurred. Please close and
 // re-open the database." Nothing mapped that latch onto `Db::poisoned()`, and
@@ -2416,87 +2480,25 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
-/// DESIGN §4's named refusal, reached by the crash model alone. One injected
-/// crash tears a redb page write inside a dropped `set_len` extension, redb
-/// asserts at open, and the open-fence turns that panic into an open error. A
-/// checkpoint has already compacted the log past seq 0, so `Db::open` refuses
-/// to rebuild the store rather than silently lose the records below it. The
-/// fix it names is a restore, and neither workload here has a restore rig, so
-/// the universe adjudicated nothing. It gives up under its own key, apart from
-/// the reopen-budget give-up.
-///
-/// All three conditions must hold, and a partial match still fails. The shared
-/// classifier stays blind to this text on purpose: `checks.rs` pins it
-/// `Unrelated`, and replication's own arm is the precedent for handling it in
-/// the workload. Found in `job_tenancy_universe` by seeds `0x3252300b37ab3e88`
-/// (final open) and `0x5b24d7f5e5947edd` (round open), both pinned there.
-/// `kernel_workload` has the code-identical gap, and no seed has reached it
-/// yet.
-fn store_bricked_below_a_compacted_log(sim: &Sim, e: &str) -> bool {
-    e.contains("cannot be rebuilt from the log alone")
-        && e.contains("panicked at open")
-        && sim.coverage().get("fault:crash").copied().unwrap_or(0) > 0
-}
-
-/// The give-up for `store_bricked_below_a_compacted_log`. The caller returns
-/// straight after it: a give-up is terminal for the universe.
-fn give_up_on_a_bricked_store(sim: &Sim, site: &str, e: &str) {
-    sim.cover("kernel:gave-up:store-bricked-after-compaction");
-    sim.give_up(format!(
-        "the {site} open met DESIGN §4's named refusal: an injected crash left a store redb \
-         cannot open, and the log is compacted past seq 0, so Db::open will not rebuild it \
-         from the log alone. The fix it names is a restore, and this workload has no restore \
-         rig, so nothing was adjudicated: {e}"
-    ));
-}
-
-/// The arm's negative space: it excuses only a full match. Each condition is
-/// dropped in turn, and each partial match must still read as a failure. The
-/// two seed pins in `mod job_tenancy` hold the positive side.
-#[test]
-fn a_partial_match_of_the_bricked_store_refusal_is_not_excused() {
-    let refusal = "table store cannot open (table store (redb) panicked at open — treating the \
-                   store as unopenable: assertion `left == right` failed) and the log is \
-                   compacted to seq 84 — the records below the store's last checkpoint no \
-                   longer exist locally, so the store cannot be rebuilt from the log alone; \
-                   restore this node from a replica or backup, or widen \
-                   DbConfig::retain_segments (DESIGN §4)";
-    let sim = Sim::with_faults(0xB41C_0001, FaultConfig::none());
-    assert!(
-        !store_bricked_below_a_compacted_log(&sim, refusal),
-        "no crash fired in this universe, so the crash model cannot have bricked the store"
-    );
-    sim.crash_disk_now();
-    assert!(store_bricked_below_a_compacted_log(&sim, refusal));
-    assert!(
-        !store_bricked_below_a_compacted_log(
-            &sim,
-            &refusal.replace("panicked at open", "returned an error at open")
-        ),
-        "a store that failed to open without the fence engaging is not this mechanism"
-    );
-    assert!(
-        !store_bricked_below_a_compacted_log(
-            &sim,
-            &refusal.replace("cannot be rebuilt from the log alone", "was rebuilt")
-        ),
-        "without the compacted-log refusal, Db::open would have rebuilt the store"
-    );
-}
-
+/// DESIGN §4's compacted-log refusal ("cannot be rebuilt from the log alone")
+/// is NOT excused at any open site here. Under redb 4.1.0 one injected crash
+/// could leave a store file redb could not open, and a workload gave up on
+/// it; redb 4.3.0 syncs a file extension before any header records it, so the
+/// crash model can no longer produce that state, and reaching the refusal is a
+/// failure. An injected IO fault inside `Store::open` still reads as fault
+/// fallout, by its injected text, before the refusal is ever consulted. The
+/// refusal itself is pinned deterministically by transactions.rs
+/// `unopenable_store_with_compacted_wal_is_a_named_hard_error`.
 fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     for _round in 0..3 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 768);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(36 + entropy.next_u64() % 438);
         let mut app = match kernel_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
                 let e = e.to_string();
                 if !is_fault_fallout(&e) {
-                    if store_bricked_below_a_compacted_log(sim, &e) {
-                        give_up_on_a_bricked_store(sim, "round", &e);
-                        return Ok(());
-                    }
                     return Err(format!("open failed non-injected: {e}"));
                 }
                 sim.restart();
@@ -2520,10 +2522,18 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         // restored). Re-pinned 2026-09-24: its predecessor 0xe653f43924f17fe8
         // was already GREEN with the classification deleted before payload
         // shapes landed, and payload shapes' 8-byte enqueue/emit growth renamed
-        // the universes again. The oldest seed is kept: it is still this
-        // suite's CHARPENTE_SEED replay pin in .github/workflows/ci.yml, and it
-        // still exercises Kernel::build's drain-id fix (dispatch.rs's "job in
-        // the heap is not Pending" assert).
+        // the universes again. Re-pinned 2026-09-30: redb 4.3.0's IO shape and
+        // the re-sized crash countdowns renamed them once more and left
+        // 0xe2d97275c15cc087 GREEN with the classification deleted. The live
+        // reproduction is now 0x0f34c969dfd340b0 (base 0x577d001a, universe
+        // 122, the only one of 10,240 scanned with the classification deleted):
+        // a countdown crash lands inside the checker's own reads, so it is RED
+        // with the classification deleted ("table store (redb): I/O error:
+        // simulated crash") and GREEN with it restored. The same day showed
+        // 0x348270b38f166529 GREEN with Kernel::build's drain-id fix removed
+        // too, so ci.yml's drain-id replay pin moved to 0xf4e437494b4b8551, a
+        // universe in which no fault fires at all: with the fix removed it
+        // trips dispatch.rs's "job 0 in the heap is not Pending" assert.
         match exactly_once_holds(&mut app).and_then(|()| tenants_never_see_each_other(&mut app)) {
             Ok(populated) => cover_multi_tenant(sim, &populated),
             Err(msg) => {
@@ -2648,10 +2658,6 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                 }
             },
             Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
-            Err(e) if store_bricked_below_a_compacted_log(sim, &e.to_string()) => {
-                give_up_on_a_bricked_store(sim, "final", &e.to_string());
-                return Ok(());
-            }
             Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
@@ -3498,6 +3504,44 @@ fn receipts_app(sim: &Sim, v2: bool) -> std::io::Result<App> {
     .mount_jobs(defs))
 }
 
+/// The deferring old binary's enqueue path (`receipt_v1_deferring`): invoice
+/// 0's receipt, its gate and the receipt that opens the gate commit in one
+/// transaction, in that order.
+#[route(POST "/receipt", public)]
+fn enqueue_gated_receipt(tx: &mut Tx, body: ReceiptBody) -> Result<(), ApiError> {
+    let invoice = body.invoice.0;
+    tx.enqueue(receipt_v1_deferring::SendReceipt { invoice });
+    if invoice == 0 {
+        tx.put(&ReceiptGate {
+            id: receipt_v1_deferring::gate(),
+            invoice,
+        });
+        tx.enqueue(receipt_v1_deferring::SendReceipt {
+            invoice: receipt_v1_deferring::OPENS_THE_GATE,
+        });
+    }
+    Ok(())
+}
+
+/// `receipt_upgrade_universe`'s two binaries. Both declare `ReceiptGate`, as a
+/// deploy that changes a job's fields keeps the app's tables; only the old one
+/// mounts the gated route and the deferring handler.
+fn gated_receipts_app(sim: &Sim, v2: bool) -> std::io::Result<App> {
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<ReceiptGate>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?;
+    Ok(if v2 {
+        app.mount(routes![enqueue_receipt])
+            .mount_jobs(jobs![receipt_v2::SendReceipt])
+    } else {
+        app.mount(routes![enqueue_gated_receipt])
+            .mount_jobs(jobs![receipt_v1_deferring::SendReceipt])
+    })
+}
+
 /// The refusal text, spelled out from the spec's wording rather than taken
 /// from the product's `format!`, so the byte-exact comparison pins the words.
 fn receipt_refusal(ids: &[u64], recorded: &str) -> String {
@@ -4167,10 +4211,44 @@ fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption()
 /// same store. The kernel refuses exactly when a durable Pending receipt
 /// carries the old shape, naming exactly those ids — it never starts over one
 /// and never refuses over none.
+///
+/// The hard case is v1 dying, by a crash or an injected fault, while a receipt
+/// is durable but has not run, so the window between a receipt's enqueue and
+/// its run has to cover a real share of v1's disk ops, and that share has to
+/// come from this workload rather than from a dependency's IO shape. Under
+/// redb 4.1.0 every commit wrote its store pages right after its WAL sync,
+/// inside that window: a crash after v1's boot found a Pending receipt 39% of
+/// the time (92 of 234, pooled over six bases). redb 4.3.0 buffers those pages
+/// until a checkpoint and the share fell to 21% (58 of 271), which left
+/// `shapes:job-refused-after-crash` at 8 of its 14. So v1 runs
+/// `receipt_v1_deferring`, which holds invoice 0's receipt, the first of every
+/// run, durable and Pending for one 2 s backoff while the receipts behind it
+/// are enqueued and run: 33% (91 of 273).
+///
+/// The hold is an app table, `ReceiptGate`, and its order follows from the
+/// dispatcher's. One transaction enqueues invoice 0's receipt, writes the
+/// gate, and enqueues the receipt that opens it, in that order, so the opener
+/// has the higher id. A fresh enqueue is due at 0 and the dispatcher runs jobs
+/// in (due, id) order, so invoice 0 runs first, finds the gate and is turned
+/// away. Its failure record puts it at now + 2 s (`RetryPolicy::backoff_nanos`
+/// after one attempt). The opener, still due at 0, runs next and deletes the
+/// gate, so invoice 0's retry finds it gone and runs. A turned-away attempt's
+/// writes are discarded, so invoice 0 cannot clear its own gate. The v2 side
+/// checks the construction: an invoice 0 that has settled is Done after
+/// exactly one turned-away attempt. The gate has an opener of its own, rather
+/// than being cleared by whichever receipt comes after invoice 0, because
+/// about one run in six enqueues invoice 0 alone (`1 + entropy % 6`). There, a
+/// gate that waits for another receipt is never cleared, and invoice 0 is
+/// turned away until it dead-letters.
+///
+/// The backoff sets the window's width. At 5 s so many runs end with invoice 0
+/// still Pending that `shapes:job-drained` falls to 112; at 1 s
+/// `shapes:job-refused` falls to 41.
 fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
-    sim.crash_disk_after(32 + entropy.next_u64() % 256);
-    match receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
+    // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+    sim.crash_disk_after(22 + entropy.next_u64() % 174);
+    match gated_receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
         Ok(mut kernel) => {
             let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
             let base = sim.now().as_nanos();
@@ -4193,7 +4271,7 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     }
     sim.restart();
     for _ in 0..64 {
-        let mut app = match receipts_app(sim, true) {
+        let mut app = match gated_receipts_app(sim, true) {
             Ok(app) => app,
             Err(e) if is_fault_fallout(&e.to_string()) => {
                 sim.restart();
@@ -4216,6 +4294,21 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
             }
             Err(e) => return Err(format!("job scan failed non-injected: {e}")),
         };
+        // The held-open window is this workload's construction, so it is
+        // checked rather than assumed: once invoice 0's receipt settles, it
+        // ran on its second attempt, having been turned away exactly once.
+        if let Some(r) = receipts.iter().find(|r| {
+            receipt_v1_deferring::SendReceipt::decode(&mut &r.payload[..])
+                .is_ok_and(|p| p.invoice == 0)
+        }) && r.status != JobStatus::Pending
+            && (r.status != JobStatus::Done || r.attempts != 1)
+        {
+            return Err(format!(
+                "invoice 0's receipt settled {:?} after {} attempt(s); its gate holds it \
+                 Pending for exactly one turned-away attempt",
+                r.status, r.attempts
+            ));
+        }
         let pending: Vec<u64> = receipts
             .iter()
             .filter(|r| r.status == JobStatus::Pending)
@@ -4291,7 +4384,11 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
 /// The floors below are exact counts, so the batch must replay: one universe
 /// run twice from one seed gives the same coverage and the same durable
 /// state. The seed's universe reaches a verdict, so the replay covers the
-/// property's own outcome.
+/// property's own outcome. It reaches it through the held-open window: its
+/// receipts for invoices 0-4 and the gate's opener are all Done, invoice 0
+/// after one turned-away attempt. Re-verified 2026-09-30, first when the
+/// deferral landed and again when `ReceiptGate` replaced its read of
+/// `charpente.jobs`.
 #[test]
 fn job_shape_upgrades_replay_identically_for_the_same_seed() {
     charpente_sim::checks::replays_identically(0x5A9E_0611, |sim: &mut Sim| {
@@ -4319,9 +4416,24 @@ fn job_shape_upgrades_replay_identically_for_the_same_seed() {
 /// stream. That is live here — at three fresh bases the refused count read
 /// 34, 39 and 46 — so a stream-shifting change is expected to re-measure
 /// these, with the new numbers in hand.
-const RECEIPT_REFUSED_FLOOR: u64 = 40;
-const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 14;
-const RECEIPT_DRAINED_FLOOR: u64 = 115;
+///
+/// **Re-measured 2026-09-30**, same base and count, two identical batches,
+/// for redb 4.3.0 and the workload that now holds its first receipt Pending
+/// for one retry (`receipt_upgrade_universe`'s doc says why). None is below
+/// its redb 4.1.0 value, and each is set to its new count. The hold first read
+/// `charpente.jobs` from the job's own transaction. It now uses an app table,
+/// `ReceiptGate`, because a job's `Tx` is not to read the platform's tables.
+/// That added one receipt per run and re-rolled the batch, which is the last
+/// column.
+///
+/// | key | 4.1.0 | job-row hold | `ReceiptGate` |
+/// |---|---|---|---|
+/// | `shapes:job-refused` | 40 | 48 | 49 |
+/// | `shapes:job-refused-after-crash` | 14 | 18 | 17 |
+/// | `shapes:job-drained` | 115 | 117 | 117 |
+const RECEIPT_REFUSED_FLOOR: u64 = 49;
+const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 17;
+const RECEIPT_DRAINED_FLOOR: u64 = 117;
 
 // ------------------------------------------ job tenancy under the fault matrix
 
@@ -4860,16 +4972,13 @@ mod job_tenancy {
         let mut seq = 0u64;
         let mut carried = BTreeSet::new();
         for _round in 0..3 {
-            sim.crash_disk_after(64 + entropy.next_u64() % 768);
+            // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+            sim.crash_disk_after(31 + entropy.next_u64() % 376);
             let mut app = match shop_app(sim) {
                 Ok(app) => app,
                 Err(e) if is_fault_fallout(&e.to_string()) => {
                     sim.restart();
                     continue;
-                }
-                Err(e) if store_bricked_below_a_compacted_log(sim, &e.to_string()) => {
-                    give_up_on_a_bricked_store(sim, "round", &e.to_string());
-                    return Ok(());
                 }
                 Err(e) => return Err(format!("open failed non-injected: {e}")),
             };
@@ -4945,10 +5054,6 @@ mod job_tenancy {
                     Err(msg) => return Err(msg),
                 },
                 Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
-                Err(e) if store_bricked_below_a_compacted_log(sim, &e.to_string()) => {
-                    give_up_on_a_bricked_store(sim, "final", &e.to_string());
-                    return Ok(());
-                }
                 Err(e) => return Err(format!("final open failed non-injected: {e}")),
             }
         }
@@ -4977,93 +5082,6 @@ mod job_tenancy {
                 "tenant:anonymous_refused",
                 "job:retried",
             ]
-        );
-    }
-
-    /// Seed `0x3252300b37ab3e88` (base `0xF1C2_0001`). One injected crash tore
-    /// a redb page write inside a dropped `set_len` extension, which left a
-    /// sub-page file length that redb 4.1.0 asserts on at open. Round 2's
-    /// clean-shutdown checkpoint had already compacted the log to seq 84. So
-    /// the final open meets DESIGN §4's named refusal, and the universe gives
-    /// up under its own key instead of failing.
-    ///
-    /// The assertions pin the REASON and the site, not just "gave up": a
-    /// re-keyed fault stream renames every universe, and a bare outcome check
-    /// would stay green on whatever give-up the renamed universe happened to
-    /// reach.
-    #[test]
-    fn a_store_bricked_below_a_compacted_log_at_the_final_open_gives_up_by_name() {
-        const SEED: u64 = 0x3252_300b_37ab_3e88;
-        // Reconstruct this universe exactly as the swarm runner derives it.
-        let mut state = SEED;
-        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
-        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
-        charpente_sim::sample_extended_fields(SEED, &mut cfg);
-        let mut sim = Sim::with_faults(SEED, cfg);
-
-        let result = job_tenancy_universe(&mut sim);
-        assert!(
-            result.is_ok(),
-            "a store bricked below a compacted log is DESIGN §4's named refusal, not a \
-             failure of this property: {:?}",
-            result.err()
-        );
-        let reason = sim
-            .gave_up()
-            .expect("and it must be RECORDED as a give-up: nothing was adjudicated");
-        assert!(
-            reason.starts_with("the final open met DESIGN §4's named refusal"),
-            "and it must be THIS give-up, at the final open: {reason}"
-        );
-        assert!(
-            reason.contains("the log is compacted to seq 84"),
-            "and it must be THIS universe's refusal, compacted to seq 84: {reason}"
-        );
-        assert_eq!(
-            sim.coverage()
-                .get("kernel:gave-up:store-bricked-after-compaction"),
-            Some(&1),
-            "and it must count under its own key, apart from the reopen-budget give-up"
-        );
-    }
-
-    /// Seed `0x5b24d7f5e5947edd` (base `0xF1C2_0005`). The same mechanism as
-    /// the pin above, reached at the round-loop open instead: one injected
-    /// crash dropped two `set_len` extensions and left a sub-page file length
-    /// inside them, and the log was already compacted to seq 26.
-    #[test]
-    fn a_store_bricked_below_a_compacted_log_at_a_round_open_gives_up_by_name() {
-        const SEED: u64 = 0x5b24_d7f5_e594_7edd;
-        // Reconstruct this universe exactly as the swarm runner derives it.
-        let mut state = SEED;
-        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
-        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
-        charpente_sim::sample_extended_fields(SEED, &mut cfg);
-        let mut sim = Sim::with_faults(SEED, cfg);
-
-        let result = job_tenancy_universe(&mut sim);
-        assert!(
-            result.is_ok(),
-            "a store bricked below a compacted log is DESIGN §4's named refusal, not a \
-             failure of this property: {:?}",
-            result.err()
-        );
-        let reason = sim
-            .gave_up()
-            .expect("and it must be RECORDED as a give-up: nothing was adjudicated");
-        assert!(
-            reason.starts_with("the round open met DESIGN §4's named refusal"),
-            "and it must be THIS give-up, at a round open: {reason}"
-        );
-        assert!(
-            reason.contains("the log is compacted to seq 26"),
-            "and it must be THIS universe's refusal, compacted to seq 26: {reason}"
-        );
-        assert_eq!(
-            sim.coverage()
-                .get("kernel:gave-up:store-bricked-after-compaction"),
-            Some(&1),
-            "and it must count under its own key, apart from the reopen-budget give-up"
         );
     }
 

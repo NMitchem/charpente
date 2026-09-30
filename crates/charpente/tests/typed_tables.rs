@@ -436,7 +436,8 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
     let mut acked = 0usize;
 
     for _round in 0..3 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(35 + entropy.next_u64() % 279);
 
         // The store's own `applied_seq` is the durable horizon (segment-mgmt
         // T4/T5, mirroring `Db::open`'s production use): opened before

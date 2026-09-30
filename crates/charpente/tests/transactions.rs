@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use charpente::{Db, DbConfig, Event, Job, Schema, Seeder, TxError, View, table};
 use charpente_core::event::EventRow;
-use charpente_core::io::{Disk, Entropy};
+use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Row, Snapshot, Store, Unscoped};
@@ -540,6 +540,13 @@ fn is_injected(text: &str) -> bool {
 /// One universe: recover → verify against the oracle → mixed commits and
 /// aborts → random checkpoint → crash, everything seeded.
 fn tx_workload(sim: &mut Sim) -> Result<(), String> {
+    tx_workload_on(sim, &|sim: &Sim| -> Box<dyn Disk> { Box::new(sim.disk()) })
+}
+
+/// `tx_workload` over the disk `disk` makes for each `Db::open`. The only other
+/// maker is `DiscardWitness`, which issues no disk op of its own, so a universe
+/// run through it is the same universe.
+fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result<(), String> {
     let entropy = sim.entropy();
     let cfg = DbConfig {
         wal: WalConfig {
@@ -552,8 +559,9 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
     let mut committed = 0u64; // acknowledged transactions
 
     for _round in 0..3 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
-        let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(43 + entropy.next_u64() % 346);
+        let mut db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(_) => {
                 sim.restart();
@@ -739,7 +747,7 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
     // final check — the oracle still runs at every successful open across
     // the universe set — but any other open error is a real bug.
     for _attempt in 0..8 {
-        let db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
+        let db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(e) => {
                 if is_injected(&e.to_string()) {
@@ -950,7 +958,8 @@ fn broken_ordering_workload(sim: &mut Sim) -> Result<(), String> {
     };
 
     for _round in 0..3 {
-        sim.crash_disk_after(32 + entropy.next_u64() % 256);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(27 + entropy.next_u64() % 219);
         let opened = (|| {
             let mut durable = 0u64;
             let wal = Wal::open(Box::new(sim.disk()), cfg.clone(), |_, _| {
@@ -1054,24 +1063,167 @@ fn harness_catches_apply_before_sync() {
 /// Hard rule 3: a crash during initial store creation left durable garbage
 /// redb rejects on every open (bad magic, InvalidData) — without the
 /// rebuild-from-WAL path in Db::open this universe bricks permanently.
+///
+/// The seed was `0x1f733f8d9eebf822` until 2026-09-30, when redb 4.3.0 and the
+/// re-sized crash countdowns left it reaching `Db::open`'s discard only through
+/// an injected fsync failure, never through garbage. `0xf79c40a51bb93ae8` was
+/// re-found by its reason (a temporary print of the discard's cause, 20,000
+/// seeds from base `0x1F730000`): its second discard is "Not a redb database:
+/// magic number mismatch", a store whose creation never became durable. With
+/// the discard-and-rebuild removed, the same universe fails "final recovery
+/// failed with a non-injected error: … magic number mismatch" on every later
+/// open. `fresh_store_creation_crash_is_discarded_and_rebuilt` below builds the
+/// same state directly and checks it at each step.
+///
+/// The test asserts its reason as well as its outcome: a `DiscardWitness`
+/// watches `Db::open` and records why each discard happened, and at least one
+/// must be creation garbage. The previous seed kept passing on `Ok(())` alone
+/// after it had stopped reaching garbage, and nothing noticed.
 #[test]
 fn regression_store_bricked_by_creation_crash() {
-    let mut sim = Sim::new(0x1f733f8d9eebf822);
+    let mut sim = Sim::new(0xf79c_40a5_1bb9_3ae8);
+    let seen = Arc::new(Mutex::new(StoreSeen::default()));
+    let witness = seen.clone();
+    let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
+        Box::new(DiscardWitness {
+            inner: sim.disk(),
+            seen: witness.clone(),
+        })
+    });
     assert_eq!(
-        tx_workload(&mut sim),
+        result,
         Ok(()),
-        "seed 0x1f733f8d9eebf822 no longer recovers a store bricked at creation"
+        "seed 0xf79c40a51bb93ae8 no longer recovers a store bricked at creation"
     );
+    let discards = seen.lock().expect("witness lock").discards.clone();
+    assert!(
+        discards.contains(&Discard::Garbage),
+        "seed 0xf79c40a51bb93ae8 no longer reaches Db::open's discard through creation garbage \
+         (a non-empty store without redb's magic number); its discards were {discards:?}. A \
+         seed names a universe, not a scenario: re-find one that reaches this reason (hard \
+         rule 3)"
+    );
+}
+
+/// redb's magic number (`MAGICNUMBER`, redb 4.3.0 `header.rs`): the nine bytes
+/// `Database::new` reads at offset 0 of a non-empty file before it will open it.
+/// A file shorter than nine bytes is compared as zeros.
+const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+
+/// Why `Db::open` discarded the store, judged from the bytes redb itself read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Discard {
+    /// A non-empty file without redb's magic number: a creation that never
+    /// became durable ("Not a redb database: magic number mismatch").
+    Garbage,
+    /// Anything else, e.g. a store with its magic number refused because an
+    /// injected fault hit its open.
+    Other,
+}
+
+#[derive(Default)]
+struct StoreSeen {
+    /// The store file's length and magic-number check, as redb read them
+    /// since `tables.redb` was last opened.
+    len: Option<u64>,
+    magic: Option<bool>,
+    discards: Vec<Discard>,
+}
+
+/// A pass-through `Disk` that watches `Db::open` discard `tables.redb`. It
+/// records the file's length and its first nine bytes as redb reads them, and
+/// classifies each removal of the file. It issues no disk op of its own. An
+/// inspection that did would tick the crash countdown and draw latency, and
+/// so rename the universe it is watching.
+struct DiscardWitness {
+    inner: charpente_sim::SimDisk,
+    seen: Arc<Mutex<StoreSeen>>,
+}
+
+impl Disk for DiscardWitness {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let file = self.inner.open(path)?;
+        if path != "tables.redb" {
+            return Ok(file);
+        }
+        let mut seen = self.seen.lock().expect("witness lock");
+        seen.len = None;
+        seen.magic = None;
+        Ok(Box::new(StoreWitness {
+            inner: file,
+            seen: self.seen.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        if path == "tables.redb" {
+            let mut seen = self.seen.lock().expect("witness lock");
+            let garbage = match seen.len {
+                Some(len) if len > 0 => len < REDB_MAGIC.len() as u64 || seen.magic == Some(false),
+                _ => false,
+            };
+            seen.discards.push(if garbage {
+                Discard::Garbage
+            } else {
+                Discard::Other
+            });
+        }
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct StoreWitness {
+    inner: Box<dyn File>,
+    seen: Arc<Mutex<StoreSeen>>,
+}
+
+impl File for StoreWitness {
+    fn len(&self) -> io::Result<u64> {
+        let len = self.inner.len()?;
+        self.seen.lock().expect("witness lock").len = Some(len);
+        Ok(len)
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)?;
+        if offset == 0 && out.len() >= REDB_MAGIC.len() {
+            self.seen.lock().expect("witness lock").magic =
+                Some(out[..REDB_MAGIC.len()] == REDB_MAGIC);
+        }
+        Ok(())
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.inner.sync()
+    }
 }
 
 /// Builds a committed, gracefully-closed store, then durably resizes its file
 /// to `resize(old_len)` — the crash-collapse states where the store file's
 /// length disagrees with its durable header's layout (an unsynced `set_len`
 /// drops while the header god-page write survives, or a torn tail write
-/// extends the file past the layout). redb 4.1.0 panics at open on both
-/// (page_manager.rs:231 / :257) instead of returning Err; Store::open must
-/// convert that into an open failure so Db::open discards and rebuilds from
-/// the WAL. Found by the kernel flagship swarm, seed 0x64622c74f8660a09.
+/// extends the file past the layout). redb 4.1.0 panicked at open on both
+/// (page_manager.rs:231 / :257) and Store::open fenced the panic; redb 4.3.0
+/// returns `StorageError::Corrupted`, and Db::open discards and rebuilds from
+/// the WAL either way. Found by the kernel flagship swarm, seed
+/// 0x64622c74f8660a09, under 4.1.0 (4.3.0's `grow()` syncs an extension
+/// before any header records it, so the crash model no longer makes these).
 fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
     let (sim, mut db) = quiet_db(0x0DD5_12E5);
     db.transact(|tx| {
@@ -1106,15 +1258,16 @@ fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
     );
 }
 
-/// File shorter than the header's layout: redb 4.1.0 asserts at
-/// page_manager.rs:231 before its own repair path can run.
+/// File shorter than the header's layout: redb 4.3.0's "File truncated below
+/// stored layout" (4.1.0 asserted at page_manager.rs:231).
 #[test]
 fn store_shorter_than_header_layout_is_discarded_and_rebuilt() {
     mangled_store_len_recovers(|len| len - 4096);
 }
 
-/// File longer than the header's layout but not page-aligned: redb 4.1.0
-/// recalculates the layout, then asserts exact equality at page_manager.rs:257.
+/// File longer than the header's layout but not page-aligned: redb 4.3.0's
+/// "File length does not correspond to a valid region layout" (4.1.0
+/// recalculated the layout, then asserted equality at page_manager.rs:257).
 #[test]
 fn store_longer_than_header_layout_is_discarded_and_rebuilt() {
     mangled_store_len_recovers(|len| len + 100);
@@ -1331,14 +1484,18 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
     let msg = err.to_string();
     // Needle + known-value, not byte-exact (error-suite T8): db.rs's `{e}`
-    // embeds redb's own panic-payload text (a literal Rust `assert!` source
-    // string from the fenced page_manager.rs quirk — upstream, version-tied,
-    // not ours to pin). Everything else is a scenario-known format arg (the
-    // compacted base), so it's checked byte-exact around that one opaque
-    // span.
+    // embeds redb's own `Corrupted` text, whose lengths are redb's layout
+    // arithmetic (upstream, version-tied, not ours to pin). Everything else
+    // is a scenario-known format arg (the compacted base), so it's checked
+    // byte-exact around that one opaque span. The redb needle is what shows
+    // the open failed as an ordinary `Err` (redb 4.3.0), not a caught panic.
     assert!(
         msg.starts_with("table store cannot open ("),
         "error must open with the named state: {msg}"
+    );
+    assert!(
+        msg.contains("(table store (redb): DB corrupted: File truncated below stored layout"),
+        "the embedded cause must be redb's own corruption verdict: {msg}"
     );
     assert!(
         msg.ends_with(&format!(
@@ -1445,13 +1602,13 @@ fn unopenable_store_with_full_wal_still_rebuilds() {
     mangled_store_len_recovers(|len| len - 4096);
 }
 
-/// Companion to `regression_store_bricked_by_creation_crash` below: that
+/// Companion to `regression_store_bricked_by_creation_crash` above: that
 /// test's pinned seed exercises the scenario through `tx_workload`'s much
-/// larger fuzz surface (3 rounds of commits/checkpoints/crashes) and was
-/// never itself re-verified to still land on a genuinely bricked store —
-/// T1's extra `sync_dir` barriers and this task's own extra `disk.list` in
-/// the rebuild-rule check both shift exactly the crash-timing that seed
-/// depends on. This test instead constructs the scenario directly and
+/// larger fuzz surface (3 rounds of commits/checkpoints/crashes), and any
+/// change that moves crash timing renames its universe — T1's extra
+/// `sync_dir` barriers, this task's own extra `disk.list` in the rebuild-rule
+/// check, and redb 4.3.0's IO shape all did (it was re-found by its cause on
+/// 2026-09-30; see its doc). This test instead constructs the scenario directly and
 /// self-verifies it at each step: an independent `Store::open` on the
 /// post-crash disk confirms the store really is bricked *before* asking
 /// `Db::open` to prove it discards and rebuilds — so this test cannot
@@ -1568,7 +1725,7 @@ fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt
     // THE BUG: discard the store (the exact proxy the landed discard/
     // rebuild regressions use elsewhere in this file -- production reaches
     // the identical applied_seq=None state via Db::open's Store::open-failed
-    // discard-and-rebuild branch, e.g. the M0 page_manager fence). Horizon
+    // discard-and-rebuild branch, e.g. a store redb refuses to open). Horizon
     // collapses to None UNLESS a breadcrumb outside the store supplies it.
     sim.disk().remove(&cfg.store_path).unwrap();
     match Db::open(Box::new(sim.disk()), cfg, app_schema()) {

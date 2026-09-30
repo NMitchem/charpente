@@ -2076,7 +2076,8 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
             return Ok(client.trace);
         }
         let entropy = sim.entropy();
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(50 + entropy.next_u64() % 399);
         let app = match realtime_app(sim) {
             Ok(app) => app,
             Err(e) => {
@@ -2324,9 +2325,9 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0xbb93400e0bc80ca4` (base `0xA11CE002`, universe 6).
+/// Seed `0xdec436b030427fc6` (base `0xA11CE002`, universe 124).
 ///
-/// **This pin was re-found once already, and that is worth knowing before
+/// **This pin has been re-found twice, and that is worth knowing before
 /// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
 /// this property (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). The
 /// directory-barrier stream split later that day re-rolled every universe one
@@ -2336,7 +2337,11 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// universe whose settle loop ends with zero clean attempts, and the assertion
 /// below now pins the give-up REASON rather than merely its presence: a future
 /// re-roll that happens to land on some *other* give-up can no longer keep this
-/// test quietly green while testing nothing.
+/// test quietly green while testing nothing. Its successor `0xbb93400e0bc80ca4`
+/// stopped reproducing when redb 4.3.0 changed the store's IO shape and the
+/// crash countdowns were re-sized (2026-09-30); this one was re-found the same
+/// way, and with the zero-clean-attempts give-up removed it fails "client never
+/// caught up", which is the regression.
 ///
 /// The scenario: every one of `SETTLE_ATTEMPTS` attempts ends with `settle_boot`
 /// returning `None`. The node never booted once, so the client never had a single
@@ -2350,7 +2355,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// give up rather than report a miss it never had the chance to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0xbb93_400e_0bc8_0ca4;
+    const SEED: u64 = 0xdec4_36b0_3042_7fc6;
     // Reconstruct this universe exactly as the swarm runner derives it.
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -2376,16 +2381,25 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
     );
 }
 
-/// Seed `0xb247eceae0daf689` (base `0x9C4177E3`). A durable, acked event is
-/// destroyed by `bit_flip` above the store's checkpoint horizon, recovery cuts
-/// there, and the next emit re-mints its id with other content. The drain
-/// probe classifies that correctly as a give-up in the first round after the
-/// restart; the universe must END there. Carrying on let retention collect the
-/// diverged row, after which the probe could no longer see the divergence and
-/// the stale frame came back as a hard failure.
+/// Seed `0x6617ca6405d1b99e` (base `0x5E1F000D`, universe 127). A durable, acked
+/// event is destroyed by `bit_flip` above the store's checkpoint horizon,
+/// recovery cuts there, and the next emit re-mints its id with other content.
+/// The drain probe classifies that correctly as a give-up in the first round
+/// after the restart; the universe must END there. Carrying on let retention
+/// collect the diverged row, after which the probe could no longer see the
+/// divergence and the stale frame came back as a hard failure.
+///
+/// Re-found 2026-09-30 (the original `0xb247eceae0daf689` stopped reproducing
+/// when redb 4.3.0 changed the store's IO shape and the crash countdowns were
+/// re-sized) by the whole reason, not just the give-up: with every `gave_up()`
+/// stop in `realtime_workload` removed, this universe fails "content mismatch
+/// at event id 0: expected (pong, {"n":"647"}) but received (ping,
+/// {"n":"697"})". It was the only universe of 13,312 scanned where carrying on
+/// turns the give-up into that failure; the other diverged-ledger give-ups
+/// stayed give-ups either way.
 #[test]
 fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
-    const SEED: u64 = 0xb247_ecea_e0da_f689;
+    const SEED: u64 = 0x6617_ca64_05d1_b99e;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
@@ -2402,8 +2416,8 @@ fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
         .gave_up()
         .expect("the divergence must be RECORDED as a give-up");
     assert!(
-        reason.contains("ledger diverged at event id 3"),
-        "and it must be THIS give-up, the divergence at id 3: {reason}"
+        reason.contains("ledger diverged at event id 0"),
+        "and it must be THIS give-up, the divergence at id 0: {reason}"
     );
     assert!(
         reason.contains("durable corruption cut it above the checkpoint horizon"),
@@ -3054,7 +3068,8 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
         if sim.gave_up().is_some() {
             return Ok(());
         }
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(40 + entropy.next_u64() % 320);
         if let Some(mut kernel) = shapes_boot(sim)? {
             let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
             let t = sim.now().as_nanos();
@@ -3374,9 +3389,20 @@ fn mixed_shape_resumes_replay_identically_for_the_same_seed() {
 /// check (neither moves a draw). Each floor is the exact count: a drop is a
 /// finding, not a number to lower. `fault:subscriber_stall` is required, not
 /// floored, like every fault axis here; it reads 2 at this base.
-const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 11;
-const SHAPES_RESHAPED_409_FLOOR: u64 = 52;
-const SHAPES_V2_DELIVERED_FLOOR: u64 = 42;
+///
+/// **Re-measured 2026-09-30**, same base and count, two identical batches,
+/// for redb 4.3.0 and the crash countdown re-sized to its disk-op volume
+/// (DESIGN §1, "countdowns"; `fault:crash` 71 under 4.1.0, 84 now). No floor
+/// fell; each is set to its new count.
+///
+/// | key | was | now |
+/// |---|---|---|
+/// | `shapes:reshaped-frame` | 11 | 19 |
+/// | `shapes:reshaped-409` | 52 | 66 |
+/// | `shapes:v2-delivered` | 42 | 56 |
+const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 19;
+const SHAPES_RESHAPED_409_FLOOR: u64 = 66;
+const SHAPES_V2_DELIVERED_FLOOR: u64 = 56;
 
 /// `shapes_verdict`'s stall arm, both sides, called directly. The sink is
 /// dropped before every verdict, so the tail is closed the way the terminal
@@ -3710,6 +3736,56 @@ fn rt_recover_exhausted_key(last: &str) -> &'static str {
     }
 }
 
+/// A local copy this property has no restore rig for: corruption at or below
+/// the durable horizon, or a log directory gapped past guessing. NOT DESIGN
+/// §4's compacted-log refusal, although it names the same "restore this node"
+/// fix: `recover_rt_node` sends that one on to its fault-fallout arm (an
+/// injected fault inside `Store::open`, carrying its injected text) and
+/// otherwise fails, because under redb 4.3.0 the crash model cannot brick the
+/// store.
+fn local_copy_unrestorable(e: &str) -> bool {
+    (e.contains("restore this node from a replica or backup") || e.contains("refusing to guess"))
+        && !e.contains("cannot be rebuilt from the log alone")
+}
+
+/// `recover_rt_node`'s arms run `local_copy_unrestorable`, then fault fallout,
+/// then fail. The compacted-log refusal must reach the second (injected cause)
+/// or the third (none), never the first — and the first must still take what
+/// it exists for. No realtime workload reaches that refusal at its pinned base
+/// (none in 20 batches, 2026-09-30), so this is the arm's oracle.
+#[test]
+fn the_compacted_log_refusal_is_fallout_or_a_failure_never_an_unrestorable_skip() {
+    let refusal = |cause: &str| {
+        format!(
+            "table store cannot open ({cause}) and the log is compacted to seq 3 — the records \
+             below the store's last checkpoint no longer exist locally, so the store cannot be \
+             rebuilt from the log alone; restore this node from a replica or backup, or widen \
+             DbConfig::retain_segments (DESIGN §4)"
+        )
+    };
+    let injected = refusal("table store (redb): I/O error: injected read error");
+    assert!(!local_copy_unrestorable(&injected), "{injected}");
+    assert!(
+        is_fault_fallout(&injected),
+        "an injected cause is fallout: {injected}"
+    );
+    let bare = refusal(
+        "table store (redb): DB corrupted: File truncated below stored layout: file_len=4096, \
+         layout_len=8192",
+    );
+    assert!(!local_copy_unrestorable(&bare), "{bare}");
+    assert!(
+        !is_fault_fallout(&bare),
+        "no injected cause, so it fails: {bare}"
+    );
+    assert!(local_copy_unrestorable(
+        "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
+         corruption of acknowledged records, not a torn tail, and truncating it would silently \
+         lose data; restore this node from a replica or backup (DESIGN §2)"
+    ));
+    assert!(local_copy_unrestorable("refusing to guess across a gap"));
+}
+
 fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
     sim.cover("restart");
     node.recoveries += 1;
@@ -3733,11 +3809,7 @@ fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
                 return Ok(());
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
-            Err(e)
-                if e.contains("restore this node from a replica or backup")
-                    || e.contains("cannot be rebuilt from the log alone")
-                    || e.contains("refusing to guess") =>
-            {
+            Err(e) if local_copy_unrestorable(&e) => {
                 sim.cover("rt:inconclusive:local-unrestorable");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} local copy unrestorable (no restore rig in this \
@@ -4960,7 +5032,8 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             return Ok(client.trace);
         }
         let entropy = sim.entropy();
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(51 + entropy.next_u64() % 410);
         let app = match scoped_realtime_app(sim) {
             Ok(app) => app,
             Err(e) => {
@@ -5285,9 +5358,28 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
 /// that is not failing is a separate decision from repairing one that is.
 /// Counts reproduced identically across two consecutive batches before these
 /// numbers were taken, the same discipline the original measurement states.
-const SCOPED_BOTH_TENANTS_FLOOR: u64 = 75;
-const SCOPED_OWN_BACKLOG_FLOOR: u64 = 78;
-const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 80;
+///
+/// **Re-measured 2026-09-30**, same base, two identical batches, for redb
+/// 4.3.0 and the crash countdown re-sized to its disk-op volume. This workload
+/// takes the re-size without the calibration margin (DESIGN §1, "countdowns":
+/// with it, `realtime:resume-backlog` fell to 122). The "floor" column is the
+/// floor as it stood: the 2026-09-07 directory-barrier split set two of them
+/// to 78 and 125 without updating the table above. The "4.1.0" column is the
+/// count at the parent commit. The paragraph above left non-failing floors
+/// alone during a repair. This time a dependency's IO shape re-rolled every
+/// universe, so each floor whose count the upgrade moved is set on its new
+/// count. `realtime:resume-backlog` reads 126 at both versions; it did not
+/// move, so its floor stays. None fell.
+///
+/// | key | floor | 4.1.0 | now | new floor |
+/// |---|---|---|---|---|
+/// | `tenant:both-tenants-emitted` | 75 | 76 | 83 | 83 |
+/// | `tenant:own-backlog-verified` | 78 | 78 | 81 | 81 |
+/// | `tenant:foreign-backlog-not-delivered` | 80 | 87 | 98 | 98 |
+/// | `realtime:resume-backlog` | 125 | 126 | 126 | 125 |
+const SCOPED_BOTH_TENANTS_FLOOR: u64 = 83;
+const SCOPED_OWN_BACKLOG_FLOOR: u64 = 81;
+const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 98;
 const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
 
 /// Floors pinned at an exact measurement are only meaningful if the batch is

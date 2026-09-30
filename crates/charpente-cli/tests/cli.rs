@@ -96,20 +96,21 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(r#""outcomes":[{"test":"counter_roundtrip","verdicts":32,"gave_up":32}]"#),
+        stdout.contains(r#""outcomes":[{"test":"counter_roundtrip","verdicts":37,"gave_up":27}]"#),
         "the per-test outcome split is the machine-readable field:\n{stdout}"
     );
     assert!(
-        stdout.contains(r#""verdicts":32,"gave_up":32,"outcomes""#),
+        stdout.contains(r#""verdicts":37,"gave_up":27,"outcomes""#),
         "the batch totals sit alongside the per-test split:\n{stdout}"
     );
     // Cross-checked a second way: `Sim::give_up` also marks coverage, so the
     // reported count and the coverage count must agree. Two independent paths
-    // to the same 32 — a constant wired into one of them cannot fake both.
+    // to the same 27 — a constant wired into one of them cannot fake both.
     // (36/28 before the 2026-09-07 barrier stream split re-rolled the fixture's
-    // universes one last time; see `archive.rs`'s floor table.)
+    // universes; 32/32 until redb 4.3.0 re-rolled them again on 2026-09-30, with
+    // the new split identical across two runs. See `archive.rs`'s floor table.)
     assert!(
-        stdout.contains(r#""universe:gave-up":32"#),
+        stdout.contains(r#""universe:gave-up":27"#),
         "give-up coverage must agree with the reported count:\n{stdout}"
     );
 }
