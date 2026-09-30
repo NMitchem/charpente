@@ -84,9 +84,14 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
   target set. The default test set is `charpente-core` + `charpente-sim` regardless of
   `--file`, so a `--file` in any other crate needs `--test-package <that crate>` or the run
   judges its mutants with suites that never exercise them and reports them all MISSED
-  (2026-09-16, `charpente-macros`). Exit 0 every viable mutant caught, 1 a finding
-  (**MISSED** = no oracle noticed, i.e. a one-sided property) or an unresolved run (**a
-  timeout is not a catch**), 2 usage, infrastructure, or a baseline that was not green.
+  (2026-09-16, `charpente-macros`). cargo-mutants 27.1.0 times its baseline over ONE
+  package (the mutated file's) while every mutant runs all of them, so with two or more
+  test packages in effect (the default set is two) and no `--timeout`, the verb first
+  times one `cargo test` over the whole set and passes `--timeout` as 5x that wall time,
+  printing both numbers; without that, slow-but-caught mutants read TIMEOUT. Exit 0 every
+  viable mutant caught, 1 a finding (**MISSED** = no oracle noticed, i.e. a one-sided
+  property) or an unresolved run (**a timeout is not a catch**), 2 usage, infrastructure,
+  or a baseline that was not green.
   `--jobs > 1` (flag or `CARGO_MUTANTS_JOBS`) is refused under an inherited
   `CARGO_TARGET_DIR`: cargo's artifact hash does not vary by mutation content, so parallel
   jobs sharing one target dir report results that measured nothing. Read the verb's output,

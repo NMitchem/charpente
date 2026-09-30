@@ -3047,6 +3047,19 @@ compile — your types rejected it, which is the compile-time contract doing its
 job. `timed out` means the run did **not resolve**: it is not a catch, and the
 verb will not let it read as one.
 
+The timeout follows the scope too. cargo-mutants times its own baseline over
+one package, the mutated file's, while every mutant runs all the packages in
+`--test-package`. So with two or more of them and no `--timeout`, the verb
+first times one `cargo test` over the whole set, passes five times that as the
+timeout, and prints both numbers:
+
+```text
+mutants: `cargo test` over charpente-core, charpente-sim took 8.6 s of wall time; each mutant runs all 2 packages and cargo-mutants' own baseline times only one, so the verb is passing --timeout 44 (5x)
+```
+
+An explicit `--timeout SECS` skips the timing run and is passed through as
+given.
+
 **It is not part of `cargo test`.** Every mutant is a rebuild plus a test run,
 so this is an on-demand instrument like the edge harness below, not something
 your inner loop pays for. Scope it at a file or a function (`--file`, `--re`)

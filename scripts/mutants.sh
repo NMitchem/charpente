@@ -18,6 +18,14 @@
 # MISSED under the default package scope and CAUGHT with charpente-sim's tests
 # in scope. Same mutant, two answers, decided by which suites were allowed to run.
 #
+# The timeout follows the same scope. cargo-mutants 27.1.0 times its baseline
+# over ONE package (the mutated file's) while each mutant runs every
+# --test-package, so its own auto-timeout is too short for the set and
+# slow-but-caught mutants read TIMEOUT. With two or more test packages (the
+# default set is two) and no --timeout, the verb times one `cargo test` over
+# the whole set first and passes 5x that as --timeout, printing both numbers.
+# An explicit --timeout SECS skips the timing run.
+#
 # Requires the pinned tool:
 #   cargo install cargo-mutants --version 27.1.0 --locked
 #

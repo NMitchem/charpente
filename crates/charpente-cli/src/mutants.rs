@@ -97,7 +97,9 @@ its mutants are judged by suites that never exercise them and all report MISSED.
        --property NAME  judge the mutants with ONE sim property only — the way to ask \
 whether that property alone would notice. Without it every property runs, and one honest \
 sibling is enough to report a mutant CAUGHT.\n\
-       --timeout    per-mutant test timeout in seconds; a TIMEOUT IS NOT A CATCH";
+       --timeout    per-mutant test timeout in seconds; a TIMEOUT IS NOT A CATCH. Without it, \
+two or more test packages (the default set is two) are timed with one `cargo test` first and \
+the verb passes 5x that, because cargo-mutants' own baseline times only one package";
 
 /// The fields of `mutants.out/outcomes.json` this verb reads. Deserialized
 /// rather than string-scanned (unlike `sim.rs`'s scan of cargo's message
@@ -207,7 +209,39 @@ pub fn run(args: &[String]) -> i32 {
         argv.push("--cargo-test-arg".into());
         argv.push(prop.clone());
     }
-    if let Some(t) = &opts.timeout {
+    let timeout = match &opts.timeout {
+        Some(t) => Some(t.clone()),
+        // cargo-mutants 27.1.0 times its baseline over ONE package, while
+        // every mutant runs all of them: its auto-timeout is then too short,
+        // and a slow-but-caught mutant reads TIMEOUT. So the verb measures
+        // the set itself. Wall time, not CPU time: `--timeout` is a
+        // wall-clock bound on this same command, so wall time is its unit.
+        // CPU time would undershoot a suite that sleeps or waits (the serve
+        // and edge tests do) and overshoot a parallel one. And the error a
+        // wall-time measurement can carry (a machine that slept or was busy
+        // mid-run) only lengthens it, which is the safe side for a timeout.
+        None if opts.test_packages.len() >= 2 => {
+            match time_the_package_set(&opts.dir, &opts.test_packages) {
+                Ok(secs) => {
+                    let derived = derived_timeout(secs);
+                    println!(
+                        "mutants: `cargo test` over {} took {secs:.1} s of wall time; each \
+                         mutant runs all {} packages and cargo-mutants' own baseline times \
+                         only one, so the verb is passing --timeout {derived} (5x)",
+                        opts.test_packages.join(", "),
+                        opts.test_packages.len()
+                    );
+                    Some(derived.to_string())
+                }
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return 2;
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(t) = &timeout {
         argv.push("--timeout".into());
         argv.push(t.clone());
     }
@@ -260,6 +294,56 @@ pub fn run(args: &[String]) -> i32 {
         opts.property.as_deref(),
         status.code(),
     )
+}
+
+/// Five times the measured wall time, rounded up to whole seconds: the
+/// multiplier cargo-mutants 27.1.0 applies to its own baseline (13.5 s gave
+/// "Auto-set test timeout to 68s").
+fn derived_timeout(secs: f64) -> u64 {
+    (secs * 5.0).ceil().max(1.0) as u64
+}
+
+/// Builds the package set's tests, then times one `cargo test` over all of
+/// them — the command each mutant runs — in wall-clock seconds. The build is
+/// outside the measurement, as it is in cargo-mutants' own baseline.
+// Spawning cargo and reading the wall clock are edge tooling, outside the
+// deterministic core (DESIGN.md §1).
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+fn time_the_package_set(dir: &str, packages: &[String]) -> Result<f64, String> {
+    let mut args: Vec<&str> = vec!["test"];
+    for pkg in packages {
+        args.push("--package");
+        args.push(pkg);
+    }
+    let build = [&args[..1], &["--no-run"], &args[1..]].concat();
+    let run = |args: &[&str]| -> Result<(), String> {
+        let status = Command::new("cargo")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .map_err(|e| {
+                format!(
+                    "error: could not run `cargo {}` to time the test set: {e}",
+                    args.join(" ")
+                )
+            })?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "error: `cargo {}` exited {} while timing the test set for --timeout — the \
+             unmutated suite is not green, so no mutant result would mean anything \
+             (cargo-mutants' own baseline refuses it too). Fix the suite first.",
+            args.join(" "),
+            status
+                .code()
+                .map_or("on a signal".to_string(), |c| c.to_string())
+        ))
+    };
+    run(&build)?;
+    let start = std::time::Instant::now();
+    run(&args)?;
+    Ok(start.elapsed().as_secs_f64())
 }
 
 /// What to say when the run left no `outcomes.json` at all. The tool's exit
@@ -636,6 +720,16 @@ mod tests {
             shared_target_dir_refusal(Some(("CARGO_MUTANTS_JOBS=", "1")), Some(dir)).is_none(),
             "one env-sourced job cannot collide either"
         );
+    }
+
+    /// The multiplier and rounding are cargo-mutants' own, read off its logs:
+    /// a 13.5 s baseline became 68 s and a 32.4 s one 162 s.
+    #[test]
+    fn the_derived_timeout_is_five_times_the_measurement_rounded_up() {
+        assert_eq!(derived_timeout(13.5), 68);
+        assert_eq!(derived_timeout(32.4), 162);
+        assert_eq!(derived_timeout(40.0), 200);
+        assert_eq!(derived_timeout(0.001), 1, "never a zero timeout");
     }
 
     #[test]
