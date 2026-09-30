@@ -2592,6 +2592,78 @@ fn one_tenants_staged_tombstone_cannot_delete_another_tenants_row_from_its_read(
     );
 }
 
+/// `scan_from` over STAGED rows starts exactly at its cursor, as it does over
+/// committed ones. The snapshot's range bound never sees a staged row, so the
+/// overlay merge applies the cursor itself: the row just below it stays out and
+/// the row exactly at it comes back. Asserted at both overlay levels (this
+/// transaction's, and the batch's from an earlier stage) and through both reads
+/// that share the merge. The boundary's two wrong answers are a merge that
+/// skips only the cursor row, `[4, 6]`, and one that skips it along with every
+/// row below, `[6]`.
+#[test]
+fn a_staged_scan_from_starts_exactly_at_its_cursor() {
+    fn ids<R: Row>(rows: Vec<R>) -> Vec<u64> {
+        rows.iter().map(|r| r.id().raw()).collect()
+    }
+    let sim = Sim::with_faults(0x7000_0003, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Widget>().table::<Ticket>(),
+    )
+    .unwrap();
+    let org = Id::<TestOrg>::from_raw(1);
+
+    let mut group = db.begin_group().unwrap();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            for id in [4, 5, 6] {
+                tx.put(&Widget {
+                    id: Id::from_raw(id),
+                    n: id as u32,
+                });
+            }
+            assert_eq!(
+                ids(tx.scan_from::<Widget>(5, 10)?),
+                vec![5, 6],
+                "View::scan_from(5) over this transaction's own staged rows 4, 5 and 6"
+            );
+            let mut tx = tx.open_scope(org, "member")?;
+            for id in [4, 5, 6] {
+                tx.put(&Ticket {
+                    id: Id::from_raw(id),
+                    n: id as u32,
+                });
+            }
+            assert_eq!(
+                ids(tx.scan_from::<Ticket>(5, 10)?),
+                vec![5, 6],
+                "ScopedTx::scan_from(5) over this transaction's own staged rows 4, 5 and 6"
+            );
+            Ok(())
+        })
+        .unwrap();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            assert_eq!(
+                ids(tx.scan_from::<Widget>(5, 10)?),
+                vec![5, 6],
+                "View::scan_from(5) over rows 4, 5 and 6 staged by an earlier transaction in \
+                 the batch"
+            );
+            let tx = tx.open_scope(org, "member")?;
+            assert_eq!(
+                ids(tx.scan_from::<Ticket>(5, 10)?),
+                vec![5, 6],
+                "ScopedTx::scan_from(5) over rows 4, 5 and 6 staged by an earlier transaction \
+                 in the batch"
+            );
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+}
+
 // ----------------------------------------------- Task 7: opening the scope
 
 /// `open_scope` runs the app's own `authorize` and returns its refusal
