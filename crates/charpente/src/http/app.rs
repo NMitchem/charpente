@@ -664,7 +664,9 @@ impl App {
     /// is a fixed literal rather than an `Entropy` draw, so probing cannot
     /// shift the app's entropy stream and perturb everything after it (hard
     /// rule 1). A handler that rejects that synthetic input comes back as
-    /// `Err` naming the route, never as a silently empty name list.
+    /// `Err` naming the route and quoting what a request would receive, the
+    /// status and the envelope's message, never as a silently empty name
+    /// list.
     #[doc(hidden)]
     pub fn subscription_event_names(&mut self, route: &str) -> Result<Vec<&'static str>, String> {
         let Some(found) = self.router.routes().iter().find(|r| r.name == route) else {
@@ -711,11 +713,24 @@ impl App {
         let wrote = !group.is_empty();
         let names = match staged {
             Ok(sub) => Ok(sub.entries.iter().map(|e| e.name).collect()),
-            Err(e) => Err(format!(
-                "route `{route}`'s subscribe handler returned {e:?} under the emits(...) drift \
-                 probe, so what it subscribes to cannot be read — a handler that rejects a \
-                 credential-free request with `\"0\"` for every :param is not probeable"
-            )),
+            Err(e) => {
+                // Rendered as a request would receive it (hard rule 5): the
+                // status and the envelope's message, through the renderer
+                // requests use, never the Rust `Debug` of the `TxError`.
+                let response = tx_error_response(e);
+                let envelope: serde_json::Value = serde_json::from_slice(&response.body)
+                    .expect("tx_error_response always answers with Response::error's envelope");
+                let status = response.status;
+                let message = envelope["error"]
+                    .as_str()
+                    .expect("Response::error's envelope carries its message as \"error\"");
+                Err(format!(
+                    "route `{route}`'s subscribe handler answered {status} under the emits(...) \
+                     drift probe, so what it subscribes to cannot be read — a handler that \
+                     rejects a credential-free request with `0` for every :param is not \
+                     probeable; the {status} reads: {message}"
+                ))
+            }
         };
         // Unconditional, and before returning on any path: `Group`'s `Drop`
         // panics on a non-empty group that was never committed, so the write

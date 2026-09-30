@@ -4054,7 +4054,8 @@ route out of the drift test.
 The probe presents no credential and does not enforce `auth`, so an `auth` stream route is
 probeable, unless its handler opens a tenant scope. Then the scope line refuses the probe
 exactly as it refuses any caller without a credential (§5's rule 3), and the probe's error
-says the route requires a credential, so the probe cannot run it. Leave that route out of
+quotes the 401 a request would get (status and message), which says the route requires a
+credential, so the probe cannot run it. Leave that route out of
 the drift test too; widening it to `public(Org)` so a test can read it is not the fix.
 
 ### Cursor semantics

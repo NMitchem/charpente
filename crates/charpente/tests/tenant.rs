@@ -514,17 +514,19 @@ fn the_drift_probe_meets_the_three_rules_as_a_request_does() {
     );
     // Byte-exact: an `auth` route already requires a credential, so its
     // refusal must not suggest opening it to every caller with `public(Org)`.
+    // The handler's error reads as a request would receive it, its status and
+    // its message, with no Rust `Debug` syntax around it.
     assert_eq!(
         app.subscription_event_names("memo_feed_auth"),
         Err(
-            "route `memo_feed_auth`'s subscribe handler returned App(AnonymousScope(\
-             \"authentication required — `SSE /memo-feed-auth/:org` is declared `auth` and \
-             opened the tenant scope `Org` for a caller with no credential; the route requires \
-             a credential, so a request without one is refused before its handler runs, and a \
+            "route `memo_feed_auth`'s subscribe handler answered 401 under the emits(...) drift \
+             probe, so what it subscribes to cannot be read — a handler that rejects a \
+             credential-free request with `0` for every :param is not probeable; the 401 reads: \
+             authentication required — `SSE /memo-feed-auth/:org` is declared `auth` and opened \
+             the tenant scope `Org` for a caller with no credential; the route requires a \
+             credential, so a request without one is refused before its handler runs, and a \
              caller that presents none, as the emits(...) drift probe does, cannot run it — \
-             leave this route out of the drift test\")) under the emits(...) drift probe, so \
-             what it subscribes to cannot be read — a handler that rejects a credential-free \
-             request with `\"0\"` for every :param is not probeable"
+             leave this route out of the drift test"
                 .to_string()
         )
     );
