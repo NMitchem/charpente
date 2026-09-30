@@ -144,6 +144,31 @@ alongside it — a probability cannot guarantee the delete-fails-FOREVER shape i
 And `SimObjectStore` completes each operation in the `poll` that takes it, so object-store
 latency is not modelled at all.
 
+**The store's crash surface, and the countdowns.** Every `Store::apply` commits at
+`Durability::None`, and redb 4.3.0 keeps such a commit's pages in its own write buffer
+(`write_barrier()` issues no file write, `cached_file.rs:594`) until a checkpoint — or until
+the buffer passes 512 MiB, which no sim workload approaches. So the sim's crash surface in
+the store file is checkpoint-only: what a crash can find unsynced there is one checkpoint's
+page writes (beside the store's creation, and `grow()`'s extension, which 4.3.0 syncs before
+any header records it, §4), and everything else a crash collapses is WAL. The torn-store
+shapes that redb 4.1.0's unsynced page writes let the crash model produce — a file cut below
+its header's layout, a sub-page tail — are therefore held by hand-built tests that write them
+directly, not by the sim: engine.rs's `open_a_store_mangled_to` pair and transactions.rs's
+`mangled_store_len_recovers` family. The sim does not model IO that no longer happens. The
+same change re-sized the crash countdowns. A workload arms `crash_disk_after(A + rand % B)`
+once per round, and it fires only if the round runs past the drawn op count, so a range is
+calibrated to its workload's op volume: under 4.3.0 a round issues 57-90% of 4.1.0's disk ops
+(mean, per workload), and at a fixed base the 4.1.0 ranges fired 24-86% fewer crashes. Each
+range was re-sized on 2026-09-30 by counting every round's ops with the countdown disarmed, at
+both versions and two bases, then scaling (A, B) until that measured distribution predicts
+4.1.0's crash count plus one standard deviation at the batch's base (`scoped_realtime_workload`
+without the margin: with it the batch crashed 10% more often than under 4.1.0 and fell below
+its exact `realtime:resume-backlog` floor). A uniform scale by the mean op ratio alone
+restores only 71-98% of the rate (per workload), because 4.3.0's saving sits in the long
+rounds. Every batch's `fault:crash` is back at or above its 4.1.0 count at its base. A redb
+upgrade that changes the IO shape again re-opens this calibration, as it re-opens the latch
+census (§4).
+
 **The same split a second time: the directory barrier.** `SimDisk::sync_dir` rolls
 `sync_error` off `keyed_stream(seed, "host-dir-faults:{host}")` — and off a global
 `dir_faults` stream for the un-hosted disk — not off the shared `faults` stream that reads,

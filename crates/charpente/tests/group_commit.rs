@@ -2333,7 +2333,8 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
     let mut watermark: u64 = 0;
 
     for _round in 0..4 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 768);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(47 + entropy.next_u64() % 568);
         let app = match App::open(
             Box::new(sim.disk()),
             Schema::new().table::<Hit>(),

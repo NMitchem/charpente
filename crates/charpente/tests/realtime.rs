@@ -2076,7 +2076,8 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
             return Ok(client.trace);
         }
         let entropy = sim.entropy();
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(50 + entropy.next_u64() % 399);
         let app = match realtime_app(sim) {
             Ok(app) => app,
             Err(e) => {
@@ -3054,7 +3055,8 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
         if sim.gave_up().is_some() {
             return Ok(());
         }
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(40 + entropy.next_u64() % 320);
         if let Some(mut kernel) = shapes_boot(sim)? {
             let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
             let t = sim.now().as_nanos();
@@ -5006,7 +5008,8 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             return Ok(client.trace);
         }
         let entropy = sim.entropy();
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(51 + entropy.next_u64() % 410);
         let app = match scoped_realtime_app(sim) {
             Ok(app) => app,
             Err(e) => {

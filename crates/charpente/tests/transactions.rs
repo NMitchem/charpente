@@ -552,7 +552,8 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
     let mut committed = 0u64; // acknowledged transactions
 
     for _round in 0..3 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(43 + entropy.next_u64() % 346);
         let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(_) => {
@@ -950,7 +951,8 @@ fn broken_ordering_workload(sim: &mut Sim) -> Result<(), String> {
     };
 
     for _round in 0..3 {
-        sim.crash_disk_after(32 + entropy.next_u64() % 256);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(27 + entropy.next_u64() % 219);
         let opened = (|| {
             let mut durable = 0u64;
             let wal = Wal::open(Box::new(sim.disk()), cfg.clone(), |_, _| {

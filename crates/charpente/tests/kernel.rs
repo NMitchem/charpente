@@ -2428,7 +2428,8 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
 fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     for _round in 0..3 {
-        sim.crash_disk_after(64 + entropy.next_u64() % 768);
+        // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+        sim.crash_disk_after(36 + entropy.next_u64() % 438);
         let mut app = match kernel_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
@@ -4102,7 +4103,8 @@ fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption()
 /// and never refuses over none.
 fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
-    sim.crash_disk_after(32 + entropy.next_u64() % 256);
+    // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+    sim.crash_disk_after(22 + entropy.next_u64() % 174);
     match receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
         Ok(mut kernel) => {
             let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
@@ -4793,7 +4795,8 @@ mod job_tenancy {
         let mut seq = 0u64;
         let mut carried = BTreeSet::new();
         for _round in 0..3 {
-            sim.crash_disk_after(64 + entropy.next_u64() % 768);
+            // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
+            sim.crash_disk_after(31 + entropy.next_u64() % 376);
             let mut app = match shop_app(sim) {
                 Ok(app) => app,
                 Err(e) if is_fault_fallout(&e.to_string()) => {
