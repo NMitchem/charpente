@@ -764,6 +764,19 @@ mod tests {
             glue: noop_glue,
         }]);
         let server = serve("127.0.0.1:0", app).unwrap();
+        // A deadline before `wait`, whose join would otherwise block forever
+        // on a kernel that does not refuse: this test then fails by name
+        // rather than hanging the binary.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !server.kernel.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kernel thread is still running after 10 s: a Pending job enqueued under \
+                 shape 0x7E57_0701 and mounted under 0x7E57_0702 must refuse at Kernel::new \
+                 and end it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(server.wait(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }

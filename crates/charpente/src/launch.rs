@@ -595,25 +595,40 @@ mod tests {
     }
 
     /// The `[]` arm's `match serve::serve(addr, app) { Ok(server) =>
-    /// server.wait(), .. }` (spec §5) is otherwise driven by no test — a
-    /// reversion to the old `serve(addr, app)?; loop { thread::park() }`
-    /// would hang this test rather than fail it cleanly, but a hang is
-    /// still noticed rather than a silent pass.
+    /// server.wait(), .. }` (spec §5) is otherwise driven by no test. A
+    /// `dispatch` that never returns (a reversion to the old `serve(addr,
+    /// app)?; loop { thread::park() }`, or a kernel that does not refuse)
+    /// fails this test at its deadline rather than hanging the binary, which
+    /// a mutation run can only read as a timeout.
     #[test]
     fn a_kernel_refusal_inside_the_serve_arm_ends_dispatch_with_its_code() {
         let dir = fresh_data_dir("serve-arm-refusal");
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = dispatch(
-            &[],
-            "127.0.0.1:0",
-            dir.to_str().unwrap(),
-            build_with_foreign_pending_job,
-            &mut out,
-            &mut err,
-        )
-        .unwrap();
-        assert_eq!(code, 1);
+        let data_dir = dir.to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = dispatch(
+                &[],
+                "127.0.0.1:0",
+                &data_dir,
+                build_with_foreign_pending_job,
+                &mut out,
+                &mut err,
+            );
+            let _ = tx.send(code.map_err(|e| e.to_string()));
+        });
+        let code = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(code) => code,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "dispatch did not return within 10 s: the serve arm must end with the kernel's \
+                 refusal code (a Pending job under a foreign shape refuses at Kernel::new), not \
+                 keep serving"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("dispatch panicked on its thread before returning a code")
+            }
+        };
+        assert_eq!(code, Ok(1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
