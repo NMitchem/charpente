@@ -59,10 +59,10 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
   member's `tests/` (charpente: archive/auth/describe/group_commit/http/kernel/realtime/
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
-  charpente-sim: crash_recovery/determinism/net_partition/open_fence/wal; charpente-cli: cli/ctl/
+  charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-cli: cli/ctl/
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
-  charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/open_fence/
-  realtime_resume/smoke/tenant_wire; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
+  charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/realtime_resume/
+  smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
   ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
   invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
   missing, the list is stale, not selective.
@@ -133,7 +133,7 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
 - `crates/guide-examples` — compile gate for docs/GUIDE.md, the CLAUDE.md inventory gate
   (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest,
   `tests/describe_contract.rs`, which diffs §13's `describe` JSON against a freshly built
-  `examples/invoicing` fixture, and `tests/hook_census.rs`, which holds "one panic-hook
+  `examples/invoicing` fixture, and `tests/hook_census.rs`, which holds "no panic-hook
   installer" by walking the sources — the deny-list is inert under a file-level allow.
   `tests/mutants_exclusions.rs` pins the known-equivalent mutant list's size and demands a
   rationale per entry.

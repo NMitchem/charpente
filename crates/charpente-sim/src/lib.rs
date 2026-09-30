@@ -570,13 +570,6 @@ impl Sim {
     }
 
     pub fn with_faults(seed: u64, cfg: FaultConfig) -> Sim {
-        // F1: install the filtering panic hook here, not only in `run_batch`.
-        // The deterministic fence regressions this task's oracle drives
-        // construct `Sim::with_faults` directly and never reach `run_batch`
-        // or `run_universes!` — `with_faults` is the single constructor
-        // funnel (`Sim::new` calls into it) that covers every path: direct
-        // construction, the CLI batch, and the in-test runner alike.
-        harness::install_open_fence_hook();
         cfg.validate();
         let mut sm = seed;
         let faults = Rng::new(splitmix64(&mut sm));

@@ -52,9 +52,10 @@ simulation testing only works if the system is designed for it from the first li
 `SystemTime::now()`, one stray `tokio::spawn`, one direct file write inside the core, and
 replay determinism is gone — and with it the entire verification story that justifies the
 platform. Retrofitting determinism onto a nondeterministic codebase is a rewrite. The
-promise holds across build modes too: redb-4.1.0's open path issues an extra,
-`debug_assertions`-gated page walk that used to draw sim IO rolls in debug only and skew
-release onto a different universe from the same seed (found via seed `0xff159ed76d2806e4`),
+promise holds across build modes too: redb's open path issues an extra,
+`debug_assertions`-gated page walk (`Database::new`'s `mark_allocated_page_for_debug`, in
+4.1.0 and still in 4.3.0) that used to draw sim IO rolls in debug only and skew release onto
+a different universe from the same seed (found via seed `0xff159ed76d2806e4` under 4.1.0),
 held now by forcing redb's debug-assertions on in release (`Cargo.toml`'s
 `[profile.release.package.redb]`) so both modes consume one identical draw stream.
 
@@ -810,9 +811,10 @@ knows tree shape.
 adapter (`table::Store::open` — the raw-path constructors are deny-listed). The store is
 a materialization of the log, never a second source of truth: `apply_batch` commits a
 contiguous run of records' row effects atomically with the `applied_seq` meta key in ONE
-redb write transaction at `Durability::None` (no fsync — the WAL is the durability
-story), and every record in the run commits or none of them does: an apply failure
-anywhere rolls the whole batch back and reports nothing applied — so the `applied_seq`
+redb write transaction at `Durability::None` (no fsync asked for — the WAL is the
+durability story; redb 4.3.0 keeps such a commit's pages in its own write buffer rather than
+writing them to the file, and does fsync the file after extending it), and every record
+in the run commits or none of them does: an apply failure anywhere rolls the whole batch back and reports nothing applied — so the `applied_seq`
 that transaction leaves durable is always a batch boundary, never an interior seq of a
 batch that did not commit. `apply(seq, …)` is that batch with one record, and does exactly
 the disk work a per-record commit always did — one read txn, one write txn, one commit —
@@ -834,19 +836,22 @@ payload, key, status (Pending/Done/Dead), attempts, due_at, and last_error — t
 dispatcher's substrate (§6). Done and Dead rows are retained (GC is a later question,
 filed with WAL segment GC). A store that cannot open at all — e.g. a crash tore its
 creation — is discarded at `Db::open` and rebuilt by replaying the WAL
-from scratch; the log is the only source of truth. "Cannot open" includes redb panicking
-at open: redb 4.1.0 asserts (page_manager.rs:231/:257) instead of erroring when a crash
-leaves the store file's length disagreeing with its durable header's layout — an unsynced
-`set_len` drops at crash while the header god-page write survives (`:231`), or a crash
-tears a data-page write inside an unsynced `set_len` extension that drops, and the
-surviving sectors leave a file length that is not a whole number of pages: redb
-recalculates its layout from that length, rounded down to whole pages, and asserts the
-two equal (`:257`) (both sim-found; the crash model is exactly ALICE's
-unordered-writeback). `Store::open` converts an open-time panic
-into an open failure so the discard path covers it; the fence is scoped to open — a redb
-panic during operation still propagates. Reported upstream; drop the fence when redb
-returns `Err` for this state. That rebuild holds only while the log still retains seq 0:
-`Db::checkpoint` durably persists the store, then deletes WAL segments below the
+from scratch; the log is the only source of truth. "Cannot open" includes a store file
+whose length disagrees with its durable header's layout. redb 4.1.0 asserted on two such
+states (page_manager.rs:231/:257) — an unsynced `set_len` dropped at crash while the header
+god-page write survived (`:231`), or a crash tore a data-page write inside an unsynced
+`set_len` extension that dropped, and the surviving sectors left a file length that is not a
+whole number of pages (`:257`) (both sim-found; the crash model is exactly ALICE's
+unordered-writeback) — and `Store::open` fenced that panic into an open failure. redb 4.3.0
+returns `StorageError::Corrupted` for both ("File truncated below stored layout",
+"File length does not correspond to a valid region layout"; `header.rs:254`/`:301`), so the
+fence is gone: an unopenable store is an ordinary `Err`, and a redb panic, at open or later,
+propagates as the real failure it is. 4.3.0 also closes the cause: `grow()` now syncs a file
+extension before any header can record it (`page_manager.rs:2372-2379`), so the crash model
+no longer produces either state (READ in source, and MEASURED: none in 16,896
+`job_tenancy_universe` universes — 4,096 of them at the very bases where 4.1.0 produced two —
+nor in 12,800 `kernel_workload` ones). That rebuild holds only while the log still retains
+seq 0: `Db::checkpoint` durably persists the store, then deletes WAL segments below the
 checkpoint (`Wal::gc`, floored at `DbConfig::retain_segments`, default 2; a caller-supplied
 retention pin can hold more), auto-firing every `DbConfig::checkpoint_every` committed
 records (default 4096; `0` disables the cadence — manual `checkpoint` only). Once the log
@@ -866,11 +871,11 @@ now follows the same fsyncgate rule as the log (§2 above, DESIGN.md:212-214):
 an un-retryable IO failure poisons, and restart-and-recover is the only exit.
 redb has its own independent latch: any error from its inner `StorageBackend`
 sets `CheckedBackend.io_failed` (five sites — `len`, `read`, `set_len`,
-`sync_data`, `write`), after which every further backend call returns
-`PreviousIo` ("close and re-open the database"). Because that inner backend
-*is* charpente's `DiskBackend`, charpente observes the identical condition at
-its own disk boundary, one layer down — a sticky `Arc<AtomicBool>`, created in
-`Store::open`, set in each of `DiskBackend`'s five methods on `Err`, exposed as
+`sync_data`, `write`; `cached_file.rs:222/231/240/249/258` in redb 4.3.0), after which every
+further backend call returns `PreviousIo` ("close and re-open the database").
+Because that inner backend *is* charpente's `DiskBackend`, charpente observes the
+identical condition at its own disk boundary, one layer down — a sticky
+`Arc<AtomicBool>`, created in `Store::open`, set in each of `DiskBackend`'s five methods on `Err`, exposed as
 `Store::failed()` (a graceful `close()` is deliberately not mirrored — it is
 not a failure). `Db::poisoned()` ORs it in via `Db::store_failed()`, so the
 kernel's existing request-arm poison stop (the 2026-07-05 ruling, §7) fires
@@ -886,12 +891,25 @@ latching where redb no longer does, which would poison healthy nodes into
 permanent unavailability and which only the redb-side assertion catches. A
 future redb that grows an entirely new latch path, one `DiskBackend` never
 sees, is not caught mechanically; that stays a review item against the
-five-site census above, to be re-walked on every redb upgrade.
+five-site census above, to be re-walked on every redb upgrade. The 4.3.0
+re-walk (2026-09-30) found the five sites unchanged and one new route that
+drifts the other way: `CheckedBackend::write_best_effort` (`cached_file.rs:266`)
+calls the inner `write` WITHOUT latching, and the read path uses it to reclaim
+non-durable-commit pages from redb's write buffer when buffer plus read cache
+exceed redb's cache budget (`:698-712`), discarding the error. `DiskBackend`
+cannot tell that call from a latching one and latches on its `Err`, so there
+charpente poisons where redb would carry on — the conservative direction (a
+restart-and-recover, never a silent pass), and reachable only past the 1 GiB
+cache budget, the DERIVED regime below. The new byte-range lock methods keep
+redb's default `Unsupported` bodies: no IO, no latch.
 
 Two shapes share the fix but not its evidentiary standing. On a
-**cache-resident store — MEASURED** — the only reachable trigger is the
-store's own checkpoint fsync (store applies commit at `Durability::None`, so
-checkpoint is the only store sync); before this fix the latch was completely
+**cache-resident store — MEASURED** (under redb 4.1.0) — the only reachable
+trigger is the store's own checkpoint fsync (store applies commit at
+`Durability::None`, so checkpoint is the only store sync charpente asks for;
+redb 4.3.0 adds one it does not, the fsync `grow()` issues after extending the
+file inside an apply, which reaches the same latch but has not been measured
+here); before this fix the latch was completely
 silent, since reads kept answering 200 off redb's page cache, and the window
 closed only when the next write converted the latch into apply-side poison —
 or never closed at all on a node taking no further writes. On a **store larger

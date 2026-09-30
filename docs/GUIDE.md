@@ -3339,9 +3339,10 @@ kernel stopped: the store handle is dead after a disk IO failure (redb refuses e
 The second is the **store latch**, and it is worth understanding because the
 message is reassuring on purpose. redb keeps its own independent "this handle
 is broken" flag: any error from its storage backend sets it, after which every
-later redb call fails with "close and re-open the database". The reachable
+later redb call fails with "close and re-open the database". The usual
 trigger is the store's own checkpoint fsync — store applies commit at
-`Durability::None`, so the checkpoint is the only store sync charpente makes.
+`Durability::None`, so the checkpoint is the only store sync charpente asks for
+(redb itself also fsyncs the file after growing it).
 charpente observes that same condition at its own disk boundary and folds it
 into `Db::poisoned()`, so the kernel stops exactly as it does for engine
 poison.

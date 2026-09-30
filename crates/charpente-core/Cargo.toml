@@ -10,7 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-redb = "4.1.0"
+redb = "4.3.0"
 # JSON wire identity only, for Id<T>'s hand-written Serialize/Deserialize
 # (table.rs): Rust's orphan rule forces that impl into whichever crate owns
 # Id<T>, which is here. `default-features = false`, no `derive`: this

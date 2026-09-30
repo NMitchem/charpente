@@ -1331,14 +1331,18 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
     let msg = err.to_string();
     // Needle + known-value, not byte-exact (error-suite T8): db.rs's `{e}`
-    // embeds redb's own panic-payload text (a literal Rust `assert!` source
-    // string from the fenced page_manager.rs quirk — upstream, version-tied,
-    // not ours to pin). Everything else is a scenario-known format arg (the
-    // compacted base), so it's checked byte-exact around that one opaque
-    // span.
+    // embeds redb's own `Corrupted` text, whose lengths are redb's layout
+    // arithmetic (upstream, version-tied, not ours to pin). Everything else
+    // is a scenario-known format arg (the compacted base), so it's checked
+    // byte-exact around that one opaque span. The redb needle is what shows
+    // the open failed as an ordinary `Err` (redb 4.3.0), not a caught panic.
     assert!(
         msg.starts_with("table store cannot open ("),
         "error must open with the named state: {msg}"
+    );
+    assert!(
+        msg.contains("(table store (redb): DB corrupted: File truncated below stored layout"),
+        "the embedded cause must be redb's own corruption verdict: {msg}"
     );
     assert!(
         msg.ends_with(&format!(

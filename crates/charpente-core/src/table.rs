@@ -935,42 +935,6 @@ fn apply_one_in_txn<T>(
     Ok(out)
 }
 
-thread_local! {
-    /// Set only while `Store::open`'s redb fence is active.
-    ///
-    /// A thread-local rather than a `set_hook` swap, and the reason is not
-    /// style: `std::panic::set_hook` is process-global while sim universes
-    /// run on parallel worker threads (`charpente-sim`'s harness, under
-    /// `thread::scope`). Swapping the hook around this fence would silence a
-    /// DIFFERENT worker's genuine panic for its duration — trading a benign
-    /// false alarm for a suppressed real one, which is strictly worse.
-    static IN_OPEN_FENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// True while this thread sits inside `Store::open`'s redb open-panic fence.
-/// A panic hook consults this to replace redb's benign `page_manager.rs`
-/// trace with one named line (F1).
-pub fn in_open_fence() -> bool {
-    IN_OPEN_FENCE.with(std::cell::Cell::get)
-}
-
-/// Clears the flag on unwind as well as on return. The hook runs BEFORE
-/// unwinding, so the flag is still set when it reads it.
-struct OpenFenceGuard;
-
-impl OpenFenceGuard {
-    fn enter() -> Self {
-        IN_OPEN_FENCE.with(|f| f.set(true));
-        OpenFenceGuard
-    }
-}
-
-impl Drop for OpenFenceGuard {
-    fn drop(&mut self) {
-        IN_OPEN_FENCE.with(|f| f.set(false));
-    }
-}
-
 impl Store {
     pub fn open(disk: &dyn Disk, path: &str) -> io::Result<Store> {
         let file = disk.open(path)?;
@@ -979,36 +943,19 @@ impl Store {
         // crash right after first creation could lose the file itself
         // (DESIGN §2).
         disk.sync_dir(path)?;
-        // redb 4.1.0 panics (asserts) instead of returning Err on some
-        // crash-mangled files — page_manager.rs:231/:257 fire when the
-        // durable header's layout length disagrees with the file length,
-        // a state an unsynced `set_len` dropped at crash produces while the
-        // header god-page write survives. Convert an open-time panic into an
-        // open failure so Db::open's discard-and-rebuild path engages; scoped
-        // to open only — a redb panic during operation still propagates.
-        // Reported upstream; drop the fence when redb returns Err here.
+        // A crash-mangled file whose length disagrees with its durable
+        // header's layout is an ordinary `Err` here (redb 4.3.0 returns
+        // `StorageError::Corrupted` where 4.1.0 asserted), so Db::open's
+        // discard-and-rebuild path — or its compacted-log refusal — takes it
+        // with no panic fence. A redb panic, at open or later, is a real
+        // failure and propagates (DESIGN §4).
         let latch = Arc::new(AtomicBool::new(false));
-        let db = {
-            let _fence = OpenFenceGuard::enter();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Builder::new().create_with_backend(DiskBackend {
-                    file,
-                    latch: latch.clone(),
-                })
-            }))
-        }
-        .map_err(|panic| {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .copied()
-                .map(str::to_owned)
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
-            io::Error::other(format!(
-                "table store (redb) panicked at open — treating the store as unopenable: {msg}"
-            ))
-        })?
-        .map_err(redb_err)?;
+        let db = Builder::new()
+            .create_with_backend(DiskBackend {
+                file,
+                latch: latch.clone(),
+            })
+            .map_err(redb_err)?;
         Ok(Store {
             db,
             latch,
@@ -2196,11 +2143,14 @@ impl Snapshot {
 struct DiskBackend {
     file: Box<dyn File>,
     /// Set whenever an operation below returns `Err`. redb's own
-    /// `CheckedBackend` latches on exactly this condition and no other
-    /// (redb-4.1.0 cached_file.rs:154-197), so this mirrors redb's
-    /// `io_failed` rather than inferring it from a downstream error. redb's
-    /// `close()` also sets `io_failed` (:148) — deliberately NOT mirrored
-    /// here: a graceful close is not a failure.
+    /// `CheckedBackend` latches on this condition (redb-4.3.0
+    /// cached_file.rs:218-261), so this mirrors redb's `io_failed` rather
+    /// than inferring it from a downstream error. Two divergences, both
+    /// deliberate: redb's `close()` also sets `io_failed` (:212) — not
+    /// mirrored, a graceful close is not a failure; and redb's
+    /// `write_best_effort` (:266) calls this same `write` without latching —
+    /// mirrored anyway, since the call is indistinguishable here, which is
+    /// the conservative direction (DESIGN §4, the 4.3.0 census re-walk).
     latch: Arc<AtomicBool>,
 }
 
@@ -2278,8 +2228,8 @@ mod latch_tests {
         (backend, latch)
     }
 
-    // Each of redb's five latch sites (cached_file.rs:158/167/176/185/194) has
-    // exactly one DiskBackend counterpart. If redb grows a sixth, the tripwire
+    // Each of redb's five latch sites (redb-4.3.0 cached_file.rs:222/231/240/
+    // 249/258) has exactly one DiskBackend counterpart. If redb grows a sixth, the tripwire
     // in crates/charpente/tests/kernel.rs is what catches it.
 
     #[test]
@@ -2321,13 +2271,12 @@ mod latch_tests {
 
     /// The sixth site, and the one deliberately NOT mirrored: redb's
     /// `CheckedBackend::close` sets `io_failed` unconditionally
-    /// (cached_file.rs:146-152), because it is reachable only from
-    /// `Database::drop`, so the flag it sets can never be read by a live
-    /// `Store`. This is the guard on that divergence — it reddens the moment a
+    /// (redb-4.3.0 cached_file.rs:210-216), because it is reachable only
+    /// from the database's close, so the flag it sets can never be read by a
+    /// live `Store`. This is the guard on that divergence — it reddens the moment a
     /// `close` override routes anything through `note`. It has to live here:
     /// the same claim is unassertable through `Store`, since `Store::open`
-    /// mints a fresh flag (table.rs:307) and any re-opened store reads clean by
-    /// construction.
+    /// mints a fresh flag and any re-opened store reads clean by construction.
     #[test]
     fn a_close_does_not_latch() {
         let (b, latch) = backend();
