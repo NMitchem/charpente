@@ -5741,3 +5741,380 @@ Noah's permission, and he gave it. Plan `docs/superpowers/plans/2026-09-27-prepu
 **Next.** C-2, the job-tenancy spec `docs/superpowers/specs/2026-09-27-job-tenancy-design.md`
 (94c64b6, approach D approved in chat), awaits Noah's review of the written spec. Then its
 plan, then the publish, then M3 sub-project 5.
+
+## 2026-09-30 — job tenancy: a job declares its tenant and runs in it, authorize is asked about principals only, and a route's stance says who reaches a tenant
+
+**Why.** The third docs-only build (2026-09-24 entry) found that a job cannot open a tenant
+scope the way GUIDE §16 documents, and that `authorize` sees neither the operation nor the
+caller kind. Noah's 2026-09-24 ruling made it a precondition of the 0.1.0 publish, beside
+C-1 (fixed 2026-09-25). Spec `docs/superpowers/specs/2026-09-27-job-tenancy-design.md`
+(94c64b6; approach D approved in chat, and the written spec, §14 included, approved
+2026-09-27; amendments A1–A13), plan `docs/superpowers/plans/2026-09-27-job-tenancy.md`
+(0674678, approved 2026-09-28), nine tasks. Workspace
+`.superpowers/sdd/2026-09-27-job-tenancy/`; every report and log named below is there.
+
+**Shipped.** Each of Tasks 1–8 passed its own review, Tasks 2, 4, 6 and 8 after one fix
+round. The controller's counted workspace gate after each task and each fix round was 87 of
+87 `test result: ok` (`gate-task-*.log`, 11 runs; Task 2's doc-comment-only fix commit was
+covered by Task 3's).
+- **T1** `fae2bee`: `#[job(global)]` is accepted in any order and swept onto every `#[job]`.
+  `SessionSweep`'s and `CountUp`'s fingerprints are pinned to literals verified at base
+  (`0x7e72_9c20_6b79_cbad`, `0x766b_8ba4_18db_4d08`), so a `global` job keeps its
+  fingerprint.
+- **T2** `6de0a09`, `95d7c32`: `TenantAdmission` and `Tx::admit_scope`, the operator's way
+  into a tenant on a `Group`-minted, sealed admission. The fix round corrected the seam
+  comments that still called `open_scope` the only `ScopedTx` constructor, and proved
+  `admit_scope`'s no-`authorize` assertion red by mutation.
+- **T3** `d78c716`: route stances. `public(Org)` admits by declaration; a credential-free
+  scope line on plain `public` is a named 401; statuspage I-1, a write route flipped to
+  `public`, is pinned.
+- **T4** `7f6c2c6`, `bc53373`: `authorize` takes `&Principal`, and `Principal`'s fields are
+  `pub(crate)`. The review found `charpente::auth::resolve` and `Presented` public, so a
+  handler could mint a principal for any subject in its own transaction; both are
+  crate-private now.
+- **T5** `e0f8df2`: record tag `0x0a` carries a scoped job's tenant into `JobRow.scope`;
+  `PROTO_VERSION` 4. The replication fixture that fed tag 10 as "a tag this binary does not
+  know" moved to 11, since `0x0a` is now the scoped enqueue.
+- **T6** `c1d24cf`, `16c755d`: `#[job(scoped_by = Org)]` runs in its enqueuer's tenant —
+  `ScopedTx::enqueue`, the declared fan-out `enqueue_in` under `cross_tenant`, and the
+  dispatcher's `JobScope` — and a bare `#[job]` is refused. DECISIONS §12's remedy clause
+  becomes spec §14's text. The review found that the refusal's taught fix,
+  `tx.enqueue_in::<Org>(…)`, was E0107; `enqueue_in` now takes the job as
+  `impl Job<Scope = S>` (A13), and a compile-pass fixture calls it as taught.
+- **T7** `29022e5`: `describe` names `public_scope` and `scoped_by` by type.
+- **T8** `03e1c5c`, `e10dfa1`, `79ae1c0`: oracle 4 (below). `e10dfa1` is its own commit
+  because it fixes another property: `kernel_workload`'s final loop returned `Ok(())` when
+  all 8 reopens failed, so a universe that adjudicated nothing counted as a pass. `79ae1c0`
+  gives oracle 4 the same `give_up`, classifies every 5xx, and adds a fourth victim.
+- After the whole-branch review (next): `c0eb74b` and `8d220fc`; then `20fb57e`, and
+  `b9821a3`, the body-cap test the mutation run found (T9-R8); the close-out, `afd5d24` and
+  `90aebf2`; and `929c0ec`, the overlay-cursor test the mutation run found.
+
+**What the whole-branch review found after all eight tasks had passed their own reviews.**
+`final-review.md` (opus, `0674678..79ae1c0`): 1 Critical, 1 Important, 7 Minor.
+
+- **C1 (Critical): any handler's bare `Tx` could write `charpente.jobs` rows.** `JobRow`
+  was an ordinary `UnscopedRow` with every field `pub`, and C-2 had made its `scope` an
+  authority: the dispatcher mints its own `TenantAdmission` and opens whatever tenant the
+  row names. The reviewer's probe used the public API only. An anonymous request on a plain
+  `public` route that opens no scope and declares no `cross_tenant` moved desk 1's Pending
+  job into desk 9 and forged one into desk 13 (`desk 9: [42]`, `desk 13: [7]`), and a
+  nulled `scope` stopped the kernel at dispatch, again on every restart. The controller
+  re-ran the probe at `79ae1c0` before acting, and it reproduced. **C1 falsified the
+  sub-project's headline guarantee and at least eight doc claims written for it, and it was
+  found only at the whole-branch review.** Every task review and every counted task gate
+  had passed over it: the spec's inventory never asked who else can write the row, and
+  oracle 4's workload is well-behaved app code. Spec §12 had refused approach C for exactly
+  this effect. Closed by `c0eb74b` (FR-C1):
+  - `Tx::put` and `Tx::delete` are bound on `WritableRow`, and `JobRow`'s scope is the
+    sealed `PlatformOwned`, so a write is E0277, "`JobRow` rows are the platform's, and app
+    code cannot write them";
+  - an app `Row` that borrows the name `charpente.jobs` fails to build with E0080. It is a
+    post-monomorphization const check, so `cargo check` and clippy do not show it
+    (FR-C2a);
+  - the dispatcher settles a job through `Tx::settle_job(&JobRow, &TenantAdmission)`,
+    whose admission only a `Group` mints;
+  - a Pending row whose tenancy disagrees with the mounted declaration is refused by name
+    at startup (FR-M4), and so is such an enqueue, at `Group::stage` (FR-C2b: a
+    hand-written `impl Job` that copies a scoped job's name and fingerprint and declares no
+    tenant).
+
+  The probes were red at `79ae1c0` and refused after (`fix-probe-*.log`). The re-review
+  probed 20 doors (`final-fix-rereview.md`).
+- **N1 (Important), found by that fix's re-review: an enqueue into a tenant of a different
+  scope type.** `Group::stage` checked tenant presence only, and `JobRow.scope` is a bare
+  `u64`. So a `public(Board)` route enqueuing a job the binary mounts as
+  `scoped_by = Desk` — a hand-written stand-in, or `use super::Board as Desk;` above an
+  unmounted `#[job]` — ran it in `Desk` 13 and 14 for anonymous callers (`desk 13: [7]`,
+  `desk 14: [8]`; `rereview-probe-runtime.log`), and six of the eight doc claims were false
+  as worded again. Closed by `20fb57e`: `Group::stage` compares the enqueuing job's scope
+  `TypeId` with the new `JobDef.scope_type` and refuses by name. That second fix round
+  departed from the one-wave rule on purpose, because N1 was C1's class (FR-N1); its
+  re-review is `final-fix-rereview-2.md`.
+- **The rest.** I1, job and event rows readable from any transaction (not a C-2
+  regression), got its boundary sentence in GUIDE §16 and DESIGN §8 (`8d220fc`, FR-I1).
+  `8d220fc` also closed M1 (the drift probe told an `auth` route to declare `public(Org)`),
+  M3 (`CrossTenant`'s texts named enumeration only), and DECISIONS.md:256's
+  `#[job(cross_tenant)]`, which no longer compiles (FR-D256). M4 landed in `c0eb74b`, and
+  the first re-review's Mn1, Mn2 and Mn4 in `20fb57e`. The second re-review's residuals are
+  stated as wide as they are in `90aebf2` (FR-NB2): GUIDE §6, DESIGN §3 and `tenant.rs`
+  name both cross-binary cases and the drain, and the fingerprint claims now say that a
+  `scoped_by` path that keeps its spelling but names another type is not a shape change.
+  M2 and M7 are follow-ups, M5 is left, and M6 is this entry naming the commit each count
+  covers. Fix reports: `final-fix-report.md` (both rounds), `close-report.md`.
+
+**Seeds and universes.**
+- **Oracle 4**, `job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from`
+  (`crates/charpente/tests/kernel.rs`): fixed base `0x70B5_0001`, N = 256. N was set by
+  timing one batch in CPU time: user+sys 3.80 s, against 3.53 s for
+  `kernel_jobs_are_exactly_once_under_the_fault_matrix` at 256 (1.08×, under the 2× limit;
+  `job-tenancy-swarm-256.log`, `kernel-swarm-timing.log`). `require:` holds spec §9's four
+  keys — `tenant:job_multi_tenant_write` 177, `tenant:job_run_after_crash` 31,
+  `tenant:job_fan_out` 167, `tenant:anonymous_refused` 449 — plus `job:retried` 128 as a
+  strengthening (ruling F19). Those are the counts at the pinned base, the same from
+  `03e1c5c` to `90aebf2`. Four naive victims each fail the shared oracle by name beside a
+  passing control on the same store: a job row carrying another shop's tenant
+  (`0x70B5_0101`), a job-written row under tenant 0 (`0x70B5_0102`), a fan-out landed in
+  the first tenant (`0x70B5_0103`), and, from T8's fix round, a credential-free write
+  stored through a route that refuses one (`0x70B5_0104`). Seen red: T8's four mutations
+  (seeds `0x2caaec11b5156590` three times, `0x653ef5e6e04b688c` once), the retry leg by a
+  dispatcher mutation (`0x1f60259c482a46cd`), and the stored-stripped-write leg by the
+  fourth victim. Two branches have no red: a global job carrying a tenant, which after C1's
+  seal only a codec bug could produce, and the wire check that fails a 200 answered to a
+  stripped request outside `public(Shop)`.
+- **Fresh bases.** `CHARPENTE_BASE_SEED` skips `require:` and `floor:`, so these runs are
+  evidence about failures only. Each row names the commit it covers.
+
+  | Commit | Property | Bases | Universes | Gave up |
+  |---|---|---|---|---|
+  | `03e1c5c` | oracle 4 | `0x70B5_A001`, `0x70B5_B002`, `0x70B5_C003` | 768 | 0 (no give-up arm yet) |
+  | `79ae1c0` | oracle 4 | the same three | 768 | 57 / 41 / 52 |
+  | `79ae1c0` | tenant, `every_scoped_read_returns_only_its_own_tenants_rows` | `0xC2F0_0001`, `0xC2F0_0002`, `0xC2F0_0003` | 768 | 0 |
+  | `79ae1c0` | `kernel_jobs_are_exactly_once_under_the_fault_matrix` | the same three | 768 | 54 / 62 / 60 |
+  | `79ae1c0` | realtime, `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing` | the same three | 384 | 0 / 1 / 0 |
+  | `c0eb74b` | oracle 4 | `0xF1C1_0001`, `0xF1C1_0002`, `0xF1C1_0003` | 768 | 59 / 55 / 48 |
+  | `c0eb74b` | kernel exactly-once | the same three | 768 | 59 / 43 / 47 |
+  | `c0eb74b` | tenant | the same three | 768 | 0 |
+  | `20fb57e` | kernel exactly-once | `0xF1C2_0001`, `0xF1C2_0002`, `0xF1C2_0003` | 768 | 54 / 50 / 56 |
+  | `20fb57e` | tenant | the same three | 768 | 0 |
+  | `20fb57e` | oracle 4 | `0xF1C2_0002`, `0xF1C2_0003`, `0xF1C2_0004` | 768 | 52 / 48 / 53 |
+  | `20fb57e` | oracle 4 | `0xF1C2_0001` | red at universe `0x3252300b37ab3e88`, below | — |
+  | `90aebf2` | oracle 4 | `0xF1C2_0001`, `0xF1C2_0005` | 512 | 53 / 57, one each under the store-bricked key |
+
+  That is 8,576 universes with no failure, plus the red batch. The diagnosis below adds
+  continue-on-failure runs at `79ae1c0`: oracle 4 over the 16 bases `0xF1C2_0001` to
+  `0xF1C2_0010` (4,096 universes, 2 failures) and `kernel_workload` over the 170 bases
+  `0xF1C2_0001` to `0xF1C2_00AA` (43,520 universes, none).
+- **Coverage, byte for byte.** The three filtered baselines taken at `0674678` — tenant at
+  base `0x7E4A_0001` (16 lines), realtime at `0x2EB2_5C09` (20), and kernel exactly-once at
+  `CHARPENTE_BASE_SEED=0x3E7A0927` (20) — were identical at Tasks 3, 4, 5 and 6 and at Task
+  6's fix round (`*-coverage-task{3,4,5,6,6-fix1}.txt`). So spec §9 item 7's prediction,
+  that no seed moves, held. `e10dfa1` added only `universe:gave-up: 58` and a new summary
+  line to the kernel file (`kernel-coverage-t8fix1-a.txt`, 21 lines), and `79ae1c0` added
+  only `universe:gave-up: 53` and a new summary line to oracle 4's
+  (`job-tenancy-coverage-t8fix1.txt`, 20 lines). Against those four baselines the fix waves
+  and the close-out were identical too: `*-coverage-fixc1.txt` (`c0eb74b`),
+  `*-coverage-fix2.txt` (`8d220fc`), `*-coverage-fix3.txt` (`20fb57e`), and
+  `kernel-coverage-close{,-head}.txt` and `job-tenancy-coverage-close{,-head}.txt` (the
+  close-out; `-head` is `90aebf2`).
+- **`0xe2d97275c15cc087`, RED first again.** ci.yml's live kernel pin was re-verified at
+  `79ae1c0` in a worktree. With the fault-fallout classification deleted (`kernel.rs:2101`,
+  `if !is_fault_fallout(&msg) {` → `if true {`) it fails with `scan_by_scoped: table store
+  (redb): I/O error: injected read error`; restored, it passes (`t9-redfirst.log`,
+  `t9-redfirst-green.log`). The pin still reaches the arm its teeth depend on.
+- **Pinned in this work: `0x3252300b37ab3e88` and `0x5b24d7f5e5947edd`,** each giving up
+  as a store bricked below a compacted log. The first failed oracle 4 at fresh base
+  `0xF1C2_0001` in fix round 2 and reproduced unchanged at `8d220fc` and `79ae1c0`; the
+  second came from the diagnosis's sweep, at base `0xF1C2_0005`. Both were red at `b9821a3`
+  before the fix. The diagnosis (`sim-0x3252300b-diagnosis.md`) is classification 2:
+  injected-fault fallout that oracle 4 misread. One injected crash tore a page write inside
+  a dropped `set_len` extension of `tables.redb` and left 441856 bytes, not a whole number
+  of pages, so redb 4.1.0 asserts at `page_manager.rs:257`. The log was already compacted
+  to seq 84, so `Db::open` returns DESIGN §4's named refusal (restore, or widen
+  `retain_segments`): a documented outcome, not a platform bug. The rate is 2 of 4,096
+  fresh oracle-4 universes and 0 of 43,520 `kernel_workload` universes, though
+  `kernel_workload`'s open sites have the same gap, which predates C-2. `afd5d24`
+  (FR-SIM) gives both workloads a narrow arm at all four open sites — the refusal's text,
+  the fence's `panicked at open`, and a fired crash — that gives up under
+  `kernel:gave-up:store-bricked-after-compaction`, as replication's arm already does. The
+  pins, `a_store_bricked_below_a_compacted_log_at_the_final_open_gives_up_by_name` and
+  `…_at_a_round_open_gives_up_by_name`, assert the reason, the site, the compaction seq
+  (84, 26) and the key's count of 1. `a_partial_match_of_the_bricked_store_refusal_is_not_excused`
+  goes red if any one of the three conditions is dropped. `90aebf2` names the
+  torn-extension shape (`:257`) in DESIGN §4 beside the header-write one (`:231`).
+- **Give-up rates.** `e10dfa1` turned `kernel_workload`'s silent passes into honest
+  give-ups: 0 → 58 of 256 at `0x3E7A0927`. Oracle 4 gives up in 53 of 256 at its pinned
+  base (21%; `kernel_workload` 23%) and in 41 to 59 of 256 across the eleven fresh batches
+  above, so its adjudicated evidence at the pinned base is 203 of 256. A give-up there is
+  the final loop's 8-reopen budget running out, and it forfeits only the last round's
+  adjudication, because each earlier round's opening oracle pass ran (ruling FR-minors).
+  The budget stays at 8 (T8's ruling). An uncommitted 64-reopen run cut the give-ups
+  58 → 13 (`kernel_workload`) and 53 → 16 (oracle 4), and every rescued universe passed.
+
+**Mutants.** `scripts/mutants.sh` (the `charpente test --mutants` verb), `--jobs 3` (2 for
+the alias and overlay reruns), each `--re` validated against `cargo mutants --list` first.
+Rulings: `db.rs` adds `apply_batch|stage` and core `job.rs` is narrowed to `JobRow` (F18);
+`genclient` is added (T9-R1); `--timeout 2600` from the second driver on (T9-R4). The first
+runs were at `79ae1c0`, before the whole-branch review; the reruns and `app` followed at
+`79ae1c0` under a second driver, which T9-R6 let run concurrently with the review. Every
+function the fix waves touched was then rerun at `b9821a3` (FR-iso): the fix source diff
+holds 56 mutants (`cargo mutants --list --in-diff`), all inside the post-fix targets. `db`
+was stopped before it started at `79ae1c0` (FR-iso), so it ran in full at `b9821a3`. The
+first `app` run ended with no result: the laptop slept through its baseline and the run was
+interrupted when the session ended. It ran again under the second driver.
+
+| Run | File, `--re` | Commit | `--test-package` | Total | Caught | Missed | Unviable | Timeout |
+|---|---|---|---|---|---|---|---|---|
+| tenant | `tenant.rs`, whole file | `79ae1c0` | charpente | 4 | 0 | 0 | 4 | 0 |
+| describe | `describe.rs`, `route_info\|job_info\|to_human` | `79ae1c0` | charpente | 5 | 3 | 0 | 2 | 0 |
+| genclient | `genclient.rs`, `into_route\|into_job` | `79ae1c0` | charpente-cli | 2 | 0 | 0 | 2 | 0 |
+| dispatch | `kernel/dispatch.rs`, `run_due_into\|JobScope` | `79ae1c0` | charpente | 8 | 3 | 0 | 5 | 0 |
+| table | core `table.rs`, `materialize_job\|NoJobTenant\|UnscopedJob` | `79ae1c0` | charpente-core, charpente | 6 | 4 | 0 | 0 | 2 (caught by log, T9-R7) |
+| job | core `job.rs`, `JobRow` | `79ae1c0` | charpente-core, charpente | 6 | 1 | 0 | 5 | 0 |
+| macros-job | macros `job.rs` and `fingerprint.rs`, whole files | `79ae1c0` | charpente-macros, charpente | 28 | 13 | 0 | 11 | 4 (caught on rerun) |
+| macros-route | macros `route.rs`, `scope_name\|public_scope_tokens\|undeclared_capability\|RouteArgs` | `79ae1c0` | charpente-macros, charpente | 15 | 2 | 0 | 11 | 2 (caught on rerun) |
+| rerun table | core `table.rs`, `materialize_job -> ` | `79ae1c0` | charpente-core, charpente | 2 | 0 | 0 | 0 | 2 (caught by log, T9-R7) |
+| rerun macros-job | macros `job.rs` and `fingerprint.rs`, `delete ! in render\|replace global_and_scoped_by` | `79ae1c0` | charpente-macros, charpente | 4 | 4 | 0 | 0 | 0 |
+| rerun macros-route | macros `route.rs`, `match guard args\.auth with (true\|false) in undeclared_capability` | `79ae1c0` | charpente-macros, charpente | 2 | 2 | 0 | 0 | 0 |
+| app | `http/app.rs`, `build_ctx\|stage_or_subscribe\|subscription_event_names\|Declared\|Stance\|public_admission\|anonymous_scope\|schedule` | `79ae1c0` | charpente | 23 | 15 | 1 | 7 | 0 |
+| post table | core `table.rs`, `row_is_scoped` | `b9821a3` | charpente-core, charpente | 5 | 5 | 0 | 0 | 0 |
+| post macros-job | macros `job.rs`, `expand` | `b9821a3` | charpente-macros, charpente | 2 | 0 | 0 | 2 | 0 |
+| post macros-route | macros `route.rs`, `undeclared_capability` | `b9821a3` | charpente-macros, charpente | 3 | 2 | 0 | 1 | 0 |
+| post dispatch | `kernel/dispatch.rs`, `run_due_into\|JobScope` | `b9821a3` | charpente | 8 | 3 | 0 | 5 | 0 |
+| post app | `http/app.rs`, app's regex plus `mount_jobs\|App::open` | `b9821a3` | charpente | 23 | 14 | 0 | 9 | 0 |
+| post db | `db.rs`: the scope constructors, the enqueue family, the record codec, `apply_batch\|stage`, and the seal's functions | `b9821a3` | charpente-core, charpente | 101 | 55 | 17 | 25 | 4 (caught by log, T9-R7) |
+| alias (T9-R9) | `db.rs`, `is_platform_table\|refuse_platform_table` | `b9821a3` | charpente-macros | 17 | 13 | 0 | 4 | 0 |
+| overlay | `db.rs`, `merge_overlay_rows` | `929c0ec` | charpente-core, charpente | 5 | 5 | 0 | 0 | 0 |
+
+The six hand inversions (Task 9 Step 2), each at `79ae1c0` in a worktree, reverted and
+sha-verified, all RED (`t9-inversion1..6.log`):
+
+| # | Site | Inversion | Red |
+|---|---|---|---|
+| 1 | `Scoped::scope` rule 1 (`public(S)`) | the declared admission → `None` | tenant.rs 6 failed, 11 passed; (b) answers 401 where 200 is right |
+| 2 | rule 2 (a credential) | `Some(principal)` → the anonymous 401 | 3 failed, 14 passed; (d) 401 where 200 is right |
+| 3 | rule 3 (no credential) | `None` → `open_scope` with an empty-subject principal | tenant.rs 5 failed, 12 passed ((a) 200 where 401 is right); oracle 4 red, "a 400 no request here should meet …", seed `0x2caaec11b5156590` |
+| 4 | the dispatcher's scope binding | `id` → `id ^ 1` | kernel.rs 7 failed, 4 passed; "desk 0's job wrote inside desk 0 left: None right: Some(1)" |
+| 5 | the dispatcher's scope assert | `assert_eq!` → `assert_ne!` | 4 failed, 1 passed |
+| 6 | `push_enqueue`'s scope assert | `!=` → `==` against `Unscoped`'s `TypeId` | 5 failed, 0 passed |
+
+Every non-clean result, and how it was resolved:
+- **The first run's 8 TIMEOUTs** (table 2, macros-job 4, macros-route 2). The six macros
+  ones were the two-`--test-package` baseline artifact (T9-R4): the baseline ran the first
+  package only (macros-job 32 s, auto-timeout 162 s; macros-route 31 s, 159 s; table's
+  `charpente-core` 13 s, 68 s), while each mutant ran both. Rerun with `--timeout 2600`, all
+  six were caught. The two `materialize_job` mutants timed out again: they are the hang
+  below, not the artifact.
+- **T9-R7, caught by log.** Each `materialize_job` mutant's log shows
+  `restore_reports_pending_jobs_and_exits_zero ... FAILED`, and then two lib tests with no
+  deadline hang, so the test binary never exits and the instrument can only say TIMEOUT.
+  Applied by hand in a scratch worktree, both went red ("the count must be the real one, or
+  a zero passes this test … pending jobs  0") beside a green control (`t9-table-probe.log`).
+  The post-fix db run's 4 TIMEOUTs are the same class: each log names failing tests before
+  the hang (`decode_record → Ok(vec![])`, `push_enqueue → ()`, `enqueue → ()`,
+  `apply_batch → Ok(())`).
+- **T9-R8, `b9821a3`.** app's MISSED was `app.rs:826` `>` → `>=` in `stage_or_subscribe`,
+  the body-cap boundary, a line from `f67a01f` (2026-07-02): the only test sent cap + 1
+  bytes. `a_body_of_exactly_body_cap_bytes_is_handled_not_refused` sends exactly 64 bytes to
+  `body_cap: 64` and pins `200 "1"`; the mutant answers 413. The post-fix app run catches it
+  (`app.rs:853`).
+- **T9-R9, the `--test-package` trap.** 13 of post db's 17 MISSED were `is_platform_table`
+  (12) and `refuse_platform_table` (1), const fns whose only oracle is the E0080 trybuild
+  fixture `job_row_table_name_borrowed`, in `charpente-macros`, outside db's test packages.
+  Rerun under `--test-package charpente-macros`, all 13 were caught.
+- **genclient (T9-R1).** Both mutants were unviable: cargo-mutants replaces whole function
+  bodies, and `RouteInfo` and `JobInfo` have no `Default`. The item the target was added
+  for, T7's deferred `.map(leak)` lines, was closed by the final reviewer's hand mutations
+  of `public_scope` and `scoped_by`, both red (`final-review.md`, triage row 156).
+- **`merge_overlay_rows`, `929c0ec`.** `db.rs:1161` `<` → `==` and `<` → `<=`
+  (`if id < from_id`, from `83b2eec`, 2026-09-03) survived because every overlay read used
+  cursor 0. `a_staged_scan_from_starts_exactly_at_its_cursor` stages rows 4, 5 and 6 and
+  requires `scan_from(5)` to return [5, 6] at four read sites; the mutants return [4, 6] and
+  [6]. The rerun at `929c0ec` caught 5 of 5.
+- **T9-R10 and T9-R11, M-c and M-d.** `db.rs:1996:29` `&&` → `||` and `:1996:44` `>` →
+  `>=`, in `apply_batch`'s migration close-out (`575ac9d`, 2026-07-18), were argued
+  equivalent on every transition the platform writes (`mutants-missed-report.md`). The
+  writers are first-write adoption and the executor's watermark and close-out. M-c differs
+  only at a close-out over an empty table, where its extra index rebuild decodes zero rows
+  and every printed read matched; M-d differs only where an in-flight marker clears at the
+  same version, which no writer produces. Only a forged `SchemaVersion` row distinguishes
+  either, since `charpente.schema_versions` is app-writable, and for M-c also
+  `migration_batch_size: 0` over an idle table. Both stay visible survivors: no
+  `.cargo/mutants.toml` entry (the file is unchanged in this work), and no test pins an
+  outcome over an already-inconsistent store.
+
+**Zero unresolved MISSED remain across every C-2 target and every function the fix waves
+changed, except the two argued-equivalent survivors, M-c and M-d.** Every TIMEOUT is
+resolved: rerun and caught, or caught by log. So spec §13 criterion 5 holds except for
+those two, which sit on pre-C-2 migration lines, and no exclusion was added.
+
+**The statuspage, rebuilt** (spec §13 criterion 2; Task 9 Step 4). `6037704` was built from
+a scratch copy against `79ae1c0`, the tree before the review's fix waves, with
+`cargo check --all-targets`; the original checkout is untouched (`statuspage-pass1.log`,
+`statuspage-pass2.log`). Criterion 2 names the finished `main`, and `79ae1c0` stands for it
+because the fix waves changed none of the code these errors come from: no line of
+`git diff 79ae1c0 929c0ec` touches the `#[job]` tenancy refusal, the signatures of
+`Tenant::authorize`, `open_scope` or the enqueue family, or `Principal`'s fields.
+- **Pass 1, 12 errors.**
+  - `maintenance.rs:109:1`, `:139:1` and `notify.rs:10:1`: "`MaintenanceSweep`" (and
+    "`ApplyWindow`", "`NotifySubscribers`") "declares no tenancy — a job says which: write
+    `#[job(scoped_by = Org)]` if it acts inside one tenant … or `#[job(global)]` if it
+    belongs to no tenant (the only kind cron can schedule). Neither is the default."
+    `maintenance.rs:109` is `#[job(cross_tenant)]`, not a bare `#[job]`, and is refused the
+    same way.
+  - `lib.rs:42:32`: E0053, method `authorize` has an incompatible type for trait.
+  - `maintenance.rs:149:48`, `notify.rs:24:48`, `public.rs:41:40`, `:90:44` and `:127:40`:
+    E0308 mismatched types, each at an `open_scope(org, None)`.
+  - `operators.rs:160:33`, `lib.rs:83:10` and `lib.rs:89:27`: E0616, field `subject` of
+    struct `Principal` is private. These are outside criterion 2's list; they are the
+    spec's designed change (Task 4).
+
+  Every criterion-2 site is refused in pass 1.
+- **Pass 2, 11 errors,** after `#[job]` → `#[job(global)]`, which changes `notify.rs:10`
+  and `maintenance.rs:139` only: `maintenance.rs:109` still declares no tenancy; `lib.rs:42`
+  E0053; the same five E0308 and three E0616; and `incidents.rs:261:20`, E0271, type
+  mismatch resolving `<NotifySubscribers as Job>::Scope == Org`. That one is induced by the
+  edit, which makes global a job that `incidents.rs` enqueues on a `ScopedTx<Org>`.
+
+**Gate** at `929c0ec`, the code-final commit, run in a detached worktree with its own target
+dir, every step CI's (`gate-final2.summary`, `gate-final2.log`, `gate-final2-<step>.log`):
+fmt, clippy `-D warnings`, `cargo check -p charpente-core` and `cargo publish --workspace
+--dry-run --no-verify` exit 0; `cargo test --workspace --no-fail-fast` 87 of 87 `test
+result: ok`, 0 FAILED, 1545 passed, 0 failed, 53 ignored — `90aebf2`'s 1544 plus
+`929c0ec`'s one test. The four replay pins passed (`0x8bee1752811ae873` 4 tests,
+`0xff159ed76d2806e4` 1, `0x348270b38f166529` 1, `0xe2d97275c15cc087` 1), as did the bench
+passthrough guard (1) and the two launch guards (2). The TS gate: `npm ci` exit 0,
+`check-client` exit 0 with no output, samples 3 passed, `npm run check` exit 0, `npm run
+test` 19 of 19. The record commit on top is docs-only, and no test reads PLAN.md, this file
+or the spec.
+
+The earlier full gate at `90aebf2` — the code tree before `929c0ec`, which adds one test —
+ran in its own worktree: fmt, clippy `-D warnings`, `cargo check -p charpente-core` and
+`cargo publish --workspace --dry-run --no-verify` exit 0; `cargo test --workspace
+--no-fail-fast` 87 of 87 `test result: ok`, 0 FAILED, 1544 passed, 53 ignored; the four
+replay pins, the bench passthrough guard, the two launch guards and the TS gate (`npm ci`,
+`check-client`, samples 3 passed, `npm run check`, `npm run test` 19 of 19) all passed
+(`gate-final.summary`, `gate-final.log`). The base gate at `0674678` was 86 of 87: the one
+red was `ctl.rs`'s `promote_against_a_dead_port_exits_2_with_the_connect_message`, the known
+ephemeral-port TOCTOU, in its third sighting; it passed 5 of 5 alone. Plus the docs-only
+check of this record commit: `cargo build -p guide-examples` clean; `cargo test -p
+guide-examples --no-fail-fast` 8 of 8 `test result: ok`, 0 FAILED.
+
+**Follow-ups.** DECISIONS.md was edited twice in this work, and Noah is told here: §12's
+remedy clause became spec §14's text, approved with the spec (`c1d24cf`), and line 256's
+`#[job(cross_tenant)]` became `#[job(…, cross_tenant)]`, a syntax fix that leaves the
+decision unchanged (`8d220fc`, FR-D256).
+
+*Decisions for Noah:*
+1. **The final-loop budget:** keep 8 reopens; raise it (64 rescued 45 `kernel_workload` and 37 oracle-4 universes, all passing); or guard the adjudicated count, which needs a key credited once per adjudicated universe or a ceiling the runner lacks (`floor:` is a lower bound, and `universe:gave-up` counts give-ups).
+2. **Seal `Tx`-side reads of platform tables** (FR-I1): jobs and events are readable across tenants, as GUIDE §16 and DESIGN §8 now say, and sessions, API keys and schema versions are unaudited (FR-C2c); the pre-C-2 `EventRow`/`Tx::emit_keyed` write class goes with it. A public-API change.
+3. **Record a scoped job's tenant type, not only its id** (FR-P3), by a record-format change or a startup check against a stored type name: closes P2 (rows from a binary that never mounted the job; such a row dead-letters after about 7.5 minutes if that binary runs a kernel) and P3 (a re-pointed `scoped_by` path with jobs Pending).
+4. **A hand-built `JobDef`** can misroute a job (P4) or invert the scope-type check through `scope_type` (P5); FR-P45 put it in the operator tier, and a ~5-line assert in `JobScope::open` would close both.
+5. **`Principal: Clone`** (M7) lets a real principal outlive its request; removing it is a public-API change to a type spec R2 shaped. `TenantAdmission: Clone + 'static` (deferred item 93) is the same property.
+6. **Scope-type rendering** (FR-NB1): the scope-type refusal renders same-last-segment types identically and a generic one as `` `B>` ``, and blames a stand-in when a hand-built `JobDef` is the cause; spec R8's last-segment choice governs `describe` and the 401 the same way.
+7. **DECISIONS.md:328** ("runs in the tenant its enqueuer opened") omits fan-out, "or its fan-out named", and the cross-binary residual (FR-C2c); the text is Noah's.
+
+*Unfinished work the docs already settle:*
+8. **redb 4.1.0 → 4.3.0, dropping the open fence** (DESIGN §4: "drop the fence when redb returns `Err` for this state"): 4.3.0 does for the torn-extension `:257` state, the `:231` header state is unchecked, and that commit updates the two store-bricked pins.
+9. **The give-up class in other swarms** (`Sim::give_up`'s doc): `tenant.rs:977`, `transactions.rs:821`, `http.rs:1398`, `group_commit.rs:2321`/`:2418` and `archive.rs:8196`/`:8580`/`:8622` return `Ok` after an exhausted retry; `typed_tables.rs:458-462` is the adjacent shape.
+10. **`migration_batch_size: 0`** bumps an idle table's version over unmigrated rows, and every later read fails (`mm-*.log`): refuse it by name (hard rule 5).
+11. **Seal writes of `charpente.schema_versions`** by adding it to `PLATFORM_TABLES`, as that list's doc describes; with 10, this removes every input that distinguishes M-c and M-d.
+12. **The 401's suggested fix** (M2) drops the route's other flags, so on an `emits(...)` route it silently drops the declaration: hard rule 5, as with A13.
+13. **The mutants verb with two or more `--test-package`** takes its timeout from a first-package-only baseline (6 of the 8 TIMEOUTs here; the other 2 are item 14's hang): baseline every package, or refuse the combination without `--timeout`.
+14. **Two lib tests with no deadline**, `launch.rs`'s `a_kernel_refusal_inside_the_serve_arm_ends_dispatch_with_its_code` and `serve.rs`'s `a_kernel_that_refuses_to_start_ends_wait_with_status_1`, hang `cargo test` when no job materializes.
+15. **`charpente-sim`'s `harness.rs:261`** prints "Db::open rebuilds it" even when `Db::open` refuses, as in both pinned universes (hard rule 5).
+16. **The drift probe's error prints the raw Debug** `App(AnonymousScope("…"))`, now pinned byte-exact by M1's test (hard rule 5).
+17. **A scoped app `Row` whose `TABLE` aliases an unscoped app table's name** is refused at apply, which poisons the store; pre-existing (FR-C2c).
+18. **The store-bricked arm's crash condition is nearly vacuous**, since both workloads crash every round (replication's arm too); a sharper cause check, such as redb's torn-extension assert signature, would close it.
+19. **The `ctl.rs` TOCTOU** (2026-09-25 entry, follow-up 2), third sighting.
+
+*FYI, not decisions (progress.md's FR-SIM follow-ups):*
+- **Optional hardening** of DESIGN §4's single-node limitation (a `set_len` plus sync before redb writes into an extension, or trimming a sub-page tail): DESIGN §4's named refusal is the platform's answer, so it is not owed.
+- **The crash model:** the diagnosis argues by reasoning, not experiment, that ext4 and XFS never leave a sector-granular length inside an extension; DESIGN §1 admits one on purpose, and changing that would change the frozen replay contract.
+
+Left without a follow-up: M5 (no end-to-end test takes a scoped Pending job through seeding or
+restore), T8's oracle-4 strengthenings M-2, M-3 and M-7, and the cosmetic deferred minors, as
+the final review triaged them (CAN WAIT); and Mn3 (rustc's sealed-trait help lists
+`PlatformOwned` in two pinned `.stderr` files), which FR-N1 deferred.
+
+**Next.** The 0.1.0 publish, which is Noah's call, then M3 sub-project 5, the launch run.

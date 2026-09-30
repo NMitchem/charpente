@@ -221,14 +221,18 @@ Sub-projects, in dependency order:
    with the brief written first and the agent given README + GUIDE only. Exit: zero
    framework patches, zero Criticals in review that a platform oracle should have caught,
    `--mutants` clean over its sim properties. Findings ledgered as testimony, as the
-   helpdesk write-up was. The 0.1.0 publish now waits on two platform fixes this build
-   found: (1) `#[event]` payload evolution is unguarded, and a delivery-time decode
-   failure stops the whole node with an error naming neither the event nor a fix — **fixed
-   2026-09-25** (spec `docs/superpowers/specs/2026-09-24-payload-shapes-design.md`: every
-   payload records its shape and is never decoded under another; delivery fails a tail,
-   never the node; a stopped kernel ends the process); (2) a job cannot open a tenant
+   helpdesk write-up was. The 0.1.0 publish waited on two platform fixes this build found,
+   and both are fixed: (1) `#[event]` payload evolution is unguarded, and a delivery-time
+   decode failure stops the whole node with an error naming neither the event nor a fix —
+   **fixed 2026-09-25** (spec `docs/superpowers/specs/2026-09-24-payload-shapes-design.md`:
+   every payload records its shape and is never decoded under another; delivery fails a
+   tail, never the node; a stopped kernel ends the process); (2) a job cannot open a tenant
    scope the way GUIDE §16 documents, and `authorize` sees neither the operation nor the
-   caller kind.
+   caller kind — **fixed 2026-09-30** (spec
+   `docs/superpowers/specs/2026-09-27-job-tenancy-design.md`: a job declares `global` or
+   `scoped_by`, and a scoped one runs in the tenant it was enqueued from, or that its
+   fan-out named; `authorize` is asked about a principal only; a route's stance, `auth`,
+   `public` or `public(Org)`, says who reaches a tenant).
 4. **Claims audit** [shipped 2026-09-22; spec
    `docs/superpowers/specs/2026-09-21-claims-audit-design.md`]. The bare-metal Linux BENCH
    run owed since 2026-08-15 lands, or the README scaling paragraph is rewritten to what
@@ -245,14 +249,15 @@ build passes on the bar in sub-project 3; (c) every number in README.md and MANI
 that is a claim about charpente is in docs/BENCH.md or absent, and every other figure
 cites its source or carries no digits (held by `claims_census`).
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
 and none does. They are listed with their triggers so that "is it time yet" has a
 mechanical answer. The payload-shapes three were deferred on 2026-09-24 by the spec that
 shipped detection and refusal (its §1 and §8): a foreign shape is already refused by name,
-so each waits for its trigger.
+so each waits for its trigger. The job-tenancy one was deferred on 2026-09-27 by the
+job-tenancy spec's §12.
 
 | Item | Trigger |
 |---|---|
@@ -266,6 +271,7 @@ so each waits for its trigger.
 | **Versioned migrations for event and job payloads** (payload-shapes spec §8, approach B) | The first app that needs exact resume, or a Pending job, to survive a shape change it cannot express as a new type. |
 | **A deep fingerprint** — every `Codec` type carries its own shape constant, so a new variant on a nested enum changes the fingerprint of every table and payload that holds it | The first nested-type change that misdecodes in a real app or a docs-only build. |
 | **A commit-time shape lock** — a committed fingerprint file plus a check verb | The first shape change that reaches a deploy unnoticed. Apps on the generated TS client already get a CI signal for event payload changes from `check-client`'s staleness diff. |
+| **`enqueue_keyed_in`** — a keyed declared fan-out (job-tenancy spec §12) | The first fan-out whose job needs an external idempotency key. `enqueue_in` and `ScopedTx::enqueue_keyed` both exist; the keyed fan-out is the one combination deferred. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,

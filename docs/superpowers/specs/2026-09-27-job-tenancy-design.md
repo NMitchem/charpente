@@ -1,7 +1,6 @@
 # Job tenancy — design
 
-**Date:** 2026-09-27. **Status:** approach D approved in chat (Noah, 2026-09-27); the written
-spec, §14 included, approved 2026-09-27; spec of record for the plan
+**Date:** 2026-09-27. **Status:** Implemented 2026-09-30 (commits `fae2bee`..`929c0ec`); plan
 `docs/superpowers/plans/2026-09-27-job-tenancy.md`.
 **Predecessor:** M3 sub-project 3's verdict (PASS, fix before publish; record
 `docs/experiments/2026-09-statuspage/`). This is the second of the two pre-publish platform
