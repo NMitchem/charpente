@@ -183,24 +183,23 @@ fn switchover_prints_the_ctrl_err_message_to_stderr_and_exits_one() {
     assert!(stderr.contains("cannot switch over"), "{stderr}");
 }
 
-/// A dead port (bind-then-drop to find one that was free, then release it):
-/// `net.connect` itself fails, before any framing or reply is involved, so
-/// the CLI's connect-failure message (ctl.rs's `run`, "is the node running
-/// with replication configured...") is what must name the address and exit
-/// 2 -- distinct from the `CtrlErr`/`Refuse` (exit 1) and malformed-reply
-/// (exit 2, but post-connect) paths the other tests here cover.
+/// A dead address: `net.connect` itself fails, before any framing or reply
+/// is involved, so the CLI's connect-failure message (ctl.rs's `run`, "is the
+/// node running with replication configured...") is what must name the
+/// address and exit 2 -- distinct from the `CtrlErr`/`Refuse` (exit 1) and
+/// malformed-reply (exit 2, but post-connect) paths the other tests here
+/// cover. Port 0 is one nothing can listen on, so no sibling test can bind it
+/// between here and the child's connect, as a released ephemeral port could
+/// (three sightings, "Connection reset by peer"). The OS's own text differs
+/// (macOS: "Can't assign requested address"; Linux: connection refused), and
+/// neither is asserted.
 #[test]
 fn promote_against_a_dead_port_exits_2_with_the_connect_message() {
-    let net = ProdNet;
-    let dead = net
-        .listen("127.0.0.1:0")
-        .expect("bind an ephemeral loopback port");
-    let addr = dead.local_addr();
-    drop(dead); // release the port -- nothing listens on `addr` from here on
+    let addr = "127.0.0.1:0";
 
     #[allow(clippy::disallowed_methods)] // edge tooling -- see charpente() above
     let out = charpente()
-        .args(["promote", "--node", &addr])
+        .args(["promote", "--node", addr])
         .output()
         .expect("run the charpente binary");
 
@@ -216,7 +215,7 @@ fn promote_against_a_dead_port_exits_2_with_the_connect_message() {
         stderr.contains("is the node running with replication configured"),
         "{stderr}"
     );
-    assert!(stderr.contains(&addr), "{stderr}");
+    assert!(stderr.contains(addr), "{stderr}");
 }
 
 /// A peer that answers with bytes `decode` cannot parse. Unlike `drive`'s
