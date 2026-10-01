@@ -1128,6 +1128,10 @@ mod tests {
         }
 
         /// Everything a sync never took is gone, and the power is back on.
+        /// An injected sync failure that has not fired is disarmed too: it
+        /// belonged to the run the power cut ended, and left armed it would
+        /// fail the next boot instead of letting a pin see what that boot
+        /// finds on disk.
         fn power_loss(&self) {
             let mut m = self.model();
             for node in &mut m.nodes {
@@ -1137,6 +1141,7 @@ mod tests {
                 }
             }
             m.calls_left = None;
+            m.failing_syncs.clear();
         }
 
         fn fail_next_sync(&self, path: &str) {
