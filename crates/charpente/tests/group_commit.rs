@@ -2483,6 +2483,10 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
 /// request — or that made every verification reopen fail — would satisfy
 /// every remaining key and pass 256 universes without comparing anything
 /// (T8b review I-3).
+/// The give-up cap, exact at the pinned base: no universe gave up in two
+/// identical batches (64 coda reopens; 27 with 8).
+const BURST_GAVE_UP_CEILING: u64 = 0;
+
 #[test]
 fn contended_request_bursts_survive_the_fault_matrix() {
     run_universes_swarm_with!(
@@ -2497,7 +2501,8 @@ fn contended_request_bursts_survive_the_fault_matrix() {
             "fault:crash",
             "crash:torn",
             "restart"
-        ]
+        ],
+        ceiling: [("universe:gave-up", BURST_GAVE_UP_CEILING)]
     );
 }
 

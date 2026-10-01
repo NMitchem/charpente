@@ -853,6 +853,14 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
     Ok(())
 }
 
+/// The give-up cap. This base is ambient, so the count moves batch to batch,
+/// and the cap is a margin, not a measurement: over 10 fresh batches (16 final
+/// attempts) it gave up 16-31 times, mean 22.5, and the cap is twice that
+/// maximum, about 7 standard deviations above the mean. It guards drift toward
+/// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
+/// up 35-38 times, under it.
+const TX_GAVE_UP_CEILING: u64 = 62;
+
 #[test]
 fn transactions_survive_the_fault_matrix() {
     run_universes_swarm!(
@@ -868,7 +876,8 @@ fn transactions_survive_the_fault_matrix() {
             "restart",
             "batch:multi_record",
             "batch:multi_record_faulted",
-        ]
+        ],
+        ceiling: [("universe:gave-up", TX_GAVE_UP_CEILING)]
     );
 }
 

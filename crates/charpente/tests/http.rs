@@ -1428,6 +1428,14 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
     http_workload_traced(sim).map(|_| ())
 }
 
+/// The give-up cap. This base is ambient, so the count moves batch to batch,
+/// and the cap is a margin, not a measurement: over 10 fresh batches (16 final
+/// attempts) it gave up 10-28 times, mean 17.6, and the cap is twice that
+/// maximum, about 7 standard deviations above the mean. It guards drift toward
+/// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
+/// up 30-35 times, under it.
+const HTTP_GAVE_UP_CEILING: u64 = 56;
+
 #[test]
 fn http_requests_survive_the_fault_matrix() {
     run_universes_swarm!(
@@ -1441,7 +1449,8 @@ fn http_requests_survive_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
-        ]
+        ],
+        ceiling: [("universe:gave-up", HTTP_GAVE_UP_CEILING)]
     );
 }
 

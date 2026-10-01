@@ -685,6 +685,13 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
     Ok(rejected)
 }
 
+/// The give-up cap. This base is ambient, so the count moves batch to batch,
+/// and the cap is a margin, not a measurement: over 10 fresh batches it gave up
+/// 25-37 times, mean 32.5, and the cap is twice that maximum, about 10
+/// standard deviations above the mean. Before the store rebuild, 8 fixed bases
+/// gave up 40-56 times.
+const TABLES_GAVE_UP_CEILING: u64 = 74;
+
 #[test]
 fn tables_and_log_survive_the_fault_matrix() {
     run_universes_swarm!(
@@ -701,7 +708,8 @@ fn tables_and_log_survive_the_fault_matrix() {
             // 7 to 16 per batch over 8 bases (2026-10-01), so a batch with
             // none is about a 1-in-190,000 event, not a flake.
             "tables:store-rebuilt",
-        ]
+        ],
+        ceiling: [("universe:gave-up", TABLES_GAVE_UP_CEILING)]
     );
 }
 

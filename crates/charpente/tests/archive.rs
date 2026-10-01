@@ -7342,6 +7342,12 @@ const CONV_SCOPED_RESTORED_FLOOR: u64 = 240;
 const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 237; // 164, then 160 after the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
 const CONV_SCOPED_CHAINED_FLOOR: u64 = 161;
 
+/// The give-up caps, exact at the two pinned bases: 19 and 16 of 256 universes
+/// gave up in two identical batches each (the breakdown is at
+/// `CONV_RESTORED_FLOOR`).
+const CONV_GAVE_UP_CEILING: u64 = 19;
+const CONV_SCOPED_GAVE_UP_CEILING: u64 = 16;
+
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that
 /// stopped firing and misses one that decayed to a token handful of rows —
@@ -8911,7 +8917,8 @@ fn archive_converges() {
             ("archive:restored", CONV_RESTORED_FLOOR),
             ("archive:restored_substantial", CONV_SUBSTANTIAL_FLOOR),
             ("archive:chained", CONV_CHAINED_FLOOR),
-        ]
+        ],
+        ceiling: [("universe:gave-up", CONV_GAVE_UP_CEILING)]
     );
 }
 
@@ -8960,7 +8967,8 @@ fn archive_converges_with_a_scoped_table() {
             ("archive:restored", CONV_SCOPED_RESTORED_FLOOR),
             ("archive:restored_substantial", CONV_SCOPED_SUBSTANTIAL_FLOOR),
             ("archive:chained", CONV_SCOPED_CHAINED_FLOOR),
-        ]
+        ],
+        ceiling: [("universe:gave-up", CONV_SCOPED_GAVE_UP_CEILING)]
     );
 }
 
