@@ -5372,12 +5372,29 @@ fn kstep_node(sim: &Sim, node: &mut KNode) -> Result<Step, String> {
         // read as a failure of the promise it can no longer underwrite). A
         // genuine data/consistency bug never surfaces here (those panic, or
         // the final oracles on the survivor's store catch them).
+        //
+        // A survivor refused as diverged behind did not fault. It fell below
+        // the primary's retained base, either because it lagged past that
+        // window or because the primary forked below it, and the refusal
+        // cannot tell which (Design B). For the survivor, a re-seed would void
+        // the promise it underwrites, so this too gives up — under its own key,
+        // because a give-up is named by what happened.
         Err(e) if !node.recoverable => {
-            sim.cover("repl:inconclusive:survivor-faulted");
-            Err(format!(
-                "{INCONCLUSIVE}: {} (the designated survivor) faulted: {e}",
-                node.name
-            ))
+            let e = e.to_string();
+            if is_diverged_behind(&e) {
+                sim.cover("repl:inconclusive:survivor-refused-behind");
+                Err(format!(
+                    "{INCONCLUSIVE}: {} (the designated survivor) was refused as diverged \
+                     behind: {e}",
+                    node.name
+                ))
+            } else {
+                sim.cover("repl:inconclusive:survivor-faulted");
+                Err(format!(
+                    "{INCONCLUSIVE}: {} (the designated survivor) faulted: {e}",
+                    node.name
+                ))
+            }
         }
         Err(e) => Err(format!("{} kernel step: {e}", node.name)),
     }
@@ -5897,8 +5914,15 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
             }
         }
     }
-    // Wipe the bricked node's disk and rebuild it as a fresh follower of the
-    // survivor — a fresh follower below the survivor's base re-seeds.
+    reseed_p(sim, p, f)
+}
+
+/// Wipe `p`'s data dir and rebuild it as a fresh follower of `f`, which must
+/// already be primary: an empty (None-position) follower snapshot-seeds even
+/// below the primary's GC'd base. The restore path's second half, and the
+/// remedy a laggard refusal names ("re-seed it deliberately from a fresh data
+/// dir"), which is why `route_p_error` answers that refusal with it.
+fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
     p.kernel = None;
     p.host.restart();
     let disk = p.host.disk();
@@ -5947,6 +5971,83 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
     })
 }
 
+/// The one place `above_horizon_universe` answers an error from stepping `p`
+/// (with or without `f`), so no error is swallowed — a pass over a swallowed
+/// error checked nothing. RESTORE_NEEDED restores `p` from the survivor.
+///
+/// A diverged-behind refusal of `p` is answered with the re-seed it names for
+/// a true laggard, and only when all four of these hold:
+/// - `p` is the node refused;
+/// - `p` is a follower;
+/// - `f` is primary;
+/// - `f` never recovered (`f.recoveries == 0`).
+///
+/// `p` is only ever a follower after `restore_p_from_survivor` wiped it and
+/// seeded it from `f`, and it has received nothing but `f`'s frames since. A
+/// follower's own recovery cut only shortens that prefix. And a primary that
+/// never recovered never cut its log. So `p`'s records are a prefix of `f`'s,
+/// the refusal's other remedy (this primary forked below the follower) is
+/// impossible, and re-seeding `p` overwrites nothing it alone holds.
+/// `a_restored_follower_refused_as_a_laggard_is_reseeded_not_failed` pins the
+/// arm, and `a_laggard_refusal_is_not_reseeded_once_the_primary_could_have_forked`
+/// its gate.
+///
+/// Every other error bubbles, to `finish_universe` (an inconclusive gives up)
+/// or as the failure it is.
+fn route_p_error(
+    sim: &Sim,
+    p: &mut KNode,
+    f: &mut KNode,
+    r: Result<(), String>,
+) -> Result<(), String> {
+    let Err(e) = r else {
+        return Ok(());
+    };
+    if e.contains(RESTORE_NEEDED) {
+        return restore_p_from_survivor(sim, p, f);
+    }
+    if e.starts_with(&format!("{} kernel step: ", p.name))
+        && is_diverged_behind(&e)
+        && p.kernel.as_ref().is_some_and(|k| !k.is_primary())
+        && f.kernel.as_ref().is_some_and(|k| k.is_primary())
+        && f.recoveries == 0
+    {
+        sim.cover("repl:laggard-reseeded");
+        return reseed_p(sim, p, f);
+    }
+    Err(e)
+}
+
+/// Design B's diverged-behind refusal (DESIGN §5): a positioned follower below
+/// the primary's GC'd base. Keyed on the phrase the refusal carries whoever
+/// wraps it, since `session::diverged_behind` is private.
+fn is_diverged_behind(e: &str) -> bool {
+    e.contains("but this primary has GC'd every record below its retained base")
+}
+
+/// The above-horizon promise with a follower (spec §4 property 8): media
+/// corruption on the primary never loses an acked record its follower had
+/// converged on. The universe is `above_horizon_universe`.
+///
+/// **How the rig answers a laggard (sub-project D3).**
+/// - **How the refusal arises.** After a restore, `p` is `f`'s follower, and
+///   the rig still crashes it every round. Each crash reaps `p`'s session and
+///   releases its retention pin, and `f` checkpoints and GCs over a window of
+///   two 256-byte segments. So `p` can rejoin below `f`'s retained base, either
+///   by lagging or after its own recovery cut, and Design B refuses it as
+///   diverged behind.
+/// - **The answer.** That refusal is correct, and it names its remedy for a true
+///   laggard. `route_p_error` applies that remedy (`repl:laggard-reseeded`),
+///   gated so it fires only where `p` is provably a prefix of `f`.
+/// - **Before D3.** The rig failed the universe when the refusal landed in a
+///   request, and dropped it when it landed in a convergence. Every error of
+///   `p` now goes through `route_p_error`, and none is dropped.
+/// - **Discovery seeds** (not pins, since any re-key renames them):
+///   - `0x6d554d5eb1e76a3` and `0xfd74b66d02fe0371`, both at 0485b76: a
+///     follower recovery cut by a misdirected write.
+///   - `0xa1d1c3332d5b0668`, at 796bff2 and cbfece0: a pure laggard.
+/// - **The pins** are `a_restored_follower_refused_as_a_laggard_is_reseeded_not_failed`
+///   and `a_laggard_refusal_is_not_reseeded_once_the_primary_could_have_forked`.
 #[test]
 fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower() {
     run_universes_swarm_with!(
@@ -6004,10 +6105,11 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
 /// outside it: they pass `assert_survivor_holds` vacuously, and if that 6 grew
 /// while the 32 shrank this floor is what would notice.
 ///
-/// **A drop below this is a finding, not a number to lower.** With
-/// `:survivor-faulted` at 87% of the give-ups, the thing to check first is
-/// whether the fault matrix got harsher on the survivor — that alone can retire
-/// this oracle without a single test going red.
+/// **A drop below this is a finding, not a number to lower.** With the
+/// survivor's two give-up keys (below) at 99% of the give-ups, the thing to
+/// check first is whether the fault matrix got harsher on the survivor, or its
+/// window shorter — either alone can retire this oracle without a single test
+/// going red.
 ///
 /// **Re-measured 2026-09-30 for redb 4.3.0**, two identical batches: 36 of 128
 /// (the parent commit under redb 4.1.0 measures 30, a control run). The give-ups
@@ -6022,6 +6124,17 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
 /// 128 (36 at 796bff2). The 84 give-ups are `:survivor-faulted` 83 and
 /// `:role-file-torn` 1. At p = 39/128 = 0.305 one SE is 5.21, so 39 − 2·5.21 =
 /// 28.6 → 28; it tolerates a 28.2% relative fall.
+///
+/// **Corrected 2026-10-01 (sub-project D3).** Every count above that says "the
+/// survivor faulting" (`:survivor-faulted`) also counted the survivor being
+/// *refused as diverged behind*, which is not a fault on `f`. In that case `f`
+/// fell below `p`'s retained base, by lagging past that two-segment window or
+/// because `p` forked below it, and the refusal cannot tell which. It now has
+/// its own key, `repl:inconclusive:survivor-refused-behind`:
+/// - At the pinned base it is 5 of the 83, now split 78 + 5. Every other count,
+///   this key's 39 included, is byte-identical.
+/// - Over 57 fresh bases it is 351 of 7296 universes (4.8%), and 6.8% of the
+///   give-ups.
 const SURVIVOR_PROMISE_FLOOR: u64 = 28;
 
 fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
@@ -6048,21 +6161,16 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
             ) {
                 Ok((200, _)) => acked.push(id),
                 Ok(_) => {} // 421 (p demoted after a restore) / 500 — not acked
-                Err(e) if e.contains(RESTORE_NEEDED) => {
-                    restore_p_from_survivor(sim, &mut p, &mut f)?
-                }
-                // INCONCLUSIVE (finish_universe covers it) or a real bug: bubble.
-                Err(e) => return Err(e),
+                Err(e) => route_p_error(sim, &mut p, &mut f, Err(e))?,
             }
         }
-        // Converge f onto p as far as faults allow (best effort — a stall under
-        // persistent faults is not a bug, we snapshot what f durably holds).
-        match krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET) {
-            Ok(()) => {}
-            Err(e) if e.contains(RESTORE_NEEDED) => restore_p_from_survivor(sim, &mut p, &mut f)?,
-            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
-            Err(_) => {}
-        }
+        // Converge f onto p. Every error is routed, none dropped. This site
+        // used to drop every error but RESTORE_NEEDED and an inconclusive as
+        // "best effort", and what it dropped was p refused as a laggard
+        // (sub-project D3). The universe then ran on with p refused and could
+        // pass having checked nothing past that point.
+        let converged = krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET);
+        route_p_error(sim, &mut p, &mut f, converged)?;
         // Record everything f durably holds now — it keeps these forever.
         promised.extend(
             retry_read_reopen(sim, &mut f, recover_kernel_node, |f| ids_present(f, &acked))
@@ -6098,17 +6206,27 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
         // a follower that would just 421); best-effort otherwise (an injected
         // fault on the sacrificial means no forced cut that round — bit_flip
         // still rolls and below-horizon rounds still restore).
-        let forced_cut = p.kernel.as_ref().is_some_and(|k| k.is_primary())
-            && matches!(
-                drive_request(
-                    sim,
-                    &mut [&mut p],
-                    0,
-                    Request::new(Method::Post, format!("/widget/{}", 10_000 + round)),
-                    KBUDGET,
-                ),
-                Ok((200, _))
-            );
+        //
+        // An error here is routed like any other: before D3 it was dropped by
+        // a `matches!`, so a RESTORE_NEEDED or a give-up on the sacrificial
+        // request let the universe run on.
+        let forced_cut = if p.kernel.as_ref().is_some_and(|k| k.is_primary()) {
+            match drive_request(
+                sim,
+                &mut [&mut p],
+                0,
+                Request::new(Method::Post, format!("/widget/{}", 10_000 + round)),
+                KBUDGET,
+            ) {
+                Ok((status, _)) => status == 200,
+                Err(e) => {
+                    route_p_error(sim, &mut p, &mut f, Err(e))?;
+                    false
+                }
+            }
+        } else {
+            false
+        };
         let last_before_crash = p.kernel.as_ref().and_then(|k| k.app().db().last_applied());
         if forced_cut {
             let _ = corrupt_last_wal_frame(&p.host);
@@ -6136,14 +6254,15 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
                     sim.cover("repl:above-horizon-cut");
                 }
             }
-            Err(e) if e.contains(RESTORE_NEEDED) => restore_p_from_survivor(sim, &mut p, &mut f)?,
-            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
-            Err(e) => return Err(e),
+            Err(e) => route_p_error(sim, &mut p, &mut f, Err(e))?,
         }
     }
 
-    // Final best-effort convergence so f reflects the latest shipped state.
-    let _ = krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET);
+    // Final convergence so f reflects the latest shipped state, routed like
+    // every other: a dropped error here let a universe whose survivor had
+    // just given up go on to check the promise anyway.
+    let converged = krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET);
+    route_p_error(sim, &mut p, &mut f, converged)?;
 
     // THE promise: every acked+converged id still lives on the survivor. No
     // single-node corruption excuse — a converged follower kept the record.
@@ -6159,6 +6278,145 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     // And the replicated jobs stayed exactly-once through it all.
     bump_exactly_once(sim, &mut f)?;
     Ok(())
+}
+
+/// The deterministic shape behind the property's laggard arm (sub-project D3).
+/// It is fault-free, so the only thing that happens is the laggard.
+const LAGGARD_RESEED_SEED: u64 = 0x2EB1_0D30;
+
+/// Builds the post-restore shape `above_horizon_universe` reaches: `f` primary,
+/// `p` its follower rebuilt from `f`. `p` is then down while `f`'s retained
+/// base moves past `p`'s position, and is recovered at that position. Returns
+/// `(p, f, k)`, where `k` is `p`'s position.
+fn restored_laggard(sim: &Sim) -> (KNode, KNode, u64) {
+    let horizon = 200 * SEC_NANOS;
+    let db_cfg = horizon_db_cfg();
+    let mut p = spawn_kernel_node(sim, "p", primary_cfg("p:1"), db_cfg.clone(), horizon, true)
+        .expect("p spawns fault-free");
+    let mut f = spawn_kernel_node(sim, "f", follower_cfg("f:1", "p:1"), db_cfg, horizon, false)
+        .expect("f spawns fault-free");
+    for id in 0..3u64 {
+        let (status, _) = drive_request(
+            sim,
+            &mut [&mut p, &mut f],
+            0,
+            Request::new(Method::Post, format!("/widget/{id}")),
+            KBUDGET,
+        )
+        .expect("a fault-free request is answered");
+        assert_eq!(status, 200, "a fault-free request to the primary is acked");
+    }
+    krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET).expect("f converges onto p");
+    restore_p_from_survivor(sim, &mut p, &mut f).expect("the restore completes fault-free");
+    assert!(
+        f.kernel.as_ref().is_some_and(|k| k.is_primary())
+            && p.kernel.as_ref().is_some_and(|k| !k.is_primary()),
+        "the restore leaves f primary and p its follower"
+    );
+    let k = klast(&p).expect("the rebuilt follower holds f's records");
+
+    // p's process dies and stays down, so f reaps its session and releases the
+    // retention pin that kept frames above p's position.
+    p.kernel = None;
+    p.host.crash_now();
+    for id in 100..400u64 {
+        if f.kernel.as_ref().expect("f is up").app().db().log_base() > k {
+            break;
+        }
+        let (status, _) = drive_request(
+            sim,
+            &mut [&mut f],
+            0,
+            Request::new(Method::Post, format!("/widget/{id}")),
+            KBUDGET,
+        )
+        .expect("a fault-free request to f is answered");
+        assert_eq!(
+            status, 200,
+            "a fault-free request to the new primary is acked"
+        );
+    }
+    let base = f.kernel.as_ref().expect("f is up").app().db().log_base();
+    assert!(
+        base > k,
+        "f's retained base {base} must pass p's position {k} — if not, this test no longer \
+         reaches the laggard shape"
+    );
+    recover_kernel_node(sim, &mut p).expect("p reopens fault-free");
+    assert_eq!(
+        klast(&p),
+        Some(k),
+        "p reopens at its own durable position, below f's retained base"
+    );
+    (p, f, k)
+}
+
+/// A follower the rig rebuilt from `f` and that then lagged past `f`'s
+/// retained window is refused as diverged behind (Design B, DESIGN §5). That
+/// is the designed answer, and the refusal names the remedy for a true
+/// laggard: re-seed it from a fresh data dir. `route_p_error` answers it with
+/// exactly that re-seed instead of failing the universe. Its records are a
+/// prefix of `f`'s by construction: it was wiped and seeded from `f`, and `f`
+/// never recovered, so `f`'s log never cut.
+#[test]
+fn a_restored_follower_refused_as_a_laggard_is_reseeded_not_failed() {
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
+    let (mut p, mut f, k) = restored_laggard(&sim);
+    let r = krun_until(&sim, &mut [&mut p, &mut f], kconverged, KBUDGET);
+    let refusal = r.clone().expect_err(
+        "p's rejoin below f's base must be refused — if not, this test no longer pins the arm",
+    );
+    assert!(
+        refusal.starts_with("p kernel step: ")
+            && refusal.contains(&format!(
+                "diverged: the follower holds a proven record at seq {k}, but this primary has \
+                 GC'd every record below its retained base"
+            )),
+        "the refusal is Design B's diverged-behind answer to p at seq {k}; got: {refusal}"
+    );
+    route_p_error(&sim, &mut p, &mut f, r).expect(
+        "a laggard refusal on the follower the rig rebuilt from f is answered with the re-seed \
+         it names, not failed",
+    );
+    assert_eq!(
+        sim.coverage().get("repl:laggard-reseeded"),
+        Some(&1),
+        "the answer is the laggard re-seed, counted by its own key"
+    );
+    assert!(
+        kconverged(&[&mut p, &mut f]),
+        "the re-seeded follower converges onto f"
+    );
+    assert!(
+        klast(&p) > Some(k),
+        "p moved past its old position {k}: it was re-seeded, not left refused"
+    );
+}
+
+/// The negative space of the arm above. Once `f` has recovered, its log may
+/// have been cut and grown back differently, so the refusal's other remedy
+/// (this primary forked below the follower: promote the follower) is live,
+/// and the rig cannot tell the two apart. The refusal must reach the
+/// property as the failure it is, never a re-seed that would overwrite `p`.
+#[test]
+fn a_laggard_refusal_is_not_reseeded_once_the_primary_could_have_forked() {
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
+    let (mut p, mut f, k) = restored_laggard(&sim);
+    f.recoveries = 1;
+    let r = krun_until(&sim, &mut [&mut p, &mut f], kconverged, KBUDGET);
+    let err = route_p_error(&sim, &mut p, &mut f, r)
+        .expect_err("a refusal the rig cannot adjudicate must still fail the universe");
+    assert!(
+        err.starts_with("p kernel step: ")
+            && err.contains("GC'd every record below its retained base"),
+        "the diverged-behind refusal itself bubbles, unanswered; got: {err}"
+    );
+    assert_eq!(
+        sim.coverage().get("repl:laggard-reseeded"),
+        None,
+        "no re-seed was counted"
+    );
+    assert_eq!(klast(&p), Some(k), "p was not re-seeded");
 }
 
 // ============================================================ M2 sub-project

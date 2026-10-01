@@ -1239,6 +1239,15 @@ silently wipe a follower the primary forked below; the refusal names both remedi
 re-seed a true laggard or promote the follower — Design B,
 `.superpowers/sdd/diverged-behind-investigation.md`); an empty (None-position) follower
 against a compacted log → snapshot-seed; otherwise `Frames` resume from position + 1.
+The sim's above-horizon replication property
+(`wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower`) meets that
+diverged-behind refusal for a follower it rebuilt from the surviving primary. It answers it
+with the remedy the refusal names, a fresh-data-dir re-seed (`repl:laggard-reseeded`), and only
+where the follower is provably a prefix: the follower was seeded from that primary, and the
+primary never recovered, so it never cut its log. Any other diverged-behind refusal there
+stays a failure. For the designated survivor it is a give-up of its own,
+`repl:inconclusive:survivor-refused-behind`, because re-seeding the survivor would void the
+promise it underwrites.
 Shipping reads exclusively through `Db::read_log` — CRC
 re-verified at read-back, capped at `last_applied`, so a frame corrupted on the primary's
 disk is refused by name rather than shipped, and the unsynced tail never travels. The
