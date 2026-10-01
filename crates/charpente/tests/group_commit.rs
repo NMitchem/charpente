@@ -2586,16 +2586,18 @@ fn a_coda_that_never_verifies_gives_up_rather_than_passing() {
     );
 }
 
-/// Seed `0x12f26268473ddbab` (universe 4 of the pinned base `0x60C1_0009`)
+/// Seed `0xba295932911b917c` (universe 12 of the pinned base `0x60C1_0009`)
 /// never got a 200, so its watermark stayed 0 and every check it made compared
 /// the durable count with 0, which cannot fail. Until 2026-10-01 its passing
-/// coda made it a verdict (review M3); it gives up. 34 of the base's 256
+/// coda made it a verdict (review M3); it gives up. 9 of the base's 256
 /// universes do the same. Re-pinned 2026-10-01 for S5 with D1, which re-key
-/// every universe: `0xf366fd85cc2bea79` now gets a 200. Found by scanning the
-/// base for the first universe that never gets one and gives up for it.
+/// every universe: `0xf366fd85cc2bea79` now gets a 200. Re-pinned again the
+/// same day when the round boots were aimed (S5 review I1): `0x12f26268473ddbab`
+/// now gets one too. Found by scanning the base for the first universe that
+/// never gets one and gives up for it.
 #[test]
 fn a_universe_that_never_acked_a_request_gives_up_rather_than_passing() {
-    const SEED: u64 = 0x12f2_6268_473d_dbab;
+    const SEED: u64 = 0xba29_5932_911b_917c;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
@@ -2617,9 +2619,9 @@ fn a_universe_that_never_acked_a_request_gives_up_rather_than_passing() {
     );
 }
 
-/// The give-up is the coda's alone. Seed `0xc871edc72ab5589f` (universe 33 of
+/// The give-up is the coda's alone. Seed `0xd4a9d634684adbe5` (universe 62 of
 /// the pinned base `0x60C1_0009`) acks requests, finds a round boundary's check
-/// unreachable even at 16 round reopens, and then verifies at the coda; it does
+/// unreachable even at 64 round reopens, and then verifies at the coda; it does
 /// not give up, since a give-up at the per-round call would be sticky and throw
 /// the coda's verdict away. That verdict does not cover the skipped boundary (a
 /// loss there is erased by later writes, per `verify_watermark`'s doc), which
@@ -2627,11 +2629,13 @@ fn a_universe_that_never_acked_a_request_gives_up_rather_than_passing() {
 /// `0x15d7721641ce58b3` never acked a request and now gives up for that
 /// (review M3). Re-pinned again the same day for S5 with D1, which re-key
 /// every universe: `0x6999d445e27fe8d3` no longer finds a check unreachable.
-/// Found by scanning the base for the first universe that acks, skips a round
-/// check and still reaches a verdict (18 of 256 do).
+/// Re-pinned again the same day when the round boots were aimed and the round
+/// reopens raised to 64 (S5 review I1): `0xc871edc72ab5589f` no longer does
+/// either. Found by scanning the base for the first universe that acks, skips
+/// a round check and still reaches a verdict (3 of 256 do).
 #[test]
 fn an_unreachable_round_check_before_a_verified_coda_does_not_give_up() {
-    const SEED: u64 = 0xc871_edc7_2ab5_589f;
+    const SEED: u64 = 0xd4a9_d634_684a_dbe5;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));

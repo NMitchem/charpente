@@ -1522,16 +1522,22 @@ fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
 /// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
 /// rule for every arm that ends a universe without a verdict). Seed
 /// `0x04e7c90b39225fee` meets it at a round's recovery (base `0x5300_0009`,
-/// universe 136), seed `0x3f2a17e8c2fe469e` at the final one (base
-/// `0x5E1F_0001`, universe 73). Re-pinned 2026-10-01 for S5 with D1, which
-/// re-key every universe: the round arm's `0x231a841f396a7d80` no longer meets
-/// durable corruption. Found by scanning the same base for the first universe
-/// that gives up for the cut at a round's recovery (two of 256 do).
+/// universe 136), seed `0x8e1c391d400cb5d4` at the final one (same base,
+/// universe 137). Re-pinned 2026-10-01 for S5 with D1, which re-key every
+/// universe: the round arm's `0x231a841f396a7d80` no longer meets durable
+/// corruption. Found by scanning the same base for the first universe that
+/// gives up for the cut at a round's recovery (two of 256 do). The final arm
+/// re-pinned the same day when the round boots were aimed (S5 review I1):
+/// `0x3f2a17e8c2fe469e` now meets corruption at or below the store's horizon
+/// at a round boot, which no restart clears, and gives up there (pinned
+/// below). Found by scanning that base for the first universe that gives up
+/// for the cut at the final recovery (11 of 2,048 over eight bases do, 2 of
+/// these 256).
 #[test]
 fn acked_requests_cut_by_durable_corruption_give_up_rather_than_pass() {
     for (seed, arm) in [
         (0x04e7_c90b_3922_5fee_u64, "at a round's recovery"),
-        (0x3f2a_17e8_c2fe_469e, "at the final recovery"),
+        (0x8e1c_391d_400c_b5d4, "at the final recovery"),
     ] {
         let mut state = seed;
         let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -1554,6 +1560,39 @@ fn acked_requests_cut_by_durable_corruption_give_up_rather_than_pass() {
             "seed {seed:#x} must give up {arm}: {reason}"
         );
     }
+}
+
+/// Corruption at or below the store's durable horizon is a refusal no restart
+/// clears, so a round boot that meets it gives the universe up at once under
+/// that reason instead of booting again and passing the failure on to the
+/// final check (`checks::boot_through_fallout`, S5 review M6). Seed
+/// `0x3f2a17e8c2fe469e` (base `0x5E1F_0001`, universe 73), which met the
+/// above-horizon cut at the final recovery before the round boots were aimed.
+#[test]
+fn a_durable_refusal_at_a_round_boot_gives_up_at_once_by_name() {
+    const SEED: u64 = 0x3f2a_17e8_c2fe_469e;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    assert!(http_workload_traced(&mut sim).is_ok(), "seed {SEED:#x}");
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.contains(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ) && reason.contains("at-or-below the store's durable horizon"),
+        "seed {SEED:#x} must give up for the refusal, carrying its text: {reason}"
+    );
 }
 
 #[test]

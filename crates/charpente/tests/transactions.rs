@@ -966,17 +966,19 @@ fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
 /// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
 /// rule for every arm that ends a universe without a verdict). Seed
 /// `0xfc1e12c7cf3f8019` meets it at a round's recovery (base `0x5E1F_0006`,
-/// universe 133), seed `0xa5c304ecd9f3a44e` at the final one (same base,
-/// universe 178). Re-pinned 2026-10-01 for S5 with D1, which re-key every
+/// universe 133), seed `0x0a51f0d80437e0dc` at the final one (same base,
+/// universe 82). Re-pinned 2026-10-01 for S5 with D1, which re-key every
 /// universe: `0x902dd63b08e51d75` now meets the cut at the final recovery
 /// instead of a round's, and `0x671991ebc8bd4f24` no longer meets durable
-/// corruption. Found by scanning the same base for the first universe that
-/// gives up for the cut at each recovery (one of 256 each).
+/// corruption. The final arm re-pinned the same day when the round boots were
+/// aimed (S5 review I1): `0xa5c304ecd9f3a44e` no longer reaches it. Found by
+/// scanning the same base for the first universe that gives up for the cut at
+/// each recovery (one of 256 at a round's, four at the final).
 #[test]
 fn acked_transactions_cut_by_durable_corruption_give_up_rather_than_pass() {
     for (seed, arm) in [
         (0xfc1e_12c7_cf3f_8019_u64, "at a round's recovery"),
-        (0xa5c3_04ec_d9f3_a44e, "at the final recovery"),
+        (0x0a51_f0d8_0437_e0dc, "at the final recovery"),
     ] {
         let mut state = seed;
         let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
