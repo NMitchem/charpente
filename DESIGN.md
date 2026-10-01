@@ -232,8 +232,8 @@ operation.
 
 **A process restart is not a power cycle.** `Sim::restart` power-cycles: the
 page cache collapses under the crash model before anything reopens.
-`Sim::restart_process` (2026-10-01) restarts only the process. Open handles die
-and nothing else happens: every unsynced write and directory entry stays pending
+`Sim::restart_process` (2026-10-01) restarts only the process. Open file handles
+die and nothing else happens: every unsynced write and directory entry stays pending
 and readable by the next open, and the next power cycle still collapses it. That
 is what a supervisor sees after a kill, a crash or an exit, and it is the only
 way to reach "the next process read back what the dead one never made durable".
