@@ -262,7 +262,9 @@ fn seed_v1_result(sim: &Sim, rows: u64) -> Result<bool, String> {
 /// without ever hitting a non-fallout, non-barrier error — every round was
 /// fallout or a legitimately-remedied barrier, so the caller should treat
 /// the universe as covered-inconclusive rather than red (harsh-config
-/// non-convergence, mirroring auth's precedent), not as a failure.
+/// non-convergence, mirroring auth's precedent), not as a failure. It also
+/// means a durable refusal ended the loop, which no restart clears, and the
+/// universe is already given up under its name (`checks::durable_refusal`).
 fn open_and_migrate_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db>, String> {
     let mut remedy_pending = false;
     for _round in 0..128 {
@@ -280,6 +282,10 @@ fn open_and_migrate_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db
                     let msg = e.to_string();
                     if !charpente_sim::checks::is_fault_fallout(&msg) {
                         return Err(format!("non-injected failure during barrier remedy: {msg}"));
+                    }
+                    // No restart clears a durable refusal (S5 re-review R-M2).
+                    if charpente_sim::checks::durable_refusal(sim, &msg)? {
+                        return Ok(None);
                     }
                     sim.restart();
                 }
@@ -302,6 +308,9 @@ fn open_and_migrate_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db
                 }
                 if !charpente_sim::checks::is_fault_fallout(&msg) {
                     return Err(format!("non-injected failure: {msg}"));
+                }
+                if charpente_sim::checks::durable_refusal(sim, &msg)? {
+                    return Ok(None);
                 }
                 sim.restart();
             }
@@ -1324,6 +1333,10 @@ fn open_and_migrate_scoped_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Op
                     if !charpente_sim::checks::is_fault_fallout(&msg) {
                         return Err(format!("non-injected failure during barrier remedy: {msg}"));
                     }
+                    // No restart clears a durable refusal (S5 re-review R-M2).
+                    if charpente_sim::checks::durable_refusal(sim, &msg)? {
+                        return Ok(None);
+                    }
                     sim.restart();
                 }
             }
@@ -1345,6 +1358,9 @@ fn open_and_migrate_scoped_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Op
                 }
                 if !charpente_sim::checks::is_fault_fallout(&msg) {
                     return Err(format!("non-injected failure: {msg}"));
+                }
+                if charpente_sim::checks::durable_refusal(sim, &msg)? {
+                    return Ok(None);
                 }
                 sim.restart();
             }

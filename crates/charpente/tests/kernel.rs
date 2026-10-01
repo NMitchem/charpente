@@ -16,7 +16,7 @@ use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 // transactions.rs/http.rs, which break-and-restart on the first Io error and
 // so use a narrower local wrapper. This is the identical-4-family case: the
 // shared classifier is used directly, no local wrapper needed.
-use charpente_sim::checks::{boot_through_fallout, is_fault_fallout};
+use charpente_sim::checks::{boot_through_fallout, durable_refusal, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
 
 #[table(global)]
@@ -2702,7 +2702,13 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                     sim.restart();
                 }
             },
-            Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+            // No restart clears a durable refusal (S5 re-review R-M2).
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(());
+                }
+                sim.restart();
+            }
             Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
@@ -2737,6 +2743,39 @@ const KERNEL_GAVE_UP_CEILING: u64 = 62;
 /// 19.1, and the floor is the mean less 4 standard deviations (2026-10-01, S5
 /// review I1).
 const KERNEL_JOB_DONE_FLOOR: u64 = 409;
+
+/// A durable refusal at the final check ends it at once, by name (S5 re-review
+/// R-M2). Seed `0x5bf2de4118bd9163`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("the final check never ran").
+#[test]
+fn a_durable_refusal_at_the_final_check_ends_it_at_once_by_name() {
+    const SEED: u64 = 0x5bf2_de41_18bd_9163;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = kernel_workload(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
 
 #[test]
 fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
@@ -5601,7 +5640,13 @@ mod job_tenancy {
                     Err(msg) if is_fault_fallout(&msg) => sim.restart(),
                     Err(msg) => return Err(msg),
                 },
-                Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                Err(e) if is_fault_fallout(&e.to_string()) => {
+                    if durable_refusal(sim, &e.to_string())? {
+                        return Ok(());
+                    }
+                    sim.restart();
+                }
                 Err(e) => return Err(format!("final open failed non-injected: {e}")),
             }
         }
@@ -5632,6 +5677,39 @@ mod job_tenancy {
     /// Job-tenancy spec §9 item 4. A fixed base, like every permanent swarm
     /// property here. N was set by timing one batch (Step 3): the commit and
     /// the LEDGER state it.
+    /// A durable refusal at the final check ends it at once, by name (S5 re-review
+    /// R-M2). Seed `0xec4ba53447d494ba`, at the batch's base, meets one there. No restart
+    /// clears it, and the loop used to spend its whole budget on it, then give
+    /// up as though every attempt had hit an injected fault ("the final check never ran").
+    #[test]
+    fn a_durable_refusal_at_the_final_check_ends_it_at_once_by_name() {
+        const SEED: u64 = 0xec4b_a534_47d4_94ba;
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        if let Err(e) = job_tenancy_universe(&mut sim) {
+            panic!("seed {SEED:#x}: {e}");
+        }
+        assert_eq!(
+            sim.coverage().get("boot:durable-refusal"),
+            Some(&1),
+            "seed {SEED:#x}: {:?}",
+            sim.coverage()
+        );
+        let reason = sim
+            .gave_up()
+            .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+        assert!(
+            reason.starts_with(
+                "the boot was refused for durable corruption at or below the store's horizon"
+            ),
+            "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+        );
+    }
+
     #[test]
     fn every_job_runs_in_the_tenant_it_was_enqueued_from() {
         run_universes_swarm_with!(

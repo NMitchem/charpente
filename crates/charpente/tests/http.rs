@@ -1397,10 +1397,15 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
         let app = match open_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
-                if !is_injected(&e.to_string()) {
+                let text = e.to_string();
+                if !is_injected(&text) {
                     return Err(format!(
                         "final recovery failed with a non-injected error: {e}"
                     ));
+                }
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                if charpente_sim::checks::durable_refusal(sim, &text)? {
+                    return Ok(responses);
                 }
                 sim.restart();
                 continue;
@@ -1592,6 +1597,39 @@ fn a_durable_refusal_at_a_round_boot_gives_up_at_once_by_name() {
             "the boot was refused for durable corruption at or below the store's horizon"
         ) && reason.contains("at-or-below the store's durable horizon"),
         "seed {SEED:#x} must give up for the refusal, carrying its text: {reason}"
+    );
+}
+
+/// A durable refusal at the final recovery ends it at once, by name (S5 re-review
+/// R-M2). Seed `0xb8e8b2103fbe283e`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("the final verification never ran").
+#[test]
+fn a_durable_refusal_at_the_final_recovery_ends_it_at_once_by_name() {
+    const SEED: u64 = 0xb8e8_b210_3fbe_283e;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = http_workload_traced(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
     );
 }
 

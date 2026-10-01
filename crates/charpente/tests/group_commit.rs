@@ -2146,7 +2146,9 @@ fn enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch() {
 // ======================================================================
 
 use charpente_core::io::Entropy;
-use charpente_sim::checks::{boot_through_fallout, durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{
+    boot_through_fallout, durable_corruption_fired, durable_refusal, is_fault_fallout,
+};
 use charpente_sim::run_universes_swarm_with;
 
 /// Drives `source` to completion via `Kernel::step`, not `run` — the
@@ -2225,13 +2227,17 @@ fn drive_burst(kernel: &mut Kernel, source: &mut SimSource, sim: &Sim) -> io::Re
 /// batch-of-1 case is pinned deterministically instead, by
 /// `a_never_contended_universe_traces_identically_to_the_pre_batching_fixture`.
 /// What one `verify_watermark` call actually established. `Checked` is the
-/// only outcome that asserted anything; the other two exist so the caller
+/// only outcome that asserted anything; the others exist so the caller
 /// can tell "the oracle ran and held" from "the oracle never got to run",
 /// which the coverage gate below turns into a batch-level requirement.
+/// `Refused` is a reopen refused for durable corruption at or below the
+/// store's horizon, which no reopen clears: the universe is already given up
+/// under that name (`checks::durable_refusal`, S5 re-review R-M2).
 enum Verify {
     Checked,
     Excused,
     Unreachable,
+    Refused,
 }
 
 /// How many reopens the final coda's `verify_watermark` gets before the
@@ -2324,8 +2330,9 @@ fn verify_watermark(sim: &Sim, watermark: u64, reopens: u32) -> Result<Verify, S
                     // silent-cut window M1 sub-project 1 documented;
                     // corruption below the horizon surfaces as the loud,
                     // named `DurableHorizon` hard error instead, which
-                    // `is_fault_fallout` already accepts and which fires in
-                    // 3 of 256 universes (measured — T8b review M-1
+                    // `is_fault_fallout` already accepts, which ends the
+                    // reopens at once (`durable_refusal`, below) and which
+                    // fires in 3 of 256 universes (measured — T8b review M-1
                     // disproved the "every record is above the horizon"
                     // reasoning this comment used to carry).
                     if durable_corruption_fired(sim) {
@@ -2338,7 +2345,12 @@ fn verify_watermark(sim: &Sim, watermark: u64, reopens: u32) -> Result<Verify, S
                 }
                 return Ok(Verify::Checked);
             }
-            Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(Verify::Refused);
+                }
+                sim.restart();
+            }
             Err(e) => return Err(format!("verification open failed non-injected: {e}")),
         }
     }
@@ -2447,7 +2459,7 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
         // (that would discard the coda's verdict); it is counted, and capped
         // batch-wide on the property.
         match verify_watermark(sim, watermark, ROUND_REOPENS)? {
-            Verify::Excused => return Ok(()),
+            Verify::Excused | Verify::Refused => return Ok(()),
             Verify::Unreachable => sim.cover("oracle:round-unreachable"),
             Verify::Checked => {}
         }
@@ -2473,6 +2485,7 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
             "the final coda never verified the watermark: all {CODA_REOPENS} reopens hit \
              injected faults, so the last round's acked requests were never checked"
         )),
+        Verify::Refused => {}
     }
     Ok(())
 }
@@ -2482,12 +2495,14 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
 /// was 38 at S5's parent (796bff2) and at S5 before the aiming; over ten fresh
 /// bases the mean went 35.0 -> 16.0.
 const BURST_GAVE_UP_CEILING: u64 = 15;
-/// The skipped-boundary cap, exact at the pinned base: 11 round-boundary
-/// checks were unreachable in two identical batches with the round boots aimed
-/// and 64 round reopens (2026-10-01, S5 review I1). It was 20 at S5's parent
-/// and 26 at S5 before the aiming; over ten fresh bases the mean went 22.6 ->
-/// 18.3.
-const BURST_ROUND_UNREACHABLE_CEILING: u64 = 11;
+/// The skipped-boundary cap, exact at the pinned base: 6 round-boundary
+/// checks were unreachable in two identical batches (2026-10-01, S5 re-review
+/// R-M2). It was 11 with the round boots aimed and 64 round reopens (S5 review
+/// I1); the other 5 were reopens refused for durable corruption, which now end
+/// the check and give the universe up at once (`Verify::Refused`), with the
+/// give-ups unchanged at 15. It was 20 at S5's parent and 26 at S5 before the
+/// aiming; over ten fresh bases the mean went 22.6 -> 18.3.
+const BURST_ROUND_UNREACHABLE_CEILING: u64 = 6;
 
 /// The reach floor, exact at the pinned base: 1,063 round boundaries and
 /// codas verified the watermark in two identical batches (2026-10-01, S5
@@ -2528,6 +2543,46 @@ const BURST_VERIFIED_FLOOR: u64 = 1063;
 /// request — or that made every verification reopen fail — would satisfy
 /// every remaining key and pass 256 universes without comparing anything
 /// (T8b review I-3).
+/// A durable refusal at a round boundary's check ends it at once, by name (S5
+/// re-review R-M2). Seed `0xf9fda70a755de95b`, at the batch's base, meets one
+/// there. No restart clears it, and the check used to spend all 64 reopens on
+/// it and count the boundary `oracle:round-unreachable`, as though every
+/// reopen had hit an injected fault; the next round's boot then gave the
+/// universe up for the same refusal.
+#[test]
+fn a_durable_refusal_at_a_round_boundary_check_ends_it_at_once_by_name() {
+    const SEED: u64 = 0xf9fd_a70a_755d_e95b;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = burst_workload(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    assert_eq!(
+        sim.coverage().get("oracle:round-unreachable"),
+        None,
+        "seed {SEED:#x}: the refused boundary is no unreachable one"
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
+
 #[test]
 fn contended_request_bursts_survive_the_fault_matrix() {
     run_universes_swarm_with!(

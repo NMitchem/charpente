@@ -2675,14 +2675,25 @@ for these before hand-rolling the same logic a fourth time:
   fallout, and what it means is yours to say: a workload whose only node
   never came up gives up by name (`counter_survives` above), and a round
   restarts and moves on. The one `None` the helper names itself is a boot
-  refused for durable corruption at or below the store's horizon: no restart
-  clears bytes on the disk, so it stops at once, marks `boot:durable-refusal`
-  and gives the universe up under that name. Use it at every boot, a round
+  refused for durable corruption at or below the store's horizon
+  (`durable_refusal`, next): no restart clears bytes on the disk, so it stops
+  at once, marks `boot:durable-refusal` and gives the universe up under that
+  name. Where no durable corruption fired, the same refusal is a finding and
+  comes back as `Err(e)`, unchanged. Use it at every boot, a round
   loop's included: an injected fault inside the table store's open is
   returned by `Db::open` as the error it is, and the next boot opens the same
   file, so a phase that gives up or skips on its first faulted boot throws
   away work a restart would have recovered. A round loop's next round does
   boot again, but the round it skipped is work the property never checks.
+- `durable_refusal(sim: &Sim, text: &str) -> Result<bool, String>` — the
+  same rule for a loop that boots on its own, such as a final verification's
+  reopen loop: call it on each fallout before booting again. `Ok(false)`: not
+  a durable refusal, carry on. `Ok(true)`: a refusal in a universe where
+  durable corruption fired, already given up under its own name and marked
+  `boot:durable-refusal`, so end the loop. `Err(..)`: a refusal where none
+  fired, which nothing excuses, so fail with the text it names. A loop that
+  retries a durable refusal spends its whole budget on bytes no restart
+  clears, then gives up claiming the attempts all hit injected faults.
 - `dir_entry_loss_fired(sim: &Sim) -> bool` — the same fire-time-marked
   discipline for the `dir_entry_loss` axis (a pending directory create
   vanished, or a pending removal resurrected). A workload that routes
@@ -2707,6 +2718,8 @@ pub fn boot_through_fallout<T, E: std::fmt::Display>(
     is_fallout: impl Fn(&str) -> bool,
     boot: impl FnMut() -> Result<T, E>,
 ) -> Result<Option<T>, E>
+
+pub fn durable_refusal(sim: &Sim, text: &str) -> Result<bool, String>
 
 pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
     seed: u64,

@@ -240,12 +240,14 @@ pub fn acked_implies_durable(
 ///     restarts and moves on, because a later phase still has to adjudicate
 ///     or give up.
 ///   - a boot was refused for durable corruption at or below the store's
-///     horizon (`FaultReason::DurableHorizon`). Those bytes are on the disk,
-///     so no restart clears them: the helper stops at once, marks
-///     `boot:durable-refusal` and gives the universe up under that name. The
-///     give-up is the first, so a caller's own later one cannot replace it.
+///     horizon, in a universe where durable corruption fired
+///     ([`durable_refusal`]). Those bytes are on the disk, so no restart
+///     clears them: the helper stops at once, marks `boot:durable-refusal`
+///     and gives the universe up under that name. The give-up is the first,
+///     so a caller's own later one cannot replace it.
 /// - `Err(e)`: the first error `is_fallout` rejects, unchanged and at once. A
-///   non-injected error is a finding, never a reason to boot again.
+///   non-injected error is a finding, never a reason to boot again. So is a
+///   durable refusal where no durable corruption fired: nothing excuses it.
 ///
 /// One injected fault used to cost the phase it hit: a workload that booted
 /// once gave up on fallout, and a round or an epoch skipped itself. That was
@@ -287,20 +289,47 @@ pub fn boot_through_fallout<T, E: std::fmt::Display>(
                 if !is_fallout(&text) {
                     return Err(e);
                 }
-                if matches!(classify(&text), FaultReason::DurableHorizon) {
-                    sim.cover("boot:durable-refusal");
-                    sim.give_up(format!(
-                        "the boot was refused for durable corruption at or below the store's \
-                         horizon, which no restart clears, so nothing past it was adjudicated: \
-                         {text}"
-                    ));
-                    return Ok(None);
+                match durable_refusal(sim, &text) {
+                    Ok(true) => return Ok(None),
+                    Ok(false) => {}
+                    Err(_) => return Err(e),
                 }
             }
         }
     }
     sim.cover("boot:exhausted");
     Ok(None)
+}
+
+/// What a boot refused for durable corruption at or below the store's horizon
+/// (`FaultReason::DurableHorizon`) ends, for any loop that boots again on
+/// fallout: [`boot_through_fallout`] and every final verification's reopen
+/// loop. Those bytes are on the disk, so no restart clears them, and booting
+/// again only spends the loop's budget before it gives up under the wrong
+/// name (S5 re-review R-M2).
+///
+/// - `Ok(false)`: `text` is no durable refusal; the loop carries on.
+/// - `Ok(true)`: it is one, and durable corruption fired in this universe
+///   ([`durable_corruption_fired`]). The universe is given up under the
+///   refusal's own name and `boot:durable-refusal` is marked; the loop ends.
+/// - `Err(..)`: it is one, but no durable corruption fired, so nothing
+///   excuses it. The text names it, and the universe fails.
+pub fn durable_refusal(sim: &Sim, text: &str) -> Result<bool, String> {
+    if !matches!(classify(text), FaultReason::DurableHorizon) {
+        return Ok(false);
+    }
+    if !durable_corruption_fired(sim) {
+        return Err(format!(
+            "a boot was refused for durable corruption at or below the store's horizon, but no \
+             durable corruption fired in this universe, so nothing excuses the refusal: {text}"
+        ));
+    }
+    sim.cover("boot:durable-refusal");
+    sim.give_up(format!(
+        "the boot was refused for durable corruption at or below the store's horizon, which no \
+         restart clears, so nothing past it was adjudicated: {text}"
+    ));
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -445,9 +474,9 @@ mod tests {
         // A misdirected write in scope IS.
         let sim = Sim::with_faults(
             0xD0C_0003,
-            FaultConfig {
+            crate::FaultConfig {
                 misdirected_write: 1.0,
-                ..FaultConfig::none()
+                ..crate::FaultConfig::none()
             },
         );
         let file = sim.disk().open("wal/f").unwrap();
@@ -457,9 +486,9 @@ mod tests {
         // A bit flip at restart IS.
         let sim = Sim::with_faults(
             0xD0C_0004,
-            FaultConfig {
+            crate::FaultConfig {
                 bit_flip: 1.0,
-                ..FaultConfig::none()
+                ..crate::FaultConfig::none()
             },
         );
         let file = sim.disk().open("wal/f").unwrap();
@@ -729,7 +758,22 @@ mod tests {
         );
         assert_eq!(sim.gave_up(), None, "what exhaustion means is the caller's");
 
-        let sim = Sim::new(0xB007);
+        // A durable refusal where durable corruption fired: a bit flip on a
+        // durable WAL byte at the power cycle.
+        let sim = Sim::with_faults(
+            0xB007,
+            crate::FaultConfig {
+                bit_flip: 1.0,
+                ..crate::FaultConfig::none()
+            },
+        );
+        let disk = sim.disk();
+        let file = disk.open("wal/00000000000000000000.log").unwrap();
+        file.write_at(0, &[7; 16]).unwrap();
+        file.sync().unwrap();
+        disk.sync_dir("wal/").unwrap();
+        sim.restart();
+        assert!(durable_corruption_fired(&sim));
         let mut calls = 0;
         let refused = boot_through_fallout(&sim, 8, is_fault_fallout, || {
             calls += 1;
@@ -754,6 +798,29 @@ mod tests {
             "under its own name, carrying the refusal: {reason}"
         );
 
+        // The same refusal where no durable corruption fired is a finding:
+        // it comes back unchanged and at once, and nothing is given up (S5
+        // re-review R-M3).
+        let sim = Sim::new(0xB007);
+        let mut calls = 0;
+        let unexcused = boot_through_fallout(&sim, 8, is_fault_fallout, || {
+            calls += 1;
+            Err::<(), _>(
+                "log frame 7 is invalid but at-or-below the store's durable horizon 9".to_string(),
+            )
+        });
+        assert_eq!(
+            unexcused,
+            Err("log frame 7 is invalid but at-or-below the store's durable horizon 9".to_string())
+        );
+        assert_eq!(
+            calls, 1,
+            "an unexcused durable refusal is never booted past"
+        );
+        assert_eq!(sim.coverage().get("boot:durable-refusal"), None);
+        assert_eq!(sim.coverage().get("boot:retried"), None);
+        assert_eq!(sim.gave_up(), None);
+
         let sim = Sim::new(0xB007);
         let mut calls = 0;
         let real = boot_through_fallout(&sim, 8, is_fault_fallout, || {
@@ -764,6 +831,54 @@ mod tests {
         assert_eq!(calls, 1, "a non-fallout error is never booted past");
         assert_eq!(sim.coverage().get("boot:retried"), None);
         assert_eq!(sim.gave_up(), None);
+    }
+
+    /// `durable_refusal`'s three answers, for a loop that boots on its own:
+    /// anything but a durable refusal carries on; a durable refusal gives up
+    /// under its name only where durable corruption fired, and fails by name
+    /// everywhere else (S5 re-review R-M2, R-M3).
+    #[test]
+    fn durable_refusal_ends_a_loop_by_name_and_is_excused_only_where_corruption_fired() {
+        const REFUSAL: &str = "log frame 3 is invalid but at-or-below the store's durable \
+                               horizon 7 — restore this node from a replica or backup";
+        let sim = Sim::new(0xD0E5);
+        assert_eq!(
+            durable_refusal(&sim, "simulated disk write error (injected fault)"),
+            Ok(false)
+        );
+        let err = durable_refusal(&sim, REFUSAL).expect_err("no corruption fired");
+        assert!(
+            err.starts_with(
+                "a boot was refused for durable corruption at or below the store's horizon, but \
+                 no durable corruption fired in this universe"
+            ) && err.ends_with(REFUSAL),
+            "{err}"
+        );
+        assert_eq!(sim.gave_up(), None);
+        assert_eq!(sim.coverage().get("boot:durable-refusal"), None);
+
+        let sim = Sim::with_faults(
+            0xD0E5,
+            crate::FaultConfig {
+                misdirected_write: 1.0,
+                ..crate::FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("wal/00000000000000000000.log").unwrap();
+        file.write_at(0, &[7; 16]).unwrap();
+        assert!(durable_corruption_fired(&sim));
+        assert_eq!(durable_refusal(&sim, REFUSAL), Ok(true));
+        assert_eq!(sim.coverage().get("boot:durable-refusal"), Some(&1));
+        let reason = sim
+            .gave_up()
+            .expect("an excused refusal gives the universe up");
+        assert!(
+            reason.starts_with(
+                "the boot was refused for durable corruption at or below the store's horizon, \
+                 which no restart clears"
+            ) && reason.ends_with(REFUSAL),
+            "{reason}"
+        );
     }
 
     #[test]
