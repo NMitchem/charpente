@@ -1793,19 +1793,22 @@ fn ambient_base_seed() -> u64 {
 /// universe, and accumulating sometimes-coverage across the batch. Add
 /// `require: [...]` to assert each named key was covered at least once in the
 /// batch — call as `run_universes_swarm!(N, f)` or `run_universes_swarm!(N,
-/// f, require: ["key", ...])` — and `ceiling: [("key", N), ...]` after it to
-/// fail the batch when a key that must stay rare was covered more than N
-/// times (see `run_universes_swarm_with!`). `run_universes!`/`run_one` are a
+/// f, require: ["key", ...])` — then `floor: [("key", N), ...]` to fail the
+/// batch when a key was covered fewer than N times, `ceiling: [("key", N),
+/// ...]` to fail it when a key that must stay rare was covered more than N
+/// times, or both, in that order (see `run_universes_swarm_with!`). This base
+/// is ambient, so the counts move batch to batch and either bound is a margin
+/// around a measured spread, never an exact count. `run_universes!`/`run_one` are a
 /// separate, frozen runner — this one is new. Set `CHARPENTE_SEED=0x…` to replay one
 /// universe (its config re-derives from the seed; the coverage requirement
 /// check is skipped, since one universe can't be expected to hit everything).
 #[macro_export]
 macro_rules! run_universes_swarm {
     ($universes:expr, $f:expr) => {
-        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[], &[], $f)
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[], &[], &[], $f)
     };
     ($universes:expr, $f:expr, require: [$($key:expr),* $(,)?]) => {
-        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[$($key),*], &[], $f)
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[$($key),*], &[], &[], $f)
     };
     ($universes:expr, $f:expr,
      require: [$($key:expr),* $(,)?],
@@ -1815,6 +1818,34 @@ macro_rules! run_universes_swarm {
             file!(),
             $universes,
             &[$($key),*],
+            &[],
+            &[$(($ckey, $max)),*],
+            $f,
+        )
+    };
+    ($universes:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     floor: [$(($fkey:expr, $min:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $universes,
+            &[$($key),*],
+            &[$(($fkey, $min)),*],
+            &[],
+            $f,
+        )
+    };
+    ($universes:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     floor: [$(($fkey:expr, $min:expr)),* $(,)?],
+     ceiling: [$(($ckey:expr, $max:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $universes,
+            &[$($key),*],
+            &[$(($fkey, $min)),*],
             &[$(($ckey, $max)),*],
             $f,
         )
@@ -1827,6 +1858,7 @@ pub fn run_universes_swarm_in(
     file: &str,
     universes: u64,
     require: &[&str],
+    floors: &[(&str, u64)],
     ceilings: &[(&str, u64)],
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
@@ -1841,7 +1873,7 @@ pub fn run_universes_swarm_in(
         ambient_base_seed(),
         universes,
         require,
-        &[],
+        floors,
         ceilings,
         |_cfg: &mut FaultConfig| {},
         f,
@@ -3044,6 +3076,7 @@ mod tests {
                 1,
                 &[],
                 &[],
+                &[],
                 |_sim: &mut Sim| -> Result<(), String> { panic!("boom") },
             );
         }))
@@ -3084,6 +3117,27 @@ mod tests {
         // "to what": 1-of-3 and 2-of-3 are different investigations.
         assert!(msg.contains("rare:key: 1 of 3 required"), "{msg}");
         assert!(msg.contains("MEASURED rate"), "{msg}");
+    }
+
+    #[test]
+    fn the_ambient_runner_enforces_a_floor_too() {
+        let universes_seen = std::sync::atomic::AtomicUsize::new(0);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::run_universes_swarm!(
+                4,
+                |sim: &mut Sim| {
+                    if universes_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        sim.cover("rare:key");
+                    }
+                    Ok(())
+                },
+                require: [],
+                floor: [("rare:key", 3)]
+            );
+        }))
+        .expect_err("an ambient batch below its floor must fail too");
+        let msg = panic_message(&*payload);
+        assert!(msg.contains("rare:key: 1 of 3 required"), "{msg}");
     }
 
     #[test]
@@ -3170,6 +3224,7 @@ mod tests {
                 "swarm_meta.rs",
                 4,
                 &["never:happens"],
+                &[],
                 &[],
                 |_sim: &mut Sim| Ok(()),
             );

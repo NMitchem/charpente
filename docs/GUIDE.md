@@ -2475,6 +2475,12 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   reported and never failed, so without a cap a property can drift toward
   adjudicating nothing with every batch green; a floor on the key would bound
   give-ups from below, which guards nothing.
+- A cap bounds what a property fails to conclude, not how much it checks, so
+  pair it with a `floor: [("key", N)]` on the key that counts its checks
+  (written before `ceiling:`, on either macro). A change that skips a round's
+  work without giving up meets every cap. At a pinned base the floor is the
+  exact count; at an ambient one it is a margin, about as far below the mean
+  over ten fresh batches as the cap sits above it.
 - If your workload already funnels give-ups through a wrapper (the
   `Err("universe-inconclusive: …")` idiom the platform's own suites use), put
   the `sim.give_up(e)` call there, beside the `sim.cover(...)` mark. Keep
