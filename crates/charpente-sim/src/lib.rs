@@ -848,7 +848,7 @@ impl Sim {
         disk.crash_countdown = None;
     }
 
-    /// Restarts the PROCESS, not the machine: every open handle dies (it
+    /// Restarts the PROCESS, not the machine: every open file handle dies (it
     /// predates the restart, the same contract as after `restart`) and
     /// nothing else happens. The page cache survives — every unsynced write
     /// and directory entry stays pending, readable by the next open exactly
@@ -862,7 +862,11 @@ impl Sim {
     /// outran the log, realtime seed 0x7df8c43a1d2591e8).
     ///
     /// Call it before dropping the old process's handles to model a kill
-    /// (no destructor reaches the disk), after to model an exit. Draws
+    /// (nothing flushed through its open files reaches the disk), after to
+    /// model an exit. Only file handles are epoch-gated, as after `restart`:
+    /// a destructor that opens a file afresh through a held `SimDisk` still
+    /// reaches the disk. `unsynced_files` reads what the restart left
+    /// unsynced. Draws
     /// nothing, collapses nothing and clears no countdown — a pending crash
     /// countdown stays armed, since power loss does not wait for a process —
     /// so a universe that never calls it is unchanged. Marks
@@ -890,6 +894,22 @@ impl Sim {
     /// the same seed must produce the same fingerprint, forever.
     pub fn durable_fingerprint(&self) -> u64 {
         fingerprint_files(&self.world.lock().disk.files)
+    }
+
+    /// The files on the global disk holding writes no sync has taken yet,
+    /// sorted by name: what the next power cycle may tear or drop. Read right
+    /// after `restart_process`, it proves the restart left the next process
+    /// something unsynced to read back; a restart that flushed would leave it
+    /// empty. Read-only: draws nothing and marks nothing.
+    pub fn unsynced_files(&self) -> Vec<String> {
+        self.world
+            .lock()
+            .disk
+            .files
+            .iter()
+            .filter(|(_, file)| !file.pending.is_empty())
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// The earliest virtual time at which a currently in-flight network
@@ -2388,8 +2408,17 @@ mod tests {
             vec!["f".to_string(), "g".to_string()],
             "a process restart keeps a directory entry that was never made durable"
         );
+        assert_eq!(
+            sim.unsynced_files(),
+            vec!["f".to_string()],
+            "a process restart leaves the dead process's unsynced write unsynced"
+        );
         let coverage = sim.coverage();
-        assert_eq!(coverage.get("restart:process"), Some(&1));
+        assert_eq!(
+            coverage.get("restart:process"),
+            Some(&1),
+            "a process restart marks restart:process once"
+        );
         assert!(
             !coverage
                 .keys()
@@ -2398,7 +2427,16 @@ mod tests {
         );
 
         sim.restart(); // the power cycle drops what the process restart kept
-        assert_eq!(disk.open("f").unwrap().len().unwrap(), 0);
+        assert_eq!(
+            disk.open("f").unwrap().len().unwrap(),
+            0,
+            "a power cycle drops the unsynced write the process restart kept — if it is still \
+             here, the write was made durable before the power cycle"
+        );
+        assert!(
+            sim.unsynced_files().is_empty(),
+            "a power cycle leaves nothing unsynced"
+        );
     }
 
     #[test]
@@ -2433,7 +2471,13 @@ mod tests {
                 coverage,
             )
         };
-        assert_eq!(run(true), run(false));
+        assert_eq!(
+            run(true),
+            run(false),
+            "a process restart changed the next power cycle's collapse, the entropy after it, or \
+             the coverage: it drew from a stream or collapsed something, so introducing it \
+             re-keys universes"
+        );
     }
 
     #[test]

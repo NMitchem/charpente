@@ -1868,7 +1868,15 @@ fn a_recovery_whose_segment_sync_fails_hands_no_frame_to_replay() {
         },
     )
     .expect_err("recovery went on past a segment whose sync failed");
-    assert_eq!(err.to_string(), "injected fsync failure");
+    // Hard rule 5: the contract, the site (the segment) and the fix, around
+    // the disk's own text, which fault classification still reads.
+    assert_eq!(
+        err.to_string(),
+        "recovery could not make log segment \"wal/00000000000000000000.log\" durable before \
+         replaying it: injected fsync failure — contract: no frame is replayed before its \
+         segment is synced (DESIGN §2), so none of this segment's frames were replayed; fix: \
+         restart to retry recovery, and if this sync keeps failing the disk is failing"
+    );
     assert_eq!(
         replayed, 0,
         "a frame reached replay from a segment whose sync failed"

@@ -479,8 +479,9 @@ then the store snapshot the batch began from. `Tx` implements `View` (`get`,
 `scan`, `scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as
 it does on a `Snapshot`. On `Ok`, every buffered write, enqueue, and emit
 commits as ONE durable log record — all or nothing — and only then applies
-to the store. On `Err`, nothing happened at all: no log position consumed,
-nothing written.
+to the store. On `Err(TxError::App(_))`, nothing happened at all: no log
+position consumed, nothing written. On `Err(TxError::Io(_))` the outcome is
+unknown — the record may already be durable (below).
 
 ```rust
 use charpente::core::table::{Codec, Unscoped};
@@ -2536,26 +2537,42 @@ the only clean attempt's tail leaves the universe with no verdict at all.
 vanishes before anything reopens. Most restarts in production are not that. A
 supervisor restarting a crashed, killed or exited process finds the OS page
 cache intact: every write the dead process made is still readable, synced or
-not. `sim.restart_process()` models that. Every open handle dies, exactly as
-after `restart`, and nothing else happens. Unsynced writes and directory entries
-stay pending and readable, and the next `restart()` still collapses them.
+not. `sim.restart_process()` models that. Every open file handle dies, exactly
+as after `restart`, and nothing else happens. Unsynced writes and directory
+entries stay pending and readable, and the next `restart()` still collapses
+them.
 
 The difference matters because readable is not durable. A node that reads back
 what a dead process wrote and persists anything derived from it, before making
 it durable, has built on data the next power loss can take away. A store
-outruns its own log exactly that way: recovery replays a WAL frame whose fsync
-failed, the store checkpoints past it, and a power cycle drops the frame. A
-property that only ever power-cycles cannot reach that shape. One that mixes
-the two can.
+outran its own log exactly that way: recovery replayed a WAL frame whose fsync
+had failed, the store checkpointed past it, and a power cycle dropped the frame.
+Charpente now syncs what it reads back at boot before it acts on it. A property
+that only ever power-cycles cannot reach that shape. One that mixes the two can.
 
-Call `restart_process()` before you drop the old process's `Db` to model a kill,
-where no destructor reaches the disk. Call it after the drop to model an exit.
-It draws from no random stream and clears no crash countdown, so the sim gained
-it without re-keying anyone's universes. Calling it does change everything your
-workload does afterwards, as any restart would. It marks `restart:process`, never
-`restart`. A crashed disk is power loss, and `restart_process()` refuses it by
-name: call `restart()` there. It covers the global disk; hosts have no process
-restart.
+The sim's kernel is an honest one: a failed sync leaves its writes pending, and
+the next sync writes them. On Linux a failed fsync can instead mark the pages
+clean, so the bytes stay readable and never reach the disk. No restart mode
+models that, and no later sync can repair it.
+
+Call `restart_process()` before you drop the old process's `Db` to model a kill:
+its open files are dead, so nothing it flushes through them on the way out
+reaches the disk. Only file handles are gated. A destructor that opens a file
+afresh through a `Disk` it still holds would reach the disk; charpente's own
+close goes through its open files. Call it after the drop to model an exit.
+
+`sim.unsynced_files()` lists the files that hold writes no sync has taken yet.
+Read it right after `restart_process()` to prove the restart left the next
+process something unsynced to read back. A property that marks "read back an
+unsynced write" from that list cannot be satisfied by a restart that quietly
+flushed.
+
+`restart_process()` draws from no random stream and clears no crash countdown,
+so the sim gained it without re-keying anyone's universes. Calling it does
+change everything your workload does afterwards, as any restart would. It marks
+`restart:process`, never `restart`. A crashed disk is power loss, and
+`restart_process()` refuses it by name: call `restart()` there. It covers the
+global disk; hosts have no process restart.
 
 ### The checkers
 

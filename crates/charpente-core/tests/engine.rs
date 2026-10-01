@@ -3591,27 +3591,48 @@ fn a_panic_inside_store_open_propagates_as_a_panic() {
 
 // ------------------------------------------- recovery syncs what it replays
 
-/// A disk whose `wal/` files fail their next `sync` while armed (one-shot,
-/// the file clears the flag as it fails), every other file untouched — so a
-/// test can fail the LOG's fsync while the store's own syncs go through. A
-/// failed sync does not reach the sim at all, so the buffer stays volatile,
-/// exactly as `SimFile::sync`'s injected failure leaves it.
-struct FailWalSync {
+/// A disk whose files under `prefix` fail `sync` while armed, every other
+/// file untouched — so a test can fail the LOG's fsync while the store's own
+/// syncs go through, or the reverse. One-shot unless `sticky` (the file clears
+/// the flag as it fails). A failed sync does not reach the sim at all, so the
+/// buffer stays volatile, exactly as `SimFile::sync`'s injected failure leaves
+/// it.
+struct FailSync {
     inner: charpente_sim::SimDisk,
+    prefix: &'static str,
+    what: &'static str,
+    sticky: bool,
     arm: Arc<std::sync::atomic::AtomicBool>,
 }
 
-struct FailWalSyncFile {
+impl FailSync {
+    /// The log's next fsync fails while `arm` is set.
+    fn wal(inner: charpente_sim::SimDisk, arm: &Arc<std::sync::atomic::AtomicBool>) -> FailSync {
+        FailSync {
+            inner,
+            prefix: "wal/",
+            what: "the log",
+            sticky: false,
+            arm: arm.clone(),
+        }
+    }
+}
+
+struct FailSyncFile {
     inner: Box<dyn File>,
-    wal: bool,
+    hit: bool,
+    what: &'static str,
+    sticky: bool,
     arm: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Disk for FailWalSync {
+impl Disk for FailSync {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
-        Ok(Box::new(FailWalSyncFile {
+        Ok(Box::new(FailSyncFile {
             inner: self.inner.open(path)?,
-            wal: path.starts_with("wal/"),
+            hit: path.starts_with(self.prefix),
+            what: self.what,
+            sticky: self.sticky,
             arm: self.arm.clone(),
         }))
     }
@@ -3626,7 +3647,7 @@ impl Disk for FailWalSync {
     }
 }
 
-impl File for FailWalSyncFile {
+impl File for FailSyncFile {
     fn len(&self) -> io::Result<u64> {
         self.inner.len()
     }
@@ -3640,8 +3661,19 @@ impl File for FailWalSyncFile {
         self.inner.set_len(len)
     }
     fn sync(&self) -> io::Result<()> {
-        if self.wal && self.arm.swap(false, Ordering::SeqCst) {
-            return Err(io::Error::other("injected fsync failure on the log"));
+        // Only a matching file touches the arm: a one-shot arm must survive
+        // every other file's sync until the one it was armed for.
+        let fire = self.hit
+            && if self.sticky {
+                self.arm.load(Ordering::SeqCst)
+            } else {
+                self.arm.swap(false, Ordering::SeqCst)
+            };
+        if fire {
+            return Err(io::Error::other(format!(
+                "injected fsync failure on {}",
+                self.what
+            )));
         }
         self.inner.sync()
     }
@@ -3656,10 +3688,7 @@ impl File for FailWalSyncFile {
 fn a_commit_whose_log_fsync_failed(seed: u64) -> (Sim, Arc<std::sync::atomic::AtomicBool>) {
     let sim = Sim::with_faults(seed, FaultConfig::none());
     let arm = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let disk = || FailWalSync {
-        inner: sim.disk(),
-        arm: arm.clone(),
-    };
+    let disk = || FailSync::wal(sim.disk(), &arm);
     let mut db = Db::open(
         Box::new(disk()),
         DbConfig::default(),
@@ -3702,8 +3731,9 @@ fn a_commit_whose_log_fsync_failed(seed: u64) -> (Sim, Arc<std::sync::atomic::At
 /// whose boot loop reopens in the same power epoch after a failed boot write:
 /// seeds `0x5d889f4c1a9ac543`, `0x7df8c43a1d2591e8`, `0x53ddec7159925eb0`
 /// (74ddf90 and 796bff2) and `0xa18e1e5bed2b612d` (89bd4e6, redb 4.1.0).
-/// Recovery's sync draws from the shared fault stream, so those universes
-/// re-roll under the fix and no longer reach this shape. THIS test, and
+/// Under the fix those universes diverge at recovery's sync of the dirty
+/// segment (a new fault roll on the shared stream), so they no longer pin this
+/// shape. THIS test, and
 /// `a_recovery_whose_log_sync_fails_replays_nothing`, are the pins, along with
 /// the swarm property below that mixes process restarts and power cycles.
 #[test]
@@ -3755,10 +3785,7 @@ fn a_recovery_whose_log_sync_fails_replays_nothing() {
     let (sim, arm) = a_commit_whose_log_fsync_failed(0xD1_0002);
     arm.store(true, Ordering::SeqCst);
     let err = Db::open(
-        Box::new(FailWalSync {
-            inner: sim.disk(),
-            arm: arm.clone(),
-        }),
+        Box::new(FailSync::wal(sim.disk(), &arm)),
         DbConfig::default(),
         Schema::new().table::<Widget>(),
     )
@@ -3789,6 +3816,75 @@ fn a_recovery_whose_log_sync_fails_replays_nothing() {
             .is_none(),
         "the store holds no row from a record the log never made durable"
     );
+}
+
+/// `Db::open` trusts the store's `applied_seq` BEFORE recovery runs: with a
+/// checkpointed store beside an empty log it lays a durable segment based at
+/// `applied_seq + 1` (the mid-seed-finish shape, db.rs). A seeder whose store
+/// checkpoint failed leaves that `applied_seq` in the page cache only, so the
+/// branch is safe only if the store is durable before it is read. Nothing in
+/// charpente syncs it there: redb 4.3.0's own open does (DESIGN §4). Without
+/// that, the power loss below leaves a store at `None` beside a log based at 6,
+/// and the next open refuses the node outright ("acknowledged records between
+/// the horizon and the base exist in neither the store nor the log"). This pins
+/// the dependency, so a redb that stops syncing at open turns it red.
+/// (D1 review M7.)
+#[test]
+fn a_seeded_store_a_restarted_node_lays_its_segment_from_survives_the_next_power_loss() {
+    let sim = Sim::with_faults(0xD1_0003, FaultConfig::none());
+    let arm = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seeder = Seeder::new(
+        Box::new(FailSync {
+            inner: sim.disk(),
+            prefix: "tables.redb",
+            what: "the store",
+            sticky: true,
+            arm: arm.clone(),
+        }),
+        DbConfig::default(),
+        Schema::new().table::<Widget>(),
+    )
+    .unwrap();
+    arm.store(true, Ordering::SeqCst); // every store fsync from here on fails
+    let err = seeder
+        .finish(5, 0, 0, 0)
+        .expect_err("the store's checkpoint fsync was armed to fail");
+    assert!(
+        err.to_string()
+            .contains("injected fsync failure on the store"),
+        "the seed failed at the store's fsync, not somewhere else: {err}"
+    );
+    arm.store(false, Ordering::SeqCst);
+
+    sim.restart_process(); // the seeding process died; its page cache did not
+    let db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Widget>(),
+    )
+    .expect("the restarted node opens the seeded store");
+    assert_eq!(
+        db.last_applied(),
+        Some(5),
+        "it trusts the seeded applied_seq"
+    );
+    assert_eq!(
+        sim.disk().list("wal/").unwrap(),
+        vec!["wal/00000000000000000006.log".to_string()],
+        "and lays the segment the seed would have"
+    );
+    sim.restart(); // power loss under the running node: no close reaches the disk
+    drop(db);
+    let db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Widget>(),
+    )
+    .expect(
+        "the node reopens after a power loss — a refusal here means the laid segment outlived \
+         the store state it was laid from: the store was not durable when Db::open read it",
+    );
+    assert_eq!(db.last_applied(), Some(5));
 }
 
 /// Rounds of one process each; bounds a universe's cost.
@@ -3853,6 +3949,11 @@ fn restart_mix_workload(sim: &mut Sim) -> Result<(), String> {
     // with no collapse in between read an unacknowledged frame back from the
     // page cache.
     let mut unacked_left: Option<(Option<u64>, u64)> = None;
+    // Whether the log held unsynced writes right after the latest process
+    // restart, read off the sim rather than inferred: a restart that flushed
+    // the page cache would leave the replayed frame durable, and the old
+    // recovery green (D1 review M1).
+    let mut log_unsynced_at_restart = false;
     for _ in 0..RESTART_MIX_ROUNDS {
         // With the durable-corruption axes off, nothing may ever corrupt a
         // frame at or below the store's horizon, so the horizon rule's named
@@ -3873,6 +3974,7 @@ fn restart_mix_workload(sim: &mut Sim) -> Result<(), String> {
             if let Some((acked_end, at)) = unacked_left.take()
                 && db.last_applied() > acked_end
                 && collapses(sim) == at
+                && log_unsynced_at_restart
             {
                 sim.cover("mix:page-cache-replayed");
             }
@@ -3897,21 +3999,26 @@ fn restart_mix_workload(sim: &mut Sim) -> Result<(), String> {
                 }
             }
         }
+        let log_unsynced = |sim: &Sim| sim.unsynced_files().iter().any(|f| f.starts_with("wal/"));
         match entropy.next_u64() % 4 {
             0 => {
                 sim.restart_process();
+                log_unsynced_at_restart = log_unsynced(sim);
                 drop(db);
             }
             1 => {
                 drop(db);
                 sim.restart_process();
+                log_unsynced_at_restart = log_unsynced(sim);
             }
             2 => {
                 drop(db);
                 sim.restart();
+                log_unsynced_at_restart = false;
             }
             _ => {
                 sim.restart();
+                log_unsynced_at_restart = false;
                 drop(db);
             }
         }
@@ -3941,24 +4048,29 @@ fn restart_mix_workload(sim: &mut Sim) -> Result<(), String> {
 ///
 /// The base is pinned where the batch is red for both ways of getting the
 /// fix wrong. With 796bff2's recovery (no sync) it fails on `Db::open`'s
-/// assert at seed 0x4d2ba213e3101be8, the minimal shape: one injected fsync
-/// error, one failed commit, a process restart that replays the frame, a
-/// power cycle that drops it, `store applied_seq 0 is ahead of the durable log
-/// end None`. With the sync moved after replay it fails at seed
-/// 0xc51c4fe5d1d1b9d7 (`applied_seq 6 … Some(5)`). Over 40 fresh bases
-/// × 256 at the fix it is green. Before the base was pinned, 21 of 30 fresh
-/// bases failed without the sync (13 on the assert, 8 on the horizon rule's
-/// refusal), and 19 of 40 failed with the sync after replay. Those seeds name
-/// universes under THIS file's code: the fix's extra sync draws from the shared
-/// fault stream, so the same seed is a different universe on either side of it.
+/// assert at seed 0xf191067210d934f0, in one round trip of the bug: a commit
+/// whose fsync failed, a process restart that replays its frame, a power cycle
+/// that drops it, `store applied_seq 0 is ahead of the durable log end None`
+/// (fired: five sync errors, two process restarts, one power cycle). With the sync moved after replay it fails at seed 0x55d5f8c87f0b8959
+/// (the same assert). Over 64 fresh bases × 256 at the fix it is green; without
+/// the sync 50 of those 64 are red (26 on the assert, 24 on the horizon rule's
+/// refusal), and with the sync after replay 23 are. Those seeds name universes
+/// under THIS tree's code (2026-10-01, after a sync with nothing to flush
+/// stopped rolling a fault, which re-keyed the first base, 0xD1F0_0011): the
+/// fix's sync of a dirty segment draws from the shared fault stream, so a seed
+/// is a different universe on either side of it.
 ///
 /// `mix:page-cache-replayed` is required, so a batch in which no process ever
-/// reads an unacknowledged frame back proves nothing and fails by name. That is
-/// also what a process restart that quietly power-cycled would do.
+/// reads an unacknowledged frame back proves nothing and fails by name. The key
+/// marks only when the sim reported the log unsynced right after the latest
+/// process restart, so a restart that quietly power-cycled, or one that
+/// flushed the page cache, fails the requirement too (and the sim's own unit
+/// tests, `a_process_restart_keeps_the_page_cache_and_a_power_cycle_does_not`
+/// and `a_process_restart_draws_from_no_stream`, hold the mode directly).
 #[test]
 fn the_store_never_outruns_the_log_across_process_restarts_and_power_cycles() {
     run_universes_swarm_with!(
-        0xD1F0_0011,
+        0xD1F0_000E,
         256,
         |cfg: &mut FaultConfig| {
             cfg.bit_flip = 0.0;
