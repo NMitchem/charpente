@@ -495,7 +495,15 @@ is always a lower bound (never over-claims) and degrades silently to no witness 
 absent, torn, or CRC-invalid. `Seeder::new` discards any breadcrumb alongside the store and
 WAL it already discards, so a stale breadcrumb from a different, higher-numbered prior
 timeline sharing the disk can never survive a reseed and over-claim protection the new
-timeline never earned. The `.horizon` sidecar is part of the node's durable set: any
+timeline never earned. The breadcrumb protects a rebuild, and `Db::open` rebuilds only from
+a log that still reaches seq 0 (§4). Beside a log compacted past seq 0, a store holding no
+records is refused before recovery runs, whatever the breadcrumb says: it holds a horizon,
+not the records below the log's base. Until 2026-10-01 it lifted the horizon past the
+vanished-prefix check instead, and the boot panicked replaying the log's base into an empty
+store. Removing the store by hand reached that state, and so did a crash inside
+`Seeder::new` between barriering the store's removal and the breadcrumb's (S5 R-I1, seed
+0x64a183075fd398b9). `Seeder::finish`'s write therefore changes no outcome: a seeded log
+starts at `applied_seq + 1`, never at 0. The `.horizon` sidecar is part of the node's durable set: any
 manual file-level restore of `store` + `wal/` must copy it or delete it alongside them —
 a leftover sidecar from the node's prior life would over-claim and refuse (by name, never
 silently) a legitimate torn tail above the restored horizon. The residual window *above*
@@ -989,9 +997,14 @@ restart fails the same way the disk is failing. One bubbling error no restart fi
 store file cut shorter than redb's header with the magic intact. redb makes a new file's
 length durable before it writes the magic (`page_manager.rs:1181-1200`), so no crash leaves
 one; it takes truncation outside the crash model. It is not a rejection, since redb built no
-verdict, so `Store::open` names it instead: the text says the file was cut, and that the
-fix is to remove it, after which the next boot rebuilds the store from the log, or refuses
-by name if the log no longer reaches seq 0. Before 2026-10-01 any `Store::open` error took the discard path: one transient
+verdict, so `Store::open` names the damage and `Db::open` names the fix, chosen by the log
+beside the store. While the log still reaches seq 0, the fix is to remove the file, and the
+next boot rebuilds the store from the log. Once the log is compacted, the store holds the
+only copy of the records below its base, so the fix is a restore from a replica or backup.
+Removing the file anyway is refused by name: `Db::open` refuses a store holding no records
+beside a log compacted past seq 0, whatever the horizon breadcrumb says (§2). M1's first text
+named removal for both logs, and on a compacted one the next boot panicked (S5 R-I1).
+Before 2026-10-01 any `Store::open` error took the discard path: one transient
 fault deleted a healthy store on a full log, and on a compacted log refused the boot with
 "restore this node from a replica or backup" (follow-up 21, found by the S4 review: an
 injected fsync failure inside `Store::open`). The rejected class includes a store file

@@ -3592,9 +3592,11 @@ fn redbs_verdicts_on_the_bytes_are_rejections_by_reason() {
 /// is the disk's and redb built no verdict: not a rejection, and `Db::open`
 /// keeps the file. But no restart fixes it, and no crash leaves it, since redb
 /// makes the file's length durable before it writes the magic, so the text
-/// names the file, the cut and the fix in place of "restart to retry". The
-/// fix it names holds: with the file removed, the next boot rebuilds the
-/// store from the log.
+/// names the file, the cut and the fix in place of "restart to retry". This
+/// log still starts at seq 0, so the fix it names is removal, and it holds:
+/// with the file removed, the next boot rebuilds the store from the log. A
+/// compacted log names the restore instead (S5 R-I1; transactions.rs pins
+/// both cases with rows).
 #[test]
 fn a_store_cut_shorter_than_redbs_header_is_named_kept_and_fixed_by_removal() {
     for len in [9u64, 100, 319] {
@@ -3630,7 +3632,7 @@ fn a_store_cut_shorter_than_redbs_header_is_named_kept_and_fixed_by_removal() {
             );
             assert!(
                 text.contains("the file was cut outside the crash model")
-                    && text.contains("Remove tables.redb and restart")
+                    && text.contains("still reaches seq 0, so remove tables.redb and restart")
                     && !text.contains("Restart to retry"),
                 "{len} bytes, boot {boot}: the text must name the cut and its fix, not a retry: \
                  {text}"

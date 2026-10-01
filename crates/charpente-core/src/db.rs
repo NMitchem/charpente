@@ -2660,7 +2660,9 @@ impl Db {
     ///   text kept: a restart retries the same file. One of these no restart
     ///   fixes, and its text says so: a store file cut shorter than redb's
     ///   header with the magic number intact, which only damage outside the
-    ///   crash model leaves (`Store::open` names it, DESIGN §4).
+    ///   crash model leaves. `Store::open` names the damage and this the fix,
+    ///   by the log beside it: remove the file while the log reaches seq 0,
+    ///   restore from a replica once it is compacted (DESIGN §4).
     ///
     /// The recovery-horizon rule (DESIGN §2, segment-mgmt T4): the store's
     /// `applied_seq` is the durable horizon threaded into `Engine::recover`,
@@ -2670,7 +2672,11 @@ impl Db {
     /// (`applied_seq + 1`), an entire prefix of acknowledged records has
     /// vanished from both the store and the log; that is never a shape
     /// `checkpoint`'s own gc produces, so it is refused rather than silently
-    /// replayed from wherever the log happens to start.
+    /// replayed from wherever the log happens to start. A store holding no
+    /// records beside a log compacted past seq 0 is refused the same way,
+    /// whatever the horizon breadcrumb says: the breadcrumb outlives the
+    /// store by design, but it holds a horizon, not the records below the
+    /// log's base (DESIGN §4).
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
         // The jobs, events, and schema-versions tables are platform-owned; an
         // app registering any itself hits the existing duplicate-registration
@@ -2689,10 +2695,33 @@ impl Db {
                 // fault a restart retries (follow-up 21; found by the S4
                 // review, an injected fsync failure inside `Store::open`).
                 let Some(rejected) = StoreRejected::of(&e) else {
-                    // `Store::open` already named a file cut too short to
-                    // open, with its own fix; a restart is not it.
+                    // `Store::open` named a file cut too short to open, which
+                    // no restart fixes. Its fix is the log's: removal rebuilds
+                    // the store only from a log that still reaches seq 0
+                    // (S5 R-I1).
                     if e.kind() == io::ErrorKind::UnexpectedEof {
-                        return Err(e);
+                        let prefix = format!("{}/", cfg.wal.dir);
+                        let base = match disk.list(&prefix)?.first() {
+                            Some(first) => Some(parse_segment_name(&cfg.wal.dir, first)?),
+                            None => None,
+                        };
+                        let fix = match base {
+                            Some(0) => format!(
+                                "The log beside it still reaches seq 0, so remove {} and \
+                                 restart: the next boot rebuilds the store from the log",
+                                cfg.store_path
+                            ),
+                            Some(base) => format!(
+                                "The log beside it starts at seq {base}, so this store holds \
+                                 the only copy of the records below it and cannot be rebuilt: \
+                                 restore this node from a replica or backup"
+                            ),
+                            None => "The log beside it is empty, so this store holds the only \
+                                     copy of its records and cannot be rebuilt: restore this \
+                                     node from a replica or backup"
+                                .to_string(),
+                        };
+                        return Err(io::Error::new(e.kind(), format!("{e}. {fix} (DESIGN §4)")));
                     }
                     return Err(io::Error::new(
                         e.kind(),
@@ -2779,13 +2808,34 @@ impl Db {
         // corruption or entry loss, not something rebuild-from-WAL can
         // recover from. Peeked here, before Engine::recover runs, so the
         // hard error mutates nothing (same peek style as the unopenable-store
-        // branch above; `None` reads as horizon `0`, so a fresh store paired
-        // with any compacted log is rejected the same way).
+        // branch above).
         let horizon = witness.map_or(0, |applied| applied + 1);
         let prefix = format!("{}/", cfg.wal.dir);
-        match disk.list(&prefix)?.first() {
-            Some(first) => {
-                let base = parse_segment_name(&cfg.wal.dir, first)?;
+        let log_base = match disk.list(&prefix)?.first() {
+            Some(first) => Some(parse_segment_name(&cfg.wal.dir, first)?),
+            None => None,
+        };
+        match log_base {
+            Some(base) => {
+                // A store holding no records beside a log compacted past seq
+                // 0 cannot be rebuilt, whatever the breadcrumb says: the
+                // records below the base were in a store that is gone. The
+                // breadcrumb is a horizon for the log's frames, not a copy of
+                // the store, and it outlives the store by design, so the
+                // check above it would pass and the replay would start at the
+                // base, into an empty store (S5 R-I1: a store removed by hand,
+                // or a crash inside `Seeder::new` between removing the store
+                // and removing the breadcrumb, seed 0x64a183075fd398b9).
+                if skip_through.is_none() && base > 0 {
+                    return Err(io::Error::other(format!(
+                        "table store {} holds no records, but the log beside it is compacted \
+                         to seq {base}: the records below seq {base} existed only in a store \
+                         that is gone, so it cannot be rebuilt from the log. Removing the store \
+                         by hand leaves this state, and so does a re-seed a crash cut short; \
+                         restore this node from a replica or backup (DESIGN §4)",
+                        cfg.store_path
+                    )));
+                }
                 if base > horizon {
                     return Err(io::Error::other(format!(
                         "log base_seq is {base} but the store's durable horizon is only \
@@ -2846,6 +2896,15 @@ impl Db {
             versions,
             saw_below: BTreeSet::new(),
         };
+        // Negative space: a replay into a store holding no records starts at
+        // seq 0. The refusal above is what keeps a compacted log away from
+        // one; replaying from anywhere else would apply records past a gap.
+        assert!(
+            skip_through.is_some() || log_base.is_none_or(|base| base == 0),
+            "Db::open is about to replay a log starting at seq {log_base:?} into a store holding \
+             no records — a replay into an empty store must start at seq 0, and the empty-store \
+             refusal above must have caught this"
+        );
         let mut engine = Engine::recover(disk, cfg.wal.clone(), machine, witness)?;
         // Recovery replay must not leak into the kernel's incremental feed —
         // the dispatcher rebuilds its due-heap from a Pending scan at open.

@@ -449,8 +449,10 @@ manual upgrade, or not a redb file), and any other open failure — an IO
 error from the disk — is returned by `Db::open` with the site and the fix
 named and the store left as it was, so retrying the open is the fix. The one
 exception says so in its text: a store file cut shorter than redb's header,
-which no crash leaves and no retry fixes, so the fix it names is removing
-the file (DESIGN §4). That rebuild only works
+which no crash leaves and no retry fixes. Its fix depends on the log beside
+it, and the text names the right one: while the log still reaches seq 0,
+remove the file and the next boot rebuilds it; once the log is compacted,
+restore the node from a replica or backup (DESIGN §4). A rebuild only works
 while the log still holds everything back
 to seq 0, though: `Db::checkpoint(&mut self)` durably persists the store,
 then deletes WAL segments below the checkpoint (`DbConfig::retain_segments`
@@ -462,7 +464,9 @@ rebuild, naming the fix: restore from a replica/backup, or widen
 `retain_segments` (for a store whose bytes name an older redb file format, it
 says that no charpente release wrote one, so the version byte is damage, and
 names redb 2.6's `Database::upgrade()` for a format-2 file something else
-wrote). `Db::open` then recovers the write-ahead log and replays
+wrote). A store file that is missing, or holds no records, beside a compacted
+log is refused the same way, by name, so removing the store is never a fix
+once the log is compacted. `Db::open` then recovers the write-ahead log and replays
 every durable record after the store's last checkpoint back into it, so a
 reopened `Db` reflects every transaction that ever committed, even one the
 store hadn't caught up to when the process died. Recovery can itself fail
