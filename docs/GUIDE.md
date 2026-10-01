@@ -3154,13 +3154,17 @@ of the time, which errs toward stopping to look.
 
 A cap that rises after such a change asks a different question, because a
 give-up is not a lost verdict when the same universe used to pass having
-checked nothing. So judge the rise by what the property checked, over the same
-ten or more fresh bases: its reach key (the key its `floor:` counts) and its
-vacuous passes (universes that passed without covering that key). If reach did
-not fall by more than one Welch standard error and vacuous passes did not
-rise, the new give-ups replaced vacuous passes, and the cap is re-set by its
-own convention, with both distributions recorded. If reach fell by more than
-one standard error, the rise is the finding. A pinned cap can read the same
+checked nothing. So judge the rise by the verdicts the property reached, over
+the same ten or more fresh bases: count its passes that covered its reach key
+(the key its `floor:` counts), and beside them its vacuous passes (universes
+that passed without covering that key). A cap may rise only if the passes
+covering the reach key did not fall by more than one Welch standard error.
+Then the new give-ups replaced vacuous passes, not verdicts, and the cap is
+re-set by its own convention, with both distributions recorded. If those
+passes fell by more than one standard error, the rise is the finding. Neither
+the reach key's own count nor the vacuous passes can decide it alone: 20 more
+give-ups beside 1 fewer vacuous pass means 19 passes that checked something
+became give-ups. A pinned cap can read the same
 number on both binaries while the rate behind it moved, so the test runs
 whenever the change could have moved it, not only when the pinned count did.
 That is also why every capped property floors its reach key: without one, the
@@ -3171,6 +3175,14 @@ counts move batch to batch, both are margins over ten or more fresh batches: a
 give-up cap is twice the largest count, and a reach floor is the mean less
 four standard deviations, which flakes about once in thirty thousand batches if
 the counts are near normal, and fails any batch that falls further.
+
+So an ambient floor catches a collapse, not a drift. Kernel exactly-once's
+`job:done` spreads by about 4% of its mean (sd 19.1 on 485.2), so its floor
+sits about 16% below the mean. A fall half that size trips about one batch in
+forty, which a change can pass by luck. The before-and-after comparison above
+is the instrument that sees a move that small, so it runs whenever a change
+could move an ambient floor's rate, as it does for a cap, and not only when a
+batch goes red.
 
 The directory barrier used to be the worst offender, because `sync_dir` is the
 call a *durability* fix is most likely to add — one such fix moved floors in
