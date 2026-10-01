@@ -1838,6 +1838,33 @@ mod tests {
         assert_eq!(disk.list("").unwrap(), ["archive/0/segment"]);
     }
 
+    /// A barrier that cannot fsync a directory on its chain says which one,
+    /// what waits on it and by whose contract, and makes nothing durable:
+    /// the name it was asked to keep is lost at the next power loss.
+    #[test]
+    fn a_failed_barrier_names_the_directory_and_the_contract() {
+        let fs = CrashFs::provisioned(NODE);
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        let file = disk.open("wal/0").unwrap();
+        file.sync().unwrap();
+        fs.fail_next_sync(NODE);
+        let err = disk.sync_dir("wal/").unwrap_err().to_string();
+        assert!(
+            err.starts_with(
+                "could not fsync directory \"/srv/node\" (CrashFs: injected fsync \
+                             failure on /srv/node) — a name is durable only once the directory \
+                             holding it and every directory above it, up to the data \
+                             directory's parent, have been fsynced (Disk::sync_dir's contract); \
+                             check that directory's permissions and the disk under it"
+            ),
+            "{err}"
+        );
+        drop((file, disk));
+        fs.power_loss();
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        assert_eq!(disk.list("").unwrap(), Vec::<String>::new());
+    }
+
     /// A power cut after every filesystem call a fresh node makes, from
     /// creating its data directory through three acknowledged writes, and
     /// after the last. After each: the node boots, holds every write it
