@@ -27,7 +27,9 @@ use charpente_core::io::{Clock, Conn, Disk, File, Net};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
 use charpente_core::table::{Codec, IndexDef, Row, RowShape, Unscoped, View};
-use charpente_sim::checks::{FaultReason, classify, dir_entry_loss_fired, is_fault_fallout};
+use charpente_sim::checks::{
+    FaultReason, classify, dir_entry_loss_fired, durable_corruption_fired, is_fault_fallout,
+};
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
 
 // ------------------------------------------------------------- fixtures
@@ -6653,13 +6655,29 @@ fn a_survivor_corrupted_below_the_horizon_by_an_injected_fault_gives_up() {
 }
 
 /// The twin: the same refusal with no durable-corruption fault fired on `f`.
-/// The test corrupts `f`'s first WAL frame itself (no sim fault, so no
-/// marker), and a below-horizon refusal nothing injected is a platform
-/// durability bug. It fails by name.
+/// The test corrupts `f`'s first WAL frame itself, so no sim fault fires on
+/// `f`. A below-horizon refusal that nothing injected explains is a platform
+/// durability bug, so it fails by name.
+///
+/// A real `bit_flip` does fire on `p`'s disk first. That makes the universe
+/// count as corrupted, so this twin also catches an excuse that asks the
+/// universe-wide `checks::durable_corruption_fired` instead of `f`'s own disk.
 #[test]
 fn a_survivor_refused_below_the_horizon_with_no_corruption_fired_fails_by_name() {
-    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
-    let (_p, mut f) = sacrificial_pair(&sim);
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (p, mut f) = sacrificial_pair(&sim);
+    p.host.restart();
+    sim.quiesce_disk_faults(); // f's reopen below flips nothing
+    assert!(
+        durable_corruption_fired(&sim) && p.host.durable_corruption_fired(),
+        "a bit flipped on p's disk, so the universe counts as corrupted"
+    );
     let disk = f.host.disk();
     let mut segments = disk.list("wal/").expect("f has a WAL");
     segments.sort();
@@ -6679,7 +6697,7 @@ fn a_survivor_refused_below_the_horizon_with_no_corruption_fired_fails_by_name()
     );
     assert!(
         !f.host.durable_corruption_fired(),
-        "no sim fault fired on f"
+        "no sim fault fired on f, only on p"
     );
     let routed =
         route_promise_scan(&sim, &f, scan).expect_err("a refused survivor promises nothing");
