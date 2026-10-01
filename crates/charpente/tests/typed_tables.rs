@@ -609,6 +609,11 @@ fn recover_and_check(
             return Ok(Recovered::Fallout);
         }
     }
+    // The reach key: a check over at least one logged record, the only kind
+    // that could have failed (S5 re-review R-M5).
+    if *acked > 0 {
+        sim.cover("tables:checked");
+    }
     Ok(Recovered::Checked(engine, store))
 }
 
@@ -740,6 +745,14 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
 /// 100, 8.8 standard deviations above the mean.
 const TABLES_GAVE_UP_CEILING: u64 = 100;
 
+/// The reach floor, a margin like the cap (GUIDE §8): recoveries that checked
+/// the store against at least one logged record (`tables:checked`). 10 fresh
+/// batches covered it 435-478 times, mean 456.5, sd 13.3, and the floor is the
+/// mean less 4 standard deviations (2026-10-01, S5 re-review R-M5). Without
+/// one, a change that cost this property its checks would pass with the cap
+/// still met.
+const TABLES_CHECKED_FLOOR: u64 = 403;
+
 /// A durable refusal at a recovery ends it at once, by name (S5 re-review
 /// R-M2). Seed `0x83cefcf9b9ca9abd`, at the batch's base, meets one there. No restart
 /// clears it, and the loop used to spend its whole budget on it, then give
@@ -792,6 +805,7 @@ fn tables_and_log_survive_the_fault_matrix() {
             // a flake.
             "tables:store-rebuilt",
         ],
+        floor: [("tables:checked", TABLES_CHECKED_FLOOR)],
         ceiling: [("universe:gave-up", TABLES_GAVE_UP_CEILING)]
     );
 }
