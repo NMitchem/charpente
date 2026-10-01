@@ -6325,3 +6325,76 @@ clean whole-workspace count is the gate after S3 merges.
 - The refusal's `.table::<…>()` hint prints the crate's own name (`charpente_core::…`) where
   in-crate code spells `crate::…`. Cosmetic.
 - `encode_record` carries a stale "only writers" comment that predates S2.
+
+## 2026-10-01 — test and instrument quality: a pass needs a verdict, a give-up is counted and capped, and the harness stops excusing what it cannot see
+
+**Why.** Follow-ups 1, 9, 13, 14, 19 and 22 of the job-tenancy and redb 4.3.0 entries: sub-project
+S3 of landing the follow-ups before 0.1.0. One principle carried it, and was sharpened by two
+reviews: **a verdict needs a check that could have failed.** A give-up is honest; a pass that
+checked nothing, or a give-up wide enough to swallow a real failure, is the defect. Workspace
+`.superpowers/sdd/2026-09-30-publish-readiness/` (`s3-brief.md`, `s3-fix-brief.md`,
+`s3-report.md`, `s3-review.md`). Branch `s3-tests`, merged at 796bff2.
+
+**Shipped.**
+- **`ceiling:`** (84ab5f6, follow-up 1). A swarm batch can cap a key: a give-up count above its
+  cap fails the batch naming the key, the count and the cap. Nine properties carry one (GUIDE §8
+  names them). Pinned bases are capped at their exact count; ambient ones at twice the largest of
+  10 fresh batches.
+- **Retry and excuse arms that ran out or were excused give up instead of passing** (99a3c38,
+  eebc453, aa8feed, 7fd70ab, 159c6b8; follow-up 9). Tenant, transactions, http, group_commit's
+  coda, typed_tables, archive's four arms, five durable-corruption excuse arms, transactions'
+  round recovery and snapshots (classified instead of `Err(_) => restart`), migrations ×2,
+  sim-fixture and invoicing. Give-ups that read 0 per 256 now read what they are. GUIDE §8 says
+  an excused universe gives up.
+- **A verdict needs a check that could have failed** (a800501, 25a1be1; review I1, M3).
+  typed_tables counted round 0's check of a fresh store against an empty model; it now needs a
+  final check over at least one logged record, after a final reopen loop of 32 (+5.7% CPU —
+  a800501's message says +8.5%, which was computed against a wrong baseline; corrected in a
+  comment at 3e8805e). group_commit's coda over a zero watermark (39 of 256 at the pinned base
+  never acked anything) gives up.
+- **Budgets raised only where they rescue** (cd86eb5, d34d391, 6a44419): the kernel's final
+  check 8 → 64; tenant, transactions, http 8 → 16; group_commit's coda 8 → 64 and its round
+  boundaries 8 → 16, with skipped boundaries capped (`oracle:round-unreachable` 20) because the
+  coda does not cover them (review I3, on `verify_watermark`'s own doc); archive's restore and
+  verify 32 → 64, two floors raised to their new exact counts (234 → 237, 236 → 240). No floor
+  was lowered.
+- **typed_tables rebuilds a store redb rejects** (867dfc2): a torn store creation had bricked
+  231 of 2,048 universes, hidden by `Err(_) => restart`. Every round error is now classified;
+  only redb-rejected bytes are rebuilt, as `Db::open` does. Pinned 0x5fc2c8c0905ed653 and
+  0xc7886d7a51eefcef by reason.
+- **Realtime re-syncs to the node's timeline after a durable cut** (dda1380, fe18840; follow-up
+  22's sibling, review I2). The first fix (387edf5) gave up when every owed id had been cut and
+  re-minted for another tenant; the review showed nothing held that gate in the loosening
+  direction. The re-sync at every boundary read makes that excuse unreachable, so it was deleted:
+  a cut id re-minted for the SUBSCRIBED tenant and never delivered now fails. Reviewer: 128 fresh
+  bases, 0 failures, 32 give-ups, 81 re-syncs.
+- **A realtime settle runs with subscriber stalls quiesced** (b1f110e, follow-up 22): a stall can
+  no longer drop the only clean attempt. Flagship over 64 fresh bases: 1 failure → 0.
+- **Smaller:** two kernel-refusal lib tests fail by name in 10 s instead of hanging (2fc5a56,
+  follow-up 14); the ctl dead-port test connects to `127.0.0.1:0` (20298fd, follow-up 19 — the
+  port race that failed main's gate at c947730); `charpente test --mutants` times one `cargo test`
+  over the test set and passes 5× as `--timeout` whenever the set differs from the mutated file's
+  package, after checking `cargo mutants --version` (2b40475, de3d4fb, 010ed1b; follow-up 13).
+
+**Review.** Independent opus review: MERGE AFTER FIXES, 0 Critical, 3 Important (I1, I2, I3
+above), 7 Minor. One fix round (with the controller's sweep folded in), then a scoped re-review:
+MERGE, all 10 addressed, re-run by the reviewer at three bases each.
+
+**Gate.** Branch at 159c6b8: fmt and clippy clean, 86/86 `test result: ok`, 1,579 passed, 0
+FAILED (3e8805e changes one comment; typed_tables re-ran 28/28). Main at 796bff2: fmt and clippy clean, 86/86 `test result: ok`, 1,596 passed, 0 FAILED —
+the first whole-workspace gate of this effort with no failure (the ctl port race is gone).
+
+**Follow-ups — S3b, before S1.** The census of the same class outside this branch's scope, ruled
+into one bounded sub-project:
+- **O1 (first).** The realtime settle-check give-up never checks whether durable corruption fired
+  (scoped `realtime.rs:5295`, flagship `:2328`, and the drain-error check). With the re-sync it
+  fires 0 times in 16,384 universes under corruption, so only a non-injected cut — a platform
+  durability bug — can reach it; with the re-sync disabled as a stand-in, 33 universes gave up
+  there and 1 failed. Give up there only when corruption fired.
+- GUIDE §8's `counter_survives` gives up on any `transact` error (review N1).
+- The flagship settle probe's re-mint residual (`realtime.rs:2308`); migrations' four
+  "inconclusive" arms (13 + 10 universes counted as verdicts); invoicing's 17 and sim-fixture
+  `verify`'s 3 fault-fallout `Ok` returns; group_commit's round budget 16 → 32 (5 skipped at +19%
+  CPU, inside the +25% rule the controller misapplied without the 32 data point).
+- Not blockers, noted: ambient caps at 2× max would not catch a regression to 8 attempts; the
+  kernel's 64-reopen budget exceeds the +25% bound set later.
