@@ -3064,8 +3064,12 @@ more often than they move because an oracle decayed.
 The directory barrier used to be the worst offender, because `sync_dir` is the
 call a *durability* fix is most likely to add — one such fix moved floors in
 three separate files in a single day. It now draws from its own fault stream, so
-adding or relocating a barrier perturbs nothing else. No other IO call has that
-treatment, so the caveat above still holds for the rest of them.
+adding or relocating a barrier perturbs nothing else. A file sync with nothing
+to flush is the other exception: it cannot fail and draws no fault, so syncing a
+file that is already durable moves no roll. That is the shape most durability
+fixes take after a power cycle. It still counts as a disk operation, so it
+ticks an armed crash countdown and advances virtual time. No other IO call has
+either treatment, so the caveat above still holds for the rest of them.
 
 ### Finding a one-sided property: `charpente test --mutants`
 

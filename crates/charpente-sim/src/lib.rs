@@ -1293,7 +1293,17 @@ impl File for SimFile {
 
     fn sync(&self) -> io::Result<()> {
         self.op(|state, cfg, path| {
-            if !state.disk_faults_off && state.faults_of(&self.host).chance(cfg.sync_error) {
+            // A file with nothing unsynced has nothing to flush and nothing to
+            // fail, so its sync rolls no fault (DESIGN §1). Recovery and boot
+            // reads sync files a power cycle already left clean; a roll there
+            // would inject failures no disk produces and re-key every universe
+            // that recovers. It is still a disk op: the countdown and the
+            // latency were charged above.
+            let dirty = !file_state(state, &self.host, path).pending.is_empty();
+            if dirty
+                && !state.disk_faults_off
+                && state.faults_of(&self.host).chance(cfg.sync_error)
+            {
                 state.cover("fault:sync_error");
                 // Real fsync failure semantics: nothing can be assumed. The
                 // buffer stays volatile; a later crash collapses it as usual.
@@ -2303,6 +2313,9 @@ mod tests {
         for disk in [&global, &hosted] {
             let file = disk.open("f").unwrap();
             assert!(file.write_at(0, b"x").is_err());
+            // The failed write left nothing to flush, and a clean sync cannot
+            // fail; `set_len` rolls no fault, so it gives the sync work to do.
+            file.set_len(1).unwrap();
             assert!(file.sync().is_err());
             assert!(disk.sync_dir("").is_err());
         }
@@ -2479,6 +2492,50 @@ mod tests {
              barrier is drawing from the shared per-host stream, so every later \
              read/write/sync roll shifted. Key it separately — DESIGN.md made the \
              same repair for the object store's delete arm."
+        );
+    }
+
+    #[test]
+    fn a_sync_with_nothing_to_flush_draws_no_fault() {
+        // Twin universes, one of which also syncs a file it never wrote,
+        // before every op of the workload: a clean sync has nothing to flush
+        // and nothing to fail, so it must neither fail nor move a single later
+        // roll. Syncing durable files is the exact shape of a durability fix
+        // made after a power cycle (recovery's per-segment sync).
+        fn run(clean_syncs: bool) -> BTreeMap<&'static str, u64> {
+            let mut cfg = FaultConfig::none();
+            cfg.write_error = 0.3;
+            cfg.read_error = 0.3;
+            cfg.sync_error = 0.3;
+            let sim = Sim::with_faults(0x5145_0005, cfg);
+            let disk = sim.disk();
+            let clean = disk.open("clean").unwrap();
+            let file = disk.open("f").unwrap();
+            for i in 0..40u64 {
+                if clean_syncs {
+                    clean
+                        .sync()
+                        .expect("a sync with nothing to flush must not fail");
+                }
+                let _ = file.write_at(i * 8, b"abcdefgh");
+                let _ = file.sync();
+                let mut buf = [0u8; 8];
+                let _ = file.read_at(i * 8, &mut buf);
+            }
+            sim.coverage()
+        }
+
+        let baseline = run(false);
+        assert!(
+            baseline.get("fault:sync_error").copied().unwrap_or(0) > 0,
+            "anti-vacuity: a dirty file's sync must still fail, or the comparison below \
+             passes with the sync fault switched off entirely: {baseline:?}"
+        );
+        assert_eq!(
+            baseline,
+            run(true),
+            "syncing a file with nothing to flush changed the fault schedule: a clean \
+             sync rolled a fault it can never fire honestly, so every later roll shifted"
         );
     }
 

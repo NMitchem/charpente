@@ -193,6 +193,22 @@ rather than argued — `a_directory_barrier_does_not_perturb_the_other_disk_faul
 semantically no-op barrier and demands the entire coverage map be unchanged; without the split
 it fails, one barrier having moved four read faults and two write faults.
 
+**A sync with nothing to flush rolls no fault** (2026-10-01). `SimFile::sync` rolls
+`sync_error` only when the file holds unsynced writes. A file with none has nothing to flush
+and nothing to fail, so its sync always succeeds and draws nothing from the `faults` stream.
+It is still a disk operation: it ticks an armed crash countdown and advances virtual time
+like any other. This is the directory barrier's hazard again, from the other side: syncs
+move for durability reasons too. §2's recovery syncs every segment before replaying it, and
+after a power cycle every one of those segments is clean. A roll on each injected failures
+no disk produces in that state and re-keyed every universe that recovers; late_follower's
+batch lost about 48 verdicts to them until this landed. What the sim gives up is a real
+kernel reporting an earlier background-writeback failure, which a later fsync of a clean
+file returns on Linux. The sim has no background writeback (a write stays pending until a
+sync takes it), so a clean file has nothing to report. The recovery-sync failure path is
+held by deterministic tests instead (§2). `a_sync_with_nothing_to_flush_draws_no_fault`
+holds the rule by comparing whole coverage maps with and without a clean sync before every
+operation.
+
 **A process restart is not a power cycle.** `Sim::restart` power-cycles: the
 page cache collapses under the crash model before anything reopens.
 `Sim::restart_process` (2026-10-01) restarts only the process. Open handles die
