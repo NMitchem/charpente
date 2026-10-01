@@ -2162,6 +2162,60 @@ mod tests {
         assert_eq!(disk.list("").unwrap(), ["archive/0/segment"]);
     }
 
+    /// Why a barrier syncs its whole chain inside the data directory, not
+    /// only the directories its own instance created: a boot whose `wal/`
+    /// barrier failed at the data directory leaves `wal/` existing but not
+    /// durable, and the next boot, with no power loss between, finds it
+    /// there and creates nothing. Only a barrier that re-syncs what already
+    /// exists keeps that boot's names.
+    #[test]
+    fn a_barrier_after_a_boot_whose_barrier_failed_resyncs_what_that_boot_created() {
+        let fs = CrashFs::provisioned(NODE);
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        let file = disk.open("wal/0").unwrap();
+        file.sync().unwrap();
+        fs.fail_next_sync(NODE);
+        disk.sync_dir("wal/")
+            .expect_err("the first boot's barrier fails at the data directory");
+        drop((file, disk));
+
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        let file = disk.open("wal/0").unwrap();
+        file.write_at(0, b"frame").unwrap();
+        file.sync().unwrap();
+        disk.sync_dir("wal/").unwrap();
+        drop((file, disk));
+        fs.power_loss();
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        assert_eq!(
+            disk.list("").unwrap(),
+            ["wal/0"],
+            "a name the second boot's barrier kept was lost: its directory, created by the \
+             boot whose barrier failed, was never re-synced into the data directory"
+        );
+    }
+
+    /// A barrier on a name directly in the data directory syncs the data
+    /// directory itself. One pin covers every such name — `role`, the
+    /// witness slots (`witnesses.<n>`), `tables.redb` and its `.horizon`
+    /// breadcrumb: none holds a `/`, so each maps to the same directory and
+    /// the same one-sync chain here. That each caller barriers its name is
+    /// the core's contract, held by the simulator's directory-entry loss
+    /// (DESIGN §2) and the role and witness pins.
+    #[test]
+    fn a_barrier_on_a_name_in_the_data_directory_keeps_it() {
+        let fs = CrashFs::provisioned(NODE);
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        let file = disk.open("role").unwrap();
+        file.write_at(0, b"primary").unwrap();
+        file.sync().unwrap();
+        disk.sync_dir("role").unwrap();
+        drop((file, disk));
+        fs.power_loss();
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        assert_eq!(disk.list("").unwrap(), ["role"]);
+    }
+
     /// A barrier that cannot fsync a directory on its chain says which one,
     /// what waits on it and by whose contract, and makes nothing durable:
     /// the name it was asked to keep is lost at the next power loss.
