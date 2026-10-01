@@ -729,8 +729,10 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
 /// 30-49 times, mean 39.3, and the cap is twice that maximum, about 10
 /// standard deviations above the mean. Set on the honest counts (2026-10-01,
 /// review I1): it was 74 while round 0's check of an empty model, which
-/// cannot fail, still counted as a verdict.
-const TABLES_GAVE_UP_CEILING: u64 = 98;
+/// cannot fail, still counted as a verdict. Re-measured 2026-10-01 for S5 with
+/// D1: 10 fresh batches gave up 28-50 times, mean 39.2, sd 6.9, so the cap is
+/// 100, 8.8 standard deviations above the mean.
+const TABLES_GAVE_UP_CEILING: u64 = 100;
 
 #[test]
 fn tables_and_log_survive_the_fault_matrix() {

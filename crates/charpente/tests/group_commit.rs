@@ -2466,12 +2466,16 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
 }
 
 /// The give-up cap, exact at the pinned base: 38 universes gave up in two
-/// identical batches, every one of them because it never got a 200 (review
-/// M3); with 64 coda reopens none gives up for an unreachable coda (27 with 8).
+/// identical batches. At their parent (796bff2) every one of them never got a
+/// 200 (review M3), and with 64 coda reopens none gave up for an unreachable
+/// coda (27 with 8). Re-measured 2026-10-01 for S5 with D1, still 38: 34 that
+/// never got a 200, and 4 whose final coda never verified the watermark in 64
+/// reopens.
 const BURST_GAVE_UP_CEILING: u64 = 38;
-/// The skipped-boundary cap, exact at the pinned base: 20 round-boundary
-/// checks were unreachable in two identical batches at 16 round reopens.
-const BURST_ROUND_UNREACHABLE_CEILING: u64 = 20;
+/// The skipped-boundary cap, exact at the pinned base: 26 round-boundary
+/// checks were unreachable in two identical batches at 16 round reopens
+/// (2026-10-01, S5 with D1; 20 at their parent, 796bff2).
+const BURST_ROUND_UNREACHABLE_CEILING: u64 = 26;
 
 /// The flagship request-arm batching property under the full fault matrix.
 /// `0x60C1_0009` (`docs/superpowers/plans/2026-08-10-group-commit.md`'s

@@ -2704,12 +2704,15 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
 
 /// The give-up cap. This base is ambient, so the count moves batch to batch,
 /// and the cap is a margin, not a measurement: over 10 fresh batches (redb
-/// 4.3.0, 64 reopens) it gave up 6-16 times, mean 10.8, and the cap is twice
+/// 4.3.0, 64 reopens) it gave up 6-16 times, mean 10.8, and the cap was twice
 /// that maximum, about 7 standard deviations above the mean. With 8 reopens
 /// the same batches gave up 48-64 times, so a return to that rate fails here.
 /// Pinning the base instead would re-baseline every universe this property
-/// examines.
-const KERNEL_GAVE_UP_CEILING: u64 = 32;
+/// examines. Re-measured 2026-10-01 for S5 with D1 (`Db::open` no longer
+/// discards a store over an IO error; WAL recovery syncs before replay): 10
+/// fresh batches gave up 9-18 times, mean 13.4, sd 3.2, so the cap is 36, 7.0
+/// standard deviations above the mean.
+const KERNEL_GAVE_UP_CEILING: u64 = 36;
 
 #[test]
 fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
@@ -4922,9 +4925,22 @@ fn job_shape_upgrades_replay_identically_for_the_same_seed() {
 /// | `shapes:job-refused` | 40 | 48 | 49 |
 /// | `shapes:job-refused-after-crash` | 14 | 18 | 17 |
 /// | `shapes:job-drained` | 115 | 117 | 117 |
-const RECEIPT_REFUSED_FLOOR: u64 = 49;
-const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 17;
-const RECEIPT_DRAINED_FLOOR: u64 = 117;
+///
+/// **Re-set 2026-10-01**, same base and count, two identical batches, for S5
+/// and D1 together: `Db::open` no longer discards a store over an IO error,
+/// the v1 boot boots again through `checks::boot_through_fallout` instead of
+/// leaving v2 an empty store after one faulted boot, and WAL recovery syncs
+/// each segment before replay (a sync with nothing to flush draws no fault).
+/// None fell; each is set on its new count.
+///
+/// | key | was | now |
+/// |---|---|---|
+/// | `shapes:job-refused` | 49 | 81 |
+/// | `shapes:job-refused-after-crash` | 17 | 30 |
+/// | `shapes:job-drained` | 117 | 140 |
+const RECEIPT_REFUSED_FLOOR: u64 = 81;
+const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 30;
+const RECEIPT_DRAINED_FLOOR: u64 = 140;
 
 // ------------------------------------------ job tenancy under the fault matrix
 
@@ -5556,9 +5572,10 @@ mod job_tenancy {
         Ok(())
     }
 
-    /// The give-up cap, exact at the pinned base: 16 of 256 universes gave up
-    /// in two identical batches (redb 4.3.0, 64 reopens; 49 with 8).
-    const JOB_TENANCY_GAVE_UP_CEILING: u64 = 16;
+    /// The give-up cap, exact at the pinned base: 17 of 256 universes gave up
+    /// in two identical batches (2026-10-01, S5 with D1). It was 16 at their
+    /// parent (redb 4.3.0, 64 reopens; 49 with 8).
+    const JOB_TENANCY_GAVE_UP_CEILING: u64 = 17;
 
     /// Job-tenancy spec §9 item 4. A fixed base, like every permanent swarm
     /// property here. N was set by timing one batch (Step 3): the commit and

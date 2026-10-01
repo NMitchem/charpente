@@ -3492,9 +3492,29 @@ fn mixed_shape_resumes_replay_identically_for_the_same_seed() {
 /// | `shapes:reshaped-frame` | 11 | 19 |
 /// | `shapes:reshaped-409` | 52 | 66 |
 /// | `shapes:v2-delivered` | 42 | 56 |
-const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 19;
-const SHAPES_RESHAPED_409_FLOOR: u64 = 66;
-const SHAPES_V2_DELIVERED_FLOOR: u64 = 56;
+///
+/// **Re-set 2026-10-01**, same base and count, two identical batches, for S5
+/// and D1 together: `Db::open` no longer discards a store over an IO error,
+/// and WAL recovery syncs each segment before replay (a sync with nothing to
+/// flush draws no fault). Both re-key every universe. `reshaped-409` rose and
+/// is set on its count. The other two fell and are re-set by GUIDE §8's re-key
+/// rule, over the same 10 fresh bases, parent of both (796bff2) against this
+/// tree: `0x5E5F_0C01`..`0x5E5F_0C0B` without `0x5E5F_0C05`, where the parent
+/// fails on the "store outran durable truth" assert D1 fixed (seed
+/// `0x99ba30a2993956be`).
+///
+/// | key | was | now | parent mean (sd) | this tree mean (sd) | difference / Welch SE |
+/// |---|---|---|---|---|---|
+/// | `shapes:reshaped-frame` | 19 | 14 | 14.4 (4.48) | 13.8 (3.74) | −0.60 / 1.84 = −0.33 |
+/// | `shapes:reshaped-409` | 66 | 70 | | | rose |
+/// | `shapes:v2-delivered` | 56 | 51 | 56.5 (4.35) | 55.7 (6.11) | −0.80 / 2.37 = −0.34 |
+///
+/// Both falls are inside one standard error, so neither rate decayed; the
+/// pinned base had sat near the top of the parent's spread (19 against a mean
+/// of 14.4).
+const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 14;
+const SHAPES_RESHAPED_409_FLOOR: u64 = 70;
+const SHAPES_V2_DELIVERED_FLOOR: u64 = 51;
 
 /// `shapes_verdict`'s stall arm, both sides, called directly. The sink is
 /// dropped before every verdict, so the tail is closed the way the terminal
@@ -5480,10 +5500,24 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
 /// | `tenant:own-backlog-verified` | 78 | 78 | 81 | 81 |
 /// | `tenant:foreign-backlog-not-delivered` | 80 | 87 | 98 | 98 |
 /// | `realtime:resume-backlog` | 125 | 126 | 126 | 125 |
-const SCOPED_BOTH_TENANTS_FLOOR: u64 = 83;
-const SCOPED_OWN_BACKLOG_FLOOR: u64 = 81;
-const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 98;
-const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
+///
+/// **Re-set 2026-10-01**, same base, two identical batches, for S5 and D1
+/// together: each epoch's boot now boots again through
+/// `checks::boot_through_fallout` instead of skipping the epoch on its first
+/// faulted boot, `Db::open` no longer discards a store over an IO error, and
+/// WAL recovery syncs each segment before replay. None fell; each is set on
+/// its new count.
+///
+/// | key | was | now |
+/// |---|---|---|
+/// | `tenant:both-tenants-emitted` | 83 | 106 |
+/// | `tenant:own-backlog-verified` | 81 | 96 |
+/// | `tenant:foreign-backlog-not-delivered` | 98 | 99 |
+/// | `realtime:resume-backlog` | 125 | 206 |
+const SCOPED_BOTH_TENANTS_FLOOR: u64 = 106;
+const SCOPED_OWN_BACKLOG_FLOOR: u64 = 96;
+const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 99;
+const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 206;
 
 /// Seed `0x20851976ea4bae36` (base `0x5E1F0013`), found 2026-09-30 by S3's
 /// fresh-base scan. A misdirected write moved event id 5's WAL frame (seq 8,

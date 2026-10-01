@@ -1115,7 +1115,13 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// give-ups fell from 92 to 3, all three `:recover-exhausted:injected`. The
 /// floor is set on the new count, keeping this constant's convention, so a
 /// return to the old give-up rate is now red.
-const CONVERGED_FLOOR: u64 = 253;
+///
+/// **253 -> 256 on 2026-10-01**, two identical batches, for S5 and D1 together
+/// (`Db::open` no longer discards a store over an IO error; WAL recovery, the
+/// role file and the witness slots sync before a boot trusts them; a sync with
+/// nothing to flush draws no fault). Every universe reaches a verdict and the
+/// three give-ups are gone. Set on the new count, the same convention.
+const CONVERGED_FLOOR: u64 = 256;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
 /// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on
@@ -1416,7 +1422,13 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 /// finish with a primary too small to move its base. 190 + 28 + 38 = 256. At
 /// p = 190/256 = 0.742 one SE is 7.0, so 190 − 2·7.0 = 176.0 → 176, the same
 /// convention; it tolerates a 7.4% relative fall.
-const SEEDED_CONVERGED_FLOOR: u64 = 176;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 198 of
+/// 256 (190 at their parent, 796bff2). The give-ups fell 28 → 22, all
+/// `:recover-exhausted:injected`, and `repl:seed-base-zero` reads 36; 198 + 22
+/// + 36 = 256. At p = 198/256 = 0.773 one SE is 6.70, so 198 − 2·6.70 = 184.6
+/// → 184, the same convention; it tolerates a 7.1% relative fall.
+const SEEDED_CONVERGED_FLOOR: u64 = 184;
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
     let mut p = spawn_node_with_schema(
@@ -4181,7 +4193,12 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
 /// `repl:switchover-inconclusive` (124 → 144), as the retry-budget experiment
 /// above predicts. At p = 103/256 = 0.402 one SE is 7.85, so 103 − 2·7.85 =
 /// 87.3 → 87; it tolerates a 15.5% relative fall.
-const SWITCHOVER_CONVERGED_FLOOR: u64 = 87;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 104 of
+/// 256 (103 at 796bff2), `repl:switchover-inconclusive` 146, no give-ups. At p
+/// = 104/256 = 0.406 one SE is 7.86, so 104 − 2·7.86 = 88.3 → 88; it tolerates
+/// a 15.4% relative fall.
+const SWITCHOVER_CONVERGED_FLOOR: u64 = 88;
 
 /// The result of one switchover attempt's drain.
 enum DrainResult {
@@ -4497,7 +4514,12 @@ fn failover_preserves_everything_the_follower_acked() {
 /// what they freed (52 → 75 `:failover-staging-gate`), and 77 give up in all.
 /// At p = 51/128 = 0.398 one SE is 5.54, so 51 − 2·5.54 = 39.9 → 39; it
 /// tolerates a 23.5% relative fall.
-const FAILOVER_PREFIX_FLOOR: u64 = 39;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 54 of
+/// 128 (51 at 796bff2). All 74 give-ups are `:failover-staging-gate`. At p =
+/// 54/128 = 0.422 one SE is 5.59, so 54 − 2·5.59 = 42.8 → 42; it tolerates a
+/// 22.2% relative fall.
+const FAILOVER_PREFIX_FLOOR: u64 = 42;
 
 fn failover_universe(sim: &mut Sim) -> Result<(), String> {
     let cfg = no_gc_cfg();
@@ -5994,7 +6016,12 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
 /// survivor's faults (inferred from the totals, not traced per universe). At
 /// p = 36/128 = 0.281 one SE is 5.09, so 36 − 2·5.09 =
 /// 25.8 → 25; it tolerates a 30.6% relative fall.
-const SURVIVOR_PROMISE_FLOOR: u64 = 25;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 39 of
+/// 128 (36 at 796bff2). The 84 give-ups are `:survivor-faulted` 83 and
+/// `:role-file-torn` 1. At p = 39/128 = 0.305 one SE is 5.21, so 39 − 2·5.21 =
+/// 28.6 → 28; it tolerates a 28.2% relative fall.
+const SURVIVOR_PROMISE_FLOOR: u64 = 28;
 
 fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     let db_cfg = horizon_db_cfg();

@@ -3107,6 +3107,18 @@ draws, so changing *where* an IO operation happens inside code a property never
 names reshuffles every universe at a pinned base. Floors move for that reason far
 more often than they move because an oracle decayed.
 
+So a floor that falls after such a change is re-measured, not defended and not
+quietly lowered. Run the property before and after the change at the same ten or
+more fresh bases (`CHARPENTE_BASE_SEED`) and compare the key's mean. It has
+decayed if the after-mean sits more than one Welch standard error below the
+before-mean, where that error is `sqrt(sd_before²/n_before + sd_after²/n_after)`
+over the per-base counts. Within one standard error, the floor is re-set to its
+new exact count at its pinned base, with both distributions recorded; beyond
+it, the fall is the finding. A base where either binary fails on an unrelated,
+named bug is left out of both sides, and the record says which. One standard
+error is deliberately strict: pure noise crosses it roughly a sixth to a quarter
+of the time, which errs toward stopping to look.
+
 The directory barrier used to be the worst offender, because `sync_dir` is the
 call a *durability* fix is most likely to add — one such fix moved floors in
 three separate files in a single day. It now draws from its own fault stream, so

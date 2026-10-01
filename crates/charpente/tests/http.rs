@@ -1433,8 +1433,11 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
 /// attempts) it gave up 10-28 times, mean 17.6, and the cap is twice that
 /// maximum, about 7 standard deviations above the mean. It guards drift toward
 /// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
-/// up 30-35 times, under it.
-const HTTP_GAVE_UP_CEILING: u64 = 56;
+/// up 30-35 times, under it. Re-measured 2026-10-01 for S5 with D1 (`Db::open`
+/// no longer discards a store over an IO error; WAL recovery syncs before
+/// replay): 10 fresh batches gave up 10-19 times, mean 14.9, sd 3.0, so the cap
+/// is 38, 7.7 standard deviations above the mean.
+const HTTP_GAVE_UP_CEILING: u64 = 38;
 
 #[test]
 fn http_requests_survive_the_fault_matrix() {

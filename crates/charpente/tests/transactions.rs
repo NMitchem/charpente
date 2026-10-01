@@ -878,7 +878,9 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
 /// attempts) it gave up 16-31 times, mean 22.5, and the cap is twice that
 /// maximum, about 7 standard deviations above the mean. It guards drift toward
 /// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
-/// up 35-38 times, under it.
+/// up 35-38 times, under it. Re-measured 2026-10-01 for S5 with D1: 10 fresh
+/// batches gave up 19-31 times, mean 25.4, sd 4.1, so the cap stays 62, 9.0
+/// standard deviations above the mean.
 const TX_GAVE_UP_CEILING: u64 = 62;
 
 #[test]

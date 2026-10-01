@@ -7299,11 +7299,33 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// `restore_never_completed` 2; the scoped base's 16 are 6 and 10 and 0. A
 /// larger manifest-read budget rescued none of the `nothing_published` ones.
 ///
+/// **Re-set 2026-10-01** at both bases, two identical batches each, for S5
+/// (`Db::open` no longer discards a store over an IO error, and the diverged
+/// plant boots through host restarts) and D1 (WAL recovery syncs each segment
+/// before replay; a sync with nothing to flush draws no fault), which re-key
+/// every universe. Five floors rose and are set on their counts. The scoped
+/// base's `restored` fell 240 -> 238 and is re-set by GUIDE §8's re-key rule:
+/// over the same 11 fresh bases (`0x5E5F_0C01`..`0x5E5F_0C0B`), the parent of
+/// both (796bff2) reads mean 242.09, sd 2.95, and this tree 241.18, sd 3.49, a
+/// difference of -0.91 against a Welch standard error of 1.38 (-0.66 SE), so no
+/// decay. The unscoped base's 18 universes without a verdict are
+/// `nothing_published` 4, `verify_never_read_cleanly` 12 and
+/// `restore_never_completed` 2; the scoped base's 18 are 7 and 11 and 0.
+///
+/// | floor | was | now |
+/// |---|---|---|
+/// | `CONV_RESTORED_FLOOR` | 237 | 238 |
+/// | `CONV_SUBSTANTIAL_FLOOR` | 235 | 236 |
+/// | `CONV_CHAINED_FLOOR` | 170 | 176 |
+/// | `CONV_SCOPED_RESTORED_FLOOR` | 240 | 238 |
+/// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 237 | 238 |
+/// | `CONV_SCOPED_CHAINED_FLOOR` | 161 | 168 |
+///
 /// `restored_substantial` can exceed `restored`: it is covered once the
 /// manifest's frontier is known, before the restore and its verification run.
-const CONV_RESTORED_FLOOR: u64 = 237;
-const CONV_SUBSTANTIAL_FLOOR: u64 = 235;
-const CONV_CHAINED_FLOOR: u64 = 170;
+const CONV_RESTORED_FLOOR: u64 = 238;
+const CONV_SUBSTANTIAL_FLOOR: u64 = 236;
+const CONV_CHAINED_FLOOR: u64 = 176;
 
 /// `archive_converges_with_a_scoped_table`'s own base and floors. Separate
 /// numbers because they are rates against a different workload — one extra row
@@ -7335,18 +7357,19 @@ const CONV_CHAINED_FLOOR: u64 = 170;
 /// `tenant:restored-multi-tenant` fired 244 times, so the `require:` key is a
 /// real floor rather than a decoration.
 ///
-/// Re-measured 2026-09-30 for redb 4.3.0 with the three above; the table and
-/// the reason are at `CONV_RESTORED_FLOOR`.
+/// Re-measured 2026-09-30 for redb 4.3.0 with the three above, and re-set
+/// 2026-10-01 with them; the tables and the reasons are at
+/// `CONV_RESTORED_FLOOR`.
 const ARCHIVE_SCOPED_CONVERGENCE_BASE: u64 = 0xA2C0_5C09;
-const CONV_SCOPED_RESTORED_FLOOR: u64 = 240;
-const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 237; // 164, then 160 after the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
-const CONV_SCOPED_CHAINED_FLOOR: u64 = 161;
+const CONV_SCOPED_RESTORED_FLOOR: u64 = 238;
+const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 238; // 164, then 160 after the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
+const CONV_SCOPED_CHAINED_FLOOR: u64 = 168;
 
-/// The give-up caps, exact at the two pinned bases: 19 and 16 of 256 universes
-/// gave up in two identical batches each (the breakdown is at
-/// `CONV_RESTORED_FLOOR`).
-const CONV_GAVE_UP_CEILING: u64 = 19;
-const CONV_SCOPED_GAVE_UP_CEILING: u64 = 16;
+/// The give-up caps, exact at the two pinned bases: 18 and 18 of 256 universes
+/// gave up in two identical batches each (2026-10-01, S5 with D1; 19 and 16 at
+/// their parent, 796bff2). The breakdown is at `CONV_RESTORED_FLOOR`.
+const CONV_GAVE_UP_CEILING: u64 = 18;
+const CONV_SCOPED_GAVE_UP_CEILING: u64 = 18;
 
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that

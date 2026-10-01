@@ -992,9 +992,11 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
-/// The give-up cap, exact at the pinned base: 16 of 256 universes gave up in
-/// two identical batches (16 final attempts; 33 with 8).
-const TENANT_GAVE_UP_CEILING: u64 = 16;
+/// The give-up cap, exact at the pinned base: 17 of 256 universes gave up in
+/// two identical batches (2026-10-01, S5 with D1), every one because the final
+/// recovery's 16 attempts all hit injected faults. It was 16 at their parent
+/// (16 final attempts; 33 with 8).
+const TENANT_GAVE_UP_CEILING: u64 = 17;
 
 /// The flagship tenant property (spec §1 as a mechanical oracle, hard rule
 /// 3): across the full fault matrix, and after every recovery, every scoped
