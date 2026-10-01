@@ -3049,12 +3049,13 @@ verb will not let it read as one.
 
 The timeout follows the scope too. cargo-mutants times its own baseline over
 one package, the mutated file's, while every mutant runs all the packages in
-`--test-package`. So with two or more of them and no `--timeout`, the verb
-first times one `cargo test` over the whole set, passes five times that as the
+`--test-package`. So whenever those differ (two or more test packages, or one
+that is not the `--file`s' package) and no `--timeout` is given, the verb first
+times one `cargo test` over the test set, passes five times that as the
 timeout, and prints both numbers:
 
 ```text
-mutants: `cargo test` over charpente-core, charpente-sim took 8.6 s of wall time; each mutant runs all 2 packages and cargo-mutants' own baseline times only one, so the verb is passing --timeout 44 (5x)
+mutants: `cargo test` over charpente-core, charpente-sim took 8.6 s of wall time; that is what each mutant runs, and cargo-mutants' own baseline times only the mutated file's package, so the verb is passing --timeout 44 (5x)
 ```
 
 An explicit `--timeout SECS` skips the timing run and is passed through as

@@ -241,7 +241,9 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 /// the shape observed 2026-09-12 under an exported CARGO_TARGET_DIR, where
 /// `./target` is never created. CI does not install cargo-mutants, so the
 /// verb's own behaviour is pinned against a stand-in that fails the same way
-/// on demand. `extra` is appended to the verb's arguments.
+/// on demand. `extra` is appended to the verb's arguments. The scratch
+/// workspace holds two one-file crates, `pkg-a` and `pkg-b`, so a `--file`
+/// under either has a package the verb can read.
 // Writing the shim and the scratch workspace is edge tooling outside the
 // deterministic core (DESIGN.md §1), the same shape as tests/genclient.rs.
 #[cfg(unix)]
@@ -264,7 +266,20 @@ fn run_mutants_with_cargo_shim(
     let bin = scratch.join("bin");
     let ws = scratch.join("ws");
     std::fs::create_dir_all(&bin).expect("shim bin dir");
-    std::fs::create_dir_all(&ws).expect("scratch workspace");
+    for pkg in ["pkg-a", "pkg-b"] {
+        std::fs::create_dir_all(ws.join(pkg).join("src")).expect("scratch crate");
+        // `[lib]` first, with a name of its own, as a real manifest may: a
+        // reader that takes the first `name` in the file gets the wrong one.
+        std::fs::write(
+            ws.join(pkg).join("Cargo.toml"),
+            format!(
+                "[lib]\nname = \"lib_of_{pkg}\"\npath = \"src/lib.rs\"\n\n\
+                 [package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\n"
+            ),
+        )
+        .expect("scratch manifest");
+        std::fs::write(ws.join(pkg).join("src/lib.rs"), "").expect("scratch source");
+    }
     let shim = bin.join("cargo");
     std::fs::write(
         &shim,
@@ -420,15 +435,20 @@ fn mutants_stops_when_the_timing_run_is_not_green() {
     );
 }
 
-/// One test package is what cargo-mutants' own baseline times, so the verb
-/// leaves the timeout to the tool.
+/// cargo-mutants' own baseline times the mutated files' package, so when the
+/// one test package is the package of every `--file`, the baseline times what
+/// each mutant runs and the verb leaves the timeout to the tool.
 #[cfg(unix)]
 #[test]
-fn mutants_leaves_the_timeout_to_the_tool_for_a_single_test_package() {
-    let (_, recorded) = run_mutants_with_cargo_shim("0", "0", &["--test-package", "pkg-a"]);
+fn mutants_leaves_the_timeout_to_the_tool_when_the_one_test_package_holds_every_file() {
+    let (_, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &["--file", "pkg-a/src/lib.rs", "--test-package", "pkg-a"],
+    );
     assert!(
         !recorded.iter().any(|l| l.starts_with("cargo test")),
-        "one package needs no timing run; the shim saw {recorded:?}"
+        "the files' own package needs no timing run; the shim saw {recorded:?}"
     );
     assert!(
         recorded
@@ -436,6 +456,64 @@ fn mutants_leaves_the_timeout_to_the_tool_for_a_single_test_package() {
             .any(|l| l.starts_with("cargo mutants ") && !l.contains("--timeout")),
         "and no --timeout reaches the tool; the shim saw {recorded:?}"
     );
+}
+
+/// One test package that is not the `--file`s' package is the same asymmetry
+/// as two of them: the baseline times `pkg-a`'s tests and every mutant runs
+/// `pkg-b`'s, so the verb times `pkg-b` itself.
+#[cfg(unix)]
+#[test]
+fn mutants_times_a_single_test_package_that_is_not_the_files_package() {
+    let (out, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &["--file", "pkg-a/src/lib.rs", "--test-package", "pkg-b"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let timing = recorded
+        .iter()
+        .position(|l| l == "cargo test --package pkg-b")
+        .unwrap_or_else(|| panic!("no timing run over pkg-b; the shim saw {recorded:?}"));
+    let mutants = recorded
+        .iter()
+        .position(|l| l.starts_with("cargo mutants ") && l.contains(" --timeout "))
+        .unwrap_or_else(|| {
+            panic!("no cargo-mutants run with a --timeout; the shim saw {recorded:?}")
+        });
+    assert!(timing < mutants, "the timing run comes first: {recorded:?}");
+    assert!(
+        stdout.contains("passing --timeout") && stdout.contains("s of wall time"),
+        "the verb must print the measurement and the timeout it derived; stdout:\n{stdout}"
+    );
+}
+
+/// A `--file` whose package the verb cannot read counts as another package:
+/// a timing run costs one `cargo test`, and a timeout set too short reports
+/// caught mutants as TIMEOUT.
+#[cfg(unix)]
+#[test]
+fn mutants_times_the_set_when_a_files_package_cannot_be_read() {
+    let (_, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &[
+            "--file",
+            "no-such-crate/src/lib.rs",
+            "--test-package",
+            "pkg-a",
+        ],
+    );
+    let timing = recorded
+        .iter()
+        .position(|l| l == "cargo test --package pkg-a")
+        .unwrap_or_else(|| panic!("no timing run over pkg-a; the shim saw {recorded:?}"));
+    let mutants = recorded
+        .iter()
+        .position(|l| l.starts_with("cargo mutants ") && l.contains(" --timeout "))
+        .unwrap_or_else(|| {
+            panic!("no cargo-mutants run with a --timeout; the shim saw {recorded:?}")
+        });
+    assert!(timing < mutants, "the timing run comes first: {recorded:?}");
 }
 
 /// An explicit `--timeout` is the operator's, so no timing run happens and the

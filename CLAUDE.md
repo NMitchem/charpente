@@ -85,10 +85,11 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
   `--file`, so a `--file` in any other crate needs `--test-package <that crate>` or the run
   judges its mutants with suites that never exercise them and reports them all MISSED
   (2026-09-16, `charpente-macros`). cargo-mutants 27.1.0 times its baseline over ONE
-  package (the mutated file's) while every mutant runs all of them, so with two or more
-  test packages in effect (the default set is two) and no `--timeout`, the verb first
-  times one `cargo test` over the whole set and passes `--timeout` as 5x that wall time,
-  printing both numbers; without that, slow-but-caught mutants read TIMEOUT. Exit 0 every
+  package (the mutated file's) while every mutant runs every test package, so whenever
+  those differ (two or more test packages, as the default set is, or one that is not
+  every `--file`'s package) and no `--timeout` is given, the verb first times one
+  `cargo test` over the test set and passes `--timeout` as 5x that wall time, printing
+  both numbers; without that, slow-but-caught mutants read TIMEOUT. Exit 0 every
   viable mutant caught, 1 a finding (**MISSED** = no oracle noticed, i.e. a one-sided
   property) or an unresolved run (**a timeout is not a catch**), 2 usage, infrastructure,
   or a baseline that was not green.

@@ -98,8 +98,9 @@ its mutants are judged by suites that never exercise them and all report MISSED.
 whether that property alone would notice. Without it every property runs, and one honest \
 sibling is enough to report a mutant CAUGHT.\n\
        --timeout    per-mutant test timeout in seconds; a TIMEOUT IS NOT A CATCH. Without it, \
-two or more test packages (the default set is two) are timed with one `cargo test` first and \
-the verb passes 5x that, because cargo-mutants' own baseline times only one package";
+the test packages are timed with one `cargo test` first and the verb passes 5x that whenever \
+they are not exactly the --files' one package (the default set is two), because \
+cargo-mutants' own baseline times only the mutated file's package";
 
 /// The fields of `mutants.out/outcomes.json` this verb reads. Deserialized
 /// rather than string-scanned (unlike `sim.rs`'s scan of cargo's message
@@ -211,25 +212,25 @@ pub fn run(args: &[String]) -> i32 {
     }
     let timeout = match &opts.timeout {
         Some(t) => Some(t.clone()),
-        // cargo-mutants 27.1.0 times its baseline over ONE package, while
-        // every mutant runs all of them: its auto-timeout is then too short,
-        // and a slow-but-caught mutant reads TIMEOUT. So the verb measures
-        // the set itself. Wall time, not CPU time: `--timeout` is a
+        // cargo-mutants 27.1.0 times its baseline over ONE package, the
+        // mutated file's, while every mutant runs all the test packages: its
+        // auto-timeout is then too short whenever those differ, and a
+        // slow-but-caught mutant reads TIMEOUT. So the verb measures the set
+        // itself. Wall time, not CPU time: `--timeout` is a
         // wall-clock bound on this same command, so wall time is its unit.
         // CPU time would undershoot a suite that sleeps or waits (the serve
         // and edge tests do) and overshoot a parallel one. And the error a
         // wall-time measurement can carry (a machine that slept or was busy
         // mid-run) only lengthens it, which is the safe side for a timeout.
-        None if opts.test_packages.len() >= 2 => {
+        None if baseline_differs(&opts.dir, &opts.files, &opts.test_packages) => {
             match time_the_package_set(&opts.dir, &opts.test_packages) {
                 Ok(secs) => {
                     let derived = derived_timeout(secs);
                     println!(
-                        "mutants: `cargo test` over {} took {secs:.1} s of wall time; each \
-                         mutant runs all {} packages and cargo-mutants' own baseline times \
-                         only one, so the verb is passing --timeout {derived} (5x)",
-                        opts.test_packages.join(", "),
-                        opts.test_packages.len()
+                        "mutants: `cargo test` over {} took {secs:.1} s of wall time; that is \
+                         what each mutant runs, and cargo-mutants' own baseline times only the \
+                         mutated file's package, so the verb is passing --timeout {derived} (5x)",
+                        opts.test_packages.join(", ")
                     );
                     Some(derived.to_string())
                 }
@@ -294,6 +295,48 @@ pub fn run(args: &[String]) -> i32 {
         opts.property.as_deref(),
         status.code(),
     )
+}
+
+/// Whether cargo-mutants' own baseline times a different `cargo test` than the
+/// one each mutant runs. The baseline runs the mutated file's package and each
+/// mutant runs every `--test-package`, so they are the same command only when
+/// there is one test package and every `--file` is in it. A file whose package
+/// cannot be read counts as different: the timing run costs one `cargo test`,
+/// and a timeout set too short reports caught mutants as TIMEOUT.
+fn baseline_differs(dir: &str, files: &[String], test_packages: &[String]) -> bool {
+    match test_packages {
+        [only] => !files
+            .iter()
+            .all(|file| package_of(dir, file).as_deref() == Some(only.as_str())),
+        _ => true,
+    }
+}
+
+/// The package `file` belongs to: the `name` in the `[package]` table of the
+/// nearest `Cargo.toml` above it inside `dir`, or `None` when there is none.
+// Reading manifests is edge tooling, outside the deterministic core
+// (DESIGN.md §1).
+#[allow(clippy::disallowed_methods)]
+fn package_of(dir: &str, file: &str) -> Option<String> {
+    let text = std::path::Path::new(file)
+        .ancestors()
+        .skip(1)
+        .find_map(|up| {
+            std::fs::read_to_string(PathBuf::from(dir).join(up).join("Cargo.toml")).ok()
+        })?;
+    let mut in_package = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package
+            && let Some(value) = line
+                .strip_prefix("name")
+                .and_then(|rest| rest.trim_start().strip_prefix('='))
+        {
+            return Some(value.trim().trim_matches('"').to_string());
+        }
+    }
+    None
 }
 
 /// Five times the measured wall time, rounded up to whole seconds: the
