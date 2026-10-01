@@ -27,7 +27,7 @@ use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
 use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped, View};
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{FaultReason, classify, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 
 #[derive(Default)]
@@ -3830,8 +3830,11 @@ fn collapses(sim: &Sim) -> u64 {
 ///
 /// The oracle is `Db::open`'s own assert that the store's `applied_seq` never
 /// passes the durable log's end (a panic fails the universe with its seed),
-/// and, at the end, with faults quiesced and the page cache collapsed,
-/// ack-implies-durable: every row whose commit returned `Ok` is in the store.
+/// its named twin — the horizon rule refusing a torn frame at or below the
+/// store's horizon, which only a durable-corruption fault may produce and
+/// none is injected — and, at the end, with faults quiesced and the page cache
+/// collapsed, ack-implies-durable: every row whose commit returned `Ok` is in
+/// the store.
 /// The durable-corruption axes are off (`bit_flip`, `misdirected_write`):
 /// their losses are excused elsewhere, and this property excuses nothing.
 fn restart_mix_workload(sim: &mut Sim) -> Result<(), String> {
@@ -3851,8 +3854,18 @@ fn restart_mix_workload(sim: &mut Sim) -> Result<(), String> {
     // page cache.
     let mut unacked_left: Option<(Option<u64>, u64)> = None;
     for _ in 0..RESTART_MIX_ROUNDS {
+        // With the durable-corruption axes off, nothing may ever corrupt a
+        // frame at or below the store's horizon, so the horizon rule's named
+        // refusal is a failure here, not fallout: it is the same bug as the
+        // assert, seen when the power cycle tore the frame instead of dropping
+        // it (8 of the 21 failing bases at 796bff2 surfaced this way).
         let mut db = match open(sim) {
             Ok(db) => Some(db),
+            Err(e) if classify(&e.to_string()) == FaultReason::DurableHorizon => {
+                return Err(format!(
+                    "the store's horizon outran the log with no durable corruption injected: {e}"
+                ));
+            }
             Err(e) if is_fault_fallout(&e.to_string()) => None,
             Err(e) => return Err(format!("Db::open failed non-injected: {e}")),
         };
