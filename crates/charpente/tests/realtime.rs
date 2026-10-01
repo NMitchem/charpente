@@ -2368,9 +2368,9 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0xdec436b030427fc6` (base `0xA11CE002`, universe 124).
+/// Seed `0xd0fce29ba31210d0` (base `0xA11CE002`, universe 281).
 ///
-/// **This pin has been re-found twice, and that is worth knowing before
+/// **This pin has been re-found three times, and that is worth knowing before
 /// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
 /// this property (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). The
 /// directory-barrier stream split later that day re-rolled every universe one
@@ -2382,8 +2382,11 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// re-roll that happens to land on some *other* give-up can no longer keep this
 /// test quietly green while testing nothing. Its successor `0xbb93400e0bc80ca4`
 /// stopped reproducing when redb 4.3.0 changed the store's IO shape and the
-/// crash countdowns were re-sized (2026-09-30); this one was re-found the same
-/// way, and with the zero-clean-attempts give-up removed it fails "client never
+/// crash countdowns were re-sized (2026-09-30); `0xdec436b030427fc6` (universe
+/// 124) stopped when `Db::open` stopped discarding a store over an IO error
+/// (2026-10-01): that universe now reaches a verdict. This one is the only
+/// universe of 512 at that base that gives up for this reason,
+/// and with the zero-clean-attempts give-up removed it fails "client never
 /// caught up", which is the regression.
 ///
 /// The scenario: every one of `SETTLE_ATTEMPTS` attempts ends with `settle_boot`
@@ -2398,7 +2401,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// give up rather than report a miss it never had the chance to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0xdec4_36b0_3042_7fc6;
+    const SEED: u64 = 0xd0fc_e29b_a312_10d0;
     // Reconstruct this universe exactly as the swarm runner derives it.
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
