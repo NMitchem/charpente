@@ -5559,6 +5559,8 @@ fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
         .insert(5, ("ping", key.clone(), "old 5".to_string()));
     client.verified.insert(5);
     client.next_scan_id = 6;
+    // A bare reconnect above the cut forfeited everything below 6.
+    client.floor = 6;
     assert!(
         client.settled(),
         "before the cut, id 5 was delivered and verified"
@@ -5573,6 +5575,40 @@ fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
         Some(5),
         "the re-mint is owed: a client that never receives it fails"
     );
+}
+
+/// A frame received from the lost timeline goes with it, and so does an aged-out
+/// mark at a cut id: a re-mint delivered there is verified by its content once
+/// the re-scan reads it, never confirmed by id before that.
+#[test]
+fn a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_content() {
+    let sim = Sim::with_faults(0x2EB2_0904, FaultConfig::none());
+    sim.cover("fault:misdirected_write");
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let key = Some(SCOPED_TENANT_A_KEY.to_string());
+    client
+        .ledger
+        .insert(6, ("ping", key.clone(), "old 6".to_string()));
+    client.gone.insert(5);
+    client.pending.push_back((5, "ping", "old 5".to_string()));
+    client.next_scan_id = 7;
+
+    client.resync_if_cut(&sim, 5);
+    client.pending.push_back((5, "ping", "new 5".to_string()));
+    assert_eq!(client.drain(), Ok(()));
+    assert!(
+        !client.settled(),
+        "the re-mint's frame waits for the re-scan: a cut id is not confirmed by id"
+    );
+    // What the next `sync_ledger` reads: id 5 re-minted for tenant A.
+    client.ledger.insert(5, ("ping", key, "new 5".to_string()));
+    client.next_scan_id = 6;
+    assert_eq!(
+        client.drain(),
+        Ok(()),
+        "only the re-mint's frame is left to match"
+    );
+    assert!(client.settled() && client.verified.contains(&5));
 }
 
 /// The other direction: with no durable corruption on record, a recorded id at
