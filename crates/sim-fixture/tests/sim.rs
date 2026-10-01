@@ -131,7 +131,13 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
     };
 
     let mut round: u64 = 0;
+    // `acked_implies_durable` runs every round even after `verify` gives up,
+    // so both closures end the universe there: a round after a give-up would
+    // adjudicate nothing (`Sim::give_up`'s doc names this checker).
     let drive = move |sim: &mut Sim| -> Result<Vec<String>, String> {
+        if sim.gave_up().is_some() {
+            return Ok(vec![]);
+        }
         round += 1;
         let schema = Schema::new().table::<FixtureCounter>();
         let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema) {
@@ -156,6 +162,9 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
     };
 
     let verify = |sim: &mut Sim, acked: &[String]| -> Result<(), String> {
+        if sim.gave_up().is_some() {
+            return Ok(());
+        }
         let schema = Schema::new().table::<FixtureCounter>();
         let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema) {
             Ok(db) => db,
@@ -172,11 +181,20 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
             match snap.get::<FixtureCounter>(Id::from_raw(raw)) {
                 Ok(Some(_)) => {}
                 // Same excuse rule as `counter_roundtrip_result`: an acked row
-                // may vanish ONLY where durable corruption actually fired. That
-                // helper reads `sim.coverage()`, which is the second reason this
-                // checker must run on the caller's world — asked of a private
-                // sim it would answer about faults nobody injected.
-                Ok(None) if durable_corruption_fired(sim) => {}
+                // may vanish ONLY where durable corruption actually fired, and
+                // the universe then gives up, since durability was not
+                // adjudicated. That helper reads `sim.coverage()`, which is the
+                // second reason this checker must run on the caller's world —
+                // asked of a private sim it would answer about faults nobody
+                // injected.
+                Ok(None) if durable_corruption_fired(sim) => {
+                    sim.cover("fixture:acked-round-cut");
+                    sim.give_up(format!(
+                        "durable corruption cut acked round {raw}, so durability was not \
+                         adjudicated"
+                    ));
+                    return Ok(());
+                }
                 Ok(None) => return Err(format!("acked round {raw} lost across a restart")),
                 Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
                 Err(e) => return Err(e.to_string()),

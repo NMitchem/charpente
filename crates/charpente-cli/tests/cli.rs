@@ -12,6 +12,10 @@ fn fixture_dir() -> String {
     format!("{}/../sim-fixture", env!("CARGO_MANIFEST_DIR"))
 }
 
+fn invoicing_dir() -> String {
+    format!("{}/../../examples/invoicing", env!("CARGO_MANIFEST_DIR"))
+}
+
 #[test]
 fn sim_green_run_exits_zero_and_prints_master_seed() {
     let out = charpente()
@@ -113,6 +117,62 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
         stdout.contains(r#""universe:gave-up":27"#),
         "give-up coverage must agree with the reported count:\n{stdout}"
     );
+}
+
+/// A universe whose acknowledged write was cut by durable corruption gives up;
+/// it does not pass, because nothing about durability was adjudicated (S3's
+/// sweep, 2026-10-01). One seed per excuse arm, each found by scanning harness
+/// universes. The harness reports no give-up reason, so each arm marks its own
+/// coverage key beside the give-up and the pin reads that key, along with the
+/// corruption axis that fired.
+#[test]
+fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
+    for (dir, test, seed, arm) in [
+        (
+            fixture_dir(),
+            "acked_counter_survives_rounds",
+            "0xd11f0d8598465913",
+            "fixture:acked-round-cut",
+        ),
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0xbdcf73ee53d9348f",
+            "invoicing:acked-customer-cut",
+        ),
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0xd394d77bc8102880",
+            "invoicing:acked-invoice-cut",
+        ),
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0x2421cf2bd53cb2c1",
+            "invoicing:acked-finalize-cut",
+        ),
+    ] {
+        let out = charpente()
+            .args(["test", "--sim", "--seed", seed, "--filter", test])
+            .args(["--format", "json", "--dir", &dir])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!(
+                r#""outcomes":[{{"test":"{test}","verdicts":0,"gave_up":1}}]"#
+            )),
+            "seed {seed} must give up, not pass:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(r#""{arm}":1"#))
+                && (stdout.contains(r#""fault:bit_flip""#)
+                    || stdout.contains(r#""fault:misdirected_write""#)),
+            "and at {arm}, with durable corruption on record:\n{stdout}"
+        );
+    }
 }
 
 /// The sentence this whole change exists to make true (MANIFESTO §9): a batch

@@ -2358,16 +2358,17 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 
 Sooner or later a workload hits a universe where the faults are severe enough
 that it cannot test its claim at all: the database never opened, the write was
-never acknowledged, every recovery attempt was exhausted. That is not a pass —
+never acknowledged, every recovery attempt was exhausted, or durable corruption
+cut the very record the claim was about. That is not a pass —
 nothing was proven — and it is not a failure either; the harness did exactly
 what it was told.
 
 Say so:
 
 ```rust
-use charpente::{Db, DbConfig, Id, Schema, table};
+use charpente::{Db, DbConfig, Id, Schema, View, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
 
 #[table(global)]
 struct Counter {
@@ -2376,8 +2377,8 @@ struct Counter {
 }
 
 fn counter_survives(sim: &mut Sim) -> Result<(), String> {
-    let schema = Schema::new().table::<Counter>();
-    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema) {
+    let schema = || Schema::new().table::<Counter>();
+    let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
         Ok(db) => db,
         Err(e) if is_fault_fallout(&e.to_string()) => {
             // Nothing to adjudicate: the disk broke before the claim was testable.
@@ -2386,9 +2387,44 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         }
         Err(e) => return Err(e.to_string()),
     };
-    let _ = db;
-    // … the real claim …
-    Ok(())
+    let put = db.transact(|tx| {
+        tx.put(&Counter {
+            id: Id::from_raw(1),
+            hits: 1,
+        });
+        Ok::<_, std::io::Error>(())
+    });
+    if put.is_err() {
+        sim.give_up("the write was never acknowledged, so there is no claim to check");
+        return Ok(());
+    }
+
+    sim.restart(); // a crash: unsynced writes tear or vanish
+    drop(db); // the old handle is dead after restart
+    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
+        Ok(db) => db,
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the reopen hit fault fallout: {e}"));
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    match db.snapshot().and_then(|snap| snap.get::<Counter>(Id::from_raw(1))) {
+        Ok(Some(_)) => Ok(()),
+        // The one loss the platform excuses on a single node, and an excused
+        // universe GIVES UP: the row's durability was not adjudicated, and a
+        // pass needs a verdict.
+        Ok(None) if durable_corruption_fired(sim) => {
+            sim.give_up("durable corruption cut the acked row, so durability was not adjudicated");
+            Ok(())
+        }
+        Ok(None) => Err("acked Counter row lost across a crash".to_string()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the read-back hit fault fallout: {e}"));
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 ```
 
@@ -2540,8 +2576,11 @@ before hand-rolling the same logic a fourth time:
   standard WAL convention; the un-checkpointed data had one local copy).
   Route an acked-durability check's *shortfall* through this so the loss is
   excused only in universes where corruption was actually injected — the
-  strong oracle stands everywhere else. Never use it to excuse wrong data
-  or a consistency violation (a cut reverts state to a prefix, which stays
+  strong oracle stands everywhere else. **An excused universe gives up**
+  (`sim.give_up(..)` and stop, as `counter_survives` under "Giving up" does):
+  the record's durability was not adjudicated, and a pass needs a verdict, so
+  an excuse that returns `Ok` without giving up is a vacuous pass. Never use it
+  to excuse wrong data or a consistency violation (a cut reverts state to a prefix, which stays
   consistent). Note this is the *single-node* excuse: a workload with a
   converged follower keeps none of it, because a record the primary lost to
   media corruption still lives on the follower.
