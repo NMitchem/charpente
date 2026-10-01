@@ -124,7 +124,11 @@ pub fn durable_corruption_fired(sim: &Sim) -> bool {
 /// path must do so ONLY when entry loss could have gapped the directory. With
 /// the recovery-cut ordering fixed (log.rs), the platform never itself leaves
 /// a durable gap, so a gap without this axis firing is a genuine platform
-/// regression that must fail loud — not be masked as a routine restore.
+/// regression that must fail loud — not be masked as a routine restore. In
+/// a multi-node workload, ask
+/// [`SimHost::dir_entry_loss_fired`](crate::SimHost::dir_entry_loss_fired)
+/// instead: it answers for one host's disk, so one node's gap is never
+/// excused by entry loss on another.
 pub fn dir_entry_loss_fired(sim: &Sim) -> bool {
     sim.coverage().get("fault:dir-entry").copied().unwrap_or(0) > 0
 }

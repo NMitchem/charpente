@@ -386,6 +386,11 @@ struct HostWorld {
     /// fired on this host's disk — `SimHost::durable_corruption_fired`.
     /// Counted alongside the universe-wide coverage keys; it draws nothing.
     durable_corruption: u64,
+    /// How many directory entries `dir_entry_loss` lost or resurrected on this
+    /// host's disk — `SimHost::dir_entry_loss_fired`. Counted from the
+    /// universe-wide `fault:dir-entry` key around this host's collapse; it
+    /// draws nothing.
+    entry_loss: u64,
 }
 
 impl HostWorld {
@@ -396,6 +401,7 @@ impl HostWorld {
             entropy: keyed_stream(seed, &format!("host-entropy:{host}")),
             dir_faults: keyed_stream(seed, &format!("host-dir-faults:{host}")),
             durable_corruption: 0,
+            entry_loss: 0,
         }
     }
 }
@@ -1014,6 +1020,16 @@ impl SimHost {
         self.world.lock().host_mut(&self.name).durable_corruption > 0
     }
 
+    /// True when the `dir_entry_loss` axis actually fired on *this host's*
+    /// disk at one of its restarts (a pending create vanished or a pending
+    /// removal came back): `checks::dir_entry_loss_fired` scoped to one host,
+    /// for the same reason as `durable_corruption_fired` above. A gapped log
+    /// directory on one node is fallout only when entry loss fired on that
+    /// node.
+    pub fn dir_entry_loss_fired(&self) -> bool {
+        self.world.lock().host_mut(&self.name).entry_loss > 0
+    }
+
     /// Injects a crash on the `ops`-th subsequent disk operation *on this
     /// host* — mirrors `Sim::crash_disk_after`.
     pub fn crash_after(&self, ops: u64) {
@@ -1043,6 +1059,7 @@ impl SimHost {
                 disk,
                 faults,
                 durable_corruption,
+                entry_loss,
                 ..
             } = host;
             // Bit-level corruption of already-durable bytes, before per-file
@@ -1075,7 +1092,12 @@ impl SimHost {
                 crate::disk::collapse(file, faults, &cfg, coverage);
             }
             if cfg.dir_entry_loss > 0.0 {
+                let lost = |coverage: &BTreeMap<&'static str, u64>| {
+                    coverage.get("fault:dir-entry").copied().unwrap_or(0)
+                };
+                let before = lost(coverage);
                 crate::disk::collapse_dir_entries(disk, faults, cfg.dir_entry_loss, coverage);
+                *entry_loss += lost(coverage) - before;
             }
             disk.epoch += 1;
             disk.crashed = false;
@@ -2972,6 +2994,36 @@ mod tests {
         assert_eq!(sim.coverage()["fault:bit_flip"], 1);
         assert!(b.durable_corruption_fired());
         assert!(!a.durable_corruption_fired(), "the flip was on b's disk");
+    }
+
+    #[test]
+    fn dir_entry_loss_fired_names_the_host_it_fired_on() {
+        let sim = Sim::with_faults(
+            0xD1E_0001,
+            FaultConfig {
+                dir_entry_loss: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let (a, b) = (sim.host("a"), sim.host("b"));
+        b.restart();
+        assert!(
+            !b.durable_corruption_fired() && !b.dir_entry_loss_fired(),
+            "b has no pending directory entry, so its restart loses none"
+        );
+        // A create whose directory entry was never synced vanishes at `a`'s
+        // restart: entry loss on `a` alone.
+        let file = a.disk().open("wal/f").unwrap();
+        file.write_at(0, b"payload!").unwrap();
+        file.sync().unwrap();
+        a.restart();
+        assert_eq!(sim.coverage()["fault:dir-entry"], 1);
+        assert!(a.dir_entry_loss_fired());
+        assert!(
+            !a.durable_corruption_fired(),
+            "entry loss is not durable corruption"
+        );
+        assert!(!b.dir_entry_loss_fired(), "the entry was lost on a's disk");
     }
 
     #[test]

@@ -2688,7 +2688,9 @@ for these before hand-rolling the same logic a fourth time:
   `Db::open`'s "a segment is missing … refusing to guess" to a restore path
   must do so *only* when this returns true: the platform never leaves a
   durable directory gap on its own, so a gap in a universe where the axis
-  never fired is a real regression and must fail loud.
+  never fired is a real regression and must fail loud. In a multi-node
+  workload, ask `SimHost::dir_entry_loss_fired()` instead: it answers for one
+  host's disk, so one node's gap is never excused by entry loss on another.
 
 ```rust,ignore
 pub fn classify(text: &str) -> FaultReason   // Injected | Poisoned | RedbLatch

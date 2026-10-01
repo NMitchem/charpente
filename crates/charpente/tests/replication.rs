@@ -5077,6 +5077,13 @@ struct KNode {
     /// recovered — a fault on it makes the universe inconclusive, because the
     /// single-follower promise needs one clean copy.
     recoverable: bool,
+    /// The rig itself corrupted this node's WAL at least once
+    /// (`corrupt_last_wal_frame`, the sanctioned `bit_flip` stand-in), or
+    /// tried to: a failed attempt's write can still land at the crash. That
+    /// is a fault injected on this node's disk like any other, so it explains
+    /// a below-horizon refusal of it (`unexplained_restore_needed`, D3 round
+    /// 5). The sim's own markers cannot see it.
+    corrupted_by_rig: bool,
 }
 
 /// Build the App + Repl + Kernel for one host, with the same torn-role
@@ -5225,6 +5232,7 @@ fn spawn_kernel_node_with_schema(
                     recoveries: 0,
                     flipped: false,
                     recoverable,
+                    corrupted_by_rig: false,
                 });
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
@@ -5946,8 +5954,9 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
 ///   - Until round 4 the wipe dropped its errors. A failed directory barrier
 ///     then let the deleted files come back at the next reboot, and `p`
 ///     reopened holding its own old timeline (seed `0xa38c1195b6343381`).
-/// - **`p` reopening non-empty** after a whole wipe gives up by name
-///   (`repl:inconclusive:reseed-not-fresh`).
+/// - **`p` reopening non-empty** after a whole, synced wipe fails by name (D3
+///   round 5): no injected fault explains it. The wipe's own faults are
+///   handled above.
 /// - **The convergence** goes through `route_reseed_convergence`.
 fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
     p.kernel = None;
@@ -5998,16 +6007,16 @@ fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
         }
     })?);
     if klast(p).is_some() {
-        sim.cover("repl:inconclusive:reseed-not-fresh");
         return Err(format!(
-            "{INCONCLUSIVE}: re-seeding p: it reopened holding records up to seq {:?} after \
-             its data dir was wiped",
+            "re-seeding p: it reopened holding records up to seq {:?} after a whole, synced \
+             wipe of its data dir. No injected fault explains that (the wipe's own faults \
+             retry or give up above), so it is a platform durability bug (DESIGN §2)",
             klast(p)
         ));
     }
     // Drive the re-seed to convergence so the restore is real, not just wired.
-    let converged = krun_until(sim, &mut [p, f], kconverged, KBUDGET);
-    route_reseed_convergence(sim, converged)
+    let converged = krun_until(sim, &mut [&mut *p, &mut *f], kconverged, KBUDGET);
+    route_reseed_convergence(sim, p, converged)
 }
 
 /// Every file in `host`'s data dir removed, and both directory barriers
@@ -6027,14 +6036,16 @@ fn wipe_data_dir(host: &SimHost) -> Result<(), String> {
 ///   origin);
 /// - `p` refused as diverged behind again gives up as
 ///   `repl:inconclusive:reseed-refused-behind`;
-/// - RESTORE_NEEDED gives up as `repl:inconclusive:reseed-restore-needed`;
+/// - RESTORE_NEEDED gives up as `repl:inconclusive:reseed-restore-needed`
+///   when an injected fault on `p`'s own disk explains it, and fails by name
+///   otherwise (`unexplained_restore_needed`, D3 round 5);
 /// - anything else fails by name.
 ///
 /// Until round 4 every error here was `repl:inconclusive:restore-stalled`.
 /// Over the review's 24,576 universes all 9 were one of the two refusals
 /// above, but a stall, an exhausted budget or an unexpected recovery error
 /// would have given up there instead of failing.
-fn route_reseed_convergence(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
+fn route_reseed_convergence(sim: &Sim, p: &KNode, r: Result<(), String>) -> Result<(), String> {
     r.map_err(|e| {
         if e.contains(INCONCLUSIVE) {
             e
@@ -6042,8 +6053,16 @@ fn route_reseed_convergence(sim: &Sim, r: Result<(), String>) -> Result<(), Stri
             sim.cover("repl:inconclusive:reseed-refused-behind");
             format!("{INCONCLUSIVE}: the re-seeded p was refused before it converged: {e}")
         } else if e.contains(RESTORE_NEEDED) {
-            sim.cover("repl:inconclusive:reseed-restore-needed");
-            format!("{INCONCLUSIVE}: the re-seeded p needed restoring before it converged: {e}")
+            match unexplained_restore_needed(p, &e) {
+                Some(failure) => failure,
+                None => {
+                    sim.cover("repl:inconclusive:reseed-restore-needed");
+                    format!(
+                        "{INCONCLUSIVE}: the re-seeded p needed restoring before it converged: \
+                         {e}"
+                    )
+                }
+            }
         } else {
             format!("the re-seed of p from f did not converge: {e}")
         }
@@ -6120,9 +6139,10 @@ fn sacrificial_cut(
 /// less while the universe could still pass. Now:
 /// - an error whose origin already gave up passes through unchanged (it is
 ///   already counted there);
-/// - a below-horizon refusal of `f`'s store (from the scan's reopen) is fault
-///   fallout if and only if durable corruption fired on `f`'s disk (D3 round
-///   3, the rule of S5 R-M3 and S3b item 0). If it did, `f` gives up as
+/// - a restore-needed refusal of `f`'s store (from the scan's reopen) is fault
+///   fallout if and only if the fault that explains it fired on `f`'s own disk
+///   (D3 rounds 3 and 5, the rule of S5 R-M3 and S3b item 0; see
+///   `unexplained_restore_needed`). If it did, `f` gives up as
 ///   `repl:inconclusive:survivor-faulted`. If not, it fails by name: nothing
 ///   injected explains it, so it is a platform durability bug.
 /// - injected-fault fallout, by `checks::classify`, gives up by name
@@ -6136,21 +6156,17 @@ fn route_promise_scan(
     scan.map_err(|e| {
         if e.contains(INCONCLUSIVE) {
             e
-        } else if e.contains(RESTORE_NEEDED) && e.contains("corrupted below the horizon") {
-            if f.host.durable_corruption_fired() {
-                sim.cover("repl:inconclusive:survivor-faulted");
-                format!(
-                    "{INCONCLUSIVE}: {e} by a durable-corruption fault injected on {}'s disk \
-                     (the designated survivor)",
-                    f.name
-                )
-            } else {
-                format!(
-                    "{e}, but no durable-corruption fault fired on {}: a below-horizon \
-                     refusal that nothing injected explains is a platform durability bug \
-                     (DESIGN §2), not fallout",
-                    f.name
-                )
+        } else if e.contains(RESTORE_NEEDED) {
+            match unexplained_restore_needed(f, &e) {
+                Some(failure) => failure,
+                None => {
+                    sim.cover("repl:inconclusive:survivor-faulted");
+                    format!(
+                        "{INCONCLUSIVE}: {e}, explained by a fault injected on {}'s disk (the \
+                         designated survivor)",
+                        f.name
+                    )
+                }
             }
         } else if is_fault_fallout(&e) {
             sim.cover("repl:inconclusive:survivor-scan-unreadable");
@@ -6164,9 +6180,60 @@ fn route_promise_scan(
     })
 }
 
+/// `None` when an injected fault on `node`'s own disk explains its
+/// RESTORE_NEEDED refusal, and otherwise the failure that names it (D3 round
+/// 5; the rule of S5 R-M3 and S3b item 0). `recover_kernel_node` raises the
+/// refusal in two forms, and each has exactly one explanation:
+/// - **"corrupted below the horizon"** is explained by durable corruption on
+///   that node: a `bit_flip` or `misdirected_write`
+///   (`SimHost::durable_corruption_fired`), or the rig's own
+///   `corrupt_last_wal_frame` (`KNode::corrupted_by_rig`). The rig's
+///   corruption was the explanation the first cut of this rule missed. At
+///   the pinned base, seed `0x78f5713c6b6cd7cd` corrupted the sacrificial
+///   frame after the checkpoint had covered it, and the universe failed.
+/// - **"log directory gapped by entry loss"** is explained by entry loss on
+///   that node: `SimHost::dir_entry_loss_fired`.
+///
+/// The universe-wide checkers will not do: this property faults `p` on most
+/// rounds, so they would excuse a refusal of one node on the strength of a
+/// fault on the other.
+fn unexplained_restore_needed(node: &KNode, e: &str) -> Option<String> {
+    assert!(
+        e.contains(&format!("{RESTORE_NEEDED}: {} ", node.name)),
+        "unexplained_restore_needed: the refusal must name {} itself, since only a fault on \
+         its own disk can explain it; fix the caller that routed another node's refusal \
+         here: {e}",
+        node.name
+    );
+    let (explained, fault) = if e.contains("corrupted below the horizon") {
+        (
+            node.host.durable_corruption_fired() || node.corrupted_by_rig,
+            "durable corruption (bit_flip, misdirected_write, or the rig's own \
+             corrupt_last_wal_frame)",
+        )
+    } else if e.contains("log directory gapped by entry loss") {
+        (
+            node.host.dir_entry_loss_fired(),
+            "entry loss (dir_entry_loss)",
+        )
+    } else {
+        (false, "known fault")
+    };
+    (!explained).then(|| {
+        format!(
+            "{e}, but no {fault} fired on {}'s disk: a restore-needed refusal that nothing \
+             injected on that node explains is a platform durability bug (DESIGN §2), not \
+             fallout",
+            node.name
+        )
+    })
+}
+
 /// The one place `above_horizon_universe` answers an error from stepping `p`
 /// (with or without `f`), so no error is swallowed — a pass over a swallowed
-/// error checked nothing. RESTORE_NEEDED restores `p` from the survivor.
+/// error checked nothing. RESTORE_NEEDED restores `p` from the survivor, but
+/// only when an injected fault on `p`'s own disk explains it; otherwise it
+/// fails by name (`unexplained_restore_needed`, D3 round 5).
 ///
 /// A diverged-behind refusal of `p` is answered with the re-seed it names for
 /// a true laggard, and only when `f` never recovered (`f.recoveries == 0`).
@@ -6212,6 +6279,9 @@ fn route_p_error(
         return Ok(());
     };
     if e.contains(RESTORE_NEEDED) {
+        if let Some(failure) = unexplained_restore_needed(p, &e) {
+            return Err(failure);
+        }
         return restore_p_from_survivor(sim, p, f);
     }
     if !e.contains(INCONCLUSIVE) && is_diverged_behind(&e) && f.recoveries == 0 {
@@ -6268,6 +6338,11 @@ fn is_diverged_behind(e: &str) -> bool {
 ///   Its wipe ignored a failed directory barrier, and its convergence gave
 ///   every error up as `restore-stalled`. Both are routed now (`reseed_p`).
 ///   The census holds all of it, and the behavioural pins are the oracle.
+/// - **Since D3 round 5** a restore-needed refusal of either node is answered
+///   (restored, or given up) only when a fault injected on that node's own
+///   disk explains it, and otherwise fails by name
+///   (`unexplained_restore_needed`). A non-empty reopen after a whole, synced
+///   re-seed wipe fails by name too.
 /// - **Discovery seeds** (not pins, since any re-key renames them):
 ///   - `0x6d554d5eb1e76a3` and `0xfd74b66d02fe0371`, both at 0485b76: a
 ///     follower recovery cut by a misdirected write.
@@ -6454,7 +6529,12 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
         // A corruption that did not happen forces no cut. When the helper
         // errs (an injected fault on its own IO), `forced_cut` must not go on
         // to claim one — before D3 its error was dropped and the cover below
-        // was claimed anyway.
+        // was claimed anyway. Whether or not it succeeds, the attempt is
+        // recorded on `p`: it is a fault injected on p's disk, and when the
+        // sacrificial frame sits at or below the horizon (the checkpoint
+        // covered it) recovery refuses p below the horizon because of it
+        // (D3 round 5, seed 0x78f5713c6b6cd7cd at the pinned base).
+        p.corrupted_by_rig |= forced_cut;
         let forced_cut = forced_cut && corrupt_last_wal_frame(&p.host).is_ok();
         p.host.crash_now();
         match recover_kernel_node(sim, &mut p) {
@@ -6806,7 +6886,7 @@ fn a_survivor_refused_below_the_horizon_with_no_corruption_fired_fails_by_name()
     let routed =
         route_promise_scan(&sim, &f, scan).expect_err("a refused survivor promises nothing");
     assert!(
-        !routed.contains(INCONCLUSIVE) && routed.contains("no durable-corruption fault fired on f"),
+        !routed.contains(INCONCLUSIVE) && routed.contains("fired on f's disk"),
         "with nothing injected on f, the refusal is a failure that says why; got: {routed}"
     );
     assert_eq!(
@@ -6970,62 +7050,136 @@ fn a_reseed_refused_behind_before_it_converges_gives_up_under_its_own_key() {
 ///   of its own pre-restore timeline against `f`'s 1. That is not a prefix
 ///   of `f`.
 /// - **Now:** the wipe power-cycles `p` and wipes again
-///   (`repl:reseed-wipe-retried`), so every re-seed reopens empty, and none
-///   gives up as `repl:inconclusive:reseed-not-fresh`.
+///   (`repl:reseed-wipe-retried`), so every re-seed reopens empty. A non-empty
+///   reopen after a whole, synced wipe would fail the universe by name (D3
+///   round 5): no injected fault explains it.
 #[test]
 fn a_reseed_whose_wipe_met_a_failed_barrier_wipes_again_and_reopens_empty() {
     let (sim, r) = replay_above_horizon(0xa38c_1195_b634_3381);
     let coverage = sim.coverage();
+    let retried = coverage.get("repl:reseed-wipe-retried").copied();
     assert!(
-        coverage
-            .get("repl:reseed-wipe-retried")
-            .copied()
-            .unwrap_or(0)
-            > 0,
+        retried.unwrap_or(0) > 0,
         "the wipe met an injected fault and was redone, or the seed no longer names the \
          scenario: {coverage:?}"
     );
     assert_eq!(
-        coverage.get("repl:inconclusive:reseed-not-fresh"),
-        None,
-        "every re-seed reopened empty: {coverage:?} ({r:?}, gave up: {:?})",
-        sim.gave_up()
+        r,
+        Ok(()),
+        "every re-seed reopened empty, so the universe did not fail: {coverage:?}"
+    );
+}
+
+/// Fires a real fault on a third host's disk, of every durable axis `sim`
+/// enables (`bit_flip`, `dir_entry_loss`). The universe then counts as
+/// faulted while neither `p` nor `f` does, so a twin that runs after this
+/// catches an excuse that asks the universe-wide checkers instead of the
+/// refused node's own disk.
+fn fault_a_bystander(sim: &Sim) {
+    let host = sim.host("bystander");
+    let file = host
+        .disk()
+        .open("wal/bystander")
+        .expect("the bystander's disk opens");
+    file.write_at(0, &[0xAA; 64]).expect("the bystander writes");
+    file.sync()
+        .expect("and syncs its bytes, not its directory entry");
+    host.restart();
+    assert!(
+        host.durable_corruption_fired() || host.dir_entry_loss_fired(),
+        "a fault fired on the bystander's disk"
+    );
+}
+
+/// D3 round 5, seed `0x78f5713c6b6cd7cd`, a universe of the pinned base. The
+/// rig's own forced corruption (`corrupt_last_wal_frame`) lands on a
+/// sacrificial frame the checkpoint has already covered, so recovery refuses
+/// `p` below the horizon. No sim fault fires anywhere in this universe, so
+/// that corruption is the only explanation. It is one, and `p` is restored.
+/// The first cut of round 5's per-node rule did not count it, and failed this
+/// universe.
+#[test]
+fn a_below_horizon_refusal_the_rigs_own_corruption_explains_is_restored() {
+    let (sim, r) = replay_above_horizon(0x78f5_713c_6b6c_d7cd);
+    let coverage = sim.coverage();
+    assert_eq!(r, Ok(()), "the universe does not fail: {coverage:?}");
+    assert_eq!(
+        (
+            coverage.get("fault:bit_flip"),
+            coverage.get("fault:misdirected_write"),
+            coverage.get("fault:dir-entry"),
+        ),
+        (None, None, None),
+        "no sim fault could explain the refusal, or this seed no longer pins the rig's own"
+    );
+    assert!(
+        coverage
+            .get("repl:restored-from-follower")
+            .is_some_and(|&n| n > 0),
+        "p was refused below the horizon and restored from f: {coverage:?}"
     );
 }
 
 /// The re-seed's convergence is routed by kind (D3 round 4, review I2).
 /// Until round 4 every error there was `restore-stalled`, a blanket give-up
-/// wide enough to swallow a real failure.
+/// wide enough to swallow a real failure. Since round 5 a RESTORE_NEEDED
+/// refusal gives up only when an injected fault on `p`'s own disk explains it
+/// (`unexplained_restore_needed`), and fails by name otherwise.
 #[test]
 fn a_reseed_convergence_error_is_routed_by_kind() {
-    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (p, _f) = sacrificial_pair(&sim);
+    fault_a_bystander(&sim);
+    assert!(
+        durable_corruption_fired(&sim) && !p.host.durable_corruption_fired(),
+        "the universe counts as corrupted, p does not"
+    );
     let given_up = format!("{INCONCLUSIVE}: f (the designated survivor) faulted: injected");
     assert_eq!(
-        route_reseed_convergence(&sim, Err(given_up.clone())),
+        route_reseed_convergence(&sim, &p, Err(given_up.clone())),
         Err(given_up),
         "an error that already gave up passes through, counted at its origin"
     );
     let behind = "p kernel step: diverged: the follower holds a proven record at seq 5, but \
                   this primary has GC'd every record below its retained base 9";
-    let routed = route_reseed_convergence(&sim, Err(behind.to_string()))
+    let routed = route_reseed_convergence(&sim, &p, Err(behind.to_string()))
         .expect_err("a refused re-seed did not converge");
     assert!(
         routed.starts_with(INCONCLUSIVE) && routed.contains(behind),
         "the laggard refusal gives up, naming itself; got: {routed}"
     );
     let restore = format!("{RESTORE_NEEDED}: p corrupted below the horizon");
-    let routed = route_reseed_convergence(&sim, Err(restore.clone()))
+    let routed = route_reseed_convergence(&sim, &p, Err(restore.clone()))
+        .expect_err("a re-seed that needs restoring did not converge");
+    assert!(
+        !routed.contains(INCONCLUSIVE)
+            && routed.contains(&restore)
+            && routed.contains("fired on p's disk"),
+        "with no fault on p's own disk, RESTORE_NEEDED fails by name; got: {routed}"
+    );
+    p.host.restart();
+    assert!(
+        p.host.durable_corruption_fired(),
+        "a bit flipped on p's disk"
+    );
+    let routed = route_reseed_convergence(&sim, &p, Err(restore.clone()))
         .expect_err("a re-seed that needs restoring did not converge");
     assert!(
         routed.starts_with(INCONCLUSIVE) && routed.contains(&restore),
-        "RESTORE_NEEDED gives up, naming itself; got: {routed}"
+        "with p's own disk corrupted, RESTORE_NEEDED gives up, naming itself; got: {routed}"
     );
     for other in [
         "kernel stall: no work, no pending events, done() false",
         "kernel budget 200000 exhausted before done()",
         "recover p: an error no arm recognises",
     ] {
-        let routed = route_reseed_convergence(&sim, Err(other.to_string()))
+        let routed = route_reseed_convergence(&sim, &p, Err(other.to_string()))
             .expect_err("an unrecognised error did not converge either");
         assert!(
             !routed.contains(INCONCLUSIVE) && routed.contains(other),
@@ -7045,6 +7199,169 @@ fn a_reseed_convergence_error_is_routed_by_kind() {
         ),
         (Some(1), Some(1), None),
         "each give-up under its own key, and none under the old blanket key"
+    );
+}
+
+/// Refuses `p`'s reopen below the horizon by flipping its first WAL frame's
+/// CRC by hand, so no sim fault fires on `p`. Returns the refusal.
+fn refuse_p_below_the_horizon_by_hand(sim: &Sim, p: &mut KNode) -> String {
+    let disk = p.host.disk();
+    let mut segments = disk.list("wal/").expect("p has a WAL");
+    segments.sort();
+    let file = disk
+        .open(segments.first().expect("p has a WAL segment"))
+        .expect("the segment opens");
+    let mut crc = [0u8; 1];
+    file.read_at(12, &mut crc).expect("frame 1's header reads");
+    crc[0] ^= 0xff;
+    file.write_at(12, &crc).expect("frame 1's CRC is rewritten");
+    file.sync().expect("and made durable");
+    let refused = recover_kernel_node(sim, p).expect_err("p's reopen is refused");
+    assert_eq!(
+        refused,
+        format!("{RESTORE_NEEDED}: p corrupted below the horizon"),
+        "frame 1 sits below p's horizon — if not, this pin no longer reaches the refusal"
+    );
+    refused
+}
+
+/// D3 round 5. A restore-needed refusal of `p` is answered with a restore only
+/// when an injected fault on `p`'s own disk explains it. Here nothing injected
+/// touched `p` (the test corrupts it by hand), so the refusal is a platform
+/// durability bug and fails by name. Before round 5 `route_p_error` restored
+/// `p` from `f` whatever explained the refusal. A real bit flip fires on a
+/// bystander first, so asking the universe-wide checker fails this pin too.
+#[test]
+fn a_restore_needed_refusal_of_p_with_no_fault_on_p_fails_by_name() {
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (mut p, mut f) = sacrificial_pair(&sim);
+    fault_a_bystander(&sim);
+    sim.quiesce_disk_faults(); // p's reopen below flips nothing
+    let refused = refuse_p_below_the_horizon_by_hand(&sim, &mut p);
+    assert!(
+        durable_corruption_fired(&sim) && !p.host.durable_corruption_fired(),
+        "the universe counts as corrupted, p does not"
+    );
+    let routed = route_p_error(&sim, &mut p, &mut f, Err(refused.clone()))
+        .expect_err("an unexplained refusal fails the universe");
+    assert!(
+        !routed.contains(INCONCLUSIVE)
+            && routed.contains(&refused)
+            && routed.contains("fired on p's disk"),
+        "it fails by name, saying no fault on p explains it; got: {routed}"
+    );
+    assert_eq!(
+        sim.coverage().get("repl:restored-from-follower"),
+        None,
+        "and p is not restored over it"
+    );
+}
+
+/// The twin: the same refusal, but a real bit flip on `p`'s own disk caused
+/// it. That is fallout, so `route_p_error` restores `p` from the survivor as
+/// before.
+#[test]
+fn a_restore_needed_refusal_of_p_with_a_fault_on_p_restores_it() {
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (mut p, mut f) = sacrificial_pair(&sim);
+    let refused = recover_kernel_node(&sim, &mut p).expect_err("p's reopen is refused");
+    assert_eq!(
+        refused,
+        format!("{RESTORE_NEEDED}: p corrupted below the horizon"),
+        "the reopen's bit flip lands below p's horizon — if not, this pin no longer reaches \
+         the refusal"
+    );
+    assert!(
+        p.host.durable_corruption_fired(),
+        "the flip fired on p's disk"
+    );
+    sim.quiesce_disk_faults(); // the restore below runs fault-free
+    assert_eq!(
+        route_p_error(&sim, &mut p, &mut f, Err(refused)),
+        Ok(()),
+        "corruption that fired on p is fallout, and the restore answers it"
+    );
+    assert_eq!(
+        sim.coverage().get("repl:restored-from-follower").copied(),
+        Some(1),
+        "p was restored from f"
+    );
+    assert!(
+        f.kernel.as_ref().is_some_and(|k| k.is_primary()) && klast(&p) == klast(&f),
+        "f is primary and p converged onto it"
+    );
+}
+
+/// D3 round 5 (round 3's concern 1). A gapped log directory is explained only
+/// by entry loss on that node's own disk, and a below-horizon refusal only by
+/// durable corruption there. The survivor's promise scan holds both: each
+/// gives up (`repl:inconclusive:survivor-faulted`) only when its own fault
+/// fired on `f`, and otherwise fails by name. Before round 5 the gapped form
+/// failed whatever had fired.
+#[test]
+fn a_survivor_restore_needed_refusal_is_explained_only_by_its_own_fault_on_f() {
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            dir_entry_loss: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (_p, f) = sacrificial_pair(&sim);
+    fault_a_bystander(&sim);
+    assert!(
+        dir_entry_loss_fired(&sim) && !f.host.dir_entry_loss_fired(),
+        "the universe counts as having lost an entry, f does not"
+    );
+    let gapped = format!("{RESTORE_NEEDED}: f log directory gapped by entry loss");
+    let corrupted = format!("{RESTORE_NEEDED}: f corrupted below the horizon");
+    let routed = route_promise_scan(&sim, &f, Err(gapped.clone()))
+        .expect_err("a refused survivor promises nothing");
+    assert!(
+        !routed.contains(INCONCLUSIVE)
+            && routed.contains(&gapped)
+            && routed.contains("fired on f's disk"),
+        "with no entry loss on f, the gap fails by name; got: {routed}"
+    );
+    f.host
+        .disk()
+        .open("wal/unsynced")
+        .expect("f creates a file whose directory entry is never synced");
+    f.host.restart();
+    assert!(
+        f.host.dir_entry_loss_fired() && !f.host.durable_corruption_fired(),
+        "entry loss fired on f's disk, and nothing else did"
+    );
+    let routed = route_promise_scan(&sim, &f, Err(gapped.clone()))
+        .expect_err("a refused survivor promises nothing");
+    assert!(
+        routed.starts_with(INCONCLUSIVE) && routed.contains(&gapped),
+        "with entry loss on f, the gap gives up; got: {routed}"
+    );
+    let routed = route_promise_scan(&sim, &f, Err(corrupted.clone()))
+        .expect_err("a refused survivor promises nothing");
+    assert!(
+        !routed.contains(INCONCLUSIVE) && routed.contains(&corrupted),
+        "entry loss does not explain a below-horizon refusal; got: {routed}"
+    );
+    assert_eq!(
+        sim.coverage()
+            .get("repl:inconclusive:survivor-faulted")
+            .copied(),
+        Some(1),
+        "one give-up, under the survivor's fault key"
     );
 }
 
@@ -7117,7 +7434,7 @@ fn route_p_error_returns_an_unrecognised_error_unchanged() {
 /// - **In `reseed_p` and `wipe_data_dir`:**
 ///   - every wipe step is `?`-propagated into a wipe loop whose only `Ok` is
 ///     a whole, synced wipe;
-///   - a non-empty reopen is checked;
+///   - a non-empty reopen is checked, and fails by name rather than giving up;
 ///   - the convergence is bound and handed whole to `route_reseed_convergence`.
 ///
 /// `route_p_error` itself is not read here.
@@ -7260,6 +7577,17 @@ fn above_horizon_universe_routes_every_error_of_p() {
             1,
         ),
         (
+            "the rig records its own corruption of p right before attempting it",
+            universe.matches("corrupt_last_wal_frame(").count(),
+            universe
+                .matches(
+                    "p.corrupted_by_rig |= forced_cut;\n\
+                     let forced_cut = forced_cut && corrupt_last_wal_frame(&p.host).is_ok();",
+                )
+                .count(),
+            1,
+        ),
+        (
             "the corruption helper's .is_ok() is the universe's only consumed result",
             universe.matches(".is_ok()").count(),
             universe
@@ -7318,6 +7646,14 @@ fn above_horizon_universe_routes_every_error_of_p() {
             2,
         ),
         (
+            "reseed_p fails by name, with no give-up, when p reopens non-empty",
+            reseed.matches("if klast(p).is_some() {").count(),
+            reseed
+                .matches("if klast(p).is_some() {\nreturn Err(format!(\n\"re-seeding p: it reopened")
+                .count(),
+            1,
+        ),
+        (
             "reseed_p checks that p reopened empty",
             reseed.matches("klast(p)").count(),
             reseed.matches("if klast(p).is_some() {").count() * 2,
@@ -7328,8 +7664,8 @@ fn above_horizon_universe_routes_every_error_of_p() {
             reseed.matches("krun_until(").count(),
             reseed
                 .matches(
-                    "let converged = krun_until(sim, &mut [p, f], kconverged, KBUDGET);\n\
-                     route_reseed_convergence(sim, converged)",
+                    "let converged = krun_until(sim, &mut [&mut *p, &mut *f], kconverged, \
+                     KBUDGET);\nroute_reseed_convergence(sim, p, converged)",
                 )
                 .count(),
             1,
