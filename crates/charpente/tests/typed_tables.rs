@@ -617,6 +617,13 @@ fn recover_and_check(
     Ok(Recovered::Checked(engine, store))
 }
 
+/// How many recoveries the final check gets before the universe gives up.
+/// Every attempt either checks or dies to injected fault fallout, so a larger
+/// budget costs time only in universes that would otherwise conclude nothing.
+/// Over four bases 16 left 157 give-ups, 32 left 155 and 64 rescued none more,
+/// for +8.5% CPU against the property without a final check (2026-10-01).
+const FINAL_ATTEMPTS: u32 = 32;
+
 fn tables_workload(sim: &mut Sim) -> Result<(), String> {
     tables_workload_traced(sim).map(|_| ())
 }
@@ -634,7 +641,6 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
     };
     let mut submitted: Vec<Vec<u8>> = Vec::new();
     let mut acked = 0usize;
-    let mut checked = false;
 
     // Every error a round meets is classified, the rule every other swarm
     // workload applies: text carrying an injected fault is fallout and the
@@ -645,10 +651,7 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
         sim.crash_disk_after(35 + entropy.next_u64() % 279);
         let (mut engine, store) =
             match recover_and_check(sim, &wal_cfg, &mut submitted, &mut acked, &mut rejected)? {
-                Recovered::Checked(engine, store) => {
-                    checked = true;
-                    (engine, store)
-                }
+                Recovered::Checked(engine, store) => (engine, store),
                 Recovered::Fallout => {
                     sim.restart();
                     continue;
@@ -704,21 +707,41 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
         }
         sim.restart();
     }
-    if !checked {
-        sim.give_up(
-            "the store was never checked against the model: every round's recovery or check \
-             hit a fault",
-        );
+
+    // The final check, the shape every other swarm property has: the last
+    // round's records get the oracle too, and the verdict is this check. It
+    // counts only over at least one logged record: a check of a store against
+    // an empty model can fail only if the store invents rows, which is not a
+    // verdict on anything this universe wrote.
+    for _attempt in 0..FINAL_ATTEMPTS {
+        match recover_and_check(sim, &wal_cfg, &mut submitted, &mut acked, &mut rejected)? {
+            Recovered::Checked(..) => {
+                if acked == 0 {
+                    sim.give_up(
+                        "no record was ever logged, so the final check compared the store with an \
+                         empty model and could not have failed",
+                    );
+                }
+                return Ok(rejected);
+            }
+            Recovered::Fallout => sim.restart(),
+            Recovered::GaveUp => return Ok(rejected),
+        }
     }
+    sim.give_up(format!(
+        "the final check never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, so the \
+         last round's records were never checked"
+    ));
     Ok(rejected)
 }
 
 /// The give-up cap. This base is ambient, so the count moves batch to batch,
 /// and the cap is a margin, not a measurement: over 10 fresh batches it gave up
-/// 25-37 times, mean 32.5, and the cap is twice that maximum, about 10
-/// standard deviations above the mean. Before the store rebuild, 8 fixed bases
-/// gave up 40-56 times.
-const TABLES_GAVE_UP_CEILING: u64 = 74;
+/// 30-49 times, mean 39.3, and the cap is twice that maximum, about 10
+/// standard deviations above the mean. Set on the honest counts (2026-10-01,
+/// review I1): it was 74 while round 0's check of an empty model, which
+/// cannot fail, still counted as a verdict.
+const TABLES_GAVE_UP_CEILING: u64 = 98;
 
 #[test]
 fn tables_and_log_survive_the_fault_matrix() {
@@ -747,9 +770,11 @@ fn tables_and_log_survive_the_fault_matrix() {
 /// rejects on every later open ("Not a redb database: magic number mismatch").
 /// A bare `Err(_) => restart` had hidden it, and classifying alone failed the
 /// universe as a platform error. `Db::open` discards and rebuilds exactly this
-/// store, and so does the workload now. In this universe each rebuild's fresh
-/// store creation is then cut by an injected fault, so the universe ends at
-/// the named give-up, never at a failure.
+/// store, and so does the workload now. In this universe rounds 1 and 2 each
+/// meet the torn store and each rebuild's fresh creation is cut by an injected
+/// fault; the final check then opens a fresh store over a log that never
+/// recorded anything, so the universe ends at the named give-up, never at a
+/// failure and never at a verdict.
 #[test]
 fn a_store_whose_creation_tore_is_discarded_for_a_rebuild_not_failed() {
     const SEED: u64 = 0x5fc2_c8c0_905e_d653;
@@ -770,10 +795,34 @@ fn a_store_whose_creation_tore_is_discarded_for_a_rebuild_not_failed() {
     );
     let reason = sim
         .gave_up()
-        .expect("every rebuild here is cut by an injected fault, so nothing was checked");
+        .expect("nothing was ever logged here, so no check could have failed");
     assert!(
-        reason.contains("the store was never checked against the model"),
+        reason.contains("no record was ever logged"),
         "and it ends at that give-up: {reason}"
+    );
+}
+
+/// Seed `0x5a4f575f09260fd5` (base `0x5300_0009`): no round's traffic ever
+/// reached the log, so every check this universe made compared a store with an
+/// empty model, which can fail only if the store invents rows. Until
+/// 2026-10-01 round 0's check alone made it a verdict (review I1); it gives up.
+#[test]
+fn a_universe_that_never_logged_a_record_gives_up_rather_than_passing() {
+    const SEED: u64 = 0x5a4f_575f_0926_0fd5;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let rejected = tables_workload_traced(&mut sim).expect("an empty log is not a failure");
+    assert!(rejected.is_empty(), "no torn store here: {rejected:?}");
+    let reason = sim
+        .gave_up()
+        .expect("a universe that never logged a record checked nothing and must give up");
+    assert!(
+        reason.contains("no record was ever logged"),
+        "and it must be THIS give-up: {reason}"
     );
 }
 
@@ -880,12 +929,11 @@ fn a_store_redb_refuses_for_another_reason_is_not_rebuilt() {
     );
 }
 
-/// A universe in which no round ever checked the store against the model
-/// adjudicated nothing, so it gives up rather than passing (LEDGER
-/// 2026-09-30, follow-up 9). Every disk op faults here, so no round's
-/// recovery ever succeeds.
+/// A universe whose final check never ran adjudicated nothing about its last
+/// round, so it gives up rather than passing (LEDGER 2026-09-30, follow-up 9).
+/// Every disk op faults here, so no recovery ever succeeds.
 #[test]
-fn a_universe_that_never_checks_the_store_gives_up_rather_than_passing() {
+fn a_universe_whose_final_check_never_runs_gives_up_rather_than_passing() {
     // Control: the same seed with no faults reaches a verdict.
     let mut control = Sim::with_faults(0x7AB1_0901, FaultConfig::none());
     assert_eq!(tables_workload(&mut control), Ok(()));
@@ -907,9 +955,9 @@ fn a_universe_that_never_checks_the_store_gives_up_rather_than_passing() {
     assert_eq!(tables_workload(&mut sim), Ok(()));
     let reason = sim
         .gave_up()
-        .expect("a universe that never checked the store must give up, not pass");
+        .expect("a universe whose final check never ran must give up, not pass");
     assert!(
-        reason.contains("the store was never checked against the model"),
+        reason.contains("the final check never ran"),
         "and it must be THIS give-up: {reason}"
     );
 }
