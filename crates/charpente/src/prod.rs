@@ -170,29 +170,72 @@ impl Fs for StdFs {
     }
 }
 
-/// `std::fs::create_dir_all`, one level at a time and with the same answers,
-/// that also says which directory it created highest up, if any: that one's
-/// own entry, in its parent, is the last thing anything below it waits on.
-fn make_dirs(fs: &dyn Fs, dir: &Path) -> io::Result<Option<PathBuf>> {
-    if dir.as_os_str().is_empty() {
-        return Ok(None); // the working directory
+/// Creates `root` when it is absent — and nothing above it. Every barrier's
+/// chain ends at the root's parent, so a directory created above that would
+/// hold an entry no chain ever syncs, and existing is not being durable: the
+/// boot that created it may have died before anything synced it. So a root
+/// whose parent is missing is refused by name, and the durability boundary
+/// is the parent the operator made. `what` names the root ("data
+/// directory", "bucket root"); `acked` names what rests on it.
+fn create_root(fs: &dyn Fs, root: &Path, what: &str, acked: &str) -> io::Result<()> {
+    match fs.create_dir(root) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = parent_dir(root).expect("`/` always exists, so it is never NotFound");
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "the {what} \"{}\" cannot be created: its parent \"{}\" does not exist, and \
+                     charpente never creates a directory above the {what} — {acked} rests on \
+                     every directory entry above it, and charpente vouches only for the entries \
+                     it creates and fsyncs. Create \"{}\" (mkdir -p \"{}\"), or point at a {what} \
+                     whose parent exists",
+                    root.display(),
+                    parent.display(),
+                    parent.display(),
+                    parent.display()
+                ),
+            ))
+        }
+        Err(_) if fs.is_dir(root) => Ok(()),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "the {what} \"{}\" cannot be created: {e} — check that path, and that its parent \
+                 is a directory you can write",
+                root.display()
+            ),
+        )),
+    }
+}
+
+/// `std::fs::create_dir_all` bounded by `root`: creates `dir` and whatever
+/// is missing between it and `root`, never `root` itself (its creator's
+/// job, `create_root`) or anything above it.
+fn create_under(fs: &dyn Fs, root: &Path, dir: &Path) -> io::Result<()> {
+    assert!(
+        dir.starts_with(root),
+        "create_under: \"{}\" is not under the root \"{}\" — every path here comes from a \
+         resolve that joins onto the root",
+        dir.display(),
+        root.display()
+    );
+    if dir == root {
+        return Ok(());
     }
     match fs.create_dir(dir) {
-        Ok(()) => return Ok(Some(dir.to_path_buf())),
+        Ok(()) => return Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(_) if fs.is_dir(dir) => return Ok(None),
+        Err(_) if fs.is_dir(dir) => return Ok(()),
         Err(e) => return Err(e),
     }
-    let Some(parent) = dir.parent() else {
-        return Err(io::Error::other(format!(
-            "could not create \"{}\": not even its filesystem root exists",
-            dir.display()
-        )));
-    };
-    let above = make_dirs(fs, parent)?;
+    let parent = dir
+        .parent()
+        .expect("a directory strictly under the root has a parent");
+    create_under(fs, root, parent)?;
     match fs.create_dir(dir) {
-        Ok(()) => Ok(Some(above.unwrap_or_else(|| dir.to_path_buf()))),
-        Err(_) if fs.is_dir(dir) => Ok(above),
+        Ok(()) => Ok(()),
+        Err(_) if fs.is_dir(dir) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -206,17 +249,11 @@ fn parent_dir(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Where a sync chain from under `root` stops: the directory holding the
-/// entry of the highest directory the caller depends on and may have
-/// created. That is `root`'s parent, which holds the root's own entry —
-/// unless this call created directories above the root, and then the parent
-/// of the highest of them.
-fn chain_top(root: &Path, created: Option<&Path>) -> PathBuf {
-    let highest = match created {
-        Some(c) if root.starts_with(c) => c,
-        _ => root,
-    };
-    parent_dir(highest).unwrap_or_else(|| highest.to_path_buf())
+/// Where every sync chain from under `root` ends: the root's parent, which
+/// holds the root's own entry — the highest directory charpente creates an
+/// entry in, since it never creates above the root (`create_root`).
+fn chain_end(root: &Path) -> PathBuf {
+    parent_dir(root).unwrap_or_else(|| root.to_path_buf())
 }
 
 /// Fsyncs `dir` and every directory above it, up to and including `top`:
@@ -283,11 +320,17 @@ const DISK_OWED: &str = "a name is durable only once the directory holding it an
 /// that exists without being durable, and the next boot cannot tell it from
 /// one that is. `open` creates directories and syncs nothing, because
 /// `Disk`'s contract makes a name durable at the barrier, not at the create.
-/// `new` creates the data directory and any missing directory above it, and
-/// before it returns fsyncs the chain up to the parent of the highest one it
-/// created — no barrier climbs above the data directory's parent. Fsyncing
-/// a directory means opening it, so the data directory's parent must be
-/// readable by the node.
+///
+/// **The data directory's parent is the boundary.** `new` creates the data
+/// directory when it is absent and nothing above it: a data directory whose
+/// parent does not exist is refused by name, with the fix (create the
+/// parent, or point at a data directory whose parent exists). Every
+/// directory the node creates is then at or below the data directory, so
+/// every entry it creates lies on some barrier's chain, whichever boot
+/// created it; the parent's own entry, above, is the operator's. `new`
+/// syncs nothing itself — the data directory's entry is on every barrier's
+/// chain, and nothing is durable before a barrier. Fsyncing a directory
+/// means opening it, so the parent must also be readable by the node.
 ///
 /// Until 2026-10-01 a barrier fsynced only the one directory holding its
 /// prefix, and nothing synced a created directory into its parent. On a
@@ -298,13 +341,10 @@ const DISK_OWED: &str = "a name is durable only once the directory holding it an
 /// prefix durable at any depth, which is the contract as written. Held by
 /// the filesystem model in this module's tests (`CrashFs`): one pin per
 /// sync, and a power cut after every filesystem call of a fresh node's boot
-/// and first writes.
-///
-/// What this leaves: a directory above the data directory's parent that a
-/// boot created, and failed or died before syncing, is trusted by the next
-/// boot exactly as an operator's own unsynced `mkdir -p` would be. Closing
-/// that would mean fsyncing every ancestor up to `/` on every boot,
-/// directories the node does not own.
+/// and first writes. Until the same day `new` also created every missing
+/// directory above the data directory, whose entries no barrier reached and
+/// which a boot that failed before syncing them left for the next boot to
+/// trust; it now refuses that path instead.
 pub struct ProdDisk {
     root: PathBuf,
     fs: Box<dyn Fs>,
@@ -317,9 +357,9 @@ impl ProdDisk {
 
     /// `new` over any filesystem: the crash model, in this module's tests.
     fn over(root: PathBuf, fs: Box<dyn Fs>) -> io::Result<ProdDisk> {
-        if let Some(created) = make_dirs(&*fs, &root)? {
-            sync_up(&*fs, &root, &chain_top(&root, Some(&created)), DISK_OWED)?;
-        }
+        // No sync here: the new entry, in the root's parent, is on every
+        // barrier's chain, and nothing is durable before a barrier.
+        create_root(&*fs, &root, "data directory", "an acknowledged write")?;
         Ok(ProdDisk { root, fs })
     }
 
@@ -340,7 +380,7 @@ impl Disk for ProdDisk {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
         let full = self.resolve(path)?;
         if let Some(parent) = full.parent() {
-            make_dirs(&*self.fs, parent)?; // `sync_dir`'s to make durable
+            create_under(&*self.fs, &self.root, parent)?; // `sync_dir`'s to make durable
         }
         self.fs.open_rw(&full)
     }
@@ -383,7 +423,7 @@ impl Disk for ProdDisk {
             Some(i) => self.root.join(&prefix[..i]),
             None => self.root.clone(),
         };
-        make_dirs(&*self.fs, &dir)?;
+        create_under(&*self.fs, &self.root, &dir)?;
         let mut below = vec![dir.clone()];
         while let Some(at) = below.pop() {
             for (path, is_dir) in self.fs.read_dir(&at)? {
@@ -398,7 +438,7 @@ impl Disk for ProdDisk {
                 }
             }
         }
-        sync_up(&*self.fs, &dir, &chain_top(&self.root, None), DISK_OWED)
+        sync_up(&*self.fs, &dir, &chain_end(&self.root), DISK_OWED)
     }
 }
 
@@ -585,18 +625,16 @@ const OBJECT_OWED: &str = "an object is durable only once every directory from t
 ///
 /// So a PUT writes `<key>.tmp`, fsyncs it, renames it onto `<key>`, then
 /// fsyncs the key's directory and every directory above it up to the bucket
-/// root's parent (`sync_up`) — or, when the PUT created directories above
-/// the bucket root, up to the parent of the highest of them. Dropping the
-/// first fsync lets a power loss leave the key holding zeros; dropping any
-/// directory fsync lets it lose an acknowledged object, and a whole new
-/// generation prefix with it. The whole chain on EVERY PUT, not only the
-/// directories this PUT created: a PUT that created them and then failed
-/// leaves them existing but not durable, and a retry that trusted their
-/// existence would be acknowledged over entries the next power loss drops.
-/// Existing is not being durable. Above the root's parent the chain cannot
-/// re-sync on every PUT without climbing to `/`, so a directory there that a
-/// failed PUT created is trusted by the retry, as `ProdDisk` trusts one above
-/// its data directory's parent.
+/// root's parent (`sync_up`). Dropping the first fsync lets a power loss
+/// leave the key holding zeros; dropping any directory fsync lets it lose an
+/// acknowledged object, and a whole new generation prefix with it. The whole
+/// chain on EVERY PUT, not only the directories this PUT created: a PUT that
+/// created them and then failed leaves them existing but not durable, and a
+/// retry that trusted their existence would be acknowledged over entries the
+/// next power loss drops. Existing is not being durable. A PUT creates the
+/// bucket root when it is absent and nothing above it, so every directory it
+/// creates is on that chain: a bucket root whose parent does not exist is
+/// refused by name on every PUT, as `ProdDisk` refuses a data directory.
 ///
 /// A GET and a LIST sync before they return (DESIGN §2's "readable is not
 /// durable", one layer up): a GET fsyncs the object and the same directory
@@ -626,7 +664,9 @@ pub struct FsObjectStore {
 impl FsObjectStore {
     /// The bucket root. Not created here — a store pointed at an absent
     /// directory answers `NotFound` for a `Get` and an empty `List`, which
-    /// is what an empty bucket looks like; a PUT creates what it needs.
+    /// is what an empty bucket looks like. A PUT creates the root, and the
+    /// directories under it a key needs, but never the root's parent: that
+    /// must exist, or every PUT is refused by name.
     pub fn new(root: impl Into<PathBuf>) -> FsObjectStore {
         FsObjectStore {
             root: root.into(),
@@ -670,7 +710,8 @@ impl FsObjectStore {
         let parent = path
             .parent()
             .expect("resolve joins onto the root, so there is always a parent");
-        let created = make_dirs(&*self.fs, parent)?;
+        create_root(&*self.fs, &self.root, "bucket root", "an acknowledged PUT")?;
+        create_under(&*self.fs, &self.root, parent)?;
         let tmp = path.with_file_name(format!(
             "{}{TMP_SUFFIX}",
             path.file_name()
@@ -686,8 +727,7 @@ impl FsObjectStore {
         self.fs.rename(&tmp, &path)?;
         // After the rename: the directory entry that makes the object exist
         // is itself a write, and so is every entry on the path down to it.
-        let top = chain_top(&self.root, created.as_deref());
-        sync_up(&*self.fs, parent, &top, OBJECT_OWED)
+        sync_up(&*self.fs, parent, &chain_end(&self.root), OBJECT_OWED)
     }
 
     fn get(&self, key: &str) -> io::Result<Vec<u8>> {
@@ -711,7 +751,7 @@ impl FsObjectStore {
         sync_up(
             &*self.fs,
             path.parent().expect("resolve joins onto the root"),
-            &chain_top(&self.root, None),
+            &chain_end(&self.root),
             OBJECT_OWED,
         )?;
         Ok(bytes)
@@ -1149,11 +1189,17 @@ mod tests {
         fn provisioned(dir: &str) -> CrashFs {
             let fs = CrashFs::new();
             let dir = Path::new(dir);
-            make_dirs(&fs, dir).unwrap();
-            let mut at = Some(dir);
-            while let Some(d) = at {
-                fs.sync_dir(d).unwrap();
-                at = d.parent();
+            for level in dir
+                .ancestors()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .skip(1)
+            {
+                fs.create_dir(level).unwrap();
+            }
+            for level in dir.ancestors() {
+                fs.sync_dir(level).unwrap();
             }
             fs
         }
@@ -1185,8 +1231,9 @@ mod tests {
             Ok(())
         }
 
-        /// A stat with the power out answers nothing, so `make_dirs` cannot
-        /// mistake the outage for a directory that already exists.
+        /// A stat with the power out answers nothing, so `create_root` and
+        /// `create_under` cannot mistake the outage for a directory that
+        /// already exists.
         fn is_dir(&self, path: &Path) -> bool {
             let mut m = self.model();
             m.tick().is_ok()
@@ -1602,23 +1649,27 @@ mod tests {
         );
     }
 
-    /// Above the root: a PUT creates every missing directory over the bucket
-    /// root too, and the highest one's entry is in a directory the chain to
-    /// the root's parent does not reach.
+    /// The bucket root's parent must exist: a PUT creates the bucket root
+    /// and nothing above it, and refuses by name rather than create a
+    /// directory whose entry no PUT's chain reaches.
     #[test]
-    fn an_acked_put_that_created_the_directory_above_the_bucket_root_survives_the_next_power_loss()
+    fn a_put_under_a_bucket_root_whose_parent_is_missing_is_refused_by_name_and_nothing_is_created()
     {
         let fs = CrashFs::new();
         let s = FsObjectStore::with_fs("/backups/bucket", Box::new(fs.clone()));
-        put(&s, "k", b"v").unwrap();
-        fs.power_loss();
-        let s = FsObjectStore::with_fs("/backups/bucket", Box::new(fs.clone()));
+        let err = put(&s, "k", b"v").expect_err("a PUT created /backups to hold the bucket root");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
         assert_eq!(
-            get(&s, "k").unwrap_or_else(|e| panic!(
-                "an acknowledged PUT that created the directory above the bucket root was lost at \
-                 the next power loss: {e}"
-            )),
-            "v"
+            err.to_string(),
+            "object PUT \"k\" failed: the bucket root \"/backups/bucket\" cannot be created: its parent \"/backups\" does \
+             not exist, and charpente never creates a directory above the bucket root — an \
+             acknowledged PUT rests on every directory entry above it, and charpente vouches only \
+             for the entries it creates and fsyncs. Create \"/backups\" (mkdir -p \"/backups\"), \
+             or point at a bucket root whose parent exists"
+        );
+        assert!(
+            !fs.is_dir(Path::new("/backups")),
+            "the refusal created /backups"
         );
     }
 
@@ -1775,27 +1826,39 @@ mod tests {
         assert_eq!(rows_after_power_loss(&fs), ["first"]);
     }
 
-    /// `ProdDisk::new` creates every missing directory above the data
-    /// directory too, and the highest one's entry is in a directory no
-    /// barrier's chain reaches: `new` syncs it before it returns.
+    /// The data directory's parent must exist: `ProdDisk::new` creates the
+    /// data directory and nothing above it, and refuses by name rather than
+    /// create a directory whose entry no barrier's chain reaches.
     #[test]
-    fn an_acked_write_on_a_node_that_created_the_directory_above_its_data_directory_survives_the_next_power_loss()
-     {
+    fn a_data_directory_whose_parent_is_missing_is_refused_by_name_and_nothing_is_created() {
         let fs = CrashFs::provisioned("/");
-        let mut db = boot(&fs).unwrap();
-        write(&mut db, 0, "first").unwrap();
-        power_cut(&fs, db);
-        assert_eq!(rows_after_power_loss(&fs), ["first"]);
+        let Err(err) = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())) else {
+            panic!("ProdDisk::new created /srv to hold the data directory /srv/node")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            err.to_string(),
+            "the data directory \"/srv/node\" cannot be created: its parent \"/srv\" does not \
+             exist, and charpente never creates a directory above the data directory — an \
+             acknowledged write rests on every directory entry above it, and charpente vouches \
+             only for the entries it creates and fsyncs. Create \"/srv\" (mkdir -p \"/srv\"), or \
+             point at a data directory whose parent exists"
+        );
+        assert!(!fs.is_dir(Path::new("/srv")), "the refusal created /srv");
     }
 
     /// Why every barrier syncs the whole chain, not only what its own call
     /// created: the boot that created the data directory failed to make its
     /// entry durable, and the next boot finds the directory there and
     /// creates nothing. Only a barrier that re-syncs what already exists
-    /// keeps that boot's acknowledged writes.
+    /// keeps that boot's acknowledged writes. Two failures, because the
+    /// first boot meets the parent twice: at the store's creation barrier,
+    /// and again at the barrier of the discard-and-rebuild `Db::open` runs
+    /// when a store will not open.
     #[test]
     fn an_acked_write_after_a_boot_whose_directory_sync_failed_survives_the_next_power_loss() {
         let fs = CrashFs::provisioned("/srv");
+        fs.fail_next_sync("/srv");
         fs.fail_next_sync("/srv");
         let Err(err) = boot(&fs) else {
             panic!(
@@ -1873,7 +1936,7 @@ mod tests {
     fn every_power_cut_on_a_fresh_node_keeps_its_acked_writes() {
         let workload = ["first", "second", "third"];
         let total = {
-            let fs = CrashFs::provisioned("/");
+            let fs = CrashFs::provisioned("/srv");
             let mut db = boot(&fs).unwrap();
             for (id, name) in workload.iter().enumerate() {
                 write(&mut db, id as u64, name).unwrap();
@@ -1881,7 +1944,7 @@ mod tests {
             fs.calls()
         };
         for cut in 0..=total {
-            let fs = CrashFs::provisioned("/");
+            let fs = CrashFs::provisioned("/srv");
             fs.power_out_after(cut);
             let mut acked = Vec::new();
             let mut cut_off = None;

@@ -88,13 +88,14 @@ pub(crate) fn dispatch(
         // `build`'s errors, neither of these two is ever a `Refusal` (a
         // disk root that cannot be created, `/dev/urandom` that cannot be
         // opened — both are platform IO, never a shape the app rejected).
+        // `ProdDisk::new`'s error names the data directory, the cause and
+        // the fix itself (a missing parent is refused, never created — GUIDE
+        // §1), so this line adds only that the node did not start: "fix the
+        // store/log" would point the operator at the wrong thing.
         let disk = match ProdDisk::new(data_dir) {
             Ok(disk) => disk,
             Err(e) => {
-                let _ = writeln!(
-                    err,
-                    "charpente failed to start — fix the store/log and restart: {e}"
-                );
+                let _ = writeln!(err, "charpente failed to start: {e}");
                 return Ok(1);
             }
         };
@@ -193,7 +194,7 @@ pub(crate) fn dispatch(
 pub const RESTORE_USAGE: &str = "usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]\n       \
 --from BUCKET    the archive's root directory (the bucket an archive wrote)\n       \
 --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim\n       \
---to DIR         the data directory to rebuild (default: this app's own data directory)\n       \
+--to DIR         the data directory to rebuild (default: this app's own data directory; its\n                        parent must exist)\n       \
 --force          discard a destination timeline the archive cannot prove is its own\n\
 \n\
 Stop the node before restoring into its data directory. Restore discards the store file and\n\
@@ -288,7 +289,20 @@ fn restore_verb(
     // on the error path below.
     #[allow(clippy::disallowed_methods)]
     let dest_was_absent = !std::path::Path::new(&to).exists();
-    let disk = ProdDisk::new(&to)?;
+    // Before a byte of the bucket is read, and named here rather than left
+    // to `?`: a raw error out of `launch` prints as `main`'s `Debug` form. A
+    // destination whose parent is missing is refused by `ProdDisk::new`,
+    // which creates nothing when it refuses.
+    let disk = match ProdDisk::new(&to) {
+        Ok(disk) => disk,
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "error: {e} — nothing in the destination has been touched"
+            );
+            return Ok(1);
+        }
+    };
     let opts = RestoreOpts { prefix, force };
     // `notice` is how `--force` says what it destroys BEFORE it acts; it goes
     // to stdout because it is not an error, and it must reach the operator
@@ -588,10 +602,54 @@ mod tests {
         assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
         assert_eq!(
             String::from_utf8(err).unwrap(),
-            "charpente failed to start — fix the store/log and restart: Not a directory (os \
-             error 20)\n"
+            format!(
+                "charpente failed to start: the data directory \"{}\" cannot be created: Not a \
+                 directory (os error 20) — check that path, and that its parent is a directory \
+                 you can write\n",
+                data_dir.display()
+            )
         );
         std::fs::remove_file(&blocker).unwrap();
+    }
+
+    /// The data dir's parent must exist (GUIDE §1): `ProdDisk::new` creates
+    /// the data dir and nothing above it, so a deep path that does not exist
+    /// yet is refused by name, before `build`, with nothing created.
+    #[test]
+    fn a_data_dir_whose_parent_is_missing_exits_one_naming_the_parent_and_creates_nothing() {
+        let missing = fresh_data_dir("missing-parent");
+        let data_dir = missing.join("data");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            "127.0.0.1:0",
+            data_dir.to_str().unwrap(),
+            |_: Box<dyn Disk>, _: Box<dyn Entropy>| -> io::Result<App> {
+                panic!("build must not run when the data dir's parent is missing")
+            },
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        let exists = missing.exists();
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!(
+                "charpente failed to start: the data directory \"{data}\" cannot be created: its \
+                 parent \"{parent}\" does not exist, and charpente never creates a directory above \
+                 the data directory — an acknowledged write rests on every directory entry above \
+                 it, and charpente vouches only for the entries it creates and fsyncs. Create \
+                 \"{parent}\" (mkdir -p \"{parent}\"), or point at a data directory whose parent \
+                 exists\n",
+                data = data_dir.display(),
+                parent = missing.display()
+            )
+        );
+        assert!(!exists, "the refusal created {}", missing.display());
     }
 
     /// The `[]` arm's `match serve::serve(addr, app) { Ok(server) =>
@@ -1130,6 +1188,43 @@ mod tests {
             "a refused restore must not leave a directory the operator did not have: {}",
             dest.display()
         );
+    }
+
+    /// A destination whose parent does not exist is refused by name before
+    /// a byte of the bucket is read, with the operator's line rather than a
+    /// raw error escaping `launch`, and nothing is created: `ProdDisk::new`
+    /// creates the destination itself and nothing above it (GUIDE §1).
+    #[test]
+    fn restore_into_a_destination_whose_parent_is_missing_exits_one_and_creates_nothing() {
+        let missing = tmp_dir("missing-parent");
+        let dest = missing.join("dest");
+        let (code, out, err) = run_restore_verb(&[
+            "restore",
+            "--from",
+            "/does/not/exist/charpente-no-such-bucket",
+            "--to",
+            dest.to_str().unwrap(),
+            "--prefix",
+            BUCKET_PREFIX,
+        ]);
+        let exists = missing.exists();
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(code, 1, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            err,
+            format!(
+                "error: the data directory \"{dest}\" cannot be created: its parent \"{parent}\" \
+                 does not exist, and charpente never creates a directory above the data directory \
+                 — an acknowledged write rests on every directory entry above it, and charpente \
+                 vouches only for the entries it creates and fsyncs. Create \"{parent}\" (mkdir \
+                 -p \"{parent}\"), or point at a data directory whose parent exists — nothing in \
+                 the destination has been touched\n",
+                dest = dest.display(),
+                parent = missing.display()
+            )
+        );
+        assert!(!exists, "the refusal created {}", missing.display());
     }
 
     /// Negative space (hard rule 4). The cleanup above removes a

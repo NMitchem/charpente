@@ -9173,6 +9173,36 @@ mod fs_object_store {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// On the real filesystem: a PUT creates the bucket root and nothing
+    /// above it (GUIDE's archive section), so a root under a parent that
+    /// does not exist is refused by name, every time, with nothing created.
+    #[test]
+    fn a_put_under_a_bucket_root_whose_parent_is_missing_is_refused_by_name() {
+        let missing = tmp("missing-parent");
+        let root = missing.join("bucket");
+        let s = FsObjectStore::new(root.clone());
+        let first = put(&s, "p/k", b"v").expect_err("a PUT created the bucket root's parent");
+        let again =
+            put(&s, "p/k", b"v").expect_err("a retried PUT created the bucket root's parent");
+        let exists = missing.exists();
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(first.kind(), io::ErrorKind::NotFound, "{first}");
+        assert_eq!(
+            first.to_string(),
+            format!(
+                "object PUT \"p/k\" failed: the bucket root \"{root}\" cannot be created: its parent \"{parent}\" does not \
+                 exist, and charpente never creates a directory above the bucket root — an \
+                 acknowledged PUT rests on every directory entry above it, and charpente vouches \
+                 only for the entries it creates and fsyncs. Create \"{parent}\" (mkdir -p \
+                 \"{parent}\"), or point at a bucket root whose parent exists",
+                root = root.display(),
+                parent = missing.display()
+            )
+        );
+        assert_eq!(again.to_string(), first.to_string());
+        assert!(!exists, "the refusal created {}", missing.display());
+    }
+
     #[test]
     fn list_is_sorted_and_prefix_scoped() {
         let root = tmp("list");

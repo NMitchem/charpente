@@ -169,7 +169,14 @@ contract as written, and only a directory tree can show the production impl fall
 it. Until 2026-10-01 it did fall short. `ProdDisk` created the data directory, any directory
 above it and `wal/` without syncing any of them into its parent, and a barrier fsynced only
 the one directory holding its prefix, so on a fresh node every write acknowledged before the
-first checkpoint rested on a `wal` entry the next power loss dropped (§2's barrier). The model
+first checkpoint rested on a `wal` entry the next power loss dropped (§2's barrier). The
+boundary of what a barrier vouches for is the root's parent: `ProdDisk` creates the data
+directory and `FsObjectStore` the bucket root, and neither ever creates a directory above it
+— a root whose parent is missing is refused by name, because an entry created up there would
+lie on no barrier's chain, and a boot that failed before syncing it would leave it for the next
+boot to trust (ruled 2026-10-01 over fsyncing every ancestor to `/`, which fails on unreadable
+ancestors and on filesystems with no directory fsync, and still cannot vouch for an
+operator's own unsynced `mkdir -p`). The model
 states its own limits (prod.rs, `Fs`): a power loss drops all unsynced state, deterministically
 and in full, so it finds a missing or misplaced sync and not a bug that needs some unsynced
 state to survive; and its kernel never marks a page clean after a failed fsync, so the EIO
@@ -543,8 +550,9 @@ create/remove of a name starting with `prefix` is durable — same flat-namespac
 contract as `list`. The prod impl fsyncs every directory a name under the prefix sits in and
 every directory above them up to the data directory's parent — the whole chain on every
 barrier, because a boot that created a directory and failed before syncing it leaves one that
-exists without being durable — and `ProdDisk::new` syncs every directory it creates into its
-parent before it returns. Until 2026-10-01 it fsynced only the holding directory, and on a fresh
+exists without being durable — and it never creates a directory above the data directory, so
+that chain covers every entry it creates (a data directory whose parent is missing is refused
+by name, §1). Until 2026-10-01 it fsynced only the holding directory, and on a fresh
 node the store's creation synced the data directory before `wal/` existed, so writes
 acknowledged before the first checkpoint rested on an unsynced `wal` entry (held by `CrashFs`,
 §1). The sim tracks pending

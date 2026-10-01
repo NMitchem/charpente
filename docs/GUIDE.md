@@ -121,16 +121,23 @@ file and the write-ahead log's segments live under one root directory, as
 flat relative names (`tables.redb`; WAL segments are named by their
 zero-padded 20-digit base sequence, so the first is
 `wal/00000000000000000000.log`); subdirectories are created on demand.
-`ProdDisk::new` creates the directory, and any missing directory above it, and
-fsyncs each one it created into its parent before it returns. Every directory
-barrier then fsyncs the whole chain, from the directory it names up to the data
-directory's parent, which holds the data directory's own entry — so give the
-node a data directory whose parent it can read.
+**The data directory's parent must exist, and the node must be able to read
+it.** `ProdDisk::new` creates the data directory itself when it is absent, and
+never a directory above it: `./data` works on a fresh checkout, while
+`/srv/app/node` with no `/srv/app` is refused at startup by name (`charpente
+failed to start: the data directory "/srv/app/node" cannot be created: its parent
+"/srv/app" does not exist, ...`) — create the parent first (`mkdir -p
+/srv/app`). The reason is durability: an acknowledged write rests on every
+directory entry above it, every directory barrier fsyncs the whole chain from
+the directory it names up to the data directory's parent (which holds the data
+directory's own entry), and the parent's own entry is yours. `restore --to`
+follows the same rule.
 
 ```rust
 use charpente::prod::ProdDisk;
 
-/// Opens the app's one data directory, creating it if it doesn't exist yet.
+/// Opens the app's one data directory, creating it if it doesn't exist yet
+/// (its parent must).
 fn open_data_dir(path: &str) -> std::io::Result<ProdDisk> {
     ProdDisk::new(path)
 }
@@ -4736,11 +4743,13 @@ never `serve_replicated`, so neither a witness conflict nor a strict-witness dea
 happen here; those are `charpente::serve_replicated`-only stops) comes from one of three
 distinct moments, each with its own line on stderr:
 
-- **Before any kernel exists.** Opening the platform IO handles (`ProdDisk::new`,
-  `ProdEntropy::new`) or `build` (`App::open`) fails — a table-gate barrier from a schema
-  this binary cannot open, or an ordinary platform IO failure (the disk root,
-  `/dev/urandom`, the store): `charpente refused to start: ...`/`charpente failed to start
-  — fix the store/log and restart: ...`. Or the HTTP bind fails, which `serve` attempts
+- **Before any kernel exists.** The data directory cannot be opened — its parent is missing
+  (§1), or the path is not a directory you can create: `charpente failed to start: the data
+  directory "<path>" cannot be created: ...`, naming the cause and the fix. Or opening
+  `/dev/urandom` (`ProdEntropy::new`) or `build` (`App::open`) fails — a table-gate barrier
+  from a schema this binary cannot open, or an ordinary platform IO failure (the store, the
+  log): `charpente refused to start: ...`/`charpente failed to start — fix the store/log and
+  restart: ...`. Or the HTTP bind fails, which `serve` attempts
   before it spawns the kernel thread: `charpente failed to start — could not bind <addr>:
   <the OS error> — free that address, or change the one the app passes to launch`.
 - **The kernel stops on its own account** — a Pending job of a foreign shape (§6), a
@@ -5887,10 +5896,11 @@ Two things to know before you deploy this:
 
 **`FsObjectStore` is the only production `ObjectStore` that ships.** It writes objects as
 files under a root directory, atomically (temp file, sync, rename, then sync every directory
-from the object's up to the root's parent, or up to the parent of the highest directory the
-PUT had to create above the root), and it syncs an object and those directories
-before a GET or LIST returns it. Point the root at a directory whose parent the node can
-read: the root's own entry lives there, and it is synced too. A real bucket — S3, GCS,
+from the object's up to the root's parent), and it syncs an object and those directories
+before a GET or LIST returns it. Point the root at a directory whose parent exists and the
+node can read: a PUT creates the root but never its parent, and refuses every PUT by name
+while the parent is missing — under `serve::archive` that refusal is retried like any failed
+PUT, so check the parent before you start the node. A real bucket — S3, GCS,
 Azure Blob — needs an `ObjectStore` implementation you write against the trait in
 `charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore` first:
 whole-object PUTs give a caller nothing to barrier, so the trait has no `sync` method, and
@@ -5964,7 +5974,8 @@ Every app binary that calls `charpente::launch` has the verb already:
 usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]
        --from BUCKET    the archive's root directory (the bucket an archive wrote)
        --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim
-       --to DIR         the data directory to rebuild (default: this app's own data directory)
+       --to DIR         the data directory to rebuild (default: this app's own data directory; its
+                        parent must exist)
        --force          discard a destination timeline the archive cannot prove is its own
 ```
 
