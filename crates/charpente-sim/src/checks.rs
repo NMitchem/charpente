@@ -101,7 +101,10 @@ pub fn is_fault_fallout(text: &str) -> bool {
 /// 8, the promise M1 replication makes good). Never use it to excuse wrong
 /// DATA (corruption must surface as loss or a named error, not as different
 /// bytes) or consistency violations (e.g. exactly-once) — a cut reverts
-/// state to a prefix, which stays consistent.
+/// state to a prefix, which stays consistent. In a multi-node workload, ask
+/// [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired)
+/// instead: it answers for one host's disk, so a refusal on one node is never
+/// excused by a fault on another.
 pub fn durable_corruption_fired(sim: &Sim) -> bool {
     let coverage = sim.coverage();
     coverage.get("fault:bit_flip").copied().unwrap_or(0) > 0

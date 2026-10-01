@@ -3935,10 +3935,11 @@ follower that is actually *ahead* of a primary that forked behind it. If the
 follower truly just lagged, stop it, clear its data directory, and restart it;
 it re-seeds from a snapshot and converges.
 charpente's own replication suite applies that remedy itself in exactly one
-case: a follower it rebuilt from the surviving primary, which therefore holds a
-prefix of that primary's timeline, provided the primary has never recovered.
-Wherever it cannot prove that, it leaves the refusal standing, and so should
-you.
+case: a follower it rebuilt from the surviving primary, provided the primary has
+never recovered. What proves that follower a prefix of the primary's timeline is
+this handshake, not the wipe: the rebuild converged only once the primary
+accepted the follower's `Hello`. Wherever it cannot prove that, it leaves the
+refusal standing, and so should you.
 
 ## 11. Realtime
 

@@ -5936,15 +5936,41 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
 /// below the primary's GC'd base. The restore path's second half, and the
 /// remedy a laggard refusal names ("re-seed it deliberately from a fresh data
 /// dir"), which is why `route_p_error` answers that refusal with it.
+///
+/// Every error is routed (D3 round 4, review I2), and `above_horizon_universe_routes_every_error_of_p`
+/// holds it:
+/// - **The wipe** meets injected faults like any boot. A failed step
+///   power-cycles `p` and wipes again (`repl:reseed-wipe-retried`), and gives
+///   up by name once the faults persist (`repl:inconclusive:reseed-wipe-faulted`).
+///   Anything else fails.
+///   - Until round 4 the wipe dropped its errors. A failed directory barrier
+///     then let the deleted files come back at the next reboot, and `p`
+///     reopened holding its own old timeline (seed `0xa38c1195b6343381`).
+/// - **`p` reopening non-empty** after a whole wipe gives up by name
+///   (`repl:inconclusive:reseed-not-fresh`).
+/// - **The convergence** goes through `route_reseed_convergence`.
 fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
     p.kernel = None;
-    p.host.restart();
-    let disk = p.host.disk();
-    for name in disk.list("").map_err(|e| e.to_string())? {
-        let _ = disk.remove(&name);
-    }
-    let _ = disk.sync_dir("");
-    let _ = disk.sync_dir("wal/");
+    let mut attempts = 1;
+    let wiped = loop {
+        p.host.restart();
+        match wipe_data_dir(&p.host) {
+            Ok(()) => break Ok(()),
+            Err(e) if is_fault_fallout(&e) && attempts < RECOVER_ATTEMPTS => {
+                attempts += 1;
+                sim.cover("repl:reseed-wipe-retried");
+            }
+            Err(e) if is_fault_fallout(&e) => {
+                sim.cover("repl:inconclusive:reseed-wipe-faulted");
+                break Err(format!(
+                    "{INCONCLUSIVE}: re-seeding p: its data dir could not be wiped in \
+                     {RECOVER_ATTEMPTS} power cycles under injected faults: {e}"
+                ));
+            }
+            Err(e) => break Err(format!("re-seeding p: wiping its data dir failed: {e}")),
+        }
+    };
+    wiped?;
     p.repl_cfg = follower_cfg("p:1", "f:1");
     p.flipped = true;
     p.recoveries += 1;
@@ -5971,16 +5997,55 @@ fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
             format!("{INCONCLUSIVE}: restore reopen: {e}")
         }
     })?);
+    if klast(p).is_some() {
+        sim.cover("repl:inconclusive:reseed-not-fresh");
+        return Err(format!(
+            "{INCONCLUSIVE}: re-seeding p: it reopened holding records up to seq {:?} after \
+             its data dir was wiped",
+            klast(p)
+        ));
+    }
     // Drive the re-seed to convergence so the restore is real, not just wired.
-    // Any failure here (a stall, or the freshly-restored node needing yet
-    // another restore) is too much damage to adjudicate: inconclusive.
-    krun_until(sim, &mut [p, f], kconverged, KBUDGET).map_err(|e| {
+    let converged = krun_until(sim, &mut [p, f], kconverged, KBUDGET);
+    route_reseed_convergence(sim, converged)
+}
+
+/// Every file in `host`'s data dir removed, and both directory barriers
+/// synced so the removals are durable. Each step's error comes back whole.
+fn wipe_data_dir(host: &SimHost) -> Result<(), String> {
+    let disk = host.disk();
+    for name in disk.list("").map_err(|e| e.to_string())? {
+        disk.remove(&name).map_err(|e| e.to_string())?;
+    }
+    disk.sync_dir("").map_err(|e| e.to_string())?;
+    disk.sync_dir("wal/").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The re-seed's convergence, routed by kind (D3 round 4, review I2):
+/// - an error that already gave up passes through (it is counted at its
+///   origin);
+/// - `p` refused as diverged behind again gives up as
+///   `repl:inconclusive:reseed-refused-behind`;
+/// - RESTORE_NEEDED gives up as `repl:inconclusive:reseed-restore-needed`;
+/// - anything else fails by name.
+///
+/// Until round 4 every error here was `repl:inconclusive:restore-stalled`.
+/// Over the review's 24,576 universes all 9 were one of the two refusals
+/// above, but a stall, an exhausted budget or an unexpected recovery error
+/// would have given up there instead of failing.
+fn route_reseed_convergence(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
+    r.map_err(|e| {
         if e.contains(INCONCLUSIVE) {
-            // Already covered at its own origin site — do not double-count.
             e
+        } else if is_diverged_behind(&e) {
+            sim.cover("repl:inconclusive:reseed-refused-behind");
+            format!("{INCONCLUSIVE}: the re-seeded p was refused before it converged: {e}")
+        } else if e.contains(RESTORE_NEEDED) {
+            sim.cover("repl:inconclusive:reseed-restore-needed");
+            format!("{INCONCLUSIVE}: the re-seeded p needed restoring before it converged: {e}")
         } else {
-            sim.cover("repl:inconclusive:restore-stalled");
-            format!("{INCONCLUSIVE}: restore convergence stalled: {e}")
+            format!("the re-seed of p from f did not converge: {e}")
         }
     })
 }
@@ -6001,11 +6066,17 @@ fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
 ///   answers it with a 500. `a_sacrificial_write_lost_to_a_reboot_...`
 ///   reaches the shape through a due cron tick.
 ///
-/// That round has no frame to corrupt, so it skips the forced cut and claims
-/// nothing (`repl:sacrificial-lost-to-reboot`, not a give-up). Silence
-/// *without* a reboot would leave `p`'s state unknown, so that is routed like
-/// any other error of `p`. Every other error goes to `route_p_error` too
-/// (before D3 a `matches!` dropped it).
+/// What the rig observes is no answer and a reboot of `p`. That alone does not
+/// prove the frame was never applied, though it was not in any probed case
+/// (31 of 31 here, and 0 of 14 in the D3 review's 96-point scan). So the round
+/// skips the forced cut and claims nothing, applied or not:
+/// - no `repl:above-horizon-cut` credit from this write, so the cut is claimed
+///   only by `last_after < last_before_crash`, as before D3;
+/// - no give-up (`repl:sacrificial-lost-to-reboot` counts the skip).
+///
+/// Silence *without* a reboot would leave `p`'s state unknown, so that is
+/// routed like any other error of `p`. Every other error goes to
+/// `route_p_error` too (before D3 a `matches!` dropped it).
 fn sacrificial_cut(
     sim: &Sim,
     p: &mut KNode,
@@ -6098,23 +6169,38 @@ fn route_promise_scan(
 /// error checked nothing. RESTORE_NEEDED restores `p` from the survivor.
 ///
 /// A diverged-behind refusal of `p` is answered with the re-seed it names for
-/// a true laggard, and only when all four of these hold:
-/// - `p` is the node refused;
-/// - `p` is a follower;
-/// - `f` is primary;
-/// - `f` never recovered (`f.recoveries == 0`).
+/// a true laggard, and only when `f` never recovered (`f.recoveries == 0`).
+/// That condition is the only one that decides anything.
 ///
-/// `p` is only ever a follower after `restore_p_from_survivor` wiped it and
-/// seeded it from `f`, and it has received nothing but `f`'s frames since. A
-/// follower's own recovery cut only shortens that prefix. And a primary that
-/// never recovered never cut its log. So `p`'s records are a prefix of `f`'s,
-/// the refusal's other remedy (this primary forked below the follower) is
-/// impossible, and re-seeding `p` overwrites nothing it alone holds.
+/// Three more facts hold whenever it fires. They are asserted, not tested,
+/// because the refusal's origin implies them (D3 review m1):
+/// - **`p` is the node refused.** An error of `f`'s own step has already given
+///   up by the time it gets here (`kstep_node`'s survivor arm), and that is
+///   excluded first.
+/// - **`p` is a follower.** A primary only sends the refusal; it surfaces on
+///   the follower's step.
+/// - **`f` is primary.** A survivor that is not primary refuses a follower's
+///   `Hello` for its role before it checks position.
+///
+/// **Why the re-seed is safe: the survivor's own handshake, not the rig's
+/// wipe.**
+/// - `p` is only ever a follower after `restore_p_from_survivor` re-seeded it
+///   from `f`. That re-seed converged only once `f` accepted `p`'s `Hello`:
+///   Design B's prefix check at `p`'s position, or a snapshot seed of an empty
+///   `p`. A `p` the wipe failed to empty is refused there, and the re-seed
+///   gives up (`route_reseed_convergence`); this arm never sees it.
+/// - Since then `p` has appended nothing but frames `f` shipped. A shipped
+///   gap re-`Hello`s, which is checked again, and a follower's own recovery
+///   cut only shortens its prefix.
+/// - A primary that never recovered never cut its log.
+/// - So `p`'s records are a prefix of `f`'s. The refusal's other remedy (this
+///   primary forked below the follower) is impossible, and re-seeding `p`
+///   overwrites nothing it alone holds.
+///
 /// `a_restored_follower_refused_as_a_laggard_is_reseeded_not_failed` pins the
 /// arm, and `a_laggard_refusal_is_not_reseeded_once_the_primary_could_have_forked`
-/// its gate.
-///
-/// Every other error bubbles, to `finish_universe` (an inconclusive gives up)
+/// its gate. `route_p_error_returns_an_unrecognised_error_unchanged` pins that
+/// every other error bubbles, to `finish_universe` (an inconclusive gives up)
 /// or as the failure it is.
 fn route_p_error(
     sim: &Sim,
@@ -6128,12 +6214,24 @@ fn route_p_error(
     if e.contains(RESTORE_NEEDED) {
         return restore_p_from_survivor(sim, p, f);
     }
-    if e.starts_with(&format!("{} kernel step: ", p.name))
-        && is_diverged_behind(&e)
-        && p.kernel.as_ref().is_some_and(|k| !k.is_primary())
-        && f.kernel.as_ref().is_some_and(|k| k.is_primary())
-        && f.recoveries == 0
-    {
+    if !e.contains(INCONCLUSIVE) && is_diverged_behind(&e) && f.recoveries == 0 {
+        assert!(
+            e.starts_with(&format!("{} kernel step: ", p.name)),
+            "route_p_error: a diverged-behind refusal that has not given up must be p's own \
+             step's (f's gives up in kstep_node's survivor arm); fix the routing that let \
+             this through: {e}"
+        );
+        assert!(
+            p.kernel.as_ref().is_some_and(|k| !k.is_primary()),
+            "route_p_error: p was refused as diverged behind, so p must be a follower (a \
+             primary only sends that refusal); fix the routing that let this through: {e}"
+        );
+        assert!(
+            f.kernel.as_ref().is_some_and(|k| k.is_primary()),
+            "route_p_error: p was refused as diverged behind, so f must be primary (a \
+             non-primary refuses a Hello for its role first); fix the routing that let this \
+             through: {e}"
+        );
         sim.cover("repl:laggard-reseeded");
         return reseed_p(sim, p, f);
     }
@@ -6160,10 +6258,16 @@ fn is_diverged_behind(e: &str) -> bool {
 ///   diverged behind.
 /// - **The answer.** That refusal is correct, and it names its remedy for a true
 ///   laggard. `route_p_error` applies that remedy (`repl:laggard-reseeded`),
-///   gated so it fires only where `p` is provably a prefix of `f`.
+///   gated so it fires only where `p` is provably a prefix of `f`. The proof
+///   is `f`'s handshake prefix check (Design B), which the re-seed had to pass
+///   to converge, not the rig's wipe (see `route_p_error`).
 /// - **Before D3.** The rig failed the universe when the refusal landed in a
 ///   request, and dropped it when it landed in a convergence. Every error of
-///   `p` now goes through `route_p_error`, and none is dropped.
+///   `p` now goes through `route_p_error`.
+/// - **Before D3 round 4** the re-seed itself still dropped errors (review I2).
+///   Its wipe ignored a failed directory barrier, and its convergence gave
+///   every error up as `restore-stalled`. Both are routed now (`reseed_p`).
+///   The census holds all of it, and the behavioural pins are the oracle.
 /// - **Discovery seeds** (not pins, since any re-key renames them):
 ///   - `0x6d554d5eb1e76a3` and `0xfd74b66d02fe0371`, both at 0485b76: a
 ///     follower recovery cut by a misdirected write.
@@ -6176,8 +6280,8 @@ fn is_diverged_behind(e: &str) -> bool {
 ///   exhaust it (`repl:inconclusive:survivor-scan-unreadable`), and fails
 ///   otherwise. It no longer promises nothing for that round and runs on.
 /// - **A sacrificial write that died with a reboot of `p`** is skipped
-///   (`repl:sacrificial-lost-to-reboot`): no frame, no forced cut, no claim,
-///   no give-up. Silence without a reboot still gives up.
+///   (`repl:sacrificial-lost-to-reboot`): no forced cut and no claim, applied
+///   or not, and no give-up. Silence without a reboot still gives up.
 /// - Both are pinned deterministically, each with its negative twin, and
 ///   `above_horizon_universe_routes_every_error_of_p` holds the routing.
 #[test]
@@ -6811,33 +6915,217 @@ fn an_unanswered_sacrificial_write_without_a_reboot_gives_up() {
     );
 }
 
-/// Holds "every error is routed, none dropped" in `above_horizon_universe` and
-/// in `sacrificial_cut`, which it calls, by reading their source.
+/// Replays one universe of `wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower`
+/// exactly as its swarm runner builds it (the same fault-config sampling and
+/// the same two overrides), and returns the world with the universe's result
+/// after `finish_universe`.
+fn replay_above_horizon(seed: u64) -> (Sim, Result<(), String>) {
+    let mut state = seed;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(seed, &mut cfg);
+    cfg.bit_flip = 0.02;
+    cfg.misdirected_write = 0.005;
+    let mut sim = Sim::with_faults(seed, cfg);
+    let r = above_horizon_universe(&mut sim);
+    let r = finish_universe(&sim, r);
+    (sim, r)
+}
+
+/// D3 round 4 (review I2), seed `0x9827a4c2014d41d4`, found by the review
+/// over its own fresh bases. A restore re-seeds `p` from `f`, and before the
+/// re-seed converges `p` is refused as diverged behind again. That is the
+/// laggard refusal itself, raised inside the re-seed's own convergence. It
+/// gives up under its own key, `repl:inconclusive:reseed-refused-behind`.
+/// Until round 4 every error there was given up as `restore-stalled`, which
+/// would have hidden a refusal no fault explains.
+#[test]
+fn a_reseed_refused_behind_before_it_converges_gives_up_under_its_own_key() {
+    let (sim, r) = replay_above_horizon(0x9827_a4c2_014d_41d4);
+    assert_eq!(r, Ok(()), "the universe gives up, it does not fail");
+    let reason = sim.gave_up().expect("the universe gives up");
+    assert!(
+        reason.contains("GC'd every record below its retained base"),
+        "and for this reason, or the seed no longer names the scenario: {reason}"
+    );
+    let coverage = sim.coverage();
+    assert_eq!(
+        coverage
+            .get("repl:inconclusive:reseed-refused-behind")
+            .copied(),
+        Some(1),
+        "under the re-seed's own key: {coverage:?}"
+    );
+    assert_eq!(
+        coverage.get("repl:inconclusive:restore-stalled"),
+        None,
+        "not the old blanket key: {coverage:?}"
+    );
+}
+
+/// D3 round 4 (review I2), seed `0xa38c1195b6343381`, found by the review.
+/// The re-seed's wipe meets a failed directory barrier.
+/// - **Until round 4:** the wipe dropped that error, the deleted files came
+///   back at the next reboot, and the "fresh" `p` reopened holding 8 records
+///   of its own pre-restore timeline against `f`'s 1. That is not a prefix
+///   of `f`.
+/// - **Now:** the wipe power-cycles `p` and wipes again
+///   (`repl:reseed-wipe-retried`), so every re-seed reopens empty, and none
+///   gives up as `repl:inconclusive:reseed-not-fresh`.
+#[test]
+fn a_reseed_whose_wipe_met_a_failed_barrier_wipes_again_and_reopens_empty() {
+    let (sim, r) = replay_above_horizon(0xa38c_1195_b634_3381);
+    let coverage = sim.coverage();
+    assert!(
+        coverage
+            .get("repl:reseed-wipe-retried")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "the wipe met an injected fault and was redone, or the seed no longer names the \
+         scenario: {coverage:?}"
+    );
+    assert_eq!(
+        coverage.get("repl:inconclusive:reseed-not-fresh"),
+        None,
+        "every re-seed reopened empty: {coverage:?} ({r:?}, gave up: {:?})",
+        sim.gave_up()
+    );
+}
+
+/// The re-seed's convergence is routed by kind (D3 round 4, review I2).
+/// Until round 4 every error there was `restore-stalled`, a blanket give-up
+/// wide enough to swallow a real failure.
+#[test]
+fn a_reseed_convergence_error_is_routed_by_kind() {
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
+    let given_up = format!("{INCONCLUSIVE}: f (the designated survivor) faulted: injected");
+    assert_eq!(
+        route_reseed_convergence(&sim, Err(given_up.clone())),
+        Err(given_up),
+        "an error that already gave up passes through, counted at its origin"
+    );
+    let behind = "p kernel step: diverged: the follower holds a proven record at seq 5, but \
+                  this primary has GC'd every record below its retained base 9";
+    let routed = route_reseed_convergence(&sim, Err(behind.to_string()))
+        .expect_err("a refused re-seed did not converge");
+    assert!(
+        routed.starts_with(INCONCLUSIVE) && routed.contains(behind),
+        "the laggard refusal gives up, naming itself; got: {routed}"
+    );
+    let restore = format!("{RESTORE_NEEDED}: p corrupted below the horizon");
+    let routed = route_reseed_convergence(&sim, Err(restore.clone()))
+        .expect_err("a re-seed that needs restoring did not converge");
+    assert!(
+        routed.starts_with(INCONCLUSIVE) && routed.contains(&restore),
+        "RESTORE_NEEDED gives up, naming itself; got: {routed}"
+    );
+    for other in [
+        "kernel stall: no work, no pending events, done() false",
+        "kernel budget 200000 exhausted before done()",
+        "recover p: an error no arm recognises",
+    ] {
+        let routed = route_reseed_convergence(&sim, Err(other.to_string()))
+            .expect_err("an unrecognised error did not converge either");
+        assert!(
+            !routed.contains(INCONCLUSIVE) && routed.contains(other),
+            "anything else fails, naming the error; got: {routed}"
+        );
+    }
+    let coverage = sim.coverage();
+    assert_eq!(
+        (
+            coverage
+                .get("repl:inconclusive:reseed-refused-behind")
+                .copied(),
+            coverage
+                .get("repl:inconclusive:reseed-restore-needed")
+                .copied(),
+            coverage.get("repl:inconclusive:restore-stalled").copied(),
+        ),
+        (Some(1), Some(1), None),
+        "each give-up under its own key, and none under the old blanket key"
+    );
+}
+
+/// `route_p_error` hands back every error it does not recognise unchanged
+/// (D3 round 4, review I1). This holds even in the arm's own shape: `p` a
+/// follower of a primary `f` that never recovered. The census does not read
+/// the router, so this pin is what stops it from learning to swallow a stall
+/// or an exhausted budget.
+#[test]
+fn route_p_error_returns_an_unrecognised_error_unchanged() {
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
+    let (mut p, mut f, k) = restored_laggard(&sim);
+    let before = sim.coverage();
+    for other in [
+        "kernel stall: no work, no pending events, done() false",
+        "kernel budget 200000 exhausted before done()",
+        "p kernel step: an error no arm recognises",
+        "recover p: an error no arm recognises",
+    ] {
+        assert_eq!(
+            route_p_error(&sim, &mut p, &mut f, Err(other.to_string())),
+            Err(other.to_string()),
+            "an unrecognised error comes back as it went in"
+        );
+    }
+    assert_eq!(sim.coverage(), before, "and nothing was counted or done");
+    assert_eq!(klast(&p), Some(k), "p was neither restored nor re-seeded");
+    assert_eq!(
+        route_p_error(&sim, &mut p, &mut f, Ok(())),
+        Ok(()),
+        "and Ok stays Ok"
+    );
+}
+
+/// Holds "every error is routed, none dropped" by reading the source of
+/// `above_horizon_universe` and the three functions it routes through:
+/// `sacrificial_cut`, `reseed_p` (the remedy both restore paths apply) and
+/// `wipe_data_dir`.
 ///
 /// A dropped error there is invisible at the pinned base: it never drops one,
 /// and the D3 sweep found the drops only over fresh bases. So the property
-/// cannot hold this itself, and this census does. Its rules are deliberately
-/// tied to the routing shape's spelling, because a looser count let a "route
-/// some, drop the rest" rewrite through (an inversion during D3).
+/// cannot hold this itself, and this census does. It is a structural lint; the
+/// behavioural pins remain the oracle. Its rules are deliberately tied to the
+/// routing shape's spelling, because a looser count let "route some, drop the
+/// rest" rewrites through, during D3 and again in its review (I1).
 ///
-/// - No drop idiom appears outside a comment, in either function. Since D3
-///   round 2 that includes `unwrap_or_default`: there are zero unrouted `f`
-///   sites as well.
-/// - In the universe:
+/// - **No drop idiom appears outside a comment**, in any of the four:
+///   - `let _ =` or a bare `_ =`;
+///   - `drop(`;
+///   - `Err(_`;
+///   - `matches!(`, `if let`/`let` on `Ok`/`Err`/`Some`;
+///   - `.is_err()`, `.ok()`, `.err()`;
+///   - `unwrap_or` (since D3 round 2 there are no unrouted `f` sites either);
+///   - `.is_ok()`, outside the universe's one deliberate use.
+/// - **In the universe:**
 ///   - every `krun_until` is bound and handed whole to `route_p_error` on the
 ///     next line;
 ///   - the survivor's promise scan is handed whole to `route_promise_scan`;
 ///   - every `drive_request` and `recover_kernel_node` is a `match` whose only
 ///     `Err` arm routes `Err(e)` whole;
 ///   - the sacrificial write goes through `sacrificial_cut`, `?`-propagated;
+///   - `spawn_kernel_node`, `assert_survivor_holds` and `bump_exactly_once`
+///     appear only as `…)?;` statements;
 ///   - one result is consumed on purpose: the corruption helper's `.is_ok()`
 ///     (a failed corruption forces no cut).
-/// - In `sacrificial_cut`:
-///   - its error and its silence without a reboot are both routed;
+/// - **In `sacrificial_cut`:**
+///   - its error and its silence without a reboot are both routed, and its
+///     only `Err` pattern is the routed arm;
 ///   - the one unrouted outcome, the skip, is gated on `p` having rebooted.
+/// - **In `reseed_p` and `wipe_data_dir`:**
+///   - every wipe step is `?`-propagated into a wipe loop whose only `Ok` is
+///     a whole, synced wipe;
+///   - a non-empty reopen is checked;
+///   - the convergence is bound and handed whole to `route_reseed_convergence`.
 ///
-/// Restructure either function and this fails by name: re-establish the
-/// routing, then update the census.
+/// `route_p_error` itself is not read here.
+/// `route_p_error_returns_an_unrecognised_error_unchanged` holds it, and
+/// `a_reseed_convergence_error_is_routed_by_kind` holds `route_reseed_convergence`.
+///
+/// Restructure any of them and this fails by name: re-establish the routing,
+/// then update the census.
 #[test]
 fn above_horizon_universe_routes_every_error_of_p() {
     let src = include_str!("replication.rs");
@@ -6856,18 +7144,27 @@ fn above_horizon_universe_routes_every_error_of_p() {
     let fix = "route it (sub-project D3: a pass over a dropped error checked nothing)";
     let universe = body("above_horizon_universe");
     let sacrificial = body("sacrificial_cut");
+    let reseed = body("reseed_p");
+    let wipe = body("wipe_data_dir");
     for (name, code) in [
         ("above_horizon_universe", &universe),
         ("sacrificial_cut", &sacrificial),
+        ("reseed_p", &reseed),
+        ("wipe_data_dir", &wipe),
     ] {
         for idiom in [
             "let _ =",
-            "Err(_)",
+            "drop(",
+            "Err(_",
             "matches!(",
             "if let Err",
             "if let Ok",
+            "let Ok(",
+            "let Err(",
+            "let Some(",
             ".is_err()",
             ".ok()",
+            ".err()",
             "unwrap_or",
         ] {
             assert!(
@@ -6875,7 +7172,28 @@ fn above_horizon_universe_routes_every_error_of_p() {
                 "{name} drops a result with `{idiom}` — {fix}"
             );
         }
+        assert!(
+            !code
+                .lines()
+                .any(|l| l.starts_with("_ =") && !l.starts_with("_ =>")),
+            "{name} drops a result with a bare `_ =` — {fix}"
+        );
+        if name != "above_horizon_universe" {
+            assert!(
+                !code.contains(".is_ok()"),
+                "{name} drops a result with `.is_ok()` — {fix}"
+            );
+        }
     }
+    let statement = |call: &str| {
+        (
+            universe.matches(call).count(),
+            universe
+                .lines()
+                .filter(|l| l.contains(call) && l.ends_with(")?;"))
+                .count(),
+        )
+    };
     let shapes = [
         (
             "every krun_until is bound and routed whole on the next line",
@@ -6924,6 +7242,24 @@ fn above_horizon_universe_routes_every_error_of_p() {
             4,
         ),
         (
+            "spawn_kernel_node appears only as a ?-propagated statement",
+            statement("spawn_kernel_node(").0,
+            statement("spawn_kernel_node(").1,
+            2,
+        ),
+        (
+            "assert_survivor_holds appears only as a ?-propagated statement",
+            statement("assert_survivor_holds(").0,
+            statement("assert_survivor_holds(").1,
+            1,
+        ),
+        (
+            "bump_exactly_once appears only as a ?-propagated statement",
+            statement("bump_exactly_once(").0,
+            statement("bump_exactly_once(").1,
+            1,
+        ),
+        (
             "the corruption helper's .is_ok() is the universe's only consumed result",
             universe.matches(".is_ok()").count(),
             universe
@@ -6943,6 +7279,12 @@ fn above_horizon_universe_routes_every_error_of_p() {
             2,
         ),
         (
+            "sacrificial_cut's only Err pattern is the routed arm",
+            sacrificial.matches("Err(").count(),
+            sacrificial.matches("Err(e) => {").count() + sacrificial.matches("route_p_error(").count(),
+            3,
+        ),
+        (
             "sacrificial_cut's skip is gated on p having rebooted",
             sacrificial.matches("Ok(None)").count(),
             sacrificial
@@ -6950,6 +7292,47 @@ fn above_horizon_universe_routes_every_error_of_p() {
                 .count()
                 + sacrificial.matches("Ok(None) => {").count(),
             2,
+        ),
+        (
+            "every wipe step is ?-propagated",
+            wipe.matches("disk.").count(),
+            wipe.matches(".map_err(|e| e.to_string())?").count(),
+            4,
+        ),
+        (
+            "the wipe's only Ok is a whole wipe",
+            wipe.matches("Ok(").count() + reseed.matches("wipe_data_dir(").count(),
+            wipe.matches("\nOk(())").count() + reseed.matches("match wipe_data_dir(&p.host) {").count(),
+            2,
+        ),
+        (
+            "reseed_p's only Ok is a whole, synced wipe",
+            reseed.matches("Ok(").count(),
+            2 * reseed.matches("Ok(()) => break Ok(()),").count(),
+            2,
+        ),
+        (
+            "reseed_p propagates the wipe's outcome",
+            reseed.matches("let wiped =").count() + reseed.matches("wiped?").count(),
+            reseed.matches("let wiped = loop {").count() + reseed.matches("\nwiped?;").count(),
+            2,
+        ),
+        (
+            "reseed_p checks that p reopened empty",
+            reseed.matches("klast(p)").count(),
+            reseed.matches("if klast(p).is_some() {").count() * 2,
+            2,
+        ),
+        (
+            "reseed_p's convergence is bound and routed whole",
+            reseed.matches("krun_until(").count(),
+            reseed
+                .matches(
+                    "let converged = krun_until(sim, &mut [p, f], kconverged, KBUDGET);\n\
+                     route_reseed_convergence(sim, converged)",
+                )
+                .count(),
+            1,
         ),
     ];
     for (rule, found, shaped, expected) in shapes {
