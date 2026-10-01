@@ -1,7 +1,9 @@
 //! Reusable oracles for sim workloads (step-7 spec §Platform-checker
 //! library). v0 shipped exactly three; `durable_corruption_fired` earned
 //! its way in when the durable-corruption fault axes landed (segment-mgmt
-//! T5) — more earn their way in the same way.
+//! T5), and `boot_through_fallout` when `Db::open` stopped absorbing an
+//! injected fault inside the table store's open (follow-up 21) — more earn
+//! their way in the same way.
 
 use crate::Sim;
 
@@ -213,6 +215,62 @@ pub fn acked_implies_durable(
         })?;
     }
     Ok(())
+}
+
+/// Boots the way a supervised process boots after a failed boot: restart and
+/// retry, which is `Db::open`'s own contract for an IO failure (DESIGN §4).
+/// Calls `boot`; when it fails with an error `is_fallout` accepts (injected
+/// fault fallout, by the caller's own classifier), calls it again, up to
+/// `tries` boots in all. Each retry marks `boot:retried`. A retry after an
+/// injected IO error boots in place, as a restarted process does: the page
+/// cache survives a process exit, and an armed crash countdown keeps
+/// counting. A retry after a crash power-cycles first (`Sim::restart`), since
+/// the disk is gone until then. Power-cycling after every failure instead
+/// would turn each injected IO error into a crash, collapsing unsynced writes
+/// and rolling the restart-time bit flip, which no restarted process does.
+///
+/// - `Ok(Some(t))`: the first boot that succeeded.
+/// - `Ok(None)`: every boot met fallout (marked `boot:exhausted`), and the sim
+///   is left as the last failed boot left it. What happens next is the
+///   caller's: a workload whose only node never came up gives up by name
+///   (`Sim::give_up`); an epoch of a multi-epoch workload restarts and moves
+///   on, as it did before it retried, because its settle phase still has to
+///   adjudicate or give up.
+/// - `Err(e)`: the first error `is_fallout` rejects, unchanged and at once. A
+///   non-injected error is a finding, never a reason to boot again.
+///
+/// One injected fault used to cost the phase it hit: a workload that booted
+/// once gave up on fallout, and an epoch skipped itself. That was cheap only
+/// while `Db::open` absorbed a fault inside the table store's open by
+/// discarding the store and rebuilding it from the log in the same call. It no
+/// longer does (it returns the error, and the next boot retries the same
+/// file), so a boot site that does not retry loses the universes that rebuild
+/// used to hand it for free. A round loop whose next round boots again is
+/// already retrying, and needs none of this: booting each round in place
+/// instead hands its final check more to recover, and in five such
+/// properties more universes then gave up, not fewer (measured 2026-10-01).
+pub fn boot_through_fallout<T, E: std::fmt::Display>(
+    sim: &Sim,
+    tries: u32,
+    is_fallout: impl Fn(&str) -> bool,
+    mut boot: impl FnMut() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    assert!(tries > 0, "boot_through_fallout needs at least one boot");
+    for attempt in 0..tries {
+        if attempt > 0 {
+            sim.cover("boot:retried");
+            if sim.disk_crashed() {
+                sim.restart();
+            }
+        }
+        match boot() {
+            Ok(t) => return Ok(Some(t)),
+            Err(e) if is_fallout(&e.to_string()) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    sim.cover("boot:exhausted");
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -570,6 +628,71 @@ mod tests {
         let err = acked_implies_durable(&mut sim, 1, toy_drive(true), toy_verify).unwrap_err();
         assert!(err.contains("injected read error"), "{err}");
         assert!(err.contains("violated after round 1"), "{err}");
+    }
+
+    /// The outcomes, each with what it leaves on the universe: a boot that
+    /// clears after two injected IO errors returns it, booted in place with no
+    /// power cycle; one whose disk crashed is power-cycled before the next
+    /// boot; one that never clears returns `None`, marked and with no give-up
+    /// of its own; a non-fallout error comes back at once, unchanged.
+    #[test]
+    fn boot_through_fallout_boots_again_and_power_cycles_only_a_crashed_disk() {
+        let sim = Sim::new(0xB007);
+        let mut calls = 0;
+        let booted = boot_through_fallout(&sim, 8, is_fault_fallout, || {
+            calls += 1;
+            if calls < 3 {
+                Err(format!(
+                    "simulated disk write error (injected fault) #{calls}"
+                ))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(booted, Ok(Some(3)));
+        assert_eq!(sim.coverage().get("boot:retried"), Some(&2));
+        assert_eq!(
+            sim.coverage().get("restart"),
+            None,
+            "an IO error is no crash"
+        );
+        assert_eq!(sim.gave_up(), None);
+
+        let sim = Sim::new(0xB007);
+        let mut calls = 0;
+        let booted = boot_through_fallout(&sim, 8, is_fault_fallout, || {
+            calls += 1;
+            if calls == 1 {
+                sim.crash_disk_now();
+                return Err("simulated crash: the disk is gone until Sim::restart()".to_string());
+            }
+            if sim.disk_crashed() {
+                return Err("booted against a disk that was never power-cycled".to_string());
+            }
+            Ok(calls)
+        });
+        assert_eq!(booted, Ok(Some(2)));
+        assert_eq!(sim.coverage().get("restart"), Some(&1));
+
+        let sim = Sim::new(0xB007);
+        let never = boot_through_fallout(&sim, 4, is_fault_fallout, || {
+            Err::<(), _>("injected read error")
+        });
+        assert_eq!(never, Ok(None));
+        assert_eq!(sim.coverage().get("boot:retried"), Some(&3));
+        assert_eq!(sim.coverage().get("boot:exhausted"), Some(&1));
+        assert_eq!(sim.gave_up(), None, "what exhaustion means is the caller's");
+
+        let sim = Sim::new(0xB007);
+        let mut calls = 0;
+        let real = boot_through_fallout(&sim, 8, is_fault_fallout, || {
+            calls += 1;
+            Err::<(), _>("row decode: needed 8 bytes for u64, 3 left")
+        });
+        assert_eq!(real, Err("row decode: needed 8 bytes for u64, 3 left"));
+        assert_eq!(calls, 1, "a non-fallout error is never booted past");
+        assert_eq!(sim.coverage().get("boot:retried"), None);
+        assert_eq!(sim.gave_up(), None);
     }
 
     #[test]

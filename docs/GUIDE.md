@@ -2387,7 +2387,7 @@ Say so:
 ```rust
 use charpente::{Db, DbConfig, Id, Schema, View, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{boot_through_fallout, durable_corruption_fired, is_fault_fallout};
 
 #[table(global)]
 struct Counter {
@@ -2397,14 +2397,15 @@ struct Counter {
 
 fn counter_survives(sim: &mut Sim) -> Result<(), String> {
     let schema = || Schema::new().table::<Counter>();
-    let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            // Nothing to adjudicate: the disk broke before the claim was testable.
-            sim.give_up(format!("Db::open hit fault fallout: {e}"));
-            return Ok(());
-        }
-        Err(e) => return Err(e.to_string()),
+    // A boot that meets an injected fault restarts and boots again, as a
+    // supervised process would: `Db::open`'s contract for an IO failure.
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(mut db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
+        .map_err(|e| e.to_string())?
+    else {
+        // Nothing to adjudicate: the disk never let the claim become testable.
+        sim.give_up("Db::open never booted in 8 tries");
+        return Ok(());
     };
     let put = db.transact(|tx| {
         tx.put(&Counter {
@@ -2420,13 +2421,12 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
 
     sim.restart(); // a crash: unsynced writes tear or vanish
     drop(db); // the old handle is dead after restart
-    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("the reopen hit fault fallout: {e}"));
-            return Ok(());
-        }
-        Err(e) => return Err(e.to_string()),
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
+        .map_err(|e| e.to_string())?
+    else {
+        sim.give_up("the reopen never booted in 8 tries");
+        return Ok(());
     };
     match db.snapshot().and_then(|snap| snap.get::<Counter>(Id::from_raw(1))) {
         Ok(Some(_)) => Ok(()),
@@ -2538,8 +2538,8 @@ the only clean attempt's tail leaves the universe with no verdict at all.
 
 ### The checkers
 
-`charpente_sim::checks` ships six reusable oracles — reach for these
-before hand-rolling the same logic a fourth time:
+`charpente_sim::checks` ships six reusable oracles and one boot idiom — reach
+for these before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
   is this the harness's own injected fault (or its consequences) rather
@@ -2603,6 +2603,22 @@ before hand-rolling the same logic a fourth time:
   consistent). Note this is the *single-node* excuse: a workload with a
   converged follower keeps none of it, because a record the primary lost to
   media corruption still lives on the follower.
+- `boot_through_fallout(sim: &Sim, tries: u32, is_fallout: impl Fn(&str) -> bool, boot: impl FnMut() -> Result<T, E>) -> Result<Option<T>, E>`
+  — boots the way a supervised process does: `boot`, and on an error your
+  `is_fallout` accepts, boot again, `tries` boots in all (each retry marks
+  `boot:retried`, and running out marks `boot:exhausted`). A retry after an
+  injected IO error boots in place, as a restarted process would; a retry
+  after a crash power-cycles first (`sim.restart()`, when `Sim::disk_crashed`
+  says the disk is gone).
+  `Ok(Some(t))` is the first clean boot, `Err(e)` the first error that is not
+  fallout, unchanged, and `Ok(None)` means every boot met fallout. What `None`
+  means is yours to say: a workload whose only node never came up gives up by
+  name (`counter_survives` above). Use it wherever one boot is all a phase
+  gets: an injected fault inside the table store's open is returned by
+  `Db::open` as the error it is, and the next boot opens the same file, so
+  giving up on the first faulted boot throws away universes a restart would
+  have recovered. A round loop whose next round boots again after a restart is
+  already retrying; it needs no inner loop.
 - `dir_entry_loss_fired(sim: &Sim) -> bool` — the same fire-time-marked
   discipline for the `dir_entry_loss` axis (a pending directory create
   vanished, or a pending removal resurrected). A workload that routes
@@ -2620,6 +2636,13 @@ pub fn is_fault_fallout(text: &str) -> bool
 pub fn durable_corruption_fired(sim: &Sim) -> bool
 
 pub fn dir_entry_loss_fired(sim: &Sim) -> bool
+
+pub fn boot_through_fallout<T, E: std::fmt::Display>(
+    sim: &Sim,
+    tries: u32,
+    is_fallout: impl Fn(&str) -> bool,
+    boot: impl FnMut() -> Result<T, E>,
+) -> Result<Option<T>, E>
 
 pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
     seed: u64,

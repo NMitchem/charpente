@@ -5887,17 +5887,29 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
     p.repl_cfg = follower_cfg("p:1", "f:1");
     p.flipped = true;
     p.recoveries += 1;
-    p.kernel = Some(
-        open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema).map_err(|e| {
-            if e.contains(INCONCLUSIVE) {
-                // Already covered at its own origin site — do not double-count.
-                e
-            } else {
-                sim.cover("repl:inconclusive:restore-reopen");
-                format!("{INCONCLUSIVE}: restore reopen: {e}")
+    // The fresh boot meets injected faults like any other: restart the host and
+    // boot again, as a supervised process would (`checks::boot_through_fallout`'s
+    // reason, on a host of its own), before calling the reopen inconclusive.
+    let mut opened = open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema);
+    for _ in 1..RECOVER_ATTEMPTS {
+        match &opened {
+            Err(e) if is_fault_fallout(e) && !e.contains(INCONCLUSIVE) => {
+                sim.cover("boot:retried");
+                p.host.restart();
+                opened = open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema);
             }
-        })?,
-    );
+            _ => break,
+        }
+    }
+    p.kernel = Some(opened.map_err(|e| {
+        if e.contains(INCONCLUSIVE) {
+            // Already covered at its own origin site — do not double-count.
+            e
+        } else {
+            sim.cover("repl:inconclusive:restore-reopen");
+            format!("{INCONCLUSIVE}: restore reopen: {e}")
+        }
+    })?);
     // Drive the re-seed to convergence so the restore is real, not just wired.
     // Any failure here (a stall, or the freshly-restored node needing yet
     // another restore) is too much damage to adjudicate: inconclusive.

@@ -30,7 +30,9 @@ use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, Row, View};
-use charpente_sim::checks::{FaultReason, classify, durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{
+    FaultReason, boot_through_fallout, classify, durable_corruption_fired, is_fault_fallout,
+};
 use charpente_sim::{FaultConfig, Sim, SimEntropy, SimHost, run_universes_swarm_with};
 use serde::{Deserialize, Serialize};
 
@@ -1988,6 +1990,13 @@ const SETTLE_ATTEMPTS: u32 = 12;
 /// them share a power cycle — see `settle_boot`.
 const SETTLE_BOOT_TRIES: u32 = 64;
 const SETTLE_CYCLE_EVERY: u32 = 8;
+/// How many boots one epoch's node gets before the epoch is skipped: each
+/// failed boot is followed by a restart, as a supervised process restarts
+/// (`checks::boot_through_fallout`). An epoch that runs out restarts and moves
+/// on, as every epoch did after one failed boot before `Db::open` stopped
+/// absorbing a store-open fault; the settle phase still adjudicates or gives
+/// up.
+const BOOT_TRIES: u32 = 8;
 
 /// Builds this round's subscribe request (if the client needs one) and
 /// queues its stall closure, returning `(was_bare, boundary)` for
@@ -2113,15 +2122,12 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
         let entropy = sim.entropy();
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(50 + entropy.next_u64() % 399);
-        let app = match realtime_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
+        let Some(app) =
+            boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || realtime_app(sim))
+                .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            sim.restart();
+            continue;
         };
         let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
             Ok(k) => k,
@@ -2360,6 +2366,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| realtime_workload(sim).map(|_trace| ()),
         require: [
+            "boot:retried",
             "realtime:resume-backlog",
             "realtime:gap",
             "realtime:stall-drop",
@@ -5126,15 +5133,13 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
         let entropy = sim.entropy();
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(51 + entropy.next_u64() % 410);
-        let app = match scoped_realtime_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
+        let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || {
+            scoped_realtime_app(sim)
+        })
+        .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            sim.restart();
+            continue;
         };
         let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
             Ok(k) => k,
@@ -5416,6 +5421,7 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| scoped_realtime_workload(sim).map(|_trace| ()),
         require: [
+            "boot:retried",
             "tenant:both-tenants-emitted",
             "tenant:own-backlog-verified",
             "tenant:foreign-backlog-not-delivered",

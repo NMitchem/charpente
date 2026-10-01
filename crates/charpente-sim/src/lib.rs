@@ -772,6 +772,15 @@ impl Sim {
         }
     }
 
+    /// Whether the disk has crashed and stays gone until `restart()`: every op
+    /// on it fails until then. A boot that failed on a crashed disk needs a
+    /// power cycle before the next one can succeed; one that failed on an
+    /// injected IO error does not (`checks::boot_through_fallout`). Reads
+    /// state only, so it draws nothing and replays unchanged.
+    pub fn disk_crashed(&self) -> bool {
+        self.world.lock().disk.crashed
+    }
+
     pub fn crash_disk_now(&self) {
         let mut guard = self.world.lock();
         if !guard.disk.crashed {

@@ -7941,10 +7941,23 @@ fn conv_plant_diverged(
 ) -> Result<bool, String> {
     let mut cfg = conv_db_config();
     cfg.checkpoint_every = 0;
-    let mut db = match Db::open(Box::new(sim.host(host).disk()), cfg, mode.schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(false),
-        Err(e) => return Err(format!("planting a diverged timeline: open: {e}")),
+    // A boot that meets an injected fault restarts the host and boots again,
+    // as a supervised process would (`checks::boot_through_fallout`'s reason,
+    // on a host of its own); only a host that never boots skips the plant.
+    let mut boots = 1;
+    let mut db = loop {
+        match Db::open(Box::new(sim.host(host).disk()), cfg.clone(), mode.schema()) {
+            Ok(db) => break db,
+            Err(e) if !is_fault_fallout(&e.to_string()) => {
+                return Err(format!("planting a diverged timeline: open: {e}"));
+            }
+            Err(_) if boots == CONV_OPEN_ATTEMPTS => return Ok(false),
+            Err(_) => {
+                boots += 1;
+                sim.cover("boot:retried");
+                sim.host(host).restart();
+            }
+        }
     };
     for i in 0..records {
         match db.transact(|tx| -> Result<(), std::convert::Infallible> {

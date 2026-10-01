@@ -16,7 +16,7 @@ use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 // transactions.rs/http.rs, which break-and-restart on the first Io error and
 // so use a narrower local wrapper. This is the identical-4-family case: the
 // shared classifier is used directly, no local wrapper needed.
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{boot_through_fallout, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
 
 #[table(global)]
@@ -1415,20 +1415,27 @@ fn hit(tx: &mut Tx, body: Hit) -> Result<WireU64, ApiError> {
     Ok(body.slot)
 }
 
-fn loop_app(sim: &Sim) -> App {
-    App::open(
+fn loop_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
         Box::new(sim.disk()),
         Schema::new().table::<Counter>(),
         Box::new(sim.entropy()),
         AppConfig::default(),
-    )
-    .unwrap()
+    )?
     .mount(routes![hit])
     .mount_jobs(jobs![CountUp])
     .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
         slot: 777,
-    })
+    }))
 }
+
+/// How many boots a single-boot node here gets before its universe gives up by
+/// name (`checks::boot_through_fallout`): as many as the receipt property's v2
+/// loop. For its v1 boot, 8 left 12 of 256 universes giving up at the pinned
+/// base, 16 left 3 and 64 none (2026-10-01). The round loops below need none:
+/// their next round is the retry, after a restart, and their final reopen
+/// loops have budgets of their own.
+const BOOT_TRIES: u32 = 64;
 
 /// Scripted request source for tests that need the reply itself (`SimSource`
 /// above only records `(status, body)`): drains a fixed list of requests in
@@ -2144,7 +2151,7 @@ fn loop_serves_requests_runs_jobs_and_ticks_cron() {
     }
     let responses = source.responses();
 
-    let mut kernel = Kernel::new(loop_app(&sim), Box::new(sim.clock())).unwrap();
+    let mut kernel = Kernel::new(loop_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
     kernel.run(&mut source).unwrap(); // returns at the horizon (Shutdown)
 
     let stats = kernel.stats();
@@ -2185,16 +2192,34 @@ fn loop_replays_identically_for_the_same_seed() {
             );
         }
         let responses = source.responses();
+        // Default faults reach the boot too, and it boots again as a
+        // supervised process does, so the loop still runs: until `Db::open`
+        // stopped discarding a store over an IO error, 0xC0FFEE's first boot
+        // met an injected write error that the discard absorbed.
         let run = (|| -> Result<(), std::io::Error> {
-            let mut kernel = Kernel::new(loop_app(&sim), Box::new(sim.clock()))?;
+            let Some(app) =
+                boot_through_fallout(&sim, BOOT_TRIES, is_fault_fallout, || loop_app(&sim))?
+            else {
+                return Ok(());
+            };
+            let mut kernel = Kernel::new(app, Box::new(sim.clock()))?;
             kernel.run(&mut source)
         })();
         let outcome = format!("{run:?}");
         let recorded = responses.lock().unwrap().clone();
-        (outcome, recorded, sim.durable_fingerprint(), sim.now())
+        let booted = !recorded.is_empty();
+        (
+            (outcome, recorded, sim.durable_fingerprint(), sim.now()),
+            booted,
+        )
     };
     for seed in [0x7, 0xB0B, 0xC0FFEE] {
-        assert_eq!(trace(seed), trace(seed), "seed {seed:#x}");
+        let (first, booted) = trace(seed);
+        assert!(
+            booted,
+            "seed {seed:#x}: the app never booted, so the loop this test replays never ran"
+        );
+        assert_eq!(first, trace(seed).0, "seed {seed:#x}");
     }
 }
 
@@ -2857,7 +2882,7 @@ fn due_jobs_are_not_starved_by_a_request_flood() {
             Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
         );
     }
-    let mut app = loop_app(&sim);
+    let mut app = loop_app(&sim).unwrap();
     app.db_for_tests()
         .transact(|tx| {
             tx.enqueue(CountUp { slot: 7777 });
@@ -2940,7 +2965,7 @@ fn due_jobs_are_serviced_before_a_request_flood_exhausts_the_source() {
             Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
         );
     }
-    let mut app = loop_app(&sim);
+    let mut app = loop_app(&sim).unwrap();
     app.db_for_tests()
         .transact(|tx| {
             tx.enqueue(CountUp { slot: 7777 });
@@ -4707,27 +4732,33 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
     sim.crash_disk_after(22 + entropy.next_u64() % 174);
-    match gated_receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
-        Ok(mut kernel) => {
-            let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
-            let base = sim.now().as_nanos();
-            for i in 0..(1 + entropy.next_u64() % 6) {
-                source.push_at(
-                    base + i * SEC,
-                    Request::new(Method::Post, "/receipt").json(&ReceiptBody {
-                        invoice: WireU64(i),
-                    }),
-                );
-            }
-            if let Err(e) = kernel.run(&mut source)
-                && !is_fault_fallout(&e.to_string())
-            {
-                return Err(format!("v1 kernel.run failed non-injected: {e}"));
-            }
-        }
-        Err(e) if is_fault_fallout(&e.to_string()) => {}
-        Err(e) => return Err(format!("v1 boot failed non-injected: {e}")),
+    let Some(mut kernel) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || {
+        gated_receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock())))
+    })
+    .map_err(|e| format!("v1 boot failed non-injected: {e}"))?
+    else {
+        sim.give_up(format!(
+            "the v1 binary never booted in {BOOT_TRIES} boots, so it enqueued nothing for v2 \
+             to refuse or drain"
+        ));
+        return Ok(());
+    };
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
+    let base = sim.now().as_nanos();
+    for i in 0..(1 + entropy.next_u64() % 6) {
+        source.push_at(
+            base + i * SEC,
+            Request::new(Method::Post, "/receipt").json(&ReceiptBody {
+                invoice: WireU64(i),
+            }),
+        );
     }
+    if let Err(e) = kernel.run(&mut source)
+        && !is_fault_fallout(&e.to_string())
+    {
+        return Err(format!("v1 kernel.run failed non-injected: {e}"));
+    }
+    drop(kernel);
     sim.restart();
     for _ in 0..64 {
         let mut app = match gated_receipts_app(sim, true) {
@@ -4827,6 +4858,7 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| receipt_upgrade_universe(sim),
         require: [
+            "boot:retried",
             "shapes:job-refused",
             "shapes:job-refused-after-crash",
             "shapes:job-drained",

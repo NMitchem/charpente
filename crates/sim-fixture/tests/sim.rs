@@ -22,6 +22,11 @@ fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
     counter_roundtrip_result(sim).map(|_| ())
 }
 
+/// How many boots one `Db::open` or `App::open` here gets, each failed boot
+/// followed by a restart, as a supervised process restarts
+/// (`checks::boot_through_fallout`).
+const BOOT_TRIES: u32 = 8;
+
 /// Wires `replays_identically` to a real app roundtrip: two fresh worlds on
 /// the same seed must retrace `counter_roundtrip_result` byte-for-byte. Uses
 /// `sim.seed()` only — the restarts happen inside the two inner `Sim`s the
@@ -46,16 +51,17 @@ fn fixture_replays(sim: &mut Sim) -> Result<(), String> {
 /// function on two private `Sim`s of its own, so the give-ups it records land
 /// on those worlds, not on the harness's.)
 fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
-    use charpente_sim::checks::is_fault_fallout;
+    use charpente_sim::checks::{boot_through_fallout, is_fault_fallout};
 
     let schema = || Schema::new().table::<FixtureCounter>();
-    let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("Db::open before the crash hit fault fallout: {e}"));
-            return Ok(None);
-        }
-        Err(e) => return Err(e.to_string()),
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(mut db) =
+        boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!(
+            "Db::open before the crash never booted in {BOOT_TRIES} boots"
+        ));
+        return Ok(None);
     };
     let acked = db
         .transact(|tx| {
@@ -67,13 +73,14 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
         .is_ok();
     sim.restart();
     drop(db);
-    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("Db::open after the crash hit fault fallout: {e}"));
-            return Ok(None);
-        }
-        Err(e) => return Err(e.to_string()),
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(db) =
+        boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!(
+            "Db::open after the crash never booted in {BOOT_TRIES} boots"
+        ));
+        return Ok(None);
     };
     if !acked {
         sim.give_up("the write was never acked, so durability has nothing to prove");
@@ -127,7 +134,7 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 /// the opposite requirement and took a seed anyway until 2026-09-05.
 fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
     use charpente_sim::checks::{
-        acked_implies_durable, durable_corruption_fired, is_fault_fallout,
+        acked_implies_durable, boot_through_fallout, durable_corruption_fired, is_fault_fallout,
     };
 
     let mut round: u64 = 0;
@@ -139,11 +146,15 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
             return Ok(vec![]);
         }
         round += 1;
-        let schema = Schema::new().table::<FixtureCounter>();
-        let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema) {
-            Ok(db) => db,
-            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(vec![]),
-            Err(e) => return Err(e.to_string()),
+        let open = || {
+            let schema = Schema::new().table::<FixtureCounter>();
+            Db::open(Box::new(sim.disk()), DbConfig::default(), schema)
+        };
+        // A round whose boots run out acks nothing, as one failed boot did.
+        let Some(mut db) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(vec![]);
         };
         let acked = db
             .transact(|tx| {
@@ -165,11 +176,14 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
         if sim.gave_up().is_some() {
             return Ok(());
         }
-        let schema = Schema::new().table::<FixtureCounter>();
-        let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema) {
-            Ok(db) => db,
-            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
-            Err(e) => return Err(e.to_string()),
+        let open = || {
+            let schema = Schema::new().table::<FixtureCounter>();
+            Db::open(Box::new(sim.disk()), DbConfig::default(), schema)
+        };
+        let Some(db) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
         };
         let snap = match db.snapshot() {
             Ok(snap) => snap,
@@ -245,7 +259,7 @@ fn sometimes_fails(sim: &mut Sim) -> Result<(), String> {
 /// `sim.give_up`, exactly as `counter_roundtrip_result` does, so these
 /// universes are reported rather than counted as passes.
 fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
-    use charpente_sim::checks::is_fault_fallout;
+    use charpente_sim::checks::{boot_through_fallout, is_fault_fallout};
 
     macro_rules! fallible {
         ($what:expr, $e:expr) => {
@@ -261,15 +275,20 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
     }
 
     let id = Id::<FixtureCounter>::from_raw(1);
-    let app = fallible!(
-        "App::open",
+    let open = || {
         App::open(
             Box::new(sim.disk()),
             Schema::new().table::<FixtureCounter>(),
             Box::new(sim.entropy()),
             AppConfig::default(),
         )
-    );
+    };
+    let Some(app) =
+        boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!("App::open never booted in {BOOT_TRIES} boots"));
+        return Ok(None);
+    };
     let mut app = app.mount_jobs(jobs![BumpCounter]);
     let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
     let db = app.db_for_tests();
