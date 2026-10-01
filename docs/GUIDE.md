@@ -616,7 +616,7 @@ The exceptions are an `Io` carrying one of `Group::stage`'s two refusals,
 each read with its own `of`. A `JobShapeRefusal`
 (`charpente::core::db::JobShapeRefusal::of`) is an enqueue under another shape
 of a job name this binary mounts (§6, "Changing a job's fields"). A
-`TableShapeRefusal` (`charpente::core::db::TableShapeRefusal::of`) is a write
+`TableWriteRefusal` (`charpente::core::db::TableWriteRefusal::of`) is a write
 the `Schema` disagrees with about its table: a table it does not register
 (add `.table::<T>()`), a scoped `Row` whose `TABLE` is an unscoped table's or
 the reverse, or a second `Row` type of a registered name with another

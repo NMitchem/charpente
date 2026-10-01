@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{
-    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableShapeRefusal, TenantAdmission,
+    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableWriteRefusal, TenantAdmission,
     Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
@@ -1032,7 +1032,7 @@ pub(crate) fn io_failure_response(e: &io::Error) -> Response {
 /// transaction never runs on an HTTP route — the kernel dispatches jobs, so
 /// only `Group::stage`'s own checks, not `Db::pending_job_shape_refusal`'s
 /// startup scan, can raise a refusal here). `Group::stage`'s two refusals,
-/// `JobShapeRefusal` and `TableShapeRefusal`, are the only ones any of them
+/// `JobShapeRefusal` and `TableWriteRefusal`, are the only ones any of them
 /// raises, so an `Io` carrying either is answered with its own text instead
 /// of the storage-failure one: nothing was written, and a retry cannot
 /// succeed. Any OTHER `Refusal` here (a table-gate barrier, a witness
@@ -1043,7 +1043,7 @@ fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),
         TxError::Io(e)
-            if JobShapeRefusal::of(&e).is_some() || TableShapeRefusal::of(&e).is_some() =>
+            if JobShapeRefusal::of(&e).is_some() || TableWriteRefusal::of(&e).is_some() =>
         {
             Response::error(500, &e.to_string())
         }

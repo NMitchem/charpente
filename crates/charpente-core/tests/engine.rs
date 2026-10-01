@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use charpente_core::db::{
-    Db, DbConfig, Refusal, Schema, Seeder, TableShapeRefusal, Tenant, Tx, TxError,
+    Db, DbConfig, Refusal, Schema, Seeder, TableWriteRefusal, Tenant, Tx, TxError,
 };
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
@@ -3043,7 +3043,7 @@ fn an_unscoped_write_beside_a_scoped_one_on_the_same_name_is_refused_too() {
     // broad one every "is this a refusal at all" caller asks.
     assert_eq!(
         (
-            TableShapeRefusal::of(&err).is_some(),
+            TableWriteRefusal::of(&err).is_some(),
             Refusal::of(&err).is_some()
         ),
         (true, true)

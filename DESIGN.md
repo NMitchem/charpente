@@ -969,7 +969,7 @@ type's `decode_row` — where the record was durable, the engine poisoned, and e
 replayed it into the same refusal. An unscoped write beside a scoped one to the same scoped
 table was worse: the record carries one tag per table, so both went out scoped and the
 unscoped row landed in tenant 0 with no error. `Group::stage` now refuses all of them by name
-before the record exists (`TableShapeRefusal`), as it refuses an enqueue under a foreign job
+before the record exists (`TableWriteRefusal`), as it refuses an enqueue under a foreign job
 shape; a job handler's transaction that hits it is an attempt, and a request gets a 500 with
 its text. A delete is checked for its table and scope shape but not its writer's type: it
 carries only an id, and apply decodes the stored row, which has the registered layout, with

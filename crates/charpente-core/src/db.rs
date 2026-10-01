@@ -133,7 +133,7 @@ pub trait Event: Codec {
 /// nothing was written; `Io` after the WAL sync means the record is durable
 /// but unacknowledged and will resurface on recovery. An `Io` carrying one of
 /// `Group::stage`'s two refusals, a `JobShapeRefusal` or a
-/// `TableShapeRefusal` (each type's own `of`), is the exception, not a
+/// `TableWriteRefusal` (each type's own `of`), is the exception, not a
 /// platform failure at all: `Group::stage` refused, before anything was
 /// written, an enqueue of a mounted job name under another shape or the other
 /// tenancy, or a write the `Schema` disagrees with about its table (not
@@ -217,7 +217,7 @@ impl std::error::Error for Refusal {}
 
 impl Refusal {
     /// `Some` when `e` carries a `Refusal` — a bare one, or one of
-    /// `Group::stage`'s `JobShapeRefusal`/`TableShapeRefusal` special cases,
+    /// `Group::stage`'s `JobShapeRefusal`/`TableWriteRefusal` special cases,
     /// so every caller that only needs "is this a refusal at all"
     /// (`kernel_stop_line`, spec §5) sees all three without knowing the
     /// wrappers exist.
@@ -226,13 +226,13 @@ impl Refusal {
             inner
                 .downcast_ref::<Refusal>()
                 .or_else(|| inner.downcast_ref::<JobShapeRefusal>().map(|j| &j.0))
-                .or_else(|| inner.downcast_ref::<TableShapeRefusal>().map(|t| &t.0))
+                .or_else(|| inner.downcast_ref::<TableWriteRefusal>().map(|t| &t.0))
         })
     }
 }
 
 /// One of the two refusals `Group::stage` itself can produce
-/// (`TableShapeRefusal` is the other): an enqueue of a
+/// (`TableWriteRefusal` is the other): an enqueue of a
 /// mounted job name under a foreign shape, or under the same shape with the
 /// other tenancy (a tenant for a `global` job, none for a `scoped_by` one).
 /// A distinct type, not a flag on
@@ -290,28 +290,28 @@ impl JobShapeRefusal {
 /// attempt stage in `kernel/dispatch.rs` and `http/app.rs`'s
 /// `tx_error_response` both classify it, as the handler's own deterministic
 /// bug with nothing written.
-pub struct TableShapeRefusal(pub Refusal);
+pub struct TableWriteRefusal(pub Refusal);
 
-impl fmt::Display for TableShapeRefusal {
+impl fmt::Display for TableWriteRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
     }
 }
 
 /// `Refusal`'s `Debug`, for the same reason.
-impl fmt::Debug for TableShapeRefusal {
+impl fmt::Debug for TableWriteRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.0, f)
     }
 }
 
-impl std::error::Error for TableShapeRefusal {}
+impl std::error::Error for TableWriteRefusal {}
 
-impl TableShapeRefusal {
+impl TableWriteRefusal {
     /// `Some` only for THIS refusal, as `JobShapeRefusal::of`.
-    pub fn of(e: &io::Error) -> Option<&TableShapeRefusal> {
+    pub fn of(e: &io::Error) -> Option<&TableWriteRefusal> {
         e.get_ref()
-            .and_then(|inner| inner.downcast_ref::<TableShapeRefusal>())
+            .and_then(|inner| inner.downcast_ref::<TableWriteRefusal>())
     }
 }
 
@@ -507,7 +507,7 @@ impl Schema {
     /// repl seeding, archive restore) and `Seeder::rows` (seed/restore
     /// import), none of which share one honest description. This binary's own
     /// writes never reach apply's lookup unregistered: `Group::stage` refuses
-    /// them before the record exists (`TableShapeRefusal`), so at apply the
+    /// them before the record exists (`TableWriteRefusal`), so at apply the
     /// refusal names a log from elsewhere — another binary's, or shipped —
     /// replayed under a `Schema` that no longer has the table.
     fn ops(&self, table: &str, site: &str) -> io::Result<&TableOps> {
@@ -2314,7 +2314,7 @@ fn downgrade_msg(table: &str, persisted: u32, compiled: u32) -> String {
 /// and applying it anyway would silently write under the wrong scope (or
 /// none) rather than refuse (hard rule 5). This binary's own writes never
 /// reach it disagreeing: `Group::stage` refuses those before the record
-/// exists (`TableShapeRefusal`), so here it names a record from elsewhere,
+/// exists (`TableWriteRefusal`), so here it names a record from elsewhere,
 /// shipped or written by another binary.
 fn resolve_effect_scope(
     table: &str,
@@ -3758,7 +3758,7 @@ impl<'a> Group<'a> {
     /// Before the record exists it also refuses, as `TxError::Io`, what apply
     /// would refuse only after the WAL sync: an enqueue of a mounted job name
     /// under another shape or tenancy (`JobShapeRefusal`), and a write the
-    /// `Schema` disagrees with about its table (`TableShapeRefusal`): a name
+    /// `Schema` disagrees with about its table (`TableWriteRefusal`): a name
     /// it does not register, the other scope shape, or a `Row` type whose
     /// `(VERSION, FINGERPRINT)` is not the registered one's.
     pub fn stage<T, E>(
@@ -3817,7 +3817,7 @@ impl<'a> Group<'a> {
         let schema = &self.db.engine.machine().schema;
         for table in effects.overlay.keys() {
             let Some(ops) = schema.tables.get(table) else {
-                return Err(TxError::Io(io::Error::other(TableShapeRefusal(Refusal(
+                return Err(TxError::Io(io::Error::other(TableWriteRefusal(Refusal(
                     format!(
                         "table \"{table}\" is not registered in the Schema, but this \
                          transaction wrote it — every table a transaction writes must be \
@@ -3842,7 +3842,7 @@ impl<'a> Group<'a> {
                 )
             };
             if other_shape {
-                return Err(TxError::Io(io::Error::other(TableShapeRefusal(Refusal(
+                return Err(TxError::Io(io::Error::other(TableWriteRefusal(Refusal(
                     format!(
                         "table \"{table}\" is registered {registered}, but this transaction \
                          wrote it {written} — a second Row type declares TABLE = \"{table}\" \
@@ -3863,7 +3863,7 @@ impl<'a> Group<'a> {
                 .get(table)
                 .expect("every written table was checked registered above");
             if (version, fingerprint) != (ops.version, ops.fingerprint) {
-                return Err(TxError::Io(io::Error::other(TableShapeRefusal(Refusal(
+                return Err(TxError::Io(io::Error::other(TableWriteRefusal(Refusal(
                     format!(
                         "table \"{table}\" is registered as version {}, fingerprint {}, but \
                          this transaction wrote it through a Row type of version {version}, \

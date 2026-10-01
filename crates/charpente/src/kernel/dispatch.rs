@@ -7,7 +7,7 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use charpente_core::db::{
-    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableShapeRefusal, TenantAdmission, Tx,
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableWriteRefusal, TenantAdmission, Tx,
     TxError,
 };
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
@@ -214,7 +214,7 @@ impl Dispatcher {
     /// `Ok(outcome)` covers handler success and handler failure (retry/dead
     /// — both are now STAGED records, not yet durable), and a handler whose
     /// own transaction `Group::stage` refused with a `JobShapeRefusal` or a
-    /// `TableShapeRefusal` is that kind of failure: an attempt, like a panic.
+    /// `TableWriteRefusal` is that kind of failure: an attempt, like a panic.
     /// Any other `Io` out of the attempt's `Group::stage` is a dispatcher invariant, not a
     /// return: it panics — the kernel stops — rather than reaching this
     /// signature. `Err` is a PLATFORM failure, one of three: an `Io` the
@@ -353,7 +353,7 @@ impl Dispatcher {
         // shape, another tenancy, or another scope type than the one mounted
         // (`JobShapeRefusal`), or wrote a table the `Schema` disagrees with:
         // unregistered, or registered under another scope shape or `Row` type
-        // (`TableShapeRefusal`). Either is the handler's own deterministic
+        // (`TableWriteRefusal`). Either is the handler's own deterministic
         // bug, like a panic — an attempt, never a platform fault, since no
         // restart could clear it. Asserted, not handled (hard rule 4): a third
         // `Io` exit in `stage` must be classified here on purpose, not
@@ -361,9 +361,9 @@ impl Dispatcher {
         let attempt = match attempt {
             Err(TxError::Io(e)) => {
                 assert!(
-                    JobShapeRefusal::of(&e).is_some() || TableShapeRefusal::of(&e).is_some(),
+                    JobShapeRefusal::of(&e).is_some() || TableWriteRefusal::of(&e).is_some(),
                     "dispatcher invariant: Group::stage returned an io error that is neither its \
-                     job-shape nor its table-shape refusal — classify it in dispatch before it \
+                     job-shape nor its table-write refusal — classify it in dispatch before it \
                      can reach a job: {e}"
                 );
                 Err(TxError::App(JobError::App(e.to_string())))
