@@ -435,6 +435,188 @@ fn redb_rejected_the_bytes(e: &io::Error) -> bool {
     text.contains("Not a redb database: magic number mismatch") || text.contains("DB corrupted: ")
 }
 
+/// What one recovery of the store and the log came to.
+enum Recovered {
+    /// Recovered and checked against the model: the round may write.
+    Checked(Engine<OpLog>, Store),
+    /// An injected fault cut it short; the caller restarts.
+    Fallout,
+    /// The universe gave up; the caller ends it.
+    GaveUp,
+}
+
+/// Opens the store (rebuilding one redb rejects), recovers the log, holds the
+/// WAL invariants, replays the gap and checks the store against the model of
+/// everything acknowledged, which it re-reads from the recovered log. A
+/// non-injected error fails the universe.
+fn recover_and_check(
+    sim: &Sim,
+    wal_cfg: &WalConfig,
+    submitted: &mut Vec<Vec<u8>>,
+    acked: &mut usize,
+    rejected: &mut Vec<String>,
+) -> Result<Recovered, String> {
+    // The store's own `applied_seq` is the durable horizon (segment-mgmt
+    // T4/T5, mirroring `Db::open`'s production use): opened before
+    // recovery so a corrupt frame at-or-below it is a named hard error
+    // rather than a silent, torn-tail-style cut. Without this, once
+    // `bit_flip`/`misdirected_write` can corrupt already-durable WAL
+    // bytes, `Engine::recover(..., None)` could quietly hand back fewer
+    // than `acked` ops — indistinguishable from a real durability bug.
+    let (engine, store) = match (|| {
+        let disk = sim.disk();
+        let store = match Store::open(&disk, "tables.redb") {
+            Ok(store) => store,
+            // `Db::open`'s discard branch, mirrored for the one state it
+            // exists for: redb rejecting the store's durable bytes, as when a
+            // crash tears the store's creation (seed 0x1f733f8d9eebf822 there,
+            // 0x5fc2c8c0905ed653 here). Any other refusal is not the log's
+            // materialization gone bad: an injected fault is fallout and the
+            // round restarts below, and anything else fails the universe.
+            Err(e) if redb_rejected_the_bytes(&e) => {
+                rejected.push(e.to_string());
+                // `Db::open` refuses to rebuild once the log is compacted past
+                // seq 0. This workload never GCs its WAL, so the log always
+                // reaches seq 0 and the rebuild loses nothing.
+                let names = disk.list("wal/")?;
+                assert!(
+                    names
+                        .first()
+                        .is_none_or(|n| n == "wal/00000000000000000000.log"),
+                    "tables_workload never GCs its WAL, yet its first segment is {names:?}"
+                );
+                match disk.remove("tables.redb") {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                // Barriered before the rebuild, as there: a removal a later
+                // crash resurrects must not shadow the rebuilt store.
+                disk.sync_dir("tables.redb")?;
+                let store = Store::open(&disk, "tables.redb")?;
+                sim.cover("tables:store-rebuilt");
+                store
+            }
+            Err(e) => return Err(e),
+        };
+        // `None` for a rebuilt store, as in `Db::open`: recovery replays the
+        // whole log into it.
+        let horizon = store.applied_seq()?;
+        let engine = Engine::recover(
+            Box::new(sim.disk()),
+            wal_cfg.clone(),
+            OpLog::default(),
+            horizon,
+        )?;
+        io::Result::Ok((engine, store))
+    })() {
+        Ok(pair) => pair,
+        Err(e) => {
+            if !is_fault_fallout(&e.to_string()) {
+                return Err(format!(
+                    "store open or WAL recovery failed non-injected: {e}"
+                ));
+            }
+            return Ok(Recovered::Fallout);
+        }
+    };
+
+    // WAL invariants, as ever.
+    let recovered = engine.machine().ops.clone();
+    if recovered.len() < *acked {
+        // Excused ONLY when the harness actually injected durable
+        // corruption in this universe: bit_flip/misdirected_write on a
+        // WAL file above the checkpoint horizon is silently cut at
+        // recovery, by the WAL convention (see
+        // `checks::durable_corruption_fired`); the strong oracle stands
+        // in every universe where corruption did not fire. Excused is a
+        // give-up, never a pass: nothing past the loss is adjudicated.
+        if charpente_sim::checks::durable_corruption_fired(sim) {
+            sim.give_up(format!(
+                "durable corruption cut acknowledged records at a round's recovery (acked \
+                 {acked}, recovered {}), so durability was not adjudicated and the rounds \
+                 after it never ran",
+                recovered.len()
+            ));
+            return Ok(Recovered::GaveUp);
+        }
+        return Err(format!(
+            "durability violated: acked {acked}, recovered {}",
+            recovered.len()
+        ));
+    }
+    if recovered[..] != submitted[..recovered.len().min(submitted.len())]
+        || recovered.len() > submitted.len()
+    {
+        return Err("recovered ops are not a prefix of submitted ops".to_string());
+    }
+    *submitted = recovered.clone();
+    *acked = submitted.len();
+
+    // The store must sit at some prefix of the recovered log…
+    let applied = match store.applied_seq() {
+        Ok(applied) => applied,
+        Err(e) => {
+            if !is_fault_fallout(&e.to_string()) {
+                return Err(format!("store applied_seq read failed non-injected: {e}"));
+            }
+            return Ok(Recovered::Fallout);
+        }
+    };
+    let next_to_apply = applied.map_or(0, |s| s + 1) as usize;
+    if next_to_apply > recovered.len() {
+        return Err(format!(
+            "store applied_seq {applied:?} is ahead of the recovered log ({} records) — it must never outrun durable truth",
+            recovered.len()
+        ));
+    }
+
+    // …and replaying the gap must reproduce the model exactly.
+    let mut alive = true;
+    for (i, payload) in recovered[next_to_apply..].iter().enumerate() {
+        let seq = (next_to_apply + i) as u64;
+        let op = Op::decode(payload);
+        if let Err(e) = store.apply(seq, |w| match &op {
+            Op::Put(row) => w.put(UNSCOPED, row),
+            Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
+        }) {
+            if !is_fault_fallout(&e.to_string()) {
+                return Err(format!(
+                    "replaying seq {seq} into the store failed non-injected: {e}"
+                ));
+            }
+            alive = false;
+            break;
+        }
+    }
+    if !alive {
+        return Ok(Recovered::Fallout);
+    }
+    match store.snapshot() {
+        Ok(snap) => {
+            // The scan/index calls inside `store_matches_model` are disk
+            // reads too — an injected `read_error` can trip one even
+            // though the snapshot itself opened fine, so its own result
+            // needs the same classify-and-reopen treatment as every
+            // other fallible step here (not the bare `?` this used to
+            // be), or a transient read fault reads as a real mismatch.
+            if let Err(msg) = store_matches_model(&snap, &model_of(&submitted[..*acked])) {
+                if !is_fault_fallout(&msg) {
+                    return Err(msg);
+                }
+                return Ok(Recovered::Fallout);
+            }
+        }
+        Err(e) => {
+            if !is_fault_fallout(&e.to_string()) {
+                return Err(format!("store snapshot failed non-injected: {e}"));
+            }
+            return Ok(Recovered::Fallout);
+        }
+    }
+    Ok(Recovered::Checked(engine, store))
+}
+
 fn tables_workload(sim: &mut Sim) -> Result<(), String> {
     tables_workload_traced(sim).map(|_| ())
 }
@@ -461,172 +643,18 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(35 + entropy.next_u64() % 279);
-
-        // The store's own `applied_seq` is the durable horizon (segment-mgmt
-        // T4/T5, mirroring `Db::open`'s production use): opened before
-        // recovery so a corrupt frame at-or-below it is a named hard error
-        // rather than a silent, torn-tail-style cut. Without this, once
-        // `bit_flip`/`misdirected_write` can corrupt already-durable WAL
-        // bytes, `Engine::recover(..., None)` could quietly hand back fewer
-        // than `acked` ops — indistinguishable from a real durability bug.
-        let (engine, store) = match (|| {
-            let disk = sim.disk();
-            let store = match Store::open(&disk, "tables.redb") {
-                Ok(store) => store,
-                // `Db::open`'s discard branch, mirrored for the one state it
-                // exists for: redb rejecting the store's durable bytes, as when a
-                // crash tears the store's creation (seed 0x1f733f8d9eebf822 there,
-                // 0x5fc2c8c0905ed653 here). Any other refusal is not the log's
-                // materialization gone bad: an injected fault is fallout and the
-                // round restarts below, and anything else fails the universe.
-                Err(e) if redb_rejected_the_bytes(&e) => {
-                    rejected.push(e.to_string());
-                    // `Db::open` refuses to rebuild once the log is compacted past
-                    // seq 0. This workload never GCs its WAL, so the log always
-                    // reaches seq 0 and the rebuild loses nothing.
-                    let names = disk.list("wal/")?;
-                    assert!(
-                        names
-                            .first()
-                            .is_none_or(|n| n == "wal/00000000000000000000.log"),
-                        "tables_workload never GCs its WAL, yet its first segment is {names:?}"
-                    );
-                    match disk.remove("tables.redb") {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
-                    }
-                    // Barriered before the rebuild, as there: a removal a later
-                    // crash resurrects must not shadow the rebuilt store.
-                    disk.sync_dir("tables.redb")?;
-                    let store = Store::open(&disk, "tables.redb")?;
-                    sim.cover("tables:store-rebuilt");
-                    store
+        let (mut engine, store) =
+            match recover_and_check(sim, &wal_cfg, &mut submitted, &mut acked, &mut rejected)? {
+                Recovered::Checked(engine, store) => {
+                    checked = true;
+                    (engine, store)
                 }
-                Err(e) => return Err(e),
-            };
-            // `None` for a rebuilt store, as in `Db::open`: recovery replays the
-            // whole log into it.
-            let horizon = store.applied_seq()?;
-            let engine = Engine::recover(
-                Box::new(sim.disk()),
-                wal_cfg.clone(),
-                OpLog::default(),
-                horizon,
-            )?;
-            io::Result::Ok((engine, store))
-        })() {
-            Ok(pair) => pair,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!(
-                        "store open or WAL recovery failed non-injected: {e}"
-                    ));
-                }
-                sim.restart();
-                continue;
-            }
-        };
-
-        // WAL invariants, as ever.
-        let mut engine = engine;
-        let recovered = engine.machine().ops.clone();
-        if recovered.len() < acked {
-            // Excused ONLY when the harness actually injected durable
-            // corruption in this universe: bit_flip/misdirected_write on a
-            // WAL file above the checkpoint horizon is silently cut at
-            // recovery, by the WAL convention (see
-            // `checks::durable_corruption_fired`); the strong oracle stands
-            // in every universe where corruption did not fire. Excused is a
-            // give-up, never a pass: nothing past the loss is adjudicated.
-            if charpente_sim::checks::durable_corruption_fired(sim) {
-                sim.give_up(format!(
-                    "durable corruption cut acknowledged records at a round's recovery (acked \
-                     {acked}, recovered {}), so durability was not adjudicated and the rounds \
-                     after it never ran",
-                    recovered.len()
-                ));
-                return Ok(rejected);
-            }
-            return Err(format!(
-                "durability violated: acked {acked}, recovered {}",
-                recovered.len()
-            ));
-        }
-        if recovered[..] != submitted[..recovered.len().min(submitted.len())]
-            || recovered.len() > submitted.len()
-        {
-            return Err("recovered ops are not a prefix of submitted ops".to_string());
-        }
-        submitted = recovered.clone();
-        acked = submitted.len();
-
-        // The store must sit at some prefix of the recovered log…
-        let applied = match store.applied_seq() {
-            Ok(applied) => applied,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("store applied_seq read failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
-        };
-        let next_to_apply = applied.map_or(0, |s| s + 1) as usize;
-        if next_to_apply > recovered.len() {
-            return Err(format!(
-                "store applied_seq {applied:?} is ahead of the recovered log ({} records) — it must never outrun durable truth",
-                recovered.len()
-            ));
-        }
-
-        // …and replaying the gap must reproduce the model exactly.
-        let mut alive = true;
-        for (i, payload) in recovered[next_to_apply..].iter().enumerate() {
-            let seq = (next_to_apply + i) as u64;
-            let op = Op::decode(payload);
-            if let Err(e) = store.apply(seq, |w| match &op {
-                Op::Put(row) => w.put(UNSCOPED, row),
-                Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
-            }) {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!(
-                        "replaying seq {seq} into the store failed non-injected: {e}"
-                    ));
-                }
-                alive = false;
-                break;
-            }
-        }
-        if !alive {
-            sim.restart();
-            continue;
-        }
-        match store.snapshot() {
-            Ok(snap) => {
-                // The scan/index calls inside `store_matches_model` are disk
-                // reads too — an injected `read_error` can trip one even
-                // though the snapshot itself opened fine, so its own result
-                // needs the same classify-and-reopen treatment as every
-                // other fallible step here (not the bare `?` this used to
-                // be), or a transient read fault reads as a real mismatch.
-                if let Err(msg) = store_matches_model(&snap, &model_of(&submitted[..acked])) {
-                    if !is_fault_fallout(&msg) {
-                        return Err(msg);
-                    }
+                Recovered::Fallout => {
                     sim.restart();
                     continue;
                 }
-                checked = true;
-            }
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("store snapshot failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
-        }
+                Recovered::GaveUp => return Ok(rejected),
+            };
 
         // New traffic: submit to the log, then apply to the store.
         for _ in 0..1 + entropy.next_u64() % 8 {
