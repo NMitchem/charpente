@@ -1425,9 +1425,10 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 ///
 /// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 198 of
 /// 256 (190 at their parent, 796bff2). The give-ups fell 28 → 22, all
-/// `:recover-exhausted:injected`, and `repl:seed-base-zero` reads 36; 198 + 22
-/// + 36 = 256. At p = 198/256 = 0.773 one SE is 6.70, so 198 − 2·6.70 = 184.6
-/// → 184, the same convention; it tolerates a 7.1% relative fall.
+/// `:recover-exhausted:injected`, and `repl:seed-base-zero` reads 36, so
+/// 198 + 22 + 36 = 256. At p = 198/256 = 0.773 one SE is 6.70, so
+/// 198 − 2·6.70 = 184.6 → 184, the same convention; it tolerates a 7.1%
+/// relative fall.
 const SEEDED_CONVERGED_FLOOR: u64 = 184;
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
