@@ -1368,6 +1368,17 @@ at all (neither node dials the other, so neither could observe the conflict). Tw
 mutually invisible, diverged timelines; the mandated fresh-data-dir re-seed then destroys
 every write the resurrected node acked.
 
+The re-seed itself carries the same hazard. The data directory holds the durable role file
+and the witness set, so a node cleared for a re-seed has neither: config alone decides its
+role, and a cleared node restarted with a primary config is a second writable primary that
+no witness gate can see. A switchover-demoted former primary is exactly that node, since its
+role file says follower while its startup config still says primary: wiped and restarted as
+configured, it acked a write beside the real primary (S5 re-review 2, R2-I1). So every
+refusal and doc that prescribes a re-seed says, in the same sentence, to restart the cleared
+node configured as a follower of the current primary, and what a primary config does instead
+(`repl::role::reseed_steps`; `Db::open`'s vanished-prefix refusal types the same steps).
+Nothing structural fences it: the guard is the operator's config.
+
 **The boot gate** (M2 sub-project 0b, spec `docs/superpowers/specs/2026-07-31-dual-primary-
 design.md`) closes that for the case the node can see. A **witness** is a node this primary
 agreed to ship to; the listen addresses are recorded durably (two CRC'd generation-stamped

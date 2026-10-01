@@ -23,7 +23,7 @@ use crate::Db;
 use crate::repl::follower::Follower;
 use crate::repl::probe::{WitnessProbe, WitnessVerdict};
 use crate::repl::protocol::Msg;
-use crate::repl::role::{Role, load_role, store_role};
+use crate::repl::role::{Role, load_role, reseed_steps, store_role};
 use crate::repl::session::{PendingCtrl, Session};
 use crate::repl::witnesses::{
     clear_witnesses, open_witnesses, render_witness_list, store_witnesses,
@@ -681,10 +681,10 @@ impl Repl {
                  handed off to while it was down, so this node is not the primary any more. It \
                  has NOT demoted itself — it cannot know which timeline you want to keep, and \
                  the writes it acked are not the platform's to discard. If {addr} holds the \
-                 timeline to keep, re-seed this node from a fresh data dir (stop it, delete its \
-                 data dir, restart to snapshot-seed from {addr}); if instead this node's \
-                 records are the ones to keep, stop {addr}, then clear this node's witness set \
-                 (GUIDE §10) and restart it."
+                 timeline to keep, re-seed this node from a fresh data dir ({}); if instead \
+                 this node's records are the ones to keep, stop {addr}, then clear this node's \
+                 witness set (GUIDE §10) and restart it.",
+                reseed_steps(&addr)
             ))));
         }
         if self

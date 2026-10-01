@@ -3809,11 +3809,13 @@ asks each witness one question, "are you a primary now?", and:
 - every witness answers *not a primary* → the gate opens and writes resume;
 - a witness answers *as a primary* → it was promoted or handed off to while
   this node was down, so this node **refuses to serve at all** and says so,
-  naming both remedies (re-seed this node from a fresh data dir if the other
-  timeline is the one to keep; or stop the other node, clear this node's
-  witness set, and restart it if these records are). It never demotes itself:
-  it cannot know which timeline you want, and the writes it acked are not the
-  platform's to discard;
+  naming both remedies (if the other timeline is the one to keep, re-seed
+  this node: clear its data directory and restart it configured as a follower
+  of the other node, never with its primary config, which brings the cleared
+  node up as a second writable primary; or stop the other node, clear this
+  node's witness set, and restart it if these records are). It never demotes
+  itself: it cannot know which timeline you want, and the writes it acked are
+  not the platform's to discard;
 - a witness cannot be reached, or answers something that says nothing about
   its role (a mismatched peer secret, protocol version, or schema digest — or
   bytes this node cannot decode at all, which is what you get when something
@@ -3918,9 +3920,17 @@ switchover chain (one this primary never shipped to) is invisible to it; the
 verdict is a refusal to run, not a repair; and any write the resurrected box
 acked before you noticed is still destroyed by the only remedy there is. So:
 promote the follower, then treat the old box as a *new* node — stop it, clear
-its data directory, and let it re-seed as a follower of the new primary. A
-switchover does not have this hazard at all (the handed-off primary demotes
-itself durably); it is specific to promote (DESIGN §5).
+its data directory, and restart it **configured as a follower of the new
+primary**, so it re-seeds from it. Change its startup config before that
+restart: with the role file gone, config alone decides the role, and a cleared
+node started with a primary config comes up as a second writable primary that
+no witness gate can see, because the witness set goes with the directory too.
+A switchover does not have the restart hazard (the handed-off primary demotes
+itself durably), but its durable demotion lives in that same role file: wipe a
+switchover-demoted primary and restart it with its old primary config, and it
+too comes up as a second writable primary. Every re-seed, after a promote or
+a switchover, restarts the cleared node configured as a follower of the
+current primary (DESIGN §5).
 
 Both travel as control messages over the replication port, issued with the
 `charpente` CLI:
@@ -3949,9 +3959,12 @@ forwarded verbatim:
 
 When a follower's own local copy is unrecoverable — media corruption below its
 checkpoint horizon, or a log directory a crash left gapped — the fix is not a
-local repair but a restore: promote a healthy replica and re-seed the damaged
-node from it as a fresh follower (its snapshot rebuilds the whole state, no
-log replay). This is the promise a single node cannot make and a replicated
+local repair but a restore: re-seed the damaged node from a healthy replica as
+a fresh follower, promoting the replica first if the damaged node was the
+primary. Clear the damaged node's data directory and restart it configured as
+a follower of the current primary, never with a primary config (the promote
+warning above says why), and its snapshot rebuilds the whole state, no log
+replay. This is the promise a single node cannot make and a replicated
 deployment can: a record one node loses to media corruption survives on
 another.
 
@@ -3961,7 +3974,8 @@ the primary has GC'd the frames that would prove the follower's records are a
 prefix of its timeline, so it refuses to re-seed it automatically — naming
 both positions and both remedies — rather than risk silently overwriting a
 follower that is actually *ahead* of a primary that forked behind it. If the
-follower truly just lagged, stop it, clear its data directory, and restart it;
+follower truly just lagged, stop it, clear its data directory, and restart it
+configured as a follower of the primary, never with a primary config;
 it re-seeds from a snapshot and converges.
 
 ## 11. Realtime
