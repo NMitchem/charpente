@@ -6228,9 +6228,11 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
             false
         };
         let last_before_crash = p.kernel.as_ref().and_then(|k| k.app().db().last_applied());
-        if forced_cut {
-            let _ = corrupt_last_wal_frame(&p.host);
-        }
+        // A corruption that did not happen forces no cut. When the helper
+        // errs (an injected fault on its own IO), `forced_cut` must not go on
+        // to claim one — before D3 its error was dropped and the cover below
+        // was claimed anyway.
+        let forced_cut = forced_cut && corrupt_last_wal_frame(&p.host).is_ok();
         p.host.crash_now();
         match recover_kernel_node(sim, &mut p) {
             Ok(()) => {
@@ -6390,6 +6392,51 @@ fn a_restored_follower_refused_as_a_laggard_is_reseeded_not_failed() {
     assert!(
         klast(&p) > Some(k),
         "p moved past its old position {k}: it was re-seeded, not left refused"
+    );
+}
+
+/// Holds "every error of `p` is routed, none dropped" in
+/// `above_horizon_universe` by reading its source. A dropped error there is
+/// invisible at the pinned base: it never drops one, and the D3 sweep found
+/// the drops only over fresh bases. So the property cannot hold this itself,
+/// and this census does.
+/// - Every call that steps `p` (`drive_request`, `krun_until`,
+///   `recover_kernel_node`) is matched by a `route_p_error`.
+/// - No drop idiom (`let _ =`, `Err(_)`, `matches!(`) appears outside a
+///   comment.
+#[test]
+fn above_horizon_universe_routes_every_error_of_p() {
+    let src = include_str!("replication.rs");
+    let start = src
+        .find("\nfn above_horizon_universe(")
+        .expect("above_horizon_universe exists");
+    let end = start + src[start..].find("\n}\n").expect("its body ends");
+    let code: Vec<&str> = src[start..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect();
+    let code = code.join("\n");
+    for idiom in ["let _ =", "Err(_)", "matches!("] {
+        assert!(
+            !code.contains(idiom),
+            "above_horizon_universe drops an error with `{idiom}` — route it through \
+             route_p_error instead (sub-project D3: a pass over a dropped error checked \
+             nothing)"
+        );
+    }
+    let steps = ["drive_request(", "krun_until(", "recover_kernel_node("]
+        .iter()
+        .map(|call| code.matches(call).count())
+        .sum::<usize>();
+    let routed = code.matches("route_p_error(").count();
+    assert!(
+        steps >= 5,
+        "the census found the universe's five stepping calls ({steps})"
+    );
+    assert_eq!(
+        routed, steps,
+        "above_horizon_universe steps p {steps} times but routes {routed} results — every \
+         call that steps p must hand its error to route_p_error"
     );
 }
 
