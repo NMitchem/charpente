@@ -163,7 +163,17 @@ directory tree in `SimDisk`'s crash model — to serve one store. The oracle is 
 prod.rs's tests): the POSIX minimum, where a power loss keeps only what a sync took, each
 directory on its own, and a process restart keeps everything. Every durability decision sits
 above that seam, so the model runs the code production runs; it cuts the power after every
-call of a workload and pins each sync by name.
+call of a workload and pins each sync by name. `ProdDisk` runs over the same seam and model,
+for the reason `SimDisk` could not catch its defect: `SimDisk`'s flat names keep `Disk`'s
+contract as written, and only a directory tree can show the production impl falling short of
+it. Until 2026-10-01 it did fall short. `ProdDisk` created the data directory, any directory
+above it and `wal/` without syncing any of them into its parent, and a barrier fsynced only
+the one directory holding its prefix, so on a fresh node every write acknowledged before the
+first checkpoint rested on a `wal` entry the next power loss dropped (§2's barrier). The model
+states its own limits (prod.rs, `Fs`): a power loss drops all unsynced state, deterministically
+and in full, so it finds a missing or misplaced sync and not a bug that needs some unsynced
+state to survive; and its kernel never marks a page clean after a failed fsync, so the EIO
+residual (§2) is out of its reach, as it is out of `SimDisk`'s.
 
 **The store's crash surface, and the countdowns.** Every `Store::apply` commits at
 `Durability::None`, and redb 4.3.0 keeps such a commit's pages in its own write buffer
@@ -530,7 +540,14 @@ rotated-in segment's name (or a store file's, at creation) could vanish on power
 taking acknowledged records with it, or a removed name could resurrect one a recovery
 already discarded. `Disk::sync_dir(prefix)` is the barrier: on `Ok`, every prior
 create/remove of a name starting with `prefix` is durable — same flat-namespace prefix
-contract as `list`. The prod impl fsyncs the holding directory; the sim tracks pending
+contract as `list`. The prod impl fsyncs every directory a name under the prefix sits in and
+every directory above them up to the data directory's parent — the whole chain on every
+barrier, because a boot that created a directory and failed before syncing it leaves one that
+exists without being durable — and `ProdDisk::new` syncs every directory it creates into its
+parent before it returns. Until 2026-10-01 it fsynced only the holding directory, and on a fresh
+node the store's creation synced the data directory before `wal/` existed, so writes
+acknowledged before the first checkpoint rested on an unsynced `wal` entry (held by `CrashFs`,
+§1). The sim tracks pending
 creates/removes and, only when `FaultConfig.dir_entry_loss > 0.0`, independently rolls
 each pending entry at crash (an affected create vanishes even if its bytes synced; an
 affected remove resurrects the file with its last durable content) — zero rng draws when

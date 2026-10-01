@@ -121,6 +121,11 @@ file and the write-ahead log's segments live under one root directory, as
 flat relative names (`tables.redb`; WAL segments are named by their
 zero-padded 20-digit base sequence, so the first is
 `wal/00000000000000000000.log`); subdirectories are created on demand.
+`ProdDisk::new` creates the directory, and any missing directory above it, and
+fsyncs each one it created into its parent before it returns. Every directory
+barrier then fsyncs the whole chain, from the directory it names up to the data
+directory's parent, which holds the data directory's own entry — so give the
+node a data directory whose parent it can read.
 
 ```rust
 use charpente::prod::ProdDisk;
@@ -5882,7 +5887,8 @@ Two things to know before you deploy this:
 
 **`FsObjectStore` is the only production `ObjectStore` that ships.** It writes objects as
 files under a root directory, atomically (temp file, sync, rename, then sync every directory
-from the object's up to the root's parent), and it syncs an object and those directories
+from the object's up to the root's parent, or up to the parent of the highest directory the
+PUT had to create above the root), and it syncs an object and those directories
 before a GET or LIST returns it. Point the root at a directory whose parent the node can
 read: the root's own entry lives there, and it is synced too. A real bucket — S3, GCS,
 Azure Blob — needs an `ObjectStore` implementation you write against the trait in

@@ -150,8 +150,9 @@ its whole subdirectory to a power loss; and a PUT that failed after its rename l
 the next process could GET from the page cache and act on, which the next power loss could
 take away. The contract is now stated for every impl — an object a `Get` or `List` returns
 is durable, and an acknowledged `Put` is durable (io.rs) — and `FsObjectStore` syncs every
-directory from the key's up to the bucket root's parent on every PUT, and syncs before a GET
-or LIST returns (DESIGN §1).
+directory from the key's up to the bucket root's parent on every PUT (further up, to the
+parent of the highest directory the PUT created, when it created any above the root), and
+syncs before a GET or LIST returns (DESIGN §1).
 
 Ordering between distinct keys is **not** guaranteed; §2's write ordering depends on that
 being explicit rather than assumed.
