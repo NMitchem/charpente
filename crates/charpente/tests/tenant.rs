@@ -800,6 +800,14 @@ fn oracle(sim: &Sim, db: &mut Db) -> Result<(), String> {
 
 // ---------------------------------------------------------- the universe
 
+/// How many reopens the final recovery gets before the universe gives up.
+/// Every attempt either runs the oracle or dies to injected fault fallout, so
+/// a larger budget costs time only in universes that would otherwise have
+/// concluded nothing. 8 -> 16 took this property's give-ups at its base from
+/// 33 to 16 for +13% CPU; 32 left 9 for +34%, over the +25% a budget may cost
+/// (2026-10-01).
+const FINAL_ATTEMPTS: u32 = 16;
+
 /// One universe: recover -> oracle -> a round of scoped writes, some of them
 /// staged as ONE batch carrying two tenants -> crash. Three rounds, then a
 /// final recovery that runs the oracle once more.
@@ -953,7 +961,7 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     // persistent injected faults an open may legitimately never succeed, so
     // an injected failure ends the universe rather than failing it — as a
     // give-up, since the last round's writes were never checked.
-    for _attempt in 0..8 {
+    for _attempt in 0..FINAL_ATTEMPTS {
         let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), ledger_schema()) {
             Ok(db) => db,
             Err(e) => {
@@ -975,10 +983,10 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
             Err(msg) => Err(msg),
         };
     }
-    sim.give_up(
-        "the final recovery never ran the oracle: all 8 attempts hit injected faults, so the \
-         last round's writes were never checked",
-    );
+    sim.give_up(format!(
+        "the final recovery never ran the oracle: all {FINAL_ATTEMPTS} attempts hit injected \
+             faults, so the last round's writes were never checked"
+    ));
     Ok(())
 }
 

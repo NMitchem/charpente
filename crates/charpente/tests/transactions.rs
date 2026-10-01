@@ -537,6 +537,14 @@ fn is_injected(text: &str) -> bool {
     )
 }
 
+/// How many reopens the final verification gets before the universe gives
+/// up. Every attempt either verifies or dies to injected fault fallout, so a
+/// larger budget costs time only in universes that would otherwise have
+/// concluded nothing. 8 -> 16 took this property's give-ups from 147 to 86
+/// over four bases for +11% CPU; 32 left 50 for +28%, over the +25% a budget
+/// may cost (2026-10-01).
+const FINAL_ATTEMPTS: u32 = 16;
+
 /// One universe: recover → verify against the oracle → mixed commits and
 /// aborts → random checkpoint → crash, everything seeded.
 fn tx_workload(sim: &mut Sim) -> Result<(), String> {
@@ -752,7 +760,7 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
     // succeed (seed 0x4cea828a65f0f1eb). Injected-fault failures skip the
     // final check, and a universe in which every attempt was skipped gives
     // up; any other open error is a real bug.
-    for _attempt in 0..8 {
+    for _attempt in 0..FINAL_ATTEMPTS {
         let db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(e) => {
@@ -838,10 +846,10 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             Err(msg) => Err(msg),
         };
     }
-    sim.give_up(
-        "the final verification never ran: all 8 attempts hit injected faults, so the last \
-         round's commits were never checked",
-    );
+    sim.give_up(format!(
+        "the final verification never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, \
+         so the last round's commits were never checked"
+    ));
     Ok(())
 }
 

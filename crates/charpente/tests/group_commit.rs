@@ -2234,6 +2234,17 @@ enum Verify {
     Unreachable,
 }
 
+/// How many reopens the final coda's `verify_watermark` gets before the
+/// universe gives up. Every attempt either verifies or dies to injected fault
+/// fallout, so a larger budget costs time only in universes that would
+/// otherwise have concluded nothing: 8 -> 64 took this property's give-ups at
+/// its base from 27 to 0 for +11% CPU (2026-10-01; 16 left 12, 32 left 3). A
+/// round boundary's check keeps `ROUND_REOPENS`: its `Unreachable` is not a
+/// give-up, since the coda still adjudicates the same watermark, so a larger
+/// budget there rescues nothing and only re-rolls the rounds after it.
+const CODA_REOPENS: u32 = 64;
+const ROUND_REOPENS: u32 = 8;
+
 /// Reopens (retrying past injected faults, exactly as `kernel_workload`'s
 /// final verification does), reads the durable count, and compares it
 /// against everything a 200 has promised SO FAR.
@@ -2250,8 +2261,8 @@ enum Verify {
 /// (`checks.rs:170-191`), `tx_workload` (`transactions.rs:519-560`) and
 /// `kernel_workload` (`kernel.rs:1393`, which also keeps a final coda, as
 /// this workload does).
-fn verify_watermark(sim: &Sim, watermark: u64) -> Result<Verify, String> {
-    for _attempt in 0..8 {
+fn verify_watermark(sim: &Sim, watermark: u64, reopens: u32) -> Result<Verify, String> {
+    for _attempt in 0..reopens {
         match App::open(
             Box::new(sim.disk()),
             Schema::new().table::<Hit>(),
@@ -2417,7 +2428,7 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
         // `verify_watermark`'s doc for the measurement.
         // `Unreachable` here is not a give-up: the next round's check, or the
         // coda, still adjudicates the same watermark.
-        match verify_watermark(sim, watermark)? {
+        match verify_watermark(sim, watermark, ROUND_REOPENS)? {
             Verify::Excused => return Ok(()),
             Verify::Unreachable => sim.cover("oracle:round-unreachable"),
             Verify::Checked => {}
@@ -2427,16 +2438,16 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
     // The final coda, kept alongside the per-round checks exactly as
     // `kernel_workload` keeps its own (`kernel.rs:1393` and again at the
     // end): the last round's writes have no round boundary after them.
-    match verify_watermark(sim, watermark)? {
+    match verify_watermark(sim, watermark, CODA_REOPENS)? {
         Verify::Checked => {}
         // The durable-corruption excuse stays a pass: the fault it excuses
         // fired and is on record under its own fire-time key
         // (`durable_corruption_fired`), unlike a check that never ran.
         Verify::Excused => {}
-        Verify::Unreachable => sim.give_up(
-            "the final coda never verified the watermark: all 8 reopens hit injected faults, \
-             so the last round's acked requests were never checked",
-        ),
+        Verify::Unreachable => sim.give_up(format!(
+            "the final coda never verified the watermark: all {CODA_REOPENS} reopens hit \
+             injected faults, so the last round's acked requests were never checked"
+        )),
     }
     Ok(())
 }

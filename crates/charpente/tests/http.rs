@@ -1268,6 +1268,14 @@ fn is_injected(text: &str) -> bool {
     )
 }
 
+/// How many reopens the final verification gets before the universe gives
+/// up. Every attempt either verifies or dies to injected fault fallout, so a
+/// larger budget costs time only in universes that would otherwise have
+/// concluded nothing. 8 -> 16 took this property's give-ups from 129 to 62
+/// over four bases for +12% CPU; 32 left 38 for +24.5%, with two of the four
+/// bases over the +25% a budget may cost (2026-10-01).
+const FINAL_ATTEMPTS: u32 = 16;
+
 /// One universe: recover → verify → requests through App::handle (an acked
 /// 200 must survive anything) → crash. A 500 whose body is not an injected
 /// fault is a real bug and fails the universe. Returns every (status, body)
@@ -1371,7 +1379,7 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     // Final verification (step-4 convention): injected-fault failures skip,
     // anything else is real, and a universe in which every attempt was
     // skipped gives up.
-    for _attempt in 0..8 {
+    for _attempt in 0..FINAL_ATTEMPTS {
         let app = match open_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
@@ -1409,10 +1417,10 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             Err(msg) => return Err(msg),
         }
     }
-    sim.give_up(
-        "the final verification never ran: all 8 attempts hit injected faults, so the last \
-         round's acked requests were never checked",
-    );
+    sim.give_up(format!(
+        "the final verification never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, \
+         so the last round's acked requests were never checked"
+    ));
     Ok(responses)
 }
 

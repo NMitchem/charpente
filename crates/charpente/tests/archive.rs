@@ -7056,15 +7056,17 @@ const CONV_MAX_RESTARTS: u32 = 64;
 /// verb, and a direct caller owns the `Disk` it passed. So the remedy this
 /// property exercises is the one `restore`'s own failure text names: re-run
 /// against the same directory, which converges because `Seeder::new`
-/// discards rather than resumes.
-const CONV_RESTORE_ATTEMPTS: u32 = 32;
+/// discards rather than resumes. 32 until 2026-10-01; 64 restores one more
+/// universe at the unscoped base for no measurable CPU (`CONV_RESTORED_FLOOR`).
+const CONV_RESTORE_ATTEMPTS: u32 = 64;
 
 /// Attempts at reading the verdict off a destination that is already
 /// restored. Separate from `CONV_RESTORE_ATTEMPTS` because it answers a
 /// different question: not "did restore complete" but "did the CHECKER get a
 /// clean read", and the fault it retries is `read_error`, which the axis's
-/// own doc calls transient.
-const CONV_VERIFY_ATTEMPTS: u32 = 32;
+/// own doc calls transient. 32 until 2026-10-01; 64 verifies 2 and 4 more
+/// universes at the two bases for no measurable CPU (`CONV_RESTORED_FLOOR`).
+const CONV_VERIFY_ATTEMPTS: u32 = 64;
 
 /// The base seed `archive_converges` runs from. Explicit, like
 /// `replication.rs`'s `0x2EB1_*` family.
@@ -7288,9 +7290,18 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 160 | 172 | 237 |
 /// | `CONV_SCOPED_CHAINED_FLOOR` | 153 | 163 | 161 |
 ///
+/// **Raised 2026-10-01 with the restore and verify budgets**
+/// (`CONV_RESTORE_ATTEMPTS` and `CONV_VERIFY_ATTEMPTS`, 32 -> 64). 3 and 4 more
+/// universes restore and verify at the two bases, so the two `restored` floors
+/// move up to their new counts, 234 -> 237 and 236 -> 240; no other floor's
+/// count moved. The unscoped base's 19 universes without a verdict are now
+/// `nothing_published` 4, `verify_never_read_cleanly` 13 and
+/// `restore_never_completed` 2; the scoped base's 16 are 6 and 10 and 0. A
+/// larger manifest-read budget rescued none of the `nothing_published` ones.
+///
 /// `restored_substantial` can exceed `restored`: it is covered once the
 /// manifest's frontier is known, before the restore and its verification run.
-const CONV_RESTORED_FLOOR: u64 = 234;
+const CONV_RESTORED_FLOOR: u64 = 237;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 235;
 const CONV_CHAINED_FLOOR: u64 = 170;
 
@@ -7327,7 +7338,7 @@ const CONV_CHAINED_FLOOR: u64 = 170;
 /// Re-measured 2026-09-30 for redb 4.3.0 with the three above; the table and
 /// the reason are at `CONV_RESTORED_FLOOR`.
 const ARCHIVE_SCOPED_CONVERGENCE_BASE: u64 = 0xA2C0_5C09;
-const CONV_SCOPED_RESTORED_FLOOR: u64 = 236;
+const CONV_SCOPED_RESTORED_FLOOR: u64 = 240;
 const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 237; // 164, then 160 after the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
 const CONV_SCOPED_CHAINED_FLOOR: u64 = 161;
 
