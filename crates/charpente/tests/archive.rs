@@ -9335,18 +9335,18 @@ mod fs_object_store {
     }
 
     /// Step 4 of the atomic PUT — the fsync of the parent directory that
-    /// makes the rename durable — has a cheap oracle for its PRESENCE even
-    /// though its durability has none. `File::open(dir, O_RDONLY)` needs
-    /// read permission on the directory, so a parent at `0o333` (write and
-    /// traverse, no read) fails that one call and only that one: creating
-    /// `<key>.tmp` needs w+x, writing it needs neither, and the rename needs
-    /// w+x. Removing the fsync is otherwise a GREEN mutation — measured, at
-    /// review: the rest of this module stays 11/0 with it gone.
+    /// makes the rename durable — on a real filesystem. `File::open(dir,
+    /// O_RDONLY)` needs read permission on the directory, so a parent at
+    /// `0o333` (write and traverse, no read) fails that one call and only
+    /// that one: creating `<key>.tmp` needs w+x, writing it needs neither,
+    /// and the rename needs w+x.
     ///
-    /// It pins presence and call site, not durability. That is exactly the
-    /// mutation the next author is likeliest to make ("why are we opening a
-    /// directory?"), which is the same argument that put
-    /// `every_op_completes_on_the_first_poll` in this file.
+    /// It pins presence, call site and the error's words, not durability:
+    /// removing the fsync was a GREEN mutation for every test in this module
+    /// (measured at review, 11/0). Durability is held by the crash model in
+    /// `charpente::prod`'s tests (`CrashFs`), which cuts the power after the
+    /// PUT and goes red without this fsync or any other on the way down to
+    /// the key (D2, 2026-10-01).
     #[test]
     fn a_put_that_cannot_fsync_its_directory_reports_the_failure() {
         use std::os::unix::fs::PermissionsExt;
@@ -9364,11 +9364,19 @@ mod fs_object_store {
              directory entry is not durable is an object that can vanish across a crash",
         );
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains(&format!("could not fsync directory \"{}\"", root.display()))
+                && msg.contains("ObjectStore's contract"),
+            "a failed directory fsync must name the directory and the contract: {msg}"
+        );
 
         // The THIRD outcome the trait's two-outcome sentence does not list:
         // this PUT failed and the key holds the NEW value. Benign, and
         // exactly archive spec §7's "PUT lands but the ack is lost" row —
-        // the archive's retry is idempotent. Pinned so it is a known
+        // the archive's retry is idempotent. And the GET that sees it has
+        // made it durable first: an object a GET returns is durable (the
+        // trait's contract), whoever reads it. Pinned so it is a known
         // property of this impl rather than a surprise.
         assert_eq!(
             get(&s, "k").unwrap(),

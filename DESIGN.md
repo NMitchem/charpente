@@ -144,6 +144,27 @@ alongside it — a probability cannot guarantee the delete-fails-FOREVER shape i
 And `SimObjectStore` completes each operation in the `poll` that takes it, so object-store
 latency is not modelled at all.
 
+**What an object store owes, and what tests it** (2026-10-01). An object a `Get` or `List`
+returns is durable, and an acknowledged `Put` is durable (`ObjectStore`'s trait doc).
+`SimObjectStore` is that contract as a model: it has no page cache, so nothing it returns or
+acknowledges can vanish, and the archive's properties test the archive against the contract
+through it. The production store over a filesystem, `FsObjectStore`, has to earn it with
+fsyncs — of the object and of every directory from its key's directory up to the bucket
+root's parent, on every `Put` and before every `Get` or `List` returns (prod.rs). Before
+2026-10-01 it did not: a `Put` that failed after its rename left an object a later process
+could read back from the page cache and the next power loss could take away, and an
+acknowledged `Put` under a new prefix could lose its whole subdirectory to a power loss,
+because the directories it created were never synced into their parents. Its oracle is not the simulator. `Disk` has no rename, so
+a `Put` through it could not be atomic; its `open` creates, so a `Get` through it would; and
+its names are a flat namespace whose `sync_dir` makes every name under a prefix durable, so
+`SimDisk` cannot express a directory whose own entry was never synced, the shape the second
+defect needs. Giving `Disk` those would change a core trait — 23 implementations, and a
+directory tree in `SimDisk`'s crash model — to serve one store. The oracle is a crash model of the filesystem calls `FsObjectStore` makes (`CrashFs`,
+prod.rs's tests): the POSIX minimum, where a power loss keeps only what a sync took, each
+directory on its own, and a process restart keeps everything. Every durability decision sits
+above that seam, so the model runs the code production runs; it cuts the power after every
+call of a workload and pins each sync by name.
+
 **The store's crash surface, and the countdowns.** Every `Store::apply` commits at
 `Durability::None`, and redb 4.3.0 keeps such a commit's pages in its own write buffer
 (`write_barrier()` issues no file write, `cached_file.rs:594`) until a checkpoint — or until
@@ -449,6 +470,9 @@ that a boot acts on syncs first, or has a stated reason it need not:
 - Restore's frontier probe reads the destination's segments unsynced because it decides
   only to refuse or to replace. A refusal writes nothing, and replacing discards every
   local byte.
+- One layer up, the bucket: `FsObjectStore` syncs every object a `Get` or `List` returns,
+  and the directories down to it, before returning it (§1). An archive that opens and
+  adopts its manifest acts on that `Get`.
 The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::read_log`,
 M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
 back one that fails — a frame corrupted on disk after append must never travel. That

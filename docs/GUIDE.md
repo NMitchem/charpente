@@ -5881,12 +5881,16 @@ one kernel step is never a 64 MiB read.
 Two things to know before you deploy this:
 
 **`FsObjectStore` is the only production `ObjectStore` that ships.** It writes objects as
-files under a root directory, atomically (temp file, sync, rename, sync the parent). A real
-bucket — S3, GCS, Azure Blob — needs an `ObjectStore` implementation you write against the
-trait in `charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore`
-first: whole-object PUTs give a caller nothing to barrier, so the trait has no `sync`
-method, and an implementation still owes whatever its own substrate needs to make an acked
-PUT survive a crash — silently, because nothing in the trait can ask for it.
+files under a root directory, atomically (temp file, sync, rename, then sync every directory
+from the object's up to the root's parent), and it syncs an object and those directories
+before a GET or LIST returns it. Point the root at a directory whose parent the node can
+read: the root's own entry lives there, and it is synced too. A real bucket — S3, GCS,
+Azure Blob — needs an `ObjectStore` implementation you write against the trait in
+`charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore` first:
+whole-object PUTs give a caller nothing to barrier, so the trait has no `sync` method, and
+every implementation still owes the trait's contract — an object a GET or LIST returns is
+durable, and an acknowledged PUT is durable — silently, because nothing in the trait can ask
+for it.
 
 **`serve::archive` is not a sidecar.** There is no `Repl` in it, so the node it runs is a
 primary in every respect except its edges: it runs the app's jobs and cron while it

@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use charpente_core::io::{
@@ -318,30 +318,141 @@ const TMP_SUFFIX: &str = ".tmp";
 /// this store. That is a property of THIS impl, not of the trait — a store
 /// with real network latency will need the bound to become a deadline.
 ///
-/// **How the atomic-PUT contract is honoured, and what it costs here.** The
-/// trait says a PUT is atomic and that there is "no `sync_dir` analogue:
-/// there is no directory entry to persist". The first is the contract; the
-/// second is true of a real object store and FALSE of a filesystem, which
-/// has a directory entry and nothing else. `rename(2)` is atomic against a
-/// process dying, but neither the renamed file's data nor the new directory
-/// entry is durable against a machine crash until each is fsynced. So a PUT
-/// here is four steps and all four are load-bearing: write `<key>.tmp`,
-/// fsync it, rename it onto `<key>`, fsync the parent directory. Dropping
-/// step 2 lets a crash resurrect the key holding zeros; dropping step 4 lets
-/// a crash lose an acked object outright.
+/// **How the contract is honoured, and what it costs here.** The trait owes
+/// two things: a PUT is atomic, and an object a GET or LIST returns, like an
+/// acknowledged PUT, is durable. A real object store gives the second for
+/// free; a filesystem does not, because an object here is a directory entry
+/// and directory entries are page cache until fsynced. `rename(2)` is atomic
+/// against a process dying, but neither the renamed file's bytes nor any
+/// entry on the path to it is durable against a power loss until fsynced.
 ///
-/// Not covered, deliberately: the ancestor directories a PUT creates on
-/// first write are not themselves fsynced into their parents, so a crash in
-/// that window can lose a newly created generation prefix. It degrades
-/// exactly like spec §7's "PUT lands but the ack is lost" row — the retry
-/// re-creates it — and closing it would mean fsyncing the whole chain on
-/// every PUT.
+/// So a PUT writes `<key>.tmp`, fsyncs it, renames it onto `<key>`, then
+/// fsyncs the key's directory and every directory above it up to the bucket
+/// root's parent (`sync_dirs`). Dropping the first fsync lets a power loss
+/// leave the key holding zeros; dropping any directory fsync lets it lose an
+/// acknowledged object, and a whole new generation prefix with it. The whole
+/// chain on EVERY PUT, not only the directories this PUT created: a PUT that
+/// created them and then failed leaves them existing but not durable, and a
+/// retry that trusted their existence would be acknowledged over entries the
+/// next power loss drops. Existing is not being durable.
+///
+/// A GET and a LIST sync before they return (DESIGN §2's "readable is not
+/// durable", one layer up): a GET fsyncs the object and the same directory
+/// chain, a LIST every directory it walks, every object it lists and the
+/// root's parent. Without that, a PUT that failed after its rename — not
+/// acknowledged, and so never retried by a process that died — is readable
+/// from the page cache by the next process, which can act on an object the
+/// next power loss takes away (an archive adopting a manifest the bucket
+/// then loses).
+///
+/// The cost is one fsync per directory level per operation, on a store whose
+/// PUTs carry whole WAL segments and snapshot batches and whose GETs are a
+/// manifest per swap and one per object at restore. Held by the crash model
+/// in this module's tests (`CrashFs`): a power cut after every filesystem
+/// call of a workload, and one pin per sync above. A DELETE is not made
+/// durable — the trait owes nothing for one, and a power loss may bring a
+/// deleted object back.
 pub struct FsObjectStore {
     root: PathBuf,
+    fs: Box<dyn Fs>,
     /// One operation in flight at a time (the trait's own words). `RefCell`,
     /// not `Mutex`: `ObjectStore` requires only `Send`, and `RefCell<T>` is
     /// `Send` whenever `T` is.
     in_flight: RefCell<Option<ObjectOp>>,
+}
+
+/// The filesystem calls `FsObjectStore` makes, one call per method:
+/// production's are `std::fs`'s, and a test swaps in a model of what a
+/// power loss keeps. Every durability decision — which file and which
+/// directory is fsynced, and in what order — is made by `FsObjectStore`
+/// above this line, so the model tests the code production runs.
+///
+/// Why not `Disk`: `Disk` has no rename, so a PUT through it could not be
+/// atomic; its `open` creates, so a GET through it would; and its names are
+/// a flat namespace whose `sync_dir` makes everything under a prefix
+/// durable, so the simulator cannot express a directory whose own entry was
+/// never synced — the shape this store must defend against.
+trait Fs: Send {
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()>;
+    /// Creates or truncates `path` for writing.
+    fn create(&self, path: &Path) -> io::Result<Box<dyn FsFile>>;
+    /// Opens `path` for reading.
+    fn open(&self, path: &Path) -> io::Result<Box<dyn FsFile>>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// fsync of the directory itself, which makes its entries durable.
+    fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+    /// `(path, is a directory)` for every entry, in no particular order.
+    fn read_dir(&self, dir: &Path) -> io::Result<Vec<(PathBuf, bool)>>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+}
+
+/// One open file. Its sync goes through the handle that wrote it: on Linux
+/// a writeback error is reported to the descriptors open when it happened,
+/// so a sync through a fresh descriptor could succeed over bytes that were
+/// lost.
+trait FsFile {
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()>;
+    fn read_to_end(&mut self) -> io::Result<Vec<u8>>;
+    /// `sync_all`: on macOS this is F_FULLFSYNC, as for `ProdFile::sync`.
+    fn sync(&self) -> io::Result<()>;
+}
+
+struct StdFs;
+
+impl Fs for StdFs {
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+
+    fn create(&self, path: &Path) -> io::Result<Box<dyn FsFile>> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Box::new(file))
+    }
+
+    fn open(&self, path: &Path) -> io::Result<Box<dyn FsFile>> {
+        Ok(Box::new(std::fs::File::open(path)?))
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        std::fs::File::open(dir)?.sync_all()
+    }
+
+    fn read_dir(&self, dir: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            entries.push((entry.path(), entry.file_type()?.is_dir()));
+        }
+        Ok(entries)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+impl FsFile for std::fs::File {
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        Write::write_all(self, data)
+    }
+
+    fn read_to_end(&mut self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        Read::read_to_end(self, &mut out)?;
+        Ok(out)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.sync_all()
+    }
 }
 
 impl FsObjectStore {
@@ -351,6 +462,16 @@ impl FsObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> FsObjectStore {
         FsObjectStore {
             root: root.into(),
+            fs: Box::new(StdFs),
+            in_flight: RefCell::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_fs(root: impl Into<PathBuf>, fs: Box<dyn Fs>) -> FsObjectStore {
+        FsObjectStore {
+            root: root.into(),
+            fs,
             in_flight: RefCell::new(None),
         }
     }
@@ -381,32 +502,77 @@ impl FsObjectStore {
         let parent = path
             .parent()
             .expect("resolve joins onto the root, so there is always a parent");
-        std::fs::create_dir_all(parent)?;
+        self.fs.create_dir_all(parent)?;
         let tmp = path.with_file_name(format!(
             "{}{TMP_SUFFIX}",
             path.file_name()
                 .expect("resolve rejects empty components")
                 .to_string_lossy()
         ));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        (&file).write_all(data)?;
+        let mut file = self.fs.create(&tmp)?;
+        file.write_all(data)?;
         // Before the rename: the name must never point at bytes that are not
         // on the platter yet.
-        file.sync_all()?;
+        file.sync()?;
         drop(file);
-        std::fs::rename(&tmp, &path)?;
+        self.fs.rename(&tmp, &path)?;
         // After the rename: the directory entry that makes the object exist
-        // is itself a write, and an unsynced one loses an acked PUT.
-        std::fs::File::open(parent)?.sync_all()
+        // is itself a write, and so is every entry on the path down to it.
+        self.sync_dirs(parent)
+    }
+
+    /// Makes `dir` reachable after a power loss: fsyncs it, every directory
+    /// above it up to the bucket root, and the root's parent, which holds the
+    /// root's own entry (a PUT creates the root when it is absent). Each of
+    /// those entries may have been created by this PUT, or by an earlier one
+    /// that failed before syncing it.
+    fn sync_dirs(&self, dir: &Path) -> io::Result<()> {
+        assert!(
+            dir.starts_with(&self.root),
+            "FsObjectStore::sync_dirs: {} is not under the bucket root {} — every path here \
+             comes from resolve, which joins onto the root",
+            dir.display(),
+            self.root.display()
+        );
+        let mut at = dir;
+        loop {
+            self.sync_dir(at)?;
+            if at == self.root {
+                break;
+            }
+            at = at
+                .parent()
+                .expect("a directory strictly under the root has a parent");
+        }
+        self.sync_root_parent()
+    }
+
+    fn sync_root_parent(&self) -> io::Result<()> {
+        match self.root.parent() {
+            None => Ok(()), // the root is `/`
+            Some(p) if p.as_os_str().is_empty() => self.sync_dir(Path::new(".")),
+            Some(p) => self.sync_dir(p),
+        }
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        self.fs.sync_dir(dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "could not fsync directory \"{}\" ({e}) — an object is durable only once \
+                     every directory from the bucket root's parent down to it has been fsynced \
+                     (ObjectStore's contract); check that directory's permissions and the disk \
+                     under it",
+                    dir.display()
+                ),
+            )
+        })
     }
 
     fn get(&self, key: &str) -> io::Result<Vec<u8>> {
         let path = self.resolve(key);
-        let mut file = match std::fs::OpenOptions::new().read(true).open(&path) {
+        let mut file = match self.fs.open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(io::Error::new(
@@ -416,9 +582,13 @@ impl FsObjectStore {
             }
             Err(e) => return Err(e),
         };
-        let mut out = Vec::new();
-        file.read_to_end(&mut out)?;
-        Ok(out)
+        // Readable is not durable (DESIGN §2): a PUT that failed after its
+        // rename leaves an object only the page cache holds, and the process
+        // reading it may not be the one that wrote it. Sync, then read.
+        file.sync()?;
+        let bytes = file.read_to_end()?;
+        self.sync_dirs(path.parent().expect("resolve joins onto the root"))?;
+        Ok(bytes)
     }
 
     /// Every key under `prefix`, sorted — never filesystem enumeration
@@ -427,44 +597,52 @@ impl FsObjectStore {
     /// objects and are never listed.
     ///
     /// **Walks the whole bucket; `prefix` is a post-filter on the assembled
-    /// key, not a descent.** So one LIST is O(objects in the bucket) while
-    /// both callers LIST per generation. Correct, and deliberate for v1 — a
-    /// prefix here is an arbitrary key substring, not a path component, so
-    /// descending into `root.join(prefix)` would answer a different question
-    /// — but it is a known property rather than a surprise, and it is the
-    /// first thing to change if a bucket ever holds many generations.
+    /// key, not a descent.** So one LIST is O(objects in the bucket), in
+    /// reads and in fsyncs: every directory it walks and every object it
+    /// lists is synced before the list is returned, and the root's parent
+    /// too, so each listed key is durable down its whole path. Correct, and
+    /// deliberate for v1 — a prefix here is an arbitrary key substring, not
+    /// a path component, so descending into `root.join(prefix)` would answer
+    /// a different question — and no product path LISTs today (the archive
+    /// and restore name every object they read). It is the first thing to
+    /// change if a bucket ever holds many generations.
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut keys = Vec::new();
         let mut stack = vec![self.root.clone()];
+        let mut walked = false;
         while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
+            let entries = match self.fs.read_dir(&dir) {
                 Ok(e) => e,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            for entry in entries {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    stack.push(entry.path());
+            walked = true;
+            self.sync_dir(&dir)?;
+            for (path, is_dir) in entries {
+                if is_dir {
+                    stack.push(path);
                     continue;
                 }
-                let key = entry
-                    .path()
+                let key = path
                     .strip_prefix(&self.root)
                     .expect("walked entries live under the root")
                     .to_string_lossy()
                     .into_owned();
                 if !key.ends_with(TMP_SUFFIX) && key.starts_with(prefix) {
+                    self.fs.open(&path)?.sync()?;
                     keys.push(key);
                 }
             }
+        }
+        if walked {
+            self.sync_root_parent()?;
         }
         keys.sort();
         Ok(keys)
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
-        match std::fs::remove_file(self.resolve(key)) {
+        match self.fs.remove_file(&self.resolve(key)) {
             // Deleting what is not there is not a failure — the archive's
             // retry paths and `SimObjectStore` both rely on it.
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -637,5 +815,636 @@ mod tests {
             }
         });
         assert_eq!(n, 0);
+    }
+
+    // ------------------------------------------- FsObjectStore's crash model
+
+    use std::collections::BTreeMap;
+    use std::path::Component;
+    use std::sync::{Arc, Mutex};
+
+    /// What a power loss keeps, for the calls `FsObjectStore` makes and no
+    /// others: the POSIX minimum, with nothing a journal's ordering might
+    /// add. A file's bytes survive once a sync of that file returns `Ok`. A
+    /// directory's entries survive once a sync of that directory returns
+    /// `Ok` — each directory on its own, so a new subdirectory's entry needs
+    /// its parent synced. A power loss drops everything else. A process
+    /// restart drops nothing, because the page cache outlives the process: a
+    /// fresh `FsObjectStore` over the same `CrashFs` is that restart. A
+    /// failed sync makes nothing durable, the worst case fsyncgate allows; a
+    /// later sync of the same node succeeds honestly, as the simulator's
+    /// disk does (DESIGN §1).
+    #[derive(Clone)]
+    struct CrashFs(Arc<Mutex<Model>>);
+
+    struct Model {
+        /// Inode 0 is `/`, which is durable from the start.
+        nodes: Vec<Node>,
+        /// One-shot: the next sync of each of these paths fails.
+        failing_syncs: Vec<PathBuf>,
+        /// Calls left before the power goes out; once it reaches 0, every
+        /// call fails until `power_loss`.
+        calls_left: Option<u64>,
+        calls: u64,
+    }
+
+    enum Node {
+        File {
+            live: Vec<u8>,
+            durable: Vec<u8>,
+        },
+        Dir {
+            live: BTreeMap<String, usize>,
+            durable: BTreeMap<String, usize>,
+        },
+    }
+
+    impl Model {
+        fn tick(&mut self) -> io::Result<()> {
+            self.calls += 1;
+            match &mut self.calls_left {
+                None => Ok(()),
+                Some(0) => Err(io::Error::other("CrashFs: the power is out")),
+                Some(n) => {
+                    *n -= 1;
+                    Ok(())
+                }
+            }
+        }
+
+        fn names(path: &Path) -> Vec<String> {
+            path.components()
+                .filter_map(|c| match c {
+                    Component::RootDir => None,
+                    Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+                    other => panic!(
+                        "CrashFs takes absolute, normalised paths — got {other:?} in {}",
+                        path.display()
+                    ),
+                })
+                .collect()
+        }
+
+        fn lookup(&self, path: &Path) -> Option<usize> {
+            let mut at = 0;
+            for name in Self::names(path) {
+                match &self.nodes[at] {
+                    Node::Dir { live, .. } => at = *live.get(&name)?,
+                    Node::File { .. } => return None,
+                }
+            }
+            Some(at)
+        }
+
+        fn not_found(path: &Path) -> io::Error {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("CrashFs: nothing at {}", path.display()),
+            )
+        }
+
+        /// The directory holding `path`, and `path`'s name in it.
+        fn parent_of(&self, path: &Path) -> io::Result<(usize, String)> {
+            let parent = path.parent().expect("CrashFs: `/` has no parent");
+            let name = path
+                .file_name()
+                .expect("CrashFs: a path below `/` has a name")
+                .to_string_lossy()
+                .into_owned();
+            match self.lookup(parent) {
+                Some(dir) if matches!(self.nodes[dir], Node::Dir { .. }) => Ok((dir, name)),
+                _ => Err(Self::not_found(parent)),
+            }
+        }
+
+        fn entries(&mut self, dir: usize) -> &mut BTreeMap<String, usize> {
+            match &mut self.nodes[dir] {
+                Node::Dir { live, .. } => live,
+                Node::File { .. } => panic!("CrashFs: inode {dir} is not a directory"),
+            }
+        }
+
+        /// A sync of the node at `ino`, reached as `path`.
+        fn make_durable(&mut self, ino: usize, path: &Path) -> io::Result<()> {
+            if let Some(i) = self.failing_syncs.iter().position(|p| p == path) {
+                self.failing_syncs.remove(i);
+                return Err(io::Error::other(format!(
+                    "CrashFs: injected fsync failure on {}",
+                    path.display()
+                )));
+            }
+            match &mut self.nodes[ino] {
+                Node::File { live, durable } => *durable = live.clone(),
+                Node::Dir { live, durable } => *durable = live.clone(),
+            }
+            Ok(())
+        }
+    }
+
+    impl CrashFs {
+        fn new() -> CrashFs {
+            CrashFs(Arc::new(Mutex::new(Model {
+                nodes: vec![Node::Dir {
+                    live: BTreeMap::new(),
+                    durable: BTreeMap::new(),
+                }],
+                failing_syncs: Vec::new(),
+                calls_left: None,
+                calls: 0,
+            })))
+        }
+
+        fn model(&self) -> std::sync::MutexGuard<'_, Model> {
+            self.0
+                .lock()
+                .expect("CrashFs lock poisoned by an earlier panic")
+        }
+
+        /// Everything a sync never took is gone, and the power is back on.
+        fn power_loss(&self) {
+            let mut m = self.model();
+            for node in &mut m.nodes {
+                match node {
+                    Node::File { live, durable } => *live = durable.clone(),
+                    Node::Dir { live, durable } => *live = durable.clone(),
+                }
+            }
+            m.calls_left = None;
+        }
+
+        fn fail_next_sync(&self, path: &str) {
+            self.model().failing_syncs.push(PathBuf::from(path));
+        }
+
+        fn power_out_after(&self, calls: u64) {
+            self.model().calls_left = Some(calls);
+        }
+
+        fn calls(&self) -> u64 {
+            self.model().calls
+        }
+
+        /// Directories that exist durably before the store sees them, as an
+        /// operator's would: `dir` and every directory above it.
+        fn provisioned(dir: &str) -> CrashFs {
+            let fs = CrashFs::new();
+            let dir = Path::new(dir);
+            fs.create_dir_all(dir).unwrap();
+            let mut at = Some(dir);
+            while let Some(d) = at {
+                fs.sync_dir(d).unwrap();
+                at = d.parent();
+            }
+            fs
+        }
+    }
+
+    impl Fs for CrashFs {
+        fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+            let mut m = self.model();
+            m.tick()?;
+            let mut at = 0;
+            for name in Model::names(dir) {
+                let next = match &m.nodes[at] {
+                    Node::Dir { live, .. } => live.get(&name).copied(),
+                    Node::File { .. } => {
+                        return Err(io::Error::other("CrashFs: a file is in the way"));
+                    }
+                };
+                at = match next {
+                    Some(ino) => ino,
+                    None => {
+                        let ino = m.nodes.len();
+                        m.nodes.push(Node::Dir {
+                            live: BTreeMap::new(),
+                            durable: BTreeMap::new(),
+                        });
+                        m.entries(at).insert(name, ino);
+                        ino
+                    }
+                };
+            }
+            Ok(())
+        }
+
+        fn create(&self, path: &Path) -> io::Result<Box<dyn FsFile>> {
+            let mut m = self.model();
+            m.tick()?;
+            let (dir, name) = m.parent_of(path)?;
+            let ino = match m.entries(dir).get(&name).copied() {
+                Some(ino) => {
+                    match &mut m.nodes[ino] {
+                        Node::File { live, .. } => live.clear(), // O_TRUNC
+                        Node::Dir { .. } => {
+                            return Err(io::Error::other("CrashFs: is a directory"));
+                        }
+                    }
+                    ino
+                }
+                None => {
+                    let ino = m.nodes.len();
+                    m.nodes.push(Node::File {
+                        live: Vec::new(),
+                        durable: Vec::new(),
+                    });
+                    m.entries(dir).insert(name, ino);
+                    ino
+                }
+            };
+            Ok(Box::new(CrashFile {
+                fs: self.clone(),
+                ino,
+                path: path.to_path_buf(),
+            }))
+        }
+
+        fn open(&self, path: &Path) -> io::Result<Box<dyn FsFile>> {
+            let mut m = self.model();
+            m.tick()?;
+            match m.lookup(path) {
+                Some(ino) if matches!(m.nodes[ino], Node::File { .. }) => Ok(Box::new(CrashFile {
+                    fs: self.clone(),
+                    ino,
+                    path: path.to_path_buf(),
+                })),
+                _ => Err(Model::not_found(path)),
+            }
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let mut m = self.model();
+            m.tick()?;
+            let (from_dir, from_name) = m.parent_of(from)?;
+            let (to_dir, to_name) = m.parent_of(to)?;
+            let ino = m
+                .entries(from_dir)
+                .remove(&from_name)
+                .ok_or_else(|| Model::not_found(from))?;
+            m.entries(to_dir).insert(to_name, ino);
+            Ok(())
+        }
+
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            let mut m = self.model();
+            m.tick()?;
+            match m.lookup(dir) {
+                Some(ino) if matches!(m.nodes[ino], Node::Dir { .. }) => m.make_durable(ino, dir),
+                _ => Err(Model::not_found(dir)),
+            }
+        }
+
+        fn read_dir(&self, dir: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+            let mut m = self.model();
+            m.tick()?;
+            match m.lookup(dir).map(|ino| &m.nodes[ino]) {
+                Some(Node::Dir { live, .. }) => Ok(live
+                    .iter()
+                    .map(|(name, &ino)| (dir.join(name), matches!(m.nodes[ino], Node::Dir { .. })))
+                    .collect()),
+                _ => Err(Model::not_found(dir)),
+            }
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            let mut m = self.model();
+            m.tick()?;
+            let (dir, name) = m.parent_of(path)?;
+            match m.entries(dir).remove(&name) {
+                Some(_) => Ok(()),
+                None => Err(Model::not_found(path)),
+            }
+        }
+    }
+
+    struct CrashFile {
+        fs: CrashFs,
+        ino: usize,
+        path: PathBuf,
+    }
+
+    impl FsFile for CrashFile {
+        fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+            let mut m = self.fs.model();
+            m.tick()?;
+            match &mut m.nodes[self.ino] {
+                Node::File { live, .. } => live.extend_from_slice(data),
+                Node::Dir { .. } => unreachable!("CrashFile always names a file"),
+            }
+            Ok(())
+        }
+
+        fn read_to_end(&mut self) -> io::Result<Vec<u8>> {
+            let mut m = self.fs.model();
+            m.tick()?;
+            match &m.nodes[self.ino] {
+                Node::File { live, .. } => Ok(live.clone()),
+                Node::Dir { .. } => unreachable!("CrashFile always names a file"),
+            }
+        }
+
+        fn sync(&self) -> io::Result<()> {
+            let mut m = self.fs.model();
+            m.tick()?;
+            m.make_durable(self.ino, &self.path)
+        }
+    }
+
+    const ROOT: &str = "/bucket";
+
+    /// A process restart: a fresh store over the same page cache.
+    fn store(fs: &CrashFs) -> FsObjectStore {
+        FsObjectStore::with_fs(ROOT, Box::new(fs.clone()))
+    }
+
+    fn run(s: &FsObjectStore, op: ObjectOp) -> io::Result<ObjectDone> {
+        s.start(op).unwrap();
+        s.poll()
+            .expect("FsObjectStore completes every op on its first poll")
+    }
+
+    fn put(s: &FsObjectStore, key: &str, data: &[u8]) -> io::Result<()> {
+        run(
+            s,
+            ObjectOp::Put {
+                key: key.to_string(),
+                data: data.to_vec(),
+            },
+        )
+        .map(|done| assert!(matches!(done, ObjectDone::Put), "{done:?}"))
+    }
+
+    /// Every object these tests write is text, so a failure prints words.
+    fn get(s: &FsObjectStore, key: &str) -> io::Result<String> {
+        match run(
+            s,
+            ObjectOp::Get {
+                key: key.to_string(),
+            },
+        )? {
+            ObjectDone::Get(bytes) => Ok(String::from_utf8(bytes).expect("test objects are text")),
+            other => panic!("a Get completed as {other:?}"),
+        }
+    }
+
+    fn list(s: &FsObjectStore, prefix: &str) -> io::Result<Vec<String>> {
+        match run(
+            s,
+            ObjectOp::List {
+                prefix: prefix.to_string(),
+            },
+        )? {
+            ObjectDone::List(keys) => Ok(keys),
+            other => panic!("a List completed as {other:?}"),
+        }
+    }
+
+    /// A file whose name is durable and whose bytes are not: what a copy into
+    /// the bucket that never fsynced leaves once something synced the
+    /// directories above it. `FsObjectStore` never makes one itself (it syncs
+    /// a temp file before renaming it into place), but its reads owe the
+    /// contract for every object they return, not only for the ones it wrote.
+    fn plant_unsynced_bytes(path: &str, data: &[u8]) -> CrashFs {
+        let path = Path::new(path);
+        let fs = CrashFs::provisioned(path.parent().unwrap().to_str().unwrap());
+        fs.create(path).unwrap().write_all(data).unwrap();
+        fs.sync_dir(path.parent().unwrap()).unwrap();
+        fs
+    }
+
+    /// (a), a GET. A PUT whose directory fsync failed was not acknowledged,
+    /// but its rename had happened, so the page cache holds the new object.
+    /// A restarted archiver's opening GET of the manifest reads it back and
+    /// acts on it; the next power loss reverts the manifest to the old one.
+    /// An object a GET returns must survive the next power loss.
+    #[test]
+    fn an_object_a_get_returned_survives_the_next_power_loss() {
+        let fs = CrashFs::provisioned("/bucket/p");
+        let s = store(&fs);
+        put(&s, "p/manifest", b"generation 1").unwrap();
+        fs.fail_next_sync("/bucket/p");
+        let err = put(&s, "p/manifest", b"generation 2").unwrap_err();
+        assert!(err.to_string().contains("injected fsync failure"), "{err}");
+
+        let s = store(&fs); // the process restarts
+        let seen = get(&s, "p/manifest").unwrap();
+        assert_eq!(
+            seen, "generation 2",
+            "the restarted store reads the unacknowledged PUT back from the page cache — if \
+             not, this test no longer reaches the shape it pins"
+        );
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "p/manifest").unwrap(),
+            seen,
+            "an object a GET returned changed at the next power loss — FsObjectStore served a \
+             name it never made durable"
+        );
+    }
+
+    /// (a), a LIST: the same shape for a key that did not exist before.
+    #[test]
+    fn a_key_a_list_returned_survives_the_next_power_loss() {
+        let fs = CrashFs::provisioned("/bucket/p/0/segments");
+        let s = store(&fs);
+        put(&s, "p/0/segments/a", b"a").unwrap();
+        fs.fail_next_sync("/bucket/p/0/segments");
+        put(&s, "p/0/segments/b", b"b").unwrap_err();
+
+        let s = store(&fs);
+        let seen = list(&s, "p/").unwrap();
+        assert_eq!(
+            seen,
+            ["p/0/segments/a", "p/0/segments/b"],
+            "the restarted store lists the unacknowledged PUT from the page cache — if not, this \
+             test no longer reaches the shape it pins"
+        );
+        fs.power_loss();
+        assert_eq!(
+            list(&store(&fs), "p/").unwrap(),
+            seen,
+            "a key a LIST returned vanished at the next power loss — FsObjectStore listed a name \
+             it never made durable"
+        );
+    }
+
+    /// (a), a LIST under a root that a failed PUT created: the root's own
+    /// entry lives in the root's parent, which only that PUT would have
+    /// synced.
+    #[test]
+    fn a_key_a_list_returned_under_a_root_a_failed_put_created_survives_the_next_power_loss() {
+        let fs = CrashFs::new();
+        fs.fail_next_sync("/bucket");
+        put(&store(&fs), "k", b"v").unwrap_err();
+
+        let s = store(&fs);
+        let seen = list(&s, "").unwrap();
+        assert_eq!(
+            seen,
+            ["k"],
+            "the restarted store lists the unacknowledged PUT from the page cache — if not, this \
+             test no longer reaches the shape it pins"
+        );
+        fs.power_loss();
+        assert_eq!(
+            list(&store(&fs), "").unwrap(),
+            seen,
+            "a key a LIST returned vanished at the next power loss — the bucket root's own \
+             entry was never made durable"
+        );
+    }
+
+    /// (a), the bytes behind a name. A GET returns them, so they must be the
+    /// bytes the next power loss leaves.
+    #[test]
+    fn the_bytes_a_get_returned_survive_the_next_power_loss() {
+        let fs = plant_unsynced_bytes("/bucket/k", b"copied in");
+        let seen = get(&store(&fs), "k").unwrap();
+        assert_eq!(seen, "copied in");
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "k").unwrap(),
+            seen,
+            "the bytes a GET returned changed at the next power loss — FsObjectStore returned \
+             bytes it never synced"
+        );
+    }
+
+    /// The same for a LIST: it returns the name, so the object behind it —
+    /// bytes included — is durable before the name is returned.
+    #[test]
+    fn the_object_behind_a_key_a_list_returned_survives_the_next_power_loss() {
+        let fs = plant_unsynced_bytes("/bucket/k", b"copied in");
+        assert_eq!(list(&store(&fs), "").unwrap(), ["k"]);
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "k").unwrap(),
+            "copied in",
+            "the object behind a key a LIST returned changed at the next power loss — \
+             FsObjectStore listed an object whose bytes it never synced"
+        );
+    }
+
+    /// (b). An acknowledged PUT under a prefix that did not exist — a new
+    /// generation's first object — survives a power loss: every directory the
+    /// PUT created has its entry synced into its parent.
+    #[test]
+    fn an_acked_put_under_a_new_prefix_survives_the_next_power_loss() {
+        let fs = CrashFs::provisioned(ROOT);
+        put(&store(&fs), "p/0/segments/a", b"sealed").unwrap();
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "p/0/segments/a").unwrap_or_else(|e| panic!(
+                "an acknowledged PUT under a new prefix was lost at the next power loss — a \
+                 directory it created was never synced into its parent: {e}"
+            )),
+            "sealed"
+        );
+    }
+
+    /// (b), and why it is not enough to sync only the directories a PUT
+    /// creates: a PUT that created them and failed before syncing them, then
+    /// a retry that finds them already there. Existing is not being durable.
+    #[test]
+    fn an_acked_retry_under_a_prefix_a_failed_put_created_survives_the_next_power_loss() {
+        let fs = CrashFs::provisioned(ROOT);
+        fs.fail_next_sync("/bucket");
+        put(&store(&fs), "p/0/segments/a", b"sealed").expect_err(
+            "the first PUT's sync of the bucket root must fail — if not, this test no longer \
+             reaches the shape it pins",
+        );
+        put(&store(&fs), "p/0/segments/a", b"sealed").unwrap(); // a restarted process retries
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "p/0/segments/a").unwrap_or_else(|e| panic!(
+                "an acknowledged retry was lost at the next power loss — it trusted directories \
+                 an earlier, failed PUT created and never synced: {e}"
+            )),
+            "sealed"
+        );
+    }
+
+    /// (b), the root: a PUT creates the bucket root when it is absent, and
+    /// the root's own entry lives in the root's parent.
+    #[test]
+    fn an_acked_put_that_created_the_bucket_root_survives_the_next_power_loss() {
+        let fs = CrashFs::new();
+        put(&store(&fs), "k", b"v").unwrap();
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "k").unwrap_or_else(|e| panic!(
+                "an acknowledged PUT that created the bucket root was lost at the next power loss \
+                 — the root's own entry was never synced into its parent: {e}"
+            )),
+            "v"
+        );
+    }
+
+    /// The class property, by sweep: the power goes out after every possible
+    /// number of filesystem calls in a fixed workload — a PUT that creates the
+    /// root, PUTs under new prefixes, an overwrite — and after it, every
+    /// acknowledged PUT holds its bytes, and a key whose PUT was cut holds its
+    /// previous value or its new one, never anything else (the atomic PUT).
+    /// Nothing is listed that a GET cannot read.
+    #[test]
+    fn every_power_cut_keeps_acked_puts_and_leaves_cut_ones_atomic() {
+        let workload = [
+            ("p/manifest", "m1"),
+            ("p/0/segments/a", "seg-a"),
+            ("p/manifest", "m2"),
+            ("p/1/snapshot/meta", "meta"),
+        ];
+        let total = {
+            let fs = CrashFs::new();
+            let s = store(&fs);
+            for (key, data) in workload {
+                put(&s, key, data.as_bytes()).unwrap();
+            }
+            fs.calls()
+        };
+        assert!(
+            total > 20,
+            "the workload makes only {total} filesystem calls — the sweep has nothing to cut"
+        );
+        for cut in 0..=total {
+            let fs = CrashFs::new();
+            fs.power_out_after(cut);
+            let s = store(&fs);
+            // key -> (last acknowledged value, value of a PUT the cut interrupted)
+            let mut expect: BTreeMap<&str, (Option<&str>, Option<&str>)> = BTreeMap::new();
+            for (key, data) in workload {
+                let entry = expect.entry(key).or_default();
+                match put(&s, key, data.as_bytes()) {
+                    Ok(()) => *entry = (Some(data), None),
+                    Err(_) => {
+                        entry.1 = Some(data);
+                        break;
+                    }
+                }
+            }
+            fs.power_loss();
+            let s = store(&fs);
+            for (key, (acked, cut_off)) in &expect {
+                let found = match get(&s, key) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("cut {cut}: GET \"{key}\" failed: {e}"),
+                };
+                let allowed: Vec<Option<&str>> = [Some(*acked), cut_off.map(Some)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert!(
+                    allowed.contains(&found.as_deref()),
+                    "cut after {cut} of {total} filesystem calls: \"{key}\" holds {found:?} — \
+                     allowed {allowed:?} (an acknowledged PUT must survive, and a cut one is \
+                     atomic)"
+                );
+            }
+            for key in list(&s, "").unwrap() {
+                get(&s, &key).unwrap_or_else(|e| {
+                    panic!("cut {cut}: LIST named \"{key}\", which GET cannot read: {e}")
+                });
+            }
+        }
     }
 }

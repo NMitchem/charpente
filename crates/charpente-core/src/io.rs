@@ -186,14 +186,23 @@ pub enum ObjectDone {
 /// codebase re-PUTs the same key with the same bytes.
 /// Ordering between distinct keys is NOT guaranteed.
 ///
+/// **An object a `Get` or `List` returns is durable, and an acknowledged
+/// `Put` is durable.** Durable means it survives a power loss of whatever
+/// holds the bucket. Both halves bind every impl: a caller acts on what a
+/// `Get` returned (the archive adopts the manifest it reads) exactly as it
+/// acts on an ack, so an impl that can see an object only its page cache
+/// holds — one a failed `Put` left behind, read by the next process — makes
+/// it durable before returning it, or does not return it. Nothing is owed
+/// for a `Delete`: a power loss may bring a deleted object back.
+///
 /// **There is no `sync_dir` analogue, and that is a statement about this
 /// trait's surface, not a discharge of the obligation.** Whole-object PUTs
-/// give a caller nothing to barrier, so no method is offered. An impl over a
-/// real namespace — a filesystem, where the key IS a directory entry — still
-/// owes whatever its own substrate needs to make an acked PUT survive a
-/// crash, and owes it silently, because this trait has no method through
-/// which a caller could ask. Read `charpente::prod::FsObjectStore` before
-/// writing a second impl: it says what that cost turned out to be.
+/// give a caller nothing to barrier, so no method is offered. An S3-like
+/// store meets the durability sentence above for free. An impl over a real
+/// namespace — a filesystem, where the key IS a directory entry — has to
+/// earn it, silently, because this trait has no method through which a
+/// caller could ask. Read `charpente::prod::FsObjectStore` before writing a
+/// second impl: it says what that cost turned out to be.
 ///
 /// `Send` for the same reason as `Disk`: `App` crosses into the kernel thread.
 pub trait ObjectStore: Send {
