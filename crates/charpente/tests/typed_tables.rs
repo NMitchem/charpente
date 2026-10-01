@@ -423,11 +423,29 @@ fn store_matches_model(
     Ok(())
 }
 
+/// The one place this test decides that redb rejected the store's durable
+/// bytes, as opposed to failing to read them: the magic-number check a torn
+/// creation fails (redb 4.3.0 reports it as an `Io` error), and `Corrupted`,
+/// its verdict on any other mangled header or page. Neither can carry an
+/// injected fault's text, since redb writes both about bytes it read. Text,
+/// because `Store::open` gives the two no kind of their own yet; LEDGER
+/// 2026-09-30 follow-up 21 adds one, and this function is what changes then.
+fn redb_rejected_the_bytes(e: &io::Error) -> bool {
+    let text = e.to_string();
+    text.contains("Not a redb database: magic number mismatch") || text.contains("DB corrupted: ")
+}
+
+fn tables_workload(sim: &mut Sim) -> Result<(), String> {
+    tables_workload_traced(sim).map(|_| ())
+}
+
 /// The full step-4-preview loop: WAL is the truth, the store materializes it,
 /// crash anywhere, recovery replays the gap. redb runs over the fault-
-/// injecting disk throughout.
-fn tables_workload(sim: &mut Sim) -> Result<(), String> {
+/// injecting disk throughout. Returns the text of every store open that
+/// `redb_rejected_the_bytes`, each of which sent the round down the rebuild.
+fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
     let entropy = sim.entropy();
+    let mut rejected: Vec<String> = Vec::new();
     let wal_cfg = WalConfig {
         dir: "wal".to_string(),
         segment_bytes: 4096,
@@ -436,6 +454,10 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
     let mut acked = 0usize;
     let mut checked = false;
 
+    // Every error a round meets is classified, the rule every other swarm
+    // workload applies: text carrying an injected fault is fallout and the
+    // round restarts; anything else fails the universe with its text, since a
+    // bare `Err(_) => restart` would pass a platform error as a fault.
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(35 + entropy.next_u64() % 279);
@@ -448,7 +470,43 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
         // bytes, `Engine::recover(..., None)` could quietly hand back fewer
         // than `acked` ops — indistinguishable from a real durability bug.
         let (engine, store) = match (|| {
-            let store = Store::open(&sim.disk(), "tables.redb")?;
+            let disk = sim.disk();
+            let store = match Store::open(&disk, "tables.redb") {
+                Ok(store) => store,
+                // `Db::open`'s discard branch, mirrored for the one state it
+                // exists for: redb rejecting the store's durable bytes, as when a
+                // crash tears the store's creation (seed 0x1f733f8d9eebf822 there,
+                // 0x5fc2c8c0905ed653 here). Any other refusal is not the log's
+                // materialization gone bad: an injected fault is fallout and the
+                // round restarts below, and anything else fails the universe.
+                Err(e) if redb_rejected_the_bytes(&e) => {
+                    rejected.push(e.to_string());
+                    // `Db::open` refuses to rebuild once the log is compacted past
+                    // seq 0. This workload never GCs its WAL, so the log always
+                    // reaches seq 0 and the rebuild loses nothing.
+                    let names = disk.list("wal/")?;
+                    assert!(
+                        names
+                            .first()
+                            .is_none_or(|n| n == "wal/00000000000000000000.log"),
+                        "tables_workload never GCs its WAL, yet its first segment is {names:?}"
+                    );
+                    match disk.remove("tables.redb") {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    // Barriered before the rebuild, as there: a removal a later
+                    // crash resurrects must not shadow the rebuilt store.
+                    disk.sync_dir("tables.redb")?;
+                    let store = Store::open(&disk, "tables.redb")?;
+                    sim.cover("tables:store-rebuilt");
+                    store
+                }
+                Err(e) => return Err(e),
+            };
+            // `None` for a rebuilt store, as in `Db::open`: recovery replays the
+            // whole log into it.
             let horizon = store.applied_seq()?;
             let engine = Engine::recover(
                 Box::new(sim.disk()),
@@ -459,7 +517,12 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
             io::Result::Ok((engine, store))
         })() {
             Ok(pair) => pair,
-            Err(_) => {
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!(
+                        "store open or WAL recovery failed non-injected: {e}"
+                    ));
+                }
                 sim.restart();
                 continue;
             }
@@ -476,7 +539,7 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
             // `checks::durable_corruption_fired`); the strong oracle stands
             // in every universe where corruption did not fire.
             if charpente_sim::checks::durable_corruption_fired(sim) {
-                return Ok(());
+                return Ok(rejected);
             }
             return Err(format!(
                 "durability violated: acked {acked}, recovered {}",
@@ -494,7 +557,10 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
         // The store must sit at some prefix of the recovered log…
         let applied = match store.applied_seq() {
             Ok(applied) => applied,
-            Err(_) => {
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("store applied_seq read failed non-injected: {e}"));
+                }
                 sim.restart();
                 continue;
             }
@@ -512,13 +578,15 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
         for (i, payload) in recovered[next_to_apply..].iter().enumerate() {
             let seq = (next_to_apply + i) as u64;
             let op = Op::decode(payload);
-            if store
-                .apply(seq, |w| match &op {
-                    Op::Put(row) => w.put(UNSCOPED, row),
-                    Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
-                })
-                .is_err()
-            {
+            if let Err(e) = store.apply(seq, |w| match &op {
+                Op::Put(row) => w.put(UNSCOPED, row),
+                Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
+            }) {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!(
+                        "replaying seq {seq} into the store failed non-injected: {e}"
+                    ));
+                }
                 alive = false;
                 break;
             }
@@ -544,7 +612,10 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
                 }
                 checked = true;
             }
-            Err(_) => {
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("store snapshot failed non-injected: {e}"));
+                }
                 sim.restart();
                 continue;
             }
@@ -568,19 +639,31 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
             submitted.push(payload.clone());
             let seq = match engine.submit(&payload) {
                 Ok(seq) => seq,
-                Err(_) => break,
+                Err(e) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("WAL submit failed non-injected: {e}"));
+                    }
+                    break;
+                }
             };
             acked += 1;
-            if store
-                .apply(seq, |w| match &op {
-                    Op::Put(row) => w.put(UNSCOPED, row),
-                    Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
-                })
-                .is_err()
-            {
+            if let Err(e) = store.apply(seq, |w| match &op {
+                Op::Put(row) => w.put(UNSCOPED, row),
+                Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
+            }) {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!(
+                        "applying seq {seq} to the store failed non-injected: {e}"
+                    ));
+                }
                 break;
             }
-            if entropy.next_u64().is_multiple_of(5) && store.checkpoint().is_err() {
+            if entropy.next_u64().is_multiple_of(5)
+                && let Err(e) = store.checkpoint()
+            {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("store checkpoint failed non-injected: {e}"));
+                }
                 break;
             }
         }
@@ -592,7 +675,7 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
              hit a fault",
         );
     }
-    Ok(())
+    Ok(rejected)
 }
 
 #[test]
@@ -608,7 +691,149 @@ fn tables_and_log_survive_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
+            // 7 to 16 per batch over 8 bases (2026-10-01), so a batch with
+            // none is about a 1-in-190,000 event, not a flake.
+            "tables:store-rebuilt",
         ]
+    );
+}
+
+/// Seed `0x5fc2c8c0905ed653`, found 2026-09-30 when S3 classified this
+/// workload's round errors. A crash dropped the header write of round 0's
+/// store creation, leaving `tables.redb` with an all-zero head that redb
+/// rejects on every later open ("Not a redb database: magic number mismatch").
+/// A bare `Err(_) => restart` had hidden it, and classifying alone failed the
+/// universe as a platform error. `Db::open` discards and rebuilds exactly this
+/// store, and so does the workload now. In this universe each rebuild's fresh
+/// store creation is then cut by an injected fault, so the universe ends at
+/// the named give-up, never at a failure.
+#[test]
+fn a_store_whose_creation_tore_is_discarded_for_a_rebuild_not_failed() {
+    const SEED: u64 = 0x5fc2_c8c0_905e_d653;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let rejected = tables_workload_traced(&mut sim)
+        .expect("a store whose creation tore is rebuilt from the log, not a platform failure");
+    assert!(
+        !rejected.is_empty()
+            && rejected
+                .iter()
+                .all(|t| t.contains("Not a redb database: magic number mismatch")),
+        "this universe's reason is redb rejecting a torn creation's header: {rejected:?}"
+    );
+    let reason = sim
+        .gave_up()
+        .expect("every rebuild here is cut by an injected fault, so nothing was checked");
+    assert!(
+        reason.contains("the store was never checked against the model"),
+        "and it ends at that give-up: {reason}"
+    );
+}
+
+/// Seed `0xc7886d7a51eefcef` (base `0x5300_0009`): round 0's store creation
+/// tore the same way, and here round 1's rebuild completes. The rebuilt store
+/// is checked, takes round 1's traffic, survives the restart that ends the
+/// round, and round 2 checks it again, so the universe reaches a verdict.
+#[test]
+fn a_store_whose_creation_tore_is_rebuilt_and_reaches_a_verdict() {
+    const SEED: u64 = 0xc788_6d7a_51ee_fcef;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let rejected = tables_workload_traced(&mut sim)
+        .expect("a store whose creation tore is rebuilt from the log, not a platform failure");
+    assert!(
+        !rejected.is_empty()
+            && rejected
+                .iter()
+                .all(|t| t.contains("Not a redb database: magic number mismatch")),
+        "this universe's reason is redb rejecting a torn creation's header: {rejected:?}"
+    );
+    assert_eq!(
+        sim.coverage().get("tables:store-rebuilt"),
+        Some(&1),
+        "the rebuild must complete"
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "and the rebuilt store must be checked against the model"
+    );
+}
+
+/// The rebuild's other trigger, met deterministically: redb's `Corrupted`,
+/// here for a transaction slot claiming a file format version newer than its
+/// own. The store is discarded and rebuilt, and the universe reaches a verdict.
+/// The log is empty, as it is whenever a torn creation is rebuilt in the
+/// swarm: the creation tears before round 0 acknowledges anything.
+#[test]
+fn a_store_redb_finds_corrupted_is_rebuilt_and_checked() {
+    let mut sim = Sim::with_faults(0x7AB1_0903, FaultConfig::none());
+    drop(Store::open(&sim.disk(), "tables.redb").unwrap());
+    let file = sim.disk().open("tables.redb").unwrap();
+    // Transaction slot 0 starts at byte 64 of redb's header, and its first
+    // byte is the file format version.
+    let mut version = [0u8; 1];
+    file.read_at(64, &mut version).unwrap();
+    assert_eq!(version, [3], "redb 4.3.0 writes file format version 3");
+    file.write_at(64, &[4]).unwrap();
+    file.sync().unwrap();
+    drop(file);
+
+    let rejected =
+        tables_workload_traced(&mut sim).expect("a store redb finds corrupted is rebuilt");
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert!(
+        rejected[0].contains("DB corrupted: Expected file format version <= 3, found 4"),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        sim.coverage().get("tables:store-rebuilt"),
+        Some(&1),
+        "the rebuild must complete"
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "and the rebuilt store must be checked against the model"
+    );
+}
+
+/// The rebuild is only for bytes redb rejects as not a database or as
+/// corrupted. A store redb refuses for any other reason is not the log's
+/// materialization gone bad, so discarding it could lose data, and the
+/// universe fails with redb's text. The refusal here is a real one: the store's
+/// first transaction slot claims file format version 1, which redb checks
+/// before the slot's checksum and answers with `UpgradeRequired`.
+#[test]
+fn a_store_redb_refuses_for_another_reason_is_not_rebuilt() {
+    let mut sim = Sim::with_faults(0x7AB1_0902, FaultConfig::none());
+    drop(Store::open(&sim.disk(), "tables.redb").unwrap());
+    let file = sim.disk().open("tables.redb").unwrap();
+    // Transaction slot 0 starts at byte 64 of redb's header, and its first
+    // byte is the file format version.
+    let mut version = [0u8; 1];
+    file.read_at(64, &mut version).unwrap();
+    assert_eq!(version, [3], "redb 4.3.0 writes file format version 3");
+    file.write_at(64, &[1]).unwrap();
+    file.sync().unwrap();
+    drop(file);
+
+    let err = tables_workload(&mut sim).expect_err("a store redb refuses must fail the universe");
+    assert!(
+        err.contains("failed non-injected") && err.contains("Manual upgrade required"),
+        "with redb's own text: {err}"
+    );
+    assert!(
+        !sim.coverage().contains_key("tables:store-rebuilt"),
+        "and it must not be rebuilt"
     );
 }
 
