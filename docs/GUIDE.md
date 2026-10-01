@@ -2371,16 +2371,17 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 
 Sooner or later a workload hits a universe where the faults are severe enough
 that it cannot test its claim at all: the database never opened, the write was
-never acknowledged, every recovery attempt was exhausted. That is not a pass —
+never acknowledged, every recovery attempt was exhausted, or durable corruption
+cut the very record the claim was about. That is not a pass —
 nothing was proven — and it is not a failure either; the harness did exactly
 what it was told.
 
 Say so:
 
 ```rust
-use charpente::{Db, DbConfig, Id, Schema, table};
+use charpente::{Db, DbConfig, Id, Schema, View, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
 
 #[table(global)]
 struct Counter {
@@ -2389,8 +2390,8 @@ struct Counter {
 }
 
 fn counter_survives(sim: &mut Sim) -> Result<(), String> {
-    let schema = Schema::new().table::<Counter>();
-    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema) {
+    let schema = || Schema::new().table::<Counter>();
+    let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
         Ok(db) => db,
         Err(e) if is_fault_fallout(&e.to_string()) => {
             // Nothing to adjudicate: the disk broke before the claim was testable.
@@ -2399,9 +2400,44 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         }
         Err(e) => return Err(e.to_string()),
     };
-    let _ = db;
-    // … the real claim …
-    Ok(())
+    let put = db.transact(|tx| {
+        tx.put(&Counter {
+            id: Id::from_raw(1),
+            hits: 1,
+        });
+        Ok::<_, std::io::Error>(())
+    });
+    if put.is_err() {
+        sim.give_up("the write was never acknowledged, so there is no claim to check");
+        return Ok(());
+    }
+
+    sim.restart(); // a crash: unsynced writes tear or vanish
+    drop(db); // the old handle is dead after restart
+    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
+        Ok(db) => db,
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the reopen hit fault fallout: {e}"));
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    match db.snapshot().and_then(|snap| snap.get::<Counter>(Id::from_raw(1))) {
+        Ok(Some(_)) => Ok(()),
+        // The one loss the platform excuses on a single node, and an excused
+        // universe GIVES UP: the row's durability was not adjudicated, and a
+        // pass needs a verdict.
+        Ok(None) if durable_corruption_fired(sim) => {
+            sim.give_up("durable corruption cut the acked row, so durability was not adjudicated");
+            Ok(())
+        }
+        Ok(None) => Err("acked Counter row lost across a crash".to_string()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the read-back hit fault fallout: {e}"));
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 ```
 
@@ -2419,9 +2455,19 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
 - A workload that gives up and then returns `Err` is still a **failure**.
   Failures outrank give-ups.
 - It also marks the coverage key `universe:gave-up` — once per universe, not
-  once per call — so a give-up *rate* is something you can put a
-  `require`/floor on like any other sometimes-key, and it cross-checks the
-  reported count exactly.
+  once per call — so a give-up *rate* is counted like any other sometimes-key,
+  and it cross-checks the reported count exactly. `ceiling:
+  [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
+  caps it: the batch fails when more than N universes gave up, naming the key,
+  the count and the cap. Nine of the platform's own 31 swarm properties carry
+  one: kernel's exactly-once and job-tenancy properties, and the flagship
+  properties of tenant, transactions, http, group_commit, typed_tables and
+  archive's two convergence properties. The rest (realtime, replication,
+  migrations, auth, the WAL suite, and kernel's job-shape property) carry none
+  yet, so a drift in their give-up rates is visible only in the split. A give-up is
+  reported and never failed, so without a cap a property can drift toward
+  adjudicating nothing with every batch green; a floor on the key would bound
+  give-ups from below, which guards nothing.
 - If your workload already funnels give-ups through a wrapper (the
   `Err("universe-inconclusive: …")` idiom the platform's own suites use), put
   the `sim.give_up(e)` call there, beside the `sim.cover(...)` mark. Keep
@@ -2474,6 +2520,15 @@ replays exactly as before. After it, an error in the check is a real failure,
 not fallout to classify. Network and object-store faults are untouched, and a
 restart still power-cycles: unsynced writes and directory entries collapse under
 the crash model as usual (`crash_apply`, `crash_torn`, `dir_entry_loss`).
+
+A realtime workload's settle phase has the same need for a different fault. The
+subscriber-stall rate is the one fault axis the sim does not inject itself: a
+workload reads `sim.subscriber_stall()` and drives its own sink's stall closure
+at that rate. `sim.quiesce_subscriber_stalls()` makes that accessor read 0.0 for
+the rest of the universe, so a stall closure built after it never refuses a send
+and draws nothing. Call it before a phase whose verdict rests on a delivery
+completing. A stall there is a fault the property excuses, so a stall that drops
+the only clean attempt's tail leaves the universe with no verdict at all.
 
 ### The checkers
 
@@ -2534,8 +2589,11 @@ before hand-rolling the same logic a fourth time:
   standard WAL convention; the un-checkpointed data had one local copy).
   Route an acked-durability check's *shortfall* through this so the loss is
   excused only in universes where corruption was actually injected — the
-  strong oracle stands everywhere else. Never use it to excuse wrong data
-  or a consistency violation (a cut reverts state to a prefix, which stays
+  strong oracle stands everywhere else. **An excused universe gives up**
+  (`sim.give_up(..)` and stop, as `counter_survives` under "Giving up" does):
+  the record's durability was not adjudicated, and a pass needs a verdict, so
+  an excuse that returns `Ok` without giving up is a vacuous pass. Never use it
+  to excuse wrong data or a consistency violation (a cut reverts state to a prefix, which stays
   consistent). Note this is the *single-node* excuse: a workload with a
   converged follower keeps none of it, because a record the primary lost to
   media corruption still lives on the follower.
@@ -2952,17 +3010,18 @@ be tested rather than assumed:
 
 ```text
 charpente-sim [realtime]: re-basing 0x000000002eb20001 -> 0x00000000a11ce001 under
-  CHARPENTE_BASE_SEED — coverage requirements and floors skipped (they are rates
-  measured at the pinned base)
+  CHARPENTE_BASE_SEED — coverage requirements, floors and ceilings skipped (they
+  are rates measured at the pinned base)
 ```
 
 Like `CHARPENTE_SEED`, it takes hex with or without `0x`, and `_` separators
 are ignored, so a base copied from the source as written (`0x2EB2_5A10`) works
 as is; a value that is not hex panics naming the variable it was read from.
 
-Floors and `require:` keys are skipped under the override, for the reason the
-floor's own panic text gives: they are rates measured AT a base, so evaluating
-them somewhere else compares against a denominator that was never taken there.
+Floors, ceilings and `require:` keys are skipped under the override, for the
+reason the floor's own panic text gives: they are rates measured AT a base, so
+evaluating them somewhere else compares against a denominator that was never
+taken there.
 What the mode tests is the property's own assertions, which are untouched.
 
 **A correctness oracle should pass at every base.** If it passes at its pinned
@@ -3045,11 +3104,29 @@ compile — your types rejected it, which is the compile-time contract doing its
 job. `timed out` means the run did **not resolve**: it is not a catch, and the
 verb will not let it read as one.
 
+The timeout follows the scope too. cargo-mutants times its own baseline over
+one package, the mutated file's, while every mutant runs all the packages in
+`--test-package`. So whenever those differ (two or more test packages, or one
+that is not the `--file`s' package) and no `--timeout` is given, the verb first
+times one `cargo test` over the test set, passes five times that as the
+timeout, and prints both numbers:
+
+```text
+mutants: `cargo test` over charpente-core, charpente-sim took 8.6 s of wall time; that is what each mutant runs, and cargo-mutants' own baseline times only the mutated file's package, so the verb is passing --timeout 44 (5x)
+```
+
+Under `--property` each mutant runs that one sim property, less than the set
+that was timed, so the line says the time is an upper bound on a mutant's run
+instead. An explicit `--timeout SECS` skips the timing run and is passed through
+as given.
+
 **It is not part of `cargo test`.** Every mutant is a rebuild plus a test run,
 so this is an on-demand instrument like the edge harness below, not something
 your inner loop pays for. Scope it at a file or a function (`--file`, `--re`)
 rather than turning it loose on a whole workspace. It needs the pinned tool:
-`cargo install cargo-mutants --version 27.1.0 --locked`.
+`cargo install cargo-mutants --version 27.1.0 --locked`. The verb checks for it
+(`cargo mutants --version`) before anything else runs, so a machine without it
+exits 2 with that install line rather than after a timing run.
 
 ### A note on the edge harness (platform dev tooling, not app surface)
 

@@ -1465,7 +1465,8 @@ struct Client {
     gone: BTreeSet<u64>,
     /// Ids strictly below this are forfeited: a bare reconnect's
     /// `next_event_id` at push time, so `settled()` never waits on them.
-    /// Monotonic (a later forfeit is always a superset of an earlier one).
+    /// Monotonic (a later forfeit is always a superset of an earlier one),
+    /// except that a timeline cut lowers it to the cut (`resync_to_head`).
     floor: u64,
     /// Delivered frames not yet checked against the ledger: `(id, name,
     /// json)`, oldest first. Every entry was RECEIVED live (pushed from a
@@ -1482,7 +1483,8 @@ struct Client {
     /// without ever receiving 6), the mark advances past the gap and
     /// permanently excuses it — the interior-skip meta-test proves
     /// membership catches what the mark could not (T6 review). `floor`
-    /// stays a separate, permanent forfeit trim; this set only ever grows.
+    /// stays a separate, permanent forfeit trim; this set only ever grows,
+    /// except that a timeline cut drops the ids it cut (`resync_to_head`).
     verified: BTreeSet<u64>,
     cursor: Option<Cursor>,
     need_subscribe: bool,
@@ -1655,6 +1657,41 @@ impl Client {
             self.ledger.insert(row.id.raw(), (name, row.key, json));
         }
         Ok(())
+    }
+
+    /// Forgets everything this client learned about ids at or above `head`, the
+    /// `next_event_id` of a store whose timeline a recovery cut back to it, so
+    /// the next `sync_ledger` re-reads those ids from the timeline the node now
+    /// holds. Every piece of state keyed by id goes: a ledger row recorded
+    /// there describes an event that no longer exists, a frame delivered there
+    /// came from the lost timeline, a `verified` or `gone` mark there would
+    /// excuse whatever event is re-minted at that id, and a `floor` above
+    /// `head` would forfeit it. What survives is exactly the state for ids the
+    /// node still holds; nothing here is forgiven.
+    fn resync_to_head(&mut self, head: u64) {
+        self.ledger.retain(|&id, _| id < head);
+        self.pending.retain(|&(id, ..)| id < head);
+        self.verified.retain(|&id| id < head);
+        self.gone.retain(|&id| id < head);
+        self.floor = self.floor.min(head);
+        self.next_scan_id = self.next_scan_id.min(head);
+    }
+
+    /// `head` is a `next_event_id` read off a node (`push_subscribe`'s
+    /// boundary). That counter only advances on commit, so a recorded id at or
+    /// above it is one a recovery cut away, which on one node takes durable
+    /// corruption above the checkpoint horizon. Then the client re-syncs to
+    /// the node's timeline (`resync_to_head`): a cut id that was never
+    /// re-minted, or was re-minted for another tenant, is no longer owed, and
+    /// one re-minted for this subscription is owed again under its new
+    /// content, so a re-mint that is never delivered FAILS the universe. With
+    /// no durable corruption on record nothing changes, and the same recorded
+    /// id stays owed, as it must: there it can only be a lost event.
+    fn resync_if_cut(&mut self, sim: &Sim, head: u64) {
+        if self.ledger.range(head..).next().is_some() && durable_corruption_fired(sim) {
+            self.resync_to_head(head);
+            sim.cover("realtime:ledger-resynced");
+        }
     }
 
     /// Direct id lookup — no positional skipping, no forfeit interaction:
@@ -1860,9 +1897,7 @@ impl Client {
                     // prune never settles, and `unsettled_report` names it.
                     match db.next_event_id() {
                         Ok(head) => {
-                            self.ledger.retain(|&id, _| id < head);
-                            self.pending.retain(|&(id, ..)| id < head);
-                            self.next_scan_id = self.next_scan_id.min(head);
+                            self.resync_to_head(head);
                             sim.cover("realtime:gap");
                             self.cursor = None;
                             self.need_subscribe = true;
@@ -2194,6 +2229,13 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     // `first_unaccounted` keeps naming it however many attempts follow. The
     // budgets bound how long the client may keep trying; they do not touch
     // what counts as caught up.
+    // No subscriber stalls in the settle. A stall is a fault this property
+    // excuses, so one that drops a clean attempt's tail leaves that attempt
+    // adjudicating nothing, and when it was the only clean attempt the
+    // universe failed "client never caught up" on no evidence (seed
+    // 0xfddd6c7112629074, pinned below). The epochs above keep exercising
+    // stall-drop and resume.
+    sim.quiesce_subscriber_stalls();
     // How many settle attempts ran all the way through `kernel.run` without
     // fault fallout. Zero means this universe never observed the platform
     // delivering anything, so it cannot testify about a missed event.
@@ -2258,6 +2300,7 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
             client.current_handle = None;
         } else {
             clean_attempts += 1;
+            sim.cover("realtime:settle-clean");
             // Only when this clean run still left the client behind: a settled client
             // breaks out at the top of the next iteration and never reaches here, so
             // no universe that catches up pays for this probe.
@@ -2378,6 +2421,45 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
         reason.contains("there was no node to catch up from"),
         "and it must be THIS give-up — no settle attempt ever ran cleanly — rather than \
          some unrelated cause that happens to keep the test green: {reason}"
+    );
+}
+
+/// Seed `0xfddd6c7112629074` (base `0x5E1F0002`, universe 70), S4's Finding D
+/// (2026-09-30). The settle phase's one clean attempt resumed from cursor 19
+/// and an injected subscriber stall dropped its tail before id 20 arrived;
+/// the other eleven attempts never booted a node. The property
+/// excuses a stall, so that universe adjudicated nothing, yet it failed "client
+/// never caught up": a harness gap, not lost delivery. The settle now runs with
+/// stalls quiesced, so that attempt delivers the backlog and the universe
+/// passes. With `quiesce_subscriber_stalls` removed it fails "client never
+/// caught up" again.
+#[test]
+fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
+    const SEED: u64 = 0xfddd_6c71_1262_9074;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    assert!(
+        cfg.subscriber_stall > 0.0,
+        "this universe must inject stalls, or it no longer pins the scenario"
+    );
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let trace = realtime_workload(&mut sim).unwrap_or_else(|e| {
+        panic!("a stall in the settle is excused, so it must not fail the universe: {e}")
+    });
+    assert_eq!(sim.gave_up(), None, "and the universe reached a verdict");
+    assert_eq!(
+        sim.coverage().get("realtime:settle-clean"),
+        Some(&1),
+        "the verdict must rest on one clean settle attempt, the one a stall dropped, or this \
+         seed no longer pins the scenario: {:?}",
+        sim.coverage()
+    );
+    assert!(
+        trace.iter().any(|(id, _, _)| *id == 20),
+        "id 20, the first matching id the failure named as unaccounted, must arrive: {trace:?}"
     );
 }
 
@@ -5023,6 +5105,13 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
 /// Returns the frame trace, so the replay check has an oracle.
 fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    // Every boundary `push_subscribe` reads goes through `resync_if_cut`. Each
+    // recovery is followed by a subscribe before any emit, so every cut is
+    // seen there before an id it cut can be re-minted. The flagship's
+    // drain-error probe cannot see a cut whose id is re-minted for the other
+    // tenant: no frame ever mismatches, and retention can collect the row
+    // before the settle. The re-sync reads a value already in hand, so it
+    // adds no disk op.
 
     for _epoch in 0..EPOCHS {
         // A give-up already recorded means this universe adjudicated
@@ -5068,6 +5157,7 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             if client.need_subscribe {
                 match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
                     Ok(info) => {
+                        client.resync_if_cut(sim, info.1);
                         subscribe = Some(info);
                         t += SEC;
                     }
@@ -5116,8 +5206,9 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     }
 
     // Settle, identical in shape and rationale to the flagship's: no new
-    // emits, boot a node through the remaining faults, let the client
-    // reconnect and catch up on its own tenant's backlog.
+    // emits, no subscriber stalls, boot a node through the remaining faults,
+    // let the client reconnect and catch up on its own tenant's backlog.
+    sim.quiesce_subscriber_stalls();
     // Same counter, same reason, as `realtime_workload` above: zero clean
     // attempts means this universe never observed a delivery and cannot
     // testify about a missed one.
@@ -5151,7 +5242,10 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
 
         let subscribe =
             match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
-                Ok(info) => info,
+                Ok(info) => {
+                    client.resync_if_cut(sim, info.1);
+                    info
+                }
                 Err(e) if is_fault_fallout(&e) => {
                     sim.restart();
                     continue;
@@ -5381,6 +5475,160 @@ const SCOPED_BOTH_TENANTS_FLOOR: u64 = 83;
 const SCOPED_OWN_BACKLOG_FLOOR: u64 = 81;
 const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 98;
 const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
+
+/// Seed `0x20851976ea4bae36` (base `0x5E1F0013`), found 2026-09-30 by S3's
+/// fresh-base scan. A misdirected write moved event id 5's WAL frame (seq 8,
+/// tenant A) off its offset, so the next recovery cut the log there, and the
+/// following emits re-minted id 5 for tenant B. The client's ledger had
+/// already recorded the old id 5 and its resume never saw the re-mint (tenant
+/// B's rows are filtered), so the flagship's drain-error probe never ran, and
+/// by the settle retention had collected the row the probe would have read.
+/// The universe failed "client never caught up" on an event its own node had
+/// lost. From 2026-09-30 it gave up; that excuse also swallowed an id
+/// re-minted for tenant A and never delivered (review I2). Since 2026-10-01
+/// the boundary read after that recovery re-syncs the client to the node's
+/// timeline (`Client::resync_if_cut`), so id 5 is B's and not owed, and the
+/// universe reaches a verdict on everything A was owed.
+#[test]
+fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced() {
+    const SEED: u64 = 0x2085_1976_ea4b_ae36;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let trace = scoped_realtime_workload(&mut sim)
+        .expect("an event lost to durable corruption must not fail the universe");
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "re-synced to the node's timeline, it reaches a verdict on what A was owed"
+    );
+    assert!(
+        durable_corruption_fired(&sim) && sim.coverage().contains_key("realtime:ledger-resynced"),
+        "this universe's reason is a cut by durable corruption, seen and re-synced: {:?}",
+        sim.coverage()
+    );
+    assert!(
+        !trace.iter().any(|&(id, ..)| id == 5),
+        "id 5 was re-minted for tenant B, so A must never receive it: {trace:?}"
+    );
+}
+
+/// `resync_if_cut` drops exactly the ids a cut removed: an id below the
+/// store's `next_event_id` is still on the node's timeline and stays owed, so
+/// a client missing it fails rather than being excused with the cut one
+/// (review I2's mixed set).
+#[test]
+fn a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed() {
+    let sim = Sim::with_faults(0x2EB2_0901, FaultConfig::none());
+    sim.cover("fault:misdirected_write");
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    for id in [3, 5] {
+        let key = Some(SCOPED_TENANT_A_KEY.to_string());
+        client.ledger.insert(id, ("ping", key, format!("old {id}")));
+    }
+    client.next_scan_id = 6;
+
+    client.resync_if_cut(&sim, 5);
+    assert_eq!(client.ledger.keys().copied().collect::<Vec<_>>(), [3]);
+    assert_eq!(
+        client.next_scan_id, 5,
+        "the next scan re-reads from the cut"
+    );
+    assert_eq!(
+        client.first_unaccounted(),
+        Some(3),
+        "id 3 was never cut, so the client still owes it"
+    );
+}
+
+/// The residual review I2 found: an id cut and re-minted for THIS
+/// subscription, then never delivered, must fail. After the re-sync the
+/// re-scan records the re-mint, and neither the old verification of the cut
+/// event nor a frame the client received from the lost timeline counts for it.
+#[test]
+fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
+    let sim = Sim::with_faults(0x2EB2_0902, FaultConfig::none());
+    sim.cover("fault:misdirected_write");
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let key = Some(SCOPED_TENANT_A_KEY.to_string());
+    client
+        .ledger
+        .insert(5, ("ping", key.clone(), "old 5".to_string()));
+    client.verified.insert(5);
+    client.next_scan_id = 6;
+    // A bare reconnect above the cut forfeited everything below 6.
+    client.floor = 6;
+    assert!(
+        client.settled(),
+        "before the cut, id 5 was delivered and verified"
+    );
+
+    client.resync_if_cut(&sim, 5);
+    // What the next `sync_ledger` reads: id 5 re-minted for tenant A.
+    client.ledger.insert(5, ("ping", key, "new 5".to_string()));
+    client.next_scan_id = 6;
+    assert_eq!(
+        client.first_unaccounted(),
+        Some(5),
+        "the re-mint is owed: a client that never receives it fails"
+    );
+}
+
+/// A frame received from the lost timeline goes with it, and so does an aged-out
+/// mark at a cut id: a re-mint delivered there is verified by its content once
+/// the re-scan reads it, never confirmed by id before that.
+#[test]
+fn a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_content() {
+    let sim = Sim::with_faults(0x2EB2_0904, FaultConfig::none());
+    sim.cover("fault:misdirected_write");
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let key = Some(SCOPED_TENANT_A_KEY.to_string());
+    client
+        .ledger
+        .insert(6, ("ping", key.clone(), "old 6".to_string()));
+    client.gone.insert(5);
+    client.pending.push_back((5, "ping", "old 5".to_string()));
+    client.next_scan_id = 7;
+
+    client.resync_if_cut(&sim, 5);
+    client.pending.push_back((5, "ping", "new 5".to_string()));
+    assert_eq!(client.drain(), Ok(()));
+    assert!(
+        !client.settled(),
+        "the re-mint's frame waits for the re-scan: a cut id is not confirmed by id"
+    );
+    // What the next `sync_ledger` reads: id 5 re-minted for tenant A.
+    client.ledger.insert(5, ("ping", key, "new 5".to_string()));
+    client.next_scan_id = 6;
+    assert_eq!(
+        client.drain(),
+        Ok(()),
+        "only the re-mint's frame is left to match"
+    );
+    assert!(client.settled() && client.verified.contains(&5));
+}
+
+/// The other direction: with no durable corruption on record, a recorded id at
+/// or above `next_event_id` is a lost event, and nothing is re-synced away.
+#[test]
+fn without_durable_corruption_a_cut_is_not_resynced() {
+    let sim = Sim::with_faults(0x2EB2_0903, FaultConfig::none());
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let key = Some(SCOPED_TENANT_A_KEY.to_string());
+    client.ledger.insert(5, ("ping", key, "old 5".to_string()));
+    client.next_scan_id = 6;
+
+    client.resync_if_cut(&sim, 5);
+    assert_eq!(
+        client.first_unaccounted(),
+        Some(5),
+        "no corruption fired, so id 5 is still owed"
+    );
+    assert!(!sim.coverage().contains_key("realtime:ledger-resynced"));
+}
 
 /// Floors pinned at an exact measurement are only meaningful if the batch is
 /// reproducible, which is the same claim the flagship's own replay check

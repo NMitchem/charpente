@@ -12,6 +12,10 @@ fn fixture_dir() -> String {
     format!("{}/../sim-fixture", env!("CARGO_MANIFEST_DIR"))
 }
 
+fn invoicing_dir() -> String {
+    format!("{}/../../examples/invoicing", env!("CARGO_MANIFEST_DIR"))
+}
+
 #[test]
 fn sim_green_run_exits_zero_and_prints_master_seed() {
     let out = charpente()
@@ -113,6 +117,62 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
         stdout.contains(r#""universe:gave-up":27"#),
         "give-up coverage must agree with the reported count:\n{stdout}"
     );
+}
+
+/// A universe whose acknowledged write was cut by durable corruption gives up;
+/// it does not pass, because nothing about durability was adjudicated (S3's
+/// sweep, 2026-10-01). One seed per excuse arm, each found by scanning harness
+/// universes. The harness reports no give-up reason, so each arm marks its own
+/// coverage key beside the give-up and the pin reads that key, along with the
+/// corruption axis that fired.
+#[test]
+fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
+    for (dir, test, seed, arm) in [
+        (
+            fixture_dir(),
+            "acked_counter_survives_rounds",
+            "0xd11f0d8598465913",
+            "fixture:acked-round-cut",
+        ),
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0xbdcf73ee53d9348f",
+            "invoicing:acked-customer-cut",
+        ),
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0xd394d77bc8102880",
+            "invoicing:acked-invoice-cut",
+        ),
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0x2421cf2bd53cb2c1",
+            "invoicing:acked-finalize-cut",
+        ),
+    ] {
+        let out = charpente()
+            .args(["test", "--sim", "--seed", seed, "--filter", test])
+            .args(["--format", "json", "--dir", &dir])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!(
+                r#""outcomes":[{{"test":"{test}","verdicts":0,"gave_up":1}}]"#
+            )),
+            "seed {seed} must give up, not pass:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(r#""{arm}":1"#))
+                && (stdout.contains(r#""fault:bit_flip""#)
+                    || stdout.contains(r#""fault:misdirected_write""#)),
+            "and at {arm}, with durable corruption on record:\n{stdout}"
+        );
+    }
 }
 
 /// The sentence this whole change exists to make true (MANIFESTO §9): a batch
@@ -233,17 +293,40 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 }
 
 /// A `cargo` placed first on PATH so the verb's `Command::new("cargo")`
-/// resolves to it: records whether the `--output` directory existed at call
-/// time, then exits with `$SHIM_EXIT`. The real tool needs that directory's
-/// parent to exist and dies with its own error when it does not — the shape
-/// observed 2026-09-12 under an exported CARGO_TARGET_DIR, where `./target`
-/// is never created. CI does not install cargo-mutants, so the verb's own
-/// behaviour is pinned against a stand-in that fails the same way on demand.
+/// resolves to it. It records every invocation's arguments, one line each,
+/// in call order. It answers the verb's install probe, `cargo mutants
+/// --version`, with exit 0. For `cargo mutants` it also records whether the `--output`
+/// directory existed at call time, then exits with `$SHIM_EXIT`; any other
+/// cargo call (the verb's own timing run) exits `$SHIM_TEST_EXIT`. The real tool needs that
+/// directory's parent to exist and dies with its own error when it does not —
+/// the shape observed 2026-09-12 under an exported CARGO_TARGET_DIR, where
+/// `./target` is never created. CI does not install cargo-mutants, so the
+/// verb's own behaviour is pinned against a stand-in that fails the same way
+/// on demand. `extra` is appended to the verb's arguments. The scratch
+/// workspace holds two one-file crates, `pkg-a` and `pkg-b`, so a `--file`
+/// under either has a package the verb can read.
 // Writing the shim and the scratch workspace is edge tooling outside the
 // deterministic core (DESIGN.md §1), the same shape as tests/genclient.rs.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)]
-fn run_mutants_with_cargo_shim(shim_exit: &str) -> (std::process::Output, String) {
+fn run_mutants_with_cargo_shim(
+    shim_exit: &str,
+    test_exit: &str,
+    extra: &[&str],
+) -> (std::process::Output, Vec<String>) {
+    run_mutants_with_cargo_shim_probed("0", shim_exit, test_exit, extra)
+}
+
+/// `run_mutants_with_cargo_shim` with the install probe answering
+/// `version_exit`: anything but 0 is a machine without cargo-mutants.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn run_mutants_with_cargo_shim_probed(
+    version_exit: &str,
+    shim_exit: &str,
+    test_exit: &str,
+    extra: &[&str],
+) -> (std::process::Output, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     // Tests run in parallel threads of one process, so pid alone is not a
     // unique name; a counter is.
@@ -257,18 +340,34 @@ fn run_mutants_with_cargo_shim(shim_exit: &str) -> (std::process::Output, String
     let bin = scratch.join("bin");
     let ws = scratch.join("ws");
     std::fs::create_dir_all(&bin).expect("shim bin dir");
-    std::fs::create_dir_all(&ws).expect("scratch workspace");
+    for pkg in ["pkg-a", "pkg-b"] {
+        std::fs::create_dir_all(ws.join(pkg).join("src")).expect("scratch crate");
+        // `[lib]` first, with a name of its own, as a real manifest may: a
+        // reader that takes the first `name` in the file gets the wrong one.
+        std::fs::write(
+            ws.join(pkg).join("Cargo.toml"),
+            format!(
+                "[lib]\nname = \"lib_of_{pkg}\"\npath = \"src/lib.rs\"\n\n\
+                 [package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\n"
+            ),
+        )
+        .expect("scratch manifest");
+        std::fs::write(ws.join(pkg).join("src/lib.rs"), "").expect("scratch source");
+    }
     let shim = bin.join("cargo");
     std::fs::write(
         &shim,
         "#!/bin/sh\n\
+         echo \"cargo $*\" >> \"$SHIM_RECORD\"\n\
+         [ \"$1\" = mutants ] || exit \"$SHIM_TEST_EXIT\"\n\
+         if [ \"$2\" = --version ]; then echo 'cargo-mutants 27.1.0'; exit \"$SHIM_VERSION_EXIT\"; fi\n\
          out=\n\
          while [ $# -gt 0 ]; do\n\
            if [ \"$1\" = --output ]; then out=$2; fi\n\
            shift\n\
          done\n\
-         if [ -d \"$out\" ]; then echo existed > \"$SHIM_RECORD\"; \
-         else echo missing > \"$SHIM_RECORD\"; fi\n\
+         if [ -d \"$out\" ]; then echo 'output existed' >> \"$SHIM_RECORD\"; \
+         else echo 'output missing' >> \"$SHIM_RECORD\"; fi\n\
          echo \"shim: cargo-mutants stand-in exiting $SHIM_EXIT\" >&2\n\
          exit \"$SHIM_EXIT\"\n",
     )
@@ -284,8 +383,11 @@ fn run_mutants_with_cargo_shim(shim_exit: &str) -> (std::process::Output, String
         .args(["test", "--mutants", "--dir"])
         .arg(&ws)
         .args(["--re", "no-such-mutant-anywhere"])
+        .args(extra)
         .env("PATH", path)
         .env("SHIM_EXIT", shim_exit)
+        .env("SHIM_TEST_EXIT", test_exit)
+        .env("SHIM_VERSION_EXIT", version_exit)
         .env("SHIM_RECORD", &record)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_MUTANTS_JOBS")
@@ -298,13 +400,13 @@ fn run_mutants_with_cargo_shim(shim_exit: &str) -> (std::process::Output, String
         )
     });
     let _ = std::fs::remove_dir_all(&scratch);
-    (out, recorded.trim().to_string())
+    (out, recorded.lines().map(str::to_string).collect())
 }
 
 #[cfg(unix)]
 #[test]
 fn mutants_names_the_tools_exit_when_it_dies_before_measuring() {
-    let (out, _) = run_mutants_with_cargo_shim("1");
+    let (out, _) = run_mutants_with_cargo_shim("1", "0", &["--timeout", "60"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
@@ -324,7 +426,7 @@ fn mutants_names_the_tools_exit_when_it_dies_before_measuring() {
 #[cfg(unix)]
 #[test]
 fn mutants_blames_the_filter_only_when_the_tool_exited_zero() {
-    let (out, _) = run_mutants_with_cargo_shim("0");
+    let (out, _) = run_mutants_with_cargo_shim("0", "0", &["--timeout", "60"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
@@ -340,9 +442,236 @@ fn mutants_blames_the_filter_only_when_the_tool_exited_zero() {
 #[cfg(unix)]
 #[test]
 fn mutants_creates_the_output_dir_before_spawning_the_tool() {
-    let (_, recorded) = run_mutants_with_cargo_shim("0");
+    let (_, recorded) = run_mutants_with_cargo_shim("0", "0", &["--timeout", "60"]);
     assert_eq!(
-        recorded, "existed",
-        "the verb chose the --output path, so the verb makes it exist; the shim saw"
+        recorded.last().map(String::as_str),
+        Some("output existed"),
+        "the verb chose the --output path, so the verb makes it exist; the shim saw {recorded:?}"
+    );
+}
+
+/// cargo-mutants 27.1.0 times its baseline over ONE package while every
+/// mutant then runs all of them, so with two or more `--test-package` its
+/// auto-timeout is too short and slow-but-caught mutants read TIMEOUT. With
+/// no `--timeout`, the verb times one `cargo test` over the whole set itself,
+/// before cargo-mutants runs, and passes five times that.
+#[cfg(unix)]
+#[test]
+fn mutants_times_the_whole_package_set_before_the_tool_when_no_timeout_is_given() {
+    let (out, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &["--test-package", "pkg-a", "--test-package", "pkg-b"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let timing = recorded
+        .iter()
+        .position(|l| l == "cargo test --package pkg-a --package pkg-b")
+        .unwrap_or_else(|| panic!("no timing run over both packages; the shim saw {recorded:?}"));
+    let mutants = recorded
+        .iter()
+        .position(|l| l.starts_with("cargo mutants --output"))
+        .unwrap_or_else(|| panic!("cargo-mutants never ran; the shim saw {recorded:?}"));
+    assert!(timing < mutants, "the timing run comes first: {recorded:?}");
+    let derived = recorded[mutants]
+        .split_once("--timeout ")
+        .map(|(_, rest)| rest.split(' ').next().unwrap().to_string())
+        .unwrap_or_else(|| {
+            panic!(
+                "no --timeout passed to cargo-mutants: {}",
+                recorded[mutants]
+            )
+        });
+    assert!(
+        stdout.contains(&format!("passing --timeout {derived} (5x)")),
+        "the verb must print the measurement and the timeout it derived; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("s of wall time"),
+        "and the measured baseline itself; stdout:\n{stdout}"
+    );
+}
+
+/// A machine without cargo-mutants learns that before the timing run, which
+/// can take minutes, not after it (review M5).
+#[cfg(unix)]
+#[test]
+fn mutants_checks_the_tool_is_installed_before_timing() {
+    let (out, recorded) = run_mutants_with_cargo_shim_probed(
+        "101",
+        "0",
+        "0",
+        &["--test-package", "pkg-a", "--test-package", "pkg-b"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("cargo-mutants is not installed")
+            && stderr.contains("cargo install cargo-mutants --version 27.1.0 --locked"),
+        "the refusal must say what is missing and how to install it; stderr:\n{stderr}"
+    );
+    assert!(
+        !recorded.iter().any(|l| l.starts_with("cargo test")),
+        "no timing run before the tool is known to be there; the shim saw {recorded:?}"
+    );
+}
+
+/// Under `--property` each mutant runs one sim property, not the whole test
+/// set the verb timed, so the printed time is an upper bound and the line
+/// says so (review M5).
+#[cfg(unix)]
+#[test]
+fn mutants_calls_the_timing_an_upper_bound_under_property() {
+    let (out, _) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &[
+            "--property",
+            "some_property",
+            "--test-package",
+            "pkg-a",
+            "--test-package",
+            "pkg-b",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("each mutant runs only the sim property `some_property`")
+            && stdout.contains("an upper bound")
+            && !stdout.contains("that is what each mutant runs"),
+        "the timing line must not claim it is what each mutant runs; stdout:\n{stdout}"
+    );
+}
+
+/// A timing run that is not green ends the verb before cargo-mutants runs:
+/// the unmutated suite failing means no mutant result would mean anything.
+#[cfg(unix)]
+#[test]
+fn mutants_stops_when_the_timing_run_is_not_green() {
+    let (out, recorded) = run_mutants_with_cargo_shim("0", "101", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("exited 101 while timing the test set for --timeout")
+            && stderr.contains("Fix the suite first."),
+        "the refusal must name the command's exit and the fix; stderr:\n{stderr}"
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|l| l.starts_with("cargo mutants --output")),
+        "cargo-mutants must not run; the shim saw {recorded:?}"
+    );
+}
+
+/// cargo-mutants' own baseline times the mutated files' package, so when the
+/// one test package is the package of every `--file`, the baseline times what
+/// each mutant runs and the verb leaves the timeout to the tool.
+#[cfg(unix)]
+#[test]
+fn mutants_leaves_the_timeout_to_the_tool_when_the_one_test_package_holds_every_file() {
+    let (_, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &["--file", "pkg-a/src/lib.rs", "--test-package", "pkg-a"],
+    );
+    assert!(
+        !recorded.iter().any(|l| l.starts_with("cargo test")),
+        "the files' own package needs no timing run; the shim saw {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|l| l.starts_with("cargo mutants --output") && !l.contains("--timeout")),
+        "and no --timeout reaches the tool; the shim saw {recorded:?}"
+    );
+}
+
+/// One test package that is not the `--file`s' package is the same asymmetry
+/// as two of them: the baseline times `pkg-a`'s tests and every mutant runs
+/// `pkg-b`'s, so the verb times `pkg-b` itself.
+#[cfg(unix)]
+#[test]
+fn mutants_times_a_single_test_package_that_is_not_the_files_package() {
+    let (out, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &["--file", "pkg-a/src/lib.rs", "--test-package", "pkg-b"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let timing = recorded
+        .iter()
+        .position(|l| l == "cargo test --package pkg-b")
+        .unwrap_or_else(|| panic!("no timing run over pkg-b; the shim saw {recorded:?}"));
+    let mutants = recorded
+        .iter()
+        .position(|l| l.starts_with("cargo mutants --output") && l.contains(" --timeout "))
+        .unwrap_or_else(|| {
+            panic!("no cargo-mutants run with a --timeout; the shim saw {recorded:?}")
+        });
+    assert!(timing < mutants, "the timing run comes first: {recorded:?}");
+    assert!(
+        stdout.contains("passing --timeout") && stdout.contains("s of wall time"),
+        "the verb must print the measurement and the timeout it derived; stdout:\n{stdout}"
+    );
+}
+
+/// A `--file` whose package the verb cannot read counts as another package:
+/// a timing run costs one `cargo test`, and a timeout set too short reports
+/// caught mutants as TIMEOUT.
+#[cfg(unix)]
+#[test]
+fn mutants_times_the_set_when_a_files_package_cannot_be_read() {
+    let (_, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &[
+            "--file",
+            "no-such-crate/src/lib.rs",
+            "--test-package",
+            "pkg-a",
+        ],
+    );
+    let timing = recorded
+        .iter()
+        .position(|l| l == "cargo test --package pkg-a")
+        .unwrap_or_else(|| panic!("no timing run over pkg-a; the shim saw {recorded:?}"));
+    let mutants = recorded
+        .iter()
+        .position(|l| l.starts_with("cargo mutants --output") && l.contains(" --timeout "))
+        .unwrap_or_else(|| {
+            panic!("no cargo-mutants run with a --timeout; the shim saw {recorded:?}")
+        });
+    assert!(timing < mutants, "the timing run comes first: {recorded:?}");
+}
+
+/// An explicit `--timeout` is the operator's, so no timing run happens and the
+/// value reaches cargo-mutants unchanged.
+#[cfg(unix)]
+#[test]
+fn mutants_passes_an_explicit_timeout_through_without_a_timing_run() {
+    let (_, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &[
+            "--test-package",
+            "pkg-a",
+            "--test-package",
+            "pkg-b",
+            "--timeout",
+            "60",
+        ],
+    );
+    assert!(
+        !recorded.iter().any(|l| l.starts_with("cargo test")),
+        "an explicit --timeout needs no timing run; the shim saw {recorded:?}"
+    );
+    let mutants = recorded
+        .iter()
+        .find(|l| l.starts_with("cargo mutants --output"))
+        .unwrap_or_else(|| panic!("cargo-mutants never ran; the shim saw {recorded:?}"));
+    assert!(
+        mutants.ends_with("--timeout 60"),
+        "the operator's timeout reaches the tool unchanged: {mutants}"
     );
 }

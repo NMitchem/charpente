@@ -2234,6 +2234,22 @@ enum Verify {
     Unreachable,
 }
 
+/// How many reopens the final coda's `verify_watermark` gets before the
+/// universe gives up. Every attempt either verifies or dies to injected fault
+/// fallout, so a larger budget costs time only in universes that would
+/// otherwise have concluded nothing: 8 -> 64 took this property's give-ups at
+/// its base from 27 to 0 for +11% CPU (2026-10-01; 16 left 12, 32 left 3).
+const CODA_REOPENS: u32 = 64;
+/// How many reopens a round boundary's check gets. Its `Unreachable` is not a
+/// give-up, which is sticky and would throw away the coda's verdict, but the
+/// coda does not cover that boundary either: as `verify_watermark`'s doc says,
+/// a loss there is erased by any later round that writes the count back above
+/// the watermark. So a skipped boundary is an unguarded window, the budget is
+/// what keeps it rare, and `oracle:round-unreachable` is capped. At the pinned
+/// base 8 -> 16 took skipped boundaries from 45 to 20 for +8.7% CPU
+/// (2026-10-01, review I3; 32 left 5 for +19%, 64 left 1 for +27%).
+const ROUND_REOPENS: u32 = 16;
+
 /// Reopens (retrying past injected faults, exactly as `kernel_workload`'s
 /// final verification does), reads the durable count, and compares it
 /// against everything a 200 has promised SO FAR.
@@ -2250,8 +2266,8 @@ enum Verify {
 /// (`checks.rs:170-191`), `tx_workload` (`transactions.rs:519-560`) and
 /// `kernel_workload` (`kernel.rs:1393`, which also keeps a final coda, as
 /// this workload does).
-fn verify_watermark(sim: &Sim, watermark: u64) -> Result<Verify, String> {
-    for _attempt in 0..8 {
+fn verify_watermark(sim: &Sim, watermark: u64, reopens: u32) -> Result<Verify, String> {
+    for _attempt in 0..reopens {
         match App::open(
             Box::new(sim.disk()),
             Schema::new().table::<Hit>(),
@@ -2414,18 +2430,48 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
 
         // The round-boundary check. Without it a loss here is erased by any
         // later round that pushes the count back above the watermark — see
-        // `verify_watermark`'s doc for the measurement.
-        if let Verify::Excused = verify_watermark(sim, watermark)? {
-            return Ok(());
+        // `verify_watermark`'s doc for the measurement. `Unreachable` here is
+        // that window left open: no later check covers it. It is not a give-up
+        // (that would discard the coda's verdict); it is counted, and capped
+        // batch-wide on the property.
+        match verify_watermark(sim, watermark, ROUND_REOPENS)? {
+            Verify::Excused => return Ok(()),
+            Verify::Unreachable => sim.cover("oracle:round-unreachable"),
+            Verify::Checked => {}
         }
     }
 
     // The final coda, kept alongside the per-round checks exactly as
     // `kernel_workload` keeps its own (`kernel.rs:1393` and again at the
     // end): the last round's writes have no round boundary after them.
-    verify_watermark(sim, watermark)?;
+    match verify_watermark(sim, watermark, CODA_REOPENS)? {
+        // A zero watermark means no request was ever acknowledged, and a
+        // durable count is never below 0: that check could not have failed,
+        // so it is no verdict (review M3).
+        Verify::Checked if watermark == 0 => sim.give_up(
+            "no request was ever acknowledged, so the final check compared the durable count \
+             with 0 and could not have failed",
+        ),
+        Verify::Checked => {}
+        // The durable-corruption excuse stays a pass: the fault it excuses
+        // fired and is on record under its own fire-time key
+        // (`durable_corruption_fired`), unlike a check that never ran.
+        Verify::Excused => {}
+        Verify::Unreachable => sim.give_up(format!(
+            "the final coda never verified the watermark: all {CODA_REOPENS} reopens hit \
+             injected faults, so the last round's acked requests were never checked"
+        )),
+    }
     Ok(())
 }
+
+/// The give-up cap, exact at the pinned base: 38 universes gave up in two
+/// identical batches, every one of them because it never got a 200 (review
+/// M3); with 64 coda reopens none gives up for an unreachable coda (27 with 8).
+const BURST_GAVE_UP_CEILING: u64 = 38;
+/// The skipped-boundary cap, exact at the pinned base: 20 round-boundary
+/// checks were unreachable in two identical batches at 16 round reopens.
+const BURST_ROUND_UNREACHABLE_CEILING: u64 = 20;
 
 /// The flagship request-arm batching property under the full fault matrix.
 /// `0x60C1_0009` (`docs/superpowers/plans/2026-08-10-group-commit.md`'s
@@ -2472,6 +2518,106 @@ fn contended_request_bursts_survive_the_fault_matrix() {
             "fault:crash",
             "crash:torn",
             "restart"
+        ],
+        ceiling: [
+            ("universe:gave-up", BURST_GAVE_UP_CEILING),
+            ("oracle:round-unreachable", BURST_ROUND_UNREACHABLE_CEILING)
         ]
+    );
+}
+
+/// A universe whose final coda never verified the watermark adjudicated
+/// nothing about its last round, so it gives up rather than passing (LEDGER
+/// 2026-09-30, follow-up 9). Every disk op faults here, so every reopen dies
+/// to injected faults.
+#[test]
+fn a_coda_that_never_verifies_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x60C1_0901, FaultConfig::none());
+    assert_eq!(burst_workload(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x60C1_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert_eq!(burst_workload(&mut sim), Ok(()));
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose coda never verified must give up, not pass");
+    assert!(
+        reason.contains("the final coda never verified the watermark"),
+        "and it must be THIS give-up: {reason}"
+    );
+}
+
+/// Seed `0xf366fd85cc2bea79` (universe of the pinned base `0x60C1_0009`)
+/// never got a 200, so its watermark stayed 0 and every check it made compared
+/// the durable count with 0, which cannot fail. Until 2026-10-01 its passing
+/// coda made it a verdict (review M3); it gives up. 39 of the base's 256
+/// universes did the same.
+#[test]
+fn a_universe_that_never_acked_a_request_gives_up_rather_than_passing() {
+    const SEED: u64 = 0xf366_fd85_cc2b_ea79;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    assert_eq!(burst_workload(&mut sim), Ok(()));
+    assert!(
+        !sim.coverage().contains_key("request:acked"),
+        "this universe must still never get a 200, or it no longer pins the scenario: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .expect("a universe that never acked a request checked nothing and must give up");
+    assert!(
+        reason.contains("no request was ever acknowledged"),
+        "and it must be THIS give-up: {reason}"
+    );
+}
+
+/// The give-up is the coda's alone. Seed `0x6999d445e27fe8d3` (universe of
+/// the pinned base `0x60C1_0009`) acks requests, finds a round boundary's check
+/// unreachable even at 16 round reopens, and then verifies at the coda; it does
+/// not give up, since a give-up at the per-round call would be sticky and throw
+/// the coda's verdict away. That verdict does not cover the skipped boundary (a
+/// loss there is erased by later writes, per `verify_watermark`'s doc), which
+/// is why the property caps `oracle:round-unreachable`. Re-pinned 2026-10-01:
+/// `0x15d7721641ce58b3` never acked a request and now gives up for that
+/// (review M3).
+#[test]
+fn an_unreachable_round_check_before_a_verified_coda_does_not_give_up() {
+    const SEED: u64 = 0x6999_d445_e27f_e8d3;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    assert_eq!(burst_workload(&mut sim), Ok(()));
+    assert!(
+        sim.coverage().contains_key("request:acked")
+            && sim.coverage().contains_key("oracle:round-unreachable"),
+        "this universe must still find a round boundary's check unreachable, or it no \
+         longer pins the scenario: {:?}",
+        sim.coverage()
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "the coda verified, so this universe reached a verdict"
     );
 }

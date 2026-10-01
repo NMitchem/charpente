@@ -139,13 +139,21 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     // durable corruption in this universe (`bit_flip`/`misdirected_write`
     // on a WAL file — see `checks::durable_corruption_fired`): corruption
     // of an acked record above the checkpoint horizon is silently cut at
-    // recovery, by the WAL convention. In every universe where no
-    // corruption fired, these stay the hard checks they always were.
+    // recovery, by the WAL convention. Excused means the universe gives up:
+    // durability was not adjudicated, and a pass needs a verdict. In every
+    // universe where no corruption fired, these stay the hard checks they
+    // always were.
     let corrupted = charpente_sim::checks::durable_corruption_fired(sim);
     if customer_acked {
         match snap.get::<Customer>(Id::from_raw(1)) {
             Ok(Some(_)) => {}
-            Ok(None) if corrupted => return Ok(()),
+            Ok(None) if corrupted => {
+                sim.cover("invoicing:acked-customer-cut");
+                sim.give_up(
+                    "durable corruption cut acked customer 1, so durability was not adjudicated",
+                );
+                return Ok(());
+            }
             Ok(None) => return Err("acked customer 1 missing after restart".to_string()),
             Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
             Err(e) => return Err(e.to_string()),
@@ -154,7 +162,13 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     if invoice_acked {
         match snap.get::<Invoice>(Id::from_raw(1)) {
             Ok(Some(_)) => {}
-            Ok(None) if corrupted => return Ok(()),
+            Ok(None) if corrupted => {
+                sim.cover("invoicing:acked-invoice-cut");
+                sim.give_up(
+                    "durable corruption cut acked invoice 1, so durability was not adjudicated",
+                );
+                return Ok(());
+            }
             Ok(None) => return Err("acked invoice 1 missing after restart".to_string()),
             Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
             Err(e) => return Err(e.to_string()),
@@ -164,7 +178,14 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
         match snap.get::<Invoice>(Id::from_raw(1)) {
             Ok(Some(inv))
                 if inv.state == InvoiceState::Final || inv.state == InvoiceState::Paid => {}
-            Ok(Some(_)) | Ok(None) if corrupted => return Ok(()),
+            Ok(Some(_)) | Ok(None) if corrupted => {
+                sim.cover("invoicing:acked-finalize-cut");
+                sim.give_up(
+                    "durable corruption cut invoice 1's acked finalize, so durability was not \
+                     adjudicated",
+                );
+                return Ok(());
+            }
             Ok(Some(inv)) => {
                 return Err(format!(
                     "acked finalize but invoice 1 is {:?} after restart",

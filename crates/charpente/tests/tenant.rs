@@ -802,6 +802,14 @@ fn oracle(sim: &Sim, db: &mut Db) -> Result<(), String> {
 
 // ---------------------------------------------------------- the universe
 
+/// How many reopens the final recovery gets before the universe gives up.
+/// Every attempt either runs the oracle or dies to injected fault fallout, so
+/// a larger budget costs time only in universes that would otherwise have
+/// concluded nothing. 8 -> 16 took this property's give-ups at its base from
+/// 33 to 16 for +13% CPU; 32 left 9 for +34%, over the +25% a budget may cost
+/// (2026-10-01).
+const FINAL_ATTEMPTS: u32 = 16;
+
 /// One universe: recover -> oracle -> a round of scoped writes, some of them
 /// staged as ONE batch carrying two tenants -> crash. Three rounds, then a
 /// final recovery that runs the oracle once more.
@@ -952,10 +960,10 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     }
 
     // Final recovery: the last round's writes get the oracle too. Under
-    // persistent injected faults an open may legitimately never succeed
-    // (the oracle already ran at every successful open above), so an
-    // injected failure ends the universe rather than failing it.
-    for _attempt in 0..8 {
+    // persistent injected faults an open may legitimately never succeed, so
+    // an injected failure ends the universe rather than failing it — as a
+    // give-up, since the last round's writes were never checked.
+    for _attempt in 0..FINAL_ATTEMPTS {
         let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), ledger_schema()) {
             Ok(db) => db,
             Err(e) => {
@@ -977,8 +985,16 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
             Err(msg) => Err(msg),
         };
     }
+    sim.give_up(format!(
+        "the final recovery never ran the oracle: all {FINAL_ATTEMPTS} attempts hit injected \
+             faults, so the last round's writes were never checked"
+    ));
     Ok(())
 }
+
+/// The give-up cap, exact at the pinned base: 16 of 256 universes gave up in
+/// two identical batches (16 final attempts; 33 with 8).
+const TENANT_GAVE_UP_CEILING: u64 = 16;
 
 /// The flagship tenant property (spec §1 as a mechanical oracle, hard rule
 /// 3): across the full fault matrix, and after every recovery, every scoped
@@ -1000,7 +1016,42 @@ fn every_scoped_read_returns_only_its_own_tenants_rows() {
         256,
         |_cfg: &mut FaultConfig| {},
         tenant_universe,
-        require: ["tenant:multi_tenant_write", "tenant:crash_mid_batch"]
+        require: ["tenant:multi_tenant_write", "tenant:crash_mid_batch"],
+        ceiling: [("universe:gave-up", TENANT_GAVE_UP_CEILING)]
+    );
+}
+
+/// A universe whose final recovery never ran the oracle adjudicated nothing
+/// about its last round, so it gives up rather than passing (LEDGER
+/// 2026-09-30, follow-up 9). Every disk op faults here, so every attempt dies
+/// to injected faults.
+#[test]
+fn a_final_recovery_that_never_runs_the_oracle_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x7E4A_0901, FaultConfig::none());
+    assert_eq!(tenant_universe(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x7E4A_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert_eq!(tenant_universe(&mut sim), Ok(()));
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose final recovery never ran the oracle must give up, not pass");
+    assert!(
+        reason.contains("the final recovery never ran the oracle"),
+        "and it must be THIS give-up: {reason}"
     );
 }
 

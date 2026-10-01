@@ -537,6 +537,14 @@ fn is_injected(text: &str) -> bool {
     )
 }
 
+/// How many reopens the final verification gets before the universe gives
+/// up. Every attempt either verifies or dies to injected fault fallout, so a
+/// larger budget costs time only in universes that would otherwise have
+/// concluded nothing. 8 -> 16 took this property's give-ups from 147 to 86
+/// over four bases for +11% CPU; 32 left 50 for +28%, over the +25% a budget
+/// may cost (2026-10-01).
+const FINAL_ATTEMPTS: u32 = 16;
+
 /// One universe: recover → verify against the oracle → mixed commits and
 /// aborts → random checkpoint → crash, everything seeded.
 fn tx_workload(sim: &mut Sim) -> Result<(), String> {
@@ -561,9 +569,19 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(43 + entropy.next_u64() % 346);
+        // Every error a recovery meets is classified, as in the final loop
+        // below. A store redb rejects never reaches here: `Db::open` discards
+        // and rebuilds it from the log itself, so what comes out is either an
+        // injected fault (the round restarts) or a real error, which fails
+        // the universe by name rather than restarting past it.
         let mut db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
-            Err(_) => {
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!(
+                        "round recovery failed with a non-injected error: {e}"
+                    ));
+                }
                 sim.restart();
                 continue;
             }
@@ -577,8 +595,14 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             // recovery, by the WAL convention (see
             // `checks::durable_corruption_fired`); ending the universe here
             // keeps the strong oracle standing everywhere corruption did
-            // not fire.
+            // not fire. Ending it is a give-up, never a pass: nothing past
+            // the loss is adjudicated.
             if charpente_sim::checks::durable_corruption_fired(sim) {
+                sim.give_up(format!(
+                    "durable corruption cut acknowledged transactions at a round's recovery \
+                     ({committed} acknowledged, {recovered} recovered), so durability was not \
+                     adjudicated and the rounds after it never ran"
+                ));
                 return Ok(());
             }
             return Err(format!(
@@ -601,7 +625,12 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
                     continue;
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!(
+                        "round snapshot failed with a non-injected error: {e}"
+                    ));
+                }
                 sim.restart();
                 continue;
             }
@@ -744,9 +773,9 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
     // WAL's read-only final recovery it needs a long fault-free streak of
     // writes; under persistent injected faults it may legitimately never
     // succeed (seed 0x4cea828a65f0f1eb). Injected-fault failures skip the
-    // final check — the oracle still runs at every successful open across
-    // the universe set — but any other open error is a real bug.
-    for _attempt in 0..8 {
+    // final check, and a universe in which every attempt was skipped gives
+    // up; any other open error is a real bug.
+    for _attempt in 0..FINAL_ATTEMPTS {
         let db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(e) => {
@@ -761,8 +790,14 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
         };
         let recovered = db.last_applied().map_or(0, |s| s + 1);
         if recovered < committed {
-            // Same excuse-only-if-injected routing as the round loop above.
+            // Same excuse-only-if-injected routing, and give-up, as the round
+            // loop above.
             if charpente_sim::checks::durable_corruption_fired(sim) {
+                sim.give_up(format!(
+                    "durable corruption cut acknowledged transactions at the final recovery \
+                     ({committed} acknowledged, {recovered} recovered), so the final state was \
+                     never checked"
+                ));
                 return Ok(());
             }
             return Err(format!(
@@ -771,7 +806,12 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
         }
         let snap = match db.snapshot() {
             Ok(snap) => snap,
-            Err(_) => {
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!(
+                        "final snapshot failed with a non-injected error: {e}"
+                    ));
+                }
                 sim.restart();
                 continue;
             }
@@ -826,8 +866,20 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             Err(msg) => Err(msg),
         };
     }
-    Ok(()) // every attempt died to injected faults; earlier rounds verified every reachable prefix
+    sim.give_up(format!(
+        "the final verification never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, \
+         so the last round's commits were never checked"
+    ));
+    Ok(())
 }
+
+/// The give-up cap. This base is ambient, so the count moves batch to batch,
+/// and the cap is a margin, not a measurement: over 10 fresh batches (16 final
+/// attempts) it gave up 16-31 times, mean 22.5, and the cap is twice that
+/// maximum, about 7 standard deviations above the mean. It guards drift toward
+/// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
+/// up 35-38 times, under it.
+const TX_GAVE_UP_CEILING: u64 = 62;
 
 #[test]
 fn transactions_survive_the_fault_matrix() {
@@ -844,8 +896,80 @@ fn transactions_survive_the_fault_matrix() {
             "restart",
             "batch:multi_record",
             "batch:multi_record_faulted",
-        ]
+        ],
+        ceiling: [("universe:gave-up", TX_GAVE_UP_CEILING)]
     );
+}
+
+/// A universe whose final verification never ran adjudicated nothing about
+/// its last round, so it gives up rather than passing (LEDGER 2026-09-30,
+/// follow-up 9). Every disk op faults here, so every attempt dies to injected
+/// faults.
+#[test]
+fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x7A00_0901, FaultConfig::none());
+    assert_eq!(tx_workload(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x7A00_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert_eq!(tx_workload(&mut sim), Ok(()));
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose final verification never ran must give up, not pass");
+    assert!(
+        reason.contains("the final verification never ran"),
+        "and it must be THIS give-up: {reason}"
+    );
+}
+
+/// Acknowledged transactions cut by durable corruption are the sanctioned
+/// single-node loss, so the durability oracle cannot run past them: the
+/// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
+/// rule for every arm that ends a universe without a verdict). Seed
+/// `0x902dd63b08e51d75` meets it at a round's recovery (base `0x5E1F_0006`),
+/// seed `0x671991ebc8bd4f24` at the final one.
+#[test]
+fn acked_transactions_cut_by_durable_corruption_give_up_rather_than_pass() {
+    for (seed, arm) in [
+        (0x902d_d63b_08e5_1d75_u64, "at a round's recovery"),
+        (0x6719_91eb_c8bd_4f24, "at the final recovery"),
+    ] {
+        let mut state = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        let mut sim = Sim::with_faults(seed, cfg);
+
+        assert_eq!(tx_workload(&mut sim), Ok(()), "seed {seed:#x}");
+        assert!(
+            charpente_sim::checks::durable_corruption_fired(&sim),
+            "seed {seed:#x}"
+        );
+        let reason = sim.gave_up().unwrap_or_else(|| {
+            panic!(
+                "seed {seed:#x}: acked transactions lost to durable corruption must give up, \
+                 not pass"
+            )
+        });
+        assert!(
+            reason.contains("durable corruption cut acknowledged transactions")
+                && reason.contains(arm),
+            "seed {seed:#x} must give up {arm}: {reason}"
+        );
+    }
 }
 
 #[test]
@@ -1123,6 +1247,13 @@ fn regression_store_bricked_by_creation_crash() {
         Ok(()),
         "seed 0xf79c40a51bb93ae8 no longer recovers a store bricked at creation"
     );
+    // `Ok` alone is also what a give-up returns: recovering means the rebuilt
+    // store went on to be checked.
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "seed 0xf79c40a51bb93ae8 must reach a verdict on the rebuilt store, not give up"
+    );
     let discards = seen.lock().expect("witness lock").discards.clone();
     assert!(
         discards.contains(&Discard::Garbage),
@@ -1130,6 +1261,63 @@ fn regression_store_bricked_by_creation_crash() {
          (a non-empty store without redb's magic number); its discards were {discards:?}. A \
          seed names a universe, not a scenario: re-find one that reaches this reason (hard \
          rule 3)"
+    );
+}
+
+/// A disk whose first listing of the log fails with an error that names no
+/// injected fault: the stand-in for a real platform error at recovery.
+struct LogListingFailsOnce {
+    inner: charpente_sim::SimDisk,
+    failed: Arc<Mutex<bool>>,
+}
+
+impl Disk for LogListingFailsOnce {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        self.inner.open(path)
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let mut failed = self.failed.lock().expect("listing lock");
+        if prefix.starts_with("wal") && !*failed {
+            *failed = true;
+            return Err(io::Error::other("the log directory could not be listed"));
+        }
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+/// A round's recovery that fails with an error naming no injected fault fails
+/// the universe by name. It used to restart past it (`Err(_) => restart`), and
+/// the next round's recovery then succeeded, so the universe passed over an
+/// error it never classified (sweep, 2026-10-01).
+#[test]
+fn a_non_injected_error_at_a_rounds_recovery_fails_the_universe() {
+    let mut sim = Sim::with_faults(0x7A0F_0001, FaultConfig::none());
+    let failed = Arc::new(Mutex::new(false));
+    let flag = failed.clone();
+    let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
+        Box::new(LogListingFailsOnce {
+            inner: sim.disk(),
+            failed: flag.clone(),
+        })
+    });
+    assert!(
+        *failed.lock().expect("listing lock"),
+        "the listing never failed"
+    );
+    let err = result.expect_err("a non-injected recovery error must fail the universe");
+    assert!(
+        err.contains("round recovery failed with a non-injected error")
+            && err.contains("the log directory could not be listed"),
+        "it must fail at the round's recovery, by name: {err}"
     );
 }
 

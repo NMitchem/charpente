@@ -1268,6 +1268,14 @@ fn is_injected(text: &str) -> bool {
     )
 }
 
+/// How many reopens the final verification gets before the universe gives
+/// up. Every attempt either verifies or dies to injected fault fallout, so a
+/// larger budget costs time only in universes that would otherwise have
+/// concluded nothing. 8 -> 16 took this property's give-ups from 129 to 62
+/// over four bases for +12% CPU; 32 left 38 for +24.5%, with two of the four
+/// bases over the +25% a budget may cost (2026-10-01).
+const FINAL_ATTEMPTS: u32 = 16;
+
 /// One universe: recover → verify → requests through App::handle (an acked
 /// 200 must survive anything) → crash. A 500 whose body is not an injected
 /// fault is a real bug and fails the universe. Returns every (status, body)
@@ -1298,8 +1306,14 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             // WAL file above the checkpoint horizon is silently cut at
             // recovery, by the WAL convention (see
             // `checks::durable_corruption_fired`); the strong oracle stands
-            // in every universe where corruption did not fire.
+            // in every universe where corruption did not fire. Excused is a
+            // give-up, never a pass: nothing past the loss is adjudicated.
             if charpente_sim::checks::durable_corruption_fired(sim) {
+                sim.give_up(format!(
+                    "durable corruption cut acknowledged requests at a round's recovery \
+                     ({acked} acked over HTTP, {recovered} recovered), so durability was not \
+                     adjudicated and the rounds after it never ran"
+                ));
                 return Ok(responses);
             }
             return Err(format!(
@@ -1363,8 +1377,9 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     }
 
     // Final verification (step-4 convention): injected-fault failures skip,
-    // anything else is real.
-    for _attempt in 0..8 {
+    // anything else is real, and a universe in which every attempt was
+    // skipped gives up.
+    for _attempt in 0..FINAL_ATTEMPTS {
         let app = match open_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
@@ -1379,8 +1394,14 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
         };
         let recovered = app.db().last_applied().map_or(0, |s| s + 1);
         if recovered < acked {
-            // Same excuse-only-if-injected routing as the round loop above.
+            // Same excuse-only-if-injected routing, and give-up, as the round
+            // loop above.
             if charpente_sim::checks::durable_corruption_fired(sim) {
+                sim.give_up(format!(
+                    "durable corruption cut acknowledged requests at the final recovery \
+                     ({acked} acked over HTTP, {recovered} recovered), so the final state was \
+                     never checked"
+                ));
                 return Ok(responses);
             }
             return Err(format!(
@@ -1396,12 +1417,24 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             Err(msg) => return Err(msg),
         }
     }
-    Ok(responses) // every attempt died to injected faults; earlier rounds verified every reachable prefix
+    sim.give_up(format!(
+        "the final verification never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, \
+         so the last round's acked requests were never checked"
+    ));
+    Ok(responses)
 }
 
 fn http_workload(sim: &mut Sim) -> Result<(), String> {
     http_workload_traced(sim).map(|_| ())
 }
+
+/// The give-up cap. This base is ambient, so the count moves batch to batch,
+/// and the cap is a margin, not a measurement: over 10 fresh batches (16 final
+/// attempts) it gave up 10-28 times, mean 17.6, and the cap is twice that
+/// maximum, about 7 standard deviations above the mean. It guards drift toward
+/// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
+/// up 30-35 times, under it.
+const HTTP_GAVE_UP_CEILING: u64 = 56;
 
 #[test]
 fn http_requests_survive_the_fault_matrix() {
@@ -1416,8 +1449,78 @@ fn http_requests_survive_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
-        ]
+        ],
+        ceiling: [("universe:gave-up", HTTP_GAVE_UP_CEILING)]
     );
+}
+
+/// A universe whose final verification never ran adjudicated nothing about
+/// its last round, so it gives up rather than passing (LEDGER 2026-09-30,
+/// follow-up 9). Every disk op faults here, so every attempt dies to injected
+/// faults.
+#[test]
+fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0x4770_0901, FaultConfig::none());
+    assert_eq!(http_workload(&mut control), Ok(()));
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let mut sim = Sim::with_faults(
+        0x4770_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    assert!(http_workload_traced(&mut sim).is_ok());
+    let reason = sim
+        .gave_up()
+        .expect("a universe whose final verification never ran must give up, not pass");
+    assert!(
+        reason.contains("the final verification never ran"),
+        "and it must be THIS give-up: {reason}"
+    );
+}
+
+/// Acknowledged requests cut by durable corruption are the sanctioned
+/// single-node loss, so the durability oracle cannot run past them: the
+/// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
+/// rule for every arm that ends a universe without a verdict). Seed
+/// `0x231a841f396a7d80` meets it at a round's recovery (base `0x5300_0009`),
+/// seed `0x3f2a17e8c2fe469e` at the final one (base `0x5E1F_0001`).
+#[test]
+fn acked_requests_cut_by_durable_corruption_give_up_rather_than_pass() {
+    for (seed, arm) in [
+        (0x231a_841f_396a_7d80_u64, "at a round's recovery"),
+        (0x3f2a_17e8_c2fe_469e, "at the final recovery"),
+    ] {
+        let mut state = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        let mut sim = Sim::with_faults(seed, cfg);
+
+        assert!(http_workload_traced(&mut sim).is_ok(), "seed {seed:#x}");
+        assert!(
+            charpente_sim::checks::durable_corruption_fired(&sim),
+            "seed {seed:#x}"
+        );
+        let reason = sim.gave_up().unwrap_or_else(|| {
+            panic!(
+                "seed {seed:#x}: acked requests lost to durable corruption must give up, not pass"
+            )
+        });
+        assert!(
+            reason.contains("durable corruption cut acknowledged requests") && reason.contains(arm),
+            "seed {seed:#x} must give up {arm}: {reason}"
+        );
+    }
 }
 
 #[test]

@@ -7056,15 +7056,17 @@ const CONV_MAX_RESTARTS: u32 = 64;
 /// verb, and a direct caller owns the `Disk` it passed. So the remedy this
 /// property exercises is the one `restore`'s own failure text names: re-run
 /// against the same directory, which converges because `Seeder::new`
-/// discards rather than resumes.
-const CONV_RESTORE_ATTEMPTS: u32 = 32;
+/// discards rather than resumes. 32 until 2026-10-01; 64 restores one more
+/// universe at the unscoped base for no measurable CPU (`CONV_RESTORED_FLOOR`).
+const CONV_RESTORE_ATTEMPTS: u32 = 64;
 
 /// Attempts at reading the verdict off a destination that is already
 /// restored. Separate from `CONV_RESTORE_ATTEMPTS` because it answers a
 /// different question: not "did restore complete" but "did the CHECKER get a
 /// clean read", and the fault it retries is `read_error`, which the axis's
-/// own doc calls transient.
-const CONV_VERIFY_ATTEMPTS: u32 = 32;
+/// own doc calls transient. 32 until 2026-10-01; 64 verifies 2 and 4 more
+/// universes at the two bases for no measurable CPU (`CONV_RESTORED_FLOOR`).
+const CONV_VERIFY_ATTEMPTS: u32 = 64;
 
 /// The base seed `archive_converges` runs from. Explicit, like
 /// `replication.rs`'s `0x2EB1_*` family.
@@ -7288,9 +7290,18 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 160 | 172 | 237 |
 /// | `CONV_SCOPED_CHAINED_FLOOR` | 153 | 163 | 161 |
 ///
+/// **Raised 2026-10-01 with the restore and verify budgets**
+/// (`CONV_RESTORE_ATTEMPTS` and `CONV_VERIFY_ATTEMPTS`, 32 -> 64). 3 and 4 more
+/// universes restore and verify at the two bases, so the two `restored` floors
+/// move up to their new counts, 234 -> 237 and 236 -> 240; no other floor's
+/// count moved. The unscoped base's 19 universes without a verdict are now
+/// `nothing_published` 4, `verify_never_read_cleanly` 13 and
+/// `restore_never_completed` 2; the scoped base's 16 are 6 and 10 and 0. A
+/// larger manifest-read budget rescued none of the `nothing_published` ones.
+///
 /// `restored_substantial` can exceed `restored`: it is covered once the
 /// manifest's frontier is known, before the restore and its verification run.
-const CONV_RESTORED_FLOOR: u64 = 234;
+const CONV_RESTORED_FLOOR: u64 = 237;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 235;
 const CONV_CHAINED_FLOOR: u64 = 170;
 
@@ -7327,9 +7338,15 @@ const CONV_CHAINED_FLOOR: u64 = 170;
 /// Re-measured 2026-09-30 for redb 4.3.0 with the three above; the table and
 /// the reason are at `CONV_RESTORED_FLOOR`.
 const ARCHIVE_SCOPED_CONVERGENCE_BASE: u64 = 0xA2C0_5C09;
-const CONV_SCOPED_RESTORED_FLOOR: u64 = 236;
+const CONV_SCOPED_RESTORED_FLOOR: u64 = 240;
 const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 237; // 164, then 160 after the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
 const CONV_SCOPED_CHAINED_FLOOR: u64 = 161;
+
+/// The give-up caps, exact at the two pinned bases: 19 and 16 of 256 universes
+/// gave up in two identical batches each (the breakdown is at
+/// `CONV_RESTORED_FLOOR`).
+const CONV_GAVE_UP_CEILING: u64 = 19;
+const CONV_SCOPED_GAVE_UP_CEILING: u64 = 16;
 
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that
@@ -8222,6 +8239,10 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
         Some(db) => db,
         None => {
             sim.cover("archive:source_never_opened");
+            sim.give_up(
+                "the source never opened: every attempt hit injected faults, so nothing was \
+                 archived or restored",
+            );
             return Ok(());
         }
     };
@@ -8578,6 +8599,10 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
     conv_settle(&store);
     let Some(m) = conv_read_manifest(&store, 16) else {
         sim.cover("archive:nothing_published");
+        sim.give_up(
+            "no manifest was ever read back from the archive, so there was no frontier to \
+             restore to",
+        );
         return Ok(());
     };
     let f = conv_frontier(&m);
@@ -8606,6 +8631,9 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
 
     let Some(report) = conv_restore_into(sim, &store, "dst", false, mode)? else {
         sim.cover("archive:restore_never_completed");
+        sim.give_up(
+            "the restore never completed past injected faults, so nothing restored was checked",
+        );
         return Ok(());
     };
     if report.applied_seq != f {
@@ -8648,6 +8676,10 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
     }
     if !verified {
         sim.cover("archive:verify_never_read_cleanly");
+        sim.give_up(format!(
+            "the restored destination never read cleanly in {CONV_VERIFY_ATTEMPTS} attempts, so \
+             the restore was never verified"
+        ));
         return Ok(());
     }
     sim.cover("archive:restored");
@@ -8885,7 +8917,8 @@ fn archive_converges() {
             ("archive:restored", CONV_RESTORED_FLOOR),
             ("archive:restored_substantial", CONV_SUBSTANTIAL_FLOOR),
             ("archive:chained", CONV_CHAINED_FLOOR),
-        ]
+        ],
+        ceiling: [("universe:gave-up", CONV_GAVE_UP_CEILING)]
     );
 }
 
@@ -8934,8 +8967,89 @@ fn archive_converges_with_a_scoped_table() {
             ("archive:restored", CONV_SCOPED_RESTORED_FLOOR),
             ("archive:restored_substantial", CONV_SCOPED_SUBSTANTIAL_FLOOR),
             ("archive:chained", CONV_SCOPED_CHAINED_FLOOR),
-        ]
+        ],
+        ceiling: [("universe:gave-up", CONV_SCOPED_GAVE_UP_CEILING)]
     );
+}
+
+/// Rebuilds a universe of `archive_converges` exactly as the swarm runner
+/// derives it: sampled config, extended fields, then the property's adjust.
+fn conv_swarm_sim(seed: u64) -> Sim {
+    let mut state = seed;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(seed, &mut cfg);
+    no_media_corruption_on_either_side(&mut cfg);
+    Sim::with_faults(seed, cfg)
+}
+
+/// Each of the four arms that ends a convergence universe before the oracle
+/// ran gives up rather than passing, and keeps its own coverage key beside
+/// the give-up (LEDGER 2026-09-30, follow-up 9). The source arm is forced (every
+/// disk op faults); the other three are universes of `archive_converges`'s
+/// pinned base, found by printing each arm's seed over that batch.
+#[test]
+fn every_convergence_arm_that_reaches_no_verdict_gives_up() {
+    // Control: the same seed with no faults reaches a verdict.
+    let mut control = Sim::with_faults(0xA2C0_0901, FaultConfig::none());
+    assert_eq!(
+        archive_convergence_universe(&mut control, ConvMode::Unscoped),
+        Ok(())
+    );
+    assert_eq!(
+        control.gave_up(),
+        None,
+        "a fault-free universe reaches a verdict"
+    );
+
+    let source = Sim::with_faults(
+        0xA2C0_0901,
+        FaultConfig {
+            read_error: 1.0,
+            write_error: 1.0,
+            sync_error: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let cases = [
+        (
+            source,
+            "archive:source_never_opened",
+            "the source never opened",
+        ),
+        (
+            conv_swarm_sim(0x30ca_c479_4b7a_961b),
+            "archive:nothing_published",
+            "no manifest was ever read back",
+        ),
+        (
+            conv_swarm_sim(0x7cc5_c550_10b6_4fd8),
+            "archive:restore_never_completed",
+            "the restore never completed",
+        ),
+        (
+            conv_swarm_sim(0x5228_c3f6_c429_ed5e),
+            "archive:verify_never_read_cleanly",
+            "the restored destination never read cleanly",
+        ),
+    ];
+    for (mut sim, key, why) in cases {
+        let seed = sim.seed();
+        assert_eq!(
+            archive_convergence_universe(&mut sim, ConvMode::Unscoped),
+            Ok(()),
+            "seed {seed:#x}"
+        );
+        assert!(
+            sim.coverage().contains_key(key),
+            "seed {seed:#x} must still end at {key}, or it no longer pins that arm: {:?}",
+            sim.coverage()
+        );
+        let reason = sim
+            .gave_up()
+            .unwrap_or_else(|| panic!("seed {seed:#x} ended at {key} and must give up, not pass"));
+        assert!(reason.contains(why), "seed {seed:#x}: {reason}");
+    }
 }
 
 /// The budget pin. `CONV_RECORDS_PER_SEGMENT` is what the outage window and
