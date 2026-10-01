@@ -15,7 +15,7 @@ use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::JobRow;
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Id, Snapshot, Store, UNSCOPED, View};
+use charpente_core::table::{Codec, Id, Snapshot, Store, StoreRejected, UNSCOPED, View};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
@@ -423,18 +423,6 @@ fn store_matches_model(
     Ok(())
 }
 
-/// The one place this test decides that redb rejected the store's durable
-/// bytes, as opposed to failing to read them: the magic-number check a torn
-/// creation fails (redb 4.3.0 reports it as an `Io` error), and `Corrupted`,
-/// its verdict on any other mangled header or page. Neither can carry an
-/// injected fault's text, since redb writes both about bytes it read. Text,
-/// because `Store::open` gives the two no kind of their own yet; LEDGER
-/// 2026-09-30 follow-up 21 adds one, and this function is what changes then.
-fn redb_rejected_the_bytes(e: &io::Error) -> bool {
-    let text = e.to_string();
-    text.contains("Not a redb database: magic number mismatch") || text.contains("DB corrupted: ")
-}
-
 /// What one recovery of the store and the log came to.
 enum Recovered {
     /// Recovered and checked against the model: the round may write.
@@ -467,13 +455,14 @@ fn recover_and_check(
         let disk = sim.disk();
         let store = match Store::open(&disk, "tables.redb") {
             Ok(store) => store,
-            // `Db::open`'s discard branch, mirrored for the one state it
-            // exists for: redb rejecting the store's durable bytes, as when a
-            // crash tears the store's creation (seed 0x1f733f8d9eebf822 there,
-            // 0x5fc2c8c0905ed653 here). Any other refusal is not the log's
-            // materialization gone bad: an injected fault is fallout and the
-            // round restarts below, and anything else fails the universe.
-            Err(e) if redb_rejected_the_bytes(&e) => {
+            // `Db::open`'s discard branch, mirrored by the same typed test:
+            // `StoreRejected` is redb's verdict on the store's durable bytes
+            // (not a redb file, corrupted, or a format needing an upgrade), as
+            // when a crash tears the store's creation (seed 0x1f733f8d9eebf822
+            // there, 0x5fc2c8c0905ed653 here). Any other error is not the
+            // log's materialization gone bad: an injected fault is fallout and
+            // the round restarts below, and anything else fails the universe.
+            Err(e) if StoreRejected::of(&e).is_some() => {
                 rejected.push(e.to_string());
                 // `Db::open` refuses to rebuild once the log is compacted past
                 // seq 0. This workload never GCs its WAL, so the log always
@@ -631,7 +620,7 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
 /// The full step-4-preview loop: WAL is the truth, the store materializes it,
 /// crash anywhere, recovery replays the gap. redb runs over the fault-
 /// injecting disk throughout. Returns the text of every store open that
-/// `redb_rejected_the_bytes`, each of which sent the round down the rebuild.
+/// redb rejected (`StoreRejected`), each of which sent the round down the rebuild.
 fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
     let entropy = sim.entropy();
     let mut rejected: Vec<String> = Vec::new();
@@ -900,14 +889,15 @@ fn a_store_redb_finds_corrupted_is_rebuilt_and_checked() {
     );
 }
 
-/// The rebuild is only for bytes redb rejects as not a database or as
-/// corrupted. A store redb refuses for any other reason is not the log's
-/// materialization gone bad, so discarding it could lose data, and the
-/// universe fails with redb's text. The refusal here is a real one: the store's
-/// first transaction slot claims file format version 1, which redb checks
-/// before the slot's checksum and answers with `UpgradeRequired`.
+/// The rebuild's third trigger, as in `Db::open`: redb's `UpgradeRequired`,
+/// here for a store whose first transaction slot claims file format version 1,
+/// which redb checks before the slot's checksum. Such a store may be intact,
+/// but this workload's log always reaches seq 0, so the rebuild loses nothing,
+/// and the universe reaches a verdict. (Until follow-up 21 gave the verdict a
+/// type, this pinned the opposite: a failure, because the text test knew only
+/// the magic mismatch and `Corrupted`.)
 #[test]
-fn a_store_redb_refuses_for_another_reason_is_not_rebuilt() {
+fn a_store_in_an_older_redb_format_is_rebuilt_and_checked() {
     let mut sim = Sim::with_faults(0x7AB1_0902, FaultConfig::none());
     drop(Store::open(&sim.disk(), "tables.redb").unwrap());
     let file = sim.disk().open("tables.redb").unwrap();
@@ -920,14 +910,24 @@ fn a_store_redb_refuses_for_another_reason_is_not_rebuilt() {
     file.sync().unwrap();
     drop(file);
 
-    let err = tables_workload(&mut sim).expect_err("a store redb refuses must fail the universe");
+    let rejected =
+        tables_workload_traced(&mut sim).expect("a store in an older redb format is rebuilt");
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
     assert!(
-        err.contains("failed non-injected") && err.contains("Manual upgrade required"),
-        "with redb's own text: {err}"
+        rejected[0].contains(
+            "Manual upgrade required. Expected file format version 3, but file is version 1"
+        ),
+        "{rejected:?}"
     );
-    assert!(
-        !sim.coverage().contains_key("tables:store-rebuilt"),
-        "and it must not be rebuilt"
+    assert_eq!(
+        sim.coverage().get("tables:store-rebuilt"),
+        Some(&1),
+        "the rebuild must complete"
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "and the rebuilt store must be checked against the model"
     );
 }
 
