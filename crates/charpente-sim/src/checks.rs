@@ -222,12 +222,13 @@ pub fn acked_implies_durable(
 /// Calls `boot`; when it fails with an error `is_fallout` accepts (injected
 /// fault fallout, by the caller's own classifier), calls it again, up to
 /// `tries` boots in all. Each retry marks `boot:retried`. A retry after an
-/// injected IO error boots in place, as a restarted process does: the page
-/// cache survives a process exit, and an armed crash countdown keeps
-/// counting. A retry after a crash power-cycles first (`Sim::restart`), since
-/// the disk is gone until then. Power-cycling after every failure instead
-/// would turn each injected IO error into a crash, collapsing unsynced writes
-/// and rolling the restart-time bit flip, which no restarted process does.
+/// injected IO error restarts the process first (`Sim::restart_process`): the
+/// failed boot's handles die, the page cache survives, and an armed crash
+/// countdown keeps counting. A retry after a crash power-cycles first
+/// (`Sim::restart`), since the disk is gone until then. Power-cycling after
+/// every failure instead would turn each injected IO error into a crash,
+/// collapsing unsynced writes and rolling the restart-time bit flip, which no
+/// restarted process does.
 ///
 /// - `Ok(Some(t))`: the first boot that succeeded.
 /// - `Ok(None)`: every boot met fallout (marked `boot:exhausted`), and the sim
@@ -261,6 +262,8 @@ pub fn boot_through_fallout<T, E: std::fmt::Display>(
             sim.cover("boot:retried");
             if sim.disk_crashed() {
                 sim.restart();
+            } else {
+                sim.restart_process();
             }
         }
         match boot() {
@@ -631,10 +634,11 @@ mod tests {
     }
 
     /// The outcomes, each with what it leaves on the universe: a boot that
-    /// clears after two injected IO errors returns it, booted in place with no
-    /// power cycle; one whose disk crashed is power-cycled before the next
-    /// boot; one that never clears returns `None`, marked and with no give-up
-    /// of its own; a non-fallout error comes back at once, unchanged.
+    /// clears after two injected IO errors returns it, after two process
+    /// restarts and no power cycle; one whose disk crashed is power-cycled
+    /// before the next boot; one that never clears returns `None`, marked and
+    /// with no give-up of its own; a non-fallout error comes back at once,
+    /// unchanged.
     #[test]
     fn boot_through_fallout_boots_again_and_power_cycles_only_a_crashed_disk() {
         let sim = Sim::new(0xB007);
@@ -655,6 +659,11 @@ mod tests {
             sim.coverage().get("restart"),
             None,
             "an IO error is no crash"
+        );
+        assert_eq!(
+            sim.coverage().get("restart:process"),
+            Some(&2),
+            "each retry after an IO error restarts the process, so the failed boot's handles die"
         );
         assert_eq!(sim.gave_up(), None);
 

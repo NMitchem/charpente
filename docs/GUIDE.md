@@ -2634,9 +2634,9 @@ for these before hand-rolling the same logic a fourth time:
   — boots the way a supervised process does: `boot`, and on an error your
   `is_fallout` accepts, boot again, `tries` boots in all (each retry marks
   `boot:retried`, and running out marks `boot:exhausted`). A retry after an
-  injected IO error boots in place, as a restarted process would; a retry
-  after a crash power-cycles first (`sim.restart()`, when `Sim::disk_crashed`
-  says the disk is gone).
+  injected IO error restarts the process first (`sim.restart_process()`, so
+  the page cache survives); a retry after a crash power-cycles first
+  (`sim.restart()`, when `Sim::disk_crashed` says the disk is gone).
   `Ok(Some(t))` is the first clean boot, `Err(e)` the first error that is not
   fallout, unchanged, and `Ok(None)` means every boot met fallout. What `None`
   means is yours to say: a workload whose only node never came up gives up by
