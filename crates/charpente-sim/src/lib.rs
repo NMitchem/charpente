@@ -2358,15 +2358,22 @@ mod tests {
                 .contains("predates a simulated restart"),
             "the dead process's handle must not reach the disk"
         );
+        let reopened = disk.open("f").unwrap();
+        assert_eq!(
+            reopened.len().unwrap(),
+            8,
+            "a process restart keeps the page cache: the unsynced write is still there"
+        );
         let mut buf = [0u8; 8];
-        disk.open("f").unwrap().read_at(0, &mut buf).unwrap();
+        reopened.read_at(0, &mut buf).unwrap();
         assert_eq!(
             &buf, b"unsynced",
             "a process restart keeps the page cache: the next process reads the unsynced write back"
         );
         assert_eq!(
             disk.list("").unwrap(),
-            vec!["f".to_string(), "g".to_string()]
+            vec!["f".to_string(), "g".to_string()],
+            "a process restart keeps a directory entry that was never made durable"
         );
         let coverage = sim.coverage();
         assert_eq!(coverage.get("restart:process"), Some(&1));
