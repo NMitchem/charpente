@@ -71,8 +71,9 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
 - Replay one universe: `CHARPENTE_SEED=0x… cargo test -p <crate> --test <file> --
   --nocapture`. Every sim failure prints this exact repro line — paste it verbatim.
   `CHARPENTE_SEED` replays **one universe, not the batch**, so every coverage
-  requirement is skipped — `floor:` as well as `require:`. A green replay says that seed
-  passes; it says nothing about any rate, and it cannot be used as evidence a floor holds.
+  requirement is skipped — `floor:` and `ceiling:` as well as `require:`. A green replay says that seed
+  passes; it says nothing about any rate, and it cannot be used as evidence a floor or a
+  ceiling holds.
 - App-level sim batch: `cargo run -p charpente-cli -- test --sim [--universes N]
   [--seed 0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json]
   [--dir PATH]` — dogfood target `--dir crates/sim-fixture`. Exit 0 green, 1 failures,

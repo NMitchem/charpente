@@ -2407,10 +2407,15 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   Failures outrank give-ups.
 - It also marks the coverage key `universe:gave-up` — once per universe, not
   once per call — so a give-up *rate* is counted like any other sometimes-key,
-  and it cross-checks the reported count exactly. The platform's own swarm
-  suites cap it: `ceiling: [("universe:gave-up", N)]` on
-  `run_universes_swarm!`/`run_universes_swarm_with!` fails the batch when more
-  than N universes gave up, naming the key, the count and the cap. A give-up is
+  and it cross-checks the reported count exactly. `ceiling:
+  [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
+  caps it: the batch fails when more than N universes gave up, naming the key,
+  the count and the cap. Nine of the platform's own 31 swarm properties carry
+  one: kernel's exactly-once and job-tenancy properties, and the flagship
+  properties of tenant, transactions, http, group_commit, typed_tables and
+  archive's two convergence properties. The rest (realtime, replication,
+  migrations, auth, the WAL suite, and kernel's job-shape property) carry none
+  yet, so a drift in their give-up rates is visible only in the split. A give-up is
   reported and never failed, so without a cap a property can drift toward
   adjudicating nothing with every batch green; a floor on the key would bound
   give-ups from below, which guards nothing.
