@@ -569,9 +569,19 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(43 + entropy.next_u64() % 346);
+        // Every error a recovery meets is classified, as in the final loop
+        // below. A store redb rejects never reaches here: `Db::open` discards
+        // and rebuilds it from the log itself, so what comes out is either an
+        // injected fault (the round restarts) or a real error, which fails
+        // the universe by name rather than restarting past it.
         let mut db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
-            Err(_) => {
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!(
+                        "round recovery failed with a non-injected error: {e}"
+                    ));
+                }
                 sim.restart();
                 continue;
             }
@@ -615,7 +625,12 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
                     continue;
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!(
+                        "round snapshot failed with a non-injected error: {e}"
+                    ));
+                }
                 sim.restart();
                 continue;
             }
@@ -791,7 +806,12 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
         }
         let snap = match db.snapshot() {
             Ok(snap) => snap,
-            Err(_) => {
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!(
+                        "final snapshot failed with a non-injected error: {e}"
+                    ));
+                }
                 sim.restart();
                 continue;
             }
@@ -1213,6 +1233,63 @@ fn regression_store_bricked_by_creation_crash() {
          (a non-empty store without redb's magic number); its discards were {discards:?}. A \
          seed names a universe, not a scenario: re-find one that reaches this reason (hard \
          rule 3)"
+    );
+}
+
+/// A disk whose first listing of the log fails with an error that names no
+/// injected fault: the stand-in for a real platform error at recovery.
+struct LogListingFailsOnce {
+    inner: charpente_sim::SimDisk,
+    failed: Arc<Mutex<bool>>,
+}
+
+impl Disk for LogListingFailsOnce {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        self.inner.open(path)
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let mut failed = self.failed.lock().expect("listing lock");
+        if prefix.starts_with("wal") && !*failed {
+            *failed = true;
+            return Err(io::Error::other("the log directory could not be listed"));
+        }
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+/// A round's recovery that fails with an error naming no injected fault fails
+/// the universe by name. It used to restart past it (`Err(_) => restart`), and
+/// the next round's recovery then succeeded, so the universe passed over an
+/// error it never classified (sweep, 2026-10-01).
+#[test]
+fn a_non_injected_error_at_a_rounds_recovery_fails_the_universe() {
+    let mut sim = Sim::with_faults(0x7A0F_0001, FaultConfig::none());
+    let failed = Arc::new(Mutex::new(false));
+    let flag = failed.clone();
+    let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
+        Box::new(LogListingFailsOnce {
+            inner: sim.disk(),
+            failed: flag.clone(),
+        })
+    });
+    assert!(
+        *failed.lock().expect("listing lock"),
+        "the listing never failed"
+    );
+    let err = result.expect_err("a non-injected recovery error must fail the universe");
+    assert!(
+        err.contains("round recovery failed with a non-injected error")
+            && err.contains("the log directory could not be listed"),
+        "it must fail at the round's recovery, by name: {err}"
     );
 }
 
