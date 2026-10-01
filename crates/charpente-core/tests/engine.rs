@@ -3587,6 +3587,69 @@ fn redbs_verdicts_on_the_bytes_are_rejections_by_reason() {
     );
 }
 
+/// A store cut below redb's 320-byte header with its magic number intact
+/// (review M1). redb reads the header past the end of the file, so the error
+/// is the disk's and redb built no verdict: not a rejection, and `Db::open`
+/// keeps the file. But no restart fixes it, and no crash leaves it, since redb
+/// makes the file's length durable before it writes the magic, so the text
+/// names the file, the cut and the fix in place of "restart to retry". The
+/// fix it names holds: with the file removed, the next boot rebuilds the
+/// store from the log.
+#[test]
+fn a_store_cut_shorter_than_redbs_header_is_named_kept_and_fixed_by_removal() {
+    for len in [9u64, 100, 319] {
+        let sim = Sim::with_faults(0x5E5F_E002, FaultConfig::none());
+        let cfg = DbConfig::default();
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), Schema::new()).unwrap();
+            db.checkpoint().unwrap();
+        }
+        let file = sim.disk().open(&cfg.store_path).unwrap();
+        file.set_len(len).unwrap();
+        file.sync().unwrap();
+        drop(file);
+
+        let e = Store::open(&sim.disk(), &cfg.store_path)
+            .err()
+            .expect("a store shorter than redb's header must not open");
+        assert!(
+            StoreRejected::of(&e).is_none(),
+            "{len} bytes: a read past the end is the disk's error, not redb's verdict: {e}"
+        );
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{len} bytes: {e}");
+        for boot in 0..2 {
+            let text = Db::open(Box::new(sim.disk()), cfg.clone(), Schema::new())
+                .expect_err("every boot fails the same way")
+                .to_string();
+            assert!(
+                text.starts_with(
+                    "table store (redb): tables.redb ends before redb's file header does \
+                     (read_at past end of \"tables.redb\""
+                ),
+                "{len} bytes, boot {boot}: {text}"
+            );
+            assert!(
+                text.contains("the file was cut outside the crash model")
+                    && text.contains("Remove tables.redb and restart")
+                    && !text.contains("Restart to retry"),
+                "{len} bytes, boot {boot}: the text must name the cut and its fix, not a retry: \
+                 {text}"
+            );
+        }
+        let file = sim.disk().open(&cfg.store_path).unwrap();
+        assert_eq!(
+            file.len().unwrap(),
+            len,
+            "{len} bytes: Db::open must leave a file it did not reject as it found it"
+        );
+        drop(file);
+
+        sim.disk().remove(&cfg.store_path).unwrap();
+        Db::open(Box::new(sim.disk()), cfg, Schema::new())
+            .unwrap_or_else(|e| panic!("{len} bytes: the named fix must boot: {e}"));
+    }
+}
+
 /// Which store-file operation `KindDisk` fails.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum StoreOp {

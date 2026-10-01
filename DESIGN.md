@@ -964,10 +964,34 @@ naming an older file format), and the one `io::Error` redb builds from the bytes
 same type as an IO error the disk returns, so `DiskBackend` wraps every error it passes up
 (`FromDisk`, `Display` and kind unchanged) and only an unwrapped `InvalidData` counts as
 the verdict. A variant not named there bubbles: the rejection deletes a store, so it needs
-positive evidence. **Every other open failure is not about the bytes** — the disk's own IO
-error (including `Store::open`'s own `disk.open`/`disk.sync_dir`), or redb's latch after
-one — so `Db::open` returns it unchanged, leaves the store alone, and a restart retries the
-same file. Before 2026-10-01 any `Store::open` error took the discard path: one transient
+positive evidence. Every error redb 4.3.0's `Builder::create_with_backend` can return, read
+in its source:
+
+| redb returns | class | why |
+|---|---|---|
+| `Storage(Corrupted(_))` | rejected, `Corrupted` | A verdict on the content: header fields, slot and page checksums, layout against length (`header.rs:254`/`:301`), btree, allocator. |
+| `UpgradeRequired(v)` | rejected, `UpgradeRequired { version }` | The commit slot's format version byte, read before its checksum (`header.rs:505`). |
+| `Storage(Io(e))`, `e` unmarked, kind `InvalidData` | rejected, `NotARedbFile` | The magic mismatch. The empty-file error beside it (`:1145`) cannot occur while creating is allowed. |
+| `Storage(Io(e))`, `e` is `FromDisk`, kind `UnexpectedEof` | bubbles, named | A file of 9 to 319 bytes with its magic intact: redb reads its 320-byte header past the end. Below. |
+| `Storage(Io(e))`, `e` is `FromDisk`, any other kind | bubbles | The disk's own error, passed through. |
+| `Storage(Io(e))`, `e` unmarked, any other kind | bubbles | redb's `invalid_input`/`unsupported`: no verdict on the bytes. |
+| `Storage(ValueTooLarge \| Unsupported \| PreviousIo \| DatabaseClosed \| LockPoisoned)`, `UnorderedKey` | bubbles | Not a verdict on the content. |
+| `DatabaseAlreadyOpen` | bubbles | Unreachable: `DiskBackend`'s lock methods return Unsupported, and `lock_whole_storage` returns Ok. |
+| `RepairAborted` | bubbles | Needs a repair callback; the default does nothing. |
+| `TransactionInProgress` | bubbles | Not produced at open. |
+| a later variant (both enums are `#[non_exhaustive]`) | bubbles | No positive evidence, so never destructive. |
+| `Store::open`'s own `disk.open`, `disk.sync_dir` | bubbles | Never classified. |
+
+**Every other open failure is not about the bytes** — the disk's own IO error, or redb's
+latch after one — so `Db::open` leaves the store alone and returns the error with its
+site and its fix named, kind and text kept: a restart retries the same file, and if every
+restart fails the same way the disk is failing. One bubbling error no restart fixes: a
+store file cut shorter than redb's header with the magic intact. redb makes a new file's
+length durable before it writes the magic (`page_manager.rs:1181-1200`), so no crash leaves
+one; it takes truncation outside the crash model. It is not a rejection, since redb built no
+verdict, so `Store::open` names it instead: the text says the file was cut, and that the
+fix is to remove it, after which the next boot rebuilds the store from the log, or refuses
+by name if the log no longer reaches seq 0. Before 2026-10-01 any `Store::open` error took the discard path: one transient
 fault deleted a healthy store on a full log, and on a compacted log refused the boot with
 "restore this node from a replica or backup" (follow-up 21, found by the S4 review: an
 injected fsync failure inside `Store::open`). The rejected class includes a store file
@@ -993,10 +1017,12 @@ is compacted past seq 0, a rejected store is no longer rebuildable from the log 
 `Db::open` checks the log's base before discarding the store and returns a named hard
 error instead (naming the compaction, and the fix: restore from a replica/backup, or widen
 `retain_segments`) rather than silently losing the records below the old checkpoint. When
-the verdict is `UpgradeRequired` the text says so: such a store may be intact, so the fix
-it offers first is upgrading the file with a redb release that can, and the restore only
-if no older redb wrote it (then its version byte is damaged). On a full log an
-`UpgradeRequired` store is rebuilt like any other rejected one, which loses nothing.
+the verdict is `UpgradeRequired` the text says so, and what it means here: charpente has
+only ever used redb 4.x, which writes format 3, so on a store the node created the version
+byte is damage and the fix is the restore. Only a format-2 file written by something else
+can be upgraded in place, with redb 2.6's `Database::upgrade()`; format 1 has no in-place
+upgrade. On a full log an `UpgradeRequired` store is rebuilt like any other rejected one,
+which loses nothing.
 A second sim-established redb finding (upstream-report material): direct corruption of the
 store file's durable bytes — bit flips, misdirected writes — can defeat redb's
 copy-on-write crash consistency entirely, either panicking internally or silently falling

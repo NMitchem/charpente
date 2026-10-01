@@ -2655,8 +2655,12 @@ impl Db {
     ///   store would need no longer exist locally: rebuild is impossible and
     ///   this is a named hard error instead of a silent (wrong) rebuild.
     /// - Anything else — the disk's own IO error, or redb's latch after one —
-    ///   says nothing about the bytes, so it is returned unchanged and the
-    ///   store is left alone: a restart retries the same file.
+    ///   says nothing about the bytes, so the store is left alone and the
+    ///   error is returned with this site and its fix named, its kind and
+    ///   text kept: a restart retries the same file. One of these no restart
+    ///   fixes, and its text says so: a store file cut shorter than redb's
+    ///   header with the magic number intact, which only damage outside the
+    ///   crash model leaves (`Store::open` names it, DESIGN §4).
     ///
     /// The recovery-horizon rule (DESIGN §2, segment-mgmt T4): the store's
     /// `applied_seq` is the durable horizon threaded into `Engine::recover`,
@@ -2685,7 +2689,21 @@ impl Db {
                 // fault a restart retries (follow-up 21; found by the S4
                 // review, an injected fsync failure inside `Store::open`).
                 let Some(rejected) = StoreRejected::of(&e) else {
-                    return Err(e);
+                    // `Store::open` already named a file cut too short to
+                    // open, with its own fix; a restart is not it.
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        return Err(e);
+                    }
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "table store {} failed to open on an IO error, which says nothing \
+                             about the file's bytes, so the store was left as it is: {e}. \
+                             Restart to retry the same file; if every restart fails the same \
+                             way, the disk under it is failing (DESIGN §4)",
+                            cfg.store_path
+                        ),
+                    ));
                 };
                 // Peek the log's floor before touching the store: if it has
                 // been compacted past seq 0, the records below the store's
@@ -2700,13 +2718,14 @@ impl Db {
                             Rejection::UpgradeRequired { version } => format!(
                                 "table store cannot open ({e}) and the log is compacted to seq \
                                  {base} — redb reads the store as file format version \
-                                 {version}, which it opens only after a manual upgrade, so the \
-                                 store may be intact; but the records below its last checkpoint \
-                                 no longer exist locally, so it cannot be rebuilt from the log \
-                                 alone. If an older redb wrote this file, upgrade it to the \
-                                 current format with a redb release that can, then restart; \
-                                 otherwise its version byte is damaged: restore this node from \
-                                 a replica or backup (DESIGN §4)"
+                                 {version}, which it opens only after a manual upgrade, and the \
+                                 records below its last checkpoint no longer exist locally, so \
+                                 it cannot be rebuilt from the log alone. No charpente release \
+                                 has written a format below 3, so on a store this node created \
+                                 the version byte is damage: restore this node from a replica \
+                                 or backup. Only a format-2 file written by something else can \
+                                 be upgraded in place, with redb 2.6's `Database::upgrade()`; \
+                                 format 1 has no in-place upgrade (DESIGN §4)"
                             ),
                             Rejection::Corrupted | Rejection::NotARedbFile => format!(
                                 "table store cannot open ({e}) and the log is compacted to seq \

@@ -893,8 +893,9 @@ fn a_store_redb_finds_corrupted_is_rebuilt_and_checked() {
 
 /// The rebuild's third trigger, as in `Db::open`: redb's `UpgradeRequired`,
 /// here for a store whose first transaction slot claims file format version 1,
-/// which redb checks before the slot's checksum. Such a store may be intact,
-/// but this workload's log always reaches seq 0, so the rebuild loses nothing,
+/// which redb checks before the slot's checksum. No charpente release wrote
+/// that format, so on a store this node created it is damage; either way
+/// this workload's log always reaches seq 0, so the rebuild loses nothing,
 /// and the universe reaches a verdict. (Until follow-up 21 gave the verdict a
 /// type, this pinned the opposite: a failure, because the text test knew only
 /// the magic mismatch and `Corrupted`.)

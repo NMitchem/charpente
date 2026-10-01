@@ -944,7 +944,8 @@ fn apply_one_in_txn<T>(
 /// rebuilding it from the log — or, on a log compacted past seq 0, by refusing
 /// to boot. Every other `Store::open` error is an IO failure (the disk's own,
 /// or redb's latch after one) that a restart retries, and `Db::open` returns it
-/// unchanged (DESIGN §4).
+/// with the site and the fix named, its kind and text kept. DESIGN §4 tables
+/// how every error redb 4.3.0 can return at open is classified.
 #[derive(Debug)]
 pub struct StoreRejected {
     /// Which verdict redb gave.
@@ -989,7 +990,7 @@ impl StoreRejected {
 /// and everything else, by type alone. A rejection needs positive evidence:
 /// it deletes a store (or refuses a boot), so a variant not named here is an
 /// IO failure and bubbles. Every variant redb 4.3.0 can return is classified
-/// in s5-report.md; the three rejected ones are:
+/// in DESIGN §4's table; the three rejected ones are:
 /// - `Corrupted` — redb's verdict on bytes it read without error;
 /// - `UpgradeRequired` — the commit slot's format version byte;
 /// - `Io` that `DiskBackend` did not pass up — redb builds exactly one such
@@ -998,8 +999,34 @@ impl StoreRejected {
 ///   reaches redb wrapped in `FromDisk`, so the wrapper is what tells the two
 ///   apart. The kind check keeps any other unwrapped error redb might build
 ///   (none is reachable at open in 4.3.0) out of the destructive arm.
-fn open_error(e: redb::DatabaseError) -> io::Error {
+///
+/// One disk error is named here rather than passed up bare: a read past the
+/// end of the file. redb reads its 320-byte header once the magic number
+/// matches, so a file of 9 to 319 bytes with its magic intact fails every
+/// open on that read. It is not a rejection, since the disk said it and redb
+/// built no verdict, but no restart fixes it either, and redb makes the
+/// file's length durable before it writes the magic (`page_manager.rs:1181-1200`),
+/// so no crash leaves one: the file was cut outside the crash model.
+fn open_error(e: redb::DatabaseError, path: &str) -> io::Error {
     use redb::{DatabaseError, StorageError};
+    if let DatabaseError::Storage(StorageError::Io(io)) = &e
+        && io.kind() == io::ErrorKind::UnexpectedEof
+        && io.get_ref().is_some_and(|inner| inner.is::<FromDisk>())
+    {
+        return io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "table store (redb): {path} ends before redb's file header does ({io}). redb \
+                 found its magic number, so this is not a file it rejects; but no crash \
+                 leaves a store this short, since redb makes the file's length durable before \
+                 it writes the magic, so the file was cut outside the crash model and every \
+                 boot will fail the same way. Remove {path} and restart: the next boot \
+                 rebuilds the store from the log, or refuses by name if the log no longer \
+                 reaches seq 0, and then this node is restored from a replica or backup \
+                 (DESIGN §4)"
+            ),
+        );
+    }
     let reason = match &e {
         DatabaseError::Storage(StorageError::Corrupted(_)) => Rejection::Corrupted,
         DatabaseError::UpgradeRequired(version) => Rejection::UpgradeRequired { version: *version },
@@ -1045,7 +1072,7 @@ impl Store {
                 file,
                 latch: latch.clone(),
             })
-            .map_err(open_error)?;
+            .map_err(|e| open_error(e, path))?;
         Ok(Store {
             db,
             latch,

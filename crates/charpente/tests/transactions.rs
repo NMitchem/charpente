@@ -1507,15 +1507,22 @@ impl OpenSite {
     }
 
     /// What `Db::open` returns once the fault bubbles: `Store::open`'s own
-    /// two calls pass the disk's error up as it is; redb's renders it as
-    /// every other redb error is rendered.
+    /// two calls pass the disk's error up as it is, redb's renders it as
+    /// every other redb error is rendered, and `Db::open` names the site and
+    /// the fix around either, keeping the text (hard rule 5).
     fn bubbled(self) -> String {
-        match self {
+        let disk = match self {
             OpenSite::Open | OpenSite::SyncDir => self.error().to_string(),
             OpenSite::Read | OpenSite::Sync => {
                 format!("table store (redb): I/O error: {}", self.error())
             }
-        }
+        };
+        format!(
+            "table store tables.redb failed to open on an IO error, which says nothing about \
+             the file's bytes, so the store was left as it is: {disk}. Restart to retry the \
+             same file; if every restart fails the same way, the disk under it is failing \
+             (DESIGN §4)"
+        )
     }
 }
 
@@ -1745,8 +1752,10 @@ fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_rebuilt_from_a_full_lo
 }
 
 /// On a compacted log the same two rewrites refuse the boot by name, each
-/// naming its own cause and fix: a store in an older format may be intact, so
-/// its text offers the upgrade before the restore (hard rule 5).
+/// naming its own cause and fix (hard rule 5). No charpente release wrote a
+/// format below 3, so the older-format text calls the version byte damage
+/// and offers the restore, naming the one in-place upgrade redb has only for
+/// a format-2 file something else wrote.
 #[test]
 fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_refused_on_a_compacted_log() {
     for (what, offset, bytes, reason) in REWRITES {
@@ -1781,11 +1790,12 @@ fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_refused_on_a_compacted
                 "table store cannot open (table store (redb): Manual upgrade required. Expected \
                  file format version 3, but file is version 2) and the log is compacted to seq \
                  {base} — redb reads the store as file format version 2, which it opens only \
-                 after a manual upgrade, so the store may be intact; but the records below its \
-                 last checkpoint no longer exist locally, so it cannot be rebuilt from the log \
-                 alone. If an older redb wrote this file, upgrade it to the current format with \
-                 a redb release that can, then restart; otherwise its version byte is damaged: \
-                 restore this node from a replica or backup (DESIGN §4)"
+                 after a manual upgrade, and the records below its last checkpoint no longer \
+                 exist locally, so it cannot be rebuilt from the log alone. No charpente release \
+                 has written a format below 3, so on a store this node created the version byte \
+                 is damage: restore this node from a replica or backup. Only a format-2 file \
+                 written by something else can be upgraded in place, with redb 2.6's \
+                 `Database::upgrade()`; format 1 has no in-place upgrade (DESIGN §4)"
             ),
             _ => format!(
                 "table store cannot open (table store (redb): I/O error: Not a redb database: \
@@ -2146,8 +2156,8 @@ fn unopenable_store_with_full_wal_still_rebuilds() {
 
 /// A store that `Store::open` could not open for a reason other than its bytes
 /// — one transient IO error, at any of the four places a clean open can meet
-/// one — is not discarded: `Db::open` returns the disk's error unchanged and the
-/// retry opens the same store file. Before S5 (follow-up 21), any `Store::open`
+/// one — is not discarded: `Db::open` returns the disk's error, naming the site
+/// and the fix, and the retry opens the same store file. Before S5 (follow-up 21), any `Store::open`
 /// error was read as "this file is damaged beyond use", so on a log still
 /// holding seq 0 this deleted a healthy store and rebuilt it from the whole log.
 #[test]
@@ -2196,7 +2206,7 @@ fn a_transient_store_open_fault_on_a_full_log_discards_nothing_and_the_retry_ope
             Err(e) => assert_eq!(
                 e.to_string(),
                 site.bubbled(),
-                "{site:?}: Db::open must return the disk's error unchanged, not a refusal"
+                "{site:?}: Db::open must return the disk's error, named, not a refusal"
             ),
         }
         assert_eq!(
@@ -2227,7 +2237,7 @@ fn a_transient_store_open_fault_on_a_full_log_discards_nothing_and_the_retry_ope
 /// with "restore this node from a replica or backup" — the wrong fix for a
 /// fault a restart retries (found by the S4 review, Inversion C': an injected
 /// fsync failure inside `Store::open`, replication seed 0x8be1b31e61e52e62).
-/// Now the error bubbles unchanged and the retry opens with every committed
+/// Now the error bubbles, named, and the retry opens with every committed
 /// record present, including the ones that exist only in the checkpointed store.
 #[test]
 fn a_transient_store_open_fault_on_a_compacted_log_bubbles_and_the_retry_opens_it() {
@@ -2273,7 +2283,7 @@ fn a_transient_store_open_fault_on_a_compacted_log_bubbles_and_the_retry_opens_i
         assert_eq!(
             err.to_string(),
             site.bubbled(),
-            "{site:?}: a transient fault must bubble as the disk's own error; refusing to boot \
+            "{site:?}: a transient fault must bubble with the disk's own error; refusing to boot \
              with \"restore this node from a replica or backup\" sends the operator to the \
              wrong fix for an error a restart retries"
         );
