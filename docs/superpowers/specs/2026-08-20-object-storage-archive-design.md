@@ -151,7 +151,8 @@ the next process could GET from the page cache and act on, which the next power 
 take away. The contract is now stated for every impl — an object a `Get` or `List` returns
 is durable, and an acknowledged `Put` is durable (io.rs) — and `FsObjectStore` syncs every
 directory from the key's up to the bucket root's parent on every PUT, creates the bucket root
-but never a directory above it (a root whose parent is missing is refused by name), and syncs
+but never a directory above it (a root whose parent is missing is refused by name, when the
+store is built and again on every PUT), and syncs
 before a GET or LIST returns (DESIGN §1).
 
 Ordering between distinct keys is **not** guaranteed; §2's write ordering depends on that

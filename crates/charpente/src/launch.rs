@@ -280,15 +280,27 @@ fn restore_verb(
     #[allow(clippy::disallowed_methods)]
     let _ = std::fs::remove_dir_all(&probe);
 
-    let store = FsObjectStore::new(&from);
-    // `ProdDisk::new` creates the destination root unconditionally, and
-    // it does so before `restore` has read a byte of the bucket — so a
-    // refusal would leave behind a directory the operator never had, and
-    // "nothing in the destination has been touched" would be true about the
-    // content and incomplete about the filesystem. Remembered here, undone
-    // on the error path below.
+    // `ProdDisk::new` creates the destination root when it is absent and its
+    // parent exists, and it does so before `restore` has read a byte of the
+    // bucket — so a refusal would leave behind a directory the operator
+    // never had, and "nothing in the destination has been touched" would be
+    // true about the content and incomplete about the filesystem. Remembered
+    // here, undone on the error paths below.
     #[allow(clippy::disallowed_methods)]
     let dest_was_absent = !std::path::Path::new(&to).exists();
+    // Only a directory THIS call created, and only while it is still empty.
+    // A failure past the discard point has written a partial restore there
+    // and its error tells the operator to re-run against it — removing that
+    // would destroy the thing the message just told them to keep.
+    // `remove_dir` rather than `remove_dir_all` so the emptiness check is
+    // enforced twice, once by us and once by the kernel.
+    let undo_dest = || {
+        #[allow(clippy::disallowed_methods)]
+        if dest_was_absent && std::fs::read_dir(&to).is_ok_and(|mut d| d.next().is_none()) {
+            #[allow(clippy::disallowed_methods)]
+            let _ = std::fs::remove_dir(&to);
+        }
+    };
     // Before a byte of the bucket is read, and named here rather than left
     // to `?`: a raw error out of `launch` prints as `main`'s `Debug` form. A
     // destination whose parent is missing is refused by `ProdDisk::new`,
@@ -300,6 +312,22 @@ fn restore_verb(
                 err,
                 "error: {e} — nothing in the destination has been touched"
             );
+            return Ok(1);
+        }
+    };
+    // After the destination's refusal, so a bad `--to` is named first
+    // whatever `--from` says. `FsObjectStore::new` only checks: a bucket
+    // root whose parent is missing is named here, rather than read as a
+    // bucket with no manifest.
+    let store = match FsObjectStore::new(&from) {
+        Ok(store) => store,
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "error: {e} — nothing in the destination has been touched"
+            );
+            drop(disk);
+            undo_dest();
             return Ok(1);
         }
     };
@@ -317,18 +345,7 @@ fn restore_verb(
         // in different words, which is the defect this task also fixed.
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            // Only a directory THIS call created, and only while it is still
-            // empty. A failure past the discard point has written a partial
-            // restore there and the error above tells the operator to re-run
-            // against it — removing that would destroy the thing the message
-            // just told them to keep. `remove_dir` rather than
-            // `remove_dir_all` so the emptiness check is enforced twice, once
-            // by us and once by the kernel.
-            #[allow(clippy::disallowed_methods)]
-            if dest_was_absent && std::fs::read_dir(&to).is_ok_and(|mut d| d.next().is_none()) {
-                #[allow(clippy::disallowed_methods)]
-                let _ = std::fs::remove_dir(&to);
-            }
+            undo_dest();
             return Ok(1);
         }
     };
@@ -612,6 +629,72 @@ mod tests {
         std::fs::remove_file(&blocker).unwrap();
     }
 
+    /// An empty data dir names no directory: the serve arm refuses it by
+    /// name before `build`, where it used to panic.
+    #[test]
+    fn an_empty_data_dir_exits_one_naming_it() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            "127.0.0.1:0",
+            "",
+            |_: Box<dyn Disk>, _: Box<dyn Entropy>| -> io::Result<App> {
+                panic!("build must not run on an empty data dir")
+            },
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "charpente failed to start: the data directory path is empty — name the directory \
+             to use (a relative path is taken from the working directory)\n"
+        );
+    }
+
+    /// The node fsyncs its data dir's parent at every start, so a parent it
+    /// cannot read stops it there, under the data-dir line naming the
+    /// directory and the fix — not later, inside `build`, under "fix the
+    /// store/log and restart".
+    #[test]
+    fn a_data_dir_whose_parent_the_node_cannot_read_exits_one_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = fresh_data_dir("unreadable-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let data_dir = parent.join("data");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            "127.0.0.1:0",
+            data_dir.to_str().unwrap(),
+            |_: Box<dyn Disk>, _: Box<dyn Entropy>| -> io::Result<App> {
+                panic!("build must not run when the data dir's parent cannot be read")
+            },
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!(
+                "charpente failed to start: could not fsync directory \"{parent}\" (Permission \
+                 denied (os error 13)) — the data directory's own entry lives there, and \
+                 charpente fsyncs it at every start so that anything under the data directory \
+                 can be durable; check that directory's permissions and the disk under it\n",
+                parent = parent.display()
+            )
+        );
+    }
+
     /// The data dir's parent must exist (GUIDE §1): `ProdDisk::new` creates
     /// the data dir and nothing above it, so a deep path that does not exist
     /// yet is refused by name, before `build`, with nothing created.
@@ -639,12 +722,13 @@ mod tests {
         assert_eq!(
             String::from_utf8(err).unwrap(),
             format!(
-                "charpente failed to start: the data directory \"{data}\" cannot be created: its \
-                 parent \"{parent}\" does not exist, and charpente never creates a directory above \
-                 the data directory — an acknowledged write rests on every directory entry above \
-                 it, and charpente vouches only for the entries it creates and fsyncs. Create \
-                 \"{parent}\" (mkdir -p \"{parent}\"), or point at a data directory whose parent \
-                 exists\n",
+                "charpente failed to start: the data directory \"{data}\" has no parent \
+                 directory: \"{parent}\" is not an existing directory, and charpente never \
+                 creates a directory above the data directory — an acknowledged write rests \
+                 on every directory entry above it, and charpente vouches only for the \
+                 entries it creates and fsyncs. Create \"{parent}\" when you provision the \
+                 machine and make it durable before the node starts (for example, run `sync` \
+                 after creating it), or point at a data directory whose parent exists\n",
                 data = data_dir.display(),
                 parent = missing.display()
             )
@@ -999,7 +1083,7 @@ mod tests {
     fn archived_bucket(tag: &str, jobs: u64) -> PathBuf {
         let src = tmp_dir(&format!("{tag}-src"));
         let bucket = tmp_dir(&format!("{tag}-bucket"));
-        let store = FsObjectStore::new(&bucket);
+        let store = FsObjectStore::new(&bucket).unwrap();
         let mut app = restore_app(
             Box::new(ProdDisk::new(&src).unwrap()),
             Box::new(ProdEntropy::new().unwrap()),
@@ -1146,15 +1230,18 @@ mod tests {
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
-    /// The failure an operator hits by mistyping `--from`: nothing landed,
-    /// and the message says so rather than leaving them to wonder.
+    /// The failure an operator hits by mistyping `--from`'s last component:
+    /// nothing landed, and the message says so rather than leaving them to
+    /// wonder. A bucket whose parent exists, so the store is built and the
+    /// read finds no manifest.
     #[test]
     fn restore_from_an_absent_bucket_exits_one_and_touches_nothing() {
         let dest = tmp_dir("absent-dest");
+        let bucket = tmp_dir("absent-bucket");
         let (code, out, err) = run_restore_verb(&[
             "restore",
             "--from",
-            "/does/not/exist/charpente-no-such-bucket",
+            bucket.to_str().unwrap(),
             "--to",
             dest.to_str().unwrap(),
             "--prefix",
@@ -1190,6 +1277,44 @@ mod tests {
         );
     }
 
+    /// A `--from` whose parent does not exist is named as that, when the
+    /// store is built, rather than read as a bucket with no manifest — and
+    /// after the destination was checked, so the destination this call
+    /// created is removed on the way out.
+    #[test]
+    fn restore_from_a_bucket_whose_parent_is_missing_exits_one_naming_it() {
+        let dest = tmp_dir("missing-from-dest");
+        let (code, out, err) = run_restore_verb(&[
+            "restore",
+            "--from",
+            "/does/not/exist/charpente-no-such-bucket",
+            "--to",
+            dest.to_str().unwrap(),
+            "--prefix",
+            BUCKET_PREFIX,
+        ]);
+        let left = dest.exists();
+        let _ = std::fs::remove_dir_all(&dest);
+        assert_eq!(code, 1, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            err,
+            "error: the bucket root \"/does/not/exist/charpente-no-such-bucket\" has no parent \
+             directory: \"/does/not/exist\" is not an existing directory, and charpente never \
+             creates a directory above the bucket root — an acknowledged PUT rests on every \
+             directory entry above it, and charpente vouches only for the entries it creates \
+             and fsyncs. Create \"/does/not/exist\" when you provision the machine and make \
+             it durable before the node starts (for example, run `sync` after creating it), \
+             or point at a bucket root whose parent exists — nothing in the destination has \
+             been touched\n"
+        );
+        assert!(
+            !left,
+            "a refused restore must not leave a directory the operator did not have: {}",
+            dest.display()
+        );
+    }
+
     /// A destination whose parent does not exist is refused by name before
     /// a byte of the bucket is read, with the operator's line rather than a
     /// raw error escaping `launch`, and nothing is created: `ProdDisk::new`
@@ -1214,17 +1339,42 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "error: the data directory \"{dest}\" cannot be created: its parent \"{parent}\" \
-                 does not exist, and charpente never creates a directory above the data directory \
-                 — an acknowledged write rests on every directory entry above it, and charpente \
-                 vouches only for the entries it creates and fsyncs. Create \"{parent}\" (mkdir \
-                 -p \"{parent}\"), or point at a data directory whose parent exists — nothing in \
-                 the destination has been touched\n",
+                "error: the data directory \"{dest}\" has no parent directory: \"{parent}\" is \
+                 not an existing directory, and charpente never creates a directory above the \
+                 data directory — an acknowledged write rests on every directory entry above \
+                 it, and charpente vouches only for the entries it creates and fsyncs. Create \
+                 \"{parent}\" when you provision the machine and make it durable before the \
+                 node starts (for example, run `sync` after creating it), or point at a data \
+                 directory whose parent exists — nothing in the destination has been \
+                 touched\n",
                 dest = dest.display(),
                 parent = missing.display()
             )
         );
         assert!(!exists, "the refusal created {}", missing.display());
+    }
+
+    /// An empty `--to` names no directory: refused by name, nothing read
+    /// from the bucket, where it used to panic.
+    #[test]
+    fn restore_into_an_empty_destination_path_exits_one_naming_it() {
+        let (code, out, err) = run_restore_verb(&[
+            "restore",
+            "--from",
+            "/does/not/exist/charpente-no-such-bucket",
+            "--to",
+            "",
+            "--prefix",
+            BUCKET_PREFIX,
+        ]);
+        assert_eq!(code, 1, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            err,
+            "error: the data directory path is empty — name the directory to use (a relative \
+             path is taken from the working directory) — nothing in the destination has been \
+             touched\n"
+        );
     }
 
     /// Negative space (hard rule 4). The cleanup above removes a

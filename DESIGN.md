@@ -176,7 +176,12 @@ directory and `FsObjectStore` the bucket root, and neither ever creates a direct
 lie on no barrier's chain, and a boot that failed before syncing it would leave it for the next
 boot to trust (ruled 2026-10-01 over fsyncing every ancestor to `/`, which fails on unreadable
 ancestors and on filesystems with no directory fsync, and still cannot vouch for an
-operator's own unsynced `mkdir -p`). The model
+operator's own unsynced `mkdir -p`, so the refusal tells the operator to make the parent durable
+when they provision it). `FsObjectStore::new` refuses such a root when the store is built, not
+at its first PUT: an archive reads a missing root as a fresh bucket and absorbs a refused PUT,
+so a node would otherwise run with no backup and no line on stderr. `ProdDisk::new` fsyncs the
+data directory's parent at every start, which no barrier needs it to, so that a parent the node
+cannot read fails at startup under the data directory's line. The model
 states its own limits (prod.rs, `Fs`): a power loss drops all unsynced state, deterministically
 and in full, so it finds a missing or misplaced sync and not a bug that needs some unsynced
 state to survive; and its kernel never marks a page clean after a failed fsync, so the EIO
