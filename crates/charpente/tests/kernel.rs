@@ -2523,21 +2523,32 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
 /// by its own text: `Db::open` returns it as itself, never as the refusal. The
 /// refusal itself is pinned deterministically by transactions.rs
 /// `unopenable_store_with_compacted_wal_is_a_named_hard_error`.
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its check
+/// and its jobs, so this budget is reach: over ten fresh bases at 256
+/// universes, booting once covered `job:done` 328.5 times per batch, and 4, 8
+/// and 16 boots 455.7, 486.1 and 508.4, for +13.4%, +20.6% and +28.8% CPU
+/// (+0.22, +0.34 and +0.48 s per batch). 8 is the largest of 4/8/16 under +25%
+/// (2026-10-01, S5 review I1).
+const KERNEL_ROUND_BOOT_TRIES: u32 = 8;
+
 fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(36 + entropy.next_u64() % 438);
-        let mut app = match kernel_crash_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                let e = e.to_string();
-                if !is_fault_fallout(&e) {
-                    return Err(format!("open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
+        let Some(mut app) =
+            boot_through_fallout(sim, KERNEL_ROUND_BOOT_TRIES, is_fault_fallout, || {
+                kernel_crash_app(sim)
+            })
+            .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(());
             }
+            sim.restart();
+            continue;
         };
         // The checker's own reads (snapshot/scan) are disk ops too: an armed
         // crash countdown can trip right here, so this call needs the same
@@ -2712,8 +2723,20 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
 /// examines. Re-measured 2026-10-01 for S5 with D1 (`Db::open` no longer
 /// discards a store over an IO error; WAL recovery syncs before replay): 10
 /// fresh batches gave up 9-18 times, mean 13.4, sd 3.2, so the cap is 36, 7.0
-/// standard deviations above the mean.
-const KERNEL_GAVE_UP_CEILING: u64 = 36;
+/// standard deviations above the mean. Re-set 2026-10-01 with the round boots
+/// aimed (S5 review I1): 10 fresh batches gave up 14-31 times, mean 22.6, sd
+/// 4.8, so the cap is 62. The rise is not lost verdicts (GUIDE §8): against
+/// S5's parent on the same bases `job:done` rose 358.3 -> 485.2 (+15.7 SE) and
+/// passes that covered no `job:done` fell 50.5 -> 22.5 per batch. The new
+/// give-ups are universes whose store, once it held jobs, never booted again
+/// under their fault rate, which used to pass having checked nothing.
+const KERNEL_GAVE_UP_CEILING: u64 = 62;
+
+/// The reach floor, a margin like the cap (GUIDE §8): with the round boots
+/// aimed, 10 fresh batches covered `job:done` 458-520 times, mean 485.2, sd
+/// 19.1, and the floor is the mean less 4 standard deviations (2026-10-01, S5
+/// review I1).
+const KERNEL_JOB_DONE_FLOOR: u64 = 409;
 
 #[test]
 fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
@@ -2728,7 +2751,9 @@ fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
             "crash:torn",
             "restart",
             "tenant:multi_tenant_write",
+            "boot:booted-after-retry",
         ],
+        floor: [("job:done", KERNEL_JOB_DONE_FLOOR)],
         ceiling: [("universe:gave-up", KERNEL_GAVE_UP_CEILING)]
     );
 }
@@ -5475,6 +5500,16 @@ mod job_tenancy {
     /// the keys, scripts paired requests, runs the kernel (dispatch and cron
     /// included) and restarts. A quiet final pass then runs the oracle once
     /// more.
+    /// How many boots each round gets before it restarts and moves on
+    /// (`checks::boot_through_fallout`). A round whose boot fails skips its
+    /// check and its jobs, so this budget is reach: over ten fresh bases at
+    /// 256 universes, booting once covered `tenant:job_multi_tenant_write`
+    /// 219.4 times per batch, and 4, 8 and 16 boots 335.2, 368.7 and 391.5,
+    /// for +21.4%, +30.2% and +39.6% CPU (+0.45, +0.64 and +0.84 s per
+    /// batch). 4 is the largest of 4/8/16 under +25% (2026-10-01, S5 review
+    /// I1).
+    const JOB_TENANCY_ROUND_BOOT_TRIES: u32 = 4;
+
     fn job_tenancy_universe(sim: &mut Sim) -> Result<(), String> {
         let entropy = sim.entropy();
         let mut seq = 0u64;
@@ -5482,13 +5517,18 @@ mod job_tenancy {
         for _round in 0..3 {
             // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
             sim.crash_disk_after(31 + entropy.next_u64() % 376);
-            let mut app = match shop_app(sim) {
-                Ok(app) => app,
-                Err(e) if is_fault_fallout(&e.to_string()) => {
-                    sim.restart();
-                    continue;
+            let Some(mut app) =
+                boot_through_fallout(sim, JOB_TENANCY_ROUND_BOOT_TRIES, is_fault_fallout, || {
+                    shop_app(sim)
+                })
+                .map_err(|e| format!("open failed non-injected: {e}"))?
+            else {
+                // A durable refusal already gave the universe up, by name.
+                if sim.gave_up().is_some() {
+                    return Ok(());
                 }
-                Err(e) => return Err(format!("open failed non-injected: {e}")),
+                sim.restart();
+                continue;
             };
             match jobs_stay_in_their_tenant(app.db_for_tests()) {
                 Ok(seen) => {
@@ -5573,10 +5613,21 @@ mod job_tenancy {
         Ok(())
     }
 
-    /// The give-up cap, exact at the pinned base: 17 of 256 universes gave up
-    /// in two identical batches (2026-10-01, S5 with D1). It was 16 at their
-    /// parent (redb 4.3.0, 64 reopens; 49 with 8).
-    const JOB_TENANCY_GAVE_UP_CEILING: u64 = 17;
+    /// The give-up cap, exact at the pinned base: 30 of 256 universes gave up
+    /// in two identical batches with the round boots aimed (2026-10-01, S5
+    /// review I1). It was 16 at their parent (redb 4.3.0, 64 reopens; 49 with
+    /// 8) and 17 unaimed. The rise is not lost verdicts (GUIDE §8): against
+    /// S5's parent over ten fresh bases the reach key rose 240.9 -> 334.4
+    /// (+15.4 SE) and passes that covered none of it fell 103.4 -> 79.4 per
+    /// batch, while give-ups went 12.1 -> 23.9.
+    const JOB_TENANCY_GAVE_UP_CEILING: u64 = 30;
+
+    /// The reach floor, exact at the pinned base: 312 checked recoveries saw
+    /// jobs from more than one tenant in two identical batches with the round
+    /// boots aimed (2026-10-01, S5 review I1). Unaimed it read 216, and over
+    /// ten fresh bases the mean was 5.4 Welch standard errors below S5's
+    /// parent with no bound noticing.
+    const JOB_TENANCY_MULTI_TENANT_WRITE_FLOOR: u64 = 312;
 
     /// Job-tenancy spec §9 item 4. A fixed base, like every permanent swarm
     /// property here. N was set by timing one batch (Step 3): the commit and
@@ -5594,7 +5645,12 @@ mod job_tenancy {
                 "tenant:job_fan_out",
                 "tenant:anonymous_refused",
                 "job:retried",
+                "boot:booted-after-retry",
             ],
+            floor: [(
+                "tenant:job_multi_tenant_write",
+                JOB_TENANCY_MULTI_TENANT_WRITE_FLOOR
+            )],
             ceiling: [("universe:gave-up", JOB_TENANCY_GAVE_UP_CEILING)]
         );
     }
