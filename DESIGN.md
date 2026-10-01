@@ -193,6 +193,22 @@ rather than argued — `a_directory_barrier_does_not_perturb_the_other_disk_faul
 semantically no-op barrier and demands the entire coverage map be unchanged; without the split
 it fails, one barrier having moved four read faults and two write faults.
 
+**A sync with nothing to flush rolls no fault** (2026-10-01). `SimFile::sync` rolls
+`sync_error` only when the file holds unsynced writes. A file with none has nothing to flush
+and nothing to fail, so its sync always succeeds and draws nothing from the `faults` stream.
+It is still a disk operation: it ticks an armed crash countdown and advances virtual time
+like any other. This is the directory barrier's hazard again, from the other side: syncs
+move for durability reasons too. §2's recovery syncs every segment before replaying it, and
+after a power cycle every one of those segments is clean. A roll on each injected failures
+no disk produces in that state and re-keyed every universe that recovers; late_follower's
+batch lost about 48 verdicts to them until this landed. What the sim gives up is a real
+kernel reporting an earlier background-writeback failure, which a later fsync of a clean
+file returns on Linux. The sim has no background writeback (a write stays pending until a
+sync takes it), so a clean file has nothing to report. The recovery-sync failure path is
+held by deterministic tests instead (§2). `a_sync_with_nothing_to_flush_draws_no_fault`
+holds the rule by comparing whole coverage maps with and without a clean sync before every
+operation.
+
 **A process restart is not a power cycle.** `Sim::restart` power-cycles: the
 page cache collapses under the crash model before anything reopens.
 `Sim::restart_process` (2026-10-01) restarts only the process. Open handles die
@@ -208,7 +224,12 @@ from no stream and clears no countdown, so introducing it re-keyed no universe. 
 pinned batches reproduced their coverage byte for byte across the change
 (migrations, realtime's mixed-shape resume, and the wal dir-entry property). The
 property that drives it on purpose is §2's class oracle,
-`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`.
+`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`. It proves each
+restart left the log something to read back with `Sim::unsynced_files()`, read right after
+the restart. A restart that flushed the page cache would leave that list empty and the
+property's coverage requirement unmet. Only open file handles are epoch-gated, as after
+`restart`: a destructor that opens a file afresh through a `Disk` it still holds reaches the
+disk. Charpente's own close goes through its open files.
 
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
@@ -391,21 +412,43 @@ poisons the log — fsync results
 cannot honestly be retried (fsyncgate); the only exit from poison is restart-and-recover,
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack,
-and recovery is read → sync → apply. **Readable is not durable**: after a process restart
-the page cache still holds every frame the dead process wrote, synced or not. A frame
-whose fsync failed, or that the process died before syncing, reads back valid.
-Recovery therefore syncs each segment's bytes before handing any of its frames to
-replay, and a segment whose sync fails hands none (fsyncgate: a failed sync guarantees
-nothing). Before 2026-10-01 the clean path replayed without syncing. A process restart
-then replayed an unsynced frame and persisted the store past it, at open or merely by
-closing it (redb's close commits durably). The next power loss took the frame, and
-`Db::open`'s own "the store outran durable truth" assert fired. Realtime found it
-(seeds 0x7df8c43a1d2591e8, 0x5d889f4c1a9ac543). The pins are
-`a_record_recovery_replays_survives_the_next_power_loss` and
+and recovery is sync → read → apply. **Readable is not durable**: after a process restart
+the page cache still holds every frame the dead process wrote, synced or not, and each
+reads back valid. Recovery therefore syncs each segment before reading any of its frames,
+every segment and not just the tail, so every frame it hands to replay is durable. A
+segment whose sync fails hands none (fsyncgate: a failed sync guarantees nothing), and
+the open fails naming the segment and the fix. Before 2026-10-01 the clean path replayed
+without syncing. A process restart then replayed an unsynced frame and persisted the store
+past it, at open or merely by closing it (redb's close commits durably). The next power
+loss took the frame, and `Db::open`'s own "the store outran durable truth" assert fired.
+Realtime found it (seeds 0x7df8c43a1d2591e8, 0x5d889f4c1a9ac543).
+**What the sync does not close.** On Linux a failed fsync can mark the dirty pages clean
+(fsyncgate). The frame then stays readable without ever reaching the disk, and the next
+process's fsync succeeds without writing it. Recovery's sync closes the process-death case
+(a kill between a frame's write and its fsync) and narrows the failed-fsync case to what
+the kernel reports. It cannot close it: no later fsync recovers a write the kernel has
+already dropped. The sim models an honest kernel, where a failed sync leaves the write
+pending and the next sync writes it.
+The pins are `a_record_recovery_replays_survives_the_next_power_loss` and
 `a_recovery_whose_log_sync_fails_replays_nothing` (charpente-core `tests/engine.rs`) and
-their WAL-level twins in charpente-sim `tests/wal.rs`. The class's oracle is
-`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`, which
-mixes §1's `Sim::restart_process` with power cycles.
+their WAL-level twins in charpente-sim `tests/wal.rs`. There,
+`a_frame_recovery_replays_from_a_non_tail_segment_survives_the_next_power_loss` holds
+the every-segment half: a tail-only sync loses a non-tail segment's unsynced frame and
+the next open refuses the log as a gap. The class's oracle is
+`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`, which mixes
+§1's `Sim::restart_process` with power cycles.
+**The rule covers every boot-time read of a durable file, not only the log's.** A read
+that a boot acts on syncs first, or has a stated reason it need not:
+- The role file and the witness slots barrier their names and sync their bytes before
+  they are trusted (§5).
+- The horizon breadcrumb need not. It is written only after the store's checkpoint
+  returned `Ok`, so even a value still in the page cache is a lower bound on durable truth
+  and never over-claims.
+- The store's `applied_seq`, which `Db::open` trusts before recovery runs, rests on redb:
+  4.3.0's open fsyncs the store file (§4).
+- Restore's frontier probe reads the destination's segments unsynced because it decides
+  only to refuse or to replace. A refusal writes nothing, and replacing discards every
+  local byte.
 The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::read_log`,
 M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
 back one that fails — a frame corrupted on disk after append must never travel. That
@@ -890,7 +933,20 @@ checkpoint and recovery replays the WAL from `applied_seq + 1`. Two redb facts t
 established: its byte layout is deterministic under identical op sequences
 (raw-fingerprint replay holds), and `Database::drop` is a *graceful close* that durably
 flushes non-durable commits — a crash is only a crash if the process dies with the
-database open, which is exactly what the sim models. Index entries are `[key len: u32][key
+database open, which is exactly what the sim models. A third is a dependency charpente does
+not re-check at runtime: redb 4.3.0's writable open fsyncs the store file
+(`Database::new` → `TransactionalMemory::begin_writable`, `db.rs:1672`,
+`page_manager.rs:1458`; a repairing open also flushes at `page_manager.rs:888`). `Db::open`
+relies on it. It reads the store's `applied_seq` before recovery runs and, beside an empty
+log, lays a durable segment at `applied_seq + 1` (the mid-seed-finish shape, §2). A seeder
+whose checkpoint fsync failed leaves that `applied_seq` in the page cache only. Without
+the open-time fsync, a power loss after the laid segment would leave a store at `None`
+beside a log based past it, a node that refuses to open. The D1 review's probe found the
+branch safe for that reason alone: `Seeder::finish(5)` with every store fsync failing, a
+process restart, then a power loss under the running node, and the reopen held `Some(5)`
+(2026-10-01). `a_seeded_store_a_restarted_node_lays_its_segment_from_survives_the_next_power_loss`
+(charpente-core `tests/engine.rs`) pins it, so a redb upgrade that drops the open-time
+fsync turns it red. Re-walk it with the latch census below on every redb upgrade. Index entries are `[key len: u32][key
 bytes][id: u64 be]` (length prefix prevents prefix-collision ambiguity); exact-match
 lookups only until a real query pattern demands order-preserving key encoding. A built-in
 `charpente.jobs` table materializes transactional enqueues in the same apply as a `JobRow`
@@ -1212,7 +1268,18 @@ Right at M1 scale; incremental streaming is the tracked fix before large-store s
 The durable role file (§2's role semantics, T5) carries its own CRC line: a torn role
 write is a named integrity error, never a parse of whatever bytes survived — a torn
 "follower:p:1" that still parses as a role naming a ghost primary is exactly what the T6
-harness caught (seed 0x51dacce702b667c8).
+harness caught (seed 0x51dacce702b667c8). It is read the way recovery reads the log (§2,
+"readable is not durable"): `load_role` barriers the file's name and syncs its bytes before
+it trusts either, and every witness-slot read does the same (2026-10-01, D1 review I3).
+Before that, a promote whose role fsync failed was still in the page cache after the
+restart its own error asked for. The node booted as `Primary` from it and served writes,
+and a power loss then reverted the file to `Follower` under a diverged log. A witness store
+that failed the same way let a primary boot checking a set the next power loss shrank. A
+sync that fails at boot fails the boot by name. The pins are in `repl/role.rs` and
+`repl/witnesses.rs`: `a_role_a_restarted_node_boots_as_survives_the_next_power_loss`,
+`a_witness_set_a_restarted_node_boots_with_survives_the_next_power_loss`, and for each the
+name (`…_name_a_restarted_node_trusts_…`) and failed-sync (`…_whose_sync_fails_at_boot_is_not_trusted`)
+twins.
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through

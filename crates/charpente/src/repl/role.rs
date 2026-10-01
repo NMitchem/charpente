@@ -163,7 +163,16 @@ fn corrupt_role_error(reason: &str) -> io::Error {
 /// boot). Present-and-different → the durable role wins; returns `(role,
 /// Some(mismatch_notice))` where the notice names both roles and, for the
 /// Primary-file/Follower-config case, the demote rule (spec §2).
+///
+/// The file's name and bytes are made durable before either is trusted
+/// (DESIGN §2, "readable is not durable"). A flip whose fsync failed, or
+/// that a killed process never synced, is still in the page cache after a
+/// restart; booting as that role and then losing it to a power cycle would
+/// revert a node that already served as primary. A sync that fails fails the
+/// boot, by name.
 pub fn load_role(disk: &dyn Disk, initial: &Role) -> io::Result<(Role, Option<String>)> {
+    disk.sync_dir(ROLE_FILE)
+        .map_err(|e| role_io_error("reading", e))?;
     if !disk
         .list(ROLE_FILE)
         .map_err(|e| role_io_error("reading", e))?
@@ -176,6 +185,7 @@ pub fn load_role(disk: &dyn Disk, initial: &Role) -> io::Result<(Role, Option<St
     let file = disk
         .open(ROLE_FILE)
         .map_err(|e| role_io_error("reading", e))?;
+    file.sync().map_err(|e| role_io_error("reading", e))?;
     let len = file.len().map_err(|e| role_io_error("reading", e))?;
     let mut buf = vec![0u8; len as usize];
     file.read_at(0, &mut buf)
@@ -197,12 +207,135 @@ pub fn load_role(disk: &dyn Disk, initial: &Role) -> io::Result<(Role, Option<St
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use charpente_core::io::Entropy;
     use charpente_sim::{FaultConfig, Sim};
 
     fn disk() -> charpente_sim::SimDisk {
         Sim::with_faults(0x5eed_5eed, FaultConfig::none()).disk()
+    }
+
+    /// A disk whose store fails its own sync (`file`) or barrier (`dir`):
+    /// the arm fires only after a write, so a read ahead of it is untouched.
+    fn failing(sim: &Sim, file: bool, dir: bool) -> crate::repl::FailNextSync {
+        crate::repl::FailNextSync {
+            inner: sim.disk(),
+            arm: Arc::new(AtomicBool::new(file)),
+            arm_dir: Arc::new(AtomicBool::new(dir)),
+            after_write: true,
+            wrote: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A disk whose very next `File::sync` fails: a boot's own read.
+    fn failing_read(sim: &Sim) -> crate::repl::FailNextSync {
+        crate::repl::FailNextSync {
+            after_write: false,
+            ..failing(sim, true, false)
+        }
+    }
+
+    /// Readable is not durable, for the role file (D1 review I3; DESIGN §2).
+    /// A promote whose role fsync failed returned `Err`, and the error says to
+    /// restart. The restarted process reads `Primary` back from the page cache;
+    /// acting on that without making it durable lets the next power loss revert
+    /// the file to `Follower` under a node that already served as primary, its
+    /// log now diverged. `load_role` syncs before it trusts, so the role a node
+    /// boots as is the role it boots as after the next power loss too.
+    #[test]
+    fn a_role_a_restarted_node_boots_as_survives_the_next_power_loss() {
+        let sim = Sim::with_faults(0xD1_1301, FaultConfig::none());
+        let follower = Role::Follower {
+            primary: "a:1".to_string(),
+        };
+        load_role(&sim.disk(), &follower).unwrap(); // first boot: a durable Follower
+        let err = store_role(&failing(&sim, true, false), &Role::Primary).unwrap_err();
+        assert!(err.to_string().contains("injected fsync failure"), "{err}");
+        sim.restart_process(); // the operator restarts, as the error says to
+        let (booted, _) = load_role(&sim.disk(), &follower).unwrap();
+        assert_eq!(
+            booted,
+            Role::Primary,
+            "the restarted node reads the failed promote back from the page cache — if not, \
+             this test no longer reaches the shape it pins"
+        );
+        sim.restart(); // power loss
+        let (after, _) = load_role(&sim.disk(), &follower).unwrap();
+        assert_eq!(
+            after, booted,
+            "the role a restarted node booted as reverted at the next power loss — load_role \
+             trusted role bytes it never made durable"
+        );
+    }
+
+    /// The name is trusted too: whether the file exists decides first boot. A
+    /// first boot whose directory barrier failed leaves a role file only the
+    /// page cache knows about; a node restarted under a changed config boots
+    /// as that file's role ("the durable role file always wins"), and a power
+    /// loss then drops the name, so the next boot is a first boot under the
+    /// new config. `load_role` barriers the name before it reads the listing.
+    #[test]
+    fn a_role_file_name_a_restarted_node_trusts_survives_the_next_power_loss() {
+        // A power cycle loses every directory entry that was never barriered.
+        let sim = Sim::with_faults(
+            0xD1_1302,
+            FaultConfig {
+                dir_entry_loss: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let err = load_role(&failing(&sim, false, true), &Role::Primary).unwrap_err();
+        assert!(
+            err.to_string().contains("injected directory fsync failure"),
+            "{err}"
+        );
+        sim.restart_process();
+        let config = Role::Follower {
+            primary: "b:1".to_string(),
+        };
+        let (booted, _) = load_role(&sim.disk(), &config).unwrap();
+        assert_eq!(
+            booted,
+            Role::Primary,
+            "the restarted node finds the first boot's role file by a name only the page cache \
+             holds — if not, this test no longer reaches the shape it pins"
+        );
+        sim.restart(); // power loss
+        let (after, _) = load_role(&sim.disk(), &config).unwrap();
+        assert_eq!(
+            after, booted,
+            "the role a restarted node booted as reverted at the next power loss — load_role \
+             trusted a role file name it never made durable"
+        );
+    }
+
+    /// A role file whose sync fails at boot is not acted on: the boot fails by
+    /// name, and after the next power loss the node still holds the last role
+    /// that was durable (fsyncgate — a failed sync guarantees nothing).
+    #[test]
+    fn a_role_file_whose_sync_fails_at_boot_is_not_trusted() {
+        let sim = Sim::with_faults(0xD1_1303, FaultConfig::none());
+        let follower = Role::Follower {
+            primary: "a:1".to_string(),
+        };
+        load_role(&sim.disk(), &follower).unwrap();
+        store_role(&failing(&sim, true, false), &Role::Primary).unwrap_err();
+        sim.restart_process();
+        let err = load_role(&failing_read(&sim), &follower)
+            .expect_err("a boot acted on a role file whose sync failed");
+        let msg = err.to_string();
+        assert!(msg.contains("reading the role file \"role\""), "{msg}");
+        assert!(msg.contains("injected fsync failure"), "{msg}");
+        assert!(msg.contains("restart"), "{msg}");
+        sim.restart(); // power loss
+        assert_eq!(
+            load_role(&sim.disk(), &follower).unwrap().0,
+            follower,
+            "the last durable role is the one the node holds after the power loss"
+        );
     }
 
     /// A raw disk-IO failure under `Repl::open`'s call to `load_role` must

@@ -857,7 +857,7 @@ impl Sim {
         disk.crash_countdown = None;
     }
 
-    /// Restarts the PROCESS, not the machine: every open handle dies (it
+    /// Restarts the PROCESS, not the machine: every open file handle dies (it
     /// predates the restart, the same contract as after `restart`) and
     /// nothing else happens. The page cache survives — every unsynced write
     /// and directory entry stays pending, readable by the next open exactly
@@ -871,7 +871,11 @@ impl Sim {
     /// outran the log, realtime seed 0x7df8c43a1d2591e8).
     ///
     /// Call it before dropping the old process's handles to model a kill
-    /// (no destructor reaches the disk), after to model an exit. Draws
+    /// (nothing flushed through its open files reaches the disk), after to
+    /// model an exit. Only file handles are epoch-gated, as after `restart`:
+    /// a destructor that opens a file afresh through a held `SimDisk` still
+    /// reaches the disk. `unsynced_files` reads what the restart left
+    /// unsynced. Draws
     /// nothing, collapses nothing and clears no countdown — a pending crash
     /// countdown stays armed, since power loss does not wait for a process —
     /// so a universe that never calls it is unchanged. Marks
@@ -899,6 +903,22 @@ impl Sim {
     /// the same seed must produce the same fingerprint, forever.
     pub fn durable_fingerprint(&self) -> u64 {
         fingerprint_files(&self.world.lock().disk.files)
+    }
+
+    /// The files on the global disk holding writes no sync has taken yet,
+    /// sorted by name: what the next power cycle may tear or drop. Read right
+    /// after `restart_process`, it proves the restart left the next process
+    /// something unsynced to read back; a restart that flushed would leave it
+    /// empty. Read-only: draws nothing and marks nothing.
+    pub fn unsynced_files(&self) -> Vec<String> {
+        self.world
+            .lock()
+            .disk
+            .files
+            .iter()
+            .filter(|(_, file)| !file.pending.is_empty())
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// The earliest virtual time at which a currently in-flight network
@@ -1302,7 +1322,17 @@ impl File for SimFile {
 
     fn sync(&self) -> io::Result<()> {
         self.op(|state, cfg, path| {
-            if !state.disk_faults_off && state.faults_of(&self.host).chance(cfg.sync_error) {
+            // A file with nothing unsynced has nothing to flush and nothing to
+            // fail, so its sync rolls no fault (DESIGN §1). Recovery and boot
+            // reads sync files a power cycle already left clean; a roll there
+            // would inject failures no disk produces and re-key every universe
+            // that recovers. It is still a disk op: the countdown and the
+            // latency were charged above.
+            let dirty = !file_state(state, &self.host, path).pending.is_empty();
+            if dirty
+                && !state.disk_faults_off
+                && state.faults_of(&self.host).chance(cfg.sync_error)
+            {
                 state.cover("fault:sync_error");
                 // Real fsync failure semantics: nothing can be assumed. The
                 // buffer stays volatile; a later crash collapses it as usual.
@@ -2312,6 +2342,9 @@ mod tests {
         for disk in [&global, &hosted] {
             let file = disk.open("f").unwrap();
             assert!(file.write_at(0, b"x").is_err());
+            // The failed write left nothing to flush, and a clean sync cannot
+            // fail; `set_len` rolls no fault, so it gives the sync work to do.
+            file.set_len(1).unwrap();
             assert!(file.sync().is_err());
             assert!(disk.sync_dir("").is_err());
         }
@@ -2384,8 +2417,17 @@ mod tests {
             vec!["f".to_string(), "g".to_string()],
             "a process restart keeps a directory entry that was never made durable"
         );
+        assert_eq!(
+            sim.unsynced_files(),
+            vec!["f".to_string()],
+            "a process restart leaves the dead process's unsynced write unsynced"
+        );
         let coverage = sim.coverage();
-        assert_eq!(coverage.get("restart:process"), Some(&1));
+        assert_eq!(
+            coverage.get("restart:process"),
+            Some(&1),
+            "a process restart marks restart:process once"
+        );
         assert!(
             !coverage
                 .keys()
@@ -2394,7 +2436,16 @@ mod tests {
         );
 
         sim.restart(); // the power cycle drops what the process restart kept
-        assert_eq!(disk.open("f").unwrap().len().unwrap(), 0);
+        assert_eq!(
+            disk.open("f").unwrap().len().unwrap(),
+            0,
+            "a power cycle drops the unsynced write the process restart kept — if it is still \
+             here, the write was made durable before the power cycle"
+        );
+        assert!(
+            sim.unsynced_files().is_empty(),
+            "a power cycle leaves nothing unsynced"
+        );
     }
 
     #[test]
@@ -2429,7 +2480,13 @@ mod tests {
                 coverage,
             )
         };
-        assert_eq!(run(true), run(false));
+        assert_eq!(
+            run(true),
+            run(false),
+            "a process restart changed the next power cycle's collapse, the entropy after it, or \
+             the coverage: it drew from a stream or collapsed something, so introducing it \
+             re-keys universes"
+        );
     }
 
     #[test]
@@ -2488,6 +2545,50 @@ mod tests {
              barrier is drawing from the shared per-host stream, so every later \
              read/write/sync roll shifted. Key it separately — DESIGN.md made the \
              same repair for the object store's delete arm."
+        );
+    }
+
+    #[test]
+    fn a_sync_with_nothing_to_flush_draws_no_fault() {
+        // Twin universes, one of which also syncs a file it never wrote,
+        // before every op of the workload: a clean sync has nothing to flush
+        // and nothing to fail, so it must neither fail nor move a single later
+        // roll. Syncing durable files is the exact shape of a durability fix
+        // made after a power cycle (recovery's per-segment sync).
+        fn run(clean_syncs: bool) -> BTreeMap<&'static str, u64> {
+            let mut cfg = FaultConfig::none();
+            cfg.write_error = 0.3;
+            cfg.read_error = 0.3;
+            cfg.sync_error = 0.3;
+            let sim = Sim::with_faults(0x5145_0005, cfg);
+            let disk = sim.disk();
+            let clean = disk.open("clean").unwrap();
+            let file = disk.open("f").unwrap();
+            for i in 0..40u64 {
+                if clean_syncs {
+                    clean
+                        .sync()
+                        .expect("a sync with nothing to flush must not fail");
+                }
+                let _ = file.write_at(i * 8, b"abcdefgh");
+                let _ = file.sync();
+                let mut buf = [0u8; 8];
+                let _ = file.read_at(i * 8, &mut buf);
+            }
+            sim.coverage()
+        }
+
+        let baseline = run(false);
+        assert!(
+            baseline.get("fault:sync_error").copied().unwrap_or(0) > 0,
+            "anti-vacuity: a dirty file's sync must still fail, or the comparison below \
+             passes with the sync fault switched off entirely: {baseline:?}"
+        );
+        assert_eq!(
+            baseline,
+            run(true),
+            "syncing a file with nothing to flush changed the fault schedule: a clean \
+             sync rolled a fault it can never fire honestly, so every later roll shifted"
         );
     }
 

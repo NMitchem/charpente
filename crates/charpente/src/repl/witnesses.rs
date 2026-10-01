@@ -336,8 +336,16 @@ enum SlotState {
 /// integrity and format failures become `SlotState::Torn`/`ForeignFormat`
 /// rather than an `Err`, because `load_witnesses` must inspect BOTH slots
 /// before deciding whether a failure here is rescuable by the other slot.
+///
+/// The slot's name and bytes are made durable before either is trusted, as
+/// `role.rs`'s `load_role` does and for the same reason (DESIGN §2, "readable
+/// is not durable"): a store whose fsync or barrier failed leaves its newer
+/// generation in the page cache, and a node that boots with that set and then
+/// loses it to a power cycle checks a SHORTER set than the one it acted on.
 fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
     let path = witness_path(slot);
+    disk.sync_dir(&path)
+        .map_err(|e| witness_io_error("reading", &path, e))?;
     if !disk
         .list(&path)
         .map_err(|e| witness_io_error("reading", &path, e))?
@@ -348,6 +356,8 @@ fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
     }
     let file = disk
         .open(&path)
+        .map_err(|e| witness_io_error("reading", &path, e))?;
+    file.sync()
         .map_err(|e| witness_io_error("reading", &path, e))?;
     let len = file
         .len()
@@ -639,9 +649,127 @@ pub fn clear_witnesses(disk: &dyn Disk) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use charpente_core::io::Entropy;
     use charpente_sim::{FaultConfig, Sim};
+
+    /// A disk whose store fails its own sync (`file`) or barrier (`dir`):
+    /// the arm fires only after a write, so a read ahead of it is untouched.
+    fn failing(sim: &Sim, file: bool, dir: bool) -> crate::repl::FailNextSync {
+        crate::repl::FailNextSync {
+            inner: sim.disk(),
+            arm: Arc::new(AtomicBool::new(file)),
+            arm_dir: Arc::new(AtomicBool::new(dir)),
+            after_write: true,
+            wrote: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A disk whose very next `File::sync` fails: a boot's own read.
+    fn failing_read(sim: &Sim) -> crate::repl::FailNextSync {
+        crate::repl::FailNextSync {
+            after_write: false,
+            ..failing(sim, true, false)
+        }
+    }
+
+    /// Readable is not durable, for the witness set (D1 review I3; DESIGN §2).
+    /// A store whose fsync failed leaves the newer generation in the page
+    /// cache. A restarted primary that boots trusting it, and a power loss
+    /// that then takes it back, leaves the node checking a SHORTER set than
+    /// the one it already acted on — the weaker check this file exists to
+    /// prevent. Reads sync a slot before trusting it, so the set a node boots
+    /// with is the set it boots with after the next power loss too.
+    #[test]
+    fn a_witness_set_a_restarted_node_boots_with_survives_the_next_power_loss() {
+        let sim = Sim::with_faults(0xD1_1304, FaultConfig::none());
+        open_witnesses(&sim.disk()).unwrap(); // a fresh data dir, established empty
+        let err = store_witnesses(&failing(&sim, true, false), &["b:1".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("injected fsync failure"), "{err}");
+        sim.restart_process();
+        let booted = open_witnesses(&sim.disk()).unwrap();
+        assert_eq!(
+            booted,
+            vec!["b:1".to_string()],
+            "the restarted node reads the failed store's set back from the page cache — if not, \
+             this test no longer reaches the shape it pins"
+        );
+        sim.restart(); // power loss
+        assert_eq!(
+            open_witnesses(&sim.disk()).unwrap(),
+            booted,
+            "the witness set a restarted node booted with shrank at the next power loss — a \
+             slot read trusted bytes it never made durable"
+        );
+    }
+
+    /// The slot's NAME is trusted too. Two barrier failures on one slot, each
+    /// followed by a restart, leave its newest generation durable in content
+    /// and known to the page cache only by name: the first restart's
+    /// establishing store fills the other slot and leaves this name pending,
+    /// and the second store lands its bytes and fails its barrier again. A
+    /// power loss then drops the name, and the older slot's shorter set wins.
+    /// Reads barrier a slot's name before trusting it.
+    #[test]
+    fn a_witness_slot_name_a_restarted_node_trusts_survives_the_next_power_loss() {
+        // A power cycle loses every directory entry that was never barriered.
+        let sim = Sim::with_faults(
+            0xD1_1305,
+            FaultConfig {
+                dir_entry_loss: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        open_witnesses(&failing(&sim, false, true)).unwrap_err(); // slot 0's barrier fails
+        sim.restart_process();
+        assert_eq!(open_witnesses(&sim.disk()).unwrap(), Vec::<String>::new());
+        let err = store_witnesses(&failing(&sim, false, true), &["b:1".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("injected directory fsync failure"),
+            "{err}"
+        );
+        sim.restart_process();
+        let booted = open_witnesses(&sim.disk()).unwrap();
+        assert_eq!(
+            booted,
+            vec!["b:1".to_string()],
+            "the restarted node reads the newest set from a slot only the page cache names — if \
+             not, this test no longer reaches the shape it pins"
+        );
+        sim.restart(); // power loss
+        assert_eq!(
+            open_witnesses(&sim.disk()).unwrap(),
+            booted,
+            "the witness set a restarted node booted with shrank at the next power loss — a \
+             slot read trusted a slot name it never made durable"
+        );
+    }
+
+    /// A slot whose sync fails at boot is not acted on: the boot fails by
+    /// name, and after the next power loss the set is the last durable one
+    /// (fsyncgate — a failed sync guarantees nothing).
+    #[test]
+    fn a_witness_slot_whose_sync_fails_at_boot_is_not_trusted() {
+        let sim = Sim::with_faults(0xD1_1306, FaultConfig::none());
+        open_witnesses(&sim.disk()).unwrap();
+        store_witnesses(&failing(&sim, true, false), &["b:1".to_string()]).unwrap_err();
+        sim.restart_process();
+        let err = open_witnesses(&failing_read(&sim))
+            .expect_err("a boot acted on a witness slot whose sync failed");
+        let msg = err.to_string();
+        assert!(msg.contains("reading the witness file"), "{msg}");
+        assert!(msg.contains("injected fsync failure"), "{msg}");
+        assert!(msg.contains("restart"), "{msg}");
+        sim.restart(); // power loss
+        assert_eq!(
+            open_witnesses(&sim.disk()).unwrap(),
+            Vec::<String>::new(),
+            "the last durable set is the one the node holds after the power loss"
+        );
+    }
 
     /// A raw disk-IO failure under `Repl::open`'s call to `open_witnesses`
     /// must name the witness file and the fix (hard rule 5), not just
@@ -1116,19 +1244,22 @@ mod tests {
     // then interrupted at every possible disk op via `crash_disk_after`,
     // with `crash_torn: 1.0` so every surviving pending op is a genuine
     // partial write. A single `store_witnesses` call for this scenario
-    // costs exactly 10 disk ops (read slot 0: list+open+len+read_at = 4;
-    // read slot 1 absent: list = 1; write slot 1: open+write_at+set_len+
-    // sync+sync_dir = 5). Content becomes durable at op index 8 (`sync`) —
-    // a crash at op index 9 (`sync_dir`, the LAST op) fires only after that
-    // `sync` already committed the new generation, so it does not tear
-    // content (`FaultConfig::none()`'s `dir_entry_loss: 0.0` here means the
-    // directory entry for a freshly-created file is unconditionally kept
-    // regardless of `sync_dir`'s own fate). So indices 0..=8 (9 crash
-    // points) are the ones that can interrupt BEFORE content durably
-    // lands — asserted below so a future refactor that changes the op
-    // count, or the point content becomes durable, fails loudly here
-    // rather than silently exercising fewer interruption points than
-    // intended.
+    // costs exactly 13 disk ops (read slot 0: sync_dir+list+open+sync+len+
+    // read_at = 6; read slot 1 absent: sync_dir+list = 2; write slot 1:
+    // open+write_at+set_len+sync+sync_dir = 5 — the reads barrier and sync
+    // before they trust, D1 review I3). Content becomes durable at op index
+    // 11 (`sync`) — a crash at op index 12 (`sync_dir`, the LAST op) fires
+    // only after that `sync` already committed the new generation, so it
+    // does not tear content (`FaultConfig::none()`'s `dir_entry_loss: 0.0`
+    // here means the directory entry for a freshly-created file is
+    // unconditionally kept regardless of `sync_dir`'s own fate). So indices
+    // 0..=11 (12 crash points) are the ones that can interrupt BEFORE
+    // content durably lands, and index 12 is the first that cannot — both
+    // sides asserted below, so a refactor that changes the op count, or the
+    // point content becomes durable, fails loudly here rather than silently
+    // exercising fewer interruption points than intended. (Until 2026-10-01
+    // only the lower side was asserted, and the I3 fix's four extra read ops
+    // left the sweep three crash points short without a failure.)
     //
     // FIX ROUND 1, Minor #4: the sweep ran on ONE seed, so `tear`'s
     // `keep = rng.below(len)` was a single fixed draw at each crash point.
@@ -1142,7 +1273,7 @@ mod tests {
         };
         let old = vec!["127.0.0.1:7001".to_string()];
         let new = vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
-        const OPS_BEFORE_CONTENT_IS_DURABLE: u64 = 9; // op indices 0..=8; index 8 is `sync`
+        const OPS_BEFORE_CONTENT_IS_DURABLE: u64 = 12; // op indices 0..=11; index 11 is `sync`
         for seed in [
             0x0DEE_000D_u64,
             0x0DEE_0011,
@@ -1179,6 +1310,26 @@ mod tests {
                      torn) new one"
                 );
             }
+            // The other side of the boundary: a crash at the last op lands
+            // after the content-durable `sync`, so the new set survives it.
+            let sim = Sim::with_faults(seed, crash_cfg.clone());
+            let disk = sim.disk();
+            store_witnesses(&disk, &old).unwrap();
+            sim.crash_disk_after(OPS_BEFORE_CONTENT_IS_DURABLE);
+            assert!(
+                store_witnesses(&disk, &new).is_err(),
+                "seed={seed:#x}: a crash at op index {OPS_BEFORE_CONTENT_IS_DURABLE} must still \
+                 interrupt the store (its last op, the barrier) — got Ok, so the store costs \
+                 fewer ops than the comment above counts"
+            );
+            sim.restart();
+            assert_eq!(
+                load_witnesses(&disk).unwrap(),
+                new,
+                "seed={seed:#x}: a crash at op index {OPS_BEFORE_CONTENT_IS_DURABLE} must land \
+                 after the content-durable sync — the store costs more ops than the comment \
+                 above counts, so the sweep stops short of its last interruption point"
+            );
         }
     }
 

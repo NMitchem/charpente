@@ -2791,7 +2791,11 @@ impl Db {
             // applied_seq itself the horizon, so in §2's words base =
             // horizon + 1), nothing to replay — instead of letting
             // `Wal::open` start a fresh log at 0 and trip the
-            // outran-durable-truth assert below.
+            // outran-durable-truth assert below. Safe only because the store
+            // was durable when `applied_seq` was read: a failed seed leaves it
+            // in the page cache, and nothing here syncs it — redb 4.3.0's
+            // writable open does (DESIGN §4, pinned by `a_seeded_store_a_-
+            // restarted_node_lays_its_segment_from_survives_the_next_power_loss`).
             None if skip_through.is_some() => {
                 disk.open(&segment_name(&cfg.wal.dir, horizon))?;
                 disk.sync_dir(&prefix)?;
@@ -2864,8 +2868,11 @@ impl Db {
 
     /// Runs one transaction: `f` reads through `tx` and buffers effects; on
     /// `Ok` the effects commit as one durable log record and apply to the
-    /// store; on `Err` nothing happened at all. A transaction with no
-    /// effects writes nothing and consumes no seq.
+    /// store; on `Err(TxError::App)` nothing was written; on
+    /// `Err(TxError::Io)` the outcome is unknown — an append or sync that
+    /// failed after `f` returned may still leave the record durable, and the
+    /// next recovery replays it. A transaction with no effects writes nothing
+    /// and consumes no seq.
     ///
     /// A group of one (spec §1): `transact` is exactly `begin_group` + one
     /// `stage` + `commit`, so the single-transaction path and a batched path
