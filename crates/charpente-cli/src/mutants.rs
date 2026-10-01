@@ -180,6 +180,31 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
 
+    // The tool is checked for before anything that takes time: the timing run
+    // below can take minutes, and a machine without cargo-mutants should
+    // learn that first. Process spawning is edge tooling (DESIGN.md §1).
+    #[allow(clippy::disallowed_methods)]
+    let probe = Command::new("cargo")
+        .args(["mutants", "--version"])
+        .current_dir(&opts.dir)
+        .output();
+    if !probe.as_ref().is_ok_and(|out| out.status.success()) {
+        let how = match &probe {
+            Ok(out) => format!(
+                "exited {}",
+                out.status
+                    .code()
+                    .map_or("on a signal".to_string(), |c| c.to_string())
+            ),
+            Err(e) => format!("could not run: {e}"),
+        };
+        eprintln!(
+            "error: cargo-mutants is not installed (`cargo mutants --version` {how}) — install \
+             the pinned version with\n  cargo install cargo-mutants --version 27.1.0 --locked"
+        );
+        return 2;
+    }
+
     let out_dir = PathBuf::from(&opts.dir).join("target/charpente-mutants");
     let mut argv: Vec<String> = vec!["mutants".into(), "--output".into(), display(&out_dir)];
     for file in &opts.files {
@@ -226,10 +251,19 @@ pub fn run(args: &[String]) -> i32 {
             match time_the_package_set(&opts.dir, &opts.test_packages) {
                 Ok(secs) => {
                     let derived = derived_timeout(secs);
+                    // Under --property each mutant runs one sim property, a
+                    // subset of what was timed, so the time only bounds it.
+                    let what = match &opts.property {
+                        None => "that is what each mutant runs".to_string(),
+                        Some(p) => format!(
+                            "each mutant runs only the sim property `{p}`, so that is an upper \
+                             bound on a mutant's run"
+                        ),
+                    };
                     println!(
-                        "mutants: `cargo test` over {} took {secs:.1} s of wall time; that is \
-                         what each mutant runs, and cargo-mutants' own baseline times only the \
-                         mutated file's package, so the verb is passing --timeout {derived} (5x)",
+                        "mutants: `cargo test` over {} took {secs:.1} s of wall time; {what}, \
+                         and cargo-mutants' own baseline times only the mutated file's package, \
+                         so the verb is passing --timeout {derived} (5x)",
                         opts.test_packages.join(", ")
                     );
                     Some(derived.to_string())
@@ -273,15 +307,6 @@ pub fn run(args: &[String]) -> i32 {
         .current_dir(&opts.dir)
         .status();
 
-    if let Err(e) = &status
-        && e.kind() == std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "error: cargo-mutants is not installed — install the pinned version with\n  \
-             cargo install cargo-mutants --version 27.1.0 --locked"
-        );
-        return 2;
-    }
     let status = match status {
         Ok(status) => status,
         Err(e) => {

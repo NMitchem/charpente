@@ -90,7 +90,9 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
   those differ (two or more test packages, as the default set is, or one that is not
   every `--file`'s package) and no `--timeout` is given, the verb first times one
   `cargo test` over the test set and passes `--timeout` as 5x that wall time, printing
-  both numbers; without that, slow-but-caught mutants read TIMEOUT. Exit 0 every
+  both numbers (an upper bound under `--property`); without that, slow-but-caught mutants
+  read TIMEOUT. It checks `cargo mutants --version` before any of that, so a missing tool
+  costs no timing run. Exit 0 every
   viable mutant caught, 1 a finding (**MISSED** = no oracle noticed, i.e. a one-sided
   property) or an unresolved run (**a timeout is not a catch**), 2 usage, infrastructure,
   or a baseline that was not green.

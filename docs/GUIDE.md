@@ -3063,14 +3063,18 @@ timeout, and prints both numbers:
 mutants: `cargo test` over charpente-core, charpente-sim took 8.6 s of wall time; that is what each mutant runs, and cargo-mutants' own baseline times only the mutated file's package, so the verb is passing --timeout 44 (5x)
 ```
 
-An explicit `--timeout SECS` skips the timing run and is passed through as
-given.
+Under `--property` each mutant runs that one sim property, less than the set
+that was timed, so the line says the time is an upper bound on a mutant's run
+instead. An explicit `--timeout SECS` skips the timing run and is passed through
+as given.
 
 **It is not part of `cargo test`.** Every mutant is a rebuild plus a test run,
 so this is an on-demand instrument like the edge harness below, not something
 your inner loop pays for. Scope it at a file or a function (`--file`, `--re`)
 rather than turning it loose on a whole workspace. It needs the pinned tool:
-`cargo install cargo-mutants --version 27.1.0 --locked`.
+`cargo install cargo-mutants --version 27.1.0 --locked`. The verb checks for it
+(`cargo mutants --version`) before anything else runs, so a machine without it
+exits 2 with that install line rather than after a timing run.
 
 ### A note on the edge harness (platform dev tooling, not app surface)
 
