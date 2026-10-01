@@ -1465,7 +1465,8 @@ struct Client {
     gone: BTreeSet<u64>,
     /// Ids strictly below this are forfeited: a bare reconnect's
     /// `next_event_id` at push time, so `settled()` never waits on them.
-    /// Monotonic (a later forfeit is always a superset of an earlier one).
+    /// Monotonic (a later forfeit is always a superset of an earlier one),
+    /// except that a timeline cut lowers it to the cut (`resync_to_head`).
     floor: u64,
     /// Delivered frames not yet checked against the ledger: `(id, name,
     /// json)`, oldest first. Every entry was RECEIVED live (pushed from a
@@ -1482,7 +1483,8 @@ struct Client {
     /// without ever receiving 6), the mark advances past the gap and
     /// permanently excuses it — the interior-skip meta-test proves
     /// membership catches what the mark could not (T6 review). `floor`
-    /// stays a separate, permanent forfeit trim; this set only ever grows.
+    /// stays a separate, permanent forfeit trim; this set only ever grows,
+    /// except that a timeline cut drops the ids it cut (`resync_to_head`).
     verified: BTreeSet<u64>,
     cursor: Option<Cursor>,
     need_subscribe: bool,
@@ -1655,6 +1657,41 @@ impl Client {
             self.ledger.insert(row.id.raw(), (name, row.key, json));
         }
         Ok(())
+    }
+
+    /// Forgets everything this client learned about ids at or above `head`, the
+    /// `next_event_id` of a store whose timeline a recovery cut back to it, so
+    /// the next `sync_ledger` re-reads those ids from the timeline the node now
+    /// holds. Every piece of state keyed by id goes: a ledger row recorded
+    /// there describes an event that no longer exists, a frame delivered there
+    /// came from the lost timeline, a `verified` or `gone` mark there would
+    /// excuse whatever event is re-minted at that id, and a `floor` above
+    /// `head` would forfeit it. What survives is exactly the state for ids the
+    /// node still holds; nothing here is forgiven.
+    fn resync_to_head(&mut self, head: u64) {
+        self.ledger.retain(|&id, _| id < head);
+        self.pending.retain(|&(id, ..)| id < head);
+        self.verified.retain(|&id| id < head);
+        self.gone.retain(|&id| id < head);
+        self.floor = self.floor.min(head);
+        self.next_scan_id = self.next_scan_id.min(head);
+    }
+
+    /// `head` is a `next_event_id` read off a node (`push_subscribe`'s
+    /// boundary). That counter only advances on commit, so a recorded id at or
+    /// above it is one a recovery cut away, which on one node takes durable
+    /// corruption above the checkpoint horizon. Then the client re-syncs to
+    /// the node's timeline (`resync_to_head`): a cut id that was never
+    /// re-minted, or was re-minted for another tenant, is no longer owed, and
+    /// one re-minted for this subscription is owed again under its new
+    /// content, so a re-mint that is never delivered FAILS the universe. With
+    /// no durable corruption on record nothing changes, and the same recorded
+    /// id stays owed, as it must: there it can only be a lost event.
+    fn resync_if_cut(&mut self, sim: &Sim, head: u64) {
+        if self.ledger.range(head..).next().is_some() && durable_corruption_fired(sim) {
+            self.resync_to_head(head);
+            sim.cover("realtime:ledger-resynced");
+        }
     }
 
     /// Direct id lookup — no positional skipping, no forfeit interaction:
@@ -1860,9 +1897,7 @@ impl Client {
                     // prune never settles, and `unsettled_report` names it.
                     match db.next_event_id() {
                         Ok(head) => {
-                            self.ledger.retain(|&id, _| id < head);
-                            self.pending.retain(|&(id, ..)| id < head);
-                            self.next_scan_id = self.next_scan_id.min(head);
+                            self.resync_to_head(head);
                             sim.cover("realtime:gap");
                             self.cursor = None;
                             self.need_subscribe = true;
@@ -5070,15 +5105,13 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
 /// Returns the frame trace, so the replay check has an oracle.
 fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
-    // Ledger ids this node's timeline no longer holds, each with the
-    // `next_event_id` that proved it. `push_subscribe` already reads that
-    // counter, which only advances on commit, so a recorded id at or above it
-    // is one a recovery cut away: on a single node, only durable corruption
-    // above the checkpoint horizon does that. Read off a value already in
-    // hand, so no disk op is added. The flagship's probe cannot see this case
-    // when the id is re-minted for the other tenant: no frame ever
-    // mismatches, and retention can collect the row before the settle.
-    let mut rolled_back_ids: BTreeMap<u64, u64> = BTreeMap::new();
+    // Every boundary `push_subscribe` reads goes through `resync_if_cut`. Each
+    // recovery is followed by a subscribe before any emit, so every cut is
+    // seen there before an id it cut can be re-minted. The flagship's
+    // drain-error probe cannot see a cut whose id is re-minted for the other
+    // tenant: no frame ever mismatches, and retention can collect the row
+    // before the settle. The re-sync reads a value already in hand, so it
+    // adds no disk op.
 
     for _epoch in 0..EPOCHS {
         // A give-up already recorded means this universe adjudicated
@@ -5124,9 +5157,7 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             if client.need_subscribe {
                 match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
                     Ok(info) => {
-                        for (&id, _) in client.ledger.range(info.1..) {
-                            rolled_back_ids.entry(id).or_insert(info.1);
-                        }
+                        client.resync_if_cut(sim, info.1);
                         subscribe = Some(info);
                         t += SEC;
                     }
@@ -5212,9 +5243,7 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
         let subscribe =
             match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
                 Ok(info) => {
-                    for (&id, _) in client.ledger.range(info.1..) {
-                        rolled_back_ids.entry(id).or_insert(info.1);
-                    }
+                    client.resync_if_cut(sim, info.1);
                     info
                 }
                 Err(e) if is_fault_fallout(&e) => {
@@ -5270,34 +5299,6 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
                  holds the recorded event (durable corruption cut it above the \
                  checkpoint horizon), so it can never be delivered and nothing here \
                  adjudicates ({})",
-                client.unsettled_report()
-            ));
-            return Ok(client.trace);
-        }
-        // Every id still owed is one this node lost to durable corruption (see
-        // `rolled_back_ids`), so none of them can ever be delivered.
-        let lo = client.floor.min(client.next_scan_id);
-        let owed: Vec<u64> = client
-            .ledger
-            .range(lo..client.next_scan_id)
-            .filter(|(id, (name, key, _))| {
-                client.matches(name, key) && !client.verified.contains(id)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        if durable_corruption_fired(sim)
-            && client.pending.is_empty()
-            && !owed.is_empty()
-            && owed.iter().all(|id| rolled_back_ids.contains_key(id))
-        {
-            let id = owed[0];
-            sim.give_up(format!(
-                "ledger id {id} left this node's timeline: recorded {} when scanned, and a later \
-                 read found the store's next_event_id at {}, so the store no longer holds it — \
-                 durable corruption cut it at recovery above the checkpoint horizon and the id \
-                 was re-minted, so it can never be delivered and nothing here adjudicates ({})",
-                client.ledger[&id].2,
-                rolled_back_ids[&id],
                 client.unsettled_report()
             ));
             return Ok(client.trace);
@@ -5483,11 +5484,13 @@ const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
 /// B's rows are filtered), so the flagship's drain-error probe never ran, and
 /// by the settle retention had collected the row the probe would have read.
 /// The universe failed "client never caught up" on an event its own node had
-/// lost to a durable-corruption fault the property excuses. It now gives up,
-/// because a `next_event_id` read after that recovery showed the store behind
-/// the recorded id.
+/// lost. From 2026-09-30 it gave up; that excuse also swallowed an id
+/// re-minted for tenant A and never delivered (review I2). Since 2026-10-01
+/// the boundary read after that recovery re-syncs the client to the node's
+/// timeline (`Client::resync_if_cut`), so id 5 is B's and not owed, and the
+/// universe reaches a verdict on everything A was owed.
 #[test]
-fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_gives_up() {
+fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced() {
     const SEED: u64 = 0x2085_1976_ea4b_ae36;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -5495,23 +5498,100 @@ fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_gives_up()
     charpente_sim::sample_extended_fields(SEED, &mut cfg);
     let mut sim = Sim::with_faults(SEED, cfg);
 
-    let result = scoped_realtime_workload(&mut sim);
-    assert!(
-        result.is_ok(),
-        "an event lost to durable corruption must not fail the universe: {:?}",
-        result.err()
-    );
-    let reason = sim
-        .gave_up()
-        .expect("and it must be RECORDED as a give-up, not counted as a pass");
-    assert!(
-        reason.contains("ledger id 5 left this node's timeline"),
-        "and it must be THIS give-up, for id 5: {reason}"
+    let trace = scoped_realtime_workload(&mut sim)
+        .expect("an event lost to durable corruption must not fail the universe");
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "re-synced to the node's timeline, it reaches a verdict on what A was owed"
     );
     assert!(
-        durable_corruption_fired(&sim),
-        "excused only because durable corruption fired"
+        durable_corruption_fired(&sim) && sim.coverage().contains_key("realtime:ledger-resynced"),
+        "this universe's reason is a cut by durable corruption, seen and re-synced: {:?}",
+        sim.coverage()
     );
+    assert!(
+        !trace.iter().any(|&(id, ..)| id == 5),
+        "id 5 was re-minted for tenant B, so A must never receive it: {trace:?}"
+    );
+}
+
+/// `resync_if_cut` drops exactly the ids a cut removed: an id below the
+/// store's `next_event_id` is still on the node's timeline and stays owed, so
+/// a client missing it fails rather than being excused with the cut one
+/// (review I2's mixed set).
+#[test]
+fn a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed() {
+    let sim = Sim::with_faults(0x2EB2_0901, FaultConfig::none());
+    sim.cover("fault:misdirected_write");
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    for id in [3, 5] {
+        let key = Some(SCOPED_TENANT_A_KEY.to_string());
+        client.ledger.insert(id, ("ping", key, format!("old {id}")));
+    }
+    client.next_scan_id = 6;
+
+    client.resync_if_cut(&sim, 5);
+    assert_eq!(client.ledger.keys().copied().collect::<Vec<_>>(), [3]);
+    assert_eq!(
+        client.next_scan_id, 5,
+        "the next scan re-reads from the cut"
+    );
+    assert_eq!(
+        client.first_unaccounted(),
+        Some(3),
+        "id 3 was never cut, so the client still owes it"
+    );
+}
+
+/// The residual review I2 found: an id cut and re-minted for THIS
+/// subscription, then never delivered, must fail. After the re-sync the
+/// re-scan records the re-mint, and neither the old verification of the cut
+/// event nor a frame the client received from the lost timeline counts for it.
+#[test]
+fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
+    let sim = Sim::with_faults(0x2EB2_0902, FaultConfig::none());
+    sim.cover("fault:misdirected_write");
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let key = Some(SCOPED_TENANT_A_KEY.to_string());
+    client
+        .ledger
+        .insert(5, ("ping", key.clone(), "old 5".to_string()));
+    client.verified.insert(5);
+    client.next_scan_id = 6;
+    assert!(
+        client.settled(),
+        "before the cut, id 5 was delivered and verified"
+    );
+
+    client.resync_if_cut(&sim, 5);
+    // What the next `sync_ledger` reads: id 5 re-minted for tenant A.
+    client.ledger.insert(5, ("ping", key, "new 5".to_string()));
+    client.next_scan_id = 6;
+    assert_eq!(
+        client.first_unaccounted(),
+        Some(5),
+        "the re-mint is owed: a client that never receives it fails"
+    );
+}
+
+/// The other direction: with no durable corruption on record, a recorded id at
+/// or above `next_event_id` is a lost event, and nothing is re-synced away.
+#[test]
+fn without_durable_corruption_a_cut_is_not_resynced() {
+    let sim = Sim::with_faults(0x2EB2_0903, FaultConfig::none());
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let key = Some(SCOPED_TENANT_A_KEY.to_string());
+    client.ledger.insert(5, ("ping", key, "old 5".to_string()));
+    client.next_scan_id = 6;
+
+    client.resync_if_cut(&sim, 5);
+    assert_eq!(
+        client.first_unaccounted(),
+        Some(5),
+        "no corruption fired, so id 5 is still owed"
+    );
+    assert!(!sim.coverage().contains_key("realtime:ledger-resynced"));
 }
 
 /// Floors pinned at an exact measurement are only meaningful if the batch is
