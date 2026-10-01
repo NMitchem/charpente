@@ -1238,7 +1238,7 @@ fn regression_store_bricked_by_creation_crash() {
     let witness = seen.clone();
     let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
         Box::new(DiscardWitness {
-            inner: sim.disk(),
+            inner: Box::new(sim.disk()),
             seen: witness.clone(),
         })
     });
@@ -1326,14 +1326,17 @@ fn a_non_injected_error_at_a_rounds_recovery_fails_the_universe() {
 /// A file shorter than nine bytes is compared as zeros.
 const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
 
-/// Why `Db::open` discarded the store, judged from the bytes redb itself read.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Why `Db::open` discarded the store, judged from what the witness saw on the
+/// store's path while it was being opened.
+#[derive(Debug, Clone, PartialEq)]
 enum Discard {
     /// A non-empty file without redb's magic number: a creation that never
     /// became durable ("Not a redb database: magic number mismatch").
     Garbage,
-    /// Anything else, e.g. a store with its magic number refused because an
-    /// injected fault hit its open.
+    /// The open that preceded the discard hit this IO error on the store's
+    /// path: a fault a retry may not repeat, not a verdict on the file's bytes.
+    AfterIoError(String),
+    /// Anything else, e.g. a store redb found corrupted.
     Other,
 }
 
@@ -1343,28 +1346,51 @@ struct StoreSeen {
     /// since `tables.redb` was last opened.
     len: Option<u64>,
     magic: Option<bool>,
+    /// True from `Disk::open("tables.redb")` until `Db::open` next touches
+    /// any other path: the span in which `Store::open` runs.
+    opening: bool,
+    /// The first IO error on the store's path while `opening`.
+    open_error: Option<String>,
     discards: Vec<Discard>,
+    /// Open errors followed by a fresh open of the same file, with no discard
+    /// between: a transient fault left to bubble and retried.
+    retried: Vec<String>,
+}
+
+impl StoreSeen {
+    fn note_error(&mut self, e: &io::Error) {
+        if self.opening && self.open_error.is_none() {
+            self.open_error = Some(e.to_string());
+        }
+    }
 }
 
 /// A pass-through `Disk` that watches `Db::open` discard `tables.redb`. It
-/// records the file's length and its first nine bytes as redb reads them, and
+/// records the file's length and its first nine bytes as redb reads them,
+/// every IO error on the store's path while the store is being opened, and
 /// classifies each removal of the file. It issues no disk op of its own. An
 /// inspection that did would tick the crash countdown and draw latency, and
 /// so rename the universe it is watching.
 struct DiscardWitness {
-    inner: charpente_sim::SimDisk,
+    inner: Box<dyn Disk>,
     seen: Arc<Mutex<StoreSeen>>,
 }
 
 impl Disk for DiscardWitness {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
-        let file = self.inner.open(path)?;
-        if path != "tables.redb" {
-            return Ok(file);
-        }
         let mut seen = self.seen.lock().expect("witness lock");
+        if path != "tables.redb" {
+            seen.opening = false;
+            drop(seen);
+            return self.inner.open(path);
+        }
+        if let Some(e) = seen.open_error.take() {
+            seen.retried.push(e);
+        }
         seen.len = None;
         seen.magic = None;
+        seen.opening = true;
+        let file = self.inner.open(path).inspect_err(|e| seen.note_error(e))?;
         Ok(Box::new(StoreWitness {
             inner: file,
             seen: self.seen.clone(),
@@ -1378,21 +1404,29 @@ impl Disk for DiscardWitness {
                 Some(len) if len > 0 => len < REDB_MAGIC.len() as u64 || seen.magic == Some(false),
                 _ => false,
             };
-            seen.discards.push(if garbage {
-                Discard::Garbage
-            } else {
-                Discard::Other
-            });
+            let discard = match seen.open_error.take() {
+                Some(e) => Discard::AfterIoError(e),
+                None if garbage => Discard::Garbage,
+                None => Discard::Other,
+            };
+            seen.discards.push(discard);
         }
         self.inner.remove(path)
     }
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.seen.lock().expect("witness lock").opening = false;
         self.inner.list(prefix)
     }
 
     fn sync_dir(&self, prefix: &str) -> io::Result<()> {
-        self.inner.sync_dir(prefix)
+        let r = self.inner.sync_dir(prefix);
+        if prefix == "tables.redb"
+            && let Err(e) = &r
+        {
+            self.seen.lock().expect("witness lock").note_error(e);
+        }
+        r
     }
 }
 
@@ -1401,20 +1435,152 @@ struct StoreWitness {
     seen: Arc<Mutex<StoreSeen>>,
 }
 
+impl StoreWitness {
+    fn noted<T>(&self, r: io::Result<T>) -> io::Result<T> {
+        if let Err(e) = &r {
+            self.seen.lock().expect("witness lock").note_error(e);
+        }
+        r
+    }
+}
+
 impl File for StoreWitness {
     fn len(&self) -> io::Result<u64> {
-        let len = self.inner.len()?;
+        let len = self.noted(self.inner.len())?;
         self.seen.lock().expect("witness lock").len = Some(len);
         Ok(len)
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.inner.read_at(offset, out)?;
+        self.noted(self.inner.read_at(offset, out))?;
         if offset == 0 && out.len() >= REDB_MAGIC.len() {
             self.seen.lock().expect("witness lock").magic =
                 Some(out[..REDB_MAGIC.len()] == REDB_MAGIC);
         }
         Ok(())
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.noted(self.inner.write_at(offset, data))
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.noted(self.inner.set_len(len))
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.noted(self.inner.sync())
+    }
+}
+
+/// Where `OneShotFault` fails the store's open, once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OpenSite {
+    /// `Disk::open("tables.redb")`: `Store::open`'s own first call.
+    Open,
+    /// `Disk::sync_dir("tables.redb")`: `Store::open`'s name barrier.
+    SyncDir,
+    /// The first `File::read_at` on the store: redb's header read.
+    Read,
+    /// The first `File::sync` on the store: redb's flush of the header it
+    /// marks in use (`begin_writable`).
+    Sync,
+}
+
+impl OpenSite {
+    const ALL: [OpenSite; 4] = [
+        OpenSite::Open,
+        OpenSite::SyncDir,
+        OpenSite::Read,
+        OpenSite::Sync,
+    ];
+
+    fn error(self) -> io::Error {
+        io::Error::other(format!("one-shot {self:?} failure injected by this test"))
+    }
+
+    /// What `Db::open` returns once the fault bubbles: `Store::open`'s own
+    /// two calls pass the disk's error up as it is; redb's renders it as
+    /// every other redb error is rendered.
+    fn bubbled(self) -> String {
+        match self {
+            OpenSite::Open | OpenSite::SyncDir => self.error().to_string(),
+            OpenSite::Read | OpenSite::Sync => {
+                format!("table store (redb): I/O error: {}", self.error())
+            }
+        }
+    }
+}
+
+/// A `Disk` that fails one store operation at `site`, once, then passes
+/// everything through: a transient IO error a restart would not see again.
+struct OneShotFault {
+    inner: charpente_sim::SimDisk,
+    site: OpenSite,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OneShotFault {
+    fn fire(&self, site: OpenSite) -> io::Result<()> {
+        if site == self.site && !self.fired.swap(true, Ordering::SeqCst) {
+            return Err(site.error());
+        }
+        Ok(())
+    }
+}
+
+impl Disk for OneShotFault {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        if path != "tables.redb" {
+            return self.inner.open(path);
+        }
+        self.fire(OpenSite::Open)?;
+        Ok(Box::new(OneShotFile {
+            inner: self.inner.open(path)?,
+            site: self.site,
+            fired: self.fired.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        if prefix == "tables.redb" {
+            self.fire(OpenSite::SyncDir)?;
+        }
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct OneShotFile {
+    inner: Box<dyn File>,
+    site: OpenSite,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OneShotFile {
+    fn fire(&self, site: OpenSite) -> io::Result<()> {
+        if site == self.site && !self.fired.swap(true, Ordering::SeqCst) {
+            return Err(site.error());
+        }
+        Ok(())
+    }
+}
+
+impl File for OneShotFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.fire(OpenSite::Read)?;
+        self.inner.read_at(offset, out)
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
@@ -1426,8 +1592,26 @@ impl File for StoreWitness {
     }
 
     fn sync(&self) -> io::Result<()> {
+        self.fire(OpenSite::Sync)?;
         self.inner.sync()
     }
+}
+
+/// The disk a one-shot test opens through: the fault at `site`, watched.
+fn one_shot_disk(
+    sim: &Sim,
+    site: OpenSite,
+    fired: &Arc<std::sync::atomic::AtomicBool>,
+    seen: &Arc<Mutex<StoreSeen>>,
+) -> Box<dyn Disk> {
+    Box::new(DiscardWitness {
+        inner: Box::new(OneShotFault {
+            inner: sim.disk(),
+            site,
+            fired: fired.clone(),
+        }),
+        seen: seen.clone(),
+    })
 }
 
 /// Builds a committed, gracefully-closed store, then durably resizes its file
@@ -1816,6 +2000,207 @@ fn unopenable_store_with_full_wal_still_rebuilds() {
     // one segment ever exists, so base_seq stays 0): the pre-T3
     // discard-and-rebuild path must still work unchanged.
     mangled_store_len_recovers(|len| len - 4096);
+}
+
+/// A store that `Store::open` could not open for a reason other than its bytes
+/// — one transient IO error, at any of the four places a clean open can meet
+/// one — is not discarded: `Db::open` returns the disk's error unchanged and the
+/// retry opens the same store file. Before S5 (follow-up 21), any `Store::open`
+/// error was read as "this file is damaged beyond use", so on a log still
+/// holding seq 0 this deleted a healthy store and rebuilt it from the whole log.
+#[test]
+fn a_transient_store_open_fault_on_a_full_log_discards_nothing_and_the_retry_opens_it() {
+    for site in OpenSite::ALL {
+        let sim = Sim::with_faults(0x5E5F_0001, FaultConfig::none());
+        let cfg = DbConfig::default();
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..10u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let first = sim.disk().list("wal/").unwrap();
+        assert_eq!(
+            first.first().map(|n| segment_base(n)),
+            Some(0),
+            "{site:?}: setup must keep the whole log, so the old code's discard-and-rebuild \
+             was available to it"
+        );
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(StoreSeen::default()));
+        let opened = Db::open(
+            one_shot_disk(&sim, site, &fired, &seen),
+            cfg.clone(),
+            app_schema(),
+        );
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "{site:?}: the one-shot fault never fired, so this proves nothing about it"
+        );
+        let discards = seen.lock().expect("witness lock").discards.clone();
+        match opened {
+            Ok(_) => panic!(
+                "{site:?}: Db::open answered Ok over a one-shot {site:?} fault, having discarded \
+                 the store and rebuilt it from the log (discards: {discards:?}). A transient IO \
+                 error is not a verdict on the file's bytes: the store must survive it and the \
+                 error must bubble, so a restart retries (DESIGN §4)"
+            ),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                site.bubbled(),
+                "{site:?}: Db::open must return the disk's error unchanged, not a refusal"
+            ),
+        }
+        assert_eq!(
+            discards,
+            Vec::<Discard>::new(),
+            "{site:?}: the store must not be discarded over a transient fault"
+        );
+
+        let db = Db::open(one_shot_disk(&sim, site, &fired, &seen), cfg, app_schema())
+            .unwrap_or_else(|e| panic!("{site:?}: the retry must open the store: {e}"));
+        let seen = seen.lock().expect("witness lock");
+        assert_eq!(
+            (seen.discards.clone(), seen.retried.clone()),
+            (Vec::new(), vec![site.error().to_string()]),
+            "{site:?}: the retry must reopen the same store file, not a rebuilt one"
+        );
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            ids(&snap.scan::<Invoice>().unwrap()),
+            (0..10).collect::<Vec<u64>>(),
+            "{site:?}: every committed record must be present after the retry"
+        );
+    }
+}
+
+/// The compacted-log half: before S5, one transient IO error inside
+/// `Store::open` on a log compacted past seq 0 made the node refuse to boot
+/// with "restore this node from a replica or backup" — the wrong fix for a
+/// fault a restart retries (found by the S4 review, Inversion C': an injected
+/// fsync failure inside `Store::open`, replication seed 0x8be1b31e61e52e62).
+/// Now the error bubbles unchanged and the retry opens with every committed
+/// record present, including the ones that exist only in the checkpointed store.
+#[test]
+fn a_transient_store_open_fault_on_a_compacted_log_bubbles_and_the_retry_opens_it() {
+    for site in OpenSite::ALL {
+        let cfg = tiny_segments_cfg();
+        let sim = Sim::with_faults(0x5E5F_0002, FaultConfig::none());
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..20u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(100 + i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let base = sim
+            .disk()
+            .list("wal/")
+            .unwrap()
+            .iter()
+            .map(|n| segment_base(n))
+            .min()
+            .unwrap();
+        assert!(
+            base > 0,
+            "{site:?}: setup must compact the log, so the store cannot be rebuilt from it"
+        );
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(StoreSeen::default()));
+        let err = Db::open(
+            one_shot_disk(&sim, site, &fired, &seen),
+            cfg.clone(),
+            app_schema(),
+        )
+        .expect_err("the faulted open must fail");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "{site:?}: the one-shot fault never fired, so this proves nothing about it"
+        );
+        assert_eq!(
+            err.to_string(),
+            site.bubbled(),
+            "{site:?}: a transient fault must bubble as the disk's own error; refusing to boot \
+             with \"restore this node from a replica or backup\" sends the operator to the \
+             wrong fix for an error a restart retries"
+        );
+
+        let db = Db::open(one_shot_disk(&sim, site, &fired, &seen), cfg, app_schema())
+            .unwrap_or_else(|e| panic!("{site:?}: the retry must open the store: {e}"));
+        assert_eq!(
+            seen.lock().expect("witness lock").discards,
+            Vec::<Discard>::new(),
+            "{site:?}: a compacted log never discards"
+        );
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            ids(&snap.scan::<Invoice>().unwrap()),
+            (100..120).collect::<Vec<u64>>(),
+            "{site:?}: every committed record must be present, including those below the \
+             compacted base, which only the store holds"
+        );
+    }
+}
+
+/// The same fault inside a seeded swarm universe of
+/// `transactions_survive_the_fault_matrix`, observed by its reason. Seed
+/// `0x894c4c28968f4c96` (scan base `0x5E5FC000`, universe 16; before S5, 166 of
+/// those 256 universes discarded a store after an injected IO error) first
+/// meets an injected fault inside `Store::open` as a simulated fsync failure,
+/// on a log that still holds seq 0. The old `Db::open` discarded that store and
+/// rebuilt it; now the error bubbles and `tx_workload` restarts and reopens the
+/// same file. Up to that fault the universe is the same either way, so the
+/// first retried open names it.
+#[test]
+fn a_swarm_universe_whose_store_open_hits_an_injected_fault_retries_and_discards_nothing() {
+    const SEED: u64 = 0x894c_4c28_968f_4c96;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+    let seen = Arc::new(Mutex::new(StoreSeen::default()));
+    let witness = seen.clone();
+    let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
+        Box::new(DiscardWitness {
+            inner: Box::new(sim.disk()),
+            seen: witness.clone(),
+        })
+    });
+    assert_eq!(result, Ok(()), "seed {SEED:#x}");
+    let seen = seen.lock().expect("witness lock");
+    let after_io: Vec<&Discard> = seen
+        .discards
+        .iter()
+        .filter(|d| matches!(d, Discard::AfterIoError(_)))
+        .collect();
+    assert!(
+        after_io.is_empty(),
+        "seed {SEED:#x}: Db::open discarded a store whose open had hit an IO error: \
+         {after_io:?}. Only redb rejecting the file's bytes may discard it; a transient \
+         fault must bubble so a restart retries (DESIGN §4)"
+    );
+    assert_eq!(
+        seen.retried.first().map(String::as_str),
+        Some(
+            "simulated fsync failure — durability of writes since the last successful sync is unknown"
+        ),
+        "seed {SEED:#x} no longer meets an injected fsync failure inside Store::open first \
+         (retried: {:?}). A seed names a universe, not a scenario: re-find one that reaches \
+         this reason (hard rule 3)",
+        seen.retried
+    );
 }
 
 /// Companion to `regression_store_bricked_by_creation_crash` above: that
