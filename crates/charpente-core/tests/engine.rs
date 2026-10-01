@@ -3937,18 +3937,28 @@ fn restart_mix_workload(sim: &mut Sim) -> Result<(), String> {
 
 /// The class oracle for recovery's sync (DESIGN §2): process restarts, which
 /// keep the page cache, mixed with power cycles, which collapse it, over the
-/// WAL and the store under the fault matrix. At 796bff2, before recovery
-/// synced what it replays, this batch failed on `Db::open`'s "the store
-/// outran durable truth" assert (`store applied_seq 6 is ahead of the durable
-/// log end Some(5)`, seed 0xc18fd13d2f38385f, which re-rolls under the fix's
-/// extra sync like every universe here). `mix:page-cache-replayed` is
-/// required, so a batch in which no process ever reads an unacknowledged frame
-/// back proves nothing and fails by name — which is also what a process
-/// restart that quietly power-cycled would do.
+/// WAL and the store under the fault matrix.
+///
+/// The base is pinned where the batch is red for both ways of getting the
+/// fix wrong. With 796bff2's recovery (no sync) it fails on `Db::open`'s
+/// assert at seed 0x4d2ba213e3101be8, the minimal shape: one injected fsync
+/// error, one failed commit, a process restart that replays the frame, a
+/// power cycle that drops it, `store applied_seq 0 is ahead of the durable log
+/// end None`. With the sync moved after replay it fails at seed
+/// 0xc51c4fe5d1d1b9d7 (`applied_seq 6 … Some(5)`). Over 40 fresh bases
+/// × 256 at the fix it is green. Before the base was pinned, 21 of 30 fresh
+/// bases failed without the sync (13 on the assert, 8 on the horizon rule's
+/// refusal), and 19 of 40 failed with the sync after replay. Those seeds name
+/// universes under THIS file's code: the fix's extra sync draws from the shared
+/// fault stream, so the same seed is a different universe on either side of it.
+///
+/// `mix:page-cache-replayed` is required, so a batch in which no process ever
+/// reads an unacknowledged frame back proves nothing and fails by name. That is
+/// also what a process restart that quietly power-cycled would do.
 #[test]
 fn the_store_never_outruns_the_log_across_process_restarts_and_power_cycles() {
     run_universes_swarm_with!(
-        0xD1_5EED,
+        0xD1F0_0011,
         256,
         |cfg: &mut FaultConfig| {
             cfg.bit_flip = 0.0;
