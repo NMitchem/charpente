@@ -1875,6 +1875,53 @@ fn a_recovery_whose_segment_sync_fails_hands_no_frame_to_replay() {
     );
 }
 
+/// Recovery syncs EVERY segment it replays, not just the tail. `rotate` syncs
+/// the old tail before the next segment exists, so a log this binary wrote
+/// never leaves an unsynced frame behind a later segment; recovery does not
+/// rest on that. This log breaks it: segment 0 holds a valid frame that was
+/// written and never synced, and segment 1 is synced and name-barriered.
+/// Syncing only the tail replays both frames after the process restart, then
+/// loses segment 0's frame at the power loss, and the next open refuses the
+/// log as a gap ("a segment is missing"): the node no longer starts.
+/// (D1 review, I2.)
+#[test]
+fn a_frame_recovery_replays_from_a_non_tail_segment_survives_the_next_power_loss() {
+    let sim = quiet_sim(); // FaultConfig::none(): a power cycle drops every unsynced write
+    {
+        let disk = sim.disk();
+        let first = disk.open("wal/00000000000000000000.log").unwrap();
+        first.write_at(0, &raw_frame(0, 8, b"record-0")).unwrap(); // never synced
+        let tail = disk.open("wal/00000000000000000001.log").unwrap();
+        tail.write_at(0, &raw_frame(1, 8, b"record-1")).unwrap();
+        tail.sync().unwrap();
+        disk.sync_dir("wal/").unwrap();
+    }
+    sim.restart_process(); // the writer died; its page cache did not
+    let replay = |sim: &Sim| {
+        let mut seen = Vec::new();
+        Wal::open(Box::new(sim.disk()), small_segments(), |seq, _| {
+            seen.push(seq);
+            Ok(())
+        })
+        .map(drop)
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(seen)
+    };
+    let first = replay(&sim);
+    assert_eq!(
+        first,
+        Ok(vec![0, 1]),
+        "the next process reads both frames back, the non-tail one from the page cache"
+    );
+    sim.restart(); // power loss
+    assert_eq!(
+        replay(&sim),
+        first,
+        "a frame recovery replayed from a non-tail segment vanished at the next power loss — \
+         recovery synced only the tail"
+    );
+}
+
 /// One frame in the WAL's real format — `[seq u64 le][len u32 le][crc u32
 /// le][payload]`, crc over seq‖len‖payload as `frame_crc` computes it — so a
 /// hand-built log differs from an appended one only where the test says.
