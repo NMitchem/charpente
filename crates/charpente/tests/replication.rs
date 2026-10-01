@@ -6399,11 +6399,22 @@ fn a_restored_follower_refused_as_a_laggard_is_reseeded_not_failed() {
 /// `above_horizon_universe` by reading its source. A dropped error there is
 /// invisible at the pinned base: it never drops one, and the D3 sweep found
 /// the drops only over fresh bases. So the property cannot hold this itself,
-/// and this census does.
-/// - Every call that steps `p` (`drive_request`, `krun_until`,
-///   `recover_kernel_node`) is matched by a `route_p_error`.
-/// - No drop idiom (`let _ =`, `Err(_)`, `matches!(`) appears outside a
-///   comment.
+/// and this census does. Its rules are deliberately tied to the routing
+/// shape's spelling, because a looser count let a "route some, drop the rest"
+/// rewrite of the round site through (an inversion during D3):
+/// - No drop idiom appears outside a comment.
+/// - Every `krun_until` is bound and handed whole to `route_p_error` on the
+///   next line.
+/// - Every `drive_request` and `recover_kernel_node` is a `match` whose only
+///   `Err` arm routes `Err(e)` whole.
+/// - Two results are consumed on purpose, each exactly once:
+///   - the corruption helper's `.is_ok()` (a failed corruption forces no
+///     cut);
+///   - the survivor's promise scan's `.unwrap_or_default()`, an `f` site the
+///     D3 ruling leaves as it is.
+///
+/// Restructure the universe and this fails by name: re-establish the routing,
+/// then update the census.
 #[test]
 fn above_horizon_universe_routes_every_error_of_p() {
     let src = include_str!("replication.rs");
@@ -6411,32 +6422,63 @@ fn above_horizon_universe_routes_every_error_of_p() {
         .find("\nfn above_horizon_universe(")
         .expect("above_horizon_universe exists");
     let end = start + src[start..].find("\n}\n").expect("its body ends");
-    let code: Vec<&str> = src[start..end]
+    let code: Vec<String> = src[start..end]
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
+        .map(|l| l.split(" // ").next().unwrap_or(l).trim().to_string())
         .collect();
     let code = code.join("\n");
-    for idiom in ["let _ =", "Err(_)", "matches!("] {
+    let fix = "route it through route_p_error (sub-project D3: a pass over a dropped error \
+               checked nothing)";
+    for idiom in [
+        "let _ =",
+        "Err(_)",
+        "matches!(",
+        "if let Err",
+        "if let Ok",
+        ".is_err()",
+        ".ok()",
+    ] {
         assert!(
             !code.contains(idiom),
-            "above_horizon_universe drops an error with `{idiom}` — route it through \
-             route_p_error instead (sub-project D3: a pass over a dropped error checked \
-             nothing)"
+            "above_horizon_universe drops a result with `{idiom}` — {fix}"
         );
     }
-    let steps = ["drive_request(", "krun_until(", "recover_kernel_node("]
-        .iter()
-        .map(|call| code.matches(call).count())
-        .sum::<usize>();
-    let routed = code.matches("route_p_error(").count();
-    assert!(
-        steps >= 5,
-        "the census found the universe's five stepping calls ({steps})"
-    );
+    for (consumer, count, what) in [
+        (".is_ok()", 1, "the corruption helper's"),
+        (".unwrap_or_default()", 1, "the survivor's promise scan's"),
+    ] {
+        assert_eq!(
+            code.matches(consumer).count(),
+            count,
+            "above_horizon_universe consumes a result with `{consumer}` other than {what} — \
+             {fix}"
+        );
+    }
+    let converges = code.matches("krun_until(").count();
+    let routed_converges = code
+        .matches(
+            "let converged = krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET);\n\
+             route_p_error(sim, &mut p, &mut f, converged)?;",
+        )
+        .count();
     assert_eq!(
-        routed, steps,
-        "above_horizon_universe steps p {steps} times but routes {routed} results — every \
-         call that steps p must hand its error to route_p_error"
+        (converges, routed_converges),
+        (2, 2),
+        "every krun_until in above_horizon_universe is bound and routed whole on the next \
+         line — {fix}"
+    );
+    let matched =
+        code.matches("drive_request(").count() + code.matches("recover_kernel_node(").count();
+    let err_arms = code.matches("Err(e) =>").count();
+    let routed_arms = code
+        .matches("route_p_error(sim, &mut p, &mut f, Err(e))?")
+        .count();
+    assert_eq!(
+        (matched, err_arms, routed_arms, code.matches("Err(").count()),
+        (3, 3, 3, 6),
+        "every drive_request and recover_kernel_node in above_horizon_universe is a match \
+         whose only Err arm, `Err(e) =>`, routes `Err(e)` whole — {fix}"
     );
 }
 
