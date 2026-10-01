@@ -4031,6 +4031,23 @@ impl Row for LedgerViaUnscopedDoor {
     }
 }
 
+/// The refusal a write through `LedgerViaUnscopedDoor` gets, spelled out
+/// independently of the product's `format!`. The type names come from
+/// `type_name`, whose rendering the compiler does not promise to keep.
+fn ledger_alias_refusal() -> String {
+    let (r, w) = (
+        std::any::type_name::<Ledger>(),
+        std::any::type_name::<LedgerViaUnscopedDoor>(),
+    );
+    format!(
+        "table \"Ledger\" is registered tenant-scoped (Row::Scope != Unscoped) as `{r}`, but \
+         this transaction wrote it unscoped through `{w}` — two Row types declare TABLE = \
+         \"Ledger\", and a table keeps one scope shape for its whole life; the transaction was \
+         refused and nothing was written, so a retry cannot succeed — write `{r}` instead, or \
+         give `{w}` a table name of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
 #[job(global, retry(max = 1, backoff = "10s"))]
 struct WritesLedgerUnscoped {}
 
@@ -4088,19 +4105,7 @@ fn a_job_writing_another_scope_shape_of_a_registered_table_dead_letters_by_name(
         (
             Ok(()),
             false,
-            Some((
-                JobStatus::Dead,
-                1,
-                Some(
-                    "table \"Ledger\" is registered tenant-scoped (Row::Scope != Unscoped), but \
-                     this transaction wrote it unscoped — a second Row type declares TABLE = \
-                     \"Ledger\" with the other scope shape, and a table keeps one shape for its \
-                     whole life; the transaction was refused and nothing was written, so a \
-                     retry cannot succeed — give the Row type this transaction wrote a table \
-                     name of its own (a #[table] type's table name is its struct name)"
-                        .to_string()
-                )
-            )),
+            Some((JobStatus::Dead, 1, Some(ledger_alias_refusal()))),
             Some((JobStatus::Done, 0, None)),
         )
     );
@@ -4150,19 +4155,7 @@ fn a_request_writing_another_scope_shape_of_a_registered_table_is_refused_by_nam
             db.last_applied() == before,
             db.poisoned()
         ),
-        (
-            500,
-            Some(
-                "table \"Ledger\" is registered tenant-scoped (Row::Scope != Unscoped), but this \
-                 transaction wrote it unscoped — a second Row type declares TABLE = \"Ledger\" \
-                 with the other scope shape, and a table keeps one shape for its whole life; the \
-                 transaction was refused and nothing was written, so a retry cannot succeed — \
-                 give the Row type this transaction wrote a table name of its own (a #[table] \
-                 type's table name is its struct name)"
-            ),
-            true,
-            false
-        )
+        (500, Some(ledger_alias_refusal().as_str()), true, false)
     );
 }
 
@@ -4210,7 +4203,8 @@ mod invoice_b {
     }
 }
 
-#[job(global, retry(max = 1, backoff = "10s"))]
+/// Two attempts, so its pin sees the refusal retried before it dead-letters.
+#[job(global, retry(max = 2, backoff = "10s"))]
 struct WritesOtherInvoice {}
 
 impl WritesOtherInvoice {
@@ -4223,10 +4217,14 @@ impl WritesOtherInvoice {
     }
 }
 
+/// A job's `(status, attempts, last_error)`, as its `JobRow` reads.
+type JobSettled = Option<(JobStatus, u32, Option<String>)>;
+
 /// Runs `job` beside a `CountUp` in an app whose `Schema` registers `Counter`
-/// plus `schema`'s tables, and reads back how each settled: the kernel's
-/// return, whether the store is poisoned, `job`'s `(status, attempts,
-/// last_error)`, `CountUp`'s, and the counter `CountUp` bumps.
+/// plus `schema`'s tables, to one second (each job's first attempt, inside
+/// any 10s backoff) and then to one minute (every retry). Reads back the
+/// kernel's return at each horizon, whether the store is poisoned, `job`'s
+/// row at each horizon, `CountUp`'s, and the counter `CountUp` bumps.
 #[allow(clippy::type_complexity)]
 fn settle_beside_count_up<J: charpente_core::table::UnscopedJob>(
     seed: u64,
@@ -4234,10 +4232,10 @@ fn settle_beside_count_up<J: charpente_core::table::UnscopedJob>(
     defs: Vec<JobDef>,
     job: J,
 ) -> (
-    Result<(), String>,
+    [Result<(), String>; 2],
     bool,
-    Option<(JobStatus, u32, Option<String>)>,
-    Option<(JobStatus, u32, Option<String>)>,
+    [JobSettled; 2],
+    JobSettled,
     Option<u64>,
 ) {
     let sim = Sim::with_faults(seed, FaultConfig::none());
@@ -4256,21 +4254,29 @@ fn settle_beside_count_up<J: charpente_core::table::UnscopedJob>(
             Ok::<(), std::io::Error>(())
         })
         .unwrap();
-    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
-    let ran = kernel.run(&mut SimSource::new(Box::new(sim.clock()), SEC));
-    let mut app = kernel.into_app();
-    let db = app.db_for_tests();
-    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
-    let settled = |name: &str| {
-        rows.iter()
+    let settled = |db: &Db, name: &str| -> JobSettled {
+        db.snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap()
+            .into_iter()
             .find(|r| r.name == name)
-            .map(|r| (r.status, r.attempts, r.last_error.clone()))
+            .map(|r| (r.status, r.attempts, r.last_error))
     };
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let first = kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), SEC))
+        .map_err(|e| e.to_string());
+    let job_first = settled(kernel.app().db(), J::NAME);
+    let second = kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC))
+        .map_err(|e| e.to_string());
+    let db = kernel.app().db();
     (
-        ran.map_err(|e| e.to_string()),
+        [first, second],
         db.poisoned(),
-        settled(J::NAME),
-        settled("CountUp"),
+        [job_first, settled(db, J::NAME)],
+        settled(db, "CountUp"),
         db.snapshot()
             .unwrap()
             .get(Id::<Counter>::from_raw(3))
@@ -4284,6 +4290,13 @@ fn settle_beside_count_up<J: charpente_core::table::UnscopedJob>(
 /// Refused at apply instead, it poisoned the store and stopped the kernel.
 #[test]
 fn a_job_writing_an_unregistered_table_dead_letters_by_name() {
+    let w = std::any::type_name::<Stray>();
+    let stray = format!(
+        "table \"Stray\" is not registered in the Schema, but this transaction wrote it through \
+         `{w}` — every table a transaction writes must be registered, or apply cannot decode its \
+         rows; the transaction was refused and nothing was written, so a retry cannot succeed — \
+         register it with .table::<{w}>() in the Schema passed to Db::open or App::open"
+    );
     assert_eq!(
         settle_beside_count_up(
             0x5A17_000A,
@@ -4292,42 +4305,46 @@ fn a_job_writing_an_unregistered_table_dead_letters_by_name() {
             WritesStray {}
         ),
         (
-            Ok(()),
+            [Ok(()), Ok(())],
             false,
-            Some((
-                JobStatus::Dead,
-                1,
-                Some(
-                    "table \"Stray\" is not registered in the Schema, but this transaction wrote \
-                     it — every table a transaction writes must be registered, or apply cannot \
-                     decode its rows; the transaction was refused and nothing was written, so a \
-                     retry cannot succeed — register its Row type with .table::<T>() in the \
-                     Schema passed to Db::open or App::open"
-                        .to_string()
-                )
-            )),
+            [
+                Some((JobStatus::Dead, 1, Some(stray.clone()))),
+                Some((JobStatus::Dead, 1, Some(stray)))
+            ],
             Some((JobStatus::Done, 0, None)),
             Some(1),
         )
     );
 }
 
+/// The type-identity refusal for a write through `W` to the table the
+/// `Schema` registered under `R`, spelled out independently of the product's
+/// `format!`.
+fn identity_refusal<R: Row, W: Row>() -> String {
+    let (table, r, w) = (
+        R::TABLE,
+        std::any::type_name::<R>(),
+        std::any::type_name::<W>(),
+    );
+    format!(
+        "table \"{table}\" is registered as `{r}`, but this transaction wrote it through `{w}` \
+         — two Row types declare TABLE = \"{table}\", and apply treats every write to a table as \
+         its registered type's, so this one would have been refused after the WAL sync or \
+         applied as a `{r}` write; the transaction was refused and nothing was written, so a \
+         retry cannot succeed — write `{r}` instead, or give `{w}` a table name of its own (a \
+         #[table] type's table name is its struct name)"
+    )
+}
+
 /// A job writing the second `#[table] struct Invoice` while the app registers
-/// the first: same name, same scope shape, another layout. Refused before the
-/// record exists, by the two types' `(VERSION, FINGERPRINT)`, and
-/// dead-lettered as an attempt.
+/// the first: same name, same scope shape, another type. Refused before the
+/// record exists, by the writing type, and an attempt like any handler
+/// error: at one second the first attempt has failed and the job waits out
+/// its backoff, and by one minute the retry has failed too and the job is
+/// dead-lettered, each time with the refusal as its `last_error`.
 #[test]
 fn a_job_writing_another_table_type_of_the_same_name_dead_letters_by_name() {
-    let expected = format!(
-        "table \"Invoice\" is registered as version 1, fingerprint {:#x}, but this transaction \
-         wrote it through a Row type of version 1, fingerprint {:#x} — a second Row type \
-         declares TABLE = \"Invoice\" with another row layout, and apply decodes every row of a \
-         table with its registered type; the transaction was refused and nothing was written, \
-         so a retry cannot succeed — give the Row type this transaction wrote a table name of \
-         its own (a #[table] type's table name is its struct name)",
-        <invoice_a::Invoice as Row>::FINGERPRINT.unwrap(),
-        <invoice_b::Invoice as Row>::FINGERPRINT.unwrap()
-    );
+    let expected = identity_refusal::<invoice_a::Invoice, invoice_b::Invoice>();
     assert_eq!(
         settle_beside_count_up(
             0x5A17_000B,
@@ -4336,11 +4353,89 @@ fn a_job_writing_another_table_type_of_the_same_name_dead_letters_by_name() {
             WritesOtherInvoice {}
         ),
         (
-            Ok(()),
+            [Ok(()), Ok(())],
             false,
-            Some((JobStatus::Dead, 1, Some(expected))),
+            [
+                Some((JobStatus::Pending, 1, Some(expected.clone()))),
+                Some((JobStatus::Dead, 2, Some(expected)))
+            ],
             Some((JobStatus::Done, 0, None)),
             Some(1),
+        )
+    );
+}
+
+/// Two more `#[table] struct Invoice`, whose `amount: Amount` is spelled
+/// alike and names a `u64` in one module and a `String` in the other. A
+/// `#[table]` fingerprint folds field names and type spellings, not what a
+/// spelling resolves to, so the two share `TABLE`, `VERSION` and
+/// `FINGERPRINT`, and only the Rust type tells them apart.
+mod amount_u64 {
+    use super::*;
+
+    pub type Amount = u64;
+
+    #[table(global)]
+    pub struct Invoice {
+        pub id: Id<Invoice>,
+        pub amount: Amount,
+    }
+}
+
+mod amount_string {
+    use super::*;
+
+    pub type Amount = String;
+
+    #[table(global)]
+    pub struct Invoice {
+        pub id: Id<Invoice>,
+        pub amount: Amount,
+    }
+}
+
+/// A write through `amount_string::Invoice` while the `Schema` registers
+/// `amount_u64::Invoice`: apply decoded the string's bytes as a `u64` and
+/// failed after the WAL sync, so the store was poisoned and every reopen
+/// replayed the record into the same failure. It is refused before the
+/// record exists, by its type.
+#[test]
+fn a_write_through_a_table_type_of_the_same_name_and_fingerprint_is_refused() {
+    assert_eq!(
+        <amount_u64::Invoice as Row>::FINGERPRINT,
+        <amount_string::Invoice as Row>::FINGERPRINT,
+        "the two types share a fingerprint, or this pins nothing a fingerprint misses"
+    );
+    let sim = Sim::with_faults(0x5A17_000E, FaultConfig::none());
+    let schema = || Schema::new().table::<amount_u64::Invoice>();
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), schema()).unwrap();
+    let staged = db
+        .transact(|tx| {
+            tx.put(&amount_string::Invoice {
+                id: Id::from_raw(1),
+                amount: "x".to_string(),
+            });
+            Ok::<(), std::io::Error>(())
+        })
+        .map_err(|e| match e {
+            TxError::Io(e) => e.to_string(),
+            other => format!("{other:?}"),
+        });
+    let after = (db.last_applied(), db.poisoned());
+    sim.restart();
+    drop(db);
+    let reopened = Db::open(Box::new(sim.disk()), DbConfig::default(), schema())
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        (staged, after, reopened),
+        (
+            Err(identity_refusal::<
+                amount_u64::Invoice,
+                amount_string::Invoice,
+            >()),
+            (None, false),
+            Ok(())
         )
     );
 }

@@ -1423,6 +1423,132 @@ fn tenant_zero_is_a_real_tenant_to_a_cross_tenant_read() {
     group.commit().unwrap();
 }
 
+// ------------------------------------------ a table name keeps one Row type
+
+/// `Note` under another scope type: the same identifier and fields, so the
+/// same `TABLE`, `VERSION` and `FINGERPRINT` (a `#[table]` fingerprint folds
+/// field names and type spellings, not `scoped_by`), and the same scope
+/// shape. Only the Rust type tells the two apart.
+mod firm_note {
+    use super::*;
+
+    #[table(scoped_by = Firm)]
+    pub(super) struct Note {
+        pub(super) id: Id<Note>,
+        pub(super) text: String,
+    }
+}
+
+/// The refusal a write through `firm_note::Note` gets, spelled out
+/// independently of the product's `format!`. The type names come from
+/// `type_name`, whose rendering the compiler does not promise to keep.
+fn firm_note_refusal() -> String {
+    let registered = std::any::type_name::<Note>();
+    let writer = std::any::type_name::<firm_note::Note>();
+    format!(
+        "table \"Note\" is registered as `{registered}`, but this transaction wrote it through \
+         `{writer}` — two Row types declare TABLE = \"Note\", and apply treats every write to a \
+         table as its registered type's, so this one would have been refused after the WAL sync \
+         or applied as a `{registered}` write; the transaction was refused and nothing was \
+         written, so a retry cannot succeed — write `{registered}` instead, or give `{writer}` a \
+         table name of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
+/// Over a `Db` holding `Team` 7's note 1, stages `write` (given the group's
+/// admission) and commits, then reads back the stage's outcome, whether the
+/// log stood still, whether the store is poisoned, and `Team` 7's note 1.
+fn through_firm_note(
+    seed: u64,
+    write: impl FnOnce(&mut Tx, &TenantAdmission),
+) -> (Result<(), String>, bool, bool, Option<String>) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(7), &admission)
+                .put(&Note {
+                    id: Id::from_raw(1),
+                    text: "Team 7's note".to_string(),
+                });
+            Ok::<(), ApiError>(())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+    let before = db.last_applied();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let staged = group
+        .stage(|tx| {
+            write(tx, &admission);
+            Ok::<(), ApiError>(())
+        })
+        .map_err(|e| match e {
+            TxError::Io(e) => e.to_string(),
+            other => format!("{other:?}"),
+        });
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+    let team_7 = db
+        .snapshot()
+        .unwrap()
+        .get_scoped::<Note>(7, Id::from_raw(1))
+        .unwrap()
+        .map(|n| n.text);
+    (staged, db.last_applied() == before, db.poisoned(), team_7)
+}
+
+/// A write admitted for `Firm` 7 through `firm_note::Note` lands, by table
+/// name and raw scope id, in the registered table as `Team` 7's row. Nothing
+/// fails at apply: the bytes decode as a `Note`. It is refused before the
+/// record exists, by the writing type.
+#[test]
+fn a_write_through_the_same_table_under_another_scope_type_is_refused() {
+    assert_eq!(
+        through_firm_note(0x5A17_000F, |tx, admission| {
+            tx.admit_scope(Id::<Firm>::from_raw(7), admission)
+                .put(&firm_note::Note {
+                    id: Id::from_raw(1),
+                    text: "written as Firm 7".to_string(),
+                });
+        }),
+        (
+            Err(firm_note_refusal()),
+            true,
+            false,
+            Some("Team 7's note".to_string())
+        )
+    );
+}
+
+/// The delete half: a tombstone carries only an id and a scope id, so one
+/// admitted for `Firm` 7 through `firm_note::Note` deleted `Team` 7's row.
+#[test]
+fn a_delete_through_the_same_table_under_another_scope_type_is_refused() {
+    assert_eq!(
+        through_firm_note(0x5A17_0010, |tx, admission| {
+            tx.admit_scope(Id::<Firm>::from_raw(7), admission)
+                .delete::<firm_note::Note>(Id::from_raw(1));
+        }),
+        (
+            Err(firm_note_refusal()),
+            true,
+            false,
+            Some("Team 7's note".to_string())
+        )
+    );
+}
+
 // ------------------------------------------ the statuspage regression (oracle 3)
 
 /// Job-tenancy spec §9 item 3. The statuspage experiment's tenant policy, in

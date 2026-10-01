@@ -2866,16 +2866,35 @@ impl Row for WidgetViaScopedDoor {
     }
 }
 
-/// The refusal `Group::stage` gives a write whose scope shape is not the one
-/// the `Schema` registered for its table name, spelled out independently of
-/// the product's `format!`.
-fn alias_refusal(table: &str, registered: &str, written: &str) -> String {
+/// The refusal `Group::stage` gives a write through `W` whose scope shape is
+/// not the one the `Schema` registered for its table name under `R`, spelled
+/// out independently of the product's `format!`. The type names come from
+/// `type_name`, whose rendering the compiler does not promise to keep.
+fn alias_refusal<R: Row, W: Row>(registered: &str, written: &str) -> String {
+    let (table, r, w) = (
+        R::TABLE,
+        std::any::type_name::<R>(),
+        std::any::type_name::<W>(),
+    );
     format!(
-        "table \"{table}\" is registered {registered}, but this transaction wrote it {written} \
-         — a second Row type declares TABLE = \"{table}\" with the other scope shape, and a \
-         table keeps one shape for its whole life; the transaction was refused and nothing was \
-         written, so a retry cannot succeed — give the Row type this transaction wrote a table \
-         name of its own (a #[table] type's table name is its struct name)"
+        "table \"{table}\" is registered {registered} as `{r}`, but this transaction wrote it \
+         {written} through `{w}` — two Row types declare TABLE = \"{table}\", and a table keeps \
+         one scope shape for its whole life; the transaction was refused and nothing was \
+         written, so a retry cannot succeed — write `{r}` instead, or give `{w}` a table name \
+         of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
+/// The refusal for a write through `W` to a table name the `Schema` does not
+/// register.
+fn unregistered_refusal<W: Row>() -> String {
+    let (table, w) = (W::TABLE, std::any::type_name::<W>());
+    format!(
+        "table \"{table}\" is not registered in the Schema, but this transaction wrote it \
+         through `{w}` — every table a transaction writes must be registered, or apply cannot \
+         decode its rows; the transaction was refused and nothing was written, so a retry \
+         cannot succeed — register it with .table::<{w}>() in the Schema passed to Db::open or \
+         App::open"
     )
 }
 
@@ -2928,8 +2947,7 @@ fn a_scoped_write_to_an_unscoped_tables_name_is_refused_before_the_record_exists
     assert_eq!(
         (text, states, reopened),
         (
-            alias_refusal(
-                Widget::TABLE,
+            alias_refusal::<Widget, WidgetViaScopedDoor>(
                 "unscoped (Row::Scope = Unscoped)",
                 "tenant-scoped"
             ),
@@ -2956,8 +2974,7 @@ fn an_unscoped_write_to_a_scoped_tables_name_is_refused_before_the_record_exists
     assert_eq!(
         (text, states, reopened),
         (
-            alias_refusal(
-                Ticket::TABLE,
+            alias_refusal::<Ticket, TicketViaUnscopedDoor>(
                 "tenant-scoped (Row::Scope != Unscoped)",
                 "unscoped"
             ),
@@ -2982,8 +2999,7 @@ fn an_unscoped_delete_to_a_scoped_tables_name_is_refused_before_the_record_exist
     assert_eq!(
         (text, states, reopened),
         (
-            alias_refusal(
-                Ticket::TABLE,
+            alias_refusal::<Ticket, TicketViaUnscopedDoor>(
                 "tenant-scoped (Row::Scope != Unscoped)",
                 "unscoped"
             ),
@@ -3032,8 +3048,7 @@ fn an_unscoped_write_beside_a_scoped_one_on_the_same_name_is_refused_too() {
     };
     assert_eq!(
         err.to_string(),
-        alias_refusal(
-            Ticket::TABLE,
+        alias_refusal::<Ticket, TicketViaUnscopedDoor>(
             "tenant-scoped (Row::Scope != Unscoped)",
             "unscoped"
         )
@@ -3065,12 +3080,25 @@ fn a_write_to_an_unregistered_table_is_refused_before_the_record_exists() {
     assert_eq!(
         (text, states, reopened),
         (
-            "table \"test.widget\" is not registered in the Schema, but this transaction wrote \
-             it — every table a transaction writes must be registered, or apply cannot decode \
-             its rows; the transaction was refused and nothing was written, so a retry cannot \
-             succeed — register its Row type with .table::<T>() in the Schema passed to \
-             Db::open or App::open"
-                .to_string(),
+            unregistered_refusal::<Widget>(),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// A delete-only transaction against a table name the `Schema` never
+/// registered: a tombstone alone is a write to the table, refused like a put.
+#[test]
+fn a_delete_from_an_unregistered_table_is_refused_too() {
+    let (text, states, reopened) = attempt_alias_write(0x5A17_000D, Schema::new, |tx| {
+        tx.delete(Id::<Widget>::from_raw(1));
+        Ok(())
+    });
+    assert_eq!(
+        (text, states, reopened),
+        (
+            unregistered_refusal::<Widget>(),
             [(None, false), (None, false)],
             Ok(())
         )
@@ -3156,17 +3184,22 @@ impl Row for TicketIdOnly {
     }
 }
 
-/// The type-identity refusal, spelled out independently of the product's
-/// `format!`. Each side is `(version, fingerprint)`.
-fn identity_refusal(table: &str, registered: (u32, &str), written: (u32, &str)) -> String {
+/// The type-identity refusal for a write through `W` to the table the
+/// `Schema` registered under `R`, spelled out independently of the product's
+/// `format!`.
+fn identity_refusal<R: Row, W: Row>() -> String {
+    let (table, r, w) = (
+        R::TABLE,
+        std::any::type_name::<R>(),
+        std::any::type_name::<W>(),
+    );
     format!(
-        "table \"{table}\" is registered as version {}, fingerprint {}, but this transaction \
-         wrote it through a Row type of version {}, fingerprint {} — a second Row type declares \
-         TABLE = \"{table}\" with another row layout, and apply decodes every row of a table \
-         with its registered type; the transaction was refused and nothing was written, so a \
-         retry cannot succeed — give the Row type this transaction wrote a table name of its \
-         own (a #[table] type's table name is its struct name)",
-        registered.0, registered.1, written.0, written.1
+        "table \"{table}\" is registered as `{r}`, but this transaction wrote it through `{w}` \
+         — two Row types declare TABLE = \"{table}\", and apply treats every write to a table as \
+         its registered type's, so this one would have been refused after the WAL sync or \
+         applied as a `{r}` write; the transaction was refused and nothing was written, so a \
+         retry cannot succeed — write `{r}` instead, or give `{w}` a table name of its own (a \
+         #[table] type's table name is its struct name)"
     )
 }
 
@@ -3188,16 +3221,16 @@ fn a_write_through_another_row_type_of_a_registered_table_is_refused_before_the_
     assert_eq!(
         (text, states, reopened),
         (
-            identity_refusal(Gizmo::TABLE, (1, "0x6a2d0001"), (1, "none")),
+            identity_refusal::<Gizmo, GizmoIdOnly>(),
             [(None, false), (None, false)],
             Ok(())
         )
     );
 }
 
-/// `Gizmo`'s fingerprint and layout under another `VERSION`: the identity is
-/// the pair, so a version alone that is not the registered one is refused,
-/// though these bytes would decode.
+/// `Gizmo`'s fingerprint and layout under another `VERSION`: these bytes
+/// decode as a `Gizmo`, so apply would have stored the row without an error.
+/// It is refused by its type, which is not the registered one.
 struct GizmoAtVersion2 {
     id: Id<GizmoAtVersion2>,
     n: u32,
@@ -3241,7 +3274,7 @@ fn a_write_through_a_row_type_of_another_version_is_refused_too() {
     assert_eq!(
         (text, states, reopened),
         (
-            identity_refusal(Gizmo::TABLE, (1, "0x6a2d0001"), (2, "0x6a2d0001")),
+            identity_refusal::<Gizmo, GizmoAtVersion2>(),
             [(None, false), (None, false)],
             Ok(())
         )
@@ -3265,7 +3298,7 @@ fn a_scoped_write_through_another_row_type_of_a_registered_table_is_refused_too(
     assert_eq!(
         (text, states, reopened),
         (
-            identity_refusal(Ticket::TABLE, (1, "none"), (1, "0x6a2d0002")),
+            identity_refusal::<Ticket, TicketIdOnly>(),
             [(None, false), (None, false)],
             Ok(())
         )

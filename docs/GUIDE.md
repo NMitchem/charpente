@@ -619,11 +619,13 @@ of a job name this binary mounts (§6, "Changing a job's fields"). A
 `TableWriteRefusal` (`charpente::core::db::TableWriteRefusal::of`) is a write
 the `Schema` disagrees with about its table: a table it does not register
 (add `.table::<T>()`), a scoped `Row` whose `TABLE` is an unscoped table's or
-the reverse, or a second `Row` type of a registered name with another
-`(VERSION, FINGERPRINT)`. A `#[table]` type's table name is its struct name,
-so two `#[table] struct Invoice` in different modules collide this way; give
-one another name. Either refusal comes before anything was written, so a
-retry cannot succeed. The HTTP layer answers
+the reverse, or a put or delete through any Rust type other than the one
+registered under that name. A `#[table]` type's table name is its struct
+name, so two `#[table] struct Invoice` in different modules collide this way
+even when their fields, and so their fingerprints, are the same. The text
+names the type that wrote and the registered one: write the registered type,
+or give the other one another name. Either refusal comes before anything was
+written, so a retry cannot succeed. The HTTP layer answers
 either with a 500 carrying the refusal's own text, and in a job handler
 either is an attempt, retried and then dead-lettered. The broader
 `Refusal::of` is not that predicate: it also matches a refusal apply raises
