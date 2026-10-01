@@ -656,11 +656,23 @@ mod tests {
     use charpente_core::io::Entropy;
     use charpente_sim::{FaultConfig, Sim};
 
+    /// A disk whose store fails its own sync (`file`) or barrier (`dir`):
+    /// the arm fires only after a write, so a read ahead of it is untouched.
     fn failing(sim: &Sim, file: bool, dir: bool) -> crate::repl::FailNextSync {
         crate::repl::FailNextSync {
             inner: sim.disk(),
             arm: Arc::new(AtomicBool::new(file)),
             arm_dir: Arc::new(AtomicBool::new(dir)),
+            after_write: true,
+            wrote: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A disk whose very next `File::sync` fails: a boot's own read.
+    fn failing_read(sim: &Sim) -> crate::repl::FailNextSync {
+        crate::repl::FailNextSync {
+            after_write: false,
+            ..failing(sim, true, false)
         }
     }
 
@@ -679,6 +691,12 @@ mod tests {
         assert!(err.to_string().contains("injected fsync failure"), "{err}");
         sim.restart_process();
         let booted = open_witnesses(&sim.disk()).unwrap();
+        assert_eq!(
+            booted,
+            vec!["b:1".to_string()],
+            "the restarted node reads the failed store's set back from the page cache — if not, \
+             this test no longer reaches the shape it pins"
+        );
         sim.restart(); // power loss
         assert_eq!(
             open_witnesses(&sim.disk()).unwrap(),
@@ -715,6 +733,12 @@ mod tests {
         );
         sim.restart_process();
         let booted = open_witnesses(&sim.disk()).unwrap();
+        assert_eq!(
+            booted,
+            vec!["b:1".to_string()],
+            "the restarted node reads the newest set from a slot only the page cache names — if \
+             not, this test no longer reaches the shape it pins"
+        );
         sim.restart(); // power loss
         assert_eq!(
             open_witnesses(&sim.disk()).unwrap(),
@@ -733,14 +757,18 @@ mod tests {
         open_witnesses(&sim.disk()).unwrap();
         store_witnesses(&failing(&sim, true, false), &["b:1".to_string()]).unwrap_err();
         sim.restart_process();
-        let err = open_witnesses(&failing(&sim, true, false))
+        let err = open_witnesses(&failing_read(&sim))
             .expect_err("a boot acted on a witness slot whose sync failed");
         let msg = err.to_string();
         assert!(msg.contains("reading the witness file"), "{msg}");
         assert!(msg.contains("injected fsync failure"), "{msg}");
         assert!(msg.contains("restart"), "{msg}");
         sim.restart(); // power loss
-        assert_eq!(open_witnesses(&sim.disk()).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            open_witnesses(&sim.disk()).unwrap(),
+            Vec::<String>::new(),
+            "the last durable set is the one the node holds after the power loss"
+        );
     }
 
     /// A raw disk-IO failure under `Repl::open`'s call to `open_witnesses`

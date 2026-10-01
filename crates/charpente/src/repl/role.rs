@@ -218,11 +218,23 @@ mod tests {
         Sim::with_faults(0x5eed_5eed, FaultConfig::none()).disk()
     }
 
+    /// A disk whose store fails its own sync (`file`) or barrier (`dir`):
+    /// the arm fires only after a write, so a read ahead of it is untouched.
     fn failing(sim: &Sim, file: bool, dir: bool) -> crate::repl::FailNextSync {
         crate::repl::FailNextSync {
             inner: sim.disk(),
             arm: Arc::new(AtomicBool::new(file)),
             arm_dir: Arc::new(AtomicBool::new(dir)),
+            after_write: true,
+            wrote: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A disk whose very next `File::sync` fails: a boot's own read.
+    fn failing_read(sim: &Sim) -> crate::repl::FailNextSync {
+        crate::repl::FailNextSync {
+            after_write: false,
+            ..failing(sim, true, false)
         }
     }
 
@@ -244,6 +256,12 @@ mod tests {
         assert!(err.to_string().contains("injected fsync failure"), "{err}");
         sim.restart_process(); // the operator restarts, as the error says to
         let (booted, _) = load_role(&sim.disk(), &follower).unwrap();
+        assert_eq!(
+            booted,
+            Role::Primary,
+            "the restarted node reads the failed promote back from the page cache — if not, \
+             this test no longer reaches the shape it pins"
+        );
         sim.restart(); // power loss
         let (after, _) = load_role(&sim.disk(), &follower).unwrap();
         assert_eq!(
@@ -279,6 +297,12 @@ mod tests {
             primary: "b:1".to_string(),
         };
         let (booted, _) = load_role(&sim.disk(), &config).unwrap();
+        assert_eq!(
+            booted,
+            Role::Primary,
+            "the restarted node finds the first boot's role file by a name only the page cache \
+             holds — if not, this test no longer reaches the shape it pins"
+        );
         sim.restart(); // power loss
         let (after, _) = load_role(&sim.disk(), &config).unwrap();
         assert_eq!(
@@ -300,14 +324,18 @@ mod tests {
         load_role(&sim.disk(), &follower).unwrap();
         store_role(&failing(&sim, true, false), &Role::Primary).unwrap_err();
         sim.restart_process();
-        let err = load_role(&failing(&sim, true, false), &follower)
+        let err = load_role(&failing_read(&sim), &follower)
             .expect_err("a boot acted on a role file whose sync failed");
         let msg = err.to_string();
         assert!(msg.contains("reading the role file \"role\""), "{msg}");
         assert!(msg.contains("injected fsync failure"), "{msg}");
         assert!(msg.contains("restart"), "{msg}");
         sim.restart(); // power loss
-        assert_eq!(load_role(&sim.disk(), &follower).unwrap().0, follower);
+        assert_eq!(
+            load_role(&sim.disk(), &follower).unwrap().0,
+            follower,
+            "the last durable role is the one the node holds after the power loss"
+        );
     }
 
     /// A raw disk-IO failure under `Repl::open`'s call to `load_role` must

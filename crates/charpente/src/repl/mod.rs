@@ -1361,18 +1361,38 @@ impl Repl {
 /// A `SimDisk` whose next `File::sync` fails while `arm` is set, and whose
 /// next `Disk::sync_dir` fails while `arm_dir` is: an fsync error on one role
 /// or witness write, which no `FaultConfig` rate can aim at a single call.
-/// Shared by `role.rs`'s and `witnesses.rs`'s tests (D1 review I3).
+/// With `after_write`, an armed sync or barrier fires only once something
+/// has been written through this disk, so it fails a store's own sync and
+/// not the read barrier ahead of it; without, it fails the very next one (a
+/// boot's read). Shared by `role.rs`'s and `witnesses.rs`'s tests (D1 review
+/// I3).
 #[cfg(test)]
 pub(crate) struct FailNextSync {
     pub(crate) inner: charpente_sim::SimDisk,
     pub(crate) arm: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) arm_dir: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) after_write: bool,
+    pub(crate) wrote: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Whether an armed failure may fire now — always, or with `after_write` only
+/// once a write has gone through the disk; consumes the arm only if it fires.
+#[cfg(test)]
+fn fail_fires(
+    arm: &std::sync::atomic::AtomicBool,
+    after_write: bool,
+    wrote: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    (!after_write || wrote.load(SeqCst)) && arm.swap(false, SeqCst)
 }
 
 #[cfg(test)]
 struct FailNextSyncFile {
     inner: Box<dyn charpente_core::io::File>,
     arm: Arc<std::sync::atomic::AtomicBool>,
+    after_write: bool,
+    wrote: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
@@ -1381,6 +1401,8 @@ impl Disk for FailNextSync {
         Ok(Box::new(FailNextSyncFile {
             inner: self.inner.open(path)?,
             arm: Arc::clone(&self.arm),
+            after_write: self.after_write,
+            wrote: Arc::clone(&self.wrote),
         }))
     }
     fn remove(&self, path: &str) -> io::Result<()> {
@@ -1390,10 +1412,7 @@ impl Disk for FailNextSync {
         self.inner.list(prefix)
     }
     fn sync_dir(&self, prefix: &str) -> io::Result<()> {
-        if self
-            .arm_dir
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+        if fail_fires(&self.arm_dir, self.after_write, &self.wrote) {
             return Err(io::Error::other("injected directory fsync failure"));
         }
         self.inner.sync_dir(prefix)
@@ -1409,13 +1428,15 @@ impl charpente_core::io::File for FailNextSyncFile {
         self.inner.read_at(offset, out)
     }
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
         self.inner.write_at(offset, data)
     }
     fn set_len(&self, len: u64) -> io::Result<()> {
+        self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
         self.inner.set_len(len)
     }
     fn sync(&self) -> io::Result<()> {
-        if self.arm.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if fail_fires(&self.arm, self.after_write, &self.wrote) {
             return Err(io::Error::other("injected fsync failure"));
         }
         self.inner.sync()
