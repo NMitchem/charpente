@@ -2530,6 +2530,33 @@ and draws nothing. Call it before a phase whose verdict rests on a delivery
 completing. A stall there is a fault the property excuses, so a stall that drops
 the only clean attempt's tail leaves the universe with no verdict at all.
 
+### Restarting the process, not the machine
+
+`sim.restart()` is a power cycle: every unsynced write survives, tears or
+vanishes before anything reopens. Most restarts in production are not that. A
+supervisor restarting a crashed, killed or exited process finds the OS page
+cache intact: every write the dead process made is still readable, synced or
+not. `sim.restart_process()` models that. Every open handle dies, exactly as
+after `restart`, and nothing else happens. Unsynced writes and directory entries
+stay pending and readable, and the next `restart()` still collapses them.
+
+The difference matters because readable is not durable. A node that reads back
+what a dead process wrote and persists anything derived from it, before making
+it durable, has built on data the next power loss can take away. A store
+outruns its own log exactly that way: recovery replays a WAL frame whose fsync
+failed, the store checkpoints past it, and a power cycle drops the frame. A
+property that only ever power-cycles cannot reach that shape. One that mixes
+the two can.
+
+Call `restart_process()` before you drop the old process's `Db` to model a kill,
+where no destructor reaches the disk. Call it after the drop to model an exit.
+It draws from no random stream and clears no crash countdown, so the sim gained
+it without re-keying anyone's universes. Calling it does change everything your
+workload does afterwards, as any restart would. It marks `restart:process`, never
+`restart`. A crashed disk is power loss, and `restart_process()` refuses it by
+name: call `restart()` there. It covers the global disk; hosts have no process
+restart.
+
 ### The checkers
 
 `charpente_sim::checks` ships six reusable oracles — reach for these

@@ -193,6 +193,21 @@ rather than argued — `a_directory_barrier_does_not_perturb_the_other_disk_faul
 semantically no-op barrier and demands the entire coverage map be unchanged; without the split
 it fails, one barrier having moved four read faults and two write faults.
 
+**A process restart is not a power cycle.** `Sim::restart` power-cycles: the
+page cache collapses under the crash model before anything reopens.
+`Sim::restart_process` (2026-10-01) restarts only the process. Open handles die
+and nothing else happens: every unsynced write and directory entry stays pending
+and readable by the next open, and the next power cycle still collapses it. That
+is what a supervisor sees after a kill, a crash or an exit, and it is the only
+way to reach "the next process read back what the dead one never made durable".
+Before it existed, a property reached that shape only by accident, when a boot
+loop reopened without a restart. Readable is not durable, and that accident
+exposed a real ordering bug: recovery replayed WAL frames it never synced, and the
+store outran the log (realtime seed 0x7df8c43a1d2591e8). The mode draws from no
+stream and clears no countdown, so introducing it re-keyed no universe. Three
+pinned batches reproduced their coverage byte for byte across the change
+(migrations, realtime's mixed-shape resume, and the wal dir-entry property).
+
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
 model, just one instance per host) and its own fault + entropy streams, keyed sub-streams

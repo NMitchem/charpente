@@ -785,7 +785,8 @@ impl Sim {
     /// Power-cycles the disk: every unsynced write independently survives,
     /// tears, or vanishes (see `disk::collapse`), open handles die, and any
     /// pending crash countdown is cleared. Called after a crash — or without
-    /// one; a clean power cycle collapses the page cache the same way.
+    /// one; a clean power cycle collapses the page cache the same way. A
+    /// process restart that keeps the page cache is `restart_process`.
     pub fn restart(&self) {
         let mut guard = self.world.lock();
         guard.cover("restart");
@@ -845,6 +846,36 @@ impl Sim {
         disk.epoch += 1;
         disk.crashed = false;
         disk.crash_countdown = None;
+    }
+
+    /// Restarts the PROCESS, not the machine: every open handle dies (it
+    /// predates the restart, the same contract as after `restart`) and
+    /// nothing else happens. The page cache survives — every unsynced write
+    /// and directory entry stays pending, readable by the next open exactly
+    /// as the dead process left it, and still at the mercy of the next power
+    /// cycle's collapse. That is what a supervisor restarting a killed or
+    /// exited process sees, and `restart` cannot model it, because there
+    /// unsynced state collapses first. Readable is not durable: a node that
+    /// persists state derived from what it read back here, before making it
+    /// durable, loses the ground under that state at the next power cycle
+    /// (found 2026-10-01: recovery replayed an unsynced WAL frame and the store
+    /// outran the log, realtime seed 0x7df8c43a1d2591e8).
+    ///
+    /// Call it before dropping the old process's handles to model a kill
+    /// (no destructor reaches the disk), after to model an exit. Draws
+    /// nothing, collapses nothing and clears no countdown — a pending crash
+    /// countdown stays armed, since power loss does not wait for a process —
+    /// so a universe that never calls it is unchanged. Marks
+    /// `restart:process`, never `restart`. The global disk only.
+    pub fn restart_process(&self) {
+        let mut guard = self.world.lock();
+        assert!(
+            !guard.disk.crashed,
+            "Sim::restart_process on a crashed disk: a crash is power loss, and only \
+             Sim::restart (the power cycle) brings the disk back — call that instead"
+        );
+        guard.cover("restart:process");
+        guard.disk.epoch += 1;
     }
 
     pub fn partition(&self, a: &str, b: &str) {
@@ -1160,7 +1191,7 @@ impl SimFile {
         let mut guard = self.world.lock();
         if guard.world_of(&self.host).epoch != self.epoch {
             return Err(io::Error::other(format!(
-                "file handle for \"{}\" predates a simulated crash — contract: reopen files after Sim::restart()",
+                "file handle for \"{}\" predates a simulated restart — contract: reopen files after Sim::restart() or Sim::restart_process()",
                 self.path
             )));
         }
@@ -2307,6 +2338,90 @@ mod tests {
             before,
             "no disk fault fired after quiescing"
         );
+    }
+
+    #[test]
+    fn a_process_restart_keeps_the_page_cache_and_a_power_cycle_does_not() {
+        // FaultConfig::none(): a power cycle drops every unsynced write, so
+        // whatever is still readable after a restart is what the mode kept.
+        let sim = Sim::with_faults(0x5145_0002, FaultConfig::none());
+        let disk = sim.disk();
+        let old = disk.open("f").unwrap();
+        old.write_at(0, b"unsynced").unwrap();
+        disk.open("g").unwrap(); // a name whose directory entry is not durable
+
+        sim.restart_process();
+        assert!(
+            old.len()
+                .unwrap_err()
+                .to_string()
+                .contains("predates a simulated restart"),
+            "the dead process's handle must not reach the disk"
+        );
+        let mut buf = [0u8; 8];
+        disk.open("f").unwrap().read_at(0, &mut buf).unwrap();
+        assert_eq!(
+            &buf, b"unsynced",
+            "a process restart keeps the page cache: the next process reads the unsynced write back"
+        );
+        assert_eq!(
+            disk.list("").unwrap(),
+            vec!["f".to_string(), "g".to_string()]
+        );
+        let coverage = sim.coverage();
+        assert_eq!(coverage.get("restart:process"), Some(&1));
+        assert!(
+            !coverage
+                .keys()
+                .any(|k| *k == "restart" || k.starts_with("crash:")),
+            "a process restart is not a power cycle: nothing collapsed: {coverage:?}"
+        );
+
+        sim.restart(); // the power cycle drops what the process restart kept
+        assert_eq!(disk.open("f").unwrap().len().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_process_restart_draws_from_no_stream() {
+        // Twin universes, one with a process restart and one without, must
+        // collapse identically at the next power cycle and draw the same
+        // entropy after it: the mode adds a coverage key and nothing else, so
+        // introducing it re-keys no existing universe.
+        let run = |process_restart: bool| {
+            let sim = Sim::with_faults(
+                0x5145_0004,
+                FaultConfig {
+                    crash_apply: 0.4,
+                    crash_torn: 0.3,
+                    ..FaultConfig::none()
+                },
+            );
+            let disk = sim.disk();
+            for i in 0..16u8 {
+                let file = disk.open(&format!("f{i}")).unwrap();
+                file.write_at(0, &[i; 1500]).unwrap();
+            }
+            if process_restart {
+                sim.restart_process();
+            }
+            sim.restart();
+            let mut coverage = sim.coverage();
+            coverage.remove("restart:process");
+            (
+                sim.durable_fingerprint(),
+                sim.entropy().next_u64(),
+                coverage,
+            )
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    #[should_panic(expected = "only Sim::restart (the power cycle) brings the disk back")]
+    fn a_process_restart_refuses_a_crashed_disk() {
+        let sim = Sim::with_faults(0x5145_0003, FaultConfig::none());
+        sim.crash_disk_now();
+        sim.restart_process();
     }
 
     #[test]
