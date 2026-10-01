@@ -2657,7 +2657,10 @@ for these before hand-rolling the same logic a fourth time:
   to excuse wrong data or a consistency violation (a cut reverts state to a prefix, which stays
   consistent). Note this is the *single-node* excuse: a workload with a
   converged follower keeps none of it, because a record the primary lost to
-  media corruption still lives on the follower.
+  media corruption still lives on the follower. In a multi-node workload,
+  ask `SimHost::durable_corruption_fired()` instead. It answers the same
+  question for one host's disk, so a refusal on one node is excused only by
+  corruption that fired on that node, never by a fault on another.
 - `boot_through_fallout(sim: &Sim, tries: u32, is_fallout: impl Fn(&str) -> bool, boot: impl FnMut() -> Result<T, E>) -> Result<Option<T>, E>`
   — boots the way a supervised process does: `boot`, and on an error your
   `is_fallout` accepts, boot again, `tries` boots in all. Each retry marks

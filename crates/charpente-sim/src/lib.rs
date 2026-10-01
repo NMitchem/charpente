@@ -382,6 +382,10 @@ struct HostWorld {
     entropy: Rng,
     /// This host's directory-barrier stream — see `State::dir_faults`.
     dir_faults: Rng,
+    /// How many durable-corruption faults (`bit_flip`, `misdirected_write`)
+    /// fired on this host's disk — `SimHost::durable_corruption_fired`.
+    /// Counted alongside the universe-wide coverage keys; it draws nothing.
+    durable_corruption: u64,
 }
 
 impl HostWorld {
@@ -391,6 +395,7 @@ impl HostWorld {
             faults: keyed_stream(seed, &format!("host-faults:{host}")),
             entropy: keyed_stream(seed, &format!("host-entropy:{host}")),
             dir_faults: keyed_stream(seed, &format!("host-dir-faults:{host}")),
+            durable_corruption: 0,
         }
     }
 }
@@ -999,6 +1004,16 @@ impl SimHost {
         }
     }
 
+    /// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
+    /// actually fired on *this host's* disk: `checks::durable_corruption_fired`
+    /// scoped to one host. A multi-node workload needs this form. A
+    /// below-horizon refusal on one node is fallout only when corruption fired
+    /// on that node, and the universe-wide answer would excuse it on the
+    /// strength of a fault on another node.
+    pub fn durable_corruption_fired(&self) -> bool {
+        self.world.lock().host_mut(&self.name).durable_corruption > 0
+    }
+
     /// Injects a crash on the `ops`-th subsequent disk operation *on this
     /// host* — mirrors `Sim::crash_disk_after`.
     pub fn crash_after(&self, ops: u64) {
@@ -1024,7 +1039,12 @@ impl SimHost {
                 ..
             } = &mut *guard;
             let host = hosts.get_mut(&self.name).expect("checked above");
-            let HostWorld { disk, faults, .. } = host;
+            let HostWorld {
+                disk,
+                faults,
+                durable_corruption,
+                ..
+            } = host;
             // Bit-level corruption of already-durable bytes, before per-file
             // crash collapse — see `Sim::restart`'s doc for the full model;
             // this is that same roll, scoped to this host's files and faults
@@ -1048,6 +1068,7 @@ impl SimHost {
                     let bit = faults.below(8) as u32;
                     file.durable[byte_idx] ^= 1 << bit;
                     *coverage.entry("fault:bit_flip").or_insert(0) += 1;
+                    *durable_corruption += 1;
                 }
             }
             for file in disk.files.values_mut() {
@@ -1299,6 +1320,9 @@ impl File for SimFile {
                 && state.faults_of(&self.host).chance(cfg.misdirected_write)
             {
                 state.cover("fault:misdirected_write");
+                if let Some(host) = &self.host {
+                    state.host_mut(host).durable_corruption += 1;
+                }
                 target_offset = offset + SECTOR * (1 + state.faults_of(&self.host).below(4));
             }
             file_state(state, &self.host, path)
@@ -2899,6 +2923,55 @@ mod tests {
             "exactly one bit must differ: {after:?}"
         );
         assert_eq!(sim.coverage()["fault:bit_flip"], 1);
+    }
+
+    #[test]
+    fn durable_corruption_fired_names_the_host_it_fired_on() {
+        // A misdirected write on `a`'s disk marks `a` alone.
+        let sim = Sim::with_faults(
+            0xB17_0003,
+            FaultConfig {
+                misdirected_write: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let (a, b) = (sim.host("a"), sim.host("b"));
+        assert!(!a.durable_corruption_fired() && !b.durable_corruption_fired());
+        let out_of_scope = a.disk().open("tables.redb").unwrap();
+        out_of_scope.write_at(0, b"payload!").unwrap();
+        assert!(
+            !a.durable_corruption_fired(),
+            "a write outside the corruption scope fires nothing, so marks nothing"
+        );
+        let file = a.disk().open("wal/f").unwrap();
+        file.write_at(0, b"payload!").unwrap();
+        assert_eq!(sim.coverage()["fault:misdirected_write"], 1);
+        assert!(a.durable_corruption_fired());
+        assert!(!b.durable_corruption_fired(), "b's disk saw no fault");
+
+        // A bit flip at `b`'s restart marks `b` alone.
+        let sim = Sim::with_faults(
+            0xB17_0004,
+            FaultConfig {
+                bit_flip: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let (a, b) = (sim.host("a"), sim.host("b"));
+        let file = b.disk().open("wal/g").unwrap();
+        file.write_at(0, &[0xAA; 64]).unwrap();
+        file.sync().unwrap();
+        a.restart();
+        assert_eq!(
+            sim.coverage().get("fault:bit_flip"),
+            None,
+            "a has no durable in-scope bytes, so its restart flips nothing"
+        );
+        assert!(!a.durable_corruption_fired());
+        b.restart();
+        assert_eq!(sim.coverage()["fault:bit_flip"], 1);
+        assert!(b.durable_corruption_fired());
+        assert!(!a.durable_corruption_fired(), "the flip was on b's disk");
     }
 
     #[test]

@@ -1738,7 +1738,8 @@ Charpente treats the coding agent as the primary developer persona:
   `acked_implies_durable` (the request-level ack-durability property, generalized for app
   workloads); and the two fire-time-marked axis companions `durable_corruption_fired` and
   `dir_entry_loss_fired`, which excuse a shortfall only in universes where that fault
-  actually fired. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
+  actually fired. `SimHost::durable_corruption_fired` is the first one scoped to a host,
+  for a multi-node workload whose excuse must name the node the fault fired on. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
   build/usage/infrastructure error.
 - **The edge harness (v0, implemented; `crates/edge-harness`).** The sim owns everything
   below the IO traits; the edge harness owns everything above them that only a real

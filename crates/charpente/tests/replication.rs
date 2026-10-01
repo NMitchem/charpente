@@ -6047,13 +6047,38 @@ fn sacrificial_cut(
 /// less while the universe could still pass. Now:
 /// - an error whose origin already gave up passes through unchanged (it is
 ///   already counted there);
+/// - a below-horizon refusal of `f`'s store (from the scan's reopen) is fault
+///   fallout if and only if durable corruption fired on `f`'s disk (D3 round
+///   3, the rule of S5 R-M3 and S3b item 0). If it did, `f` gives up as
+///   `repl:inconclusive:survivor-faulted`. If not, it fails by name: nothing
+///   injected explains it, so it is a platform durability bug.
 /// - injected-fault fallout, by `checks::classify`, gives up by name
 ///   (`repl:inconclusive:survivor-scan-unreadable`);
 /// - anything else is the failure it is.
-fn route_promise_scan(sim: &Sim, scan: Result<Vec<u64>, String>) -> Result<Vec<u64>, String> {
+fn route_promise_scan(
+    sim: &Sim,
+    f: &KNode,
+    scan: Result<Vec<u64>, String>,
+) -> Result<Vec<u64>, String> {
     scan.map_err(|e| {
         if e.contains(INCONCLUSIVE) {
             e
+        } else if e.contains(RESTORE_NEEDED) && e.contains("corrupted below the horizon") {
+            if f.host.durable_corruption_fired() {
+                sim.cover("repl:inconclusive:survivor-faulted");
+                format!(
+                    "{INCONCLUSIVE}: {e} by a durable-corruption fault injected on {}'s disk \
+                     (the designated survivor)",
+                    f.name
+                )
+            } else {
+                format!(
+                    "{e}, but no durable-corruption fault fired on {}: a below-horizon \
+                     refusal that nothing injected explains is a platform durability bug \
+                     (DESIGN §2), not fallout",
+                    f.name
+                )
+            }
         } else if is_fault_fallout(&e) {
             sim.cover("repl:inconclusive:survivor-scan-unreadable");
             format!(
@@ -6287,7 +6312,7 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
         route_p_error(sim, &mut p, &mut f, converged)?;
         // Record everything f durably holds now — it keeps these forever.
         let scan = retry_read_reopen(sim, &mut f, recover_kernel_node, |f| ids_present(f, &acked));
-        promised.extend(route_promise_scan(sim, scan)?);
+        promised.extend(route_promise_scan(sim, &f, scan)?);
 
         // The corruption trigger: crash + restart p (bit_flip rolls on p's
         // wal/ at restart). Recovery may cut above the horizon (silent loss,
@@ -6524,7 +6549,7 @@ fn an_exhausted_survivor_scan_gives_up_by_name_rather_than_promising_nothing() {
         "the exhaustion names the injected fault it ran out on, so checks::classify reads it \
          as fallout; got: {exhausted}"
     );
-    let routed = route_promise_scan(&sim, scan).expect_err(
+    let routed = route_promise_scan(&sim, &n, scan).expect_err(
         "an exhausted scan gives up by name, where the old site promised nothing and ran on",
     );
     assert!(
@@ -6557,7 +6582,7 @@ fn a_survivor_scan_error_that_is_not_fallout_fails_the_universe() {
     n.kernel = None;
     let scan = retry_read_reopen(&sim, &mut n, recover_kernel_node, |n| ids_present(n, &[0]));
     assert_eq!(
-        route_promise_scan(&sim, scan),
+        route_promise_scan(&sim, &n, scan),
         Err("node has no kernel".to_string()),
         "a scan that fails for a reason no fault explains fails the universe"
     );
@@ -6566,6 +6591,106 @@ fn a_survivor_scan_error_that_is_not_fallout_fails_the_universe() {
             .get("repl:inconclusive:survivor-scan-unreadable"),
         None,
         "and is not counted as a give-up"
+    );
+}
+
+/// The survivor's promise scan meets `f`'s store refused below the horizon:
+/// its read hits the redb latch tell once, and the reopen that follows is
+/// refused. Returns what the scan returned.
+fn scan_through_a_reopen(sim: &Sim, f: &mut KNode) -> Result<Vec<u64>, String> {
+    let latched = std::cell::Cell::new(false);
+    retry_read_reopen(sim, f, recover_kernel_node, |f| {
+        if !latched.replace(true) {
+            return Err("the database must be closed: close and re-open the database".to_string());
+        }
+        ids_present(f, &[0, 1, 2])
+    })
+}
+
+/// D3 round 3. A below-horizon refusal is fault fallout if and only if durable
+/// corruption fired on that node (the rule of S5 R-M3 and S3b item 0). Here a
+/// real `bit_flip` fires on `f`'s disk at the scan's reopen, so `f` gives up
+/// under `repl:inconclusive:survivor-faulted`. Round 2 failed the universe
+/// instead: `checks::classify` reads `universe-restore-needed` as Unrelated.
+#[test]
+fn a_survivor_corrupted_below_the_horizon_by_an_injected_fault_gives_up() {
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (_p, mut f) = sacrificial_pair(&sim);
+    assert!(
+        !f.host.durable_corruption_fired(),
+        "nothing restarted yet, so no bit flipped"
+    );
+    let scan = scan_through_a_reopen(&sim, &mut f);
+    assert_eq!(
+        scan,
+        Err(format!("{RESTORE_NEEDED}: f corrupted below the horizon")),
+        "the reopen's bit flip lands below f's horizon — if not, this test no longer reaches \
+         the refusal"
+    );
+    assert!(
+        f.host.durable_corruption_fired(),
+        "the flip fired on f's disk"
+    );
+    let routed =
+        route_promise_scan(&sim, &f, scan).expect_err("a refused survivor promises nothing");
+    assert!(
+        routed.starts_with(INCONCLUSIVE),
+        "corruption that fired on f is fallout, so the universe gives up; got: {routed}"
+    );
+    assert_eq!(
+        sim.coverage()
+            .get("repl:inconclusive:survivor-faulted")
+            .copied(),
+        Some(1),
+        "under the survivor's fault key"
+    );
+}
+
+/// The twin: the same refusal with no durable-corruption fault fired on `f`.
+/// The test corrupts `f`'s first WAL frame itself (no sim fault, so no
+/// marker), and a below-horizon refusal nothing injected is a platform
+/// durability bug. It fails by name.
+#[test]
+fn a_survivor_refused_below_the_horizon_with_no_corruption_fired_fails_by_name() {
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
+    let (_p, mut f) = sacrificial_pair(&sim);
+    let disk = f.host.disk();
+    let mut segments = disk.list("wal/").expect("f has a WAL");
+    segments.sort();
+    let file = disk
+        .open(segments.first().expect("f has a WAL segment"))
+        .expect("the segment opens");
+    let mut crc = [0u8; 1];
+    file.read_at(12, &mut crc).expect("frame 1's header reads");
+    crc[0] ^= 0xff;
+    file.write_at(12, &crc).expect("frame 1's CRC is rewritten");
+    file.sync().expect("and made durable");
+    let scan = scan_through_a_reopen(&sim, &mut f);
+    assert_eq!(
+        scan,
+        Err(format!("{RESTORE_NEEDED}: f corrupted below the horizon")),
+        "frame 1 sits below f's horizon — if not, this test no longer reaches the refusal"
+    );
+    assert!(
+        !f.host.durable_corruption_fired(),
+        "no sim fault fired on f"
+    );
+    let routed =
+        route_promise_scan(&sim, &f, scan).expect_err("a refused survivor promises nothing");
+    assert!(
+        !routed.contains(INCONCLUSIVE) && routed.contains("no durable-corruption fault fired on f"),
+        "with nothing injected on f, the refusal is a failure that says why; got: {routed}"
+    );
+    assert_eq!(
+        sim.coverage().get("repl:inconclusive:survivor-faulted"),
+        None,
+        "and not a give-up"
     );
 }
 
@@ -6751,7 +6876,7 @@ fn above_horizon_universe_routes_every_error_of_p() {
             universe
                 .matches(
                     "let scan = retry_read_reopen(sim, &mut f, recover_kernel_node, |f| \
-                     ids_present(f, &acked));\npromised.extend(route_promise_scan(sim, scan)?);",
+                     ids_present(f, &acked));\npromised.extend(route_promise_scan(sim, &f, scan)?);",
                 )
                 .count(),
             1,
