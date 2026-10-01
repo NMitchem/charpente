@@ -1358,6 +1358,70 @@ impl Repl {
     }
 }
 
+/// A `SimDisk` whose next `File::sync` fails while `arm` is set, and whose
+/// next `Disk::sync_dir` fails while `arm_dir` is: an fsync error on one role
+/// or witness write, which no `FaultConfig` rate can aim at a single call.
+/// Shared by `role.rs`'s and `witnesses.rs`'s tests (D1 review I3).
+#[cfg(test)]
+pub(crate) struct FailNextSync {
+    pub(crate) inner: charpente_sim::SimDisk,
+    pub(crate) arm: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) arm_dir: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+struct FailNextSyncFile {
+    inner: Box<dyn charpente_core::io::File>,
+    arm: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl Disk for FailNextSync {
+    fn open(&self, path: &str) -> io::Result<Box<dyn charpente_core::io::File>> {
+        Ok(Box::new(FailNextSyncFile {
+            inner: self.inner.open(path)?,
+            arm: Arc::clone(&self.arm),
+        }))
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        if self
+            .arm_dir
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other("injected directory fsync failure"));
+        }
+        self.inner.sync_dir(prefix)
+    }
+}
+
+#[cfg(test)]
+impl charpente_core::io::File for FailNextSyncFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn sync(&self) -> io::Result<()> {
+        if self.arm.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::other("injected fsync failure"));
+        }
+        self.inner.sync()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use charpente_core::table::{Codec, Unscoped};

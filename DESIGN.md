@@ -1210,7 +1210,18 @@ Right at M1 scale; incremental streaming is the tracked fix before large-store s
 The durable role file (§2's role semantics, T5) carries its own CRC line: a torn role
 write is a named integrity error, never a parse of whatever bytes survived — a torn
 "follower:p:1" that still parses as a role naming a ghost primary is exactly what the T6
-harness caught (seed 0x51dacce702b667c8).
+harness caught (seed 0x51dacce702b667c8). It is read the way recovery reads the log (§2,
+"readable is not durable"): `load_role` barriers the file's name and syncs its bytes before
+it trusts either, and every witness-slot read does the same (2026-10-01, D1 review I3).
+Before that, a promote whose role fsync failed was still in the page cache after the
+restart its own error asked for. The node booted as `Primary` from it and served writes,
+and a power loss then reverted the file to `Follower` under a diverged log. A witness store
+that failed the same way let a primary boot checking a set the next power loss shrank. A
+sync that fails at boot fails the boot by name. The pins are in `repl/role.rs` and
+`repl/witnesses.rs`: `a_role_a_restarted_node_boots_as_survives_the_next_power_loss`,
+`a_witness_set_a_restarted_node_boots_with_survives_the_next_power_loss`, and for each the
+name (`…_name_a_restarted_node_trusts_…`) and failed-sync (`…_whose_sync_fails_at_boot_is_not_trusted`)
+twins.
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through
