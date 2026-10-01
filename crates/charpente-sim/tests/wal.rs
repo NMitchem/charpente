@@ -1796,6 +1796,85 @@ fn a_failed_sync_poisons_the_log_and_every_later_call_is_refused() {
     assert!(wal.poisoned(), "refusals do not clear the poison");
 }
 
+/// Readable is not durable. A process that dies between a frame's write and
+/// its fsync leaves the frame in the page cache, and the next process reads
+/// it back as a perfectly valid record. Until 2026-10-01 recovery handed it to
+/// `on_record` without ever syncing it, so the next power loss took back a
+/// record the caller had already applied — and a `Db` had already persisted,
+/// which is how realtime found it (the store outran the log; seeds and the
+/// Db-level pins are in charpente-core's `tests/engine.rs`,
+/// `a_record_recovery_replays_survives_the_next_power_loss`). Recovery now
+/// syncs each segment before any of its frames reaches replay.
+///
+/// The next process opens in the same power epoch with no `Sim` call between:
+/// dropping the `Wal` is the process dying (it has no destructor IO), and the
+/// sim's page cache is everything not yet collapsed by `Sim::restart`.
+#[test]
+fn a_frame_recovery_replays_survives_the_next_power_loss() {
+    let sim = quiet_sim(); // FaultConfig::none(): a power cycle drops every unsynced write
+    {
+        let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+        assert_eq!(wal.append(b"written, never synced").unwrap(), 0);
+    } // the process dies before its fsync
+    let replay = |sim: &Sim| {
+        let mut seen = Vec::new();
+        drop(
+            Wal::open(Box::new(sim.disk()), small_segments(), |seq, payload| {
+                seen.push((seq, payload.to_vec()));
+                Ok(())
+            })
+            .unwrap(),
+        );
+        seen
+    };
+    let first = replay(&sim);
+    assert_eq!(
+        first,
+        vec![(0, b"written, never synced".to_vec())],
+        "the next process reads the frame back from the page cache"
+    );
+    sim.restart(); // power loss
+    assert_eq!(
+        replay(&sim),
+        first,
+        "a record recovery replayed vanished at the next power loss — recovery handed on a frame \
+         it never made durable"
+    );
+}
+
+/// fsyncgate, at recovery: a segment whose sync fails is a segment of which
+/// nothing is known to be durable, so recovery fails before handing a single
+/// one of its frames to `on_record`. Syncing after replay instead would let the
+/// caller apply (and persist) the very frames the failed sync says nothing
+/// about.
+#[test]
+fn a_recovery_whose_segment_sync_fails_hands_no_frame_to_replay() {
+    let sim = quiet_sim();
+    {
+        let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+        wal.append(b"written, never synced").unwrap();
+    } // the process dies before its fsync
+    let arm = Arc::new(AtomicBool::new(true));
+    let mut replayed = 0;
+    let err = Wal::open(
+        Box::new(FailOneSync {
+            inner: sim.disk(),
+            arm: arm.clone(),
+        }),
+        small_segments(),
+        |_, _| {
+            replayed += 1;
+            Ok(())
+        },
+    )
+    .expect_err("recovery went on past a segment whose sync failed");
+    assert_eq!(err.to_string(), "injected fsync failure");
+    assert_eq!(
+        replayed, 0,
+        "a frame reached replay from a segment whose sync failed"
+    );
+}
+
 /// One frame in the WAL's real format — `[seq u64 le][len u32 le][crc u32
 /// le][payload]`, crc over seq‖len‖payload as `frame_crc` computes it — so a
 /// hand-built log differs from an appended one only where the test says.

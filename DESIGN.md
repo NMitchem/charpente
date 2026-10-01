@@ -193,6 +193,23 @@ rather than argued — `a_directory_barrier_does_not_perturb_the_other_disk_faul
 semantically no-op barrier and demands the entire coverage map be unchanged; without the split
 it fails, one barrier having moved four read faults and two write faults.
 
+**A process restart is not a power cycle.** `Sim::restart` power-cycles: the
+page cache collapses under the crash model before anything reopens.
+`Sim::restart_process` (2026-10-01) restarts only the process. Open handles die
+and nothing else happens: every unsynced write and directory entry stays pending
+and readable by the next open, and the next power cycle still collapses it. That
+is what a supervisor sees after a kill, a crash or an exit, and it is the only
+way to reach "the next process read back what the dead one never made durable".
+Before it existed, a property reached that shape only by accident, when a boot
+loop reopened without a restart. Readable is not durable, and that accident
+exposed a real ordering bug: recovery replayed WAL frames it never synced, and the
+store outran the log (realtime seed 0x7df8c43a1d2591e8; fixed, §2). The mode draws
+from no stream and clears no countdown, so introducing it re-keyed no universe. Three
+pinned batches reproduced their coverage byte for byte across the change
+(migrations, realtime's mixed-shape resume, and the wal dir-entry property). The
+property that drives it on purpose is §2's class oracle,
+`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`.
+
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
 model, just one instance per host) and its own fault + entropy streams, keyed sub-streams
@@ -373,7 +390,22 @@ delete-before-truncate order is a fence in its own right (fence 3, below). Any I
 poisons the log — fsync results
 cannot honestly be retried (fsyncgate); the only exit from poison is restart-and-recover,
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
-machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
+machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack,
+and recovery is read → sync → apply. **Readable is not durable**: after a process restart
+the page cache still holds every frame the dead process wrote, synced or not. A frame
+whose fsync failed, or that the process died before syncing, reads back valid.
+Recovery therefore syncs each segment's bytes before handing any of its frames to
+replay, and a segment whose sync fails hands none (fsyncgate: a failed sync guarantees
+nothing). Before 2026-10-01 the clean path replayed without syncing. A process restart
+then replayed an unsynced frame and persisted the store past it, at open or merely by
+closing it (redb's close commits durably). The next power loss took the frame, and
+`Db::open`'s own "the store outran durable truth" assert fired. Realtime found it
+(seeds 0x7df8c43a1d2591e8, 0x5d889f4c1a9ac543). The pins are
+`a_record_recovery_replays_survives_the_next_power_loss` and
+`a_recovery_whose_log_sync_fails_replays_nothing` (charpente-core `tests/engine.rs`) and
+their WAL-level twins in charpente-sim `tests/wal.rs`. The class's oracle is
+`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`, which
+mixes §1's `Sim::restart_process` with power cycles.
 The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::read_log`,
 M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
 back one that fails — a frame corrupted on disk after append must never travel. That
