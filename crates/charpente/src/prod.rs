@@ -113,6 +113,8 @@ trait Fs: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe {
     /// `(path, is a directory)` for every entry, in no particular order.
     fn read_dir(&self, dir: &Path) -> io::Result<Vec<(PathBuf, bool)>>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    /// `rmdir(2)`: the directory must be empty.
+    fn remove_dir(&self, dir: &Path) -> io::Result<()>;
 }
 
 struct StdFs;
@@ -172,12 +174,17 @@ impl Fs for StdFs {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
+
+    fn remove_dir(&self, dir: &Path) -> io::Result<()> {
+        std::fs::remove_dir(dir)
+    }
 }
 
-/// Creates `root` when it is absent — and nothing above it. Every barrier's
-/// chain ends at the root's parent, so a directory created above that would
-/// hold an entry no chain ever syncs, and existing is not being durable: the
-/// boot that created it may have died before anything synced it. So a root
+/// Creates `root` when it is absent — and nothing above it. The highest
+/// directory charpente syncs is the root's parent (`ProdDisk::new` at every
+/// start, a PUT on every PUT), so a directory created above that would hold
+/// an entry nothing ever syncs, and existing is not being durable: the boot
+/// that created it may have died before anything synced it. So a root
 /// whose parent is missing is refused by name, and the durability boundary
 /// is the parent the operator made. `what` names the root ("data
 /// directory", "bucket root"); `acked` names what rests on it.
@@ -280,9 +287,10 @@ fn parent_dir(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Where every sync chain from under `root` ends: the root's parent, which
-/// holds the root's own entry — the highest directory charpente creates an
-/// entry in, since it never creates above the root (`create_root`).
+/// The directory holding `root`'s own entry: its parent, the highest
+/// directory charpente creates an entry in, since it never creates above
+/// the root (`create_root`). `ProdDisk::new` syncs it at every start; an
+/// object's chain ends there on every PUT, GET and LIST.
 fn chain_end(root: &Path) -> PathBuf {
     parent_dir(root).unwrap_or_else(|| root.to_path_buf())
 }
@@ -306,8 +314,8 @@ fn sync_up(fs: &dyn Fs, dir: &Path, top: &Path, owed: &str) -> io::Result<()> {
         at = parent_dir(&at).filter(|p| *p != at).unwrap_or_else(|| {
             panic!(
                 "sync_up: \"{}\" is not below \"{}\" — a sync chain climbs from a \
-                 directory to one above it, and every chain here starts under the root it \
-                 stops above",
+                 directory to one above it, and every chain here starts at or under the \
+                 directory it stops at",
                 dir.display(),
                 top.display()
             )
@@ -344,18 +352,42 @@ fn sync_file_named(file: &dyn File, path: &Path, owed: &str) -> io::Result<()> {
     })
 }
 
+/// Removes `dir` when it is an empty directory, durably, and answers
+/// whether it did: `restore` takes back a destination it created when a
+/// refusal leaves it empty. The emptiness is checked twice, here and by
+/// `rmdir` itself. Durably, because `ProdDisk::new` fsynced the directory's
+/// entry into its parent when it created it, and an unsynced removal would
+/// let a power loss bring back a directory the operator never had.
+pub(crate) fn remove_empty_dir(dir: &Path) -> io::Result<bool> {
+    remove_empty(&StdFs, dir)
+}
+
+fn remove_empty(fs: &dyn Fs, dir: &Path) -> io::Result<bool> {
+    if !fs.read_dir(dir)?.is_empty() {
+        return Ok(false);
+    }
+    fs.remove_dir(dir)?;
+    sync_dir_named(fs, &chain_end(dir), REMOVED_OWED)?;
+    Ok(true)
+}
+
+/// Why `remove_empty_dir` fsyncs the parent, for the error that names it.
+const REMOVED_OWED: &str = "a removed directory stays removed across a power loss only once the \
+                            directory that held it has been fsynced";
+
 // ---------------------------------------------------------------- Disk
 
 /// Why `ProdDisk::new` fsyncs the data directory's parent, for the error
 /// that names it.
 const START_OWED: &str = "the data directory's own entry lives there, and charpente fsyncs it at \
-                          every start so that anything under the data directory can be durable";
+                          every start, before anything is acknowledged, because no barrier \
+                          reaches above the data directory";
 
 /// What an unsynced directory costs a `Disk` name, for the error that names
 /// it.
 const DISK_OWED: &str = "a name is durable only once the directory holding it and every \
-                         directory above it, up to the data directory's parent, have been \
-                         fsynced (Disk::sync_dir's contract)";
+                         directory above it, up to the data directory, have been fsynced \
+                         (Disk::sync_dir's contract)";
 
 /// Files under a root directory, the node's data directory. The trait's flat
 /// names may contain `/`, which maps to subdirectories created on demand.
@@ -363,15 +395,22 @@ const DISK_OWED: &str = "a name is durable only once the directory holding it an
 /// **Directory entries.** A name survives a power loss only once the
 /// directory holding it has been fsynced, and that directory's own entry in
 /// its parent, and so on up: a power loss that drops `wal`'s entry in the
-/// data directory drops every segment under it, synced or not. So
-/// `sync_dir(prefix)` fsyncs every directory a name starting with `prefix`
-/// sits in, then every directory above them up to the data directory's
-/// parent, which holds the data directory's own entry. The whole chain on
-/// every barrier, not only what the barrier's own call created: a boot that
-/// created a directory and then failed or died before syncing it leaves one
-/// that exists without being durable, and the next boot cannot tell it from
-/// one that is. `open` creates directories and syncs nothing, because
-/// `Disk`'s contract makes a name durable at the barrier, not at the create.
+/// data directory drops every segment under it, synced or not. Each entry
+/// has one sync that carries it:
+/// - a name under the data directory: the barrier. `sync_dir(prefix)`
+///   fsyncs every directory a name starting with `prefix` sits in, then
+///   every directory above them up to and including the data directory.
+///   The whole chain on every barrier, not only what the barrier's own call
+///   created: a boot that created a directory and then failed or died
+///   before syncing it leaves one that exists without being durable, and
+///   the next boot cannot tell it from one that is. `open` creates
+///   directories and syncs nothing, because `Disk`'s contract makes a name
+///   durable at the barrier, not at the create.
+/// - the data directory's own entry, in its parent: `new`, which fsyncs the
+///   parent at every start, whichever boot created the data directory and
+///   before anything can be acknowledged. No barrier reaches above the data
+///   directory, and none creates it.
+/// - the parent's own entry, and everything above it: the operator's.
 ///
 /// **The data directory's parent is the boundary.** `new` creates the data
 /// directory when it is absent and nothing above it: a data directory whose
@@ -379,13 +418,10 @@ const DISK_OWED: &str = "a name is durable only once the directory holding it an
 /// parent when the machine is provisioned and make it durable, or point at
 /// a data directory whose parent exists). Every
 /// directory the node creates is then at or below the data directory, so
-/// every entry it creates lies on some barrier's chain, whichever boot
-/// created it; the parent's own entry, above, is the operator's. `new`
-/// fsyncs the parent at every start, which durability does not need (the
-/// data directory's entry is on every barrier's chain, and nothing is
-/// durable before a barrier) but the operator does: fsyncing a directory
-/// means opening it, so a parent the node cannot read is refused there, by
-/// name, rather than at the app's first barrier.
+/// every entry it creates is carried by a barrier or by the start sync,
+/// whichever boot created it. Fsyncing a directory means opening it, so a
+/// parent the node cannot read stops the start there, by name, rather than
+/// at the app's first barrier.
 ///
 /// Until 2026-10-01 a barrier fsynced only the one directory holding its
 /// prefix, and nothing synced a created directory into its parent. On a
@@ -420,10 +456,10 @@ impl ProdDisk {
     /// `new` over any filesystem: the crash model, in this module's tests.
     fn over(root: PathBuf, fs: Box<dyn Fs>) -> io::Result<ProdDisk> {
         create_root(&*fs, &root, "data directory", "an acknowledged write")?;
-        // Every barrier syncs this too, so durability does not need it here;
-        // the operator does. A parent the node cannot open fails now, under
-        // the start-up line that names the data directory, and not inside
-        // the app's first barrier, under one that blames the store.
+        // The data directory's own entry: this sync is the only one that
+        // carries it, whichever boot created it (barriers stop at the data
+        // directory). A parent the node cannot open fails here, under the
+        // start-up line, not inside the app's first barrier.
         sync_dir_named(&*fs, &chain_end(&root), START_OWED)?;
         Ok(ProdDisk { root, fs })
     }
@@ -503,7 +539,10 @@ impl Disk for ProdDisk {
                 }
             }
         }
-        sync_up(&*self.fs, &dir, &chain_end(&self.root), DISK_OWED)
+        // Up to the data directory and no further: its own entry, in its
+        // parent, is `new`'s to sync, at every start and before anything
+        // can be acknowledged.
+        sync_up(&*self.fs, &dir, &self.root, DISK_OWED)
     }
 }
 
@@ -1407,6 +1446,24 @@ mod tests {
                 None => Err(Model::not_found(path)),
             }
         }
+
+        fn remove_dir(&self, dir: &Path) -> io::Result<()> {
+            let mut m = self.model();
+            m.tick()?;
+            let (parent, name) = m.parent_of(dir)?;
+            let ino = m.entries(parent).get(&name).copied();
+            match ino.map(|ino| &m.nodes[ino]) {
+                Some(Node::Dir { live, .. }) if live.is_empty() => {
+                    m.entries(parent).remove(&name);
+                    Ok(())
+                }
+                Some(Node::Dir { .. }) => Err(io::Error::new(
+                    io::ErrorKind::DirectoryNotEmpty,
+                    format!("CrashFs: {} is not empty", dir.display()),
+                )),
+                _ => Err(Model::not_found(dir)),
+            }
+        }
     }
 
     struct CrashFile {
@@ -1921,7 +1978,8 @@ mod tests {
         );
     }
 
-    /// The data directory's own entry, in its parent, which nothing synced.
+    /// The data directory's own entry, in its parent: only `new`'s start
+    /// sync carries it, since no barrier climbs above the data directory.
     #[test]
     fn an_acked_write_on_a_node_that_created_its_data_directory_survives_the_next_power_loss() {
         let fs = CrashFs::provisioned("/srv");
@@ -2055,13 +2113,13 @@ mod tests {
         assert!(!fs.is_dir(Path::new("/srv")), "the refusal created /srv");
     }
 
-    /// Why every barrier syncs the whole chain, not only what its own call
-    /// created: the boot that created the data directory failed to make its
-    /// entry durable, and the next boot finds the directory there and
-    /// creates nothing. Only a barrier that re-syncs what already exists
-    /// keeps that boot's acknowledged writes. One armed failure: the first
-    /// boot meets the parent in `ProdDisk::new`, before `Db::open` runs at
-    /// all, so no store rebuild retries it.
+    /// Why `new` syncs the data directory's parent at EVERY start, not only
+    /// the start that created it: the boot that created the data directory
+    /// failed to make its entry durable, and the next boot finds the
+    /// directory there and creates nothing. Only a start sync that re-syncs
+    /// what already exists keeps that boot's acknowledged writes. One armed
+    /// failure: the first boot meets the parent in `ProdDisk::new`, before
+    /// `Db::open` runs at all, so no store rebuild retries it.
     #[test]
     fn an_acked_write_after_a_boot_whose_directory_sync_failed_survives_the_next_power_loss() {
         let fs = CrashFs::provisioned("/srv");
@@ -2120,8 +2178,8 @@ mod tests {
                 "could not fsync directory \"/srv/node\" (CrashFs: injected fsync \
                              failure on /srv/node) — a name is durable only once the directory \
                              holding it and every directory above it, up to the data \
-                             directory's parent, have been fsynced (Disk::sync_dir's contract); \
-                             check that directory's permissions and the disk under it"
+                             directory, have been fsynced (Disk::sync_dir's contract); check \
+                             that directory's permissions and the disk under it"
             ),
             "{err}"
         );
@@ -2129,6 +2187,31 @@ mod tests {
         fs.power_loss();
         let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
         assert_eq!(disk.list("").unwrap(), Vec::<String>::new());
+    }
+
+    /// A destination `restore` created and then took back on a refusal
+    /// stays gone across a power loss: `ProdDisk::new` made its creation
+    /// durable (the start sync), so the removal must be durable too, or the
+    /// power loss brings back a directory the operator never had. One that
+    /// holds anything is never removed.
+    #[test]
+    fn a_removed_empty_data_directory_stays_removed_across_a_power_loss() {
+        let fs = CrashFs::provisioned("/srv");
+        let disk = ProdDisk::over(PathBuf::from(NODE), Box::new(fs.clone())).unwrap();
+        let file = disk.open("held").unwrap();
+        drop((file, disk));
+        assert!(
+            !remove_empty(&fs, Path::new(NODE)).unwrap(),
+            "removed a directory holding a file"
+        );
+        assert!(fs.is_dir(Path::new(NODE)));
+        fs.remove_file(Path::new("/srv/node/held")).unwrap();
+        assert!(remove_empty(&fs, Path::new(NODE)).unwrap());
+        fs.power_loss();
+        assert!(
+            !fs.is_dir(Path::new(NODE)),
+            "a data directory removed after a refused restore came back at the power loss"
+        );
     }
 
     /// A power cut after every filesystem call a fresh node makes, from

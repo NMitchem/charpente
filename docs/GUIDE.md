@@ -130,11 +130,12 @@ failed to start: the data directory "/srv/app/node" has no parent directory:
 provision the machine, and make it durable before the node starts — a bare
 `mkdir -p` leaves the new entries in the page cache, so follow it with `sync`.
 The reason is durability: an acknowledged write rests on every directory entry
-above it, every directory barrier fsyncs the whole chain from the directory it
-names up to the data directory's parent (which holds the data directory's own
-entry), and the parent's own entry is yours. `ProdDisk::new` fsyncs that parent
-at every start, so a parent the node cannot read stops the start there, under
-the same line, rather than inside your app's first barrier. An empty path is
+above it. Every directory barrier fsyncs the whole chain from the directory it
+names up to the data directory; `ProdDisk::new` fsyncs the data directory's
+parent, which holds the data directory's own entry, at every start, before
+anything is acknowledged; and the parent's own entry is yours. That start sync
+also means a parent the node cannot read stops the start there, under the same
+line, rather than inside your app's first barrier. An empty path is
 refused by name too. `restore --to` follows the same rule.
 
 ```rust

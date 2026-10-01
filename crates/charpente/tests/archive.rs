@@ -10,6 +10,8 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 
+mod support;
+
 use charpente::archive::manifest::{
     Manifest, SnapshotMeta, TableBatches, decode_snapshot_batch, manifest_key, segment_key,
     snapshot_batch_key, snapshot_meta_key,
@@ -9205,6 +9207,35 @@ mod fs_object_store {
             "the refusal created {}",
             missing.display()
         );
+
+        // A parent that exists as a regular file is no directory either: a
+        // check for mere existence would build this store, and every PUT
+        // would then fail "Not a directory" and be absorbed, silently.
+        let file = tmp("file-parent");
+        std::fs::write(&file, b"").unwrap();
+        let root = file.join("bucket");
+        let built = FsObjectStore::new(root.clone());
+        let still_a_file = file.is_file();
+        std::fs::remove_file(&file).unwrap();
+        let Err(err) = built else {
+            panic!("a store was built over a bucket root whose parent is a regular file")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the bucket root \"{root}\" has no parent directory: \"{parent}\" is not an \
+                 existing directory, and charpente never creates a directory above the bucket \
+                 root — an acknowledged PUT rests on every directory entry above it, and \
+                 charpente vouches only for the entries it creates and fsyncs. Create \
+                 \"{parent}\" when you provision the machine and make it durable before the \
+                 node starts (for example, run `sync` after creating it), or point at a \
+                 bucket root whose parent exists",
+                root = root.display(),
+                parent = file.display()
+            )
+        );
+        assert!(still_a_file, "the refusal replaced {}", file.display());
     }
 
     /// An empty path names no bucket root: refused when the store is built,
@@ -9336,7 +9367,7 @@ mod fs_object_store {
         let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "a", &[1; 4096]).unwrap();
 
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        crate::support::chmod_that_bites(&root, 0o555);
         let e = put(&s, "a", &[2; 4096]).unwrap_err();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -9362,7 +9393,7 @@ mod fs_object_store {
         let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "seed", &[0]).unwrap(); // creates the bucket directory
 
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        crate::support::chmod_that_bites(&root, 0o555);
         assert!(put(&s, "new", &[1, 2, 3]).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -9437,7 +9468,7 @@ mod fs_object_store {
         let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "k", &[1; 16]).unwrap(); // creates the bucket directory
 
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o333)).unwrap();
+        crate::support::chmod_that_bites(&root, 0o333);
         let result = put(&s, "k", &[2; 16]);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 

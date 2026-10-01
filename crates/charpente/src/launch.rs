@@ -17,6 +17,11 @@ use crate::describe::{to_human, to_json};
 use crate::http::App;
 use crate::prod::{FsObjectStore, ProdDisk, ProdEntropy};
 
+/// The permission-pin helper `tests/archive.rs` shares (D2 re-review R4).
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
 pub const LAUNCH_USAGE: &str = "usage: <app> [describe [--format json|human]]\n       \
        <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  — no verb serves the app";
 
@@ -286,19 +291,23 @@ fn restore_verb(
     // never had, and "nothing in the destination has been touched" would be
     // true about the content and incomplete about the filesystem. Remembered
     // here, undone on the error paths below.
+    //
+    // Accepted race: an empty directory another process creates at `to`
+    // between this check and `ProdDisk::new` reads as one this call made,
+    // and a refusal removes it. Only an empty one, and only one created in
+    // that window — the removal re-checks emptiness, and `rmdir` refuses
+    // anything else.
     #[allow(clippy::disallowed_methods)]
     let dest_was_absent = !std::path::Path::new(&to).exists();
     // Only a directory THIS call created, and only while it is still empty.
     // A failure past the discard point has written a partial restore there
     // and its error tells the operator to re-run against it — removing that
-    // would destroy the thing the message just told them to keep.
-    // `remove_dir` rather than `remove_dir_all` so the emptiness check is
-    // enforced twice, once by us and once by the kernel.
+    // would destroy the thing the message just told them to keep. Durably:
+    // `ProdDisk::new` fsynced the creation, so an unsynced removal would
+    // come back at a power loss. Best-effort, on a path already failing.
     let undo_dest = || {
-        #[allow(clippy::disallowed_methods)]
-        if dest_was_absent && std::fs::read_dir(&to).is_ok_and(|mut d| d.next().is_none()) {
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_dir(&to);
+        if dest_was_absent {
+            let _ = crate::prod::remove_empty_dir(std::path::Path::new(&to));
         }
     };
     // Before a byte of the bucket is read, and named here rather than left
@@ -664,7 +673,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let parent = fresh_data_dir("unreadable-parent");
         std::fs::create_dir(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+        support::chmod_that_bites(&parent, 0o300);
         let data_dir = parent.join("data");
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -688,8 +697,9 @@ mod tests {
             format!(
                 "charpente failed to start: could not fsync directory \"{parent}\" (Permission \
                  denied (os error 13)) — the data directory's own entry lives there, and \
-                 charpente fsyncs it at every start so that anything under the data directory \
-                 can be durable; check that directory's permissions and the disk under it\n",
+                 charpente fsyncs it at every start, before anything is acknowledged, because \
+                 no barrier reaches above the data directory; check that directory's \
+                 permissions and the disk under it\n",
                 parent = parent.display()
             )
         );
@@ -1451,32 +1461,50 @@ mod tests {
     /// check.
     #[test]
     fn a_refusal_never_removes_a_destination_the_operator_created() {
-        let dest = tmp_dir("operator-made");
-        std::fs::create_dir_all(&dest).unwrap();
+        // Both refusal arms that take a destination back, each asserted by
+        // its own words so neither case can drift onto the other's arm:
+        // restore's error arm (a bucket with no manifest, under a parent
+        // that exists) and the `--from` arm (a bucket root whose parent is
+        // missing, refused when the store is built).
+        let absent_bucket = tmp_dir("operator-made-bucket");
+        for (from, arm) in [
+            (absent_bucket.to_str().unwrap(), "there is no manifest at"),
+            (
+                "/does/not/exist/charpente-no-such-bucket",
+                "has no parent directory",
+            ),
+        ] {
+            let dest = tmp_dir("operator-made");
+            std::fs::create_dir_all(&dest).unwrap();
 
-        let (code, out, err) = run_restore_verb(&[
-            "restore",
-            "--from",
-            "/does/not/exist/charpente-no-such-bucket",
-            "--to",
-            dest.to_str().unwrap(),
-            "--prefix",
-            BUCKET_PREFIX,
-        ]);
+            let (code, out, err) = run_restore_verb(&[
+                "restore",
+                "--from",
+                from,
+                "--to",
+                dest.to_str().unwrap(),
+                "--prefix",
+                BUCKET_PREFIX,
+            ]);
 
-        assert_eq!(code, 1, "stdout: {out}");
-        assert!(
-            err.to_lowercase()
-                .contains("nothing in the destination has been touched"),
-            "{err}"
-        );
-        assert!(
-            dest.exists(),
-            "the refusal deleted a directory the OPERATOR created, while telling them \
-             nothing had been touched: {}",
-            dest.display()
-        );
-        std::fs::remove_dir_all(&dest).unwrap();
+            let kept = dest.exists();
+            let _ = std::fs::remove_dir_all(&dest);
+            assert_eq!(code, 1, "--from {from}: stdout: {out}");
+            assert!(
+                err.contains(arm),
+                "--from {from} reached another arm: {err}"
+            );
+            assert!(
+                err.to_lowercase()
+                    .contains("nothing in the destination has been touched"),
+                "{err}"
+            );
+            assert!(
+                kept,
+                "--from {from}: the refusal deleted a directory the OPERATOR created, while                  telling them nothing had been touched: {}",
+                dest.display()
+            );
+        }
     }
 
     #[test]

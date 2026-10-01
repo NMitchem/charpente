@@ -170,18 +170,23 @@ it. Until 2026-10-01 it did fall short. `ProdDisk` created the data directory, a
 above it and `wal/` without syncing any of them into its parent, and a barrier fsynced only
 the one directory holding its prefix, so on a fresh node every write acknowledged before the
 first checkpoint rested on a `wal` entry the next power loss dropped (§2's barrier). The
-boundary of what a barrier vouches for is the root's parent: `ProdDisk` creates the data
+boundary of what charpente vouches for is the root's parent: `ProdDisk` creates the data
 directory and `FsObjectStore` the bucket root, and neither ever creates a directory above it
 — a root whose parent is missing is refused by name, because an entry created up there would
-lie on no barrier's chain, and a boot that failed before syncing it would leave it for the next
+lie on no sync's chain, and a boot that failed before syncing it would leave it for the next
 boot to trust (ruled 2026-10-01 over fsyncing every ancestor to `/`, which fails on unreadable
 ancestors and on filesystems with no directory fsync, and still cannot vouch for an
 operator's own unsynced `mkdir -p`, so the refusal tells the operator to make the parent durable
 when they provision it). `FsObjectStore::new` refuses such a root when the store is built, not
 at its first PUT: an archive reads a missing root as a fresh bucket and absorbs a refused PUT,
-so a node would otherwise run with no backup and no line on stderr. `ProdDisk::new` fsyncs the
-data directory's parent at every start, which no barrier needs it to, so that a parent the node
-cannot read fails at startup under the data directory's line. The model
+so a node would otherwise run with no backup and no line on stderr. Each entry in `ProdDisk`'s
+tree has exactly one sync that carries it, and each is pinned by inverting it: a name under the
+data directory is carried by the barrier, which syncs up to and including the data directory;
+the data directory's own entry by `ProdDisk::new`, which fsyncs its parent at every start,
+whichever boot created it and before anything can be acknowledged (no barrier climbs above the
+data directory, and none creates it); the parent's own entry by the operator. That start sync
+also makes a parent the node cannot read fail at startup, under the data directory's line. The
+model
 states its own limits (prod.rs, `Fs`): a power loss drops all unsynced state, deterministically
 and in full, so it finds a missing or misplaced sync and not a bug that needs some unsynced
 state to survive; and its kernel never marks a page clean after a failed fsync, so the EIO
@@ -553,11 +558,12 @@ taking acknowledged records with it, or a removed name could resurrect one a rec
 already discarded. `Disk::sync_dir(prefix)` is the barrier: on `Ok`, every prior
 create/remove of a name starting with `prefix` is durable — same flat-namespace prefix
 contract as `list`. The prod impl fsyncs every directory a name under the prefix sits in and
-every directory above them up to the data directory's parent — the whole chain on every
+every directory above them up to and including the data directory — the whole chain on every
 barrier, because a boot that created a directory and failed before syncing it leaves one that
-exists without being durable — and it never creates a directory above the data directory, so
-that chain covers every entry it creates (a data directory whose parent is missing is refused
-by name, §1). Until 2026-10-01 it fsynced only the holding directory, and on a fresh
+exists without being durable. The data directory's own entry is `ProdDisk::new`'s, synced into
+its parent at every start, and nothing is created above the data directory (a data directory
+whose parent is missing is refused by name, §1), so between them the barrier and the start
+sync carry every entry the prod impl creates. Until 2026-10-01 it fsynced only the holding directory, and on a fresh
 node the store's creation synced the data directory before `wal/` existed, so writes
 acknowledged before the first checkpoint rested on an unsynced `wal` entry (held by `CrashFs`,
 §1). The sim tracks pending
