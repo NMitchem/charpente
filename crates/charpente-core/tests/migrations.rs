@@ -347,12 +347,88 @@ fn migrated_twin(rows: u64) -> Vec<(u64, u32, String)> {
 /// data or a non-corruption loss (spec: never excuse wrong data, only
 /// missing data; loss is excused ONLY in universes where corruption was
 /// actually injected).
-fn corruption_excuses_the_loss(
-    got: &[(u64, u32, String)],
-    twin: &[(u64, u32, String)],
+fn corruption_excuses_the_loss<T: PartialEq>(
+    got: &[T],
+    twin: &[T],
     corruption_fired: bool,
 ) -> bool {
     corruption_fired && got.iter().all(|row| twin.contains(row))
+}
+
+/// The verdict on a faulted universe whose `what` ("migrated store") is not
+/// its uninterrupted twin. A loss durable corruption explains
+/// (`corruption_excuses_the_loss`) is marked `excused` and GIVES UP: the
+/// migration's result was not adjudicated, and a pass needs a verdict.
+/// Anything else fails.
+fn judge_divergence<T: PartialEq + std::fmt::Debug>(
+    sim: &Sim,
+    got: &[T],
+    twin: &[T],
+    excused: &'static str,
+    what: &str,
+) -> Result<(), String> {
+    if corruption_excuses_the_loss(
+        got,
+        twin,
+        charpente_sim::checks::durable_corruption_fired(sim),
+    ) {
+        sim.cover(excused);
+        sim.give_up(format!(
+            "durable corruption cut rows from the {what}: it kept {} of the uninterrupted \
+             twin's {} rows, every one of them intact, so the migration was not adjudicated",
+            got.len(),
+            twin.len()
+        ));
+        return Ok(());
+    }
+    Err(format!(
+        "faulted universe's {what} diverged from the uninterrupted twin: got {got:?}"
+    ))
+}
+
+/// A loss durable corruption explains gives up rather than passing, and the
+/// same loss without corruption fails (sweep, 2026-10-01). No swarm universe
+/// reaches this arm (0 of 6,144 over 24 bases for both properties, with
+/// corruption firing in every batch), so it is held on a constructed state.
+#[test]
+fn a_loss_durable_corruption_explains_gives_up_rather_than_passing() {
+    let twin = vec![
+        (0u64, 0u32, "migrated".to_string()),
+        (1, 1, "migrated".to_string()),
+    ];
+    let sim = Sim::with_faults(0x2EB7_0901, FaultConfig::none());
+    sim.cover("fault:bit_flip");
+    let verdict = judge_divergence(
+        &sim,
+        &twin[..1],
+        &twin,
+        "migrations:corruption-excused",
+        "migrated store",
+    );
+    assert_eq!(verdict, Ok(()), "an explained loss is not a failure");
+    let reason = sim
+        .gave_up()
+        .expect("an excused loss must give up, not pass: nothing was adjudicated");
+    assert!(
+        reason.contains("durable corruption cut rows from the migrated store")
+            && reason.contains("kept 1 of the uninterrupted twin's 2 rows"),
+        "and it must be THIS give-up: {reason}"
+    );
+
+    let clean = Sim::with_faults(0x2EB7_0902, FaultConfig::none());
+    let err = judge_divergence(
+        &clean,
+        &twin[..1],
+        &twin,
+        "migrations:corruption-excused",
+        "migrated store",
+    )
+    .expect_err("without corruption the same loss fails");
+    assert!(
+        err.contains("diverged from the uninterrupted twin"),
+        "{err}"
+    );
+    assert_eq!(clean.gave_up(), None);
 }
 
 #[cfg(test)]
@@ -432,18 +508,13 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
             let got: Vec<(u64, u32, String)> =
                 rows.into_iter().map(|r| (r.id.raw(), r.count, r.label)).collect();
             if got != twin {
-                if corruption_excuses_the_loss(
+                return judge_divergence(
+                    sim,
                     &got,
                     &twin,
-                    charpente_sim::checks::durable_corruption_fired(sim),
-                ) {
-                    sim.cover("migrations:corruption-excused");
-                    return Ok(());
-                }
-                return Err(format!(
-                    "faulted universe's migrated store diverged from the uninterrupted twin: \
-                     got {got:?}"
-                ));
+                    "migrations:corruption-excused",
+                    "migrated store",
+                );
             }
             Ok(())
         },
@@ -1264,15 +1335,13 @@ fn migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninter
                 })
                 .collect::<Result<_, String>>()?;
             if got != twin {
-                let corruption_fired = charpente_sim::checks::durable_corruption_fired(sim);
-                if corruption_fired && got.iter().all(|row| twin.contains(row)) {
-                    sim.cover("migrations:scoped-corruption-excused");
-                    return Ok(());
-                }
-                return Err(format!(
-                    "faulted universe's migrated scoped store diverged from the uninterrupted \
-                     twin: got {got:?}"
-                ));
+                return judge_divergence(
+                    sim,
+                    &got,
+                    &twin,
+                    "migrations:scoped-corruption-excused",
+                    "migrated scoped store",
+                );
             }
             Ok(())
         },
