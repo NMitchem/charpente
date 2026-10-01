@@ -1199,6 +1199,13 @@ fn regression_store_bricked_by_creation_crash() {
         Ok(()),
         "seed 0xf79c40a51bb93ae8 no longer recovers a store bricked at creation"
     );
+    // `Ok` alone is also what a give-up returns: recovering means the rebuilt
+    // store went on to be checked.
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "seed 0xf79c40a51bb93ae8 must reach a verdict on the rebuilt store, not give up"
+    );
     let discards = seen.lock().expect("witness lock").discards.clone();
     assert!(
         discards.contains(&Discard::Garbage),

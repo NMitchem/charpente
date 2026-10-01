@@ -2465,6 +2465,14 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
+/// The give-up cap, exact at the pinned base: 38 universes gave up in two
+/// identical batches, every one of them because it never got a 200 (review
+/// M3); with 64 coda reopens none gives up for an unreachable coda (27 with 8).
+const BURST_GAVE_UP_CEILING: u64 = 38;
+/// The skipped-boundary cap, exact at the pinned base: 20 round-boundary
+/// checks were unreachable in two identical batches at 16 round reopens.
+const BURST_ROUND_UNREACHABLE_CEILING: u64 = 20;
+
 /// The flagship request-arm batching property under the full fault matrix.
 /// `0x60C1_0009` (`docs/superpowers/plans/2026-08-10-group-commit.md`'s
 /// seed table): the next free `0x60C1_*` slot after 8a's seven and the
@@ -2496,14 +2504,6 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
 /// request — or that made every verification reopen fail — would satisfy
 /// every remaining key and pass 256 universes without comparing anything
 /// (T8b review I-3).
-/// The give-up cap, exact at the pinned base: 38 universes gave up in two
-/// identical batches, every one of them because it never got a 200 (review
-/// M3); with 64 coda reopens none gives up for an unreachable coda (27 with 8).
-const BURST_GAVE_UP_CEILING: u64 = 38;
-/// The skipped-boundary cap, exact at the pinned base: 20 round-boundary
-/// checks were unreachable in two identical batches at 16 round reopens.
-const BURST_ROUND_UNREACHABLE_CEILING: u64 = 20;
-
 #[test]
 fn contended_request_bursts_survive_the_fault_matrix() {
     run_universes_swarm_with!(

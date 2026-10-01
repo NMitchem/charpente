@@ -990,6 +990,10 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
+/// The give-up cap, exact at the pinned base: 16 of 256 universes gave up in
+/// two identical batches (16 final attempts; 33 with 8).
+const TENANT_GAVE_UP_CEILING: u64 = 16;
+
 /// The flagship tenant property (spec §1 as a mechanical oracle, hard rule
 /// 3): across the full fault matrix, and after every recovery, every scoped
 /// read returns ONLY its own tenant's rows — `get`, `scan`, `scan_from` and
@@ -1003,10 +1007,6 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
 /// this repo uses: a property that must not flake batch to batch does not
 /// take an ambient seed. Fresh bases are run and recorded rather than
 /// swapped in here.
-/// The give-up cap, exact at the pinned base: 16 of 256 universes gave up in
-/// two identical batches (16 final attempts; 33 with 8).
-const TENANT_GAVE_UP_CEILING: u64 = 16;
-
 #[test]
 fn every_scoped_read_returns_only_its_own_tenants_rows() {
     run_universes_swarm_with!(

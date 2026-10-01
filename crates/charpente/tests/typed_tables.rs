@@ -756,8 +756,10 @@ fn tables_and_log_survive_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
-            // 7 to 16 per batch over 8 bases (2026-10-01), so a batch with
-            // none is about a 1-in-190,000 event, not a flake.
+            // 10 to 24 per batch over 10 fresh batches with the final check
+            // (2026-10-01), mean 15.3 and variance 14.9, so as a Poisson count
+            // a batch with none is about a 1-in-4-million event (e^-15.3), not
+            // a flake.
             "tables:store-rebuilt",
         ],
         ceiling: [("universe:gave-up", TABLES_GAVE_UP_CEILING)]
