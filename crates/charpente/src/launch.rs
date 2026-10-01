@@ -1501,7 +1501,8 @@ mod tests {
             );
             assert!(
                 kept,
-                "--from {from}: the refusal deleted a directory the OPERATOR created, while                  telling them nothing had been touched: {}",
+                "--from {from}: the refusal deleted a directory the OPERATOR created, while \
+                 telling them nothing had been touched: {}",
                 dest.display()
             );
         }
