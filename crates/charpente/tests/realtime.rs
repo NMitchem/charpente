@@ -2366,7 +2366,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| realtime_workload(sim).map(|_trace| ()),
         require: [
-            "boot:retried",
+            "boot:booted-after-retry",
             "realtime:resume-backlog",
             "realtime:gap",
             "realtime:stall-drop",
@@ -5447,7 +5447,7 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| scoped_realtime_workload(sim).map(|_trace| ()),
         require: [
-            "boot:retried",
+            "boot:booted-after-retry",
             "tenant:both-tenants-emitted",
             "tenant:own-backlog-verified",
             "tenant:foreign-backlog-not-delivered",

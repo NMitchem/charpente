@@ -4862,7 +4862,7 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| receipt_upgrade_universe(sim),
         require: [
-            "boot:retried",
+            "boot:booted-after-retry",
             "shapes:job-refused",
             "shapes:job-refused-after-crash",
             "shapes:job-drained",

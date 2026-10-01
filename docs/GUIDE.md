@@ -2649,20 +2649,25 @@ for these before hand-rolling the same logic a fourth time:
   media corruption still lives on the follower.
 - `boot_through_fallout(sim: &Sim, tries: u32, is_fallout: impl Fn(&str) -> bool, boot: impl FnMut() -> Result<T, E>) -> Result<Option<T>, E>`
   — boots the way a supervised process does: `boot`, and on an error your
-  `is_fallout` accepts, boot again, `tries` boots in all (each retry marks
-  `boot:retried`, and running out marks `boot:exhausted`). A retry after an
-  injected IO error restarts the process first (`sim.restart_process()`, so
-  the page cache survives); a retry after a crash power-cycles first
-  (`sim.restart()`, when `Sim::disk_crashed` says the disk is gone).
-  `Ok(Some(t))` is the first clean boot, `Err(e)` the first error that is not
-  fallout, unchanged, and `Ok(None)` means every boot met fallout. What `None`
-  means is yours to say: a workload whose only node never came up gives up by
-  name (`counter_survives` above). Use it wherever one boot is all a phase
-  gets: an injected fault inside the table store's open is returned by
-  `Db::open` as the error it is, and the next boot opens the same file, so
-  giving up on the first faulted boot throws away universes a restart would
-  have recovered. A round loop whose next round boots again after a restart is
-  already retrying; it needs no inner loop.
+  `is_fallout` accepts, boot again, `tries` boots in all. Each retry marks
+  `boot:retried`, a retry that boots marks `boot:booted-after-retry` (require
+  that one: it proves the retries do more than run), and running out marks
+  `boot:exhausted`. A retry after an injected IO error restarts the process
+  first (`sim.restart_process()`, so the page cache survives); a retry after a
+  crash power-cycles first (`sim.restart()`, when `Sim::disk_crashed` says the
+  disk is gone). `Ok(Some(t))` is the first clean boot and `Err(e)` the first
+  error that is not fallout, unchanged. `Ok(None)` means every boot met
+  fallout, and what it means is yours to say: a workload whose only node
+  never came up gives up by name (`counter_survives` above), and a round
+  restarts and moves on. The one `None` the helper names itself is a boot
+  refused for durable corruption at or below the store's horizon: no restart
+  clears bytes on the disk, so it stops at once, marks `boot:durable-refusal`
+  and gives the universe up under that name. Use it at every boot, a round
+  loop's included: an injected fault inside the table store's open is
+  returned by `Db::open` as the error it is, and the next boot opens the same
+  file, so a phase that gives up or skips on its first faulted boot throws
+  away work a restart would have recovered. A round loop's next round does
+  boot again, but the round it skipped is work the property never checks.
 - `dir_entry_loss_fired(sim: &Sim) -> bool` — the same fire-time-marked
   discipline for the `dir_entry_loss` axis (a pending directory create
   vanished, or a pending removal resurrected). A workload that routes

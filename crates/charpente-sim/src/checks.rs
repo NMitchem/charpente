@@ -221,35 +221,44 @@ pub fn acked_implies_durable(
 /// retry, which is `Db::open`'s own contract for an IO failure (DESIGN §4).
 /// Calls `boot`; when it fails with an error `is_fallout` accepts (injected
 /// fault fallout, by the caller's own classifier), calls it again, up to
-/// `tries` boots in all. Each retry marks `boot:retried`. A retry after an
-/// injected IO error restarts the process first (`Sim::restart_process`): the
-/// failed boot's handles die, the page cache survives, and an armed crash
-/// countdown keeps counting. A retry after a crash power-cycles first
-/// (`Sim::restart`), since the disk is gone until then. Power-cycling after
-/// every failure instead would turn each injected IO error into a crash,
-/// collapsing unsynced writes and rolling the restart-time bit flip, which no
-/// restarted process does.
+/// `tries` boots in all. Each retry marks `boot:retried`, and a retry that
+/// boots marks `boot:booted-after-retry`, so a batch can require that retries
+/// do more than run. A retry after an injected IO error restarts the process
+/// first (`Sim::restart_process`): the failed boot's handles die, the page
+/// cache survives, and an armed crash countdown keeps counting. A retry after
+/// a crash power-cycles first (`Sim::restart`), since the disk is gone until
+/// then. Power-cycling after every failure instead would turn each injected
+/// IO error into a crash, collapsing unsynced writes and rolling the
+/// restart-time bit flip, which no restarted process does.
 ///
 /// - `Ok(Some(t))`: the first boot that succeeded.
-/// - `Ok(None)`: every boot met fallout (marked `boot:exhausted`), and the sim
-///   is left as the last failed boot left it. What happens next is the
-///   caller's: a workload whose only node never came up gives up by name
-///   (`Sim::give_up`); an epoch of a multi-epoch workload restarts and moves
-///   on, as it did before it retried, because its settle phase still has to
-///   adjudicate or give up.
+/// - `Ok(None)`, one of two ways, and the sim is left as the last failed boot
+///   left it:
+///   - every boot met fallout (marked `boot:exhausted`). What happens next is
+///     the caller's: a workload whose only node never came up gives up by
+///     name (`Sim::give_up`); a round or epoch of a multi-round workload
+///     restarts and moves on, because a later phase still has to adjudicate
+///     or give up.
+///   - a boot was refused for durable corruption at or below the store's
+///     horizon (`FaultReason::DurableHorizon`). Those bytes are on the disk,
+///     so no restart clears them: the helper stops at once, marks
+///     `boot:durable-refusal` and gives the universe up under that name. The
+///     give-up is the first, so a caller's own later one cannot replace it.
 /// - `Err(e)`: the first error `is_fallout` rejects, unchanged and at once. A
 ///   non-injected error is a finding, never a reason to boot again.
 ///
 /// One injected fault used to cost the phase it hit: a workload that booted
-/// once gave up on fallout, and an epoch skipped itself. That was cheap only
-/// while `Db::open` absorbed a fault inside the table store's open by
-/// discarding the store and rebuilding it from the log in the same call. It no
-/// longer does (it returns the error, and the next boot retries the same
-/// file), so a boot site that does not retry loses the universes that rebuild
-/// used to hand it for free. A round loop whose next round boots again is
-/// already retrying, and needs none of this: booting each round in place
-/// instead hands its final check more to recover, and in five such
-/// properties more universes then gave up, not fewer (measured 2026-10-01).
+/// once gave up on fallout, and a round or an epoch skipped itself. That was
+/// cheap only while `Db::open` absorbed a fault inside the table store's open
+/// by discarding the store and rebuilding it from the log in the same call.
+/// It no longer does (it returns the error, and the next boot retries the same
+/// file), so a boot site that does not retry loses the universes, and the
+/// rounds, that rebuild used to hand it for free. That includes a round loop:
+/// its next round boots again, but the round a failed boot skips is work the
+/// property never checks. Aiming one is a measured trade. Unaimed, S5 cost
+/// group_commit 8.9% of its verified checks and tenant 11% of its
+/// multi-tenant writes over 10 fresh bases (2026-10-01, review I1); aimed, both
+/// checked more than before S5.
 pub fn boot_through_fallout<T, E: std::fmt::Display>(
     sim: &Sim,
     tries: u32,
@@ -267,9 +276,27 @@ pub fn boot_through_fallout<T, E: std::fmt::Display>(
             }
         }
         match boot() {
-            Ok(t) => return Ok(Some(t)),
-            Err(e) if is_fallout(&e.to_string()) => {}
-            Err(e) => return Err(e),
+            Ok(t) => {
+                if attempt > 0 {
+                    sim.cover("boot:booted-after-retry");
+                }
+                return Ok(Some(t));
+            }
+            Err(e) => {
+                let text = e.to_string();
+                if !is_fallout(&text) {
+                    return Err(e);
+                }
+                if matches!(classify(&text), FaultReason::DurableHorizon) {
+                    sim.cover("boot:durable-refusal");
+                    sim.give_up(format!(
+                        "the boot was refused for durable corruption at or below the store's \
+                         horizon, which no restart clears, so nothing past it was adjudicated: \
+                         {text}"
+                    ));
+                    return Ok(None);
+                }
+            }
         }
     }
     sim.cover("boot:exhausted");
@@ -656,6 +683,11 @@ mod tests {
         assert_eq!(booted, Ok(Some(3)));
         assert_eq!(sim.coverage().get("boot:retried"), Some(&2));
         assert_eq!(
+            sim.coverage().get("boot:booted-after-retry"),
+            Some(&1),
+            "a retry that boots says so, once"
+        );
+        assert_eq!(
             sim.coverage().get("restart"),
             None,
             "an IO error is no crash"
@@ -690,7 +722,37 @@ mod tests {
         assert_eq!(never, Ok(None));
         assert_eq!(sim.coverage().get("boot:retried"), Some(&3));
         assert_eq!(sim.coverage().get("boot:exhausted"), Some(&1));
+        assert_eq!(
+            sim.coverage().get("boot:booted-after-retry"),
+            None,
+            "retries that never boot must not read as recovery"
+        );
         assert_eq!(sim.gave_up(), None, "what exhaustion means is the caller's");
+
+        let sim = Sim::new(0xB007);
+        let mut calls = 0;
+        let refused = boot_through_fallout(&sim, 8, is_fault_fallout, || {
+            calls += 1;
+            Err::<(), _>(
+                "log frame 7 is invalid but at-or-below the store's durable horizon 9".to_string(),
+            )
+        });
+        assert_eq!(refused, Ok(None));
+        assert_eq!(
+            calls, 1,
+            "a durable refusal is never booted past: no restart clears it"
+        );
+        assert_eq!(sim.coverage().get("boot:durable-refusal"), Some(&1));
+        assert_eq!(sim.coverage().get("boot:retried"), None);
+        assert_eq!(sim.coverage().get("boot:exhausted"), None);
+        let reason = sim
+            .gave_up()
+            .expect("a durable refusal gives the universe up at once");
+        assert!(
+            reason.contains("refused for durable corruption")
+                && reason.contains("durable horizon 9"),
+            "under its own name, carrying the refusal: {reason}"
+        );
 
         let sim = Sim::new(0xB007);
         let mut calls = 0;
