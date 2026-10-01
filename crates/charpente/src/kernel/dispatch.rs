@@ -7,7 +7,8 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use charpente_core::db::{
-    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TenantAdmission, Tx, TxError,
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableWriteRefusal, TenantAdmission, Tx,
+    TxError,
 };
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
@@ -17,7 +18,8 @@ use crate::tenant::TenantScope;
 /// Why a job run did not complete. The App/Io split mirrors `TxError` and is
 /// load-bearing: `App` is the handler's own rejection (or an absorbed panic,
 /// a payload that does not decode, or the handler's transaction refused for
-/// enqueueing another shape of a mounted job) — a real attempt that feeds
+/// enqueueing another shape of a mounted job or for writing a table the
+/// `Schema` disagrees with) — a real attempt that feeds
 /// retry budget and lands in the row's `last_error`. `Io` is a platform fault
 /// surfaced through the handler's reads — NOT an attempt: the job stays
 /// Pending, nothing is recorded, the error bubbles (restart-and-recover).
@@ -211,9 +213,9 @@ impl Dispatcher {
     /// `run_due`'s one-job wrapper and the kernel's batched job-arm drain.
     /// `Ok(outcome)` covers handler success and handler failure (retry/dead
     /// — both are now STAGED records, not yet durable), and a handler whose
-    /// own transaction `Group::stage` refused with a `JobShapeRefusal` is
-    /// that kind of failure: an attempt, like a panic. A non-shape `Io` out
-    /// of the attempt's `Group::stage` is a dispatcher invariant, not a
+    /// own transaction `Group::stage` refused with a `JobShapeRefusal` or a
+    /// `TableWriteRefusal` is that kind of failure: an attempt, like a panic.
+    /// Any other `Io` out of the attempt's `Group::stage` is a dispatcher invariant, not a
     /// return: it panics — the kernel stops — rather than reaching this
     /// signature. `Err` is a PLATFORM failure, one of three: an `Io` the
     /// handler's own reads surfaced; the failure-record stage's own
@@ -346,19 +348,23 @@ impl Dispatcher {
             Ok(())
         });
 
-        // `Group::stage`'s only `TxError::Io` exit is its enqueue refusal: this
+        // `Group::stage`'s only `TxError::Io` exits are its two refusals: this
         // handler's transaction enqueued a mounted job name under another
-        // shape, another tenancy, or another scope type than the one mounted.
-        // That is the handler's own deterministic bug, like a panic — an
-        // attempt, never a platform fault, since no restart could clear it.
-        // Asserted, not handled (hard rule 4): a second `Io` exit in `stage`
-        // must be classified here on purpose, not dead-lettered by default.
+        // shape, another tenancy, or another scope type than the one mounted
+        // (`JobShapeRefusal`), or wrote a table the `Schema` disagrees with:
+        // unregistered, or registered under another scope shape or `Row` type
+        // (`TableWriteRefusal`). Either is the handler's own deterministic
+        // bug, like a panic — an attempt, never a platform fault, since no
+        // restart could clear it. Asserted, not handled (hard rule 4): a third
+        // `Io` exit in `stage` must be classified here on purpose, not
+        // dead-lettered by default.
         let attempt = match attempt {
             Err(TxError::Io(e)) => {
                 assert!(
-                    JobShapeRefusal::of(&e).is_some(),
-                    "dispatcher invariant: Group::stage returned an io error that is not its \
-                     job-shape refusal — classify it in dispatch before it can reach a job: {e}"
+                    JobShapeRefusal::of(&e).is_some() || TableWriteRefusal::of(&e).is_some(),
+                    "dispatcher invariant: Group::stage returned an io error that is neither its \
+                     job-shape nor its table-write refusal — classify it in dispatch before it \
+                     can reach a job: {e}"
                 );
                 Err(TxError::App(JobError::App(e.to_string())))
             }

@@ -897,25 +897,53 @@ fn poisoned_reports_wal_poison_after_io_failure() {
 
 /// T1 followup: the WAL-poison test above never reaches the engine's OWN
 /// poison bit (engine.rs's "a durable record failed to apply" guard) — a
-/// crashed disk fails the WAL's own append/sync first. This test opens with
-/// Invoice missing from the schema on purpose: the WAL append and sync for
-/// an Invoice put both succeed (no disk fault at all), but
-/// `TableMachine::apply`'s schema lookup fails afterward — a post-sync
-/// apply failure, which is the engine's own bit, not the WAL's.
+/// crashed disk fails the WAL's own append/sync first. This test registers a
+/// hand-written row whose `decode_row` cannot read what its own `encode_row`
+/// wrote: `Group::stage` finds the table registered and written through its
+/// registered type, the WAL append and sync succeed (no disk fault at all),
+/// and `TableMachine::apply`'s decode fails afterward — a post-sync apply
+/// failure, which is the engine's own bit, not the WAL's. (Until
+/// `Group::stage` refused a write to an unregistered table before its record
+/// existed, an `Invoice` put with `Invoice` left out of the schema was this
+/// test's way to fail apply.)
 #[test]
 fn poisoned_reports_the_engines_own_bit_after_a_post_sync_apply_failure() {
+    struct Undecodable {
+        id: Id<Undecodable>,
+    }
+    impl Row for Undecodable {
+        type Scope = Unscoped;
+        const TABLE: &'static str = "test.undecodable";
+        const INDEXES: &'static [charpente_core::table::IndexDef<Undecodable>] = &[];
+        fn id(&self) -> Id<Undecodable> {
+            self.id
+        }
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            self.id.encode(out);
+        }
+        // Reads a field `encode_row` never wrote.
+        fn decode_row(bytes: &[u8]) -> io::Result<Undecodable> {
+            let input = &mut &bytes[..];
+            let id = Id::decode(input)?;
+            u32::decode(input)?;
+            Ok(Undecodable { id })
+        }
+    }
+
     let sim = Sim::with_faults(0x9015_0DEE, FaultConfig::none());
     let mut db = Db::open(
         Box::new(sim.disk()),
         DbConfig::default(),
-        Schema::new().table::<Org>(), // Invoice missing on purpose
+        Schema::new().table::<Org>().table::<Undecodable>(),
     )
     .unwrap();
     assert!(!db.poisoned());
 
     let err = db
         .transact(|tx| {
-            tx.put(&invoice(1, 1, 1));
+            tx.put(&Undecodable {
+                id: Id::from_raw(1),
+            });
             Ok::<_, io::Error>(())
         })
         .unwrap_err();

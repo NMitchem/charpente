@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{
-    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TenantAdmission, Tx, TxError,
+    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableWriteRefusal, TenantAdmission,
+    Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, UnscopedJob, View};
@@ -664,7 +665,9 @@ impl App {
     /// is a fixed literal rather than an `Entropy` draw, so probing cannot
     /// shift the app's entropy stream and perturb everything after it (hard
     /// rule 1). A handler that rejects that synthetic input comes back as
-    /// `Err` naming the route, never as a silently empty name list.
+    /// `Err` naming the route and quoting what a request would receive, the
+    /// status and the envelope's message, never as a silently empty name
+    /// list.
     #[doc(hidden)]
     pub fn subscription_event_names(&mut self, route: &str) -> Result<Vec<&'static str>, String> {
         let Some(found) = self.router.routes().iter().find(|r| r.name == route) else {
@@ -711,11 +714,24 @@ impl App {
         let wrote = !group.is_empty();
         let names = match staged {
             Ok(sub) => Ok(sub.entries.iter().map(|e| e.name).collect()),
-            Err(e) => Err(format!(
-                "route `{route}`'s subscribe handler returned {e:?} under the emits(...) drift \
-                 probe, so what it subscribes to cannot be read — a handler that rejects a \
-                 credential-free request with `\"0\"` for every :param is not probeable"
-            )),
+            Err(e) => {
+                // Rendered as a request would receive it (hard rule 5): the
+                // status and the envelope's message, through the renderer
+                // requests use, never the Rust `Debug` of the `TxError`.
+                let response = tx_error_response(e);
+                let envelope: serde_json::Value = serde_json::from_slice(&response.body)
+                    .expect("tx_error_response always answers with Response::error's envelope");
+                let status = response.status;
+                let message = envelope["error"]
+                    .as_str()
+                    .expect("Response::error's envelope carries its message as \"error\"");
+                Err(format!(
+                    "route `{route}`'s subscribe handler answered {status} under the emits(...) \
+                     drift probe, so what it subscribes to cannot be read — a handler that \
+                     rejects a credential-free request with `0` for every :param is not \
+                     probeable; the {status} reads: {message}"
+                ))
+            }
         };
         // Unconditional, and before returning on any path: `Group`'s `Drop`
         // panics on a non-empty group that was never committed, so the write
@@ -1014,18 +1030,23 @@ pub(crate) fn io_failure_response(e: &io::Error) -> Response {
 /// reach comes from `begin_group`'s own snapshot (`handle_or_subscribe`), a
 /// `group.commit()` failure, or `Group::stage` (a job handler's own
 /// transaction never runs on an HTTP route — the kernel dispatches jobs, so
-/// only `Group::stage`'s enqueue check, not `Db::pending_job_shape_refusal`'s
-/// startup scan, can raise a refusal here). `JobShapeRefusal` is the only
-/// refusal any of them raises, so an `Io` carrying one is answered with its
-/// own text instead of the storage-failure one: nothing was written, and a
-/// retry cannot succeed. Any OTHER `Refusal` here (a table-gate barrier, a
-/// witness conflict) would name node state, not this request, and must fall
-/// through to `io_failure_response` like a genuine commit failure — which is
-/// why this matches `JobShapeRefusal::of`, not `Refusal::of`.
+/// only `Group::stage`'s own checks, not `Db::pending_job_shape_refusal`'s
+/// startup scan, can raise a refusal here). `Group::stage`'s two refusals,
+/// `JobShapeRefusal` and `TableWriteRefusal`, are the only ones any of them
+/// raises, so an `Io` carrying either is answered with its own text instead
+/// of the storage-failure one: nothing was written, and a retry cannot
+/// succeed. Any OTHER `Refusal` here (a table-gate barrier, a witness
+/// conflict) would name node state, not this request, and must fall through
+/// to `io_failure_response` like a genuine commit failure — which is why this
+/// matches the two wrappers' own `of`, not `Refusal::of`.
 fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),
-        TxError::Io(e) if JobShapeRefusal::of(&e).is_some() => Response::error(500, &e.to_string()),
+        TxError::Io(e)
+            if JobShapeRefusal::of(&e).is_some() || TableWriteRefusal::of(&e).is_some() =>
+        {
+            Response::error(500, &e.to_string())
+        }
         TxError::Io(e) => io_failure_response(&e),
         TxError::NotPrimary { primary } => Response::error(
             421,

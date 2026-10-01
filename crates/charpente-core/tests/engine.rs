@@ -18,7 +18,9 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use charpente_core::db::{Db, DbConfig, Schema, Seeder, Tenant, Tx, TxError};
+use charpente_core::db::{
+    Db, DbConfig, Refusal, Schema, Seeder, TableWriteRefusal, Tenant, Tx, TxError,
+};
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
@@ -2832,6 +2834,475 @@ fn reopening_the_same_scope_is_allowed() {
         Ok::<(), io::Error>(())
     })
     .unwrap();
+}
+
+// ------------------------------------- a table name keeps one scope shape
+
+/// A scoped `Row` whose `TABLE` is `Widget`'s, an unscoped table: the mirror
+/// of `TicketViaUnscopedDoor`. `Schema::table` registers one type per name,
+/// so this type can only ever be written, never registered beside `Widget`.
+struct WidgetViaScopedDoor {
+    id: Id<WidgetViaScopedDoor>,
+    n: u32,
+}
+
+impl Row for WidgetViaScopedDoor {
+    type Scope = TestOrg;
+    const TABLE: &'static str = Widget::TABLE;
+    const INDEXES: &'static [IndexDef<WidgetViaScopedDoor>] = &[];
+
+    fn id(&self) -> Id<WidgetViaScopedDoor> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<WidgetViaScopedDoor> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(WidgetViaScopedDoor { id, n })
+    }
+}
+
+/// The refusal `Group::stage` gives a write through `W` whose scope shape is
+/// not the one the `Schema` registered for its table name under `R`, spelled
+/// out independently of the product's `format!`. The type names come from
+/// `type_name`, whose rendering the compiler does not promise to keep.
+fn alias_refusal<R: Row, W: Row>(registered: &str, written: &str) -> String {
+    let (table, r, w) = (
+        R::TABLE,
+        std::any::type_name::<R>(),
+        std::any::type_name::<W>(),
+    );
+    format!(
+        "table \"{table}\" is registered {registered} as `{r}`, but this transaction wrote it \
+         {written} through `{w}` — two Row types declare TABLE = \"{table}\", and a table keeps \
+         one scope shape for its whole life; the transaction was refused and nothing was \
+         written, so a retry cannot succeed — write `{r}` instead, or give `{w}` a table name \
+         of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
+/// The refusal for a write through `W` to a table name the `Schema` does not
+/// register.
+fn unregistered_refusal<W: Row>() -> String {
+    let (table, w) = (W::TABLE, std::any::type_name::<W>());
+    format!(
+        "table \"{table}\" is not registered in the Schema, but this transaction wrote it \
+         through `{w}` — every table a transaction writes must be registered, or apply cannot \
+         decode its rows; the transaction was refused and nothing was written, so a retry \
+         cannot succeed — register it with .table::<{w}>() in the Schema passed to Db::open or \
+         App::open"
+    )
+}
+
+/// The refusal's text, `(last_applied, poisoned)` before and after, and the
+/// reopen's outcome.
+type AliasAttempt = (String, [(Option<u64>, bool); 2], Result<(), String>);
+
+/// Runs `write` against a fresh `Db` over `schema`, then crash-restarts and
+/// reopens. Refusing at apply, after the WAL sync, would leave the record
+/// durable: the engine poisoned, and every reopen replaying it into the same
+/// refusal.
+fn attempt_alias_write(
+    seed: u64,
+    schema: fn() -> Schema,
+    write: impl FnOnce(&mut Tx) -> Result<(), io::Error>,
+) -> AliasAttempt {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), schema()).unwrap();
+    let before = (db.last_applied(), db.poisoned());
+    let err = match db.transact(write) {
+        Err(TxError::Io(e)) => e,
+        other => panic!("the alias write was not refused as TxError::Io: {other:?}"),
+    };
+    let after = (db.last_applied(), db.poisoned());
+    sim.restart();
+    drop(db);
+    let reopened = Db::open(Box::new(sim.disk()), DbConfig::default(), schema())
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    (err.to_string(), [before, after], reopened)
+}
+
+/// A scoped write to a table the `Schema` registered unscoped is refused
+/// before its record exists: nothing applied, nothing poisoned, and the
+/// store reopens. At apply it was a durable poison that no restart cleared.
+#[test]
+fn a_scoped_write_to_an_unscoped_tables_name_is_refused_before_the_record_exists() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_0001,
+        || Schema::new().table::<Widget>(),
+        |tx| {
+            tx.open_scope(Id::<TestOrg>::from_raw(1), "member")?
+                .put(&WidgetViaScopedDoor {
+                    id: Id::from_raw(5),
+                    n: 1,
+                });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            alias_refusal::<Widget, WidgetViaScopedDoor>(
+                "unscoped (Row::Scope = Unscoped)",
+                "tenant-scoped"
+            ),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// The mirror: an unscoped write to a table the `Schema` registered scoped.
+#[test]
+fn an_unscoped_write_to_a_scoped_tables_name_is_refused_before_the_record_exists() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_0002,
+        || Schema::new().table::<Ticket>(),
+        |tx| {
+            tx.put(&TicketViaUnscopedDoor {
+                id: Id::from_raw(5),
+                n: 1,
+            });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            alias_refusal::<Ticket, TicketViaUnscopedDoor>(
+                "tenant-scoped (Row::Scope != Unscoped)",
+                "unscoped"
+            ),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// `Tx::delete` is the other unscoped write: its tombstone meets the same
+/// refusal, not apply's.
+#[test]
+fn an_unscoped_delete_to_a_scoped_tables_name_is_refused_before_the_record_exists() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_0006,
+        || Schema::new().table::<Ticket>(),
+        |tx| {
+            tx.delete(Id::<TicketViaUnscopedDoor>::from_raw(5));
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            alias_refusal::<Ticket, TicketViaUnscopedDoor>(
+                "tenant-scoped (Row::Scope != Unscoped)",
+                "unscoped"
+            ),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// The mirror's quiet half: the same unscoped write beside a scoped write to
+/// the registered type in one transaction. The record carried one tag per
+/// table, so both rows went out scoped, and the unscoped one landed in
+/// tenant 0 (a legal tenant, R35) with no error anywhere. It is refused like
+/// the lone write, and nothing lands.
+#[test]
+fn an_unscoped_write_beside_a_scoped_one_on_the_same_name_is_refused_too() {
+    let sim = Sim::with_faults(0x5A17_0003, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let result = db.transact(|tx| -> Result<(), io::Error> {
+        tx.open_scope(Id::<TestOrg>::from_raw(3), "member")?
+            .put(&Ticket {
+                id: Id::from_raw(4),
+                n: 1,
+            });
+        tx.put(&TicketViaUnscopedDoor {
+            id: Id::from_raw(5),
+            n: 2,
+        });
+        Ok(())
+    });
+    let err = match result {
+        Err(TxError::Io(e)) => e,
+        other => panic!(
+            "the mixed write was not refused as TxError::Io: {other:?}; tenant 0 now holds \
+             {:?}",
+            db.snapshot()
+                .unwrap()
+                .get_scoped::<Ticket>(0, Id::from_raw(5))
+                .map(|row| row.map(|t| t.n))
+        ),
+    };
+    assert_eq!(
+        err.to_string(),
+        alias_refusal::<Ticket, TicketViaUnscopedDoor>(
+            "tenant-scoped (Row::Scope != Unscoped)",
+            "unscoped"
+        )
+    );
+    assert_eq!((db.last_applied(), db.poisoned()), (None, false));
+    // The narrow predicate the dispatcher and the HTTP layer ask, and the
+    // broad one every "is this a refusal at all" caller asks.
+    assert_eq!(
+        (
+            TableWriteRefusal::of(&err).is_some(),
+            Refusal::of(&err).is_some()
+        ),
+        (true, true)
+    );
+}
+
+/// A write to a table name the `Schema` never registered. Apply cannot
+/// decode a row of a table it does not know, so after the WAL sync this was a
+/// durable poison too.
+#[test]
+fn a_write_to_an_unregistered_table_is_refused_before_the_record_exists() {
+    let (text, states, reopened) = attempt_alias_write(0x5A17_0007, Schema::new, |tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(1),
+            n: 1,
+        });
+        Ok(())
+    });
+    assert_eq!(
+        (text, states, reopened),
+        (
+            unregistered_refusal::<Widget>(),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// A delete-only transaction against a table name the `Schema` never
+/// registered: a tombstone alone is a write to the table, refused like a put.
+#[test]
+fn a_delete_from_an_unregistered_table_is_refused_too() {
+    let (text, states, reopened) = attempt_alias_write(0x5A17_000D, Schema::new, |tx| {
+        tx.delete(Id::<Widget>::from_raw(1));
+        Ok(())
+    });
+    assert_eq!(
+        (text, states, reopened),
+        (
+            unregistered_refusal::<Widget>(),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// A registered table whose `Row` carries a fingerprint, for the
+/// type-identity refusal below.
+struct Gizmo {
+    id: Id<Gizmo>,
+    n: u32,
+}
+
+impl Row for Gizmo {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "test.gizmo";
+    const INDEXES: &'static [IndexDef<Gizmo>] = &[];
+    const FINGERPRINT: Option<u64> = Some(0x6A2D_0001);
+
+    fn id(&self) -> Id<Gizmo> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Gizmo> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(Gizmo { id, n })
+    }
+}
+
+/// A hand-written `Row` on `Gizmo`'s table with the same scope shape, no
+/// fingerprint, and a shorter layout: apply decodes its bytes as a `Gizmo`.
+struct GizmoIdOnly {
+    id: Id<GizmoIdOnly>,
+}
+
+impl Row for GizmoIdOnly {
+    type Scope = Unscoped;
+    const TABLE: &'static str = Gizmo::TABLE;
+    const INDEXES: &'static [IndexDef<GizmoIdOnly>] = &[];
+
+    fn id(&self) -> Id<GizmoIdOnly> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<GizmoIdOnly> {
+        let input = &mut &bytes[..];
+        Ok(GizmoIdOnly {
+            id: Id::decode(input)?,
+        })
+    }
+}
+
+/// The scoped twin: a `Row` on `Ticket`'s scoped table with a fingerprint
+/// `Ticket` does not have, and a shorter layout.
+struct TicketIdOnly {
+    id: Id<TicketIdOnly>,
+}
+
+impl Row for TicketIdOnly {
+    type Scope = TestOrg;
+    const TABLE: &'static str = Ticket::TABLE;
+    const INDEXES: &'static [IndexDef<TicketIdOnly>] = &[];
+    const FINGERPRINT: Option<u64> = Some(0x6A2D_0002);
+
+    fn id(&self) -> Id<TicketIdOnly> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<TicketIdOnly> {
+        let input = &mut &bytes[..];
+        Ok(TicketIdOnly {
+            id: Id::decode(input)?,
+        })
+    }
+}
+
+/// The type-identity refusal for a write through `W` to the table the
+/// `Schema` registered under `R`, spelled out independently of the product's
+/// `format!`.
+fn identity_refusal<R: Row, W: Row>() -> String {
+    let (table, r, w) = (
+        R::TABLE,
+        std::any::type_name::<R>(),
+        std::any::type_name::<W>(),
+    );
+    format!(
+        "table \"{table}\" is registered as `{r}`, but this transaction wrote it through `{w}` \
+         — two Row types declare TABLE = \"{table}\", and apply treats every write to a table as \
+         its registered type's, so this one would have been refused after the WAL sync or \
+         applied as a `{r}` write; the transaction was refused and nothing was written, so a \
+         retry cannot succeed — write `{r}` instead, or give `{w}` a table name of its own (a \
+         #[table] type's table name is its struct name)"
+    )
+}
+
+/// Same scope shape, another layout: a write through a second `Row` type of a
+/// registered table. Apply decoded it with the registered type and failed,
+/// after the WAL sync; it is refused before the record exists.
+#[test]
+fn a_write_through_another_row_type_of_a_registered_table_is_refused_before_the_record_exists() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_0008,
+        || Schema::new().table::<Gizmo>(),
+        |tx| {
+            tx.put(&GizmoIdOnly {
+                id: Id::from_raw(1),
+            });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            identity_refusal::<Gizmo, GizmoIdOnly>(),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// `Gizmo`'s fingerprint and layout under another `VERSION`: these bytes
+/// decode as a `Gizmo`, so apply would have stored the row without an error.
+/// It is refused by its type, which is not the registered one.
+struct GizmoAtVersion2 {
+    id: Id<GizmoAtVersion2>,
+    n: u32,
+}
+
+impl Row for GizmoAtVersion2 {
+    type Scope = Unscoped;
+    const TABLE: &'static str = Gizmo::TABLE;
+    const INDEXES: &'static [IndexDef<GizmoAtVersion2>] = &[];
+    const VERSION: u32 = 2;
+    const FINGERPRINT: Option<u64> = Gizmo::FINGERPRINT;
+
+    fn id(&self) -> Id<GizmoAtVersion2> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<GizmoAtVersion2> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(GizmoAtVersion2 { id, n })
+    }
+}
+
+#[test]
+fn a_write_through_a_row_type_of_another_version_is_refused_too() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_000C,
+        || Schema::new().table::<Gizmo>(),
+        |tx| {
+            tx.put(&GizmoAtVersion2 {
+                id: Id::from_raw(1),
+                n: 1,
+            });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            identity_refusal::<Gizmo, GizmoAtVersion2>(),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// The same refusal through `ScopedTx::put`, the scoped write.
+#[test]
+fn a_scoped_write_through_another_row_type_of_a_registered_table_is_refused_too() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_0009,
+        || Schema::new().table::<Ticket>(),
+        |tx| {
+            tx.open_scope(Id::<TestOrg>::from_raw(1), "member")?
+                .put(&TicketIdOnly {
+                    id: Id::from_raw(1),
+                });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            identity_refusal::<Ticket, TicketIdOnly>(),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
 }
 
 // ----------------------------------------- job-tenancy Task 2: the admission

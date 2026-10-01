@@ -434,7 +434,9 @@ built-in `charpente.events` table the same way: each checkpoint deletes all
 but the newest `event_retention` event rows (`Db::event_floor()` reports the
 smallest id still retained). `migration_batch_size` caps how many rows one
 schema-migration transaction rewrites at a time, bounding a single migration
-commit's WAL record size.
+commit's WAL record size. It must be at least 1: a batch of 0 rewrites nothing,
+so `migrate_schema` refuses by name, before writing anything, when a table is due
+to migrate and the size is 0.
 
 ### Recovery, behaviorally
 
@@ -610,11 +612,22 @@ committed record's log entry after `f` returned `Ok`. That second case is
 genuinely ambiguous — the record may already be durable and will reappear
 after the next recovery even though the caller was told the commit failed —
 so treat `TxError::Io` as "unknown," never as "definitely didn't happen."
-The one exception is an `Io` carrying a `JobShapeRefusal`
-(`charpente::core::db::JobShapeRefusal::of`): an enqueue under another shape
-of a job name this binary mounts (§6, "Changing a job's fields"), refused
-before anything was written, so a retry cannot succeed. The HTTP layer
-answers it with a 500 carrying the refusal's own text. The broader
+The exceptions are an `Io` carrying one of `Group::stage`'s two refusals,
+each read with its own `of`. A `JobShapeRefusal`
+(`charpente::core::db::JobShapeRefusal::of`) is an enqueue under another shape
+of a job name this binary mounts (§6, "Changing a job's fields"). A
+`TableWriteRefusal` (`charpente::core::db::TableWriteRefusal::of`) is a write
+the `Schema` disagrees with about its table: a table it does not register
+(add `.table::<T>()`), a scoped `Row` whose `TABLE` is an unscoped table's or
+the reverse, or a put or delete through any Rust type other than the one
+registered under that name. A `#[table]` type's table name is its struct
+name, so two `#[table] struct Invoice` in different modules collide this way
+even when their fields, and so their fingerprints, are the same. The text
+names the type that wrote and the registered one: write the registered type,
+or give the other one another name. Either refusal comes before anything was
+written, so a retry cannot succeed. The HTTP layer answers
+either with a 500 carrying the refusal's own text, and in a job handler
+either is an attempt, retried and then dead-lettered. The broader
 `Refusal::of` is not that predicate: it also matches a refusal apply raises
 after the log sync (a replicated record decoded under a mismatched shape),
 whose record may already be durable.
@@ -4052,7 +4065,8 @@ route out of the drift test.
 The probe presents no credential and does not enforce `auth`, so an `auth` stream route is
 probeable, unless its handler opens a tenant scope. Then the scope line refuses the probe
 exactly as it refuses any caller without a credential (§5's rule 3), and the probe's error
-says the route requires a credential, so the probe cannot run it. Leave that route out of
+quotes the 401 a request would get (status and message), which says the route requires a
+credential, so the probe cannot run it. Leave that route out of
 the drift test too; widening it to `public(Org)` so a test can read it is not the fix.
 
 ### Cursor semantics
@@ -4461,7 +4475,7 @@ registered chain to the compiled version 2, and admits (every open runs this che
 every node — refusing by name instead is the barrier, below). The rewrite is a separate
 step, `migrate_schema`, which the kernel calls right after open, before it serves
 anything, on a single node or a primary: it reads existing rows in batches
-(`DbConfig::migration_batch_size`, default 1000), applies `migrate` to each, and commits
+(`DbConfig::migration_batch_size`, at least 1, default 1000), applies `migrate` to each, and commits
 the rewritten batch plus a resumable watermark in one transaction. A crash mid-migration
 is exactly resumption — the next start picks up from the watermark and finishes; no row
 is transformed twice, none skipped. Once every row has moved, one

@@ -1027,10 +1027,10 @@ fn the_drift_probe_names_a_route_it_cannot_read() {
 /// handler returned — never as a silently empty name list, which a drift
 /// test would read as "this route declares nothing".
 ///
-/// The quoted value is `App(Unauthorized)`, not `Unauthorized`: the probe
-/// formats `Group::stage`'s error, which wraps a handler's `ApiError` in
-/// `App(..)`. Pinned as it actually reads, so a reword of that wrapper is a
-/// visible change rather than a silent one.
+/// What it quotes is what a request would receive: the status and the error
+/// envelope's message, here `ApiError::Unauthorized`'s 401, never the Rust
+/// `Debug` of the `TxError` wrapping it (`App(Unauthorized)`, which this pin
+/// read before the probe rendered through the one renderer requests use).
 #[test]
 fn the_drift_probe_names_a_handler_that_rejected_it() {
     let sim = Sim::with_faults(0x2EC2_0009, FaultConfig::none());
@@ -1046,10 +1046,11 @@ fn the_drift_probe_names_a_handler_that_rejected_it() {
     assert_eq!(
         app.subscription_event_names("picky_feed"),
         Err(
-            "route `picky_feed`'s subscribe handler returned App(Unauthorized) under the \
-             emits(...) drift probe, so what it subscribes to cannot be read — a handler \
-             that rejects a credential-free request with `\"0\"` for every :param is not \
-             probeable"
+            "route `picky_feed`'s subscribe handler answered 401 under the emits(...) drift \
+             probe, so what it subscribes to cannot be read — a handler that rejects a \
+             credential-free request with `0` for every :param is not probeable; the 401 reads: \
+             authentication required — send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie"
                 .to_string()
         )
     );

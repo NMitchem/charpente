@@ -4003,6 +4003,443 @@ fn a_job_handler_enqueuing_another_shape_of_a_mounted_job_dead_letters_by_name()
     );
 }
 
+/// A hand-written unscoped `Row` whose `TABLE` is `Ledger`'s, a table this
+/// file registers `scoped_by = Org`.
+struct LedgerViaUnscopedDoor {
+    id: Id<LedgerViaUnscopedDoor>,
+    marker: u64,
+}
+
+impl Row for LedgerViaUnscopedDoor {
+    type Scope = Unscoped;
+    const TABLE: &'static str = <Ledger as Row>::TABLE;
+    const INDEXES: &'static [IndexDef<LedgerViaUnscopedDoor>] = &[];
+
+    fn id(&self) -> Id<LedgerViaUnscopedDoor> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.marker.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> std::io::Result<LedgerViaUnscopedDoor> {
+        let input = &mut &bytes[..];
+        Ok(LedgerViaUnscopedDoor {
+            id: Id::decode(input)?,
+            marker: u64::decode(input)?,
+        })
+    }
+}
+
+/// The refusal a write through `LedgerViaUnscopedDoor` gets, spelled out
+/// independently of the product's `format!`. The type names come from
+/// `type_name`, whose rendering the compiler does not promise to keep.
+fn ledger_alias_refusal() -> String {
+    let (r, w) = (
+        std::any::type_name::<Ledger>(),
+        std::any::type_name::<LedgerViaUnscopedDoor>(),
+    );
+    format!(
+        "table \"Ledger\" is registered tenant-scoped (Row::Scope != Unscoped) as `{r}`, but \
+         this transaction wrote it unscoped through `{w}` — two Row types declare TABLE = \
+         \"Ledger\", and a table keeps one scope shape for its whole life; the transaction was \
+         refused and nothing was written, so a retry cannot succeed — write `{r}` instead, or \
+         give `{w}` a table name of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
+#[job(global, retry(max = 1, backoff = "10s"))]
+struct WritesLedgerUnscoped {}
+
+impl WritesLedgerUnscoped {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        tx.put(&LedgerViaUnscopedDoor {
+            id: Id::from_raw(1),
+            marker: 7,
+        });
+        Ok(())
+    }
+}
+
+/// `Group::stage` refuses a write whose scope shape is not the one the
+/// `Schema` registered for its table name, before the record exists. In a
+/// job handler's own transaction that is the handler's deterministic bug, as
+/// the job-shape refusal is: an attempt that dead-letters with the refusal as
+/// its `last_error`. Refused at apply instead, it was a durable poison that
+/// stopped the kernel on every restart.
+#[test]
+fn a_job_writing_another_scope_shape_of_a_registered_table_dead_letters_by_name() {
+    let sim = Sim::with_faults(0x5A17_0004, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Ledger>().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![WritesLedgerUnscoped, CountUp]);
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(WritesLedgerUnscoped {});
+            tx.enqueue(CountUp { slot: 3 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let ran = kernel.run(&mut SimSource::new(Box::new(sim.clock()), SEC));
+    let mut app = kernel.into_app();
+    let db = app.db_for_tests();
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    let settled = |name: &str| {
+        rows.iter()
+            .find(|r| r.name == name)
+            .map(|r| (r.status, r.attempts, r.last_error.clone()))
+    };
+    assert_eq!(
+        (
+            ran.map_err(|e| e.to_string()),
+            db.poisoned(),
+            settled("WritesLedgerUnscoped"),
+            settled("CountUp"),
+        ),
+        (
+            Ok(()),
+            false,
+            Some((JobStatus::Dead, 1, Some(ledger_alias_refusal()))),
+            Some((JobStatus::Done, 0, None)),
+        )
+    );
+    assert_eq!(
+        db.snapshot()
+            .unwrap()
+            .get(Id::<Counter>::from_raw(3))
+            .unwrap()
+            .map(|c| c.hits),
+        Some(1),
+        "the kernel kept running the other job"
+    );
+}
+
+#[route(POST "/ledger-alias", public)]
+fn write_ledger_alias(tx: &mut Tx) -> Result<(), ApiError> {
+    tx.put(&LedgerViaUnscopedDoor {
+        id: Id::from_raw(1),
+        marker: 7,
+    });
+    Ok(())
+}
+
+/// The same refusal on a request: nothing was written and a retry cannot
+/// succeed, so the 500 carries the refusal's own text, as it does for the
+/// job-shape refusal, never the storage-failure text that says the write may
+/// have committed.
+#[test]
+fn a_request_writing_another_scope_shape_of_a_registered_table_is_refused_by_name() {
+    let sim = Sim::with_faults(0x5A17_0005, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Ledger>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![write_ledger_alias]);
+    let before = app.db_for_tests().last_applied();
+    let response = app.handle(Request::new(Method::Post, "/ledger-alias"));
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let db = app.db_for_tests();
+    assert_eq!(
+        (
+            response.status,
+            body["error"].as_str(),
+            db.last_applied() == before,
+            db.poisoned()
+        ),
+        (500, Some(ledger_alias_refusal().as_str()), true, false)
+    );
+}
+
+/// A `#[table]` this file never registers in the app's `Schema`.
+#[table(global)]
+struct Stray {
+    id: Id<Stray>,
+    n: u64,
+}
+
+#[job(global, retry(max = 1, backoff = "10s"))]
+struct WritesStray {}
+
+impl WritesStray {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        tx.put(&Stray {
+            id: Id::from_raw(1),
+            n: 7,
+        });
+        Ok(())
+    }
+}
+
+/// Two `#[table] struct Invoice` in different modules: a `#[table]` type's
+/// `TABLE` is its bare struct name, so both declare `TABLE = "Invoice"`, with
+/// different fields and so different fingerprints. The app registers the
+/// first; a job writes the second.
+mod invoice_a {
+    use super::*;
+
+    #[table(global)]
+    pub struct Invoice {
+        pub id: Id<Invoice>,
+        pub total: u64,
+    }
+}
+
+mod invoice_b {
+    use super::*;
+
+    #[table(global)]
+    pub struct Invoice {
+        pub id: Id<Invoice>,
+        pub memo: String,
+    }
+}
+
+/// Two attempts, so its pin sees the refusal retried before it dead-letters.
+#[job(global, retry(max = 2, backoff = "10s"))]
+struct WritesOtherInvoice {}
+
+impl WritesOtherInvoice {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        tx.put(&invoice_b::Invoice {
+            id: Id::from_raw(1),
+            memo: "x".to_string(),
+        });
+        Ok(())
+    }
+}
+
+/// A job's `(status, attempts, last_error)`, as its `JobRow` reads.
+type JobSettled = Option<(JobStatus, u32, Option<String>)>;
+
+/// Runs `job` beside a `CountUp` in an app whose `Schema` registers `Counter`
+/// plus `schema`'s tables, to one second (each job's first attempt, inside
+/// any 10s backoff) and then to one minute (every retry). Reads back the
+/// kernel's return at each horizon, whether the store is poisoned, `job`'s
+/// row at each horizon, `CountUp`'s, and the counter `CountUp` bumps.
+#[allow(clippy::type_complexity)]
+fn settle_beside_count_up<J: charpente_core::table::UnscopedJob>(
+    seed: u64,
+    schema: Schema,
+    defs: Vec<JobDef>,
+    job: J,
+) -> (
+    [Result<(), String>; 2],
+    bool,
+    [JobSettled; 2],
+    JobSettled,
+    Option<u64>,
+) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        schema.table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(defs);
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(job);
+            tx.enqueue(CountUp { slot: 3 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    let settled = |db: &Db, name: &str| -> JobSettled {
+        db.snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == name)
+            .map(|r| (r.status, r.attempts, r.last_error))
+    };
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let first = kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), SEC))
+        .map_err(|e| e.to_string());
+    let job_first = settled(kernel.app().db(), J::NAME);
+    let second = kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC))
+        .map_err(|e| e.to_string());
+    let db = kernel.app().db();
+    (
+        [first, second],
+        db.poisoned(),
+        [job_first, settled(db, J::NAME)],
+        settled(db, "CountUp"),
+        db.snapshot()
+            .unwrap()
+            .get(Id::<Counter>::from_raw(3))
+            .unwrap()
+            .map(|c| c.hits),
+    )
+}
+
+/// A job writing a table the `Schema` never registered: refused before the
+/// record exists, and dead-lettered as an attempt like item 17's refusal.
+/// Refused at apply instead, it poisoned the store and stopped the kernel.
+#[test]
+fn a_job_writing_an_unregistered_table_dead_letters_by_name() {
+    let w = std::any::type_name::<Stray>();
+    let stray = format!(
+        "table \"Stray\" is not registered in the Schema, but this transaction wrote it through \
+         `{w}` — every table a transaction writes must be registered, or apply cannot decode its \
+         rows; the transaction was refused and nothing was written, so a retry cannot succeed — \
+         register it with .table::<{w}>() in the Schema passed to Db::open or App::open"
+    );
+    assert_eq!(
+        settle_beside_count_up(
+            0x5A17_000A,
+            Schema::new(),
+            jobs![WritesStray, CountUp],
+            WritesStray {}
+        ),
+        (
+            [Ok(()), Ok(())],
+            false,
+            [
+                Some((JobStatus::Dead, 1, Some(stray.clone()))),
+                Some((JobStatus::Dead, 1, Some(stray)))
+            ],
+            Some((JobStatus::Done, 0, None)),
+            Some(1),
+        )
+    );
+}
+
+/// The type-identity refusal for a write through `W` to the table the
+/// `Schema` registered under `R`, spelled out independently of the product's
+/// `format!`.
+fn identity_refusal<R: Row, W: Row>() -> String {
+    let (table, r, w) = (
+        R::TABLE,
+        std::any::type_name::<R>(),
+        std::any::type_name::<W>(),
+    );
+    format!(
+        "table \"{table}\" is registered as `{r}`, but this transaction wrote it through `{w}` \
+         — two Row types declare TABLE = \"{table}\", and apply treats every write to a table as \
+         its registered type's, so this one would have been refused after the WAL sync or \
+         applied as a `{r}` write; the transaction was refused and nothing was written, so a \
+         retry cannot succeed — write `{r}` instead, or give `{w}` a table name of its own (a \
+         #[table] type's table name is its struct name)"
+    )
+}
+
+/// A job writing the second `#[table] struct Invoice` while the app registers
+/// the first: same name, same scope shape, another type. Refused before the
+/// record exists, by the writing type, and an attempt like any handler
+/// error: at one second the first attempt has failed and the job waits out
+/// its backoff, and by one minute the retry has failed too and the job is
+/// dead-lettered, each time with the refusal as its `last_error`.
+#[test]
+fn a_job_writing_another_table_type_of_the_same_name_dead_letters_by_name() {
+    let expected = identity_refusal::<invoice_a::Invoice, invoice_b::Invoice>();
+    assert_eq!(
+        settle_beside_count_up(
+            0x5A17_000B,
+            Schema::new().table::<invoice_a::Invoice>(),
+            jobs![WritesOtherInvoice, CountUp],
+            WritesOtherInvoice {}
+        ),
+        (
+            [Ok(()), Ok(())],
+            false,
+            [
+                Some((JobStatus::Pending, 1, Some(expected.clone()))),
+                Some((JobStatus::Dead, 2, Some(expected)))
+            ],
+            Some((JobStatus::Done, 0, None)),
+            Some(1),
+        )
+    );
+}
+
+/// Two more `#[table] struct Invoice`, whose `amount: Amount` is spelled
+/// alike and names a `u64` in one module and a `String` in the other. A
+/// `#[table]` fingerprint folds field names and type spellings, not what a
+/// spelling resolves to, so the two share `TABLE`, `VERSION` and
+/// `FINGERPRINT`, and only the Rust type tells them apart.
+mod amount_u64 {
+    use super::*;
+
+    pub type Amount = u64;
+
+    #[table(global)]
+    pub struct Invoice {
+        pub id: Id<Invoice>,
+        pub amount: Amount,
+    }
+}
+
+mod amount_string {
+    use super::*;
+
+    pub type Amount = String;
+
+    #[table(global)]
+    pub struct Invoice {
+        pub id: Id<Invoice>,
+        pub amount: Amount,
+    }
+}
+
+/// A write through `amount_string::Invoice` while the `Schema` registers
+/// `amount_u64::Invoice`: apply decoded the string's bytes as a `u64` and
+/// failed after the WAL sync, so the store was poisoned and every reopen
+/// replayed the record into the same failure. It is refused before the
+/// record exists, by its type.
+#[test]
+fn a_write_through_a_table_type_of_the_same_name_and_fingerprint_is_refused() {
+    assert_eq!(
+        <amount_u64::Invoice as Row>::FINGERPRINT,
+        <amount_string::Invoice as Row>::FINGERPRINT,
+        "the two types share a fingerprint, or this pins nothing a fingerprint misses"
+    );
+    let sim = Sim::with_faults(0x5A17_000E, FaultConfig::none());
+    let schema = || Schema::new().table::<amount_u64::Invoice>();
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), schema()).unwrap();
+    let staged = db
+        .transact(|tx| {
+            tx.put(&amount_string::Invoice {
+                id: Id::from_raw(1),
+                amount: "x".to_string(),
+            });
+            Ok::<(), std::io::Error>(())
+        })
+        .map_err(|e| match e {
+            TxError::Io(e) => e.to_string(),
+            other => format!("{other:?}"),
+        });
+    let after = (db.last_applied(), db.poisoned());
+    sim.restart();
+    drop(db);
+    let reopened = Db::open(Box::new(sim.disk()), DbConfig::default(), schema())
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        (staged, after, reopened),
+        (
+            Err(identity_refusal::<
+                amount_u64::Invoice,
+                amount_string::Invoice,
+            >()),
+            (None, false),
+            Ok(())
+        )
+    );
+}
+
 /// A cron schedule's enqueue has no attempt to absorb it into: the refused
 /// tick stops the kernel, carrying the same refusal.
 #[test]
