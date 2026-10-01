@@ -1285,7 +1285,10 @@ sync that fails at boot fails the boot by name. The pins are in `repl/role.rs` a
 `repl/witnesses.rs`: `a_role_a_restarted_node_boots_as_survives_the_next_power_loss`,
 `a_witness_set_a_restarted_node_boots_with_survives_the_next_power_loss`, and for each the
 name (`…_name_a_restarted_node_trusts_…`) and failed-sync (`…_whose_sync_fails_at_boot_is_not_trusted`)
-twins.
+twins. So a failed role or witness write has an unknown outcome, and its error says so: the
+change may already have happened, because the restart it asks for boots as whatever the
+file holds (2026-10-01; `a_failed_role_write_says_the_flip_may_already_have_happened` and
+its witness twin).
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through

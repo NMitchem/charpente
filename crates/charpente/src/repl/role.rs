@@ -121,6 +121,23 @@ fn role_io_error(action: &str, e: io::Error) -> io::Error {
     )
 }
 
+/// A failed role write, named with the role it was writing. Its outcome is
+/// unknown (fsyncgate): the page cache can already hold the new role, and the
+/// next boot's `load_role` makes whatever the file holds durable and runs as
+/// it. So the text says the flip may already have happened; "restart" alone
+/// reads as if it had not.
+fn role_write_error(line: &str, e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!(
+            "writing the role file \"{ROLE_FILE}\" (to \"{line}\"): {e} — the change may already \
+             have happened: the file can hold the new role, and the next boot runs as whatever \
+             role the file holds; fix the underlying disk problem and restart, then check the role \
+             the node booted as before treating the change as failed"
+        ),
+    )
+}
+
 /// Writes the durable role file — `<role line>\n<crc32 hex>` — with
 /// `write_at` + `set_len` + `sync` + `sync_dir`: a role flip must survive
 /// any crash before it takes effect (spec §2's three-state switchover
@@ -133,14 +150,14 @@ pub fn store_role(disk: &dyn Disk, role: &Role) -> io::Result<()> {
     let bytes = content.as_bytes();
     let file = disk
         .open(ROLE_FILE)
-        .map_err(|e| role_io_error("writing", e))?;
+        .map_err(|e| role_write_error(&line, e))?;
     file.write_at(0, bytes)
-        .map_err(|e| role_io_error("writing", e))?;
+        .map_err(|e| role_write_error(&line, e))?;
     file.set_len(bytes.len() as u64)
-        .map_err(|e| role_io_error("writing", e))?;
-    file.sync().map_err(|e| role_io_error("writing", e))?;
+        .map_err(|e| role_write_error(&line, e))?;
+    file.sync().map_err(|e| role_write_error(&line, e))?;
     disk.sync_dir(ROLE_FILE)
-        .map_err(|e| role_io_error("writing", e))?;
+        .map_err(|e| role_write_error(&line, e))?;
     Ok(())
 }
 
@@ -268,6 +285,37 @@ mod tests {
             after, booted,
             "the role a restarted node booted as reverted at the next power loss — load_role \
              trusted role bytes it never made durable"
+        );
+    }
+
+    /// Hard rule 5 for an outcome that is unknown. A role write that failed
+    /// may still have flipped the role: the page cache can hold the new one,
+    /// and the restart the error asks for boots as it, durably (`load_role`
+    /// syncs before it trusts). An operator told only "restart" would take
+    /// the flip for one that did not happen, so the text says it may have.
+    #[test]
+    fn a_failed_role_write_says_the_flip_may_already_have_happened() {
+        let sim = Sim::with_faults(0xD2_0C01, FaultConfig::none());
+        let follower = Role::Follower {
+            primary: "a:1".to_string(),
+        };
+        load_role(&sim.disk(), &follower).unwrap();
+        let msg = store_role(&failing(&sim, true, false), &Role::Primary)
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "writing the role file \"role\" (to \"primary\")",
+            "injected fsync failure",
+            "may already have happened",
+            "restart",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+        }
+        sim.restart_process(); // the restart the error asks for
+        assert_eq!(
+            load_role(&sim.disk(), &follower).unwrap().0,
+            Role::Primary,
+            "the restart boots as the role the failed write left — what the error must warn of"
         );
     }
 
