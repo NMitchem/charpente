@@ -540,10 +540,19 @@ fn is_injected(text: &str) -> bool {
 /// How many reopens the final verification gets before the universe gives
 /// up. Every attempt either verifies or dies to injected fault fallout, so a
 /// larger budget costs time only in universes that would otherwise have
-/// concluded nothing. 8 -> 16 took this property's give-ups from 147 to 86
-/// over four bases for +11% CPU; 32 left 50 for +28%, over the +25% a budget
-/// may cost (2026-10-01).
-const FINAL_ATTEMPTS: u32 = 16;
+/// concluded nothing. With the rounds aimed, 16 -> 64 took give-ups over ten
+/// fresh bases from 362 to 164 for +4.4% CPU (2026-10-01, S5 review I1). Before
+/// S5 a failed reopen rebuilt the table store, and 32 cost +28%.
+const FINAL_ATTEMPTS: u32 = 64;
+
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its check
+/// and its commits, so this budget is reach: over ten fresh bases at 256
+/// universes, booting once left 3,463 rounds unbooted, and 16, 32 and 64 left
+/// 563, 275 and 103, for +15.4%, +19.0% and +23.1% CPU (2026-10-01, S5 review
+/// I1). More rounds mean more to recover at the end: give-ups went 73 -> 134,
+/// 149 and 164, against 243 for the same bases before S5.
+const ROUND_BOOT_TRIES: u32 = 64;
 
 /// One universe: recover → verify against the oracle → mixed commits and
 /// aborts → random checkpoint → crash, everything seeded.
@@ -574,17 +583,18 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
         // and rebuilds it from the log itself, so what comes out is either an
         // injected fault (the round restarts) or a real error, which fails
         // the universe by name rather than restarting past it.
-        let mut db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
-            Ok(db) => db,
-            Err(e) => {
-                if !is_injected(&e.to_string()) {
-                    return Err(format!(
-                        "round recovery failed with a non-injected error: {e}"
-                    ));
-                }
-                sim.restart();
-                continue;
+        let Some(mut db) =
+            charpente_sim::checks::boot_through_fallout(sim, ROUND_BOOT_TRIES, is_injected, || {
+                Db::open(disk(sim), cfg.clone(), property_schema())
+            })
+            .map_err(|e| format!("round recovery failed with a non-injected error: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(());
             }
+            sim.restart();
+            continue;
         };
 
         let recovered = db.last_applied().map_or(0, |s| s + 1);
@@ -624,6 +634,8 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
                     sim.restart();
                     continue;
                 }
+                // A round's recovered state was checked against the model.
+                sim.cover("tx:round-verified");
             }
             Err(e) => {
                 if !is_injected(&e.to_string()) {
@@ -880,8 +892,17 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
 /// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
 /// up 35-38 times, under it. Re-measured 2026-10-01 for S5 with D1: 10 fresh
 /// batches gave up 19-31 times, mean 25.4, sd 4.1, so the cap stays 62, 9.0
-/// standard deviations above the mean.
-const TX_GAVE_UP_CEILING: u64 = 62;
+/// standard deviations above the mean. Re-measured 2026-10-01 with the round
+/// boots aimed and 64 final attempts (S5 review I1): 10 fresh batches gave up
+/// 8-24 times, mean 15.6, sd 5.0, so the cap is 48, 6.5 standard deviations
+/// above the mean (23.0 at S5's parent, same bases).
+const TX_GAVE_UP_CEILING: u64 = 48;
+
+/// The reach floor: rounds whose recovered state was checked against the
+/// model. A margin, as the cap is: 10 fresh batches (2026-10-01, S5 review I1)
+/// checked 738-756 rounds, mean 749.4, sd 4.9, and the floor sits 7 standard
+/// deviations below the mean, as far as the cap sits above its own.
+const TX_ROUND_VERIFIED_FLOOR: u64 = 715;
 
 #[test]
 fn transactions_survive_the_fault_matrix() {
@@ -898,7 +919,10 @@ fn transactions_survive_the_fault_matrix() {
             "restart",
             "batch:multi_record",
             "batch:multi_record_faulted",
+            "tx:round-verified",
+            "boot:booted-after-retry",
         ],
+        floor: [("tx:round-verified", TX_ROUND_VERIFIED_FLOOR)],
         ceiling: [("universe:gave-up", TX_GAVE_UP_CEILING)]
     );
 }

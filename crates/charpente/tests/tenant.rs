@@ -805,10 +805,19 @@ fn oracle(sim: &Sim, db: &mut Db) -> Result<(), String> {
 /// How many reopens the final recovery gets before the universe gives up.
 /// Every attempt either runs the oracle or dies to injected fault fallout, so
 /// a larger budget costs time only in universes that would otherwise have
-/// concluded nothing. 8 -> 16 took this property's give-ups at its base from
-/// 33 to 16 for +13% CPU; 32 left 9 for +34%, over the +25% a budget may cost
-/// (2026-10-01).
-const FINAL_ATTEMPTS: u32 = 16;
+/// concluded nothing. With the rounds aimed, 16 -> 64 took give-ups over ten
+/// fresh bases from 234 to 65 for +2.8% CPU (2026-10-01, S5 review I1). Before
+/// S5 a failed reopen rebuilt the table store, and 32 cost +34%.
+const FINAL_ATTEMPTS: u32 = 64;
+
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its oracle
+/// and its writes, so this budget is reach: over ten fresh bases at 256
+/// universes, booting once left 3,381 rounds unbooted, and 16, 32 and 64 left
+/// 444, 167 and 43, for +10.0%, +13.2% and +15.1% CPU (2026-10-01, S5 review
+/// I1). More rounds mean more to recover at the end: give-ups went 27 -> 56,
+/// 60 and 65, against 137 for the same bases before S5.
+const ROUND_BOOT_TRIES: u32 = 64;
 
 /// One universe: recover -> oracle -> a round of scoped writes, some of them
 /// staged as ONE batch carrying two tenants -> crash. Three rounds, then a
@@ -820,15 +829,18 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     for _round in 0..3u64 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(43 + entropy.next_u64() % 340);
-        let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), ledger_schema()) {
-            Ok(db) => db,
-            Err(e) => {
-                if !is_injected(&e.to_string()) {
-                    return Err(format!("recovery failed with a non-injected error: {e}"));
-                }
-                sim.restart();
-                continue;
+        let Some(mut db) =
+            charpente_sim::checks::boot_through_fallout(sim, ROUND_BOOT_TRIES, is_injected, || {
+                Db::open(Box::new(sim.disk()), cfg.clone(), ledger_schema())
+            })
+            .map_err(|e| format!("recovery failed with a non-injected error: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(());
             }
+            sim.restart();
+            continue;
         };
 
         // THE ORACLE, at every recovery.
@@ -992,11 +1004,19 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
-/// The give-up cap, exact at the pinned base: 17 of 256 universes gave up in
-/// two identical batches (2026-10-01, S5 with D1), every one because the final
-/// recovery's 16 attempts all hit injected faults. It was 16 at their parent
-/// (16 final attempts; 33 with 8).
-const TENANT_GAVE_UP_CEILING: u64 = 17;
+/// The give-up cap, exact at the pinned base: 4 of 256 universes gave up in
+/// two identical batches with the round boots aimed and 64 final attempts
+/// (2026-10-01, S5 review I1). It was 16 at S5's parent and 17 at S5 before
+/// the aiming; over ten fresh bases the mean went 13.1 -> 7.1.
+const TENANT_GAVE_UP_CEILING: u64 = 4;
+
+/// The reach floor, exact at the pinned base: 1,091 checked recoveries saw two
+/// tenants' writes in two identical batches (2026-10-01, S5 review I1). A cap
+/// bounds what the property fails to conclude; this bounds what it checks,
+/// which S5 cut by 11% before the round boots were aimed with no cap
+/// noticing. Over ten fresh bases the mean is 1,071.6 against 707.2 at S5's
+/// parent.
+const TENANT_MULTI_TENANT_WRITE_FLOOR: u64 = 1091;
 
 /// The flagship tenant property (spec §1 as a mechanical oracle, hard rule
 /// 3): across the full fault matrix, and after every recovery, every scoped
@@ -1018,7 +1038,12 @@ fn every_scoped_read_returns_only_its_own_tenants_rows() {
         256,
         |_cfg: &mut FaultConfig| {},
         tenant_universe,
-        require: ["tenant:multi_tenant_write", "tenant:crash_mid_batch"],
+        require: [
+            "tenant:multi_tenant_write",
+            "tenant:crash_mid_batch",
+            "boot:booted-after-retry"
+        ],
+        floor: [("tenant:multi_tenant_write", TENANT_MULTI_TENANT_WRITE_FLOOR)],
         ceiling: [("universe:gave-up", TENANT_GAVE_UP_CEILING)]
     );
 }

@@ -1271,10 +1271,19 @@ fn is_injected(text: &str) -> bool {
 /// How many reopens the final verification gets before the universe gives
 /// up. Every attempt either verifies or dies to injected fault fallout, so a
 /// larger budget costs time only in universes that would otherwise have
-/// concluded nothing. 8 -> 16 took this property's give-ups from 129 to 62
-/// over four bases for +12% CPU; 32 left 38 for +24.5%, with two of the four
-/// bases over the +25% a budget may cost (2026-10-01).
-const FINAL_ATTEMPTS: u32 = 16;
+/// concluded nothing. With the rounds aimed, 16 -> 64 took give-ups over ten
+/// fresh bases from 258 to 94 for +2.2% CPU (2026-10-01, S5 review I1). Before
+/// S5 a failed reopen rebuilt the table store, and 32 cost +24.5%.
+const FINAL_ATTEMPTS: u32 = 64;
+
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its check
+/// and its requests, so this budget is reach: over ten fresh bases at 256
+/// universes, booting once left 3,375 rounds unbooted, and 16, 32 and 64 left
+/// 407, 159 and 30, for +7.9%, +10.5% and +11.8% CPU (2026-10-01, S5 review
+/// I1). More rounds mean more to recover at the end: give-ups went 60 -> 82,
+/// 86 and 94, against 170 for the same bases before S5.
+const ROUND_BOOT_TRIES: u32 = 64;
 
 /// One universe: recover → verify → requests through App::handle (an acked
 /// 200 must survive anything) → crash. A 500 whose body is not an injected
@@ -1289,15 +1298,18 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(44 + entropy.next_u64() % 353);
-        let mut app = match open_crash_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                if !is_injected(&e.to_string()) {
-                    return Err(format!("recovery failed with a non-injected error: {e}"));
-                }
-                sim.restart();
-                continue;
+        let Some(mut app) =
+            charpente_sim::checks::boot_through_fallout(sim, ROUND_BOOT_TRIES, is_injected, || {
+                open_crash_app(sim)
+            })
+            .map_err(|e| format!("recovery failed with a non-injected error: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(responses);
             }
+            sim.restart();
+            continue;
         };
         let recovered = app.db().last_applied().map_or(0, |s| s + 1);
         if recovered < acked {
@@ -1333,6 +1345,8 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             sim.restart();
             continue;
         }
+        // A round's recovered state was checked against everything acked.
+        sim.cover("http:round-verified");
 
         for _ in 0..1 + entropy.next_u64() % 8 {
             // Sprinkle guaranteed-no-write requests: they must not consume a seq.
@@ -1436,8 +1450,17 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
 /// up 30-35 times, under it. Re-measured 2026-10-01 for S5 with D1 (`Db::open`
 /// no longer discards a store over an IO error; WAL recovery syncs before
 /// replay): 10 fresh batches gave up 10-19 times, mean 14.9, sd 3.0, so the cap
-/// is 38, 7.7 standard deviations above the mean.
-const HTTP_GAVE_UP_CEILING: u64 = 38;
+/// is 38, 7.7 standard deviations above the mean. Re-measured 2026-10-01 with
+/// the round boots aimed and 64 final attempts (S5 review I1): 10 fresh
+/// batches gave up 6-14 times, mean 10.0, sd 2.8, so the cap is 28, 6.5
+/// standard deviations above the mean (16.0 at S5's parent, same bases).
+const HTTP_GAVE_UP_CEILING: u64 = 28;
+
+/// The reach floor: rounds whose recovered state was checked against every
+/// acked request. A margin, as the cap is: 10 fresh batches (2026-10-01, S5
+/// review I1) checked 750-763 rounds, mean 756.3, sd 3.8, and the floor sits
+/// 7 standard deviations below the mean, as far as the cap sits above its own.
+const HTTP_ROUND_VERIFIED_FLOOR: u64 = 729;
 
 #[test]
 fn http_requests_survive_the_fault_matrix() {
@@ -1452,7 +1475,10 @@ fn http_requests_survive_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
+            "http:round-verified",
+            "boot:booted-after-retry",
         ],
+        floor: [("http:round-verified", HTTP_ROUND_VERIFIED_FLOOR)],
         ceiling: [("universe:gave-up", HTTP_GAVE_UP_CEILING)]
     );
 }

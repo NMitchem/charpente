@@ -2146,7 +2146,7 @@ fn enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch() {
 // ======================================================================
 
 use charpente_core::io::Entropy;
-use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{boot_through_fallout, durable_corruption_fired, is_fault_fallout};
 use charpente_sim::run_universes_swarm_with;
 
 /// Drives `source` to completion via `Kernel::step`, not `run` — the
@@ -2245,10 +2245,11 @@ const CODA_REOPENS: u32 = 64;
 /// coda does not cover that boundary either: as `verify_watermark`'s doc says,
 /// a loss there is erased by any later round that writes the count back above
 /// the watermark. So a skipped boundary is an unguarded window, the budget is
-/// what keeps it rare, and `oracle:round-unreachable` is capped. At the pinned
-/// base 8 -> 16 took skipped boundaries from 45 to 20 for +8.7% CPU
-/// (2026-10-01, review I3; 32 left 5 for +19%, 64 left 1 for +27%).
-const ROUND_REOPENS: u32 = 16;
+/// what keeps it rare, and `oracle:round-unreachable` is capped. With the round
+/// boot aimed (`ROUND_BOOT_TRIES`), 16 -> 64 took skipped boundaries over ten
+/// fresh bases from 915 to 155 for +1.5% CPU (2026-10-01, S5 review I1). It
+/// cost +27% before S5, when every failed reopen rebuilt the table store.
+const ROUND_REOPENS: u32 = 64;
 
 /// Reopens (retrying past injected faults, exactly as `kernel_workload`'s
 /// final verification does), reads the durable count, and compares it
@@ -2344,6 +2345,14 @@ fn verify_watermark(sim: &Sim, watermark: u64, reopens: u32) -> Result<Verify, S
     Ok(Verify::Unreachable)
 }
 
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its
+/// requests and its boundary check, so this budget is reach: over ten fresh
+/// bases at 256 universes, booting once left 3,472 rounds unbooted, and 16,
+/// 32 and 64 left 158, 75 and 29, for +22.5%, +23.6% and +24.2% CPU, with
+/// give-ups 459 -> 148, 150 and 144 (2026-10-01, S5 review I1).
+const ROUND_BOOT_TRIES: u32 = 64;
+
 fn burst_workload(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     let mut watermark: u64 = 0;
@@ -2351,21 +2360,24 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
     for _round in 0..4 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(47 + entropy.next_u64() % 568);
-        let app = match App::open(
-            Box::new(sim.disk()),
-            Schema::new().table::<Hit>(),
-            Box::new(sim.entropy()),
-            AppConfig::default(),
-        ) {
-            Ok(app) => app.mount(hit_routes()),
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
+        let Some(app) = boot_through_fallout(sim, ROUND_BOOT_TRIES, is_fault_fallout, || {
+            App::open(
+                Box::new(sim.disk()),
+                Schema::new().table::<Hit>(),
+                Box::new(sim.entropy()),
+                AppConfig::default(),
+            )
+        })
+        .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(());
             }
+            sim.restart();
+            continue;
         };
+        let app = app.mount(hit_routes());
 
         let now = sim.now().as_nanos();
         let mut source = SimSource::new(Box::new(sim.clock()), now + 5 * SEC);
@@ -2465,17 +2477,25 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
-/// The give-up cap, exact at the pinned base: 38 universes gave up in two
-/// identical batches. At their parent (796bff2) every one of them never got a
-/// 200 (review M3), and with 64 coda reopens none gave up for an unreachable
-/// coda (27 with 8). Re-measured 2026-10-01 for S5 with D1, still 38: 34 that
-/// never got a 200, and 4 whose final coda never verified the watermark in 64
-/// reopens.
-const BURST_GAVE_UP_CEILING: u64 = 38;
-/// The skipped-boundary cap, exact at the pinned base: 26 round-boundary
-/// checks were unreachable in two identical batches at 16 round reopens
-/// (2026-10-01, S5 with D1; 20 at their parent, 796bff2).
-const BURST_ROUND_UNREACHABLE_CEILING: u64 = 26;
+/// The give-up cap, exact at the pinned base: 15 universes gave up in two
+/// identical batches with the round boots aimed (2026-10-01, S5 review I1). It
+/// was 38 at S5's parent (796bff2) and at S5 before the aiming; over ten fresh
+/// bases the mean went 35.0 -> 16.0.
+const BURST_GAVE_UP_CEILING: u64 = 15;
+/// The skipped-boundary cap, exact at the pinned base: 11 round-boundary
+/// checks were unreachable in two identical batches with the round boots aimed
+/// and 64 round reopens (2026-10-01, S5 review I1). It was 20 at S5's parent
+/// and 26 at S5 before the aiming; over ten fresh bases the mean went 22.6 ->
+/// 18.3.
+const BURST_ROUND_UNREACHABLE_CEILING: u64 = 11;
+
+/// The reach floor, exact at the pinned base: 1,063 round boundaries and
+/// codas verified the watermark in two identical batches (2026-10-01, S5
+/// review I1). A cap bounds what the property fails to conclude; this bounds
+/// what it checks, which S5 cut by 8.9% before the round boots were aimed
+/// with no cap noticing. Over ten fresh bases the mean is 1,055.1 against
+/// 810.6 at S5's parent.
+const BURST_VERIFIED_FLOOR: u64 = 1063;
 
 /// The flagship request-arm batching property under the full fault matrix.
 /// `0x60C1_0009` (`docs/superpowers/plans/2026-08-10-group-commit.md`'s
@@ -2519,10 +2539,12 @@ fn contended_request_bursts_survive_the_fault_matrix() {
             "request:contended",
             "request:acked",
             "oracle:verified",
+            "boot:booted-after-retry",
             "fault:crash",
             "crash:torn",
             "restart"
         ],
+        floor: [("oracle:verified", BURST_VERIFIED_FLOOR)],
         ceiling: [
             ("universe:gave-up", BURST_GAVE_UP_CEILING),
             ("oracle:round-unreachable", BURST_ROUND_UNREACHABLE_CEILING)
