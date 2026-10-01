@@ -2514,15 +2514,6 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
-/// DESIGN §4's compacted-log refusal ("cannot be rebuilt from the log alone")
-/// is NOT excused at any open site here. Under redb 4.1.0 one injected crash
-/// could leave a store file redb could not open, and a workload gave up on
-/// it; redb 4.3.0 syncs a file extension before any header records it, so the
-/// crash model can no longer produce that state, and reaching the refusal is a
-/// failure. An injected IO fault inside `Store::open` reads as fault fallout
-/// by its own text: `Db::open` returns it as itself, never as the refusal. The
-/// refusal itself is pinned deterministically by transactions.rs
-/// `unopenable_store_with_compacted_wal_is_a_named_hard_error`.
 /// How many boots each round gets before it restarts and moves on
 /// (`checks::boot_through_fallout`). A round whose boot fails skips its check
 /// and its jobs, so this budget is reach: over ten fresh bases at 256
@@ -2532,6 +2523,15 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
 /// (2026-10-01, S5 review I1).
 const KERNEL_ROUND_BOOT_TRIES: u32 = 8;
 
+/// DESIGN §4's compacted-log refusal ("cannot be rebuilt from the log alone")
+/// is NOT excused at any open site here. Under redb 4.1.0 one injected crash
+/// could leave a store file redb could not open, and a workload gave up on
+/// it; redb 4.3.0 syncs a file extension before any header records it, so the
+/// crash model can no longer produce that state, and reaching the refusal is a
+/// failure. An injected IO fault inside `Store::open` reads as fault fallout
+/// by its own text: `Db::open` returns it as itself, never as the refusal. The
+/// refusal itself is pinned deterministically by transactions.rs
+/// `unopenable_store_with_compacted_wal_is_a_named_hard_error`.
 fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     for _round in 0..3 {
@@ -5534,11 +5534,6 @@ mod job_tenancy {
         }
     }
 
-    /// One universe: `kernel_workload`'s shape. Three rounds, each of which
-    /// crashes the disk at a random point, reopens, runs the oracle, seeds
-    /// the keys, scripts paired requests, runs the kernel (dispatch and cron
-    /// included) and restarts. A quiet final pass then runs the oracle once
-    /// more.
     /// How many boots each round gets before it restarts and moves on
     /// (`checks::boot_through_fallout`). A round whose boot fails skips its
     /// check and its jobs, so this budget is reach: over ten fresh bases at
@@ -5549,6 +5544,11 @@ mod job_tenancy {
     /// I1).
     const JOB_TENANCY_ROUND_BOOT_TRIES: u32 = 4;
 
+    /// One universe: `kernel_workload`'s shape. Three rounds, each of which
+    /// crashes the disk at a random point, reopens, runs the oracle, seeds
+    /// the keys, scripts paired requests, runs the kernel (dispatch and cron
+    /// included) and restarts. A quiet final pass then runs the oracle once
+    /// more.
     fn job_tenancy_universe(sim: &mut Sim) -> Result<(), String> {
         let entropy = sim.entropy();
         let mut seq = 0u64;
