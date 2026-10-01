@@ -6256,3 +6256,72 @@ block, and no change is owed.
 **Next.** S2 and S3 merge on top of this. Then S5 (follow-up 21), then S1 (plan f54bd4a,
 awaiting Noah's review). S1 re-rolls the same pinned batches, so it re-measures the floors
 set here.
+
+## 2026-10-01 — error text and schema safety: a write the Schema disagrees with about its table is refused before the record exists, through its registered Rust type
+
+**Why.** Follow-ups 10, 16 and 17 of the job-tenancy entry. This is sub-project S2 of landing
+that entry's follow-ups before the 0.1.0 publish (see the redb 4.3.0 entry above). Workspace
+`.superpowers/sdd/2026-09-30-publish-readiness/` (`s2-brief.md`, `s2-fix-brief.md`,
+`s2-report.md`, `s2-review.md`, `s2-cov/`). Branch `s2-errors`, merged at c947730.
+
+**Shipped.**
+- **`migration_batch_size: 0` is refused by name** (7671e61, follow-up 10). An empty batch is
+  the executor's close-out signal, so a size of 0 bumped the persisted version over rows it never
+  migrated, and every later read of the table failed with "row decode". `migrate_schema` now
+  refuses it before anything is written, when a table is due to migrate.
+- **The drift probe quotes a rejecting handler as a request would see it** (c0d90a1, follow-up
+  16): the status and the error envelope's message, never the Rust `Debug` form. Two pinned tests
+  moved (`tenant.rs`, and `describe.rs`, which the research dossier missed).
+- **A write the `Schema` disagrees with is refused before the record exists** (3180d94,
+  4715477, 44f7a2a; follow-up 17, widened twice by controller rulings). `Group::stage` refuses,
+  as `TableWriteRefusal`, a put or delete to a table name the `Schema` does not register, under
+  the other scope shape of a registered name, or through any Rust type other than the registered
+  one. A job attempt that hits it fails and retries, then dead-letters; a request gets a 500 with
+  its text. Before, depending on the case, the write either committed, poisoned the store at apply
+  and bricked every reopen, or was stored silently as the registered type.
+  - **Found by S2, beyond its brief:** a scoped `Ticket` written beside an unscoped alias of its
+    own table landed the alias row silently in tenant 0. Closed in 3180d94.
+  - **Found by the whole-branch review (I1):** the first version compared `(VERSION,
+    FINGERPRINT)`. A `#[table]` fingerprint hashes field names and type *spellings*, not
+    `scoped_by` and not what a spelling resolves to. So a same-named `#[table(scoped_by = Firm)]
+    struct Note` wrote and deleted the registered `scoped_by = Team` table's rows with no error
+    (a cross-tenant-type write), and two `#[table] struct Invoice` whose `amount: Amount` resolved
+    to `u64` and `String` still committed and then poisoned. The check now compares
+    `TypeId::of::<R>()`, held in memory only: never in a record, a fingerprint or `describe`. The
+    reviewer re-ran both probes at the tip: refused, no poison.
+  - Every refusal names the type that wrote and the registered one, and offers both fixes: write
+    through the registered type, or give the other its own table name.
+  - Deletes are checked for registration, scope shape and type. A delete through an alias does
+    not poison (probed), but without the type check it deleted another scope type's row.
+- **`TableShapeRefusal` is `TableWriteRefusal`** (02f5d68, review M3). It covers three cases,
+  and a rename after 0.1.0 would be breaking.
+
+**Review.** Independent opus review (`s2-review.md`): MERGE AFTER FIXES, 0 Critical, 1
+Important (I1 above), 4 Minor (refusal text named no type; docs said every case used to reach a
+refusal at apply; the rename; the job pin used `retry(max = 1)`, so "retried, then
+dead-lettered" was never observed). One fix round, then a scoped re-review: MERGE, all six
+addressed, re-run by the reviewer. One new Minor (N1) is carried to S1, below.
+
+**Gate.** Coverage at the tip against the base, same seeds and commands: 55 blocks identical, 8
+ambient-seed blocks covered by `CHARPENTE_BASE_SEED` reruns, 0 differing; both CLI master-seed
+JSONs byte-identical. The checks add no draw, disk operation or record byte. Branch gate at
+44f7a2a: fmt and clippy clean, 86 `test result: ok` (replication split, 91 lines), 0 FAILED.
+Main at c947730: fmt and clippy clean; 85 of 86 `test result: ok`, 1,553 passed. The one
+failure is the known `ctl` port race (`promote_against_a_dead_port_exits_2_with_the_connect_message`,
+"Connection reset by peer": a released ephemeral port re-bound by a sibling, seen 09-25/27/28).
+S2 touches no `charpente-cli` file; the suite re-ran 6/6 ok; S3's item 19 closes the race, so the
+clean whole-workspace count is the gate after S3 merges.
+
+**Follow-ups.**
+- **For S1 (tenancy completion), before its plan runs.** Its plan (f54bd4a) must be amended
+  against this merge: `TableWriteRefusal` beside `JobShapeRefusal` in docs and the dispatch
+  assert, `Group::stage`'s rewritten loop, and the per-writer type record. Two items join it:
+  - **A18, reads through an alias of another scope type.** `ScopedTx<Firm>::get` through a
+    same-named alias reads the registered `Team` table's row of the same id. Writes and deletes
+    are closed here; reads are tenancy work. S1's A13 seals only platform-table names for reads,
+    so A18 is new.
+  - **N1.** `Group::stage`'s new assert checks only that every written table is registered,
+    while its message claims every write recorded its type. Assert what the message says.
+- The refusal's `.table::<…>()` hint prints the crate's own name (`charpente_core::…`) where
+  in-crate code spells `crate::…`. Cosmetic.
+- `encode_record` carries a stale "only writers" comment that predates S2.
