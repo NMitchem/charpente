@@ -900,9 +900,9 @@ const TX_GAVE_UP_CEILING: u64 = 48;
 
 /// The reach floor: rounds whose recovered state was checked against the
 /// model. A margin, as the cap is: 10 fresh batches (2026-10-01, S5 review I1)
-/// checked 738-756 rounds, mean 749.4, sd 4.9, and the floor sits 7 standard
-/// deviations below the mean, as far as the cap sits above its own.
-const TX_ROUND_VERIFIED_FLOOR: u64 = 715;
+/// checked 738-756 rounds, mean 749.4, sd 4.9, and the floor is the mean less
+/// 4 standard deviations (GUIDE §8).
+const TX_ROUND_VERIFIED_FLOOR: u64 = 729;
 
 #[test]
 fn transactions_survive_the_fault_matrix() {

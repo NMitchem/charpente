@@ -2484,8 +2484,8 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   pair it with a `floor: [("key", N)]` on the key that counts its checks
   (written before `ceiling:`, on either macro). A change that skips a round's
   work without giving up meets every cap. At a pinned base the floor is the
-  exact count; at an ambient one it is a margin, about as far below the mean
-  over ten fresh batches as the cap sits above it.
+  exact count; at an ambient one it is a margin, the mean over ten or more
+  fresh batches less four standard deviations (§8).
 - If your workload already funnels give-ups through a wrapper (the
   `Err("universe-inconclusive: …")` idiom the platform's own suites use), put
   the `sim.give_up(e)` call there, beside the `sim.cover(...)` mark. Keep
@@ -3134,6 +3134,26 @@ it, the fall is the finding. A base where either binary fails on an unrelated,
 named bug is left out of both sides, and the record says which. One standard
 error is deliberately strict: pure noise crosses it roughly a sixth to a quarter
 of the time, which errs toward stopping to look.
+
+A cap that rises after such a change asks a different question, because a
+give-up is not a lost verdict when the same universe used to pass having
+checked nothing. So judge the rise by what the property checked, over the same
+ten or more fresh bases: its reach key (the key its `floor:` counts) and its
+vacuous passes (universes that passed without covering that key). If reach did
+not fall by more than one Welch standard error and vacuous passes did not
+rise, the new give-ups replaced vacuous passes, and the cap is re-set by its
+own convention, with both distributions recorded. If reach fell by more than
+one standard error, the rise is the finding. A pinned cap can read the same
+number on both binaries while the rate behind it moved, so the test runs
+whenever the change could have moved it, not only when the pinned count did.
+That is also why every capped property floors its reach key: without one, the
+next change that costs it reach passes with every cap still met.
+
+At a pinned base both bounds are exact counts. At an ambient base, where the
+counts move batch to batch, both are margins over ten or more fresh batches: a
+give-up cap is twice the largest count, and a reach floor is the mean less
+four standard deviations, which flakes about once in thirty thousand batches if
+the counts are near normal, and fails any batch that falls further.
 
 The directory barrier used to be the worst offender, because `sync_dir` is the
 call a *durability* fix is most likely to add — one such fix moved floors in

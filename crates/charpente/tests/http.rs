@@ -1458,9 +1458,9 @@ const HTTP_GAVE_UP_CEILING: u64 = 28;
 
 /// The reach floor: rounds whose recovered state was checked against every
 /// acked request. A margin, as the cap is: 10 fresh batches (2026-10-01, S5
-/// review I1) checked 750-763 rounds, mean 756.3, sd 3.8, and the floor sits
-/// 7 standard deviations below the mean, as far as the cap sits above its own.
-const HTTP_ROUND_VERIFIED_FLOOR: u64 = 729;
+/// review I1) checked 750-763 rounds, mean 756.3, sd 3.8, and the floor is
+/// the mean less 4 standard deviations (GUIDE §8).
+const HTTP_ROUND_VERIFIED_FLOOR: u64 = 741;
 
 #[test]
 fn http_requests_survive_the_fault_matrix() {
