@@ -13,7 +13,7 @@ use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Codec, Id, Row, Snapshot, Store, Unscoped};
+use charpente_core::table::{Codec, Id, Rejection, Row, Snapshot, Store, StoreRejected, Unscoped};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[table(global)]
@@ -1643,6 +1643,7 @@ fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
     file.set_len(resize(len)).unwrap();
     file.sync().unwrap();
     drop(file);
+    assert_rejected_as(&sim, Rejection::Corrupted);
 
     let db = Db::open(Box::new(sim.disk()), DbConfig::default(), app_schema()).unwrap();
     let snap = db.snapshot().unwrap();
@@ -1656,6 +1657,139 @@ fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
         1,
         "rebuilt store must replay the full WAL"
     );
+}
+
+/// Probes the store the next `Db::open` will meet with an independent
+/// `Store::open`, and asserts redb rejects its bytes for `reason` — the only
+/// kind of open error `Db::open` discards a store for (or, on a compacted log,
+/// refuses to boot over). The probe fails before redb writes anything, so the
+/// store `Db::open` meets is the one probed.
+fn assert_rejected_as(sim: &Sim, reason: Rejection) {
+    let e = Store::open(&sim.disk(), "tables.redb")
+        .err()
+        .expect("the damaged store must not open");
+    assert_eq!(
+        StoreRejected::of(&e).map(|r| r.reason),
+        Some(reason),
+        "the damaged store must be redb's verdict on its bytes, not an IO error: {e}"
+    );
+}
+
+/// redb's two other verdicts, written by hand into a gracefully closed store:
+/// a file that does not begin with redb's magic number, and a commit slot that
+/// names file format 2 (byte 64 is slot 0's version, redb 4.3.0 header.rs).
+const REWRITES: [(&str, u64, &[u8], Rejection); 2] = [
+    ("not a redb file", 0, b"not redb!", Rejection::NotARedbFile),
+    (
+        "an older file format",
+        64,
+        &[2],
+        Rejection::UpgradeRequired { version: 2 },
+    ),
+];
+
+fn rewrite_store(sim: &Sim, offset: u64, bytes: &[u8]) {
+    let file = sim.disk().open("tables.redb").unwrap();
+    file.write_at(offset, bytes).unwrap();
+    file.sync().unwrap();
+}
+
+/// On a log that still holds seq 0, both rewrites are discarded and rebuilt,
+/// like the truncations below: the format-upgrade verdict is in the rejected
+/// class too, because rebuilding from the whole log loses nothing.
+#[test]
+fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_rebuilt_from_a_full_log() {
+    for (what, offset, bytes, reason) in REWRITES {
+        let (sim, mut db) = quiet_db(0x5E5F_0003);
+        for i in 0..10u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+        drop(db);
+        rewrite_store(&sim, offset, bytes);
+        assert_rejected_as(&sim, reason);
+
+        let seen = Arc::new(Mutex::new(StoreSeen::default()));
+        let db = Db::open(
+            Box::new(DiscardWitness {
+                inner: Box::new(sim.disk()),
+                seen: seen.clone(),
+            }),
+            DbConfig::default(),
+            app_schema(),
+        )
+        .unwrap_or_else(|e| panic!("{what}: a full log must rebuild the store: {e}"));
+        let discards = seen.lock().expect("witness lock").discards.clone();
+        assert_eq!(discards.len(), 1, "{what}: one discard: {discards:?}");
+        assert!(
+            !matches!(discards[0], Discard::AfterIoError(_)),
+            "{what}: {discards:?}"
+        );
+        assert_eq!(
+            ids(&db.snapshot().unwrap().scan::<Invoice>().unwrap()),
+            (0..10).collect::<Vec<u64>>(),
+            "{what}: the rebuilt store must replay the full WAL"
+        );
+    }
+}
+
+/// On a compacted log the same two rewrites refuse the boot by name, each
+/// naming its own cause and fix: a store in an older format may be intact, so
+/// its text offers the upgrade before the restore (hard rule 5).
+#[test]
+fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_refused_on_a_compacted_log() {
+    for (what, offset, bytes, reason) in REWRITES {
+        let cfg = tiny_segments_cfg();
+        let sim = Sim::with_faults(0x5E5F_0004, FaultConfig::none());
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..20u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let base = sim
+            .disk()
+            .list("wal/")
+            .unwrap()
+            .iter()
+            .map(|n| segment_base(n))
+            .min()
+            .unwrap();
+        assert!(base > 0, "{what}: setup must compact the log");
+        rewrite_store(&sim, offset, bytes);
+        assert_rejected_as(&sim, reason);
+
+        let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
+        let expected = match reason {
+            Rejection::UpgradeRequired { .. } => format!(
+                "table store cannot open (table store (redb): Manual upgrade required. Expected \
+                 file format version 3, but file is version 2) and the log is compacted to seq \
+                 {base} — redb reads the store as file format version 2, which it opens only \
+                 after a manual upgrade, so the store may be intact; but the records below its \
+                 last checkpoint no longer exist locally, so it cannot be rebuilt from the log \
+                 alone. If an older redb wrote this file, upgrade it to the current format with \
+                 a redb release that can, then restart; otherwise its version byte is damaged: \
+                 restore this node from a replica or backup (DESIGN §4)"
+            ),
+            _ => format!(
+                "table store cannot open (table store (redb): I/O error: Not a redb database: \
+                 magic number mismatch) and the log is compacted to seq {base} — the records \
+                 below the store's last checkpoint no longer exist locally, so the store cannot \
+                 be rebuilt from the log alone; restore this node from a replica or backup, or \
+                 widen DbConfig::retain_segments (DESIGN §4)"
+            ),
+        };
+        assert_eq!(err.to_string(), expected, "{what}");
+    }
 }
 
 /// File shorter than the header's layout: redb 4.3.0's "File truncated below
@@ -1880,6 +2014,7 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
     file.set_len(len - 4096).unwrap();
     file.sync().unwrap();
     drop(file);
+    assert_rejected_as(&sim, Rejection::Corrupted);
 
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
     let msg = err.to_string();
@@ -2244,9 +2379,13 @@ fn fresh_store_creation_crash_is_discarded_and_rebuilt() {
     let cfg = DbConfig::default();
     assert!(Db::open(Box::new(sim.disk()), cfg.clone(), Schema::new()).is_err());
     sim.restart();
+    let bricked = Store::open(&sim.disk(), &cfg.store_path).err().expect(
+        "setup must independently confirm the store is bricked before Db::open is asked to fix it",
+    );
     assert!(
-        Store::open(&sim.disk(), &cfg.store_path).is_err(),
-        "setup must independently confirm the store is bricked before Db::open is asked to fix it"
+        StoreRejected::of(&bricked).is_some(),
+        "the bricked store must be one redb rejects by its bytes — the only open error Db::open \
+         discards a store for — not an IO error a retry could clear: {bricked}"
     );
 
     let db = Db::open(Box::new(sim.disk()), cfg, Schema::new())

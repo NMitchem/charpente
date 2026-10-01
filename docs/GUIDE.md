@@ -440,18 +440,24 @@ to migrate and the size is 0.
 
 ### Recovery, behaviorally
 
-`Db::open` opens the table store first; if the store itself can't open (a
-crash mid-creation can leave bytes redb refuses to read), it's discarded and
-rebuilt — the store is a materialization of the log, never a second source
-of truth. That rebuild only works while the log still holds everything back
+`Db::open` opens the table store first; if redb rejects the store file's
+bytes (a crash mid-creation can leave bytes redb refuses to read), it's
+discarded and rebuilt — the store is a materialization of the log, never a
+second source of truth. Only that verdict costs the store: `Store::open`
+reports it as `table::StoreRejected` (corrupted, a file format that needs a
+manual upgrade, or not a redb file), and any other open failure — an IO
+error from the disk — is returned by `Db::open` unchanged, with the store
+left as it was, so retrying the open is the fix. That rebuild only works
+while the log still holds everything back
 to seq 0, though: `Db::checkpoint(&mut self)` durably persists the store,
 then deletes WAL segments below the checkpoint (`DbConfig::retain_segments`
 floors how much it keeps; `checkpoint_every` auto-fires the cadence every N
 committed records, `0` to disable it and checkpoint only by hand). Once the
-log has been compacted this way, a store that can't open is unrecoverable
+log has been compacted this way, a rejected store is unrecoverable
 locally — `Db::open` returns a named error instead of a silent (wrong)
 rebuild, naming the fix: restore from a replica/backup, or widen
-`retain_segments`. `Db::open` then recovers the write-ahead log and replays
+`retain_segments` (for a store in an older redb file format, which may be
+intact, it names upgrading the file first). `Db::open` then recovers the write-ahead log and replays
 every durable record after the store's last checkpoint back into it, so a
 reopened `Db` reflects every transaction that ever committed, even one the
 store hadn't caught up to when the process died. Recovery can itself fail

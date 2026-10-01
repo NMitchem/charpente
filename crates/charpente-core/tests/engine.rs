@@ -26,7 +26,9 @@ use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
-use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped, View};
+use charpente_core::table::{
+    Codec, Id, IndexDef, Rejection, Row, Snapshot, Store, StoreRejected, UNSCOPED, Unscoped, View,
+};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Default)]
@@ -3486,7 +3488,14 @@ fn a_store_truncated_below_its_layout_fails_to_open_by_name_without_panicking() 
     let err = match open_a_store_mangled_to(|len| len - 4096) {
         Err(panic) => panic!("Store::open panicked instead of returning Err: {panic}"),
         Ok(Ok(_)) => panic!("a store truncated below its layout must not open"),
-        Ok(Err(e)) => e.to_string(),
+        Ok(Err(e)) => {
+            assert_eq!(
+                StoreRejected::of(&e).map(|r| r.reason),
+                Some(Rejection::Corrupted),
+                "redb's corruption verdict must reach the caller as a rejection of the bytes: {e}"
+            );
+            e.to_string()
+        }
     };
     assert!(
         err.contains("table store (redb): DB corrupted: File truncated below stored layout"),
@@ -3504,7 +3513,14 @@ fn a_store_with_a_sub_page_tail_fails_to_open_by_name_without_panicking() {
     let err = match open_a_store_mangled_to(|len| len + 1536) {
         Err(panic) => panic!("Store::open panicked instead of returning Err: {panic}"),
         Ok(Ok(_)) => panic!("a store with a sub-page tail must not open"),
-        Ok(Err(e)) => e.to_string(),
+        Ok(Err(e)) => {
+            assert_eq!(
+                StoreRejected::of(&e).map(|r| r.reason),
+                Some(Rejection::Corrupted),
+                "redb's corruption verdict must reach the caller as a rejection of the bytes: {e}"
+            );
+            e.to_string()
+        }
     };
     assert!(
         err.contains(
@@ -3513,6 +3529,197 @@ fn a_store_with_a_sub_page_tail_fails_to_open_by_name_without_panicking() {
         ),
         "the open failure must name redb's own corruption verdict: {err}"
     );
+}
+
+/// A gracefully closed store at `probe.redb`, then `mangle` applied to its
+/// durable bytes, then one `Store::open` of the result.
+fn open_a_store_rewritten(mangle: impl Fn(&dyn File)) -> io::Result<Store> {
+    let sim = Sim::with_faults(0x5E5F_E001, FaultConfig::none());
+    let disk = sim.disk();
+    {
+        let store = Store::open(&disk, "probe.redb").unwrap();
+        store.apply(0, |_w| Ok::<(), io::Error>(())).unwrap();
+        store.checkpoint().unwrap();
+    }
+    let file = disk.open("probe.redb").unwrap();
+    mangle(&*file);
+    file.sync().unwrap();
+    drop(file);
+    Store::open(&disk, "probe.redb")
+}
+
+/// redb's other two verdicts on the bytes, by type: a non-empty file that does
+/// not begin with redb's magic number, and a commit slot that names an older
+/// file format. With the truncation pair above, these are every rejection
+/// `Store::open` reports, and the only open errors `Db::open` discards a store
+/// for (DESIGN §4).
+#[test]
+fn redbs_verdicts_on_the_bytes_are_rejections_by_reason() {
+    let e = open_a_store_rewritten(|f| f.write_at(0, b"not redb!").unwrap())
+        .err()
+        .expect("a file without redb's magic number must not open");
+    assert_eq!(
+        StoreRejected::of(&e).map(|r| r.reason),
+        Some(Rejection::NotARedbFile),
+        "{e}"
+    );
+    assert_eq!(
+        e.to_string(),
+        "table store (redb): I/O error: Not a redb database: magic number mismatch"
+    );
+
+    // Byte 64 is commit slot 0's format version (redb 4.3.0 header.rs,
+    // TRANSACTION_0_OFFSET + VERSION_OFFSET); redb reads it before the
+    // slot's checksum, and 2 is FILE_FORMAT_VERSION2.
+    let e = open_a_store_rewritten(|f| f.write_at(64, &[2]).unwrap())
+        .err()
+        .expect("a store in an older file format must not open");
+    assert_eq!(
+        StoreRejected::of(&e).map(|r| r.reason),
+        Some(Rejection::UpgradeRequired { version: 2 }),
+        "{e}"
+    );
+    assert_eq!(
+        e.to_string(),
+        "table store (redb): Manual upgrade required. Expected file format version 3, but file \
+         is version 2"
+    );
+}
+
+/// Which store-file operation `KindDisk` fails.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StoreOp {
+    Len,
+    Read,
+    Write,
+    SetLen,
+    Sync,
+}
+
+/// A `Disk` that fails the first `op` on any file it opens, with an
+/// `io::Error` of kind `InvalidData` — the kind of redb's own "Not a redb
+/// database" verdict, so only `DiskBackend`'s wrapper can tell them apart.
+struct KindDisk {
+    inner: charpente_sim::SimDisk,
+    op: StoreOp,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Disk for KindDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        Ok(Box::new(KindFile {
+            inner: self.inner.open(path)?,
+            op: self.op,
+            fired: self.fired.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct KindFile {
+    inner: Box<dyn File>,
+    op: StoreOp,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl KindFile {
+    fn fail(&self, op: StoreOp) -> io::Result<()> {
+        if op == self.op && !self.fired.swap(true, Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the disk's own {op:?} failure, kind InvalidData"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl File for KindFile {
+    fn len(&self) -> io::Result<u64> {
+        self.fail(StoreOp::Len)?;
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.fail(StoreOp::Read)?;
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.fail(StoreOp::Write)?;
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.fail(StoreOp::SetLen)?;
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.fail(StoreOp::Sync)?;
+        self.inner.sync()
+    }
+}
+
+/// An IO error the disk returns inside redb's open is never a rejection of the
+/// bytes, even when it carries `InvalidData`, the kind redb gives its own "Not
+/// a redb database" verdict: `DiskBackend` wraps every error it passes up, and
+/// the wrapper survives redb's `StorageError::Io` to `Store::open`'s caller.
+/// Each of the backend's five methods is driven down its error arm: `set_len`
+/// on a fresh store (only creation resizes at open), the other four on an
+/// existing one.
+#[test]
+fn a_disk_error_inside_store_open_is_never_a_rejection_even_of_redbs_own_kind() {
+    for (op, existing) in [
+        (StoreOp::Len, true),
+        (StoreOp::Read, true),
+        (StoreOp::Write, true),
+        (StoreOp::Sync, true),
+        (StoreOp::SetLen, false),
+    ] {
+        let sim = Sim::with_faults(0x5E5F_E002, FaultConfig::none());
+        if existing {
+            let store = Store::open(&sim.disk(), "probe.redb").unwrap();
+            store.apply(0, |_w| Ok::<(), io::Error>(())).unwrap();
+            store.checkpoint().unwrap();
+        }
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disk = KindDisk {
+            inner: sim.disk(),
+            op,
+            fired: fired.clone(),
+        };
+        let e = Store::open(&disk, "probe.redb")
+            .err()
+            .expect("an open whose disk failed must not succeed");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "{op:?}: the open never reached the failing op, so this proves nothing about it"
+        );
+        assert!(
+            StoreRejected::of(&e).is_none(),
+            "{op:?}: the disk's own error was taken for redb's verdict on the bytes, which \
+             would let Db::open delete a store over an IO error: {e}"
+        );
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "table store (redb): I/O error: the disk's own {op:?} failure, kind InvalidData"
+            ),
+            "{op:?}: the error must reach the caller as the disk rendered it"
+        );
+    }
 }
 
 /// A `Disk` whose file panics on its first use, standing in for any panic

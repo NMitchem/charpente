@@ -866,9 +866,23 @@ per enqueue effect — id from the monotonic `next_job_id` meta counter (bumped 
 with `applied_seq` in the same store transaction, deterministic across replay), plus name,
 payload, key, status (Pending/Done/Dead), attempts, due_at, and last_error — the queue
 dispatcher's substrate (§6). Done and Dead rows are retained (GC is a later question,
-filed with WAL segment GC). A store that cannot open at all — e.g. a crash tore its
+filed with WAL segment GC). A store whose bytes redb rejects — e.g. a crash tore its
 creation — is discarded at `Db::open` and rebuilt by replaying the WAL
-from scratch; the log is the only source of truth. "Cannot open" includes a store file
+from scratch; the log is the only source of truth. `Store::open` reports that verdict as
+its own error, `table::StoreRejected`, classified by type in `table.rs`'s `open_error`:
+redb's `StorageError::Corrupted`, its `DatabaseError::UpgradeRequired` (a commit slot
+naming an older file format), and the one `io::Error` redb builds from the bytes at open,
+"Not a redb database: magic number mismatch" (`page_manager.rs:1137`). That last one has the
+same type as an IO error the disk returns, so `DiskBackend` wraps every error it passes up
+(`FromDisk`, `Display` and kind unchanged) and only an unwrapped `InvalidData` counts as
+the verdict. A variant not named there bubbles: the rejection deletes a store, so it needs
+positive evidence. **Every other open failure is not about the bytes** — the disk's own IO
+error (including `Store::open`'s own `disk.open`/`disk.sync_dir`), or redb's latch after
+one — so `Db::open` returns it unchanged, leaves the store alone, and a restart retries the
+same file. Before 2026-10-01 any `Store::open` error took the discard path: one transient
+fault deleted a healthy store on a full log, and on a compacted log refused the boot with
+"restore this node from a replica or backup" (follow-up 21, found by the S4 review: an
+injected fsync failure inside `Store::open`). The rejected class includes a store file
 whose length disagrees with its durable header's layout. redb 4.1.0 asserted on two such
 states (page_manager.rs:231/:257) — an unsynced `set_len` dropped at crash while the header
 god-page write survived (`:231`), or a crash tore a data-page write inside an unsynced
@@ -887,10 +901,14 @@ seq 0: `Db::checkpoint` durably persists the store, then deletes WAL segments be
 checkpoint (`Wal::gc`, floored at `DbConfig::retain_segments`, default 2; a caller-supplied
 retention pin can hold more), auto-firing every `DbConfig::checkpoint_every` committed
 records (default 4096; `0` disables the cadence — manual `checkpoint` only). Once the log
-is compacted past seq 0, an unopenable store is no longer rebuildable from the log alone —
+is compacted past seq 0, a rejected store is no longer rebuildable from the log alone —
 `Db::open` checks the log's base before discarding the store and returns a named hard
 error instead (naming the compaction, and the fix: restore from a replica/backup, or widen
-`retain_segments`) rather than silently losing the records below the old checkpoint.
+`retain_segments`) rather than silently losing the records below the old checkpoint. When
+the verdict is `UpgradeRequired` the text says so: such a store may be intact, so the fix
+it offers first is upgrading the file with a redb release that can, and the restore only
+if no older redb wrote it (then its version byte is damaged). On a full log an
+`UpgradeRequired` store is rebuilt like any other rejected one, which loses nothing.
 A second sim-established redb finding (upstream-report material): direct corruption of the
 store file's durable bytes — bit flips, misdirected writes — can defeat redb's
 copy-on-write crash consistency entirely, either panicking internally or silently falling

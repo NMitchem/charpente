@@ -50,8 +50,8 @@ use crate::io::{Disk, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
-    Codec, Id, IndexDef, Row, RowShape, Snapshot, Store, UnscopedJob, UnscopedRow, View,
-    WritableRow, Writer,
+    Codec, Id, IndexDef, Rejection, Row, RowShape, Snapshot, Store, StoreRejected, UnscopedJob,
+    UnscopedRow, View, WritableRow, Writer,
 };
 
 // ---------------------------------------------------------------- config
@@ -2642,14 +2642,21 @@ impl fmt::Debug for Db {
 impl Db {
     /// Opens the store, then recovers the WAL, replaying every durable
     /// record past the store's checkpoint into it. Recovery can fail under
-    /// IO faults; it is idempotent — restart and retry. A store that cannot
-    /// open at all is discarded and rebuilt from the WAL — the store is a
-    /// materialization of the log, never a second source of truth (DESIGN
-    /// §4) — but only while the log still holds everything back to seq 0.
-    /// Once `Db::checkpoint` has GC'd segments below its floor
-    /// (`DbConfig::retain_segments`/`checkpoint_every`), the records the
-    /// store would need no longer exist locally: rebuild is impossible and
-    /// this is a named hard error instead of a silent (wrong) rebuild.
+    /// IO faults; it is idempotent — restart and retry. Opening the store
+    /// fails one of two ways, and only one is about the file:
+    ///
+    /// - redb rejects the file's bytes ([`StoreRejected`]: corrupted, a
+    ///   format that needs a manual upgrade, or not a redb file at all). The
+    ///   store is discarded and rebuilt from the WAL — it is a
+    ///   materialization of the log, never a second source of truth (DESIGN
+    ///   §4) — but only while the log still holds everything back to seq 0.
+    ///   Once `Db::checkpoint` has GC'd segments below its floor
+    ///   (`DbConfig::retain_segments`/`checkpoint_every`), the records the
+    ///   store would need no longer exist locally: rebuild is impossible and
+    ///   this is a named hard error instead of a silent (wrong) rebuild.
+    /// - Anything else — the disk's own IO error, or redb's latch after one —
+    ///   says nothing about the bytes, so it is returned unchanged and the
+    ///   store is left alone: a restart retries the same file.
     ///
     /// The recovery-horizon rule (DESIGN §2, segment-mgmt T4): the store's
     /// `applied_seq` is the durable horizon threaded into `Engine::recover`,
@@ -2671,6 +2678,15 @@ impl Db {
         let store = match Store::open(&*disk, &cfg.store_path) {
             Ok(store) => store,
             Err(e) => {
+                // Only redb's verdict on the file's bytes may cost the store.
+                // An IO error — the disk's own, or redb's latch after one —
+                // is not one: discarding here deleted a healthy store, and on
+                // a compacted log refused a boot with the wrong fix, over a
+                // fault a restart retries (follow-up 21; found by the S4
+                // review, an injected fsync failure inside `Store::open`).
+                let Some(rejected) = StoreRejected::of(&e) else {
+                    return Err(e);
+                };
                 // Peek the log's floor before touching the store: if it has
                 // been compacted past seq 0, the records below the store's
                 // last checkpoint are gone for good and rebuilding would
@@ -2680,20 +2696,33 @@ impl Db {
                 if let Some(first) = names.first() {
                     let base = parse_segment_name(&cfg.wal.dir, first)?;
                     if base > 0 {
-                        return Err(io::Error::other(format!(
-                            "table store cannot open ({e}) and the log is compacted to seq \
-                             {base} — the records below the store's last checkpoint no longer \
-                             exist locally, so the store cannot be rebuilt from the log alone; \
-                             restore this node from a replica or backup, or widen \
-                             DbConfig::retain_segments (DESIGN §4)"
-                        )));
+                        return Err(io::Error::other(match rejected.reason {
+                            Rejection::UpgradeRequired { version } => format!(
+                                "table store cannot open ({e}) and the log is compacted to seq \
+                                 {base} — redb reads the store as file format version \
+                                 {version}, which it opens only after a manual upgrade, so the \
+                                 store may be intact; but the records below its last checkpoint \
+                                 no longer exist locally, so it cannot be rebuilt from the log \
+                                 alone. If an older redb wrote this file, upgrade it to the \
+                                 current format with a redb release that can, then restart; \
+                                 otherwise its version byte is damaged: restore this node from \
+                                 a replica or backup (DESIGN §4)"
+                            ),
+                            Rejection::Corrupted | Rejection::NotARedbFile => format!(
+                                "table store cannot open ({e}) and the log is compacted to seq \
+                                 {base} — the records below the store's last checkpoint no \
+                                 longer exist locally, so the store cannot be rebuilt from the \
+                                 log alone; restore this node from a replica or backup, or \
+                                 widen DbConfig::retain_segments (DESIGN §4)"
+                            ),
+                        }));
                     }
                 }
-                // A store that cannot open is discarded and rebuilt from the
-                // WAL — it is a materialization of the log, never a second
-                // source of truth (DESIGN §4). E.g. a crash can tear the
-                // store's creation, leaving durable bytes redb rejects on
-                // every later open (found by seed 0x1f733f8d9eebf822).
+                // A store redb rejects is discarded and rebuilt from the WAL
+                // — it is a materialization of the log, never a second source
+                // of truth (DESIGN §4). E.g. a crash can tear the store's
+                // creation, leaving durable bytes redb rejects on every later
+                // open (found by seed 0x1f733f8d9eebf822).
                 match disk.remove(&cfg.store_path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}

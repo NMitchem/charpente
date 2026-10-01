@@ -2493,8 +2493,8 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
 /// could leave a store file redb could not open, and a workload gave up on
 /// it; redb 4.3.0 syncs a file extension before any header records it, so the
 /// crash model can no longer produce that state, and reaching the refusal is a
-/// failure. An injected IO fault inside `Store::open` still reads as fault
-/// fallout, by its injected text, before the refusal is ever consulted. The
+/// failure. An injected IO fault inside `Store::open` reads as fault fallout
+/// by its own text: `Db::open` returns it as itself, never as the refusal. The
 /// refusal itself is pinned deterministically by transactions.rs
 /// `unopenable_store_with_compacted_wal_is_a_named_hard_error`.
 fn kernel_workload(sim: &mut Sim) -> Result<(), String> {

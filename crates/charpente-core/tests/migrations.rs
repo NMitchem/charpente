@@ -467,7 +467,8 @@ mod corruption_excuse_tests {
 
 // Finding 3 (migrations T9 interlude addendum — dossier
 // .superpowers/sdd/migrations-t9-interlude.md): seed 0x6b436e3ea995cb6f.
-// Mechanism, verified: a `Store::open` failure triggers discard-and-rebuild,
+// Mechanism, verified: a `Store::open` failure triggers discard-and-rebuild (then
+// any failure; since 2026-10-01 only redb rejecting the store's bytes, DESIGN §4),
 // which resets that attempt's recovery horizon to `None`/0; a real
 // `fault:bit_flip` had earlier corrupted the seed record's (first) frame,
 // which is now "above" the recomputed horizon and gets silently torn-tail-

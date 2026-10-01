@@ -382,11 +382,12 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
         }
         match reopen(sim, node) {
             Ok(()) => return Ok(()),
-            // Fallout first: DESIGN §4's compacted-log refusal ("cannot be rebuilt
-            // from the log alone") is excused only here, when an injected fault
-            // inside `Store::open` caused it and the refusal carries that text.
-            // A bare refusal is a failure — under redb 4.3.0 the crash model
-            // cannot brick the store.
+            // Fallout first: an injected fault inside `Store::open` bubbles from
+            // `Db::open` as itself and is excused here by its own text. DESIGN
+            // §4's compacted-log refusal ("cannot be rebuilt from the log alone")
+            // now carries only redb's verdict on the store's bytes, never an
+            // injected cause, so reaching it is a failure — under redb 4.3.0 the
+            // crash model cannot brick the store.
             Err(e) if is_fault_fallout(&e) => last = e, // open faulted; retry, cycling periodically
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
@@ -5267,9 +5268,10 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             // local copy is bricked and the fix is restore. Surface it (the
             // caller reseeds from the survivor) rather than retry into the same
             // durable bytes forever. DESIGN §4's compacted-log refusal names the
-            // same fix but is not this: it goes on to the fallout arm (an injected
-            // fault inside `Store::open`, carrying its injected text) or fails —
-            // under redb 4.3.0 the crash model cannot brick the store.
+            // same fix but is not this: it goes on to the fallout arm, which an
+            // injected fault inside `Store::open` reaches as itself (it no longer
+            // becomes the refusal), or fails — under redb 4.3.0 the crash model
+            // cannot brick the store.
             Err(e)
                 if e.contains("restore this node from a replica or backup")
                     && !e.contains("cannot be rebuilt from the log alone") =>

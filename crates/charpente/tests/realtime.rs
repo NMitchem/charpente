@@ -3821,10 +3821,10 @@ fn rt_recover_exhausted_key(last: &str) -> &'static str {
 /// A local copy this property has no restore rig for: corruption at or below
 /// the durable horizon, or a log directory gapped past guessing. NOT DESIGN
 /// §4's compacted-log refusal, although it names the same "restore this node"
-/// fix: `recover_rt_node` sends that one on to its fault-fallout arm (an
-/// injected fault inside `Store::open`, carrying its injected text) and
+/// fix: `recover_rt_node` sends that one on to its fault-fallout arm and
 /// otherwise fails, because under redb 4.3.0 the crash model cannot brick the
-/// store.
+/// store. (An injected fault inside `Store::open` no longer becomes the
+/// refusal at all: `Db::open` returns it as itself, DESIGN §4.)
 fn local_copy_unrestorable(e: &str) -> bool {
     (e.contains("restore this node from a replica or backup") || e.contains("refusing to guess"))
         && !e.contains("cannot be rebuilt from the log alone")
