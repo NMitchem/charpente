@@ -4097,9 +4097,9 @@ fn a_recovery_whose_log_sync_fails_replays_nothing() {
 /// branch is safe only if the store is durable before it is read. Nothing in
 /// charpente syncs it there: redb 4.3.0's own open does (DESIGN §4). Without
 /// that, the power loss below leaves a store at `None` beside a log based at 6,
-/// and the next open refuses the node outright ("acknowledged records between
-/// the horizon and the base exist in neither the store nor the log"). This pins
-/// the dependency, so a redb that stops syncing at open turns it red.
+/// and the next open refuses the node outright ("the acknowledged records from
+/// seq 0 to seq 5 exist in neither the store nor the log"). This pins the
+/// dependency, so a redb that stops syncing at open turns it red.
 /// (D1 review M7.)
 #[test]
 fn a_seeded_store_a_restarted_node_lays_its_segment_from_survives_the_next_power_loss() {

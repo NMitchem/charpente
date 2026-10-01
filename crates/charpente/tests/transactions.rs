@@ -1991,13 +1991,138 @@ fn a_store_cut_short_beside_a_compacted_log_names_a_restore_and_removing_it_is_r
             .expect_err("a compacted log beside no store must not boot");
         assert_eq!(
             e.to_string(),
-            "table store tables.redb holds no records, but the log beside it is compacted to \
-             seq 18: the records below seq 18 existed only in a store that is gone, so it \
-             cannot be rebuilt from the log. Removing the store by hand leaves this state, and \
-             so does a re-seed a crash cut short; restore this node from a replica or backup \
-             (DESIGN §4)",
+            "table store tables.redb holds no records, but the log beside it starts at seq 18: \
+             the acknowledged records from seq 0 to seq 17 exist in neither the store nor the \
+             log, so the store cannot be rebuilt from the log. Removing the store by hand leaves \
+             this state, and so does a re-seed a crash cut short; restore this node from a \
+             replica or backup. For a follower, or a primary once a follower is promoted in its \
+             place, that is a re-seed: stop the node, delete its data dir, and restart it \
+             configured as a follower of the current primary so it snapshot-seeds from it, never \
+             with a primary config: the durable role file that outranks config is deleted with \
+             the data dir, so a cleared node started as a primary comes up as a second writable \
+             primary (DESIGN §4)",
             "boot {boot}"
         );
+    }
+}
+
+/// `Db::open`'s vanished-prefix refusal for a log starting at `base`, typed
+/// out (error-suite T8): `held` is the store's `applied_seq`, `None` for a
+/// store holding no records.
+fn vanished_prefix_refusal(held: Option<u64>, base: u64) -> String {
+    let next = held.map_or(0, |applied| applied + 1);
+    let (held, cause) = match held {
+        None => (
+            "holds no records".to_string(),
+            "Removing the store by hand leaves this state, and so does a re-seed a crash cut \
+             short",
+        ),
+        Some(applied) => (
+            format!(
+                "holds records only through seq {applied}, the durable horizon its own \
+                 checkpoint vouches for"
+            ),
+            "Putting back an older copy of the store without its log leaves this state, and so \
+             do corruption and entry loss",
+        ),
+    };
+    format!(
+        "table store tables.redb {held}, but the log beside it starts at seq {base}: the \
+         acknowledged records from seq {next} to seq {} exist in neither the store nor the log, \
+         so the store cannot be rebuilt from the log. {cause}; restore this node from a replica \
+         or backup. For a follower, or a primary once a follower is promoted in its place, that \
+         is a re-seed: stop the node, delete its data dir, and restart it configured as a \
+         follower of the current primary so it snapshot-seeds from it, never with a primary \
+         config: the durable role file that outranks config is deleted with the data dir, so a \
+         cleared node started as a primary comes up as a second writable primary (DESIGN §4)",
+        base - 1
+    )
+}
+
+/// An older copy of the store put back behind a log compacted past it (S5
+/// R2-M1, the reviewer's probe): the store checkpointed at seq 19 is copied,
+/// the node runs on to a checkpoint at seq 39 that compacts the log to seq 38,
+/// and the copy is put back. The breadcrumb still says 39, and the
+/// vanished-prefix check used to measure against it, so the boot passed the
+/// check and panicked replaying seq 38 into a store that ends at 19
+/// ("Store::apply_batch reached seq 38 but expected 20"). Without the
+/// breadcrumb it was refused by name. It is refused by name either way now,
+/// and so is the same store beside an empty log, which used to lay its
+/// segment at the breadcrumb's seq 40 and panic at the first write.
+#[test]
+fn an_older_store_put_back_behind_a_compacted_log_is_refused_by_name_whatever_the_breadcrumb_says()
+{
+    for shape in ["breadcrumb", "no breadcrumb", "empty log"] {
+        let sim = Sim::with_faults(0x5E5F_1001, FaultConfig::none());
+        let cfg = tiny_segments_cfg();
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..20u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let file = sim.disk().open(&cfg.store_path).unwrap();
+        let mut older = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut older).unwrap();
+        drop(file);
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 20..40u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+            assert_eq!(
+                db.log_base(),
+                38,
+                "{shape}: setup must compact the log past seq 20"
+            );
+        }
+        let file = sim.disk().open(&cfg.store_path).unwrap();
+        file.set_len(older.len() as u64).unwrap();
+        file.write_at(0, &older).unwrap();
+        file.sync().unwrap();
+        drop(file);
+        let expected = match shape {
+            "breadcrumb" => vanished_prefix_refusal(Some(19), 38),
+            "no breadcrumb" => {
+                sim.disk().remove("tables.redb.horizon").unwrap();
+                sim.disk().sync_dir("tables.redb").unwrap();
+                vanished_prefix_refusal(Some(19), 38)
+            }
+            _ => {
+                for name in sim.disk().list("wal/").unwrap() {
+                    sim.disk().remove(&name).unwrap();
+                }
+                sim.disk().sync_dir("wal/").unwrap();
+                "table store tables.redb holds records only through seq 19, the durable horizon \
+                 its own checkpoint vouches for, but the log beside it is empty, and the horizon \
+                 breadcrumb records a checkpoint through seq 39: the acknowledged records from \
+                 seq 20 to seq 39 exist in neither the store nor the log, so the store cannot be \
+                 rebuilt from the log. Putting back an older copy of the store without its log \
+                 leaves this state, and so do corruption and entry loss; restore this node from \
+                 a replica or backup. For a follower, or a primary once a follower is promoted \
+                 in its place, that is a re-seed: stop the node, delete its data dir, and restart \
+                 it configured as a follower of the current primary so it snapshot-seeds from \
+                 it, never with a primary config: the durable role file that outranks config is \
+                 deleted with the data dir, so a cleared node started as a primary comes up as a \
+                 second writable primary (DESIGN §4)"
+                    .to_string()
+            }
+        };
+        for boot in 0..2 {
+            let e = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema())
+                .expect_err("a store that stops short of the log's base must not boot");
+            assert_eq!(e.to_string(), expected, "{shape}, boot {boot}");
+        }
     }
 }
 
@@ -2312,14 +2437,9 @@ fn db_open_refuses_a_vanished_prefix() {
     );
     drop(wal);
 
+    let base = segment_base(&sim.disk().list("wal/").unwrap()[0]);
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
-    let msg = err.to_string();
-    for needle in ["base", "horizon", "neither", "restore"] {
-        assert!(
-            msg.contains(needle),
-            "vanished-prefix error must name the base, the horizon, and the fix: {msg}"
-        );
-    }
+    assert_eq!(err.to_string(), vanished_prefix_refusal(Some(5), base));
 }
 
 #[test]
@@ -2885,13 +3005,7 @@ fn a_seeded_node_whose_store_is_gone_is_refused_before_recovery_reads_a_frame() 
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema())
         .expect_err("a seeded node whose store is gone must not boot");
     // Byte-exact (error-suite T8): the seed segment's base is 1.
-    assert_eq!(
-        err.to_string(),
-        "table store tables.redb holds no records, but the log beside it is compacted to seq \
-         1: the records below seq 1 existed only in a store that is gone, so it cannot be \
-         rebuilt from the log. Removing the store by hand leaves this state, and so does a \
-         re-seed a crash cut short; restore this node from a replica or backup (DESIGN §4)"
-    );
+    assert_eq!(err.to_string(), vanished_prefix_refusal(None, 1));
 }
 
 /// `Seeder::new` must clear a stale breadcrumb left behind by a PRIOR,
@@ -3103,10 +3217,7 @@ fn a_reseed_crash_that_strands_the_breadcrumb_without_its_store_is_refused_by_na
         .expect_err("a compacted log beside no store must not boot");
     assert_eq!(
         e.to_string(),
-        "table store tables.redb holds no records, but the log beside it is compacted to seq \
-         18: the records below seq 18 existed only in a store that is gone, so it cannot be \
-         rebuilt from the log. Removing the store by hand leaves this state, and so does a \
-         re-seed a crash cut short; restore this node from a replica or backup (DESIGN §4)",
+        vanished_prefix_refusal(None, 18),
         "seed {SEED:#x}"
     );
 }

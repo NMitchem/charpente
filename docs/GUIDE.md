@@ -464,9 +464,12 @@ rebuild, naming the fix: restore from a replica/backup, or widen
 `retain_segments` (for a store whose bytes name an older redb file format, it
 says that no charpente release wrote one, so the version byte is damage, and
 names redb 2.6's `Database::upgrade()` for a format-2 file something else
-wrote). A store file that is missing, or holds no records, beside a compacted
-log is refused the same way, by name, so removing the store is never a fix
-once the log is compacted. `Db::open` then recovers the write-ahead log and replays
+wrote). A store whose records stop short of the log's base is refused the same
+way, by name, whatever the horizon breadcrumb beside it says: a store file that
+is missing, or holds no records, beside a compacted log, or an older copy put
+back without its log. Removing or replacing the store is never a fix once the
+log is compacted. For a follower the text names the re-seed instead, with the
+config it must restart under (§10). `Db::open` then recovers the write-ahead log and replays
 every durable record after the store's last checkpoint back into it, so a
 reopened `Db` reflects every transaction that ever committed, even one the
 store hadn't caught up to when the process died. Recovery can itself fail

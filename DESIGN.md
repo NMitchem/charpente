@@ -466,10 +466,11 @@ durable horizon — and threads it through `Engine::recover` into
 error naming the frame, the horizon, and restore-from-replica/backup, never a cut (and
 the error path mutates nothing — no truncation, no segment deletion); above the horizon
 it is a torn tail and cuts exactly as before. The rule's other half guards the state no
-invalid frame can reveal: if the log's `base_seq` exceeds the horizon + 1, whole
-acknowledged records exist in neither the store nor the log (never a state checkpoint
-GC can produce — its floor is bounded by its own checkpoint's `applied_seq + 1`), and
-`Db::open` refuses with the same restore-naming error before recovery runs. Standalone
+invalid frame can reveal: if the log's `base_seq` exceeds the store's own `applied_seq` + 1
+(seq 0 for a store holding no records), whole acknowledged records exist in neither the
+store nor the log (never a state checkpoint GC can produce — its floor is bounded by its
+own checkpoint's `applied_seq + 1`), and `Db::open` refuses with a restore-naming error
+before recovery runs. Standalone
 `Wal::open` (no store in sight) keeps cut-at-first-invalid. M1 replication is what
 makes repair possible. One shape is exempted because it provably loses nothing: a
 checkpointed store beside an *entirely empty* log directory. Segment names are
@@ -496,14 +497,17 @@ absent, torn, or CRC-invalid. `Seeder::new` discards any breadcrumb alongside th
 WAL it already discards, so a stale breadcrumb from a different, higher-numbered prior
 timeline sharing the disk can never survive a reseed and over-claim protection the new
 timeline never earned. The breadcrumb protects a rebuild, and `Db::open` rebuilds only from
-a log that still reaches seq 0 (§4). Beside a log compacted past seq 0, a store holding no
-records is refused before recovery runs, whatever the breadcrumb says: it holds a horizon,
-not the records below the log's base. Until 2026-10-01 it lifted the horizon past the
-vanished-prefix check instead, and the boot panicked replaying the log's base into an empty
-store. Removing the store by hand reached that state, and so did a crash inside
+a log that still reaches seq 0 (§4). It never lifts the vanished-prefix bound: that is
+measured against the store's own `applied_seq`, because the breadcrumb holds a horizon, not
+the records below the log's base. Until 2026-10-01 the bound was the breadcrumb-lifted
+horizon, and a boot whose store stopped short of the log's base passed it and panicked in
+the replay. A store removed by hand reached that state, and so did a crash inside
 `Seeder::new` between barriering the store's removal and the breadcrumb's (S5 R-I1, seed
-0x64a183075fd398b9). `Seeder::finish`'s write therefore changes no outcome: a seeded log
-starts at `applied_seq + 1`, never at 0. The `.horizon` sidecar is part of the node's durable set: any
+0x64a183075fd398b9), and so did an older copy of the store put back over a newer
+breadcrumb ("reached seq 38 but expected 20", S5 R2-M1). The exempt empty-log shape above
+replays from the horizon, so a breadcrumb past the store refuses there too, where it used to
+lay the segment past the store and panic at the first write. `Seeder::finish`'s write
+therefore changes no outcome: a seeded log starts at `applied_seq + 1`, never at 0. The `.horizon` sidecar is part of the node's durable set: any
 manual file-level restore of `store` + `wal/` must copy it or delete it alongside them —
 a leftover sidecar from the node's prior life would over-claim and refuse (by name, never
 silently) a legitimate torn tail above the restored horizon. The residual window *above*
@@ -1003,7 +1007,9 @@ next boot rebuilds the store from the log. Once the log is compacted, the store 
 only copy of the records below its base, so the fix is a restore from a replica or backup.
 Removing the file anyway is refused by name: `Db::open` refuses a store holding no records
 beside a log compacted past seq 0, whatever the horizon breadcrumb says (§2). M1's first text
-named removal for both logs, and on a compacted one the next boot panicked (S5 R-I1).
+named removal for both logs, and on a compacted one the next boot panicked (S5 R-I1). The
+refusal names the restore, and for a follower the re-seed it amounts to, with the config the
+node must restart under (§5's re-seed rule).
 Before 2026-10-01 any `Store::open` error took the discard path: one transient
 fault deleted a healthy store on a full log, and on a compacted log refused the boot with
 "restore this node from a replica or backup" (follow-up 21, found by the S4 review: an
