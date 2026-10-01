@@ -577,8 +577,14 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             // recovery, by the WAL convention (see
             // `checks::durable_corruption_fired`); ending the universe here
             // keeps the strong oracle standing everywhere corruption did
-            // not fire.
+            // not fire. Ending it is a give-up, never a pass: nothing past
+            // the loss is adjudicated.
             if charpente_sim::checks::durable_corruption_fired(sim) {
+                sim.give_up(format!(
+                    "durable corruption cut acknowledged transactions at a round's recovery \
+                     ({committed} acknowledged, {recovered} recovered), so durability was not \
+                     adjudicated and the rounds after it never ran"
+                ));
                 return Ok(());
             }
             return Err(format!(
@@ -761,8 +767,14 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
         };
         let recovered = db.last_applied().map_or(0, |s| s + 1);
         if recovered < committed {
-            // Same excuse-only-if-injected routing as the round loop above.
+            // Same excuse-only-if-injected routing, and give-up, as the round
+            // loop above.
             if charpente_sim::checks::durable_corruption_fired(sim) {
+                sim.give_up(format!(
+                    "durable corruption cut acknowledged transactions at the final recovery \
+                     ({committed} acknowledged, {recovered} recovered), so the final state was \
+                     never checked"
+                ));
                 return Ok(());
             }
             return Err(format!(
@@ -884,6 +896,43 @@ fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
         reason.contains("the final verification never ran"),
         "and it must be THIS give-up: {reason}"
     );
+}
+
+/// Acknowledged transactions cut by durable corruption are the sanctioned
+/// single-node loss, so the durability oracle cannot run past them: the
+/// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
+/// rule for every arm that ends a universe without a verdict). Seed
+/// `0x902dd63b08e51d75` meets it at a round's recovery (base `0x5E1F_0006`),
+/// seed `0x671991ebc8bd4f24` at the final one.
+#[test]
+fn acked_transactions_cut_by_durable_corruption_give_up_rather_than_pass() {
+    for (seed, arm) in [
+        (0x902d_d63b_08e5_1d75_u64, "at a round's recovery"),
+        (0x6719_91eb_c8bd_4f24, "at the final recovery"),
+    ] {
+        let mut state = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        let mut sim = Sim::with_faults(seed, cfg);
+
+        assert_eq!(tx_workload(&mut sim), Ok(()), "seed {seed:#x}");
+        assert!(
+            charpente_sim::checks::durable_corruption_fired(&sim),
+            "seed {seed:#x}"
+        );
+        let reason = sim.gave_up().unwrap_or_else(|| {
+            panic!(
+                "seed {seed:#x}: acked transactions lost to durable corruption must give up, \
+                 not pass"
+            )
+        });
+        assert!(
+            reason.contains("durable corruption cut acknowledged transactions")
+                && reason.contains(arm),
+            "seed {seed:#x} must give up {arm}: {reason}"
+        );
+    }
 }
 
 #[test]
