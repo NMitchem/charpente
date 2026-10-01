@@ -941,13 +941,18 @@ fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
 /// single-node loss, so the durability oracle cannot run past them: the
 /// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
 /// rule for every arm that ends a universe without a verdict). Seed
-/// `0x902dd63b08e51d75` meets it at a round's recovery (base `0x5E1F_0006`),
-/// seed `0x671991ebc8bd4f24` at the final one.
+/// `0xfc1e12c7cf3f8019` meets it at a round's recovery (base `0x5E1F_0006`,
+/// universe 133), seed `0xa5c304ecd9f3a44e` at the final one (same base,
+/// universe 178). Re-pinned 2026-10-01 for S5 with D1, which re-key every
+/// universe: `0x902dd63b08e51d75` now meets the cut at the final recovery
+/// instead of a round's, and `0x671991ebc8bd4f24` no longer meets durable
+/// corruption. Found by scanning the same base for the first universe that
+/// gives up for the cut at each recovery (one of 256 each).
 #[test]
 fn acked_transactions_cut_by_durable_corruption_give_up_rather_than_pass() {
     for (seed, arm) in [
-        (0x902d_d63b_08e5_1d75_u64, "at a round's recovery"),
-        (0x6719_91eb_c8bd_4f24, "at the final recovery"),
+        (0xfc1e_12c7_cf3f_8019_u64, "at a round's recovery"),
+        (0xa5c3_04ec_d9f3_a44e, "at the final recovery"),
     ] {
         let mut state = seed;
         let cfg_seed = charpente_sim::rng::splitmix64(&mut state);

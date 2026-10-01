@@ -2239,8 +2239,8 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     // excuses, so one that drops a clean attempt's tail leaves that attempt
     // adjudicating nothing, and when it was the only clean attempt the
     // universe failed "client never caught up" on no evidence (seed
-    // 0xfddd6c7112629074, pinned below). The epochs above keep exercising
-    // stall-drop and resume.
+    // 0xfddd6c7112629074; the scenario is pinned below). The epochs above
+    // keep exercising stall-drop and resume.
     sim.quiesce_subscriber_stalls();
     // How many settle attempts ran all the way through `kernel.run` without
     // fault fallout. Zero means this universe never observed the platform
@@ -2375,7 +2375,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0xd0fce29ba31210d0` (base `0xA11CE002`, universe 281).
+/// Seed `0xaf1ba92646f937ea` (base `0xA11CE002`, universe 452).
 ///
 /// **This pin has been re-found three times, and that is worth knowing before
 /// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
@@ -2391,8 +2391,10 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// stopped reproducing when redb 4.3.0 changed the store's IO shape and the
 /// crash countdowns were re-sized (2026-09-30); `0xdec436b030427fc6` (universe
 /// 124) stopped when `Db::open` stopped discarding a store over an IO error
-/// (2026-10-01): that universe now reaches a verdict. This one is the only
-/// universe of 512 at that base that gives up for this reason,
+/// (2026-10-01): that universe now reaches a verdict. `0xd0fce29ba31210d0`
+/// (universe 281) stopped the same day, when the epochs began booting through
+/// restarts and WAL recovery began syncing before replay (S5 with D1). This
+/// one is the only universe of 512 at that base that gives up for this reason,
 /// and with the zero-clean-attempts give-up removed it fails "client never
 /// caught up", which is the regression.
 ///
@@ -2408,7 +2410,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// give up rather than report a miss it never had the chance to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0xd0fc_e29b_a312_10d0;
+    const SEED: u64 = 0xaf1b_a926_46f9_37ea;
     // Reconstruct this universe exactly as the swarm runner derives it.
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -2434,18 +2436,22 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
     );
 }
 
-/// Seed `0xfddd6c7112629074` (base `0x5E1F0002`, universe 70), S4's Finding D
-/// (2026-09-30). The settle phase's one clean attempt resumed from cursor 19
-/// and an injected subscriber stall dropped its tail before id 20 arrived;
-/// the other eleven attempts never booted a node. The property
-/// excuses a stall, so that universe adjudicated nothing, yet it failed "client
-/// never caught up": a harness gap, not lost delivery. The settle now runs with
-/// stalls quiesced, so that attempt delivers the backlog and the universe
-/// passes. With `quiesce_subscriber_stalls` removed it fails "client never
-/// caught up" again.
+/// Seed `0x02b911a604c2ead4` (base `0x5E1F003A`, universe 226), the scenario
+/// of S4's Finding D (2026-09-30). The settle phase has one clean attempt; with
+/// `quiesce_subscriber_stalls` removed, an injected subscriber stall drops that
+/// attempt's tail, it resumes from cursor 22, and id 23 never arrives. The
+/// property excuses a stall, so that universe adjudicated nothing, yet it
+/// failed "client never caught up": a harness gap, not lost delivery. The
+/// settle runs with stalls quiesced, so that attempt delivers the backlog and
+/// the universe passes. Re-pinned 2026-10-01 for S5 with D1, which re-key every
+/// universe: the finding's `0xfddd6c7112629074` (base `0x5E1F0002`, universe
+/// 70) no longer has a single clean settle attempt. Found by removing the
+/// quiesce and scanning 64 fresh bases from `0x5E1F0002` for universes that
+/// fail "client never caught up": this is the only one of 4,185 that inject
+/// stalls.
 #[test]
 fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
-    const SEED: u64 = 0xfddd_6c71_1262_9074;
+    const SEED: u64 = 0x02b9_11a6_04c2_ead4;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
@@ -2468,8 +2474,8 @@ fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
         sim.coverage()
     );
     assert!(
-        trace.iter().any(|(id, _, _)| *id == 20),
-        "id 20, the first matching id the failure named as unaccounted, must arrive: {trace:?}"
+        trace.iter().any(|(id, _, _)| *id == 23),
+        "id 23, the first matching id the failure named as unaccounted, must arrive: {trace:?}"
     );
 }
 
@@ -5519,9 +5525,9 @@ const SCOPED_OWN_BACKLOG_FLOOR: u64 = 96;
 const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 99;
 const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 206;
 
-/// Seed `0x20851976ea4bae36` (base `0x5E1F0013`), found 2026-09-30 by S3's
-/// fresh-base scan. A misdirected write moved event id 5's WAL frame (seq 8,
-/// tenant A) off its offset, so the next recovery cut the log there, and the
+/// Found 2026-09-30 by S3's fresh-base scan, at seed `0x20851976ea4bae36`
+/// (base `0x5E1F0013`). A misdirected write moved event id 5's WAL frame (seq
+/// 8, tenant A) off its offset, so the next recovery cut the log there, and the
 /// following emits re-minted id 5 for tenant B. The client's ledger had
 /// already recorded the old id 5 and its resume never saw the re-mint (tenant
 /// B's rows are filtered), so the flagship's drain-error probe never ran, and
@@ -5530,11 +5536,22 @@ const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 206;
 /// lost. From 2026-09-30 it gave up; that excuse also swallowed an id
 /// re-minted for tenant A and never delivered (review I2). Since 2026-10-01
 /// the boundary read after that recovery re-syncs the client to the node's
-/// timeline (`Client::resync_if_cut`), so id 5 is B's and not owed, and the
-/// universe reaches a verdict on everything A was owed.
+/// timeline (`Client::resync_if_cut`), so the cut id is B's and not owed, and
+/// the universe reaches a verdict on everything A was owed.
+///
+/// Pinned at seed `0x083bd434c717d60c` (base `0x5E1F0039`, universe 73) since
+/// S5 with D1 re-keyed every universe the same day and the original seed
+/// stopped meeting durable corruption. It meets the same shape at id 3: one
+/// misdirected write, a recovery that cuts id 3 out of tenant A's recorded
+/// ledger, and id 3 re-minted for tenant B, which A never receives. With the
+/// re-sync disabled it gives up "ledger id 3 is behind this node's timeline",
+/// the 2026-09-30 behaviour. Found by disabling the re-sync and scanning 48
+/// bases (`0x2EB2_5C09` and `0x5E1F0013`..`0x5E1F0041`, 12,288 universes) for
+/// that give-up: 12 universes give it, and this is the only one whose cut id
+/// was re-minted rather than left absent.
 #[test]
 fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced() {
-    const SEED: u64 = 0x2085_1976_ea4b_ae36;
+    const SEED: u64 = 0x083b_d434_c717_d60c;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
@@ -5554,8 +5571,8 @@ fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynce
         sim.coverage()
     );
     assert!(
-        !trace.iter().any(|&(id, ..)| id == 5),
-        "id 5 was re-minted for tenant B, so A must never receive it: {trace:?}"
+        !trace.iter().any(|&(id, ..)| id == 3),
+        "id 3 was re-minted for tenant B, so A must never receive it: {trace:?}"
     );
 }
 

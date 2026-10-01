@@ -1431,10 +1431,11 @@ fn loop_app(sim: &Sim) -> std::io::Result<App> {
 
 /// How many boots a single-boot node here gets before its universe gives up by
 /// name (`checks::boot_through_fallout`): as many as the receipt property's v2
-/// loop. For its v1 boot, 8 left 12 of 256 universes giving up at the pinned
-/// base, 16 left 3 and 64 none (2026-10-01). The round loops below need none:
-/// their next round is the retry, after a restart, and their final reopen
-/// loops have budgets of their own.
+/// loop. For its v1 boot, 8 left 12 of 256 universes exhausted at the pinned
+/// base, 16 left 3 and 64 none (2026-10-01, measured before D1's WAL recovery
+/// sync merged and again after it: the same counts). The round loops below
+/// need none: their next round is the retry, after a restart, and their final
+/// reopen loops have budgets of their own.
 const BOOT_TRIES: u32 = 64;
 
 /// Scripted request source for tests that need the reply itself (`SimSource`

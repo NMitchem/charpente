@@ -1495,12 +1495,16 @@ fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
 /// single-node loss, so the durability oracle cannot run past them: the
 /// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
 /// rule for every arm that ends a universe without a verdict). Seed
-/// `0x231a841f396a7d80` meets it at a round's recovery (base `0x5300_0009`),
-/// seed `0x3f2a17e8c2fe469e` at the final one (base `0x5E1F_0001`).
+/// `0x04e7c90b39225fee` meets it at a round's recovery (base `0x5300_0009`,
+/// universe 136), seed `0x3f2a17e8c2fe469e` at the final one (base
+/// `0x5E1F_0001`, universe 73). Re-pinned 2026-10-01 for S5 with D1, which
+/// re-key every universe: the round arm's `0x231a841f396a7d80` no longer meets
+/// durable corruption. Found by scanning the same base for the first universe
+/// that gives up for the cut at a round's recovery (two of 256 do).
 #[test]
 fn acked_requests_cut_by_durable_corruption_give_up_rather_than_pass() {
     for (seed, arm) in [
-        (0x231a_841f_396a_7d80_u64, "at a round's recovery"),
+        (0x04e7_c90b_3922_5fee_u64, "at a round's recovery"),
         (0x3f2a_17e8_c2fe_469e, "at the final recovery"),
     ] {
         let mut state = seed;

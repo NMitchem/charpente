@@ -9023,7 +9023,10 @@ fn conv_swarm_sim(seed: u64) -> Sim {
 /// ran gives up rather than passing, and keeps its own coverage key beside
 /// the give-up (LEDGER 2026-09-30, follow-up 9). The source arm is forced (every
 /// disk op faults); the other three are universes of `archive_converges`'s
-/// pinned base, found by printing each arm's seed over that batch.
+/// pinned base, found by printing each arm's seed over that batch. The verify
+/// arm was re-found that way on 2026-10-01 for S5 with D1, which re-key every
+/// universe: `0x5228c3f6c429ed5e` no longer ends there, and `0xdcaa7c9885fba707`
+/// (universe 28) is the first of the 12 that do.
 #[test]
 fn every_convergence_arm_that_reaches_no_verdict_gives_up() {
     // Control: the same seed with no faults reaches a verdict.
@@ -9064,7 +9067,7 @@ fn every_convergence_arm_that_reaches_no_verdict_gives_up() {
             "the restore never completed",
         ),
         (
-            conv_swarm_sim(0x5228_c3f6_c429_ed5e),
+            conv_swarm_sim(0xdcaa_7c98_85fb_a707),
             "archive:verify_never_read_cleanly",
             "the restored destination never read cleanly",
         ),
