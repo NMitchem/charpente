@@ -1241,6 +1241,49 @@ mod tests {
         );
     }
 
+    /// (a), a GET whose object sits under a directory a failed PUT created:
+    /// the key's own directory was synced, the entry for the new prefix in
+    /// the root was not. A GET syncs every directory up to the root.
+    #[test]
+    fn an_object_a_get_returned_under_a_prefix_a_failed_put_created_survives_the_next_power_loss() {
+        let fs = CrashFs::provisioned(ROOT);
+        fs.fail_next_sync("/bucket");
+        put(&store(&fs), "p/0/segments/a", b"sealed").expect_err(
+            "the PUT's sync of the bucket root must fail — if not, this test no longer reaches \
+             the shape it pins",
+        );
+        let seen = get(&store(&fs), "p/0/segments/a").unwrap();
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "p/0/segments/a").unwrap_or_else(|e| panic!(
+                "an object a GET returned vanished at the next power loss — a directory above \
+                 its key was never made durable: {e}"
+            )),
+            seen
+        );
+    }
+
+    /// (a), a GET under a root a failed PUT created: only the root's own
+    /// entry, in the root's parent, was never synced.
+    #[test]
+    fn an_object_a_get_returned_under_a_root_a_failed_put_created_survives_the_next_power_loss() {
+        let fs = CrashFs::new();
+        fs.fail_next_sync("/");
+        put(&store(&fs), "k", b"v").expect_err(
+            "the PUT's sync of the root's parent must fail — if not, this test no longer reaches \
+             the shape it pins",
+        );
+        let seen = get(&store(&fs), "k").unwrap();
+        fs.power_loss();
+        assert_eq!(
+            get(&store(&fs), "k").unwrap_or_else(|e| panic!(
+                "an object a GET returned vanished at the next power loss — the bucket root's own \
+                 entry was never made durable: {e}"
+            )),
+            seen
+        );
+    }
+
     /// (a), a LIST: the same shape for a key that did not exist before.
     #[test]
     fn a_key_a_list_returned_survives_the_next_power_loss() {
