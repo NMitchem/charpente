@@ -621,7 +621,7 @@ fn recover_and_check(
 /// Every attempt either checks or dies to injected fault fallout, so a larger
 /// budget costs time only in universes that would otherwise conclude nothing.
 /// Over four bases 16 left 157 give-ups, 32 left 155 and 64 rescued none more,
-/// for +8.5% CPU against the property without a final check (2026-10-01).
+/// for 4.62 s of CPU against 4.37 s without a final check, +5.7% (2026-10-01).
 const FINAL_ATTEMPTS: u32 = 32;
 
 fn tables_workload(sim: &mut Sim) -> Result<(), String> {
