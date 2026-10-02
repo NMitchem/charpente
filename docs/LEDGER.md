@@ -6934,3 +6934,12 @@ universes (`BF=0.5 B=0x5D200000 N=5200`, 12 chains): 26 -> 0 failures, all this 
 Own distribution, 204,000 universes (`N=8500`, 12 chains each, `B` `0x5D000000` and `0x5D100000`):
 1 -> 0 (`0xb62d99f8f90232c9`). The S1 reviewer's own, differently derived sets gave 1 in 230,528,
 4 in 102,400 (0.019) and 17 in 61,440 (0.5); those are theirs, not reproducible from the tree.
+
+**Review and gate.** Review by the S1 amend reviewer (it found the mechanism): MERGE AFTER FIXES
+(0 C, 1 I, 4 M); by running, with no durable corruption every redelivery still fails by name (a cut
+nothing explains, 40,960 universes; a platform that redelivers with no fault, 36,864), and the trim
+can only turn a failure into a pass. Round 2 fixed I1's text and M1–M4; the controller re-ran both
+pins green, both red with the trim disabled, and the seed pin red with the 409 arm's cursor clear
+removed. Full gate at 9dbf42d: 86/86 `test result: ok`, 1,741 passed, 0 failed; round 2 touched only
+realtime.rs and this file — realtime 64 passed, 1 ignored (the scan), guide-examples 30, clippy and
+fmt clean. Branch `d5-flagship-resync`, merged at 8f6909f; main's tree is byte-identical to e5893c3.
