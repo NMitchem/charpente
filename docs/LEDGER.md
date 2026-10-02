@@ -6869,3 +6869,40 @@ and the controller re-ran the N2 pin red with the old text and green with the fi
 `npm run check`, `npm run test` 22/22. Round 4 changed one product text and its pin, re-run at
 0c736a8: replication, charpente lib and guide-examples 10/10 ok, 334 passed; TS 22/22. Branch
 `d4-fixes`, merged at 22e0c48; main's tree is byte-identical to 0c736a8.
+
+## 2026-10-02 — D5: the realtime flagship's client kept a stale `last_id` across a cut, and failed a correct universe
+
+**The finding** (the S1 amend review, I1). `Client::resync_to_head` in `crates/charpente/tests/realtime.rs`
+pruned the ledger, pending, verified, gone, floor and next_scan_id, but kept `last_id`. A sanctioned
+durable-corruption fault cuts an id the client was already delivered; the 409 "diverged from this
+node's timeline" sends the client bare; if the round that drew the 409 committed fewer re-mints than
+were cut, the bare tail starts at or below `last_id`, and the first re-mint it delivers failed
+`assert_strictly_increasing` ("duplicate or out-of-order event id 3 ... (previous id 3)"). The platform
+was correct: the node re-minted the cut id on its new timeline, and a bare tail owes nothing about a
+lost one. Test-only; nothing under `crates/charpente/src` changed.
+
+**The fix.** In `resync_to_head`, when `last_id >= Some(head)`, `last_id = head.checked_sub(1)`: the
+last id the node still holds. Both callers (`resync_if_cut` and the 409-diverged arm) go through it.
+
+**Pins.** `a_bare_tail_after_a_cut_may_start_below_the_last_id_the_client_saw` replays seed
+`0xe0779a282feb80eb` (the flagship's universe) and asserts the reason: a cut by durable corruption seen
+and re-synced, a frame delivered at or below an earlier one, a verdict. Red on the base with the text
+above (commit c9dca27). `a_cut_trims_last_id_to_the_last_id_the_node_still_holds` pins the operand.
+Inversions: trim removed, trimmed to `head` (one too high) and `>` for `>=` all turn the seed pin red;
+trimmed to `head - 2` (one too low) passes the seed pin and turns the unit pin red, as do the first
+two.
+
+**The sweep.** `Client` is the only rig client that carries a last id across a cut: the scoped sibling,
+the multi-node follower property and the tenant properties all construct it, so one fix covers them.
+The edge-harness `realtime_resume` clients keep `last_id` only as a resume cursor, or a per-connection
+monotonic check that starts `None`, across a `kill -9` with no corruption fault, where a cut would be
+a platform bug and should fail. The TS runtime and fixture hold no last id; the caller owns the cursor.
+
+**Nothing moved.** The four realtime swarm coverage blocks (flagship, scoped, tenant, follower) are
+byte-identical before and after; gave-ups 26 (flagship cap 26), 23 (scoped cap 23), `frame-verified`
+1,049 (floor 1,049).
+
+**Rates, same universe sets, before -> after.** `bit_flip` forced to 0.5, 62,400 universes: 26 -> 0
+failures, all this text. Own distribution, 204,000 universes (two 102,000 sets): 1 -> 0
+(`0xb62d99f8f90232c9`). The S1 reviewer's figures on their own sets were 1 in 230,528, 4 in 102,400
+(0.019) and 17 in 61,440 (0.5).
