@@ -29,7 +29,7 @@
 
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
-import { Api } from "./generated/client";
+import { Api, CursorRefused } from "./generated/client";
 import type { CustomerId, StreamEnd } from "./generated/client";
 import {
   createCustomerBody,
@@ -38,6 +38,116 @@ import {
   invoiceVoided,
 } from "./generated/samples";
 import { stubJsonResponse, stubSseResponse } from "./testing/fetch-stub";
+
+// `onOpen` is where a re-sync reads (GUIDE §11): the server has fixed the
+// stream's start, so a read sent from there is served after it. It must fire
+// once, before any frame, and never for a subscribe the server refused.
+test("onOpen fires once, after the subscribe is accepted and before any frame", async () => {
+  const { restore } = stubSseResponse([
+    { event: "invoice_paid", data: invoicePaid },
+    { event: "invoice_voided", data: invoiceVoided },
+  ]);
+  const order: string[] = [];
+  try {
+    await new Api("http://fixture.invalid").feed({
+      onOpen: () => {
+        order.push("open");
+      },
+      onEvent: (ev) => {
+        order.push(ev.event);
+      },
+      onEnd: (end) => {
+        order.push(end.kind);
+      },
+    });
+  } finally {
+    restore();
+  }
+  assert.deepEqual(order, ["open", "invoice_paid", "invoice_voided", "closed"]);
+});
+
+// The order a re-sync APPLIES things in, not only the order it sends them
+// (D4 round 3, review I2). `onOpen` returns at once and frames dispatch as they
+// arrive, so a frame, and even `onEnd`, can reach the caller before a read
+// started in `onOpen` returns. Here the read was served before the invoice was
+// paid and voided; only its frames carry those changes. A client that installs
+// the read when it arrives overwrites both; one that holds the frames until the
+// read is installed, then applies them over it in order, ends current.
+test("frames that beat the re-sync's read must be held and applied over it", async () => {
+  const { restore } = stubSseResponse([
+    { event: "invoice_paid", data: invoicePaid },
+    { event: "invoice_voided", data: invoiceVoided },
+  ]);
+  const arrived: string[] = [];
+  const status = (ev: { event: string }) => (ev.event === "invoice_paid" ? "paid" : "voided");
+  let naive = "unknown";
+  let held = "unknown";
+  let installed = false;
+  const pending: string[] = [];
+  let read: Promise<void> | undefined;
+  try {
+    await new Api("http://fixture.invalid").feed({
+      onOpen: () => {
+        read = new Promise<void>((resolve) => setTimeout(resolve, 5)).then(() => {
+          arrived.push("read");
+          naive = "open";
+          held = "open";
+          for (const s of pending) held = s;
+          installed = true;
+        });
+      },
+      onEvent: (ev) => {
+        arrived.push(ev.event);
+        naive = status(ev);
+        if (installed) held = status(ev);
+        else pending.push(status(ev));
+      },
+      onEnd: (end) => {
+        arrived.push(end.kind);
+      },
+    });
+    await read;
+  } finally {
+    restore();
+  }
+  assert.deepEqual(arrived, ["invoice_paid", "invoice_voided", "closed", "read"]);
+  assert.equal(naive, "open", "installing the read on arrival overwrites both changes");
+  assert.equal(held, "voided");
+});
+
+test("a refused cursor never fires onOpen, and names the subscribe-first re-sync", async () => {
+  const { restore } = stubJsonResponse(
+    { error: "cursor 1.0 is below this node's retention floor 8" },
+    409,
+  );
+  let opened = false;
+  let refused: unknown;
+  try {
+    await new Api("http://fixture.invalid").feed({
+      cursor: "1.0",
+      onOpen: () => {
+        opened = true;
+      },
+      onEvent: () => {},
+      onEnd: () => {},
+    });
+  } catch (e) {
+    refused = e;
+  } finally {
+    restore();
+  }
+  assert.equal(opened, false);
+  if (!(refused instanceof CursorRefused)) throw new Error("expected CursorRefused: " + String(refused));
+  assert.ok(
+    refused.message.endsWith(
+      "Reconnect without a cursor, wait for the stream to open (onOpen), then read current " +
+        "state from the same node, holding every frame that arrives until that read is " +
+        "installed and then applying the held frames and every later one over it in order, " +
+        "idempotently.",
+    ),
+    refused.message,
+  );
+});
 
 test("JSON round trip: a real sample document survives request()", async () => {
   const { restore, calls } = stubJsonResponse(customerView);
@@ -101,7 +211,7 @@ test("a reshaped frame ends the stream by name, and nothing after it is delivere
   const detail = {
     event: "invoice_paid",
     id: 1,
-    fix: "re-sync current state through reads, then reconnect without a cursor",
+    fix: "reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently",
   };
   const { restore } = stubSseResponse([
     { event: "invoice_paid", data: invoicePaid, id: "0.1" },

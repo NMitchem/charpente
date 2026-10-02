@@ -19,7 +19,8 @@ use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::witnesses::{load_witnesses, store_witnesses};
 use charpente::repl::{
-    MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS, ReplConfig, WITNESS_DEADLINE_NANOS,
+    MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS, ReplConfig, SWITCHOVER_DEADLINE_NANOS,
+    WITNESS_DEADLINE_NANOS,
 };
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
 use charpente_core::engine::REHELLO_MARKER;
@@ -4378,7 +4379,16 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
 /// 256 (103 at 796bff2), `repl:switchover-inconclusive` 146, no give-ups. At p
 /// = 104/256 = 0.406 one SE is 7.86, so 104 − 2·7.86 = 88.3 → 88; it tolerates
 /// a 15.4% relative fall.
-const SWITCHOVER_CONVERGED_FLOOR: u64 = 88;
+///
+/// **Re-set 2026-10-02 for the HandOff resend** (D4 round 2), two identical
+/// batches: 106 of 256, `repl:switchover-stalled` 6 → 2, one give-up
+/// (`repl:inconclusive:role-file-torn`, a universe that now completes its
+/// switchover and runs on into a torn role write). Over the same 64 fresh bases
+/// the key's mean rose 96.97 (sd 8.41) → 100.16 (sd 8.27), +2.16 Welch SE, and
+/// give-ups went 2.94 (sd 1.72) → 3.05 (sd 1.71), +0.36 SE. At p = 106/256 =
+/// 0.414 one SE is 7.88, so 106 − 2·7.88 = 90.2 → 90; it tolerates a 15.1%
+/// relative fall (16/106).
+const SWITCHOVER_CONVERGED_FLOOR: u64 = 90;
 
 /// The result of one switchover attempt's drain.
 enum DrainResult {
@@ -4483,6 +4493,7 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
         drive_rounds(sim, &mut [&mut p, &mut f], 3)?;
     }
     let base_p_recoveries = p.recoveries;
+    let f_recoveries_at_verb = f.recoveries;
     // From the first verb on, either node's durable role may flip.
     p.flipped = true;
     f.flipped = true;
@@ -4584,7 +4595,7 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
         Msg::CtrlOk { .. } => {
             assert_one_writable(&p, &f)?;
             if !f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
-                return Err("f is not writable after the switchover completed".to_string());
+                await_reverified_target(sim, &mut p, &mut f, f_recoveries_at_verb)?;
             }
             if !matches!(f.repl.role(), Role::Primary) {
                 return Err(format!(
@@ -4614,9 +4625,18 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
             Ok(())
         }
         Msg::CtrlErr { message } => {
-            // The rare HandOffDone-loss window (spec §2): the hand-off was sent
-            // and f promoted, but the confirmation was lost, so p stays
-            // write-stopped. Safety holds; this is not the happy-path oracle.
+            // The hand-off was sent and no confirmation came back (spec §2):
+            // either f promoted and the confirmation was lost, or f has not
+            // taken it. Over 64 fresh bases (D4 round 2) the second case fell
+            // from 229 to 32 once a reconnect's verified Hello position counted
+            // as acked: 17 with the HandOff still in flight at the deadline,
+            // which f then takes
+            // (`a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply`),
+            // and 15 with f down past it after its role write failed
+            // (`a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`).
+            // A drain abort (the other CtrlErr, after which p resumes writes)
+            // fell from 174 to 45. Neither breaks safety, which
+            // `assert_one_writable` checks; this is not the happy-path oracle.
             sim.cover("repl:switchover-stalled");
             if !message.contains("switchover") {
                 return Err(format!("unexpected CtrlErr from a switchover: {message}"));
@@ -4624,6 +4644,116 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
             assert_one_writable(&p, &f)
         }
         other => Err(format!("unexpected switchover reply: {other:?}")),
+    }
+}
+
+/// `f` unwritable when the `CtrlOk` arrives has one sanctioned cause.
+/// `accept_handoff` allows writes before it sends `HandOffDone`, and `p` sends
+/// `CtrlOk` only once it reads that, so `f` was writable when the reply left.
+/// What can shut it again is a restart of `f` after it recorded `p`, now its
+/// follower, as a witness: `f` boots as a durable primary with a non-empty
+/// witness set, and the boot gate withholds writes until `p` answers "not a
+/// primary" (DESIGN §5; GUIDE §10, "What a restarting primary does"). In seeds
+/// `0xbab47736c4b9ccb1`, `0x5b3716b404fe0d0e` and `0x86e23800809100c2` the
+/// fsync of that witness write fails, which stops `f` by design.
+///
+/// So the instant is excused only when all three hold: `f` restarted since
+/// the verb, its gate is `Verifying` rather than `NotPrimary`, and its role is
+/// `Primary`. Even then only until the gate opens: `p` is live and a follower
+/// here, and `WITNESS_DEADLINE_NANOS` is where the platform itself calls a
+/// witness unresolved. At most one node is writable at every round of the wait.
+fn await_reverified_target(
+    sim: &Sim,
+    p: &mut Node,
+    f: &mut Node,
+    f_recoveries_at_verb: u32,
+) -> Result<(), String> {
+    let restarted = f.recoveries > f_recoveries_at_verb;
+    let verifying = f.db.as_ref().is_some_and(|d| d.verifying());
+    let primary = matches!(f.repl.role(), Role::Primary);
+    if !(restarted && verifying && primary) {
+        return Err(format!(
+            "f is not writable after the switchover completed, and not for the boot gate's \
+             reason (f restarted since the verb: {restarted}; f's gate is verifying: \
+             {verifying}; f's role: {:?})",
+            f.repl.role()
+        ));
+    }
+    sim.cover("repl:switchover-target-reverified");
+    let deadline = sim.now().as_nanos() + WITNESS_DEADLINE_NANOS;
+    let mut stopped = "the step budget ran out";
+    for _ in 0..CONVERGE_BUDGET {
+        if f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
+            return Ok(());
+        }
+        if sim.now().as_nanos() > deadline {
+            stopped = "the witness deadline passed";
+            break;
+        }
+        if !scheduler_round(sim, &mut [p, f])? {
+            stopped = "the world went quiescent";
+            break;
+        }
+        assert_one_writable(p, f)?;
+    }
+    // Only what was observed: the gate can stay shut with p answering (a gate
+    // that never opens on a resolved set), so this does not name a cause.
+    Err(format!(
+        "f's witness gate never opened after the switchover completed: f restarted as a primary \
+         with p in its witness set, and {stopped} ({}s budget, WITNESS_DEADLINE_NANOS) with f \
+         still write-stopped (f's gate is verifying: {}; f's role: {:?}; p's role: {:?})",
+        WITNESS_DEADLINE_NANOS / 1_000_000_000,
+        f.db.as_ref().is_some_and(|d| d.verifying()),
+        f.repl.role(),
+        p.repl.role()
+    ))
+}
+
+/// Replays one universe of `switchover_mid_write_load_loses_nothing_and_serves_reads_throughout`
+/// exactly as its swarm runner builds it, and returns the world with the
+/// universe's result after `finish_universe`.
+fn replay_switchover(seed: u64) -> (Sim, Result<(), String>) {
+    let mut state = seed;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(seed, &mut cfg);
+    no_media_corruption(&mut cfg);
+    let mut sim = Sim::with_faults(seed, cfg);
+    let r = switchover_universe(&mut sim);
+    let r = finish_universe(&sim, r);
+    (sim, r)
+}
+
+/// The three universes D4 found failing "f is not writable after the
+/// switchover completed" (bases `0x51D31002`, `0xD4F20012`, `0xD4F20025`). In
+/// each, `f` restarted after recording `p` as its witness and read the
+/// `CtrlOk` while still verifying, and the gate opened within 3–17 ms (virtual)
+/// of it. Each now waits that out under the excuse's key and then runs the full
+/// oracle, zero-loss and convergence included. A seed names a universe: if one
+/// stops covering the key, it no longer meets the scenario and must be re-found
+/// by mechanism, not dropped.
+#[test]
+fn a_switchover_target_restarted_after_the_hand_off_writes_once_its_witness_answers() {
+    for seed in [
+        0xbab4_7736_c4b9_ccb1_u64,
+        0x5b37_16b4_04fe_0d0e,
+        0x86e2_3800_8091_00c2,
+    ] {
+        let (sim, r) = replay_switchover(seed);
+        assert_eq!(r, Ok(()), "seed {seed:#x}");
+        assert_eq!(sim.gave_up(), None, "seed {seed:#x} reaches a verdict");
+        let coverage = sim.coverage();
+        assert_eq!(
+            coverage.get("repl:switchover-target-reverified"),
+            Some(&1),
+            "seed {seed:#x}: for this reason, or the seed no longer names the scenario: \
+             {coverage:?}"
+        );
+        assert_eq!(
+            coverage.get("repl:logical-converged"),
+            Some(&1),
+            "seed {seed:#x}: and the full oracle ran after the gate opened: {coverage:?}"
+        );
     }
 }
 
@@ -5012,6 +5142,458 @@ fn crash_between_handoff_and_demote_never_yields_two_writable_primaries() {
     assert_converged(&sim, &mut p, &mut f).unwrap();
 }
 
+/// A switchover driven to its point of no return: `p` is HandedOff, with the
+/// `HandOff` sent and not yet taken by `f`. Returns the world with the verb's
+/// control conn still waiting, and `p`'s hand-off seq.
+fn handed_off_to_f() -> (Sim, Node, Node, CtrlConn, u64) {
+    use charpente::repl::SwitchoverPhase;
+
+    let sim = Sim::with_faults(STALLED_SWITCHOVER_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    p.flipped = true;
+    f.flipped = true;
+    let cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[0].repl.switchover_phase() == Some(SwitchoverPhase::HandedOff),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    let at =
+        p.db.as_ref()
+            .unwrap()
+            .last_applied()
+            .expect("handed off at a durable seq");
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "sanity: f has not taken the HandOff yet: {:?}",
+        f.repl.role()
+    );
+    (sim, p, f, cli, at)
+}
+
+/// The `HandOff` resend (D4 round 2). A target that dies before the `HandOff`
+/// lands reboots as the follower its role file says it is and reconnects
+/// already caught up. A write-stopped `p` ships it nothing, so it never acks
+/// again; the `Hello`'s position, which `p` verified against its own log, is
+/// what says it holds every record up to the hand-off seq. `p` resends on the
+/// new session, `f` takes it, and the switchover completes with nothing lost.
+/// D4 found 229 of 635 `CtrlErr`s over 64 fresh bases stalled this way, with
+/// no node writable, before the resend counted that position.
+#[test]
+fn a_switchover_target_that_restarts_before_taking_the_hand_off_is_sent_it_again() {
+    let (sim, mut p, mut f, mut cli, at) = handed_off_to_f();
+    f.host.crash_now();
+    recover_node(&sim, &mut f).unwrap();
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "sanity: f never applied the HandOff, so it reboots a follower: {:?}",
+        f.repl.role()
+    );
+    let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert!(
+        matches!(&reply, Msg::CtrlOk { .. }),
+        "a target that reconnects caught up inside the window must be handed off again: \
+         {reply:?}"
+    );
+    assert_eq!(f.repl.role(), &Role::Primary);
+    assert!(f.db.as_ref().is_some_and(|d| d.writes_allowed()));
+    assert_eq!(
+        f.db.as_ref().unwrap().last_applied(),
+        Some(at),
+        "f took the hand-off at p's own seq"
+    );
+    assert_eq!(
+        p.repl.role(),
+        &Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_one_writable(&p, &f).unwrap();
+    assert_all_present(&sim, &mut f, &(0..10).collect::<Vec<_>>(), "f").unwrap();
+    commit_widget(&sim, &mut f, 10).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// A switchover whose target never took the `HandOff` and did not come back
+/// inside the window: `f` stays down until `p`'s deadline passes, so no
+/// reconnect reaches `p` to be handed off again (15 of the 32 never-promoted
+/// stalls left over 64 fresh bases, D4 round 2, where `f`'s role write failed
+/// inside `accept_handoff` and its reboot outlasted the window). `f` then reboots
+/// as the follower its role file says it is. Returns the world at the stall,
+/// with `p`'s reply and its hand-off seq.
+fn stalled_switchover_target_never_promoted() -> (Sim, Node, Node, String, u64) {
+    let (sim, mut p, mut f, mut cli, at) = handed_off_to_f();
+    f.host.crash_now();
+    let message = match drive_ctrl(&sim, &mut [&mut p], &mut cli, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlErr { message } => message,
+        other => panic!("a switchover whose target never took the hand-off must stall: {other:?}"),
+    };
+    recover_node(&sim, &mut f).unwrap();
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "sanity: f never applied the HandOff, so it reboots a follower: {:?}",
+        f.repl.role()
+    );
+    (sim, p, f, message, at)
+}
+
+const STALLED_SWITCHOVER_SEED: u64 = 0x2EB1_0D40;
+
+/// What is true once a switchover stalls with its target never promoted, and
+/// that the stall's `CtrlErr` says exactly that (D4 item 4). No node accepts
+/// writes, and nothing changes that on its own: `p` does not resume, and
+/// restarting `p` alone leaves it handing off. The remedy the text names does
+/// change it. Promoting `f` loses nothing (its reply names `p`'s own
+/// hand-off seq), and restarting `p` then rejoins it as `f`'s follower.
+#[test]
+fn a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing() {
+    let (sim, mut p, mut f, message, at) = stalled_switchover_target_never_promoted();
+    assert_eq!(
+        message,
+        format!(
+            "switchover to f:1: the hand-off was sent at seq {at} but no confirmation returned \
+             before the deadline — this node stays write-stopped and will not resume writes on \
+             its own, because f:1 may already be the primary. If f:1's role file says primary, \
+             restart this node to resolve against f:1: it rejoins as f:1's follower. If it \
+             still says follower, f:1 has not taken the hand-off yet and no node accepts writes: \
+             promote it (charpente promote --node f:1) — it confirmed it holds every record up \
+             to seq {at} and this node has accepted no write since, so its reply names \
+             last_applied Some({at}) and nothing is lost — then restart this node to resolve \
+             against f:1. If the promote answers \"cannot promote: this node is already the \
+             primary\", f:1 took a hand-off still in flight at the deadline: just restart this \
+             node"
+        )
+    );
+    let none_writable = |p: &Node, f: &Node| {
+        !p.db.as_ref().is_some_and(|d| d.writes_allowed())
+            && !f.db.as_ref().is_some_and(|d| d.writes_allowed())
+    };
+    assert!(none_writable(&p, &f), "no node accepts writes at the stall");
+
+    // Nothing resolves it on its own, across twice the switchover deadline.
+    let until = sim.now().as_nanos() + 2 * SWITCHOVER_DEADLINE_NANOS;
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |_| sim.now().as_nanos() > until,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert!(
+        matches!(p.repl.role(), Role::HandingOff { .. }),
+        "{:?}",
+        p.repl.role()
+    );
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "{:?}",
+        f.repl.role()
+    );
+    assert!(
+        none_writable(&p, &f),
+        "p does not resume and nothing resends"
+    );
+
+    // The remedy, as the text orders it: promote f, then restart p.
+    let mut promote = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    match drive_ctrl(&sim, &mut [&mut p, &mut f], &mut promote, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlOk { message } => assert!(
+            message.starts_with(&format!("promoted to primary at last_applied Some({at}) ")),
+            "the promote names p's own hand-off seq, so nothing is lost: {message}"
+        ),
+        other => panic!("promoting the never-promoted target must succeed: {other:?}"),
+    }
+    recover_node(&sim, &mut p).unwrap();
+    let mut rejoined = false;
+    for _ in 0..CONVERGE_BUDGET {
+        assert_one_writable(&p, &f).unwrap();
+        if matches!(p.repl.role(), Role::Follower { .. }) {
+            rejoined = true;
+            break;
+        }
+        scheduler_round(&sim, &mut [&mut p, &mut f]).unwrap();
+    }
+    assert!(rejoined, "the restarted p resolves against the promoted f");
+    assert_all_present(&sim, &mut f, &(0..10).collect::<Vec<_>>(), "f").unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// The branch the stall text rules out: with the target never promoted,
+/// restarting the stalled primary alone leaves it handing off, and still no
+/// node accepts writes.
+#[test]
+fn restarting_a_stalled_primary_alone_does_not_resolve_a_never_promoted_target() {
+    let (sim, mut p, mut f, _, _) = stalled_switchover_target_never_promoted();
+    recover_node(&sim, &mut p).unwrap();
+    let until = sim.now().as_nanos() + 2 * SWITCHOVER_DEADLINE_NANOS;
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |_| sim.now().as_nanos() > until,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert!(
+        matches!(p.repl.role(), Role::HandingOff { .. }),
+        "{:?}",
+        p.repl.role()
+    );
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "{:?}",
+        f.repl.role()
+    );
+    assert!(!p.db.as_ref().is_some_and(|d| d.writes_allowed()));
+    assert!(!f.db.as_ref().is_some_and(|d| d.writes_allowed()));
+}
+
+/// A `HandOff` still in flight at the deadline: 17 of the 32 never-promoted
+/// stalls left over 64 fresh bases (D4 round 2), sent on a live conn up to 11 s
+/// before a deadline the drain had mostly used up. Here `f` is not stepped
+/// until `p` has replied. The reply's second case holds when it is sent, and
+/// then `f` takes the `HandOff` on its own and becomes the primary, which is
+/// the first case. A promote sent after that answers that `f` is already the
+/// primary, which the stall reply names as this race (review M1), and
+/// restarting `p` resolves it with nothing lost.
+#[test]
+fn a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply() {
+    let (sim, mut p, mut f, mut cli, at) = handed_off_to_f();
+    let stall = match drive_ctrl(&sim, &mut [&mut p], &mut cli, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlErr { message } => {
+            assert!(
+                message.starts_with(&format!(
+                    "switchover to f:1: the hand-off was sent at seq {at} but no confirmation"
+                )),
+                "{message}"
+            );
+            message
+        }
+        other => panic!("p must stall while f has not taken the hand-off: {other:?}"),
+    };
+    assert!(matches!(f.repl.role(), Role::Follower { .. }));
+    assert!(!p.db.as_ref().is_some_and(|d| d.writes_allowed()));
+    assert!(!f.db.as_ref().is_some_and(|d| d.writes_allowed()));
+
+    let mut took = false;
+    for _ in 0..CONVERGE_BUDGET {
+        assert_one_writable(&p, &f).unwrap();
+        if matches!(f.repl.role(), Role::Primary) {
+            took = true;
+            break;
+        }
+        scheduler_round(&sim, &mut [&mut p, &mut f]).unwrap();
+    }
+    assert!(took, "f takes the HandOff that was in flight");
+    assert!(f.db.as_ref().is_some_and(|d| d.writes_allowed()));
+    assert_eq!(f.db.as_ref().unwrap().last_applied(), Some(at));
+    assert!(
+        matches!(p.repl.role(), Role::HandingOff { .. }),
+        "{:?}",
+        p.repl.role()
+    );
+
+    let mut promote = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    match drive_ctrl(&sim, &mut [&mut p, &mut f], &mut promote, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlErr { message } => {
+            assert_eq!(message, "cannot promote: this node is already the primary");
+            assert!(
+                stall.ends_with(&format!(
+                    "If the promote answers \"{message}\", f:1 took a hand-off still in flight \
+                     at the deadline: just restart this node"
+                )),
+                "the stall reply must name the promote reply this race gets: {stall}"
+            );
+        }
+        other => panic!("a promote after the hand-off landed: {other:?}"),
+    }
+    recover_node(&sim, &mut p).unwrap();
+    let mut rejoined = false;
+    for _ in 0..CONVERGE_BUDGET {
+        assert_one_writable(&p, &f).unwrap();
+        if matches!(p.repl.role(), Role::Follower { .. }) {
+            rejoined = true;
+            break;
+        }
+        scheduler_round(&sim, &mut [&mut p, &mut f]).unwrap();
+    }
+    assert!(rejoined, "the restarted p resolves against f");
+    assert_all_present(&sim, &mut f, &(0..10).collect::<Vec<_>>(), "f").unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// A switchover on a quiet cluster whose target reconnected since the last
+/// write (D4 round 3, review I1). The target is shipped nothing and never acks
+/// again, so only its verified `Hello` position shows it is caught up. Before
+/// D4 round 2 the drain never saw it caught up: no faults at all, and the
+/// switchover aborted at the deadline naming a lag of 10 records that `f`
+/// already held ("the follower lag is 10 record(s) (it acked None, this
+/// primary is at Some(9))"). This pins the drain's half of the fix; the
+/// resend's half is
+/// `a_switchover_target_that_restarts_before_taking_the_hand_off_is_sent_it_again`.
+#[test]
+fn a_switchover_after_the_target_reconnected_with_no_write_since_completes() {
+    let sim = Sim::with_faults(0x2EB1_0D41, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    f.host.crash_now();
+    recover_node(&sim, &mut f).unwrap();
+    drive_rounds(&sim, &mut [&mut p, &mut f], 50).unwrap();
+    let at = p.db.as_ref().unwrap().last_applied();
+    assert_eq!(
+        f.db.as_ref().unwrap().last_applied(),
+        at,
+        "sanity: f reconnected already caught up"
+    );
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert!(
+        matches!(&reply, Msg::CtrlOk { .. }),
+        "a target that reconnected caught up must be handed off, not aborted: {reply:?}"
+    );
+    assert_eq!(f.repl.role(), &Role::Primary);
+    assert!(f.db.as_ref().is_some_and(|d| d.writes_allowed()));
+    assert_eq!(f.db.as_ref().unwrap().last_applied(), at);
+    assert_eq!(
+        p.repl.role(),
+        &Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_one_writable(&p, &f).unwrap();
+    assert_all_present(&sim, &mut f, &(0..10).collect::<Vec<_>>(), "f").unwrap();
+    commit_widget(&sim, &mut f, 10).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// A verified `Hello` position counts as acked only while it is the answer the
+/// session is living under (D4 round 3, review M6). `handle` answers a `Hello`
+/// in any phase, so a peer that sends a second one on the same connection (no
+/// conformant follower does: one `Hello` per connection) gets it decided
+/// afresh. Here the first carries `p`'s own last position and is answered
+/// `Frames`; the second carries none, on a log GC'd past its base, and is
+/// answered `Snapshot`. The peer has now proved nothing, so a switchover to it
+/// must drain and abort by name. Kept from the first `Hello`, the position
+/// would read as caught up and `p` would hand off to a peer it is seeding.
+///
+/// That is all the reset holds: a second `Hello` answered `Snapshot` no longer
+/// leaves a stale position. A peer that also sends a stale or forged `Ack` can
+/// still look caught up. No real follower or witness probe sends one, and what
+/// keeps a non-conformant peer out is `peer_secret`.
+#[test]
+fn a_second_hello_answered_with_a_snapshot_drops_the_position_the_first_proved() {
+    let sim = Sim::with_faults(0x2EB1_0D42, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    for i in 0..60u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    let (last, crc, digest) = {
+        let db = p.db.as_ref().unwrap();
+        assert!(
+            db.log_base() > 0,
+            "a log-less Hello must be answered Snapshot"
+        );
+        let last = db.last_applied().unwrap();
+        let frames = db.read_log(last, 1).unwrap();
+        let (seq, payload) = frames.first().unwrap();
+        (
+            last,
+            charpente_core::log::frame_crc(*seq, payload),
+            db.schema_digest(),
+        )
+    };
+    let hello = |position| Msg::Hello {
+        proto: charpente::repl::PROTO_VERSION,
+        listen: Some("x:1".to_string()),
+        position,
+        secret: None,
+        schema_digest: digest,
+    };
+    let peer = sim.host("x").net().connect("p:1").unwrap();
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut answer = |sim: &Sim, p: &mut Node| -> Msg {
+        for _ in 0..CONVERGE_BUDGET {
+            drive_rounds(sim, &mut [&mut *p], 1).unwrap();
+            if let Some(n) = peer.recv(&mut buf).unwrap() {
+                assert!(n > 0, "p closed the peer's connection");
+                return decode(&buf[..n]).unwrap();
+            }
+        }
+        panic!("p never answered the peer");
+    };
+    peer.send(&encode(&hello(Some((last, crc))))).unwrap();
+    let first = answer(&sim, &mut p);
+    assert!(
+        matches!(first, Msg::Heartbeat { next_seq } if next_seq == last + 1),
+        "the first Hello is answered Frames from {}: {first:?}",
+        last + 1
+    );
+    peer.send(&encode(&hello(None))).unwrap();
+    let second = answer(&sim, &mut p);
+    assert!(
+        matches!(second, Msg::SnapshotStart { .. }),
+        "the second Hello is answered Snapshot: {second:?}"
+    );
+
+    p.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "x:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    match drive_ctrl(&sim, &mut [&mut p], &mut cli, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            format!(
+                "switchover to x:1 aborted: the follower lag is {} record(s) (it has confirmed \
+                 no record yet, this primary is at Some({last})) and the drain did not complete \
+                 before the 30000000000ns deadline — this node is primary again and accepting \
+                 writes",
+                last + 1
+            )
+        ),
+        other => panic!("a switchover to a peer that proved nothing must abort: {other:?}"),
+    }
+    assert_eq!(p.repl.role(), &Role::Primary);
+    assert!(p.db.as_ref().is_some_and(|d| d.writes_allowed()));
+}
+
 // ------------------------------ property: switchover aborts on a laggard
 
 #[test]
@@ -5047,14 +5629,16 @@ fn switchover_aborts_on_a_lagging_follower_by_name() {
     .unwrap();
     let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
     match reply {
-        Msg::CtrlErr { message } => {
-            for needle in ["lag", "deadline", "aborted"] {
-                assert!(
-                    message.contains(needle),
-                    "abort message missing {needle:?}: {message}"
-                );
-            }
-        }
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            format!(
+                "switchover to f:1 aborted: the follower lag is {} record(s) (it confirmed it \
+                 holds every record up to {f_last:?}, this primary is at {p_last:?}) and the \
+                 drain did not complete before the 30000000000ns deadline — this node is \
+                 primary again and accepting writes",
+                p_last.unwrap() - f_last.unwrap()
+            )
+        ),
         other => panic!("a lagging switchover must abort with CtrlErr, got {other:?}"),
     }
 

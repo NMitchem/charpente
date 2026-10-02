@@ -1432,13 +1432,31 @@ crash-safe on the three-state role file: `store_role(HandingOff{to})` write-stop
 primary (`db.forbid_writes(to)` — reads and effect-free transactions still run, effectful
 ones get `TxError::NotPrimary`), then it *drains* — the target session's `Ack`s are read
 each step and, when its acked seq reaches `db.last_applied()`, the primary sends
-`HandOff{at_seq}` and enters HandedOff, **the point of no return**. Draining is abortable:
+`HandOff{at_seq}` and enters HandedOff, **the point of no return**. A target session's
+`Hello` position, once verified against this log, counts as acked: a target that
+reconnects already caught up is shipped nothing by a write-stopped primary and never
+acks again, so without it neither the drain nor the HandedOff resend (to a new session
+of `to`, once per session) could fire (D4 round 2:
+`a_switchover_target_that_restarts_before_taking_the_hand_off_is_sent_it_again`). Draining is abortable:
 the `SWITCHOVER_DEADLINE_NANOS` deadline while still Draining returns durably to `Primary`,
 resumes writes, and the `CtrlErr` names the follower's remaining lag. HandedOff never
 aborts: on `HandOffDone` the primary flips durably to `Follower(to)`, drops its ship
 sessions, and starts a follower client toward the new primary (drained to byte equality,
-no divergence possible); on the deadline it stays write-stopped and the `CtrlErr` says the
-hand-off was sent — verify `to` and restart to resolve. The follower side of `HandOff`
+no divergence possible); on the deadline it stays write-stopped, and the `CtrlErr` names the
+hand-off seq and both answers to "did `to` take it?" (2026-10-02, D4). If `to`'s role file
+says primary, restarting this node resolves against it. If it still says follower, no node
+accepts writes, and nothing resends after the reply. Either the `HandOff` is still in
+flight (the drain and the hand-off share one deadline), and `to` may take it and become the
+primary, the first case, where a promote answers "already the primary" and the `CtrlErr`
+says to just restart this node
+(`a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply`); or `to` was down
+past the deadline (in the sim, its role write failed inside `accept_handoff` and its
+reboot outlasted the window), and nothing changes on its own. Restarting this node alone
+leaves it handing off. Promoting `to` loses nothing, since it confirmed it holds every
+record up to the hand-off seq and this node has written nothing since, and a restart then
+rejoins this node as its follower
+(`a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`,
+`restarting_a_stalled_primary_alone_does_not_resolve_a_never_promoted_target`). The follower side of `HandOff`
 verifies `last_applied == at_seq` (else a named `Refuse` protocol error), requires a
 configured listen address (an unpromotable follower is never a switchover target — its
 `Hello` carries no listen, so it never matches), flips durably to `Primary`, allows
@@ -1671,8 +1689,15 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   through, or clamps it — access control is the handler's own session/row logic, not the
   platform's). The platform extracts the client's cursor before the handler runs:
   `Last-Event-ID` header wins (browser-native SSE resume), else a `cursor` query
-  parameter, else `None` ("from now" — only future events); an unparseable cursor is a 400
-  and the handler never runs. The route may also DECLARE the event types its stream
+  parameter, else `None` ("from now"); an unparseable cursor is a 400 and the handler never
+  runs. "From now" is the node's `next_event_id` when it SERVES the subscribe
+  (`validate_subscribe`), not when the client sent it: every event committed before that
+  point, and on a follower every event applied from the primary's log before it (one that
+  landed while the request was in flight included), is behind the tail. A subscribe ends
+  its request batch, so on a primary a change that arrived ahead of it is behind the tail
+  and one that arrived behind it is delivered, even at the same instant
+  (`a_bare_subscribe_on_a_primary_starts_between_the_changes_that_arrived_around_it`).
+  The stream does not name that point. The route may also DECLARE the event types its stream
   carries — `#[route(SSE "/path", emits(InvoicePaid, InvoiceVoided))]` — which is what
   lets a generated client type `subscribe()` as a discriminated union of exactly those
   payloads instead of "anything". The declaration names Rust types, and the contract
@@ -1713,7 +1738,15 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
 - **Honesty at the edges.** A cursor below the retention floor, or one naming an event id
   this node never minted (or minted with a different seq — the cross-timeline case), is
   refused at subscribe with a 409 naming the floor or the divergence detail and the fix:
-  re-sync current state through reads, then reconnect without a cursor. A tail that falls
+  reconnect without a cursor, wait for the stream to open, then read current state from
+  the same node, holding every frame that arrives until that read is installed and then
+  applying the held frames and every later one over it in order, idempotently. The order
+  is the fix, twice: read-first, a change landing after the read is served and before the
+  subscribe is (a follower apply in flight included) reaches the client by neither route;
+  and a client that installs the read when it arrives overwrites any change whose frame
+  beat it, which nothing delivers again (`realtime.rs`, the `the_resync_remedy_*` tests: a
+  change in each of the five windows around the two requests, on a follower and a primary,
+  judged by what arrives and by the state the client ends in; 2026-10-02, D4). A tail that falls
   behind retention mid-stream gets the same fact set as a terminal SSE frame —
   `event: charpente.gap` — then its sink closes. A stored event whose recorded shape (§3)
   is not the subscribed type's is never decoded: the tail gets a terminal

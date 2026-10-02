@@ -6686,3 +6686,173 @@ f50bb05: 18 ok, 0 failed. Main's tree at 6f62929 is byte-identical to f50bb05.
   no login retry); the CLI template's `open_app` refusal path has no test; `reseed_p`'s catch-all
   for a failed reopen after restore (0 hits).
 - Two fresh-base failures on main found by this census, both rig gaps, went to D4 (below).
+
+## 2026-10-02 — a switchover target that restarts after the hand-off is excused for its witness gate, a bare subscribe owes what its tail starts at, "from now" names its moment, and a stalled switchover says what is true
+
+**Why.** Two fresh-base failures seen at 7466538, both passing at their pinned bases. F2:
+`switchover_mid_write_load_loses_nothing_and_serves_reads_throughout` failed "f is not writable
+after the switchover completed" (seed `0xbab47736c4b9ccb1`, base `0x51D31002`). F1:
+`follower_tails_and_the_failover_resume_divergence_property` failed "client never caught up"
+(`0x4aad5f8abb5ca6ef`, base `0x5E1F0105`). Sub-project D4 (`d4-report.md` the diagnosis,
+`d4-impl-report.md` the implementation). Branch `d4-fixes`, built on S3b's 221555f.
+
+**The diagnoses.** Neither is a product bug. F2: `f` is writable when `p` sends `CtrlOk`. In each
+failing universe `f` then recorded `p`, now its follower, as a witness; that write's fsync failed,
+which stops `f` by design; `f` rebooted as a durable primary with `p` in its witness set, and the
+boot gate withheld writes until `p` answered (GUIDE §10, "What a restarting primary does"). The CLI
+read the `CtrlOk` in that window, and the gate opened 3–17 ms later. 2 of 64 fresh bases failed;
+the mechanism dates to 3b5335c, the boot gate. F1: the rig took a bare subscribe's floor when it
+sent the request, but the tail starts where the node serves it, and on a follower a shipped event
+can apply in between. 1 of 64 fresh bases failed.
+
+**Shipped.**
+- **F2 (rig).** The `CtrlOk` arm excuses an unwritable `f` only if it restarted since the verb,
+  its gate is `Verifying`, and its role is `Primary`. It then waits for the gate, bounded by
+  `WITNESS_DEADLINE_NANOS`, under `repl:switchover-target-reverified`, and runs the full oracle.
+  Three seeds pinned by reason. Each conjunct was mutation-proved against its own product mutation,
+  and so were the two `allow_writes` sites (`d4-impl-report.md`).
+- **F1 (rig).** The floor is read right after the round in which the 200 appears; the send-time
+  read stays a lower bound. Two seeds pinned by reason. A tail that starts one late fails the
+  property.
+- **"From now" (docs).** GUIDE §11 and DESIGN §6 now say the tail starts at the node's next event
+  id when it serves the subscribe, follower applies included, and that the stream does not name
+  that point. On a primary, a change that arrived just ahead of the subscribe is behind the tail
+  and one just behind it is delivered, even at the same instant; a test now pins that (red with
+  `ends_batch` forced false).
+- **The re-sync remedy's order (docs, proved first).** With a change landed in each of the five
+  windows around its two requests, on a follower and on a primary: subscribe, wait for the stream
+  to open, then read from the same node, and every change arrives. Read first, then subscribe (the
+  order the texts name the steps in), and two changes arrive by neither route.
+- **A stalled switchover's `CtrlErr`.** In 229 of 635 stalls over 64 fresh bases the target never
+  took the hand-off. Its role write failed inside `accept_handoff`, and it rebooted a follower
+  already caught up. No node accepts writes then, and nothing changes that on its own. The text
+  now names the hand-off seq and both branches, and the promote that loses nothing. Probed and
+  pinned (`a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`);
+  doc_truth floor 28 → 29.
+
+**Follow-ups.**
+- **State a cursorless tail's start in the stream.** Additive and non-breaking (an opening SSE
+  comment, say), so clients and oracles can see where "from now" fell. Not a pre-publish blocker.
+- **Reword the remedy texts subscribe-first.** Done in round 2 (below).
+- **The switchover's HandOff resend is dead for a caught-up reconnect.** Done in round 2 (below).
+
+## 2026-10-02 — D4 round 2: a target that reconnects caught up is handed off again, and every re-sync text gives the order that loses nothing
+
+**Why.** Both were ruled pre-publish product bugs from D4's concerns. The switchover's HandOff
+resend never fired for a target that reconnected already caught up, so a transient disconnect or
+reboot during a hand-off left no node writable until an operator acted. The remedy texts gave the
+read-first order D4's window test shows loses events. Branch `d4-fixes`; `d4-impl-report.md`,
+"Round 2".
+
+**Shipped.**
+- **The resend (repl).** A session records the position its `Hello` carried once
+  `decide_hello` verified it (a `Frames` answer). `drive_switchover` counts that position as
+  acked, for the drain's HandOff and for the HandedOff resend. The retention pin is unchanged.
+  - **Seed first.** A deterministic pin
+    (`a_switchover_target_that_restarts_before_taking_the_hand_off_is_sent_it_again`) was red on
+    the parent, a stall at seq 9, and is green with the fix.
+  - **Inversions, all red:** dropping the position from the caught-up test (the resend
+    re-killed); recording the position one too high; recording it one too low.
+  - **Over 64 fresh bases,** the switchover property's never-promoted stalls went 229 → 32, its
+    drain aborts 174 → 45, and its `CtrlOk`s 6,206 → 6,410.
+  - **Every one of the 32 remaining stalls has a traced cause:**
+    - 17 had the HandOff still in flight at the deadline. Driven 60 s on, every one became
+      primary on its own.
+    - 15 had the target's role write fail inside `accept_handoff`, and its reboot outlasted the
+      window. Of those, 1 reconnected 0.57 s before the deadline, but the primary's next step was
+      the deadline itself.
+- **The stall text stays true.** "has not taken" replaces "never took", and "confirmed it holds"
+  replaces "acked". GUIDE §10 separates the in-flight case from the down-past-the-deadline case,
+  and `a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply` probes the first.
+- **The remedy order.** Every site now gives the proven order: reconnect without a cursor, wait
+  for the stream to open, then re-sync through reads from the same node, applying each frame
+  idempotently. The sites:
+  - the kernel's four 409s;
+  - the `charpente.gap` and `charpente.reshaped` frames;
+  - the TS runtime's `CursorRefused`;
+  - GUIDE §11 and §14, and DESIGN §6.
+
+  The TS client gains `SubscribeOptions.onOpen`, without which "wait for the stream to open" is
+  not something a TS caller can do. Each text is pinned exactly, and each pin was shown to catch
+  the old wording at its site.
+
+**Moved.** The switchover pinned batch: `repl:logical-converged` 104 → 106, `stalled` 6 → 2, and
+one give-up (`role-file-torn`, from a universe that now completes its switchover). The GUIDE §8
+re-measure over the same 64 bases:
+
+| Measure (per base) | Before | After | Change |
+|---|---|---|---|
+| Reach mean | 96.97 | 100.16 | +2.16 Welch SE |
+| Give-ups | 2.94 | 3.05 | +0.36 SE |
+
+`SWITCHOVER_CONVERGED_FLOOR` is re-set from 88 to 90. Every other replication and realtime test's
+output is byte-identical to the round-1 tip.
+
+**Follow-ups.**
+- **The drain and the hand-off share one 30 s deadline.** A slow drain can leave a HandOff a
+  fraction of a second to be confirmed. This caused 17 of the 32 remaining stalls. All 17 resolve
+  on their own, but the CLI has already reported a stall by then. Giving HandedOff its own window
+  changes the CLI's wait, which is bounded by the same constant.
+- **A caught-up reconnect is acted on at the primary's next step,** which can be up to one
+  heartbeat later. In 1 universe in 16,384 the deadline came first. Making a due resend count as
+  `has_work` would close it.
+
+## 2026-10-02 — D4 round 3: a quiet-cluster switchover no longer aborts, a re-sync installs its read before the frames that beat it, and the stall reply names the promote race
+
+**Why.** The independent review of D4 returned MERGE AFTER FIXES: 0 Critical, 2 Important, 7
+Minor (`d4-review.md`). Branch `d4-fixes`; `d4-impl-report.md`, "Round 3 (review fixes)".
+
+**Shipped.**
+- **Fixed, and now named: a planned switchover on a quiet cluster aborted whenever its target
+  had reconnected since the last write (I1).** A target shipped nothing never acks again, so
+  before round 2 the drain never saw it caught up. It aborted at the 30 s deadline, naming a lag
+  of 10 records the target already held. This happened with no faults at all (seed
+  `0x2EB1_0D41`). Round 2's drain half fixed it, unpinned. The pin is
+  `a_switchover_after_the_target_reconnected_with_no_write_since_completes`.
+  - It is red with only the Draining half reverted: "lag is 0 record(s) (it acked Some(9), …)".
+  - It is red with the pre-D4 logic: "lag is 10 record(s) (it acked None, …)".
+- **The re-sync remedy states the order the client applies results in (I2), not only the order
+  it sends requests in.** Frames keep arriving while the read is in flight, and the TS runtime
+  dispatches them, and even `onEnd`, at once. A client that installs the read when it arrives
+  overwrites the changes whose frames beat it.
+  - **The proof came before the text.** realtime.rs's window rig now judges the state a client
+    ends in over every arrival order. An install-on-arrival client is red: it ends at latest 4,
+    not the node's 5. A client that holds frames until the read is installed is green, on a
+    follower and on a primary. A TS test shows the same thing on the real runtime.
+  - **The new text, at every site:** "…then read current state from the same node, holding
+    every frame that arrives until that read is installed and then applying the held frames and
+    every later one over it in order, idempotently".
+  - **The sites:** the four 409s, the gap and reshaped frames, `CursorRefused`, the `onOpen` and
+    `StreamEnd` docs, the generated client, GUIDE §11 and §14, and DESIGN §6. Each pinned site
+    was shown red under its old wording.
+- **A second `Hello` answered with a snapshot no longer leaves a stale position (M6).** A
+  second `Hello` on one connection, answered with a snapshot, kept the position the first one
+  proved, and a switchover handed off to the peer it was seeding (seed `0x2EB1_0D42`; red before
+  the reset). It now drains and aborts by name. That is all the reset holds. A peer that also
+  sends a stale or forged `Ack` can still look caught up. No real follower or witness probe sends
+  one (one `Hello` per connection), and what keeps a non-conformant peer out is `peer_secret`.
+- **A drain abort before the target confirmed anything says so (round 4, N2).** A target being
+  snapshot-seeded made the abort read "it confirmed it holds every record up to None". It now
+  reads "it has confirmed no record yet", pinned by the M6 test, which is red with the old
+  rendering.
+- **Minors.**
+  - **M1:** the stall reply names the promote race ("If the promote answers \"cannot promote:
+    this node is already the primary\" …").
+  - **M2:** the abort says "confirmed it holds", not "acked".
+  - **M4:** GUIDE §10 says the resend needs the target back at least a heartbeat (1 s) before
+    the deadline.
+  - **M5:** the F2 failure text no longer names a cause it never checked.
+  - **M7:** three comments are corrected.
+
+**Moved.** Nothing. Every replication and realtime test's output is identical to the round-2
+merge (`0c91203`), apart from a thread id in one `should_panic` line. The 4 new tests are the
+only additions.
+
+**Follow-ups.**
+- **M3 is routed to the S1 amendment:** the tenancy plan's A16 cursor refusal must give the
+  corrected remedy.
+- **GUIDE §11's gap-frame block carries no `<!-- pinned -->`.** Its `id: 1.0` line is under
+  doc_truth's 16-character minimum. The product text is pinned exactly in kernel.rs.
+- **Refusing an `Ack` beyond what its session has shipped** would be defence in depth against a
+  non-conformant peer. It needs its own analysis first: a legitimate follower may ack, on a new
+  session, records an earlier session shipped, and refusing that would stall a real drain.

@@ -3390,16 +3390,43 @@ fn cursor_below_floor_and_diverged_cursor_are_named_409s() {
     assert_eq!(responses.len(), 4);
     assert_eq!(responses[0].0, 200, "the flood commits");
     let body = |i: usize| String::from_utf8(responses[i].1.clone()).unwrap();
+    let error = |i: usize| {
+        let v: serde_json::Value = serde_json::from_slice(&responses[i].1).unwrap();
+        v["error"].as_str().unwrap().to_string()
+    };
+    // Each refusal names the re-sync remedy in the order that loses no event
+    // (realtime.rs's `the_resync_remedy_*` tests): subscribe first, read from
+    // the same node, hold frames until the read is installed, then apply them
+    // over it idempotently.
     assert_eq!(responses[1].0, 409, "{}", body(1));
-    assert!(body(1).contains("retention floor"), "{}", body(1));
+    assert_eq!(
+        error(1),
+        "cursor 1.0 is below this node's retention floor 8 — events that old are gone; reconnect \
+         without a cursor, wait for the stream to open, then read current state from the same \
+         node, holding every frame that arrives until that read is installed and then applying the \
+         held frames and every later one over it in order, idempotently"
+    );
     assert_eq!(responses[2].0, 409, "{}", body(2));
-    assert!(
-        body(2).contains("diverged") && body(2).contains("next event id"),
-        "{}",
-        body(2)
+    assert_eq!(
+        error(2),
+        "cursor 999.1 diverged from this node's timeline (next event id is 10) — your history came \
+         from another primary; reconnect without a cursor, wait for the stream to open, then read \
+         current state from the same node, holding every frame that arrives until that read is \
+         installed and then applying the held frames and every later one over it in order, \
+         idempotently"
     );
     assert_eq!(responses[3].0, 409, "{}", body(3));
-    assert!(body(3).contains("not"), "{}", body(3));
+    assert_eq!(
+        error(3),
+        format!(
+            "cursor 8.{max} diverged from this node's timeline (event 8 here has seq 1, not {max}) \
+             — your history came from another primary; reconnect without a cursor, wait for the \
+             stream to open, then read current state from the same node, holding every frame that \
+             arrives until that read is installed and then applying the held frames and every \
+             later one over it in order, idempotently",
+            max = u64::MAX
+        )
+    );
 }
 
 #[test]
@@ -3437,10 +3464,12 @@ fn a_tail_behind_retention_gets_the_gap_frame_then_closes() {
     assert_eq!(last.name, "charpente.gap");
     assert!(last.json.contains("\"floor\":4"), "{}", last.json);
     assert!(last.json.contains("\"tail\":1"), "{}", last.json);
-    assert!(
-        last.json.contains("reconnect without a cursor"),
-        "{}",
-        last.json
+    assert_eq!(
+        last.json,
+        "{\"floor\":4,\"tail\":1,\"fix\":\"reconnect without a cursor, wait for the stream to \
+         open, then read current state from the same node, holding every frame that arrives until \
+         that read is installed and then applying the held frames and every later one over it in \
+         order, idempotently\"}"
     );
     assert!(handles[0].closed());
 }

@@ -793,14 +793,17 @@ impl Repl {
         // advertising `to` (a reconnect may have left a stale/dead one still in
         // the Vec before the reap; a HandOffDone can also arrive buffered with
         // the peer's EOF). Take the highest acked seen, and prefer a live
-        // session to send the HandOff on.
+        // session to send the HandOff on. A verified Hello position counts as
+        // acked: a target that reconnects already caught up is shipped nothing
+        // while this node is write-stopped, so it never acks again, and without
+        // it the resend below could never fire (D4 round 2).
         let mut got_done = false;
         let mut best_acked: Option<u64> = None;
         let mut live_target: Option<usize> = None;
         for (i, s) in self.sessions.iter_mut().enumerate() {
             if !s.control && s.listen.as_deref() == Some(to.as_str()) {
                 got_done |= s.drain_switchover_inbox();
-                best_acked = best_acked.max(s.acked);
+                best_acked = best_acked.max(s.acked).max(s.hello_position);
                 if !s.dead {
                     live_target = Some(i);
                 }
@@ -839,11 +842,13 @@ impl Repl {
                     return Ok(true);
                 }
                 if now >= deadline {
-                    self.stall_switchover(ctrl_id, &to, now);
+                    let at = last.expect("a HandOff is only ever sent at a durable position");
+                    self.stall_switchover(ctrl_id, &to, at, now);
                     return Ok(true);
                 }
                 // The HandOff was lost and the follower reconnected (a fresh
-                // session id, caught up again): resend once. If the follower
+                // session id, caught up again, which its verified Hello position
+                // shows): resend once. If the follower
                 // already promoted it will not reconnect, so this never
                 // double-promotes.
                 if caught_up && let Some(i) = live_target {
@@ -1056,8 +1061,9 @@ impl Repl {
     /// durably to primary, ack with `HandOffDone`, and start serving Hellos.
     fn accept_handoff(&mut self, db: &mut Db, at_seq: u64, _now: u64) -> io::Result<()> {
         if db.last_applied() != Some(at_seq) {
-            // The drain waits for acked == last, so this should be impossible;
-            // a named protocol error rather than a silent wrong promotion.
+            // The drain hands off only once the target has acked `last` or its
+            // verified Hello carried it, so this should be impossible; a named
+            // protocol error rather than a silent wrong promotion.
             let msg = format!(
                 "hand-off protocol error: the primary handed off at seq {at_seq} but this \
                  follower's last_applied is {:?} — the drain did not reach equality",
@@ -1157,12 +1163,18 @@ impl Repl {
             (Some(l), None) => l + 1,
             _ => 0,
         };
+        // A target being snapshot-seeded has confirmed nothing; "holds every
+        // record up to None" would read as a claim.
+        let confirmed = match acked {
+            Some(_) => format!("it confirmed it holds every record up to {acked:?}"),
+            None => "it has confirmed no record yet".to_string(),
+        };
         self.reply_ctrl(
             ctrl_id,
             &Msg::CtrlErr {
                 message: format!(
-                    "switchover to {to} aborted: the follower lag is {lag} record(s) (it acked \
-                     {acked:?}, this primary is at {last:?}) and the drain did not complete \
+                    "switchover to {to} aborted: the follower lag is {lag} record(s) \
+                     ({confirmed}, this primary is at {last:?}) and the drain did not complete \
                      before the {SWITCHOVER_DEADLINE_NANOS}ns deadline — this node is primary \
                      again and accepting writes"
                 ),
@@ -1175,16 +1187,33 @@ impl Repl {
 
     /// The `HandOff` was sent (point of no return) but no `HandOffDone` came
     /// back before the deadline: stay write-stopped, name the situation. The
-    /// durable role stays `HandingOff` — a restart resolves against `to`.
-    fn stall_switchover(&mut self, ctrl_id: u64, to: &str, now: u64) {
+    /// durable role stays `HandingOff` — a restart resolves against `to` once
+    /// `to` is a primary, and never before.
+    ///
+    /// Both answers to "did `to` take it?" leave this node write-stopped. A
+    /// `to` that lost the `HandOff` and reconnected caught up at least a
+    /// heartbeat before the deadline was sent it again (`drive_switchover` runs
+    /// on the step the new session's heartbeat brings), so a `to` still a
+    /// follower here either has the `HandOff` in flight, and may yet take it and
+    /// become the primary, or was down past (or within a heartbeat of) the
+    /// deadline. Nothing resends after this reply.
+    fn stall_switchover(&mut self, ctrl_id: u64, to: &str, at: u64, now: u64) {
         self.reply_ctrl(
             ctrl_id,
             &Msg::CtrlErr {
                 message: format!(
-                    "switchover to {to}: the hand-off was sent but no confirmation returned \
-                     before the deadline — this node stays write-stopped; verify {to} has been \
-                     promoted (its role file says primary), then restart this node to resolve \
-                     against {to}"
+                    "switchover to {to}: the hand-off was sent at seq {at} but no confirmation \
+                     returned before the deadline — this node stays write-stopped and will not \
+                     resume writes on its own, because {to} may already be the primary. If \
+                     {to}'s role file says primary, restart this node to resolve against {to}: \
+                     it rejoins as {to}'s follower. If it still says follower, {to} has not \
+                     taken the hand-off yet and no node accepts writes: promote it (charpente \
+                     promote --node {to}) — it confirmed it holds every record up to seq {at} \
+                     and this node has accepted no write since, so its reply names \
+                     last_applied Some({at}) and nothing is lost — then restart this node to \
+                     resolve against {to}. If the promote answers \"cannot promote: this node \
+                     is already the primary\", {to} took a hand-off still in flight at the \
+                     deadline: just restart this node"
                 ),
             },
             now,

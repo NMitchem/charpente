@@ -63,6 +63,13 @@ pub(crate) struct Session {
     pub cursor: u64,
     /// The highest seq the follower has acknowledged durable, if any.
     pub acked: Option<u64>,
+    /// The position this follower's `Hello` carried, once `decide_hello`
+    /// verified it against this log (a `Frames` answer resuming past it). The
+    /// follower holds every record up to it durably, so a switchover counts it
+    /// as acked: a target that reconnects already caught up to a write-stopped
+    /// primary is shipped nothing and never sends another `Ack` (D4 round 2).
+    /// A later `Hello` on the same connection answered `Snapshot` clears it.
+    pub hello_position: Option<u64>,
     phase: Phase,
     /// A control connection: its first message was a control verb, not a
     /// `Hello`. It ships nothing, heartbeats nothing, and pins no retention;
@@ -92,6 +99,7 @@ impl Session {
             listen: None,
             cursor: 0,
             acked: None,
+            hello_position: None,
             phase: Phase::AwaitHello,
             control: false,
             pending_ctrl: None,
@@ -311,12 +319,17 @@ impl Session {
                     }
                     Decision::Frames { from } => {
                         self.listen = listen;
+                        self.hello_position = from.checked_sub(1);
                         self.cursor = from;
                         self.last_sent = now;
                         self.phase = Phase::Shipping;
                     }
                     Decision::Snapshot => {
                         self.listen = listen;
+                        // A position an earlier Hello on this connection proved
+                        // is not this answer's: the peer is being seeded, and
+                        // only its acks may show it caught up again.
+                        self.hello_position = None;
                         self.begin_seeding(db, now)?;
                     }
                 }
