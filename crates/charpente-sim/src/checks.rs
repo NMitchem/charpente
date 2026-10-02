@@ -101,7 +101,10 @@ pub fn is_fault_fallout(text: &str) -> bool {
 /// 8, the promise M1 replication makes good). Never use it to excuse wrong
 /// DATA (corruption must surface as loss or a named error, not as different
 /// bytes) or consistency violations (e.g. exactly-once) — a cut reverts
-/// state to a prefix, which stays consistent.
+/// state to a prefix, which stays consistent. In a multi-node workload, ask
+/// [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired)
+/// instead: it answers for one host's disk, so a refusal on one node is never
+/// excused by a fault on another.
 pub fn durable_corruption_fired(sim: &Sim) -> bool {
     let coverage = sim.coverage();
     coverage.get("fault:bit_flip").copied().unwrap_or(0) > 0
@@ -121,7 +124,11 @@ pub fn durable_corruption_fired(sim: &Sim) -> bool {
 /// path must do so ONLY when entry loss could have gapped the directory. With
 /// the recovery-cut ordering fixed (log.rs), the platform never itself leaves
 /// a durable gap, so a gap without this axis firing is a genuine platform
-/// regression that must fail loud — not be masked as a routine restore.
+/// regression that must fail loud — not be masked as a routine restore. In
+/// a multi-node workload, ask
+/// [`SimHost::dir_entry_loss_fired`](crate::SimHost::dir_entry_loss_fired)
+/// instead: it answers for one host's disk, so one node's gap is never
+/// excused by entry loss on another.
 pub fn dir_entry_loss_fired(sim: &Sim) -> bool {
     sim.coverage().get("fault:dir-entry").copied().unwrap_or(0) > 0
 }

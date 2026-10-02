@@ -1318,6 +1318,24 @@ silently wipe a follower the primary forked below; the refusal names both remedi
 re-seed a true laggard or promote the follower — Design B,
 `.superpowers/sdd/diverged-behind-investigation.md`); an empty (None-position) follower
 against a compacted log → snapshot-seed; otherwise `Frames` resume from position + 1.
+The sim's above-horizon replication property
+(`wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower`) meets that
+diverged-behind refusal for a follower it rebuilt from the surviving primary. It answers it
+with the remedy the refusal names, a fresh-data-dir re-seed (`repl:laggard-reseeded`), and
+only where the follower is provably a prefix of the primary. That proof is this handshake's,
+not the rig's wipe. The rebuild converged only once the primary accepted the follower's
+`Hello` (the prefix check at its position, or a snapshot seed of an empty follower). Since
+then the follower has appended only shipped frames, and the primary never recovered, so it
+never cut its log. The re-seed's wipe retries until it is whole and synced, and a follower
+that still reopens non-empty fails by name at the property's freshness check, before that
+handshake runs. A refusal inside a re-seed's own convergence gives up as
+`repl:inconclusive:reseed-refused-behind`. Once the primary has recovered, a diverged-behind
+refusal stays a failure. For the designated survivor it is a give-up of its own,
+`repl:inconclusive:survivor-refused-behind`, because re-seeding the survivor would void the
+promise it underwrites. A restore-needed refusal of either node is
+answered (restored, or given up) only when a fault injected on that node's own disk explains
+it: durable corruption for a below-horizon refusal, entry loss for a gapped log directory.
+Otherwise it fails as the platform durability bug it would be.
 Shipping reads exclusively through `Db::read_log` — CRC
 re-verified at read-back, capped at `last_applied`, so a frame corrupted on the primary's
 disk is refused by name rather than shipped, and the unsynced tail never travels. The
@@ -1822,7 +1840,9 @@ Charpente treats the coding agent as the primary developer persona:
   `acked_implies_durable` (the request-level ack-durability property, generalized for app
   workloads); and the two fire-time-marked axis companions `durable_corruption_fired` and
   `dir_entry_loss_fired`, which excuse a shortfall only in universes where that fault
-  actually fired. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
+  actually fired. `SimHost::durable_corruption_fired` and `SimHost::dir_entry_loss_fired`
+  are the same two scoped to a host, for a multi-node workload whose excuse must name the
+  node the fault fired on. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
   build/usage/infrastructure error.
 - **The edge harness (v0, implemented; `crates/edge-harness`).** The sim owns everything
   below the IO traits; the edge harness owns everything above them that only a real

@@ -2681,7 +2681,10 @@ for these before hand-rolling the same logic a fourth time:
   to excuse wrong data or a consistency violation (a cut reverts state to a prefix, which stays
   consistent). Note this is the *single-node* excuse: a workload with a
   converged follower keeps none of it, because a record the primary lost to
-  media corruption still lives on the follower.
+  media corruption still lives on the follower. In a multi-node workload,
+  ask `SimHost::durable_corruption_fired()` instead. It answers the same
+  question for one host's disk, so a refusal on one node is excused only by
+  corruption that fired on that node, never by a fault on another.
 - `boot_through_fallout(sim: &Sim, tries: u32, is_fallout: impl Fn(&str) -> bool, boot: impl FnMut() -> Result<T, E>) -> Result<Option<T>, E>`
   — boots the way a supervised process does: `boot`, and on an error your
   `is_fallout` accepts, boot again, `tries` boots in all. Each retry marks
@@ -2720,7 +2723,9 @@ for these before hand-rolling the same logic a fourth time:
   `Db::open`'s "a segment is missing … refusing to guess" to a restore path
   must do so *only* when this returns true: the platform never leaves a
   durable directory gap on its own, so a gap in a universe where the axis
-  never fired is a real regression and must fail loud.
+  never fired is a real regression and must fail loud. In a multi-node
+  workload, ask `SimHost::dir_entry_loss_fired()` instead: it answers for one
+  host's disk, so one node's gap is never excused by entry loss on another.
 
 ```rust,ignore
 pub fn classify(text: &str) -> FaultReason   // Injected | Poisoned | RedbLatch
@@ -3994,6 +3999,12 @@ follower that is actually *ahead* of a primary that forked behind it. If the
 follower truly just lagged, stop it, clear its data directory, and restart it
 configured as a follower of the primary, never with a primary config;
 it re-seeds from a snapshot and converges.
+charpente's own replication suite applies that remedy itself in exactly one
+case: a follower it rebuilt from the surviving primary, provided the primary has
+never recovered. What proves that follower a prefix of the primary's timeline is
+this handshake, not the wipe: the rebuild converged only once the primary
+accepted the follower's `Hello`. Wherever it cannot prove that, it leaves the
+refusal standing, and so should you.
 
 ## 11. Realtime
 
