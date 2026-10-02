@@ -6357,6 +6357,15 @@ struct Mark {
     n: u64,
 }
 
+/// The one row every change overwrites: the latest change. A client that
+/// installs a stale read over a newer frame regresses it, which a set of marks
+/// alone could not show.
+#[table(global)]
+struct Latest {
+    id: Id<Latest>,
+    n: u64,
+}
+
 #[event]
 struct Marked {
     n: WireU64,
@@ -6373,18 +6382,28 @@ fn put_mark(tx: &mut Tx, body: MarkBody) -> Result<(), ApiError> {
         id: Id::from_raw(body.n.0),
         n: body.n.0,
     });
+    tx.put(&Latest {
+        id: Id::from_raw(0),
+        n: body.n.0,
+    });
     tx.emit(Marked { n: body.n });
     Ok(())
 }
 
+/// The marks, then the latest change: `1,2,3|3`.
 #[route(GET "/marks", public)]
 fn read_marks(tx: &mut Tx) -> Result<String, ApiError> {
     let marks = tx.scan::<Mark>()?;
-    Ok(marks
-        .iter()
-        .map(|m| m.n.to_string())
-        .collect::<Vec<_>>()
-        .join(","))
+    let latest = tx.get::<Latest>(Id::from_raw(0))?;
+    Ok(format!(
+        "{}|{}",
+        marks
+            .iter()
+            .map(|m| m.n.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        latest.map(|l| l.n.to_string()).unwrap_or_default()
+    ))
 }
 
 #[route(SSE "/marks-feed", public, emits(Marked))]
@@ -6397,7 +6416,7 @@ fn spawn_marks_node(sim: &Sim, host: &str, cfg: ReplConfig) -> RNode {
     let h = sim.host(host);
     let mut app = App::open(
         Box::new(h.disk()),
-        Schema::new().table::<Mark>(),
+        Schema::new().table::<Mark>().table::<Latest>(),
         Box::new(h.entropy()),
         AppConfig {
             db: multi_node_db_cfg(),
@@ -6462,15 +6481,55 @@ enum Remedy {
     SubscribeThenRead,
 }
 
+/// What a client holds of the marks app: every mark it knows of, and the latest
+/// change.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct MarkState {
+    marks: BTreeSet<u64>,
+    latest: Option<u64>,
+}
+
+impl MarkState {
+    /// `GET /marks`'s body: `1,2,3|3`.
+    fn parse(body: &[u8]) -> MarkState {
+        let text = String::from_utf8_lossy(body).trim_matches('"').to_string();
+        let (marks, latest) = text.split_once('|').expect("marks|latest");
+        MarkState {
+            marks: marks
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse().unwrap())
+                .collect(),
+            latest: (!latest.is_empty()).then(|| latest.parse().unwrap()),
+        }
+    }
+
+    /// One `Marked` frame, applied idempotently: a mark is a set member, and
+    /// the latest change is the frame's own.
+    fn apply(&mut self, n: u64) {
+        self.marks.insert(n);
+        self.latest = Some(n);
+    }
+}
+
+/// One run of the remedy: the changes by window, what the read returned, the
+/// frames the tail delivered in stream order, and the node's own state once
+/// everything has landed.
+struct RemedyRun {
+    by_window: [u64; 5],
+    read: MarkState,
+    frames: Vec<u64>,
+    node: MarkState,
+}
+
 /// One client carrying out `remedy` against the follower (or the primary),
 /// with one change landed in each of the five windows around its two
 /// requests: before the first is sent, while it is in flight (sent, not yet
 /// served), between its serve and the second's send, while the second is in
 /// flight, and after the second is served. Changes are written on the
 /// primary. On the follower a change "lands" when the shipped record has
-/// applied there; on the primary, when the primary has committed it. Returns
-/// the changes by window, what the read returned, and what the tail delivered.
-fn remedy_windows(remedy: Remedy, on_follower: bool) -> ([u64; 5], BTreeSet<u64>, BTreeSet<u64>) {
+/// applied there; on the primary, when the primary has committed it.
+fn remedy_windows(remedy: Remedy, on_follower: bool) -> RemedyRun {
     const IN_FLIGHT: u64 = 100_000_000;
     let sim = Sim::with_faults(0x2EB2_D400, FaultConfig::none());
     let mut p = spawn_marks_node(&sim, "p", rt_primary_cfg("p:1"));
@@ -6556,13 +6615,7 @@ fn remedy_windows(remedy: Remedy, on_follower: bool) -> ([u64; 5], BTreeSet<u64>
         if is_subscribe {
             handle = Some(nodes[target].sinks.lock().unwrap().last().cloned().unwrap());
         } else {
-            let text = String::from_utf8_lossy(&body).trim_matches('"').to_string();
-            read = Some(
-                text.split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.parse::<u64>().unwrap())
-                    .collect::<BTreeSet<u64>>(),
-            );
+            read = Some(MarkState::parse(&body));
         }
         // After this request is served (and before the next is sent).
         nodes[0].source.push_at(sim.now().as_nanos(), mark(after));
@@ -6586,7 +6639,7 @@ fn remedy_windows(remedy: Remedy, on_follower: bool) -> ([u64; 5], BTreeSet<u64>
         }
         assert!(rt_kernel_round(&sim, &mut nodes).unwrap());
     }
-    let delivered = handle
+    let frames = handle
         .frames()
         .iter()
         .map(|f| {
@@ -6594,7 +6647,70 @@ fn remedy_windows(remedy: Remedy, on_follower: bool) -> ([u64; 5], BTreeSet<u64>
             v["n"].as_str().unwrap().parse::<u64>().unwrap()
         })
         .collect();
-    (by_window, read.unwrap(), delivered)
+    nodes[target]
+        .source
+        .push_at(sim.now().as_nanos(), Request::new(Method::Get, "/marks"));
+    let index = if on_follower {
+        target_responses
+    } else {
+        p_responses
+    };
+    let (status, body) = await_response(&sim, &mut nodes, target, index);
+    assert_eq!(status, 200);
+    RemedyRun {
+        by_window,
+        read: read.unwrap(),
+        frames,
+        node: MarkState::parse(&body),
+    }
+}
+
+/// A client that installs the read's result the moment it arrives and applies
+/// each frame the moment it arrives.
+fn install_on_arrival(read: &MarkState, frames: &[u64], read_after: usize) -> MarkState {
+    let mut state = MarkState::default();
+    for &n in &frames[..read_after] {
+        state.apply(n);
+    }
+    state = read.clone();
+    for &n in &frames[read_after..] {
+        state.apply(n);
+    }
+    state
+}
+
+/// The remedy as the texts give it: hold every frame until the read is
+/// installed, install it, then apply the held frames and every later one over
+/// it in stream order. Where the read landed among the frames no longer
+/// matters, which is the point.
+fn hold_until_installed(read: &MarkState, frames: &[u64], _read_after: usize) -> MarkState {
+    let mut state = read.clone();
+    for &n in frames {
+        state.apply(n);
+    }
+    state
+}
+
+/// The oracle the remedy answers to: whatever order the read's response and the
+/// stream's frames reach the client in (each connection keeps its own order,
+/// so the read can land after any prefix of the frames), the client ends
+/// holding exactly the node's state. Names the first arrival order that does
+/// not.
+fn ends_at_the_nodes_state(
+    run: &RemedyRun,
+    client: fn(&MarkState, &[u64], usize) -> MarkState,
+) -> Result<(), String> {
+    for read_after in 0..=run.frames.len() {
+        let state = client(&run.read, &run.frames, read_after);
+        if state != run.node {
+            return Err(format!(
+                "with the read arriving after {read_after} of the frames {:?}, the client \
+                 ends at {state:?}, not the node's {:?} (the read returned {:?})",
+                run.frames, run.node, run.read
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The remedy every cursor refusal and terminal frame names, carried out
@@ -6607,7 +6723,9 @@ fn remedy_windows(remedy: Remedy, on_follower: bool) -> ([u64; 5], BTreeSet<u64>
 #[test]
 fn the_resync_remedy_subscribe_first_then_read_misses_no_change_in_any_window() {
     for on_follower in [true, false] {
-        let (by_window, read, delivered) = remedy_windows(Remedy::SubscribeThenRead, on_follower);
+        let run = remedy_windows(Remedy::SubscribeThenRead, on_follower);
+        let (by_window, read) = (run.by_window, run.read.marks);
+        let delivered: BTreeSet<u64> = run.frames.into_iter().collect();
         let seen: BTreeSet<u64> = read.union(&delivered).copied().collect();
         let missed: Vec<u64> = by_window
             .iter()
@@ -6635,7 +6753,9 @@ fn the_resync_remedy_subscribe_first_then_read_misses_no_change_in_any_window() 
 #[test]
 fn the_resync_remedy_read_first_then_subscribe_misses_the_changes_between_its_steps() {
     for on_follower in [true, false] {
-        let (by_window, read, delivered) = remedy_windows(Remedy::ReadThenSubscribe, on_follower);
+        let run = remedy_windows(Remedy::ReadThenSubscribe, on_follower);
+        let (by_window, read) = (run.by_window, run.read.marks);
+        let delivered: BTreeSet<u64> = run.frames.into_iter().collect();
         let seen: BTreeSet<u64> = read.union(&delivered).copied().collect();
         let missed: Vec<u64> = by_window
             .iter()
@@ -6647,6 +6767,53 @@ fn the_resync_remedy_read_first_then_subscribe_misses_the_changes_between_its_st
             vec![by_window[2], by_window[3]],
             "follower {on_follower}: read {read:?}, tail {delivered:?}"
         );
+    }
+}
+
+/// The remedy judged by the state a client ends in, not by the sets of what
+/// reached it (D4 round 3, review I2). Subscribe first, and a client that holds
+/// every frame until its read is installed, then applies the held frames over
+/// it in order, ends at the node's state for every order the read's response
+/// and the frames can arrive in, on a follower and on the primary.
+#[test]
+fn the_resync_remedy_ends_at_the_nodes_state_when_frames_wait_for_the_read() {
+    for on_follower in [true, false] {
+        let run = remedy_windows(Remedy::SubscribeThenRead, on_follower);
+        assert_eq!(
+            run.node,
+            MarkState {
+                marks: run.by_window.iter().copied().collect(),
+                latest: Some(run.by_window[4]),
+            },
+            "sanity: the node holds every change"
+        );
+        ends_at_the_nodes_state(&run, hold_until_installed)
+            .unwrap_or_else(|e| panic!("follower {on_follower}: {e}"));
+    }
+}
+
+/// The same oracle, failing where it must. A client that installs its read the
+/// moment it arrives ends wrong whenever the frame of a change that landed after
+/// the read was served reaches it first: that change is not in the read, the
+/// install overwrites it, and nothing delivers it again. Holding frames does
+/// not rescue the read-first order, which misses changes outright.
+#[test]
+fn installing_the_read_on_arrival_or_reading_first_ends_short_of_the_nodes_state() {
+    for on_follower in [true, false] {
+        let run = remedy_windows(Remedy::SubscribeThenRead, on_follower);
+        let err = ends_at_the_nodes_state(&run, install_on_arrival)
+            .expect_err("a client that installs the read on arrival must end wrong");
+        assert!(
+            err.starts_with(&format!(
+                "with the read arriving after {} of the frames",
+                run.frames.len()
+            )),
+            "follower {on_follower}: it ends wrong only once every frame, the last change's \
+             included, beat the read: {err}"
+        );
+        let read_first = remedy_windows(Remedy::ReadThenSubscribe, on_follower);
+        ends_at_the_nodes_state(&read_first, hold_until_installed)
+            .expect_err("reading first misses changes no holding can recover");
     }
 }
 

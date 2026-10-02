@@ -66,6 +66,55 @@ test("onOpen fires once, after the subscribe is accepted and before any frame", 
   assert.deepEqual(order, ["open", "invoice_paid", "invoice_voided", "closed"]);
 });
 
+// The order a re-sync APPLIES things in, not only the order it sends them
+// (D4 round 3, review I2). `onOpen` returns at once and frames dispatch as they
+// arrive, so a frame, and even `onEnd`, can reach the caller before a read
+// started in `onOpen` returns. Here the read was served before the invoice was
+// paid and voided; only its frames carry those changes. A client that installs
+// the read when it arrives overwrites both; one that holds the frames until the
+// read is installed, then applies them over it in order, ends current.
+test("frames that beat the re-sync's read must be held and applied over it", async () => {
+  const { restore } = stubSseResponse([
+    { event: "invoice_paid", data: invoicePaid },
+    { event: "invoice_voided", data: invoiceVoided },
+  ]);
+  const arrived: string[] = [];
+  const status = (ev: { event: string }) => (ev.event === "invoice_paid" ? "paid" : "voided");
+  let naive = "unknown";
+  let held = "unknown";
+  let installed = false;
+  const pending: string[] = [];
+  let read: Promise<void> | undefined;
+  try {
+    await new Api("http://fixture.invalid").feed({
+      onOpen: () => {
+        read = new Promise<void>((resolve) => setTimeout(resolve, 5)).then(() => {
+          arrived.push("read");
+          naive = "open";
+          held = "open";
+          for (const s of pending) held = s;
+          installed = true;
+        });
+      },
+      onEvent: (ev) => {
+        arrived.push(ev.event);
+        naive = status(ev);
+        if (installed) held = status(ev);
+        else pending.push(status(ev));
+      },
+      onEnd: (end) => {
+        arrived.push(end.kind);
+      },
+    });
+    await read;
+  } finally {
+    restore();
+  }
+  assert.deepEqual(arrived, ["invoice_paid", "invoice_voided", "closed", "read"]);
+  assert.equal(naive, "open", "installing the read on arrival overwrites both changes");
+  assert.equal(held, "voided");
+});
+
 test("a refused cursor never fires onOpen, and names the subscribe-first re-sync", async () => {
   const { restore } = stubJsonResponse(
     { error: "cursor 1.0 is below this node's retention floor 8" },
