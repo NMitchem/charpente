@@ -91,13 +91,31 @@ fn mismatch_notice(durable: &Role, config: &Role) -> String {
         describe(durable),
         describe(config),
     );
-    if matches!(durable, Role::Primary) && matches!(config, Role::Follower { .. }) {
-        notice.push_str(
-            "; demoting a primary requires a fresh data dir (re-seed) — a demoted \
-             primary's log may have diverged, and re-seeding is the only safe rejoin",
-        );
+    if let (Role::Primary, Role::Follower { primary }) = (durable, config) {
+        notice.push_str(&format!(
+            "; demoting a primary requires a fresh data dir (re-seed) — a demoted primary's log \
+             may have diverged, and re-seeding is the only safe rejoin; to re-seed, {}",
+            reseed_steps(primary)
+        ));
     }
     notice
+}
+
+/// The re-seed steps, in one sentence with the hazard they carry, for every
+/// text that prescribes a re-seed (S5 R2-I1). The data dir holds this role
+/// file, which outranks config, and the witness set. Delete them and config
+/// alone decides the role, so a cleared node started with a primary config
+/// comes up as a second writable primary that no witness gate sees. Found
+/// for a switchover-demoted former primary, whose role file says follower
+/// while its startup config still says primary: wiped and restarted as
+/// configured, it acked a write beside the real primary.
+pub(crate) fn reseed_steps(primary: &str) -> String {
+    format!(
+        "stop it, delete its data dir, and restart it configured as a follower of {primary} so \
+         it snapshot-seeds from it, never with a primary config: the durable role file that \
+         outranks config is deleted with the data dir, so a cleared node started as a primary \
+         comes up as a second writable primary"
+    )
 }
 
 fn line_crc(line: &str) -> u32 {
@@ -472,7 +490,11 @@ mod tests {
             "role file says primary, but config says follower of new-primary:9000 — the \
              durable role file always wins over config, never the reverse; demoting a primary \
              requires a fresh data dir (re-seed) — a demoted primary's log may have diverged, \
-             and re-seeding is the only safe rejoin"
+             and re-seeding is the only safe rejoin; to re-seed, stop it, delete its data dir, \
+             and restart it configured as a follower of new-primary:9000 so it snapshot-seeds \
+             from it, never with a primary config: the durable role file that outranks config \
+             is deleted with the data dir, so a cleared node started as a primary comes up as a \
+             second writable primary"
         );
     }
 

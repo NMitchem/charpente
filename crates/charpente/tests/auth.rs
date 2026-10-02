@@ -265,9 +265,9 @@ fn spawn_auth_node(
 ///
 /// DESIGN §4's compacted-log refusal ("cannot be rebuilt from the log alone")
 /// also names "restore this node" but is NOT one of these: callers check fault
-/// fallout for it (an injected fault inside `Store::open`, carrying its
-/// injected text) and otherwise fail — under redb 4.3.0 the crash model cannot
-/// brick the store.
+/// fallout for it and otherwise fail — under redb 4.3.0 the crash model cannot
+/// brick the store. (An injected fault inside `Store::open` no longer becomes
+/// the refusal at all: `Db::open` returns it as itself, DESIGN §4.)
 fn needs_restore(text: &str) -> bool {
     (text.contains("restore this node from a replica or backup")
         || text.contains("refusing to guess")

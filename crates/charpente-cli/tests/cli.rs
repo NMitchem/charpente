@@ -100,21 +100,24 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(r#""outcomes":[{"test":"counter_roundtrip","verdicts":37,"gave_up":27}]"#),
+        stdout.contains(r#""outcomes":[{"test":"counter_roundtrip","verdicts":52,"gave_up":12}]"#),
         "the per-test outcome split is the machine-readable field:\n{stdout}"
     );
     assert!(
-        stdout.contains(r#""verdicts":37,"gave_up":27,"outcomes""#),
+        stdout.contains(r#""verdicts":52,"gave_up":12,"outcomes""#),
         "the batch totals sit alongside the per-test split:\n{stdout}"
     );
     // Cross-checked a second way: `Sim::give_up` also marks coverage, so the
     // reported count and the coverage count must agree. Two independent paths
-    // to the same 27 — a constant wired into one of them cannot fake both.
+    // to the same 12 — a constant wired into one of them cannot fake both.
     // (36/28 before the 2026-09-07 barrier stream split re-rolled the fixture's
-    // universes; 32/32 until redb 4.3.0 re-rolled them again on 2026-09-30, with
-    // the new split identical across two runs. See `archive.rs`'s floor table.)
+    // universes; 32/32 until redb 4.3.0 re-rolled them again on 2026-09-30; 37/27
+    // until 2026-10-01, when S5 with D1 re-rolled them once more and
+    // `counter_roundtrip` began booting through `checks::boot_through_fallout`
+    // instead of giving up on its first faulted boot. Each split identical
+    // across two runs. See `archive.rs`'s floor table.)
     assert!(
-        stdout.contains(r#""universe:gave-up":27"#),
+        stdout.contains(r#""universe:gave-up":12"#),
         "give-up coverage must agree with the reported count:\n{stdout}"
     );
 }
@@ -177,7 +180,10 @@ fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
 
 /// The sentence this whole change exists to make true (MANIFESTO §9): a batch
 /// in which every universe gave up must not print as an unqualified success.
-/// Seed 0x1 is a measured give-up universe of `counter_roundtrip`.
+/// Seed 0x3 is a measured give-up universe of `counter_roundtrip`: the first
+/// seed counting up from 0x1 whose universe gives up, re-found 2026-10-01 when
+/// S5 with D1 re-rolled the fixture's universes and 0x1 began reaching a
+/// verdict.
 #[test]
 fn a_batch_where_every_universe_gave_up_is_not_an_unqualified_success() {
     let out = charpente()
@@ -185,7 +191,7 @@ fn a_batch_where_every_universe_gave_up_is_not_an_unqualified_success() {
             "test",
             "--sim",
             "--seed",
-            "0x1",
+            "0x3",
             "--filter",
             "counter_roundtrip",
             "--dir",

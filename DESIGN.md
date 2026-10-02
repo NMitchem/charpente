@@ -517,10 +517,11 @@ durable horizon — and threads it through `Engine::recover` into
 error naming the frame, the horizon, and restore-from-replica/backup, never a cut (and
 the error path mutates nothing — no truncation, no segment deletion); above the horizon
 it is a torn tail and cuts exactly as before. The rule's other half guards the state no
-invalid frame can reveal: if the log's `base_seq` exceeds the horizon + 1, whole
-acknowledged records exist in neither the store nor the log (never a state checkpoint
-GC can produce — its floor is bounded by its own checkpoint's `applied_seq + 1`), and
-`Db::open` refuses with the same restore-naming error before recovery runs. Standalone
+invalid frame can reveal: if the log's `base_seq` exceeds the store's own `applied_seq` + 1
+(seq 0 for a store holding no records), whole acknowledged records exist in neither the
+store nor the log (never a state checkpoint GC can produce — its floor is bounded by its
+own checkpoint's `applied_seq + 1`), and `Db::open` refuses with a restore-naming error
+before recovery runs. Standalone
 `Wal::open` (no store in sight) keeps cut-at-first-invalid. M1 replication is what
 makes repair possible. One shape is exempted because it provably loses nothing: a
 checkpointed store beside an *entirely empty* log directory. Segment names are
@@ -546,7 +547,18 @@ is always a lower bound (never over-claims) and degrades silently to no witness 
 absent, torn, or CRC-invalid. `Seeder::new` discards any breadcrumb alongside the store and
 WAL it already discards, so a stale breadcrumb from a different, higher-numbered prior
 timeline sharing the disk can never survive a reseed and over-claim protection the new
-timeline never earned. The `.horizon` sidecar is part of the node's durable set: any
+timeline never earned. The breadcrumb protects a rebuild, and `Db::open` rebuilds only from
+a log that still reaches seq 0 (§4). It never lifts the vanished-prefix bound: that is
+measured against the store's own `applied_seq`, because the breadcrumb holds a horizon, not
+the records below the log's base. Until 2026-10-01 the bound was the breadcrumb-lifted
+horizon, and a boot whose store stopped short of the log's base passed it and panicked in
+the replay. A store removed by hand reached that state, and so did a crash inside
+`Seeder::new` between barriering the store's removal and the breadcrumb's (S5 R-I1, seed
+0x64a183075fd398b9), and so did an older copy of the store put back over a newer
+breadcrumb ("reached seq 38 but expected 20", S5 R2-M1). The exempt empty-log shape above
+replays from the horizon, so a breadcrumb past the store refuses there too, where it used to
+lay the segment past the store and panic at the first write. `Seeder::finish`'s write
+therefore changes no outcome: a seeded log starts at `applied_seq + 1`, never at 0. The `.horizon` sidecar is part of the node's durable set: any
 manual file-level restore of `store` + `wal/` must copy it or delete it alongside them —
 a leftover sidecar from the node's prior life would over-claim and refuse (by name, never
 silently) a legitimate torn tail above the restored horizon. The residual window *above*
@@ -1014,9 +1026,54 @@ per enqueue effect — id from the monotonic `next_job_id` meta counter (bumped 
 with `applied_seq` in the same store transaction, deterministic across replay), plus name,
 payload, key, status (Pending/Done/Dead), attempts, due_at, and last_error — the queue
 dispatcher's substrate (§6). Done and Dead rows are retained (GC is a later question,
-filed with WAL segment GC). A store that cannot open at all — e.g. a crash tore its
+filed with WAL segment GC). A store whose bytes redb rejects — e.g. a crash tore its
 creation — is discarded at `Db::open` and rebuilt by replaying the WAL
-from scratch; the log is the only source of truth. "Cannot open" includes a store file
+from scratch; the log is the only source of truth. `Store::open` reports that verdict as
+its own error, `table::StoreRejected`, classified by type in `table.rs`'s `open_error`:
+redb's `StorageError::Corrupted`, its `DatabaseError::UpgradeRequired` (a commit slot
+naming an older file format), and the one `io::Error` redb builds from the bytes at open,
+"Not a redb database: magic number mismatch" (`page_manager.rs:1137`). That last one has the
+same type as an IO error the disk returns, so `DiskBackend` wraps every error it passes up
+(`FromDisk`, `Display` and kind unchanged) and only an unwrapped `InvalidData` counts as
+the verdict. A variant not named there bubbles: the rejection deletes a store, so it needs
+positive evidence. Every error redb 4.3.0's `Builder::create_with_backend` can return, read
+in its source:
+
+| redb returns | class | why |
+|---|---|---|
+| `Storage(Corrupted(_))` | rejected, `Corrupted` | A verdict on the content: header fields, slot and page checksums, layout against length (`header.rs:254`/`:301`), btree, allocator. |
+| `UpgradeRequired(v)` | rejected, `UpgradeRequired { version }` | The commit slot's format version byte, read before its checksum (`header.rs:505`). |
+| `Storage(Io(e))`, `e` unmarked, kind `InvalidData` | rejected, `NotARedbFile` | The magic mismatch. The empty-file error beside it (`:1145`) cannot occur while creating is allowed. |
+| `Storage(Io(e))`, `e` is `FromDisk`, kind `UnexpectedEof` | bubbles, named | A file of 9 to 319 bytes with its magic intact: redb reads its 320-byte header past the end. Below. |
+| `Storage(Io(e))`, `e` is `FromDisk`, any other kind | bubbles | The disk's own error, passed through. |
+| `Storage(Io(e))`, `e` unmarked, any other kind | bubbles | redb's `invalid_input`/`unsupported`: no verdict on the bytes. |
+| `Storage(ValueTooLarge \| Unsupported \| PreviousIo \| DatabaseClosed \| LockPoisoned)`, `UnorderedKey` | bubbles | Not a verdict on the content. |
+| `DatabaseAlreadyOpen` | bubbles | Unreachable: `DiskBackend`'s lock methods return Unsupported, and `lock_whole_storage` returns Ok. |
+| `RepairAborted` | bubbles | Needs a repair callback; the default does nothing. |
+| `TransactionInProgress` | bubbles | Not produced at open. |
+| a later variant (both enums are `#[non_exhaustive]`) | bubbles | No positive evidence, so never destructive. |
+| `Store::open`'s own `disk.open`, `disk.sync_dir` | bubbles | Never classified. |
+
+**Every other open failure is not about the bytes** — the disk's own IO error, or redb's
+latch after one — so `Db::open` leaves the store alone and returns the error with its
+site and its fix named, kind and text kept: a restart retries the same file, and if every
+restart fails the same way the disk is failing. One bubbling error no restart fixes: a
+store file cut shorter than redb's header with the magic intact. redb makes a new file's
+length durable before it writes the magic (`page_manager.rs:1181-1200`), so no crash leaves
+one; it takes truncation outside the crash model. It is not a rejection, since redb built no
+verdict, so `Store::open` names the damage and `Db::open` names the fix, chosen by the log
+beside the store. While the log still reaches seq 0, the fix is to remove the file, and the
+next boot rebuilds the store from the log. Once the log is compacted, the store holds the
+only copy of the records below its base, so the fix is a restore from a replica or backup.
+Removing the file anyway is refused by name: `Db::open` refuses a store holding no records
+beside a log compacted past seq 0, whatever the horizon breadcrumb says (§2). M1's first text
+named removal for both logs, and on a compacted one the next boot panicked (S5 R-I1). The
+refusal names the restore, and for a follower the re-seed it amounts to, with the config the
+node must restart under (§5's re-seed rule).
+Before 2026-10-01 any `Store::open` error took the discard path: one transient
+fault deleted a healthy store on a full log, and on a compacted log refused the boot with
+"restore this node from a replica or backup" (follow-up 21, found by the S4 review: an
+injected fsync failure inside `Store::open`). The rejected class includes a store file
 whose length disagrees with its durable header's layout. redb 4.1.0 asserted on two such
 states (page_manager.rs:231/:257) — an unsynced `set_len` dropped at crash while the header
 god-page write survived (`:231`), or a crash tore a data-page write inside an unsynced
@@ -1035,10 +1092,16 @@ seq 0: `Db::checkpoint` durably persists the store, then deletes WAL segments be
 checkpoint (`Wal::gc`, floored at `DbConfig::retain_segments`, default 2; a caller-supplied
 retention pin can hold more), auto-firing every `DbConfig::checkpoint_every` committed
 records (default 4096; `0` disables the cadence — manual `checkpoint` only). Once the log
-is compacted past seq 0, an unopenable store is no longer rebuildable from the log alone —
+is compacted past seq 0, a rejected store is no longer rebuildable from the log alone —
 `Db::open` checks the log's base before discarding the store and returns a named hard
 error instead (naming the compaction, and the fix: restore from a replica/backup, or widen
-`retain_segments`) rather than silently losing the records below the old checkpoint.
+`retain_segments`) rather than silently losing the records below the old checkpoint. When
+the verdict is `UpgradeRequired` the text says so, and what it means here: charpente has
+only ever used redb 4.x, which writes format 3, so on a store the node created the version
+byte is damage and the fix is the restore. Only a format-2 file written by something else
+can be upgraded in place, with redb 2.6's `Database::upgrade()`; format 1 has no in-place
+upgrade. On a full log an `UpgradeRequired` store is rebuilt like any other rejected one,
+which loses nothing.
 A second sim-established redb finding (upstream-report material): direct corruption of the
 store file's durable bytes — bit flips, misdirected writes — can defeat redb's
 copy-on-write crash consistency entirely, either panicking internally or silently falling
@@ -1367,6 +1430,17 @@ it with its original config used to resume it as a second writable primary with 
 at all (neither node dials the other, so neither could observe the conflict). Two live,
 mutually invisible, diverged timelines; the mandated fresh-data-dir re-seed then destroys
 every write the resurrected node acked.
+
+The re-seed itself carries the same hazard. The data directory holds the durable role file
+and the witness set, so a node cleared for a re-seed has neither: config alone decides its
+role, and a cleared node restarted with a primary config is a second writable primary that
+no witness gate can see. A switchover-demoted former primary is exactly that node, since its
+role file says follower while its startup config still says primary: wiped and restarted as
+configured, it acked a write beside the real primary (S5 re-review 2, R2-I1). So every
+refusal and doc that prescribes a re-seed says, in the same sentence, to restart the cleared
+node configured as a follower of the current primary, and what a primary config does instead
+(`repl::role::reseed_steps`; `Db::open`'s vanished-prefix refusal types the same steps).
+Nothing structural fences it: the guard is the operator's config.
 
 **The boot gate** (M2 sub-project 0b, spec `docs/superpowers/specs/2026-07-31-dual-primary-
 design.md`) closes that for the case the node can see. A **witness** is a node this primary

@@ -16,7 +16,7 @@ use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 // transactions.rs/http.rs, which break-and-restart on the first Io error and
 // so use a narrower local wrapper. This is the identical-4-family case: the
 // shared classifier is used directly, no local wrapper needed.
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{boot_through_fallout, durable_refusal, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
 
 #[table(global)]
@@ -1415,20 +1415,28 @@ fn hit(tx: &mut Tx, body: Hit) -> Result<WireU64, ApiError> {
     Ok(body.slot)
 }
 
-fn loop_app(sim: &Sim) -> App {
-    App::open(
+fn loop_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
         Box::new(sim.disk()),
         Schema::new().table::<Counter>(),
         Box::new(sim.entropy()),
         AppConfig::default(),
-    )
-    .unwrap()
+    )?
     .mount(routes![hit])
     .mount_jobs(jobs![CountUp])
     .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
         slot: 777,
-    })
+    }))
 }
+
+/// How many boots a single-boot node here gets before its universe gives up by
+/// name (`checks::boot_through_fallout`): as many as the receipt property's v2
+/// loop. For its v1 boot, 8 left 12 of 256 universes exhausted at the pinned
+/// base, 16 left 3 and 64 none (2026-10-01, measured before D1's WAL recovery
+/// sync merged and again after it: the same counts). The round loops below
+/// need none: their next round is the retry, after a restart, and their final
+/// reopen loops have budgets of their own.
+const BOOT_TRIES: u32 = 64;
 
 /// Scripted request source for tests that need the reply itself (`SimSource`
 /// above only records `(status, body)`): drains a fixed list of requests in
@@ -2144,7 +2152,7 @@ fn loop_serves_requests_runs_jobs_and_ticks_cron() {
     }
     let responses = source.responses();
 
-    let mut kernel = Kernel::new(loop_app(&sim), Box::new(sim.clock())).unwrap();
+    let mut kernel = Kernel::new(loop_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
     kernel.run(&mut source).unwrap(); // returns at the horizon (Shutdown)
 
     let stats = kernel.stats();
@@ -2185,16 +2193,34 @@ fn loop_replays_identically_for_the_same_seed() {
             );
         }
         let responses = source.responses();
+        // Default faults reach the boot too, and it boots again as a
+        // supervised process does, so the loop still runs: until `Db::open`
+        // stopped discarding a store over an IO error, 0xC0FFEE's first boot
+        // met an injected write error that the discard absorbed.
         let run = (|| -> Result<(), std::io::Error> {
-            let mut kernel = Kernel::new(loop_app(&sim), Box::new(sim.clock()))?;
+            let Some(app) =
+                boot_through_fallout(&sim, BOOT_TRIES, is_fault_fallout, || loop_app(&sim))?
+            else {
+                return Ok(());
+            };
+            let mut kernel = Kernel::new(app, Box::new(sim.clock()))?;
             kernel.run(&mut source)
         })();
         let outcome = format!("{run:?}");
         let recorded = responses.lock().unwrap().clone();
-        (outcome, recorded, sim.durable_fingerprint(), sim.now())
+        let booted = !recorded.is_empty();
+        (
+            (outcome, recorded, sim.durable_fingerprint(), sim.now()),
+            booted,
+        )
     };
     for seed in [0x7, 0xB0B, 0xC0FFEE] {
-        assert_eq!(trace(seed), trace(seed), "seed {seed:#x}");
+        let (first, booted) = trace(seed);
+        assert!(
+            booted,
+            "seed {seed:#x}: the app never booted, so the loop this test replays never ran"
+        );
+        assert_eq!(first, trace(seed).0, "seed {seed:#x}");
     }
 }
 
@@ -2488,13 +2514,22 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its check
+/// and its jobs, so this budget is reach: over ten fresh bases at 256
+/// universes, booting once covered `job:done` 328.5 times per batch, and 4, 8
+/// and 16 boots 455.7, 486.1 and 508.4, for +13.4%, +20.6% and +28.8% CPU
+/// (+0.22, +0.34 and +0.48 s per batch). 8 is the largest of 4/8/16 under +25%
+/// (2026-10-01, S5 review I1).
+const KERNEL_ROUND_BOOT_TRIES: u32 = 8;
+
 /// DESIGN §4's compacted-log refusal ("cannot be rebuilt from the log alone")
 /// is NOT excused at any open site here. Under redb 4.1.0 one injected crash
 /// could leave a store file redb could not open, and a workload gave up on
 /// it; redb 4.3.0 syncs a file extension before any header records it, so the
 /// crash model can no longer produce that state, and reaching the refusal is a
-/// failure. An injected IO fault inside `Store::open` still reads as fault
-/// fallout, by its injected text, before the refusal is ever consulted. The
+/// failure. An injected IO fault inside `Store::open` reads as fault fallout
+/// by its own text: `Db::open` returns it as itself, never as the refusal. The
 /// refusal itself is pinned deterministically by transactions.rs
 /// `unopenable_store_with_compacted_wal_is_a_named_hard_error`.
 fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
@@ -2502,16 +2537,18 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(36 + entropy.next_u64() % 438);
-        let mut app = match kernel_crash_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                let e = e.to_string();
-                if !is_fault_fallout(&e) {
-                    return Err(format!("open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
+        let Some(mut app) =
+            boot_through_fallout(sim, KERNEL_ROUND_BOOT_TRIES, is_fault_fallout, || {
+                kernel_crash_app(sim)
+            })
+            .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(());
             }
+            sim.restart();
+            continue;
         };
         // The checker's own reads (snapshot/scan) are disk ops too: an armed
         // crash countdown can trip right here, so this call needs the same
@@ -2665,7 +2702,13 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                     sim.restart();
                 }
             },
-            Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+            // No restart clears a durable refusal (S5 re-review R-M2).
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(());
+                }
+                sim.restart();
+            }
             Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
@@ -2679,12 +2722,60 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
 
 /// The give-up cap. This base is ambient, so the count moves batch to batch,
 /// and the cap is a margin, not a measurement: over 10 fresh batches (redb
-/// 4.3.0, 64 reopens) it gave up 6-16 times, mean 10.8, and the cap is twice
+/// 4.3.0, 64 reopens) it gave up 6-16 times, mean 10.8, and the cap was twice
 /// that maximum, about 7 standard deviations above the mean. With 8 reopens
 /// the same batches gave up 48-64 times, so a return to that rate fails here.
 /// Pinning the base instead would re-baseline every universe this property
-/// examines.
-const KERNEL_GAVE_UP_CEILING: u64 = 32;
+/// examines. Re-measured 2026-10-01 for S5 with D1 (`Db::open` no longer
+/// discards a store over an IO error; WAL recovery syncs before replay): 10
+/// fresh batches gave up 9-18 times, mean 13.4, sd 3.2, so the cap is 36, 7.0
+/// standard deviations above the mean. Re-set 2026-10-01 with the round boots
+/// aimed (S5 review I1): 10 fresh batches gave up 14-31 times, mean 22.6, sd
+/// 4.8, so the cap is 62. The rise is not lost verdicts (GUIDE §8): against
+/// S5's parent on the same bases `job:done` rose 358.3 -> 485.2 (+15.7 SE) and
+/// passes that covered no `job:done` fell 50.5 -> 22.5 per batch. The new
+/// give-ups are universes whose store, once it held jobs, never booted again
+/// under their fault rate, which used to pass having checked nothing.
+const KERNEL_GAVE_UP_CEILING: u64 = 62;
+
+/// The reach floor, a margin like the cap (GUIDE §8): with the round boots
+/// aimed, 10 fresh batches covered `job:done` 458-520 times, mean 485.2, sd
+/// 19.1, and the floor is the mean less 4 standard deviations (2026-10-01, S5
+/// review I1).
+const KERNEL_JOB_DONE_FLOOR: u64 = 409;
+
+/// A durable refusal at the final check ends it at once, by name (S5 re-review
+/// R-M2). Seed `0x5bf2de4118bd9163`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("the final check never ran").
+#[test]
+fn a_durable_refusal_at_the_final_check_ends_it_at_once_by_name() {
+    const SEED: u64 = 0x5bf2_de41_18bd_9163;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = kernel_workload(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
 
 #[test]
 fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
@@ -2699,7 +2790,9 @@ fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
             "crash:torn",
             "restart",
             "tenant:multi_tenant_write",
+            "boot:booted-after-retry",
         ],
+        floor: [("job:done", KERNEL_JOB_DONE_FLOOR)],
         ceiling: [("universe:gave-up", KERNEL_GAVE_UP_CEILING)]
     );
 }
@@ -2857,7 +2950,7 @@ fn due_jobs_are_not_starved_by_a_request_flood() {
             Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
         );
     }
-    let mut app = loop_app(&sim);
+    let mut app = loop_app(&sim).unwrap();
     app.db_for_tests()
         .transact(|tx| {
             tx.enqueue(CountUp { slot: 7777 });
@@ -2940,7 +3033,7 @@ fn due_jobs_are_serviced_before_a_request_flood_exhausts_the_source() {
             Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
         );
     }
-    let mut app = loop_app(&sim);
+    let mut app = loop_app(&sim).unwrap();
     app.db_for_tests()
         .transact(|tx| {
             tx.enqueue(CountUp { slot: 7777 });
@@ -4707,27 +4800,33 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
     sim.crash_disk_after(22 + entropy.next_u64() % 174);
-    match gated_receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
-        Ok(mut kernel) => {
-            let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
-            let base = sim.now().as_nanos();
-            for i in 0..(1 + entropy.next_u64() % 6) {
-                source.push_at(
-                    base + i * SEC,
-                    Request::new(Method::Post, "/receipt").json(&ReceiptBody {
-                        invoice: WireU64(i),
-                    }),
-                );
-            }
-            if let Err(e) = kernel.run(&mut source)
-                && !is_fault_fallout(&e.to_string())
-            {
-                return Err(format!("v1 kernel.run failed non-injected: {e}"));
-            }
-        }
-        Err(e) if is_fault_fallout(&e.to_string()) => {}
-        Err(e) => return Err(format!("v1 boot failed non-injected: {e}")),
+    let Some(mut kernel) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || {
+        gated_receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock())))
+    })
+    .map_err(|e| format!("v1 boot failed non-injected: {e}"))?
+    else {
+        sim.give_up(format!(
+            "the v1 binary never booted in {BOOT_TRIES} boots, so it enqueued nothing for v2 \
+             to refuse or drain"
+        ));
+        return Ok(());
+    };
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
+    let base = sim.now().as_nanos();
+    for i in 0..(1 + entropy.next_u64() % 6) {
+        source.push_at(
+            base + i * SEC,
+            Request::new(Method::Post, "/receipt").json(&ReceiptBody {
+                invoice: WireU64(i),
+            }),
+        );
     }
+    if let Err(e) = kernel.run(&mut source)
+        && !is_fault_fallout(&e.to_string())
+    {
+        return Err(format!("v1 kernel.run failed non-injected: {e}"));
+    }
+    drop(kernel);
     sim.restart();
     for _ in 0..64 {
         let mut app = match gated_receipts_app(sim, true) {
@@ -4827,6 +4926,7 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| receipt_upgrade_universe(sim),
         require: [
+            "boot:booted-after-retry",
             "shapes:job-refused",
             "shapes:job-refused-after-crash",
             "shapes:job-drained",
@@ -4890,9 +4990,22 @@ fn job_shape_upgrades_replay_identically_for_the_same_seed() {
 /// | `shapes:job-refused` | 40 | 48 | 49 |
 /// | `shapes:job-refused-after-crash` | 14 | 18 | 17 |
 /// | `shapes:job-drained` | 115 | 117 | 117 |
-const RECEIPT_REFUSED_FLOOR: u64 = 49;
-const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 17;
-const RECEIPT_DRAINED_FLOOR: u64 = 117;
+///
+/// **Re-set 2026-10-01**, same base and count, two identical batches, for S5
+/// and D1 together: `Db::open` no longer discards a store over an IO error,
+/// the v1 boot boots again through `checks::boot_through_fallout` instead of
+/// leaving v2 an empty store after one faulted boot, and WAL recovery syncs
+/// each segment before replay (a sync with nothing to flush draws no fault).
+/// None fell; each is set on its new count.
+///
+/// | key | was | now |
+/// |---|---|---|
+/// | `shapes:job-refused` | 49 | 81 |
+/// | `shapes:job-refused-after-crash` | 17 | 30 |
+/// | `shapes:job-drained` | 117 | 140 |
+const RECEIPT_REFUSED_FLOOR: u64 = 81;
+const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 30;
+const RECEIPT_DRAINED_FLOOR: u64 = 140;
 
 // ------------------------------------------ job tenancy under the fault matrix
 
@@ -5421,6 +5534,16 @@ mod job_tenancy {
         }
     }
 
+    /// How many boots each round gets before it restarts and moves on
+    /// (`checks::boot_through_fallout`). A round whose boot fails skips its
+    /// check and its jobs, so this budget is reach: over ten fresh bases at
+    /// 256 universes, booting once covered `tenant:job_multi_tenant_write`
+    /// 219.4 times per batch, and 4, 8 and 16 boots 335.2, 368.7 and 391.5,
+    /// for +21.4%, +30.2% and +39.6% CPU (+0.45, +0.64 and +0.84 s per
+    /// batch). 4 is the largest of 4/8/16 under +25% (2026-10-01, S5 review
+    /// I1).
+    const JOB_TENANCY_ROUND_BOOT_TRIES: u32 = 4;
+
     /// One universe: `kernel_workload`'s shape. Three rounds, each of which
     /// crashes the disk at a random point, reopens, runs the oracle, seeds
     /// the keys, scripts paired requests, runs the kernel (dispatch and cron
@@ -5433,13 +5556,18 @@ mod job_tenancy {
         for _round in 0..3 {
             // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
             sim.crash_disk_after(31 + entropy.next_u64() % 376);
-            let mut app = match shop_app(sim) {
-                Ok(app) => app,
-                Err(e) if is_fault_fallout(&e.to_string()) => {
-                    sim.restart();
-                    continue;
+            let Some(mut app) =
+                boot_through_fallout(sim, JOB_TENANCY_ROUND_BOOT_TRIES, is_fault_fallout, || {
+                    shop_app(sim)
+                })
+                .map_err(|e| format!("open failed non-injected: {e}"))?
+            else {
+                // A durable refusal already gave the universe up, by name.
+                if sim.gave_up().is_some() {
+                    return Ok(());
                 }
-                Err(e) => return Err(format!("open failed non-injected: {e}")),
+                sim.restart();
+                continue;
             };
             match jobs_stay_in_their_tenant(app.db_for_tests()) {
                 Ok(seen) => {
@@ -5512,7 +5640,13 @@ mod job_tenancy {
                     Err(msg) if is_fault_fallout(&msg) => sim.restart(),
                     Err(msg) => return Err(msg),
                 },
-                Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                Err(e) if is_fault_fallout(&e.to_string()) => {
+                    if durable_refusal(sim, &e.to_string())? {
+                        return Ok(());
+                    }
+                    sim.restart();
+                }
                 Err(e) => return Err(format!("final open failed non-injected: {e}")),
             }
         }
@@ -5524,13 +5658,58 @@ mod job_tenancy {
         Ok(())
     }
 
-    /// The give-up cap, exact at the pinned base: 16 of 256 universes gave up
-    /// in two identical batches (redb 4.3.0, 64 reopens; 49 with 8).
-    const JOB_TENANCY_GAVE_UP_CEILING: u64 = 16;
+    /// The give-up cap, exact at the pinned base: 30 of 256 universes gave up
+    /// in two identical batches with the round boots aimed (2026-10-01, S5
+    /// review I1). It was 16 at their parent (redb 4.3.0, 64 reopens; 49 with
+    /// 8) and 17 unaimed. The rise is not lost verdicts (GUIDE §8): against
+    /// S5's parent over ten fresh bases the reach key rose 240.9 -> 334.4
+    /// (+15.4 SE) and passes that covered none of it fell 103.4 -> 79.4 per
+    /// batch, while give-ups went 12.1 -> 23.9.
+    const JOB_TENANCY_GAVE_UP_CEILING: u64 = 30;
+
+    /// The reach floor, exact at the pinned base: 312 checked recoveries saw
+    /// jobs from more than one tenant in two identical batches with the round
+    /// boots aimed (2026-10-01, S5 review I1). Unaimed it read 216, and over
+    /// ten fresh bases the mean was 5.4 Welch standard errors below S5's
+    /// parent with no bound noticing.
+    const JOB_TENANCY_MULTI_TENANT_WRITE_FLOOR: u64 = 312;
 
     /// Job-tenancy spec §9 item 4. A fixed base, like every permanent swarm
     /// property here. N was set by timing one batch (Step 3): the commit and
     /// the LEDGER state it.
+    /// A durable refusal at the final check ends it at once, by name (S5 re-review
+    /// R-M2). Seed `0xec4ba53447d494ba`, at the batch's base, meets one there. No restart
+    /// clears it, and the loop used to spend its whole budget on it, then give
+    /// up as though every attempt had hit an injected fault ("the final check never ran").
+    #[test]
+    fn a_durable_refusal_at_the_final_check_ends_it_at_once_by_name() {
+        const SEED: u64 = 0xec4b_a534_47d4_94ba;
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        if let Err(e) = job_tenancy_universe(&mut sim) {
+            panic!("seed {SEED:#x}: {e}");
+        }
+        assert_eq!(
+            sim.coverage().get("boot:durable-refusal"),
+            Some(&1),
+            "seed {SEED:#x}: {:?}",
+            sim.coverage()
+        );
+        let reason = sim
+            .gave_up()
+            .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+        assert!(
+            reason.starts_with(
+                "the boot was refused for durable corruption at or below the store's horizon"
+            ),
+            "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+        );
+    }
+
     #[test]
     fn every_job_runs_in_the_tenant_it_was_enqueued_from() {
         run_universes_swarm_with!(
@@ -5544,7 +5723,12 @@ mod job_tenancy {
                 "tenant:job_fan_out",
                 "tenant:anonymous_refused",
                 "job:retried",
+                "boot:booted-after-retry",
             ],
+            floor: [(
+                "tenant:job_multi_tenant_write",
+                JOB_TENANCY_MULTI_TENANT_WRITE_FLOOR
+            )],
             ceiling: [("universe:gave-up", JOB_TENANCY_GAVE_UP_CEILING)]
         );
     }

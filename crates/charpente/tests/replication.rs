@@ -382,11 +382,12 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
         }
         match reopen(sim, node) {
             Ok(()) => return Ok(()),
-            // Fallout first: DESIGN §4's compacted-log refusal ("cannot be rebuilt
-            // from the log alone") is excused only here, when an injected fault
-            // inside `Store::open` caused it and the refusal carries that text.
-            // A bare refusal is a failure — under redb 4.3.0 the crash model
-            // cannot brick the store.
+            // Fallout first: an injected fault inside `Store::open` bubbles from
+            // `Db::open` as itself and is excused here by its own text. DESIGN
+            // §4's compacted-log refusal ("cannot be rebuilt from the log alone")
+            // now carries only redb's verdict on the store's bytes, never an
+            // injected cause, so reaching it is a failure — under redb 4.3.0 the
+            // crash model cannot brick the store.
             Err(e) if is_fault_fallout(&e) => last = e, // open faulted; retry, cycling periodically
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
@@ -1114,7 +1115,13 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// give-ups fell from 92 to 3, all three `:recover-exhausted:injected`. The
 /// floor is set on the new count, keeping this constant's convention, so a
 /// return to the old give-up rate is now red.
-const CONVERGED_FLOOR: u64 = 253;
+///
+/// **253 -> 256 on 2026-10-01**, two identical batches, for S5 and D1 together
+/// (`Db::open` no longer discards a store over an IO error; WAL recovery, the
+/// role file and the witness slots sync before a boot trusts them; a sync with
+/// nothing to flush draws no fault). Every universe reaches a verdict and the
+/// three give-ups are gone. Set on the new count, the same convention.
+const CONVERGED_FLOOR: u64 = 256;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
 /// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on
@@ -1415,7 +1422,14 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 /// finish with a primary too small to move its base. 190 + 28 + 38 = 256. At
 /// p = 190/256 = 0.742 one SE is 7.0, so 190 − 2·7.0 = 176.0 → 176, the same
 /// convention; it tolerates a 7.4% relative fall.
-const SEEDED_CONVERGED_FLOOR: u64 = 176;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 198 of
+/// 256 (190 at their parent, 796bff2). The give-ups fell 28 → 22, all
+/// `:recover-exhausted:injected`, and `repl:seed-base-zero` reads 36, so
+/// 198 + 22 + 36 = 256. At p = 198/256 = 0.773 one SE is 6.70, so
+/// 198 − 2·6.70 = 184.6 → 184, the same convention; it tolerates a 7.1%
+/// relative fall.
+const SEEDED_CONVERGED_FLOOR: u64 = 184;
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
     let mut p = spawn_node_with_schema(
@@ -2010,7 +2024,10 @@ fn diverged_follower_is_refused_by_name() {
             "but this primary's last durable position is seq {last} (crc n/a) — the follower \
              holds records this primary never had (or lost), a forked timeline that can never \
              be merged; re-seed the follower from a fresh data dir (stop it, delete its data \
-             dir, restart to snapshot-seed from this primary)"
+             dir, and restart it configured as a follower of this primary so it snapshot-seeds \
+             from it, never with a primary config: the durable role file that outranks config \
+             is deleted with the data dir, so a cleared node started as a primary comes up as a \
+             second writable primary)"
         )),
         "refusal must name the primary's last durable seq {last} and the fix: {err}"
     );
@@ -2258,7 +2275,10 @@ fn a_seeded_follower_with_zero_frames_refuses_a_lossy_primary() {
             "but this primary's last durable position is seq {p_last_after} (crc n/a) — the \
              follower holds records this primary never had (or lost), a forked timeline that \
              can never be merged; re-seed the follower from a fresh data dir (stop it, delete \
-             its data dir, restart to snapshot-seed from this primary)"
+             its data dir, and restart it configured as a follower of this primary so it \
+             snapshot-seeds from it, never with a primary config: the durable role file that \
+             outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary)"
         )),
         "refusal must name the primary's last {p_last_after} and the fix: {err}"
     );
@@ -2436,10 +2456,13 @@ fn expected_diverged_behind(pos_seq: u64, base: u64) -> String {
          {pos_seq} to compare, this primary cannot prove the follower's records are a prefix of \
          its own timeline, and re-seeding here would silently overwrite whatever the follower \
          holds; if the follower merely lagged past the retained window, re-seed it deliberately \
-         from a fresh data dir (stop it, delete its data dir, restart to snapshot-seed from this \
-         primary); if instead this primary forked below the follower (recovered past an \
-         above-horizon corruption cut and kept serving), promote the follower and re-seed this \
-         node from it"
+         from a fresh data dir (stop it, delete its data dir, and restart it configured as a \
+         follower of this primary so it snapshot-seeds from it, never with a primary config: the \
+         durable role file that outranks config is deleted with the data dir, so a cleared node \
+         started as a primary comes up as a second writable primary); if instead this primary \
+         forked below the follower (recovered past an above-horizon corruption cut and kept \
+         serving), promote the follower and re-seed this node from it the same way, configured \
+         as a follower of the promoted node"
     )
 }
 
@@ -2554,6 +2577,167 @@ fn a_converged_follower_below_a_forked_primarys_base_is_refused_not_rewound() {
         fp_before,
         "the follower's data must be untouched — no silent re-seed from the forked primary"
     );
+}
+
+/// `diverged_crc`'s text, pinned (S5 R2-I1: a pin for each refusal text that
+/// prescribes a re-seed). A follower forked at a seq the primary also holds,
+/// with different bytes, is refused by CRC, and the fix names the config the
+/// cleared follower must restart under. This test computes neither CRC
+/// (error-suite T8's CRC carve-out), so the text is pinned on both sides of
+/// them.
+#[test]
+fn a_follower_forked_at_a_seq_the_primary_holds_is_refused_by_crc_naming_the_reseed_config() {
+    let sim = Sim::with_faults(0x5E5F_1002, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    let fork = p.db.as_ref().unwrap().last_applied().expect("p committed") + 1;
+
+    // Each side writes a different record at the same seq: the follower as a
+    // wrongly-promoted node would, the primary as it keeps serving.
+    sim.partition("p", "f");
+    {
+        let fdb = f.db.as_mut().unwrap();
+        fdb.allow_writes();
+        fdb.transact(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(999),
+                kind: 0,
+                weight: 1,
+            });
+            Ok::<(), io::Error>(())
+        })
+        .expect("the forking write commits locally");
+    }
+    commit_widget(&sim, &mut p, 10).unwrap();
+    assert_eq!(p.db.as_ref().unwrap().last_applied(), Some(fork));
+    assert_eq!(f.db.as_ref().unwrap().last_applied(), Some(fork));
+
+    sim.repair("p", "f");
+    recover_node(&sim, &mut f).unwrap();
+    // Both sit at `fork`, so `converged` holds already: drive until the refusal.
+    let err = run_until(&sim, &mut [&mut p, &mut f], |_| false, CONVERGE_BUDGET)
+        .expect_err("a follower forked at a seq the primary holds must be refused, never merged");
+    assert!(
+        err.starts_with(&format!(
+            "f step: diverged: the follower's frame at seq {fork} has crc 0x"
+        )),
+        "{err}"
+    );
+    assert!(
+        err.ends_with(&format!(
+            " (this primary is at seq {fork}) — the logs share a seq but not its bytes, a forked \
+             timeline that can never be merged; re-seed the follower from a fresh data dir (stop \
+             it, delete its data dir, and restart it configured as a follower of this primary so \
+             it snapshot-seeds from it, never with a primary config: the durable role file that \
+             outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary)"
+        )),
+        "{err}"
+    );
+}
+
+/// The re-seed the refusals prescribe, on the node it is most dangerous for
+/// (S5 R2-I1, the reviewer's probe): a former primary demoted by a
+/// switchover, whose durable role file says follower while its startup
+/// config still says primary. Its store is removed beside its compacted log,
+/// and the boot refuses by name, naming the step. Followed as named (the data
+/// dir deleted, the node restarted configured as a follower of the current
+/// primary), it re-seeds and converges. The second arm deletes the data dir
+/// and restarts the node with its old primary config, which the texts warn
+/// against: the role file that outranked that config went with the data dir,
+/// so the node comes up as a second writable primary and acks a write. That
+/// arm pins the warning's truth. A fence that closed the hazard would turn it
+/// red, and the texts would change with it.
+#[test]
+fn a_wiped_switchover_demoted_primary_rejoins_only_when_restarted_configured_as_a_follower() {
+    for as_follower in [true, false] {
+        let sim = Sim::with_faults(0x2EB1_0013, FaultConfig::none());
+        let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+        let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+        for i in 0..30u64 {
+            commit_widget(&sim, &mut p, i).unwrap();
+        }
+        run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+        p.flipped = true;
+        f.flipped = true;
+        let mut cli = CtrlConn::open(
+            &sim,
+            "p:1",
+            &Msg::CtrlSwitchover {
+                to: "f:1".to_string(),
+                secret: None,
+            },
+        )
+        .unwrap();
+        let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+        assert!(matches!(reply, Msg::CtrlOk { .. }), "switchover: {reply:?}");
+        let follower_of_f = Role::Follower {
+            primary: "f:1".to_string(),
+        };
+        assert_eq!(
+            p.repl.role(),
+            &follower_of_f,
+            "the switchover demoted p durably"
+        );
+        // f moves on as the primary. p is not driven again: f compacts past
+        // p's position, so p's next Hello would be refused as diverged behind.
+        for i in 30..40u64 {
+            commit_widget(&sim, &mut f, i).unwrap();
+        }
+        p.db.as_mut().unwrap().checkpoint().unwrap();
+        let base = p.db.as_ref().unwrap().log_base();
+        assert!(base > 0, "setup must compact p's log past seq 0");
+
+        p.db = None;
+        let disk = p.host.disk();
+        disk.remove("tables.redb").unwrap();
+        disk.sync_dir("tables.redb").unwrap();
+        p.host.restart();
+        let err = reopen(&sim, &mut p).expect_err("a compacted log beside no store must not boot");
+        assert!(
+            err.contains(&format!(
+                "but the log beside it starts at seq {base}: the acknowledged records from seq 0"
+            )) && err.contains(
+                "stop the node, delete its data dir, and restart it configured as a follower of \
+                 the current primary"
+            ),
+            "the refusal must name the step: {err}"
+        );
+
+        for name in disk.list("").unwrap() {
+            disk.remove(&name).unwrap();
+        }
+        disk.sync_dir("").unwrap();
+        p.host.restart();
+        if as_follower {
+            p.repl_cfg = follower_cfg("p:1", "f:1");
+            reopen(&sim, &mut p).unwrap();
+            assert_eq!(p.repl.role(), &follower_of_f);
+            let seeds = total_seeds(&p);
+            for i in 40..50u64 {
+                commit_widget(&sim, &mut f, i).unwrap();
+            }
+            run_until(&sim, &mut [&mut f, &mut p], converged, CONVERGE_BUDGET).unwrap();
+            assert!(total_seeds(&p) > seeds, "p must re-seed from f");
+            assert_converged(&sim, &mut f, &mut p).unwrap();
+            assert_eq!(
+                commit_widget(&sim, &mut p, 1000)
+                    .map_err(|e| e.starts_with("commit refused: not primary of ")),
+                Err(true),
+                "the re-seeded node must refuse writes as a follower"
+            );
+        } else {
+            reopen(&sim, &mut p).unwrap();
+            assert_eq!(p.repl.role(), &Role::Primary);
+            assert_eq!(f.repl.role(), &Role::Primary);
+            commit_widget(&sim, &mut p, 1000)
+                .expect("a cleared node started as a primary acks writes beside the real one");
+        }
+    }
 }
 
 /// Design B's deliberate cost, pinned so it is a choice and not an accident: a
@@ -4180,7 +4364,12 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
 /// `repl:switchover-inconclusive` (124 → 144), as the retry-budget experiment
 /// above predicts. At p = 103/256 = 0.402 one SE is 7.85, so 103 − 2·7.85 =
 /// 87.3 → 87; it tolerates a 15.5% relative fall.
-const SWITCHOVER_CONVERGED_FLOOR: u64 = 87;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 104 of
+/// 256 (103 at 796bff2), `repl:switchover-inconclusive` 146, no give-ups. At p
+/// = 104/256 = 0.406 one SE is 7.86, so 104 − 2·7.86 = 88.3 → 88; it tolerates
+/// a 15.4% relative fall.
+const SWITCHOVER_CONVERGED_FLOOR: u64 = 88;
 
 /// The result of one switchover attempt's drain.
 enum DrainResult {
@@ -4496,7 +4685,12 @@ fn failover_preserves_everything_the_follower_acked() {
 /// what they freed (52 → 75 `:failover-staging-gate`), and 77 give up in all.
 /// At p = 51/128 = 0.398 one SE is 5.54, so 51 − 2·5.54 = 39.9 → 39; it
 /// tolerates a 23.5% relative fall.
-const FAILOVER_PREFIX_FLOOR: u64 = 39;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 54 of
+/// 128 (51 at 796bff2). All 74 give-ups are `:failover-staging-gate`. At p =
+/// 54/128 = 0.422 one SE is 5.59, so 54 − 2·5.59 = 42.8 → 42; it tolerates a
+/// 22.2% relative fall.
+const FAILOVER_PREFIX_FLOOR: u64 = 42;
 
 fn failover_universe(sim: &mut Sim) -> Result<(), String> {
     let cfg = no_gc_cfg();
@@ -5267,9 +5461,10 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             // local copy is bricked and the fix is restore. Surface it (the
             // caller reseeds from the survivor) rather than retry into the same
             // durable bytes forever. DESIGN §4's compacted-log refusal names the
-            // same fix but is not this: it goes on to the fallout arm (an injected
-            // fault inside `Store::open`, carrying its injected text) or fails —
-            // under redb 4.3.0 the crash model cannot brick the store.
+            // same fix but is not this: it goes on to the fallout arm, which an
+            // injected fault inside `Store::open` reaches as itself (it no longer
+            // becomes the refusal), or fails — under redb 4.3.0 the crash model
+            // cannot brick the store.
             Err(e)
                 if e.contains("restore this node from a replica or backup")
                     && !e.contains("cannot be rebuilt from the log alone") =>
@@ -5885,17 +6080,29 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
     p.repl_cfg = follower_cfg("p:1", "f:1");
     p.flipped = true;
     p.recoveries += 1;
-    p.kernel = Some(
-        open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema).map_err(|e| {
-            if e.contains(INCONCLUSIVE) {
-                // Already covered at its own origin site — do not double-count.
-                e
-            } else {
-                sim.cover("repl:inconclusive:restore-reopen");
-                format!("{INCONCLUSIVE}: restore reopen: {e}")
+    // The fresh boot meets injected faults like any other: restart the host and
+    // boot again, as a supervised process would (`checks::boot_through_fallout`'s
+    // reason, on a host of its own), before calling the reopen inconclusive.
+    let mut opened = open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema);
+    for _ in 1..RECOVER_ATTEMPTS {
+        match &opened {
+            Err(e) if is_fault_fallout(e) && !e.contains(INCONCLUSIVE) => {
+                sim.cover("boot:retried");
+                p.host.restart();
+                opened = open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema);
             }
-        })?,
-    );
+            _ => break,
+        }
+    }
+    p.kernel = Some(opened.map_err(|e| {
+        if e.contains(INCONCLUSIVE) {
+            // Already covered at its own origin site — do not double-count.
+            e
+        } else {
+            sim.cover("repl:inconclusive:restore-reopen");
+            format!("{INCONCLUSIVE}: restore reopen: {e}")
+        }
+    })?);
     // Drive the re-seed to convergence so the restore is real, not just wired.
     // Any failure here (a stall, or the freshly-restored node needing yet
     // another restore) is too much damage to adjudicate: inconclusive.
@@ -5980,7 +6187,12 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
 /// survivor's faults (inferred from the totals, not traced per universe). At
 /// p = 36/128 = 0.281 one SE is 5.09, so 36 − 2·5.09 =
 /// 25.8 → 25; it tolerates a 30.6% relative fall.
-const SURVIVOR_PROMISE_FLOOR: u64 = 25;
+///
+/// **Re-set 2026-10-01** for S5 and D1 together, two identical batches: 39 of
+/// 128 (36 at 796bff2). The 84 give-ups are `:survivor-faulted` 83 and
+/// `:role-file-torn` 1. At p = 39/128 = 0.305 one SE is 5.21, so 39 − 2·5.21 =
+/// 28.6 → 28; it tolerates a 28.2% relative fall.
+const SURVIVOR_PROMISE_FLOOR: u64 = 28;
 
 fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     let db_cfg = horizon_db_cfg();
@@ -6947,9 +7159,12 @@ fn a_resurrected_primary_refuses_by_name_when_its_witness_answers_as_a_primary()
          while it was down, so this node is not the primary any more. It has NOT demoted itself \
          — it cannot know which timeline you want to keep, and the writes it acked are not the \
          platform's to discard. If f:1 holds the timeline to keep, re-seed this node from a \
-         fresh data dir (stop it, delete its data dir, restart to snapshot-seed from f:1); if \
-         instead this node's records are the ones to keep, stop f:1, then clear this node's \
-         witness set (GUIDE §10) and restart it."
+         fresh data dir (stop it, delete its data dir, and restart it configured as a follower \
+         of f:1 so it snapshot-seeds from it, never with a primary config: the durable role \
+         file that outranks config is deleted with the data dir, so a cleared node started as \
+         a primary comes up as a second writable primary); if instead this node's records are \
+         the ones to keep, stop f:1, then clear this node's witness set (GUIDE §10) and \
+         restart it."
     );
 
     // The probe must not make its target record it (the probe Hellos with no

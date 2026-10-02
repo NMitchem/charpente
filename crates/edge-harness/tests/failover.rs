@@ -685,7 +685,11 @@ fn run_oracle(
             "role file says primary, but config says follower of {follower_repl_addr} — the \
              durable role file always wins over config, never the reverse; demoting a primary \
              requires a fresh data dir (re-seed) — a demoted primary's log may have diverged, \
-             and re-seeding is the only safe rejoin"
+             and re-seeding is the only safe rejoin; to re-seed, stop it, delete its data dir, \
+             and restart it configured as a follower of {follower_repl_addr} so it \
+             snapshot-seeds from it, never with a primary config: the durable role file that \
+             outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary"
         );
         let expected_notice_line = format!("charpente replication: {expected_notice}");
         let spawn_result = ChildNode::spawn(
@@ -1266,8 +1270,11 @@ fn run_resurrection_oracle(
                  any more. It has NOT demoted itself — it cannot know which timeline you want \
                  to keep, and the writes it acked are not the platform's to discard. If \
                  {follower_repl_addr} holds the timeline to keep, re-seed this node from a \
-                 fresh data dir (stop it, delete its data dir, restart to snapshot-seed from \
-                 {follower_repl_addr}); if instead this node's records are the ones to keep, \
+                 fresh data dir (stop it, delete its data dir, and restart it configured as a \
+                 follower of {follower_repl_addr} so it snapshot-seeds from it, never with a \
+                 primary config: the durable role file that outranks config is deleted with the \
+                 data dir, so a cleared node started as a primary comes up as a second writable \
+                 primary); if instead this node's records are the ones to keep, \
                  stop {follower_repl_addr}, then clear this node's witness set (GUIDE §10) and \
                  restart it."
             )
