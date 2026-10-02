@@ -2330,7 +2330,7 @@ you something real: either the workload never drives the system into that
 state, or the universe count is too low to make it likely.
 
 ```rust
-use charpente::{Db, DbConfig, Id, Schema, View, table};
+use charpente::{Db, DbConfig, Id, Schema, TxError, View, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{boot_through_fallout, is_fault_fallout, replays_identically};
 
@@ -2364,9 +2364,11 @@ fn counter_replays(sim: &mut Sim) -> Result<(), String> {
 
 /// Puts a row, restarts the simulated disk (crashes and reopens), and reads
 /// it back. Returns `None` — not a failure — when there is nothing to
-/// assert: the write was never acked, or either `Db::open` never booted
-/// through fault fallout (the harness's own fault paths, not this workload's
-/// contract, are under test elsewhere). `is_fault_fallout` recognizes the
+/// assert: an injected fault kept the write from its ack, or either
+/// `Db::open` never booted through fault fallout (the harness's own fault
+/// paths, not this workload's contract, are under test elsewhere). Only a
+/// `TxError::Io` can be fallout: the closure's own `App` error, or a
+/// follower's refusal, is this workload's bug. `is_fault_fallout` recognizes the
 /// sim's own injected-fault wording, the WAL/engine poison wording, and
 /// redb's "close and re-open the database" latch; `boot_through_fallout`
 /// boots again on those, and excuses a refusal for durable corruption only
@@ -2380,15 +2382,17 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     else {
         return Ok(None);
     };
-    let acked = db
-        .transact(|tx| {
-            tx.put(&Counter {
-                id: Id::from_raw(1),
-                hits: 1,
-            });
-            Ok::<_, std::io::Error>(())
-        })
-        .is_ok();
+    let acked = match db.transact(|tx| {
+        tx.put(&Counter {
+            id: Id::from_raw(1),
+            hits: 1,
+        });
+        Ok::<_, std::io::Error>(())
+    }) {
+        Ok(()) => true,
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => false,
+        Err(e) => return Err(format!("{e:?}")),
+    };
 
     sim.restart(); // power-cycles the simulated disk: unsynced writes tear or vanish
     drop(db); // the old handle is dead after restart — reopen, per its own contract
@@ -2422,7 +2426,7 @@ what it was told.
 Say so:
 
 ```rust
-use charpente::{Db, DbConfig, Id, Schema, View, table};
+use charpente::{Db, DbConfig, Id, Schema, TxError, View, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{boot_through_fallout, durable_corruption_fired, is_fault_fallout};
 
@@ -2451,9 +2455,15 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         });
         Ok::<_, std::io::Error>(())
     });
-    if put.is_err() {
-        sim.give_up("the write was never acknowledged, so there is no claim to check");
-        return Ok(());
+    match put {
+        Ok(()) => {}
+        // An injected fault kept the write from its ack: no claim to check.
+        // Any other error is the platform's, and fails, as the opens do.
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up("the write was never acknowledged, so there is no claim to check");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("{e:?}")),
     }
 
     sim.restart(); // a crash: unsynced writes tear or vanish

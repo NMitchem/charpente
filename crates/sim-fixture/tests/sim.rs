@@ -5,7 +5,7 @@
 use charpente::core::io::Entropy;
 use charpente::http::{App, AppConfig};
 use charpente::kernel::Dispatcher;
-use charpente::{Db, DbConfig, Id, Schema, View, jobs};
+use charpente::{Db, DbConfig, Id, Schema, TxError, View, jobs};
 use charpente_sim::Sim;
 use sim_fixture::{BumpCounter, FixtureCounter, NoteAdded};
 
@@ -63,14 +63,18 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
         ));
         return Ok(None);
     };
-    let acked = db
-        .transact(|tx| {
-            let id = Id::<FixtureCounter>::from_raw(7);
-            tx.put(&FixtureCounter { id, hits: 1 });
-            tx.emit(NoteAdded { note: id });
-            Ok::<_, std::io::Error>(())
-        })
-        .is_ok();
+    // Only an injected fault excuses a write that never acked; any other
+    // error is the platform's, and fails.
+    let acked = match db.transact(|tx| {
+        let id = Id::<FixtureCounter>::from_raw(7);
+        tx.put(&FixtureCounter { id, hits: 1 });
+        tx.emit(NoteAdded { note: id });
+        Ok::<_, std::io::Error>(())
+    }) {
+        Ok(()) => true,
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => false,
+        Err(e) => return Err(format!("{e:?}")),
+    };
     sim.restart();
     drop(db);
     let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
@@ -156,15 +160,17 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
         else {
             return Ok(vec![]);
         };
-        let acked = db
-            .transact(|tx| {
-                tx.put(&FixtureCounter {
-                    id: Id::<FixtureCounter>::from_raw(round),
-                    hits: round,
-                });
-                Ok::<_, std::io::Error>(())
-            })
-            .is_ok();
+        let acked = match db.transact(|tx| {
+            tx.put(&FixtureCounter {
+                id: Id::<FixtureCounter>::from_raw(round),
+                hits: round,
+            });
+            Ok::<_, std::io::Error>(())
+        }) {
+            Ok(()) => true,
+            Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => false,
+            Err(e) => return Err(format!("{e:?}")),
+        };
         Ok(if acked {
             vec![round.to_string()]
         } else {
@@ -293,21 +299,22 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
     let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
     let db = app.db_for_tests();
 
-    // `.is_ok()` rather than inspecting the error, matching this file's other
-    // properties: a transaction that did not commit was never acknowledged, so
-    // there is no claim to test in this universe.
-    let seeded = db
-        .transact(|tx| {
-            tx.put(&FixtureCounter { id, hits: 1 });
-            tx.enqueue(BumpCounter { note: id });
-            Ok::<(), std::io::Error>(())
-        })
-        .is_ok();
-    if !seeded {
-        sim.give_up(
-            "the seeding transaction never committed, so no job was ever enqueued".to_string(),
-        );
-        return Ok(None);
+    // A transaction an injected fault kept from committing was never
+    // acknowledged, so there is no claim to test in this universe. Any other
+    // error is the platform's, and fails, as this file's other properties do.
+    match db.transact(|tx| {
+        tx.put(&FixtureCounter { id, hits: 1 });
+        tx.enqueue(BumpCounter { note: id });
+        Ok::<(), std::io::Error>(())
+    }) {
+        Ok(()) => {}
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(
+                "the seeding transaction never committed, so no job was ever enqueued".to_string(),
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("{e:?}")),
     }
 
     dispatcher.note_enqueued(db.drain_enqueued());
