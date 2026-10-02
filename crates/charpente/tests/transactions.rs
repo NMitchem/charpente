@@ -3081,12 +3081,25 @@ fn seeder_new_clears_a_stale_breadcrumb_so_reseed_never_over_claims() {
 /// breadcrumb, then the log, barriering each removal before the next, so a
 /// crash between the first barrier and the second leaves no store, a
 /// breadcrumb, and a log compacted past seq 0. Nothing in that state can be
-/// rebuilt: the records below the log's base lived only in the store. Each
-/// universe crashes the re-seed at a disk op drawn from its seed, power-cycles
-/// and boots, and the boot must be one of four things: the old timeline whole,
-/// the new one whole, a fresh node (every byte of the old one discarded), or
-/// the named refusal. Anything else, a panic included, fails the universe.
-/// Measured at this base: 76 old, 40 new, 110 fresh, 30 refused.
+/// rebuilt: the records below the log's base lived only in the store.
+///
+/// Each universe crashes the re-seed at a disk op drawn from its seed and
+/// power-cycles. Before the boot, it reads what the crash left: the store's
+/// records (read from a copy, so the boot meets the bytes untouched), whether
+/// the breadcrumb survived, and the log's base. That state names the one
+/// outcome the boot may have (S5 re-review 2, R2-M2):
+/// - a log based past the store's own next seq is refused with the exact
+///   vanished-prefix text, whatever the breadcrumb says;
+/// - otherwise the store and log boot the old timeline whole, or the new one
+///   at `RESEED_AT`;
+/// - with no log and no records, the node boots fresh.
+///
+/// A different outcome fails the universe, and so does a panic or a state
+/// the crash model should not leave. The fresh outcome used to accept any
+/// empty boot, so a `Db::open` that deleted the log and booted empty beside
+/// a breadcrumb passed the batch, and only the seed pin caught it.
+/// Measured at this base: 76 old, 40 new, 110 fresh, 30 refused (6 of them
+/// beside the breadcrumb).
 #[test]
 fn a_reseed_cut_short_by_a_crash_boots_a_whole_timeline_or_refuses_by_name() {
     run_universes_swarm_with!(
@@ -3095,47 +3108,157 @@ fn a_reseed_cut_short_by_a_crash_boots_a_whole_timeline_or_refuses_by_name() {
         crash_model_only,
         |sim: &mut Sim| {
             let (base, crash_at) = crash_a_reseed(sim)?;
-            match Db::open(Box::new(sim.disk()), tiny_segments_cfg(), app_schema()) {
+            // The reads below are the oracle's, not the node's: no fault may
+            // roll on them, and none is left to roll on the boot either.
+            sim.quiesce_disk_faults();
+            let left = reseed_left(sim)?;
+            let expected = left.expected_boot().map_err(|e| {
+                format!(
+                    "a re-seed of a log compacted to seq {base}, crashed at disk op {crash_at}: {e}"
+                )
+            })?;
+            let got = match Db::open(Box::new(sim.disk()), tiny_segments_cfg(), app_schema()) {
                 Ok(db) => {
                     let rows = db
                         .snapshot()
                         .and_then(|snap| snap.scan::<Invoice>())
                         .map_err(|e| format!("read after boot: {e}"))?;
                     let rows = ids(&rows);
-                    let key = if rows == (0..23).collect::<Vec<_>>() {
-                        "reseed:old-timeline"
-                    } else if rows == [1000] && db.last_applied() == Some(RESEED_AT) {
-                        "reseed:new-timeline"
-                    } else if rows.is_empty() && db.last_applied().is_none() {
-                        "reseed:fresh"
-                    } else {
-                        return Err(format!(
-                            "a re-seed of a log compacted to seq {base}, crashed at disk op \
-                             {crash_at}, booted neither timeline nor a fresh node: rows \
-                             {rows:?}, last applied {:?}",
-                            db.last_applied()
-                        ));
-                    };
-                    sim.cover(key);
-                    Ok(())
+                    match (rows.as_slice(), db.last_applied()) {
+                        (rows, Some(22)) if rows == (0..23).collect::<Vec<_>>() => {
+                            ReseedBoot::OldTimeline
+                        }
+                        ([1000], Some(RESEED_AT)) => ReseedBoot::NewTimeline,
+                        ([], None) => ReseedBoot::Fresh,
+                        (rows, last) => ReseedBoot::Other(format!(
+                            "booted rows {rows:?}, last applied {last:?}"
+                        )),
+                    }
                 }
-                Err(e) if e.to_string().contains("restore this node from a replica or backup") => {
-                    sim.cover("reseed:refused");
-                    Ok(())
-                }
-                Err(e) => Err(format!(
+                Err(e) => ReseedBoot::Refused(e.to_string()),
+            };
+            if got != expected {
+                return Err(format!(
                     "a re-seed of a log compacted to seq {base}, crashed at disk op {crash_at}, \
-                     left a node whose boot failed without naming a fix: {e}"
-                )),
+                     left {left:?}, so the boot must be {expected:?}, but it was {got:?}"
+                ));
             }
+            sim.cover(match got {
+                ReseedBoot::OldTimeline => "reseed:old-timeline",
+                ReseedBoot::NewTimeline => "reseed:new-timeline",
+                ReseedBoot::Fresh => "reseed:fresh",
+                ReseedBoot::Refused(_) if left.breadcrumb => "reseed:refused-beside-breadcrumb",
+                ReseedBoot::Refused(_) => "reseed:refused",
+                ReseedBoot::Other(_) => unreachable!("an unexpected boot never equals a prediction"),
+            });
+            Ok(())
         },
         require: [
             "reseed:old-timeline",
             "reseed:new-timeline",
             "reseed:fresh",
             "reseed:refused",
+            "reseed:refused-beside-breadcrumb",
         ]
     );
+}
+
+/// What a crashed re-seed left on disk, read before the boot.
+#[derive(Debug)]
+struct ReseedLeft {
+    store: StoreLeft,
+    breadcrumb: bool,
+    log_base: Option<u64>,
+}
+
+#[derive(Debug)]
+enum StoreLeft {
+    Absent,
+    /// A file redb rejects: `Seeder::new`'s new store, its creation torn.
+    Rejected,
+    /// The store's `applied_seq`: `None` for a store holding no records.
+    Held(Option<u64>),
+}
+
+#[derive(Debug, PartialEq)]
+enum ReseedBoot {
+    OldTimeline,
+    NewTimeline,
+    Fresh,
+    Refused(String),
+    Other(String),
+}
+
+impl ReseedLeft {
+    /// The one boot this state allows, by the recovery-horizon rule: a log
+    /// based past the store's own next seq is refused, whatever the
+    /// breadcrumb says (DESIGN §2).
+    fn expected_boot(&self) -> Result<ReseedBoot, String> {
+        let held = match self.store {
+            // `Db::open` discards a store redb rejects, and rebuilds only
+            // from a log that still reaches seq 0; none survives beside one.
+            StoreLeft::Rejected if self.log_base.is_none() => return Ok(ReseedBoot::Fresh),
+            StoreLeft::Rejected => {
+                return Err(format!(
+                    "the crash left a state no crash should leave: {self:?}"
+                ));
+            }
+            StoreLeft::Absent => None,
+            StoreLeft::Held(applied) => applied,
+        };
+        let next = held.map_or(0, |applied| applied + 1);
+        Ok(match (held, self.log_base) {
+            (_, Some(base)) if base > next => {
+                ReseedBoot::Refused(vanished_prefix_refusal(held, base))
+            }
+            (Some(RESEED_AT), _) => ReseedBoot::NewTimeline,
+            (Some(applied), Some(_)) if applied > RESEED_AT => ReseedBoot::OldTimeline,
+            (None, None) => ReseedBoot::Fresh,
+            _ => {
+                return Err(format!(
+                    "the crash left a state no crash should leave: {self:?}"
+                ));
+            }
+        })
+    }
+}
+
+/// Reads the store's records from a copy of its bytes on a scratch disk, so
+/// the boot that follows meets the file exactly as the crash left it.
+fn reseed_left(sim: &Sim) -> Result<ReseedLeft, String> {
+    let disk = sim.disk();
+    let names = disk
+        .list("tables.redb")
+        .map_err(|e| format!("list the store: {e}"))?;
+    let store = if names.iter().any(|name| name == "tables.redb") {
+        let read = || -> io::Result<StoreLeft> {
+            let file = disk.open("tables.redb")?;
+            let mut bytes = vec![0u8; file.len()? as usize];
+            file.read_at(0, &mut bytes)?;
+            let scratch = Sim::with_faults(0, FaultConfig::none());
+            let copy = scratch.disk().open("tables.redb")?;
+            copy.write_at(0, &bytes)?;
+            copy.sync()?;
+            match Store::open(&scratch.disk(), "tables.redb") {
+                Ok(store) => Ok(StoreLeft::Held(store.applied_seq()?)),
+                Err(e) if StoreRejected::of(&e).is_some() => Ok(StoreLeft::Rejected),
+                Err(e) => Err(e),
+            }
+        };
+        read().map_err(|e| format!("read the store the crash left: {e}"))?
+    } else {
+        StoreLeft::Absent
+    };
+    let log_base = disk
+        .list("wal/")
+        .map_err(|e| format!("list the log: {e}"))?
+        .first()
+        .map(|name| segment_base(name));
+    Ok(ReseedLeft {
+        store,
+        breadcrumb: names.iter().any(|name| name == "tables.redb.horizon"),
+        log_base,
+    })
 }
 
 /// The crash model alone: where the crash lands and what survives it. An
