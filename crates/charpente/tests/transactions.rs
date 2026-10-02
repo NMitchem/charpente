@@ -528,9 +528,10 @@ fn is_injected(text: &str) -> bool {
     // makes every `Db::open` fail permanently passes the final-recovery arm
     // below green, because redb's latch wording is generic and is exactly
     // the wording a real store bug would wear (task-5 review C1,
-    // MUTATION-B6). Injected and DurableHorizon only (the latter is
-    // permanent — a universe that hits it on recovery retries into the
-    // every-attempt-died fallthrough).
+    // MUTATION-B6). Injected only: the durable-horizon refusal is excused
+    // where durable corruption fired and nowhere else, which its text cannot
+    // say, so every open site asks `checks::durable_refusal` first (S3b
+    // item 0; `boot_through_fallout` does it for the round boots).
     //
     // "breaks and restarts immediately" is load-bearing, not incidental: it
     // is what the multi-record arm's `stage_failed` break preserves. A
@@ -542,7 +543,6 @@ fn is_injected(text: &str) -> bool {
     matches!(
         charpente_sim::checks::classify(text),
         charpente_sim::checks::FaultReason::Injected
-            | charpente_sim::checks::FaultReason::DurableHorizon
     )
 }
 
@@ -801,11 +801,12 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             Ok(db) => db,
             Err(e) => {
                 let text = e.to_string();
+                // No restart clears a durable refusal (S5 re-review R-M2), and
+                // only a fired durable-corruption fault excuses one (S3b item 0).
+                if charpente_sim::checks::durable_refusal(sim, &text)? {
+                    return Ok(());
+                }
                 if is_injected(&text) {
-                    // No restart clears a durable refusal (S5 re-review R-M2).
-                    if charpente_sim::checks::durable_refusal(sim, &text)? {
-                        return Ok(());
-                    }
                     sim.restart();
                     continue;
                 }

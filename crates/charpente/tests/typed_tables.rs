@@ -502,15 +502,17 @@ fn recover_and_check(
         Ok(pair) => pair,
         Err(e) => {
             let text = e.to_string();
+            // No restart clears a durable refusal, so neither a round's
+            // recovery nor the final one tries again (S5 re-review R-M2); and
+            // only a fired durable-corruption fault excuses one, so it is
+            // judged before the fallout check (S3b item 0).
+            if charpente_sim::checks::durable_refusal(sim, &text)? {
+                return Ok(Recovered::GaveUp);
+            }
             if !is_fault_fallout(&text) {
                 return Err(format!(
                     "store open or WAL recovery failed non-injected: {e}"
                 ));
-            }
-            // No restart clears a durable refusal, so neither a round's
-            // recovery nor the final one tries again (S5 re-review R-M2).
-            if charpente_sim::checks::durable_refusal(sim, &text)? {
-                return Ok(Recovered::GaveUp);
             }
             return Ok(Recovered::Fallout);
         }

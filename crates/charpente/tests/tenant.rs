@@ -647,12 +647,14 @@ fn ledger_cfg() -> DbConfig {
 /// This binary's fault classifier, the narrow form `transactions.rs` uses and
 /// for the same reason: this workload breaks and restarts the universe on the
 /// first Io error, so it never sees a poisoned or redb-latched handle, and
-/// accepting those wordings here could only ever LOOSEN the oracle.
+/// accepting those wordings here could only ever LOOSEN the oracle. Nor the
+/// durable-horizon refusal: only a fired durable-corruption fault excuses it,
+/// so every open site asks `checks::durable_refusal` first (S3b item 0;
+/// `boot_through_fallout` does it for the round boots).
 fn is_injected(text: &str) -> bool {
     matches!(
         charpente_sim::checks::classify(text),
         charpente_sim::checks::FaultReason::Injected
-            | charpente_sim::checks::FaultReason::DurableHorizon
     )
 }
 
@@ -980,14 +982,15 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
             Ok(db) => db,
             Err(e) => {
                 let text = e.to_string();
+                // No restart clears a durable refusal (S5 re-review R-M2), and
+                // only a fired durable-corruption fault excuses one (S3b item 0).
+                if charpente_sim::checks::durable_refusal(sim, &text)? {
+                    return Ok(());
+                }
                 if !is_injected(&text) {
                     return Err(format!(
                         "final recovery failed with a non-injected error: {e}"
                     ));
-                }
-                // No restart clears a durable refusal (S5 re-review R-M2).
-                if charpente_sim::checks::durable_refusal(sim, &text)? {
-                    return Ok(());
                 }
                 sim.restart();
                 continue;

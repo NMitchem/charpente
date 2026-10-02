@@ -2721,14 +2721,18 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                     sim.restart();
                 }
             },
-            // No restart clears a durable refusal (S5 re-review R-M2).
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            // No restart clears a durable refusal (S5 re-review R-M2), and only a
+            // fired durable-corruption fault excuses one, so it is judged before the
+            // fallout check (S3b item 0).
+            Err(e) => {
                 if durable_refusal(sim, &e.to_string())? {
                     return Ok(());
                 }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("final open failed non-injected: {e}"));
+                }
                 sim.restart();
             }
-            Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
     // A universe that adjudicated nothing gives up; it does not pass.
@@ -4850,11 +4854,18 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     for _ in 0..64 {
         let mut app = match gated_receipts_app(sim, true) {
             Ok(app) => app,
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            Err(e) => {
+                // No restart clears a durable refusal, and only a fired
+                // durable-corruption fault excuses one (S3b item 0).
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(());
+                }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("v2 open failed non-injected: {e}"));
+                }
                 sim.restart();
                 continue;
             }
-            Err(e) => return Err(format!("v2 open failed non-injected: {e}")),
         };
         let receipts: Vec<JobRow> = match app
             .db_for_tests()
@@ -4937,6 +4948,40 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
 /// The universe count was set by timing batches (see the commit message); the
 /// seed base is fixed and replays with `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED`
 /// like every swarm here.
+/// A durable refusal at the v2 binary's boot gives the universe up at once,
+/// by name (S3b item 0). Seed `0xeeb32c0d58259628`, universe 31 at the batch's
+/// base, meets one there. The loop used to send it through
+/// `is_fault_fallout`, which excused it by its text alone, so it spent all 64
+/// boots on bytes no restart clears.
+#[test]
+fn a_durable_refusal_at_the_v2_boot_gives_up_at_once_by_name() {
+    const SEED: u64 = 0xeeb3_2c0d_5825_9628;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = receipt_upgrade_universe(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
+
 #[test]
 fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
     run_universes_swarm_with!(
@@ -5659,14 +5704,18 @@ mod job_tenancy {
                     Err(msg) if is_fault_fallout(&msg) => sim.restart(),
                     Err(msg) => return Err(msg),
                 },
-                // No restart clears a durable refusal (S5 re-review R-M2).
-                Err(e) if is_fault_fallout(&e.to_string()) => {
+                // No restart clears a durable refusal (S5 re-review R-M2), and only a
+                // fired durable-corruption fault excuses one, so it is judged before the
+                // fallout check (S3b item 0).
+                Err(e) => {
                     if durable_refusal(sim, &e.to_string())? {
                         return Ok(());
                     }
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("final open failed non-injected: {e}"));
+                    }
                     sim.restart();
                 }
-                Err(e) => return Err(format!("final open failed non-injected: {e}")),
             }
         }
         // A universe that adjudicated nothing gives up; it does not pass.

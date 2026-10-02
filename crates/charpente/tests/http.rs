@@ -1258,13 +1258,14 @@ fn http_state_matches(db: &Db, n: u64) -> Result<(), String> {
 // error, so no second op ever reaches a poisoned WAL or redb's latched
 // handle — Poisoned/RedbLatch cannot surface, and recognizing them here
 // would only ever LOOSEN this oracle. The reopen-time state checks remain
-// the oracle either way. Injected and DurableHorizon only (the latter a
-// legitimate fault-matrix consequence, not a bug, same as transactions.rs).
+// the oracle either way. Injected only: the durable-horizon refusal is
+// excused where durable corruption fired and nowhere else, which its text
+// cannot say, so every open site asks `checks::durable_refusal` first (S3b
+// item 0; `boot_through_fallout` does it for the round boots).
 fn is_injected(text: &str) -> bool {
     matches!(
         charpente_sim::checks::classify(text),
         charpente_sim::checks::FaultReason::Injected
-            | charpente_sim::checks::FaultReason::DurableHorizon
     )
 }
 
@@ -1398,14 +1399,15 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             Ok(app) => app,
             Err(e) => {
                 let text = e.to_string();
+                // No restart clears a durable refusal (S5 re-review R-M2), and
+                // only a fired durable-corruption fault excuses one (S3b item 0).
+                if charpente_sim::checks::durable_refusal(sim, &text)? {
+                    return Ok(responses);
+                }
                 if !is_injected(&text) {
                     return Err(format!(
                         "final recovery failed with a non-injected error: {e}"
                     ));
-                }
-                // No restart clears a durable refusal (S5 re-review R-M2).
-                if charpente_sim::checks::durable_refusal(sim, &text)? {
-                    return Ok(responses);
                 }
                 sim.restart();
                 continue;

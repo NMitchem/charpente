@@ -2083,12 +2083,13 @@ fn settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
         let app = match realtime_app(sim) {
             Ok(app) => app,
             Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("settle open failed non-injected: {e}"));
-                }
-                // No restart clears a durable refusal (S5 re-review R-M2).
+                // No restart clears a durable refusal (S5 re-review R-M2), and
+                // only a fired durable-corruption fault excuses one (S3b item 0).
                 if durable_refusal(sim, &e.to_string())? {
                     return Ok(None);
+                }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle open failed non-injected: {e}"));
                 }
                 continue;
             }
@@ -3188,8 +3189,18 @@ fn shapes_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
         }
         let app = match shapes_app(sim) {
             Ok(app) => app,
-            Err(e) if is_fault_fallout(&e.to_string()) => continue,
-            Err(e) => return Err(format!("shapes open failed non-injected: {e}")),
+            Err(e) => {
+                // No restart clears a durable refusal, and only a fired
+                // durable-corruption fault excuses one (S3b item 0). The
+                // workload checks for the give-up before every phase.
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(None);
+                }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("shapes open failed non-injected: {e}"));
+                }
+                continue;
+            }
         };
         match Kernel::new(app, Box::new(sim.clock())) {
             Ok(kernel) => return Ok(Some(kernel)),
@@ -3487,6 +3498,40 @@ fn decode_exact<T: Codec>(row: &EventRow, tag: u64) -> Result<T, String> {
 /// Spec §6.3's property. The universe count was set by timing one batch (see
 /// the commit message); the seed base is fixed and replays with
 /// `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED` like every swarm here.
+/// A durable refusal at a mixed-shapes boot gives the universe up at once, by
+/// name (S3b item 0). Seed `0x6439126a0a64fc94`, universe 105 at the batch's
+/// base, meets one there. `shapes_boot` used to send it through
+/// `is_fault_fallout`, which excused it by its text alone, so every boot of
+/// every phase spent its whole budget on bytes no restart clears.
+#[test]
+fn a_durable_refusal_at_a_shapes_boot_gives_up_at_once_by_name() {
+    const SEED: u64 = 0x6439_126a_0a64_fc94;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = shapes_workload(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
+
 #[test]
 fn a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix() {
     run_universes_swarm_with!(
@@ -3911,6 +3956,21 @@ fn local_copy_unrestorable(e: &str) -> bool {
         && !e.contains("cannot be rebuilt from the log alone")
 }
 
+/// Whether a fault on `host`'s own disk explains its `local_copy_unrestorable`
+/// refusal `e` (S3b item 0; the rule of replication.rs's
+/// `unexplained_restore_needed`): a gap by entry loss on that disk, anything
+/// else by durable corruption on it. A refusal nothing on that node explains
+/// is a platform durability bug, never an inconclusive skip. The property that
+/// recovers these nodes turns both durable-corruption axes off
+/// (`no_media_corruption`), so there only a gap can be explained.
+fn unrestorable_explained(host: &SimHost, e: &str) -> bool {
+    if e.contains("refusing to guess") {
+        host.dir_entry_loss_fired()
+    } else {
+        host.durable_corruption_fired()
+    }
+}
+
 /// `recover_rt_node`'s arms run `local_copy_unrestorable`, then fault fallout,
 /// then fail. The compacted-log refusal must reach the second (injected cause)
 /// or the third (none), never the first — and the first must still take what
@@ -3949,6 +4009,84 @@ fn the_compacted_log_refusal_is_fallout_or_a_failure_never_an_unrestorable_skip(
     assert!(local_copy_unrestorable("refusing to guess across a gap"));
 }
 
+/// S3b item 0: `recover_rt_node` skips a node whose local copy is
+/// unrestorable only when a fault on that node's own disk explains the
+/// refusal. Here a frame below the store's horizon is corrupted by hand, so
+/// nothing fired, which is what a durability bug looks like from the rig: the
+/// recovery must fail by name. Until item 0 it skipped the universe as
+/// inconclusive. The property behind this rig turns both durable-corruption
+/// axes off, so there this refusal could never be explained.
+#[test]
+fn an_unrestorable_local_copy_is_skipped_only_for_a_fault_on_its_own_disk() {
+    let sim = Sim::with_faults(0x53B0_0011, FaultConfig::none());
+    let mut p = spawn_rt_node(
+        &sim,
+        "p",
+        rt_primary_cfg("p:1"),
+        multi_node_db_cfg(),
+        RT_HORIZON,
+    )
+    .expect("spawns under FaultConfig::none()");
+    for n in 0..4u64 {
+        let ping = Request::new(Method::Post, "/ping").json(&EmitBody {
+            n: WireU64(n),
+            key: None,
+        });
+        let (status, _) = rt_drive_request(&sim, &mut [&mut p], 0, ping, 2_000).unwrap();
+        assert_eq!(status, 200);
+    }
+    // The reopen persists the store at the log's tail, so the horizon now
+    // covers every frame written so far.
+    recover_rt_node(&sim, &mut p).unwrap();
+    let segment = p.host.disk().open("wal/00000000000000000000.log").unwrap();
+    let mut byte = [0u8; 1];
+    segment.read_at(16, &mut byte).unwrap();
+    segment.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+    assert!(!p.host.durable_corruption_fired());
+
+    let err = recover_rt_node(&sim, &mut p).unwrap_err();
+    assert!(
+        !err.contains(INCONCLUSIVE)
+            && err.contains("durable horizon")
+            && err.ends_with(
+                "but no fault on p's own disk explains the refusal: a platform durability bug, \
+                 not an unrestorable copy"
+            ),
+        "{err}"
+    );
+    assert_eq!(
+        sim.coverage().get("rt:inconclusive:local-unrestorable"),
+        None
+    );
+
+    let gap = "a segment is missing … refusing to guess";
+    assert!(!unrestorable_explained(&p.host, gap));
+    assert!(!unrestorable_explained(&p.host, &err));
+
+    // Each family is explained by its own fault on that disk, and only there.
+    let sim = Sim::with_faults(
+        0x53B0_0012,
+        FaultConfig {
+            misdirected_write: 1.0,
+            dir_entry_loss: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (q, r) = (sim.host("q"), sim.host("r"));
+    q.disk()
+        .open("wal/x.log")
+        .unwrap()
+        .write_at(0, &[7; 16])
+        .unwrap();
+    r.disk().open("wal/new.log").unwrap();
+    r.restart();
+    assert!(q.durable_corruption_fired() && !q.dir_entry_loss_fired());
+    assert!(r.dir_entry_loss_fired() && !r.durable_corruption_fired());
+    assert!(unrestorable_explained(&q, &err) && !unrestorable_explained(&q, gap));
+    assert!(unrestorable_explained(&r, gap) && !unrestorable_explained(&r, &err));
+}
+
 fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
     sim.cover("restart");
     node.recoveries += 1;
@@ -3973,6 +4111,13 @@ fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
             Err(e) if local_copy_unrestorable(&e) => {
+                if !unrestorable_explained(&node.host, &e) {
+                    return Err(format!(
+                        "recover {}: {e}, but no fault on {}'s own disk explains the \
+                         refusal: a platform durability bug, not an unrestorable copy",
+                        node.name, node.name
+                    ));
+                }
                 sim.cover("rt:inconclusive:local-unrestorable");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} local copy unrestorable (no restore rig in this \
@@ -5158,12 +5303,13 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
         let app = match scoped_realtime_app(sim) {
             Ok(app) => app,
             Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("settle open failed non-injected: {e}"));
-                }
-                // No restart clears a durable refusal (S5 re-review R-M2).
+                // No restart clears a durable refusal (S5 re-review R-M2), and
+                // only a fired durable-corruption fault excuses one (S3b item 0).
                 if durable_refusal(sim, &e.to_string())? {
                     return Ok(None);
+                }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle open failed non-injected: {e}"));
                 }
                 continue;
             }

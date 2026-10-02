@@ -27,8 +27,10 @@ pub enum FaultReason {
     Poisoned,
     /// redb's latch ("close and re-open the database").
     RedbLatch,
-    /// The WAL's durable-horizon hard error (corruption of acked records —
-    /// loud by design, not a bug).
+    /// The WAL's durable-horizon hard error: acknowledged records failed
+    /// their check at or below the store's horizon. Loud by design, and
+    /// fallout only where durable corruption fired on that node's disk,
+    /// which its text cannot say, so [`is_fault_fallout`] never excuses it.
     DurableHorizon,
     /// Everything else: NOT fallout; fails the universe for adjudication.
     Unrelated,
@@ -50,11 +52,17 @@ pub enum FaultReason {
 ///  4. the WAL's durable-horizon hard error (segment-mgmt T4's recovery-
 ///     horizon rule): `bit_flip`/`misdirected_write` corrupting an
 ///     already-acknowledged frame is a legitimate consequence of the fault
-///     matrix, surfaced loudly by design — not a bug.
+///     matrix, surfaced loudly by design. But only then: the same text is
+///     what a durability bug in the platform looks like (D1's WAL bug showed
+///     itself in 8 of 21 failing bases only as this refusal), so this family
+///     is a NAME, not an excuse. Only a check that durable corruption fired
+///     excuses it: [`durable_refusal`] in a single-node workload, and
+///     [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired)
+///     for the refusing node in a multi-node one (S3b item 0).
 ///
 /// Anything else is `Unrelated`: NOT fallout, must fail the universe for
-/// adjudication. Recognizing these cannot mask a real bug so long as the
-/// workload's end-state oracle (e.g. exactly-once on reopen) still runs
+/// adjudication. Recognizing families 1-3 cannot mask a real bug so long as
+/// the workload's end-state oracle (e.g. exactly-once on reopen) still runs
 /// either way.
 ///
 /// First-match-wins, and the order is load-bearing: transactions.rs's and
@@ -80,9 +88,20 @@ pub fn classify(text: &str) -> FaultReason {
     }
 }
 
-/// `true` for every recognized family — see `classify`'s doc for the four.
+/// `true` for the families an error's text alone excuses: injected,
+/// poisoned and the redb latch (`classify`'s families 1-3). Never for the
+/// durable-horizon refusal: whether that is fallout depends on whether durable
+/// corruption fired, which text cannot say, so it is `false` here and a
+/// caller that retries or gives up on fallout fails it unless it asks
+/// [`durable_refusal`] (or, for one node of several,
+/// [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired))
+/// first. Until S3b item 0 this returned `true` for every recognized family,
+/// so any such workload excused the refusal where no fault had fired.
 pub fn is_fault_fallout(text: &str) -> bool {
-    !matches!(classify(text), FaultReason::Unrelated)
+    matches!(
+        classify(text),
+        FaultReason::Injected | FaultReason::Poisoned | FaultReason::RedbLatch
+    )
 }
 
 /// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
@@ -228,7 +247,9 @@ pub fn acked_implies_durable(
 /// retry, which is `Db::open`'s own contract for an IO failure (DESIGN §4).
 /// Calls `boot`; when it fails with an error `is_fallout` accepts (injected
 /// fault fallout, by the caller's own classifier), calls it again, up to
-/// `tries` boots in all. Each retry marks `boot:retried`, and a retry that
+/// `tries` boots in all. A durable-horizon refusal is judged by
+/// [`durable_refusal`] before `is_fallout` sees it, so a caller's classifier
+/// cannot excuse one where no durable corruption fired. Each retry marks `boot:retried`, and a retry that
 /// boots marks `boot:booted-after-retry`, so a batch can require that retries
 /// do more than run. A retry after an injected IO error restarts the process
 /// first (`Sim::restart_process`): the failed boot's handles die, the page
@@ -293,13 +314,13 @@ pub fn boot_through_fallout<T, E: std::fmt::Display>(
             }
             Err(e) => {
                 let text = e.to_string();
-                if !is_fallout(&text) {
-                    return Err(e);
-                }
                 match durable_refusal(sim, &text) {
                     Ok(true) => return Ok(None),
                     Ok(false) => {}
                     Err(_) => return Err(e),
+                }
+                if !is_fallout(&text) {
+                    return Err(e);
                 }
             }
         }
@@ -354,9 +375,6 @@ mod tests {
             "engine poisoned: a durable record failed to apply",
             "Storage error: close and re-open the database",
             "injected read error",
-            "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
-             corruption of acknowledged records, not a torn tail, and truncating it would \
-             silently lose data; restore this node from a replica or backup (DESIGN §2)",
         ] {
             assert!(is_fault_fallout(fallout), "must classify: {fallout}");
         }
@@ -364,6 +382,11 @@ mod tests {
             "row decode: needed 8 bytes for u64, 3 left — schema drift or corruption",
             "assertion failed: durable.is_some_and(|d| d >= applied)",
             "exactly-once violated: hits 3, done 2 for key 7",
+            // A recognized family, but not fallout by its text: only a check
+            // that durable corruption fired excuses it (S3b item 0).
+            "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
+             corruption of acknowledged records, not a torn tail, and truncating it would \
+             silently lose data; restore this node from a replica or backup (DESIGN §2)",
         ] {
             assert!(!is_fault_fallout(real_bug), "must NOT classify: {real_bug}");
         }

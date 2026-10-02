@@ -10,7 +10,7 @@ use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, View};
 use charpente_sim::Sim;
-use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{durable_corruption_fired, durable_refusal, is_fault_fallout};
 use {{ident}}::{NewNote, Note, build_app};
 
 charpente_sim::sim_tests! {
@@ -20,15 +20,23 @@ charpente_sim::sim_tests! {
 
 const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
 
-/// Opens the app on this universe's disk, or gives up on fault fallout.
+/// Opens the app on this universe's disk, or gives up on fault fallout. A
+/// boot refused for durable corruption gives up only where the harness
+/// injected some (`durable_refusal`); anywhere else it is a durability bug
+/// and fails (GUIDE §8).
 fn open_app(sim: &mut Sim) -> Result<Option<App>, String> {
     match build_app(Box::new(sim.disk()), Box::new(sim.entropy())) {
         Ok(app) => Ok(Some(app)),
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("App::open hit fault fallout: {e}"));
-            Ok(None)
+        Err(e) => {
+            if durable_refusal(sim, &e.to_string())? {
+                return Ok(None);
+            }
+            if is_fault_fallout(&e.to_string()) {
+                sim.give_up(format!("App::open hit fault fallout: {e}"));
+                return Ok(None);
+            }
+            Err(e.to_string())
         }
-        Err(e) => Err(e.to_string()),
     }
 }
 

@@ -389,7 +389,11 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
             // §4's compacted-log refusal ("cannot be rebuilt from the log alone")
             // now carries only redb's verdict on the store's bytes, never an
             // injected cause, so reaching it is a failure — under redb 4.3.0 the
-            // crash model cannot brick the store.
+            // crash model cannot brick the store. So is the durable-horizon
+            // refusal (S3b item 0): every property that recovers through here
+            // turns both durable-corruption axes off (`no_media_corruption`),
+            // so no fault on this node's disk can explain it, and
+            // `is_fault_fallout` no longer excuses it by its text.
             Err(e) if is_fault_fallout(&e) => last = e, // open faulted; retry, cycling periodically
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }

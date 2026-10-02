@@ -2332,7 +2332,7 @@ state, or the universe count is too low to make it likely.
 ```rust
 use charpente::{Db, DbConfig, Id, Schema, View, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::{is_fault_fallout, replays_identically};
+use charpente_sim::checks::{boot_through_fallout, is_fault_fallout, replays_identically};
 
 #[table(global)]
 struct Counter {
@@ -2364,18 +2364,21 @@ fn counter_replays(sim: &mut Sim) -> Result<(), String> {
 
 /// Puts a row, restarts the simulated disk (crashes and reopens), and reads
 /// it back. Returns `None` — not a failure — when there is nothing to
-/// assert: the write was never acked, or either `Db::open` hit fault
-/// fallout (the harness's own fault paths, not this workload's contract,
-/// are under test elsewhere). `is_fault_fallout` recognizes the sim's own
-/// injected-fault wording, the WAL/engine poison wording, and redb's
-/// "close and re-open the database" latch — anything else is treated as a
-/// real bug and fails the universe.
+/// assert: the write was never acked, or either `Db::open` never booted
+/// through fault fallout (the harness's own fault paths, not this workload's
+/// contract, are under test elsewhere). `is_fault_fallout` recognizes the
+/// sim's own injected-fault wording, the WAL/engine poison wording, and
+/// redb's "close and re-open the database" latch; `boot_through_fallout`
+/// boots again on those, and excuses a refusal for durable corruption only
+/// where the harness injected some. Anything else is treated as a real bug
+/// and fails the universe.
 fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let schema = || Schema::new().table::<Counter>();
-    let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(mut db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
     };
     let acked = db
         .transact(|tx| {
@@ -2390,10 +2393,11 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     sim.restart(); // power-cycles the simulated disk: unsynced writes tear or vanish
     drop(db); // the old handle is dead after restart — reopen, per its own contract
 
-    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
     };
     if !acked {
         return Ok(None);
@@ -2627,23 +2631,31 @@ for these before hand-rolling the same logic a fourth time:
   is this the harness's own injected fault (or its consequences) rather
   than a bug your workload should fail on? It recognizes the sim's
   injected-fault wording (including the `read_error` axis), the WAL/engine
-  poison wording, the WAL's durable-horizon hard error (bit-level corruption
-  of an already-acknowledged frame — a fault-matrix consequence, not a bug),
-  and redb's "close and re-open the database" latch. Used inside a workload
-  to turn "the disk broke, as instructed" into "no answer this round" rather
-  than a hard failure — never to swallow anything else. (`misdirected_write`
-  is not in that list and cannot be: it returns `Ok`, so it has no wording —
-  what you eventually see is the corrupt frame it left behind.)
-- `classify(text: &str) -> FaultReason` — the same judgement, typed:
+  poison wording, and redb's "close and re-open the database" latch. Used
+  inside a workload to turn "the disk broke, as instructed" into "no answer
+  this round" rather than a hard failure — never to swallow anything else.
+  (`misdirected_write` is not in that list and cannot be: it returns `Ok`, so
+  it has no wording — what you eventually see is the corrupt frame it left
+  behind.) **It never excuses the WAL's durable-horizon refusal**, the boot
+  refused because an already-acknowledged frame failed its check at or below
+  the store's horizon. That refusal is fallout where `bit_flip` or
+  `misdirected_write` fired, and a durability bug in the platform everywhere
+  else (a real one showed itself only as this refusal in 8 of 21 failing
+  bases), and text cannot say which. So it is `false` here, and an open site
+  asks `durable_refusal` (below) first, or, for one node of several,
+  `SimHost::durable_corruption_fired()`. `boot_through_fallout` does that for
+  you.
+- `classify(text: &str) -> FaultReason` — the families, typed:
   `Injected`, `Poisoned`, `RedbLatch`, `DurableHorizon`, or `Unrelated`
-  (`is_fault_fallout` is `!matches!(…, Unrelated)`). Use it when your
+  (`is_fault_fallout` is `Injected | Poisoned | RedbLatch`). Use it when your
   workload wants to accept some families and fail on others — e.g. "an
-  injected fault or a durable-horizon error is fallout this round, but a
-  poisoned engine is a finding". Matching on a variant instead of on
-  substrings keeps the prose coupling in one place: if a platform error
-  string is ever reworded, `classify` is the single site that must change,
-  and it fails by name instead of leaking a wrong classification into
-  whichever oracle saw the text first.
+  injected fault is fallout this round, but a poisoned engine is a finding" —
+  or to name the family in a coverage key. `DurableHorizon` is a name, never
+  an excuse on its own. Matching on a variant instead of on substrings keeps
+  the prose coupling in one place: if a platform error string is ever
+  reworded, `classify` is the single site that must change, and it fails by
+  name instead of leaking a wrong classification into whichever oracle saw
+  the text first.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
@@ -2697,7 +2709,9 @@ for these before hand-rolling the same logic a fourth time:
   first (`sim.restart_process()`, so the page cache survives); a retry after a
   crash power-cycles first (`sim.restart()`, when `Sim::disk_crashed` says the
   disk is gone). `Ok(Some(t))` is the first clean boot and `Err(e)` the first
-  error that is not fallout, unchanged. `Ok(None)` means every boot met
+  error that is not fallout, unchanged. A durable-horizon refusal is judged
+  before your `is_fallout` sees it, so no classifier of yours can excuse one
+  where no durable corruption fired. `Ok(None)` means every boot met
   fallout, and what it means is yours to say: a workload whose only node
   never came up gives up by name (`counter_survives` above), and a round
   restarts and moves on. The one `None` the helper names itself is a boot
@@ -2713,7 +2727,8 @@ for these before hand-rolling the same logic a fourth time:
   boot again, but the round it skipped is work the property never checks.
 - `durable_refusal(sim: &Sim, text: &str) -> Result<bool, String>` — the
   same rule for a loop that boots on its own, such as a final verification's
-  reopen loop: call it on each fallout before booting again. `Ok(false)`: not
+  reopen loop: call it on each failed boot's error before the fallout check,
+  since `is_fault_fallout` turns the refusal down. `Ok(false)`: not
   a durable refusal, carry on. `Ok(true)`: a refusal in a universe where
   durable corruption fired, already given up under its own name and marked
   `boot:durable-refusal`, so end the loop. `Err(..)`: a refusal where none

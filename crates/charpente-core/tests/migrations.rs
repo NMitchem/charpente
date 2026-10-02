@@ -241,6 +241,9 @@ fn seed_v1_result(sim: &Sim, rows: u64) -> Result<bool, String> {
             Ok(()) => return Ok(true),
             Err(e) => {
                 let msg = e.to_string();
+                if charpente_sim::checks::durable_refusal(sim, &msg)? {
+                    return Ok(false);
+                }
                 if !charpente_sim::checks::is_fault_fallout(&msg) {
                     return Err(format!("non-injected failure while seeding: {msg}"));
                 }
@@ -280,12 +283,14 @@ fn open_and_migrate_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if !charpente_sim::checks::is_fault_fallout(&msg) {
-                        return Err(format!("non-injected failure during barrier remedy: {msg}"));
-                    }
-                    // No restart clears a durable refusal (S5 re-review R-M2).
+                    // No restart clears a durable refusal (S5 re-review R-M2),
+                    // and only a fired durable-corruption fault excuses one
+                    // (S3b item 0), so it is judged before the fallout check.
                     if charpente_sim::checks::durable_refusal(sim, &msg)? {
                         return Ok(None);
+                    }
+                    if !charpente_sim::checks::is_fault_fallout(&msg) {
+                        return Err(format!("non-injected failure during barrier remedy: {msg}"));
                     }
                     sim.restart();
                 }
@@ -306,11 +311,11 @@ fn open_and_migrate_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db
                     remedy_pending = true;
                     continue;
                 }
-                if !charpente_sim::checks::is_fault_fallout(&msg) {
-                    return Err(format!("non-injected failure: {msg}"));
-                }
                 if charpente_sim::checks::durable_refusal(sim, &msg)? {
                     return Ok(None);
+                }
+                if !charpente_sim::checks::is_fault_fallout(&msg) {
+                    return Err(format!("non-injected failure: {msg}"));
                 }
                 sim.restart();
             }
@@ -488,6 +493,41 @@ mod corruption_excuse_tests {
 // ledgered as a production follow-up outside this sub-project; here it is
 // excused exactly like every other single-node durable-corruption loss
 // (`corruption_excuses_the_loss` above), never masking wrong data.
+/// A durable refusal while seeding the v1 store gives the universe up at once,
+/// by name (S3b item 0). Seed `0x666269ea79118eb9`, universe 10 at the batch's
+/// base, meets one there. `seed_v1_result` used to send it through
+/// `is_fault_fallout`, which excused it by its text alone, so it spent all 64
+/// rounds on bytes no restart clears and the universe passed as
+/// `migrations:inconclusive`, having adjudicated nothing.
+#[test]
+fn a_durable_refusal_while_seeding_gives_up_at_once_by_name() {
+    const SEED: u64 = 0x6662_69ea_7911_8eb9;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+    let twin = migrated_twin(20);
+    if let Err(e) = migration_universe(&mut sim, &twin) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
+
 #[test]
 fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
     let twin = migrated_twin(20);
@@ -495,41 +535,50 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
         0x2EB7_2000,
         128,
         |_cfg: &mut FaultConfig| {},
-        |sim: &mut Sim| {
-            if !seed_v1_result(sim, 20)? {
-                sim.cover("migrations:inconclusive");
-                return Ok(());
-            }
-            let db_cfg = DbConfig {
-                migration_batch_size: 3,
-                ..cfg()
-            };
-            let Some(db) = open_and_migrate_with_remedy(sim, db_cfg)? else {
-                // Harsh-config non-convergence (auth's inconclusive precedent):
-                // every round was fault-fallout or a legitimately-remedied
-                // barrier, and the budget ran out before a clean open+migrate.
-                sim.cover("migrations:inconclusive");
-                return Ok(());
-            };
-            sim.cover("migrations:resumed-to-completion");
-            let mut rows: Vec<Widget2> =
-                db.snapshot().map_err(|e| e.to_string())?.scan().map_err(|e| e.to_string())?;
-            rows.sort_by_key(|r| r.id.raw());
-            let got: Vec<(u64, u32, String)> =
-                rows.into_iter().map(|r| (r.id.raw(), r.count, r.label)).collect();
-            if got != twin {
-                return judge_divergence(
-                    sim,
-                    &got,
-                    &twin,
-                    "migrations:corruption-excused",
-                    "migrated store",
-                );
-            }
-            Ok(())
-        },
+        |sim: &mut Sim| migration_universe(sim, &twin),
         require: ["migrations:resumed-to-completion"]
     );
+}
+
+/// One universe of the property above: seed the v1 store, open and migrate it
+/// under the fault matrix, and compare the migrated store with `twin`.
+fn migration_universe(sim: &mut Sim, twin: &[(u64, u32, String)]) -> Result<(), String> {
+    if !seed_v1_result(sim, 20)? {
+        sim.cover("migrations:inconclusive");
+        return Ok(());
+    }
+    let db_cfg = DbConfig {
+        migration_batch_size: 3,
+        ..cfg()
+    };
+    let Some(db) = open_and_migrate_with_remedy(sim, db_cfg)? else {
+        // Harsh-config non-convergence (auth's inconclusive precedent):
+        // every round was fault-fallout or a legitimately-remedied
+        // barrier, and the budget ran out before a clean open+migrate.
+        sim.cover("migrations:inconclusive");
+        return Ok(());
+    };
+    sim.cover("migrations:resumed-to-completion");
+    let mut rows: Vec<Widget2> = db
+        .snapshot()
+        .map_err(|e| e.to_string())?
+        .scan()
+        .map_err(|e| e.to_string())?;
+    rows.sort_by_key(|r| r.id.raw());
+    let got: Vec<(u64, u32, String)> = rows
+        .into_iter()
+        .map(|r| (r.id.raw(), r.count, r.label))
+        .collect();
+    if got != twin {
+        return judge_divergence(
+            sim,
+            &got,
+            twin,
+            "migrations:corruption-excused",
+            "migrated store",
+        );
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------ Step 2
@@ -1304,6 +1353,9 @@ fn seed_scoped_v1_result(sim: &Sim, rows_per_scope: u64, scopes: &[u64]) -> Resu
             Ok(()) => return Ok(true),
             Err(e) => {
                 let msg = e.to_string();
+                if charpente_sim::checks::durable_refusal(sim, &msg)? {
+                    return Ok(false);
+                }
                 if !charpente_sim::checks::is_fault_fallout(&msg) {
                     return Err(format!("non-injected failure while seeding: {msg}"));
                 }
@@ -1330,12 +1382,14 @@ fn open_and_migrate_scoped_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Op
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if !charpente_sim::checks::is_fault_fallout(&msg) {
-                        return Err(format!("non-injected failure during barrier remedy: {msg}"));
-                    }
-                    // No restart clears a durable refusal (S5 re-review R-M2).
+                    // No restart clears a durable refusal (S5 re-review R-M2),
+                    // and only a fired durable-corruption fault excuses one
+                    // (S3b item 0), so it is judged before the fallout check.
                     if charpente_sim::checks::durable_refusal(sim, &msg)? {
                         return Ok(None);
+                    }
+                    if !charpente_sim::checks::is_fault_fallout(&msg) {
+                        return Err(format!("non-injected failure during barrier remedy: {msg}"));
                     }
                     sim.restart();
                 }
@@ -1356,11 +1410,11 @@ fn open_and_migrate_scoped_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Op
                     remedy_pending = true;
                     continue;
                 }
-                if !charpente_sim::checks::is_fault_fallout(&msg) {
-                    return Err(format!("non-injected failure: {msg}"));
-                }
                 if charpente_sim::checks::durable_refusal(sim, &msg)? {
                     return Ok(None);
+                }
+                if !charpente_sim::checks::is_fault_fallout(&msg) {
+                    return Err(format!("non-injected failure: {msg}"));
                 }
                 sim.restart();
             }
