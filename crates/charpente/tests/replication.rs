@@ -5416,6 +5416,65 @@ fn a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply() {
     assert_converged(&sim, &mut p, &mut f).unwrap();
 }
 
+/// A switchover on a quiet cluster whose target reconnected since the last
+/// write (D4 round 3, review I1). The target is shipped nothing and never acks
+/// again, so only its verified `Hello` position shows it is caught up. Before
+/// D4 round 2 the drain never saw it caught up: no faults at all, and the
+/// switchover aborted at the deadline naming a lag of 10 records that `f`
+/// already held ("the follower lag is 10 record(s) (it acked None, this
+/// primary is at Some(9))"). This pins the drain's half of the fix; the
+/// resend's half is
+/// `a_switchover_target_that_restarts_before_taking_the_hand_off_is_sent_it_again`.
+#[test]
+fn a_switchover_after_the_target_reconnected_with_no_write_since_completes() {
+    let sim = Sim::with_faults(0x2EB1_0D41, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    f.host.crash_now();
+    recover_node(&sim, &mut f).unwrap();
+    drive_rounds(&sim, &mut [&mut p, &mut f], 50).unwrap();
+    let at = p.db.as_ref().unwrap().last_applied();
+    assert_eq!(
+        f.db.as_ref().unwrap().last_applied(),
+        at,
+        "sanity: f reconnected already caught up"
+    );
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert!(
+        matches!(&reply, Msg::CtrlOk { .. }),
+        "a target that reconnected caught up must be handed off, not aborted: {reply:?}"
+    );
+    assert_eq!(f.repl.role(), &Role::Primary);
+    assert!(f.db.as_ref().is_some_and(|d| d.writes_allowed()));
+    assert_eq!(f.db.as_ref().unwrap().last_applied(), at);
+    assert_eq!(
+        p.repl.role(),
+        &Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_one_writable(&p, &f).unwrap();
+    assert_all_present(&sim, &mut f, &(0..10).collect::<Vec<_>>(), "f").unwrap();
+    commit_widget(&sim, &mut f, 10).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
 // ------------------------------ property: switchover aborts on a laggard
 
 #[test]
