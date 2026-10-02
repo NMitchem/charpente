@@ -1061,8 +1061,9 @@ impl Repl {
     /// durably to primary, ack with `HandOffDone`, and start serving Hellos.
     fn accept_handoff(&mut self, db: &mut Db, at_seq: u64, _now: u64) -> io::Result<()> {
         if db.last_applied() != Some(at_seq) {
-            // The drain waits for acked == last, so this should be impossible;
-            // a named protocol error rather than a silent wrong promotion.
+            // The drain hands off only once the target has acked `last` or its
+            // verified Hello carried it, so this should be impossible; a named
+            // protocol error rather than a silent wrong promotion.
             let msg = format!(
                 "hand-off protocol error: the primary handed off at seq {at_seq} but this \
                  follower's last_applied is {:?} — the drain did not reach equality",
@@ -1185,10 +1186,12 @@ impl Repl {
     /// `to` is a primary, and never before.
     ///
     /// Both answers to "did `to` take it?" leave this node write-stopped. A
-    /// `to` that lost the `HandOff` and reconnected caught up inside the window
-    /// was sent it again (`drive_switchover`), so a `to` still a follower here
-    /// either has the `HandOff` in flight, and may yet take it and become the
-    /// primary, or was down past the deadline. Nothing resends after this reply.
+    /// `to` that lost the `HandOff` and reconnected caught up at least a
+    /// heartbeat before the deadline was sent it again (`drive_switchover` runs
+    /// on the step the new session's heartbeat brings), so a `to` still a
+    /// follower here either has the `HandOff` in flight, and may yet take it and
+    /// become the primary, or was down past (or within a heartbeat of) the
+    /// deadline. Nothing resends after this reply.
     fn stall_switchover(&mut self, ctrl_id: u64, to: &str, at: u64, now: u64) {
         self.reply_ctrl(
             ctrl_id,

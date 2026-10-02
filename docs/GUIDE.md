@@ -4013,8 +4013,10 @@ role file:
 switchover only while the target is still catching up. After the hand-off is
 sent, the target may already be the primary, so the old primary never resumes
 writes on its own. A target that loses the hand-off (its connection drops, or it
-restarts before applying it) and reconnects within the deadline is sent it
-again. If no confirmation returns before the deadline, the old primary stays
+restarts before applying it) and reconnects at least a heartbeat (1 s) before
+the deadline is sent it again: the resend goes out on the old primary's next
+step, which the reconnected session's heartbeat brings within a second. If no
+confirmation returns before the deadline, the old primary stays
 write-stopped and replies with both possible answers to "did the target take
 it?":
 
@@ -4042,7 +4044,8 @@ follower is in one of two states:
   case. A promote sent after that answers `cannot promote: this node is already
   the primary`, and the reply's last sentence says what that means: restart the
   old primary.
-- **The target was down past the deadline.** Nothing changes on its own, and
+- **The target was down past the deadline**, or came back within a heartbeat
+  of it, too late for the resend. Nothing changes on its own, and
   restarting the old primary alone does not help: it comes back still handing
   off, and resolves only once the target answers as a primary. Promote the
   target, as the reply says.

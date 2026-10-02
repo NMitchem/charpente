@@ -68,6 +68,7 @@ pub(crate) struct Session {
     /// follower holds every record up to it durably, so a switchover counts it
     /// as acked: a target that reconnects already caught up to a write-stopped
     /// primary is shipped nothing and never sends another `Ack` (D4 round 2).
+    /// A later `Hello` on the same connection answered `Snapshot` clears it.
     pub hello_position: Option<u64>,
     phase: Phase,
     /// A control connection: its first message was a control verb, not a
@@ -325,6 +326,10 @@ impl Session {
                     }
                     Decision::Snapshot => {
                         self.listen = listen;
+                        // A position an earlier Hello on this connection proved
+                        // is not this answer's: the peer is being seeded, and
+                        // only its acks may show it caught up again.
+                        self.hello_position = None;
                         self.begin_seeding(db, now)?;
                     }
                 }

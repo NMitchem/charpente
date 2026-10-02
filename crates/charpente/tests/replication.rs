@@ -4386,8 +4386,8 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
 /// switchover and runs on into a torn role write). Over the same 64 fresh bases
 /// the key's mean rose 96.97 (sd 8.41) → 100.16 (sd 8.27), +2.16 Welch SE, and
 /// give-ups went 2.94 (sd 1.72) → 3.05 (sd 1.71), +0.36 SE. At p = 106/256 =
-/// 0.414 one SE is 7.88, so 106 − 2·7.88 = 90.2 → 90; it tolerates a 14.9%
-/// relative fall.
+/// 0.414 one SE is 7.88, so 106 − 2·7.88 = 90.2 → 90; it tolerates a 15.1%
+/// relative fall (16/106).
 const SWITCHOVER_CONVERGED_FLOOR: u64 = 90;
 
 /// The result of one switchover attempt's drain.
@@ -4634,9 +4634,9 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
             // (`a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply`),
             // and 15 with f down past it after its role write failed
             // (`a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`).
-            // A drain abort (the other CtrlErr) fell from 174 to 45. Either way
-            // p stays write-stopped. Safety holds; this is not the happy-path
-            // oracle.
+            // A drain abort (the other CtrlErr, after which p resumes writes)
+            // fell from 174 to 45. Neither breaks safety, which
+            // `assert_one_writable` checks; this is not the happy-path oracle.
             sim.cover("repl:switchover-stalled");
             if !message.contains("switchover") {
                 return Err(format!("unexpected CtrlErr from a switchover: {message}"));
@@ -4681,21 +4681,31 @@ fn await_reverified_target(
     }
     sim.cover("repl:switchover-target-reverified");
     let deadline = sim.now().as_nanos() + WITNESS_DEADLINE_NANOS;
+    let mut stopped = "the step budget ran out";
     for _ in 0..CONVERGE_BUDGET {
         if f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
             return Ok(());
         }
-        if sim.now().as_nanos() > deadline || !scheduler_round(sim, &mut [p, f])? {
+        if sim.now().as_nanos() > deadline {
+            stopped = "the witness deadline passed";
+            break;
+        }
+        if !scheduler_round(sim, &mut [p, f])? {
+            stopped = "the world went quiescent";
             break;
         }
         assert_one_writable(p, f)?;
     }
+    // Only what was observed: the gate can stay shut with p answering (a gate
+    // that never opens on a resolved set), so this does not name a cause.
     Err(format!(
         "f's witness gate never opened after the switchover completed: f restarted as a primary \
-         with p in its witness set, and p (role {:?}) did not answer \"not a primary\" within \
-         {}s (WITNESS_DEADLINE_NANOS)",
-        p.repl.role(),
-        WITNESS_DEADLINE_NANOS / 1_000_000_000
+         with p in its witness set, and {stopped} ({}s budget, WITNESS_DEADLINE_NANOS) with f \
+         still write-stopped (f's gate is verifying: {}; f's role: {:?}; p's role: {:?})",
+        WITNESS_DEADLINE_NANOS / 1_000_000_000,
+        f.db.as_ref().is_some_and(|d| d.verifying()),
+        f.repl.role(),
+        p.repl.role()
     ))
 }
 
@@ -5486,6 +5496,97 @@ fn a_switchover_after_the_target_reconnected_with_no_write_since_completes() {
     commit_widget(&sim, &mut f, 10).unwrap();
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// A verified `Hello` position counts as acked only while it is the answer the
+/// session is living under (D4 round 3, review M6). `handle` answers a `Hello`
+/// in any phase, so a peer that sends a second one on the same connection (no
+/// conformant follower does: one `Hello` per connection) gets it decided
+/// afresh. Here the first carries `p`'s own last position and is answered
+/// `Frames`; the second carries none, on a log GC'd past its base, and is
+/// answered `Snapshot`. The peer has now proved nothing, so a switchover to it
+/// must drain and abort by name. Kept from the first `Hello`, the position
+/// would read as caught up and `p` would hand off to a peer it is seeding.
+#[test]
+fn a_second_hello_answered_with_a_snapshot_drops_the_position_the_first_proved() {
+    let sim = Sim::with_faults(0x2EB1_0D42, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    for i in 0..60u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    let (last, crc, digest) = {
+        let db = p.db.as_ref().unwrap();
+        assert!(
+            db.log_base() > 0,
+            "a log-less Hello must be answered Snapshot"
+        );
+        let last = db.last_applied().unwrap();
+        let frames = db.read_log(last, 1).unwrap();
+        let (seq, payload) = frames.first().unwrap();
+        (
+            last,
+            charpente_core::log::frame_crc(*seq, payload),
+            db.schema_digest(),
+        )
+    };
+    let hello = |position| Msg::Hello {
+        proto: charpente::repl::PROTO_VERSION,
+        listen: Some("x:1".to_string()),
+        position,
+        secret: None,
+        schema_digest: digest,
+    };
+    let peer = sim.host("x").net().connect("p:1").unwrap();
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut answer = |sim: &Sim, p: &mut Node| -> Msg {
+        for _ in 0..CONVERGE_BUDGET {
+            drive_rounds(sim, &mut [&mut *p], 1).unwrap();
+            if let Some(n) = peer.recv(&mut buf).unwrap() {
+                assert!(n > 0, "p closed the peer's connection");
+                return decode(&buf[..n]).unwrap();
+            }
+        }
+        panic!("p never answered the peer");
+    };
+    peer.send(&encode(&hello(Some((last, crc))))).unwrap();
+    let first = answer(&sim, &mut p);
+    assert!(
+        matches!(first, Msg::Heartbeat { next_seq } if next_seq == last + 1),
+        "the first Hello is answered Frames from {}: {first:?}",
+        last + 1
+    );
+    peer.send(&encode(&hello(None))).unwrap();
+    let second = answer(&sim, &mut p);
+    assert!(
+        matches!(second, Msg::SnapshotStart { .. }),
+        "the second Hello is answered Snapshot: {second:?}"
+    );
+
+    p.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "x:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    match drive_ctrl(&sim, &mut [&mut p], &mut cli, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            format!(
+                "switchover to x:1 aborted: the follower lag is {} record(s) (it confirmed it \
+                 holds every record up to None, this primary is at Some({last})) and the drain \
+                 did not complete before the 30000000000ns deadline — this node is primary \
+                 again and accepting writes",
+                last + 1
+            )
+        ),
+        other => panic!("a switchover to a peer that proved nothing must abort: {other:?}"),
+    }
+    assert_eq!(p.repl.role(), &Role::Primary);
+    assert!(p.db.as_ref().is_some_and(|d| d.writes_allowed()));
 }
 
 // ------------------------------ property: switchover aborts on a laggard
