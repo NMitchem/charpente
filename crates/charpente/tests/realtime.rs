@@ -1507,6 +1507,13 @@ struct Client {
     cut_explained: fn(&Sim) -> bool,
 }
 
+thread_local! {
+    /// Counts the 409-diverged arm's re-syncs on this thread, so a pin can
+    /// assert that step of its reason without a coverage key (which would move
+    /// every batch's block). Read by `a_bare_tail_after_a_cut...` only.
+    static DIVERGED_409_RESYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl Client {
     fn new(mode_names: &'static [&'static str], mode_key: Option<&'static str>) -> Client {
         Client {
@@ -1716,7 +1723,11 @@ impl Client {
         // `last_id` is the strictly-increasing check's memory of the lost
         // timeline. A cut id was re-minted (or not) on the new one, and a bare
         // tail owes nothing about it, so the first re-mint it delivers may sit
-        // at or below an id delivered before the cut.
+        // at or below an id delivered before the cut. The trim is exactly as
+        // safe as `cut_explained` is precise: the flagship's judge is
+        // `durable_corruption_fired`, true from the node's FIRST durable
+        // corruption on, so it excuses every later cut whatever caused it, and
+        // a lost event after that point loses this check's backstop too.
         if self.last_id >= Some(head) {
             self.last_id = head.checked_sub(1);
         }
@@ -1920,7 +1931,7 @@ impl Client {
                     self.need_subscribe = true;
                 }
                 409 if text.contains("diverged from this node's timeline")
-                    && durable_corruption_fired(sim) =>
+                    && (self.cut_explained)(sim) =>
                 {
                     // T6 interlude investigation (t6-realtime-interlude-
                     // investigation.md): a synced-and-delivered event can
@@ -1952,6 +1963,7 @@ impl Client {
                     // prune never settles, and `unsettled_report` names it.
                     match db.next_event_id() {
                         Ok(head) => {
+                            DIVERGED_409_RESYNCS.with(|c| c.set(c.get() + 1));
                             self.resync_to_head(head);
                             sim.cover("realtime:gap");
                             self.cursor = None;
@@ -2496,10 +2508,16 @@ fn a_bare_tail_after_a_cut_may_start_below_the_last_id_the_client_saw() {
     charpente_sim::sample_extended_fields(SEED, &mut cfg);
     let mut sim = Sim::with_faults(SEED, cfg);
 
+    DIVERGED_409_RESYNCS.with(|c| c.set(0));
     let trace = realtime_workload(&mut sim).unwrap_or_else(|e| {
         panic!("a cut re-minted below a delivered id must not fail the universe: {e}")
     });
     assert_eq!(sim.gave_up(), None, "and the universe reached a verdict");
+    assert!(
+        DIVERGED_409_RESYNCS.with(|c| c.get()) >= 1,
+        "the diverged-409 refusal must have sent the client bare, or this universe no \
+         longer pins the scenario"
+    );
     assert!(
         durable_corruption_fired(&sim) && sim.coverage().contains_key("realtime:ledger-resynced"),
         "this universe's reason is a cut by durable corruption, seen and re-synced: {:?}",
@@ -6914,4 +6932,59 @@ fn a_bare_subscribe_on_a_primary_starts_between_the_changes_that_arrived_around_
         vec![r#"{"n":"2"}"#.to_string()],
         "the change that arrived behind the subscribe is delivered, the one ahead of it is not"
     );
+}
+
+/// The instrument behind D5's LEDGER rates (not a test: `--ignored`). Runs
+/// `SCAN_N` universes derived exactly as the swarm does (a splitmix64 chain
+/// from `SCAN_BASE` (decimal, or hex with `0x`), then `FaultConfig::swarm` and `sample_extended_fields`),
+/// with `SCAN_BF` (default unset) forcing `bit_flip`. Prints `SCAN ... failures=N`
+/// and each failing seed. One process runs one chain; a set is 12 chains, bases
+/// `B+0 .. B+11` (no threads: the deny-list forbids them in this crate's tests).
+///
+/// D5's rates; "before" neutralises the trim's guard first with
+/// `sed -i '' 's/if self.last_id >= Some(head) {/if false {/' crates/charpente/tests/realtime.rs`
+/// (restore with `git checkout`). Per set, from the repo root:
+/// `for t in 0 1 2 3 4 5 6 7 8 9 10 11; do SCAN_BF=$BF SCAN_BASE=$((B+t)) SCAN_N=$N cargo test -p charpente --test realtime last_id_trim_rate_scan -- --ignored --nocapture 2>&1 | grep -E '^(SCAN|FAIL)' & done; wait`
+/// summing the `failures=`; build once first so the 12 do not race the compiler.
+/// - `BF=0.5 B=0x5D200000 N=5200` (62,400 universes): 26 before, 0 after.
+/// - `BF=-1 B=0x5D000000 N=8500` (102,000): 0 before, 0 after.
+/// - `BF=-1 B=0x5D100000 N=8500` (102,000): 1 before (`0xb62d99f8f90232c9`), 0 after.
+#[test]
+#[ignore]
+fn last_id_trim_rate_scan() {
+    let p = |k: &str, d: &str| std::env::var(k).unwrap_or(d.to_string());
+    let raw = p("SCAN_BASE", "0");
+    let base = match raw.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => raw.parse(),
+    }
+    .unwrap();
+    let per: u64 = p("SCAN_N", "512").parse().unwrap();
+    let bf: f64 = p("SCAN_BF", "-1").parse().unwrap();
+    let (mut fails, mut state) = (0u64, base);
+    for _ in 0..per {
+        let seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut s = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut s);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        if bf >= 0.0 {
+            cfg.bit_flip = bf;
+        }
+        let mut sim = Sim::with_faults(seed, cfg);
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| realtime_workload(&mut sim)));
+        match r {
+            Ok(Ok(_)) => {}
+            Ok(Err(m)) => {
+                fails += 1;
+                eprintln!("FAIL {seed:#x}: {m}");
+            }
+            Err(_) => {
+                fails += 1;
+                eprintln!("FAIL {seed:#x}: PANIC");
+            }
+        }
+    }
+    eprintln!("SCAN base={base:#x} bf={bf} universes={per} failures={fails}");
 }

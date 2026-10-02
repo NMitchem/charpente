@@ -6889,8 +6889,7 @@ last id the node still holds. Both callers (`resync_if_cut` and the 409-diverged
 and re-synced, a frame delivered at or below an earlier one, a verdict. Red on the base with the text
 above (commit c9dca27). `a_cut_trims_last_id_to_the_last_id_the_node_still_holds` pins the operand.
 Inversions: trim removed, trimmed to `head` (one too high) and `>` for `>=` all turn the seed pin red;
-trimmed to `head - 2` (one too low) passes the seed pin and turns the unit pin red, as do the first
-two.
+trimmed to `head - 2` (one too low) passes the seed pin; the unit pin turns red under all four.
 
 **The sweep.** `Client` is the only rig client that carries a last id across a cut: the scoped sibling,
 the multi-node follower property and the tenant properties all construct it, so one fix covers them.
@@ -6902,7 +6901,36 @@ a platform bug and should fail. The TS runtime and fixture hold no last id; the 
 byte-identical before and after; gave-ups 26 (flagship cap 26), 23 (scoped cap 23), `frame-verified`
 1,049 (floor 1,049).
 
-**Rates, same universe sets, before -> after.** `bit_flip` forced to 0.5, 62,400 universes: 26 -> 0
-failures, all this text. Own distribution, 204,000 universes (two 102,000 sets): 1 -> 0
-(`0xb62d99f8f90232c9`). The S1 reviewer's figures on their own sets were 1 in 230,528, 4 in 102,400
-(0.019) and 17 in 61,440 (0.5).
+**The bound (D5 review, I1; predates D5).** The trim is exactly as safe as the client's `cut_explained`
+is precise. The flagship's judge is `durable_corruption_fired`, true from the node's FIRST durable
+corruption on, so it excuses every later cut, whatever caused it; the trim then also drops that cut's
+`last_id` memory. The review's stand-in for a platform that loses committed events at a clean restart
+(later flips recorded as `probe:silent-flip`) saw a cut with only silent flips in 2,284 of 20,480
+universes at `bit_flip` 0.5; with the trim none fail, without it 3 do, so D5 removes an accidental
+backstop in 3 of them (the other 2,281 were already excused by S3b's ledger re-sync). With no durable
+corruption nothing changes: neither caller reaches `resync_to_head`, and every redelivery still fails
+by name (the review ran this over 20,000+ universes). The 409-diverged arm now asks
+`self.cut_explained` rather than `durable_corruption_fired`, equivalent today, so a tighter judge
+reaches it.
+
+**Follow-up (not a publish blocker; a test oracle's excuse width, not the product): a per-cut judge.**
+"Corruption fired on this node since the cut ids were recorded", the since-when shape of S3b's
+baseline-at-wipe. It needs a design, not a one-liner: 16 of the same 20,480 universes saw a cut with
+no new flip of any kind since the previous boundary check (latent corruption, or the attribution
+window), and a naive freshness judge would fail them.
+
+**Seed pin, the 409 step.** The pin also asserts the diverged-409 arm re-synced at least once
+(`DIVERGED_409_RESYNCS`, a thread-local, since a coverage key would move every batch's block). Under
+an inversion that removes that arm's `self.cursor = None` the client never goes bare and the pin goes
+red ("a frame must be delivered at or below an earlier one").
+
+**Nothing moved** holds after the 409 arm's routing change too: the four coverage blocks are
+byte-identical to the round-1 tip's.
+
+**Rates, same universe sets, before -> after** (instrument: the `#[ignore]`d
+`last_id_trim_rate_scan` in realtime.rs, whose doc carries the 12-process shell loop per set; "before" neutralises the
+trim's guard with the `sed` there; each re-run at the round-2 tip through that loop). `bit_flip` forced to 0.5, 62,400
+universes (`BF=0.5 B=0x5D200000 N=5200`, 12 chains): 26 -> 0 failures, all this text.
+Own distribution, 204,000 universes (`N=8500`, 12 chains each, `B` `0x5D000000` and `0x5D100000`):
+1 -> 0 (`0xb62d99f8f90232c9`). The S1 reviewer's own, differently derived sets gave 1 in 230,528,
+4 in 102,400 (0.019) and 17 in 61,440 (0.5); those are theirs, not reproducible from the tree.
