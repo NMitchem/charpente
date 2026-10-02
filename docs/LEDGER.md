@@ -6898,7 +6898,7 @@ The edge-harness `realtime_resume` clients keep `last_id` only as a resume curso
 monotonic check that starts `None`, across a `kill -9` with no corruption fault, where a cut would be
 a platform bug and should fail. The TS runtime and fixture hold no last id; the caller owns the cursor.
 
-**Nothing moved.** The four realtime swarm coverage blocks (flagship, scoped, tenant, follower) are
+**Nothing moved.** The four realtime swarm coverage blocks (128, 128, 180 and 128 universes) are
 byte-identical before and after; gave-ups 26 (flagship cap 26), 23 (scoped cap 23), `frame-verified`
 1,049 (floor 1,049).
 
