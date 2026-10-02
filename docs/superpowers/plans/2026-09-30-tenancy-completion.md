@@ -15078,7 +15078,8 @@ Why `realtime.rs`, and not `tenant.rs` or a new file:
     - The scoped `FINGERPRINT`, which mixes `S::NAME`.
 - Produces:
   - The swarm property `tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix`,
-    with base `0x5C0B_0001`, its universe count N (Step 4), and its measured floors (Step 5).
+    with base `0x5C0B_0001`, its universe count N (Step 4), and its measured floors and
+    give-up cap (Step 5).
   - Its coverage keys:
     - `tenancy:every-shop-delivered`
     - `tenancy:global-delivered`
@@ -15097,7 +15098,7 @@ Why `realtime.rs`, and not `tenant.rs` or a new file:
   - The replay-faithfulness check
     `replaying_the_tail_with_the_products_scope_rule_is_the_kernels_own_delivery`.
   - Six named victims, all prefixed `tenancy_feeds::the_oracle_names_`.
-  - Task 14 quotes the base, N, the floors and the fresh-base counts.
+  - Task 14 quotes the base, N, the floors, the cap and the fresh-base counts.
 
 The property, stated once. Three shops (0, 1 and 2) emit scoped `note`s, and the app emits
 global `note`s: the same NAME and the same fields, told apart by tenancy only. Four feeds
@@ -15126,9 +15127,9 @@ Every symbol below is read, not assumed. Run from the repo root:
 ```zsh
 D=.superpowers/sdd/2026-09-30-tenancy-completion
 R=crates/charpente/tests/realtime.rs
-for sym in '^fn push_subscribe(' '^fn stall_closure(' '^fn assert_strictly_increasing(' \
-    '^fn reshaped_frame(' '^fn reshaped_409(' '^fn error_text(' '^fn statuses(' \
-    '^fn frames_of(' '^const EPOCHS: u32' '^const ROUNDS_PER_EPOCH: u32' \
+for sym in '^fn push_subscribe\(' '^fn stall_closure\(' '^fn assert_strictly_increasing\(' \
+    '^fn reshaped_frame\(' '^fn reshaped_409\(' '^fn error_text\(' '^fn statuses\(' \
+    '^fn frames_of\(' '^const EPOCHS: u32' '^const ROUNDS_PER_EPOCH: u32' \
     '^const SETTLE_ATTEMPTS: u32' '^const SETTLE_BOOT_TRIES: u32' '^const SETTLE_CYCLE_EVERY: u32' \
     '^mod tenancy_feeds'; do
   print -r -- "$(grep -c -E "$sym" $R)  $sym"
@@ -15146,8 +15147,12 @@ Expected:
 - `1` for `EventRow.scope`.
 - `1` for A16's text, Task 10's tenancy 409. `0` means Task 10 did not land as this plan
   wrote it: stop and report.
-- For `ceiling:`: `0` means the runner has no ceiling arm (e749823). A positive count means S3
-  added one: Step 5 then also pins `universe:gave-up` as a ceiling.
+- For `ceiling:`: positive (7 at 57e5df5; 0 at e749823, before S3 added the arm). The property
+  below carries a `ceiling:` on `universe:gave-up` beside its reach floors (GUIDE §8,
+  "Re-basing a pinned property"), and Step 5 measures it.
+
+Each pattern escapes its `(`: an unescaped one is an ERE error (`grep: parentheses not
+balanced`, exit 2), which `$(grep -c …)` prints as an empty count.
 
 A helper whose count is not `1` was renamed by an earlier task. Find it by what it does, use
 its new name below, and say so in the task report.
@@ -15158,22 +15163,34 @@ keep its source's fault classification:
 ```zsh
 D=.superpowers/sdd/2026-09-30-tenancy-completion
 R=crates/charpente/tests/realtime.rs
-for f in settle_boot realtime_workload; do
-  git show e749823:$R | sed -n "/^fn $f(/,/^}/p" > $D/t13-$f-e749823.rs
+for f in settle_boot realtime_workload_judged realtime_app; do
+  git show 57e5df5:$R | sed -n "/^fn $f(/,/^}/p" > $D/t13-$f-57e5df5.rs
   sed -n "/^fn $f(/,/^}/p" $R > $D/t13-$f-now.rs
-  diff $D/t13-$f-e749823.rs $D/t13-$f-now.rs > $D/t13-$f.diff; print -r -- "$f: diff exit $?"
+  diff $D/t13-$f-57e5df5.rs $D/t13-$f-now.rs > $D/t13-$f.diff; print -r -- "$f: diff exit $?"
 done
 ```
 
-- `settle_boot: diff exit 0` is expected. If it is `1`, S3 or S4 changed how a boot failure is
-  classified. Apply the same change to `tenancy_settle_boot` below, and quote the diff in the
-  report.
-- For `realtime_workload`, read the diff. Only its open, `Kernel::new`, `push_subscribe`,
-  `kernel.run` and settle arms matter here. The same arms in `tenancy_universe` below must
-  classify identically: a store-bricked arm or a give-up S3 added there is copied. A change to
-  `Client` is not this module's concern.
-- In both diffs, a changed `App::open` call in `realtime_app` means `open_tenancy` below takes
-  the same shape.
+The module below already carries what changed under these functions between e749823 and
+57e5df5 (amended 2026-10-02). `realtime_workload` is now a wrapper that passes
+`durable_corruption_fired` to `realtime_workload_judged` (S3b), so the copy follows the latter:
+- `settle_boot`'s `durable_refusal` arm (S5 re-review R-M2, S3b item 0) is in
+  `tenancy_settle_boot`;
+- the epoch boot goes through `checks::boot_through_fallout` with `BOOT_TRIES` (S5);
+- the crash countdown is the flagship's range re-sized for redb 4.3.0 (D1; DESIGN §1,
+  "countdowns");
+- `sim.quiesce_subscriber_stalls()` runs before the settle (S3b);
+- a universe that adjudicated nothing gives up (S3b item 7);
+- a cut, or a ledger row the store no longer holds, is excused only where durable corruption
+  fired (S3b item 1). Anywhere else it fails as a lost event.
+
+The flagship re-syncs its client's ledger at a cut a fault explains (`Client::resync_if_cut`).
+This module gives the universe up there instead, by name and under its cap, because its four
+feeds share one ledger (`read_answer`'s doc). `realtime_workload_judged`'s re-sync and its
+`realtime:settle-clean` and `realtime:frame-verified` marks belong to `Client`, and are not
+copied.
+- Every diff exits `0` at 57e5df5. A `1` means a change landed after it. Apply it to the copy
+  as above, and quote the diff in the report.
+- `realtime_app` has not changed since e749823, and `open_tenancy` mirrors its store config.
 
 - [ ] **Step 1: Write the module: the world, the oracle, the workload and the property**
 
@@ -15319,6 +15336,13 @@ mod tenancy_feeds {
     const TENANCY_REFUSED_SAME_KIND_FLOOR: u64 = 1;
     const TENANCY_REFUSED_OTHER_KIND_FLOOR: u64 = 1;
     const TENANCY_RESUME_BACKLOG_FLOOR: u64 = 1;
+    /// The give-up cap, exact at `TENANCY_BASE` like the floors, and written
+    /// by Step 5 from the same two batches. A give-up is never failed, so
+    /// without a cap a batch that drifted to giving up everything would stay
+    /// green (GUIDE §8). The reach keys it pairs with are the two
+    /// `*-delivered` floors, which only a universe that kept its verdict
+    /// credits.
+    const TENANCY_GAVE_UP_CEILING: u64 = 128;
 
     /// One emit request. `/tenancy/announce` ignores `shop`, and
     /// `/tenancy/desk-note` reads it as the desk's id.
@@ -15541,8 +15565,10 @@ mod tenancy_feeds {
     fn tenancy_409(cursor: Cursor) -> String {
         format!(
             "cursor {} sits on an event outside this feed's tenancy — a cursor resumes only \
-             the feed that delivered it, and this feed never delivers that event; re-sync \
-             current state through reads, then reconnect without a cursor",
+             the feed that delivered it, and this feed never delivers that event; reconnect \
+             without a cursor, wait for the stream to open, then read current state from the \
+             same node, holding every frame that arrives until that read is installed and then \
+             applying the held frames and every later one over it in order, idempotently",
             cursor.wire()
         )
     }
@@ -15934,9 +15960,12 @@ mod tenancy_feeds {
     }
 
     /// The flagship's classification. A diverged 409 after durable corruption
-    /// is a cut. The flagship prunes its one client's ledger there. Four feeds
-    /// share this ledger, so this universe gives up instead: a cut is a
-    /// universe that no longer adjudicates set equality.
+    /// is a cut. The flagship re-syncs its one client's ledger there
+    /// (`Client::resync_if_cut`, S3b). Four feeds share this ledger, so this
+    /// universe gives up instead, by name and under the property's cap: a cut
+    /// is a universe that no longer adjudicates set equality. A diverged 409
+    /// where no durable corruption fired is `Refused`, and fails: nothing
+    /// excuses it (S3b item 1).
     fn read_answer(status: u16, raw: &str, durable_fired: bool) -> Answer {
         if status == 200 {
             return Answer::Connected;
@@ -16148,7 +16177,9 @@ mod tenancy_feeds {
                 Ok(()) => Ok(false),
                 Err(Fail::Finding(e)) => Err(e),
                 Err(Fail::Mismatch(e)) => match self.ledger.diverged_entry(db) {
-                    Some((id, recorded, stored)) => {
+                    // Excused only where durable corruption fired on this
+                    // node's disk (S3b item 1).
+                    Some((id, recorded, stored)) if durable_corruption_fired(sim) => {
                         sim.give_up(format!(
                             "ledger diverged at event id {id}: recorded {recorded} when scanned, \
                              store now holds {stored} — this node's timeline no longer holds \
@@ -16158,6 +16189,11 @@ mod tenancy_feeds {
                         ));
                         Ok(true)
                     }
+                    Some((id, recorded, stored)) => Err(format!(
+                        "ledger id {id} was recorded off this node as {recorded}, but the store \
+                         now holds {stored}, and no fault on this node explains the change, so \
+                         this node lost an event it had committed ({e})"
+                    )),
                     None => Err(e),
                 },
             }
@@ -16247,6 +16283,19 @@ mod tenancy_feeds {
 
         fn settled(&self) -> bool {
             self.clients.iter().all(|c| c.settled(&self.ledger))
+        }
+
+        /// `Client::adjudicated_nothing` over four feeds (S3b item 7; GUIDE §8,
+        /// "a verdict needs a check that could have failed"): no feed was
+        /// delivered a frame, none had a scanned row in its window, and no
+        /// probe was refused by name.
+        fn adjudicated_nothing(&self) -> bool {
+            let next = self.ledger.next_scan_id;
+            self.clients.iter().all(|c| {
+                c.trace.is_empty()
+                    && c.refused_same_kind + c.refused_other_kind == 0
+                    && self.ledger.rows.range(c.floor.min(next)..next).next().is_none()
+            })
         }
 
         fn unsettled_report(&self) -> String {
@@ -16340,6 +16389,11 @@ mod tenancy_feeds {
             let app = match tenancy_app(sim) {
                 Ok(app) => app,
                 Err(e) => {
+                    // No restart clears a durable refusal (S5 re-review R-M2), and
+                    // only a fired durable-corruption fault excuses one (S3b item 0).
+                    if durable_refusal(sim, &e.to_string())? {
+                        return Ok(None);
+                    }
                     if !is_fault_fallout(&e.to_string()) {
                         return Err(format!("settle open failed non-injected: {e}"));
                     }
@@ -16374,16 +16428,15 @@ mod tenancy_feeds {
                 return Ok(u.trace());
             }
             let entropy = sim.entropy();
-            sim.crash_disk_after(64 + entropy.next_u64() % 512);
-            let app = match tenancy_app(sim) {
-                Ok(app) => app,
-                Err(e) => {
-                    if !is_fault_fallout(&e.to_string()) {
-                        return Err(format!("open failed non-injected: {e}"));
-                    }
-                    sim.restart();
-                    continue;
-                }
+            // The flagship's range, sized to redb 4.3.0's disk-op volume per
+            // round (DESIGN §1, "countdowns").
+            sim.crash_disk_after(50 + entropy.next_u64() % 399);
+            let Some(app) =
+                boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || tenancy_app(sim))
+                    .map_err(|e| format!("open failed non-injected: {e}"))?
+            else {
+                sim.restart();
+                continue;
             };
             let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
                 Ok(k) => k,
@@ -16454,6 +16507,11 @@ mod tenancy_feeds {
         // retries add chances to RECEIVE and nothing else. `verified` grows
         // only through `drain`, which matches a frame the server delivered, so
         // no attempt count can excuse a row that was skipped.
+        //
+        // No subscriber stalls in the settle, as in `realtime_workload_judged`
+        // (S3b): a stall that drops a clean attempt's tail leaves that attempt
+        // adjudicating nothing. The epochs keep exercising stall-drop and resume.
+        sim.quiesce_subscriber_stalls();
         let mut clean_attempts = 0u32;
         let mut rolled_back: Option<(u64, String, String)> = None;
         for _attempt in 0..SETTLE_ATTEMPTS {
@@ -16515,10 +16573,13 @@ mod tenancy_feeds {
         }
 
         if !u.settled() {
-            // The flagship's two give-ups, for its reasons: a scanned row the
-            // store has rolled back past can never be delivered, and zero clean
-            // attempts means there was no node to catch up FROM.
-            if let Some((id, recorded, stored)) = rolled_back {
+            // Two give-ups. A scanned row the store has rolled back past can
+            // never be delivered, and is excused only where durable corruption
+            // fired (S3b item 1); anywhere else it fails below as a lost event.
+            // Zero clean attempts means there was no node to catch up FROM.
+            if let Some((id, recorded, stored)) = rolled_back
+                && durable_corruption_fired(sim)
+            {
                 sim.give_up(format!(
                     "ledger id {id} is behind this node's timeline: recorded {recorded} when \
                      scanned, store now says {stored} — this node's timeline no longer holds \
@@ -16538,6 +16599,13 @@ mod tenancy_feeds {
             }
             return Err(u.unsettled_report());
         }
+        if u.adjudicated_nothing() {
+            sim.give_up(
+                "every feed settled owed nothing, delivered nothing and refused no probe, so \
+                 nothing was adjudicated",
+            );
+            return Ok(u.trace());
+        }
         u.credit(sim);
         Ok(u.trace())
     }
@@ -16553,6 +16621,7 @@ mod tenancy_feeds {
             |_cfg: &mut FaultConfig| {},
             |sim: &mut Sim| tenancy_universe(sim).map(|_trace| ()),
             require: [
+                "boot:booted-after-retry",
                 "tenancy:every-shop-delivered",
                 "tenancy:global-delivered",
                 "tenancy:global-passed-a-scoped-row",
@@ -16583,7 +16652,8 @@ mod tenancy_feeds {
                     TENANCY_REFUSED_OTHER_KIND_FLOOR
                 ),
                 ("realtime:resume-backlog", TENANCY_RESUME_BACKLOG_FLOOR)
-            ]
+            ],
+            ceiling: [("universe:gave-up", TENANCY_GAVE_UP_CEILING)]
         );
     }
 
@@ -16600,6 +16670,14 @@ mod tenancy_feeds {
 ```
 
 Notes for the implementer, each checked against the code the module copies:
+- `universe:gave-up` is capped, and `tenancy:every-shop-delivered` and
+  `tenancy:global-delivered` are its reach floors: only a universe that kept its verdict
+  credits them (GUIDE §8, "every capped property floors its reach key").
+  `boot:booted-after-retry` is required as the flagship and the sibling require it (S5), so
+  the boot retries do more than run.
+- The crash countdown is the flagship's range. DESIGN §1 ("countdowns") calibrates a range to
+  its own workload's disk-op volume, and this plan does not recalibrate it. Step 4 reports
+  `fault:crash` beside the flagship's, and a large gap is for the controller.
 - `realtime:stall-drop` and `fault:subscriber_stall` are required but not floored. Their rate
   belongs to a fault axis the flagship already pins, and a second exact pin would turn one
   finding into two failing properties. This is the sibling's documented reason.
@@ -17148,8 +17226,10 @@ Inside `mod tenancy_feeds`, after Step 2's tests:
                 format!(
                     "cursor {index}.{} sits on an event outside this feed's tenancy — a cursor \
                      resumes only the feed that delivered it, and this feed never delivers that \
-                     event; re-sync current state through reads, then reconnect without a \
-                     cursor",
+                     event; reconnect without a cursor, wait for the stream to open, then read \
+                     current state from the same node, holding every frame that arrives until \
+                     that read is installed and then applying the held frames and every later \
+                     one over it in order, idempotently",
                     rows[index].seq
                 ),
                 "{} from row {index}",
@@ -17342,7 +17422,10 @@ Expected:
 - `test result: ok. 1 passed` for both.
 - The new property prints `charpente-sim [realtime]: N of 128 universes reached a verdict, K
   gave up`.
-- Every floor is still `1` here, so the batch checks `require:` and nothing more.
+- Every floor is still `1` and the cap is still the universe count here, so the batch checks
+  `require:` and nothing more.
+- Read `fault:crash` from both coverage blocks, and record the two counts (see the countdown
+  note under Step 1).
 
 The rule for N:
 - Keep 128, the realtime properties' standard, if the new batch's user+sys time is at most
@@ -17415,26 +17498,31 @@ for const, key in FLOORS.items():
     assert src.count(old) == 1, f'{const}: expected exactly one "= 1" definition'
     src = src.replace(old, f'    const {const}: u64 = {count};\n')
     print(f'{const} = {count}  ({key})')
+gave_up = counts.get('universe:gave-up', 0)
+old = '    const TENANCY_GAVE_UP_CEILING: u64 = 128;\n'
+assert src.count(old) == 1, 'TENANCY_GAVE_UP_CEILING: expected exactly one "= 128" definition'
+src = src.replace(old, f'    const TENANCY_GAVE_UP_CEILING: u64 = {gave_up};\n')
+print(f'TENANCY_GAVE_UP_CEILING = {gave_up}  (universe:gave-up)')
 R.write_text(src)
-print(f'universes {universes}; {verdict}; universe:gave-up {counts.get("universe:gave-up", 0)}')
+print(f'universes {universes}; {verdict}; universe:gave-up {gave_up}')
 EOF
 grep -n "const TENANCY_.*_FLOOR: u64 = 1;" crates/charpente/tests/realtime.rs
 ```
 
 Expected:
-- Eight `CONST = count` lines, then the verdict line.
+- Eight `CONST = count` lines for the floors and one for the cap, then the verdict line.
 - The final grep prints nothing (it exits 1): no floor is left at `1`, unless a key truly
   measured exactly 1. The script's own line shows which is the case.
 
-If Step 0 found a `ceiling:` arm, add `universe:gave-up` to the invocation at the gave-up count
-this script printed, in the syntax S3's `ceiling:` doc shows. Then re-run the batch once:
+The cap is now the gave-up count the script printed. The invocation has carried the `ceiling:`
+since Step 1, because 57e5df5 has the arm. Re-run the batch once:
 
 ```zsh
 cargo test -p charpente --test realtime -- tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix --exact --nocapture 2>&1 | tee $D/t13-floors-3.log | grep -E "^test result|reached a verdict"
 ```
 
-Expected: `test result: ok. 1 passed`, with the same verdict line. Put the eight counts in the
-report and in `$D/progress.md`. Task 14's LEDGER entry quotes them.
+Expected: `test result: ok. 1 passed`, with the same verdict line. Put the eight counts and the
+cap in the report and in `$D/progress.md`. Task 14's LEDGER entry quotes them.
 
 - [ ] **Step 6: Fresh bases**
 
@@ -17478,7 +17566,7 @@ Re-check `git status` and `git log -1`: another session may have committed. Then
 ```zsh
 git status --short
 git add crates/charpente/tests/realtime.rs
-git commit -m "test(tenancy): realtime tenancy under the fault matrix — a global feed receives no scoped row, a shop's feed exactly its own rows, and a resume from outside a feed's tenancy is refused by name (base 0x5C0B_0001, N universes, K gave up; floors F; 3N fresh over 0x5C0B_A001/B002/C003); six named victims, the replay-faithfulness check, and the tenant-zero and two-tenant-type pins"
+git commit -m "test(tenancy): realtime tenancy under the fault matrix — a global feed receives no scoped row, a shop's feed exactly its own rows, and a resume from outside a feed's tenancy is refused by name (base 0x5C0B_0001, N universes, K gave up, the cap; floors F; 3N fresh over 0x5C0B_A001/B002/C003); six named victims, the replay-faithfulness check, and the tenant-zero and two-tenant-type pins"
 ```
 
 Fill in the message's slots with measured values:
@@ -17510,8 +17598,8 @@ cargo test -p charpente --test realtime -- tenancy_feeds:: 2>&1 | tee $D/t13-$k.
 | M3 | `crates/charpente/src/kernel/mod.rs`, `validate_subscribe` | delete A16's tenancy refusal (the `row.scope != sub.scope` block) | `a_resume_from_a_row_outside_the_feeds_tenancy_is_refused_by_name` (statuses become `[200; 6]`), and the swarm with `… and was accepted: a cursor on a row outside this feed's tenancy is refused by name, never resumed past` |
 | M4 | `crates/charpente-core/src/db.rs`, `ScopedTx::emit` | record `scope: None` in place of the tenant's id | the twin tests at `synced` (`event id 0 is a note emitted inside shop 0, but its durable EventRow.scope reads None, not Some(0) — …`) and the swarm with the same arm |
 | M5 | same | record `scope: Some(0)` for every tenant | `event id 2 is a note emitted inside shop 1, but its durable EventRow.scope reads Some(0), not Some(1) — …`, and the swarm |
-| M6 | `crates/charpente-core/src/event.rs`, `EventRow`'s `Codec::decode` | read the trailing scope as it does, then bind `scope: None` | the ledger arm on readback (`… reads None, not Some(0) — the tenant did not survive commit, replay and readback`) |
-| M7 | `crates/charpente-core/src/db.rs`, the record encoder's emit arm (Task 10's `0x0b` choice) | add the guard `if s != 0` where the arm matches `Some(s)` to write `0x0b`, so tenant 0 is written as a global `0x09` record | `each_feed_…` at `synced`: `event id 0 is a note emitted inside shop 0, but its durable EventRow.scope reads None, not Some(0) — …` |
+| M6 | `crates/charpente-core/src/event.rs`, `EventRow::decode_row` (its `Row` impl, Task 10's `16` arm) | read the trailing scope as it does, then bind `scope: None` | the ledger arm on readback (`… reads None, not Some(0) — the tenant did not survive commit, replay and readback`) |
+| M7 | `crates/charpente-core/src/db.rs`, `encode_record`'s emit loop (Task 10's `0x0b` choice) | at the top of the loop's body, shadow `let scope = scope.filter(\|&s\| s != 0);`, so tenant 0 is written as a global `0x09` record, with no tenant bytes. Task 10's loop picks the tag with `if scope.is_some()`, and has no `Some(s)` arm to guard | `each_feed_…` at `synced`: `event id 0 is a note emitted inside shop 0, but its durable EventRow.scope reads None, not Some(0) — …` |
 | M8 | Task 11's scoped-fingerprint emission (`tenant_name`, A7) | pass `""` in place of `S::NAME` | `the_three_notes_share_a_name_and_differ_only_in_tenancy` (`SHOP_FP == DESK_FP`) and `a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape` (shop 1's feed decodes desk 1's note) |
 
 One case needs more than a green or red reading.
