@@ -6943,3 +6943,29 @@ pins green, both red with the trim disabled, and the seed pin red with the 409 a
 removed. Full gate at 9dbf42d: 86/86 `test result: ok`, 1,741 passed, 0 failed; round 2 touched only
 realtime.rs and this file — realtime 64 passed, 1 ignored (the scan), guide-examples 30, clippy and
 fmt clean. Branch `d5-flagship-resync`, merged at 8f6909f; main's tree is byte-identical to e5893c3.
+
+## 2026-10-02 — the S1 tenancy-completion plan, amended against everything that landed since it was written, ready for review
+
+**Why.** The plan (`docs/superpowers/plans/2026-09-30-tenancy-completion.md`, f54bd4a) was written
+against a main that S2, S3, S5, D1, D2, D3, S3b, D4 and D5 then moved. A plan that names a changed
+type, text, seed, floor or line is a plan an implementer executes wrongly. Workspace
+`.superpowers/sdd/2026-09-30-publish-readiness/` (`s1-amend-brief.md`, `s1-amend-report.md` rounds
+1–4, `s1-amend-review.md` with a re-review). Branch `s1-plan-amend`, merged at 34c3f8b. Plan only:
+nothing in it has been executed.
+
+**Amended.** 788 references checked; the changed ones re-cited at dec346b. Folded in: S2's
+`TableWriteRefusal` and `Group::stage` record; A18 (a scoped read goes through the type registered
+for its table — including a transaction's own reads, since before commit they consult the overlays
+at the unscoped key, where a same-named global alias read tenant 0's staged row); N1 (the stage
+assert checks what its message says); A16's 409 gives D4's re-sync remedy verbatim; the TS
+`CursorRefused` doc goes to four causes; Task 13's swarm follows GUIDE §8 and re-syncs a cut as
+the flagship does, with a calibration step for its crash countdown; Task 10 keeps D5's
+`cut_explained` judge, which the plan's earlier text would have reverted.
+
+**Review.** Independent opus review READY AFTER FIXES (0 C, 3 I, 4 M; 82 references sampled, 3
+wrong). Its I1 was a bug on main, not the plan (D5, above). Scoped re-review READY AFTER FIXES (0 C,
+1 I, 2 M), fixed in 9eaf494. The re-review ran A18 on main with every refusal logged across every
+workspace suite and edge-harness `tenant_wire`: 10 refusals, all from the plan's pins, so no
+legitimate read is refused. Every scripted edit (39) was chain-dry-run in task order on a copy of
+dec346b, by the amending agent and independently in part by the reviewer: 0 anchor misses. The
+first dry-run had used base files only, which is how one anchor that Task 2 rewrites slipped through.
