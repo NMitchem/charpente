@@ -6398,3 +6398,109 @@ into one bounded sub-project:
   CPU, inside the +25% rule the controller misapplied without the 32 data point).
 - Not blockers, noted: ambient caps at 2× max would not catch a regression to 8 attempts; the
   kernel's 64-reopen budget exceeds the +25% bound set later.
+
+## 2026-10-01 — WAL recovery syncs before it replays: a frame from a process that died before its fsync was applied, made durable in the store, and lost at the next power cut
+
+**Why.** Found by S5's fresh-base measurement (its concern 2), on main at c947730: the realtime
+mixed-shapes property panicked "store applied_seq 0 is ahead of the durable log end None — the
+store outran durable truth" at 2 of 6 fresh bases (`CHARPENTE_SEED=0x5d889f4c1a9ac543`; 2 in
+~9,000 universes over 50 bases at 74ddf90). Sub-project D1 of
+landing the follow-ups before 0.1.0. Workspace `.superpowers/sdd/2026-09-30-publish-readiness/`
+(`d1-report.md`, `d1-fix-report.md`, `d1-review.md`). Branch `d1-wal-sync`, merged through
+`s5-open` at 125226d.
+
+**The bug.** `Wal::open` replayed every frame it could READ and never `File::sync`ed a segment, so
+a frame written by a process that died before its WAL fsync succeeded was applied to the store and
+made durable there (by `persist_store_at_open`, or by redb's close on any drop); the next power loss
+dropped the frame from the log. A real `kill -9` plus a power loss reproduces it with no injected
+fault. Latent since the WAL's first commit (`cfef3ea`, 2026-07-01, which syncs only the cut's
+truncation); `persist_store_at_open` dates from `575ac9d` (2026-07-18). Reproduced by mechanism at
+848c799, 89bd4e6, c07ceef and 74ddf90 — not a redb-bump regression. No property modelled a process
+restart with the page cache intact; `shapes_boot`'s `continue` reached it by accident.
+
+**Shipped.**
+- **Recovery syncs each segment before it replays it** (25e5ee6), with four deterministic pins and a
+  class property, `the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`
+  (engine.rs, base `0xD1F0_000E`, pinned where both wrong fixes go red).
+- **`Sim::restart_process`** (ffd50b4): a process restart that keeps the page cache — every open file
+  handle dies, pending writes and directory entries survive. Public, GUIDE §8.
+- **The clean-sync rule** (56d10e6): a sync on a file with nothing pending draws no fault, so the new
+  syncs re-key only universes that had something to lose. Every pinned floor and pin was still
+  re-measured (S5 rounds 4–8).
+- **Role and witness boot reads sync first** (271cb9b, review I3): the same class one layer up — the
+  durable role file and the witness slots were trusted before their bytes were.
+- DESIGN §2 states what the sync does NOT close (review I1): the Linux fsync-EIO case, where a failed
+  sync can mark pages clean; the fix narrows it to what the kernel reports honestly.
+
+**Review.** Independent opus review: MERGE AFTER FIXES (I1 docs overclaimed, I2 non-tail segment,
+I3 role/witness, M1–M7); one fix round; MERGE. M7 recorded: `Db::open`'s laid-segment branch rests
+on redb 4.3.0 syncing at open.
+
+**Follow-ups.**
+- Hosts (replication nodes) have no `restart_process`; only the global disk does.
+- The fsync-EIO residual is documented, not closed.
+- Any future boot read that adds a disk op re-keys replication's universes.
+- The clean-sync rule's re-key exposed a replication rig gap older than D1 (D3, below).
+
+## 2026-10-01 — store-open classification: Db::open discards or refuses only a store whose bytes redb rejects, a store behind its log is refused by name, and every re-seed text says to restart the node as a follower
+
+**Why.** The 2026-09-30 store-open ruling: before this, ANY `Store::open` error led to discard and
+rebuild, or on a compacted log to a "restore from a replica" refusal — including a transient IO
+error a restart would clear. Sub-project S5. Workspace as above (`s5-brief.md`, `s5-report.md`
+rounds 1–10, `s5-review.md` with three re-reviews, `s5-cov/`). Branch `s5-open`, merged at 125226d.
+
+**Shipped.**
+- **`StoreRejected`** (8b7d8eb): only a store whose bytes redb 4.3.0 rejects (Corrupted,
+  UpgradeRequired, magic mismatch) is discarded, or refused on a compacted log; every other error
+  bubbles, named by site and fix (review M5). The variant table is DESIGN §4, checked row by row
+  against redb's source; a FromDisk marker keeps a disk error from passing as a redb verdict.
+- **A store behind its log is refused by name, never replayed into** (0005f99, 3315e58; review
+  R-I1, R2-M1). One rule: refuse when replay would start past the store's own next seq, whatever
+  the `tables.redb.horizon` breadcrumb says; the same bound is asserted before recovery. Before, the
+  breadcrumb lifted the horizon past the vanished-prefix check and the boot panicked "Store::apply_batch
+  reached seq 18 but expected 0". **Reachable without an operator:** a crash inside `Seeder::new`
+  between barriering the store's removal and the breadcrumb's (seed `0x64a183075fd398b9`); the
+  property `a_reseed_cut_short_by_a_crash_boots_a_whole_timeline_or_refuses_by_name`
+  (transactions.rs, base `0x5EED_C0A1`) judges each boot against the disk state the crash left and
+  requires the exact refusal text.
+- **Every text that prescribes clearing a data directory says to restart the node configured as a
+  follower of the current primary** (5449d8b; review R2-I1), through one clause,
+  `repl::role::reseed_steps`. The old texts ("stop it, delete its data dir, restart to snapshot-seed
+  from …") followed literally on a switchover-demoted primary whose config still said primary
+  brought up a SECOND WRITABLE PRIMARY that acked a write: clearing the directory deletes the durable
+  role file that outranks config. A two-arm pin holds both the remedy and the warning.
+- **Boots go through injected faults the way a supervised restart would**
+  (`checks::boot_through_fallout`, `Sim::disk_crashed`), and **a durable refusal ends every
+  recovery loop at once by name, given up only where durable corruption fired**
+  (`checks::durable_refusal`, review M6, R-M2, R-M3).
+- **Round loops are aimed and floored** (review I1: S5 had cost group_commit −5.1 SE, tenant −5.0
+  SE, kernel exactly-once −3.5 SE of reach with nothing noticing — those properties had no reach
+  floor and their caps were re-set upward). Reach parent → merge: group_commit 823 → 1,059,
+  tenant 720 → 1,083, kernel exactly-once 365 → 495, job_tenancy 247 → 346 (reviewer's own bases).
+  Every capped property now floors its reach key; `run_universes_swarm!` takes `floor:`.
+
+**Rules (GUIDE §8; controller rulings, revisable).** After a re-key a floor may be re-set down only
+if the after-mean is within one Welch SE of the before-mean over the same ≥10 fresh bases; a cap
+may rise only if the passes covering the property's reach key did not fall by more than one SE
+(a give-up that replaced a vacuous pass is the principle working — aiming kernel exactly-once cut
+vacuous passes 66 → 23 per batch while give-ups rose); an ambient floor sits at mean − 4 sd and
+catches a collapse (~16% for kernel exactly-once), the before/after test catches drift.
+
+**Review.** Independent opus whole-branch review: MERGE AFTER FIXES (0 C, 2 I, 6 M). Three scoped
+re-reviews; the last MERGE (0 C, 0 I, 1 M carried to S3b).
+
+**Gate.** Branch at 00a3321: fmt and clippy clean, 91/91 `test result: ok`, 1,640 passed, 0 failed.
+Main at 125226d: fmt and clippy clean, 86/86 `test result: ok`, 1,640 passed, 0 failed.
+
+**Follow-ups.**
+- **S3b, first:** eight "restore … from a replica or backup" texts lack the follower-config step
+  (db.rs ×6, log.rs, role.rs's torn-role text, which in-model appears only after a role flip).
+- **For Noah (design):** an interrupted re-seed now refuses by name instead of panicking, and the
+  operator re-seeds it by hand; self-healing would need a durable seeding-intent marker (a re-key of
+  every seeding universe). And protection from a second primary after a wipe rests on the operator's
+  config; DESIGN acknowledges the witness gate is bounded — a structural fence is a design change.
+- The swarm runner does not report vacuous passes; the two cap rises it justified need S5's scanner
+  re-run at the next re-key.
+- Several pinned scenarios are now rare (group_commit never-acked 9/256, unreachable round 3/256,
+  realtime never-booted 1 in 14,336): the next re-key needs wide scans.
+- `cargo doc -D warnings` fails on two pre-existing intra-doc links (prod.rs, http/mod.rs).
