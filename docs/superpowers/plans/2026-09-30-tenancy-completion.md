@@ -10011,7 +10011,9 @@ Why these packages:
   declare one: core's `db.rs` tests, `engine.rs` (the `…::TABLE` borrowers), `migrations.rs`,
   `migration_gate.rs`, `describe_tables.rs`, `repl/follower.rs`'s tests, `replication.rs`,
   `kernel.rs`, `tenant.rs`, `tenant_node.rs`, and the compile-fail fixture
-  `job_row_table_name_borrowed.rs`. Read, not run: none of them reads through a `Tx` a type
+  `job_row_table_name_borrowed.rs`. Run, not only read (the S1 amend re-review applied A18 to main
+  at dec346b, logged every refusal across every workspace suite and edge-harness `tenant_wire
+  --ignored`, and found 10, all from this task's three pins): none of them reads through a `Tx` a type
   that its `Db`'s `Schema` does not register for that `TABLE`. They write the second type, read
   it through a snapshot, or register it in a `Db` of its own (`tenant_node`'s
   `--legacy-unscoped` app reads `legacy::Doc`, which that app registers). These suites are what
@@ -15505,7 +15507,7 @@ grep -n "Subscribe" crates/charpente/src/lib.rs
 grep -c "pub scope: Option<u64>" crates/charpente-core/src/event.rs
 grep -c "sits on an event outside this feed's tenancy" crates/charpente/src/kernel/mod.rs
 grep -c "ceiling:" crates/charpente-sim/src/lib.rs
-grep -c "if self.last_id >= Some(head) {" $R
+grep -c "^        if self.last_id >= Some(head) {$" $R
 ```
 
 Expected:
@@ -15518,7 +15520,9 @@ Expected:
   below carries a `ceiling:` on `universe:gave-up` beside its reach floors (GUIDE §8,
   "Re-basing a pinned property"), and Step 5 measures it.
 - `1` for D5's `last_id` trim in the flagship's `Client::resync_to_head` (`realtime.rs:1731` at
-  dec346b), which `Universe::resync_to_head` makes too. `0` means main no longer holds D5:
+  dec346b), which `Universe::resync_to_head` makes too. The pattern is anchored on the code
+  line's indentation because the doc of D5's `#[ignore]`d `last_id_trim_rate_scan`
+  (`realtime.rs:6945` at dec346b) quotes the same guard: unanchored, the count is `2`. `0` means main no longer holds D5:
   stop and report, since the flagship then fails correct universes after a cut (seed
   `0xe0779a282feb80eb`) and Task 14's sweep would meet that failure.
 
@@ -18958,7 +18962,7 @@ reports that as the fixture's mismatch, which is a behavioural red for that orac
 | 44 | 11 | `TenantFeed::and`'s bound | `Event<Scope = S>` → `Event` | trybuild — the scope-mixing `.and()` fixture |
 | 45 | 11 | the scoped `FINGERPRINT` emission | pass `""` for `S::NAME` (Task 13's M8) | `a_scoped_events_fingerprint_mixes_its_tenants_name`, and `tenancy_feeds::a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape` |
 | 46 | 12 | `describe`'s event info | `scoped_by` → `None` | `describe_names_an_events_tenant_by_its_tenant_types_name`, `examples/invoicing`'s `describe_golden`, and `guide-examples`' `describe_contract` |
-| 47 | 9 | `crates/charpente-core/src/db.rs`, `Tx::refuse_read_as` (A18) | the comparison's left operand `ops.row_type` → `TypeId::of::<R>()` (the reader is compared with itself, so nothing is refused) | `cargo test -p charpente --test tenant` — `a_read_through_the_same_table_under_another_scope_type_is_refused`, red first as `scan_by`'s missing-index panic inside the stage closure, `no index named "text" on table Note — declare it with #[index] (check the field's index name)` (`firm_note::Note` declares no index), before its `assert_eq!` is reached |
+| 47 | 9 | `crates/charpente-core/src/db.rs`, `Tx::refuse_read_as` (A18) | the comparison's left operand `ops.row_type` → `TypeId::of::<R>()` (the reader is compared with itself, so nothing is refused) | `cargo test -p charpente --test tenant` — `a_read_through_the_same_table_under_another_scope_type_is_refused`, red first as `scan_by`'s missing-index panic inside the stage closure, `no index named "text" on table Note — declare it with #[index] (check the field's index name)` (`firm_note::Note` declares no index), before its `assert_eq!` is reached; the same mutation also turns `a_transactions_read_through_a_global_twin_is_refused_before_commit` red (S1 amend re-review) |
 | 48 | 9 | same | `==` → `!=` (a read through the registered type is refused, and one through any other type is let through) | the same test, at its `as_team` read, and every scoped-read test in the tenant suite (after review I2, every `Tx` read of a registered table too) |
 | 49 | 8 | `Group::stage`'s overlay assert (N1) | Task 8 Step 9's mutation 8, on the committed tree: delete `put_schema_version`'s `written_as` record | `cargo test -p charpente-core --test migrations` — `migrate_schema_records_each_schema_version_as_an_unscoped_put`, panicking with "Group::stage: a transaction wrote a table TxEffects::written_as did not record, so the check above never saw it — …" |
 | 50 | 8 | same | the assert's `*table == JobRow::TABLE` clause → `false` (the one exemption, for `Tx::settle_job`) | `cargo test -p charpente --test kernel` — every test in which a job settles panics with the same text |
