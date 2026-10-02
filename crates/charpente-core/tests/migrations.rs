@@ -178,6 +178,12 @@ impl TableMigration for Widget3 {
     }
 }
 
+/// Rounds a seeding helper gets before it stops: each round is one boot and
+/// one write, and a round that meets fault fallout restarts and goes again.
+const SEED_ROUNDS: u32 = 64;
+/// Rounds an open-and-migrate helper gets, the barrier remedy's included.
+const MIGRATE_ROUNDS: u32 = 128;
+
 fn cfg() -> DbConfig {
     DbConfig {
         store_path: "t.redb".into(),
@@ -209,13 +215,15 @@ fn seed_v1(sim: &Sim, rows: u64) {
 /// fault-classified restart loop as the main workload: a faulted universe
 /// can fail the SEED too. `Ok(false)` means the round budget exhausted
 /// without ever hitting a non-fallout error — every round was fault-fallout
-/// — so the caller should treat the universe as covered-inconclusive rather
-/// than red: the same harsh-config non-convergence class as
-/// `open_and_migrate_with_remedy`'s `Ok(None)` (e.g. a config with only
-/// `write_error` active and no crash axes at all can still, for an unlucky
-/// seed, fail every write attempt across the whole budget).
+/// — so there is no store to migrate and the caller gives the universe up
+/// (S3b item 4: it used to pass as inconclusive): the same harsh-config
+/// non-convergence class as `open_and_migrate_with_remedy`'s `Ok(None)`
+/// (e.g. a config with only `write_error` active and no crash axes at all
+/// can still, for an unlucky seed, fail every write attempt across the
+/// whole budget). It also means a durable refusal ended the loop, and the
+/// universe is already given up under that name.
 fn seed_v1_result(sim: &Sim, rows: u64) -> Result<bool, String> {
-    for _round in 0..64 {
+    for _round in 0..SEED_ROUNDS {
         let attempt: io::Result<()> = (|| {
             let mut db = Db::open(
                 Box::new(sim.disk()),
@@ -263,14 +271,15 @@ fn seed_v1_result(sim: &Sim, rows: u64) -> Result<bool, String> {
 /// retrying the real open+migrate. Remedy rounds share the SAME bounded
 /// round budget as ordinary retries. `Ok(None)` means the budget exhausted
 /// without ever hitting a non-fallout, non-barrier error — every round was
-/// fallout or a legitimately-remedied barrier, so the caller should treat
-/// the universe as covered-inconclusive rather than red (harsh-config
-/// non-convergence, mirroring auth's precedent), not as a failure. It also
-/// means a durable refusal ended the loop, which no restart clears, and the
-/// universe is already given up under its name (`checks::durable_refusal`).
+/// fallout or a legitimately-remedied barrier, so there is no migrated store
+/// to compare and the caller gives the universe up (harsh-config
+/// non-convergence; S3b item 4: it used to pass as inconclusive), never
+/// fails it. It also means a durable refusal ended the loop, which no
+/// restart clears, and the universe is already given up under its name
+/// (`checks::durable_refusal`).
 fn open_and_migrate_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db>, String> {
     let mut remedy_pending = false;
-    for _round in 0..128 {
+    for _round in 0..MIGRATE_ROUNDS {
         if remedy_pending {
             match Db::open(
                 Box::new(sim.disk()),
@@ -528,6 +537,68 @@ fn a_durable_refusal_while_seeding_gives_up_at_once_by_name() {
     );
 }
 
+/// A migration universe whose round budget runs out before its comparison
+/// gives up by name, and never passes (S3b item 4). Until then each passed as
+/// `migrations:inconclusive` or `migrations:scoped-inconclusive` having
+/// compared nothing: the four arms S3 counted as verdicts, and the
+/// budget-exhausted path S5's round 9 found still passing. One seed per arm,
+/// each the first such universe at its base:
+/// - plain, seeding: `0xafacf79599dcb367` (base `0x2EB72000`, universe 4);
+/// - plain, open-and-migrate: `0x94bcdae88fea9141` (same base, universe 115);
+/// - scoped, seeding: `0x1ee4034fda27b296` (base `0x2EB75000`, universe 57);
+/// - scoped, open-and-migrate: `0x063a7755a85be5b3` (base `0x5E1F0013`,
+///   universe 84; the scoped batch's own base has none).
+#[test]
+fn a_migration_universe_whose_budget_runs_out_gives_up_by_name() {
+    let twin = migrated_twin(20);
+    let scopes = [1u64, 2, 3];
+    let scoped_twin = migrated_scoped_twin(4, &scopes);
+    for (seed, scoped, reason, key) in [
+        (
+            0xafac_f795_99dc_b367_u64,
+            false,
+            seed_never_completed(),
+            "migrations:inconclusive",
+        ),
+        (
+            0x94bc_dae8_8fea_9141,
+            false,
+            migrate_never_completed(),
+            "migrations:inconclusive",
+        ),
+        (
+            0x1ee4_034f_da27_b296,
+            true,
+            seed_never_completed(),
+            "migrations:scoped-inconclusive",
+        ),
+        (
+            0x063a_7755_a85b_e5b3,
+            true,
+            migrate_never_completed(),
+            "migrations:scoped-inconclusive",
+        ),
+    ] {
+        let mut state = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        let mut sim = Sim::with_faults(seed, cfg);
+        let result = if scoped {
+            scoped_migration_universe(&mut sim, 4, &scopes, &scoped_twin)
+        } else {
+            migration_universe(&mut sim, &twin)
+        };
+        result.unwrap_or_else(|e| panic!("seed {seed:#x}: an exhausted budget is no failure: {e}"));
+        assert_eq!(
+            sim.gave_up().as_deref(),
+            Some(reason.as_str()),
+            "seed {seed:#x}: a universe that compared nothing gives up, by this name"
+        );
+        assert_eq!(sim.coverage().get(key), Some(&1), "seed {seed:#x}");
+    }
+}
+
 #[test]
 fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
     let twin = migrated_twin(20);
@@ -540,11 +611,28 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
     );
 }
 
+/// The give-ups of a migration universe that never reached its comparison
+/// (S3b item 4). Every seeding or open-and-migrate round met fault fallout
+/// (the barrier remedy counts as a round), so no store was compared.
+fn seed_never_completed() -> String {
+    format!(
+        "seeding the v1 store never completed: every one of its {SEED_ROUNDS} rounds met fault \
+         fallout, so there was no store to migrate"
+    )
+}
+fn migrate_never_completed() -> String {
+    format!(
+        "open-and-migrate never completed: every one of its {MIGRATE_ROUNDS} rounds met fault \
+         fallout or the upgrade barrier, so there was no migrated store to compare"
+    )
+}
+
 /// One universe of the property above: seed the v1 store, open and migrate it
 /// under the fault matrix, and compare the migrated store with `twin`.
 fn migration_universe(sim: &mut Sim, twin: &[(u64, u32, String)]) -> Result<(), String> {
     if !seed_v1_result(sim, 20)? {
         sim.cover("migrations:inconclusive");
+        sim.give_up(seed_never_completed());
         return Ok(());
     }
     let db_cfg = DbConfig {
@@ -552,10 +640,11 @@ fn migration_universe(sim: &mut Sim, twin: &[(u64, u32, String)]) -> Result<(), 
         ..cfg()
     };
     let Some(db) = open_and_migrate_with_remedy(sim, db_cfg)? else {
-        // Harsh-config non-convergence (auth's inconclusive precedent):
-        // every round was fault-fallout or a legitimately-remedied
-        // barrier, and the budget ran out before a clean open+migrate.
+        // Harsh-config non-convergence: every round was fault-fallout or a
+        // legitimately-remedied barrier, and the budget ran out before a
+        // clean open+migrate. Nothing was compared, so nothing passes.
         sim.cover("migrations:inconclusive");
+        sim.give_up(migrate_never_completed());
         return Ok(());
     };
     sim.cover("migrations:resumed-to-completion");
@@ -1333,7 +1422,7 @@ fn seed_scoped_v1(sim: &Sim, rows_per_scope: u64, scopes: &[u64]) {
 /// at seq 0 (which the log correctly refuses as out of order).
 fn seed_scoped_v1_result(sim: &Sim, rows_per_scope: u64, scopes: &[u64]) -> Result<bool, String> {
     let all_records = scoped_seed_records(rows_per_scope, scopes);
-    for _round in 0..64 {
+    for _round in 0..SEED_ROUNDS {
         let attempt: io::Result<()> = (|| {
             let mut db = Db::open(
                 Box::new(sim.disk()),
@@ -1369,7 +1458,7 @@ fn seed_scoped_v1_result(sim: &Sim, rows_per_scope: u64, scopes: &[u64]) -> Resu
 /// `open_and_migrate_with_remedy`, scoped: same barrier-remedy shape.
 fn open_and_migrate_scoped_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db>, String> {
     let mut remedy_pending = false;
-    for _round in 0..128 {
+    for _round in 0..MIGRATE_ROUNDS {
         if remedy_pending {
             match Db::open(
                 Box::new(sim.disk()),
@@ -1470,46 +1559,56 @@ fn migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninter
         0x2EB7_5000,
         128,
         |_cfg: &mut FaultConfig| {},
-        |sim: &mut Sim| {
-            if !seed_scoped_v1_result(sim, rows_per_scope, &scopes)? {
-                sim.cover("migrations:scoped-inconclusive");
-                return Ok(());
-            }
-            let db_cfg = DbConfig {
-                migration_batch_size: 3,
-                ..cfg()
-            };
-            let Some(db) = open_and_migrate_scoped_with_remedy(sim, db_cfg)? else {
-                sim.cover("migrations:scoped-inconclusive");
-                return Ok(());
-            };
-            sim.cover("migrations:scoped-resumed-to-completion");
-            let mut rows = db
-                .snapshot()
-                .map_err(|e| e.to_string())?
-                .scan_raw(ScopedWidgetV2::TABLE, true)
-                .map_err(|e| e.to_string())?;
-            rows.sort();
-            let got: Vec<(u64, u64, u32, String)> = rows
-                .into_iter()
-                .map(|(scope, id, bytes)| {
-                    let r = <ScopedWidgetV2 as Row>::decode_row(&bytes).map_err(|e| e.to_string())?;
-                    Ok::<_, String>((scope, id, r.count, r.label))
-                })
-                .collect::<Result<_, String>>()?;
-            if got != twin {
-                return judge_divergence(
-                    sim,
-                    &got,
-                    &twin,
-                    "migrations:scoped-corruption-excused",
-                    "migrated scoped store",
-                );
-            }
-            Ok(())
-        },
+        |sim: &mut Sim| scoped_migration_universe(sim, rows_per_scope, &scopes, &twin),
         require: ["migrations:scoped-resumed-to-completion"]
     );
+}
+
+/// One universe of the scoped property above.
+fn scoped_migration_universe(
+    sim: &mut Sim,
+    rows_per_scope: u64,
+    scopes: &[u64],
+    twin: &[(u64, u64, u32, String)],
+) -> Result<(), String> {
+    if !seed_scoped_v1_result(sim, rows_per_scope, scopes)? {
+        sim.cover("migrations:scoped-inconclusive");
+        sim.give_up(seed_never_completed());
+        return Ok(());
+    }
+    let db_cfg = DbConfig {
+        migration_batch_size: 3,
+        ..cfg()
+    };
+    let Some(db) = open_and_migrate_scoped_with_remedy(sim, db_cfg)? else {
+        sim.cover("migrations:scoped-inconclusive");
+        sim.give_up(migrate_never_completed());
+        return Ok(());
+    };
+    sim.cover("migrations:scoped-resumed-to-completion");
+    let mut rows = db
+        .snapshot()
+        .map_err(|e| e.to_string())?
+        .scan_raw(ScopedWidgetV2::TABLE, true)
+        .map_err(|e| e.to_string())?;
+    rows.sort();
+    let got: Vec<(u64, u64, u32, String)> = rows
+        .into_iter()
+        .map(|(scope, id, bytes)| {
+            let r = <ScopedWidgetV2 as Row>::decode_row(&bytes).map_err(|e| e.to_string())?;
+            Ok::<_, String>((scope, id, r.count, r.label))
+        })
+        .collect::<Result<_, String>>()?;
+    if got != twin {
+        return judge_divergence(
+            sim,
+            &got,
+            twin,
+            "migrations:scoped-corruption-excused",
+            "migrated scoped store",
+        );
+    }
+    Ok(())
 }
 
 /// Fix round 2, I-2 owed (termination was pinned; exactly-once was not):
