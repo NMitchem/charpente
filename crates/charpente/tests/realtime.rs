@@ -6322,3 +6322,306 @@ fn the_scoped_oracle_catches_an_emit_that_drops_the_scope_key() {
         "the failure must name the emitting scope: {err}"
     );
 }
+
+// ============== the re-sync remedy's order, a change landed in every window
+
+/// A row and an event for one change, so a client can rebuild state two ways:
+/// by reading the rows, or by applying the events.
+#[table(global)]
+struct Mark {
+    id: Id<Mark>,
+    n: u64,
+}
+
+#[event]
+struct Marked {
+    n: WireU64,
+}
+
+#[derive(WireDerive, Serialize, Deserialize)]
+struct MarkBody {
+    n: WireU64,
+}
+
+#[route(POST "/mark", public)]
+fn put_mark(tx: &mut Tx, body: MarkBody) -> Result<(), ApiError> {
+    tx.put(&Mark {
+        id: Id::from_raw(body.n.0),
+        n: body.n.0,
+    });
+    tx.emit(Marked { n: body.n });
+    Ok(())
+}
+
+#[route(GET "/marks", public)]
+fn read_marks(tx: &mut Tx) -> Result<String, ApiError> {
+    let marks = tx.scan::<Mark>()?;
+    Ok(marks
+        .iter()
+        .map(|m| m.n.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+#[route(SSE "/marks-feed", public, emits(Marked))]
+fn marks_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<Marked>().cursor(cursor))
+}
+
+fn spawn_marks_node(sim: &Sim, host: &str, cfg: ReplConfig) -> RNode {
+    let h = sim.host(host);
+    let mut app = App::open(
+        Box::new(h.disk()),
+        Schema::new().table::<Mark>(),
+        Box::new(h.entropy()),
+        AppConfig {
+            db: multi_node_db_cfg(),
+            ..AppConfig::default()
+        },
+    )
+    .unwrap()
+    .mount(routes![put_mark, read_marks, marks_feed]);
+    let (repl, _) = Repl::open(
+        Box::new(h.net()),
+        Box::new(h.disk()),
+        cfg.clone(),
+        app.db_for_tests(),
+    )
+    .unwrap();
+    let kernel = Kernel::with_replication(app, Box::new(sim.clock()), repl).unwrap();
+    let source = SimSource::new(Box::new(sim.clock()), RT_HORIZON);
+    RNode {
+        host: h,
+        kernel: Some(kernel),
+        responses: source.responses(),
+        sinks: source.sinks(),
+        source,
+        name: host.to_string(),
+        repl_cfg: cfg,
+        db_cfg: multi_node_db_cfg(),
+        recoveries: 0,
+        flipped: false,
+    }
+}
+
+fn last_applied(node: &RNode) -> Option<u64> {
+    node.kernel.as_ref().unwrap().app().db().last_applied()
+}
+
+/// Drives both nodes until `node`'s response `index` is recorded, and returns it.
+fn await_response(
+    sim: &Sim,
+    nodes: &mut [&mut RNode],
+    node: usize,
+    index: usize,
+) -> (u16, Vec<u8>) {
+    for _ in 0..RT_STEP_BUDGET {
+        if let Some(r) = nodes[node].responses.lock().unwrap().get(index) {
+            return r.clone();
+        }
+        assert!(
+            rt_kernel_round(sim, nodes).unwrap(),
+            "quiescent before response {index}"
+        );
+    }
+    panic!("no response {index} within budget");
+}
+
+/// The order a client carries out "re-sync current state through reads, then
+/// reconnect without a cursor" in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Remedy {
+    /// As the text reads: the read, then the bare subscribe.
+    ReadThenSubscribe,
+    /// The bare subscribe, then (once its stream is open) the read.
+    SubscribeThenRead,
+}
+
+/// One client carrying out `remedy` against the follower (or the primary),
+/// with one change landed in each of the five windows around its two
+/// requests: before the first is sent, while it is in flight (sent, not yet
+/// served), between its serve and the second's send, while the second is in
+/// flight, and after the second is served. Changes are written on the
+/// primary. On the follower a change "lands" when the shipped record has
+/// applied there; on the primary, when the primary has committed it. Returns
+/// the changes by window, what the read returned, and what the tail delivered.
+fn remedy_windows(remedy: Remedy, on_follower: bool) -> ([u64; 5], BTreeSet<u64>, BTreeSet<u64>) {
+    const IN_FLIGHT: u64 = 100_000_000;
+    let sim = Sim::with_faults(0x2EB2_D400, FaultConfig::none());
+    let mut p = spawn_marks_node(&sim, "p", rt_primary_cfg("p:1"));
+    let mut f = spawn_marks_node(&sim, "f", rt_follower_cfg("f:1", "p:1"));
+    let target = if on_follower { 1 } else { 0 };
+    let mut nodes = [&mut p, &mut f];
+    let mark = |n: u64| Request::new(Method::Post, "/mark").json(&MarkBody { n: WireU64(n) });
+
+    let first_is_subscribe = remedy == Remedy::SubscribeThenRead;
+    let mut read = None;
+    let mut handle = None;
+    let mut by_window = [0u64; 5];
+
+    // Waits until the primary has answered its next write and, on the
+    // follower, until the shipped record has applied there.
+    let mut p_responses = 0usize;
+    let settle = |sim: &Sim, nodes: &mut [&mut RNode], p_responses: &mut usize| {
+        let (status, _) = await_response(sim, nodes, 0, *p_responses);
+        assert_eq!(status, 200, "a mark is written");
+        *p_responses += 1;
+        if on_follower {
+            for _ in 0..RT_STEP_BUDGET {
+                if last_applied(nodes[1]) == last_applied(nodes[0]) {
+                    return;
+                }
+                assert!(rt_kernel_round(sim, nodes).unwrap());
+            }
+            panic!("the follower never applied the mark");
+        }
+    };
+    // Window 0: before the first request is sent.
+    nodes[0].source.push_at(sim.now().as_nanos(), mark(1));
+    settle(&sim, &mut nodes, &mut p_responses);
+    by_window[0] = 1;
+
+    let mut target_responses = 0usize;
+    for (step, is_subscribe) in [(0usize, first_is_subscribe), (1, !first_is_subscribe)] {
+        let in_flight = 2 * step as u64 + 2;
+        let after = in_flight + 1;
+        let request = if is_subscribe {
+            Request::new(Method::Get, "/marks-feed")
+        } else {
+            Request::new(Method::Get, "/marks")
+        };
+        let sent = sim.now().as_nanos();
+        let arrives = sent + IN_FLIGHT;
+        if on_follower {
+            // Sent: the request is on its way to the follower, arriving later.
+            nodes[1].source.push_at(arrives, request);
+            nodes[0]
+                .source
+                .push_at(sim.now().as_nanos(), mark(in_flight));
+            settle(&sim, &mut nodes, &mut p_responses);
+            assert!(
+                sim.now().as_nanos() < arrives,
+                "the change must land while the request is in flight"
+            );
+        } else {
+            // Sent: the change, written by another client, reaches the primary
+            // first, so it commits before this request is served.
+            nodes[0].source.push_at(arrives - 1, mark(in_flight));
+            nodes[0].source.push_at(arrives, request);
+            sim.clock().sleep(Duration::from_nanos(arrives - 1 - sent));
+            settle(&sim, &mut nodes, &mut p_responses);
+        }
+        by_window[2 * step + 1] = in_flight;
+        if sim.now().as_nanos() < arrives {
+            sim.clock()
+                .sleep(Duration::from_nanos(arrives - sim.now().as_nanos()));
+        }
+        let index = if on_follower {
+            target_responses
+        } else {
+            p_responses
+        };
+        let (status, body) = await_response(&sim, &mut nodes, target, index);
+        if on_follower {
+            target_responses += 1;
+        } else {
+            p_responses += 1;
+        }
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        if is_subscribe {
+            handle = Some(nodes[target].sinks.lock().unwrap().last().cloned().unwrap());
+        } else {
+            let text = String::from_utf8_lossy(&body).trim_matches('"').to_string();
+            read = Some(
+                text.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<u64>().unwrap())
+                    .collect::<BTreeSet<u64>>(),
+            );
+        }
+        // After this request is served (and before the next is sent).
+        nodes[0].source.push_at(sim.now().as_nanos(), mark(after));
+        settle(&sim, &mut nodes, &mut p_responses);
+        by_window[2 * step + 2] = after;
+    }
+
+    // Let the tail deliver everything the target has.
+    let handle = handle.unwrap();
+    let head = nodes[target]
+        .kernel
+        .as_ref()
+        .unwrap()
+        .app()
+        .db()
+        .next_event_id()
+        .unwrap();
+    for _ in 0..RT_STEP_BUDGET {
+        if handle.frames().last().is_some_and(|f| f.id + 1 == head) {
+            break;
+        }
+        assert!(rt_kernel_round(&sim, &mut nodes).unwrap());
+    }
+    let delivered = handle
+        .frames()
+        .iter()
+        .map(|f| {
+            let v: serde_json::Value = serde_json::from_str(&f.json).unwrap();
+            v["n"].as_str().unwrap().parse::<u64>().unwrap()
+        })
+        .collect();
+    (by_window, read.unwrap(), delivered)
+}
+
+/// The remedy every cursor refusal and terminal frame names, carried out
+/// subscribe-first, misses nothing: with a change landed in each of the five
+/// windows around its two requests, on a follower and on the primary, every
+/// change reaches the client by the read, the tail, or both. The two that land
+/// between the stream opening and the read being served arrive by both routes,
+/// which is why the client applies frames idempotently, keyed by what the
+/// change is (here the mark's own number).
+#[test]
+fn the_resync_remedy_subscribe_first_then_read_misses_no_change_in_any_window() {
+    for on_follower in [true, false] {
+        let (by_window, read, delivered) = remedy_windows(Remedy::SubscribeThenRead, on_follower);
+        let seen: BTreeSet<u64> = read.union(&delivered).copied().collect();
+        let missed: Vec<u64> = by_window
+            .iter()
+            .copied()
+            .filter(|n| !seen.contains(n))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "follower {on_follower}: changes {missed:?} reached neither the read {read:?} nor \
+             the tail {delivered:?}"
+        );
+        assert_eq!(
+            read.intersection(&delivered).copied().collect::<Vec<_>>(),
+            vec![by_window[2], by_window[3]],
+            "follower {on_follower}: the changes between the stream opening and the read \
+             arrive by both routes"
+        );
+    }
+}
+
+/// The same five windows with the remedy carried out in the order its text
+/// reads, the read and then the bare subscribe: the change landing after the
+/// read is served and the one landing while the subscribe is in flight reach
+/// the client by neither route, on a follower and on the primary alike.
+#[test]
+fn the_resync_remedy_read_first_then_subscribe_misses_the_changes_between_its_steps() {
+    for on_follower in [true, false] {
+        let (by_window, read, delivered) = remedy_windows(Remedy::ReadThenSubscribe, on_follower);
+        let seen: BTreeSet<u64> = read.union(&delivered).copied().collect();
+        let missed: Vec<u64> = by_window
+            .iter()
+            .copied()
+            .filter(|n| !seen.contains(n))
+            .collect();
+        assert_eq!(
+            missed,
+            vec![by_window[2], by_window[3]],
+            "follower {on_follower}: read {read:?}, tail {delivered:?}"
+        );
+    }
+}

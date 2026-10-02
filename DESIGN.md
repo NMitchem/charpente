@@ -1680,8 +1680,13 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   through, or clamps it — access control is the handler's own session/row logic, not the
   platform's). The platform extracts the client's cursor before the handler runs:
   `Last-Event-ID` header wins (browser-native SSE resume), else a `cursor` query
-  parameter, else `None` ("from now" — only future events); an unparseable cursor is a 400
-  and the handler never runs. The route may also DECLARE the event types its stream
+  parameter, else `None` ("from now"); an unparseable cursor is a 400 and the handler never
+  runs. "From now" is the node's `next_event_id` when it SERVES the subscribe
+  (`validate_subscribe`), not when the client sent it: every event committed before that
+  point, and on a follower every event applied from the primary's log before it (one that
+  landed while the request was in flight included), is behind the tail. A subscribe ends
+  its request batch, so on a primary the batch-mates staged ahead of it are behind the
+  tail and nothing staged after it is. The stream does not name that point. The route may also DECLARE the event types its stream
   carries — `#[route(SSE "/path", emits(InvoicePaid, InvoiceVoided))]` — which is what
   lets a generated client type `subscribe()` as a discriminated union of exactly those
   payloads instead of "anything". The declaration names Rust types, and the contract
@@ -1722,7 +1727,13 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
 - **Honesty at the edges.** A cursor below the retention floor, or one naming an event id
   this node never minted (or minted with a different seq — the cross-timeline case), is
   refused at subscribe with a 409 naming the floor or the divergence detail and the fix:
-  re-sync current state through reads, then reconnect without a cursor. A tail that falls
+  re-sync current state through reads, then reconnect without a cursor. The two steps are
+  gap-free only subscribe-first: reconnect bare, wait for the stream to open, read from the
+  same node, and apply each frame idempotently over the read. Read-first, a change landing
+  after the read is served and before the subscribe is (a follower apply in flight
+  included) reaches the client by neither route (`realtime.rs`, the two
+  `the_resync_remedy_*` tests: a change in each of the five windows around the two
+  requests, on a follower and a primary; 2026-10-02, D4). A tail that falls
   behind retention mid-stream gets the same fact set as a terminal SSE frame —
   `event: charpente.gap` — then its sink closes. A stored event whose recorded shape (§3)
   is not the subscribed type's is never decoded: the tail gets a terminal

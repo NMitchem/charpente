@@ -4442,7 +4442,14 @@ unparseable one never reaches app code:
    `EventSource` reconnection resume automatically, no client code required.
 2. Else the `cursor` query parameter (`?cursor=<id>.<seq>`) — for a first connect
    from a non-browser client, or a manual reconnect.
-3. Else `None` — "from now": only events committed after this moment.
+3. Else `None` — "from now". The tail starts at the node's next event id at the
+   moment the node *serves* the subscribe, not the moment the client sent it. An
+   event the node committed before that moment is not delivered, and on a
+   follower that includes every event it had applied from the primary's log, even
+   one that landed while the request was on its way. On a primary, events from the
+   requests it took before the subscribe are behind the tail, and events from those
+   after it are delivered (a subscribe ends its batch). The stream does not say where that moment fell,
+   so a client that must not miss an event resumes with a cursor.
 
 A present-but-unparseable cursor is a 400, and the handler never runs:
 
@@ -4503,6 +4510,20 @@ state through ordinary reads, then reconnect with no cursor at all — a fresh
 corrupt-row case does not: reconnecting without a cursor does not un-corrupt
 the stored bytes, so its fix is to restore this node from its archive or
 re-seed it from its primary instead.
+
+**Carry the two steps out subscribe-first.** Reconnect with no cursor, wait for
+the stream to open, then read from that same node, and apply each frame
+idempotently over what the read returned. A change that lands between the stream
+opening and the read being served arrives by both routes, which is why each
+frame must be safe to apply twice. In the order the text names them, the read
+and then the reconnect, a change that lands after the read is served and before
+the subscribe is served reaches the client by neither route: it is not in what
+the read returned, and the tail starts after it. `realtime.rs`'s
+`the_resync_remedy_subscribe_first_then_read_misses_no_change_in_any_window`
+lands one change in each of the five windows around the two requests, on a
+follower and on a primary, and every change arrives.
+`the_resync_remedy_read_first_then_subscribe_misses_the_changes_between_its_steps`
+shows the text's order missing exactly those two windows.
 
 ### Delivery: one bounded path, no live/catch-up modes
 
