@@ -30,7 +30,10 @@ use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, Row, View};
-use charpente_sim::checks::{FaultReason, classify, durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{
+    FaultReason, boot_through_fallout, classify, durable_corruption_fired, durable_refusal,
+    is_fault_fallout,
+};
 use charpente_sim::{FaultConfig, Sim, SimEntropy, SimHost, run_universes_swarm_with};
 use serde::{Deserialize, Serialize};
 
@@ -1988,6 +1991,13 @@ const SETTLE_ATTEMPTS: u32 = 12;
 /// them share a power cycle — see `settle_boot`.
 const SETTLE_BOOT_TRIES: u32 = 64;
 const SETTLE_CYCLE_EVERY: u32 = 8;
+/// How many boots one epoch's node gets before the epoch is skipped: each
+/// failed boot is followed by a restart, as a supervised process restarts
+/// (`checks::boot_through_fallout`). An epoch that runs out restarts and moves
+/// on, as every epoch did after one failed boot before `Db::open` stopped
+/// absorbing a store-open fault; the settle phase still adjudicates or gives
+/// up.
+const BOOT_TRIES: u32 = 8;
 
 /// Builds this round's subscribe request (if the client needs one) and
 /// queues its stall closure, returning `(was_bare, boundary)` for
@@ -2076,6 +2086,10 @@ fn settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
                 if !is_fault_fallout(&e.to_string()) {
                     return Err(format!("settle open failed non-injected: {e}"));
                 }
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(None);
+                }
                 continue;
             }
         };
@@ -2113,15 +2127,12 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
         let entropy = sim.entropy();
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(50 + entropy.next_u64() % 399);
-        let app = match realtime_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
+        let Some(app) =
+            boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || realtime_app(sim))
+                .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            sim.restart();
+            continue;
         };
         let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
             Ok(k) => k,
@@ -2233,8 +2244,8 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     // excuses, so one that drops a clean attempt's tail leaves that attempt
     // adjudicating nothing, and when it was the only clean attempt the
     // universe failed "client never caught up" on no evidence (seed
-    // 0xfddd6c7112629074, pinned below). The epochs above keep exercising
-    // stall-drop and resume.
+    // 0xfddd6c7112629074; the scenario is pinned below). The epochs above
+    // keep exercising stall-drop and resume.
     sim.quiesce_subscriber_stalls();
     // How many settle attempts ran all the way through `kernel.run` without
     // fault fallout. Zero means this universe never observed the platform
@@ -2352,6 +2363,40 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
 
 // ------------------------------------------------------------------ tests
 
+/// A durable refusal at the settle phase's boot ends it at once, by name (S5 re-review
+/// R-M2). Seed `0x28a2433c2792b1b9`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("no settle attempt
+/// completed without fault fallout over 12 attempts").
+#[test]
+fn a_durable_refusal_at_the_settle_boot_ends_it_at_once_by_name() {
+    const SEED: u64 = 0x28a2_433c_2792_b1b9;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = realtime_workload(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
+
 #[test]
 fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     run_universes_swarm_with!(
@@ -2360,6 +2405,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| realtime_workload(sim).map(|_trace| ()),
         require: [
+            "boot:booted-after-retry",
             "realtime:resume-backlog",
             "realtime:gap",
             "realtime:stall-drop",
@@ -2368,9 +2414,9 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0xdec436b030427fc6` (base `0xA11CE002`, universe 124).
+/// Seed `0xe9110992f2280d36` (base `0xA11CE013`, universe 289).
 ///
-/// **This pin has been re-found twice, and that is worth knowing before
+/// **This pin has been re-found three times, and that is worth knowing before
 /// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
 /// this property (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). The
 /// directory-barrier stream split later that day re-rolled every universe one
@@ -2382,9 +2428,20 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// re-roll that happens to land on some *other* give-up can no longer keep this
 /// test quietly green while testing nothing. Its successor `0xbb93400e0bc80ca4`
 /// stopped reproducing when redb 4.3.0 changed the store's IO shape and the
-/// crash countdowns were re-sized (2026-09-30); this one was re-found the same
-/// way, and with the zero-clean-attempts give-up removed it fails "client never
-/// caught up", which is the regression.
+/// crash countdowns were re-sized (2026-09-30); `0xdec436b030427fc6` (universe
+/// 124) stopped when `Db::open` stopped discarding a store over an IO error
+/// (2026-10-01): that universe now reaches a verdict. `0xd0fce29ba31210d0`
+/// (universe 281) stopped the same day, when the epochs began booting through
+/// restarts and WAL recovery began syncing before replay (S5 with D1).
+/// `0xaf1ba92646f937ea` (base `0xA11CE002`, universe 452) stopped too, when the
+/// settle boot began ending at once on a boot refused for durable corruption
+/// (S5 re-review R-M2): every one of its boots had been that refusal, so it
+/// now gives up under the refusal's name. This one, found by scanning 14,336
+/// universes over the 28 bases `0xA11CE002` to `0xA11CE01D` for a give-up
+/// naming no node to catch up from, is the only one of them; it meets no
+/// durable refusal, and
+/// with the zero-clean-attempts give-up removed it fails "client never caught
+/// up", which is the regression.
 ///
 /// The scenario: every one of `SETTLE_ATTEMPTS` attempts ends with `settle_boot`
 /// returning `None`. The node never booted once, so the client never had a single
@@ -2398,7 +2455,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// give up rather than report a miss it never had the chance to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0xdec4_36b0_3042_7fc6;
+    const SEED: u64 = 0xe911_0992_f228_0d36;
     // Reconstruct this universe exactly as the swarm runner derives it.
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -2424,18 +2481,22 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
     );
 }
 
-/// Seed `0xfddd6c7112629074` (base `0x5E1F0002`, universe 70), S4's Finding D
-/// (2026-09-30). The settle phase's one clean attempt resumed from cursor 19
-/// and an injected subscriber stall dropped its tail before id 20 arrived;
-/// the other eleven attempts never booted a node. The property
-/// excuses a stall, so that universe adjudicated nothing, yet it failed "client
-/// never caught up": a harness gap, not lost delivery. The settle now runs with
-/// stalls quiesced, so that attempt delivers the backlog and the universe
-/// passes. With `quiesce_subscriber_stalls` removed it fails "client never
-/// caught up" again.
+/// Seed `0x02b911a604c2ead4` (base `0x5E1F003A`, universe 226), the scenario
+/// of S4's Finding D (2026-09-30). The settle phase has one clean attempt; with
+/// `quiesce_subscriber_stalls` removed, an injected subscriber stall drops that
+/// attempt's tail, it resumes from cursor 22, and id 23 never arrives. The
+/// property excuses a stall, so that universe adjudicated nothing, yet it
+/// failed "client never caught up": a harness gap, not lost delivery. The
+/// settle runs with stalls quiesced, so that attempt delivers the backlog and
+/// the universe passes. Re-pinned 2026-10-01 for S5 with D1, which re-key every
+/// universe: the finding's `0xfddd6c7112629074` (base `0x5E1F0002`, universe
+/// 70) no longer has a single clean settle attempt. Found by removing the
+/// quiesce and scanning 64 fresh bases from `0x5E1F0002` for universes that
+/// fail "client never caught up": this is the only one of 4,185 that inject
+/// stalls.
 #[test]
 fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
-    const SEED: u64 = 0xfddd_6c71_1262_9074;
+    const SEED: u64 = 0x02b9_11a6_04c2_ead4;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
@@ -2458,8 +2519,8 @@ fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
         sim.coverage()
     );
     assert!(
-        trace.iter().any(|(id, _, _)| *id == 20),
-        "id 20, the first matching id the failure named as unaccounted, must arrive: {trace:?}"
+        trace.iter().any(|(id, _, _)| *id == 23),
+        "id 23, the first matching id the failure named as unaccounted, must arrive: {trace:?}"
     );
 }
 
@@ -3482,9 +3543,29 @@ fn mixed_shape_resumes_replay_identically_for_the_same_seed() {
 /// | `shapes:reshaped-frame` | 11 | 19 |
 /// | `shapes:reshaped-409` | 52 | 66 |
 /// | `shapes:v2-delivered` | 42 | 56 |
-const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 19;
-const SHAPES_RESHAPED_409_FLOOR: u64 = 66;
-const SHAPES_V2_DELIVERED_FLOOR: u64 = 56;
+///
+/// **Re-set 2026-10-01**, same base and count, two identical batches, for S5
+/// and D1 together: `Db::open` no longer discards a store over an IO error,
+/// and WAL recovery syncs each segment before replay (a sync with nothing to
+/// flush draws no fault). Both re-key every universe. `reshaped-409` rose and
+/// is set on its count. The other two fell and are re-set by GUIDE §8's re-key
+/// rule, over the same 10 fresh bases, parent of both (796bff2) against this
+/// tree: `0x5E5F_0C01`..`0x5E5F_0C0B` without `0x5E5F_0C05`, where the parent
+/// fails on the "store outran durable truth" assert D1 fixed (seed
+/// `0x99ba30a2993956be`).
+///
+/// | key | was | now | parent mean (sd) | this tree mean (sd) | difference / Welch SE |
+/// |---|---|---|---|---|---|
+/// | `shapes:reshaped-frame` | 19 | 14 | 14.4 (4.48) | 13.8 (3.74) | −0.60 / 1.84 = −0.33 |
+/// | `shapes:reshaped-409` | 66 | 70 | | | rose |
+/// | `shapes:v2-delivered` | 56 | 51 | 56.5 (4.35) | 55.7 (6.11) | −0.80 / 2.37 = −0.34 |
+///
+/// Both falls are inside one standard error, so neither rate decayed; the
+/// pinned base had sat near the top of the parent's spread (19 against a mean
+/// of 14.4).
+const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 14;
+const SHAPES_RESHAPED_409_FLOOR: u64 = 70;
+const SHAPES_V2_DELIVERED_FLOOR: u64 = 51;
 
 /// `shapes_verdict`'s stall arm, both sides, called directly. The sink is
 /// dropped before every verdict, so the tail is closed the way the terminal
@@ -3821,10 +3902,10 @@ fn rt_recover_exhausted_key(last: &str) -> &'static str {
 /// A local copy this property has no restore rig for: corruption at or below
 /// the durable horizon, or a log directory gapped past guessing. NOT DESIGN
 /// §4's compacted-log refusal, although it names the same "restore this node"
-/// fix: `recover_rt_node` sends that one on to its fault-fallout arm (an
-/// injected fault inside `Store::open`, carrying its injected text) and
+/// fix: `recover_rt_node` sends that one on to its fault-fallout arm and
 /// otherwise fails, because under redb 4.3.0 the crash model cannot brick the
-/// store.
+/// store. (An injected fault inside `Store::open` no longer becomes the
+/// refusal at all: `Db::open` returns it as itself, DESIGN §4.)
 fn local_copy_unrestorable(e: &str) -> bool {
     (e.contains("restore this node from a replica or backup") || e.contains("refusing to guess"))
         && !e.contains("cannot be rebuilt from the log alone")
@@ -5080,6 +5161,10 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
                 if !is_fault_fallout(&e.to_string()) {
                     return Err(format!("settle open failed non-injected: {e}"));
                 }
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(None);
+                }
                 continue;
             }
         };
@@ -5123,15 +5208,13 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
         let entropy = sim.entropy();
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(51 + entropy.next_u64() % 410);
-        let app = match scoped_realtime_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
+        let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || {
+            scoped_realtime_app(sim)
+        })
+        .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            sim.restart();
+            continue;
         };
         let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
             Ok(k) => k,
@@ -5413,6 +5496,7 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| scoped_realtime_workload(sim).map(|_trace| ()),
         require: [
+            "boot:booted-after-retry",
             "tenant:both-tenants-emitted",
             "tenant:own-backlog-verified",
             "tenant:foreign-backlog-not-delivered",
@@ -5471,14 +5555,28 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
 /// | `tenant:own-backlog-verified` | 78 | 78 | 81 | 81 |
 /// | `tenant:foreign-backlog-not-delivered` | 80 | 87 | 98 | 98 |
 /// | `realtime:resume-backlog` | 125 | 126 | 126 | 125 |
-const SCOPED_BOTH_TENANTS_FLOOR: u64 = 83;
-const SCOPED_OWN_BACKLOG_FLOOR: u64 = 81;
-const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 98;
-const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
+///
+/// **Re-set 2026-10-01**, same base, two identical batches, for S5 and D1
+/// together: each epoch's boot now boots again through
+/// `checks::boot_through_fallout` instead of skipping the epoch on its first
+/// faulted boot, `Db::open` no longer discards a store over an IO error, and
+/// WAL recovery syncs each segment before replay. None fell; each is set on
+/// its new count.
+///
+/// | key | was | now |
+/// |---|---|---|
+/// | `tenant:both-tenants-emitted` | 83 | 106 |
+/// | `tenant:own-backlog-verified` | 81 | 96 |
+/// | `tenant:foreign-backlog-not-delivered` | 98 | 99 |
+/// | `realtime:resume-backlog` | 125 | 206 |
+const SCOPED_BOTH_TENANTS_FLOOR: u64 = 106;
+const SCOPED_OWN_BACKLOG_FLOOR: u64 = 96;
+const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 99;
+const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 206;
 
-/// Seed `0x20851976ea4bae36` (base `0x5E1F0013`), found 2026-09-30 by S3's
-/// fresh-base scan. A misdirected write moved event id 5's WAL frame (seq 8,
-/// tenant A) off its offset, so the next recovery cut the log there, and the
+/// Found 2026-09-30 by S3's fresh-base scan, at seed `0x20851976ea4bae36`
+/// (base `0x5E1F0013`). A misdirected write moved event id 5's WAL frame (seq
+/// 8, tenant A) off its offset, so the next recovery cut the log there, and the
 /// following emits re-minted id 5 for tenant B. The client's ledger had
 /// already recorded the old id 5 and its resume never saw the re-mint (tenant
 /// B's rows are filtered), so the flagship's drain-error probe never ran, and
@@ -5487,11 +5585,22 @@ const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
 /// lost. From 2026-09-30 it gave up; that excuse also swallowed an id
 /// re-minted for tenant A and never delivered (review I2). Since 2026-10-01
 /// the boundary read after that recovery re-syncs the client to the node's
-/// timeline (`Client::resync_if_cut`), so id 5 is B's and not owed, and the
-/// universe reaches a verdict on everything A was owed.
+/// timeline (`Client::resync_if_cut`), so the cut id is B's and not owed, and
+/// the universe reaches a verdict on everything A was owed.
+///
+/// Pinned at seed `0x083bd434c717d60c` (base `0x5E1F0039`, universe 73) since
+/// S5 with D1 re-keyed every universe the same day and the original seed
+/// stopped meeting durable corruption. It meets the same shape at id 3: one
+/// misdirected write, a recovery that cuts id 3 out of tenant A's recorded
+/// ledger, and id 3 re-minted for tenant B, which A never receives. With the
+/// re-sync disabled it gives up "ledger id 3 is behind this node's timeline",
+/// the 2026-09-30 behaviour. Found by disabling the re-sync and scanning 48
+/// bases (`0x2EB2_5C09` and `0x5E1F0013`..`0x5E1F0041`, 12,288 universes) for
+/// that give-up: 12 universes give it, and this is the only one whose cut id
+/// was re-minted rather than left absent.
 #[test]
 fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced() {
-    const SEED: u64 = 0x2085_1976_ea4b_ae36;
+    const SEED: u64 = 0x083b_d434_c717_d60c;
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
     let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
@@ -5511,8 +5620,8 @@ fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynce
         sim.coverage()
     );
     assert!(
-        !trace.iter().any(|&(id, ..)| id == 5),
-        "id 5 was re-minted for tenant B, so A must never receive it: {trace:?}"
+        !trace.iter().any(|&(id, ..)| id == 3),
+        "id 3 was re-minted for tenant B, so A must never receive it: {trace:?}"
     );
 }
 

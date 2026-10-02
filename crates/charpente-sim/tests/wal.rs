@@ -1796,6 +1796,140 @@ fn a_failed_sync_poisons_the_log_and_every_later_call_is_refused() {
     assert!(wal.poisoned(), "refusals do not clear the poison");
 }
 
+/// Readable is not durable. A process that dies between a frame's write and
+/// its fsync leaves the frame in the page cache, and the next process reads
+/// it back as a perfectly valid record. Until 2026-10-01 recovery handed it to
+/// `on_record` without ever syncing it, so the next power loss took back a
+/// record the caller had already applied — and a `Db` had already persisted,
+/// which is how realtime found it (the store outran the log; seeds and the
+/// Db-level pins are in charpente-core's `tests/engine.rs`,
+/// `a_record_recovery_replays_survives_the_next_power_loss`). Recovery now
+/// syncs each segment before any of its frames reaches replay.
+///
+/// The next process opens in the same power epoch with no `Sim` call between:
+/// dropping the `Wal` is the process dying (it has no destructor IO), and the
+/// sim's page cache is everything not yet collapsed by `Sim::restart`.
+#[test]
+fn a_frame_recovery_replays_survives_the_next_power_loss() {
+    let sim = quiet_sim(); // FaultConfig::none(): a power cycle drops every unsynced write
+    {
+        let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+        assert_eq!(wal.append(b"written, never synced").unwrap(), 0);
+    } // the process dies before its fsync
+    let replay = |sim: &Sim| {
+        let mut seen = Vec::new();
+        drop(
+            Wal::open(Box::new(sim.disk()), small_segments(), |seq, payload| {
+                seen.push((seq, payload.to_vec()));
+                Ok(())
+            })
+            .unwrap(),
+        );
+        seen
+    };
+    let first = replay(&sim);
+    assert_eq!(
+        first,
+        vec![(0, b"written, never synced".to_vec())],
+        "the next process reads the frame back from the page cache"
+    );
+    sim.restart(); // power loss
+    assert_eq!(
+        replay(&sim),
+        first,
+        "a record recovery replayed vanished at the next power loss — recovery handed on a frame \
+         it never made durable"
+    );
+}
+
+/// fsyncgate, at recovery: a segment whose sync fails is a segment of which
+/// nothing is known to be durable, so recovery fails before handing a single
+/// one of its frames to `on_record`. Syncing after replay instead would let the
+/// caller apply (and persist) the very frames the failed sync says nothing
+/// about.
+#[test]
+fn a_recovery_whose_segment_sync_fails_hands_no_frame_to_replay() {
+    let sim = quiet_sim();
+    {
+        let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+        wal.append(b"written, never synced").unwrap();
+    } // the process dies before its fsync
+    let arm = Arc::new(AtomicBool::new(true));
+    let mut replayed = 0;
+    let err = Wal::open(
+        Box::new(FailOneSync {
+            inner: sim.disk(),
+            arm: arm.clone(),
+        }),
+        small_segments(),
+        |_, _| {
+            replayed += 1;
+            Ok(())
+        },
+    )
+    .expect_err("recovery went on past a segment whose sync failed");
+    // Hard rule 5: the contract, the site (the segment) and the fix, around
+    // the disk's own text, which fault classification still reads.
+    assert_eq!(
+        err.to_string(),
+        "recovery could not make log segment \"wal/00000000000000000000.log\" durable before \
+         replaying it: injected fsync failure — contract: no frame is replayed before its \
+         segment is synced (DESIGN §2), so none of this segment's frames were replayed; fix: \
+         restart to retry recovery, and if this sync keeps failing the disk is failing"
+    );
+    assert_eq!(
+        replayed, 0,
+        "a frame reached replay from a segment whose sync failed"
+    );
+}
+
+/// Recovery syncs EVERY segment it replays, not just the tail. `rotate` syncs
+/// the old tail before the next segment exists, so a log this binary wrote
+/// never leaves an unsynced frame behind a later segment; recovery does not
+/// rest on that. This log breaks it: segment 0 holds a valid frame that was
+/// written and never synced, and segment 1 is synced and name-barriered.
+/// Syncing only the tail replays both frames after the process restart, then
+/// loses segment 0's frame at the power loss, and the next open refuses the
+/// log as a gap ("a segment is missing"): the node no longer starts.
+/// (D1 review, I2.)
+#[test]
+fn a_frame_recovery_replays_from_a_non_tail_segment_survives_the_next_power_loss() {
+    let sim = quiet_sim(); // FaultConfig::none(): a power cycle drops every unsynced write
+    {
+        let disk = sim.disk();
+        let first = disk.open("wal/00000000000000000000.log").unwrap();
+        first.write_at(0, &raw_frame(0, 8, b"record-0")).unwrap(); // never synced
+        let tail = disk.open("wal/00000000000000000001.log").unwrap();
+        tail.write_at(0, &raw_frame(1, 8, b"record-1")).unwrap();
+        tail.sync().unwrap();
+        disk.sync_dir("wal/").unwrap();
+    }
+    sim.restart_process(); // the writer died; its page cache did not
+    let replay = |sim: &Sim| {
+        let mut seen = Vec::new();
+        Wal::open(Box::new(sim.disk()), small_segments(), |seq, _| {
+            seen.push(seq);
+            Ok(())
+        })
+        .map(drop)
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(seen)
+    };
+    let first = replay(&sim);
+    assert_eq!(
+        first,
+        Ok(vec![0, 1]),
+        "the next process reads both frames back, the non-tail one from the page cache"
+    );
+    sim.restart(); // power loss
+    assert_eq!(
+        replay(&sim),
+        first,
+        "a frame recovery replayed from a non-tail segment vanished at the next power loss — \
+         recovery synced only the tail"
+    );
+}
+
 /// One frame in the WAL's real format — `[seq u64 le][len u32 le][crc u32
 /// le][payload]`, crc over seq‖len‖payload as `frame_crc` computes it — so a
 /// hand-built log differs from an appended one only where the test says.

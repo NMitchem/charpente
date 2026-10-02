@@ -32,6 +32,19 @@
 //! resurrected by an unsynced removal would reintroduce the exact stale data
 //! the cut just discarded (and, now, reopen the gap the ordering closes).
 //!
+//! Recovery syncs each segment's bytes before handing any of its frames to
+//! `on_record` — the same append→sync→apply order `submit` keeps, applied to
+//! what recovery reads back. Readable is not durable: a frame the previous
+//! process wrote and never synced (it died first, or its fsync failed) is
+//! still in the page cache after a process restart and reads back valid, and
+//! replaying it unsynced let the store persist a record the next power loss
+//! took from the log (the store outran the log, realtime seed
+//! 0x7df8c43a1d2591e8). A segment whose sync fails hands nothing to replay.
+//! The sync closes the process-death case. It only narrows the failed-fsync
+//! one: on Linux a failed fsync can mark the pages clean, so a frame can stay
+//! readable without ever reaching the disk, and this sync then succeeds
+//! without writing it (DESIGN §2).
+//!
 //! Every successful `open` also barriers the directory before returning,
 //! including the clean recovery path that cut nothing. A `sync_dir` that
 //! FAILS leaves the names it covered non-durable while the segment file
@@ -137,6 +150,10 @@ impl Wal {
     /// mutates nothing — it returns before any truncation or deletion runs,
     /// so a caller that retries with a wider (or no) horizon still sees
     /// today's cut behavior, untouched.
+    ///
+    /// Every frame handed to `on_record` is durable: each segment is synced
+    /// before its first frame is read, and a failed sync returns `Err` before
+    /// any of that segment's frames reaches `on_record` (module docs).
     pub fn open_with_horizon(
         disk: Box<dyn Disk>,
         cfg: WalConfig,
@@ -194,6 +211,29 @@ impl Wal {
                 )));
             }
             let file = disk.open(name)?;
+            // Readable is not durable. A frame the previous process wrote and
+            // never synced — it died first, or its fsync failed and poisoned
+            // the log — is still in the page cache, and reads back valid. Make
+            // the segment's bytes durable BEFORE any of its frames reaches
+            // `on_record`: replay applies them to the store, which can persist
+            // them (`Db::open`'s checkpoint, or merely the store's close), and
+            // a power loss after that would leave the store ahead of the log
+            // (realtime seed 0x7df8c43a1d2591e8). A sync that fails returns
+            // here, before replay: it guarantees nothing about these bytes
+            // (fsyncgate), so none of them may be applied. The error keeps
+            // the disk's own kind and text (fault classification reads it).
+            file.sync().map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "recovery could not make log segment \"{name}\" durable before replaying \
+                         it: {e} — contract: no frame is replayed before its segment is synced \
+                         (DESIGN §2), so none of this segment's frames were replayed; fix: \
+                         restart to retry recovery, and if this sync keeps failing the disk is \
+                         failing"
+                    ),
+                )
+            })?;
             let len = file.len()?;
             let mut offset = 0u64;
             let cut = loop {

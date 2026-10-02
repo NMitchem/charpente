@@ -5,7 +5,7 @@ use charpente::core::table::{Codec, Id};
 use charpente::http::{App, Cursor, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::wire::{WireI64, WireU64};
-use charpente_sim::checks::{is_fault_fallout, replays_identically};
+use charpente_sim::checks::{boot_through_fallout, is_fault_fallout, replays_identically};
 use charpente_sim::{FaultConfig, Sim};
 use invoicing::model::{Customer, Invoice, InvoiceState, Receipt, Reminder};
 use invoicing::routes::{CreateCustomerBody, CreateInvoiceBody, LineItemInput};
@@ -27,6 +27,10 @@ charpente_sim::sim_tests! {
 fn build(sim: &Sim) -> std::io::Result<App> {
     invoicing::build_app(Box::new(sim.disk()), Box::new(sim.entropy()))
 }
+
+/// How many boots the app gets, each failed boot followed by a restart, as a
+/// supervised process restarts (`checks::boot_through_fallout`).
+const BOOT_TRIES: u32 = 8;
 
 /// Runs a login-only phase against `kernel` and returns the bearer token
 /// from the recorded response — GUIDE §8's "script a login phase, read the
@@ -70,10 +74,11 @@ fn statuses_of(source: &SimSource) -> Result<Vec<u16>, String> {
 // ---- 1. no acknowledged write is lost under crash injection ---------------
 
 fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
-    let app = match build(sim) {
-        Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
-        Err(e) => return Err(e.to_string()),
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
@@ -124,10 +129,11 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     sim.restart(); // power-cycles the simulated disk: unsynced writes tear or vanish
     drop(kernel); // the old handle is dead after restart — reopen, per its own contract
 
-    let app = match build(sim) {
-        Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
-        Err(e) => return Err(e.to_string()),
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        return Ok(());
     };
     let snap = match app.db().snapshot() {
         Ok(s) => s,
@@ -209,10 +215,10 @@ fn app_replays_deterministically(sim: &mut Sim) -> Result<(), String> {
 }
 
 fn scripted_flow(sim: &mut Sim) -> Result<Vec<u16>, String> {
-    let app = match build(sim) {
-        Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(vec![]),
-        Err(e) => return Err(e.to_string()),
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(vec![]);
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
@@ -261,10 +267,11 @@ fn scripted_flow(sim: &mut Sim) -> Result<Vec<u16>, String> {
 // ---- 3. receipts match finalized invoices exactly (exactly-once) ----------
 
 fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
-    let app = match build(sim) {
-        Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
-        Err(e) => return Err(e.to_string()),
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
@@ -391,10 +398,11 @@ fn check_receipts(app: &App, finalize_acked: u64) -> Result<(), String> {
 // ---- 4. overdue-reminder behavior over simulated months --------------------
 
 fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
-    let app = match build(sim) {
-        Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
-        Err(e) => return Err(e.to_string()),
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
@@ -748,10 +756,11 @@ fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
 /// (durably committed, per the platform's ack-after-durable rule), a 200 on
 /// the next read with the same key is a real bug, not fallout.
 fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), String> {
-    let app = match build(sim) {
-        Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
-        Err(e) => return Err(e.to_string()),
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,

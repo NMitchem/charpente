@@ -772,6 +772,15 @@ impl Sim {
         }
     }
 
+    /// Whether the disk has crashed and stays gone until `restart()`: every op
+    /// on it fails until then. A boot that failed on a crashed disk needs a
+    /// power cycle before the next one can succeed; one that failed on an
+    /// injected IO error does not (`checks::boot_through_fallout`). Reads
+    /// state only, so it draws nothing and replays unchanged.
+    pub fn disk_crashed(&self) -> bool {
+        self.world.lock().disk.crashed
+    }
+
     pub fn crash_disk_now(&self) {
         let mut guard = self.world.lock();
         if !guard.disk.crashed {
@@ -785,7 +794,8 @@ impl Sim {
     /// Power-cycles the disk: every unsynced write independently survives,
     /// tears, or vanishes (see `disk::collapse`), open handles die, and any
     /// pending crash countdown is cleared. Called after a crash — or without
-    /// one; a clean power cycle collapses the page cache the same way.
+    /// one; a clean power cycle collapses the page cache the same way. A
+    /// process restart that keeps the page cache is `restart_process`.
     pub fn restart(&self) {
         let mut guard = self.world.lock();
         guard.cover("restart");
@@ -847,6 +857,40 @@ impl Sim {
         disk.crash_countdown = None;
     }
 
+    /// Restarts the PROCESS, not the machine: every open file handle dies (it
+    /// predates the restart, the same contract as after `restart`) and
+    /// nothing else happens. The page cache survives — every unsynced write
+    /// and directory entry stays pending, readable by the next open exactly
+    /// as the dead process left it, and still at the mercy of the next power
+    /// cycle's collapse. That is what a supervisor restarting a killed or
+    /// exited process sees, and `restart` cannot model it, because there
+    /// unsynced state collapses first. Readable is not durable: a node that
+    /// persists state derived from what it read back here, before making it
+    /// durable, loses the ground under that state at the next power cycle
+    /// (found 2026-10-01: recovery replayed an unsynced WAL frame and the store
+    /// outran the log, realtime seed 0x7df8c43a1d2591e8).
+    ///
+    /// Call it before dropping the old process's handles to model a kill
+    /// (nothing flushed through its open files reaches the disk), after to
+    /// model an exit. Only file handles are epoch-gated, as after `restart`:
+    /// a destructor that opens a file afresh through a held `SimDisk` still
+    /// reaches the disk. `unsynced_files` reads what the restart left
+    /// unsynced. Draws
+    /// nothing, collapses nothing and clears no countdown — a pending crash
+    /// countdown stays armed, since power loss does not wait for a process —
+    /// so a universe that never calls it is unchanged. Marks
+    /// `restart:process`, never `restart`. The global disk only.
+    pub fn restart_process(&self) {
+        let mut guard = self.world.lock();
+        assert!(
+            !guard.disk.crashed,
+            "Sim::restart_process on a crashed disk: a crash is power loss, and only \
+             Sim::restart (the power cycle) brings the disk back — call that instead"
+        );
+        guard.cover("restart:process");
+        guard.disk.epoch += 1;
+    }
+
     pub fn partition(&self, a: &str, b: &str) {
         self.world.lock().net.partitions.insert(normalize(a, b));
     }
@@ -859,6 +903,22 @@ impl Sim {
     /// the same seed must produce the same fingerprint, forever.
     pub fn durable_fingerprint(&self) -> u64 {
         fingerprint_files(&self.world.lock().disk.files)
+    }
+
+    /// The files on the global disk holding writes no sync has taken yet,
+    /// sorted by name: what the next power cycle may tear or drop. Read right
+    /// after `restart_process`, it proves the restart left the next process
+    /// something unsynced to read back; a restart that flushed would leave it
+    /// empty. Read-only: draws nothing and marks nothing.
+    pub fn unsynced_files(&self) -> Vec<String> {
+        self.world
+            .lock()
+            .disk
+            .files
+            .iter()
+            .filter(|(_, file)| !file.pending.is_empty())
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// The earliest virtual time at which a currently in-flight network
@@ -1160,7 +1220,7 @@ impl SimFile {
         let mut guard = self.world.lock();
         if guard.world_of(&self.host).epoch != self.epoch {
             return Err(io::Error::other(format!(
-                "file handle for \"{}\" predates a simulated crash — contract: reopen files after Sim::restart()",
+                "file handle for \"{}\" predates a simulated restart — contract: reopen files after Sim::restart() or Sim::restart_process()",
                 self.path
             )));
         }
@@ -1262,7 +1322,17 @@ impl File for SimFile {
 
     fn sync(&self) -> io::Result<()> {
         self.op(|state, cfg, path| {
-            if !state.disk_faults_off && state.faults_of(&self.host).chance(cfg.sync_error) {
+            // A file with nothing unsynced has nothing to flush and nothing to
+            // fail, so its sync rolls no fault (DESIGN §1). Recovery and boot
+            // reads sync files a power cycle already left clean; a roll there
+            // would inject failures no disk produces and re-key every universe
+            // that recovers. It is still a disk op: the countdown and the
+            // latency were charged above.
+            let dirty = !file_state(state, &self.host, path).pending.is_empty();
+            if dirty
+                && !state.disk_faults_off
+                && state.faults_of(&self.host).chance(cfg.sync_error)
+            {
                 state.cover("fault:sync_error");
                 // Real fsync failure semantics: nothing can be assumed. The
                 // buffer stays volatile; a later crash collapses it as usual.
@@ -1723,19 +1793,22 @@ fn ambient_base_seed() -> u64 {
 /// universe, and accumulating sometimes-coverage across the batch. Add
 /// `require: [...]` to assert each named key was covered at least once in the
 /// batch — call as `run_universes_swarm!(N, f)` or `run_universes_swarm!(N,
-/// f, require: ["key", ...])` — and `ceiling: [("key", N), ...]` after it to
-/// fail the batch when a key that must stay rare was covered more than N
-/// times (see `run_universes_swarm_with!`). `run_universes!`/`run_one` are a
+/// f, require: ["key", ...])` — then `floor: [("key", N), ...]` to fail the
+/// batch when a key was covered fewer than N times, `ceiling: [("key", N),
+/// ...]` to fail it when a key that must stay rare was covered more than N
+/// times, or both, in that order (see `run_universes_swarm_with!`). This base
+/// is ambient, so the counts move batch to batch and either bound is a margin
+/// around a measured spread, never an exact count. `run_universes!`/`run_one` are a
 /// separate, frozen runner — this one is new. Set `CHARPENTE_SEED=0x…` to replay one
 /// universe (its config re-derives from the seed; the coverage requirement
 /// check is skipped, since one universe can't be expected to hit everything).
 #[macro_export]
 macro_rules! run_universes_swarm {
     ($universes:expr, $f:expr) => {
-        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[], &[], $f)
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[], &[], &[], $f)
     };
     ($universes:expr, $f:expr, require: [$($key:expr),* $(,)?]) => {
-        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[$($key),*], &[], $f)
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[$($key),*], &[], &[], $f)
     };
     ($universes:expr, $f:expr,
      require: [$($key:expr),* $(,)?],
@@ -1745,6 +1818,34 @@ macro_rules! run_universes_swarm {
             file!(),
             $universes,
             &[$($key),*],
+            &[],
+            &[$(($ckey, $max)),*],
+            $f,
+        )
+    };
+    ($universes:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     floor: [$(($fkey:expr, $min:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $universes,
+            &[$($key),*],
+            &[$(($fkey, $min)),*],
+            &[],
+            $f,
+        )
+    };
+    ($universes:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     floor: [$(($fkey:expr, $min:expr)),* $(,)?],
+     ceiling: [$(($ckey:expr, $max:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $universes,
+            &[$($key),*],
+            &[$(($fkey, $min)),*],
             &[$(($ckey, $max)),*],
             $f,
         )
@@ -1757,6 +1858,7 @@ pub fn run_universes_swarm_in(
     file: &str,
     universes: u64,
     require: &[&str],
+    floors: &[(&str, u64)],
     ceilings: &[(&str, u64)],
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
@@ -1771,7 +1873,7 @@ pub fn run_universes_swarm_in(
         ambient_base_seed(),
         universes,
         require,
-        &[],
+        floors,
         ceilings,
         |_cfg: &mut FaultConfig| {},
         f,
@@ -2272,6 +2374,9 @@ mod tests {
         for disk in [&global, &hosted] {
             let file = disk.open("f").unwrap();
             assert!(file.write_at(0, b"x").is_err());
+            // The failed write left nothing to flush, and a clean sync cannot
+            // fail; `set_len` rolls no fault, so it gives the sync work to do.
+            file.set_len(1).unwrap();
             assert!(file.sync().is_err());
             assert!(disk.sync_dir("").is_err());
         }
@@ -2307,6 +2412,121 @@ mod tests {
             before,
             "no disk fault fired after quiescing"
         );
+    }
+
+    #[test]
+    fn a_process_restart_keeps_the_page_cache_and_a_power_cycle_does_not() {
+        // FaultConfig::none(): a power cycle drops every unsynced write, so
+        // whatever is still readable after a restart is what the mode kept.
+        let sim = Sim::with_faults(0x5145_0002, FaultConfig::none());
+        let disk = sim.disk();
+        let old = disk.open("f").unwrap();
+        old.write_at(0, b"unsynced").unwrap();
+        disk.open("g").unwrap(); // a name whose directory entry is not durable
+
+        sim.restart_process();
+        assert!(
+            old.len()
+                .unwrap_err()
+                .to_string()
+                .contains("predates a simulated restart"),
+            "the dead process's handle must not reach the disk"
+        );
+        let reopened = disk.open("f").unwrap();
+        assert_eq!(
+            reopened.len().unwrap(),
+            8,
+            "a process restart keeps the page cache: the unsynced write is still there"
+        );
+        let mut buf = [0u8; 8];
+        reopened.read_at(0, &mut buf).unwrap();
+        assert_eq!(
+            &buf, b"unsynced",
+            "a process restart keeps the page cache: the next process reads the unsynced write back"
+        );
+        assert_eq!(
+            disk.list("").unwrap(),
+            vec!["f".to_string(), "g".to_string()],
+            "a process restart keeps a directory entry that was never made durable"
+        );
+        assert_eq!(
+            sim.unsynced_files(),
+            vec!["f".to_string()],
+            "a process restart leaves the dead process's unsynced write unsynced"
+        );
+        let coverage = sim.coverage();
+        assert_eq!(
+            coverage.get("restart:process"),
+            Some(&1),
+            "a process restart marks restart:process once"
+        );
+        assert!(
+            !coverage
+                .keys()
+                .any(|k| *k == "restart" || k.starts_with("crash:")),
+            "a process restart is not a power cycle: nothing collapsed: {coverage:?}"
+        );
+
+        sim.restart(); // the power cycle drops what the process restart kept
+        assert_eq!(
+            disk.open("f").unwrap().len().unwrap(),
+            0,
+            "a power cycle drops the unsynced write the process restart kept — if it is still \
+             here, the write was made durable before the power cycle"
+        );
+        assert!(
+            sim.unsynced_files().is_empty(),
+            "a power cycle leaves nothing unsynced"
+        );
+    }
+
+    #[test]
+    fn a_process_restart_draws_from_no_stream() {
+        // Twin universes, one with a process restart and one without, must
+        // collapse identically at the next power cycle and draw the same
+        // entropy after it: the mode adds a coverage key and nothing else, so
+        // introducing it re-keys no existing universe.
+        let run = |process_restart: bool| {
+            let sim = Sim::with_faults(
+                0x5145_0004,
+                FaultConfig {
+                    crash_apply: 0.4,
+                    crash_torn: 0.3,
+                    ..FaultConfig::none()
+                },
+            );
+            let disk = sim.disk();
+            for i in 0..16u8 {
+                let file = disk.open(&format!("f{i}")).unwrap();
+                file.write_at(0, &[i; 1500]).unwrap();
+            }
+            if process_restart {
+                sim.restart_process();
+            }
+            sim.restart();
+            let mut coverage = sim.coverage();
+            coverage.remove("restart:process");
+            (
+                sim.durable_fingerprint(),
+                sim.entropy().next_u64(),
+                coverage,
+            )
+        };
+        assert_eq!(
+            run(true),
+            run(false),
+            "a process restart changed the next power cycle's collapse, the entropy after it, or \
+             the coverage: it drew from a stream or collapsed something, so introducing it \
+             re-keys universes"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "only Sim::restart (the power cycle) brings the disk back")]
+    fn a_process_restart_refuses_a_crashed_disk() {
+        let sim = Sim::with_faults(0x5145_0003, FaultConfig::none());
+        sim.crash_disk_now();
+        sim.restart_process();
     }
 
     #[test]
@@ -2357,6 +2577,50 @@ mod tests {
              barrier is drawing from the shared per-host stream, so every later \
              read/write/sync roll shifted. Key it separately — DESIGN.md made the \
              same repair for the object store's delete arm."
+        );
+    }
+
+    #[test]
+    fn a_sync_with_nothing_to_flush_draws_no_fault() {
+        // Twin universes, one of which also syncs a file it never wrote,
+        // before every op of the workload: a clean sync has nothing to flush
+        // and nothing to fail, so it must neither fail nor move a single later
+        // roll. Syncing durable files is the exact shape of a durability fix
+        // made after a power cycle (recovery's per-segment sync).
+        fn run(clean_syncs: bool) -> BTreeMap<&'static str, u64> {
+            let mut cfg = FaultConfig::none();
+            cfg.write_error = 0.3;
+            cfg.read_error = 0.3;
+            cfg.sync_error = 0.3;
+            let sim = Sim::with_faults(0x5145_0005, cfg);
+            let disk = sim.disk();
+            let clean = disk.open("clean").unwrap();
+            let file = disk.open("f").unwrap();
+            for i in 0..40u64 {
+                if clean_syncs {
+                    clean
+                        .sync()
+                        .expect("a sync with nothing to flush must not fail");
+                }
+                let _ = file.write_at(i * 8, b"abcdefgh");
+                let _ = file.sync();
+                let mut buf = [0u8; 8];
+                let _ = file.read_at(i * 8, &mut buf);
+            }
+            sim.coverage()
+        }
+
+        let baseline = run(false);
+        assert!(
+            baseline.get("fault:sync_error").copied().unwrap_or(0) > 0,
+            "anti-vacuity: a dirty file's sync must still fail, or the comparison below \
+             passes with the sync fault switched off entirely: {baseline:?}"
+        );
+        assert_eq!(
+            baseline,
+            run(true),
+            "syncing a file with nothing to flush changed the fault schedule: a clean \
+             sync rolled a fault it can never fire honestly, so every later roll shifted"
         );
     }
 
@@ -2812,6 +3076,7 @@ mod tests {
                 1,
                 &[],
                 &[],
+                &[],
                 |_sim: &mut Sim| -> Result<(), String> { panic!("boom") },
             );
         }))
@@ -2852,6 +3117,27 @@ mod tests {
         // "to what": 1-of-3 and 2-of-3 are different investigations.
         assert!(msg.contains("rare:key: 1 of 3 required"), "{msg}");
         assert!(msg.contains("MEASURED rate"), "{msg}");
+    }
+
+    #[test]
+    fn the_ambient_runner_enforces_a_floor_too() {
+        let universes_seen = std::sync::atomic::AtomicUsize::new(0);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::run_universes_swarm!(
+                4,
+                |sim: &mut Sim| {
+                    if universes_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        sim.cover("rare:key");
+                    }
+                    Ok(())
+                },
+                require: [],
+                floor: [("rare:key", 3)]
+            );
+        }))
+        .expect_err("an ambient batch below its floor must fail too");
+        let msg = panic_message(&*payload);
+        assert!(msg.contains("rare:key: 1 of 3 required"), "{msg}");
     }
 
     #[test]
@@ -2938,6 +3224,7 @@ mod tests {
                 "swarm_meta.rs",
                 4,
                 &["never:happens"],
+                &[],
                 &[],
                 |_sim: &mut Sim| Ok(()),
             );

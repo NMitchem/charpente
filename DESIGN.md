@@ -193,6 +193,44 @@ rather than argued — `a_directory_barrier_does_not_perturb_the_other_disk_faul
 semantically no-op barrier and demands the entire coverage map be unchanged; without the split
 it fails, one barrier having moved four read faults and two write faults.
 
+**A sync with nothing to flush rolls no fault** (2026-10-01). `SimFile::sync` rolls
+`sync_error` only when the file holds unsynced writes. A file with none has nothing to flush
+and nothing to fail, so its sync always succeeds and draws nothing from the `faults` stream.
+It is still a disk operation: it ticks an armed crash countdown and advances virtual time
+like any other. This is the directory barrier's hazard again, from the other side: syncs
+move for durability reasons too. §2's recovery syncs every segment before replaying it, and
+after a power cycle every one of those segments is clean. A roll on each injected failures
+no disk produces in that state and re-keyed every universe that recovers; late_follower's
+batch lost about 48 verdicts to them until this landed. What the sim gives up is a real
+kernel reporting an earlier background-writeback failure, which a later fsync of a clean
+file returns on Linux. The sim has no background writeback (a write stays pending until a
+sync takes it), so a clean file has nothing to report. The recovery-sync failure path is
+held by deterministic tests instead (§2). `a_sync_with_nothing_to_flush_draws_no_fault`
+holds the rule by comparing whole coverage maps with and without a clean sync before every
+operation.
+
+**A process restart is not a power cycle.** `Sim::restart` power-cycles: the
+page cache collapses under the crash model before anything reopens.
+`Sim::restart_process` (2026-10-01) restarts only the process. Open handles die
+and nothing else happens: every unsynced write and directory entry stays pending
+and readable by the next open, and the next power cycle still collapses it. That
+is what a supervisor sees after a kill, a crash or an exit, and it is the only
+way to reach "the next process read back what the dead one never made durable".
+Before it existed, a property reached that shape only by accident, when a boot
+loop reopened without a restart. Readable is not durable, and that accident
+exposed a real ordering bug: recovery replayed WAL frames it never synced, and the
+store outran the log (realtime seed 0x7df8c43a1d2591e8; fixed, §2). The mode draws
+from no stream and clears no countdown, so introducing it re-keyed no universe. Three
+pinned batches reproduced their coverage byte for byte across the change
+(migrations, realtime's mixed-shape resume, and the wal dir-entry property). The
+property that drives it on purpose is §2's class oracle,
+`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`. It proves each
+restart left the log something to read back with `Sim::unsynced_files()`, read right after
+the restart. A restart that flushed the page cache would leave that list empty and the
+property's coverage requirement unmet. Only open file handles are epoch-gated, as after
+`restart`: a destructor that opens a file afresh through a `Disk` it still holds reaches the
+disk. Charpente's own close goes through its open files.
+
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
 model, just one instance per host) and its own fault + entropy streams, keyed sub-streams
@@ -373,7 +411,44 @@ delete-before-truncate order is a fence in its own right (fence 3, below). Any I
 poisons the log — fsync results
 cannot honestly be retried (fsyncgate); the only exit from poison is restart-and-recover,
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
-machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
+machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack,
+and recovery is sync → read → apply. **Readable is not durable**: after a process restart
+the page cache still holds every frame the dead process wrote, synced or not, and each
+reads back valid. Recovery therefore syncs each segment before reading any of its frames,
+every segment and not just the tail, so every frame it hands to replay is durable. A
+segment whose sync fails hands none (fsyncgate: a failed sync guarantees nothing), and
+the open fails naming the segment and the fix. Before 2026-10-01 the clean path replayed
+without syncing. A process restart then replayed an unsynced frame and persisted the store
+past it, at open or merely by closing it (redb's close commits durably). The next power
+loss took the frame, and `Db::open`'s own "the store outran durable truth" assert fired.
+Realtime found it (seeds 0x7df8c43a1d2591e8, 0x5d889f4c1a9ac543).
+**What the sync does not close.** On Linux a failed fsync can mark the dirty pages clean
+(fsyncgate). The frame then stays readable without ever reaching the disk, and the next
+process's fsync succeeds without writing it. Recovery's sync closes the process-death case
+(a kill between a frame's write and its fsync) and narrows the failed-fsync case to what
+the kernel reports. It cannot close it: no later fsync recovers a write the kernel has
+already dropped. The sim models an honest kernel, where a failed sync leaves the write
+pending and the next sync writes it.
+The pins are `a_record_recovery_replays_survives_the_next_power_loss` and
+`a_recovery_whose_log_sync_fails_replays_nothing` (charpente-core `tests/engine.rs`) and
+their WAL-level twins in charpente-sim `tests/wal.rs`. There,
+`a_frame_recovery_replays_from_a_non_tail_segment_survives_the_next_power_loss` holds
+the every-segment half: a tail-only sync loses a non-tail segment's unsynced frame and
+the next open refuses the log as a gap. The class's oracle is
+`the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`, which mixes
+§1's `Sim::restart_process` with power cycles.
+**The rule covers every boot-time read of a durable file, not only the log's.** A read
+that a boot acts on syncs first, or has a stated reason it need not:
+- The role file and the witness slots barrier their names and sync their bytes before
+  they are trusted (§5).
+- The horizon breadcrumb need not. It is written only after the store's checkpoint
+  returned `Ok`, so even a value still in the page cache is a lower bound on durable truth
+  and never over-claims.
+- The store's `applied_seq`, which `Db::open` trusts before recovery runs, rests on redb:
+  4.3.0's open fsyncs the store file (§4).
+- Restore's frontier probe reads the destination's segments unsynced because it decides
+  only to refuse or to replace. A refusal writes nothing, and replacing discards every
+  local byte.
 The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::read_log`,
 M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
 back one that fails — a frame corrupted on disk after append must never travel. That
@@ -391,10 +466,11 @@ durable horizon — and threads it through `Engine::recover` into
 error naming the frame, the horizon, and restore-from-replica/backup, never a cut (and
 the error path mutates nothing — no truncation, no segment deletion); above the horizon
 it is a torn tail and cuts exactly as before. The rule's other half guards the state no
-invalid frame can reveal: if the log's `base_seq` exceeds the horizon + 1, whole
-acknowledged records exist in neither the store nor the log (never a state checkpoint
-GC can produce — its floor is bounded by its own checkpoint's `applied_seq + 1`), and
-`Db::open` refuses with the same restore-naming error before recovery runs. Standalone
+invalid frame can reveal: if the log's `base_seq` exceeds the store's own `applied_seq` + 1
+(seq 0 for a store holding no records), whole acknowledged records exist in neither the
+store nor the log (never a state checkpoint GC can produce — its floor is bounded by its
+own checkpoint's `applied_seq + 1`), and `Db::open` refuses with a restore-naming error
+before recovery runs. Standalone
 `Wal::open` (no store in sight) keeps cut-at-first-invalid. M1 replication is what
 makes repair possible. One shape is exempted because it provably loses nothing: a
 checkpointed store beside an *entirely empty* log directory. Segment names are
@@ -420,7 +496,18 @@ is always a lower bound (never over-claims) and degrades silently to no witness 
 absent, torn, or CRC-invalid. `Seeder::new` discards any breadcrumb alongside the store and
 WAL it already discards, so a stale breadcrumb from a different, higher-numbered prior
 timeline sharing the disk can never survive a reseed and over-claim protection the new
-timeline never earned. The `.horizon` sidecar is part of the node's durable set: any
+timeline never earned. The breadcrumb protects a rebuild, and `Db::open` rebuilds only from
+a log that still reaches seq 0 (§4). It never lifts the vanished-prefix bound: that is
+measured against the store's own `applied_seq`, because the breadcrumb holds a horizon, not
+the records below the log's base. Until 2026-10-01 the bound was the breadcrumb-lifted
+horizon, and a boot whose store stopped short of the log's base passed it and panicked in
+the replay. A store removed by hand reached that state, and so did a crash inside
+`Seeder::new` between barriering the store's removal and the breadcrumb's (S5 R-I1, seed
+0x64a183075fd398b9), and so did an older copy of the store put back over a newer
+breadcrumb ("reached seq 38 but expected 20", S5 R2-M1). The exempt empty-log shape above
+replays from the horizon, so a breadcrumb past the store refuses there too, where it used to
+lay the segment past the store and panic at the first write. `Seeder::finish`'s write
+therefore changes no outcome: a seeded log starts at `applied_seq + 1`, never at 0. The `.horizon` sidecar is part of the node's durable set: any
 manual file-level restore of `store` + `wal/` must copy it or delete it alongside them —
 a leftover sidecar from the node's prior life would over-claim and refuse (by name, never
 silently) a legitimate torn tail above the restored horizon. The residual window *above*
@@ -858,7 +945,20 @@ checkpoint and recovery replays the WAL from `applied_seq + 1`. Two redb facts t
 established: its byte layout is deterministic under identical op sequences
 (raw-fingerprint replay holds), and `Database::drop` is a *graceful close* that durably
 flushes non-durable commits — a crash is only a crash if the process dies with the
-database open, which is exactly what the sim models. Index entries are `[key len: u32][key
+database open, which is exactly what the sim models. A third is a dependency charpente does
+not re-check at runtime: redb 4.3.0's writable open fsyncs the store file
+(`Database::new` → `TransactionalMemory::begin_writable`, `db.rs:1672`,
+`page_manager.rs:1458`; a repairing open also flushes at `page_manager.rs:888`). `Db::open`
+relies on it. It reads the store's `applied_seq` before recovery runs and, beside an empty
+log, lays a durable segment at `applied_seq + 1` (the mid-seed-finish shape, §2). A seeder
+whose checkpoint fsync failed leaves that `applied_seq` in the page cache only. Without
+the open-time fsync, a power loss after the laid segment would leave a store at `None`
+beside a log based past it, a node that refuses to open. The D1 review's probe found the
+branch safe for that reason alone: `Seeder::finish(5)` with every store fsync failing, a
+process restart, then a power loss under the running node, and the reopen held `Some(5)`
+(2026-10-01). `a_seeded_store_a_restarted_node_lays_its_segment_from_survives_the_next_power_loss`
+(charpente-core `tests/engine.rs`) pins it, so a redb upgrade that drops the open-time
+fsync turns it red. Re-walk it with the latch census below on every redb upgrade. Index entries are `[key len: u32][key
 bytes][id: u64 be]` (length prefix prevents prefix-collision ambiguity); exact-match
 lookups only until a real query pattern demands order-preserving key encoding. A built-in
 `charpente.jobs` table materializes transactional enqueues in the same apply as a `JobRow`
@@ -866,9 +966,54 @@ per enqueue effect — id from the monotonic `next_job_id` meta counter (bumped 
 with `applied_seq` in the same store transaction, deterministic across replay), plus name,
 payload, key, status (Pending/Done/Dead), attempts, due_at, and last_error — the queue
 dispatcher's substrate (§6). Done and Dead rows are retained (GC is a later question,
-filed with WAL segment GC). A store that cannot open at all — e.g. a crash tore its
+filed with WAL segment GC). A store whose bytes redb rejects — e.g. a crash tore its
 creation — is discarded at `Db::open` and rebuilt by replaying the WAL
-from scratch; the log is the only source of truth. "Cannot open" includes a store file
+from scratch; the log is the only source of truth. `Store::open` reports that verdict as
+its own error, `table::StoreRejected`, classified by type in `table.rs`'s `open_error`:
+redb's `StorageError::Corrupted`, its `DatabaseError::UpgradeRequired` (a commit slot
+naming an older file format), and the one `io::Error` redb builds from the bytes at open,
+"Not a redb database: magic number mismatch" (`page_manager.rs:1137`). That last one has the
+same type as an IO error the disk returns, so `DiskBackend` wraps every error it passes up
+(`FromDisk`, `Display` and kind unchanged) and only an unwrapped `InvalidData` counts as
+the verdict. A variant not named there bubbles: the rejection deletes a store, so it needs
+positive evidence. Every error redb 4.3.0's `Builder::create_with_backend` can return, read
+in its source:
+
+| redb returns | class | why |
+|---|---|---|
+| `Storage(Corrupted(_))` | rejected, `Corrupted` | A verdict on the content: header fields, slot and page checksums, layout against length (`header.rs:254`/`:301`), btree, allocator. |
+| `UpgradeRequired(v)` | rejected, `UpgradeRequired { version }` | The commit slot's format version byte, read before its checksum (`header.rs:505`). |
+| `Storage(Io(e))`, `e` unmarked, kind `InvalidData` | rejected, `NotARedbFile` | The magic mismatch. The empty-file error beside it (`:1145`) cannot occur while creating is allowed. |
+| `Storage(Io(e))`, `e` is `FromDisk`, kind `UnexpectedEof` | bubbles, named | A file of 9 to 319 bytes with its magic intact: redb reads its 320-byte header past the end. Below. |
+| `Storage(Io(e))`, `e` is `FromDisk`, any other kind | bubbles | The disk's own error, passed through. |
+| `Storage(Io(e))`, `e` unmarked, any other kind | bubbles | redb's `invalid_input`/`unsupported`: no verdict on the bytes. |
+| `Storage(ValueTooLarge \| Unsupported \| PreviousIo \| DatabaseClosed \| LockPoisoned)`, `UnorderedKey` | bubbles | Not a verdict on the content. |
+| `DatabaseAlreadyOpen` | bubbles | Unreachable: `DiskBackend`'s lock methods return Unsupported, and `lock_whole_storage` returns Ok. |
+| `RepairAborted` | bubbles | Needs a repair callback; the default does nothing. |
+| `TransactionInProgress` | bubbles | Not produced at open. |
+| a later variant (both enums are `#[non_exhaustive]`) | bubbles | No positive evidence, so never destructive. |
+| `Store::open`'s own `disk.open`, `disk.sync_dir` | bubbles | Never classified. |
+
+**Every other open failure is not about the bytes** — the disk's own IO error, or redb's
+latch after one — so `Db::open` leaves the store alone and returns the error with its
+site and its fix named, kind and text kept: a restart retries the same file, and if every
+restart fails the same way the disk is failing. One bubbling error no restart fixes: a
+store file cut shorter than redb's header with the magic intact. redb makes a new file's
+length durable before it writes the magic (`page_manager.rs:1181-1200`), so no crash leaves
+one; it takes truncation outside the crash model. It is not a rejection, since redb built no
+verdict, so `Store::open` names the damage and `Db::open` names the fix, chosen by the log
+beside the store. While the log still reaches seq 0, the fix is to remove the file, and the
+next boot rebuilds the store from the log. Once the log is compacted, the store holds the
+only copy of the records below its base, so the fix is a restore from a replica or backup.
+Removing the file anyway is refused by name: `Db::open` refuses a store holding no records
+beside a log compacted past seq 0, whatever the horizon breadcrumb says (§2). M1's first text
+named removal for both logs, and on a compacted one the next boot panicked (S5 R-I1). The
+refusal names the restore, and for a follower the re-seed it amounts to, with the config the
+node must restart under (§5's re-seed rule).
+Before 2026-10-01 any `Store::open` error took the discard path: one transient
+fault deleted a healthy store on a full log, and on a compacted log refused the boot with
+"restore this node from a replica or backup" (follow-up 21, found by the S4 review: an
+injected fsync failure inside `Store::open`). The rejected class includes a store file
 whose length disagrees with its durable header's layout. redb 4.1.0 asserted on two such
 states (page_manager.rs:231/:257) — an unsynced `set_len` dropped at crash while the header
 god-page write survived (`:231`), or a crash tore a data-page write inside an unsynced
@@ -887,10 +1032,16 @@ seq 0: `Db::checkpoint` durably persists the store, then deletes WAL segments be
 checkpoint (`Wal::gc`, floored at `DbConfig::retain_segments`, default 2; a caller-supplied
 retention pin can hold more), auto-firing every `DbConfig::checkpoint_every` committed
 records (default 4096; `0` disables the cadence — manual `checkpoint` only). Once the log
-is compacted past seq 0, an unopenable store is no longer rebuildable from the log alone —
+is compacted past seq 0, a rejected store is no longer rebuildable from the log alone —
 `Db::open` checks the log's base before discarding the store and returns a named hard
 error instead (naming the compaction, and the fix: restore from a replica/backup, or widen
-`retain_segments`) rather than silently losing the records below the old checkpoint.
+`retain_segments`) rather than silently losing the records below the old checkpoint. When
+the verdict is `UpgradeRequired` the text says so, and what it means here: charpente has
+only ever used redb 4.x, which writes format 3, so on a store the node created the version
+byte is damage and the fix is the restore. Only a format-2 file written by something else
+can be upgraded in place, with redb 2.6's `Database::upgrade()`; format 1 has no in-place
+upgrade. On a full log an `UpgradeRequired` store is rebuilt like any other rejected one,
+which loses nothing.
 A second sim-established redb finding (upstream-report material): direct corruption of the
 store file's durable bytes — bit flips, misdirected writes — can defeat redb's
 copy-on-write crash consistency entirely, either panicking internally or silently falling
@@ -1162,7 +1313,18 @@ Right at M1 scale; incremental streaming is the tracked fix before large-store s
 The durable role file (§2's role semantics, T5) carries its own CRC line: a torn role
 write is a named integrity error, never a parse of whatever bytes survived — a torn
 "follower:p:1" that still parses as a role naming a ghost primary is exactly what the T6
-harness caught (seed 0x51dacce702b667c8).
+harness caught (seed 0x51dacce702b667c8). It is read the way recovery reads the log (§2,
+"readable is not durable"): `load_role` barriers the file's name and syncs its bytes before
+it trusts either, and every witness-slot read does the same (2026-10-01, D1 review I3).
+Before that, a promote whose role fsync failed was still in the page cache after the
+restart its own error asked for. The node booted as `Primary` from it and served writes,
+and a power loss then reverted the file to `Follower` under a diverged log. A witness store
+that failed the same way let a primary boot checking a set the next power loss shrank. A
+sync that fails at boot fails the boot by name. The pins are in `repl/role.rs` and
+`repl/witnesses.rs`: `a_role_a_restarted_node_boots_as_survives_the_next_power_loss`,
+`a_witness_set_a_restarted_node_boots_with_survives_the_next_power_loss`, and for each the
+name (`…_name_a_restarted_node_trusts_…`) and failed-sync (`…_whose_sync_fails_at_boot_is_not_trusted`)
+twins.
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through
@@ -1205,6 +1367,17 @@ it with its original config used to resume it as a second writable primary with 
 at all (neither node dials the other, so neither could observe the conflict). Two live,
 mutually invisible, diverged timelines; the mandated fresh-data-dir re-seed then destroys
 every write the resurrected node acked.
+
+The re-seed itself carries the same hazard. The data directory holds the durable role file
+and the witness set, so a node cleared for a re-seed has neither: config alone decides its
+role, and a cleared node restarted with a primary config is a second writable primary that
+no witness gate can see. A switchover-demoted former primary is exactly that node, since its
+role file says follower while its startup config still says primary: wiped and restarted as
+configured, it acked a write beside the real primary (S5 re-review 2, R2-I1). So every
+refusal and doc that prescribes a re-seed says, in the same sentence, to restart the cleared
+node configured as a follower of the current primary, and what a primary config does instead
+(`repl::role::reseed_steps`; `Db::open`'s vanished-prefix refusal types the same steps).
+Nothing structural fences it: the guard is the operator's config.
 
 **The boot gate** (M2 sub-project 0b, spec `docs/superpowers/specs/2026-07-31-dual-primary-
 design.md`) closes that for the case the node can see. A **witness** is a node this primary

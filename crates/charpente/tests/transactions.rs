@@ -13,8 +13,8 @@ use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Codec, Id, Row, Snapshot, Store, Unscoped};
-use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
+use charpente_core::table::{Codec, Id, Rejection, Row, Snapshot, Store, StoreRejected, Unscoped};
+use charpente_sim::{FaultConfig, Sim, run_universes_swarm, run_universes_swarm_with};
 
 #[table(global)]
 struct Org {
@@ -540,10 +540,19 @@ fn is_injected(text: &str) -> bool {
 /// How many reopens the final verification gets before the universe gives
 /// up. Every attempt either verifies or dies to injected fault fallout, so a
 /// larger budget costs time only in universes that would otherwise have
-/// concluded nothing. 8 -> 16 took this property's give-ups from 147 to 86
-/// over four bases for +11% CPU; 32 left 50 for +28%, over the +25% a budget
-/// may cost (2026-10-01).
-const FINAL_ATTEMPTS: u32 = 16;
+/// concluded nothing. With the rounds aimed, 16 -> 64 took give-ups over ten
+/// fresh bases from 362 to 164 for +4.4% CPU (2026-10-01, S5 review I1). Before
+/// S5 a failed reopen rebuilt the table store, and 32 cost +28%.
+const FINAL_ATTEMPTS: u32 = 64;
+
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its check
+/// and its commits, so this budget is reach: over ten fresh bases at 256
+/// universes, booting once left 3,463 rounds unbooted, and 16, 32 and 64 left
+/// 563, 275 and 103, for +15.4%, +19.0% and +23.1% CPU (2026-10-01, S5 review
+/// I1). More rounds mean more to recover at the end: give-ups went 73 -> 134,
+/// 149 and 164, against 243 for the same bases before S5.
+const ROUND_BOOT_TRIES: u32 = 64;
 
 /// One universe: recover → verify against the oracle → mixed commits and
 /// aborts → random checkpoint → crash, everything seeded.
@@ -574,17 +583,18 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
         // and rebuilds it from the log itself, so what comes out is either an
         // injected fault (the round restarts) or a real error, which fails
         // the universe by name rather than restarting past it.
-        let mut db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
-            Ok(db) => db,
-            Err(e) => {
-                if !is_injected(&e.to_string()) {
-                    return Err(format!(
-                        "round recovery failed with a non-injected error: {e}"
-                    ));
-                }
-                sim.restart();
-                continue;
+        let Some(mut db) =
+            charpente_sim::checks::boot_through_fallout(sim, ROUND_BOOT_TRIES, is_injected, || {
+                Db::open(disk(sim), cfg.clone(), property_schema())
+            })
+            .map_err(|e| format!("round recovery failed with a non-injected error: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(());
             }
+            sim.restart();
+            continue;
         };
 
         let recovered = db.last_applied().map_or(0, |s| s + 1);
@@ -624,6 +634,8 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
                     sim.restart();
                     continue;
                 }
+                // A round's recovered state was checked against the model.
+                sim.cover("tx:round-verified");
             }
             Err(e) => {
                 if !is_injected(&e.to_string()) {
@@ -779,7 +791,12 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
         let db = match Db::open(disk(sim), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(e) => {
-                if is_injected(&e.to_string()) {
+                let text = e.to_string();
+                if is_injected(&text) {
+                    // No restart clears a durable refusal (S5 re-review R-M2).
+                    if charpente_sim::checks::durable_refusal(sim, &text)? {
+                        return Ok(());
+                    }
                     sim.restart();
                     continue;
                 }
@@ -878,8 +895,52 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
 /// attempts) it gave up 16-31 times, mean 22.5, and the cap is twice that
 /// maximum, about 7 standard deviations above the mean. It guards drift toward
 /// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
-/// up 35-38 times, under it.
-const TX_GAVE_UP_CEILING: u64 = 62;
+/// up 35-38 times, under it. Re-measured 2026-10-01 for S5 with D1: 10 fresh
+/// batches gave up 19-31 times, mean 25.4, sd 4.1, so the cap stays 62, 9.0
+/// standard deviations above the mean. Re-measured 2026-10-01 with the round
+/// boots aimed and 64 final attempts (S5 review I1): 10 fresh batches gave up
+/// 8-24 times, mean 15.6, sd 5.0, so the cap is 48, 6.5 standard deviations
+/// above the mean (23.0 at S5's parent, same bases).
+const TX_GAVE_UP_CEILING: u64 = 48;
+
+/// The reach floor: rounds whose recovered state was checked against the
+/// model. A margin, as the cap is: 10 fresh batches (2026-10-01, S5 review I1)
+/// checked 738-756 rounds, mean 749.4, sd 4.9, and the floor is the mean less
+/// 4 standard deviations (GUIDE §8).
+const TX_ROUND_VERIFIED_FLOOR: u64 = 729;
+
+/// A durable refusal at the final recovery ends it at once, by name (S5 re-review
+/// R-M2). Seed `0x14656f1b6c57a314`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("the final verification never ran").
+#[test]
+fn a_durable_refusal_at_the_final_recovery_ends_it_at_once_by_name() {
+    const SEED: u64 = 0x1465_6f1b_6c57_a314;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = tx_workload(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
 
 #[test]
 fn transactions_survive_the_fault_matrix() {
@@ -896,7 +957,10 @@ fn transactions_survive_the_fault_matrix() {
             "restart",
             "batch:multi_record",
             "batch:multi_record_faulted",
+            "tx:round-verified",
+            "boot:booted-after-retry",
         ],
+        floor: [("tx:round-verified", TX_ROUND_VERIFIED_FLOOR)],
         ceiling: [("universe:gave-up", TX_GAVE_UP_CEILING)]
     );
 }
@@ -939,13 +1003,20 @@ fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
 /// single-node loss, so the durability oracle cannot run past them: the
 /// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
 /// rule for every arm that ends a universe without a verdict). Seed
-/// `0x902dd63b08e51d75` meets it at a round's recovery (base `0x5E1F_0006`),
-/// seed `0x671991ebc8bd4f24` at the final one.
+/// `0xfc1e12c7cf3f8019` meets it at a round's recovery (base `0x5E1F_0006`,
+/// universe 133), seed `0x0a51f0d80437e0dc` at the final one (same base,
+/// universe 82). Re-pinned 2026-10-01 for S5 with D1, which re-key every
+/// universe: `0x902dd63b08e51d75` now meets the cut at the final recovery
+/// instead of a round's, and `0x671991ebc8bd4f24` no longer meets durable
+/// corruption. The final arm re-pinned the same day when the round boots were
+/// aimed (S5 review I1): `0xa5c304ecd9f3a44e` no longer reaches it. Found by
+/// scanning the same base for the first universe that gives up for the cut at
+/// each recovery (one of 256 at a round's, four at the final).
 #[test]
 fn acked_transactions_cut_by_durable_corruption_give_up_rather_than_pass() {
     for (seed, arm) in [
-        (0x902d_d63b_08e5_1d75_u64, "at a round's recovery"),
-        (0x6719_91eb_c8bd_4f24, "at the final recovery"),
+        (0xfc1e_12c7_cf3f_8019_u64, "at a round's recovery"),
+        (0x0a51_f0d8_0437_e0dc, "at the final recovery"),
     ] {
         let mut state = seed;
         let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -1238,7 +1309,7 @@ fn regression_store_bricked_by_creation_crash() {
     let witness = seen.clone();
     let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
         Box::new(DiscardWitness {
-            inner: sim.disk(),
+            inner: Box::new(sim.disk()),
             seen: witness.clone(),
         })
     });
@@ -1326,14 +1397,17 @@ fn a_non_injected_error_at_a_rounds_recovery_fails_the_universe() {
 /// A file shorter than nine bytes is compared as zeros.
 const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
 
-/// Why `Db::open` discarded the store, judged from the bytes redb itself read.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Why `Db::open` discarded the store, judged from what the witness saw on the
+/// store's path while it was being opened.
+#[derive(Debug, Clone, PartialEq)]
 enum Discard {
     /// A non-empty file without redb's magic number: a creation that never
     /// became durable ("Not a redb database: magic number mismatch").
     Garbage,
-    /// Anything else, e.g. a store with its magic number refused because an
-    /// injected fault hit its open.
+    /// The open that preceded the discard hit this IO error on the store's
+    /// path: a fault a retry may not repeat, not a verdict on the file's bytes.
+    AfterIoError(String),
+    /// Anything else, e.g. a store redb found corrupted.
     Other,
 }
 
@@ -1343,28 +1417,51 @@ struct StoreSeen {
     /// since `tables.redb` was last opened.
     len: Option<u64>,
     magic: Option<bool>,
+    /// True from `Disk::open("tables.redb")` until `Db::open` next touches
+    /// any other path: the span in which `Store::open` runs.
+    opening: bool,
+    /// The first IO error on the store's path while `opening`.
+    open_error: Option<String>,
     discards: Vec<Discard>,
+    /// Open errors followed by a fresh open of the same file, with no discard
+    /// between: a transient fault left to bubble and retried.
+    retried: Vec<String>,
+}
+
+impl StoreSeen {
+    fn note_error(&mut self, e: &io::Error) {
+        if self.opening && self.open_error.is_none() {
+            self.open_error = Some(e.to_string());
+        }
+    }
 }
 
 /// A pass-through `Disk` that watches `Db::open` discard `tables.redb`. It
-/// records the file's length and its first nine bytes as redb reads them, and
+/// records the file's length and its first nine bytes as redb reads them,
+/// every IO error on the store's path while the store is being opened, and
 /// classifies each removal of the file. It issues no disk op of its own. An
 /// inspection that did would tick the crash countdown and draw latency, and
 /// so rename the universe it is watching.
 struct DiscardWitness {
-    inner: charpente_sim::SimDisk,
+    inner: Box<dyn Disk>,
     seen: Arc<Mutex<StoreSeen>>,
 }
 
 impl Disk for DiscardWitness {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
-        let file = self.inner.open(path)?;
-        if path != "tables.redb" {
-            return Ok(file);
-        }
         let mut seen = self.seen.lock().expect("witness lock");
+        if path != "tables.redb" {
+            seen.opening = false;
+            drop(seen);
+            return self.inner.open(path);
+        }
+        if let Some(e) = seen.open_error.take() {
+            seen.retried.push(e);
+        }
         seen.len = None;
         seen.magic = None;
+        seen.opening = true;
+        let file = self.inner.open(path).inspect_err(|e| seen.note_error(e))?;
         Ok(Box::new(StoreWitness {
             inner: file,
             seen: self.seen.clone(),
@@ -1378,21 +1475,29 @@ impl Disk for DiscardWitness {
                 Some(len) if len > 0 => len < REDB_MAGIC.len() as u64 || seen.magic == Some(false),
                 _ => false,
             };
-            seen.discards.push(if garbage {
-                Discard::Garbage
-            } else {
-                Discard::Other
-            });
+            let discard = match seen.open_error.take() {
+                Some(e) => Discard::AfterIoError(e),
+                None if garbage => Discard::Garbage,
+                None => Discard::Other,
+            };
+            seen.discards.push(discard);
         }
         self.inner.remove(path)
     }
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.seen.lock().expect("witness lock").opening = false;
         self.inner.list(prefix)
     }
 
     fn sync_dir(&self, prefix: &str) -> io::Result<()> {
-        self.inner.sync_dir(prefix)
+        let r = self.inner.sync_dir(prefix);
+        if prefix == "tables.redb"
+            && let Err(e) = &r
+        {
+            self.seen.lock().expect("witness lock").note_error(e);
+        }
+        r
     }
 }
 
@@ -1401,20 +1506,159 @@ struct StoreWitness {
     seen: Arc<Mutex<StoreSeen>>,
 }
 
+impl StoreWitness {
+    fn noted<T>(&self, r: io::Result<T>) -> io::Result<T> {
+        if let Err(e) = &r {
+            self.seen.lock().expect("witness lock").note_error(e);
+        }
+        r
+    }
+}
+
 impl File for StoreWitness {
     fn len(&self) -> io::Result<u64> {
-        let len = self.inner.len()?;
+        let len = self.noted(self.inner.len())?;
         self.seen.lock().expect("witness lock").len = Some(len);
         Ok(len)
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.inner.read_at(offset, out)?;
+        self.noted(self.inner.read_at(offset, out))?;
         if offset == 0 && out.len() >= REDB_MAGIC.len() {
             self.seen.lock().expect("witness lock").magic =
                 Some(out[..REDB_MAGIC.len()] == REDB_MAGIC);
         }
         Ok(())
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.noted(self.inner.write_at(offset, data))
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.noted(self.inner.set_len(len))
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.noted(self.inner.sync())
+    }
+}
+
+/// Where `OneShotFault` fails the store's open, once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OpenSite {
+    /// `Disk::open("tables.redb")`: `Store::open`'s own first call.
+    Open,
+    /// `Disk::sync_dir("tables.redb")`: `Store::open`'s name barrier.
+    SyncDir,
+    /// The first `File::read_at` on the store: redb's header read.
+    Read,
+    /// The first `File::sync` on the store: redb's flush of the header it
+    /// marks in use (`begin_writable`).
+    Sync,
+}
+
+impl OpenSite {
+    const ALL: [OpenSite; 4] = [
+        OpenSite::Open,
+        OpenSite::SyncDir,
+        OpenSite::Read,
+        OpenSite::Sync,
+    ];
+
+    fn error(self) -> io::Error {
+        io::Error::other(format!("one-shot {self:?} failure injected by this test"))
+    }
+
+    /// What `Db::open` returns once the fault bubbles: `Store::open`'s own
+    /// two calls pass the disk's error up as it is, redb's renders it as
+    /// every other redb error is rendered, and `Db::open` names the site and
+    /// the fix around either, keeping the text (hard rule 5).
+    fn bubbled(self) -> String {
+        let disk = match self {
+            OpenSite::Open | OpenSite::SyncDir => self.error().to_string(),
+            OpenSite::Read | OpenSite::Sync => {
+                format!("table store (redb): I/O error: {}", self.error())
+            }
+        };
+        format!(
+            "table store tables.redb failed to open on an IO error, which says nothing about \
+             the file's bytes, so the store was left as it is: {disk}. Restart to retry the \
+             same file; if every restart fails the same way, the disk under it is failing \
+             (DESIGN §4)"
+        )
+    }
+}
+
+/// A `Disk` that fails one store operation at `site`, once, then passes
+/// everything through: a transient IO error a restart would not see again.
+struct OneShotFault {
+    inner: charpente_sim::SimDisk,
+    site: OpenSite,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OneShotFault {
+    fn fire(&self, site: OpenSite) -> io::Result<()> {
+        if site == self.site && !self.fired.swap(true, Ordering::SeqCst) {
+            return Err(site.error());
+        }
+        Ok(())
+    }
+}
+
+impl Disk for OneShotFault {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        if path != "tables.redb" {
+            return self.inner.open(path);
+        }
+        self.fire(OpenSite::Open)?;
+        Ok(Box::new(OneShotFile {
+            inner: self.inner.open(path)?,
+            site: self.site,
+            fired: self.fired.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        if prefix == "tables.redb" {
+            self.fire(OpenSite::SyncDir)?;
+        }
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct OneShotFile {
+    inner: Box<dyn File>,
+    site: OpenSite,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OneShotFile {
+    fn fire(&self, site: OpenSite) -> io::Result<()> {
+        if site == self.site && !self.fired.swap(true, Ordering::SeqCst) {
+            return Err(site.error());
+        }
+        Ok(())
+    }
+}
+
+impl File for OneShotFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.fire(OpenSite::Read)?;
+        self.inner.read_at(offset, out)
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
@@ -1426,8 +1670,26 @@ impl File for StoreWitness {
     }
 
     fn sync(&self) -> io::Result<()> {
+        self.fire(OpenSite::Sync)?;
         self.inner.sync()
     }
+}
+
+/// The disk a one-shot test opens through: the fault at `site`, watched.
+fn one_shot_disk(
+    sim: &Sim,
+    site: OpenSite,
+    fired: &Arc<std::sync::atomic::AtomicBool>,
+    seen: &Arc<Mutex<StoreSeen>>,
+) -> Box<dyn Disk> {
+    Box::new(DiscardWitness {
+        inner: Box::new(OneShotFault {
+            inner: sim.disk(),
+            site,
+            fired: fired.clone(),
+        }),
+        seen: seen.clone(),
+    })
 }
 
 /// Builds a committed, gracefully-closed store, then durably resizes its file
@@ -1459,6 +1721,7 @@ fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
     file.set_len(resize(len)).unwrap();
     file.sync().unwrap();
     drop(file);
+    assert_rejected_as(&sim, Rejection::Corrupted);
 
     let db = Db::open(Box::new(sim.disk()), DbConfig::default(), app_schema()).unwrap();
     let snap = db.snapshot().unwrap();
@@ -1474,6 +1737,142 @@ fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
     );
 }
 
+/// Probes the store the next `Db::open` will meet with an independent
+/// `Store::open`, and asserts redb rejects its bytes for `reason` — the only
+/// kind of open error `Db::open` discards a store for (or, on a compacted log,
+/// refuses to boot over). The probe fails before redb writes anything, so the
+/// store `Db::open` meets is the one probed.
+fn assert_rejected_as(sim: &Sim, reason: Rejection) {
+    let e = Store::open(&sim.disk(), "tables.redb")
+        .err()
+        .expect("the damaged store must not open");
+    assert_eq!(
+        StoreRejected::of(&e).map(|r| r.reason),
+        Some(reason),
+        "the damaged store must be redb's verdict on its bytes, not an IO error: {e}"
+    );
+}
+
+/// redb's two other verdicts, written by hand into a gracefully closed store:
+/// a file that does not begin with redb's magic number, and a commit slot that
+/// names file format 2 (byte 64 is slot 0's version, redb 4.3.0 header.rs).
+const REWRITES: [(&str, u64, &[u8], Rejection); 2] = [
+    ("not a redb file", 0, b"not redb!", Rejection::NotARedbFile),
+    (
+        "an older file format",
+        64,
+        &[2],
+        Rejection::UpgradeRequired { version: 2 },
+    ),
+];
+
+fn rewrite_store(sim: &Sim, offset: u64, bytes: &[u8]) {
+    let file = sim.disk().open("tables.redb").unwrap();
+    file.write_at(offset, bytes).unwrap();
+    file.sync().unwrap();
+}
+
+/// On a log that still holds seq 0, both rewrites are discarded and rebuilt,
+/// like the truncations below: the format-upgrade verdict is in the rejected
+/// class too, because rebuilding from the whole log loses nothing.
+#[test]
+fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_rebuilt_from_a_full_log() {
+    for (what, offset, bytes, reason) in REWRITES {
+        let (sim, mut db) = quiet_db(0x5E5F_0003);
+        for i in 0..10u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+        drop(db);
+        rewrite_store(&sim, offset, bytes);
+        assert_rejected_as(&sim, reason);
+
+        let seen = Arc::new(Mutex::new(StoreSeen::default()));
+        let db = Db::open(
+            Box::new(DiscardWitness {
+                inner: Box::new(sim.disk()),
+                seen: seen.clone(),
+            }),
+            DbConfig::default(),
+            app_schema(),
+        )
+        .unwrap_or_else(|e| panic!("{what}: a full log must rebuild the store: {e}"));
+        let discards = seen.lock().expect("witness lock").discards.clone();
+        assert_eq!(discards.len(), 1, "{what}: one discard: {discards:?}");
+        assert!(
+            !matches!(discards[0], Discard::AfterIoError(_)),
+            "{what}: {discards:?}"
+        );
+        assert_eq!(
+            ids(&db.snapshot().unwrap().scan::<Invoice>().unwrap()),
+            (0..10).collect::<Vec<u64>>(),
+            "{what}: the rebuilt store must replay the full WAL"
+        );
+    }
+}
+
+/// On a compacted log the same two rewrites refuse the boot by name, each
+/// naming its own cause and fix (hard rule 5). No charpente release wrote a
+/// format below 3, so the older-format text calls the version byte damage
+/// and offers the restore, naming the one in-place upgrade redb has only for
+/// a format-2 file something else wrote.
+#[test]
+fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_refused_on_a_compacted_log() {
+    for (what, offset, bytes, reason) in REWRITES {
+        let cfg = tiny_segments_cfg();
+        let sim = Sim::with_faults(0x5E5F_0004, FaultConfig::none());
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..20u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let base = sim
+            .disk()
+            .list("wal/")
+            .unwrap()
+            .iter()
+            .map(|n| segment_base(n))
+            .min()
+            .unwrap();
+        assert!(base > 0, "{what}: setup must compact the log");
+        rewrite_store(&sim, offset, bytes);
+        assert_rejected_as(&sim, reason);
+
+        let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
+        let expected = match reason {
+            Rejection::UpgradeRequired { .. } => format!(
+                "table store cannot open (table store (redb): Manual upgrade required. Expected \
+                 file format version 3, but file is version 2) and the log is compacted to seq \
+                 {base} — redb reads the store as file format version 2, which it opens only \
+                 after a manual upgrade, and the records below its last checkpoint no longer \
+                 exist locally, so it cannot be rebuilt from the log alone. No charpente release \
+                 has written a format below 3, so on a store this node created the version byte \
+                 is damage: restore this node from a replica or backup. Only a format-2 file \
+                 written by something else can be upgraded in place, with redb 2.6's \
+                 `Database::upgrade()`; format 1 has no in-place upgrade (DESIGN §4)"
+            ),
+            _ => format!(
+                "table store cannot open (table store (redb): I/O error: Not a redb database: \
+                 magic number mismatch) and the log is compacted to seq {base} — the records \
+                 below the store's last checkpoint no longer exist locally, so the store cannot \
+                 be rebuilt from the log alone; restore this node from a replica or backup, or \
+                 widen DbConfig::retain_segments (DESIGN §4)"
+            ),
+        };
+        assert_eq!(err.to_string(), expected, "{what}");
+    }
+}
+
 /// File shorter than the header's layout: redb 4.3.0's "File truncated below
 /// stored layout" (4.1.0 asserted at page_manager.rs:231).
 #[test]
@@ -1487,6 +1886,244 @@ fn store_shorter_than_header_layout_is_discarded_and_rebuilt() {
 #[test]
 fn store_longer_than_header_layout_is_discarded_and_rebuilt() {
     mangled_store_len_recovers(|len| len + 100);
+}
+
+fn cut_store(sim: &Sim, len: u64) {
+    let file = sim.disk().open("tables.redb").unwrap();
+    file.set_len(len).unwrap();
+    file.sync().unwrap();
+}
+
+/// A store cut below redb's header (review M1) beside a log that still holds
+/// seq 0: the text names removing the file, and the fix holds, every row back
+/// from the log (S5 R-I1, the full-log case).
+#[test]
+fn a_store_cut_short_beside_a_full_log_names_removal_and_removal_rebuilds_every_row() {
+    let sim = Sim::with_faults(0x5E5F_0901, FaultConfig::none());
+    let cfg = DbConfig::default();
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+        for i in 0..20u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+    cut_store(&sim, 100);
+    for boot in 0..2 {
+        let e = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema())
+            .expect_err("a store cut below redb's header must not open");
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "boot {boot}: {e}");
+        let text = e.to_string();
+        assert!(
+            text.ends_with(
+                "every boot will fail the same way. The log beside it still reaches seq 0, so \
+                 remove tables.redb and restart: the next boot rebuilds the store from the log \
+                 (DESIGN §4)"
+            ),
+            "boot {boot}: {text}"
+        );
+    }
+    sim.disk().remove(&cfg.store_path).unwrap();
+    let db = Db::open(Box::new(sim.disk()), cfg, app_schema())
+        .unwrap_or_else(|e| panic!("the fix the text names must boot: {e}"));
+    assert_eq!(
+        ids(&db.snapshot().unwrap().scan::<Invoice>().unwrap()),
+        (0..20).collect::<Vec<u64>>(),
+        "the store rebuilt from a full log must hold every row"
+    );
+}
+
+/// The same cut beside a log compacted past seq 0 (S5 R-I1, the reviewer's
+/// repro: base 18, the store cut to 100 bytes). The store's last checkpoint
+/// is the only copy of the records below the base, so the text names the
+/// restore, not removal. An operator who removes the file anyway, as M1's
+/// first text told them to, leaves the horizon breadcrumb behind; it used to
+/// lift the recovery horizon past the vanished-prefix check, and the boot
+/// panicked replaying seq 18 into an empty store. Every boot after the
+/// removal now refuses by name.
+#[test]
+fn a_store_cut_short_beside_a_compacted_log_names_a_restore_and_removing_it_is_refused_by_name() {
+    let sim = Sim::with_faults(0x5E5F_0902, FaultConfig::none());
+    let cfg = tiny_segments_cfg();
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+        for i in 0..20u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+    let base = segment_base(&sim.disk().list("wal/").unwrap()[0]);
+    assert_eq!(
+        base, 18,
+        "setup must compact the log to the reviewer's base"
+    );
+    assert_eq!(
+        sim.disk().list("tables.redb.horizon").unwrap(),
+        ["tables.redb.horizon"],
+        "setup must leave the breadcrumb the removal below leaves behind"
+    );
+    cut_store(&sim, 100);
+    let e = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema())
+        .expect_err("a store cut below redb's header must not open");
+    assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+    let text = e.to_string();
+    assert!(
+        text.ends_with(
+            "every boot will fail the same way. The log beside it starts at seq 18, so this \
+             store holds the only copy of the records below it and cannot be rebuilt: restore \
+             this node from a replica or backup (DESIGN §4)"
+        ),
+        "{text}"
+    );
+
+    // The operator's sequence under M1's first text: remove the file, restart.
+    sim.disk().remove(&cfg.store_path).unwrap();
+    for boot in 0..2 {
+        let e = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema())
+            .expect_err("a compacted log beside no store must not boot");
+        assert_eq!(
+            e.to_string(),
+            "table store tables.redb holds no records, but the log beside it starts at seq 18: \
+             the acknowledged records from seq 0 to seq 17 exist in neither the store nor the \
+             log, so the store cannot be rebuilt from the log. Removing the store by hand leaves \
+             this state, and so does a re-seed a crash cut short; restore this node from a \
+             replica or backup. For a follower, or a primary once a follower is promoted in its \
+             place, that is a re-seed: stop the node, delete its data dir, and restart it \
+             configured as a follower of the current primary so it snapshot-seeds from it, never \
+             with a primary config: the durable role file that outranks config is deleted with \
+             the data dir, so a cleared node started as a primary comes up as a second writable \
+             primary (DESIGN §4)",
+            "boot {boot}"
+        );
+    }
+}
+
+/// `Db::open`'s vanished-prefix refusal for a log starting at `base`, typed
+/// out (error-suite T8): `held` is the store's `applied_seq`, `None` for a
+/// store holding no records.
+fn vanished_prefix_refusal(held: Option<u64>, base: u64) -> String {
+    let next = held.map_or(0, |applied| applied + 1);
+    let (held, cause) = match held {
+        None => (
+            "holds no records".to_string(),
+            "Removing the store by hand leaves this state, and so does a re-seed a crash cut \
+             short",
+        ),
+        Some(applied) => (
+            format!(
+                "holds records only through seq {applied}, the durable horizon its own \
+                 checkpoint vouches for"
+            ),
+            "Putting back an older copy of the store without its log leaves this state, and so \
+             do corruption and entry loss",
+        ),
+    };
+    format!(
+        "table store tables.redb {held}, but the log beside it starts at seq {base}: the \
+         acknowledged records from seq {next} to seq {} exist in neither the store nor the log, \
+         so the store cannot be rebuilt from the log. {cause}; restore this node from a replica \
+         or backup. For a follower, or a primary once a follower is promoted in its place, that \
+         is a re-seed: stop the node, delete its data dir, and restart it configured as a \
+         follower of the current primary so it snapshot-seeds from it, never with a primary \
+         config: the durable role file that outranks config is deleted with the data dir, so a \
+         cleared node started as a primary comes up as a second writable primary (DESIGN §4)",
+        base - 1
+    )
+}
+
+/// An older copy of the store put back behind a log compacted past it (S5
+/// R2-M1, the reviewer's probe): the store checkpointed at seq 19 is copied,
+/// the node runs on to a checkpoint at seq 39 that compacts the log to seq 38,
+/// and the copy is put back. The breadcrumb still says 39, and the
+/// vanished-prefix check used to measure against it, so the boot passed the
+/// check and panicked replaying seq 38 into a store that ends at 19
+/// ("Store::apply_batch reached seq 38 but expected 20"). Without the
+/// breadcrumb it was refused by name. It is refused by name either way now,
+/// and so is the same store beside an empty log, which used to lay its
+/// segment at the breadcrumb's seq 40 and panic at the first write.
+#[test]
+fn an_older_store_put_back_behind_a_compacted_log_is_refused_by_name_whatever_the_breadcrumb_says()
+{
+    for shape in ["breadcrumb", "no breadcrumb", "empty log"] {
+        let sim = Sim::with_faults(0x5E5F_1001, FaultConfig::none());
+        let cfg = tiny_segments_cfg();
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..20u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let file = sim.disk().open(&cfg.store_path).unwrap();
+        let mut older = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut older).unwrap();
+        drop(file);
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 20..40u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+            assert_eq!(
+                db.log_base(),
+                38,
+                "{shape}: setup must compact the log past seq 20"
+            );
+        }
+        let file = sim.disk().open(&cfg.store_path).unwrap();
+        file.set_len(older.len() as u64).unwrap();
+        file.write_at(0, &older).unwrap();
+        file.sync().unwrap();
+        drop(file);
+        let expected = match shape {
+            "breadcrumb" => vanished_prefix_refusal(Some(19), 38),
+            "no breadcrumb" => {
+                sim.disk().remove("tables.redb.horizon").unwrap();
+                sim.disk().sync_dir("tables.redb").unwrap();
+                vanished_prefix_refusal(Some(19), 38)
+            }
+            _ => {
+                for name in sim.disk().list("wal/").unwrap() {
+                    sim.disk().remove(&name).unwrap();
+                }
+                sim.disk().sync_dir("wal/").unwrap();
+                "table store tables.redb holds records only through seq 19, the durable horizon \
+                 its own checkpoint vouches for, but the log beside it is empty, and the horizon \
+                 breadcrumb records a checkpoint through seq 39: the acknowledged records from \
+                 seq 20 to seq 39 exist in neither the store nor the log, so the store cannot be \
+                 rebuilt from the log. Putting back an older copy of the store without its log \
+                 leaves this state, and so do corruption and entry loss; restore this node from \
+                 a replica or backup. For a follower, or a primary once a follower is promoted \
+                 in its place, that is a re-seed: stop the node, delete its data dir, and restart \
+                 it configured as a follower of the current primary so it snapshot-seeds from \
+                 it, never with a primary config: the durable role file that outranks config is \
+                 deleted with the data dir, so a cleared node started as a primary comes up as a \
+                 second writable primary (DESIGN §4)"
+                    .to_string()
+            }
+        };
+        for boot in 0..2 {
+            let e = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema())
+                .expect_err("a store that stops short of the log's base must not boot");
+            assert_eq!(e.to_string(), expected, "{shape}, boot {boot}");
+        }
+    }
 }
 
 // ---------------------------------------------------- segment-mgmt T3: GC
@@ -1696,6 +2333,7 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
     file.set_len(len - 4096).unwrap();
     file.sync().unwrap();
     drop(file);
+    assert_rejected_as(&sim, Rejection::Corrupted);
 
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
     let msg = err.to_string();
@@ -1799,14 +2437,9 @@ fn db_open_refuses_a_vanished_prefix() {
     );
     drop(wal);
 
+    let base = segment_base(&sim.disk().list("wal/").unwrap()[0]);
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
-    let msg = err.to_string();
-    for needle in ["base", "horizon", "neither", "restore"] {
-        assert!(
-            msg.contains(needle),
-            "vanished-prefix error must name the base, the horizon, and the fix: {msg}"
-        );
-    }
+    assert_eq!(err.to_string(), vanished_prefix_refusal(Some(5), base));
 }
 
 #[test]
@@ -1816,6 +2449,207 @@ fn unopenable_store_with_full_wal_still_rebuilds() {
     // one segment ever exists, so base_seq stays 0): the pre-T3
     // discard-and-rebuild path must still work unchanged.
     mangled_store_len_recovers(|len| len - 4096);
+}
+
+/// A store that `Store::open` could not open for a reason other than its bytes
+/// — one transient IO error, at any of the four places a clean open can meet
+/// one — is not discarded: `Db::open` returns the disk's error, naming the site
+/// and the fix, and the retry opens the same store file. Before S5 (follow-up 21), any `Store::open`
+/// error was read as "this file is damaged beyond use", so on a log still
+/// holding seq 0 this deleted a healthy store and rebuilt it from the whole log.
+#[test]
+fn a_transient_store_open_fault_on_a_full_log_discards_nothing_and_the_retry_opens_it() {
+    for site in OpenSite::ALL {
+        let sim = Sim::with_faults(0x5E5F_0001, FaultConfig::none());
+        let cfg = DbConfig::default();
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..10u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let first = sim.disk().list("wal/").unwrap();
+        assert_eq!(
+            first.first().map(|n| segment_base(n)),
+            Some(0),
+            "{site:?}: setup must keep the whole log, so the old code's discard-and-rebuild \
+             was available to it"
+        );
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(StoreSeen::default()));
+        let opened = Db::open(
+            one_shot_disk(&sim, site, &fired, &seen),
+            cfg.clone(),
+            app_schema(),
+        );
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "{site:?}: the one-shot fault never fired, so this proves nothing about it"
+        );
+        let discards = seen.lock().expect("witness lock").discards.clone();
+        match opened {
+            Ok(_) => panic!(
+                "{site:?}: Db::open answered Ok over a one-shot {site:?} fault, having discarded \
+                 the store and rebuilt it from the log (discards: {discards:?}). A transient IO \
+                 error is not a verdict on the file's bytes: the store must survive it and the \
+                 error must bubble, so a restart retries (DESIGN §4)"
+            ),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                site.bubbled(),
+                "{site:?}: Db::open must return the disk's error, named, not a refusal"
+            ),
+        }
+        assert_eq!(
+            discards,
+            Vec::<Discard>::new(),
+            "{site:?}: the store must not be discarded over a transient fault"
+        );
+
+        let db = Db::open(one_shot_disk(&sim, site, &fired, &seen), cfg, app_schema())
+            .unwrap_or_else(|e| panic!("{site:?}: the retry must open the store: {e}"));
+        let seen = seen.lock().expect("witness lock");
+        assert_eq!(
+            (seen.discards.clone(), seen.retried.clone()),
+            (Vec::new(), vec![site.error().to_string()]),
+            "{site:?}: the retry must reopen the same store file, not a rebuilt one"
+        );
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            ids(&snap.scan::<Invoice>().unwrap()),
+            (0..10).collect::<Vec<u64>>(),
+            "{site:?}: every committed record must be present after the retry"
+        );
+    }
+}
+
+/// The compacted-log half: before S5, one transient IO error inside
+/// `Store::open` on a log compacted past seq 0 made the node refuse to boot
+/// with "restore this node from a replica or backup" — the wrong fix for a
+/// fault a restart retries (found by the S4 review, Inversion C': an injected
+/// fsync failure inside `Store::open`, replication seed 0x8be1b31e61e52e62).
+/// Now the error bubbles, named, and the retry opens with every committed
+/// record present, including the ones that exist only in the checkpointed store.
+#[test]
+fn a_transient_store_open_fault_on_a_compacted_log_bubbles_and_the_retry_opens_it() {
+    for site in OpenSite::ALL {
+        let cfg = tiny_segments_cfg();
+        let sim = Sim::with_faults(0x5E5F_0002, FaultConfig::none());
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..20u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(100 + i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let base = sim
+            .disk()
+            .list("wal/")
+            .unwrap()
+            .iter()
+            .map(|n| segment_base(n))
+            .min()
+            .unwrap();
+        assert!(
+            base > 0,
+            "{site:?}: setup must compact the log, so the store cannot be rebuilt from it"
+        );
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(StoreSeen::default()));
+        let err = Db::open(
+            one_shot_disk(&sim, site, &fired, &seen),
+            cfg.clone(),
+            app_schema(),
+        )
+        .expect_err("the faulted open must fail");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "{site:?}: the one-shot fault never fired, so this proves nothing about it"
+        );
+        assert_eq!(
+            err.to_string(),
+            site.bubbled(),
+            "{site:?}: a transient fault must bubble with the disk's own error; refusing to boot \
+             with \"restore this node from a replica or backup\" sends the operator to the \
+             wrong fix for an error a restart retries"
+        );
+
+        let db = Db::open(one_shot_disk(&sim, site, &fired, &seen), cfg, app_schema())
+            .unwrap_or_else(|e| panic!("{site:?}: the retry must open the store: {e}"));
+        assert_eq!(
+            seen.lock().expect("witness lock").discards,
+            Vec::<Discard>::new(),
+            "{site:?}: a compacted log never discards"
+        );
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            ids(&snap.scan::<Invoice>().unwrap()),
+            (100..120).collect::<Vec<u64>>(),
+            "{site:?}: every committed record must be present, including those below the \
+             compacted base, which only the store holds"
+        );
+    }
+}
+
+/// The same fault inside a seeded swarm universe of
+/// `transactions_survive_the_fault_matrix`, observed by its reason. Seed
+/// `0x894c4c28968f4c96` (scan base `0x5E5FC000`, universe 16; before S5, 166 of
+/// those 256 universes discarded a store after an injected IO error) first
+/// meets an injected fault inside `Store::open` as a simulated fsync failure,
+/// on a log that still holds seq 0. The old `Db::open` discarded that store and
+/// rebuilt it; now the error bubbles and `tx_workload` restarts and reopens the
+/// same file. Up to that fault the universe is the same either way, so the
+/// first retried open names it.
+#[test]
+fn a_swarm_universe_whose_store_open_hits_an_injected_fault_retries_and_discards_nothing() {
+    const SEED: u64 = 0x894c_4c28_968f_4c96;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+    let seen = Arc::new(Mutex::new(StoreSeen::default()));
+    let witness = seen.clone();
+    let result = tx_workload_on(&mut sim, &move |sim: &Sim| -> Box<dyn Disk> {
+        Box::new(DiscardWitness {
+            inner: Box::new(sim.disk()),
+            seen: witness.clone(),
+        })
+    });
+    assert_eq!(result, Ok(()), "seed {SEED:#x}");
+    let seen = seen.lock().expect("witness lock");
+    let after_io: Vec<&Discard> = seen
+        .discards
+        .iter()
+        .filter(|d| matches!(d, Discard::AfterIoError(_)))
+        .collect();
+    assert!(
+        after_io.is_empty(),
+        "seed {SEED:#x}: Db::open discarded a store whose open had hit an IO error: \
+         {after_io:?}. Only redb rejecting the file's bytes may discard it; a transient \
+         fault must bubble so a restart retries (DESIGN §4)"
+    );
+    assert_eq!(
+        seen.retried.first().map(String::as_str),
+        Some(
+            "simulated fsync failure — durability of writes since the last successful sync is unknown"
+        ),
+        "seed {SEED:#x} no longer meets an injected fsync failure inside Store::open first \
+         (retried: {:?}). A seed names a universe, not a scenario: re-find one that reaches \
+         this reason (hard rule 3)",
+        seen.retried
+    );
 }
 
 /// Companion to `regression_store_bricked_by_creation_crash` above: that
@@ -1859,9 +2693,13 @@ fn fresh_store_creation_crash_is_discarded_and_rebuilt() {
     let cfg = DbConfig::default();
     assert!(Db::open(Box::new(sim.disk()), cfg.clone(), Schema::new()).is_err());
     sim.restart();
+    let bricked = Store::open(&sim.disk(), &cfg.store_path).err().expect(
+        "setup must independently confirm the store is bricked before Db::open is asked to fix it",
+    );
     assert!(
-        Store::open(&sim.disk(), &cfg.store_path).is_err(),
-        "setup must independently confirm the store is bricked before Db::open is asked to fix it"
+        StoreRejected::of(&bricked).is_some(),
+        "the bricked store must be one redb rejects by its bytes — the only open error Db::open \
+         discards a store for — not an IO error a retry could clear: {bricked}"
     );
 
     let db = Db::open(Box::new(sim.disk()), cfg, Schema::new())
@@ -2125,11 +2963,16 @@ fn store_discard_with_a_breadcrumb_and_a_clean_log_replays_everything() {
     );
 }
 
-/// `Seeder::finish` writes the breadcrumb too (brief-mandated touch point):
-/// a freshly seeded node is exactly as protected against store discard as
-/// one that reached the same state through ordinary `Db::checkpoint`.
+/// A seeded node whose store is gone (S5 R-I1). `Seeder::finish` lays the
+/// log at `applied_seq + 1`, so a seeded node's log never reaches seq 0 and
+/// its store holds the only copy of the seed. This test used to pin that the
+/// breadcrumb `finish` writes lifted the horizon far enough for a corrupt
+/// frame at it to refuse as corruption. Without the corrupt frame the same
+/// state replayed seq 1 into an empty store and panicked, so the store's loss
+/// is now refused first, by name, before recovery reads a frame: nothing can
+/// rebuild the seed, whatever the frames hold.
 #[test]
-fn seeder_finish_writes_the_breadcrumb_so_a_reseeded_node_is_protected_too() {
+fn a_seeded_node_whose_store_is_gone_is_refused_before_recovery_reads_a_frame() {
     let sim = Sim::with_faults(0x0EA5_0005, FaultConfig::none());
     let cfg = DbConfig::default();
 
@@ -2159,18 +3002,10 @@ fn seeder_finish_writes_the_breadcrumb_so_a_reseeded_node_is_protected_too() {
     file.sync().unwrap();
     sim.disk().remove(&cfg.store_path).unwrap();
 
-    let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).expect_err(
-        "a seeded-then-checkpointed node must be exactly as protected as an ordinary one",
-    );
-    // Byte-exact (error-suite T8): the corrupted frame is the segment's only
-    // frame, seq 1 (the post-seed commit), and the checkpoint above pins the
-    // breadcrumb at 1 — both format args are scenario-known.
-    assert_eq!(
-        err.to_string(),
-        "log frame 1 is invalid but at-or-below the store's durable horizon 1 — this is \
-         corruption of acknowledged records, not a torn tail, and truncating it would silently \
-         lose data; restore this node from a replica or backup (DESIGN §2)"
-    );
+    let err = Db::open(Box::new(sim.disk()), cfg, app_schema())
+        .expect_err("a seeded node whose store is gone must not boot");
+    // Byte-exact (error-suite T8): the seed segment's base is 1.
+    assert_eq!(err.to_string(), vanished_prefix_refusal(None, 1));
 }
 
 /// `Seeder::new` must clear a stale breadcrumb left behind by a PRIOR,
@@ -2211,7 +3046,14 @@ fn seeder_new_clears_a_stale_breadcrumb_so_reseed_never_over_claims() {
         Ok::<_, io::Error>(())
     })
     .unwrap();
+    // Power is lost before the store closes, so it comes back at the seed's
+    // checkpoint, applied_seq 0: seq 1's apply was never checkpointed, and a
+    // graceful close would have persisted it. (Removing the store, as this
+    // test once did, now refuses by name before recovery reads a frame: the
+    // log starts at seq 1, so nothing could rebuild the seed, S5 R-I1.)
+    sim.crash_disk_now();
     drop(db);
+    sim.restart();
 
     // `Seeder::finish` lays the segment at base_seq = applied_seq + 1 = 1, so
     // the post-seed transaction above (seq 1) sits at offset 0 within it.
@@ -2221,7 +3063,6 @@ fn seeder_new_clears_a_stale_breadcrumb_so_reseed_never_over_claims() {
     file.read_at(16, &mut byte).unwrap();
     file.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
     file.sync().unwrap();
-    sim.disk().remove(&cfg.store_path).unwrap();
 
     let db = Db::open(Box::new(sim.disk()), cfg, app_schema()).expect(
         "the stale breadcrumb must not survive Seeder::new -- an ordinary above-horizon torn \
@@ -2232,6 +3073,275 @@ fn seeder_new_clears_a_stale_breadcrumb_so_reseed_never_over_claims() {
         rows.is_empty(),
         "seq 1 was never checkpointed in the new timeline and must cut silently: {:?}",
         ids(&rows)
+    );
+}
+
+/// A re-seed of a compacted node that a crash cuts short (S5 R-I1, the crash
+/// model's half). `Seeder::new` removes the store, then the horizon
+/// breadcrumb, then the log, barriering each removal before the next, so a
+/// crash between the first barrier and the second leaves no store, a
+/// breadcrumb, and a log compacted past seq 0. Nothing in that state can be
+/// rebuilt: the records below the log's base lived only in the store.
+///
+/// Each universe crashes the re-seed at a disk op drawn from its seed and
+/// power-cycles. Before the boot, it reads what the crash left: the store's
+/// records (read from a copy, so the boot meets the bytes untouched), whether
+/// the breadcrumb survived, and the log's base. That state names the one
+/// outcome the boot may have (S5 re-review 2, R2-M2):
+/// - a log based past the store's own next seq is refused with the exact
+///   vanished-prefix text, whatever the breadcrumb says;
+/// - otherwise the store and log boot the old timeline whole, or the new one
+///   at `RESEED_AT`;
+/// - with no log and no records, the node boots fresh.
+///
+/// A different outcome fails the universe, and so does a panic or a state
+/// the crash model should not leave. The fresh outcome used to accept any
+/// empty boot, so a `Db::open` that deleted the log and booted empty beside
+/// a breadcrumb passed the batch, and only the seed pin caught it.
+/// Measured at this base: 76 old, 40 new, 110 fresh, 30 refused (6 of them
+/// beside the breadcrumb).
+#[test]
+fn a_reseed_cut_short_by_a_crash_boots_a_whole_timeline_or_refuses_by_name() {
+    run_universes_swarm_with!(
+        0x5EED_C0A1,
+        256,
+        crash_model_only,
+        |sim: &mut Sim| {
+            let (base, crash_at) = crash_a_reseed(sim)?;
+            // The reads below are the oracle's, not the node's: no fault may
+            // roll on them, and none is left to roll on the boot either.
+            sim.quiesce_disk_faults();
+            let left = reseed_left(sim)?;
+            let expected = left.expected_boot().map_err(|e| {
+                format!(
+                    "a re-seed of a log compacted to seq {base}, crashed at disk op {crash_at}: {e}"
+                )
+            })?;
+            let got = match Db::open(Box::new(sim.disk()), tiny_segments_cfg(), app_schema()) {
+                Ok(db) => {
+                    let rows = db
+                        .snapshot()
+                        .and_then(|snap| snap.scan::<Invoice>())
+                        .map_err(|e| format!("read after boot: {e}"))?;
+                    let rows = ids(&rows);
+                    match (rows.as_slice(), db.last_applied()) {
+                        (rows, Some(22)) if rows == (0..23).collect::<Vec<_>>() => {
+                            ReseedBoot::OldTimeline
+                        }
+                        ([1000], Some(RESEED_AT)) => ReseedBoot::NewTimeline,
+                        ([], None) => ReseedBoot::Fresh,
+                        (rows, last) => ReseedBoot::Other(format!(
+                            "booted rows {rows:?}, last applied {last:?}"
+                        )),
+                    }
+                }
+                Err(e) => ReseedBoot::Refused(e.to_string()),
+            };
+            if got != expected {
+                return Err(format!(
+                    "a re-seed of a log compacted to seq {base}, crashed at disk op {crash_at}, \
+                     left {left:?}, so the boot must be {expected:?}, but it was {got:?}"
+                ));
+            }
+            sim.cover(match got {
+                ReseedBoot::OldTimeline => "reseed:old-timeline",
+                ReseedBoot::NewTimeline => "reseed:new-timeline",
+                ReseedBoot::Fresh => "reseed:fresh",
+                ReseedBoot::Refused(_) if left.breadcrumb => "reseed:refused-beside-breadcrumb",
+                ReseedBoot::Refused(_) => "reseed:refused",
+                ReseedBoot::Other(_) => unreachable!("an unexpected boot never equals a prediction"),
+            });
+            Ok(())
+        },
+        require: [
+            "reseed:old-timeline",
+            "reseed:new-timeline",
+            "reseed:fresh",
+            "reseed:refused",
+            "reseed:refused-beside-breadcrumb",
+        ]
+    );
+}
+
+/// What a crashed re-seed left on disk, read before the boot.
+#[derive(Debug)]
+struct ReseedLeft {
+    store: StoreLeft,
+    breadcrumb: bool,
+    log_base: Option<u64>,
+}
+
+#[derive(Debug)]
+enum StoreLeft {
+    Absent,
+    /// A file redb rejects: `Seeder::new`'s new store, its creation torn.
+    Rejected,
+    /// The store's `applied_seq`: `None` for a store holding no records.
+    Held(Option<u64>),
+}
+
+#[derive(Debug, PartialEq)]
+enum ReseedBoot {
+    OldTimeline,
+    NewTimeline,
+    Fresh,
+    Refused(String),
+    Other(String),
+}
+
+impl ReseedLeft {
+    /// The one boot this state allows, by the recovery-horizon rule: a log
+    /// based past the store's own next seq is refused, whatever the
+    /// breadcrumb says (DESIGN §2).
+    fn expected_boot(&self) -> Result<ReseedBoot, String> {
+        let held = match self.store {
+            // `Db::open` discards a store redb rejects, and rebuilds only
+            // from a log that still reaches seq 0; none survives beside one.
+            StoreLeft::Rejected if self.log_base.is_none() => return Ok(ReseedBoot::Fresh),
+            StoreLeft::Rejected => {
+                return Err(format!(
+                    "the crash left a state no crash should leave: {self:?}"
+                ));
+            }
+            StoreLeft::Absent => None,
+            StoreLeft::Held(applied) => applied,
+        };
+        let next = held.map_or(0, |applied| applied + 1);
+        Ok(match (held, self.log_base) {
+            (_, Some(base)) if base > next => {
+                ReseedBoot::Refused(vanished_prefix_refusal(held, base))
+            }
+            (Some(RESEED_AT), _) => ReseedBoot::NewTimeline,
+            (Some(applied), Some(_)) if applied > RESEED_AT => ReseedBoot::OldTimeline,
+            (None, None) => ReseedBoot::Fresh,
+            _ => {
+                return Err(format!(
+                    "the crash left a state no crash should leave: {self:?}"
+                ));
+            }
+        })
+    }
+}
+
+/// Reads the store's records from a copy of its bytes on a scratch disk, so
+/// the boot that follows meets the file exactly as the crash left it.
+fn reseed_left(sim: &Sim) -> Result<ReseedLeft, String> {
+    let disk = sim.disk();
+    let names = disk
+        .list("tables.redb")
+        .map_err(|e| format!("list the store: {e}"))?;
+    let store = if names.iter().any(|name| name == "tables.redb") {
+        let read = || -> io::Result<StoreLeft> {
+            let file = disk.open("tables.redb")?;
+            let mut bytes = vec![0u8; file.len()? as usize];
+            file.read_at(0, &mut bytes)?;
+            let scratch = Sim::with_faults(0, FaultConfig::none());
+            let copy = scratch.disk().open("tables.redb")?;
+            copy.write_at(0, &bytes)?;
+            copy.sync()?;
+            match Store::open(&scratch.disk(), "tables.redb") {
+                Ok(store) => Ok(StoreLeft::Held(store.applied_seq()?)),
+                Err(e) if StoreRejected::of(&e).is_some() => Ok(StoreLeft::Rejected),
+                Err(e) => Err(e),
+            }
+        };
+        read().map_err(|e| format!("read the store the crash left: {e}"))?
+    } else {
+        StoreLeft::Absent
+    };
+    let log_base = disk
+        .list("wal/")
+        .map_err(|e| format!("list the log: {e}"))?
+        .first()
+        .map(|name| segment_base(name));
+    Ok(ReseedLeft {
+        store,
+        breadcrumb: names.iter().any(|name| name == "tables.redb.horizon"),
+        log_base,
+    })
+}
+
+/// The crash model alone: where the crash lands and what survives it. An
+/// injected IO error would end the re-seed early instead.
+fn crash_model_only(cfg: &mut FaultConfig) {
+    cfg.write_error = 0.0;
+    cfg.sync_error = 0.0;
+    cfg.read_error = 0.0;
+    cfg.bit_flip = 0.0;
+    cfg.misdirected_write = 0.0;
+}
+
+/// Where the crashed re-seed's new timeline starts.
+const RESEED_AT: u64 = 5;
+
+/// Writes 23 rows with a checkpoint after the 20th, so the log is compacted
+/// past seq 0 with records above its base, then re-seeds the node to one row
+/// at `RESEED_AT` with a crash armed at a disk op drawn from the seed, and
+/// power-cycles. Returns the log's base before the re-seed and the crash point.
+fn crash_a_reseed(sim: &mut Sim) -> Result<(u64, u64), String> {
+    let mut db = Db::open(Box::new(sim.disk()), tiny_segments_cfg(), app_schema())
+        .map_err(|e| format!("setup open: {e}"))?;
+    for i in 0..23u64 {
+        db.transact(|tx| {
+            tx.put(&invoice(i, 1, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .map_err(|e| format!("setup write {i}: {e:?}"))?;
+        if i == 19 {
+            db.checkpoint()
+                .map_err(|e| format!("setup checkpoint: {e}"))?;
+        }
+    }
+    let base = db.log_base();
+    assert!(base > 0, "setup must compact the log past seq 0");
+    let crash_at = sim.entropy().next_u64() % 80;
+    sim.crash_disk_after(crash_at);
+    let reseeded = db.into_seeder().and_then(|mut seeder| {
+        let mut bytes = Vec::new();
+        invoice(1000, 1, 1000).encode_row(&mut bytes);
+        seeder.rows(Invoice::TABLE, &[(0, 1000, bytes)])?;
+        seeder.finish(RESEED_AT, 0, 0, 0)
+    });
+    drop(reseeded);
+    sim.restart();
+    Ok((base, crash_at))
+}
+
+/// Sim-found (S5 R-I1): seed `0x64a183075fd398b9`, the first universe the
+/// property above failed at base `0x5EED_C0A1` before the fix. Its crash
+/// lands inside `Seeder::new` after the store's removal is barriered and
+/// before the breadcrumb's is, so the boot met no store, the breadcrumb, and
+/// a log compacted to seq 18, and panicked replaying seq 18 into an empty
+/// store ("Store::apply_batch reached seq 18 but expected 0"). It refuses by
+/// name now.
+#[test]
+fn a_reseed_crash_that_strands_the_breadcrumb_without_its_store_is_refused_by_name() {
+    const SEED: u64 = 0x64a1_8307_5fd3_98b9;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut faults = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut faults);
+    crash_model_only(&mut faults);
+    let mut sim = Sim::with_faults(SEED, faults);
+
+    let (base, _) = crash_a_reseed(&mut sim).unwrap();
+    assert_eq!(base, 18, "seed {SEED:#x}");
+    assert_eq!(
+        sim.disk().list("tables.redb").unwrap(),
+        ["tables.redb.horizon"],
+        "seed {SEED:#x}: the crash must leave the breadcrumb without its store"
+    );
+    assert_eq!(
+        segment_base(&sim.disk().list("wal/").unwrap()[0]),
+        18,
+        "seed {SEED:#x}: the crash must leave the compacted log"
+    );
+    let e = Db::open(Box::new(sim.disk()), tiny_segments_cfg(), app_schema())
+        .expect_err("a compacted log beside no store must not boot");
+    assert_eq!(
+        e.to_string(),
+        vanished_prefix_refusal(None, 18),
+        "seed {SEED:#x}"
     );
 }
 

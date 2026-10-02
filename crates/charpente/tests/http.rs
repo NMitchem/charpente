@@ -1271,10 +1271,19 @@ fn is_injected(text: &str) -> bool {
 /// How many reopens the final verification gets before the universe gives
 /// up. Every attempt either verifies or dies to injected fault fallout, so a
 /// larger budget costs time only in universes that would otherwise have
-/// concluded nothing. 8 -> 16 took this property's give-ups from 129 to 62
-/// over four bases for +12% CPU; 32 left 38 for +24.5%, with two of the four
-/// bases over the +25% a budget may cost (2026-10-01).
-const FINAL_ATTEMPTS: u32 = 16;
+/// concluded nothing. With the rounds aimed, 16 -> 64 took give-ups over ten
+/// fresh bases from 258 to 94 for +2.2% CPU (2026-10-01, S5 review I1). Before
+/// S5 a failed reopen rebuilt the table store, and 32 cost +24.5%.
+const FINAL_ATTEMPTS: u32 = 64;
+
+/// How many boots each round gets before it restarts and moves on
+/// (`checks::boot_through_fallout`). A round whose boot fails skips its check
+/// and its requests, so this budget is reach: over ten fresh bases at 256
+/// universes, booting once left 3,375 rounds unbooted, and 16, 32 and 64 left
+/// 407, 159 and 30, for +7.9%, +10.5% and +11.8% CPU (2026-10-01, S5 review
+/// I1). More rounds mean more to recover at the end: give-ups went 60 -> 82,
+/// 86 and 94, against 170 for the same bases before S5.
+const ROUND_BOOT_TRIES: u32 = 64;
 
 /// One universe: recover → verify → requests through App::handle (an acked
 /// 200 must survive anything) → crash. A 500 whose body is not an injected
@@ -1289,15 +1298,18 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     for _round in 0..3 {
         // Sized to redb 4.3.0's disk-op volume per round: DESIGN §1, "countdowns".
         sim.crash_disk_after(44 + entropy.next_u64() % 353);
-        let mut app = match open_crash_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                if !is_injected(&e.to_string()) {
-                    return Err(format!("recovery failed with a non-injected error: {e}"));
-                }
-                sim.restart();
-                continue;
+        let Some(mut app) =
+            charpente_sim::checks::boot_through_fallout(sim, ROUND_BOOT_TRIES, is_injected, || {
+                open_crash_app(sim)
+            })
+            .map_err(|e| format!("recovery failed with a non-injected error: {e}"))?
+        else {
+            // A durable refusal already gave the universe up, by name.
+            if sim.gave_up().is_some() {
+                return Ok(responses);
             }
+            sim.restart();
+            continue;
         };
         let recovered = app.db().last_applied().map_or(0, |s| s + 1);
         if recovered < acked {
@@ -1333,6 +1345,8 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             sim.restart();
             continue;
         }
+        // A round's recovered state was checked against everything acked.
+        sim.cover("http:round-verified");
 
         for _ in 0..1 + entropy.next_u64() % 8 {
             // Sprinkle guaranteed-no-write requests: they must not consume a seq.
@@ -1383,10 +1397,15 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
         let app = match open_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
-                if !is_injected(&e.to_string()) {
+                let text = e.to_string();
+                if !is_injected(&text) {
                     return Err(format!(
                         "final recovery failed with a non-injected error: {e}"
                     ));
+                }
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                if charpente_sim::checks::durable_refusal(sim, &text)? {
+                    return Ok(responses);
                 }
                 sim.restart();
                 continue;
@@ -1433,8 +1452,20 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
 /// attempts) it gave up 10-28 times, mean 17.6, and the cap is twice that
 /// maximum, about 7 standard deviations above the mean. It guards drift toward
 /// adjudicating nothing, not the budget: with 8 attempts four fixed bases gave
-/// up 30-35 times, under it.
-const HTTP_GAVE_UP_CEILING: u64 = 56;
+/// up 30-35 times, under it. Re-measured 2026-10-01 for S5 with D1 (`Db::open`
+/// no longer discards a store over an IO error; WAL recovery syncs before
+/// replay): 10 fresh batches gave up 10-19 times, mean 14.9, sd 3.0, so the cap
+/// is 38, 7.7 standard deviations above the mean. Re-measured 2026-10-01 with
+/// the round boots aimed and 64 final attempts (S5 review I1): 10 fresh
+/// batches gave up 6-14 times, mean 10.0, sd 2.8, so the cap is 28, 6.5
+/// standard deviations above the mean (16.0 at S5's parent, same bases).
+const HTTP_GAVE_UP_CEILING: u64 = 28;
+
+/// The reach floor: rounds whose recovered state was checked against every
+/// acked request. A margin, as the cap is: 10 fresh batches (2026-10-01, S5
+/// review I1) checked 750-763 rounds, mean 756.3, sd 3.8, and the floor is
+/// the mean less 4 standard deviations (GUIDE §8).
+const HTTP_ROUND_VERIFIED_FLOOR: u64 = 741;
 
 #[test]
 fn http_requests_survive_the_fault_matrix() {
@@ -1449,7 +1480,10 @@ fn http_requests_survive_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
+            "http:round-verified",
+            "boot:booted-after-retry",
         ],
+        floor: [("http:round-verified", HTTP_ROUND_VERIFIED_FLOOR)],
         ceiling: [("universe:gave-up", HTTP_GAVE_UP_CEILING)]
     );
 }
@@ -1492,13 +1526,23 @@ fn a_final_verification_that_never_runs_gives_up_rather_than_passing() {
 /// single-node loss, so the durability oracle cannot run past them: the
 /// universe gives up rather than passing (LEDGER 2026-09-30, follow-up 9's
 /// rule for every arm that ends a universe without a verdict). Seed
-/// `0x231a841f396a7d80` meets it at a round's recovery (base `0x5300_0009`),
-/// seed `0x3f2a17e8c2fe469e` at the final one (base `0x5E1F_0001`).
+/// `0x04e7c90b39225fee` meets it at a round's recovery (base `0x5300_0009`,
+/// universe 136), seed `0x8e1c391d400cb5d4` at the final one (same base,
+/// universe 137). Re-pinned 2026-10-01 for S5 with D1, which re-key every
+/// universe: the round arm's `0x231a841f396a7d80` no longer meets durable
+/// corruption. Found by scanning the same base for the first universe that
+/// gives up for the cut at a round's recovery (two of 256 do). The final arm
+/// re-pinned the same day when the round boots were aimed (S5 review I1):
+/// `0x3f2a17e8c2fe469e` now meets corruption at or below the store's horizon
+/// at a round boot, which no restart clears, and gives up there (pinned
+/// below). Found by scanning that base for the first universe that gives up
+/// for the cut at the final recovery (11 of 2,048 over eight bases do, 2 of
+/// these 256).
 #[test]
 fn acked_requests_cut_by_durable_corruption_give_up_rather_than_pass() {
     for (seed, arm) in [
-        (0x231a_841f_396a_7d80_u64, "at a round's recovery"),
-        (0x3f2a_17e8_c2fe_469e, "at the final recovery"),
+        (0x04e7_c90b_3922_5fee_u64, "at a round's recovery"),
+        (0x8e1c_391d_400c_b5d4, "at the final recovery"),
     ] {
         let mut state = seed;
         let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -1521,6 +1565,72 @@ fn acked_requests_cut_by_durable_corruption_give_up_rather_than_pass() {
             "seed {seed:#x} must give up {arm}: {reason}"
         );
     }
+}
+
+/// Corruption at or below the store's durable horizon is a refusal no restart
+/// clears, so a round boot that meets it gives the universe up at once under
+/// that reason instead of booting again and passing the failure on to the
+/// final check (`checks::boot_through_fallout`, S5 review M6). Seed
+/// `0x3f2a17e8c2fe469e` (base `0x5E1F_0001`, universe 73), which met the
+/// above-horizon cut at the final recovery before the round boots were aimed.
+#[test]
+fn a_durable_refusal_at_a_round_boot_gives_up_at_once_by_name() {
+    const SEED: u64 = 0x3f2a_17e8_c2fe_469e;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    assert!(http_workload_traced(&mut sim).is_ok(), "seed {SEED:#x}");
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.contains(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ) && reason.contains("at-or-below the store's durable horizon"),
+        "seed {SEED:#x} must give up for the refusal, carrying its text: {reason}"
+    );
+}
+
+/// A durable refusal at the final recovery ends it at once, by name (S5 re-review
+/// R-M2). Seed `0xb8e8b2103fbe283e`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("the final verification never ran").
+#[test]
+fn a_durable_refusal_at_the_final_recovery_ends_it_at_once_by_name() {
+    const SEED: u64 = 0xb8e8_b210_3fbe_283e;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = http_workload_traced(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
 }
 
 #[test]

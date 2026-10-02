@@ -937,7 +937,121 @@ fn apply_one_in_txn<T>(
     Ok(out)
 }
 
+/// redb's verdict, at [`Store::open`], that the store file's bytes are not a
+/// database it will open. It is the payload of the `io::Error` `Store::open`
+/// returns (kind `InvalidData`; read it back with [`StoreRejected::of`]), and
+/// the only open failure `Db::open` answers by discarding the store and
+/// rebuilding it from the log — or, on a log compacted past seq 0, by refusing
+/// to boot. Every other `Store::open` error is an IO failure (the disk's own,
+/// or redb's latch after one) that a restart retries, and `Db::open` returns it
+/// with the site and the fix named, its kind and text kept. DESIGN §4 tables
+/// how every error redb 4.3.0 can return at open is classified.
+#[derive(Debug)]
+pub struct StoreRejected {
+    /// Which verdict redb gave.
+    pub reason: Rejection,
+    /// redb's own wording, rendered as `redb_err` renders every redb error.
+    text: String,
+}
+
+/// The three ways redb rejects a store file's bytes at open (redb 4.3.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    /// `StorageError::Corrupted`: a header field, a commit slot's or page's
+    /// checksum, or a tree's structure that redb read and refused.
+    Corrupted,
+    /// `DatabaseError::UpgradeRequired`: the file's commit slot names redb
+    /// file format `version`, which this redb opens only after a manual
+    /// upgrade. Not damage in itself.
+    UpgradeRequired { version: u8 },
+    /// The file is not empty and does not begin with redb's magic number,
+    /// e.g. a creation that never became durable.
+    NotARedbFile,
+}
+
+impl fmt::Display for StoreRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for StoreRejected {}
+
+impl StoreRejected {
+    /// `Some` only for redb's rejection of the file's bytes, as
+    /// `TableWriteRefusal::of`.
+    pub fn of(e: &io::Error) -> Option<&StoreRejected> {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<StoreRejected>())
+    }
+}
+
+/// Sorts what `create_with_backend` returned into redb's verdict on the bytes
+/// and everything else, by type alone. A rejection needs positive evidence:
+/// it deletes a store (or refuses a boot), so a variant not named here is an
+/// IO failure and bubbles. Every variant redb 4.3.0 can return is classified
+/// in DESIGN §4's table; the three rejected ones are:
+/// - `Corrupted` — redb's verdict on bytes it read without error;
+/// - `UpgradeRequired` — the commit slot's format version byte;
+/// - `Io` that `DiskBackend` did not pass up — redb builds exactly one such
+///   error from the bytes at open, "Not a redb database: magic number
+///   mismatch" (`page_manager.rs:1137`), and every error the disk returns
+///   reaches redb wrapped in `FromDisk`, so the wrapper is what tells the two
+///   apart. The kind check keeps any other unwrapped error redb might build
+///   (none is reachable at open in 4.3.0) out of the destructive arm.
+///
+/// One disk error is named here rather than passed up bare: a read past the
+/// end of the file. redb reads its 320-byte header once the magic number
+/// matches, so a file of 9 to 319 bytes with its magic intact fails every
+/// open on that read. It is not a rejection, since the disk said it and redb
+/// built no verdict, but no restart fixes it either, and redb makes the
+/// file's length durable before it writes the magic (`page_manager.rs:1181-1200`),
+/// so no crash leaves one: the file was cut outside the crash model. Its fix
+/// depends on the log beside the store, which only `Db::open` sees, so
+/// `Db::open` names it.
+fn open_error(e: redb::DatabaseError, path: &str) -> io::Error {
+    use redb::{DatabaseError, StorageError};
+    if let DatabaseError::Storage(StorageError::Io(io)) = &e
+        && io.kind() == io::ErrorKind::UnexpectedEof
+        && io.get_ref().is_some_and(|inner| inner.is::<FromDisk>())
+    {
+        return io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "table store (redb): {path} ends before redb's file header does ({io}). redb \
+                 found its magic number, so this is not a file it rejects; but no crash \
+                 leaves a store this short, since redb makes the file's length durable before \
+                 it writes the magic, so the file was cut outside the crash model and every \
+                 boot will fail the same way"
+            ),
+        );
+    }
+    let reason = match &e {
+        DatabaseError::Storage(StorageError::Corrupted(_)) => Rejection::Corrupted,
+        DatabaseError::UpgradeRequired(version) => Rejection::UpgradeRequired { version: *version },
+        DatabaseError::Storage(StorageError::Io(io))
+            if io.kind() == io::ErrorKind::InvalidData
+                && !io.get_ref().is_some_and(|inner| inner.is::<FromDisk>()) =>
+        {
+            Rejection::NotARedbFile
+        }
+        _ => return redb_err(e),
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        StoreRejected {
+            reason,
+            text: redb_err(e).to_string(),
+        },
+    )
+}
+
 impl Store {
+    /// Opens (or creates) the store at `path` through `disk`. An `Err` whose
+    /// [`StoreRejected::of`] is `Some` is redb refusing the file's bytes;
+    /// any other `Err` — including this function's own `disk.open` and
+    /// `disk.sync_dir` — is an IO failure, passed up as the disk or redb
+    /// rendered it.
     pub fn open(disk: &dyn Disk, path: &str) -> io::Result<Store> {
         let file = disk.open(path)?;
         // The store file's name must be durable too — File::sync (below,
@@ -947,17 +1061,17 @@ impl Store {
         disk.sync_dir(path)?;
         // A crash-mangled file whose length disagrees with its durable
         // header's layout is an ordinary `Err` here (redb 4.3.0 returns
-        // `StorageError::Corrupted` where 4.1.0 asserted), so Db::open's
-        // discard-and-rebuild path — or its compacted-log refusal — takes it
-        // with no panic fence. A redb panic, at open or later, is a real
-        // failure and propagates (DESIGN §4).
+        // `StorageError::Corrupted` where 4.1.0 asserted), rejected by
+        // `open_error`, so Db::open's discard-and-rebuild path — or its
+        // compacted-log refusal — takes it with no panic fence. A redb panic,
+        // at open or later, is a real failure and propagates (DESIGN §4).
         let latch = Arc::new(AtomicBool::new(false));
         let db = Builder::new()
             .create_with_backend(DiskBackend {
                 file,
                 latch: latch.clone(),
             })
-            .map_err(redb_err)?;
+            .map_err(|e| open_error(e, path))?;
         Ok(Store {
             db,
             latch,
@@ -2163,12 +2277,36 @@ impl fmt::Debug for DiskBackend {
 }
 
 impl DiskBackend {
-    /// Mirrors redb's latch: set on `Err`, never cleared.
+    /// Mirrors redb's latch: set on `Err`, never cleared. The error goes up
+    /// wrapped in `FromDisk`, which is how `open_error` tells it from an
+    /// `io::Error` redb builds itself.
     fn note<T>(&self, r: Result<T, io::Error>) -> Result<T, io::Error> {
-        if r.is_err() {
+        r.map_err(|e| {
             self.latch.store(true, Ordering::SeqCst);
-        }
-        r
+            io::Error::new(e.kind(), FromDisk(e))
+        })
+    }
+}
+
+/// An error `DiskBackend` passed up from the `Disk`. redb's own "Not a redb
+/// database" verdict is a `StorageError::Io` too, so without this wrapper an
+/// injected or real IO error could pass for a verdict on the bytes. redb moves
+/// a backend's error into `StorageError::Io` without rebuilding it
+/// (redb-4.3.0 cached_file.rs:218-261, `map_err(StorageError::from)`), so the
+/// wrapper survives to `open_error`; `Display` and kind are the inner error's,
+/// so every message that reads it is unchanged.
+#[derive(Debug)]
+struct FromDisk(io::Error);
+
+impl fmt::Display for FromDisk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for FromDisk {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
     }
 }
 
