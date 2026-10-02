@@ -19,7 +19,8 @@ use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::witnesses::{load_witnesses, store_witnesses};
 use charpente::repl::{
-    MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS, ReplConfig, WITNESS_DEADLINE_NANOS,
+    MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS, ReplConfig, SWITCHOVER_DEADLINE_NANOS,
+    WITNESS_DEADLINE_NANOS,
 };
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
 use charpente_core::engine::REHELLO_MARKER;
@@ -4615,9 +4616,12 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
             Ok(())
         }
         Msg::CtrlErr { message } => {
-            // The rare HandOffDone-loss window (spec §2): the hand-off was sent
-            // and f promoted, but the confirmation was lost, so p stays
-            // write-stopped. Safety holds; this is not the happy-path oracle.
+            // The hand-off was sent and no confirmation came back (spec §2):
+            // either f promoted and the confirmation was lost, or f never took
+            // it (229 of 635 stalls over 64 fresh bases, D4; pinned by
+            // `a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`).
+            // Either way p stays write-stopped. Safety holds; this is not the
+            // happy-path oracle.
             sim.cover("repl:switchover-stalled");
             if !message.contains("switchover") {
                 return Err(format!("unexpected CtrlErr from a switchover: {message}"));
@@ -5111,6 +5115,168 @@ fn crash_between_handoff_and_demote_never_yields_two_writable_primaries() {
 
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// A switchover whose target never took the `HandOff`: the deterministic
+/// shape of D4's 229 stalled universes over 64 fresh bases, where `f`'s role
+/// write failed inside `accept_handoff`. Here `f` dies before the message
+/// lands. Either way `f` reboots as the follower its role file says it is and
+/// reconnects already caught up, so it never acks again and `p` never resends.
+/// Returns the world at the stall, with `p`'s reply and its hand-off seq.
+fn stalled_switchover_target_never_promoted() -> (Sim, Node, Node, String, u64) {
+    use charpente::repl::SwitchoverPhase;
+
+    let sim = Sim::with_faults(STALLED_SWITCHOVER_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[0].repl.switchover_phase() == Some(SwitchoverPhase::HandedOff),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    let at =
+        p.db.as_ref()
+            .unwrap()
+            .last_applied()
+            .expect("handed off at a durable seq");
+    f.host.crash_now();
+    recover_node(&sim, &mut f).unwrap();
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "sanity: f never applied the HandOff, so it reboots a follower: {:?}",
+        f.repl.role()
+    );
+    let message = match drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap()
+    {
+        Msg::CtrlErr { message } => message,
+        other => panic!("a switchover whose target never took the hand-off must stall: {other:?}"),
+    };
+    (sim, p, f, message, at)
+}
+
+const STALLED_SWITCHOVER_SEED: u64 = 0x2EB1_0D40;
+
+/// What is true once a switchover stalls with its target never promoted, and
+/// that the stall's `CtrlErr` says exactly that (D4 item 4). No node accepts
+/// writes, and nothing changes that on its own: `p` does not resume, and
+/// restarting `p` alone leaves it handing off. The remedy the text names does
+/// change it. Promoting `f` loses nothing (its reply names `p`'s own
+/// hand-off seq), and restarting `p` then rejoins it as `f`'s follower.
+#[test]
+fn a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing() {
+    let (sim, mut p, mut f, message, at) = stalled_switchover_target_never_promoted();
+    assert_eq!(
+        message,
+        format!(
+            "switchover to f:1: the hand-off was sent at seq {at} but no confirmation returned \
+             before the deadline — this node stays write-stopped and will not resume writes on \
+             its own, because f:1 may already be the primary. If f:1's role file says primary, \
+             restart this node to resolve against f:1: it rejoins as f:1's follower. If it \
+             still says follower, f:1 never took the hand-off and no node accepts writes: \
+             promote it (charpente promote --node f:1) — it acked every record up to seq {at} \
+             and this node has accepted no write since, so its reply names last_applied \
+             Some({at}) and nothing is lost — then restart this node to resolve against f:1"
+        )
+    );
+    let none_writable = |p: &Node, f: &Node| {
+        !p.db.as_ref().is_some_and(|d| d.writes_allowed())
+            && !f.db.as_ref().is_some_and(|d| d.writes_allowed())
+    };
+    assert!(none_writable(&p, &f), "no node accepts writes at the stall");
+
+    // Nothing resolves it on its own, across twice the switchover deadline.
+    let until = sim.now().as_nanos() + 2 * SWITCHOVER_DEADLINE_NANOS;
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |_| sim.now().as_nanos() > until,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert!(
+        matches!(p.repl.role(), Role::HandingOff { .. }),
+        "{:?}",
+        p.repl.role()
+    );
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "{:?}",
+        f.repl.role()
+    );
+    assert!(
+        none_writable(&p, &f),
+        "p does not resume and nothing resends"
+    );
+
+    // The remedy, as the text orders it: promote f, then restart p.
+    let mut promote = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    match drive_ctrl(&sim, &mut [&mut p, &mut f], &mut promote, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlOk { message } => assert!(
+            message.starts_with(&format!("promoted to primary at last_applied Some({at}) ")),
+            "the promote names p's own hand-off seq, so nothing is lost: {message}"
+        ),
+        other => panic!("promoting the never-promoted target must succeed: {other:?}"),
+    }
+    recover_node(&sim, &mut p).unwrap();
+    let mut rejoined = false;
+    for _ in 0..CONVERGE_BUDGET {
+        assert_one_writable(&p, &f).unwrap();
+        if matches!(p.repl.role(), Role::Follower { .. }) {
+            rejoined = true;
+            break;
+        }
+        scheduler_round(&sim, &mut [&mut p, &mut f]).unwrap();
+    }
+    assert!(rejoined, "the restarted p resolves against the promoted f");
+    assert_all_present(&sim, &mut f, &(0..10).collect::<Vec<_>>(), "f").unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// The branch the stall text rules out: with the target never promoted,
+/// restarting the stalled primary alone leaves it handing off, and still no
+/// node accepts writes.
+#[test]
+fn restarting_a_stalled_primary_alone_does_not_resolve_a_never_promoted_target() {
+    let (sim, mut p, mut f, _, _) = stalled_switchover_target_never_promoted();
+    recover_node(&sim, &mut p).unwrap();
+    let until = sim.now().as_nanos() + 2 * SWITCHOVER_DEADLINE_NANOS;
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |_| sim.now().as_nanos() > until,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert!(
+        matches!(p.repl.role(), Role::HandingOff { .. }),
+        "{:?}",
+        p.repl.role()
+    );
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "{:?}",
+        f.repl.role()
+    );
+    assert!(!p.db.as_ref().is_some_and(|d| d.writes_allowed()));
+    assert!(!f.db.as_ref().is_some_and(|d| d.writes_allowed()));
 }
 
 // ------------------------------ property: switchover aborts on a laggard

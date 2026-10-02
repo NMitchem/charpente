@@ -1437,8 +1437,17 @@ the `SWITCHOVER_DEADLINE_NANOS` deadline while still Draining returns durably to
 resumes writes, and the `CtrlErr` names the follower's remaining lag. HandedOff never
 aborts: on `HandOffDone` the primary flips durably to `Follower(to)`, drops its ship
 sessions, and starts a follower client toward the new primary (drained to byte equality,
-no divergence possible); on the deadline it stays write-stopped and the `CtrlErr` says the
-hand-off was sent — verify `to` and restart to resolve. The follower side of `HandOff`
+no divergence possible); on the deadline it stays write-stopped, and the `CtrlErr` names the
+hand-off seq and both answers to "did `to` take it?" (2026-10-02, D4). If `to`'s role file
+says primary, restarting this node resolves against it. If it still says follower, no node
+accepts writes and nothing changes that on its own: `to` rebooted before applying the
+`HandOff` (in the sim, its role write failed inside `accept_handoff`), reconnected already
+caught up, and so never acks again, and the drain's resend waits on an ack that never
+comes. Restarting this node alone leaves it handing off. Promoting `to` loses nothing,
+since it acked every record up to the hand-off seq and this node has written nothing since,
+and a restart then rejoins this node as its follower
+(`a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`,
+`restarting_a_stalled_primary_alone_does_not_resolve_a_never_promoted_target`). The follower side of `HandOff`
 verifies `last_applied == at_seq` (else a named `Refuse` protocol error), requires a
 configured listen address (an unpromotable follower is never a switchover target — its
 `Hello` carries no listen, so it never matches), flips durably to `Primary`, allows

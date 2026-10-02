@@ -839,7 +839,8 @@ impl Repl {
                     return Ok(true);
                 }
                 if now >= deadline {
-                    self.stall_switchover(ctrl_id, &to, now);
+                    let at = last.expect("a HandOff is only ever sent at a durable position");
+                    self.stall_switchover(ctrl_id, &to, at, now);
                     return Ok(true);
                 }
                 // The HandOff was lost and the follower reconnected (a fresh
@@ -1175,16 +1176,27 @@ impl Repl {
 
     /// The `HandOff` was sent (point of no return) but no `HandOffDone` came
     /// back before the deadline: stay write-stopped, name the situation. The
-    /// durable role stays `HandingOff` — a restart resolves against `to`.
-    fn stall_switchover(&mut self, ctrl_id: u64, to: &str, now: u64) {
+    /// durable role stays `HandingOff` — a restart resolves against `to` once
+    /// `to` is a primary, and never before.
+    ///
+    /// Both answers to "did `to` take it?" leave this node write-stopped, and
+    /// nothing here resends: a `to` that restarted before applying the
+    /// `HandOff` reconnects already caught up, so it never acks again and the
+    /// drain never sees it caught up. Only an operator moves either state.
+    fn stall_switchover(&mut self, ctrl_id: u64, to: &str, at: u64, now: u64) {
         self.reply_ctrl(
             ctrl_id,
             &Msg::CtrlErr {
                 message: format!(
-                    "switchover to {to}: the hand-off was sent but no confirmation returned \
-                     before the deadline — this node stays write-stopped; verify {to} has been \
-                     promoted (its role file says primary), then restart this node to resolve \
-                     against {to}"
+                    "switchover to {to}: the hand-off was sent at seq {at} but no confirmation \
+                     returned before the deadline — this node stays write-stopped and will not \
+                     resume writes on its own, because {to} may already be the primary. If \
+                     {to}'s role file says primary, restart this node to resolve against {to}: \
+                     it rejoins as {to}'s follower. If it still says follower, {to} never took \
+                     the hand-off and no node accepts writes: promote it (charpente promote \
+                     --node {to}) — it acked every record up to seq {at} and this node has \
+                     accepted no write since, so its reply names last_applied Some({at}) and \
+                     nothing is lost — then restart this node to resolve against {to}"
                 ),
             },
             now,

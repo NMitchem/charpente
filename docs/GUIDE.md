@@ -3977,6 +3977,30 @@ role file:
   target cannot catch up before the deadline, the switchover aborts and the
   primary resumes.
 
+**Once the hand-off is sent, there is no abort.** The deadline aborts a
+switchover only while the target is still catching up. After the hand-off is
+sent, the target may already be the primary, so the old primary never resumes
+writes on its own. If no confirmation returns before the deadline, it stays
+write-stopped and replies with both possible answers to "did the target take
+it?":
+
+<!-- pinned -->
+```text
+switchover to <to>: the hand-off was sent at seq <seq> but no confirmation
+returned before the deadline — this node stays write-stopped and will not resume
+writes on its own, because <to> may already be the primary. If <to>'s role file
+says primary, restart this node to resolve against <to>: it rejoins as <to>'s
+follower. If it still says follower, <to> never took the hand-off and no node
+accepts writes: promote it (charpente promote --node <to>) — it acked every record
+up to seq <seq> and this node has accepted no write since, so its reply names
+last_applied Some(<seq>) and nothing is lost — then restart this node
+to resolve against <to>
+```
+
+In the second case nothing changes on its own, and restarting the old primary
+alone does not help: it comes back still handing off, and resolves only once
+the target answers as a primary.
+
 **After a `promote`, the old primary must be wiped before it is ever started
 again.** Its durable role file still says `Primary`, and the durable role always
 wins over config, so restarting it as it was configured brings up a *second*
