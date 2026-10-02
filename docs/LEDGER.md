@@ -6825,10 +6825,16 @@ Minor (`d4-review.md`). Branch `d4-fixes`; `d4-impl-report.md`, "Round 3 (review
   - **The sites:** the four 409s, the gap and reshaped frames, `CursorRefused`, the `onOpen` and
     `StreamEnd` docs, the generated client, GUIDE §11 and §14, and DESIGN §6. Each pinned site
     was shown red under its old wording.
-- **A peer that sends a second `Hello` keeps no stale position (M6).** A second `Hello` on one
-  connection, answered with a snapshot, kept the position the first one proved, and a switchover
-  handed off to the peer it was seeding (seed `0x2EB1_0D42`; red before the reset). It now
-  drains and aborts by name.
+- **A second `Hello` answered with a snapshot no longer leaves a stale position (M6).** A
+  second `Hello` on one connection, answered with a snapshot, kept the position the first one
+  proved, and a switchover handed off to the peer it was seeding (seed `0x2EB1_0D42`; red before
+  the reset). It now drains and aborts by name. That is all the reset holds. A peer that also
+  sends a stale or forged `Ack` can still look caught up. No real follower or witness probe sends
+  one (one `Hello` per connection), and what keeps a non-conformant peer out is `peer_secret`.
+- **A drain abort before the target confirmed anything says so (round 4, N2).** A target being
+  snapshot-seeded made the abort read "it confirmed it holds every record up to None". It now
+  reads "it has confirmed no record yet", pinned by the M6 test, which is red with the old
+  rendering.
 - **Minors.**
   - **M1:** the stall reply names the promote race ("If the promote answers \"cannot promote:
     this node is already the primary\" …").
@@ -6847,3 +6853,6 @@ only additions.
   corrected remedy.
 - **GUIDE §11's gap-frame block carries no `<!-- pinned -->`.** Its `id: 1.0` line is under
   doc_truth's 16-character minimum. The product text is pinned exactly in kernel.rs.
+- **Refusing an `Ack` beyond what its session has shipped** would be defence in depth against a
+  non-conformant peer. It needs its own analysis first: a legitimate follower may ack, on a new
+  session, records an earlier session shipped, and refusing that would stall a real drain.
