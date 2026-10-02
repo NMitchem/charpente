@@ -6626,3 +6626,63 @@ title (392f863) with the identical tree before landing.
 fault before a re-seed wipe still excuses the re-seeded node (the reviewer: 0 of 6,231 outcomes
 change if baselined at the wipe, and 325 excuses become checks); `recover_kernel_node`'s gap gate,
 shared with the other replication properties, is still universe-wide.
+
+## 2026-10-02 — the vacuous-pass census, finished: an excuse needs a fault on that node's own disk, a visible give-up has a ceiling, and every restore text names the follower step
+
+**Why.** The rest of the item-9 class S3 began (a verdict needs a check that could have failed),
+swept rather than sampled, plus the last operator texts that could mislead after S5 found its
+re-seed texts could create a second writable primary. Sub-project S3b. Workspace
+`.superpowers/sdd/2026-09-30-publish-readiness/` (`s3b-brief.md`, `s3b-report.md` rounds 1–4,
+`s3b-review.md` with a re-review). Branch `s3b-census`, merged at 6f62929.
+
+**Shipped.**
+- **Operator texts** (8e85677, review R3-M1 of S5). Eight "restore this node from a replica or
+  backup" texts name the re-seed's step: restart the cleared node configured as a follower of the
+  current primary. The torn-role-file text, which in-model appears only after a role flip, also
+  names an exit that keeps the node's data — probed before it was written, then re-probed by the
+  reviewer in three more flip directions (data kept, one writable primary each time).
+- **The checker library stops excusing what it cannot explain** (33e64f2, 221555f). `checks`
+  treats the recovery-horizon refusal as fallout only where durable corruption fired on the refused
+  host; `no_classifier_can_excuse_a_durable_refusal` holds GUIDE §8's promise. The first narrowing
+  missed three kernel spawn loops (replication, auth, realtime): 187 failures over 192 fresh bases,
+  23 of 32 fresh bases failing the property — and the 31 pinned batches never reached it. Only a
+  fresh-base sweep of every property with corruption on can measure a classifier narrowing.
+- **The per-node rule, finished** (42cdf5c). `SimHost::durable_corruption_count()` and
+  `dir_entry_loss_count()` (public, drawing nothing) let an excuse count only faults since the
+  node's last re-seed wipe: 6,231 refusals over 192 bases, 0 outcomes changed, 325 excuses became
+  checks. `recover_kernel_node`'s gap gate asks the recovered node's own disk.
+- **Former vacuous passes give up by name** (726f4f8, db1a1e4, 8e3dd60, d155d7f, 15ab719,
+  a8579e5, 0a3412c): realtime cuts excused only by a fault on the client's node; the flagship
+  re-syncs at every boundary; a settle owed and delivered nothing gives up; migrations' exhausted
+  budgets, invoicing's and sim-fixture's fault-fallout exits, GUIDE §8's `counter_survives`, and
+  `checks::acked_implies_durable` with nothing acked.
+- **Every give-up S3b made visible has a ceiling and a reach floor** (75f72fd, bf1f974, f50bb05;
+  review). wal bit_flip 42 / misdirected 22 / read_error 182 / dir_entry 0 / gc 0, realtime flagship
+  26 and scoped 23, migrations 12 and 1, the ambient wal fault matrix 4 — each red under a
+  collapse mutation that exits 0 at its parent. The demo app's 11 give-ups no fault can reach are
+  bounded by `require`s (311b426; a minted key that never authorized had passed with 256 give-ups).
+  GUIDE §8 lists 19 capped and 11 uncapped swarm properties.
+
+**Rules (GUIDE §8; controller rulings, revisable).** One ambient cap rule: cap = max(2 × the
+largest of ≥10 fresh batches, the smallest k with P(Poisson(λ) > k) < 1e-4), λ = n × U(x) / N,
+U(x) the exact one-sided 95% Poisson upper bound for the x give-ups seen in N universes. It
+replaced a pair of rules that jumped at a maximum of one give-up (the reviewer: cap 2 would flake
+~1.25%, and two of 20 fresh matrix bases did give up once). The four existing ambient caps
+(kernel exactly-once 62, transactions 48, http 28, typed_tables 100) all satisfy it.
+
+**Review.** Independent opus review: MERGE AFTER FIXES (0 C, 1 I, 6 M). Scoped re-review: MERGE
+(0 C, 0 I, 1 M — the cap rule, fixed). The reviewer: ~250 fresh-base runs over 14 properties with
+corruption on, 0 failures; 31 pinned batches matching the implementer's numbers; ~18,000 demo and
+fixture universes with no misfire of the new failures.
+
+**Gate.** Full at 2d1f94d: fmt and clippy clean, 91/91 `test result: ok`, 1,724 passed, 0 failed.
+The files changed after it (wal.rs, four charpente test files, GUIDE) re-run in their partitions at
+f50bb05: 18 ok, 0 failed. Main's tree at 6f62929 is byte-identical to f50bb05.
+
+**Follow-ups.**
+- `sim_tests!` (app-level properties) takes no ceiling or floor; `require` catches a collapse to
+  zero verdicts, not give-up drift.
+- invoicing reaches a verdict in ~36–49% of universes (`Kernel::new` sits outside the boot retry;
+  no login retry); the CLI template's `open_app` refusal path has no test; `reseed_p`'s catch-all
+  for a failed reopen after restore (0 hits).
+- Two fresh-base failures on main found by this census, both rig gaps, went to D4 (below).
