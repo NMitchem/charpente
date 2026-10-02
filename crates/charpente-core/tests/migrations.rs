@@ -488,20 +488,6 @@ mod corruption_excuse_tests {
     }
 }
 
-// Finding 3 (migrations T9 interlude addendum — dossier
-// .superpowers/sdd/migrations-t9-interlude.md): seed 0x6b436e3ea995cb6f.
-// Mechanism, verified: a `Store::open` failure triggers discard-and-rebuild (then
-// any failure; since 2026-10-01 only redb rejecting the store's bytes, DESIGN §4),
-// which resets that attempt's recovery horizon to `None`/0; a real
-// `fault:bit_flip` had earlier corrupted the seed record's (first) frame,
-// which is now "above" the recomputed horizon and gets silently torn-tail-
-// cut instead of hitting the corrupt-at-or-below-horizon hard error —
-// cutting the first frame cuts everything. Pre-existing (log.rs is untouched
-// by f1b711e; the decode-free replay path never runs here — the log is cut
-// empty before replay reaches it). The silent-loss window itself is
-// ledgered as a production follow-up outside this sub-project; here it is
-// excused exactly like every other single-node durable-corruption loss
-// (`corruption_excuses_the_loss` above), never masking wrong data.
 /// A durable refusal while seeding the v1 store gives the universe up at once,
 /// by name (S3b item 0). Seed `0x666269ea79118eb9`, universe 10 at the batch's
 /// base, meets one there. `seed_v1_result` used to send it through
@@ -599,6 +585,20 @@ fn a_migration_universe_whose_budget_runs_out_gives_up_by_name() {
     }
 }
 
+// Finding 3 (migrations T9 interlude addendum — dossier
+// .superpowers/sdd/migrations-t9-interlude.md): seed 0x6b436e3ea995cb6f.
+// Mechanism, verified: a `Store::open` failure triggers discard-and-rebuild (then
+// any failure; since 2026-10-01 only redb rejecting the store's bytes, DESIGN §4),
+// which resets that attempt's recovery horizon to `None`/0; a real
+// `fault:bit_flip` had earlier corrupted the seed record's (first) frame,
+// which is now "above" the recomputed horizon and gets silently torn-tail-
+// cut instead of hitting the corrupt-at-or-below-horizon hard error —
+// cutting the first frame cuts everything. Pre-existing (log.rs is untouched
+// by f1b711e; the decode-free replay path never runs here — the log is cut
+// empty before replay reaches it). The silent-loss window itself is
+// ledgered as a production follow-up outside this sub-project; here it is
+// excused exactly like every other single-node durable-corruption loss
+// (`corruption_excuses_the_loss` above), never masking wrong data.
 #[test]
 fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
     let twin = migrated_twin(20);

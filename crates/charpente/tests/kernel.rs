@@ -11,11 +11,13 @@ use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::migration::{MigrationError, TableMigration};
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 // This workload's own sequential reads (`exactly_once_holds`'s snapshot/scan
-// calls) can still hit a freshly armed crash mid-check, so all four
-// `checks::classify` families stay reachable here — unlike
-// transactions.rs/http.rs, which break-and-restart on the first Io error and
-// so use a narrower local wrapper. This is the identical-4-family case: the
-// shared classifier is used directly, no local wrapper needed.
+// calls) can still hit a freshly armed crash mid-check, so the three fallout
+// families `is_fault_fallout` accepts (injected, poisoned, redb latch) all stay
+// reachable here — unlike transactions.rs/http.rs, which break-and-restart on
+// the first Io error and so use a narrower local wrapper. The shared
+// classifier is used directly, no local wrapper needed. The fourth
+// `classify` family, the durable-horizon refusal, goes through
+// `durable_refusal` at every open site (S3b item 0).
 use charpente_sim::checks::{boot_through_fallout, durable_refusal, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -4945,9 +4947,6 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
-/// The universe count was set by timing batches (see the commit message); the
-/// seed base is fixed and replays with `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED`
-/// like every swarm here.
 /// A durable refusal at the v2 binary's boot gives the universe up at once,
 /// by name (S3b item 0). Seed `0xeeb32c0d58259628`, universe 31 at the batch's
 /// base, meets one there. The loop used to send it through
@@ -4982,6 +4981,9 @@ fn a_durable_refusal_at_the_v2_boot_gives_up_at_once_by_name() {
     );
 }
 
+/// The universe count was set by timing batches (see the commit message); the
+/// seed base is fixed and replays with `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED`
+/// like every swarm here.
 #[test]
 fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
     run_universes_swarm_with!(

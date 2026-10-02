@@ -3553,9 +3553,6 @@ fn decode_exact<T: Codec>(row: &EventRow, tag: u64) -> Result<T, String> {
     Ok(value)
 }
 
-/// Spec §6.3's property. The universe count was set by timing one batch (see
-/// the commit message); the seed base is fixed and replays with
-/// `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED` like every swarm here.
 /// A durable refusal at a mixed-shapes boot gives the universe up at once, by
 /// name (S3b item 0). Seed `0x6439126a0a64fc94`, universe 105 at the batch's
 /// base, meets one there. `shapes_boot` used to send it through
@@ -3590,6 +3587,9 @@ fn a_durable_refusal_at_a_shapes_boot_gives_up_at_once_by_name() {
     );
 }
 
+/// Spec §6.3's property. The universe count was set by timing one batch (see
+/// the commit message); the seed base is fixed and replays with
+/// `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED` like every swarm here.
 #[test]
 fn a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix() {
     run_universes_swarm_with!(
