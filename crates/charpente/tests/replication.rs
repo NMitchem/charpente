@@ -4483,6 +4483,7 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
         drive_rounds(sim, &mut [&mut p, &mut f], 3)?;
     }
     let base_p_recoveries = p.recoveries;
+    let f_recoveries_at_verb = f.recoveries;
     // From the first verb on, either node's durable role may flip.
     p.flipped = true;
     f.flipped = true;
@@ -4584,7 +4585,7 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
         Msg::CtrlOk { .. } => {
             assert_one_writable(&p, &f)?;
             if !f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
-                return Err("f is not writable after the switchover completed".to_string());
+                await_reverified_target(sim, &mut p, &mut f, f_recoveries_at_verb)?;
             }
             if !matches!(f.repl.role(), Role::Primary) {
                 return Err(format!(
@@ -4624,6 +4625,106 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
             assert_one_writable(&p, &f)
         }
         other => Err(format!("unexpected switchover reply: {other:?}")),
+    }
+}
+
+/// `f` unwritable when the `CtrlOk` arrives has one sanctioned cause.
+/// `accept_handoff` allows writes before it sends `HandOffDone`, and `p` sends
+/// `CtrlOk` only once it reads that, so `f` was writable when the reply left.
+/// What can shut it again is a restart of `f` after it recorded `p`, now its
+/// follower, as a witness: `f` boots as a durable primary with a non-empty
+/// witness set, and the boot gate withholds writes until `p` answers "not a
+/// primary" (DESIGN §5; GUIDE §10, "What a restarting primary does"). In seeds
+/// `0xbab47736c4b9ccb1`, `0x5b3716b404fe0d0e` and `0x86e23800809100c2` the
+/// fsync of that witness write fails, which stops `f` by design.
+///
+/// So the instant is excused only when all three hold: `f` restarted since
+/// the verb, its gate is `Verifying` rather than `NotPrimary`, and its role is
+/// `Primary`. Even then only until the gate opens: `p` is live and a follower
+/// here, and `WITNESS_DEADLINE_NANOS` is where the platform itself calls a
+/// witness unresolved. At most one node is writable at every round of the wait.
+fn await_reverified_target(
+    sim: &Sim,
+    p: &mut Node,
+    f: &mut Node,
+    f_recoveries_at_verb: u32,
+) -> Result<(), String> {
+    let restarted = f.recoveries > f_recoveries_at_verb;
+    let verifying = f.db.as_ref().is_some_and(|d| d.verifying());
+    let primary = matches!(f.repl.role(), Role::Primary);
+    if !(restarted && verifying && primary) {
+        return Err(format!(
+            "f is not writable after the switchover completed, and not for the boot gate's \
+             reason (f restarted since the verb: {restarted}; f's gate is verifying: \
+             {verifying}; f's role: {:?})",
+            f.repl.role()
+        ));
+    }
+    sim.cover("repl:switchover-target-reverified");
+    let deadline = sim.now().as_nanos() + WITNESS_DEADLINE_NANOS;
+    for _ in 0..CONVERGE_BUDGET {
+        if f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
+            return Ok(());
+        }
+        if sim.now().as_nanos() > deadline || !scheduler_round(sim, &mut [p, f])? {
+            break;
+        }
+        assert_one_writable(p, f)?;
+    }
+    Err(format!(
+        "f's witness gate never opened after the switchover completed: f restarted as a primary \
+         with p in its witness set, and p (role {:?}) did not answer \"not a primary\" within \
+         {}s (WITNESS_DEADLINE_NANOS)",
+        p.repl.role(),
+        WITNESS_DEADLINE_NANOS / 1_000_000_000
+    ))
+}
+
+/// Replays one universe of `switchover_mid_write_load_loses_nothing_and_serves_reads_throughout`
+/// exactly as its swarm runner builds it, and returns the world with the
+/// universe's result after `finish_universe`.
+fn replay_switchover(seed: u64) -> (Sim, Result<(), String>) {
+    let mut state = seed;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(seed, &mut cfg);
+    no_media_corruption(&mut cfg);
+    let mut sim = Sim::with_faults(seed, cfg);
+    let r = switchover_universe(&mut sim);
+    let r = finish_universe(&sim, r);
+    (sim, r)
+}
+
+/// The three universes D4 found failing "f is not writable after the
+/// switchover completed" (bases `0x51D31002`, `0xD4F20012`, `0xD4F20025`). In
+/// each, `f` restarted after recording `p` as its witness and read the
+/// `CtrlOk` while still verifying, and the gate opened within 3–17 ms (virtual)
+/// of it. Each now waits that out under the excuse's key and then runs the full
+/// oracle, zero-loss and convergence included. A seed names a universe: if one
+/// stops covering the key, it no longer meets the scenario and must be re-found
+/// by mechanism, not dropped.
+#[test]
+fn a_switchover_target_restarted_after_the_hand_off_writes_once_its_witness_answers() {
+    for seed in [
+        0xbab4_7736_c4b9_ccb1_u64,
+        0x5b37_16b4_04fe_0d0e,
+        0x86e2_3800_8091_00c2,
+    ] {
+        let (sim, r) = replay_switchover(seed);
+        assert_eq!(r, Ok(()), "seed {seed:#x}");
+        assert_eq!(sim.gave_up(), None, "seed {seed:#x} reaches a verdict");
+        let coverage = sim.coverage();
+        assert_eq!(
+            coverage.get("repl:switchover-target-reverified"),
+            Some(&1),
+            "seed {seed:#x}: for this reason, or the seed no longer names the scenario: \
+             {coverage:?}"
+        );
+        assert_eq!(
+            coverage.get("repl:logical-converged"),
+            Some(&1),
+            "seed {seed:#x}: and the full oracle ran after the gate opened: {coverage:?}"
+        );
     }
 }
 
