@@ -1713,6 +1713,13 @@ impl Client {
         self.gone.retain(|&id| id < head);
         self.floor = self.floor.min(head);
         self.next_scan_id = self.next_scan_id.min(head);
+        // `last_id` is the strictly-increasing check's memory of the lost
+        // timeline. A cut id was re-minted (or not) on the new one, and a bare
+        // tail owes nothing about it, so the first re-mint it delivers may sit
+        // at or below an id delivered before the cut.
+        if self.last_id >= Some(head) {
+            self.last_id = head.checked_sub(1);
+        }
     }
 
     /// `head` is a `next_event_id` read off a node (`push_subscribe`'s
@@ -6132,6 +6139,28 @@ fn a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed() {
         Some(3),
         "id 3 was never cut, so the client still owes it"
     );
+}
+
+/// A cut trims `last_id` to the last id the node still holds, `head - 1`: no
+/// lower, since an id still on the timeline must never be redelivered (the
+/// strictly-increasing check keeps its teeth), and no higher, since the cut id
+/// itself is what the node re-mints. An id below the head is untouched, and a
+/// head of 0 leaves nothing seen (D5).
+#[test]
+fn a_cut_trims_last_id_to_the_last_id_the_node_still_holds() {
+    for (last, head, want) in [
+        (Some(5), 5, Some(4)),
+        (Some(7), 5, Some(4)),
+        (Some(4), 5, Some(4)),
+        (Some(2), 5, Some(2)),
+        (Some(0), 0, None),
+        (None, 5, None),
+    ] {
+        let mut client = Client::new(PING_ONLY, None);
+        client.last_id = last;
+        client.resync_to_head(head);
+        assert_eq!(client.last_id, want, "last_id {last:?} cut to head {head}");
+    }
 }
 
 /// The residual review I2 found: an id cut and re-minted for THIS
