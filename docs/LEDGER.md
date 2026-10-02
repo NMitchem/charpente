@@ -6796,3 +6796,54 @@ output is byte-identical to the round-1 tip.
 - **A caught-up reconnect is acted on at the primary's next step,** which can be up to one
   heartbeat later. In 1 universe in 16,384 the deadline came first. Making a due resend count as
   `has_work` would close it.
+
+## 2026-10-02 — D4 round 3: a quiet-cluster switchover no longer aborts, a re-sync installs its read before the frames that beat it, and the stall reply names the promote race
+
+**Why.** The independent review of D4 returned MERGE AFTER FIXES: 0 Critical, 2 Important, 7
+Minor (`d4-review.md`). Branch `d4-fixes`; `d4-impl-report.md`, "Round 3 (review fixes)".
+
+**Shipped.**
+- **Fixed, and now named: a planned switchover on a quiet cluster aborted whenever its target
+  had reconnected since the last write (I1).** A target shipped nothing never acks again, so
+  before round 2 the drain never saw it caught up. It aborted at the 30 s deadline, naming a lag
+  of 10 records the target already held. This happened with no faults at all (seed
+  `0x2EB1_0D41`). Round 2's drain half fixed it, unpinned. The pin is
+  `a_switchover_after_the_target_reconnected_with_no_write_since_completes`.
+  - It is red with only the Draining half reverted: "lag is 0 record(s) (it acked Some(9), …)".
+  - It is red with the pre-D4 logic: "lag is 10 record(s) (it acked None, …)".
+- **The re-sync remedy states the order the client applies results in (I2), not only the order
+  it sends requests in.** Frames keep arriving while the read is in flight, and the TS runtime
+  dispatches them, and even `onEnd`, at once. A client that installs the read when it arrives
+  overwrites the changes whose frames beat it.
+  - **The proof came before the text.** realtime.rs's window rig now judges the state a client
+    ends in over every arrival order. An install-on-arrival client is red: it ends at latest 4,
+    not the node's 5. A client that holds frames until the read is installed is green, on a
+    follower and on a primary. A TS test shows the same thing on the real runtime.
+  - **The new text, at every site:** "…then read current state from the same node, holding
+    every frame that arrives until that read is installed and then applying the held frames and
+    every later one over it in order, idempotently".
+  - **The sites:** the four 409s, the gap and reshaped frames, `CursorRefused`, the `onOpen` and
+    `StreamEnd` docs, the generated client, GUIDE §11 and §14, and DESIGN §6. Each pinned site
+    was shown red under its old wording.
+- **A peer that sends a second `Hello` keeps no stale position (M6).** A second `Hello` on one
+  connection, answered with a snapshot, kept the position the first one proved, and a switchover
+  handed off to the peer it was seeding (seed `0x2EB1_0D42`; red before the reset). It now
+  drains and aborts by name.
+- **Minors.**
+  - **M1:** the stall reply names the promote race ("If the promote answers \"cannot promote:
+    this node is already the primary\" …").
+  - **M2:** the abort says "confirmed it holds", not "acked".
+  - **M4:** GUIDE §10 says the resend needs the target back at least a heartbeat (1 s) before
+    the deadline.
+  - **M5:** the F2 failure text no longer names a cause it never checked.
+  - **M7:** three comments are corrected.
+
+**Moved.** Nothing. Every replication and realtime test's output is identical to the round-2
+merge (`0c91203`), apart from a thread id in one `should_panic` line. The 4 new tests are the
+only additions.
+
+**Follow-ups.**
+- **M3 is routed to the S1 amendment:** the tenancy plan's A16 cursor refusal must give the
+  corrected remedy.
+- **GUIDE §11's gap-frame block carries no `<!-- pinned -->`.** Its `id: 1.0` line is under
+  doc_truth's 16-character minimum. The product text is pinned exactly in kernel.rs.
