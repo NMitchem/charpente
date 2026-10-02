@@ -179,6 +179,21 @@ pub enum TxError<E> {
     },
 }
 
+/// What "restore this node from a replica or backup" asks of a replicated
+/// node, carried by every text that prescribes that restore (DESIGN §5's
+/// re-seed rule). Restoring a follower, or a primary a follower has replaced,
+/// from a replica is a re-seed, and a re-seed clears the data dir, which holds
+/// the durable role file that outranks config and the witness set. A cleared
+/// node started with a primary config is a second writable primary that no
+/// witness gate sees, so the restore names the config step in the same text
+/// (S5 re-review 3, R3-M1). `repl::role::reseed_steps` is the replication
+/// layer's copy, naming the primary it knows.
+pub(crate) const RESTORE_IS_A_RESEED: &str = "For a follower, or a primary once a follower \
+     is promoted in its place, that is a re-seed: stop the node, delete its data dir, and \
+     restart it configured as a follower of the current primary so it snapshot-seeds from it, \
+     never with a primary config: the durable role file that outranks config is deleted with \
+     the data dir, so a cleared node started as a primary comes up as a second writable primary";
+
 /// A named refusal: the platform declining to proceed on state it will not
 /// guess about — a Pending job of a foreign shape
 /// (`Db::pending_job_shape_refusal`), an enqueue of a mounted job name under
@@ -2361,7 +2376,7 @@ fn resolve_effect_scope(
                 "record decode: table \"{table}\" is tenant-scoped (Row::Scope != Unscoped) \
                  but this {kind} effect carries no scope (tag 0x00/0x01) — the record was \
                  written for an unscoped shape of this table; restore from a replica or \
-                 backup, or replay under the schema that wrote it"
+                 backup, or replay under the schema that wrote it. {RESTORE_IS_A_RESEED}"
             )),
         )),
         (false, Some(scope)) => Err(io::Error::new(
@@ -2370,7 +2385,8 @@ fn resolve_effect_scope(
                 "record decode: table \"{table}\" is not tenant-scoped (Row::Scope = \
                  Unscoped) but this {kind} effect carries scope {scope} (tag 0x05/0x06) — \
                  the record was written for a scoped shape of this table; restore from a \
-                 replica or backup, or replay under the schema that wrote it"
+                 replica or backup, or replay under the schema that wrote it. \
+                 {RESTORE_IS_A_RESEED}"
             )),
         )),
     }
@@ -2427,7 +2443,7 @@ fn check_replay_version(
         return Err(io::Error::other(Refusal(format!(
             "replaying a record for versioned table \"{table}\" with no adoption row on \
              record — this log was not written by an adoption-aware binary, or is corrupt; \
-             restore from a replica or backup"
+             restore from a replica or backup. {RESTORE_IS_A_RESEED}"
         ))));
     };
     // Every caller (both effect arms above) already calls `is_below_compiled`
@@ -2715,12 +2731,14 @@ impl Db {
                             Some(base) => format!(
                                 "The log beside it starts at seq {base}, so this store holds \
                                  the only copy of the records below it and cannot be rebuilt: \
-                                 restore this node from a replica or backup"
+                                 restore this node from a replica or backup. \
+                                 {RESTORE_IS_A_RESEED}"
                             ),
-                            None => "The log beside it is empty, so this store holds the only \
-                                     copy of its records and cannot be rebuilt: restore this \
-                                     node from a replica or backup"
-                                .to_string(),
+                            None => format!(
+                                "The log beside it is empty, so this store holds the only \
+                                 copy of its records and cannot be rebuilt: restore this node \
+                                 from a replica or backup. {RESTORE_IS_A_RESEED}"
+                            ),
                         };
                         return Err(io::Error::new(e.kind(), format!("{e}. {fix} (DESIGN §4)")));
                     }
@@ -2753,7 +2771,8 @@ impl Db {
                                  it cannot be rebuilt from the log alone. No charpente release \
                                  has written a format below 3, so on a store this node created \
                                  the version byte is damage: restore this node from a replica \
-                                 or backup. Only a format-2 file written by something else can \
+                                 or backup. {RESTORE_IS_A_RESEED}. Only a format-2 file written \
+                                 by something else can \
                                  be upgraded in place, with redb 2.6's `Database::upgrade()`; \
                                  format 1 has no in-place upgrade (DESIGN §4)"
                             ),
@@ -2762,7 +2781,8 @@ impl Db {
                                  {base} — the records below the store's last checkpoint no \
                                  longer exist locally, so the store cannot be rebuilt from the \
                                  log alone; restore this node from a replica or backup, or \
-                                 widen DbConfig::retain_segments (DESIGN §4)"
+                                 widen DbConfig::retain_segments. {RESTORE_IS_A_RESEED} \
+                                 (DESIGN §4)"
                             ),
                         }));
                     }
@@ -2857,13 +2877,8 @@ impl Db {
             return Err(io::Error::other(format!(
                 "table store {} {held}, but {log}: the acknowledged records from seq {next} to \
                  seq {} exist in neither the store nor the log, so the store cannot be rebuilt \
-                 from the log. {cause}; restore this node from a replica or backup. For a \
-                 follower, or a primary once a follower is promoted in its place, that is a \
-                 re-seed: stop the node, delete its data dir, and restart it configured as a \
-                 follower of the current primary so it snapshot-seeds from it, never with a \
-                 primary config: the durable role file that outranks config is deleted with \
-                 the data dir, so a cleared node started as a primary comes up as a second \
-                 writable primary (DESIGN §4)",
+                 from the log. {cause}; restore this node from a replica or backup. \
+                 {RESTORE_IS_A_RESEED} (DESIGN §4)",
                 cfg.store_path,
                 from - 1
             )));
@@ -3369,7 +3384,8 @@ impl Db {
                  something that contradicts {name}'s #[job] wrote these rows: a hand-written \
                  `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch \
                  them; mount {name} as its #[job] declares it, or restore the store from a \
-                 replica or backup taken before these rows were written (GUIDE §6)",
+                 replica or backup taken before these rows were written. \
+                 {RESTORE_IS_A_RESEED} (GUIDE §6)",
                 ids.len(),
                 listed(&ids),
                 if scoped_by.is_some() {

@@ -469,7 +469,10 @@ exception says so in its text: a store file cut shorter than redb's header,
 which no crash leaves and no retry fixes. Its fix depends on the log beside
 it, and the text names the right one: while the log still reaches seq 0,
 remove the file and the next boot rebuilds it; once the log is compacted,
-restore the node from a replica or backup (DESIGN §4). A rebuild only works
+restore the node from a replica or backup (DESIGN §4). On a replicated node
+that restore is a re-seed, and every text that names it says so in the same
+breath: clear the data directory and restart the node configured as a follower
+of the current primary, never with a primary config (§10). A rebuild only works
 while the log still holds everything back
 to seq 0, though: `Db::checkpoint(&mut self)` durably persists the store,
 then deletes WAL segments below the checkpoint (`DbConfig::retain_segments`
@@ -1812,7 +1815,7 @@ wherever the shape refusal runs. `<presence>` is `a tenant` or `no tenant`, and
 <!-- pinned -->
 ```text
 job "<job>" was enqueued with <presence>, but this binary mounts <job> as <declaration> under the same shape (<shape>) — a hand-written `impl Job` or `JobDef` contradicts <job>'s #[job]; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted type, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
-<n> Pending "<job>" job(s) (ids <ids>) carry <presence>, but this binary declares <job> <declaration> — the enqueue family writes a tenant exactly for a `scoped_by` job, so something that contradicts <job>'s #[job] wrote these rows: a hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount <job> as its #[job] declares it, or restore the store from a replica or backup taken before these rows were written (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) carry <presence>, but this binary declares <job> <declaration> — the enqueue family writes a tenant exactly for a `scoped_by` job, so something that contradicts <job>'s #[job] wrote these rows: a hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount <job> as its #[job] declares it, or restore the store from a replica or backup taken before these rows were written. For a follower, or a primary once a follower is promoted in its place, that is a re-seed: stop the node, delete its data dir, and restart it configured as a follower of the current primary so it snapshot-seeds from it, never with a primary config: the durable role file that outranks config is deleted with the data dir, so a cleared node started as a primary comes up as a second writable primary (GUIDE §6)
 ```
 
 Presence is not the whole of a tenant. A row records the tenant's id and not the scope type
@@ -4005,6 +4008,20 @@ never recovered. What proves that follower a prefix of the primary's timeline is
 this handshake, not the wipe: the rebuild converged only once the primary
 accepted the follower's `Hello`. Wherever it cannot prove that, it leaves the
 refusal standing, and so should you.
+
+A role file torn by a crash refuses the boot by name, because a torn role cannot
+be told from a real one. If the node never finished its first boot, delete the
+`role` file and the node re-initializes from config. Otherwise a role flip tore
+it — a `promote`, either end of a `switchover`, or an aborted one — and the
+node's data is intact: delete the `role` file and restart the node configured
+as a follower of the writable primary if another node is serving as one, and
+as primary only if none is. Never restart it as primary beside a writable
+primary: after a promote nothing stops it becoming a second one, because the
+promote cleared the node's witness set before its flip. Restarting it as the role the
+flip was writing is not the same rule either: a node whose switchover tore at
+its first step, `handing-off`, never handed anything off, and restarted as
+`handing-off` it stays write-stopped. A restore from a replica works too, as a
+re-seed configured as above.
 
 ## 11. Realtime
 
@@ -6732,7 +6749,7 @@ consequences you may meet:
   table is scoped stops instead of misreading the key:
 
   ```text
-  record decode: table "Doc" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect carries scope 1 (tag 0x05/0x06) — the record was written for a scoped shape of this table; restore from a replica or backup, or replay under the schema that wrote it
+  record decode: table "Doc" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect carries scope 1 (tag 0x05/0x06) — the record was written for a scoped shape of this table; restore from a replica or backup, or replay under the schema that wrote it. For a follower, or a primary once a follower is promoted in its place, that is a re-seed: stop the node, delete its data dir, and restart it configured as a follower of the current primary so it snapshot-seeds from it, never with a primary config: the durable role file that outranks config is deleted with the data dir, so a cleared node started as a primary comes up as a second writable primary
   ```
 
   Note that the replication handshake's schema digest covers a table's fields

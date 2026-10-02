@@ -10260,3 +10260,500 @@ fn a_write_gate_opening_over_foreign_pending_jobs_is_a_refusal() {
          Refusal: {err}"
     );
 }
+
+// ------------------------------- a torn role file, restarted as its text says
+
+/// A role disk whose `role` file fails its next `sync` while armed: the
+/// failed flip a torn role file comes from. The flip's write is in the page
+/// cache, the flip returns `Err` and the node stops, and a crash can then tear
+/// what it wrote.
+struct FailRoleSync {
+    inner: charpente_sim::SimDisk,
+    arm: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct FailRoleSyncFile {
+    inner: Box<dyn File>,
+    arm: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Disk for FailRoleSync {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        Ok(Box::new(FailRoleSyncFile {
+            inner: self.inner.open(path)?,
+            arm: (path == "role").then(|| Arc::clone(&self.arm)),
+        }))
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+impl File for FailRoleSyncFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn sync(&self) -> io::Result<()> {
+        if self
+            .arm
+            .as_ref()
+            .is_some_and(|a| a.swap(false, Ordering::SeqCst))
+        {
+            return Err(io::Error::other("injected fsync failure"));
+        }
+        self.inner.sync()
+    }
+}
+
+/// A node on a fresh host whose role disk fails a `role` sync when `arm` is set.
+fn node_failing_role_syncs(
+    sim: &Sim,
+    name: &str,
+    cfg: ReplConfig,
+    arm: &Arc<std::sync::atomic::AtomicBool>,
+) -> Node {
+    let h = sim.host(name);
+    let mut db = Db::open(Box::new(h.disk()), DbConfig::default(), make_schema()).unwrap();
+    let role_disk = FailRoleSync {
+        inner: h.disk(),
+        arm: Arc::clone(arm),
+    };
+    let (repl, _) =
+        Repl::open(Box::new(h.net()), Box::new(role_disk), cfg.clone(), &mut db).unwrap();
+    Node {
+        host: h,
+        db: Some(db),
+        repl,
+        clock: sim.clock(),
+        name: name.to_string(),
+        repl_cfg: cfg,
+        db_cfg: DbConfig::default(),
+        schema: make_schema(),
+        recoveries: 0,
+        carried_seeds: 0,
+        flipped: true,
+    }
+}
+
+/// `scheduler_round` for a fault-free world, except that a node whose step
+/// fails stops (its process died) and the round names it, instead of being
+/// recovered: a failed flip is the state under test.
+fn round_stopping_on_error(sim: &Sim, nodes: &mut [&mut Node]) -> Option<String> {
+    let now = sim.now().as_nanos();
+    for node in nodes.iter_mut().filter(|n| n.db.is_some()) {
+        node.repl.pump_io(now);
+    }
+    let mut worked = false;
+    for node in nodes.iter_mut() {
+        let Some(db) = node.db.as_mut() else { continue };
+        if !node.repl.has_work(db, now) {
+            continue;
+        }
+        worked = true;
+        if let Err(e) = node.repl.step(db, &node.clock) {
+            node.db = None;
+            return Some(format!("{}: {e}", node.name));
+        }
+        if node.repl.db_needs_reseed() {
+            let db = node.db.take().expect("db present before reseed");
+            node.db = Some(node.repl.run_seed(db, &node.clock).unwrap());
+        }
+    }
+    if !worked {
+        let mut next = sim.next_wakeup();
+        for node in nodes.iter().filter(|n| n.db.is_some()) {
+            if let Some(d) = node.repl.next_deadline(now)
+                && d > now
+            {
+                next = Some(next.map_or(d, |x| x.min(d)));
+            }
+        }
+        if let Some(t) = next.filter(|&t| t > now) {
+            sim.clock().sleep(Duration::from_nanos(t - now));
+        }
+    }
+    None
+}
+
+/// Up to `k` rounds; the first node that stops, named.
+fn rounds_stopping_on_error(sim: &Sim, nodes: &mut [&mut Node], k: u32) -> Option<String> {
+    (0..k).find_map(|_| round_stopping_on_error(sim, nodes))
+}
+
+/// Rounds until `done`, asserting no node stops on the way.
+fn rounds_until(sim: &Sim, nodes: &mut [&mut Node], done: impl Fn(&[&mut Node]) -> bool) {
+    for _ in 0..20_000 {
+        if done(nodes) {
+            return;
+        }
+        if let Some(e) = round_stopping_on_error(sim, nodes) {
+            panic!("a node stopped before the state under test: {e}");
+        }
+    }
+    panic!("the state under test was never reached");
+}
+
+/// A crash tears `node`'s unsynced write of `line`: the line's prefix lands
+/// and the CRC line does not. Then the host power-cycles.
+fn tear_role_write(node: &mut Node, line: &str) {
+    node.db = None;
+    let disk = node.host.disk();
+    let file = disk.open("role").unwrap();
+    let torn = format!("{}\n00000000", &line[..line.len() - 1]);
+    file.write_at(0, torn.as_bytes()).unwrap();
+    file.set_len(torn.len() as u64).unwrap();
+    file.sync().unwrap();
+    disk.sync_dir("role").unwrap();
+    node.host.restart();
+}
+
+/// Boots `node` as configured, which must meet the torn-role text, then does
+/// what the text says for a node a flip tore: delete the role file and
+/// restart it configured as `restart_as`.
+fn restart_torn_node_as(sim: &Sim, node: &mut Node, restart_as: ReplConfig) {
+    let mut db = Db::open(
+        Box::new(node.host.disk()),
+        node.db_cfg.clone(),
+        node.schema.clone(),
+    )
+    .unwrap();
+    let boot = Repl::open(
+        Box::new(node.host.net()),
+        Box::new(node.host.disk()),
+        node.repl_cfg.clone(),
+        &mut db,
+    );
+    let err = boot
+        .err()
+        .map(|e| e.to_string())
+        .expect("a node whose role file tore must not boot");
+    assert!(
+        err.contains("role file failed its integrity check")
+            && err.contains("never as primary beside one"),
+        "{}: {err}",
+        node.name
+    );
+    drop(db);
+    node.host.disk().remove("role").unwrap();
+    node.host.disk().sync_dir("role").unwrap();
+    node.repl_cfg = restart_as;
+    reopen(sim, node).unwrap();
+}
+
+fn widget_count(node: &Node) -> usize {
+    let db = node.db.as_ref().expect("a live node");
+    db.snapshot()
+        .unwrap()
+        .scan_raw(Widget::TABLE, false)
+        .unwrap()
+        .len()
+}
+
+fn writable(nodes: &[&Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|n| n.db.as_ref().is_some_and(|d| d.writes_allowed()))
+        .map(|n| n.name.clone())
+        .collect()
+}
+
+/// p a primary at `p:1` and f its follower at `f:1`, ten widgets each.
+fn torn_role_pair(
+    sim: &Sim,
+    p_arm: &Arc<std::sync::atomic::AtomicBool>,
+    f_arm: &Arc<std::sync::atomic::AtomicBool>,
+) -> (Node, Node) {
+    let mut p = node_failing_role_syncs(sim, "p", primary_cfg("p:1"), p_arm);
+    let mut f = node_failing_role_syncs(sim, "f", follower_cfg("f:1", "p:1"), f_arm);
+    for i in 0..10u64 {
+        commit_widget(sim, &mut p, i).unwrap();
+        assert_eq!(
+            rounds_stopping_on_error(sim, &mut [&mut p, &mut f], 3),
+            None
+        );
+    }
+    rounds_until(sim, &mut [&mut p, &mut f], converged);
+    assert_eq!(widget_count(&f), 10);
+    (p, f)
+}
+
+fn arm() -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
+/// S3b R3-M1, the torn-role text's data-keeping exit, followed literally for
+/// every flip that writes the role file after first boot. A tear means the
+/// flip's write failed and a crash tore it, so each arm fails that flip's
+/// sync, tears what it wrote, and boots the node as configured, which meets
+/// the text. Then it deletes the role file and restarts the node as the text
+/// says: a follower of the writable primary if another node is serving as
+/// one, primary otherwise. In every arm the node comes back in that role with
+/// its ten widgets, and exactly one node accepts writes.
+///
+/// Two readings the text does not give are pinned failing beside them. The
+/// role the flip was writing (S5 re-review 3's proposal) is right for five
+/// flips but not for a switchover's first, to handing-off: the node then
+/// stays write-stopped, since that switchover handed nothing off, and no node
+/// accepts writes. And primary beside another writable primary, after a
+/// promote that tore when the operator promoted a different follower instead,
+/// is a second writable primary no witness gate sees: the promote cleared the
+/// node's witness set before its flip.
+#[test]
+fn a_torn_role_file_restarted_as_its_text_says_keeps_its_data_and_one_writable_primary() {
+    // Promote (Follower -> Primary). The old primary is dead, so no node is
+    // serving as primary: restart as primary. The old primary, back with its
+    // own config, is refused by its witness gate.
+    let sim = Sim::with_faults(0x53B0_0001, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    p.db = None;
+    p.host.restart();
+    fa.store(true, Ordering::SeqCst);
+    let _cli = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut f], 10_000).unwrap();
+    assert!(stopped.contains("(to \"primary\")"), "{stopped}");
+    tear_role_write(&mut f, "primary");
+    restart_torn_node_as(&sim, &mut f, primary_cfg("f:1"));
+    reopen(&sim, &mut p).unwrap();
+    let refused = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000).unwrap();
+    assert!(
+        refused.starts_with("p: witness f:1 answers as a primary itself"),
+        "{refused}"
+    );
+    assert_eq!(*f.repl.role(), Role::Primary);
+    assert_eq!(widget_count(&f), 10);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // A switchover's first flip (Primary -> HandingOff). The follower never
+    // got a hand-off, so no node is serving as primary: restart as primary.
+    // Restarted as the role that flip was writing, it never resumes.
+    for (as_written, restart_as) in [
+        (false, primary_cfg("p:1")),
+        (
+            true,
+            ReplConfig {
+                initial_role: Role::HandingOff {
+                    to: "f:1".to_string(),
+                },
+                ..primary_cfg("p:1")
+            },
+        ),
+    ] {
+        let sim = Sim::with_faults(0x53B0_0002, FaultConfig::none());
+        let (pa, fa) = (arm(), arm());
+        let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+        pa.store(true, Ordering::SeqCst);
+        let to = "f:1".to_string();
+        let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+        let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 10_000).unwrap();
+        assert!(stopped.contains("(to \"handing-off:f:1\")"), "{stopped}");
+        assert!(writable(&[&p, &f]).is_empty());
+        tear_role_write(&mut p, "handing-off:f:1");
+        restart_torn_node_as(&sim, &mut p, restart_as);
+        assert_eq!(
+            rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000),
+            None
+        );
+        assert_eq!(widget_count(&p), 10);
+        if as_written {
+            assert!(
+                matches!(p.repl.role(), Role::HandingOff { .. }) && writable(&[&p, &f]).is_empty(),
+                "restarted as the handing-off its flip was writing, the node stays write-stopped \
+                 and no node accepts writes — if this changes, the text's handing-off reading \
+                 needs a second look"
+            );
+        } else {
+            assert_eq!(*p.repl.role(), Role::Primary);
+            assert_eq!(writable(&[&p, &f]), ["p"]);
+        }
+    }
+
+    // A switchover's last flip on the old primary (HandingOff -> Follower),
+    // after the target took over: restart as the target's follower.
+    let sim = Sim::with_faults(0x53B0_0003, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], |n| {
+        matches!(n[0].repl.role(), Role::HandingOff { .. })
+    });
+    pa.store(true, Ordering::SeqCst);
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 10_000).unwrap();
+    assert!(stopped.contains("(to \"follower:f:1\")"), "{stopped}");
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+    tear_role_write(&mut p, "follower:f:1");
+    restart_torn_node_as(&sim, &mut p, follower_cfg("p:1", "f:1"));
+    commit_widget(&sim, &mut f, 10).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], converged);
+    assert_eq!(
+        *p.repl.role(),
+        Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_eq!(widget_count(&p), 11);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // The same flip at a restart resolving a durable HandingOff against a
+    // target that took over (`resolve_to_follower`): restart as its follower.
+    let sim = Sim::with_faults(0x53B0_0006, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], |n| {
+        *n[1].repl.role() == Role::Primary
+    });
+    p.db = None; // p dies before it hears HandOffDone
+    p.host.restart();
+    let p_cfg = p.repl_cfg.clone();
+    p = node_failing_role_syncs(&sim, "p", p_cfg, &pa);
+    assert!(matches!(p.repl.role(), Role::HandingOff { .. }));
+    pa.store(true, Ordering::SeqCst);
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000).unwrap();
+    assert!(stopped.contains("(to \"follower:f:1\")"), "{stopped}");
+    tear_role_write(&mut p, "follower:f:1");
+    restart_torn_node_as(&sim, &mut p, follower_cfg("p:1", "f:1"));
+    commit_widget(&sim, &mut f, 10).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], converged);
+    assert_eq!(
+        *p.repl.role(),
+        Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_eq!(widget_count(&p), 11);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // The target's flip (Follower -> Primary). The old primary is write-stopped
+    // in HandingOff, so no node is serving as primary: restart as primary. The
+    // old primary, restarted as the switchover's stall text says, resolves
+    // against it and follows.
+    let sim = Sim::with_faults(0x53B0_0004, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    fa.store(true, Ordering::SeqCst);
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 10_000).unwrap();
+    assert!(
+        stopped.starts_with("f:") && stopped.contains("(to \"primary\")"),
+        "{stopped}"
+    );
+    assert_eq!(rounds_stopping_on_error(&sim, &mut [&mut p], 20_000), None);
+    assert!(matches!(p.repl.role(), Role::HandingOff { .. }) && writable(&[&p]).is_empty());
+    tear_role_write(&mut f, "primary");
+    restart_torn_node_as(&sim, &mut f, primary_cfg("f:1"));
+    p.db = None;
+    p.host.restart();
+    reopen(&sim, &mut p).unwrap();
+    commit_widget(&sim, &mut f, 10).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], |n| {
+        converged(n) && matches!(n[0].repl.role(), Role::Follower { .. })
+    });
+    assert_eq!(*f.repl.role(), Role::Primary);
+    assert_eq!(
+        *p.repl.role(),
+        Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_eq!(widget_count(&f), 11);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // An aborted switchover's flip back (HandingOff -> Primary), whose failed
+    // write the abort drops: the follower lagged and never took over, so no
+    // node is serving as primary — restart as primary.
+    let sim = Sim::with_faults(0x53B0_0005, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    for i in 10..20u64 {
+        commit_widget(&sim, &mut p, i).unwrap(); // f, not driven, lags
+    }
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    rounds_until(&sim, &mut [&mut p], |n| {
+        matches!(n[0].repl.role(), Role::HandingOff { .. })
+    });
+    pa.store(true, Ordering::SeqCst);
+    assert_eq!(rounds_stopping_on_error(&sim, &mut [&mut p], 50_000), None);
+    assert!(
+        !pa.load(Ordering::SeqCst) && *p.repl.role() == Role::Primary,
+        "the abort's role write must have failed, dropped, and left p primary"
+    );
+    tear_role_write(&mut p, "primary");
+    restart_torn_node_as(&sim, &mut p, primary_cfg("p:1"));
+    assert_eq!(
+        rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000),
+        None
+    );
+    assert_eq!(*p.repl.role(), Role::Primary);
+    assert_eq!(widget_count(&p), 20);
+    assert_eq!(writable(&[&p, &f]), ["p"]);
+
+    // A promote that tore while the operator promoted another follower
+    // instead: g serves as primary, so restart as its follower. Restarted as
+    // primary, the role its flip was writing, it is a second writable primary.
+    for as_written in [false, true] {
+        let sim = Sim::with_faults(0x53B0_0007, FaultConfig::none());
+        let (pa, fa, ga) = (arm(), arm(), arm());
+        let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+        let mut g = node_failing_role_syncs(&sim, "g", follower_cfg("g:1", "p:1"), &ga);
+        rounds_until(&sim, &mut [&mut p, &mut f, &mut g], |n| {
+            n[2].db.as_ref().and_then(|d| d.last_applied()) == Some(9)
+        });
+        p.db = None;
+        p.host.restart();
+        fa.store(true, Ordering::SeqCst);
+        let _cli = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+        let stopped = rounds_stopping_on_error(&sim, &mut [&mut f], 10_000).unwrap();
+        assert!(stopped.contains("(to \"primary\")"), "{stopped}");
+        tear_role_write(&mut f, "primary");
+        let mut cli = CtrlConn::open(&sim, "g:1", &Msg::CtrlPromote { secret: None }).unwrap();
+        let reply = drive_ctrl(&sim, &mut [&mut g], &mut cli, 10_000).unwrap();
+        assert!(matches!(reply, Msg::CtrlOk { .. }), "{reply:?}");
+        let restart_as = if as_written {
+            primary_cfg("f:1")
+        } else {
+            follower_cfg("f:1", "g:1")
+        };
+        restart_torn_node_as(&sim, &mut f, restart_as);
+        assert_eq!(
+            rounds_stopping_on_error(&sim, &mut [&mut f, &mut g], 50_000),
+            None
+        );
+        assert_eq!(widget_count(&f), 10);
+        if as_written {
+            assert_eq!(
+                writable(&[&f, &g]),
+                ["f", "g"],
+                "restarted as primary beside another, the node is a second writable primary — \
+                 the text's warning, pinned true"
+            );
+        } else {
+            assert_eq!(
+                *f.repl.role(),
+                Role::Follower {
+                    primary: "g:1".to_string()
+                }
+            );
+            assert_eq!(writable(&[&f, &g]), ["g"]);
+        }
+    }
+}

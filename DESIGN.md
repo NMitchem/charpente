@@ -1406,6 +1406,18 @@ twins. So a failed role or witness write has an unknown outcome, and its error s
 change may already have happened, because the restart it asks for boots as whatever the
 file holds (2026-10-01; `a_failed_role_write_says_the_flip_may_already_have_happened` and
 its witness twin).
+A role file torn after first boot was torn by a flip whose write failed, so the node's data
+is intact, and the torn-role text names an exit that keeps it: delete the file and restart
+the node configured as a follower of the writable primary if another node is serving as one,
+and as primary only if none is. Probed and pinned for every flip that writes the file
+(promote, both ends of a switchover, an abort, a restart resolving a hand-off;
+`a_torn_role_file_restarted_as_its_text_says_keeps_its_data_and_one_writable_primary`), it
+brings the node back in that role with its data and leaves one writable primary. The flip's
+own target is not the rule. A switchover's first flip, to handing-off, handed nothing off, so a
+node restarted as handing-off stays write-stopped and no node takes writes. A promote that
+tore while the operator promoted another follower instead, restarted as the primary it was
+writing, is a second writable primary no witness gate sees: the promote cleared its witness
+set first. Both are pinned beside the rule (S3b, R3-M1).
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through
@@ -1457,7 +1469,11 @@ role file says follower while its startup config still says primary: wiped and r
 configured, it acked a write beside the real primary (S5 re-review 2, R2-I1). So every
 refusal and doc that prescribes a re-seed says, in the same sentence, to restart the cleared
 node configured as a follower of the current primary, and what a primary config does instead
-(`repl::role::reseed_steps`; `Db::open`'s vanished-prefix refusal types the same steps).
+(`repl::role::reseed_steps`). So does every text that says "restore this node from a replica
+or backup", since on a replicated node that restore is a re-seed: the core's refusals (the
+recovery-horizon and read-back corruption refusals, the store refusals on a compacted or
+empty log, the replay-shape refusals, the mistenanted-jobs refusal) all carry
+`db::RESTORE_IS_A_RESEED`, and the torn-role-file text carries `reseed_steps` (S3b, R3-M1).
 Nothing structural fences it: the guard is the operator's config.
 
 **The boot gate** (M2 sub-project 0b, spec `docs/superpowers/specs/2026-07-31-dual-primary-

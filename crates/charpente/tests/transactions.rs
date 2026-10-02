@@ -16,6 +16,15 @@ use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Rejection, Row, Snapshot, Store, StoreRejected, Unscoped};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm, run_universes_swarm_with};
 
+/// The re-seed clause every "restore … from a replica or backup" text carries
+/// (DESIGN §5's re-seed rule; S3b R3-M1), typed out so a pin goes red if it
+/// drifts or goes missing.
+const RESTORE_IS_A_RESEED: &str = "For a follower, or a primary once a follower is promoted in \
+     its place, that is a re-seed: stop the node, delete its data dir, and restart it configured \
+     as a follower of the current primary so it snapshot-seeds from it, never with a primary \
+     config: the durable role file that outranks config is deleted with the data dir, so a \
+     cleared node started as a primary comes up as a second writable primary";
+
 #[table(global)]
 struct Org {
     id: Id<Org>,
@@ -1857,16 +1866,16 @@ fn a_store_redb_rejects_as_not_redb_or_an_older_format_is_refused_on_a_compacted
                  after a manual upgrade, and the records below its last checkpoint no longer \
                  exist locally, so it cannot be rebuilt from the log alone. No charpente release \
                  has written a format below 3, so on a store this node created the version byte \
-                 is damage: restore this node from a replica or backup. Only a format-2 file \
-                 written by something else can be upgraded in place, with redb 2.6's \
-                 `Database::upgrade()`; format 1 has no in-place upgrade (DESIGN §4)"
+                 is damage: restore this node from a replica or backup. {RESTORE_IS_A_RESEED}. \
+                 Only a format-2 file written by something else can be upgraded in place, with \
+                 redb 2.6's `Database::upgrade()`; format 1 has no in-place upgrade (DESIGN §4)"
             ),
             _ => format!(
                 "table store cannot open (table store (redb): I/O error: Not a redb database: \
                  magic number mismatch) and the log is compacted to seq {base} — the records \
                  below the store's last checkpoint no longer exist locally, so the store cannot \
                  be rebuilt from the log alone; restore this node from a replica or backup, or \
-                 widen DbConfig::retain_segments (DESIGN §4)"
+                 widen DbConfig::retain_segments. {RESTORE_IS_A_RESEED} (DESIGN §4)"
             ),
         };
         assert_eq!(err.to_string(), expected, "{what}");
@@ -1976,11 +1985,11 @@ fn a_store_cut_short_beside_a_compacted_log_names_a_restore_and_removing_it_is_r
     assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
     let text = e.to_string();
     assert!(
-        text.ends_with(
+        text.ends_with(&format!(
             "every boot will fail the same way. The log beside it starts at seq 18, so this \
              store holds the only copy of the records below it and cannot be rebuilt: restore \
-             this node from a replica or backup (DESIGN §4)"
-        ),
+             this node from a replica or backup. {RESTORE_IS_A_RESEED} (DESIGN §4)"
+        )),
         "{text}"
     );
 
@@ -1991,19 +2000,53 @@ fn a_store_cut_short_beside_a_compacted_log_names_a_restore_and_removing_it_is_r
             .expect_err("a compacted log beside no store must not boot");
         assert_eq!(
             e.to_string(),
-            "table store tables.redb holds no records, but the log beside it starts at seq 18: \
-             the acknowledged records from seq 0 to seq 17 exist in neither the store nor the \
-             log, so the store cannot be rebuilt from the log. Removing the store by hand leaves \
-             this state, and so does a re-seed a crash cut short; restore this node from a \
-             replica or backup. For a follower, or a primary once a follower is promoted in its \
-             place, that is a re-seed: stop the node, delete its data dir, and restart it \
-             configured as a follower of the current primary so it snapshot-seeds from it, never \
-             with a primary config: the durable role file that outranks config is deleted with \
-             the data dir, so a cleared node started as a primary comes up as a second writable \
-             primary (DESIGN §4)",
+            format!(
+                "table store tables.redb holds no records, but the log beside it starts at seq \
+                 18: the acknowledged records from seq 0 to seq 17 exist in neither the store \
+                 nor the log, so the store cannot be rebuilt from the log. Removing the store by \
+                 hand leaves this state, and so does a re-seed a crash cut short; restore this \
+                 node from a replica or backup. {RESTORE_IS_A_RESEED} (DESIGN §4)"
+            ),
             "boot {boot}"
         );
     }
+}
+
+/// The same cut beside an empty log: the store holds the only copy of every
+/// record, so the text names the restore, and the restore carries the
+/// re-seed's config step (S3b R3-M1).
+#[test]
+fn a_store_cut_short_beside_an_empty_log_names_a_restore_with_its_reseed_step() {
+    let sim = Sim::with_faults(0x5E5F_0903, FaultConfig::none());
+    let cfg = DbConfig::default();
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+        for i in 0..5u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+    for name in sim.disk().list("wal/").unwrap() {
+        sim.disk().remove(&name).unwrap();
+    }
+    sim.disk().sync_dir("wal/").unwrap();
+    cut_store(&sim, 100);
+    let e = Db::open(Box::new(sim.disk()), cfg, app_schema())
+        .expect_err("a store cut below redb's header must not open");
+    assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+    let text = e.to_string();
+    assert!(
+        text.ends_with(&format!(
+            "every boot will fail the same way. The log beside it is empty, so this store holds \
+             the only copy of its records and cannot be rebuilt: restore this node from a \
+             replica or backup. {RESTORE_IS_A_RESEED} (DESIGN §4)"
+        )),
+        "{text}"
+    );
 }
 
 /// `Db::open`'s vanished-prefix refusal for a log starting at `base`, typed
@@ -2030,11 +2073,7 @@ fn vanished_prefix_refusal(held: Option<u64>, base: u64) -> String {
         "table store tables.redb {held}, but the log beside it starts at seq {base}: the \
          acknowledged records from seq {next} to seq {} exist in neither the store nor the log, \
          so the store cannot be rebuilt from the log. {cause}; restore this node from a replica \
-         or backup. For a follower, or a primary once a follower is promoted in its place, that \
-         is a re-seed: stop the node, delete its data dir, and restart it configured as a \
-         follower of the current primary so it snapshot-seeds from it, never with a primary \
-         config: the durable role file that outranks config is deleted with the data dir, so a \
-         cleared node started as a primary comes up as a second writable primary (DESIGN §4)",
+         or backup. {RESTORE_IS_A_RESEED} (DESIGN §4)",
         base - 1
     )
 }
@@ -2356,7 +2395,7 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
             ") and the log is compacted to seq {base} — the records below the store's last \
              checkpoint no longer exist locally, so the store cannot be rebuilt from the log \
              alone; restore this node from a replica or backup, or widen \
-             DbConfig::retain_segments (DESIGN §4)"
+             DbConfig::retain_segments. {RESTORE_IS_A_RESEED} (DESIGN §4)"
         )),
         "error must name the compacted base {base} and the fix: {msg}"
     );
@@ -2396,9 +2435,12 @@ fn db_open_routes_the_store_horizon_into_recovery() {
     // string reconstructs in full.
     assert_eq!(
         err.to_string(),
-        "log frame 0 is invalid but at-or-below the store's durable horizon 9 — this is \
-         corruption of acknowledged records, not a torn tail, and truncating it would silently \
-         lose data; restore this node from a replica or backup (DESIGN §2)"
+        format!(
+            "log frame 0 is invalid but at-or-below the store's durable horizon 9 — this is \
+             corruption of acknowledged records, not a torn tail, and truncating it would \
+             silently lose data; restore this node from a replica or backup. \
+             {RESTORE_IS_A_RESEED} (DESIGN §2)"
+        )
     );
 }
 
@@ -2761,9 +2803,12 @@ fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt
     // this checkpoint durably pins the horizon at 19 (20 rows, seq 0..19) —
     // both format args are scenario-known, whether the horizon comes from the
     // intact store's applied_seq (control) or the breadcrumb (discard, below).
-    const EXPECTED: &str = "log frame 0 is invalid but at-or-below the store's durable horizon \
-         19 — this is corruption of acknowledged records, not a torn tail, and truncating it \
-         would silently lose data; restore this node from a replica or backup (DESIGN §2)";
+    let expected = format!(
+        "log frame 0 is invalid but at-or-below the store's durable horizon 19 — this is \
+         corruption of acknowledged records, not a torn tail, and truncating it would silently \
+         lose data; restore this node from a replica or backup. {RESTORE_IS_A_RESEED} \
+         (DESIGN §2)"
+    );
 
     // Control: store INTACT. applied_seq = 19 is the durable horizon; the
     // corrupt frame 0 is at-or-below it, so recovery refuses by name. This
@@ -2772,7 +2817,7 @@ fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt
         .expect_err("store intact: corruption of an acked frame must be a hard error");
     assert_eq!(
         intact_err.to_string(),
-        EXPECTED,
+        expected,
         "control (store intact) should name the contract"
     );
 
@@ -2786,7 +2831,7 @@ fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt
         Err(e) => {
             assert_eq!(
                 e.to_string(),
-                EXPECTED,
+                expected,
                 "expected the named corruption-of-acknowledged-records refusal"
             );
         }

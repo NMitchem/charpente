@@ -19,6 +19,15 @@ use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::checks::{boot_through_fallout, durable_refusal, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
 
+/// The re-seed clause every "restore … from a replica or backup" text carries
+/// (DESIGN §5's re-seed rule; S3b R3-M1), typed out so a pin goes red if it
+/// drifts or goes missing.
+const RESTORE_IS_A_RESEED: &str = "For a follower, or a primary once a follower is promoted in \
+     its place, that is a re-seed: stop the node, delete its data dir, and restart it configured \
+     as a follower of the current primary so it snapshot-seeds from it, never with a primary \
+     config: the durable role file that outranks config is deleted with the data dir, so a \
+     cleared node started as a primary comes up as a second writable primary";
+
 #[table(global)]
 struct Counter {
     id: Id<Counter>,
@@ -812,12 +821,20 @@ mod scoped_jobs {
         };
         assert_eq!(
             err.to_string(),
+            // Typed out in full rather than through the const: GUIDE §6's
+            // pinned block quotes this line, and the doc-truth gate matches it
+            // against a literal that denotes the whole text.
             "2 Pending \"File\" job(s) (ids 0, 1) carry no tenant, but this binary declares \
              File `scoped_by = Desk` — the enqueue family writes a tenant exactly for a \
              `scoped_by` job, so something that contradicts File's #[job] wrote these rows: a \
              hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not \
              dispatch them; mount File as its #[job] declares it, or restore the store from a \
-             replica or backup taken before these rows were written (GUIDE §6)"
+             replica or backup taken before these rows were written. For a follower, or a \
+             primary once a follower is promoted in its place, that is a re-seed: stop the node, \
+             delete its data dir, and restart it configured as a follower of the current primary \
+             so it snapshot-seeds from it, never with a primary config: the durable role file \
+             that outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary (GUIDE §6)"
         );
         assert!(
             charpente::core::db::Refusal::of(&err).is_some(),
@@ -838,12 +855,14 @@ mod scoped_jobs {
         };
         assert_eq!(
             err.to_string(),
-            "1 Pending \"File\" job(s) (ids 0) carry a tenant, but this binary declares File \
-             `global` — the enqueue family writes a tenant exactly for a `scoped_by` job, so \
-             something that contradicts File's #[job] wrote these rows: a hand-written `impl \
-             Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount \
-             File as its #[job] declares it, or restore the store from a replica or backup \
-             taken before these rows were written (GUIDE §6)"
+            format!(
+                "1 Pending \"File\" job(s) (ids 0) carry a tenant, but this binary declares File \
+                 `global` — the enqueue family writes a tenant exactly for a `scoped_by` job, so \
+                 something that contradicts File's #[job] wrote these rows: a hand-written `impl \
+                 Job` or `JobDef`, or a raw store write; this binary will not dispatch them; \
+                 mount File as its #[job] declares it, or restore the store from a replica or \
+                 backup taken before these rows were written. {RESTORE_IS_A_RESEED} (GUIDE §6)"
+            )
         );
     }
 

@@ -17,8 +17,10 @@
 //! parse of whatever bytes survived — and never a silent fall back to
 //! config: a corrupt file is indistinguishable from a real role flip, and
 //! the durable role must win over config (spec §2), so only the operator
-//! can safely decide (delete the file to re-init from config on a node
-//! that never finished first boot; restore the node otherwise).
+//! can safely decide: delete the file to re-init from config on a node
+//! that never finished first boot; after a flip tore it, delete it and
+//! restart as a follower of the writable primary if another node serves as
+//! one, as primary otherwise; or restore the node (`corrupt_role_error`).
 
 use std::io;
 
@@ -179,17 +181,37 @@ pub fn store_role(disk: &dyn Disk, role: &Role) -> io::Result<()> {
     Ok(())
 }
 
-/// The corrupt-role-file hard error: names the failure and both exits. Not
+/// The corrupt-role-file hard error: names the failure and every exit. Not
 /// classified as fault fallout — an operator (or a first-boot caller that
 /// KNOWS no flip ever happened) must decide, never an automatic fallback.
+///
+/// After first boot only a flip writes the file, so a tear means a flip's
+/// write failed (it returned `Err`) and a crash tore it; the node's data is
+/// untouched. Deleting the file re-initializes the role from config, which is
+/// right when config names the role the cluster now needs this node in. Probed
+/// for every flip (S3b R3-M1, the replication suite's
+/// `a_torn_role_file_restarted_as_its_text_says_keeps_its_data_and_one_writable_primary`):
+/// a follower of the writable primary when another node is serving as one,
+/// and primary otherwise, keeps the data and leaves one writable primary. Two
+/// other readings fail. "The role the flip was writing" leaves a node whose
+/// switchover's first flip (to handing-off) tore write-stopped forever, since
+/// it handed nothing off; and after a promote that tore, when the operator
+/// promoted another node instead, it brings up a second writable primary
+/// that no witness gate sees (the flip cleared the witness set first).
 fn corrupt_role_error(reason: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "role file failed its integrity check ({reason}) — a torn write or corruption; if \
+            "role file failed its integrity check ({reason}) — a torn write or corruption. If \
              this node never finished first boot, delete the \"role\" file to re-initialize it \
-             from config; otherwise restore this node from a replica or backup (expected \
-             contents: one of {EXPECTED_FORMS}, then its crc32 on a second line)"
+             from config. Otherwise a role flip's failed write tore it and the node's data is \
+             intact: delete the \"role\" file and restart this node configured as a follower \
+             of the writable primary if another node is serving as one now, and as primary \
+             only if none is — never as primary beside one, which brings it up as a second \
+             writable primary. Or restore this node from a replica or backup; for a follower, \
+             or a primary once a follower is promoted in its place, that is a re-seed: {} \
+             (expected contents: one of {EXPECTED_FORMS}, then its crc32 on a second line)",
+            reseed_steps("the current primary")
         ),
     )
 }
@@ -579,6 +601,40 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("integrity check"), "{msg}");
         assert!(msg.contains("delete the \"role\" file"), "{msg}");
+    }
+
+    /// Byte-exact (hard rule 5): the torn-role text names all three exits. A
+    /// tear after first boot is a flip's, and the data-keeping exit says which
+    /// config to restart under; the restore says what a re-seed's restart
+    /// needs, as every re-seed text does (S3b R3-M1, DESIGN §5). What each
+    /// exit does is pinned in the replication suite by
+    /// `a_torn_role_file_restarted_as_its_text_says_keeps_its_data_and_one_writable_primary`.
+    #[test]
+    fn a_torn_role_file_names_every_exit_with_the_config_each_restarts_under() {
+        let disk = disk();
+        store_role(&disk, &Role::Primary).unwrap();
+        let file = disk.open(ROLE_FILE).unwrap();
+        file.write_at(0, b"primar\n00000000").unwrap();
+        file.set_len(15).unwrap();
+        file.sync().unwrap();
+        let msg = load_role(&disk, &Role::Primary).unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            "role file failed its integrity check (crc mismatch) — a torn write or corruption. \
+             If this node never finished first boot, delete the \"role\" file to re-initialize \
+             it from config. Otherwise a role flip's failed write tore it and the node's data is \
+             intact: delete the \"role\" file and restart this node configured as a follower of \
+             the writable primary if another node is serving as one now, and as primary only if \
+             none is — never as primary beside one, which brings it up as a second writable \
+             primary. Or restore this node from a replica or backup; for a follower, or a \
+             primary once a follower is promoted in its place, that is a re-seed: stop it, \
+             delete its data dir, and restart it configured as a follower of the current primary \
+             so it snapshot-seeds from it, never with a primary config: the durable role file \
+             that outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary (expected contents: one of primary / \
+             handing-off:<addr> / follower:<addr> / backup:<addr>, then its crc32 on a second \
+             line)"
+        );
     }
 
     #[test]
