@@ -6626,3 +6626,58 @@ title (392f863) with the identical tree before landing.
 fault before a re-seed wipe still excuses the re-seeded node (the reviewer: 0 of 6,231 outcomes
 change if baselined at the wipe, and 325 excuses become checks); `recover_kernel_node`'s gap gate,
 shared with the other replication properties, is still universe-wide.
+
+## 2026-10-02 — a switchover target that restarts after the hand-off is excused for its witness gate, a bare subscribe owes what its tail starts at, "from now" names its moment, and a stalled switchover says what is true
+
+**Why.** Two fresh-base failures seen at 7466538, both passing at their pinned bases. F2:
+`switchover_mid_write_load_loses_nothing_and_serves_reads_throughout` failed "f is not writable
+after the switchover completed" (seed `0xbab47736c4b9ccb1`, base `0x51D31002`). F1:
+`follower_tails_and_the_failover_resume_divergence_property` failed "client never caught up"
+(`0x4aad5f8abb5ca6ef`, base `0x5E1F0105`). Sub-project D4 (`d4-report.md` the diagnosis,
+`d4-impl-report.md` the implementation). Branch `d4-fixes`, built on S3b's 221555f.
+
+**The diagnoses.** Neither is a product bug. F2: `f` is writable when `p` sends `CtrlOk`. In each
+failing universe `f` then recorded `p`, now its follower, as a witness; that write's fsync failed,
+which stops `f` by design; `f` rebooted as a durable primary with `p` in its witness set, and the
+boot gate withheld writes until `p` answered (GUIDE §10, "What a restarting primary does"). The CLI
+read the `CtrlOk` in that window, and the gate opened 3–17 ms later. 2 of 64 fresh bases failed;
+the mechanism dates to 3b5335c, the boot gate. F1: the rig took a bare subscribe's floor when it
+sent the request, but the tail starts where the node serves it, and on a follower a shipped event
+can apply in between. 1 of 64 fresh bases failed.
+
+**Shipped.**
+- **F2 (rig).** The `CtrlOk` arm excuses an unwritable `f` only if it restarted since the verb,
+  its gate is `Verifying`, and its role is `Primary`. It then waits for the gate, bounded by
+  `WITNESS_DEADLINE_NANOS`, under `repl:switchover-target-reverified`, and runs the full oracle.
+  Three seeds pinned by reason. Each conjunct was mutation-proved against its own product mutation,
+  and so were the two `allow_writes` sites (`d4-impl-report.md`).
+- **F1 (rig).** The floor is read right after the round in which the 200 appears; the send-time
+  read stays a lower bound. Two seeds pinned by reason. A tail that starts one late fails the
+  property.
+- **"From now" (docs).** GUIDE §11 and DESIGN §6 now say the tail starts at the node's next event
+  id when it serves the subscribe, follower applies included, and that the stream does not name
+  that point.
+- **The re-sync remedy's order (docs, proved first).** With a change landed in each of the five
+  windows around its two requests, on a follower and on a primary: subscribe, wait for the stream
+  to open, then read from the same node, and every change arrives. Read first, then subscribe (the
+  order the texts name the steps in), and two changes arrive by neither route.
+- **A stalled switchover's `CtrlErr`.** In 229 of 635 stalls over 64 fresh bases the target never
+  took the hand-off. Its role write failed inside `accept_handoff`, and it rebooted a follower
+  already caught up. No node accepts writes then, and nothing changes that on its own. The text
+  now names the hand-off seq and both branches, and the promote that loses nothing. Probed and
+  pinned (`a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`);
+  doc_truth floor 28 → 29.
+
+**Follow-ups.**
+- **State a cursorless tail's start in the stream.** Additive and non-breaking (an opening SSE
+  comment, say), so clients and oracles can see where "from now" fell. Not a pre-publish blocker.
+- **Reword the remedy texts subscribe-first.** The three 409s, the `charpente.gap` and
+  `charpente.reshaped` frames' `fix`, and the TS client runtime still read "re-sync current state
+  through reads, then reconnect without a cursor", the order the window test shows leaves a gap.
+  This is product and wire surface.
+- **The switchover's HandOff resend is dead for a caught-up reconnect.** `drive_switchover`
+  resends to a reconnected target only once its acked seq reaches the primary's. A target that
+  reconnects already caught up never acks again, because a write-stopped primary ships nothing.
+  Counting a Hello position the primary has verified as acked would likely turn most of those 229
+  stalls into completed switchovers. Not attempted: it is a product liveness change outside D4's
+  items.
