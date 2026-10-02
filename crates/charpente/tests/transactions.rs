@@ -910,7 +910,9 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
 /// standard deviations above the mean. Re-measured 2026-10-01 with the round
 /// boots aimed and 64 final attempts (S5 review I1): 10 fresh batches gave up
 /// 8-24 times, mean 15.6, sd 5.0, so the cap is 48, 6.5 standard deviations
-/// above the mean (23.0 at S5's parent, same bases).
+/// above the mean (23.0 at S5's parent, same bases). GUIDE §8's Poisson cap on
+/// those batches (x = 156 over N = 2,560, n = 256, lambda = 17.8) is 35, under
+/// 48 (2026-10-02).
 const TX_GAVE_UP_CEILING: u64 = 48;
 
 /// The reach floor: rounds whose recovered state was checked against the

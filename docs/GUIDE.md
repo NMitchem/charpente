@@ -2517,15 +2517,25 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   and it cross-checks the reported count exactly. `ceiling:
   [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
   caps it: the batch fails when more than N universes gave up, naming the key,
-  the count and the cap. Nine of the platform's own 31 swarm properties carry
-  one: kernel's exactly-once and job-tenancy properties, and the flagship
-  properties of tenant, transactions, http, group_commit, typed_tables and
-  archive's two convergence properties. The rest (realtime, replication,
-  migrations, auth, the WAL suite, and kernel's job-shape property) carry none
-  yet, so a drift in their give-up rates is visible only in the split. A give-up is
+  the count and the cap. Nineteen of the platform's own swarm properties carry
+  one:
+  - kernel's exactly-once and job-tenancy properties;
+  - the flagship properties of tenant, transactions, http, group_commit and
+    typed_tables, and archive's two convergence properties;
+  - realtime's flagship and scoped settled-client properties, migrations' two,
+    and the WAL suite's fault-matrix, bit-flip, misdirected-write, read-error,
+    dir-entry and gc properties.
+
+  The rest carry none yet, so a drift in their give-up rates is visible only in
+  the split: realtime's mixed-shapes and follower properties, replication's,
+  auth's, kernel's job-shape property, transactions' crashed-reseed property,
+  and engine's. A give-up is
   reported and never failed, so without a cap a property can drift toward
   adjudicating nothing with every batch green; a floor on the key would bound
-  give-ups from below, which guards nothing.
+  give-ups from below, which guards nothing. An app's `sim_tests!` takes no
+  `ceiling:`. Its property `require`s instead the key its verdict marks, past
+  every give-up arm. That fails a batch in which no universe reached a
+  verdict, but not one whose rate merely drifted.
 - A cap bounds what a property fails to conclude, not how much it checks, so
   pair it with a `floor: [("key", N)]` on the key that counts its checks
   (written before `ceiling:`, on either macro). A change that skips a round's
@@ -3246,14 +3256,35 @@ That is also why every capped property floors its reach key: without one, the
 next change that costs it reach passes with every cap still met.
 
 At a pinned base both bounds are exact counts. At an ambient base, where the
-counts move batch to batch, both are margins over ten or more fresh batches: a
-give-up cap is twice the largest count, and a reach floor is the mean less
-four standard deviations, which flakes about once in thirty thousand batches if
-the counts are near normal, and fails any batch that falls further.
+counts move batch to batch, both are margins over ten or more fresh batches.
 
-So an ambient floor catches a collapse, not a drift. Kernel exactly-once's
-`job:done` spreads by about 4% of its mean (sd 19.1 on 485.2), so its floor
-sits about 16% below the mean. A fall half that size trips about one batch in
+An ambient give-up cap is the larger of two numbers:
+- twice the largest fresh-batch count;
+- the smallest k with P(Poisson(lambda) > k) < 1e-4, where
+  lambda = n x U(x) / N. Here n is the universes in one batch, N the universes
+  over all the fresh batches, and x the give-ups among them. U(x) is the exact
+  one-sided 95% Poisson upper bound for x: 2.996 for x = 0, 4.744 for 1, and
+  6.296 for 2.
+
+The second number matters where give-ups are rare. When no batch gave up,
+twice the largest count is 0, which one legitimately exhausted universe fails.
+When one batch gave up once, it is 2, which a healthy batch fails about once
+in eighty. Where counts are large the first number is the larger, and the
+second only confirms it.
+
+Two worked examples for the WAL fault matrix, whose 10 fresh batches of
+n = 512 make N = 5,120:
+- **x = 0**, as measured. lambda = 512 x 2.996 / 5,120 = 0.30. P(> 3) is
+  2.6e-4 and P(> 4) is 1.6e-5, so k = 4, and the cap is max(0, 4) = 4.
+- **x = 1**, as ten bases including 0x9E7C000A would have read: one batch gave
+  up once. lambda = 512 x 4.744 / 5,120 = 0.47. P(> 4) is 1.4e-4 and P(> 5) is
+  1.1e-5, so k = 5, and the cap is max(2, 5) = 5, not 2.
+
+An ambient reach floor is the mean less four standard deviations. That flakes
+about once in thirty thousand batches if the counts are near normal, and fails
+any batch that falls further. So an ambient floor catches a collapse, not a
+drift. Kernel exactly-once's `job:done` spreads by about 4% of its mean (sd
+19.1 on 485.2), so its floor sits about 16% below the mean. A fall half that size trips about one batch in
 forty, which a change can pass by luck. The before-and-after comparison above
 is the instrument that sees a move that small, so it runs whenever a change
 could move an ambient floor's rate, as it does for a cap, and not only when a

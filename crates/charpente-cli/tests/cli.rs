@@ -186,7 +186,15 @@ fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
 /// one universe at a time. The harness reports no give-up
 /// reason, so each arm marks its own key and the pin reads it. The arms no
 /// scan reached (the read-backs, the key lookup, and the last read's
-/// statuses) give up the same way and have no seed.
+/// statuses) give up the same way and have no seed; each property's `require`
+/// on the key its verdict marks, past all of them, is what fails if one of them
+/// swallows every universe (S3b review I1).
+///
+/// The fixture's second seed, `0x761e4dd8bee6497b` (master seed 0x53b00033),
+/// is the case only `checked_any` decides (S3b review M6): two earlier rounds
+/// checked with nothing acked, then the last round's check met fault fallout.
+/// An earlier check of an empty list checked nothing, so the universe gives up.
+/// The first seed skipped every round's check, so it cannot tell.
 #[test]
 fn a_universe_that_checked_nothing_gives_up_by_its_arm() {
     for (dir, test, seed, arm) in [
@@ -230,6 +238,12 @@ fn a_universe_that_checked_nothing_gives_up_by_its_arm() {
             fixture_dir(),
             "acked_counter_survives_rounds",
             "0xe84e1ab0d423cc57",
+            "fixture:last-verify-fallout",
+        ),
+        (
+            fixture_dir(),
+            "acked_counter_survives_rounds",
+            "0x761e4dd8bee6497b",
             "fixture:last-verify-fallout",
         ),
     ] {

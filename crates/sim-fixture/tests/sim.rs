@@ -12,7 +12,7 @@ use sim_fixture::{BumpCounter, FixtureCounter, NoteAdded};
 charpente_sim::sim_tests! {
     counter_roundtrip require ["restart"],
     fixture_replays,
-    acked_counter_survives_rounds require ["restart"],
+    acked_counter_survives_rounds require ["restart", "fixture:acked-rows-checked"],
     counter_bump_job_changes_the_row,
     counter_bump_job_leaves_the_row_readable,
     sometimes_fails,
@@ -122,6 +122,9 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     }
 }
 
+/// Rounds `acked_counter_survives_rounds` runs.
+const ROUNDS: u32 = 3;
+
 /// `acked_implies_durable` against a real app, and the end-to-end proof that it
 /// credits coverage on the world the HARNESS is watching.
 ///
@@ -136,9 +139,6 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 /// needs a pair identical at time zero. Its doc comment had the mechanism right
 /// all along; nothing had applied the same reasoning to this checker, which has
 /// the opposite requirement and took a seed anyway until 2026-09-05.
-/// Rounds `acked_counter_survives_rounds` runs.
-const ROUNDS: u32 = 3;
-
 fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
     use charpente_sim::checks::{
         acked_implies_durable, boot_through_fallout, durable_corruption_fired, is_fault_fallout,
@@ -244,6 +244,9 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
                 }
                 Err(e) => return Err(e.to_string()),
             }
+        }
+        if !acked.is_empty() {
+            sim.cover("fixture:acked-rows-checked");
         }
         checked_any |= !acked.is_empty();
         Ok(())

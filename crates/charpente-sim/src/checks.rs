@@ -36,8 +36,9 @@ pub enum FaultReason {
     Unrelated,
 }
 
-/// Classifies `text` (an error's Display/to_string output) into one of the
-/// four recognized fault-fallout families or `Unrelated`:
+/// Classifies `text` (an error's Display/to_string output) into one of four
+/// recognized families or `Unrelated`. Families 1-3 are fault fallout by their
+/// text alone ([`is_fault_fallout`]); family 4 is only named here:
 ///  1. the sim's own injected-fault wordings — including the `read_error`
 ///     axis (segment-mgmt T5), whose error text is "injected" too.
 ///     `misdirected_write` is NOT in this family and cannot be: it returns
@@ -65,13 +66,12 @@ pub enum FaultReason {
 /// the workload's end-state oracle (e.g. exactly-once on reopen) still runs
 /// either way.
 ///
-/// First-match-wins, and the order is load-bearing: transactions.rs's and
-/// http.rs's narrower `matches!(classify(t), Injected | DurableHorizon)`
-/// wrappers equal their old 3-needle `contains` ORs only because `Injected`
-/// is tested before `Poisoned`/`RedbLatch` — text carrying both an injected
-/// wording and a poison wording must land `Injected`, not `Poisoned`, or
-/// those two call sites would silently start rejecting text they used to
-/// accept. Reordering the arms below is exactly the class of drift this
+/// First-match-wins, and the order is load-bearing: transactions.rs's,
+/// http.rs's and tenant.rs's narrower `matches!(classify(t), Injected)`
+/// wrappers accept injected text only because `Injected` is tested before
+/// `Poisoned`/`RedbLatch` — text carrying both an injected wording and a
+/// poison wording must land `Injected`, not `Poisoned`, or those call sites
+/// would silently start rejecting text they used to accept. Reordering the arms below is exactly the class of drift this
 /// classifier exists to prevent; see the precedence pin in
 /// `classify_pins_each_family_to_its_exemplar`.
 pub fn classify(text: &str) -> FaultReason {
@@ -424,10 +424,10 @@ mod tests {
             RedbLatch
         );
 
-        // Precedence pin (review I1): transactions.rs's/http.rs's narrower
-        // `matches!(classify(t), Injected | DurableHorizon)` wrappers equal
-        // their old 3-needle OR only because `Injected` is tested before
-        // `Poisoned`/`RedbLatch` above. A text carrying both an injected AND
+        // Precedence pin (review I1): transactions.rs's/http.rs's/tenant.rs's
+        // narrower `matches!(classify(t), Injected)` wrappers accept injected
+        // text only because `Injected` is tested before `Poisoned`/`RedbLatch`
+        // above. A text carrying both an injected AND
         // a poisoned wording must land `Injected` — is_fault_fallout's own
         // tests are order-invariant (a union can't see arm order) and every
         // other exemplar here is single-family, so nothing else in the
@@ -944,6 +944,65 @@ mod tests {
                  which no restart clears"
             ) && reason.ends_with(REFUSAL),
             "{reason}"
+        );
+    }
+
+    /// GUIDE §8's promise that no classifier of the caller's can excuse a
+    /// durable refusal (S3b review M5). Every other caller passes
+    /// `is_fault_fallout`, which already rejects the refusal's text, so only a
+    /// classifier that accepts everything can tell whether
+    /// `boot_through_fallout` judges the refusal itself. With no corruption
+    /// fired, the first refusal comes back at once, unchanged, and nothing
+    /// gives up. Where corruption did fire, it gives up at once by name.
+    #[test]
+    fn no_classifier_can_excuse_a_durable_refusal() {
+        const REFUSAL: &str =
+            "log frame 7 is invalid but at-or-below the store's durable horizon 9";
+        let sim = Sim::new(0xB7F5);
+        let mut calls = 0;
+        let booted = boot_through_fallout(
+            &sim,
+            8,
+            |_| true,
+            || {
+                calls += 1;
+                Err::<(), _>(REFUSAL.to_string())
+            },
+        );
+        assert_eq!(
+            booted,
+            Err(REFUSAL.to_string()),
+            "nothing fired, so the refusal is the answer, whatever the classifier says"
+        );
+        assert_eq!(calls, 1, "and it is not booted again");
+        assert_eq!(sim.gave_up(), None);
+        assert_eq!(sim.coverage().get("boot:retried"), None);
+
+        let sim = Sim::with_faults(
+            0xB7F5,
+            crate::FaultConfig {
+                misdirected_write: 1.0,
+                ..crate::FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("wal/00000000000000000000.log").unwrap();
+        file.write_at(0, &[7; 16]).unwrap();
+        let mut calls = 0;
+        let booted = boot_through_fallout(
+            &sim,
+            8,
+            |_| true,
+            || {
+                calls += 1;
+                Err::<(), _>(REFUSAL.to_string())
+            },
+        );
+        assert_eq!(booted, Ok(None), "corruption fired: the refusal gives up");
+        assert_eq!(calls, 1, "at once, not after the classifier's retries");
+        assert!(
+            sim.gave_up().is_some_and(|r| r.ends_with(REFUSAL)),
+            "{:?}",
+            sim.gave_up()
         );
     }
 

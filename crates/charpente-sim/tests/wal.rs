@@ -194,8 +194,41 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
     if replay.hash != engine.machine().hash {
         return Err("machine hash diverged from a clean replay of its own records".to_string());
     }
+    sim.cover("wal:prefix-checked");
     Ok(())
 }
+
+/// Give-up caps and reach floors (S3b review round 2). S3b made these
+/// properties give up where they had passed having checked nothing, and a
+/// give-up is never failed, so without a cap a batch that drifted to giving
+/// up everything would stay green (GUIDE §8). Each capped property also
+/// floors the key that counts its checks: `wal:prefix-checked` (a recovered
+/// prefix checked against what was acked) or `wal:gap-free-checked`. The
+/// pinned bases' values are exact counts at the commit that set them
+/// (2026-10-02); the `horizon-fence-held` universes are verdicts too, which
+/// is why a floor sits below its batch's verdict count.
+///
+/// The fault matrix's base is ambient. Over 10 fresh bases (0xF3A70001..0A,
+/// 512 each) it gave up 0 times and checked a prefix 496-508 times (mean
+/// 501.3, sample sd 3.3), so its floor is the mean less 4 sd. Its cap follows
+/// GUIDE §8's ambient rule, the larger of twice the largest count (0) and the
+/// Poisson cap. With x = 0 give-ups over N = 5,120 universes, U(0) = 2.996, so
+/// a batch of n = 512 has lambda = 512 x 2.996 / 5,120 = 0.30. P(> 3) is
+/// 2.6e-4 and P(> 4) is 1.6e-5, so k = 4.
+const FAULT_MATRIX_GAVE_UP_CEILING: u64 = 4;
+const FAULT_MATRIX_PREFIX_FLOOR: u64 = 488;
+const DIR_ENTRY_GAVE_UP_CEILING: u64 = 0;
+const DIR_ENTRY_PREFIX_FLOOR: u64 = 247;
+const BIT_FLIP_GAVE_UP_CEILING: u64 = 42;
+const BIT_FLIP_PREFIX_FLOOR: u64 = 196;
+const MISDIRECTED_GAVE_UP_CEILING: u64 = 22;
+const MISDIRECTED_PREFIX_FLOOR: u64 = 120;
+/// 182 of 256: the initial open or the one recovery died to an injected read
+/// error. Before S3b item 0 each of those passed having checked nothing.
+const READ_ERROR_GAVE_UP_CEILING: u64 = 182;
+const READ_ERROR_PREFIX_FLOOR: u64 = 74;
+const GC_GAVE_UP_CEILING: u64 = 0;
+const GC_GAP_FREE_FLOOR: u64 = 252;
 
 #[test]
 fn wal_survives_the_fault_matrix() {
@@ -210,7 +243,9 @@ fn wal_survives_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
-        ]
+        ],
+        floor: [("wal:prefix-checked", FAULT_MATRIX_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", FAULT_MATRIX_GAVE_UP_CEILING)]
     );
 }
 
@@ -227,7 +262,9 @@ fn wal_survives_dir_entry_loss() {
         256,
         |cfg: &mut FaultConfig| { cfg.dir_entry_loss = 0.5; },
         |sim| wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize),
-        require: ["fault:dir-entry", "restart"]
+        require: ["fault:dir-entry", "restart"],
+        floor: [("wal:prefix-checked", DIR_ENTRY_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", DIR_ENTRY_GAVE_UP_CEILING)]
     );
 }
 
@@ -324,7 +361,11 @@ fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
         Ledger::default(),
         horizon,
     ) {
-        Ok(engine) => check_prefix(&engine.machine().records, &submitted, acked),
+        Ok(engine) => {
+            check_prefix(&engine.machine().records, &submitted, acked)?;
+            sim.cover("wal:prefix-checked");
+            Ok(())
+        }
         Err(e) => {
             let msg = e.to_string();
             if horizon_fence_held(sim, &msg)? {
@@ -370,7 +411,9 @@ fn wal_survives_bit_flip() {
             cfg.bit_flip = 0.1;
         },
         wal_survives_hot_axis,
-        require: ["fault:bit_flip"]
+        require: ["fault:bit_flip"],
+        floor: [("wal:prefix-checked", BIT_FLIP_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", BIT_FLIP_GAVE_UP_CEILING)]
     );
 }
 
@@ -383,7 +426,9 @@ fn wal_survives_misdirected_write() {
             cfg.misdirected_write = 0.1;
         },
         wal_survives_hot_axis,
-        require: ["fault:misdirected_write"]
+        require: ["fault:misdirected_write"],
+        floor: [("wal:prefix-checked", MISDIRECTED_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", MISDIRECTED_GAVE_UP_CEILING)]
     );
 }
 
@@ -396,7 +441,9 @@ fn wal_survives_read_error() {
             cfg.read_error = 0.1;
         },
         wal_survives_hot_axis,
-        require: ["fault:read_error"]
+        require: ["fault:read_error"],
+        floor: [("wal:prefix-checked", READ_ERROR_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", READ_ERROR_GAVE_UP_CEILING)]
     );
 }
 
@@ -1433,6 +1480,7 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
             ));
         }
     }
+    sim.cover("wal:gap-free-checked");
     Ok(())
 }
 
@@ -1445,7 +1493,9 @@ fn gc_interrupted_by_crash_never_leaves_a_gap() {
             cfg.dir_entry_loss = 0.5;
         },
         gc_crash_workload,
-        require: ["restart"]
+        require: ["restart"],
+        floor: [("wal:gap-free-checked", GC_GAP_FREE_FLOOR)],
+        ceiling: [("universe:gave-up", GC_GAVE_UP_CEILING)]
     );
 }
 

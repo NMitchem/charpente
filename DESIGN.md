@@ -1879,8 +1879,10 @@ Charpente treats the coding agent as the primary developer persona:
   master_seed, config, message, repro}`, `coverage`, `missing_coverage` (`{test, key}`
   pairs for `require`d keys never hit), and a trailing `summary`. Ships with the public
   checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/
-  redb-latch/durable-horizon fallout classifier, productized out of four hand-rolled
-  internal copies) and its typed form `classify` → `FaultReason`, for a workload that
+  redb-latch fallout classifier, productized out of four hand-rolled internal copies; a
+  durable-horizon refusal is never fallout by its text and is judged by `durable_refusal`,
+  which excuses it only where durable corruption fired) and its typed form `classify` →
+  `FaultReason`, which still names the durable-horizon family, for a workload that
   accepts some families and fails on others (sub-project 6 T7 — first-match arm order is
   load-bearing and pinned); `replays_identically` (determinism oracle);
   `acked_implies_durable` (the request-level ack-durability property, generalized for app
