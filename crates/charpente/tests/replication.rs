@@ -5438,6 +5438,23 @@ fn spawn_kernel_node_with_schema(
                 });
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            // A refusal for durable corruption at or below the horizon is
+            // fallout only where that corruption fired on this host's own
+            // disk (S3b item 0's rule), and then no power-cycle clears the
+            // bytes, so the spawn gives up at once. Unexplained, it falls to
+            // the failure arm below. Item 0 missed this loop: it went from
+            // retrying 500 power-cycles into `spawn-exhausted` to failing,
+            // 187 universes over 192 fresh bases (S3b item 8's sweep).
+            Err(e)
+                if matches!(classify(&e), FaultReason::DurableHorizon)
+                    && h.durable_corruption_fired() =>
+            {
+                sim.cover("repl:inconclusive:spawn-durable-refusal");
+                return Err(format!(
+                    "{INCONCLUSIVE}: {host} kernel spawn refused for durable corruption that \
+                     fired on {host}'s disk, which no power-cycle clears: {e}"
+                ));
+            }
             // Power-cycle on EVERY attempt here, deliberately — the opposite of
             // `recover_node`/`reopen_p_frames`'s gated shape, and MEASURED
             // rather than assumed (oracle-density task 3, fix round 1).
@@ -7243,6 +7260,76 @@ fn replay_above_horizon(seed: u64) -> (Sim, Result<(), String>) {
     let r = above_horizon_universe(&mut sim);
     let r = finish_universe(&sim, r);
     (sim, r)
+}
+
+/// S3b item 8's sweep found the kernel spawn loop still excusing nothing for
+/// a refusal below the horizon. Item 0 had taken that refusal out of
+/// `is_fault_fallout`, so 187 universes over 192 fresh bases went from 500
+/// futile power-cycles into `spawn-exhausted` to failing the property.
+/// - **Seed `0x14c38063db535c63`** (base `0x51D31101`): `p`'s spawn is refused
+///   for corruption that fired on `p`'s own disk. It gives up at once, under
+///   `repl:inconclusive:spawn-durable-refusal`.
+/// - **The twin, built by hand:** a bit flip fires on `f` only, and `p`'s own
+///   frame 1 is corrupted by the test. `p`'s spawn is refused the same way,
+///   but nothing fired on `p` explains it, so it fails by name.
+#[test]
+fn a_spawn_refused_below_the_horizon_gives_up_only_for_corruption_on_its_own_disk() {
+    let (sim, r) = replay_above_horizon(0x14c3_8063_db53_5c63);
+    assert_eq!(r, Ok(()), "the universe gives up, it does not fail");
+    let reason = sim.gave_up().expect("the universe gives up");
+    assert!(
+        reason.contains("p kernel spawn refused for durable corruption that fired on p's disk")
+            && reason.contains("durable horizon"),
+        "for this reason, or the seed no longer names the scenario: {reason}"
+    );
+    assert_eq!(
+        sim.coverage()
+            .get("repl:inconclusive:spawn-durable-refusal")
+            .copied(),
+        Some(1),
+        "under the spawn's own key"
+    );
+
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (p, f) = sacrificial_pair(&sim);
+    f.host.restart();
+    sim.quiesce_disk_faults();
+    assert!(
+        f.host.durable_corruption_fired() && !p.host.durable_corruption_fired(),
+        "a bit flipped on f's disk, none on p's"
+    );
+    let disk = p.host.disk();
+    let mut segments = disk.list("wal/").expect("p has a WAL");
+    segments.sort();
+    let file = disk
+        .open(segments.first().expect("p has a WAL segment"))
+        .expect("the segment opens");
+    let mut crc = [0u8; 1];
+    file.read_at(12, &mut crc).expect("frame 1's header reads");
+    crc[0] ^= 0xff;
+    file.write_at(12, &crc).expect("frame 1's CRC is rewritten");
+    file.sync().expect("and made durable");
+    drop(p);
+    let refused = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        horizon_db_cfg(),
+        200 * SEC_NANOS,
+        true,
+    )
+    .err()
+    .expect("p's spawn over its corrupted frame is refused");
+    assert!(
+        refused.starts_with("p: App::open: log frame") && refused.contains("durable horizon"),
+        "nothing fired on p explains the refusal, so it fails by name; got: {refused}"
+    );
 }
 
 /// D3 round 4 (review I2), seed `0x9827a4c2014d41d4`, found by the review
