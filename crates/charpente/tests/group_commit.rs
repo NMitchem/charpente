@@ -2329,9 +2329,9 @@ fn verify_watermark(sim: &Sim, watermark: u64, reopens: u32) -> Result<Verify, S
                     // CURRENT round's uncheckpointed tail sits in the
                     // silent-cut window M1 sub-project 1 documented;
                     // corruption below the horizon surfaces as the loud,
-                    // named `DurableHorizon` hard error instead, which
-                    // `is_fault_fallout` already accepts, which ends the
-                    // reopens at once (`durable_refusal`, below) and which
+                    // named `DurableHorizon` hard error instead, which ends
+                    // the reopens at once, excused only where durable
+                    // corruption fired (`durable_refusal`, below), and which
                     // fires in 3 of 256 universes (measured — T8b review M-1
                     // disproved the "every record is above the horizon"
                     // reasoning this comment used to carry).
@@ -2345,13 +2345,17 @@ fn verify_watermark(sim: &Sim, watermark: u64, reopens: u32) -> Result<Verify, S
                 }
                 return Ok(Verify::Checked);
             }
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            Err(e) => {
+                // Before the fallout check: only a fired durable-corruption
+                // fault excuses a durable refusal (S3b item 0).
                 if durable_refusal(sim, &e.to_string())? {
                     return Ok(Verify::Refused);
                 }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("verification open failed non-injected: {e}"));
+                }
                 sim.restart();
             }
-            Err(e) => return Err(format!("verification open failed non-injected: {e}")),
         }
     }
     Ok(Verify::Unreachable)

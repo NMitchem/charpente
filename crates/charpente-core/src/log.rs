@@ -249,8 +249,10 @@ impl Wal {
                                 "log frame {expected_seq} is invalid but at-or-below the store's \
                                  durable horizon {h} — this is corruption of acknowledged records, \
                                  not a torn tail, and truncating it would silently lose data; \
-                                 restore this node from a replica or backup (DESIGN §2)",
+                                 restore this node from a replica or backup. {reseed} \
+                                 (DESIGN §2)",
                                 h = horizon.expect("checked by is_some_and"),
+                                reseed = crate::db::RESTORE_IS_A_RESEED,
                             )));
                         }
                         break Some(offset);
@@ -442,7 +444,8 @@ impl Wal {
                             "log frame {seq} failed verification while being read back for \
                              shipping — a corrupted frame must never be shipped; durable bytes \
                              below the acknowledged end are corrupt; restore this node from a \
-                             replica or backup (DESIGN §2)"
+                             replica or backup. {reseed} (DESIGN §2)",
+                            reseed = crate::db::RESTORE_IS_A_RESEED,
                         )));
                     }
                 }

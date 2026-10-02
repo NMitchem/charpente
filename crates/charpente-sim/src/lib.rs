@@ -1030,6 +1030,23 @@ impl SimHost {
         self.world.lock().host_mut(&self.name).entry_loss > 0
     }
 
+    /// How many durable-corruption faults have fired on this host's disk so
+    /// far: the count `durable_corruption_fired` compares with zero. It only
+    /// grows. A workload that wipes this host's data (a re-seed deletes every
+    /// file) reads it at the wipe and explains a later refusal only by a fault
+    /// since then, since the wipe deleted every byte an earlier fault touched.
+    pub fn durable_corruption_count(&self) -> u64 {
+        self.world.lock().host_mut(&self.name).durable_corruption
+    }
+
+    /// How many directory entries `dir_entry_loss` has lost on this host's
+    /// disk so far: the count `dir_entry_loss_fired` compares with zero. It
+    /// only grows, and is read at a wipe for the reason
+    /// `durable_corruption_count` gives.
+    pub fn dir_entry_loss_count(&self) -> u64 {
+        self.world.lock().host_mut(&self.name).entry_loss
+    }
+
     /// Injects a crash on the `ops`-th subsequent disk operation *on this
     /// host* — mirrors `Sim::crash_disk_after`.
     pub fn crash_after(&self, ops: u64) {

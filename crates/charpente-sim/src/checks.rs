@@ -27,15 +27,18 @@ pub enum FaultReason {
     Poisoned,
     /// redb's latch ("close and re-open the database").
     RedbLatch,
-    /// The WAL's durable-horizon hard error (corruption of acked records —
-    /// loud by design, not a bug).
+    /// The WAL's durable-horizon hard error: acknowledged records failed
+    /// their check at or below the store's horizon. Loud by design, and
+    /// fallout only where durable corruption fired on that node's disk,
+    /// which its text cannot say, so [`is_fault_fallout`] never excuses it.
     DurableHorizon,
     /// Everything else: NOT fallout; fails the universe for adjudication.
     Unrelated,
 }
 
-/// Classifies `text` (an error's Display/to_string output) into one of the
-/// four recognized fault-fallout families or `Unrelated`:
+/// Classifies `text` (an error's Display/to_string output) into one of four
+/// recognized families or `Unrelated`. Families 1-3 are fault fallout by their
+/// text alone ([`is_fault_fallout`]); family 4 is only named here:
 ///  1. the sim's own injected-fault wordings — including the `read_error`
 ///     axis (segment-mgmt T5), whose error text is "injected" too.
 ///     `misdirected_write` is NOT in this family and cannot be: it returns
@@ -50,20 +53,25 @@ pub enum FaultReason {
 ///  4. the WAL's durable-horizon hard error (segment-mgmt T4's recovery-
 ///     horizon rule): `bit_flip`/`misdirected_write` corrupting an
 ///     already-acknowledged frame is a legitimate consequence of the fault
-///     matrix, surfaced loudly by design — not a bug.
+///     matrix, surfaced loudly by design. But only then: the same text is
+///     what a durability bug in the platform looks like (D1's WAL bug showed
+///     itself in 8 of 21 failing bases only as this refusal), so this family
+///     is a NAME, not an excuse. Only a check that durable corruption fired
+///     excuses it: [`durable_refusal`] in a single-node workload, and
+///     [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired)
+///     for the refusing node in a multi-node one (S3b item 0).
 ///
 /// Anything else is `Unrelated`: NOT fallout, must fail the universe for
-/// adjudication. Recognizing these cannot mask a real bug so long as the
-/// workload's end-state oracle (e.g. exactly-once on reopen) still runs
+/// adjudication. Recognizing families 1-3 cannot mask a real bug so long as
+/// the workload's end-state oracle (e.g. exactly-once on reopen) still runs
 /// either way.
 ///
-/// First-match-wins, and the order is load-bearing: transactions.rs's and
-/// http.rs's narrower `matches!(classify(t), Injected | DurableHorizon)`
-/// wrappers equal their old 3-needle `contains` ORs only because `Injected`
-/// is tested before `Poisoned`/`RedbLatch` — text carrying both an injected
-/// wording and a poison wording must land `Injected`, not `Poisoned`, or
-/// those two call sites would silently start rejecting text they used to
-/// accept. Reordering the arms below is exactly the class of drift this
+/// First-match-wins, and the order is load-bearing: transactions.rs's,
+/// http.rs's and tenant.rs's narrower `matches!(classify(t), Injected)`
+/// wrappers accept injected text only because `Injected` is tested before
+/// `Poisoned`/`RedbLatch` — text carrying both an injected wording and a
+/// poison wording must land `Injected`, not `Poisoned`, or those call sites
+/// would silently start rejecting text they used to accept. Reordering the arms below is exactly the class of drift this
 /// classifier exists to prevent; see the precedence pin in
 /// `classify_pins_each_family_to_its_exemplar`.
 pub fn classify(text: &str) -> FaultReason {
@@ -80,9 +88,20 @@ pub fn classify(text: &str) -> FaultReason {
     }
 }
 
-/// `true` for every recognized family — see `classify`'s doc for the four.
+/// `true` for the families an error's text alone excuses: injected,
+/// poisoned and the redb latch (`classify`'s families 1-3). Never for the
+/// durable-horizon refusal: whether that is fallout depends on whether durable
+/// corruption fired, which text cannot say, so it is `false` here and a
+/// caller that retries or gives up on fallout fails it unless it asks
+/// [`durable_refusal`] (or, for one node of several,
+/// [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired))
+/// first. Until S3b item 0 this returned `true` for every recognized family,
+/// so any such workload excused the refusal where no fault had fired.
 pub fn is_fault_fallout(text: &str) -> bool {
-    !matches!(classify(text), FaultReason::Unrelated)
+    matches!(
+        classify(text),
+        FaultReason::Injected | FaultReason::Poisoned | FaultReason::RedbLatch
+    )
 }
 
 /// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
@@ -175,7 +194,8 @@ pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
 /// collapses the disk as usual, and `verify` checks that every id acked so
 /// far (not just this round's) is still present. A `verify` failure fails
 /// the whole check, prefixed with the round and seed so a repro can target
-/// the exact round.
+/// the exact round. A run in which no round acked anything checked nothing,
+/// and gives the universe up by name (`Sim::give_up`) instead of passing.
 ///
 /// **Takes `&mut Sim`, not a seed, and the distinction is load-bearing** —
 /// unlike [`replays_identically`] above, which takes a seed because it needs
@@ -221,6 +241,13 @@ pub fn acked_implies_durable(
             format!("acked-implies-durable violated after round {round} under seed {seed:#x}: {e}")
         })?;
     }
+    // Every `verify` above ran over an empty list, so none could have failed.
+    if acked.is_empty() {
+        sim.give_up(format!(
+            "acked-implies-durable: no round acked anything in {rounds} rounds, so there was \
+             no claim to check"
+        ));
+    }
     Ok(())
 }
 
@@ -228,7 +255,9 @@ pub fn acked_implies_durable(
 /// retry, which is `Db::open`'s own contract for an IO failure (DESIGN §4).
 /// Calls `boot`; when it fails with an error `is_fallout` accepts (injected
 /// fault fallout, by the caller's own classifier), calls it again, up to
-/// `tries` boots in all. Each retry marks `boot:retried`, and a retry that
+/// `tries` boots in all. A durable-horizon refusal is judged by
+/// [`durable_refusal`] before `is_fallout` sees it, so a caller's classifier
+/// cannot excuse one where no durable corruption fired. Each retry marks `boot:retried`, and a retry that
 /// boots marks `boot:booted-after-retry`, so a batch can require that retries
 /// do more than run. A retry after an injected IO error restarts the process
 /// first (`Sim::restart_process`): the failed boot's handles die, the page
@@ -293,13 +322,13 @@ pub fn boot_through_fallout<T, E: std::fmt::Display>(
             }
             Err(e) => {
                 let text = e.to_string();
-                if !is_fallout(&text) {
-                    return Err(e);
-                }
                 match durable_refusal(sim, &text) {
                     Ok(true) => return Ok(None),
                     Ok(false) => {}
                     Err(_) => return Err(e),
+                }
+                if !is_fallout(&text) {
+                    return Err(e);
                 }
             }
         }
@@ -354,9 +383,6 @@ mod tests {
             "engine poisoned: a durable record failed to apply",
             "Storage error: close and re-open the database",
             "injected read error",
-            "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
-             corruption of acknowledged records, not a torn tail, and truncating it would \
-             silently lose data; restore this node from a replica or backup (DESIGN §2)",
         ] {
             assert!(is_fault_fallout(fallout), "must classify: {fallout}");
         }
@@ -364,6 +390,11 @@ mod tests {
             "row decode: needed 8 bytes for u64, 3 left — schema drift or corruption",
             "assertion failed: durable.is_some_and(|d| d >= applied)",
             "exactly-once violated: hits 3, done 2 for key 7",
+            // A recognized family, but not fallout by its text: only a check
+            // that durable corruption fired excuses it (S3b item 0).
+            "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
+             corruption of acknowledged records, not a torn tail, and truncating it would \
+             silently lose data; restore this node from a replica or backup (DESIGN §2)",
         ] {
             assert!(!is_fault_fallout(real_bug), "must NOT classify: {real_bug}");
         }
@@ -393,10 +424,10 @@ mod tests {
             RedbLatch
         );
 
-        // Precedence pin (review I1): transactions.rs's/http.rs's narrower
-        // `matches!(classify(t), Injected | DurableHorizon)` wrappers equal
-        // their old 3-needle OR only because `Injected` is tested before
-        // `Poisoned`/`RedbLatch` above. A text carrying both an injected AND
+        // Precedence pin (review I1): transactions.rs's/http.rs's/tenant.rs's
+        // narrower `matches!(classify(t), Injected)` wrappers accept injected
+        // text only because `Injected` is tested before `Poisoned`/`RedbLatch`
+        // above. A text carrying both an injected AND
         // a poisoned wording must land `Injected` — is_fault_fallout's own
         // tests are order-invariant (a union can't see arm order) and every
         // other exemplar here is single-family, so nothing else in the
@@ -648,6 +679,34 @@ mod tests {
         assert!(err.contains("boom"), "{err}");
     }
 
+    /// A run in which no round acked anything checked nothing: `verify` ran
+    /// over an empty list every round. It gives up by name rather than pass.
+    #[test]
+    fn acked_implies_durable_gives_up_when_nothing_was_ever_acked() {
+        let mut sim = Sim::new(0xACE0);
+        acked_implies_durable(&mut sim, 3, |_sim: &mut Sim| Ok(vec![]), toy_verify).unwrap();
+        assert_eq!(
+            sim.gave_up().as_deref(),
+            Some(
+                "acked-implies-durable: no round acked anything in 3 rounds, so there was no claim to check"
+            )
+        );
+    }
+
+    /// One ack in any round is a claim, and the run reaches a verdict on it.
+    #[test]
+    fn acked_implies_durable_reaches_a_verdict_on_a_single_ack() {
+        let mut sim = Sim::new(0xACE1);
+        let mut drive = toy_drive(true);
+        let mut round = 0;
+        let once = move |sim: &mut Sim| {
+            round += 1;
+            if round == 2 { drive(sim) } else { Ok(vec![]) }
+        };
+        acked_implies_durable(&mut sim, 3, once, toy_verify).unwrap();
+        assert_eq!(sim.gave_up(), None);
+    }
+
     #[test]
     fn acked_implies_durable_passes_when_synced_before_ack() {
         let mut sim = Sim::new(0xACED);
@@ -885,6 +944,65 @@ mod tests {
                  which no restart clears"
             ) && reason.ends_with(REFUSAL),
             "{reason}"
+        );
+    }
+
+    /// GUIDE §8's promise that no classifier of the caller's can excuse a
+    /// durable refusal (S3b review M5). Every other caller passes
+    /// `is_fault_fallout`, which already rejects the refusal's text, so only a
+    /// classifier that accepts everything can tell whether
+    /// `boot_through_fallout` judges the refusal itself. With no corruption
+    /// fired, the first refusal comes back at once, unchanged, and nothing
+    /// gives up. Where corruption did fire, it gives up at once by name.
+    #[test]
+    fn no_classifier_can_excuse_a_durable_refusal() {
+        const REFUSAL: &str =
+            "log frame 7 is invalid but at-or-below the store's durable horizon 9";
+        let sim = Sim::new(0xB7F5);
+        let mut calls = 0;
+        let booted = boot_through_fallout(
+            &sim,
+            8,
+            |_| true,
+            || {
+                calls += 1;
+                Err::<(), _>(REFUSAL.to_string())
+            },
+        );
+        assert_eq!(
+            booted,
+            Err(REFUSAL.to_string()),
+            "nothing fired, so the refusal is the answer, whatever the classifier says"
+        );
+        assert_eq!(calls, 1, "and it is not booted again");
+        assert_eq!(sim.gave_up(), None);
+        assert_eq!(sim.coverage().get("boot:retried"), None);
+
+        let sim = Sim::with_faults(
+            0xB7F5,
+            crate::FaultConfig {
+                misdirected_write: 1.0,
+                ..crate::FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("wal/00000000000000000000.log").unwrap();
+        file.write_at(0, &[7; 16]).unwrap();
+        let mut calls = 0;
+        let booted = boot_through_fallout(
+            &sim,
+            8,
+            |_| true,
+            || {
+                calls += 1;
+                Err::<(), _>(REFUSAL.to_string())
+            },
+        );
+        assert_eq!(booted, Ok(None), "corruption fired: the refusal gives up");
+        assert_eq!(calls, 1, "at once, not after the classifier's retries");
+        assert!(
+            sim.gave_up().is_some_and(|r| r.ends_with(REFUSAL)),
+            "{:?}",
+            sim.gave_up()
         );
     }
 

@@ -5,14 +5,14 @@
 use charpente::core::io::Entropy;
 use charpente::http::{App, AppConfig};
 use charpente::kernel::Dispatcher;
-use charpente::{Db, DbConfig, Id, Schema, View, jobs};
+use charpente::{Db, DbConfig, Id, Schema, TxError, View, jobs};
 use charpente_sim::Sim;
 use sim_fixture::{BumpCounter, FixtureCounter, NoteAdded};
 
 charpente_sim::sim_tests! {
     counter_roundtrip require ["restart"],
     fixture_replays,
-    acked_counter_survives_rounds require ["restart"],
+    acked_counter_survives_rounds require ["restart", "fixture:acked-rows-checked"],
     counter_bump_job_changes_the_row,
     counter_bump_job_leaves_the_row_readable,
     sometimes_fails,
@@ -63,14 +63,18 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
         ));
         return Ok(None);
     };
-    let acked = db
-        .transact(|tx| {
-            let id = Id::<FixtureCounter>::from_raw(7);
-            tx.put(&FixtureCounter { id, hits: 1 });
-            tx.emit(NoteAdded { note: id });
-            Ok::<_, std::io::Error>(())
-        })
-        .is_ok();
+    // Only an injected fault excuses a write that never acked; any other
+    // error is the platform's, and fails.
+    let acked = match db.transact(|tx| {
+        let id = Id::<FixtureCounter>::from_raw(7);
+        tx.put(&FixtureCounter { id, hits: 1 });
+        tx.emit(NoteAdded { note: id });
+        Ok::<_, std::io::Error>(())
+    }) {
+        Ok(()) => true,
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => false,
+        Err(e) => return Err(format!("{e:?}")),
+    };
     sim.restart();
     drop(db);
     let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
@@ -118,6 +122,9 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     }
 }
 
+/// Rounds `acked_counter_survives_rounds` runs.
+const ROUNDS: u32 = 3;
+
 /// `acked_implies_durable` against a real app, and the end-to-end proof that it
 /// credits coverage on the world the HARNESS is watching.
 ///
@@ -156,15 +163,17 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
         else {
             return Ok(vec![]);
         };
-        let acked = db
-            .transact(|tx| {
-                tx.put(&FixtureCounter {
-                    id: Id::<FixtureCounter>::from_raw(round),
-                    hits: round,
-                });
-                Ok::<_, std::io::Error>(())
-            })
-            .is_ok();
+        let acked = match db.transact(|tx| {
+            tx.put(&FixtureCounter {
+                id: Id::<FixtureCounter>::from_raw(round),
+                hits: round,
+            });
+            Ok::<_, std::io::Error>(())
+        }) {
+            Ok(()) => true,
+            Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => false,
+            Err(e) => return Err(format!("{e:?}")),
+        };
         Ok(if acked {
             vec![round.to_string()]
         } else {
@@ -172,7 +181,25 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
         })
     };
 
-    let verify = |sim: &mut Sim, acked: &[String]| -> Result<(), String> {
+    // A round's check that meets fault fallout is skipped. While a later round
+    // remains that loses nothing: `acked` is cumulative, so the next round's
+    // `verify` checks every row this one would have. A skip in the last round
+    // leaves a verdict only if an earlier round checked acked rows; otherwise
+    // the universe checked nothing and gives up (S3b item 5: every skip used
+    // to pass).
+    let mut verified_rounds = 0u32;
+    let mut checked_any = false;
+    let verify = move |sim: &mut Sim, acked: &[String]| -> Result<(), String> {
+        verified_rounds += 1;
+        let skip = |sim: &mut Sim, what: String| {
+            if verified_rounds == ROUNDS && !checked_any {
+                sim.cover("fixture:last-verify-fallout");
+                sim.give_up(format!(
+                    "the last round's check {what}, and no earlier round checked an acked row"
+                ));
+            }
+            Ok(())
+        };
         if sim.gave_up().is_some() {
             return Ok(());
         }
@@ -183,11 +210,13 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
         let Some(db) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open)
             .map_err(|e| e.to_string())?
         else {
-            return Ok(());
+            return skip(sim, format!("never booted in {BOOT_TRIES} boots"));
         };
         let snap = match db.snapshot() {
             Ok(snap) => snap,
-            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                return skip(sim, format!("hit fault fallout taking a snapshot: {e}"));
+            }
             Err(e) => return Err(e.to_string()),
         };
         for id in acked {
@@ -210,14 +239,20 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
                     return Ok(());
                 }
                 Ok(None) => return Err(format!("acked round {raw} lost across a restart")),
-                Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+                Err(e) if is_fault_fallout(&e.to_string()) => {
+                    return skip(sim, format!("hit fault fallout reading round {raw}: {e}"));
+                }
                 Err(e) => return Err(e.to_string()),
             }
         }
+        if !acked.is_empty() {
+            sim.cover("fixture:acked-rows-checked");
+        }
+        checked_any |= !acked.is_empty();
         Ok(())
     };
 
-    acked_implies_durable(sim, 3, drive, verify)
+    acked_implies_durable(sim, ROUNDS, drive, verify)
 }
 
 fn sometimes_fails(sim: &mut Sim) -> Result<(), String> {
@@ -293,21 +328,22 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
     let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
     let db = app.db_for_tests();
 
-    // `.is_ok()` rather than inspecting the error, matching this file's other
-    // properties: a transaction that did not commit was never acknowledged, so
-    // there is no claim to test in this universe.
-    let seeded = db
-        .transact(|tx| {
-            tx.put(&FixtureCounter { id, hits: 1 });
-            tx.enqueue(BumpCounter { note: id });
-            Ok::<(), std::io::Error>(())
-        })
-        .is_ok();
-    if !seeded {
-        sim.give_up(
-            "the seeding transaction never committed, so no job was ever enqueued".to_string(),
-        );
-        return Ok(None);
+    // A transaction an injected fault kept from committing was never
+    // acknowledged, so there is no claim to test in this universe. Any other
+    // error is the platform's, and fails, as this file's other properties do.
+    match db.transact(|tx| {
+        tx.put(&FixtureCounter { id, hits: 1 });
+        tx.enqueue(BumpCounter { note: id });
+        Ok::<(), std::io::Error>(())
+    }) {
+        Ok(()) => {}
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(
+                "the seeding transaction never committed, so no job was ever enqueued".to_string(),
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("{e:?}")),
     }
 
     dispatcher.note_enqueued(db.drain_enqueued());

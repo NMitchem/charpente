@@ -469,7 +469,10 @@ exception says so in its text: a store file cut shorter than redb's header,
 which no crash leaves and no retry fixes. Its fix depends on the log beside
 it, and the text names the right one: while the log still reaches seq 0,
 remove the file and the next boot rebuilds it; once the log is compacted,
-restore the node from a replica or backup (DESIGN §4). A rebuild only works
+restore the node from a replica or backup (DESIGN §4). On a replicated node
+that restore is a re-seed, and every text that names it says so in the same
+breath: clear the data directory and restart the node configured as a follower
+of the current primary, never with a primary config (§10). A rebuild only works
 while the log still holds everything back
 to seq 0, though: `Db::checkpoint(&mut self)` durably persists the store,
 then deletes WAL segments below the checkpoint (`DbConfig::retain_segments`
@@ -1812,7 +1815,7 @@ wherever the shape refusal runs. `<presence>` is `a tenant` or `no tenant`, and
 <!-- pinned -->
 ```text
 job "<job>" was enqueued with <presence>, but this binary mounts <job> as <declaration> under the same shape (<shape>) — a hand-written `impl Job` or `JobDef` contradicts <job>'s #[job]; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted type, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
-<n> Pending "<job>" job(s) (ids <ids>) carry <presence>, but this binary declares <job> <declaration> — the enqueue family writes a tenant exactly for a `scoped_by` job, so something that contradicts <job>'s #[job] wrote these rows: a hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount <job> as its #[job] declares it, or restore the store from a replica or backup taken before these rows were written (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) carry <presence>, but this binary declares <job> <declaration> — the enqueue family writes a tenant exactly for a `scoped_by` job, so something that contradicts <job>'s #[job] wrote these rows: a hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount <job> as its #[job] declares it, or restore the store from a replica or backup taken before these rows were written. For a follower, or a primary once a follower is promoted in its place, that is a re-seed: stop the node, delete its data dir, and restart it configured as a follower of the current primary so it snapshot-seeds from it, never with a primary config: the durable role file that outranks config is deleted with the data dir, so a cleared node started as a primary comes up as a second writable primary (GUIDE §6)
 ```
 
 Presence is not the whole of a tenant. A row records the tenant's id and not the scope type
@@ -2327,9 +2330,9 @@ you something real: either the workload never drives the system into that
 state, or the universe count is too low to make it likely.
 
 ```rust
-use charpente::{Db, DbConfig, Id, Schema, View, table};
+use charpente::{Db, DbConfig, Id, Schema, TxError, View, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::{is_fault_fallout, replays_identically};
+use charpente_sim::checks::{boot_through_fallout, is_fault_fallout, replays_identically};
 
 #[table(global)]
 struct Counter {
@@ -2347,9 +2350,14 @@ charpente_sim::sim_tests! {
 
 /// `sim_tests!` workloads return `Result<(), String>` — this one delegates
 /// to a helper that returns the interesting value instead, so the
-/// determinism checker below can reuse the exact same logic.
+/// determinism checker below can reuse the exact same logic. `None` asserted
+/// nothing, and a pass needs a verdict, so it gives the universe up ("Giving
+/// up" below).
 fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
-    counter_roundtrip_result(sim).map(|_| ())
+    if counter_roundtrip_result(sim)?.is_none() {
+        sim.give_up("nothing to assert: the write never acked, or a boot never came up");
+    }
+    Ok(())
 }
 
 /// `replays_identically` is the determinism oracle: it runs `workload` twice
@@ -2361,36 +2369,44 @@ fn counter_replays(sim: &mut Sim) -> Result<(), String> {
 
 /// Puts a row, restarts the simulated disk (crashes and reopens), and reads
 /// it back. Returns `None` — not a failure — when there is nothing to
-/// assert: the write was never acked, or either `Db::open` hit fault
-/// fallout (the harness's own fault paths, not this workload's contract,
-/// are under test elsewhere). `is_fault_fallout` recognizes the sim's own
-/// injected-fault wording, the WAL/engine poison wording, and redb's
-/// "close and re-open the database" latch — anything else is treated as a
-/// real bug and fails the universe.
+/// assert: an injected fault kept the write from its ack, or either
+/// `Db::open` never booted through fault fallout (the harness's own fault
+/// paths, not this workload's contract, are under test elsewhere). Only a
+/// `TxError::Io` can be fallout: the closure's own `App` error, or a
+/// follower's refusal, is this workload's bug. `is_fault_fallout` recognizes the
+/// sim's own injected-fault wording, the WAL/engine poison wording, and
+/// redb's "close and re-open the database" latch; `boot_through_fallout`
+/// boots again on those, and excuses a refusal for durable corruption only
+/// where the harness injected some. Anything else is treated as a real bug
+/// and fails the universe.
 fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let schema = || Schema::new().table::<Counter>();
-    let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(mut db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
     };
-    let acked = db
-        .transact(|tx| {
-            tx.put(&Counter {
-                id: Id::from_raw(1),
-                hits: 1,
-            });
-            Ok::<_, std::io::Error>(())
-        })
-        .is_ok();
+    let acked = match db.transact(|tx| {
+        tx.put(&Counter {
+            id: Id::from_raw(1),
+            hits: 1,
+        });
+        Ok::<_, std::io::Error>(())
+    }) {
+        Ok(()) => true,
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => false,
+        Err(e) => return Err(format!("{e:?}")),
+    };
 
     sim.restart(); // power-cycles the simulated disk: unsynced writes tear or vanish
     drop(db); // the old handle is dead after restart — reopen, per its own contract
 
-    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
-        Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+    let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
+    let Some(db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
     };
     if !acked {
         return Ok(None);
@@ -2415,7 +2431,7 @@ what it was told.
 Say so:
 
 ```rust
-use charpente::{Db, DbConfig, Id, Schema, View, table};
+use charpente::{Db, DbConfig, Id, Schema, TxError, View, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{boot_through_fallout, durable_corruption_fired, is_fault_fallout};
 
@@ -2444,9 +2460,15 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         });
         Ok::<_, std::io::Error>(())
     });
-    if put.is_err() {
-        sim.give_up("the write was never acknowledged, so there is no claim to check");
-        return Ok(());
+    match put {
+        Ok(()) => {}
+        // An injected fault kept the write from its ack: no claim to check.
+        // Any other error is the platform's, and fails, as the opens do.
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up("the write was never acknowledged, so there is no claim to check");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("{e:?}")),
     }
 
     sim.restart(); // a crash: unsynced writes tear or vanish
@@ -2495,15 +2517,25 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   and it cross-checks the reported count exactly. `ceiling:
   [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
   caps it: the batch fails when more than N universes gave up, naming the key,
-  the count and the cap. Nine of the platform's own 31 swarm properties carry
-  one: kernel's exactly-once and job-tenancy properties, and the flagship
-  properties of tenant, transactions, http, group_commit, typed_tables and
-  archive's two convergence properties. The rest (realtime, replication,
-  migrations, auth, the WAL suite, and kernel's job-shape property) carry none
-  yet, so a drift in their give-up rates is visible only in the split. A give-up is
+  the count and the cap. Nineteen of the platform's own swarm properties carry
+  one:
+  - kernel's exactly-once and job-tenancy properties;
+  - the flagship properties of tenant, transactions, http, group_commit and
+    typed_tables, and archive's two convergence properties;
+  - realtime's flagship and scoped settled-client properties, migrations' two,
+    and the WAL suite's fault-matrix, bit-flip, misdirected-write, read-error,
+    dir-entry and gc properties.
+
+  The rest carry none yet, so a drift in their give-up rates is visible only in
+  the split: realtime's mixed-shapes and follower properties, replication's,
+  auth's, kernel's job-shape property, transactions' crashed-reseed property,
+  and engine's. A give-up is
   reported and never failed, so without a cap a property can drift toward
   adjudicating nothing with every batch green; a floor on the key would bound
-  give-ups from below, which guards nothing.
+  give-ups from below, which guards nothing. An app's `sim_tests!` takes no
+  `ceiling:`. Its property `require`s instead the key its verdict marks, past
+  every give-up arm. That fails a batch in which no universe reached a
+  verdict, but not one whose rate merely drifted.
 - A cap bounds what a property fails to conclude, not how much it checks, so
   pair it with a `floor: [("key", N)]` on the key that counts its checks
   (written before `ceiling:`, on either macro). A change that skips a round's
@@ -2624,23 +2656,31 @@ for these before hand-rolling the same logic a fourth time:
   is this the harness's own injected fault (or its consequences) rather
   than a bug your workload should fail on? It recognizes the sim's
   injected-fault wording (including the `read_error` axis), the WAL/engine
-  poison wording, the WAL's durable-horizon hard error (bit-level corruption
-  of an already-acknowledged frame — a fault-matrix consequence, not a bug),
-  and redb's "close and re-open the database" latch. Used inside a workload
-  to turn "the disk broke, as instructed" into "no answer this round" rather
-  than a hard failure — never to swallow anything else. (`misdirected_write`
-  is not in that list and cannot be: it returns `Ok`, so it has no wording —
-  what you eventually see is the corrupt frame it left behind.)
-- `classify(text: &str) -> FaultReason` — the same judgement, typed:
+  poison wording, and redb's "close and re-open the database" latch. Used
+  inside a workload to turn "the disk broke, as instructed" into "no answer
+  this round" rather than a hard failure — never to swallow anything else.
+  (`misdirected_write` is not in that list and cannot be: it returns `Ok`, so
+  it has no wording — what you eventually see is the corrupt frame it left
+  behind.) **It never excuses the WAL's durable-horizon refusal**, the boot
+  refused because an already-acknowledged frame failed its check at or below
+  the store's horizon. That refusal is fallout where `bit_flip` or
+  `misdirected_write` fired, and a durability bug in the platform everywhere
+  else (a real one showed itself only as this refusal in 8 of 21 failing
+  bases), and text cannot say which. So it is `false` here, and an open site
+  asks `durable_refusal` (below) first, or, for one node of several,
+  `SimHost::durable_corruption_fired()`. `boot_through_fallout` does that for
+  you.
+- `classify(text: &str) -> FaultReason` — the families, typed:
   `Injected`, `Poisoned`, `RedbLatch`, `DurableHorizon`, or `Unrelated`
-  (`is_fault_fallout` is `!matches!(…, Unrelated)`). Use it when your
+  (`is_fault_fallout` is `Injected | Poisoned | RedbLatch`). Use it when your
   workload wants to accept some families and fail on others — e.g. "an
-  injected fault or a durable-horizon error is fallout this round, but a
-  poisoned engine is a finding". Matching on a variant instead of on
-  substrings keeps the prose coupling in one place: if a platform error
-  string is ever reworded, `classify` is the single site that must change,
-  and it fails by name instead of leaking a wrong classification into
-  whichever oracle saw the text first.
+  injected fault is fallout this round, but a poisoned engine is a finding" —
+  or to name the family in a coverage key. `DurableHorizon` is a name, never
+  an excuse on its own. Matching on a variant instead of on substrings keeps
+  the prose coupling in one place: if a platform error string is ever
+  reworded, `classify` is the single site that must change, and it fails by
+  name instead of leaking a wrong classification into whichever oracle saw
+  the text first.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
@@ -2659,7 +2699,8 @@ for these before hand-rolling the same logic a fourth time:
   one round of work and returns the ids it promised are durable (classifying
   its own faults with `is_fault_fallout`, same as above), the sim restarts,
   and `verify` checks every id acked *so far* survived. A failure names the
-  round it broke on. **Pass it your own `sim`, not `sim.seed()`** — it restarts
+  round it broke on. A run where no round acked anything gives the universe
+  up by name, since no `verify` could have failed. **Pass it your own `sim`, not `sim.seed()`** — it restarts
   the world you give it, so `require: ["restart"]` over it fires, the excuse
   helpers below read the same world your workload ran in, and your universe's
   fault config actually applies. Until 2026-09-05 it took a seed and built its
@@ -2684,7 +2725,11 @@ for these before hand-rolling the same logic a fourth time:
   media corruption still lives on the follower. In a multi-node workload,
   ask `SimHost::durable_corruption_fired()` instead. It answers the same
   question for one host's disk, so a refusal on one node is excused only by
-  corruption that fired on that node, never by a fault on another.
+  corruption that fired on that node, never by a fault on another. A workload
+  that wipes a host's data (a re-seed) reads
+  `SimHost::durable_corruption_count()` and `dir_entry_loss_count()` at the
+  wipe, and excuses a later refusal only when the count has grown since: the
+  wipe deleted every byte an earlier fault touched.
 - `boot_through_fallout(sim: &Sim, tries: u32, is_fallout: impl Fn(&str) -> bool, boot: impl FnMut() -> Result<T, E>) -> Result<Option<T>, E>`
   — boots the way a supervised process does: `boot`, and on an error your
   `is_fallout` accepts, boot again, `tries` boots in all. Each retry marks
@@ -2694,7 +2739,9 @@ for these before hand-rolling the same logic a fourth time:
   first (`sim.restart_process()`, so the page cache survives); a retry after a
   crash power-cycles first (`sim.restart()`, when `Sim::disk_crashed` says the
   disk is gone). `Ok(Some(t))` is the first clean boot and `Err(e)` the first
-  error that is not fallout, unchanged. `Ok(None)` means every boot met
+  error that is not fallout, unchanged. A durable-horizon refusal is judged
+  before your `is_fallout` sees it, so no classifier of yours can excuse one
+  where no durable corruption fired. `Ok(None)` means every boot met
   fallout, and what it means is yours to say: a workload whose only node
   never came up gives up by name (`counter_survives` above), and a round
   restarts and moves on. The one `None` the helper names itself is a boot
@@ -2710,7 +2757,8 @@ for these before hand-rolling the same logic a fourth time:
   boot again, but the round it skipped is work the property never checks.
 - `durable_refusal(sim: &Sim, text: &str) -> Result<bool, String>` — the
   same rule for a loop that boots on its own, such as a final verification's
-  reopen loop: call it on each fallout before booting again. `Ok(false)`: not
+  reopen loop: call it on each failed boot's error before the fallout check,
+  since `is_fault_fallout` turns the refusal down. `Ok(false)`: not
   a durable refusal, carry on. `Ok(true)`: a refusal in a universe where
   durable corruption fired, already given up under its own name and marked
   `boot:durable-refusal`, so end the loop. `Err(..)`: a refusal where none
@@ -2971,9 +3019,14 @@ fn check_invariants(app: &App, acked: u64) -> Result<(), String> {
 /// seconds, each enqueueing a job; an hourly cron schedule ticks twice
 /// before the two-hour horizon; then the durable end-state is checked.
 fn whole_app(sim: &mut Sim) -> Result<(), String> {
+    // Each fault-fallout exit gives up: the universe checked nothing, and a
+    // pass needs a verdict ("Giving up" above).
     let app = match build_app(sim) {
         Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the app never booted: {e}"));
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
     };
 
@@ -2988,7 +3041,10 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
 
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(kernel) => kernel,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("Kernel::new hit fault fallout: {e}"));
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
     };
     // The same event loop `serve` runs in production. An `Err` here means
@@ -3016,8 +3072,12 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
         Ok(()) => Ok(()),
         // The oracle's own reads go through the same faulted disk (e.g. the
         // store can latch after an earlier injected write error): fallout
-        // ends the universe with nothing to assert; anything else is real.
-        Err(msg) if is_fault_fallout(&msg) => Ok(()),
+        // ends the universe with nothing asserted, a give-up; anything else is
+        // real.
+        Err(msg) if is_fault_fallout(&msg) => {
+            sim.give_up(format!("the invariant check hit fault fallout: {msg}"));
+            Ok(())
+        }
         Err(msg) => Err(msg),
     }
 }
@@ -3196,14 +3256,35 @@ That is also why every capped property floors its reach key: without one, the
 next change that costs it reach passes with every cap still met.
 
 At a pinned base both bounds are exact counts. At an ambient base, where the
-counts move batch to batch, both are margins over ten or more fresh batches: a
-give-up cap is twice the largest count, and a reach floor is the mean less
-four standard deviations, which flakes about once in thirty thousand batches if
-the counts are near normal, and fails any batch that falls further.
+counts move batch to batch, both are margins over ten or more fresh batches.
 
-So an ambient floor catches a collapse, not a drift. Kernel exactly-once's
-`job:done` spreads by about 4% of its mean (sd 19.1 on 485.2), so its floor
-sits about 16% below the mean. A fall half that size trips about one batch in
+An ambient give-up cap is the larger of two numbers:
+- twice the largest fresh-batch count;
+- the smallest k with P(Poisson(lambda) > k) < 1e-4, where
+  lambda = n x U(x) / N. Here n is the universes in one batch, N the universes
+  over all the fresh batches, and x the give-ups among them. U(x) is the exact
+  one-sided 95% Poisson upper bound for x: 2.996 for x = 0, 4.744 for 1, and
+  6.296 for 2.
+
+The second number matters where give-ups are rare. When no batch gave up,
+twice the largest count is 0, which one legitimately exhausted universe fails.
+When one batch gave up once, it is 2, which a healthy batch fails about once
+in eighty. Where counts are large the first number is the larger, and the
+second only confirms it.
+
+Two worked examples for the WAL fault matrix, whose 10 fresh batches of
+n = 512 make N = 5,120:
+- **x = 0**, as measured. lambda = 512 x 2.996 / 5,120 = 0.30. P(> 3) is
+  2.6e-4 and P(> 4) is 1.6e-5, so k = 4, and the cap is max(0, 4) = 4.
+- **x = 1**, as ten bases including 0x9E7C000A would have read: one batch gave
+  up once. lambda = 512 x 4.744 / 5,120 = 0.47. P(> 4) is 1.4e-4 and P(> 5) is
+  1.1e-5, so k = 5, and the cap is max(2, 5) = 5, not 2.
+
+An ambient reach floor is the mean less four standard deviations. That flakes
+about once in thirty thousand batches if the counts are near normal, and fails
+any batch that falls further. So an ambient floor catches a collapse, not a
+drift. Kernel exactly-once's `job:done` spreads by about 4% of its mean (sd
+19.1 on 485.2), so its floor sits about 16% below the mean. A fall half that size trips about one batch in
 forty, which a change can pass by luck. The before-and-after comparison above
 is the instrument that sees a move that small, so it runs whenever a change
 could move an ambient floor's rate, as it does for a cap, and not only when a
@@ -4005,6 +4086,20 @@ never recovered. What proves that follower a prefix of the primary's timeline is
 this handshake, not the wipe: the rebuild converged only once the primary
 accepted the follower's `Hello`. Wherever it cannot prove that, it leaves the
 refusal standing, and so should you.
+
+A role file torn by a crash refuses the boot by name, because a torn role cannot
+be told from a real one. If the node never finished its first boot, delete the
+`role` file and the node re-initializes from config. Otherwise a role flip tore
+it — a `promote`, either end of a `switchover`, or an aborted one — and the
+node's data is intact: delete the `role` file and restart the node configured
+as a follower of the writable primary if another node is serving as one, and
+as primary only if none is. Never restart it as primary beside a writable
+primary: after a promote nothing stops it becoming a second one, because the
+promote cleared the node's witness set before its flip. Restarting it as the role the
+flip was writing is not the same rule either: a node whose switchover tore at
+its first step, `handing-off`, never handed anything off, and restarted as
+`handing-off` it stays write-stopped. A restore from a replica works too, as a
+re-seed configured as above.
 
 ## 11. Realtime
 
@@ -6732,7 +6827,7 @@ consequences you may meet:
   table is scoped stops instead of misreading the key:
 
   ```text
-  record decode: table "Doc" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect carries scope 1 (tag 0x05/0x06) — the record was written for a scoped shape of this table; restore from a replica or backup, or replay under the schema that wrote it
+  record decode: table "Doc" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect carries scope 1 (tag 0x05/0x06) — the record was written for a scoped shape of this table; restore from a replica or backup, or replay under the schema that wrote it. For a follower, or a primary once a follower is promoted in its place, that is a re-seed: stop the node, delete its data dir, and restart it configured as a follower of the current primary so it snapshot-seeds from it, never with a primary config: the durable role file that outranks config is deleted with the data dir, so a cleared node started as a primary comes up as a second writable primary
   ```
 
   Note that the replication handshake's schema digest covers a table's fields

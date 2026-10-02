@@ -502,15 +502,17 @@ fn recover_and_check(
         Ok(pair) => pair,
         Err(e) => {
             let text = e.to_string();
+            // No restart clears a durable refusal, so neither a round's
+            // recovery nor the final one tries again (S5 re-review R-M2); and
+            // only a fired durable-corruption fault excuses one, so it is
+            // judged before the fallout check (S3b item 0).
+            if charpente_sim::checks::durable_refusal(sim, &text)? {
+                return Ok(Recovered::GaveUp);
+            }
             if !is_fault_fallout(&text) {
                 return Err(format!(
                     "store open or WAL recovery failed non-injected: {e}"
                 ));
-            }
-            // No restart clears a durable refusal, so neither a round's
-            // recovery nor the final one tries again (S5 re-review R-M2).
-            if charpente_sim::checks::durable_refusal(sim, &text)? {
-                return Ok(Recovered::GaveUp);
             }
             return Ok(Recovered::Fallout);
         }
@@ -742,7 +744,9 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
 /// review I1): it was 74 while round 0's check of an empty model, which
 /// cannot fail, still counted as a verdict. Re-measured 2026-10-01 for S5 with
 /// D1: 10 fresh batches gave up 28-50 times, mean 39.2, sd 6.9, so the cap is
-/// 100, 8.8 standard deviations above the mean.
+/// 100, 8.8 standard deviations above the mean. GUIDE §8's Poisson cap on
+/// those batches (x = 392 over N = 2,560, n = 256, lambda = 42.6) is 69, under
+/// 100 (2026-10-02).
 const TABLES_GAVE_UP_CEILING: u64 = 100;
 
 /// The reach floor, a margin like the cap (GUIDE §8): recoveries that checked

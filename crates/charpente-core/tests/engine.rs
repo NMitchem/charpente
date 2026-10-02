@@ -4358,3 +4358,129 @@ fn the_store_never_outruns_the_log_across_process_restarts_and_power_cycles() {
         ]
     );
 }
+
+/// The re-seed clause every "restore … from a replica or backup" text carries
+/// (DESIGN §5's re-seed rule; S3b R3-M1), typed out so a pin goes red if it
+/// drifts or goes missing.
+const RESTORE_IS_A_RESEED: &str = "For a follower, or a primary once a follower is promoted in \
+     its place, that is a re-seed: stop the node, delete its data dir, and restart it configured \
+     as a follower of the current primary so it snapshot-seeds from it, never with a primary \
+     config: the durable role file that outranks config is deleted with the data dir, so a \
+     cleared node started as a primary comes up as a second writable primary";
+
+/// A one-effect Put record for `table` under `tag` (`0x00` bare, `0x05`
+/// scoped), hand-encoded the way `scoped_put_record` above builds one.
+fn put_record(tag: u8, table: &str, scope: Option<u64>, row: &[u8]) -> Vec<u8> {
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(tag);
+    encode_len_prefixed(table.as_bytes(), &mut record);
+    if let Some(scope) = scope {
+        scope.encode(&mut record);
+    }
+    encode_len_prefixed(row, &mut record);
+    record
+}
+
+/// A shipped record written for the other scope shape of a table is refused
+/// by name in both directions (`resolve_effect_scope`), and the restore its
+/// text names carries the re-seed's config step: on a follower that restore
+/// is a re-seed, and a re-seeded node started with a primary config is a
+/// second writable primary (S3b R3-M1).
+#[test]
+fn a_record_written_for_the_other_scope_shape_names_the_restore_with_its_reseed_step() {
+    let sim = Sim::with_faults(0x53B0_0101, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Widget>(),
+    )
+    .unwrap();
+    let mut row = Vec::new();
+    Widget {
+        id: Id::from_raw(3),
+        n: 1,
+    }
+    .encode_row(&mut row);
+    let err = db
+        .apply_shipped(&[(0, put_record(5, Widget::TABLE, Some(7), &row))])
+        .expect_err("a scoped record for an unscoped table must be refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "record decode: table \"test.widget\" is not tenant-scoped (Row::Scope = Unscoped) \
+             but this Put effect carries scope 7 (tag 0x05/0x06) — the record was written for a \
+             scoped shape of this table; restore from a replica or backup, or replay under the \
+             schema that wrote it. {RESTORE_IS_A_RESEED}"
+        )
+    );
+
+    let sim = Sim::with_faults(0x53B0_0102, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let mut row = Vec::new();
+    Ticket {
+        id: Id::from_raw(3),
+        n: 1,
+    }
+    .encode_row(&mut row);
+    let err = db
+        .apply_shipped(&[(0, put_record(0, Ticket::TABLE, None, &row))])
+        .expect_err("an unscoped record for a scoped table must be refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "record decode: table \"test.ticket\" is tenant-scoped (Row::Scope != Unscoped) but \
+             this Put effect carries no scope (tag 0x00/0x01) — the record was written for an \
+             unscoped shape of this table; restore from a replica or backup, or replay under the \
+             schema that wrote it. {RESTORE_IS_A_RESEED}"
+        )
+    );
+}
+
+/// A frame corrupted on disk after it was acknowledged is refused at the
+/// shipper's read-back by name, never shipped, and the restore the text names
+/// carries the re-seed's config step (S3b R3-M1).
+#[test]
+fn a_frame_corrupted_after_its_ack_is_refused_at_read_back_naming_the_restore_with_its_reseed_step()
+{
+    let sim = Sim::with_faults(0x53B0_0103, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Widget>(),
+    )
+    .unwrap();
+    for i in 0..3u64 {
+        db.transact(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(i),
+                n: i as u32,
+            });
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    assert_eq!(db.read_log(0, usize::MAX).unwrap().len(), 3);
+    // Frame 0's header is 16 bytes ([seq u64][len u32][crc u32]); flip a
+    // payload byte so its CRC no longer matches.
+    let file = sim.disk().open("wal/00000000000000000000.log").unwrap();
+    let mut byte = [0u8; 1];
+    file.read_at(16, &mut byte).unwrap();
+    file.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+    let err = db
+        .read_log(0, usize::MAX)
+        .expect_err("a corrupted frame must never be shipped");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "log frame 0 failed verification while being read back for shipping — a corrupted \
+             frame must never be shipped; durable bytes below the acknowledged end are corrupt; \
+             restore this node from a replica or backup. {RESTORE_IS_A_RESEED} (DESIGN §2)"
+        )
+    );
+}

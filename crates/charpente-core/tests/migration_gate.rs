@@ -9,6 +9,15 @@ use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, s
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
+/// The re-seed clause every "restore … from a replica or backup" text carries
+/// (DESIGN §5's re-seed rule; S3b R3-M1), typed out so a pin goes red if it
+/// drifts or goes missing.
+const RESTORE_IS_A_RESEED: &str = "For a follower, or a primary once a follower is promoted in \
+     its place, that is a re-seed: stop the node, delete its data dir, and restart it configured \
+     as a follower of the current primary so it snapshot-seeds from it, never with a primary \
+     config: the durable role file that outranks config is deleted with the data dir, so a \
+     cleared node started as a primary comes up as a second writable primary";
+
 struct WidgetV1 {
     id: Id<WidgetV1>,
     count: u32,
@@ -527,9 +536,11 @@ fn no_adoption_row_refuses_a_foreign_tail_from_an_unversioned_binary() {
     .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "replaying a record for versioned table \"Widget\" with no adoption row on record — \
-         this log was not written by an adoption-aware binary, or is corrupt; restore from a \
-         replica or backup"
+        format!(
+            "replaying a record for versioned table \"Widget\" with no adoption row on record — \
+             this log was not written by an adoption-aware binary, or is corrupt; restore from a \
+             replica or backup. {RESTORE_IS_A_RESEED}"
+        )
     );
     assert!(
         Refusal::of(&err).is_some(),

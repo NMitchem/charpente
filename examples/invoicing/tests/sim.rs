@@ -14,14 +14,25 @@ use std::collections::{BTreeMap, BTreeSet};
 const SEC: u64 = 1_000_000_000;
 const DAY: u64 = 24 * 3600 * SEC;
 
+// Each fault-injected property requires the key its verdict marks, past every
+// give-up arm: `sim_tests!` takes no `ceiling:`, so an arm that swallowed every
+// universe would otherwise pass with exit 0 (S3b review I1).
 charpente_sim::sim_tests! {
-    acked_writes_survive_restart require ["restart"],
+    acked_writes_survive_restart require [
+        "restart",
+        "invoicing:acked-customer-verified",
+        "invoicing:acked-invoice-verified",
+        "invoicing:acked-finalize-verified",
+    ],
     app_replays_deterministically,
-    receipts_exactly_once require ["kernel:served"],
+    receipts_exactly_once require ["kernel:served", "invoicing:receipts-checked"],
     overdue_reminders_over_months require ["reminder:sent"],
     illegal_transitions_are_rejected,
     events_feed_resumes_across_restart,
-    api_key_authorizes_then_revoked_is_rejected,
+    api_key_authorizes_then_revoked_is_rejected require [
+        "auth:key-authorizes",
+        "auth:revoked-key-rejected",
+    ],
 }
 
 fn build(sim: &Sim) -> std::io::Result<App> {
@@ -31,6 +42,16 @@ fn build(sim: &Sim) -> std::io::Result<App> {
 /// How many boots the app gets, each failed boot followed by a restart, as a
 /// supervised process restarts (`checks::boot_through_fallout`).
 const BOOT_TRIES: u32 = 8;
+
+/// Ends a universe that adjudicated nothing: gives it up under `reason`, and
+/// marks `key`, the arm's name, because the harness reports a give-up's count
+/// but not its text (charpente-cli's tests read the key). Every fault-fallout
+/// exit of a property below comes through here: a pass needs a verdict.
+fn gave_up(sim: &Sim, key: &'static str, reason: String) -> Result<(), String> {
+    sim.cover(key);
+    sim.give_up(reason);
+    Ok(())
+}
 
 /// Runs a login-only phase against `kernel` and returns the bearer token
 /// from the recorded response — GUIDE §8's "script a login phase, read the
@@ -82,7 +103,13 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:kernel-new",
+                format!("Kernel::new hit fault fallout: {e}"),
+            );
+        }
         Err(e) => return Err(e.to_string()),
     };
     let token = login(&mut kernel, sim)?.unwrap_or_default();
@@ -137,9 +164,22 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     };
     let snap = match app.db().snapshot() {
         Ok(s) => s,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:reopen-snapshot",
+                format!("the snapshot after the restart hit fault fallout: {e}"),
+            );
+        }
         Err(e) => return Err(e.to_string()),
     };
+    if !(customer_acked || invoice_acked || finalize_acked) {
+        return gave_up(
+            sim,
+            "invoicing:gave-up:nothing-acked",
+            "no write was acknowledged, so there was no durability claim to check".to_string(),
+        );
+    }
 
     // Acked-but-lost is excused ONLY when the harness actually injected
     // durable corruption in this universe (`bit_flip`/`misdirected_write`
@@ -152,7 +192,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     let corrupted = charpente_sim::checks::durable_corruption_fired(sim);
     if customer_acked {
         match snap.get::<Customer>(Id::from_raw(1)) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => sim.cover("invoicing:acked-customer-verified"),
             Ok(None) if corrupted => {
                 sim.cover("invoicing:acked-customer-cut");
                 sim.give_up(
@@ -161,13 +201,19 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 return Ok(());
             }
             Ok(None) => return Err("acked customer 1 missing after restart".to_string()),
-            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                return gave_up(
+                    sim,
+                    "invoicing:gave-up:customer-read",
+                    format!("reading customer 1 back hit fault fallout: {e}"),
+                );
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
     if invoice_acked {
         match snap.get::<Invoice>(Id::from_raw(1)) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => sim.cover("invoicing:acked-invoice-verified"),
             Ok(None) if corrupted => {
                 sim.cover("invoicing:acked-invoice-cut");
                 sim.give_up(
@@ -176,14 +222,23 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 return Ok(());
             }
             Ok(None) => return Err("acked invoice 1 missing after restart".to_string()),
-            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                return gave_up(
+                    sim,
+                    "invoicing:gave-up:invoice-read",
+                    format!("reading invoice 1 back hit fault fallout: {e}"),
+                );
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
     if finalize_acked {
         match snap.get::<Invoice>(Id::from_raw(1)) {
             Ok(Some(inv))
-                if inv.state == InvoiceState::Final || inv.state == InvoiceState::Paid => {}
+                if inv.state == InvoiceState::Final || inv.state == InvoiceState::Paid =>
+            {
+                sim.cover("invoicing:acked-finalize-verified");
+            }
             Ok(Some(_)) | Ok(None) if corrupted => {
                 sim.cover("invoicing:acked-finalize-cut");
                 sim.give_up(
@@ -201,7 +256,13 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
             Ok(None) => {
                 return Err("acked finalize but invoice 1 missing after restart".to_string());
             }
-            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                return gave_up(
+                    sim,
+                    "invoicing:gave-up:finalize-read",
+                    format!("reading invoice 1's state back hit fault fallout: {e}"),
+                );
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -214,6 +275,12 @@ fn app_replays_deterministically(sim: &mut Sim) -> Result<(), String> {
     replays_identically(sim.seed(), scripted_flow)
 }
 
+/// `replays_identically` compares both worlds' durable state as well as the
+/// statuses returned, so a run whose boot or `Kernel::new` met fault fallout
+/// still reaches a verdict: two worlds that faulted identically must hold
+/// identical bytes. Its two `Ok(vec![])` exits are that verdict, not a skip.
+/// A give-up here would land on `replays_identically`'s private worlds, which
+/// the harness never reads.
 fn scripted_flow(sim: &mut Sim) -> Result<Vec<u16>, String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
         .map_err(|e| e.to_string())?
@@ -275,7 +342,13 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:kernel-new",
+                format!("Kernel::new hit fault fallout: {e}"),
+            );
+        }
         Err(e) => return Err(e.to_string()),
     };
     let token = login(&mut kernel, sim)?.unwrap_or_default();
@@ -335,13 +408,28 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
 
     let app = kernel.into_app();
     match check_receipts(&app, finalize_acked) {
-        Ok(()) => Ok(()),
-        Err(msg) if is_fault_fallout(&msg) => Ok(()),
+        Ok(true) => {
+            sim.cover("invoicing:receipts-checked");
+            Ok(())
+        }
+        Ok(false) => gave_up(
+            sim,
+            "invoicing:gave-up:nothing-to-count",
+            "no finalize acked and no receipt job or row exists, so exactly-once counted nothing"
+                .to_string(),
+        ),
+        Err(msg) if is_fault_fallout(&msg) => gave_up(
+            sim,
+            "invoicing:gave-up:receipts-read",
+            format!("reading the receipts back hit fault fallout: {msg}"),
+        ),
         Err(msg) => Err(msg),
     }
 }
 
-fn check_receipts(app: &App, finalize_acked: u64) -> Result<(), String> {
+/// `Ok(false)` when there was nothing to count: no finalize acked, and no
+/// `SendReceipt` job or `Receipt` row in the store.
+fn check_receipts(app: &App, finalize_acked: u64) -> Result<bool, String> {
     let snap = app.db().snapshot().map_err(|e| e.to_string())?;
 
     let mut done_by_invoice: BTreeMap<u64, u64> = BTreeMap::new();
@@ -392,7 +480,7 @@ fn check_receipts(app: &App, finalize_acked: u64) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(finalize_acked > 0 || durable_send_receipt_jobs > 0 || !receipts_by_invoice.is_empty())
 }
 
 // ---- 4. overdue-reminder behavior over simulated months --------------------
@@ -406,7 +494,13 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:kernel-new",
+                format!("Kernel::new hit fault fallout: {e}"),
+            );
+        }
         Err(e) => return Err(e.to_string()),
     };
     let token = login(&mut kernel, sim)?.unwrap_or_default();
@@ -454,13 +548,22 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
 
     let app = kernel.into_app();
     match check_reminders(&app) {
-        Ok(any_fired) => {
-            if any_fired {
-                sim.cover("reminder:sent");
-            }
+        Ok(true) => {
+            sim.cover("reminder:sent");
             Ok(())
         }
-        Err(msg) if is_fault_fallout(&msg) => Ok(()),
+        // The checks run per reminder (none duplicated, none before its due
+        // day), so with none fired there was nothing to check.
+        Ok(false) => gave_up(
+            sim,
+            "invoicing:gave-up:no-reminder",
+            "no reminder fired, so no reminder was checked".to_string(),
+        ),
+        Err(msg) if is_fault_fallout(&msg) => gave_up(
+            sim,
+            "invoicing:gave-up:reminders-read",
+            format!("reading the reminders back hit fault fallout: {msg}"),
+        ),
         Err(msg) => Err(msg),
     }
 }
@@ -752,9 +855,15 @@ fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
 /// fault-free `Sim`, unlike `illegal_transitions_are_rejected` /
 /// `events_feed_resumes_across_restart`), so every step follows the other
 /// fault-injected workloads' discipline: an unclean ack is fault fallout,
-/// not a failure, EXCEPT the final read — once the revoke itself acked 200
-/// (durably committed, per the platform's ack-after-durable rule), a 200 on
-/// the next read with the same key is a real bug, not fallout.
+/// not a failure, except where no fault produces the answer.
+/// - Once the revoke itself acked 200 (durably committed, per the platform's
+///   ack-after-durable rule), a 200 on the next read with the same key is a
+///   real bug.
+/// - An IO error answers 500 with its own text. So at the minted key's first
+///   read, any status but 200 fails unless it is a 5xx whose body is fault
+///   fallout; at the revoked key's read, any status but 200 or 401 does the
+///   same (S3b review I1). No answer at all is fallout: a fault stopped the
+///   kernel first.
 fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
         .map_err(|e| e.to_string())?
@@ -764,7 +873,13 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:kernel-new",
+                format!("Kernel::new hit fault fallout: {e}"),
+            );
+        }
         Err(e) => return Err(e.to_string()),
     };
     let token = login(&mut kernel, sim)?.unwrap_or_default();
@@ -782,7 +897,11 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         return Err(e.to_string());
     }
     let Some(200) = statuses_of(&source)?.first().copied() else {
-        return Ok(()); // mint didn't cleanly ack — fault fallout
+        return gave_up(
+            sim,
+            "invoicing:gave-up:mint-unacked",
+            "the key mint never acked, so there was no key to check".to_string(),
+        );
     };
     let raw_key: String = {
         let responses = source.responses();
@@ -804,9 +923,48 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     {
         return Err(e.to_string());
     }
-    let Some(200) = statuses_of(&source)?.first().copied() else {
-        return Ok(()); // the authorizing read didn't cleanly ack — fault fallout
-    };
+    let first = source
+        .responses()
+        .lock()
+        .map_err(|_| "responses lock poisoned".to_string())?
+        .first()
+        .cloned();
+    match first {
+        Some((200, _)) => {}
+        // No answer, or a 5xx whose body is fault fallout (an IO error answers
+        // 500 with its own text): a fault stopped the read, and nothing about
+        // the key was checked.
+        None => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:authorize-unacked",
+                "the read under the fresh key got no answer, so revocation had nothing to undo"
+                    .to_string(),
+            );
+        }
+        Some((status, body))
+            if (500..=599).contains(&status)
+                && is_fault_fallout(&String::from_utf8_lossy(&body)) =>
+        {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:authorize-unacked",
+                format!(
+                    "the read under the fresh key answered {status} on fault fallout, so \
+                     revocation had nothing to undo"
+                ),
+            );
+        }
+        // Any other answer comes from no fault: the key was minted on this same
+        // running node and its mint acked 200 (S3b review I1).
+        Some((status, body)) => {
+            return Err(format!(
+                "a key minted on this running node answered {status} to its first authed \
+                 read, which no injected fault produces: {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+    }
     sim.cover("auth:key-authorizes");
 
     // Look up the minted key's row to get its id for the revoke route —
@@ -814,15 +972,34 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     let key_hash = hash_token(&raw_key);
     let snap = match kernel.app().db().snapshot() {
         Ok(s) => s,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:key-snapshot",
+                format!("the snapshot to find the key's row hit fault fallout: {e}"),
+            );
+        }
         Err(e) => return Err(e.to_string()),
     };
     let key_id = match ApiKey::by_key_hash(&snap, &key_hash) {
         Ok(rows) => match rows.into_iter().next() {
             Some(row) => row.id,
-            None => return Ok(()), // row not durable yet — fault fallout
+            // The mint acked 200, and an ack follows durability, on this same
+            // running node: its row must be here.
+            None => {
+                return Err(
+                    "the key mint acked 200 but the running node holds no row for its hash"
+                        .to_string(),
+                );
+            }
         },
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:key-lookup",
+                format!("looking the key's row up hit fault fallout: {e}"),
+            );
+        }
         Err(e) => return Err(e.to_string()),
     };
     drop(snap);
@@ -840,7 +1017,11 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         return Err(e.to_string());
     }
     let Some(200) = statuses_of(&source)?.first().copied() else {
-        return Ok(()); // revoke didn't cleanly ack — fault fallout
+        return gave_up(
+            sim,
+            "invoicing:gave-up:revoke-unacked",
+            "the revoke never acked, so there was no revocation to check".to_string(),
+        );
     };
 
     // The revoked key is now rejected — the named 401, byte-exact (copied
@@ -862,7 +1043,14 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             .map_err(|_| "responses lock poisoned".to_string())?;
         match responses.first() {
             Some((status, body)) => (*status, body.clone()),
-            None => return Ok(()), // no response recorded — fault fallout
+            None => {
+                return gave_up(
+                    sim,
+                    "invoicing:gave-up:no-final-response",
+                    "the read under the revoked key got no response, so nothing was checked"
+                        .to_string(),
+                );
+            }
         }
     };
     const UNRECOGNIZED: &str =
@@ -885,11 +1073,28 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
                     err.error
                 ));
             }
+            sim.cover("auth:revoked-key-rejected");
             Ok(())
         }
-        // Any other status (e.g. 500 from a fault mid-ladder-resolution) is
-        // fault fallout, not a bug: the revoke's own 200 ack already proved
-        // the delete committed.
-        _ => Ok(()),
+        // A 5xx whose body is fault fallout (a fault mid-ladder-resolution)
+        // checked nothing about the revoked key. Any other answer comes from
+        // no fault (an IO error answers 500 with its own text).
+        other
+            if (500..=599).contains(&other)
+                && is_fault_fallout(&String::from_utf8_lossy(&body)) =>
+        {
+            gave_up(
+                sim,
+                "invoicing:gave-up:final-status",
+                format!(
+                    "the read under the revoked key answered {other} on fault fallout, so \
+                     nothing was checked"
+                ),
+            )
+        }
+        other => Err(format!(
+            "the revoked key's read answered {other}, which no injected fault produces: {}",
+            String::from_utf8_lossy(&body)
+        )),
     }
 }

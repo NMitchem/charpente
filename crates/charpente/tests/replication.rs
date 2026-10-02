@@ -389,7 +389,11 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
             // §4's compacted-log refusal ("cannot be rebuilt from the log alone")
             // now carries only redb's verdict on the store's bytes, never an
             // injected cause, so reaching it is a failure — under redb 4.3.0 the
-            // crash model cannot brick the store.
+            // crash model cannot brick the store. So is the durable-horizon
+            // refusal (S3b item 0): every property that recovers through here
+            // turns both durable-corruption axes off (`no_media_corruption`),
+            // so no fault on this node's disk can explain it, and
+            // `is_fault_fallout` no longer excuses it by its text.
             Err(e) if is_fault_fallout(&e) => last = e, // open faulted; retry, cycling periodically
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
@@ -5260,6 +5264,26 @@ struct KNode {
     ///   round's crash settles the write, and the wipe deletes it (D3 re-review
     ///   m6).
     corrupted_by_rig: bool,
+    /// `host`'s durable-corruption and entry-loss counts at its last data-dir
+    /// wipe (`reseed_p`), zero until one. The wipe deletes every byte an
+    /// earlier fault touched, so only a fault since then explains a refusal of
+    /// this node (S3b item 8, D3 re-review m7): `corruption_since_wipe`,
+    /// `entry_loss_since_wipe`.
+    corruption_at_wipe: u64,
+    entry_loss_at_wipe: u64,
+}
+
+impl KNode {
+    /// Durable corruption (`bit_flip`, `misdirected_write`) fired on this
+    /// node's own disk since its last wipe.
+    fn corruption_since_wipe(&self) -> bool {
+        self.host.durable_corruption_count() > self.corruption_at_wipe
+    }
+
+    /// Entry loss fired on this node's own disk since its last wipe.
+    fn entry_loss_since_wipe(&self) -> bool {
+        self.host.dir_entry_loss_count() > self.entry_loss_at_wipe
+    }
 }
 
 /// Build the App + Repl + Kernel for one host, with the same torn-role
@@ -5409,9 +5433,28 @@ fn spawn_kernel_node_with_schema(
                     flipped: false,
                     recoverable,
                     corrupted_by_rig: false,
+                    corruption_at_wipe: 0,
+                    entry_loss_at_wipe: 0,
                 });
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            // A refusal for durable corruption at or below the horizon is
+            // fallout only where that corruption fired on this host's own
+            // disk (S3b item 0's rule), and then no power-cycle clears the
+            // bytes, so the spawn gives up at once. Unexplained, it falls to
+            // the failure arm below. Item 0 missed this loop: it went from
+            // retrying 500 power-cycles into `spawn-exhausted` to failing,
+            // 187 universes over 192 fresh bases (S3b item 8's sweep).
+            Err(e)
+                if matches!(classify(&e), FaultReason::DurableHorizon)
+                    && h.durable_corruption_fired() =>
+            {
+                sim.cover("repl:inconclusive:spawn-durable-refusal");
+                return Err(format!(
+                    "{INCONCLUSIVE}: {host} kernel spawn refused for durable corruption that \
+                     fired on {host}'s disk, which no power-cycle clears: {e}"
+                ));
+            }
             // Power-cycle on EVERY attempt here, deliberately — the opposite of
             // `recover_node`/`reopen_p_frames`'s gated shape, and MEASURED
             // rather than assumed (oracle-density task 3, fix round 1).
@@ -5503,8 +5546,11 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             // leaves a durable gap, so this restore excuse is legitimate only
             // when entry loss could have caused the gap. A gap in a universe
             // where the axis never fired is a platform regression — it falls
-            // through to the loud bug arm below, not this mask.
-            Err(e) if e.contains("refusing to guess") && dir_entry_loss_fired(sim) => {
+            // through to the loud bug arm below, not this mask. Asked of this
+            // node's own disk since its last wipe (S3b item 8): entry loss on
+            // another node, or before a wipe that deleted the gapped
+            // directory, cannot have caused this gap.
+            Err(e) if e.contains("refusing to guess") && node.entry_loss_since_wipe() => {
                 return Err(format!(
                     "{RESTORE_NEEDED}: {} log directory gapped by entry loss",
                     node.name
@@ -6158,6 +6204,10 @@ fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
     wiped?;
     // The wipe deleted every byte the rig ever corrupted.
     p.corrupted_by_rig = false;
+    // And every byte an earlier sim fault touched: only a fault since then
+    // explains a refusal of the re-seeded p.
+    p.corruption_at_wipe = p.host.durable_corruption_count();
+    p.entry_loss_at_wipe = p.host.dir_entry_loss_count();
     p.repl_cfg = follower_cfg("p:1", "f:1");
     p.flipped = true;
     p.recoveries += 1;
@@ -6365,12 +6415,15 @@ fn route_promise_scan(
 /// - **"corrupted below the horizon"** is explained by durable corruption on
 ///   that node, from any of the three byte-level faults in the property's
 ///   fault model: a `bit_flip` or `misdirected_write`
-///   (`SimHost::durable_corruption_fired`), or the rig's forced CRC flip this
+///   (`KNode::corruption_since_wipe`), or the rig's forced CRC flip this
 ///   round (`KNode::corrupted_by_rig`). Seed `0x78f5713c6b6cd7cd` pins a
 ///   refusal that only the rig's flip explains: it landed on a sacrificial
 ///   frame the checkpoint had already covered.
 /// - **"log directory gapped by entry loss"** is explained by entry loss on
-///   that node: `SimHost::dir_entry_loss_fired`.
+///   that node: `KNode::entry_loss_since_wipe`.
+///
+/// Each counts only faults since the node's last re-seed wipe, which deleted
+/// every byte an earlier fault touched (S3b item 8, D3 re-review m7).
 ///
 /// The universe-wide checkers will not do: this property faults `p` on most
 /// rounds, so they would excuse a refusal of one node on the strength of a
@@ -6385,23 +6438,20 @@ fn unexplained_restore_needed(node: &KNode, e: &str) -> Option<String> {
     );
     let (explained, fault) = if e.contains("corrupted below the horizon") {
         (
-            node.host.durable_corruption_fired() || node.corrupted_by_rig,
+            node.corruption_since_wipe() || node.corrupted_by_rig,
             "durable corruption (bit_flip, misdirected_write, or the rig's own \
              corrupt_last_wal_frame)",
         )
     } else if e.contains("log directory gapped by entry loss") {
-        (
-            node.host.dir_entry_loss_fired(),
-            "entry loss (dir_entry_loss)",
-        )
+        (node.entry_loss_since_wipe(), "entry loss (dir_entry_loss)")
     } else {
         (false, "known fault")
     };
     (!explained).then(|| {
         format!(
-            "{e}, but no {fault} fired on {}'s disk: a restore-needed refusal that nothing \
-             injected on that node explains is a platform durability bug (DESIGN §2), not \
-             fallout",
+            "{e}, but no {fault} fired on {}'s disk since its last re-seed wipe, if any: a \
+             restore-needed refusal that nothing injected on that node explains is a \
+             platform durability bug (DESIGN §2), not fallout",
             node.name
         )
     })
@@ -7212,6 +7262,76 @@ fn replay_above_horizon(seed: u64) -> (Sim, Result<(), String>) {
     (sim, r)
 }
 
+/// S3b item 8's sweep found the kernel spawn loop still excusing nothing for
+/// a refusal below the horizon. Item 0 had taken that refusal out of
+/// `is_fault_fallout`, so 187 universes over 192 fresh bases went from 500
+/// futile power-cycles into `spawn-exhausted` to failing the property.
+/// - **Seed `0x14c38063db535c63`** (base `0x51D31101`): `p`'s spawn is refused
+///   for corruption that fired on `p`'s own disk. It gives up at once, under
+///   `repl:inconclusive:spawn-durable-refusal`.
+/// - **The twin, built by hand:** a bit flip fires on `f` only, and `p`'s own
+///   frame 1 is corrupted by the test. `p`'s spawn is refused the same way,
+///   but nothing fired on `p` explains it, so it fails by name.
+#[test]
+fn a_spawn_refused_below_the_horizon_gives_up_only_for_corruption_on_its_own_disk() {
+    let (sim, r) = replay_above_horizon(0x14c3_8063_db53_5c63);
+    assert_eq!(r, Ok(()), "the universe gives up, it does not fail");
+    let reason = sim.gave_up().expect("the universe gives up");
+    assert!(
+        reason.contains("p kernel spawn refused for durable corruption that fired on p's disk")
+            && reason.contains("durable horizon"),
+        "for this reason, or the seed no longer names the scenario: {reason}"
+    );
+    assert_eq!(
+        sim.coverage()
+            .get("repl:inconclusive:spawn-durable-refusal")
+            .copied(),
+        Some(1),
+        "under the spawn's own key"
+    );
+
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (p, f) = sacrificial_pair(&sim);
+    f.host.restart();
+    sim.quiesce_disk_faults();
+    assert!(
+        f.host.durable_corruption_fired() && !p.host.durable_corruption_fired(),
+        "a bit flipped on f's disk, none on p's"
+    );
+    let disk = p.host.disk();
+    let mut segments = disk.list("wal/").expect("p has a WAL");
+    segments.sort();
+    let file = disk
+        .open(segments.first().expect("p has a WAL segment"))
+        .expect("the segment opens");
+    let mut crc = [0u8; 1];
+    file.read_at(12, &mut crc).expect("frame 1's header reads");
+    crc[0] ^= 0xff;
+    file.write_at(12, &crc).expect("frame 1's CRC is rewritten");
+    file.sync().expect("and made durable");
+    drop(p);
+    let refused = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        horizon_db_cfg(),
+        200 * SEC_NANOS,
+        true,
+    )
+    .err()
+    .expect("p's spawn over its corrupted frame is refused");
+    assert!(
+        refused.starts_with("p: App::open: log frame") && refused.contains("durable horizon"),
+        "nothing fired on p explains the refusal, so it fails by name; got: {refused}"
+    );
+}
+
 /// D3 round 4 (review I2), seed `0x9827a4c2014d41d4`, found by the review
 /// over its own fresh bases. A restore re-seeds `p` from `f`, and before the
 /// re-seed converges `p` is refused as diverged behind again. That is the
@@ -7504,6 +7624,125 @@ fn a_restore_needed_refusal_of_p_with_a_fault_on_p_restores_it() {
     );
 }
 
+/// S3b item 8 (D3 re-review m7). A re-seed wipe deletes every byte an earlier
+/// fault touched, so a refusal of the re-seeded `p` is explained only by a
+/// fault since that wipe. Here a real bit flip on `p` is answered by the
+/// restore, as in the twin above, which re-seeds `p` through `reseed_p`.
+/// Afterwards `p`'s lifetime marker still reads true, and the same refusal,
+/// with nothing fired since the wipe, fails by name. Until item 8 the lifetime
+/// marker explained it. In a second world a flip after the baseline does
+/// explain it. In a third, entry loss on `p` before its re-seed explains no
+/// later gap of the re-seeded `p`.
+#[test]
+fn a_fault_before_a_re_seed_wipe_explains_no_later_refusal_of_that_node() {
+    let refusal = format!("{RESTORE_NEEDED}: p corrupted below the horizon");
+    let flips = FaultConfig {
+        bit_flip: 1.0,
+        ..FaultConfig::none()
+    };
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, flips.clone());
+    let (mut p, mut f) = sacrificial_pair(&sim);
+    let refused = recover_kernel_node(&sim, &mut p).expect_err("p's reopen is refused");
+    assert_eq!(
+        refused, refusal,
+        "as in the twin, or this pin reaches nothing"
+    );
+    sim.quiesce_disk_faults(); // the restore, and everything after, runs fault-free
+    route_p_error(&sim, &mut p, &mut f, Err(refused)).expect("p is restored from f");
+    assert!(
+        p.host.durable_corruption_fired() && !p.corrupted_by_rig,
+        "p's disk took a flip before its wipe, and the rig touched nothing"
+    );
+    let failure = unexplained_restore_needed(&p, &refusal)
+        .expect("a fault before the wipe explains nothing after it");
+    assert!(
+        failure.contains("fired on p's disk since its last re-seed wipe"),
+        "{failure}"
+    );
+
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, flips);
+    let (mut p, _f) = sacrificial_pair(&sim);
+    p.host.restart();
+    p.corruption_at_wipe = p.host.durable_corruption_count(); // as `reseed_p` does
+    assert!(
+        p.corruption_at_wipe > 0 && unexplained_restore_needed(&p, &refusal).is_some(),
+        "a flip before the baseline explains nothing"
+    );
+    p.host.restart();
+    assert!(
+        p.corruption_since_wipe() && unexplained_restore_needed(&p, &refusal).is_none(),
+        "a flip since the baseline explains the refusal"
+    );
+
+    let gapped = format!("{RESTORE_NEEDED}: p log directory gapped by entry loss");
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            dir_entry_loss: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (mut p, mut f) = sacrificial_pair(&sim);
+    p.host
+        .disk()
+        .open("wal/unsynced")
+        .expect("p creates a file whose directory entry is never synced");
+    p.host.restart();
+    assert!(
+        p.host.dir_entry_loss_fired() && unexplained_restore_needed(&p, &gapped).is_none(),
+        "entry loss fired on p, so a gap of p is explained before any wipe"
+    );
+    sim.quiesce_disk_faults();
+    restore_p_from_survivor(&sim, &mut p, &mut f).expect("p is re-seeded from f");
+    let failure = unexplained_restore_needed(&p, &gapped)
+        .expect("entry loss before the wipe explains no gap after it");
+    assert!(
+        failure.contains("no entry loss (dir_entry_loss) fired on p's disk since its last"),
+        "{failure}"
+    );
+}
+
+/// S3b item 8. `recover_kernel_node` excuses a gapped log directory only by
+/// entry loss on the recovered node's own disk since its last wipe. Here a
+/// middle segment of `p`'s WAL is deleted by hand, so nothing injected explains the gap,
+/// while entry loss fires on a bystander, so the universe counts as having lost
+/// an entry. The recovery fails, naming the gap, instead of answering
+/// RESTORE_NEEDED. Until item 8 the arm asked the universe-wide
+/// `checks::dir_entry_loss_fired`, and it would have answered RESTORE_NEEDED
+/// here.
+#[test]
+fn a_gap_on_one_node_is_not_excused_by_entry_loss_on_another() {
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            dir_entry_loss: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (mut p, _f) = sacrificial_pair(&sim);
+    let disk = p.host.disk();
+    let mut segments = disk.list("wal/").expect("p has a WAL");
+    segments.sort();
+    assert!(
+        segments.len() >= 3,
+        "p holds a segment between two others, or this pin cannot gap it: {segments:?}"
+    );
+    disk.remove(&segments[1])
+        .expect("a middle segment of p's log is removed");
+    disk.sync_dir("wal/").expect("and the removal made durable");
+    fault_a_bystander(&sim);
+    sim.quiesce_disk_faults();
+    assert!(
+        dir_entry_loss_fired(&sim) && !p.host.dir_entry_loss_fired(),
+        "the universe lost an entry, p did not"
+    );
+    let refused = recover_kernel_node(&sim, &mut p).expect_err("p's gapped log is refused");
+    assert!(
+        refused.starts_with("recover p: ") && refused.contains("refusing to guess"),
+        "a gap nothing on p explains fails by name; got: {refused}"
+    );
+}
+
 /// D3 round 5 (round 3's concern 1). A gapped log directory is explained only
 /// by entry loss on that node's own disk, and a below-horizon refusal only by
 /// durable corruption there. The survivor's promise scan holds both: each
@@ -7639,7 +7878,8 @@ fn route_p_error_returns_an_unrecognised_error_unchanged() {
 ///   - every wipe step is `?`-propagated into a wipe loop whose only `Ok` is
 ///     a whole, synced wipe;
 ///   - a non-empty reopen is checked, and fails by name rather than giving up;
-///   - the wipe clears `corrupted_by_rig`;
+///   - the wipe clears `corrupted_by_rig` and baselines `p`'s fault counts
+///     (S3b item 8);
 ///   - the convergence is bound and handed whole to `route_reseed_convergence`.
 ///
 /// `route_p_error` itself is not read here.
@@ -7851,6 +8091,19 @@ fn above_horizon_universe_routes_every_error_of_p() {
                 .matches("\nwiped?;\np.corrupted_by_rig = false;")
                 .count(),
             1,
+        ),
+        (
+            "the re-seed's wipe baselines p's own fault counts, right after it",
+            reseed.matches("_at_wipe = ").count(),
+            reseed
+                .matches(
+                    "p.corrupted_by_rig = false;\n\
+                     p.corruption_at_wipe = p.host.durable_corruption_count();\n\
+                     p.entry_loss_at_wipe = p.host.dir_entry_loss_count();",
+                )
+                .count()
+                * 2,
+            2,
         ),
         (
             "sacrificial_cut's skip is gated on p having rebooted",
@@ -10259,4 +10512,501 @@ fn a_write_gate_opening_over_foreign_pending_jobs_is_a_refusal() {
         "the raw error's own text must still be the named foreign-shape refusal, not just any \
          Refusal: {err}"
     );
+}
+
+// ------------------------------- a torn role file, restarted as its text says
+
+/// A role disk whose `role` file fails its next `sync` while armed: the
+/// failed flip a torn role file comes from. The flip's write is in the page
+/// cache, the flip returns `Err` and the node stops, and a crash can then tear
+/// what it wrote.
+struct FailRoleSync {
+    inner: charpente_sim::SimDisk,
+    arm: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct FailRoleSyncFile {
+    inner: Box<dyn File>,
+    arm: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Disk for FailRoleSync {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        Ok(Box::new(FailRoleSyncFile {
+            inner: self.inner.open(path)?,
+            arm: (path == "role").then(|| Arc::clone(&self.arm)),
+        }))
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+impl File for FailRoleSyncFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn sync(&self) -> io::Result<()> {
+        if self
+            .arm
+            .as_ref()
+            .is_some_and(|a| a.swap(false, Ordering::SeqCst))
+        {
+            return Err(io::Error::other("injected fsync failure"));
+        }
+        self.inner.sync()
+    }
+}
+
+/// A node on a fresh host whose role disk fails a `role` sync when `arm` is set.
+fn node_failing_role_syncs(
+    sim: &Sim,
+    name: &str,
+    cfg: ReplConfig,
+    arm: &Arc<std::sync::atomic::AtomicBool>,
+) -> Node {
+    let h = sim.host(name);
+    let mut db = Db::open(Box::new(h.disk()), DbConfig::default(), make_schema()).unwrap();
+    let role_disk = FailRoleSync {
+        inner: h.disk(),
+        arm: Arc::clone(arm),
+    };
+    let (repl, _) =
+        Repl::open(Box::new(h.net()), Box::new(role_disk), cfg.clone(), &mut db).unwrap();
+    Node {
+        host: h,
+        db: Some(db),
+        repl,
+        clock: sim.clock(),
+        name: name.to_string(),
+        repl_cfg: cfg,
+        db_cfg: DbConfig::default(),
+        schema: make_schema(),
+        recoveries: 0,
+        carried_seeds: 0,
+        flipped: true,
+    }
+}
+
+/// `scheduler_round` for a fault-free world, except that a node whose step
+/// fails stops (its process died) and the round names it, instead of being
+/// recovered: a failed flip is the state under test.
+fn round_stopping_on_error(sim: &Sim, nodes: &mut [&mut Node]) -> Option<String> {
+    let now = sim.now().as_nanos();
+    for node in nodes.iter_mut().filter(|n| n.db.is_some()) {
+        node.repl.pump_io(now);
+    }
+    let mut worked = false;
+    for node in nodes.iter_mut() {
+        let Some(db) = node.db.as_mut() else { continue };
+        if !node.repl.has_work(db, now) {
+            continue;
+        }
+        worked = true;
+        if let Err(e) = node.repl.step(db, &node.clock) {
+            node.db = None;
+            return Some(format!("{}: {e}", node.name));
+        }
+        if node.repl.db_needs_reseed() {
+            let db = node.db.take().expect("db present before reseed");
+            node.db = Some(node.repl.run_seed(db, &node.clock).unwrap());
+        }
+    }
+    if !worked {
+        let mut next = sim.next_wakeup();
+        for node in nodes.iter().filter(|n| n.db.is_some()) {
+            if let Some(d) = node.repl.next_deadline(now)
+                && d > now
+            {
+                next = Some(next.map_or(d, |x| x.min(d)));
+            }
+        }
+        if let Some(t) = next.filter(|&t| t > now) {
+            sim.clock().sleep(Duration::from_nanos(t - now));
+        }
+    }
+    None
+}
+
+/// Up to `k` rounds; the first node that stops, named.
+fn rounds_stopping_on_error(sim: &Sim, nodes: &mut [&mut Node], k: u32) -> Option<String> {
+    (0..k).find_map(|_| round_stopping_on_error(sim, nodes))
+}
+
+/// Rounds until `done`, asserting no node stops on the way.
+fn rounds_until(sim: &Sim, nodes: &mut [&mut Node], done: impl Fn(&[&mut Node]) -> bool) {
+    for _ in 0..20_000 {
+        if done(nodes) {
+            return;
+        }
+        if let Some(e) = round_stopping_on_error(sim, nodes) {
+            panic!("a node stopped before the state under test: {e}");
+        }
+    }
+    panic!("the state under test was never reached");
+}
+
+/// A crash tears `node`'s unsynced write of `line`: the line's prefix lands
+/// and the CRC line does not. Then the host power-cycles.
+fn tear_role_write(node: &mut Node, line: &str) {
+    node.db = None;
+    let disk = node.host.disk();
+    let file = disk.open("role").unwrap();
+    let torn = format!("{}\n00000000", &line[..line.len() - 1]);
+    file.write_at(0, torn.as_bytes()).unwrap();
+    file.set_len(torn.len() as u64).unwrap();
+    file.sync().unwrap();
+    disk.sync_dir("role").unwrap();
+    node.host.restart();
+}
+
+/// Boots `node` as configured, which must meet the torn-role text, then does
+/// what the text says for a node a flip tore: delete the role file and
+/// restart it configured as `restart_as`.
+fn restart_torn_node_as(sim: &Sim, node: &mut Node, restart_as: ReplConfig) {
+    let mut db = Db::open(
+        Box::new(node.host.disk()),
+        node.db_cfg.clone(),
+        node.schema.clone(),
+    )
+    .unwrap();
+    let boot = Repl::open(
+        Box::new(node.host.net()),
+        Box::new(node.host.disk()),
+        node.repl_cfg.clone(),
+        &mut db,
+    );
+    let err = boot
+        .err()
+        .map(|e| e.to_string())
+        .expect("a node whose role file tore must not boot");
+    assert!(
+        err.contains("role file failed its integrity check")
+            && err.contains("never as primary beside one"),
+        "{}: {err}",
+        node.name
+    );
+    drop(db);
+    node.host.disk().remove("role").unwrap();
+    node.host.disk().sync_dir("role").unwrap();
+    node.repl_cfg = restart_as;
+    reopen(sim, node).unwrap();
+}
+
+fn widget_count(node: &Node) -> usize {
+    let db = node.db.as_ref().expect("a live node");
+    db.snapshot()
+        .unwrap()
+        .scan_raw(Widget::TABLE, false)
+        .unwrap()
+        .len()
+}
+
+fn writable(nodes: &[&Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|n| n.db.as_ref().is_some_and(|d| d.writes_allowed()))
+        .map(|n| n.name.clone())
+        .collect()
+}
+
+/// p a primary at `p:1` and f its follower at `f:1`, ten widgets each.
+fn torn_role_pair(
+    sim: &Sim,
+    p_arm: &Arc<std::sync::atomic::AtomicBool>,
+    f_arm: &Arc<std::sync::atomic::AtomicBool>,
+) -> (Node, Node) {
+    let mut p = node_failing_role_syncs(sim, "p", primary_cfg("p:1"), p_arm);
+    let mut f = node_failing_role_syncs(sim, "f", follower_cfg("f:1", "p:1"), f_arm);
+    for i in 0..10u64 {
+        commit_widget(sim, &mut p, i).unwrap();
+        assert_eq!(
+            rounds_stopping_on_error(sim, &mut [&mut p, &mut f], 3),
+            None
+        );
+    }
+    rounds_until(sim, &mut [&mut p, &mut f], converged);
+    assert_eq!(widget_count(&f), 10);
+    (p, f)
+}
+
+fn arm() -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
+/// S3b R3-M1, the torn-role text's data-keeping exit, followed literally for
+/// every flip that writes the role file after first boot. A tear means the
+/// flip's write failed and a crash tore it, so each arm fails that flip's
+/// sync, tears what it wrote, and boots the node as configured, which meets
+/// the text. Then it deletes the role file and restarts the node as the text
+/// says: a follower of the writable primary if another node is serving as
+/// one, primary otherwise. In every arm the node comes back in that role with
+/// its ten widgets, and exactly one node accepts writes.
+///
+/// Two readings the text does not give are pinned failing beside them. The
+/// role the flip was writing (S5 re-review 3's proposal) is right for five
+/// flips but not for a switchover's first, to handing-off: the node then
+/// stays write-stopped, since that switchover handed nothing off, and no node
+/// accepts writes. And primary beside another writable primary, after a
+/// promote that tore when the operator promoted a different follower instead,
+/// is a second writable primary no witness gate sees: the promote cleared the
+/// node's witness set before its flip.
+#[test]
+fn a_torn_role_file_restarted_as_its_text_says_keeps_its_data_and_one_writable_primary() {
+    // Promote (Follower -> Primary). The old primary is dead, so no node is
+    // serving as primary: restart as primary. The old primary, back with its
+    // own config, is refused by its witness gate.
+    let sim = Sim::with_faults(0x53B0_0001, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    p.db = None;
+    p.host.restart();
+    fa.store(true, Ordering::SeqCst);
+    let _cli = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut f], 10_000).unwrap();
+    assert!(stopped.contains("(to \"primary\")"), "{stopped}");
+    tear_role_write(&mut f, "primary");
+    restart_torn_node_as(&sim, &mut f, primary_cfg("f:1"));
+    reopen(&sim, &mut p).unwrap();
+    let refused = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000).unwrap();
+    assert!(
+        refused.starts_with("p: witness f:1 answers as a primary itself"),
+        "{refused}"
+    );
+    assert_eq!(*f.repl.role(), Role::Primary);
+    assert_eq!(widget_count(&f), 10);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // A switchover's first flip (Primary -> HandingOff). The follower never
+    // got a hand-off, so no node is serving as primary: restart as primary.
+    // Restarted as the role that flip was writing, it never resumes.
+    for (as_written, restart_as) in [
+        (false, primary_cfg("p:1")),
+        (
+            true,
+            ReplConfig {
+                initial_role: Role::HandingOff {
+                    to: "f:1".to_string(),
+                },
+                ..primary_cfg("p:1")
+            },
+        ),
+    ] {
+        let sim = Sim::with_faults(0x53B0_0002, FaultConfig::none());
+        let (pa, fa) = (arm(), arm());
+        let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+        pa.store(true, Ordering::SeqCst);
+        let to = "f:1".to_string();
+        let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+        let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 10_000).unwrap();
+        assert!(stopped.contains("(to \"handing-off:f:1\")"), "{stopped}");
+        assert!(writable(&[&p, &f]).is_empty());
+        tear_role_write(&mut p, "handing-off:f:1");
+        restart_torn_node_as(&sim, &mut p, restart_as);
+        assert_eq!(
+            rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000),
+            None
+        );
+        assert_eq!(widget_count(&p), 10);
+        if as_written {
+            assert!(
+                matches!(p.repl.role(), Role::HandingOff { .. }) && writable(&[&p, &f]).is_empty(),
+                "restarted as the handing-off its flip was writing, the node stays write-stopped \
+                 and no node accepts writes — if this changes, the text's handing-off reading \
+                 needs a second look"
+            );
+        } else {
+            assert_eq!(*p.repl.role(), Role::Primary);
+            assert_eq!(writable(&[&p, &f]), ["p"]);
+        }
+    }
+
+    // A switchover's last flip on the old primary (HandingOff -> Follower),
+    // after the target took over: restart as the target's follower.
+    let sim = Sim::with_faults(0x53B0_0003, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], |n| {
+        matches!(n[0].repl.role(), Role::HandingOff { .. })
+    });
+    pa.store(true, Ordering::SeqCst);
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 10_000).unwrap();
+    assert!(stopped.contains("(to \"follower:f:1\")"), "{stopped}");
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+    tear_role_write(&mut p, "follower:f:1");
+    restart_torn_node_as(&sim, &mut p, follower_cfg("p:1", "f:1"));
+    commit_widget(&sim, &mut f, 10).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], converged);
+    assert_eq!(
+        *p.repl.role(),
+        Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_eq!(widget_count(&p), 11);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // The same flip at a restart resolving a durable HandingOff against a
+    // target that took over (`resolve_to_follower`): restart as its follower.
+    let sim = Sim::with_faults(0x53B0_0006, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], |n| {
+        *n[1].repl.role() == Role::Primary
+    });
+    p.db = None; // p dies before it hears HandOffDone
+    p.host.restart();
+    let p_cfg = p.repl_cfg.clone();
+    p = node_failing_role_syncs(&sim, "p", p_cfg, &pa);
+    assert!(matches!(p.repl.role(), Role::HandingOff { .. }));
+    pa.store(true, Ordering::SeqCst);
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000).unwrap();
+    assert!(stopped.contains("(to \"follower:f:1\")"), "{stopped}");
+    tear_role_write(&mut p, "follower:f:1");
+    restart_torn_node_as(&sim, &mut p, follower_cfg("p:1", "f:1"));
+    commit_widget(&sim, &mut f, 10).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], converged);
+    assert_eq!(
+        *p.repl.role(),
+        Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_eq!(widget_count(&p), 11);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // The target's flip (Follower -> Primary). The old primary is write-stopped
+    // in HandingOff, so no node is serving as primary: restart as primary. The
+    // old primary, restarted as the switchover's stall text says, resolves
+    // against it and follows.
+    let sim = Sim::with_faults(0x53B0_0004, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    fa.store(true, Ordering::SeqCst);
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    let stopped = rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 10_000).unwrap();
+    assert!(
+        stopped.starts_with("f:") && stopped.contains("(to \"primary\")"),
+        "{stopped}"
+    );
+    assert_eq!(rounds_stopping_on_error(&sim, &mut [&mut p], 20_000), None);
+    assert!(matches!(p.repl.role(), Role::HandingOff { .. }) && writable(&[&p]).is_empty());
+    tear_role_write(&mut f, "primary");
+    restart_torn_node_as(&sim, &mut f, primary_cfg("f:1"));
+    p.db = None;
+    p.host.restart();
+    reopen(&sim, &mut p).unwrap();
+    commit_widget(&sim, &mut f, 10).unwrap();
+    rounds_until(&sim, &mut [&mut p, &mut f], |n| {
+        converged(n) && matches!(n[0].repl.role(), Role::Follower { .. })
+    });
+    assert_eq!(*f.repl.role(), Role::Primary);
+    assert_eq!(
+        *p.repl.role(),
+        Role::Follower {
+            primary: "f:1".to_string()
+        }
+    );
+    assert_eq!(widget_count(&f), 11);
+    assert_eq!(writable(&[&p, &f]), ["f"]);
+
+    // An aborted switchover's flip back (HandingOff -> Primary), whose failed
+    // write the abort drops: the follower lagged and never took over, so no
+    // node is serving as primary — restart as primary.
+    let sim = Sim::with_faults(0x53B0_0005, FaultConfig::none());
+    let (pa, fa) = (arm(), arm());
+    let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+    for i in 10..20u64 {
+        commit_widget(&sim, &mut p, i).unwrap(); // f, not driven, lags
+    }
+    let to = "f:1".to_string();
+    let _cli = CtrlConn::open(&sim, "p:1", &Msg::CtrlSwitchover { to, secret: None }).unwrap();
+    rounds_until(&sim, &mut [&mut p], |n| {
+        matches!(n[0].repl.role(), Role::HandingOff { .. })
+    });
+    pa.store(true, Ordering::SeqCst);
+    assert_eq!(rounds_stopping_on_error(&sim, &mut [&mut p], 50_000), None);
+    assert!(
+        !pa.load(Ordering::SeqCst) && *p.repl.role() == Role::Primary,
+        "the abort's role write must have failed, dropped, and left p primary"
+    );
+    tear_role_write(&mut p, "primary");
+    restart_torn_node_as(&sim, &mut p, primary_cfg("p:1"));
+    assert_eq!(
+        rounds_stopping_on_error(&sim, &mut [&mut p, &mut f], 50_000),
+        None
+    );
+    assert_eq!(*p.repl.role(), Role::Primary);
+    assert_eq!(widget_count(&p), 20);
+    assert_eq!(writable(&[&p, &f]), ["p"]);
+
+    // A promote that tore while the operator promoted another follower
+    // instead: g serves as primary, so restart as its follower. Restarted as
+    // primary, the role its flip was writing, it is a second writable primary.
+    for as_written in [false, true] {
+        let sim = Sim::with_faults(0x53B0_0007, FaultConfig::none());
+        let (pa, fa, ga) = (arm(), arm(), arm());
+        let (mut p, mut f) = torn_role_pair(&sim, &pa, &fa);
+        let mut g = node_failing_role_syncs(&sim, "g", follower_cfg("g:1", "p:1"), &ga);
+        rounds_until(&sim, &mut [&mut p, &mut f, &mut g], |n| {
+            n[2].db.as_ref().and_then(|d| d.last_applied()) == Some(9)
+        });
+        p.db = None;
+        p.host.restart();
+        fa.store(true, Ordering::SeqCst);
+        let _cli = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+        let stopped = rounds_stopping_on_error(&sim, &mut [&mut f], 10_000).unwrap();
+        assert!(stopped.contains("(to \"primary\")"), "{stopped}");
+        tear_role_write(&mut f, "primary");
+        let mut cli = CtrlConn::open(&sim, "g:1", &Msg::CtrlPromote { secret: None }).unwrap();
+        let reply = drive_ctrl(&sim, &mut [&mut g], &mut cli, 10_000).unwrap();
+        assert!(matches!(reply, Msg::CtrlOk { .. }), "{reply:?}");
+        let restart_as = if as_written {
+            primary_cfg("f:1")
+        } else {
+            follower_cfg("f:1", "g:1")
+        };
+        restart_torn_node_as(&sim, &mut f, restart_as);
+        assert_eq!(
+            rounds_stopping_on_error(&sim, &mut [&mut f, &mut g], 50_000),
+            None
+        );
+        assert_eq!(widget_count(&f), 10);
+        if as_written {
+            assert_eq!(
+                writable(&[&f, &g]),
+                ["f", "g"],
+                "restarted as primary beside another, the node is a second writable primary — \
+                 the text's warning, pinned true"
+            );
+        } else {
+            assert_eq!(
+                *f.repl.role(),
+                Role::Follower {
+                    primary: "g:1".to_string()
+                }
+            );
+            assert_eq!(writable(&[&f, &g]), ["g"]);
+        }
+    }
 }

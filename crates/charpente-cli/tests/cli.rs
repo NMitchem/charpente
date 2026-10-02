@@ -178,6 +178,91 @@ fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
     }
 }
 
+/// Every fault-fallout exit of the invoicing demo's fault-injected properties,
+/// and of the fixture's round checker, gives up by name instead of passing
+/// (S3b item 5), as does a universe that ended with nothing to check. One seed
+/// per arm the swarm reaches, found by scanning master seed 0x53b00051
+/// (invoicing, 1,024 universes) or 0x53b00033 (fixture, 256), replayed here
+/// one universe at a time. The harness reports no give-up
+/// reason, so each arm marks its own key and the pin reads it. The arms no
+/// scan reached (the read-backs, the key lookup, and the last read's
+/// statuses) give up the same way and have no seed; each property's `require`
+/// on the key its verdict marks, past all of them, is what fails if one of them
+/// swallows every universe (S3b review I1).
+///
+/// The fixture's second seed, `0x761e4dd8bee6497b` (master seed 0x53b00033),
+/// is the case only `checked_any` decides (S3b review M6): two earlier rounds
+/// checked with nothing acked, then the last round's check met fault fallout.
+/// An earlier check of an empty list checked nothing, so the universe gives up.
+/// The first seed skipped every round's check, so it cannot tell.
+#[test]
+fn a_universe_that_checked_nothing_gives_up_by_its_arm() {
+    for (dir, test, seed, arm) in [
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0xe0120eeed0f12260",
+            "invoicing:gave-up:kernel-new",
+        ),
+        (
+            invoicing_dir(),
+            "acked_writes_survive_restart",
+            "0x1c67721b024348c0",
+            "invoicing:gave-up:nothing-acked",
+        ),
+        (
+            invoicing_dir(),
+            "receipts_exactly_once",
+            "0xd04041b814e56fe4",
+            "invoicing:gave-up:nothing-to-count",
+        ),
+        (
+            invoicing_dir(),
+            "overdue_reminders_over_months",
+            "0xf9679b2775d024d2",
+            "invoicing:gave-up:no-reminder",
+        ),
+        (
+            invoicing_dir(),
+            "api_key_authorizes_then_revoked_is_rejected",
+            "0xb103f8e1389c6303",
+            "invoicing:gave-up:mint-unacked",
+        ),
+        (
+            invoicing_dir(),
+            "api_key_authorizes_then_revoked_is_rejected",
+            "0x5ba83a0b8b9f8977",
+            "invoicing:gave-up:revoke-unacked",
+        ),
+        (
+            fixture_dir(),
+            "acked_counter_survives_rounds",
+            "0xe84e1ab0d423cc57",
+            "fixture:last-verify-fallout",
+        ),
+        (
+            fixture_dir(),
+            "acked_counter_survives_rounds",
+            "0x761e4dd8bee6497b",
+            "fixture:last-verify-fallout",
+        ),
+    ] {
+        let out = charpente()
+            .args(["test", "--sim", "--seed", seed, "--filter", test])
+            .args(["--format", "json", "--dir", &dir])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!(
+                r#""outcomes":[{{"test":"{test}","verdicts":0,"gave_up":1}}]"#
+            )) && stdout.contains(&format!(r#""{arm}":1"#)),
+            "seed {seed} must give up at {arm}, not pass:\n{stdout}"
+        );
+    }
+}
+
 /// The sentence this whole change exists to make true (MANIFESTO §9): a batch
 /// in which every universe gave up must not print as an unqualified success.
 /// Seed 0x3 is a measured give-up universe of `counter_roundtrip`: the first

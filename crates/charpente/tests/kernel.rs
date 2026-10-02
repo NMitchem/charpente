@@ -11,13 +11,24 @@ use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::migration::{MigrationError, TableMigration};
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 // This workload's own sequential reads (`exactly_once_holds`'s snapshot/scan
-// calls) can still hit a freshly armed crash mid-check, so all four
-// `checks::classify` families stay reachable here — unlike
-// transactions.rs/http.rs, which break-and-restart on the first Io error and
-// so use a narrower local wrapper. This is the identical-4-family case: the
-// shared classifier is used directly, no local wrapper needed.
+// calls) can still hit a freshly armed crash mid-check, so the three fallout
+// families `is_fault_fallout` accepts (injected, poisoned, redb latch) all stay
+// reachable here — unlike transactions.rs/http.rs, which break-and-restart on
+// the first Io error and so use a narrower local wrapper. The shared
+// classifier is used directly, no local wrapper needed. The fourth
+// `classify` family, the durable-horizon refusal, goes through
+// `durable_refusal` at every open site (S3b item 0).
 use charpente_sim::checks::{boot_through_fallout, durable_refusal, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
+
+/// The re-seed clause every "restore … from a replica or backup" text carries
+/// (DESIGN §5's re-seed rule; S3b R3-M1), typed out so a pin goes red if it
+/// drifts or goes missing.
+const RESTORE_IS_A_RESEED: &str = "For a follower, or a primary once a follower is promoted in \
+     its place, that is a re-seed: stop the node, delete its data dir, and restart it configured \
+     as a follower of the current primary so it snapshot-seeds from it, never with a primary \
+     config: the durable role file that outranks config is deleted with the data dir, so a \
+     cleared node started as a primary comes up as a second writable primary";
 
 #[table(global)]
 struct Counter {
@@ -812,12 +823,20 @@ mod scoped_jobs {
         };
         assert_eq!(
             err.to_string(),
+            // Typed out in full rather than through the const: GUIDE §6's
+            // pinned block quotes this line, and the doc-truth gate matches it
+            // against a literal that denotes the whole text.
             "2 Pending \"File\" job(s) (ids 0, 1) carry no tenant, but this binary declares \
              File `scoped_by = Desk` — the enqueue family writes a tenant exactly for a \
              `scoped_by` job, so something that contradicts File's #[job] wrote these rows: a \
              hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not \
              dispatch them; mount File as its #[job] declares it, or restore the store from a \
-             replica or backup taken before these rows were written (GUIDE §6)"
+             replica or backup taken before these rows were written. For a follower, or a \
+             primary once a follower is promoted in its place, that is a re-seed: stop the node, \
+             delete its data dir, and restart it configured as a follower of the current primary \
+             so it snapshot-seeds from it, never with a primary config: the durable role file \
+             that outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary (GUIDE §6)"
         );
         assert!(
             charpente::core::db::Refusal::of(&err).is_some(),
@@ -838,12 +857,14 @@ mod scoped_jobs {
         };
         assert_eq!(
             err.to_string(),
-            "1 Pending \"File\" job(s) (ids 0) carry a tenant, but this binary declares File \
-             `global` — the enqueue family writes a tenant exactly for a `scoped_by` job, so \
-             something that contradicts File's #[job] wrote these rows: a hand-written `impl \
-             Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount \
-             File as its #[job] declares it, or restore the store from a replica or backup \
-             taken before these rows were written (GUIDE §6)"
+            format!(
+                "1 Pending \"File\" job(s) (ids 0) carry a tenant, but this binary declares File \
+                 `global` — the enqueue family writes a tenant exactly for a `scoped_by` job, so \
+                 something that contradicts File's #[job] wrote these rows: a hand-written `impl \
+                 Job` or `JobDef`, or a raw store write; this binary will not dispatch them; \
+                 mount File as its #[job] declares it, or restore the store from a replica or \
+                 backup taken before these rows were written. {RESTORE_IS_A_RESEED} (GUIDE §6)"
+            )
         );
     }
 
@@ -2702,14 +2723,18 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                     sim.restart();
                 }
             },
-            // No restart clears a durable refusal (S5 re-review R-M2).
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            // No restart clears a durable refusal (S5 re-review R-M2), and only a
+            // fired durable-corruption fault excuses one, so it is judged before the
+            // fallout check (S3b item 0).
+            Err(e) => {
                 if durable_refusal(sim, &e.to_string())? {
                     return Ok(());
                 }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("final open failed non-injected: {e}"));
+                }
                 sim.restart();
             }
-            Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
     // A universe that adjudicated nothing gives up; it does not pass.
@@ -2735,7 +2760,9 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
 /// S5's parent on the same bases `job:done` rose 358.3 -> 485.2 (+15.7 SE) and
 /// passes that covered no `job:done` fell 50.5 -> 22.5 per batch. The new
 /// give-ups are universes whose store, once it held jobs, never booted again
-/// under their fault rate, which used to pass having checked nothing.
+/// under their fault rate, which used to pass having checked nothing. GUIDE
+/// §8's Poisson cap on those batches (x = 226 over N = 2,560, n = 256,
+/// lambda = 25.2) is 46, under 62 (2026-10-02).
 const KERNEL_GAVE_UP_CEILING: u64 = 62;
 
 /// The reach floor, a margin like the cap (GUIDE §8): with the round boots
@@ -4831,11 +4858,18 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     for _ in 0..64 {
         let mut app = match gated_receipts_app(sim, true) {
             Ok(app) => app,
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            Err(e) => {
+                // No restart clears a durable refusal, and only a fired
+                // durable-corruption fault excuses one (S3b item 0).
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(());
+                }
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("v2 open failed non-injected: {e}"));
+                }
                 sim.restart();
                 continue;
             }
-            Err(e) => return Err(format!("v2 open failed non-injected: {e}")),
         };
         let receipts: Vec<JobRow> = match app
             .db_for_tests()
@@ -4913,6 +4947,40 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     }
     sim.give_up("the v2 binary never booted cleanly — nothing adjudicated");
     Ok(())
+}
+
+/// A durable refusal at the v2 binary's boot gives the universe up at once,
+/// by name (S3b item 0). Seed `0xeeb32c0d58259628`, universe 31 at the batch's
+/// base, meets one there. The loop used to send it through
+/// `is_fault_fallout`, which excused it by its text alone, so it spent all 64
+/// boots on bytes no restart clears.
+#[test]
+fn a_durable_refusal_at_the_v2_boot_gives_up_at_once_by_name() {
+    const SEED: u64 = 0xeeb3_2c0d_5825_9628;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = receipt_upgrade_universe(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
 }
 
 /// The universe count was set by timing batches (see the commit message); the
@@ -5640,14 +5708,18 @@ mod job_tenancy {
                     Err(msg) if is_fault_fallout(&msg) => sim.restart(),
                     Err(msg) => return Err(msg),
                 },
-                // No restart clears a durable refusal (S5 re-review R-M2).
-                Err(e) if is_fault_fallout(&e.to_string()) => {
+                // No restart clears a durable refusal (S5 re-review R-M2), and only a
+                // fired durable-corruption fault excuses one, so it is judged before the
+                // fallout check (S3b item 0).
+                Err(e) => {
                     if durable_refusal(sim, &e.to_string())? {
                         return Ok(());
                     }
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("final open failed non-injected: {e}"));
+                    }
                     sim.restart();
                 }
-                Err(e) => return Err(format!("final open failed non-injected: {e}")),
             }
         }
         // A universe that adjudicated nothing gives up; it does not pass.

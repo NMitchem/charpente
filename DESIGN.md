@@ -599,8 +599,9 @@ Recovery removes the orphans first — highest base first, each `sync_dir`-barri
 exactly as `gc` removes ascending — and truncates last, so every crash-intermediate is a
 contiguous prefix, recovery re-finds the same cut, and it is idempotent at every crash
 point (found by replication seed 0x4177819b4a2ba984; the test-side restore path that had
-masked it now gates on `checks::dir_entry_loss_fired`, so a platform-created gap fails
-loud again).
+masked it now gates on entry loss having fired on the refused node's own disk since its
+last re-seed wipe, `SimHost::dir_entry_loss_count`, so a platform-created gap fails loud
+again).
 
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
@@ -1406,6 +1407,18 @@ twins. So a failed role or witness write has an unknown outcome, and its error s
 change may already have happened, because the restart it asks for boots as whatever the
 file holds (2026-10-01; `a_failed_role_write_says_the_flip_may_already_have_happened` and
 its witness twin).
+A role file torn after first boot was torn by a flip whose write failed, so the node's data
+is intact, and the torn-role text names an exit that keeps it: delete the file and restart
+the node configured as a follower of the writable primary if another node is serving as one,
+and as primary only if none is. Probed and pinned for every flip that writes the file
+(promote, both ends of a switchover, an abort, a restart resolving a hand-off;
+`a_torn_role_file_restarted_as_its_text_says_keeps_its_data_and_one_writable_primary`), it
+brings the node back in that role with its data and leaves one writable primary. The flip's
+own target is not the rule. A switchover's first flip, to handing-off, handed nothing off, so a
+node restarted as handing-off stays write-stopped and no node takes writes. A promote that
+tore while the operator promoted another follower instead, restarted as the primary it was
+writing, is a second writable primary no witness gate sees: the promote cleared its witness
+set first. Both are pinned beside the rule (S3b, R3-M1).
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through
@@ -1457,7 +1470,11 @@ role file says follower while its startup config still says primary: wiped and r
 configured, it acked a write beside the real primary (S5 re-review 2, R2-I1). So every
 refusal and doc that prescribes a re-seed says, in the same sentence, to restart the cleared
 node configured as a follower of the current primary, and what a primary config does instead
-(`repl::role::reseed_steps`; `Db::open`'s vanished-prefix refusal types the same steps).
+(`repl::role::reseed_steps`). So does every text that says "restore this node from a replica
+or backup", since on a replicated node that restore is a re-seed: the core's refusals (the
+recovery-horizon and read-back corruption refusals, the store refusals on a compacted or
+empty log, the replay-shape refusals, the mistenanted-jobs refusal) all carry
+`db::RESTORE_IS_A_RESEED`, and the torn-role-file text carries `reseed_steps` (S3b, R3-M1).
 Nothing structural fences it: the guard is the operator's config.
 
 **The boot gate** (M2 sub-project 0b, spec `docs/superpowers/specs/2026-07-31-dual-primary-
@@ -1833,8 +1850,10 @@ Charpente treats the coding agent as the primary developer persona:
   master_seed, config, message, repro}`, `coverage`, `missing_coverage` (`{test, key}`
   pairs for `require`d keys never hit), and a trailing `summary`. Ships with the public
   checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/
-  redb-latch/durable-horizon fallout classifier, productized out of four hand-rolled
-  internal copies) and its typed form `classify` → `FaultReason`, for a workload that
+  redb-latch fallout classifier, productized out of four hand-rolled internal copies; a
+  durable-horizon refusal is never fallout by its text and is judged by `durable_refusal`,
+  which excuses it only where durable corruption fired) and its typed form `classify` →
+  `FaultReason`, which still names the durable-horizon family, for a workload that
   accepts some families and fails on others (sub-project 6 T7 — first-match arm order is
   load-bearing and pinned); `replays_identically` (determinism oracle);
   `acked_implies_durable` (the request-level ack-durability property, generalized for app
@@ -1842,7 +1861,9 @@ Charpente treats the coding agent as the primary developer persona:
   `dir_entry_loss_fired`, which excuse a shortfall only in universes where that fault
   actually fired. `SimHost::durable_corruption_fired` and `SimHost::dir_entry_loss_fired`
   are the same two scoped to a host, for a multi-node workload whose excuse must name the
-  node the fault fired on. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
+  node the fault fired on, and `SimHost::durable_corruption_count`/`dir_entry_loss_count`
+  are their counts, so a workload that wipes a host's data reads them at the wipe and
+  excuses a later refusal only by a fault since then. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
   build/usage/infrastructure error.
 - **The edge harness (v0, implemented; `crates/edge-harness`).** The sim owns everything
   below the IO traits; the edge harness owns everything above them that only a real

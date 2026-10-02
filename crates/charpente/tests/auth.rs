@@ -240,6 +240,22 @@ fn spawn_auth_node(
                 });
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            // A refusal for durable corruption at or below the horizon is
+            // fallout only where that corruption fired on this host's own
+            // disk (S3b item 0's rule), and then no power-cycle clears the
+            // bytes, so the spawn gives up at once. Unexplained, it falls to
+            // the failure arm below. Item 0 missed this loop, as it missed
+            // replication's kernel spawn (S3b item 8's sweep).
+            Err(e)
+                if matches!(classify(&e), FaultReason::DurableHorizon)
+                    && h.durable_corruption_fired() =>
+            {
+                sim.cover("auth:inconclusive:spawn-durable-refusal");
+                return Err(format!(
+                    "{INCONCLUSIVE}: {host} kernel spawn refused for durable corruption that \
+                     fired on {host}'s disk, which no power-cycle clears: {e}"
+                ));
+            }
             Err(e) if is_fault_fallout(&e) => {
                 h.restart();
                 continue;
@@ -274,6 +290,121 @@ fn needs_restore(text: &str) -> bool {
         || text.contains("forked timeline")
         || text.contains("re-seed the follower"))
         && !text.contains("cannot be rebuilt from the log alone")
+}
+
+/// Whether a fault explains the `needs_restore` refusal `text` that `node`
+/// raised (S3b item 0; the rule of replication.rs's
+/// `unexplained_restore_needed`), asked of the disk whose fault would cause
+/// it: a gap by entry loss on `node`'s own disk; a forked timeline by durable
+/// corruption on `primary`'s, whose log lost records the follower holds,
+/// whichever node reports it; anything else by durable corruption on `node`'s
+/// own disk. A refusal nothing there explains is a platform durability bug,
+/// never an inconclusive skip.
+fn restore_explained(node: &SimHost, primary: &SimHost, text: &str) -> bool {
+    if text.contains("refusing to guess") {
+        node.dir_entry_loss_fired()
+    } else if text.contains("forked timeline") || text.contains("re-seed the follower") {
+        primary.durable_corruption_fired()
+    } else {
+        node.durable_corruption_fired()
+    }
+}
+
+/// S3b item 8's sweep. Item 0 took the refusal below the horizon out of
+/// `is_fault_fallout`, and this spawn loop retried only fallout, so a spawn
+/// refused for corruption on its own disk failed the universe. It gives up at
+/// once now, and only for a fault on that disk.
+/// - **Explained:** a bit flip on `p`'s disk at its power-cycle lands below
+///   the horizon, and the respawn gives up under
+///   `auth:inconclusive:spawn-durable-refusal`.
+/// - **Unexplained:** the same frame is corrupted by hand, with a flip fired
+///   only on a bystander's disk, and the respawn fails by name.
+#[test]
+fn a_spawn_refused_below_the_horizon_gives_up_only_for_corruption_on_its_own_disk() {
+    let respawn = |sim: &Sim| {
+        spawn_auth_node(
+            sim,
+            "p",
+            auth_primary_cfg("p:1"),
+            multi_node_db_cfg(),
+            AUTH_HORIZON,
+        )
+    };
+    let logged_in = |sim: &Sim| {
+        let mut p = respawn(sim).expect("spawns before anything fires");
+        for subject in ["a", "b", "c"] {
+            let login = Request::new(Method::Post, "/login").json(&subject.to_string());
+            let (status, _) = auth_drive_request(sim, &mut [&mut p], 0, login, 2_000).unwrap();
+            assert_eq!(status, 200);
+        }
+        p
+    };
+
+    let sim = Sim::with_faults(
+        0x53B0_0018,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let p = logged_in(&sim);
+    let host = p.host.clone();
+    drop(p);
+    host.restart();
+    sim.quiesce_disk_faults();
+    assert!(
+        host.durable_corruption_fired(),
+        "the flip fired on p's disk"
+    );
+    let refused = respawn(&sim)
+        .err()
+        .expect("the flip lands below p's horizon, or this pin reaches nothing");
+    assert!(
+        refused.starts_with(INCONCLUSIVE)
+            && refused.contains("p kernel spawn refused for durable corruption that fired on p's"),
+        "{refused}"
+    );
+    assert_eq!(
+        sim.coverage()
+            .get("auth:inconclusive:spawn-durable-refusal")
+            .copied(),
+        Some(1)
+    );
+
+    let sim = Sim::with_faults(
+        0x53B0_0016,
+        FaultConfig {
+            bit_flip: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let mut p = logged_in(&sim);
+    // A flip on a bystander's disk, so the universe counts as corrupted and
+    // only the per-host check tells the two apart.
+    let q = sim.host("q");
+    let file = q.disk().open("wal/x.log").unwrap();
+    file.write_at(0, &[7; 64]).unwrap();
+    file.sync().unwrap();
+    q.restart();
+    sim.quiesce_disk_faults();
+    assert!(durable_corruption_fired(&sim) && !p.host.durable_corruption_fired());
+    // The reopen persists the store at the log's tail, so the horizon covers
+    // every frame written so far.
+    recover_auth_node(&sim, &mut p).unwrap();
+    let segment = p.host.disk().open("wal/00000000000000000000.log").unwrap();
+    let mut byte = [0u8; 1];
+    segment.read_at(16, &mut byte).unwrap();
+    segment.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+    assert!(!p.host.durable_corruption_fired());
+    drop(p);
+    let refused = respawn(&sim)
+        .err()
+        .expect("the respawn over a corrupted frame is refused");
+    assert!(
+        refused.starts_with("p: ") && refused.contains("durable horizon"),
+        "nothing fired on p explains it, so it fails by name: {refused}"
+    );
 }
 
 /// `recover_auth_node`'s arms run `needs_restore`, then fault fallout, then
@@ -353,6 +484,170 @@ fn auth_recover_exhausted_key(last: &str) -> &'static str {
     }
 }
 
+/// S3b item 0: auth's restore skips, in `recover_auth_node` and in
+/// `kstep_auth_node`, excuse a refusal only by a fault on the disk that would
+/// cause it. A frame below the store's horizon is corrupted by hand here, so
+/// nothing fired, and the recovery must fail by name; until item 0 it skipped
+/// the universe as inconclusive. Then each family's explanation is asked of
+/// the disk it names, and only that one.
+#[test]
+fn a_restore_skip_is_excused_only_by_a_fault_on_the_disk_that_causes_it() {
+    let sim = Sim::with_faults(0x53B0_0013, FaultConfig::none());
+    let mut p = spawn_auth_node(
+        &sim,
+        "p",
+        auth_primary_cfg("p:1"),
+        multi_node_db_cfg(),
+        AUTH_HORIZON,
+    )
+    .expect("spawns under FaultConfig::none()");
+    for subject in ["a", "b", "c"] {
+        let login = Request::new(Method::Post, "/login").json(&subject.to_string());
+        let (status, _) = auth_drive_request(&sim, &mut [&mut p], 0, login, 2_000).unwrap();
+        assert_eq!(status, 200);
+    }
+    // The reopen persists the store at the log's tail, so the horizon now
+    // covers every frame written so far.
+    recover_auth_node(&sim, &mut p).unwrap();
+    let segment = p.host.disk().open("wal/00000000000000000000.log").unwrap();
+    let mut byte = [0u8; 1];
+    segment.read_at(16, &mut byte).unwrap();
+    segment.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+    assert!(!p.host.durable_corruption_fired());
+
+    let err = recover_auth_node(&sim, &mut p).unwrap_err();
+    assert!(
+        !err.contains(INCONCLUSIVE)
+            && err.contains("durable horizon")
+            && err.ends_with(
+                "but no fault explains the refusal: a platform durability bug, not an \
+                 unrestorable copy"
+            ),
+        "{err}"
+    );
+    assert_eq!(
+        sim.coverage().get("auth:inconclusive:local-unrestorable"),
+        None
+    );
+
+    let sim = Sim::with_faults(
+        0x53B0_0014,
+        FaultConfig {
+            misdirected_write: 1.0,
+            dir_entry_loss: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (primary, follower, quiet) = (sim.host("p"), sim.host("f"), sim.host("q"));
+    let forked = "the follower's frame at seq 3 has crc 0x1 but this primary's frame at the \
+                  same seq has crc 0x2 — a forked timeline that can never be merged";
+    let gap = "a segment is missing … refusing to guess";
+    assert!(!restore_explained(&follower, &quiet, forked));
+    assert!(!restore_explained(&follower, &quiet, &err));
+    assert!(!restore_explained(&follower, &quiet, gap));
+    follower
+        .disk()
+        .open("wal/x.log")
+        .unwrap()
+        .write_at(0, &[7; 16])
+        .unwrap();
+    assert!(follower.durable_corruption_fired());
+    assert!(
+        !restore_explained(&follower, &quiet, forked),
+        "corruption on the follower's own disk forks no timeline"
+    );
+    assert!(restore_explained(&follower, &quiet, &err));
+    primary
+        .disk()
+        .open("wal/x.log")
+        .unwrap()
+        .write_at(0, &[7; 16])
+        .unwrap();
+    assert!(restore_explained(&follower, &primary, forked));
+    assert!(!restore_explained(&follower, &primary, gap));
+    follower.restart();
+    assert!(follower.dir_entry_loss_fired());
+    assert!(restore_explained(&follower, &primary, gap));
+}
+
+/// The step-time skip, `kstep_auth_node`'s, by the same rule (S3b item 0):
+/// the primary refuses to ship a frame that fails its read-back check, and
+/// here the frame was corrupted by hand after the follower converged, so no
+/// fault on the primary's disk explains it and the step fails by name. Until
+/// item 0 the universe was skipped as inconclusive.
+#[test]
+fn a_shipping_refusal_is_skipped_only_for_a_fault_on_the_primarys_disk() {
+    let sim = Sim::with_faults(0x53B0_0015, FaultConfig::none());
+    let db_cfg = multi_node_db_cfg();
+    let mut p = spawn_auth_node(
+        &sim,
+        "p",
+        auth_primary_cfg("p:1"),
+        db_cfg.clone(),
+        AUTH_HORIZON,
+    )
+    .expect("spawns under FaultConfig::none()");
+    let mut f = spawn_auth_node(
+        &sim,
+        "f",
+        auth_follower_cfg("f:1", "p:1"),
+        db_cfg,
+        AUTH_HORIZON,
+    )
+    .expect("spawns under FaultConfig::none()");
+    let login = Request::new(Method::Post, "/login").json(&"a".to_string());
+    let (status, _) = auth_drive_request(&sim, &mut [&mut p, &mut f], 0, login, 2_000).unwrap();
+    assert_eq!(status, 200);
+    for _ in 0..2_000 {
+        if applied(&p).is_some() && applied(&p) == applied(&f) {
+            break;
+        }
+        auth_kernel_round(&sim, &mut [&mut p, &mut f]).unwrap();
+    }
+    assert!(applied(&f).is_some() && applied(&p) == applied(&f));
+    // A second login on the primary alone, so its frames wait unshipped.
+    let shipped = applied(&f).unwrap();
+    let login = Request::new(Method::Post, "/login").json(&"b".to_string());
+    let (status, _) = auth_drive_request(&sim, &mut [&mut p], 0, login, 2_000).unwrap();
+    assert_eq!(status, 200);
+    assert!(applied(&p).unwrap() > shipped);
+    // Corrupt every unshipped frame's first payload byte: the frames after the
+    // follower's position are all in the last segment.
+    let disk = p.host.disk();
+    let last = disk.list("wal/").unwrap().into_iter().max().unwrap();
+    let segment = disk.open(&last).unwrap();
+    let len = segment.len().unwrap();
+    let mut byte = [0u8; 1];
+    segment.read_at(len - 1, &mut byte).unwrap();
+    segment.write_at(len - 1, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+    assert!(!p.host.durable_corruption_fired());
+
+    let mut err = None;
+    for _ in 0..2_000 {
+        match auth_kernel_round(&sim, &mut [&mut p, &mut f]) {
+            Ok(_) => {}
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let err = err.expect("the primary must refuse to ship the corrupted frame");
+    assert!(
+        !err.contains(INCONCLUSIVE)
+            && err.starts_with("p kernel step: ")
+            && err.contains("corrupted frame must never be shipped")
+            && err.ends_with(
+                "but no fault explains the refusal: a platform durability bug, not a copy that \
+                 needs restore"
+            ),
+        "{err}"
+    );
+    assert_eq!(sim.coverage().get("auth:inconclusive:needs-restore"), None);
+}
+
 fn recover_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<(), String> {
     sim.cover("restart");
     node.kernel = None;
@@ -368,6 +663,13 @@ fn recover_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<(), String> {
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
             Err(e) if needs_restore(&e) => {
+                if !restore_explained(&node.host, &sim.host("p"), &e) {
+                    return Err(format!(
+                        "recover {}: {e}, but no fault explains the refusal: a platform \
+                         durability bug, not an unrestorable copy",
+                        node.name
+                    ));
+                }
                 sim.cover("auth:inconclusive:local-unrestorable");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} local copy unrestorable (no restore rig in this \
@@ -408,6 +710,13 @@ fn kstep_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<Step, String> {
         // follower refusing a forked timeline (spec §5's Diverged) — both the
         // platform working as designed, both needing an out-of-scope restore.
         Err(e) if needs_restore(&e.to_string()) => Err({
+            if !restore_explained(&node.host, &sim.host("p"), &e.to_string()) {
+                return Err(format!(
+                    "{} kernel step: {e}, but no fault explains the refusal: a platform \
+                     durability bug, not a copy that needs restore",
+                    node.name
+                ));
+            }
             sim.cover("auth:inconclusive:needs-restore");
             format!(
                 "{INCONCLUSIVE}: {} local durable copy needs restore (media corruption of \

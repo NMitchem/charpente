@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::log::{MAX_RECORD_BYTES, Wal, WalConfig, frame_crc};
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{FaultReason, classify, durable_corruption_fired, is_fault_fallout};
 use charpente_sim::{
     FaultConfig, Sim, SimDisk, run_universes, run_universes_swarm, run_universes_swarm_with,
 };
@@ -101,17 +101,17 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
             Ok(engine) => engine,
             Err(e) => {
                 let msg = e.to_string();
-                if !is_fault_fallout(&msg) {
-                    return Err(format!("recovery failed with a non-fallout error: {msg}"));
-                }
                 // The horizon hard error is permanent — the corrupted bytes
                 // don't un-corrupt on retry, and DESIGN §2's own remedy
                 // (restore from a replica or backup) is out of scope for
                 // this workload — so the universe ends here, successfully:
                 // the fence held, and every acked record has already
                 // cleared `check_prefix` in an earlier round.
-                if msg.contains("durable horizon") {
+                if horizon_fence_held(sim, &msg)? {
                     return Ok(());
+                }
+                if !is_fault_fallout(&msg) {
+                    return Err(format!("recovery failed with a non-fallout error: {msg}"));
                 }
                 sim.restart();
                 continue;
@@ -164,6 +164,9 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
                 break;
             }
             Err(e) => {
+                if horizon_fence_held(sim, &e.to_string())? {
+                    return Ok(());
+                }
                 if !is_fault_fallout(&e.to_string()) {
                     return Err(format!(
                         "final recovery failed with a non-fallout error: {e}"
@@ -174,7 +177,11 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
         }
     }
     let Some(engine) = recovered else {
-        return Ok(()); // every attempt died to recognized faults (incl. the horizon fence)
+        sim.give_up(
+            "every final recovery died to injected faults, so the last round's records were \
+             never checked",
+        );
+        return Ok(());
     };
     check_prefix(&engine.machine().records, &submitted, acked)?;
 
@@ -187,8 +194,41 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
     if replay.hash != engine.machine().hash {
         return Err("machine hash diverged from a clean replay of its own records".to_string());
     }
+    sim.cover("wal:prefix-checked");
     Ok(())
 }
+
+/// Give-up caps and reach floors (S3b review round 2). S3b made these
+/// properties give up where they had passed having checked nothing, and a
+/// give-up is never failed, so without a cap a batch that drifted to giving
+/// up everything would stay green (GUIDE §8). Each capped property also
+/// floors the key that counts its checks: `wal:prefix-checked` (a recovered
+/// prefix checked against what was acked) or `wal:gap-free-checked`. The
+/// pinned bases' values are exact counts at the commit that set them
+/// (2026-10-02); the `horizon-fence-held` universes are verdicts too, which
+/// is why a floor sits below its batch's verdict count.
+///
+/// The fault matrix's base is ambient. Over 10 fresh bases (0xF3A70001..0A,
+/// 512 each) it gave up 0 times and checked a prefix 496-508 times (mean
+/// 501.3, sample sd 3.3), so its floor is the mean less 4 sd. Its cap follows
+/// GUIDE §8's ambient rule, the larger of twice the largest count (0) and the
+/// Poisson cap. With x = 0 give-ups over N = 5,120 universes, U(0) = 2.996, so
+/// a batch of n = 512 has lambda = 512 x 2.996 / 5,120 = 0.30. P(> 3) is
+/// 2.6e-4 and P(> 4) is 1.6e-5, so k = 4.
+const FAULT_MATRIX_GAVE_UP_CEILING: u64 = 4;
+const FAULT_MATRIX_PREFIX_FLOOR: u64 = 488;
+const DIR_ENTRY_GAVE_UP_CEILING: u64 = 0;
+const DIR_ENTRY_PREFIX_FLOOR: u64 = 247;
+const BIT_FLIP_GAVE_UP_CEILING: u64 = 42;
+const BIT_FLIP_PREFIX_FLOOR: u64 = 196;
+const MISDIRECTED_GAVE_UP_CEILING: u64 = 22;
+const MISDIRECTED_PREFIX_FLOOR: u64 = 120;
+/// 182 of 256: the initial open or the one recovery died to an injected read
+/// error. Before S3b item 0 each of those passed having checked nothing.
+const READ_ERROR_GAVE_UP_CEILING: u64 = 182;
+const READ_ERROR_PREFIX_FLOOR: u64 = 74;
+const GC_GAVE_UP_CEILING: u64 = 0;
+const GC_GAP_FREE_FLOOR: u64 = 252;
 
 #[test]
 fn wal_survives_the_fault_matrix() {
@@ -203,7 +243,9 @@ fn wal_survives_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
-        ]
+        ],
+        floor: [("wal:prefix-checked", FAULT_MATRIX_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", FAULT_MATRIX_GAVE_UP_CEILING)]
     );
 }
 
@@ -220,7 +262,9 @@ fn wal_survives_dir_entry_loss() {
         256,
         |cfg: &mut FaultConfig| { cfg.dir_entry_loss = 0.5; },
         |sim| wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize),
-        require: ["fault:dir-entry", "restart"]
+        require: ["fault:dir-entry", "restart"],
+        floor: [("wal:prefix-checked", DIR_ENTRY_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", DIR_ENTRY_GAVE_UP_CEILING)]
     );
 }
 
@@ -260,9 +304,9 @@ fn wal_replays_identically_for_the_same_seed() {
 /// horizon = the last acked seq — mirroring `Db::open`'s production use of
 /// the store's `applied_seq` as the horizon threaded into `Engine::recover`.
 /// Never silent loss: either every acked record comes back, or recovery
-/// fails with a recognized fault-fallout error (the horizon hard error and
-/// the injected read error both count — `checks::is_fault_fallout`
-/// classifies both).
+/// is refused at the durable horizon where durable corruption fired (the
+/// fence held: `horizon_fence_held`). An injected fault that stops either
+/// open checks nothing, so it gives up by name.
 fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     let mut engine = match Engine::recover(
@@ -275,6 +319,7 @@ fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
         Err(e) => {
             let msg = e.to_string();
             return if is_fault_fallout(&msg) {
+                sim.give_up(format!("the initial open died to an injected fault: {msg}"));
                 Ok(())
             } else {
                 Err(format!(
@@ -316,11 +361,18 @@ fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
         Ledger::default(),
         horizon,
     ) {
-        Ok(engine) => check_prefix(&engine.machine().records, &submitted, acked),
+        Ok(engine) => {
+            check_prefix(&engine.machine().records, &submitted, acked)?;
+            sim.cover("wal:prefix-checked");
+            Ok(())
+        }
         Err(e) => {
             let msg = e.to_string();
-            if is_fault_fallout(&msg) {
-                Ok(()) // the fence held (or an ordinary transient fault) — not silent loss
+            if horizon_fence_held(sim, &msg)? {
+                Ok(())
+            } else if is_fault_fallout(&msg) {
+                sim.give_up(format!("the recovery died to an injected fault: {msg}"));
+                Ok(())
             } else {
                 Err(format!(
                     "recovery failed with a non-fault-fallout error: {msg}"
@@ -328,6 +380,26 @@ fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
             }
         }
     }
+}
+
+/// Whether a recovery `msg` refused at the store's durable horizon is this
+/// file's verdict that the fence held: never silent loss, the corrupted
+/// acknowledged frame refused by name instead of cut. It is that only where
+/// durable corruption fired; anywhere else the refusal is the platform
+/// refusing good records, a finding (S3b item 0: until then the text alone
+/// excused it, through `is_fault_fallout`). `Ok(false)`: not that refusal.
+fn horizon_fence_held(sim: &Sim, msg: &str) -> Result<bool, String> {
+    if classify(msg) != FaultReason::DurableHorizon {
+        return Ok(false);
+    }
+    if !durable_corruption_fired(sim) {
+        return Err(format!(
+            "recovery was refused at the durable horizon, but no durable corruption fired in \
+             this universe, so the refusal is no fence holding: {msg}"
+        ));
+    }
+    sim.cover("wal:horizon-fence-held");
+    Ok(true)
 }
 
 #[test]
@@ -339,7 +411,9 @@ fn wal_survives_bit_flip() {
             cfg.bit_flip = 0.1;
         },
         wal_survives_hot_axis,
-        require: ["fault:bit_flip"]
+        require: ["fault:bit_flip"],
+        floor: [("wal:prefix-checked", BIT_FLIP_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", BIT_FLIP_GAVE_UP_CEILING)]
     );
 }
 
@@ -352,7 +426,9 @@ fn wal_survives_misdirected_write() {
             cfg.misdirected_write = 0.1;
         },
         wal_survives_hot_axis,
-        require: ["fault:misdirected_write"]
+        require: ["fault:misdirected_write"],
+        floor: [("wal:prefix-checked", MISDIRECTED_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", MISDIRECTED_GAVE_UP_CEILING)]
     );
 }
 
@@ -365,7 +441,9 @@ fn wal_survives_read_error() {
             cfg.read_error = 0.1;
         },
         wal_survives_hot_axis,
-        require: ["fault:read_error"]
+        require: ["fault:read_error"],
+        floor: [("wal:prefix-checked", READ_ERROR_PREFIX_FLOOR)],
+        ceiling: [("universe:gave-up", READ_ERROR_GAVE_UP_CEILING)]
     );
 }
 
@@ -793,6 +871,93 @@ fn corruption_below_the_horizon_is_a_hard_error_not_a_cut() {
         vec![before[0].clone()],
         "the real recovery still deletes later segments after the cut"
     );
+}
+
+/// S3b item 0 (D1 fix-report concern 2): the recovery-horizon refusal is
+/// fallout only where durable corruption fired. Here the frame is corrupted
+/// by hand, so no fault axis fired, which is what a real durability bug looks
+/// like from the checker's side: D1's WAL bug showed itself in 8 of 21 failing
+/// bases only as this refusal. `is_fault_fallout` judges text alone, so it
+/// must not excuse the refusal at all, and `durable_refusal`, which can ask
+/// the sim, fails it by name. Before item 0, `is_fault_fallout` returned true
+/// here, and every workload that retried or gave up on fallout excused it.
+#[test]
+fn a_horizon_refusal_where_no_corruption_fired_is_not_fallout_and_fails_by_name() {
+    use charpente_sim::checks::{FaultReason, classify, durable_corruption_fired, durable_refusal};
+
+    let sim = quiet_sim();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 300]).collect();
+    let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+    build_log(&sim, &refs);
+    let segment = sim
+        .disk()
+        .open(&sim.disk().list("wal/").unwrap()[0])
+        .unwrap();
+    let offset = 3 * 316 + 16 + 100;
+    let mut byte = [0u8; 1];
+    segment.read_at(offset, &mut byte).unwrap();
+    segment.write_at(offset, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+    let refusal =
+        Wal::open_with_horizon(Box::new(sim.disk()), small_segments(), Some(7), |_, _| {
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(classify(&refusal), FaultReason::DurableHorizon, "{refusal}");
+    assert!(!durable_corruption_fired(&sim));
+    assert!(
+        !is_fault_fallout(&refusal),
+        "a horizon refusal with no corruption fired is a finding, not fallout: {refusal}"
+    );
+    let failed = durable_refusal(&sim, &refusal).unwrap_err();
+    assert!(
+        failed.contains("no durable corruption fired in this universe")
+            && failed.ends_with(&refusal),
+        "{failed}"
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "an unexcused refusal is a failure, never a give-up"
+    );
+}
+
+/// `horizon_fence_held`, the verdict every recovery site in this file takes
+/// for a durable-horizon refusal, both ways: where no durable corruption fired
+/// the refusal fails by name, and where it fired it is a verdict, marked, and
+/// no give-up (S3b item 0).
+#[test]
+fn a_horizon_refusal_is_a_held_fence_only_where_durable_corruption_fired() {
+    const REFUSAL: &str = "log frame 3 is invalid but at-or-below the store's durable horizon 7";
+    let sim = quiet_sim();
+    assert_eq!(
+        horizon_fence_held(&sim, "simulated disk write error (injected fault)"),
+        Ok(false)
+    );
+    let err = horizon_fence_held(&sim, REFUSAL).unwrap_err();
+    assert!(
+        err.starts_with(
+            "recovery was refused at the durable horizon, but no durable corruption fired"
+        ) && err.ends_with(REFUSAL),
+        "{err}"
+    );
+    assert_eq!(sim.coverage().get("wal:horizon-fence-held"), None);
+
+    let sim = Sim::with_faults(
+        0xA11,
+        FaultConfig {
+            misdirected_write: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let file = sim.disk().open("wal/00000000000000000000.log").unwrap();
+    file.write_at(0, &[7; 16]).unwrap();
+    assert!(durable_corruption_fired(&sim));
+    assert_eq!(horizon_fence_held(&sim, REFUSAL), Ok(true));
+    assert_eq!(sim.coverage().get("wal:horizon-fence-held"), Some(&1));
+    assert_eq!(sim.gave_up(), None, "a held fence is a verdict");
 }
 
 #[test]
@@ -1275,17 +1440,21 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
                 if msg.contains("a segment is missing") {
                     return Err(format!("gc left a gap after crash: {msg}"));
                 }
+                if horizon_fence_held(sim, &msg)? {
+                    return Ok(());
+                }
                 if !is_fault_fallout(&msg) {
                     return Err(format!(
                         "final reopen failed with a non-fallout error: {msg}"
                     ));
                 }
-                sim.restart(); // transient fault (or the horizon fence) — retry
+                sim.restart(); // transient fault — retry
             }
         }
     }
     let Some(records) = recovered else {
-        return Ok(()); // every attempt died to recognized faults (incl. the horizon fence)
+        sim.give_up("every final reopen died to injected faults, so gap-freedom was never checked");
+        return Ok(());
     };
 
     for (i, (seq, payload)) in records.iter().enumerate() {
@@ -1311,6 +1480,7 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
             ));
         }
     }
+    sim.cover("wal:gap-free-checked");
     Ok(())
 }
 
@@ -1323,7 +1493,9 @@ fn gc_interrupted_by_crash_never_leaves_a_gap() {
             cfg.dir_entry_loss = 0.5;
         },
         gc_crash_workload,
-        require: ["restart"]
+        require: ["restart"],
+        floor: [("wal:gap-free-checked", GC_GAP_FREE_FLOOR)],
+        ceiling: [("universe:gave-up", GC_GAVE_UP_CEILING)]
     );
 }
 
