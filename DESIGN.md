@@ -1432,7 +1432,12 @@ crash-safe on the three-state role file: `store_role(HandingOff{to})` write-stop
 primary (`db.forbid_writes(to)` — reads and effect-free transactions still run, effectful
 ones get `TxError::NotPrimary`), then it *drains* — the target session's `Ack`s are read
 each step and, when its acked seq reaches `db.last_applied()`, the primary sends
-`HandOff{at_seq}` and enters HandedOff, **the point of no return**. Draining is abortable:
+`HandOff{at_seq}` and enters HandedOff, **the point of no return**. A target session's
+`Hello` position, once verified against this log, counts as acked: a target that
+reconnects already caught up is shipped nothing by a write-stopped primary and never
+acks again, so without it neither the drain nor the HandedOff resend (to a new session
+of `to`, once per session) could fire (D4 round 2:
+`a_switchover_target_that_restarts_before_taking_the_hand_off_is_sent_it_again`). Draining is abortable:
 the `SWITCHOVER_DEADLINE_NANOS` deadline while still Draining returns durably to `Primary`,
 resumes writes, and the `CtrlErr` names the follower's remaining lag. HandedOff never
 aborts: on `HandOffDone` the primary flips durably to `Follower(to)`, drops its ship
@@ -1440,12 +1445,15 @@ sessions, and starts a follower client toward the new primary (drained to byte e
 no divergence possible); on the deadline it stays write-stopped, and the `CtrlErr` names the
 hand-off seq and both answers to "did `to` take it?" (2026-10-02, D4). If `to`'s role file
 says primary, restarting this node resolves against it. If it still says follower, no node
-accepts writes and nothing changes that on its own: `to` rebooted before applying the
-`HandOff` (in the sim, its role write failed inside `accept_handoff`), reconnected already
-caught up, and so never acks again, and the drain's resend waits on an ack that never
-comes. Restarting this node alone leaves it handing off. Promoting `to` loses nothing,
-since it acked every record up to the hand-off seq and this node has written nothing since,
-and a restart then rejoins this node as its follower
+accepts writes, and nothing resends after the reply. Either the `HandOff` is still in
+flight (the drain and the hand-off share one deadline), and `to` may take it and become the
+primary, the first case
+(`a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply`); or `to` was down
+past the deadline (in the sim, its role write failed inside `accept_handoff` and its
+reboot outlasted the window), and nothing changes on its own. Restarting this node alone
+leaves it handing off. Promoting `to` loses nothing, since it confirmed it holds every
+record up to the hand-off seq and this node has written nothing since, and a restart then
+rejoins this node as its follower
 (`a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_nothing`,
 `restarting_a_stalled_primary_alone_does_not_resolve_a_never_promoted_target`). The follower side of `HandOff`
 verifies `last_applied == at_seq` (else a named `Refuse` protocol error), requires a

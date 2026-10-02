@@ -3973,14 +3973,17 @@ role file:
   promoted at so the window is explicit.
 - **`switchover`** is the zero-loss, planned handoff: the current primary
   write-stops and *drains* to the target follower, and only once the follower
-  has acked every record does it hand off — no acked record is lost. If the
-  target cannot catch up before the deadline, the switchover aborts and the
-  primary resumes.
+  holds every record does it hand off — no acked record is lost. The follower
+  shows it holds them by acking them, or, when it reconnects already caught up,
+  by the position its `Hello` carries. If the target cannot catch up before the
+  deadline, the switchover aborts and the primary resumes.
 
 **Once the hand-off is sent, there is no abort.** The deadline aborts a
 switchover only while the target is still catching up. After the hand-off is
 sent, the target may already be the primary, so the old primary never resumes
-writes on its own. If no confirmation returns before the deadline, it stays
+writes on its own. A target that loses the hand-off (its connection drops, or it
+restarts before applying it) and reconnects within the deadline is sent it
+again. If no confirmation returns before the deadline, the old primary stays
 write-stopped and replies with both possible answers to "did the target take
 it?":
 
@@ -3990,16 +3993,25 @@ switchover to <to>: the hand-off was sent at seq <seq> but no confirmation
 returned before the deadline — this node stays write-stopped and will not resume
 writes on its own, because <to> may already be the primary. If <to>'s role file
 says primary, restart this node to resolve against <to>: it rejoins as <to>'s
-follower. If it still says follower, <to> never took the hand-off and no node
-accepts writes: promote it (charpente promote --node <to>) — it acked every record
-up to seq <seq> and this node has accepted no write since, so its reply names
-last_applied Some(<seq>) and nothing is lost — then restart this node
-to resolve against <to>
+follower. If it still says follower, <to> has not taken the hand-off and no node
+accepts writes: promote it (charpente promote --node <to>) — it confirmed it holds
+every record up to seq <seq> and this node has accepted no write since, so its
+reply names last_applied Some(<seq>) and nothing is lost — then restart this
+node to resolve against <to>
 ```
 
-In the second case nothing changes on its own, and restarting the old primary
-alone does not help: it comes back still handing off, and resolves only once
-the target answers as a primary.
+Nothing resends the hand-off after this reply. A target that still says
+follower is in one of two states:
+
+- **The hand-off is still in flight.** The drain and the hand-off share one
+  deadline, so a hand-off sent late in the window may still be on its way. The
+  target can take it after the reply and become the primary, which is the first
+  case. A promote sent after that answers `cannot promote: this node is already
+  the primary`; restart the old primary.
+- **The target was down past the deadline.** Nothing changes on its own, and
+  restarting the old primary alone does not help: it comes back still handing
+  off, and resolves only once the target answers as a primary. Promote the
+  target, as the reply says.
 
 **After a `promote`, the old primary must be wiped before it is ever started
 again.** Its durable role file still says `Primary`, and the durable role always

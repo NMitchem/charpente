@@ -793,14 +793,17 @@ impl Repl {
         // advertising `to` (a reconnect may have left a stale/dead one still in
         // the Vec before the reap; a HandOffDone can also arrive buffered with
         // the peer's EOF). Take the highest acked seen, and prefer a live
-        // session to send the HandOff on.
+        // session to send the HandOff on. A verified Hello position counts as
+        // acked: a target that reconnects already caught up is shipped nothing
+        // while this node is write-stopped, so it never acks again, and without
+        // it the resend below could never fire (D4 round 2).
         let mut got_done = false;
         let mut best_acked: Option<u64> = None;
         let mut live_target: Option<usize> = None;
         for (i, s) in self.sessions.iter_mut().enumerate() {
             if !s.control && s.listen.as_deref() == Some(to.as_str()) {
                 got_done |= s.drain_switchover_inbox();
-                best_acked = best_acked.max(s.acked);
+                best_acked = best_acked.max(s.acked).max(s.hello_position);
                 if !s.dead {
                     live_target = Some(i);
                 }
@@ -844,7 +847,8 @@ impl Repl {
                     return Ok(true);
                 }
                 // The HandOff was lost and the follower reconnected (a fresh
-                // session id, caught up again): resend once. If the follower
+                // session id, caught up again, which its verified Hello position
+                // shows): resend once. If the follower
                 // already promoted it will not reconnect, so this never
                 // double-promotes.
                 if caught_up && let Some(i) = live_target {
@@ -1179,10 +1183,11 @@ impl Repl {
     /// durable role stays `HandingOff` — a restart resolves against `to` once
     /// `to` is a primary, and never before.
     ///
-    /// Both answers to "did `to` take it?" leave this node write-stopped, and
-    /// nothing here resends: a `to` that restarted before applying the
-    /// `HandOff` reconnects already caught up, so it never acks again and the
-    /// drain never sees it caught up. Only an operator moves either state.
+    /// Both answers to "did `to` take it?" leave this node write-stopped. A
+    /// `to` that lost the `HandOff` and reconnected caught up inside the window
+    /// was sent it again (`drive_switchover`), so a `to` still a follower here
+    /// either has the `HandOff` in flight, and may yet take it and become the
+    /// primary, or was down past the deadline. Nothing resends after this reply.
     fn stall_switchover(&mut self, ctrl_id: u64, to: &str, at: u64, now: u64) {
         self.reply_ctrl(
             ctrl_id,
@@ -1192,11 +1197,12 @@ impl Repl {
                      returned before the deadline — this node stays write-stopped and will not \
                      resume writes on its own, because {to} may already be the primary. If \
                      {to}'s role file says primary, restart this node to resolve against {to}: \
-                     it rejoins as {to}'s follower. If it still says follower, {to} never took \
-                     the hand-off and no node accepts writes: promote it (charpente promote \
-                     --node {to}) — it acked every record up to seq {at} and this node has \
-                     accepted no write since, so its reply names last_applied Some({at}) and \
-                     nothing is lost — then restart this node to resolve against {to}"
+                     it rejoins as {to}'s follower. If it still says follower, {to} has not \
+                     taken the hand-off and no node accepts writes: promote it (charpente \
+                     promote --node {to}) — it confirmed it holds every record up to seq {at} \
+                     and this node has accepted no write since, so its reply names \
+                     last_applied Some({at}) and nothing is lost — then restart this node to \
+                     resolve against {to}"
                 ),
             },
             now,
