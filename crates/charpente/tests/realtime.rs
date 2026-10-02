@@ -1495,6 +1495,13 @@ struct Client {
     frames_consumed: usize,
     last_id: Option<u64>,
     trace: Vec<(u64, &'static str, String)>,
+    /// Whether a fault explains a cut of this client's node's timeline: one
+    /// that removed a ledgered event. `durable_corruption_fired` for the
+    /// single-node workloads; the follower property asks its tail node's own
+    /// disk. Only where it answers true is a cut re-synced (`resync_if_cut`)
+    /// or a diverged drain excused (`sync_and_drain_or_give_up`); a cut
+    /// nothing explains is a lost event, and the universe fails (S3b item 1).
+    cut_explained: fn(&Sim) -> bool,
 }
 
 impl Client {
@@ -1514,6 +1521,7 @@ impl Client {
             frames_consumed: 0,
             last_id: None,
             trace: Vec::new(),
+            cut_explained: durable_corruption_fired,
         }
     }
 
@@ -1691,7 +1699,7 @@ impl Client {
     /// no durable corruption on record nothing changes, and the same recorded
     /// id stays owed, as it must: there it can only be a lost event.
     fn resync_if_cut(&mut self, sim: &Sim, head: u64) {
-        if self.ledger.range(head..).next().is_some() && durable_corruption_fired(sim) {
+        if self.ledger.range(head..).next().is_some() && (self.cut_explained)(sim) {
             self.resync_to_head(head);
             sim.cover("realtime:ledger-resynced");
         }
@@ -1806,10 +1814,20 @@ impl Client {
     ///
     /// The probe runs ONLY after a drain error, so the common path is
     /// unchanged and no passing universe's fault schedule moves.
+    ///
+    /// The give-up is only for a cut a fault explains (`cut_explained`). One
+    /// nothing explains is the lost event this property exists to catch, so
+    /// it fails, naming the divergence (S3b item 1: until then any diverged
+    /// entry gave the universe up).
     fn sync_and_drain_or_give_up(&mut self, sim: &Sim, db: &Db) -> Result<bool, String> {
         match self.sync_and_drain(db) {
             Ok(()) => Ok(false),
             Err(e) => match self.diverged_ledger_entry(db) {
+                Some((id, recorded, stored)) if !(self.cut_explained)(sim) => Err(format!(
+                    "{e}: ledger diverged at event id {id}: recorded {recorded} when scanned, \
+                     store now holds {stored}, and no fault on this node explains the cut, so \
+                     this node lost an event it had committed"
+                )),
                 Some((id, recorded, stored)) => {
                     sim.give_up(format!(
                         "ledger diverged at event id {id}: recorded {recorded} when scanned, \
@@ -2115,8 +2133,20 @@ fn settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
 /// observed frame trace (id, name, json) — the determinism check's oracle —
 /// on success.
 fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, String> {
+    realtime_workload_judged(sim, durable_corruption_fired)
+}
+
+/// `realtime_workload`, its client asking `cut_explained` whether a fault
+/// explains a cut: `durable_corruption_fired` for the property, a check that
+/// explains nothing for the pins that stand a cut in for a platform durability
+/// bug (S3b item 1; `scoped_realtime_workload_judged`'s reason).
+fn realtime_workload_judged(
+    sim: &mut Sim,
+    cut_explained: fn(&Sim) -> bool,
+) -> Result<Vec<(u64, &'static str, String)>, String> {
     let (path, mode_names, mode_key) = mode_for(sim.seed());
     let mut client = Client::new(mode_names, mode_key);
+    client.cut_explained = cut_explained;
 
     for _epoch in 0..EPOCHS {
         // A give-up already recorded means this universe adjudicated
@@ -2338,6 +2368,17 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
         // above). A universe that adjudicated nothing gives up; it does not fail,
         // and it does not pass either.
         if let Some((id, recorded, stored)) = rolled_back {
+            // Only a cut a fault explains is excused (S3b item 1). One nothing
+            // explains is an event this node lost, the miss this property
+            // exists to catch.
+            if !(client.cut_explained)(sim) {
+                return Err(format!(
+                    "{}; ledger id {id} is behind this node's timeline: recorded {recorded} \
+                     when scanned, store now says {stored}, and no fault on this node \
+                     explains the cut",
+                    client.unsettled_report()
+                ));
+            }
             sim.give_up(format!(
                 "ledger id {id} is behind this node's timeline: recorded {recorded} \
                  when scanned, store now says {stored} — this node's timeline no longer \
@@ -2541,6 +2582,44 @@ fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
 /// {"n":"697"})". It was the only universe of 13,312 scanned where carrying on
 /// turns the give-up into that failure; the other diverged-ledger give-ups
 /// stayed give-ups either way.
+/// Seeds where the flagship meets a cut a fault explains, run with the cut
+/// standing in for one nothing explains (S3b item 1; the stand-in is
+/// `realtime_workload_judged` with a check that explains nothing). Each is
+/// then a lost event and must FAIL, naming the divergence. Until item 1 both
+/// probes gave the universe up on any diverged ledger entry, so a platform
+/// durability bug passed as a give-up. `0x6617ca6405d1b99e` meets it at the
+/// drain probe (the give-up pinned above), `0xb1bcbb46b1c81e2f` (base
+/// `0x5E1F001D`, universe 6) at the settle's rolled-back probe ("ledger id 2
+/// is behind this node's timeline"), found by scanning 25 bases.
+#[test]
+fn a_cut_nothing_explains_fails_the_flagship_by_name() {
+    for (seed, at) in [
+        (0x6617_ca64_05d1_b99e_u64, "ledger diverged at event id 0"),
+        (
+            0xb1bc_bb46_b1c8_1e2f,
+            "ledger id 2 is behind this node's timeline",
+        ),
+    ] {
+        let mut state = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        let mut sim = Sim::with_faults(seed, cfg);
+
+        let err = realtime_workload_judged(&mut sim, |_| false)
+            .expect_err("a cut nothing explains is a lost event");
+        assert!(
+            err.contains(at) && err.contains("no fault on this node explains the cut"),
+            "seed {seed:#x}: {err}"
+        );
+        assert_eq!(
+            sim.gave_up(),
+            None,
+            "seed {seed:#x}: a failure, never a give-up"
+        );
+    }
+}
+
 #[test]
 fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
     const SEED: u64 = 0x6617_ca64_05d1_b99e;
@@ -4427,6 +4506,10 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
 
     let (path, mode_names, mode_key) = mode_for(sim.seed());
     let mut client = Client::new(mode_names, mode_key);
+    // The client tails `f` in every phase, so only a fault on `f`'s own disk
+    // can explain a cut of its timeline. This property turns the
+    // durable-corruption axes off, so none can (S3b item 1).
+    client.cut_explained = |sim| sim.host("f").durable_corruption_fired();
 
     // ---------------------------------------------------- Phase 1: follower-tail
     drive_client_to_settled(sim, &mut [&mut p, &mut f], 1, &mut client, path)?;
@@ -5335,7 +5418,20 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
 /// `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have.
 /// Returns the frame trace, so the replay check has an oracle.
 fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
+    scoped_realtime_workload_judged(sim, durable_corruption_fired)
+}
+
+/// `scoped_realtime_workload`, its client asking `cut_explained` whether a
+/// fault explains a cut. The property passes `durable_corruption_fired`. A pin
+/// passes a check that explains nothing, so every cut stands in for one no
+/// injected fault explains, which is the S3 re-review's stand-in (re-sync
+/// disabled) for a platform durability bug (S3b item 1).
+fn scoped_realtime_workload_judged(
+    sim: &mut Sim,
+    cut_explained: fn(&Sim) -> bool,
+) -> Result<ScopedTrace, String> {
     let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    client.cut_explained = cut_explained;
     // Every boundary `push_subscribe` reads goes through `resync_if_cut`. Each
     // recovery is followed by a subscribe before any emit, so every cut is
     // seen there before an id it cut can be re-minted. The flagship's
@@ -5442,11 +5538,6 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     // attempts means this universe never observed a delivery and cannot
     // testify about a missed one.
     let mut clean_attempts = 0u32;
-    // A ledger id this node's store has rolled back PAST, observed during a clean
-    // attempt. Carried out of the loop because the unsettled verdict below has no
-    // node of its own to ask, and booting one there would be both fault-prone and a
-    // new disk op on the failure path.
-    let mut rolled_back: Option<(u64, String, String)> = None;
     for _attempt in 0..SETTLE_ATTEMPTS {
         // A give-up already recorded means this universe adjudicated
         // nothing; carrying on can only turn it into a failure, and the
@@ -5503,12 +5594,6 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             client.current_handle = None;
         } else {
             clean_attempts += 1;
-            // Only when this clean run still left the client behind: a settled client
-            // breaks out at the top of the next iteration and never reaches here, so
-            // no universe that catches up pays for this probe.
-            if rolled_back.is_none() && !client.settled() {
-                rolled_back = client.diverged_ledger_entry(kernel.app().db());
-            }
         }
         // The loop-top check never runs after the LAST attempt, whose give-up
         // would otherwise fall through to the unsettled verdict below.
@@ -5520,18 +5605,12 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     if !client.settled() {
         // See `realtime_workload`'s note: `settle_boot` returning `None` is
         // fault-only, so no clean attempt means there was no node to catch up
-        // FROM. That universe adjudicated nothing and gives up.
-        if let Some((id, recorded, stored)) = rolled_back {
-            sim.give_up(format!(
-                "ledger id {id} is behind this node's timeline: recorded {recorded} \
-                 when scanned, store now says {stored} — this node's timeline no longer \
-                 holds the recorded event (durable corruption cut it above the \
-                 checkpoint horizon), so it can never be delivered and nothing here \
-                 adjudicates ({})",
-                client.unsettled_report()
-            ));
-            return Ok(client.trace);
-        }
+        // FROM. That universe adjudicated nothing and gives up. There is no
+        // rolled-back-ledger give-up here, unlike the flagship's: every boundary
+        // re-syncs a cut a fault explains (`resync_if_cut`), so a ledgered id the
+        // node rolled back past is one nothing explains, which fails below. That
+        // give-up reached 0 of 3,200 universes over 25 bases (S3b item 1), as the
+        // S3 re-review measured (0 of 16,384), so it went.
         if clean_attempts == 0 {
             sim.give_up(format!(
                 "no settle attempt completed without fault fallout over \
@@ -5768,6 +5847,36 @@ fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynce
     assert!(
         !trace.iter().any(|&(id, ..)| id == 3),
         "id 3 was re-minted for tenant B, so A must never receive it: {trace:?}"
+    );
+}
+
+/// The same universe with its cut standing in for one nothing explains (S3b
+/// item 1, the S3 re-review's stand-in: re-sync disabled): the client's
+/// `cut_explained` answers false, so the cut id 3 stays owed and is never
+/// delivered. That is a lost event, and the universe must FAIL by name. Until
+/// item 1 the settle's rolled-back-ledger arm gave it up ("ledger id 3 is
+/// behind this node's timeline") without asking whether anything explained
+/// the cut, so a platform durability bug passed as a give-up.
+#[test]
+fn a_cut_nothing_explains_fails_the_scoped_universe_by_name() {
+    const SEED: u64 = 0x083b_d434_c717_d60c;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let err = scoped_realtime_workload_judged(&mut sim, |_| false)
+        .expect_err("a cut nothing explains is a lost event");
+    assert!(
+        err.starts_with("client never caught up")
+            && err.contains("first unaccounted matching id Some(3)"),
+        "{err}"
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "a lost event is a failure, never a give-up"
     );
 }
 
