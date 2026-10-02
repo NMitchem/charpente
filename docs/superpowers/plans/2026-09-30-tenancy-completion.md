@@ -17623,8 +17623,8 @@ test names and quoted message, in `$D/progress.md`. Task 14 carries them into th
 
 **Files:**
 - Modify:
-  - `DECISIONS.md`: §12's "What an app is told, and where" paragraph (lines 325–333 at
-    e749823).
+  - `DECISIONS.md`: §12's "What an app is told, and where" paragraph (lines 347–355 at
+    57e5df5; 325–333 at e749823).
   - `README.md`:
     - the "What it looks like" snippet gains the event's declaration;
     - two sentences name events beside routes, tables and jobs (spec §10: "README, if it names
@@ -17648,7 +17648,7 @@ test names and quoted message, in `$D/progress.md`. Task 14 carries them into th
   - Tasks 1–13 as landed.
   - The plan's base commit, which Task 1 Step 1 wrote into `$D/progress.md`.
   - Task 1's workspace `test result:` baseline.
-  - Task 13's base, N, gave-up count, floors, fresh total, and its M1–M8 results.
+  - Task 13's base, N, gave-up count, floors, give-up cap, fresh total, and its M1–M8 results.
 - Produces:
   - DECISIONS §12's corrected remedy.
   - A stale-phrase sweep with zero hits.
@@ -17662,12 +17662,12 @@ test names and quoted message, in `$D/progress.md`. Task 14 carries them into th
 
 - [ ] **Step 1: DECISIONS.md:328 — the fan-out, and the tenant type's name (spec §7 item 7)**
 
-The decision does not change; its wording does. At e749823 the paragraph says the job "runs in
-the tenant its enqueuer opened". Two things are missing from it:
+The decision does not change; its wording does. At 57e5df5 (unchanged since e749823) the paragraph
+says the job "runs in the tenant its enqueuer opened". Two things are missing from it:
 - the declared fan-out, `Tx::enqueue_in`;
 - any statement of how a job's tenant *type* is identified across two binaries.
 
-LEDGER 2026-09-30 item 7 calls the second "the cross-binary residual". The text at e749823 has
+LEDGER 2026-09-30 item 7 calls the second "the cross-binary residual". The text at 57e5df5 has
 no residual sentence to replace, so this step adds a pointer to the mechanism that now answers
 it: spec §2 ruling 2 and §4, the declared `Tenant::NAME` inside the fingerprint. The note
 follows the paragraph's existing *(Corrected …)* style, and is dated by the commit that makes
@@ -17840,7 +17840,8 @@ PHRASES = {
     'proto_version is 4': 'Task 10',
     'proto_version: u8 = 4': 'Task 10',
     'last path segment': 'Task 2',
-    'last segment': 'Task 2',
+    'by its last segment': 'Task 2',
+    "scope path's last segment": 'Task 2',
     'as spelled': 'Task 4',
     'keeps its spelling': 'Task 4',
     'a route, table or job that says none of this': 'Task 14 Step 2',
@@ -17898,6 +17899,14 @@ Expected:
 This script was run read-only at e749823. Its phrase half counted 97 hits across 23 files, and
 its six checks read `34 2 1 2 0 0`. That run is the evidence that each phrase, and each
 check's pattern, detects the state it exists to catch.
+
+It was re-run read-only at 57e5df5 when the plan was amended (2026-10-02). It swept 377 files:
+97 hits across 23 files, and checks `35 2 1 2 0 0`. The extra bare `#[event]` is the one D4
+added to `realtime.rs`, which Task 1 converts. At 57e5df5 the phrase `'last segment'` also
+matched `crates/charpente/tests/auth.rs:616` ("the last segment", S3b's 33e64f2). That comment
+is about the WAL's newest segment file, not a type path. So the phrase is split in two above,
+`'by its last segment'` and `"scope path's last segment"`, and the pair still finds both of
+e749823's hits (`charpente-macros/src/job.rs` and `route.rs`).
 
 On a non-zero line:
 - The hit is a doc Tasks 2–12 missed. Its owner is in brackets.
@@ -17962,7 +17971,7 @@ unset CARGO_TARGET_DIR
 git diff $BASE HEAD -- ':(glob)crates/*/src/**' > $D/s1-src.diff
 cargo mutants --list --in-diff $D/s1-src.diff > $D/s1-in-diff.txt; wc -l < $D/s1-in-diff.txt
 rm -f $D/mut-list-*.txt
-cargo mutants --list --file crates/charpente-core/src/db.rs --re 'scoped_fingerprint|ScopedTx|emit|encode_record|decode_record|apply_batch|put_schema_version|migrate_table|migrate_schema|cross_tenant_cap|tenant_admission|CrossTenant|TenantAdmission|enter_scope|open_scope|admit_scope|stage' > $D/mut-list-db.txt
+cargo mutants --list --file crates/charpente-core/src/db.rs --re 'scoped_fingerprint|ScopedTx|emit|encode_record|decode_record|apply_batch|put_schema_version|migrate_table|migrate_schema|cross_tenant_cap|tenant_admission|CrossTenant|TenantAdmission|enter_scope|open_scope|admit_scope|stage|refuse_read_as|TableReadRefusal' > $D/mut-list-db.txt
 cargo mutants --list --file crates/charpente-core/src/db.rs --re 'is_platform_table|refuse_platform_table|refuse_platform_read' > $D/mut-list-db-platform.txt
 cargo mutants --list --file crates/charpente-core/src/event.rs > $D/mut-list-event.txt
 cargo mutants --list --file crates/charpente-core/src/table.rs > $D/mut-list-table.txt
@@ -18005,30 +18014,39 @@ Expected:
 **Then run each target.** Read the verb's output, never cargo-mutants' exit code. Every
 `--file` outside core and sim names the packages whose suites exercise it (CLAUDE.md's
 `--test-package` trap). The db platform target adds `charpente-macros`, whose trybuild E0080
-fixtures are those functions' only oracle (LEDGER 2026-09-30, T9-R9). Runs with two or more
-packages pass `--timeout 2600` (T9-R4). `CARGO_TARGET_DIR` stays unset: the verb refuses
-`--jobs > 1` under an inherited one, and a shared target dir can leave a mutant's build
-looking fresh. The controller runs each line in the background and waits on its log.
+fixtures are those functions' only oracle (LEDGER 2026-09-30, T9-R9). No run passes
+`--timeout`. T9-R4 fixed `--timeout 2600` by hand on 2026-09-30. The verb now takes that
+measure itself (2b40475 and de3d4fb, both after e749823; CLAUDE.md, "Mutation instrument").
+Whenever a run's test set is two or more packages, or is not every `--file`'s package, the
+verb times one `cargo test` over the set and passes 5x that time, printing both numbers. So
+the timeout is re-measured at execution, over the tree being mutated. The db target names
+A18's `refuse_read_as` and `TableReadRefusal` (Task 9 Step 4). The calls to them sit in
+`Tx`'s `get_in`, `scan_in`, `scan_by_in` and `scan_from_in`, which the completeness pass adds
+if their mutants fall on S1's lines. The dispatch target's `run_due_into` holds N8's
+read-refusal arm. `Group::stage`'s N1 assert is inside `assert!`, where cargo-mutants places
+no mutant, so Step 4's rows 49 and 50 are its only inversions. `CARGO_TARGET_DIR` stays
+unset: the verb refuses `--jobs > 1` under an inherited one, and a shared target dir can leave
+a mutant's build looking fresh. The controller runs each line in the background and waits on its log.
 
 ```zsh
 D=.superpowers/sdd/2026-09-30-tenancy-completion
 unset CARGO_TARGET_DIR
-scripts/mutants.sh --file crates/charpente-core/src/db.rs --re 'scoped_fingerprint|ScopedTx|emit|encode_record|decode_record|apply_batch|put_schema_version|migrate_table|migrate_schema|cross_tenant_cap|tenant_admission|CrossTenant|TenantAdmission|enter_scope|open_scope|admit_scope|stage' --test-package charpente-core --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-db.log
-scripts/mutants.sh --file crates/charpente-core/src/db.rs --re 'is_platform_table|refuse_platform_table|refuse_platform_read' --test-package charpente-core --test-package charpente-macros --timeout 2600 2>&1 | tee $D/mutants-db-platform.log
-scripts/mutants.sh --file crates/charpente-core/src/event.rs --test-package charpente-core --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-event.log
-scripts/mutants.sh --file crates/charpente-core/src/table.rs --test-package charpente-core --test-package charpente --test-package charpente-macros --timeout 2600 2>&1 | tee $D/mutants-table.log
-scripts/mutants.sh --file crates/charpente-core/src/migration.rs --test-package charpente-core --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-migration.log
+scripts/mutants.sh --file crates/charpente-core/src/db.rs --re 'scoped_fingerprint|ScopedTx|emit|encode_record|decode_record|apply_batch|put_schema_version|migrate_table|migrate_schema|cross_tenant_cap|tenant_admission|CrossTenant|TenantAdmission|enter_scope|open_scope|admit_scope|stage|refuse_read_as|TableReadRefusal' --test-package charpente-core --test-package charpente 2>&1 | tee $D/mutants-db.log
+scripts/mutants.sh --file crates/charpente-core/src/db.rs --re 'is_platform_table|refuse_platform_table|refuse_platform_read' --test-package charpente-core --test-package charpente-macros 2>&1 | tee $D/mutants-db-platform.log
+scripts/mutants.sh --file crates/charpente-core/src/event.rs --test-package charpente-core --test-package charpente 2>&1 | tee $D/mutants-event.log
+scripts/mutants.sh --file crates/charpente-core/src/table.rs --test-package charpente-core --test-package charpente --test-package charpente-macros 2>&1 | tee $D/mutants-table.log
+scripts/mutants.sh --file crates/charpente-core/src/migration.rs --test-package charpente-core --test-package charpente 2>&1 | tee $D/mutants-migration.log
 scripts/mutants.sh --file crates/charpente/src/http/mod.rs --re 'Subscription|TenantFeed|Subscribe|admits' --test-package charpente 2>&1 | tee $D/mutants-subscription.log
 scripts/mutants.sh --file crates/charpente/src/kernel/tail.rs --re 'deliver_unit' --test-package charpente 2>&1 | tee $D/mutants-tail.log
 scripts/mutants.sh --file crates/charpente/src/kernel/mod.rs --re 'validate_subscribe|refuse_foreign_pending_jobs' --test-package charpente 2>&1 | tee $D/mutants-resume.log
 scripts/mutants.sh --file crates/charpente/src/kernel/dispatch.rs --re 'JobScope|run_due_into' --test-package charpente 2>&1 | tee $D/mutants-dispatch.log
 scripts/mutants.sh --file crates/charpente/src/http/app.rs --test-package charpente 2>&1 | tee $D/mutants-app.log
 scripts/mutants.sh --file crates/charpente/src/tenant.rs --test-package charpente 2>&1 | tee $D/mutants-tenant.log
-scripts/mutants.sh --file crates/charpente/src/describe.rs --test-package charpente --test-package charpente-cli --timeout 2600 2>&1 | tee $D/mutants-describe.log
-scripts/mutants.sh --file crates/charpente-cli/src/genclient.rs --test-package charpente-cli --test-package charpente-tsgen --timeout 2600 2>&1 | tee $D/mutants-genclient.log
-scripts/mutants.sh --file 'crates/charpente-tsgen/src/*.rs' --test-package charpente-tsgen --test-package ts-fixture-app --timeout 2600 2>&1 | tee $D/mutants-tsgen.log
-scripts/mutants.sh --file crates/charpente-macros/src/event.rs --file crates/charpente-macros/src/fingerprint.rs --test-package charpente-macros --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-macros-event.log
-scripts/mutants.sh --file crates/charpente-macros/src/job.rs --file crates/charpente-macros/src/route.rs --file crates/charpente-macros/src/table.rs --test-package charpente-macros --test-package charpente --timeout 2600 2>&1 | tee $D/mutants-macros-rest.log
+scripts/mutants.sh --file crates/charpente/src/describe.rs --test-package charpente --test-package charpente-cli 2>&1 | tee $D/mutants-describe.log
+scripts/mutants.sh --file crates/charpente-cli/src/genclient.rs --test-package charpente-cli --test-package charpente-tsgen 2>&1 | tee $D/mutants-genclient.log
+scripts/mutants.sh --file 'crates/charpente-tsgen/src/*.rs' --test-package charpente-tsgen --test-package ts-fixture-app 2>&1 | tee $D/mutants-tsgen.log
+scripts/mutants.sh --file crates/charpente-macros/src/event.rs --file crates/charpente-macros/src/fingerprint.rs --test-package charpente-macros --test-package charpente 2>&1 | tee $D/mutants-macros-event.log
+scripts/mutants.sh --file crates/charpente-macros/src/job.rs --file crates/charpente-macros/src/route.rs --file crates/charpente-macros/src/table.rs --test-package charpente-macros --test-package charpente 2>&1 | tee $D/mutants-macros-rest.log
 ```
 
 Any target Step 3's completeness pass widened is run in its widened form. A whole-file target
@@ -18049,7 +18067,7 @@ rerun it with a larger `--timeout`, or show it caught in the log.
   `apply_batch`.
   - Their equivalence argument rested on one fact: only a forged `SchemaVersion` row, or
     `migration_batch_size: 0` over an idle table, distinguishes them.
-  - S2 refuses `migration_batch_size: 0` (LEDGER item 10). Task 8 seals
+  - S2 refuses `migration_batch_size: 0` (LEDGER item 10; db.rs:3723 at 57e5df5). Task 8 seals
     `charpente.schema_versions` against app writes (item 11).
   - So re-argue them. Name the inputs that remain: the operator path through the `Group`, and
     nothing an app can write. State whether any reaches the difference.
@@ -18133,6 +18151,10 @@ reports that as the fixture's mismatch, which is a behavioural red for that orac
 | 44 | 11 | `TenantFeed::and`'s bound | `Event<Scope = S>` → `Event` | trybuild — the scope-mixing `.and()` fixture |
 | 45 | 11 | the scoped `FINGERPRINT` emission | pass `""` for `S::NAME` (Task 13's M8) | `a_scoped_events_fingerprint_mixes_its_tenants_name`, and `tenancy_feeds::a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape` |
 | 46 | 12 | `describe`'s event info | `scoped_by` → `None` | `describe_names_an_events_tenant_by_its_tenant_types_name`, `examples/invoicing`'s `describe_golden`, and `guide-examples`' `describe_contract` |
+| 47 | 9 | `crates/charpente-core/src/db.rs`, `Tx::refuse_read_as` (A18) | the comparison's left operand `ops.row_type` → `TypeId::of::<R>()` (the reader is compared with itself, so nothing is refused) | `cargo test -p charpente --test tenant` — `a_read_through_the_same_table_under_another_scope_type_is_refused` |
+| 48 | 9 | same | `==` → `!=` (a read through the registered type is refused, and one through any other type is let through) | the same test, at its `as_team` read, and every scoped-read test in the tenant suite |
+| 49 | 8 | `Group::stage`'s overlay assert (N1) | Task 8 Step 9's mutation 8, on the committed tree: delete `put_schema_version`'s `written_as` record | `cargo test -p charpente-core --test migrations` — `migrate_schema_records_each_schema_version_as_an_unscoped_put`, panicking with "Group::stage: a transaction wrote a table TxEffects::written_as did not record, so the check above never saw it — …" |
+| 50 | 8 | same | the assert's `*table == JobRow::TABLE` clause → `false` (the one exemption, for `Tx::settle_job`) | `cargo test -p charpente --test kernel` — every test in which a job settles panics with the same text |
 
 Commands, by suite:
 - trybuild: `cargo test -p charpente-macros --test trybuild`
@@ -18147,7 +18169,7 @@ A row's "must fail" names what must go red. Other suites may go red too, and tha
 
 A green result under any row except 32 is ambiguous: the test may be vacuous, or the inversion
 inert. Print the observable behaviour (the status, the row's scope, the frames) before
-concluding either. Operand rows (13, 26–31) prove each input to a check is read, not only that
+concluding either. Operand rows (13, 26–31, 47, 49, 50) prove each input to a check is read, not only that
 the check exists.
 
 Then clean up, one git-native step at a time. Nothing is copied out: the logs were written to
@@ -18231,17 +18253,32 @@ else happens. Paste its `CHARPENTE_SEED=…` line into the report.
 **CI's replay pins**, exactly as `.github/workflows/ci.yml` lists them at this commit. Read the
 file; do not copy the lines from this plan. Each must be green.
 
-**The RED-first pin.** `0xe2d97275c15cc087` is the kernel swarm's live RED-first
-reproduction. S1 changed that workload's bytes: Task 2 added `Tenant::NAME`, and Task 9 moved
-its platform-table reads. A moved op schedule is what defanged its predecessors. So re-verify
-its meaning the way it was first proven, in a scratch worktree with its own target dir:
-1. Delete the `is_fault_fallout` classification in `kernel_workload`'s checker arm, and replay
-   the seed. It must be RED.
-2. Restore the classification, and replay again. It must be GREEN.
+**The RED-first pins.** At 57e5df5 ci.yml replays two kernel-swarm seeds, and each is a RED-first
+reproduction (ci.yml:54-88; both re-found on 2026-09-30, after redb 4.3.0 renamed the
+universes, LEDGER 2026-09-30 "Pins re-found by their reason"):
+- `0x0f34c969dfd340b0` reaches the `is_fault_fallout` classification in `kernel_workload`'s
+  checker arm (kernel.rs:2603-2611 at 57e5df5). It replaced `0xe2d97275c15cc087`, which went
+  GREEN with the classification deleted.
+- `0xf4e437494b4b8551` reaches `Kernel::build`'s drain-id fix,
+  `let _ = app.db_mut().drain_enqueued();` (kernel/mod.rs:252 at 57e5df5). No fault fires in
+  its universe, so it depends on the workload's shape alone.
 
-If it is GREEN with the classification deleted, the pin no longer reaches the arm. Report it;
-do not fix it silently. The re-pin procedure is in the `ci.yml` comment above that line: a
-10,000-universe batch at base `0x577d39b752d077c7`. Remove the worktree as in Step 4.
+S1 changed that workload's bytes: Task 2 added `Tenant::NAME`, and Task 9 moved its
+platform-table reads. A moved op schedule is what defanged each pin's predecessors. So
+re-verify each pin's meaning the way it was proven. Work in a scratch worktree with its own
+target dir, and replay each seed with ci.yml's own line:
+1. Delete the classification, and replay `0x0f34c969dfd340b0`. It must be RED. At 57e5df5 it
+   failed with "table store (redb): I/O error: simulated crash".
+2. Restore the classification, and replay again. It must be GREEN.
+3. Delete the `drain_enqueued` line, and replay `0xf4e437494b4b8551`. It must be RED, at
+   dispatch.rs's "dispatcher invariant: job 0 in the heap is not Pending".
+4. Restore the line, and replay again. It must be GREEN.
+
+Restore with `git checkout -- <file>`, and confirm `git status --short` is empty between the
+two pins. If a pin is GREEN with its code deleted, it no longer reaches that code. Report it;
+do not fix it silently. The re-pin procedure is in the `ci.yml` comment above each line. On
+2026-09-30 the classification pin was the only hit among 10,240 universes at base `0x577d001a`.
+Remove the worktree as in Step 4.
 
 - [ ] **Step 6: The counted gate, CI's other steps, the TS gate and the guide gates**
 
@@ -18374,7 +18411,7 @@ grep -c "two from M3's tenancy completion" PLAN.md; grep -c "A cross-tenant subs
 Expected: `1`, `1`, and the Date line now reads `… **Status:** Implemented <date> (commits
 …); plan …`.
 
-Task 1's subject is the one D1's Task 1 commit uses (`feat(tenancy-completion):
+Task 1's subject is the one Task 1's commit step uses (`feat(tenancy-completion):
 #[event(global)] …`), and Task 13's is Step 7's above. If either grep finds nothing, the
 subject differs. Read `git log --oneline $BASE..HEAD` and pass the two shas by hand.
 
@@ -18394,10 +18431,11 @@ subject differs. Read `git log --oneline $BASE..HEAD` and pass the two shas by h
 - **CI (exit criterion 4):** CI runs on the merged tip only after Noah pushes. Record that the run is pending on that push, and record its result in a one-line follow-up once it lands.
 - **Seeds and universes:**
   - Task 13's base `0x5C0B_0001`, its N, and how N was set (both CPU timings).
-  - Its verdict line, its gave-up count, and its eight floors.
+  - Its verdict line, its gave-up count, its eight floors and its give-up cap.
   - Its fresh total.
   - Step 5's table (Commit | Property | Bases | Universes | Gave up) and its totals.
-  - `0xe2d97275c15cc087`'s RED-first re-verification.
+  - The RED-first re-verification of the two kernel pins, `0x0f34c969dfd340b0` and
+    `0xf4e437494b4b8551`.
   - Task 1's coverage baselines: which reproduced byte-identically through Tasks 2–12, and
     which moved in Task 10 by design.
   - Every seed pinned in this work, with its reason.
@@ -18442,7 +18480,9 @@ Do not push. Pushing and publishing are Noah's calls.
 
 ## Appendix: measured evidence behind the amendments
 
-The scratch crates and logs quoted here live in this session's scratchpad (`scratchpad/D2`, `D3`, `D4`). The quotes below are the record; the scratchpad may be gone by the time a task runs.
+The scratch crates and logs quoted here live in the drafting session's scratchpad, in directories named `D2`, `D3` and `D4`. Those names are the drafting session's own, not the sub-projects D2–D4 that landed on main later (the head's **Base:** line). The quotes below are the record; the scratchpad may be gone by the time a task runs.
+
+Re-checked at 57e5df5 when the plan was amended (2026-10-02): the `UnscopedRow` census below is unchanged apart from line numbers (`engine.rs`'s assertion moved from 469–476 to 474–481), `a_job_row_is_still_read_through_view` is at `engine.rs:480`, the three `*_missing_tenant_scope.rs` fixtures still make no `View` call (no trybuild fixture changed between e749823 and 57e5df5), and the `#[table]` accessor still emits `view: &impl ::charpente::core::table::View` (`charpente-macros/src/table.rs:161`).
 
 ### A9: a token tied to `&self` (spec §5's form) on the tree's three mint-then-stage shapes
 
