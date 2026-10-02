@@ -5261,11 +5261,13 @@ fn a_switchover_stalled_on_a_never_promoted_target_says_so_and_its_remedy_loses_
              before the deadline — this node stays write-stopped and will not resume writes on \
              its own, because f:1 may already be the primary. If f:1's role file says primary, \
              restart this node to resolve against f:1: it rejoins as f:1's follower. If it \
-             still says follower, f:1 has not taken the hand-off and no node accepts writes: \
+             still says follower, f:1 has not taken the hand-off yet and no node accepts writes: \
              promote it (charpente promote --node f:1) — it confirmed it holds every record up \
              to seq {at} and this node has accepted no write since, so its reply names \
              last_applied Some({at}) and nothing is lost — then restart this node to resolve \
-             against f:1"
+             against f:1. If the promote answers \"cannot promote: this node is already the \
+             primary\", f:1 took a hand-off still in flight at the deadline: just restart this \
+             node"
         )
     );
     let none_writable = |p: &Node, f: &Node| {
@@ -5358,19 +5360,23 @@ fn restarting_a_stalled_primary_alone_does_not_resolve_a_never_promoted_target()
 /// until `p` has replied. The reply's second case holds when it is sent, and
 /// then `f` takes the `HandOff` on its own and becomes the primary, which is
 /// the first case. A promote sent after that answers that `f` is already the
-/// primary, and restarting `p` resolves it with nothing lost.
+/// primary, which the stall reply names as this race (review M1), and
+/// restarting `p` resolves it with nothing lost.
 #[test]
 fn a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply() {
     let (sim, mut p, mut f, mut cli, at) = handed_off_to_f();
-    match drive_ctrl(&sim, &mut [&mut p], &mut cli, CONVERGE_BUDGET).unwrap() {
-        Msg::CtrlErr { message } => assert!(
-            message.starts_with(&format!(
-                "switchover to f:1: the hand-off was sent at seq {at} but no confirmation"
-            )),
-            "{message}"
-        ),
+    let stall = match drive_ctrl(&sim, &mut [&mut p], &mut cli, CONVERGE_BUDGET).unwrap() {
+        Msg::CtrlErr { message } => {
+            assert!(
+                message.starts_with(&format!(
+                    "switchover to f:1: the hand-off was sent at seq {at} but no confirmation"
+                )),
+                "{message}"
+            );
+            message
+        }
         other => panic!("p must stall while f has not taken the hand-off: {other:?}"),
-    }
+    };
     assert!(matches!(f.repl.role(), Role::Follower { .. }));
     assert!(!p.db.as_ref().is_some_and(|d| d.writes_allowed()));
     assert!(!f.db.as_ref().is_some_and(|d| d.writes_allowed()));
@@ -5396,7 +5402,14 @@ fn a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply() {
     let mut promote = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
     match drive_ctrl(&sim, &mut [&mut p, &mut f], &mut promote, CONVERGE_BUDGET).unwrap() {
         Msg::CtrlErr { message } => {
-            assert_eq!(message, "cannot promote: this node is already the primary")
+            assert_eq!(message, "cannot promote: this node is already the primary");
+            assert!(
+                stall.ends_with(&format!(
+                    "If the promote answers \"{message}\", f:1 took a hand-off still in flight \
+                     at the deadline: just restart this node"
+                )),
+                "the stall reply must name the promote reply this race gets: {stall}"
+            );
         }
         other => panic!("a promote after the hand-off landed: {other:?}"),
     }
@@ -5510,14 +5523,16 @@ fn switchover_aborts_on_a_lagging_follower_by_name() {
     .unwrap();
     let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
     match reply {
-        Msg::CtrlErr { message } => {
-            for needle in ["lag", "deadline", "aborted"] {
-                assert!(
-                    message.contains(needle),
-                    "abort message missing {needle:?}: {message}"
-                );
-            }
-        }
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            format!(
+                "switchover to f:1 aborted: the follower lag is {} record(s) (it confirmed it \
+                 holds every record up to {f_last:?}, this primary is at {p_last:?}) and the \
+                 drain did not complete before the 30000000000ns deadline — this node is \
+                 primary again and accepting writes",
+                p_last.unwrap() - f_last.unwrap()
+            )
+        ),
         other => panic!("a lagging switchover must abort with CtrlErr, got {other:?}"),
     }
 

@@ -1447,7 +1447,8 @@ hand-off seq and both answers to "did `to` take it?" (2026-10-02, D4). If `to`'s
 says primary, restarting this node resolves against it. If it still says follower, no node
 accepts writes, and nothing resends after the reply. Either the `HandOff` is still in
 flight (the drain and the hand-off share one deadline), and `to` may take it and become the
-primary, the first case
+primary, the first case, where a promote answers "already the primary" and the `CtrlErr`
+says to just restart this node
 (`a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply`); or `to` was down
 past the deadline (in the sim, its role write failed inside `accept_handoff` and its
 reboot outlasted the window), and nothing changes on its own. Restarting this node alone

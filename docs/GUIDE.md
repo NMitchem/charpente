@@ -4024,11 +4024,13 @@ switchover to <to>: the hand-off was sent at seq <seq> but no confirmation
 returned before the deadline — this node stays write-stopped and will not resume
 writes on its own, because <to> may already be the primary. If <to>'s role file
 says primary, restart this node to resolve against <to>: it rejoins as <to>'s
-follower. If it still says follower, <to> has not taken the hand-off and no node
-accepts writes: promote it (charpente promote --node <to>) — it confirmed it holds
-every record up to seq <seq> and this node has accepted no write since, so its
-reply names last_applied Some(<seq>) and nothing is lost — then restart this
-node to resolve against <to>
+follower. If it still says follower, <to> has not taken the hand-off yet and no
+node accepts writes: promote it (charpente promote --node <to>) — it confirmed it
+holds every record up to seq <seq> and this node has accepted no write since, so
+its reply names last_applied Some(<seq>) and nothing is lost — then restart this
+node to resolve against <to>. If the promote answers "cannot promote: this node
+is already the primary", <to> took a hand-off still in flight at the deadline:
+just restart this node
 ```
 
 Nothing resends the hand-off after this reply. A target that still says
@@ -4038,7 +4040,8 @@ follower is in one of two states:
   deadline, so a hand-off sent late in the window may still be on its way. The
   target can take it after the reply and become the primary, which is the first
   case. A promote sent after that answers `cannot promote: this node is already
-  the primary`; restart the old primary.
+  the primary`, and the reply's last sentence says what that means: restart the
+  old primary.
 - **The target was down past the deadline.** Nothing changes on its own, and
   restarting the old primary alone does not help: it comes back still handing
   off, and resolves only once the target answers as a primary. Promote the

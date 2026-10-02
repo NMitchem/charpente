@@ -1166,10 +1166,11 @@ impl Repl {
             ctrl_id,
             &Msg::CtrlErr {
                 message: format!(
-                    "switchover to {to} aborted: the follower lag is {lag} record(s) (it acked \
-                     {acked:?}, this primary is at {last:?}) and the drain did not complete \
-                     before the {SWITCHOVER_DEADLINE_NANOS}ns deadline — this node is primary \
-                     again and accepting writes"
+                    "switchover to {to} aborted: the follower lag is {lag} record(s) (it \
+                     confirmed it holds every record up to {acked:?}, this primary is at \
+                     {last:?}) and the drain did not complete before the \
+                     {SWITCHOVER_DEADLINE_NANOS}ns deadline — this node is primary again and \
+                     accepting writes"
                 ),
             },
             now,
@@ -1198,11 +1199,13 @@ impl Repl {
                      resume writes on its own, because {to} may already be the primary. If \
                      {to}'s role file says primary, restart this node to resolve against {to}: \
                      it rejoins as {to}'s follower. If it still says follower, {to} has not \
-                     taken the hand-off and no node accepts writes: promote it (charpente \
+                     taken the hand-off yet and no node accepts writes: promote it (charpente \
                      promote --node {to}) — it confirmed it holds every record up to seq {at} \
                      and this node has accepted no write since, so its reply names \
                      last_applied Some({at}) and nothing is lost — then restart this node to \
-                     resolve against {to}"
+                     resolve against {to}. If the promote answers \"cannot promote: this node \
+                     is already the primary\", {to} took a hand-off still in flight at the \
+                     deadline: just restart this node"
                 ),
             },
             now,
