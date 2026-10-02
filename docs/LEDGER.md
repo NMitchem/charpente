@@ -6656,7 +6656,9 @@ can apply in between. 1 of 64 fresh bases failed.
   property.
 - **"From now" (docs).** GUIDE §11 and DESIGN §6 now say the tail starts at the node's next event
   id when it serves the subscribe, follower applies included, and that the stream does not name
-  that point.
+  that point. On a primary, a change that arrived just ahead of the subscribe is behind the tail
+  and one just behind it is delivered, even at the same instant; a test now pins that (red with
+  `ends_batch` forced false).
 - **The re-sync remedy's order (docs, proved first).** With a change landed in each of the five
   windows around its two requests, on a follower and on a primary: subscribe, wait for the stream
   to open, then read from the same node, and every change arrives. Read first, then subscribe (the
