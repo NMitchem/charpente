@@ -74,8 +74,10 @@ export type Result<T, E> =
  * decode it (GUIDE §11, "Changing an event"). `error` is `charpente.error`: a
  * stored event does not decode (corrupt bytes, or a change inside a type one
  * of its fields holds) or does not encode as JSON, and its detail names the
- * server-side fix (GUIDE §11). Neither may be resumed from: re-sync, then
- * subscribe without a cursor.
+ * server-side fix (GUIDE §11). None of the three may be resumed from: subscribe
+ * without a cursor, and once `onOpen` fires, re-sync through reads from the same
+ * node, applying each frame idempotently (GUIDE §11: the reverse order loses
+ * the events that land between the two steps).
  *
  * `closed` is the ordinary end of the response body.
  *
@@ -111,7 +113,8 @@ export class CursorRefused extends Error {
       "another timeline's events under ids this client has already used, which is the " +
       "misattribution the cursor's seq half exists to detect. " +
       "At a reshaped event, resuming would skip the one event the server refused to decode. " +
-      "Re-sync current state through reads, then reconnect without a cursor.",
+      "Reconnect without a cursor, wait for the stream to open (onOpen), then re-sync " +
+      "current state through reads from the same node, applying each frame idempotently.",
     );
   }
 }
@@ -181,6 +184,13 @@ export interface SubscribeOptions<Ev> {
   cursor?: string | undefined;
   onEvent: (ev: Ev, cursor: string) => void;
   onEnd: (end: StreamEnd) => void;
+  /**
+   * Called once, when the server has accepted the subscribe and before any
+   * frame: the stream's start is fixed, so a read sent from here on is served
+   * after it. A re-sync reads here, from the same node, and applies each frame
+   * idempotently over what the read returned (GUIDE §11).
+   */
+  onOpen?: (() => void) | undefined;
   /**
    * A frame whose name is not one this route declared. Without it, such a
    * frame raises `UndeclaredEvent` — it is never cast into `Ev`, and never
@@ -305,13 +315,15 @@ export class ApiBase {
     let buf = "";
     // Every exit from the loop below cancels the reader: the `gap`,
     // `reshaped` or `error` return, an `UndeclaredEvent` throw, or a callback
-    // of the caller's that throws.
+    // of the caller's that throws, `onOpen` included.
     // charpente notices a gone client only when hyper drops the response body
     // (serve.rs `sse_pump`), so a reader left locked and abandoned lets the
     // kernel Tail outlive the client that stopped reading. `catch` because
     // cancelling an already-errored body rejects, and that must not replace
     // the reason we are leaving.
     try {
+      // Inside the try, so a callback that throws still cancels the reader.
+      opts.onOpen?.();
       for (;;) {
         const chunk = await reader.read();
         if (chunk.done) {

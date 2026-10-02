@@ -205,7 +205,7 @@ export function tail(api: Api, cursor?: string): Promise<void> {
         case "gap":
         case "reshaped":
         case "error":
-          console.warn(end.kind + ":", end.detail); // re-sync, then subscribe without a cursor
+          console.warn(end.kind + ":", end.detail); // subscribe without a cursor, then re-sync in onOpen
           break;
         case "closed":
           console.warn("closed");

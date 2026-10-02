@@ -421,8 +421,16 @@ fn every_early_exit_sits_inside_the_try_whose_finally_cancels_the_reader() {
     let reshaped = at(r#"opts.onEnd({ kind: "reshaped", detail: data });"#);
     let error = at(r#"opts.onEnd({ kind: "error", detail: data });"#);
     let throw = at("throw new UndeclaredEvent(name);");
+    let open = at("opts.onOpen?.();");
+    let first_read = at("await reader.read()");
     let finally = at("\n    } finally {\n");
     let cancel = at("await reader.cancel()");
+    assert!(
+        try_ < open && open < first_read,
+        "onOpen must fire inside the try (a throwing callback still cancels the reader) and \
+         before the first frame is read: try {try_}, onOpen {open}, first read {first_read}: \
+         {base}"
+    );
     assert!(
         reader < try_
             && try_ < gap
@@ -440,6 +448,26 @@ fn every_early_exit_sits_inside_the_try_whose_finally_cancels_the_reader() {
         finally < cancel,
         "the cancel must be in the finally, not on one path: finally {finally}, \
          cancel {cancel}: {base}"
+    );
+}
+
+/// `CursorRefused` names the re-sync remedy in the order that loses no event:
+/// subscribe, wait for the stream to open (`onOpen`), then read from the same
+/// node and apply frames idempotently (GUIDE §11, realtime.rs's
+/// `the_resync_remedy_*` window tests). The read-first order it used to give
+/// misses the changes that land between the two steps.
+#[test]
+fn the_cursor_refusal_gives_the_resync_order_that_loses_nothing() {
+    let ts = emit_client(&fixture_contract());
+    assert!(
+        ts.contains(
+            "      \"Reconnect without a cursor, wait for the stream to open (onOpen), then re-sync \" +\n      \"current state through reads from the same node, applying each frame idempotently.\","
+        ),
+        "{ts}"
+    );
+    assert!(
+        !ts.contains("Re-sync current state through reads, then reconnect"),
+        "{ts}"
     );
 }
 

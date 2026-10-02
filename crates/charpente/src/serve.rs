@@ -937,11 +937,11 @@ mod tests {
             id: 5,
             seq: 12,
             name: kernel::RESHAPED_FRAME,
-            json: r#"{"event":"incident_opened","id":5,"fix":"re-sync current state through reads, then reconnect without a cursor"}"#.to_string(),
+            json: r#"{"event":"incident_opened","id":5,"fix":"reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently"}"#.to_string(),
         };
         assert_eq!(
             std::str::from_utf8(&encode_frame(&frame)).unwrap(),
-            "id: 5.12\nevent: charpente.reshaped\ndata: {\"event\":\"incident_opened\",\"id\":5,\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}\n\n"
+            "id: 5.12\nevent: charpente.reshaped\ndata: {\"event\":\"incident_opened\",\"id\":5,\"fix\":\"reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently\"}\n\n"
         );
     }
 

@@ -423,7 +423,7 @@ fn reshaped_frame(row: &EventRow) -> (u64, u64, String, String) {
         row.seq,
         "charpente.reshaped".to_string(),
         format!(
-            r#"{{"event":"{}","id":{},"fix":"re-sync current state through reads, then reconnect without a cursor"}}"#,
+            r#"{{"event":"{}","id":{},"fix":"reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently"}}"#,
             row.name,
             row.id.raw()
         ),
@@ -439,7 +439,8 @@ fn reshaped_409(row: &EventRow, compiled: u64) -> String {
     format!(
         "cursor {} sits on an \"{}\" event written under a different shape of that event \
          (recorded {recorded}; this binary {compiled:#x}) — this binary will not decode it; \
-         re-sync current state through reads, then reconnect without a cursor",
+         reconnect without a cursor, wait for the stream to open, then re-sync current state \
+         through reads from the same node, applying each frame idempotently",
         cursor_of(row),
         row.name
     )
@@ -2881,7 +2882,7 @@ fn the_harness_refuses_a_diverged_409_without_durable_corruption() {
     );
 
     let mut client = Client::new(PING_ONLY, None);
-    let body = br#"{"error":"cursor 0.2 diverged from this node's timeline (next event id is 0) -- re-sync current state through reads, then reconnect without a cursor"}"#.to_vec();
+    let body = br#"{"error":"cursor 0.2 diverged from this node's timeline (next event id is 0) -- reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently"}"#.to_vec();
     let sinks: SinkHandles = Arc::new(Mutex::new(Vec::new()));
     let err = client
         .absorb(&sim, app.db(), &[(409, body)], Some((true, 0)), &sinks)
@@ -6428,8 +6429,8 @@ fn await_response(
     panic!("no response {index} within budget");
 }
 
-/// The order a client carries out "re-sync current state through reads, then
-/// reconnect without a cursor" in.
+/// The order a client carries out the re-sync remedy in. The refusals and
+/// terminal frames named it read-first until D4 round 2.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Remedy {
     /// As the text reads: the read, then the bare subscribe.

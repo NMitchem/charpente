@@ -974,7 +974,9 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
             409,
             &format!(
                 "cursor {} is below this node's retention floor {floor} — events that old are \
-                 gone; re-sync current state through reads, then reconnect without a cursor",
+                 gone; reconnect without a cursor, wait for the stream to open, then re-sync \
+                 current state through reads from the same node, applying each frame \
+                 idempotently",
                 cursor.wire()
             ),
         ));
@@ -1004,8 +1006,10 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
                     409,
                     &format!(
                         "cursor {} diverged from this node's timeline (event {} here has seq \
-                         {}, not {}) — your history came from another primary; re-sync current \
-                         state through reads, then reconnect without a cursor",
+                         {}, not {}) — your history came from another primary; reconnect \
+                         without a cursor, wait for the stream to open, then re-sync current \
+                         state through reads from the same node, applying each frame \
+                         idempotently",
                         cursor.wire(),
                         cursor.id,
                         row.seq,
@@ -1034,8 +1038,9 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
                     &format!(
                         "cursor {} sits on an \"{}\" event written under a different shape of \
                          that event (recorded {recorded}; this binary {:#x}) — this binary will \
-                         not decode it; re-sync current state through reads, then reconnect \
-                         without a cursor",
+                         not decode it; reconnect without a cursor, wait for the stream to \
+                         open, then re-sync current state through reads from the same node, \
+                         applying each frame idempotently",
                         cursor.wire(),
                         entry.name,
                         entry.fingerprint
@@ -1048,8 +1053,9 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
             409,
             &format!(
                 "cursor {} diverged from this node's timeline (next event id is {next_event_id}) \
-                 — your history came from another primary; re-sync current state through reads, \
-                 then reconnect without a cursor",
+                 — your history came from another primary; reconnect without a cursor, wait \
+                 for the stream to open, then re-sync current state through reads from the \
+                 same node, applying each frame idempotently",
                 cursor.wire()
             ),
         )),

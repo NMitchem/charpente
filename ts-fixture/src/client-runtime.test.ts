@@ -29,7 +29,7 @@
 
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
-import { Api } from "./generated/client";
+import { Api, CursorRefused } from "./generated/client";
 import type { CustomerId, StreamEnd } from "./generated/client";
 import {
   createCustomerBody,
@@ -38,6 +38,65 @@ import {
   invoiceVoided,
 } from "./generated/samples";
 import { stubJsonResponse, stubSseResponse } from "./testing/fetch-stub";
+
+// `onOpen` is where a re-sync reads (GUIDE §11): the server has fixed the
+// stream's start, so a read sent from there is served after it. It must fire
+// once, before any frame, and never for a subscribe the server refused.
+test("onOpen fires once, after the subscribe is accepted and before any frame", async () => {
+  const { restore } = stubSseResponse([
+    { event: "invoice_paid", data: invoicePaid },
+    { event: "invoice_voided", data: invoiceVoided },
+  ]);
+  const order: string[] = [];
+  try {
+    await new Api("http://fixture.invalid").feed({
+      onOpen: () => {
+        order.push("open");
+      },
+      onEvent: (ev) => {
+        order.push(ev.event);
+      },
+      onEnd: (end) => {
+        order.push(end.kind);
+      },
+    });
+  } finally {
+    restore();
+  }
+  assert.deepEqual(order, ["open", "invoice_paid", "invoice_voided", "closed"]);
+});
+
+test("a refused cursor never fires onOpen, and names the subscribe-first re-sync", async () => {
+  const { restore } = stubJsonResponse(
+    { error: "cursor 1.0 is below this node's retention floor 8" },
+    409,
+  );
+  let opened = false;
+  let refused: unknown;
+  try {
+    await new Api("http://fixture.invalid").feed({
+      cursor: "1.0",
+      onOpen: () => {
+        opened = true;
+      },
+      onEvent: () => {},
+      onEnd: () => {},
+    });
+  } catch (e) {
+    refused = e;
+  } finally {
+    restore();
+  }
+  assert.equal(opened, false);
+  if (!(refused instanceof CursorRefused)) throw new Error("expected CursorRefused: " + String(refused));
+  assert.ok(
+    refused.message.endsWith(
+      "Reconnect without a cursor, wait for the stream to open (onOpen), then re-sync " +
+        "current state through reads from the same node, applying each frame idempotently.",
+    ),
+    refused.message,
+  );
+});
 
 test("JSON round trip: a real sample document survives request()", async () => {
   const { restore, calls } = stubJsonResponse(customerView);
@@ -101,7 +160,7 @@ test("a reshaped frame ends the stream by name, and nothing after it is delivere
   const detail = {
     event: "invoice_paid",
     id: 1,
-    fix: "re-sync current state through reads, then reconnect without a cursor",
+    fix: "reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently",
   };
   const { restore } = stubSseResponse([
     { event: "invoice_paid", data: invoicePaid, id: "0.1" },

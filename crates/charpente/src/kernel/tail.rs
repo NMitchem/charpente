@@ -102,7 +102,7 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
             seq: 0,
             name: "charpente.gap",
             json: format!(
-                "{{\"floor\":{floor},\"tail\":{},\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}}",
+                "{{\"floor\":{floor},\"tail\":{},\"fix\":\"reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently\"}}",
                 tail.next_id
             ),
         };
@@ -156,7 +156,7 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
                 seq: row.seq,
                 name: RESHAPED_FRAME,
                 json: format!(
-                    "{{\"event\":{},\"id\":{},\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}}",
+                    "{{\"event\":{},\"id\":{},\"fix\":\"reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently\"}}",
                     serde_json::Value::String(entry.name.to_string()),
                     row.id.raw()
                 ),

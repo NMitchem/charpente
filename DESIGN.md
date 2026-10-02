@@ -1737,12 +1737,11 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
 - **Honesty at the edges.** A cursor below the retention floor, or one naming an event id
   this node never minted (or minted with a different seq — the cross-timeline case), is
   refused at subscribe with a 409 naming the floor or the divergence detail and the fix:
-  re-sync current state through reads, then reconnect without a cursor. The two steps are
-  gap-free only subscribe-first: reconnect bare, wait for the stream to open, read from the
-  same node, and apply each frame idempotently over the read. Read-first, a change landing
-  after the read is served and before the subscribe is (a follower apply in flight
-  included) reaches the client by neither route (`realtime.rs`, the two
-  `the_resync_remedy_*` tests: a change in each of the five windows around the two
+  reconnect without a cursor, wait for the stream to open, then re-sync current state
+  through reads from the same node, applying each frame idempotently. The order is the
+  fix: read-first, a change landing after the read is served and before the subscribe is
+  (a follower apply in flight included) reaches the client by neither route (`realtime.rs`,
+  the two `the_resync_remedy_*` tests: a change in each of the five windows around the two
   requests, on a follower and a primary; 2026-10-02, D4). A tail that falls
   behind retention mid-stream gets the same fact set as a terminal SSE frame —
   `event: charpente.gap` — then its sink closes. A stored event whose recorded shape (§3)
