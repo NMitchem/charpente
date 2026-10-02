@@ -1498,9 +1498,10 @@ struct Client {
     /// Whether a fault explains a cut of this client's node's timeline: one
     /// that removed a ledgered event. `durable_corruption_fired` for the
     /// single-node workloads; the follower property asks its tail node's own
-    /// disk. Only where it answers true is a cut re-synced (`resync_if_cut`)
-    /// or a diverged drain excused (`sync_and_drain_or_give_up`); a cut
-    /// nothing explains is a lost event, and the universe fails (S3b item 1).
+    /// disk. Only where it answers true is a cut re-synced (`resync_if_cut`);
+    /// a cut nothing explains is a lost event, and the universe fails where it
+    /// is first seen: a boundary, or for the follower property, which re-syncs
+    /// nothing, the drain (S3b items 1 and 3).
     cut_explained: fn(&Sim) -> bool,
 }
 
@@ -1695,14 +1696,25 @@ impl Client {
     /// the node's timeline (`resync_to_head`): a cut id that was never
     /// re-minted, or was re-minted for another tenant, is no longer owed, and
     /// one re-minted for this subscription is owed again under its new
-    /// content, so a re-mint that is never delivered FAILS the universe. With
-    /// no durable corruption on record nothing changes, and the same recorded
-    /// id stays owed, as it must: there it can only be a lost event.
-    fn resync_if_cut(&mut self, sim: &Sim, head: u64) {
-        if self.ledger.range(head..).next().is_some() && (self.cut_explained)(sim) {
-            self.resync_to_head(head);
-            sim.cover("realtime:ledger-resynced");
+    /// content, so a re-mint that is never delivered FAILS the universe. A cut
+    /// no fault on this node explains (`cut_explained`) is a lost event, and
+    /// fails here, where it is first seen (S3b item 3). Until then it stayed
+    /// owed and failed only in a settle with a clean attempt, so a settle with
+    /// none gave it up.
+    fn resync_if_cut(&mut self, sim: &Sim, head: u64) -> Result<(), String> {
+        let Some((&id, _)) = self.ledger.range(head..).next() else {
+            return Ok(());
+        };
+        if !(self.cut_explained)(sim) {
+            return Err(format!(
+                "ledger id {id} was recorded off this node, but its next_event_id is now \
+                 {head}: a recovery cut a committed event, and no fault on this node explains \
+                 the cut, so this node lost an event it had committed"
+            ));
         }
+        self.resync_to_head(head);
+        sim.cover("realtime:ledger-resynced");
+        Ok(())
     }
 
     /// Direct id lookup — no positional skipping, no forfeit interaction:
@@ -1802,46 +1814,37 @@ impl Client {
     /// boundary)`: `boundary` is `next_event_id` read right before the
     /// subscribe was pushed — the precise point a *successful bare*
     /// subscribe resumes from, folded straight into `floor`.
-    /// `sync_and_drain`, with the one outcome that is NOT this property's
-    /// subject filtered out: a drain error whose cause is that the store no
-    /// longer holds what the ledger recorded. See `diverged_ledger_entry` —
-    /// the recorded event left this node's timeline through durable
-    /// corruption above the checkpoint horizon or a failover inside the
-    /// replication loss window, windows the platform names. Returns `true`
-    /// when the universe gave up; every caller's loop must then end the
-    /// universe, because a later round can let retention collect the
-    /// diverged row and turn the same drain error into a hard failure.
-    ///
+    /// `sync_and_drain`, whose failure names a diverged ledger entry when the
+    /// store no longer holds what the ledger recorded (`diverged_ledger_entry`).
     /// The probe runs ONLY after a drain error, so the common path is
     /// unchanged and no passing universe's fault schedule moves.
     ///
-    /// The give-up is only for a cut a fault explains (`cut_explained`). One
-    /// nothing explains is the lost event this property exists to catch, so
-    /// it fails, naming the divergence (S3b item 1: until then any diverged
-    /// entry gave the universe up).
-    fn sync_and_drain_or_give_up(&mut self, sim: &Sim, db: &Db) -> Result<bool, String> {
-        match self.sync_and_drain(db) {
-            Ok(()) => Ok(false),
-            Err(e) => match self.diverged_ledger_entry(db) {
-                Some((id, recorded, stored)) if !(self.cut_explained)(sim) => Err(format!(
-                    "{e}: ledger diverged at event id {id}: recorded {recorded} when scanned, \
-                     store now holds {stored}, and no fault on this node explains the cut, so \
-                     this node lost an event it had committed"
-                )),
-                Some((id, recorded, stored)) => {
-                    sim.give_up(format!(
-                        "ledger diverged at event id {id}: recorded {recorded} when scanned, \
-                         store now holds {stored} — this node's timeline no longer holds the \
-                         recorded event (durable corruption cut it above the checkpoint \
-                         horizon, or a failover lost it inside the replication loss window) \
-                         and any row now at this id is a re-mint, so nothing here adjudicates \
-                         delivery ({e})"
-                    ));
-                    Ok(true)
-                }
-                None => Err(e),
-            },
-        }
+    /// Every divergence fails. A cut a fault explains never reaches here: a
+    /// recovery is always followed by a subscribe, whose boundary re-syncs the
+    /// client to the node's timeline (`resync_if_cut`) before any emit can
+    /// re-mint a cut id. A cut nothing explains is the lost event this
+    /// property exists to catch. Until S3b items 1 and 3 any divergence gave
+    /// the universe up here; with the flagship re-syncing as the scoped
+    /// sibling does, that give-up reached 0 of 6,528 universes over 26 + 25
+    /// bases, so it went.
+    fn sync_and_drain_naming_divergence(&mut self, sim: &Sim, db: &Db) -> Result<(), String> {
+        let Err(e) = self.sync_and_drain(db) else {
+            return Ok(());
+        };
+        Err(match self.diverged_ledger_entry(db) {
+            Some((id, recorded, stored)) if !(self.cut_explained)(sim) => format!(
+                "{e}: ledger diverged at event id {id}: recorded {recorded} when scanned, \
+                 store now holds {stored}, and no fault on this node explains the cut, so \
+                 this node lost an event it had committed"
+            ),
+            Some((id, recorded, stored)) => format!(
+                "{e}: ledger diverged at event id {id}: recorded {recorded} when scanned, \
+                 store now holds {stored}, a cut no boundary re-synced: every recovery is \
+                 followed by a subscribe whose boundary re-syncs a cut a fault explains \
+                 (`resync_if_cut`), so a drain should never meet one"
+            ),
+            None => e,
+        })
     }
 
     fn absorb(
@@ -1852,9 +1855,7 @@ impl Client {
         subscribe: Option<(bool, u64)>,
         sinks: &SinkHandles,
     ) -> Result<(), String> {
-        if self.sync_and_drain_or_give_up(sim, db)? {
-            return Ok(());
-        }
+        self.sync_and_drain_naming_divergence(sim, db)?;
 
         let mut ri = 0usize;
         if subscribe.is_some()
@@ -1994,7 +1995,7 @@ impl Client {
 
         // This round's fresh deliveries get a fair shot at draining too,
         // against whatever `sync_ledger` already picked up above.
-        self.sync_and_drain_or_give_up(sim, db).map(|_| ())
+        self.sync_and_drain_naming_divergence(sim, db)
     }
 }
 
@@ -2197,6 +2198,7 @@ fn realtime_workload_judged(
                 // seed 0xdc154f8c66271f15.
                 match push_subscribe(sim, &kernel, &mut source, path, client.cursor, t) {
                     Ok(info) => {
+                        client.resync_if_cut(sim, info.1)?;
                         subscribe = Some(info);
                         t += SEC;
                     }
@@ -2282,11 +2284,6 @@ fn realtime_workload_judged(
     // fault fallout. Zero means this universe never observed the platform
     // delivering anything, so it cannot testify about a missed event.
     let mut clean_attempts = 0u32;
-    // A ledger id this node's store has rolled back PAST, observed during a clean
-    // attempt. Carried out of the loop because the unsettled verdict below has no
-    // node of its own to ask, and booting one there would be both fault-prone and a
-    // new disk op on the failure path.
-    let mut rolled_back: Option<(u64, String, String)> = None;
     for _attempt in 0..SETTLE_ATTEMPTS {
         // A give-up already recorded means this universe adjudicated
         // nothing; carrying on can only turn it into a failure, and the
@@ -2313,7 +2310,10 @@ fn realtime_workload_judged(
         // own `kernel.run` below: a latched store makes this read fail, and
         // the recovery is a restart, not a universe failure.
         let subscribe = match push_subscribe(sim, &kernel, &mut source, path, client.cursor, t) {
-            Ok(info) => info,
+            Ok(info) => {
+                client.resync_if_cut(sim, info.1)?;
+                info
+            }
             Err(e) if is_fault_fallout(&e) => {
                 sim.restart();
                 continue;
@@ -2343,12 +2343,6 @@ fn realtime_workload_judged(
         } else {
             clean_attempts += 1;
             sim.cover("realtime:settle-clean");
-            // Only when this clean run still left the client behind: a settled client
-            // breaks out at the top of the next iteration and never reaches here, so
-            // no universe that catches up pays for this probe.
-            if rolled_back.is_none() && !client.settled() {
-                rolled_back = client.diverged_ledger_entry(kernel.app().db());
-            }
         }
         // The loop-top check never runs after the LAST attempt, whose give-up
         // would otherwise fall through to the unsettled verdict below.
@@ -2366,29 +2360,11 @@ fn realtime_workload_judged(
         // Reporting it as `unsettled_report()` claimed the platform lost an event
         // on evidence that was never gathered (seed 0x22eac3ba9fa5bef7, pinned
         // above). A universe that adjudicated nothing gives up; it does not fail,
-        // and it does not pass either.
-        if let Some((id, recorded, stored)) = rolled_back {
-            // Only a cut a fault explains is excused (S3b item 1). One nothing
-            // explains is an event this node lost, the miss this property
-            // exists to catch.
-            if !(client.cut_explained)(sim) {
-                return Err(format!(
-                    "{}; ledger id {id} is behind this node's timeline: recorded {recorded} \
-                     when scanned, store now says {stored}, and no fault on this node \
-                     explains the cut",
-                    client.unsettled_report()
-                ));
-            }
-            sim.give_up(format!(
-                "ledger id {id} is behind this node's timeline: recorded {recorded} \
-                 when scanned, store now says {stored} — this node's timeline no longer \
-                 holds the recorded event (durable corruption cut it above the \
-                 checkpoint horizon), so it can never be delivered and nothing here \
-                 adjudicates ({})",
-                client.unsettled_report()
-            ));
-            return Ok(client.trace);
-        }
+        // and it does not pass either. There is no rolled-back-ledger give-up:
+        // every boundary re-syncs a cut a fault explains (`resync_if_cut`), as
+        // the scoped sibling's do, so a ledgered id the node rolled back past is
+        // one nothing explains, which fails below. That give-up reached 0 of
+        // 3,328 universes over 26 bases once the flagship re-synced (S3b item 3).
         if clean_attempts == 0 {
             sim.give_up(format!(
                 "no settle attempt completed without fault fallout over \
@@ -2456,53 +2432,42 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0xe9110992f2280d36` (base `0xA11CE013`, universe 289).
+/// Seed `0x53b010000001` under `write_error` 0.3 and no other fault.
 ///
-/// **This pin has been re-found three times, and that is worth knowing before
+/// **This pin has been re-found many times, and that is worth knowing before
 /// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
-/// this property (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). The
-/// directory-barrier stream split later that day re-rolled every universe one
-/// final time and that seed stopped reproducing the scenario — a pinned seed
-/// names a UNIVERSE, and re-keying a fault stream renames all of them at once.
-/// So the regression was re-found by scanning the same swarm construction for a
-/// universe whose settle loop ends with zero clean attempts, and the assertion
-/// below now pins the give-up REASON rather than merely its presence: a future
-/// re-roll that happens to land on some *other* give-up can no longer keep this
-/// test quietly green while testing nothing. Its successor `0xbb93400e0bc80ca4`
-/// stopped reproducing when redb 4.3.0 changed the store's IO shape and the
-/// crash countdowns were re-sized (2026-09-30); `0xdec436b030427fc6` (universe
-/// 124) stopped when `Db::open` stopped discarding a store over an IO error
-/// (2026-10-01): that universe now reaches a verdict. `0xd0fce29ba31210d0`
-/// (universe 281) stopped the same day, when the epochs began booting through
-/// restarts and WAL recovery began syncing before replay (S5 with D1).
-/// `0xaf1ba92646f937ea` (base `0xA11CE002`, universe 452) stopped too, when the
-/// settle boot began ending at once on a boot refused for durable corruption
-/// (S5 re-review R-M2): every one of its boots had been that refusal, so it
-/// now gives up under the refusal's name. This one, found by scanning 14,336
-/// universes over the 28 bases `0xA11CE002` to `0xA11CE01D` for a give-up
-/// naming no node to catch up from, is the only one of them; it meets no
-/// durable refusal, and
+/// this property (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07); its
+/// swarm-universe successors `0xbb93400e0bc80ca4`, `0xdec436b030427fc6`,
+/// `0xd0fce29ba31210d0`, `0xaf1ba92646f937ea` and `0xe9110992f2280d36` each
+/// stopped reproducing when a later change re-rolled or rescued its universe
+/// (a pinned seed names a UNIVERSE). The last went with S3b item 3: its client
+/// was owed only an event durable corruption had cut, so once the boundary
+/// re-synced the cut it owed nothing, and the settle had nothing to catch up
+/// on. The swarm no longer yields the scenario: 0 of 16,384 universes over the
+/// 32 bases `0xA11CE002` to `0xA11CE021`, 512 each, and 0 of 3,328 over the
+/// batch's base and 25 fresh ones. So this pin builds its universe instead: at
+/// `write_error` 0.3, 110 of 400 seeds give this give-up, and this is the first.
+/// The assertion pins the give-up REASON and that something was owed, so a
+/// universe that reaches the arm with nothing owed cannot keep it green, and
 /// with the zero-clean-attempts give-up removed it fails "client never caught
 /// up", which is the regression.
 ///
 /// The scenario: every one of `SETTLE_ATTEMPTS` attempts ends with `settle_boot`
 /// returning `None`. The node never booted once, so the client never had a single
-/// fault-free chance to receive event 0. The workload would otherwise return
-/// `unsettled_report()`, whose text asserts the platform lost an event. What
-/// actually happened is the fact the settle loop's own comment says is NOT this
-/// property's subject: "there was no node to catch up FROM". `settle_boot` exists
-/// to draw exactly that distinction, and returns `Ok(None)` only after every boot
-/// failure classified as fault fallout — a non-injected failure returns `Err`
-/// immediately. So a universe with no clean attempt adjudicated NOTHING, and must
-/// give up rather than report a miss it never had the chance to observe.
+/// fault-free chance to receive what it was owed. The workload would otherwise
+/// return `unsettled_report()`, whose text asserts the platform lost an event.
+/// What actually happened is the fact the settle loop's own comment says is NOT
+/// this property's subject: "there was no node to catch up FROM". `settle_boot`
+/// exists to draw exactly that distinction, and returns `Ok(None)` only after
+/// every boot failure classified as fault fallout — a non-injected failure
+/// returns `Err` immediately. So a universe with no clean attempt adjudicated
+/// NOTHING, and must give up rather than report a miss it never had the chance
+/// to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0xe911_0992_f228_0d36;
-    // Reconstruct this universe exactly as the swarm runner derives it.
-    let mut state = SEED;
-    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
-    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
-    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    const SEED: u64 = 0x53b0_1000_0001;
+    let mut cfg = FaultConfig::none();
+    cfg.write_error = 0.3;
     let mut sim = Sim::with_faults(SEED, cfg);
 
     let result = realtime_workload(&mut sim);
@@ -2517,10 +2482,13 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
          adjudicated nothing is not evidence for the property",
     );
     assert!(
-        reason.contains("there was no node to catch up from"),
-        "and it must be THIS give-up — no settle attempt ever ran cleanly — rather than \
-         some unrelated cause that happens to keep the test green: {reason}"
+        reason.contains("there was no node to catch up from")
+            && reason.contains("first unaccounted matching id Some("),
+        "and it must be THIS give-up — no settle attempt ever ran cleanly while the client \
+         was owed an event — rather than some unrelated cause that happens to keep the test \
+         green: {reason}"
     );
+    assert!(!sim.coverage().contains_key("realtime:settle-clean"));
 }
 
 /// Seed `0x02b911a604c2ead4` (base `0x5E1F003A`, universe 226), the scenario
@@ -2566,39 +2534,58 @@ fn a_stall_cannot_defeat_the_only_clean_settle_attempt() {
     );
 }
 
-/// Seed `0x6617ca6405d1b99e` (base `0x5E1F000D`, universe 127). A durable, acked
-/// event is destroyed by `bit_flip` above the store's checkpoint horizon,
-/// recovery cuts there, and the next emit re-mints its id with other content.
-/// The drain probe classifies that correctly as a give-up in the first round
-/// after the restart; the universe must END there. Carrying on let retention
-/// collect the diverged row, after which the probe could no longer see the
-/// divergence and the stale frame came back as a hard failure.
-///
-/// Re-found 2026-09-30 (the original `0xb247eceae0daf689` stopped reproducing
-/// when redb 4.3.0 changed the store's IO shape and the crash countdowns were
-/// re-sized) by the whole reason, not just the give-up: with every `gave_up()`
-/// stop in `realtime_workload` removed, this universe fails "content mismatch
-/// at event id 0: expected (pong, {"n":"647"}) but received (ping,
-/// {"n":"697"})". It was the only universe of 13,312 scanned where carrying on
-/// turns the give-up into that failure; the other diverged-ledger give-ups
-/// stayed give-ups either way.
+/// Seed `0x6617ca6405d1b99e` (base `0x5E1F000D`, universe 127). A durable,
+/// acked event is destroyed by `bit_flip` above the store's checkpoint horizon,
+/// recovery cuts there, and the next emit re-mints id 0 with other content:
+/// recorded (pong, {"n":"647"}), re-minted (ping, {"n":"697"}). From
+/// 2026-09-30 until S3b item 3 the drain probe gave the universe up in the
+/// first round after the restart, and this test pinned that give-up and its
+/// stop. Now the subscribe that follows the recovery re-syncs the client to
+/// the node's timeline at its boundary, as the scoped sibling's do: the
+/// recorded id 0 is dropped, and its re-mint, which this subscription matches,
+/// is owed and delivered, so the universe reaches a verdict that includes it.
+/// With the re-sync standing in for a cut nothing explains it fails at that
+/// boundary (`a_cut_nothing_explains_fails_the_flagship_by_name`).
+#[test]
+fn a_ledgered_event_cut_and_re_minted_is_resynced_and_its_re_mint_is_owed() {
+    const SEED: u64 = 0x6617_ca64_05d1_b99e;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let trace = realtime_workload(&mut sim)
+        .expect("a cut durable corruption explains must not fail the universe");
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "re-synced to the node's timeline, it reaches a verdict"
+    );
+    assert!(
+        durable_corruption_fired(&sim) && sim.coverage().contains_key("realtime:ledger-resynced"),
+        "this universe's reason is a cut by durable corruption, seen and re-synced: {:?}",
+        sim.coverage()
+    );
+    assert!(
+        trace.contains(&(0, "ping", r#"{"n":"697"}"#.to_string())),
+        "the re-mint at id 0 is owed, and delivered: {trace:?}"
+    );
+}
+
 /// Seeds where the flagship meets a cut a fault explains, run with the cut
-/// standing in for one nothing explains (S3b item 1; the stand-in is
-/// `realtime_workload_judged` with a check that explains nothing). Each is
-/// then a lost event and must FAIL, naming the divergence. Until item 1 both
-/// probes gave the universe up on any diverged ledger entry, so a platform
-/// durability bug passed as a give-up. `0x6617ca6405d1b99e` meets it at the
-/// drain probe (the give-up pinned above), `0xb1bcbb46b1c81e2f` (base
-/// `0x5E1F001D`, universe 6) at the settle's rolled-back probe ("ledger id 2
-/// is behind this node's timeline"), found by scanning 25 bases.
+/// standing in for one nothing explains (S3b items 1 and 3; the stand-in is
+/// `realtime_workload_judged` with a check that explains nothing). Each is then
+/// a lost event, and must FAIL at the boundary that first sees it. Until item 1
+/// the drain and settle probes gave such a universe up on any diverged entry:
+/// `0x6617ca6405d1b99e` met it at the drain probe, and `0xb1bcbb46b1c81e2f`
+/// (base `0x5E1F001D`, universe 6, found by scanning 25 bases) at the settle's
+/// rolled-back probe ("ledger id 2 is behind this node's timeline").
 #[test]
 fn a_cut_nothing_explains_fails_the_flagship_by_name() {
-    for (seed, at) in [
-        (0x6617_ca64_05d1_b99e_u64, "ledger diverged at event id 0"),
-        (
-            0xb1bc_bb46_b1c8_1e2f,
-            "ledger id 2 is behind this node's timeline",
-        ),
+    for (seed, id) in [
+        (0x6617_ca64_05d1_b99e_u64, 0u64),
+        (0xb1bc_bb46_b1c8_1e2f, 2),
     ] {
         let mut state = seed;
         let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -2609,7 +2596,8 @@ fn a_cut_nothing_explains_fails_the_flagship_by_name() {
         let err = realtime_workload_judged(&mut sim, |_| false)
             .expect_err("a cut nothing explains is a lost event");
         assert!(
-            err.contains(at) && err.contains("no fault on this node explains the cut"),
+            err.starts_with(&format!("ledger id {id} was recorded off this node"))
+                && err.contains("no fault on this node explains the cut"),
             "seed {seed:#x}: {err}"
         );
         assert_eq!(
@@ -2618,39 +2606,6 @@ fn a_cut_nothing_explains_fails_the_flagship_by_name() {
             "seed {seed:#x}: a failure, never a give-up"
         );
     }
-}
-
-#[test]
-fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
-    const SEED: u64 = 0x6617_ca64_05d1_b99e;
-    let mut state = SEED;
-    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
-    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
-    charpente_sim::sample_extended_fields(SEED, &mut cfg);
-    let mut sim = Sim::with_faults(SEED, cfg);
-
-    let result = realtime_workload(&mut sim);
-    assert!(
-        result.is_ok(),
-        "a universe whose probe found a diverged ledger must give up, not fail: {:?}",
-        result.err()
-    );
-    let reason = sim
-        .gave_up()
-        .expect("the divergence must be RECORDED as a give-up");
-    assert!(
-        reason.contains("ledger diverged at event id 0"),
-        "and it must be THIS give-up, the divergence at id 0: {reason}"
-    );
-    assert!(
-        reason.contains("durable corruption cut it above the checkpoint horizon"),
-        "and it must name THIS cause, not just the id: {reason}"
-    );
-    assert!(
-        durable_corruption_fired(&sim),
-        "this universe's divergence is excused only because durable corruption fired — \
-         if it didn't, this give-up would be masking a real miss"
-    );
 }
 
 #[test]
@@ -5482,7 +5437,7 @@ fn scoped_realtime_workload_judged(
             if client.need_subscribe {
                 match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
                     Ok(info) => {
-                        client.resync_if_cut(sim, info.1);
+                        client.resync_if_cut(sim, info.1)?;
                         subscribe = Some(info);
                         t += SEC;
                     }
@@ -5563,7 +5518,7 @@ fn scoped_realtime_workload_judged(
         let subscribe =
             match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
                 Ok(info) => {
-                    client.resync_if_cut(sim, info.1);
+                    client.resync_if_cut(sim, info.1)?;
                     info
                 }
                 Err(e) if is_fault_fallout(&e) => {
@@ -5852,11 +5807,12 @@ fn a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynce
 
 /// The same universe with its cut standing in for one nothing explains (S3b
 /// item 1, the S3 re-review's stand-in: re-sync disabled): the client's
-/// `cut_explained` answers false, so the cut id 3 stays owed and is never
-/// delivered. That is a lost event, and the universe must FAIL by name. Until
-/// item 1 the settle's rolled-back-ledger arm gave it up ("ledger id 3 is
-/// behind this node's timeline") without asking whether anything explained
-/// the cut, so a platform durability bug passed as a give-up.
+/// `cut_explained` answers false. That is a lost event, and the universe must
+/// FAIL by name, at the boundary that first sees the cut (since item 3; under
+/// item 1 it failed later, "client never caught up" on id 3). Until item 1 the
+/// settle's rolled-back-ledger arm gave it up ("ledger id 3 is behind this
+/// node's timeline") without asking whether anything explained the cut, so a
+/// platform durability bug passed as a give-up.
 #[test]
 fn a_cut_nothing_explains_fails_the_scoped_universe_by_name() {
     const SEED: u64 = 0x083b_d434_c717_d60c;
@@ -5869,8 +5825,8 @@ fn a_cut_nothing_explains_fails_the_scoped_universe_by_name() {
     let err = scoped_realtime_workload_judged(&mut sim, |_| false)
         .expect_err("a cut nothing explains is a lost event");
     assert!(
-        err.starts_with("client never caught up")
-            && err.contains("first unaccounted matching id Some(3)"),
+        err.starts_with("ledger id 3 was recorded off this node")
+            && err.contains("no fault on this node explains the cut"),
         "{err}"
     );
     assert_eq!(
@@ -5895,7 +5851,7 @@ fn a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed() {
     }
     client.next_scan_id = 6;
 
-    client.resync_if_cut(&sim, 5);
+    client.resync_if_cut(&sim, 5).unwrap();
     assert_eq!(client.ledger.keys().copied().collect::<Vec<_>>(), [3]);
     assert_eq!(
         client.next_scan_id, 5,
@@ -5930,7 +5886,7 @@ fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
         "before the cut, id 5 was delivered and verified"
     );
 
-    client.resync_if_cut(&sim, 5);
+    client.resync_if_cut(&sim, 5).unwrap();
     // What the next `sync_ledger` reads: id 5 re-minted for tenant A.
     client.ledger.insert(5, ("ping", key, "new 5".to_string()));
     client.next_scan_id = 6;
@@ -5957,7 +5913,7 @@ fn a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_cont
     client.pending.push_back((5, "ping", "old 5".to_string()));
     client.next_scan_id = 7;
 
-    client.resync_if_cut(&sim, 5);
+    client.resync_if_cut(&sim, 5).unwrap();
     client.pending.push_back((5, "ping", "new 5".to_string()));
     assert_eq!(client.drain(), Ok(()));
     assert!(
@@ -5976,7 +5932,9 @@ fn a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_cont
 }
 
 /// The other direction: with no durable corruption on record, a recorded id at
-/// or above `next_event_id` is a lost event, and nothing is re-synced away.
+/// or above `next_event_id` is a lost event. It fails where it is first seen,
+/// and nothing is re-synced away (S3b item 3: it used to stay owed, failing
+/// only in a settle with a clean attempt).
 #[test]
 fn without_durable_corruption_a_cut_is_not_resynced() {
     let sim = Sim::with_faults(0x2EB2_0903, FaultConfig::none());
@@ -5985,7 +5943,15 @@ fn without_durable_corruption_a_cut_is_not_resynced() {
     client.ledger.insert(5, ("ping", key, "old 5".to_string()));
     client.next_scan_id = 6;
 
-    client.resync_if_cut(&sim, 5);
+    let err = client
+        .resync_if_cut(&sim, 5)
+        .expect_err("a cut nothing explains is a lost event");
+    assert_eq!(
+        err,
+        "ledger id 5 was recorded off this node, but its next_event_id is now 5: a recovery \
+         cut a committed event, and no fault on this node explains the cut, so this node lost \
+         an event it had committed"
+    );
     assert_eq!(
         client.first_unaccounted(),
         Some(5),
