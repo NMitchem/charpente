@@ -209,12 +209,12 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
 /// is why a floor sits below its batch's verdict count.
 ///
 /// The fault matrix's base is ambient. Over 10 fresh bases (0xF3A70001..0A,
-/// 512 each) it gave up 0 times and checked a prefix 496-508 times, mean
-/// 501.3, sd 3.1, so its floor is the mean less 4 sd. It carries no cap: the
-/// rule's 2x the largest fresh count is 0, and 0 of 5,120 bounds the rate
-/// only below about 3 in 5,120, so a cap of 0 could fail a batch that met one
-/// legitimately exhausted universe. The floor still fails a batch that gives
-/// up instead of checking.
+/// 512 each) it gave up 0 times and checked a prefix 496-508 times (mean
+/// 501.3, sample sd 3.3), so its floor is the mean less 4 sd. It carries no
+/// cap: the rule's 2x the largest fresh count is 0, and 0 of 5,120 bounds the
+/// rate only below about 3 in 5,120, so a cap of 0 could fail a batch that met
+/// one legitimately exhausted universe. The floor still fails a batch that
+/// gives up instead of checking.
 const FAULT_MATRIX_PREFIX_FLOOR: u64 = 488;
 const DIR_ENTRY_GAVE_UP_CEILING: u64 = 0;
 const DIR_ENTRY_PREFIX_FLOOR: u64 = 247;
