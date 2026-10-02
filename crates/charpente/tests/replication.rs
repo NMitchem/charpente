@@ -6509,9 +6509,13 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
         // frame) with the rig's own `corrupt_last_wal_frame` (the sanctioned
         // bit_flip stand-in from
         // `a_seeded_follower_with_zero_frames_refuses_a_lossy_primary`). The
-        // sacrificial frame is applied (acked) and above the checkpoint, so
-        // recovery cuts it above the horizon (fired as the cover below via the
-        // `forced_cut` observable). Two things keep this from weakening the
+        // sacrificial frame is applied (acked) and usually above the
+        // checkpoint, so recovery cuts it above the horizon (fired as the cover
+        // below via the `forced_cut` observable). Not always: when the
+        // checkpoint has already covered it, recovery refuses p below the
+        // horizon instead, and the restore path answers, with the rig's own
+        // corruption as the explanation (112 of 7,424 universes over the pinned
+        // and 57 fresh bases, D3 round 5). Two things keep this from weakening the
         // property: (1) f never
         // held the sacrificial, so p re-appending at the cut seq next round is
         // conflict-free — never a primary-diverges-behind-a-longer-follower
