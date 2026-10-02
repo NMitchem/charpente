@@ -2467,6 +2467,44 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
+/// Seed `0xe0779a282feb80eb` (D5, the S1 amend review's I1): a correct universe
+/// the property's own client failed. Durable corruption cut an id the client had
+/// already been delivered (id 3); the node re-minted it on its new timeline, and
+/// the 409 that told the client its cursor had diverged sent it bare. When the
+/// round that drew the 409 committed fewer re-mints than were cut, the bare
+/// tail starts at or below the client's `last_id`, and the first re-mint
+/// delivered failed `assert_strictly_increasing` ("duplicate or out-of-order
+/// event id 3 ... previous id 3") although the platform did exactly what a
+/// sanctioned fault left it to do. `resync_to_head` kept `last_id` across the
+/// cut. The assertion pins the REASON (a cut seen and re-synced, a delivered id
+/// at or above the cut head, a frame delivered below an earlier one) and that
+/// the universe reaches a verdict; with the trim removed it fails with the text
+/// above.
+#[test]
+fn a_bare_tail_after_a_cut_may_start_below_the_last_id_the_client_saw() {
+    const SEED: u64 = 0xe077_9a28_2feb_80eb;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let trace = realtime_workload(&mut sim).unwrap_or_else(|e| {
+        panic!("a cut re-minted below a delivered id must not fail the universe: {e}")
+    });
+    assert_eq!(sim.gave_up(), None, "and the universe reached a verdict");
+    assert!(
+        durable_corruption_fired(&sim) && sim.coverage().contains_key("realtime:ledger-resynced"),
+        "this universe's reason is a cut by durable corruption, seen and re-synced: {:?}",
+        sim.coverage()
+    );
+    assert!(
+        trace.windows(2).any(|w| w[1].0 <= w[0].0),
+        "a frame must be delivered at or below an earlier one (the bare tail under the cut \
+         id), or this universe no longer pins the scenario: {trace:?}"
+    );
+}
+
 /// Seed `0x53b010000001` under `write_error` 0.3 and no other fault.
 ///
 /// **This pin has been re-found many times, and that is worth knowing before
