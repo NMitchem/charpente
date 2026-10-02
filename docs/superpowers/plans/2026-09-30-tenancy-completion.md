@@ -41,7 +41,7 @@
 - **A6 — Task 4 executes before Task 3.** They consume nothing from each other. Task 3's refusal text says a tenant's NAME "is inside every scoped job's and event's fingerprint", and its GUIDE step extends the §6 residual that Task 4 writes. So Task 4 runs first, and the job half of that text is true on the commit that lands it. The event half becomes true at Task 11, a forward reference inside this plan that the fixed text accepts. The numbering stays, so every cross-reference keeps its meaning.
 - **A7 — macro output names a tenant through `::charpente::tenant::tenant_name::<S>()`.** The contract's `<S as ::charpente::core::db::Tenant>::NAME` adds a second, unhoused E0277 ("the trait bound `Team: Tenant` is not satisfied … consider adding one") to every "scope type has no `Tenant` impl" diagnostic, measured in a scratch proc-macro crate. `<S as ::charpente::TenantScope>::NAME` is E0576. Instead, `tenant.rs` gains `#[doc(hidden)] pub const fn tenant_name<S: TenantScope>() -> &'static str { S::NAME }`. The value is `S::NAME` and it is still a const expression. Its bound is the one the three macros' `__charpente_assert_tenant_scope` const asserts carried, so those asserts are deleted, and a missing impl gets exactly one error per site, the house one. The three missing-impl fixtures keep their error counts (1, 1, 2). `#[event(scoped_by)]` (Task 11) uses the same helper.
 - **A8 — a compile-time refusal quotes a scope path as written.** `#[job]`'s and `#[table]`'s "`global` and `scoped_by = …`" refusals and `#[route]`'s undeclared-capability refusal run at expansion time, where `Tenant::NAME` does not exist. With the macro's `scope_name` last-segment helper deleted (Task 2), they render the path through a new `fingerprint::path_as_written`, built from `render`'s words: `crate::tenancy::Org` and `Wrap<Desk>`, never `Org` and `Wrap`. A single-identifier path renders as before, so no existing pin moves. `#[event]`'s refusal (Task 11) uses the same renderer.
-- **A9 — the capability tokens borrow what their `Group` borrows, not the `Group` itself.** Spec §5's `-> CrossTenant<'_>` / `-> TenantAdmission<'_>` ties a token to `&self`, which keeps the group shared-borrowed. Every site that mints and then stages in the same group (the dispatcher, the request path, the drift probe, every operator helper, GUIDE §16's `seed`; 22 mint sites) would then be E0502. They are written `impl<'a> Group<'a> { fn cross_tenant_cap(&self) -> CrossTenant<'a>; fn tenant_admission(&self) -> TenantAdmission<'a>; }`. A token then lives no longer than the group's `&'a mut Db`, so it cannot enter a `static` or a `thread_local!` (E0521), and cloning a `&CrossTenant` only copies the reference (E0308). *Residual, true of both forms:* operator code that `Box::leak`s its `Db` can mint a `'static` token. That is the operator building a bypass on purpose, with the standing `Db::snapshot` already gives it (DECISIONS §12). Spec §2 ruling 4 reads: a handler cannot park a token, and `main` cannot without leaking the `Db`. Task 7 Step 5 re-measures the `&self` form on the real tree.
+- **A9 — the capability tokens borrow what their `Group` borrows, not the `Group` itself.** Spec §5's `-> CrossTenant<'_>` / `-> TenantAdmission<'_>` ties a token to `&self`, which keeps the group shared-borrowed. Every site that mints and then stages in the same group (the dispatcher, the request path, the drift probe, every operator helper, GUIDE §16's `seed`; 22 mint sites when this plan was written, and S2's `through_firm_note` in `tenant.rs` adds two) would then be E0502. They are written `impl<'a> Group<'a> { fn cross_tenant_cap(&self) -> CrossTenant<'a>; fn tenant_admission(&self) -> TenantAdmission<'a>; }`. A token then lives no longer than the group's `&'a mut Db`, so it cannot enter a `static` or a `thread_local!` (E0521), and cloning a `&CrossTenant` only copies the reference (E0308). *Residual, true of both forms:* operator code that `Box::leak`s its `Db` can mint a `'static` token. That is the operator building a bypass on purpose, with the standing `Db::snapshot` already gives it (DECISIONS §12). Spec §2 ruling 4 reads: a handler cannot park a token, and `main` cannot without leaking the `Db`. Task 7 Step 5 re-measures the `&self` form on the real tree.
 - **A10 — P5 exactly as the re-review built it is refused at mount, and the dispatch assert closes the rest.** `JobDef { scope_type: TypeId::of::<Board>(), ..File::def() }` keeps `File`'s NAME `Desk` for a type that is not `Desk`. Beside any other `Desk`-scoped mount, Task 3's uniqueness check refuses it before anything is enqueued. The P5 shape that survives mount has a `scoped_by` and `scope_type` that agree with each other but not with its glue, and `JobScope::open`'s assert (Task 5) closes it. `JobScope` carries the job's name as a third private field (`job`), because spec §7's message names the job. *Stated residual (spec §7):* a `JobDef` whose glue and `scope_type` lie the same way is undetectable. It is also not a tenancy breach: `Group::stage` held the enqueuer to that same type.
 - **A11 — item 12 closes the class of refusal, not two instances.** A fix clause that restates an attribute from the author's own declaration drops the author's other arguments. Spec §7 names the 401 and `undeclared_capability`. A sweep of every `crates/*/src/**/*.rs` literal that spells an attribute found five more, and Task 6 fixes all seven:
   - `#[route]`'s neither-stance refusal, which drops `cross_tenant` and `emits(…)`;
@@ -5190,21 +5190,22 @@ except files other writers own. The class sweep's `$D/task6-class-sweep.py` sits
 
 **Files:**
 - Modify `crates/charpente-core/src/db.rs`:
-  - `CrossTenant` and its doc, and `Group::cross_tenant_cap` (`:1724-1755` at `e749823`);
-  - `TenantAdmission` and its doc, and `Group::tenant_admission` (`:1757-1790`);
-  - the four token-taking signatures, each with its destructure: `Tx::settle_job` (`:940-941`),
-    `Tx::enqueue_in` (`:1084-1090`), `Tx::admit_scope` (`:1565-1570`) and `Tx::across_tenants`
-    (`:1801-1802`).
+  - `CrossTenant` and its doc, and `Group::cross_tenant_cap` (`:1835-1866` at `57e5df5`;
+    `:1724-1755` at `e749823`);
+  - `TenantAdmission` and its doc, and `Group::tenant_admission` (`:1868-1901`);
+  - the four token-taking signatures, each with its destructure: `Tx::settle_job` (`:1039-1040`),
+    `Tx::enqueue_in` (`:1195-1201`), `Tx::admit_scope` (`:1676-1681`) and `Tx::across_tenants`
+    (`:1912-1913`).
 - Modify `crates/charpente/src/http/app.rs`:
-  - `Ctx<'g>` and its doc (`:75-100`), `impl<'g> Ctx<'g>`, `Ctx::cap`,
+  - `Ctx<'g>` and its doc (`:76-101`), `impl<'g> Ctx<'g>`, `Ctx::cap`,
     `Ctx::public_admission`;
-  - `Declared::admitted` and `Stance<'g>` (`:265-287`);
-  - `build_ctx` (`:942-993`);
-  - the two `cap.clone()` in `stage_or_subscribe` (`:902`, `:919`).
+  - `Declared::admitted` and `Stance<'g>` (`:266-288`);
+  - `build_ctx` (`:958-1009`);
+  - the two `cap.clone()` in `stage_or_subscribe` (`:918`, `:935`).
 - Modify `crates/charpente/src/http/router.rs`: `Glue` and `SubGlue` (`:15`, `:22`).
 - Modify `crates/charpente/src/tenant.rs`: `Scoped::scope`, the trait and the impl
   (`:98-131`), and one clause in the module doc.
-- Modify `crates/charpente/src/kernel/dispatch.rs`: `JobGlue` (`:107-108`) and the
+- Modify `crates/charpente/src/kernel/dispatch.rs`: `JobGlue` (`:109-110`) and the
   `JobScope.admission` field (as Task 5 left it).
 - Modify `crates/charpente-macros/src/job.rs` (`:342-345`, `:417-422`) and
   `crates/charpente-macros/src/route.rs` (`:514-519`, the SSE glue's matching
@@ -5240,8 +5241,8 @@ except files other writers own. The class sweep's `$D/task6-class-sweep.py` sits
     `kernel::JobGlue = fn(&mut Tx, &[u8], Option<&CrossTenant<'_>>, Option<JobScope<'_>>) ->
     …`, and `Scoped::scope(&mut self, scope: Id<S>, ctx: &Ctx<'_>)`.
   - Handler, job and helper **source is unchanged**: `ctx: &Ctx` and `cap: &CrossTenant` elide.
-    The workspace enables neither `elided_lifetimes_in_paths` nor `rust_2018_idioms` (see the
-    Global Constraints), so that spelling is lint-clean. Platform signatures spell `<'_>`/`<'g>`:
+    The workspace enables neither `elided_lifetimes_in_paths` nor `rust_2018_idioms` (no
+    `Cargo.toml` or crate root names either, checked at 57e5df5), so that spelling is lint-clean. Platform signatures spell `<'_>`/`<'g>`:
     `mismatched_lifetime_syntaxes` (warn-by-default, an error under clippy `-D warnings`)
     refuses a hidden lifetime in an accessor's *output*.
   - No record, no draw and no disk operation changes, so every Task 1 baseline must reproduce.
@@ -5795,7 +5796,7 @@ Never run it with `TRYBUILD=overwrite` under a mutation. Restore with
    Expected: E0502 "cannot borrow … as mutable because it is also borrowed as immutable" at
    `kernel/dispatch.rs` (`run_due_into`'s `group.stage`), at `http/app.rs`
    (`stage_or_subscribe`'s two `group.stage`s and the probe's), and at the test helpers that
-   mint then stage. Quote the count. This is A9's evidence on the tree itself.
+   mint then stage (S2's `through_firm_note` in `tenant.rs` among them). Quote the count. This is A9's evidence on the tree itself.
 
 - [ ] **Step 6: Byte identity**
 
@@ -5928,14 +5929,14 @@ matched table and its write path. Today `tx.put(&EventRow { .. })` forges an eve
 tenant's feed, and `tx.put(&SchemaVersion { .. })` claims a table migrated whose rows never ran
 the migration. The platform's own writes keep their doors:
 - apply still materializes event rows from emit effects;
-- first-write adoption still inserts into the overlay directly (`Group::stage`, db.rs:3799-3856
-  at e749823);
+- first-write adoption still inserts into the overlay directly (`Group::stage`, db.rs:4139-4196
+  at 57e5df5; 3799-3856 at e749823);
 - `migrate_table`'s two writes move to a crate-private `Tx::put_schema_version`, and a test pins
   that its record is byte-identical to the one `tx.put` wrote.
 
 Reads are untouched here; Task 9 seals them.
 
-Storage does not move. `row_is_scoped` (table.rs:757 at e749823) already treats `PlatformOwned`
+Storage does not move. `row_is_scoped` (table.rs:759 at 57e5df5, 757 at e749823) already treats `PlatformOwned`
 as `Unscoped`, so every table keeps its bare `u64` key, and every Task 1 baseline must reproduce.
 
 **Files:**
@@ -5944,25 +5945,30 @@ as `Unscoped`, so every table keeps its bare `u64` key, and every Task 1 baselin
 - Modify `crates/charpente-core/src/migration.rs`: `impl Row for SchemaVersion`'s `type Scope`,
   with a comment.
 - Modify `crates/charpente-core/src/db.rs`:
-  - `PLATFORM_TABLES` (`:826` at e749823) and its doc;
+  - `PLATFORM_TABLES` (`:913` at 57e5df5; `:826` at e749823) and its doc;
   - `is_platform_table` becomes `platform_table`, returning the index;
-  - `refuse_platform_table` (`:849`) becomes one text per table;
+  - `refuse_platform_table` (`:936`) becomes one text per table;
   - `Tx::put`'s doc;
-  - `Tx::put_schema_version` (new, `pub(crate)`, after `settle_job`);
-  - `Db::migrate_table`'s two `tx.put(&crate::migration::SchemaVersion {` (`:3517`, `:3558`);
+  - `Tx::put_schema_version` (new, `pub(crate)`, after `settle_job`), which records its write in
+    `TxEffects::written_as` as `put` does since S2;
+  - `Db::migrate_table`'s two `tx.put(&crate::migration::SchemaVersion {` (`:3779`, `:3820`);
+  - `Group::stage`'s negative-space assert after S2's `written_as` loop (`:4044-4055`): it asserts
+    what its message says (S2 review N1, carried to S1);
+  - the unscoped-overlay writer lists in `encode_record`'s comment (`:726-729`, stale since before
+    S2) and `merge_overlay_rows`' comment (`:1259-1263`), which gain `Tx::put_schema_version`;
   - `mod tests`: `refusal_text` and `each_platform_table_name_is_refused_by_its_own_text`.
-- Modify `crates/charpente-core/src/table.rs`:
-  - `PlatformOwned`'s doc (`:298-310`);
-  - `AppWritable`'s doc and two new notes (`:451-476`);
-  - `unscoped_open_err`'s doc (`:697-699`, "`EventRow::Scope` is `Unscoped` at compile time");
-  - `row_is_scoped`'s doc (`:755-756`).
+- Modify `crates/charpente-core/src/table.rs` (lines at 57e5df5):
+  - `PlatformOwned`'s doc (`:298-310`, unmoved since e749823);
+  - `AppWritable`'s doc and two new notes (`:451-476`, unmoved);
+  - `unscoped_open_err`'s doc (`:699-701`, "`EventRow::Scope` is `Unscoped` at compile time");
+  - `row_is_scoped`'s doc (`:757-758`).
 - Test:
   - `crates/charpente-core/tests/migrations.rs`: `schema_version_puts` and
     `migrate_schema_records_each_schema_version_as_an_unscoped_put` (new);
   - `crates/charpente-core/tests/migrate_apply.rs`: `schema_version_record` and `ship` (new),
     and `migrate_put_overwrites_without_indexing_then_close_out_rebuilds` ships its two
-    schema-version rows (`:100`, `:144`);
-  - `crates/charpente-core/tests/engine.rs`: `an_ordinary_table_is_unscoped_by_default` (`:463`)
+    schema-version rows (`:100`, `:144`, unmoved since e749823);
+  - `crates/charpente-core/tests/engine.rs`: `an_ordinary_table_is_unscoped_by_default` (`:468`)
     takes `Widget`, and `the_platform_tables_are_platform_owned` (new).
 - Create in `crates/charpente-macros/tests/compile_fail/`, each with its `.stderr`:
   `event_row_written_on_bare_tx.rs`, `schema_version_written_on_bare_tx.rs`,
@@ -5973,8 +5979,9 @@ as `Unscoped`, so every table keeps its bare `u64` key, and every Task 1 baselin
     (`AppWritable`'s two new notes);
   - `job_row_table_name_borrowed.stderr` (the quoted `panic!` block moves into a `match` arm).
 - Docs:
-  - `docs/GUIDE.md` §3 (`:404`), §6 ("Job rows are the platform's", both pinned blocks), §10's
-    list of panics (`:3236`), and §16 (the tail of "The compile errors", and "Where the
+  - `docs/GUIDE.md` §3 (`:421`), §6 ("Job rows are the platform's", both pinned blocks), §9's
+    "Duplicate registration" entry (`:3601`; this plan said §10, but the entry has been in §9,
+    the Error index, since before e749823), and §16 (the tail of "The compile errors", and "Where the
     guarantee stops");
   - `DESIGN.md` §3's **Jobs** bullet and §8's Multi-tenancy bullet.
 
@@ -6521,9 +6528,9 @@ still the writer. Stop and report the diff. Do not adjust the code to fit the te
 - [ ] **Step 4: Ship `migrate_apply.rs`'s schema-version rows, and see it green at the Task 7 commit**
 
 `migrate_put_overwrites_without_indexing_then_close_out_rebuilds` writes its migration marker and
-its close-out with `tx.put(&SchemaVersion { … })` (`:100`, `:144` at e749823), which stops
+its close-out with `tx.put(&SchemaVersion { … })` (`:100`, `:144` at e749823 and at 57e5df5), which stops
 compiling in Step 5. They become hand-encoded `0x00` records shipped through
-`Db::apply_shipped`, the way `migrations.rs`'s `scoped_widget_adoption_record` (`:1063`) builds
+`Db::apply_shipped`, the way `migrations.rs`'s `scoped_widget_adoption_record` (`:1389` at 57e5df5) builds
 one. `apply_shipped` is the follower apply path, one of the three the design requires to rebuild
 identically, so the test's property does not change.
 
@@ -6792,6 +6799,12 @@ After `settle_job`, add:
     pub(crate) fn put_schema_version(&mut self, row: &crate::migration::SchemaVersion) {
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
+        self.effects.written_as.insert((
+            crate::migration::SchemaVersion::TABLE,
+            std::any::type_name::<crate::migration::SchemaVersion>(),
+            false,
+            TypeId::of::<crate::migration::SchemaVersion>(),
+        ));
         self.effects
             .overlay
             .entry(crate::migration::SchemaVersion::TABLE)
@@ -6799,6 +6812,90 @@ After `settle_job`, add:
             .insert((UNSCOPED, row.id.raw()), Some(bytes));
     }
 ```
+
+Since S2 (LEDGER 2026-10-01, "error text and schema safety"), `put` records each write in
+`TxEffects::written_as` (db.rs:997-1002 at 57e5df5), so the `written_as` insert is part of
+"`put`'s body". It is memory only, never in a record, a fingerprint or `describe`, so the record
+Step 3 pins does not move. `Group::stage`'s `written_as` loop (db.rs:4003-4043) checks the write
+against the registration `Db::open` makes on every path (`SchemaVersion`, unscoped, its own
+`TypeId`, db.rs:2701-2704), so the loop always admits it.
+
+**`Group::stage`'s negative-space assert (S2 review N1, carried to S1).** After the `written_as`
+loop, the assert (db.rs:4044-4055 at 57e5df5) checks only that every overlay table is
+registered, while its message says every overlay writer but `Tx::settle_job` records its `Row`
+type in `written_as`. An unrecorded `put_schema_version` would pass it. Assert what the message
+says. Replace:
+
+```rust
+        assert!(
+            effects
+                .overlay
+                .keys()
+                .all(|table| schema.tables.contains_key(table)),
+            "Group::stage: a transaction wrote a table the Schema does not register and \
+             TxEffects::written_as did not record — every overlay writer but Tx::settle_job \
+             records its Row type there"
+        );
+```
+
+with:
+
+```rust
+        assert!(
+            effects.overlay.keys().all(|table| {
+                *table == JobRow::TABLE
+                    || effects.written_as.iter().any(|&(written, ..)| written == *table)
+            }),
+            "Group::stage: a transaction wrote a table TxEffects::written_as did not record, so \
+             the check above never saw it — every overlay writer but Tx::settle_job (whose \
+             JobRow Db::open registers on every path) records its Row type there"
+        );
+```
+
+The comment above it ("`Tx::settle_job`'s `JobRow` is the one overlay write `written_as` does not
+record, and `Db::open` registers it on every path, so no table reaches the record unchecked")
+stays: it now says what the assert checks. First-write adoption inserts its `SchemaVersion` rows
+after this assert, so they are not writes it sees.
+
+Two comments list the unscoped overlay's writers, and gain the new one. In `encode_record`
+(db.rs:726-729 at 57e5df5), replace the stale comment, which predates S2:
+
+```text
+                // `Tx::put`/`Tx::delete` are the overlay's only writers
+                // (besides the SchemaVersion adoption row, always UNSCOPED)
+                // and populate `scoped_tables` in lockstep with the overlay
+                // — negative space, not a resolvable input.
+```
+
+with:
+
+```text
+                // A table outside `scoped_tables` is written only UNSCOPED:
+                // by `Tx::put`/`Tx::delete`, `Tx::settle_job`,
+                // `Tx::put_schema_version` and the SchemaVersion adoption
+                // row. The scoped writers, `put_in`/`delete_in`, populate
+                // `scoped_tables` in lockstep with the overlay — negative
+                // space, not a resolvable input.
+```
+
+In `merge_overlay_rows` (db.rs:1261-1262), replace:
+
+```text
+            // `Tx::settle_job` and the SchemaVersion adoption row, all of
+            // which stage `UNSCOPED`. A skip here would turn a staging bug into a
+```
+
+with:
+
+```text
+            // `Tx::settle_job`, `Tx::put_schema_version` and the SchemaVersion
+            // adoption row, all of which stage `UNSCOPED`. A skip here would turn
+            // a staging bug into a
+```
+
+The assert messages beside both comments ("Tx::put/Tx::delete populate both together",
+"Tx::put/Tx::delete stage UNSCOPED only") stay as they are: no test pins them, and this task does
+not reword messages it does not need to.
 
 In `Db::migrate_table` (re-locate by symbol: S2 edited `migrate_schema`, its caller), the two
 writes change door:
@@ -6819,7 +6916,7 @@ grep -rn "put(&crate::migration::SchemaVersion\|put(&SchemaVersion" crates/charp
 
 Expected: `2`, then no output.
 
-`crates/charpente-core/src/table.rs`. Replace `PlatformOwned`'s doc (`:298-310` at e749823)
+`crates/charpente-core/src/table.rs`. Replace `PlatformOwned`'s doc (`:298-310` at e749823 and 57e5df5)
 with:
 
 ```rust
@@ -6925,7 +7022,7 @@ Expected: exit 0.
 - [ ] **Step 6: `engine.rs` — the stand-in, and a type-level pin**
 
 `an_ordinary_table_is_unscoped_by_default` uses `SchemaVersion` as its stand-in, which is no
-longer `Unscoped`. Replace it and its doc (`:454-466` at e749823) with:
+longer `Unscoped`. Replace it and its doc (`:459-471` at 57e5df5; `:454-466` at e749823) with:
 
 ```rust
 /// Task 2 (tenant scoping): `Row::Scope` defaults every existing table to
@@ -7059,10 +7156,16 @@ Apply each mutation alone, run its command, record the red, then restore with
    record now carries a scoped Put (`0x05`), and apply refuses it: `record decode: table
    "charpente.schema_versions" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect
    carries scope 0 (tag 0x05/0x06) — …`.
+8. `put_schema_version`: delete its `self.effects.written_as.insert((…));`. Same test. Expected:
+   red at `db.migrate_schema().unwrap()`, a panic with "Group::stage: a transaction wrote a table
+   TxEffects::written_as did not record, so the check above never saw it — …". Under 57e5df5's
+   registration-only assert this mutation is green, because `Db::open` registers
+   `SchemaVersion` on every path: that is N1.
 
 Mutations 6 and 7 were run when this plan was drafted, on a copy of e749823 with this task
-applied, and failed exactly as above. Its trybuild overwrite produced exactly Step 8's file
-set and diffs.
+applied, and failed exactly as above. Mutation 8 was added when the plan was amended against
+57e5df5 and has not been run; its expected red is read from db.rs:4044-4055, so quote what it
+prints. The drafting run's trybuild overwrite produced exactly Step 8's file set and diffs.
 
 Every mutation must be red. A green one is an unpinned property: stop and report it, and do not
 weaken the mutation. Then run `git diff --stat crates/charpente-core/src` and confirm it matches
@@ -7257,7 +7360,7 @@ git add crates/charpente-core/src/event.rs crates/charpente-core/src/migration.r
   crates/charpente-macros/tests/compile_fail/job_row_untenanted_on_bare_tx.stderr \
   crates/charpente-macros/tests/compile_fail/job_row_table_name_borrowed.stderr \
   docs/GUIDE.md DESIGN.md
-git commit -m "feat(tenancy): EventRow and SchemaVersion are the platform's — PlatformOwned, in PLATFORM_TABLES, each refusal names its table and write path; migrate_table writes through Tx::put_schema_version, record byte-identical (pinned); 4 new compile-fail pins, <N> re-pinned; <M>/7 mutations red; <K> of <K> gate lines ok; 11 baselines reproduce"
+git commit -m "feat(tenancy): EventRow and SchemaVersion are the platform's — PlatformOwned, in PLATFORM_TABLES, each refusal names its table and write path; migrate_table writes through Tx::put_schema_version, record byte-identical (pinned); 4 new compile-fail pins, <N> re-pinned; Group::stage asserts every unrecorded overlay write is settle_job's (S2 N1); <M>/8 mutations red; <K> of <K> gate lines ok; 11 baselines reproduce"
 ```
 
 ---
