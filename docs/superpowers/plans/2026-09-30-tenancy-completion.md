@@ -14718,8 +14718,8 @@ Add any site Step 6 found beyond this list (Task 10's additions) to the `git add
 ### Task 12: `describe` names each event's tenant — `EventInfo.scoped_by` replaces `keyed`
 
 **Files:**
-- Modify `crates/charpente/src/describe.rs`: `EventInfo` (120–134 at `e749823`), `event_info` (302–308) and `to_human`'s events line (436).
-- Modify `crates/charpente-cli/src/genclient.rs`: the mirror's `EventInfo` (310–314), `into_event` (481–487) and `EVERY_SHAPE`'s `events` (624).
+- Modify `crates/charpente/src/describe.rs`: `EventInfo` (120–134 at 57e5df5 and at `e749823`; the file has not changed), `event_info` (302–308) and `to_human`'s events line (436).
+- Modify `crates/charpente-cli/src/genclient.rs`: the mirror's `EventInfo` (310–314), `into_event` (481–487) and `EVERY_SHAPE`'s `events` (624), unchanged since `e749823`.
 - Modify `crates/charpente-tsgen/tests/common/mod.rs`: the two `EventInfo` literals (164–173).
 - Test:
   - `crates/charpente/tests/describe.rs`:
@@ -14730,7 +14730,7 @@ Add any site Step 6 found beyond this list (Task 10's additions) to the `git add
     - the golden is re-pinned;
   - `examples/invoicing/tests/describe_golden.rs`: the golden;
   - `crates/charpente-cli/tests/describe.rs`: `GOLDEN`.
-- Modify `crates/charpente/tests/realtime.rs`: `feed_keyed`'s doc comment (207 at `e749823`), which cites `EventInfo.keyed`.
+- Modify `crates/charpente/tests/realtime.rs`: `feed_keyed`'s doc comment (210 at 57e5df5; 207 at `e749823`), which cites `EventInfo.keyed`.
 - Docs:
   - `docs/GUIDE.md` §11 ("Registering events": the JSON entry and the sentence after it), §13 (the introduction and the JSON, via `describe_contract`);
   - `DESIGN.md` §7's **Introspection** bullet.
@@ -14741,7 +14741,7 @@ Add any site Step 6 found beyond this list (Task 10's additions) to the `git add
   - `EventInfo { name, payload, scoped_by: Option<&'static str> }`. `scoped_by` is in `keyed`'s old position, last, so the JSON order is `name`, `payload`, `scoped_by`.
   - JSON renders it as the tenant type's `NAME` or `null`.
   - The human dump's events line is `  <name> payload=<payload> scoped_by=<NAME|none>`. `none` follows `fingerprint=none`'s and the jobs line's `scoped_by=none` precedent.
-  - `charpente-tsgen` reads no `EventInfo` field (`grep -rn "EventInfo\|keyed" crates/charpente-tsgen/src` is empty at `e749823`), so the generated TS client is unchanged. Only tsgen's test fixtures build `EventInfo` literals.
+  - `charpente-tsgen` reads no `EventInfo` field (`grep -rn "EventInfo\|keyed" crates/charpente-tsgen/src` is empty at `e749823` and at 57e5df5; D4's tsgen change touched only the runtime's `onOpen` and `CursorRefused` text), so the generated TS client is unchanged. Only tsgen's test fixtures build `EventInfo` literals.
 
 Byte identity: `describe` is a pure registry walk (DESIGN §7). This task changes no record, no fingerprint and no sim path, so no coverage baseline has a reason to move. The frame still requires Tasks 2–9, 11 and 12 to reproduce Task 1's baselines, so Step 7 re-runs all eleven through `baselines.sh`. Expected: every one reproduces, `realtime-tenant` against the same reference Task 11 used.
 
@@ -14942,7 +14942,7 @@ Expected numstat:
 
 Every golden event is `global` (Task 1 swept them, and invoicing's two stay global), so every rewritten value is `null`. A test failing on a `null` that should be a name means that assumption broke: read it, and never patch the value in.
 
-The final `grep` matches 25 lines at `e749823`. Here it prints only the lines Step 6 rewrites: DESIGN §7's two lines (1412–1413 at `e749823`) and GUIDE §11's "`keyed` is always `false`" line. After Step 6 it prints nothing.
+The final `grep` matches 25 lines at `e749823` and at 57e5df5. Here it prints only the lines Step 6 rewrites: DESIGN §7's two lines (1794–1795 at 57e5df5; 1412–1413 at `e749823`) and GUIDE §11's "`keyed` is always `false`" line. After Step 6 it prints nothing.
 
 - [ ] **Step 5: Run, then prove red by mutation**
 
@@ -14958,7 +14958,7 @@ cargo test -p guide-examples --test describe_contract
 
 Expected: all green, and `ts-fixture-app`'s staleness diff unmoved. The TS client reads no `EventInfo` field.
 
-Save the implementation with `git diff crates/charpente/src/describe.rs crates/charpente-cli/src/genclient.rs > .superpowers/sdd/2026-09-30-tenancy-completion/task12-impl.patch`. Apply each mutation alone, and restore it with `git checkout -- <file>` and `git apply` of the patch:
+Save the implementation with `git diff crates/charpente/src/describe.rs crates/charpente-cli/src/genclient.rs > .superpowers/sdd/2026-09-30-tenancy-completion/task12-impl.patch`. Apply each mutation alone, and restore it with `git checkout -- <file> && git apply --include=<file> .superpowers/sdd/2026-09-30-tenancy-completion/task12-impl.patch`, naming the one mutated file both times (a whole-patch apply fails on the other file, which still holds it, and applies nothing):
 1. `event_info`: `scoped_by: None`. Expected: `describe_names_every_scoped_event` fails on `ledger_posted` (left `None`, right `Some("Org")`), and `to_human_carries_an_events_scoped_by` fails on its first line.
 2. `to_human`: print `e.payload` in `scoped_by`'s place. Expected: both human tests fail, `to_human_pins_the_events_section` on `scoped_by=WidgetAdded`. This pins the renderer's operand, not only its presence.
 3. `genclient.rs` `into_event`: `scoped_by: None`. Expected: `round_trip_preserves_every_shape` fails, because the parsed contract loses `widget_added`'s `"Org"`.
