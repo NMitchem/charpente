@@ -20,7 +20,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-30-tenancy-completion-design.md` (commit `e749823`, approved by Noah on 2026-09-30). Read it first; the plan argues from it. Where this plan differs, the difference is listed under "Spec amendments" below, and Task 1 writes those into the spec.
 
-**Base:** `main` after sub-projects S4 (redb 4.3.0, the open fence dropped), S2 (`Group::stage`'s TABLE-alias refusal, `migrate_schema`'s batch-size-0 refusal, the drift-probe text) and S3 (give-ups, reopen budget, ceilings, the mutants baseline, test deadlines) have landed. Line numbers in this plan are cited **at `e749823`** and are for orientation only. S2 and S3 edit `Group::stage`, `migrate_schema` and several test files, so an implementer re-locates every site **by symbol** before editing. Task 1 records the base sha it ran on.
+**Base:** `main` at or after `57e5df5`, which holds sub-projects S4 (redb 4.3.0, the open fence dropped), S2 (`Group::stage`'s `TableWriteRefusal`, `migrate_schema`'s batch-size-0 refusal, the drift-probe text), S3 (give-ups, `ceiling:`, budgets, the mutants baseline, test deadlines), S5 with D1 (`StoreRejected`, WAL recovery syncs before replay, `Sim::restart_process`, `checks::boot_through_fallout`/`durable_refusal`, `floor:` on every capped property, every re-seed text names the follower step), D2 (the filesystem stores), D3 (the replication rig's laggard re-seed), S3b (the vacuous-pass census, the per-host fault markers, one ambient cap rule) and D4 (the re-sync remedy order, "from now", `SubscribeOptions.onOpen`, the switchover stall texts). The plan was written at `e749823` and amended against `57e5df5` on 2026-10-02 (`.superpowers/sdd/2026-09-30-publish-readiness/s1-amend-report.md`; LEDGER 2026-10-01 and 2026-10-02 are the record of what landed). Line numbers in this plan are cited **at `57e5df5`** and are for orientation only; a citation explicitly marked "at e749823" is the plan's original measurement, kept where it records what the plan's author saw. Any later merge can move them again, so an implementer re-locates every site **by symbol** before editing. Task 1 records the base sha it ran on.
 
 **Working directory for mid-flight state:** `.superpowers/sdd/2026-09-30-tenancy-completion/` (gitignored). Put these there:
 - `progress.md`;
@@ -76,7 +76,7 @@
   - `grep -c FAILED <log>` is 0;
   - neither count was inferred from the absence of `FAILED`.
 
-  The baseline count of `test result:` lines is **measured at the base by Task 1**, not assumed. It was 87 at `89bd4e6`, and S2–S4 may change it. This plan adds no test file, so the count Task 1 measures holds to Task 14. A task that adds one must update CLAUDE.md's exhaustive list in the same commit (`doc_inventory` fails otherwise).
+  The baseline count of `test result:` lines is **measured at the base by Task 1**, not assumed. It was 87 at `89bd4e6` and 86 at `57e5df5` (S4 deleted `charpente-sim`'s and `edge-harness`'s `open_fence` suites and added `edge-harness`'s `unopenable_store`; LEDGER 2026-10-02, D4's gate: 86/86), and a later merge may change it again. This plan adds no test file, so the count Task 1 measures holds to Task 14. A task that adds one must update CLAUDE.md's exhaustive list in the same commit (`doc_inventory` fails otherwise).
 - **Two markers are filled at execution, never guessed.** `<the commit's date>` is the date of the commit that lands the text. `N` in a universe count or a commit message is the value measured in that task's timing or gate step.
 - **The full suite exceeds the 600 s tool ceiling.**
   - **Implementers** run the per-package, per-file commands each task lists, in the foreground.
@@ -89,6 +89,7 @@
   - `echo ====` is a zsh error; use `echo '----'`.
   - `timeout` does not exist on this machine; bound a run with perl `alarm` if needed.
 - **Error text is product surface (hard rule 5).** Every message below is fixed wording, pinned byte-exact by a test that spells it out independently of the product's `format!`. Do not "improve" a message without changing its pin and its GUIDE quote in the same commit.
+  - **Operator texts keep main's forms (S5, S3b, D4).** A text that tells a client to re-sync gives D4's order, copied from main's kernel 409s (`validate_subscribe`, `kernel/mod.rs:966-1066` at `57e5df5`), never paraphrased: "reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently". A text that prescribes clearing a data directory goes through `repl::role::reseed_steps` (`repl/role.rs:114`), which names "restart it configured as a follower of …". This plan adds one re-sync text (A16's 409); it adds no re-seed text.
 - **Docs in the same commit as the behaviour (hard rule 6).**
   - `docs/GUIDE.md`'s ```rust blocks are compiled by `crates/guide-examples/build.rs`, **each block as its own module**, so every block must carry its own `use`s and types. Check them alone with `cargo build -p guide-examples`.
   - A ` ```text` block preceded by `<!-- pinned -->` is checked by `crates/guide-examples/tests/doc_truth.rs`. **Every non-blank pinned line's fragments must appear in some `.rs` under `crates/` or `examples/`.** A fragment is the text between `<lowercase placeholder>`s, trimmed, 16 or more characters. The check applies Rust's literal rules: a `\` + newline continuation vanishes, `\"` becomes `"`, and `\n` becomes a newline.
@@ -100,6 +101,11 @@
 - **Byte identity is measured, not assumed.** Task 1 records the coverage baselines at the base. Tasks 2–9, 11 and 12 must reproduce them exactly. Task 10 is the one expected to move the universes that emit inside a tenant scope. It names which tests' coverage may move, and every other baseline must still reproduce. A moved baseline elsewhere is a finding. Stop, and adjudicate it before touching an oracle (memory `pinned-seed-names-a-universe`).
 - **trybuild pins.** Regenerate `.stderr` files with `TRYBUILD=overwrite` and review the diff line by line. A moved line number is expected. A changed diagnostic is a finding unless the task changes that diagnostic. `charpente-macros`' trybuild pins quote std's `panic!` source line, which rustc prints only with the `rust-src` component (`57e804d`). Keep `rust-src` installed locally.
 - **Sim failures are findings.** A property failure is a finding: stop, pin the seed, and adjudicate before weakening anything. A timeout is not a catch, and a green replay of one seed proves nothing about a rate or a floor.
+- **Swarm properties follow GUIDE §8 as it stands at the base (S3, S5, S3b).** Any property or batch this plan adds or re-measures:
+  - **a verdict needs a check that could have failed.** A universe that cannot test its claim gives up by name (`sim.give_up`, GUIDE §8 "Giving up: a universe that reached no verdict"), never passes vacuously; a boot goes through `checks::boot_through_fallout`, and a durable refusal ends a recovery loop through `checks::durable_refusal`, excused only where durable corruption fired on that node's own disk (`SimHost::durable_corruption_fired`/`_count`, `dir_entry_loss_fired`/`_count`, counted since the node's last wipe);
+  - **every `ceiling:` on `universe:gave-up` comes with a `floor:` on the property's reach key** (GUIDE §8, "Re-basing a pinned property"). Pinned bases are capped and floored at their exact counts; an ambient cap is max(2 × the largest of ≥ 10 fresh batches, the smallest k with P(Poisson(λ) > k) < 1e-4), and an ambient reach floor is mean − 4 sd;
+  - **the re-key rules.** After a change that re-keys universes, a floor may be re-set down only if the after-mean is within one Welch SE of the before-mean over the same ≥ 10 fresh bases (`CHARPENTE_BASE_SEED`); a cap may rise only if the passes covering the reach key did not fall by more than one Welch SE. Both distributions are recorded. A pinned count re-set by any other argument is a finding.
+- **Quoted seeds, bases, floors and caps are re-measured at execution.** D1, S5, D3 and D4 re-keyed universes after this plan was written. Where a task quotes a count measured before 2026-10-01, the 2026-10-02 amendment marks it "re-measure at execution" and names the rule above; the value in the source at the base is the operand, not the plan's.
 - **Mutation runs.**
   - Commit before any mutation run.
   - Never share `CARGO_TARGET_DIR` across worktrees.
@@ -155,20 +161,21 @@ No new test files, so the `test result:` count Task 1 measures holds to Task 14,
   file; the coverage-baseline driver every later task runs).
 - Modify `crates/charpente-macros/src/event.rs`: the module doc's first paragraph; add
   `EventArgs`, `ACCEPTED_FORMS` and `impl Parse for EventArgs`.
-- Modify `crates/charpente-macros/src/lib.rs`: the `event` attribute entry (lines 238–253 at
-  e749823), which today refuses any argument.
-- Modify every `#[event]` attribute site, 32 in Rust (lines at e749823):
+- Modify `crates/charpente-macros/src/lib.rs`: the `event` attribute entry (lines 238–253;
+  charpente-macros is unchanged from e749823 to 57e5df5), which today refuses any argument.
+- Modify every `#[event]` attribute site, 33 in Rust (lines at 57e5df5; 32 at e749823, and D4
+  added `Marked` at realtime.rs:6370 in 5c9192e):
   - `crates/sim-fixture/src/lib.rs:20`
   - `crates/charpente-cli/templates/lib.rs:27`
   - `crates/bench-harness/src/lib.rs:45`
   - `crates/ts-fixture-app/src/lib.rs:330,339`
-  - `crates/charpente/tests/group_commit.rs:2012`
+  - `crates/charpente/tests/group_commit.rs:2019`
   - `crates/charpente/tests/tenant.rs:167`
-  - `crates/charpente/tests/archive.rs:35`
+  - `crates/charpente/tests/archive.rs:37`
   - `crates/charpente/tests/describe.rs:87,95`
-  - `crates/charpente/tests/kernel.rs:3059`
+  - `crates/charpente/tests/kernel.rs:3207`
   - `crates/charpente/tests/http.rs:1072`
-  - `crates/charpente/tests/realtime.rs:45,50,63,68,74,86,93,100,2839,2937`
+  - `crates/charpente/tests/realtime.rs:48,53,66,71,77,89,96,103,3066,3164,6370`
   - `crates/charpente-macros/tests/compile_fail/route_duplicate_emits_name.rs:15`
   - `crates/charpente-macros/tests/compile_fail/route_duplicate_emits_clause.rs:16,21`
   - `crates/charpente-macros/tests/compile_fail/route_emits_on_non_sse.rs:15`
@@ -176,8 +183,8 @@ No new test files, so the `test result:` count Task 1 measures holds to Task 14,
   - `crates/charpente-macros/tests/compile_pass/route_public_scope.rs:37`
   - `examples/invoicing/src/routes.rs:26`, `examples/invoicing/src/jobs.rs:70`,
     `examples/invoicing/src/bin/tenant_node.rs:103`
-- Modify the six compiled `#[event]` blocks in `docs/GUIDE.md` (lines 523, 3719, 3724, 3772,
-  3911, 4237 at e749823: §4's `InvoiceFinalized`; §11's `HTTPEvent`, `InvoicePDFSent`,
+- Modify the six compiled `#[event]` blocks in `docs/GUIDE.md` (lines 564, 4161, 4166, 4214,
+  4353, 4731 at 57e5df5: §4's `InvoiceFinalized`; §11's `HTTPEvent`, `InvoicePDFSent`,
   `NoteAdded` (registering), `Ping` (the SSE route), `Ping` (testing a tail)).
 - Create `crates/charpente-macros/tests/compile_pass/event_global_forms.rs`.
 - Create `crates/charpente-macros/tests/compile_fail/event_duplicate_global.rs`,
@@ -186,7 +193,7 @@ No new test files, so the `test result:` count Task 1 measures holds to Task 14,
   `examples/invoicing/tests/describe_golden.rs` (the invoicing events' fingerprint pin).
 - Docs:
   - `docs/GUIDE.md` §11 ("`#[event]`"), §9 (a new `#[event]` catalog entry);
-  - `DESIGN.md` §3's **Events** bullet (line 643 at e749823);
+  - `DESIGN.md` §3's **Events** bullet (line 823 at 57e5df5);
   - the spec, which gets the plan's amendments.
 
 **Interfaces:**
@@ -225,8 +232,9 @@ The baselines, and why each is here:
 
 - [ ] **Step 1: Write the baseline driver and record every baseline, before any change**
 
-Confirm the base: `git rev-parse --short HEAD` prints the plan's base commit (the tip after
-S2, S3 and S4 landed — write it into `progress.md`), and `git status --short` is empty.
+Confirm the base: `git rev-parse --short HEAD` prints the plan's base commit (`57e5df5` or a
+later `main` — write it into `progress.md`; if it is later than `57e5df5`, list the merges
+between them there and re-check the cited sites they touch), and `git status --short` is empty.
 
 Write the driver with a quoted heredoc (the quote on `EOF` keeps `$` and `\` literal):
 
@@ -611,12 +619,13 @@ print('total', total)
 EOF
 ```
 
-Expected at e749823: 20 files listed and `total 38` (32 Rust sites in 19 files from this
-task's file list, plus GUIDE's 6). The spec's §11 counts (≈95 in tests, 26 in GUIDE) count
-every mention of `#[event`; the other mentions are prose, comments and error texts naming the
-attribute (GUIDE 3107, 3108 and 3873 at e749823 quote texts the code emits), and they stay as
-written, the way prose says `#[job]`. If S2–S4 added an event, the total is higher by exactly
-those sites and the proof greps below are the authority. `event_global_forms.rs` is untracked
+Expected at 57e5df5: 20 files listed and `total 39` (33 Rust sites in 19 files from this
+task's file list, plus GUIDE's 6; it was 38 at e749823, before D4 added `Marked`). The spec's
+§11 counts (≈95 in tests, 26 in GUIDE) count every mention of `#[event`; the other mentions
+are prose, comments and error texts naming the attribute (GUIDE 3472, 3473 and 4315 at 57e5df5
+quote texts the code emits), and they stay as written, the way prose says `#[job]`. If a merge
+after 57e5df5 added an event, the total is higher by exactly those sites and the proof greps
+below are the authority. `event_global_forms.rs` is untracked
 until Step 8, so `git ls-files` does not list it; the `skip` entry is belt and braces.
 
 Prove the sweep complete:
@@ -629,7 +638,7 @@ grep -rnE '^[[:space:]]*#\[event\(global\)\][[:space:]]*$' --include='*.rs' crat
 
 Expected: the first prints exactly one line, `crates/charpente-macros/tests/compile_pass/
 event_global_forms.rs:9:#[event]` (the deliberate bare control); the second prints nothing; the
-third prints `33` (the 32 swept sites plus the fixture's `Declared`). `crates/charpente/src/
+third prints `34` (the 33 swept sites plus the fixture's `Declared`). `crates/charpente/src/
 http/mod.rs:292` mentions `#[event]` inside a string and is not an attribute line, so the
 anchored pattern never matched it. `crates/charpente-cli/templates/lib.rs` is what
 `charpente new` writes (`include_str!`); `crates/charpente-cli/tests/new.rs`'s
@@ -762,18 +771,18 @@ No `Co-Authored-By` trailer (CLAUDE.md).
 
 **Files:**
 - Modify `crates/charpente-core/src/db.rs`:
-  - `trait Tenant` (~1476): `const NAME` as its first item, plus a doc paragraph;
-  - `Tx.opened_scope` (~878) and `Tx::enter_scope`'s one-scope assert (~1497–1518);
-  - `EnqueuedTenant.scope_name`'s doc (~587);
-  - `Tx::push_enqueue` (~1026), `Tx::enqueue_in` (~1084), `ScopedTx::enqueue`/`enqueue_keyed` (~1699–1708);
-  - `Group::stage`'s scope-type refusal (~3774–3797) and the comment above the loop (~3716–3733);
-  - `DeclaredTenancy`'s doc (~359).
+  - `trait Tenant` (~1587): `const NAME` as its first item, plus a doc paragraph;
+  - `Tx.opened_scope` (~965) and `Tx::enter_scope`'s one-scope assert (~1608–1629);
+  - `EnqueuedTenant.scope_name`'s doc (~666);
+  - `Tx::push_enqueue` (~1137), `Tx::enqueue_in` (~1195), `ScopedTx::enqueue`/`enqueue_keyed` (~1810–1819);
+  - `Group::stage`'s scope-type refusal (~4114–4137) and the comment above its enqueue loop (~4056–4073). Since S2, `stage` checks `TxEffects.written_as` in a loop of its own before that one (~3985–4043, refusing as `TableWriteRefusal`); this task does not touch it;
+  - `DeclaredTenancy`'s doc (~432).
 - Modify `crates/charpente-core/src/table.rs`: `Row::SCOPE_NAME`, after `FINGERPRINT` (~347).
 - Modify `crates/charpente/src/tenant.rs`:
   - add `tenant_name` (A7);
   - `TenantScope`'s `on_unimplemented` note and the doc paragraph naming the const assert.
 - Modify `crates/charpente/src/http/app.rs`:
-  - `Ctx::anonymous_scope` (~137–175);
+  - `Ctx::anonymous_scope` (~138–176);
   - add `Tenant` to the `charpente_core::db::{…}` import (rustfmt keeps it on one line).
 - Modify docs only (no code change):
   - `crates/charpente/src/http/router.rs`: `PublicScope.name`'s doc;
@@ -790,13 +799,13 @@ No `Co-Authored-By` trailer (CLAUDE.md).
   - `JobDef.scoped_by` is emitted through `tenant_name`;
   - delete the scoped arm's `tenant_scope_assert` (A7);
   - `global_and_scoped_by` quotes the path through `path_as_written`.
-- The sweep (Step 4) adds `const NAME` to every `impl Tenant`. At e749823 that is 57 sites (census: Step 4's regex, dry-run, read-only), and Step 1 adds 7 more:
+- The sweep (Step 4) adds `const NAME` to every `impl Tenant`. At 57e5df5 that is 57 sites, as at e749823 (census: Step 4's regex, dry-run, read-only, run at both), and Step 1 adds 7 more:
   - 25 impls in 23 `crates/charpente-macros/tests/compile_fail/*.rs`;
   - 8 impls in `compile_pass/*.rs`;
   - `crates/charpente-core/tests/engine.rs` ×3;
   - `crates/charpente/tests/`: `tenant.rs` ×4, `kernel.rs` ×4, `archive.rs` ×2, and one each in `describe.rs`, `realtime.rs`, `typed_tables.rs`, `replication.rs`;
   - `examples/invoicing/src/bin/tenant_node.rs`;
-  - 6 in `docs/GUIDE.md`'s ```rust blocks (~1452, ~1994, ~6010, ~6095, ~6297, ~6473).
+  - 6 in `docs/GUIDE.md`'s ```rust blocks (~1504, ~2046, ~6524, ~6609, ~6811, ~6987).
 - Tests:
   - `crates/charpente/tests/{kernel,tenant,describe,typed_tables}.rs`;
   - `crates/charpente-core/tests/engine.rs`;
@@ -807,10 +816,10 @@ No `Co-Authored-By` trailer (CLAUDE.md).
 - Docs:
   - `docs/GUIDE.md`:
     - §5: the sentence after the rule-3 401 block;
-    - §6: the scope-type refusal's lead-in and its pinned block (~1767–1783);
-    - §13: the route and job field sentence (~4501–4502);
-    - §16: the declaring example's comment, a new bullet, the one-scope text block (~6180) and its parenthesis, the rendered `TenantScope` note (~6213–6226), and the `public_scope` paragraph (~6379–6383);
-  - `DESIGN.md`: §3's **Scope** bullet (~569–571), and §7's `describe` field list (~1401, ~1414).
+    - §6: the scope-type refusal's lead-in and its pinned block (~1819–1835);
+    - §13: the route and job field sentence (~4995–4996);
+    - §16: the declaring example's comment, a new bullet, the one-scope text block (~6694) and its parenthesis, the rendered `TenantScope` note (~6727–6740), and the `public_scope` paragraph (~6893–6897);
+  - `DESIGN.md`: §3's **Scope** bullet (~749–751), and §7's `describe` field list (~1783, ~1796).
 
 **Interfaces:**
 - Consumes: nothing from this plan (Task 1 swept `#[event(global)]` only).
@@ -1457,7 +1466,7 @@ In `Group::stage`, replace the whole scope-type arm, from `if let (Some(tenant),
             }
 ```
 
-Every continuation line of that literal ends in a space before its `\`. Step 1's pins will fail on a missing space. In the comment above the loop, after "This is the only place both types are known (job-tenancy final review N1).", add: "A hand-built `JobDef` whose `scope_type` is not its `#[job]`'s trips the same check on the honest enqueue, so the refusal names that cause too (final re-review NB1)."
+Every continuation line of that literal ends in a space before its `\`. Step 1's pins will fail on a missing space. In the comment above the enqueue loop (the second loop in `stage`; S2's `written_as` loop comes first), after "This is the only place both types are known (job-tenancy final review N1).", add: "A hand-built `JobDef` whose `scope_type` is not its `#[job]`'s trips the same check on the honest enqueue, so the refusal names that cause too (final re-review NB1)."
 
 In `crates/charpente-core/src/table.rs`, inside `pub trait Row`, after `const FINGERPRINT`:
 
@@ -1545,7 +1554,7 @@ Expected output:
 - `crates/charpente-core/tests/engine.rs: 3`;
 - `total 64`.
 
-If S2–S4 landed an `impl Tenant` since e749823, the total is higher by exactly those. GUIDE's ~6222 is inside a `text` block (the rendered diagnostic), and must not be counted: a GUIDE count of 7 is a bug in the fence tracking.
+No `impl Tenant` landed between e749823 and 57e5df5 (the census reads 57 at both); if a later merge lands one, the total is higher by exactly those. GUIDE's ~6736 is inside a `text` block (the rendered diagnostic), and must not be counted: a GUIDE count of 7 is a bug in the fence tracking.
 
 Prove the sweep complete:
 
@@ -2019,7 +2028,7 @@ zsh $D/baselines.sh task2 invoicing; print -r -- "exit ${?}"
 
 Each label must print `reproduces the base`, and each call `exit 0`.
 
-Expected: one `identical` line per baseline, and no `DIFFERS`. This task writes no byte differently: every in-tree NAME equals its identifier, no fingerprint is touched, and `enter_scope`'s tuple lives in memory only. A difference is a finding: stop.
+Expected: no `MOVED` line (the driver prints `reproduces the base` or `MOVED`, never `identical`/`DIFFERS`). This task writes no byte differently: every in-tree NAME equals its identifier, no fingerprint is touched, and `enter_scope`'s tuple lives in memory only. A difference is a finding: stop.
 
 - [ ] **Step 12: Gate and commit**
 
@@ -2091,7 +2100,7 @@ The second `git status --short` shows nothing staged-but-unlisted and nothing le
 - Modify the macros:
   - `crates/charpente-macros/src/route.rs`: emit `PublicScope.type_name`;
   - `crates/charpente-macros/src/job.rs`: emit `JobDef.scope_type_name`.
-- Modify the hand-built `JobDef` literals, which the new field makes a compile error until filled: `crates/charpente/src/launch.rs` (~437) and `crates/charpente/src/serve.rs` (~757, ~846).
+- Modify the hand-built `JobDef` literals, which the new field makes a compile error until filled: `crates/charpente/src/launch.rs` (~477) and `crates/charpente/src/serve.rs` (~757, ~859).
 - Tests: `crates/charpente/tests/tenant.rs`, a new section at the end, plus its imports.
 - Modify `crates/guide-examples/tests/doc_truth.rs`: `PINNED_FLOOR` goes up by one.
 - Docs:
@@ -2111,7 +2120,7 @@ The second `git status --short` shows nothing staged-but-unlisted and nothing le
   - `Schema::table_tenants(&self) -> Vec<(&'static str, TypeId, &'static str)>`.
   - `TableOps { scope_name, scope_type, scope_type_name }`.
   - The two refusal texts, fixed by the contract.
-- Renames (A4's "fixtures whose two tenant types share an identifier"): none. At e749823, the one test binary with two same-identifier tenant types is `tenant.rs`, with its `Org` and `statuspage::Org`, and no `App` there mounts both. `kernel.rs`'s `spelled_alike` is an alias of `Board`, not a second type. Step 7 checks this mechanically: every suite that mounts an `App` runs, and a missed collision panics with the pinned text. Nothing pinned moves in this task.
+- Renames (A4's "fixtures whose two tenant types share an identifier"): none. At e749823 and at 57e5df5 (no `impl Tenant` landed between them; S2's `firm_note::Note` is scoped by `Firm`, NAME `"Firm"`, beside `Note`'s `Team`), the one test binary with two same-identifier tenant types is `tenant.rs`, with its `Org` and `statuspage::Org`, and no `App` there mounts both. `kernel.rs`'s `spelled_alike` is an alias of `Board`, not a second type. Step 7 checks this mechanically: every suite that mounts an `App` runs, and a missed collision panics with the pinned text. Nothing pinned moves in this task.
 - Byte identity: nothing this task adds is recorded. The map is in memory, and `type_name` is display only. Every Task 1 baseline must reproduce.
 
 - [ ] **Step 1: Write the tests against Task 4's commit**
@@ -2440,10 +2449,12 @@ with
 }
 ```
 
-In `Schema::table`, replace
+In `Schema::table`, replace (S2 added `row_type` and `row_name` between `scoped` and `index_names`; they stay)
 
 ```rust
                 scoped: crate::table::row_is_scoped::<R>(),
+                row_type: TypeId::of::<R>(),
+                row_name: std::any::type_name::<R>(),
                 index_names: R::INDEXES.iter().map(|d| d.name).collect(),
             },
 ```
@@ -2452,12 +2463,16 @@ with
 
 ```rust
                 scoped: crate::table::row_is_scoped::<R>(),
+                row_type: TypeId::of::<R>(),
+                row_name: std::any::type_name::<R>(),
                 index_names: R::INDEXES.iter().map(|d| d.name).collect(),
                 scope_name: R::SCOPE_NAME,
                 scope_type: TypeId::of::<R::Scope>(),
                 scope_type_name: std::any::type_name::<R::Scope>(),
             },
 ```
+
+`row_type` is the row's own `TypeId`, which `Group::stage` holds every write to (S2); `scope_type` is its scope type's. Both live in memory only.
 
 After `Schema::table_names`, add:
 
@@ -2754,7 +2769,7 @@ After the last restore, check that `git diff --stat crates/charpente/src/http/ap
 
 - [ ] **Step 7: The census — no existing app names two tenant types under one `NAME`**
 
-Every app in the tree mounts through `App::open`, `mount` and `mount_jobs`, so a collision nobody listed would now panic with the pinned text. Only these places hold a tenant type at all (census of `impl Tenant` at e749823):
+Every app in the tree mounts through `App::open`, `mount` and `mount_jobs`, so a collision nobody listed would now panic with the pinned text. Only these places hold a tenant type at all (census of `impl Tenant` at e749823, unchanged at 57e5df5):
 - `crates/charpente/tests/`;
 - `examples/invoicing` (one `Org`);
 - the GUIDE blocks, which are compiled and never mounted;
@@ -2794,7 +2809,7 @@ zsh $D/baselines.sh task3 invoicing; print -r -- "exit ${?}"
 
 Each label must print `reproduces the base`, and each call `exit 0`.
 
-Expected: every baseline `identical`. This task records nothing: the map lives in `App`'s memory, and the `type_name`s are display only.
+Expected: no `MOVED` line. This task records nothing: the map lives in `App`'s memory, and the `type_name`s are display only.
 
 - [ ] **Step 9: Docs**
 
@@ -2826,7 +2841,7 @@ type, and mounts.
 
 `DESIGN.md` §3, **Scope**: "`scoped_by` without one is a compile error at the struct." becomes "`scoped_by` without one is a compile error at the struct, and two tenant types under one `NAME`, or an empty `NAME`, are refused when the app mounts them."
 
-`crates/guide-examples/tests/doc_truth.rs`: `const PINNED_FLOOR: usize = 28;` becomes `29`. Read it first: if an earlier task moved it, add one to what is there.
+`crates/guide-examples/tests/doc_truth.rs`: `const PINNED_FLOOR: usize = 29;` becomes `30` (it was 28 at e749823; D4 raised it to 29 for the switchover-stall block). Read it first: if an earlier task moved it, add one to what is there.
 
 ```zsh
 cargo test -p guide-examples --test doc_truth --test describe_contract
@@ -2835,7 +2850,7 @@ grep -c '<!-- pinned -->' docs/GUIDE.md
 
 Expected:
 - both tests green;
-- the marker count one higher than before this step (30 in the scratch copy, where one of the hits is prose).
+- the marker count one higher than before this step: 31 from 57e5df5's 30, where one of the hits is prose (the scratch copy at e749823 read 30 from 29).
 
 The block's fragments are substrings of `note_tenant`'s two joined format strings. The scratch copy proved `doc_truth` reads both lines: breaking one word in each made it name GUIDE lines 6101 and 6102. The uniqueness text's "and event's" becomes true for events at Task 11 (A6).
 
