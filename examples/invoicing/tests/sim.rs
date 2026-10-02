@@ -14,14 +14,25 @@ use std::collections::{BTreeMap, BTreeSet};
 const SEC: u64 = 1_000_000_000;
 const DAY: u64 = 24 * 3600 * SEC;
 
+// Each fault-injected property requires the key its verdict marks, past every
+// give-up arm: `sim_tests!` takes no `ceiling:`, so an arm that swallowed every
+// universe would otherwise pass with exit 0 (S3b review I1).
 charpente_sim::sim_tests! {
-    acked_writes_survive_restart require ["restart"],
+    acked_writes_survive_restart require [
+        "restart",
+        "invoicing:acked-customer-verified",
+        "invoicing:acked-invoice-verified",
+        "invoicing:acked-finalize-verified",
+    ],
     app_replays_deterministically,
-    receipts_exactly_once require ["kernel:served"],
+    receipts_exactly_once require ["kernel:served", "invoicing:receipts-checked"],
     overdue_reminders_over_months require ["reminder:sent"],
     illegal_transitions_are_rejected,
     events_feed_resumes_across_restart,
-    api_key_authorizes_then_revoked_is_rejected,
+    api_key_authorizes_then_revoked_is_rejected require [
+        "auth:key-authorizes",
+        "auth:revoked-key-rejected",
+    ],
 }
 
 fn build(sim: &Sim) -> std::io::Result<App> {
@@ -181,7 +192,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     let corrupted = charpente_sim::checks::durable_corruption_fired(sim);
     if customer_acked {
         match snap.get::<Customer>(Id::from_raw(1)) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => sim.cover("invoicing:acked-customer-verified"),
             Ok(None) if corrupted => {
                 sim.cover("invoicing:acked-customer-cut");
                 sim.give_up(
@@ -202,7 +213,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     }
     if invoice_acked {
         match snap.get::<Invoice>(Id::from_raw(1)) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => sim.cover("invoicing:acked-invoice-verified"),
             Ok(None) if corrupted => {
                 sim.cover("invoicing:acked-invoice-cut");
                 sim.give_up(
@@ -224,7 +235,10 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     if finalize_acked {
         match snap.get::<Invoice>(Id::from_raw(1)) {
             Ok(Some(inv))
-                if inv.state == InvoiceState::Final || inv.state == InvoiceState::Paid => {}
+                if inv.state == InvoiceState::Final || inv.state == InvoiceState::Paid =>
+            {
+                sim.cover("invoicing:acked-finalize-verified");
+            }
             Ok(Some(_)) | Ok(None) if corrupted => {
                 sim.cover("invoicing:acked-finalize-cut");
                 sim.give_up(
@@ -394,7 +408,10 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
 
     let app = kernel.into_app();
     match check_receipts(&app, finalize_acked) {
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            sim.cover("invoicing:receipts-checked");
+            Ok(())
+        }
         Ok(false) => gave_up(
             sim,
             "invoicing:gave-up:nothing-to-count",
@@ -838,9 +855,15 @@ fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
 /// fault-free `Sim`, unlike `illegal_transitions_are_rejected` /
 /// `events_feed_resumes_across_restart`), so every step follows the other
 /// fault-injected workloads' discipline: an unclean ack is fault fallout,
-/// not a failure, EXCEPT the final read — once the revoke itself acked 200
-/// (durably committed, per the platform's ack-after-durable rule), a 200 on
-/// the next read with the same key is a real bug, not fallout.
+/// not a failure, except where no fault produces the answer.
+/// - Once the revoke itself acked 200 (durably committed, per the platform's
+///   ack-after-durable rule), a 200 on the next read with the same key is a
+///   real bug.
+/// - An IO error answers 500 with its own text. So at the minted key's first
+///   read, any status but 200 fails unless it is a 5xx whose body is fault
+///   fallout; at the revoked key's read, any status but 200 or 401 does the
+///   same (S3b review I1). No answer at all is fallout: a fault stopped the
+///   kernel first.
 fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
         .map_err(|e| e.to_string())?
@@ -900,14 +923,48 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     {
         return Err(e.to_string());
     }
-    let Some(200) = statuses_of(&source)?.first().copied() else {
-        return gave_up(
-            sim,
-            "invoicing:gave-up:authorize-unacked",
-            "the read under the fresh key never acked 200, so revocation had nothing to undo"
-                .to_string(),
-        );
-    };
+    let first = source
+        .responses()
+        .lock()
+        .map_err(|_| "responses lock poisoned".to_string())?
+        .first()
+        .cloned();
+    match first {
+        Some((200, _)) => {}
+        // No answer, or a 5xx whose body is fault fallout (an IO error answers
+        // 500 with its own text): a fault stopped the read, and nothing about
+        // the key was checked.
+        None => {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:authorize-unacked",
+                "the read under the fresh key got no answer, so revocation had nothing to undo"
+                    .to_string(),
+            );
+        }
+        Some((status, body))
+            if (500..=599).contains(&status)
+                && is_fault_fallout(&String::from_utf8_lossy(&body)) =>
+        {
+            return gave_up(
+                sim,
+                "invoicing:gave-up:authorize-unacked",
+                format!(
+                    "the read under the fresh key answered {status} on fault fallout, so \
+                     revocation had nothing to undo"
+                ),
+            );
+        }
+        // Any other answer comes from no fault: the key was minted on this same
+        // running node and its mint acked 200 (S3b review I1).
+        Some((status, body)) => {
+            return Err(format!(
+                "a key minted on this running node answered {status} to its first authed \
+                 read, which no injected fault produces: {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+    }
     sim.cover("auth:key-authorizes");
 
     // Look up the minted key's row to get its id for the revoke route —
@@ -1016,15 +1073,28 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
                     err.error
                 ));
             }
+            sim.cover("auth:revoked-key-rejected");
             Ok(())
         }
-        // Any other status (e.g. 500 from a fault mid-ladder-resolution) is
-        // fault fallout, not a bug: the revoke's own 200 ack already proved
-        // the delete committed. Nothing about the revoked key was checked.
-        other => gave_up(
-            sim,
-            "invoicing:gave-up:final-status",
-            format!("the read under the revoked key answered {other}, so nothing was checked"),
-        ),
+        // A 5xx whose body is fault fallout (a fault mid-ladder-resolution)
+        // checked nothing about the revoked key. Any other answer comes from
+        // no fault (an IO error answers 500 with its own text).
+        other
+            if (500..=599).contains(&other)
+                && is_fault_fallout(&String::from_utf8_lossy(&body)) =>
+        {
+            gave_up(
+                sim,
+                "invoicing:gave-up:final-status",
+                format!(
+                    "the read under the revoked key answered {other} on fault fallout, so \
+                     nothing was checked"
+                ),
+            )
+        }
+        other => Err(format!(
+            "the revoked key's read answered {other}, which no injected fault produces: {}",
+            String::from_utf8_lossy(&body)
+        )),
     }
 }

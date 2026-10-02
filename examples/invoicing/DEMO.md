@@ -78,7 +78,11 @@ a universe that gave up and one that adjudicated. Since 2026-10-01
 an acknowledged write. Since 2026-10-02 every fault-fallout exit of the app's
 fault-injected properties gives up too, as does a universe that ended with
 nothing to check (no write acked, no finalize or receipt to count, no reminder
-fired), so a verdict is a universe that checked something. At master seed
+fired), so a verdict is a universe that checked something. A status no fault
+produces, at the minted key's first read or at the revoked key's read, fails
+the universe instead. Each of the four requires the coverage key its verdict
+marks, so a give-up arm that swallowed every universe fails the batch rather
+than passing with no verdicts. At master seed
 0x53b00051, 256 universes each, the four such properties reach 125
 (`acked_writes_survive_restart`), 120 (`receipts_exactly_once`), 93
 (`overdue_reminders_over_months`) and 118
