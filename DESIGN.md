@@ -1685,8 +1685,10 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   (`validate_subscribe`), not when the client sent it: every event committed before that
   point, and on a follower every event applied from the primary's log before it (one that
   landed while the request was in flight included), is behind the tail. A subscribe ends
-  its request batch, so on a primary the batch-mates staged ahead of it are behind the
-  tail and nothing staged after it is. The stream does not name that point. The route may also DECLARE the event types its stream
+  its request batch, so on a primary a change that arrived ahead of it is behind the tail
+  and one that arrived behind it is delivered, even at the same instant
+  (`a_bare_subscribe_on_a_primary_starts_between_the_changes_that_arrived_around_it`).
+  The stream does not name that point. The route may also DECLARE the event types its stream
   carries — `#[route(SSE "/path", emits(InvoicePaid, InvoiceVoided))]` — which is what
   lets a generated client type `subscribe()` as a discriminated union of exactly those
   payloads instead of "anything". The declaration names Rust types, and the contract

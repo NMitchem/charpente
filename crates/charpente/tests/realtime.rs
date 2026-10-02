@@ -6625,3 +6625,34 @@ fn the_resync_remedy_read_first_then_subscribe_misses_the_changes_between_its_st
         );
     }
 }
+
+/// On a primary, "from now" is the subscribe's place in arrival order, even
+/// for requests that arrive at one instant and could share a batch: a change
+/// that arrived ahead of the subscribe is behind its tail, and one that
+/// arrived behind it is delivered.
+#[test]
+fn a_bare_subscribe_on_a_primary_starts_between_the_changes_that_arrived_around_it() {
+    let sim = Sim::with_faults(0x2EB2_D401, FaultConfig::none());
+    let mut p = spawn_marks_node(&sim, "p", rt_primary_cfg("p:1"));
+    let mut nodes = [&mut p];
+    let mark = |n: u64| Request::new(Method::Post, "/mark").json(&MarkBody { n: WireU64(n) });
+    let now = sim.now().as_nanos();
+    nodes[0].source.push_at(now, mark(1));
+    nodes[0]
+        .source
+        .push_at(now, Request::new(Method::Get, "/marks-feed"));
+    nodes[0].source.push_at(now, mark(2));
+    for index in 0..3 {
+        let (status, body) = await_response(&sim, &mut nodes, 0, index);
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    }
+    let handle = nodes[0].sinks.lock().unwrap().last().cloned().unwrap();
+    let until = sim.now().as_nanos() + SEC;
+    while sim.now().as_nanos() < until && rt_kernel_round(&sim, &mut nodes).unwrap() {}
+    let delivered: Vec<String> = handle.frames().iter().map(|f| f.json.clone()).collect();
+    assert_eq!(
+        delivered,
+        vec![r#"{"n":"2"}"#.to_string()],
+        "the change that arrived behind the subscribe is delivered, the one ahead of it is not"
+    );
+}

@@ -4446,10 +4446,11 @@ unparseable one never reaches app code:
    moment the node *serves* the subscribe, not the moment the client sent it. An
    event the node committed before that moment is not delivered, and on a
    follower that includes every event it had applied from the primary's log, even
-   one that landed while the request was on its way. On a primary, events from the
-   requests it took before the subscribe are behind the tail, and events from those
-   after it are delivered (a subscribe ends its batch). The stream does not say where that moment fell,
-   so a client that must not miss an event resumes with a cursor.
+   one that landed while the request was on its way. On a primary, a change that
+   arrived ahead of the subscribe is behind the tail and one that arrived behind it
+   is delivered, even at the same instant, because a subscribe ends its request
+   batch. The stream does not say where that moment fell, so a client that must not
+   miss an event resumes with a cursor.
 
 A present-but-unparseable cursor is a 400, and the handler never runs:
 
