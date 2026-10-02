@@ -1163,15 +1163,20 @@ impl Repl {
             (Some(l), None) => l + 1,
             _ => 0,
         };
+        // A target being snapshot-seeded has confirmed nothing; "holds every
+        // record up to None" would read as a claim.
+        let confirmed = match acked {
+            Some(_) => format!("it confirmed it holds every record up to {acked:?}"),
+            None => "it has confirmed no record yet".to_string(),
+        };
         self.reply_ctrl(
             ctrl_id,
             &Msg::CtrlErr {
                 message: format!(
-                    "switchover to {to} aborted: the follower lag is {lag} record(s) (it \
-                     confirmed it holds every record up to {acked:?}, this primary is at \
-                     {last:?}) and the drain did not complete before the \
-                     {SWITCHOVER_DEADLINE_NANOS}ns deadline — this node is primary again and \
-                     accepting writes"
+                    "switchover to {to} aborted: the follower lag is {lag} record(s) \
+                     ({confirmed}, this primary is at {last:?}) and the drain did not complete \
+                     before the {SWITCHOVER_DEADLINE_NANOS}ns deadline — this node is primary \
+                     again and accepting writes"
                 ),
             },
             now,

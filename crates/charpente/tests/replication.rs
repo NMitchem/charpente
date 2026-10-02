@@ -5507,6 +5507,11 @@ fn a_switchover_after_the_target_reconnected_with_no_write_since_completes() {
 /// answered `Snapshot`. The peer has now proved nothing, so a switchover to it
 /// must drain and abort by name. Kept from the first `Hello`, the position
 /// would read as caught up and `p` would hand off to a peer it is seeding.
+///
+/// That is all the reset holds: a second `Hello` answered `Snapshot` no longer
+/// leaves a stale position. A peer that also sends a stale or forged `Ack` can
+/// still look caught up. No real follower or witness probe sends one, and what
+/// keeps a non-conformant peer out is `peer_secret`.
 #[test]
 fn a_second_hello_answered_with_a_snapshot_drops_the_position_the_first_proved() {
     let sim = Sim::with_faults(0x2EB1_0D42, FaultConfig::none());
@@ -5576,10 +5581,10 @@ fn a_second_hello_answered_with_a_snapshot_drops_the_position_the_first_proved()
         Msg::CtrlErr { message } => assert_eq!(
             message,
             format!(
-                "switchover to x:1 aborted: the follower lag is {} record(s) (it confirmed it \
-                 holds every record up to None, this primary is at Some({last})) and the drain \
-                 did not complete before the 30000000000ns deadline — this node is primary \
-                 again and accepting writes",
+                "switchover to x:1 aborted: the follower lag is {} record(s) (it has confirmed \
+                 no record yet, this primary is at Some({last})) and the drain did not complete \
+                 before the 30000000000ns deadline — this node is primary again and accepting \
+                 writes",
                 last + 1
             )
         ),
