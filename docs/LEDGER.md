@@ -6504,3 +6504,69 @@ Main at 125226d: fmt and clippy clean, 86/86 `test result: ok`, 1,640 passed, 0 
 - Several pinned scenarios are now rare (group_commit never-acked 9/256, unreachable round 3/256,
   realtime never-booted 1 in 14,336): the next re-key needs wide scans.
 - `cargo doc -D warnings` fails on two pre-existing intra-doc links (prod.rs, http/mod.rs).
+
+## 2026-10-01 — the filesystem stores return and acknowledge only durable objects: an acked PUT under a new prefix, and an acked write on a fresh node, no longer vanish at the next power cut
+
+**Why.** D1's class — a boot or a reader trusting bytes the page cache held but the disk did not —
+found one layer up by D1's reviewer, in `charpente::prod`. Sub-project D2. Workspace
+`.superpowers/sdd/2026-09-30-publish-readiness/` (`d2-brief.md`, `d2-report.md` rounds 1–6 and the
+merge, `d2-review.md` with two re-reviews). Branch `d2-objstore`, merged at e8eb74e.
+
+**The bugs.**
+- **`FsObjectStore`, the archive's filesystem bucket** (402bca5). A PUT created missing directories
+  and never synced their entries into their parents — the comment said "the retry re-creates it",
+  but no retry follows an acknowledgement. Every generation roll wrote `<gen>/snapshot` and
+  `<gen>/segments` under unsynced directories and then deleted the previous generation: a power cut
+  could leave a bucket with neither. A GET or LIST could return an object whose name was not yet
+  durable.
+- **`ProdDisk`, the production `Disk`** (3a81ba7). On a fresh node `Store::open` synced the data
+  directory before `wal/` existed and the WAL's barrier synced only `wal/`, so every write acked
+  before the first checkpoint rested on an unsynced `wal` entry. A clean stop masks it (redb's
+  shutdown commit makes the rows durable in the store), so only a power cut shows it.
+
+**Shipped.**
+- An object a GET or LIST returns, and an acknowledged PUT, is durable; `ObjectStore`'s contract in
+  io.rs says so in one sentence (and that nothing is owed for a Delete). A barrier syncs from the
+  prefix's directory up to the data directory; `ProdDisk::new` syncs the data directory's own entry
+  at every start, so an unreadable parent fails at start under its own line (fadd9d8). Each sync has
+  exactly one owner and one pin that goes red under its inversion (fa7cca8; two were found unpinned
+  by the second re-review).
+- **Neither store ever creates a directory above the data directory or the bucket root** (d400b1f,
+  a controller ruling): a directory created up there can only be made durable by fsyncing every
+  ancestor to `/`, which fails on unreadable ancestors and on squashfs. A missing parent is refused
+  by name, telling the operator to create it at provisioning time and make it durable. A behaviour
+  change before 0.1.0: a deep `--data-dir` that used to be created is now refused.
+- **`FsObjectStore::new` is fallible** (affb516, review I1): a bucket root whose parent is missing
+  is refused when the store is built. Before, the archive read the missing manifest as a fresh
+  bucket, every PUT was refused and absorbed, and a low-write node ran with no backup and nothing on
+  stderr (a probe: 97 of 200 PUTs refused, no gap notice, no stop). An empty path is refused by name
+  instead of panicking the kernel thread (review I2).
+- A refused `restore` removes only a destination it created, through `remove_empty_dir`, which
+  syncs the removal; permission-based pins assert their precondition and say "this pin needs a
+  non-root runner" rather than failing as if durability broke. A failed role or witness write says
+  the change may already have happened (d42919c). `ProdDisk` keeps `Send + Sync + UnwindSafe`,
+  asserted at compile time.
+- **The oracle.** The simulator cannot express an unsynced directory entry (`Disk` has no rename and
+  a flat namespace), so prod.rs gained a private `Fs` seam and a test-only crash model, `CrashFs`,
+  that keeps only what a sync took, each directory on its own; a process restart keeps everything.
+  Its limits are stated: unsynced state is lost totally and deterministically, and the Linux
+  fsync-EIO case is not modelled.
+
+**Review.** Independent opus review: MERGE AFTER FIXES (0 C, 3 I, 7 M). Two scoped re-reviews; the
+second found two syncs unpinned, and the controller ran both new pins' inversions itself (one first
+tripped a precondition, so a faithful created-only inversion was built: red at its own assertion).
+
+**Gate.** Branch at ac37b18 (main 125226d merged in): fmt and clippy clean, 91/91 `test result: ok`,
+1,678 passed, 0 failed; edge-harness ignored suites (smoke, acked_durable) 5/5. The merge at
+e8eb74e differs from ac37b18 by exactly the D1/S5 LEDGER commit (d98eda2), byte for byte.
+
+**Follow-ups.**
+- **Cost is unmeasured** and quotable only through docs/BENCH.md: the reviewer's estimate on macOS
+  (F_FULLFSYNC) is ~60,000 syncs for a 10M-row snapshot upload (~300 s against ~100 s before),
+  restore +~300 s, and a LIST over 10 generations ~500 s (nothing calls LIST today). The per-commit
+  path makes no directory syncs.
+- A bucket root's parent removed after the store is built makes the archive silent again
+  (documented residual).
+- `examples/invoicing`'s binaries print a refused `--data-dir` in Rust's Debug form (their `main`
+  returns `io::Result`); apps on `launch` get the named line.
+- 3a81ba7's message counts 45 filesystem calls in the power-cut sweep; at the tip it is 53.
