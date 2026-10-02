@@ -51,12 +51,13 @@
   - `NoTenant`'s job line in charpente-core.
 
   The rule: a refusal names the word to add or change and says to keep the rest. Where it names the site, it writes an elided attribute. Task 6's class sweep reports 12 restated literal lines at its base and must report 0 after. `#[event]`'s bare refusal (Task 11) is written in the same shape from the start.
-- **A12 — the dispatcher reads its job row through an admission-gated door, `Tx::get_job`.** `Dispatcher::run_due_into` re-reads the job row inside `group.stage`, where the batch's own overlay must be visible and no snapshot exists (`dispatch.rs:411-418` says why). Core's crate-private readers do not reach the `charpente` crate. So `Tx` gains `pub fn get_job(&self, id: Id<JobRow>, admission: &TenantAdmission<'_>) -> io::Result<Option<JobRow>>`, sealed exactly as `settle_job` is: only a `Group` mints the admission. Four operator-side test reads that already hold an admission move onto it.
+- **A12 — the dispatcher reads its job row through an admission-gated door, `Tx::get_job`.** `Dispatcher::run_due_into` re-reads the job row inside `group.stage`, where the batch's own overlay must be visible and no snapshot exists (`dispatch.rs:417-424` at 57e5df5 says why; `:411-418` at e749823). Core's crate-private readers do not reach the `charpente` crate. So `Tx` gains `pub fn get_job(&self, id: Id<JobRow>, admission: &TenantAdmission<'_>) -> io::Result<Option<JobRow>>`, sealed exactly as `settle_job` is: only a `Group` mints the admission. Four operator-side test reads that already hold an admission move onto it.
 - **A13 — a transaction's read of a `Row` whose `TABLE` borrows a platform table's name is refused at build, like the write.** A typed bound covers `JobRow`/`EventRow`/`SchemaVersion` themselves, but not an app's hand-written `Row` with `TABLE = "charpente.jobs"` and `Scope = Unscoped`, the door C-2's FR-C1 closed for writes. `Tx`'s four `View` methods evaluate `const { refuse_platform_read(R::TABLE) }`, the read twin of `put`'s `refuse_platform_table`. This is a post-monomorphization E0080 that `cargo build`/`cargo test` report and `cargo check` does not, FR-C2a's accepted limitation, now for reads too.
 - **A14 — DESIGN §2's group-commit visibility pin moves to core.** `enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch` (`crates/charpente/tests/group_commit.rs`) reads `JobRow`/`EventRow` from handlers, which Task 9 makes compile errors. The property still exists where the dispatcher reads the queue inside a batch. So Task 9 deletes that test and its routes, pins the job half in `crates/charpente-core/tests/group_commit.rs` through `Tx::get_job`, and states the emit half in DESIGN §2: no transaction can read an emit any more.
 - **A15 — one quoted `View` declaration line re-pins.** Spec §3 keeps `View`'s existing diagnostics for scoped tables byte-identical. The message, the label, both `help:` blocks, every `note:` and the error count are identical. The line rustc quotes from `View::scan`'s declaration cannot be, because the bound sits on it. So `compile_fail/scoped_read_from_bare_tx.stderr`'s `fn scan<R: UnscopedRow>(…)` becomes `fn scan<R: UnscopedRow + ReadableBy<Self>>(…)`, the only `.stderr` in the tree that quotes a `View` declaration.
 - **A16 — resume validation refuses, by name, a cursor on a row of another tenancy.** When `row.scope != sub.scope` (another tenant's event on a tenant feed, a global event on a tenant feed, or a tenant's event on a global subscription), the resume gets a 409 checked after the seq check and before the reshape check: `cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; re-sync current state through reads, then reconnect without a cursor`. It names no tenant and no event. Validation still does not refuse a cursor on a same-tenancy row the feed does not admit (another event type, another app key), which payload-shapes spec §3 pins. So no global feed's behaviour, and no global baseline, moves. `Subscription::admits` stays the one predicate: delivery uses it to skip, and validation uses it to gate the reshape refusal. This makes spec §9's "a resume across the boundary is refused, not misdelivered" exact.
 - **A17 — `Subscription.entries` and `SubEntry` become crate-private (Task 11).** With them `pub`, a handler admitted to `Team` 1 could push an `Org`-scoped event's `SubEntry` into its own feed. Delivery would then admit `Org` 1's rows of that event: same name, same shape, same raw id. The typed bounds and the NAME-mixing fingerprint never see a hand-pushed entry, and exit criterion 1 forbids that read. The one out-of-crate user, `realtime.rs`'s failing-encoder test, moves into a `#[cfg(test)]` module in `kernel/tail.rs`. A compile-fail fixture pins the privacy. `Subscription.key` and `.cursor` stay public: a key is an app filter (spec §2.3), and the tenant rides in the private `scope`.
+- **A18 — a scoped read goes through the `Row` type registered for its table (Task 9).** Since S2 (LEDGER 2026-10-01, "error text and schema safety"), `Group::stage` refuses a put or delete through any Rust type other than the one `Schema::table` registered under its `TABLE` (`TableWriteRefusal`). A read is not checked: `ScopedTx<Firm>::get` through a same-named `#[table(scoped_by = Firm)]` type keys on the table name and the raw scope id, so it reads the registered `Team` table's row of the same id (DESIGN §4 states this residual). A13 seals only the platform tables' names, so this is new. `Tx` holds the `Schema` its `Group` stages against, and each scoped read (`ScopedTx`'s `get`/`scan`/`scan_by`/`scan_from`, and `AllTenants::scan`) compares `TypeId::of::<R>()` with the registered `row_type` before it reads. A mismatch returns `TableReadRefusal`, an `io::Error` like `TableWriteRefusal`, naming the table, the type that read, the registered type and S2's two fixes. The read returns nothing, so no row reaches the caller. In a job handler the refusal comes back through the handler's `?` as `JobError::Io`, and the dispatcher classifies it as an attempt, never a platform fault. A route's `?` answers it with a 500 carrying its text (`ApiError`'s `From<io::Error>`). `Tx`'s own `View` reads are not checked: they read unscoped tables, which every handler may read, and an unscoped type naming a scoped table opens the other key layout and fails loudly (`unscoped_open_err`). A table the `Schema` does not register is not checked either, since no registered type is there to read as. *Drafted when this plan was amended against 57e5df5, and not compiled then: Task 9 measures it.*
 
 ## Global Constraints
 
@@ -132,23 +133,24 @@ These are the inputs the spec implies but does not spell out that are most likel
    - Task 3: `two_instantiations_of_one_generic_tenant_type_are_refused_naming_both` and `one_tenant_type_named_through_a_table_a_route_and_a_job_mounts`;
    - Task 2: the generic 401 and stage-refusal renderings.
 5. **A follower, or a peer on the old protocol, meets a `0x0b` record.** A follower applying a shipped `0x0b` materializes the same `EventRow.scope`. A peer on protocol 4 is refused by name at the handshake rather than sent a tag it cannot decode. Replication, restore and replay all apply through `decode_record`, the only tag decoder in the tree. Owner: Task 10, `a_shipped_scoped_emit_materializes_with_its_scope_tenant_zero_included` and `hello_declaring_protocol_version_4_is_refused_by_name`.
+6. **Two `#[table]` types under one name, read inside a tenant.** `firm_note::Note` (`scoped_by = Firm`) beside the registered `Note` (`scoped_by = Team`): since S2 a write through it is refused, and after A18 a read is too, by the read, so `Firm` 7 never sees `Team` 7's row. In a job the refusal is an attempt that dead-letters, never a stopped dispatcher. Owner: Task 9, `a_read_through_the_same_table_under_another_scope_type_is_refused` (`tenant.rs`) and `a_scoped_job_reading_through_another_rust_type_dead_letters_by_name` (`kernel.rs`).
 
 ## File map
 
 | File | Responsibility | Tasks |
 |---|---|---|
-| `crates/charpente-core/src/db.rs` | `Tenant::NAME`; `scoped_fingerprint`; the scope renderings in `enter_scope` and `Group::stage`; the tokens `CrossTenant<'g>`/`TenantAdmission<'g>` and their four signatures; `PLATFORM_TABLES`, `refuse_platform_table`/`refuse_platform_read`, `put_schema_version`, `get_job`; `View for Tx` through crate-private readers; tag `0x0b`, `Effect::Emit`/`Emit.scope`, the emit family, `ScopedTx::event_key` removed; `Event::Scope`, `push_emit` | 2, 3, 4, 7, 8, 9, 10, 11 |
+| `crates/charpente-core/src/db.rs` | `Tenant::NAME`; `scoped_fingerprint`; the scope renderings in `enter_scope` and `Group::stage`; the tokens `CrossTenant<'g>`/`TenantAdmission<'g>` and their four signatures; `PLATFORM_TABLES`, `refuse_platform_table`/`refuse_platform_read`, `put_schema_version`, `get_job`; `Group::stage`'s negative-space assert (S2's N1); `View for Tx` through crate-private readers; `TableReadRefusal`, `Tx`'s `Schema` and the scoped reads' type check (A18); tag `0x0b`, `Effect::Emit`/`Emit.scope`, the emit family, `ScopedTx::event_key` removed; `Event::Scope`, `push_emit` | 2, 3, 4, 7, 8, 9, 10, 11 |
 | `crates/charpente-core/src/table.rs` | `Row::SCOPE_NAME`, `TableOps`' tenant fields; `NoTenant`'s job line (A11); `ScopeReadableBy`/`ReadableBy`, the `Operator` seal, `View`'s bounds; `NoEventTenant`/`UnscopedEvent`; `materialize_event`'s scope | 2, 3, 6, 8, 9, 10, 11 |
 | `crates/charpente-core/src/{event,migration,job}.rs` | `EventRow`/`SchemaVersion` become `PlatformOwned`; `EventRow.scope` and its codec | 8, 9, 10 |
 | `crates/charpente-macros/src/{table,job,route,event,fingerprint,lib}.rs` | `SCOPE_NAME`, `tenant_name` emission (A7), `path_as_written` (A8); the scoped job fingerprint; the refusal class (A11); `#[event(global \| scoped_by)]` and its refusal; `<'_>` in generated glue | 1, 2, 3, 4, 6, 7, 11 |
 | `crates/charpente/src/tenant.rs` | `tenant_name` (A7); `Scoped::scope`'s `&Ctx<'_>`; module doc | 2, 4, 5, 7 |
 | `crates/charpente/src/http/{app,router,mod}.rs` | `note_tenant` and the mount-time uniqueness; `PublicScope.type_name`; the 401 (NAME, then A11); `Ctx<'g>`, `Stance<'g>`; `Subscription.scope`, `admits`, the widening assert, `Subscribe`/`TenantFeed<S>`, the bounds, crate-private `entries` (A17) | 2, 3, 6, 7, 10, 11 |
-| `crates/charpente/src/kernel/{dispatch,mod,tail}.rs` | `JobDef.scope_type_name`; `JobScope`'s assert (Task 5); `JobGlue`'s `<'_>`; `get_job` (A12); `validate_subscribe`'s tenancy 409 (A16) and one predicate; tail delivery through `admits` | 2, 3, 4, 5, 7, 9, 10, 11 |
+| `crates/charpente/src/kernel/{dispatch,mod,tail}.rs` | `JobDef.scope_type_name`; `JobScope`'s assert (Task 5); `JobGlue`'s `<'_>`; `get_job` (A12); a job's `TableReadRefusal` is an attempt (A18); `validate_subscribe`'s tenancy 409 (A16) and one predicate; tail delivery through `admits` | 2, 3, 4, 5, 7, 9, 10, 11 |
 | `crates/charpente/src/{describe,lib,serve,launch}.rs`, `crates/charpente/src/repl/mod.rs`, `crates/charpente-cli/src/genclient.rs` | `EventDef`/`EventInfo.scoped_by` and NAME rendering; `Subscribe`'s re-export; `PROTO_VERSION` 5; hand-written defs | 2, 3, 10, 11, 12 |
 | `crates/charpente-macros/tests/compile_{fail,pass}/` | every new compile error's pin and the re-pins (reviewed line by line) | 1, 2, 6, 7, 8, 9, 11 |
 | tests: `crates/charpente/tests/{kernel,tenant,realtime,describe,replication,group_commit,transactions,archive,http,typed_tables}.rs`, `crates/charpente-core/tests/{engine,group_commit,materialize,migrate_apply,migrations}.rs`, `crates/charpente-tsgen/tests/common/mod.rs`, `crates/charpente-cli/tests/describe.rs`, `crates/edge-harness/tests/tenant_wire.rs`, `examples/invoicing/tests/describe_golden.rs`, `crates/guide-examples/tests/doc_truth.rs` | oracles, pins, goldens, `PINNED_FLOOR` | all |
 | `examples/invoicing/src/{routes,jobs}.rs`, `examples/invoicing/src/bin/tenant_node.rs`, `crates/{sim-fixture,ts-fixture-app,bench-harness}/src/lib.rs`, `crates/charpente-cli/templates/lib.rs` | the `#[event(global)]` sweep; `const NAME`; `DocCreated`'s tenancy | 1, 2, 10, 11 |
-| `docs/GUIDE.md`, `DESIGN.md`, `DECISIONS.md` (:328), `README.md`, `PLAN.md`, `docs/LEDGER.md`, the job-tenancy and default-secure specs, this plan's spec | spec §10, amendments A1–A17, the record | all |
+| `docs/GUIDE.md`, `DESIGN.md`, `DECISIONS.md` (:328), `README.md`, `PLAN.md`, `docs/LEDGER.md`, the job-tenancy and default-secure specs, this plan's spec | spec §10, amendments A1–A18, the record | all |
 
 No new test files, so the `test result:` count Task 1 measures holds to Task 14, and CLAUDE.md's exhaustive list and `doc_inventory` stay as they are. New trybuild fixtures are globbed by `tests/trybuild.rs`. Task 13's oracle lives in `crates/charpente/tests/realtime.rs`, beside the tenant-feed property it extends (spec §9 names `tenant.rs`, but that property is in `realtime.rs`).
 
@@ -7381,15 +7383,15 @@ satisfied` in place of the text.
 
 Three things read a platform table through a `Tx` today, and each moves:
 - The dispatcher reads its batch's job rows inside `group.stage`
-  (`crates/charpente/src/kernel/dispatch.rs:268`, `:424` at e749823). It moves to a new
-  admission-gated door, `Tx::get_job` (A12). Four operator-side test reads that
-  already hold an admission move with it (`crates/charpente/tests/kernel.rs:3656`, `:3663`;
-  `crates/charpente/tests/replication.rs:8027`, `:8233`).
+  (`crates/charpente/src/kernel/dispatch.rs:270`, `:430` at 57e5df5; `:268`, `:424` at
+  e749823). It moves to a new admission-gated door, `Tx::get_job` (A12). Four operator-side
+  test reads that already hold an admission move with it (`crates/charpente/tests/kernel.rs:3871`,
+  `:3878`; `crates/charpente/tests/replication.rs:10730`, `:10936`, all at 57e5df5).
 - The job-tenancy oracle reads the queue inside its admitted group
-  (`crates/charpente/tests/kernel.rs:4695`). It moves to `db.snapshot()`, taken just before the
+  (`crates/charpente/tests/kernel.rs:5476` at 57e5df5). It moves to `db.snapshot()`, taken just before the
   group, over the same committed image.
 - `enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch`
-  (`crates/charpente/tests/group_commit.rs:2010-2129`, seed `0x60C1_0007`) pins DESIGN §2's
+  (`crates/charpente/tests/group_commit.rs:2017-2136` at 57e5df5, seed `0x60C1_0007`) pins DESIGN §2's
   group-commit visibility sentence through two handlers that scan `JobRow` and `EventRow`.
   Those handlers can no longer exist. The property still exists at the platform level, where
   the dispatcher reads the queue inside a batch, so it is re-pinned in
@@ -7399,6 +7401,14 @@ Three things read a platform table through a `Tx` today, and each moves:
 A hand-written `Row` whose `TABLE` borrows a platform name, with `Scope = Unscoped`, would still
 meet `View`'s bounds. So `Tx`'s four `View` reads also evaluate `refuse_platform_read(R::TABLE)`
 in a `const` block, the read twin of Task 8's write refusal (amendment A13).
+
+A scoped read is held to its table's registered `Row` type, as S2 holds a write (amendment
+A18). `ScopedTx`'s four reads and `AllTenants::scan` refuse, as a `TableReadRefusal`, a read
+through any Rust type other than the one `Schema::table` registered under its `TABLE`. At
+57e5df5, `ScopedTx<Firm>::get` through `crates/charpente/tests/tenant.rs`' `firm_note::Note`
+(the same-named `scoped_by = Firm` type S2 added for the write half, :1551) reads the
+registered `Team` `Note` table's row of the same id. Each A18 part below is marked **A18**;
+they were drafted when the plan was amended against 57e5df5 and have not been compiled.
 
 Byte identity: reads draw nothing from the fault stream, and no record changes. Every Task 1
 baseline must reproduce. `job-tenancy` is the one to watch, because its oracle's read moves.
@@ -7415,23 +7425,35 @@ baseline must reproduce. `job-tenancy` is the one to watch, because its oracle's
   - the `crate::table` import gains `ReadableBy`;
   - `refuse_platform_read` (new, after `refuse_platform_table`);
   - `Tx::get_any` (new, private) and `Tx::get_job` (new, `pub`), after `put_schema_version`;
-  - `impl View for Tx<'_>` (`:1234-1315` at e749823): the bounds, a `const` refusal per method,
-    and the snapshot reads through `*_any`;
-  - `mod tests`: `each_platform_table_name_is_refused_for_a_read_by_its_own_text`.
+  - `impl View for Tx<'_>` (`:1345-1429` at 57e5df5; `:1234-1318` at e749823): the bounds, a
+    `const` refusal per method, and the snapshot reads through `*_any`;
+  - `mod tests`: `each_platform_table_name_is_refused_for_a_read_by_its_own_text`;
+  - **A18:** `TableReadRefusal` (new, after `TableWriteRefusal`, `:294-339` at 57e5df5);
+    `Tx`'s `schema` field and `Tx::over`'s second parameter (`:956-982`), and `Tx::over`'s one
+    caller in `Group::stage` (`:3964`); `Tx::refuse_read_as` (new, private) and its five calls,
+    in `get_in`/`scan_in`/`scan_by_in`/`scan_from_in` (`:1447-1550`) and `AllTenants::scan`
+    (`:1942`).
 - Modify `crates/charpente-core/src/job.rs`: `JobRow`'s doc and the comment above its `Row` impl.
 - Modify `crates/charpente-core/src/event.rs` and `crates/charpente-core/src/migration.rs`: the
   comments Task 8 wrote above each `Row` impl ("no app code writes one" becomes "reads or writes").
 - Modify `crates/charpente/src/kernel/dispatch.rs`: both `tx.get(Id::<JobRow>::from_raw(id))?`
-  become `tx.get_job(Id::from_raw(id), &admission)?`, and two comments.
+  become `tx.get_job(Id::from_raw(id), &admission)?`, and two comments; **A18:** the attempt
+  classification after the handler's stage (`:351-370` at 57e5df5) gains `TableReadRefusal`, and
+  the `charpente_core::db` import gains it.
 - Test:
   - `crates/charpente-core/tests/group_commit.rs`: `Ping` (new job), and
     `an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits` and
     `the_dispatchers_job_read_sees_a_settle_staged_earlier_in_its_batch` (new);
   - `crates/charpente-core/tests/engine.rs`: `a_job_row_is_still_read_through_view` becomes
     `a_platform_row_is_read_through_a_snapshot`;
-  - `crates/charpente/tests/kernel.rs`: `:3656`, `:3663` move to `get_job`, and
-    `job_tenancy::jobs_stay_in_their_tenant` reads the queue through `db.snapshot()`;
-  - `crates/charpente/tests/replication.rs`: `:8027`, `:8233` move to `get_job`;
+  - `crates/charpente/tests/kernel.rs`: `:3871`, `:3878` (at 57e5df5) move to `get_job`, and
+    `job_tenancy::jobs_stay_in_their_tenant` reads the queue through `db.snapshot()`; **A18:**
+    in `mod scoped_jobs`, `filed_alias::Filed`, `PeeksFiled` and
+    `a_scoped_job_reading_through_another_rust_type_dead_letters_by_name` (new);
+  - `crates/charpente/tests/replication.rs`: `:10730`, `:10936` (at 57e5df5) move to `get_job`;
+  - **A18:** `crates/charpente/tests/tenant.rs`: `firm_note_read_refusal` and
+    `a_read_through_the_same_table_under_another_scope_type_is_refused` (new, after S2's
+    `a_delete_through_the_same_table_under_another_scope_type_is_refused`, :1656);
   - `crates/charpente/tests/group_commit.rs`: the "Step 5b.2" section (`Tick`, `QuietJob`, four
     routes and the test) is deleted, with its now-unused imports.
 - Create in `crates/charpente-macros/tests/`, each compile-fail file with its `.stderr`:
@@ -7466,7 +7488,9 @@ baseline must reproduce. `job-tenancy` is the one to watch, because its oracle's
     - §2 (the group-commit visibility paragraph);
     - §3's **Jobs** bullet;
     - §8's Multi-tenancy bullet: "Three limits" becomes "Two limits", and the platform-tables
-      limit becomes the boundary sentence plus the Sessions/API-keys ruling.
+      limit becomes the boundary sentence plus the Sessions/API-keys ruling;
+    - **A18:** §4's "The check covers writes, not reads" sentence (`:1194-1196` at 57e5df5).
+  - **A18:** `docs/GUIDE.md` §4's `TxError` paragraph gains the read refusal (`:654-672`).
 
 **Interfaces:**
 - Consumes:
@@ -7476,6 +7500,8 @@ baseline must reproduce. `job-tenancy` is the one to watch, because its oracle's
     `let TenantAdmission(_) = admission;`.
   - Task 2: `Tenant::NAME` (every new fixture's `impl Tenant` carries `const NAME`).
   - Task 1: the baselines.
+  - S2, at 57e5df5 (A18): `TableOps.row_type`/`row_name` (db.rs:382-383), `TableWriteRefusal`'s
+    shape (db.rs:294-339), and `tenant.rs`' `firm_note::Note` (:1551).
 - Produces:
   - `pub trait ScopeReadableBy<V: ?Sized, R>: sealed::ReadScope {}`, implemented for
     `Unscoped` (every `V`), every `S: Tenant` (every `V`), and `PlatformOwned` for
@@ -7486,6 +7512,17 @@ baseline must reproduce. `job-tenancy` is the one to watch, because its oracle's
   - `pub(crate) fn Snapshot::{get_any, scan_any, scan_by_any, scan_from_any}`, bounded
     `R: UnscopedRow` only.
   - `pub fn Tx::get_job(&self, id: Id<JobRow>, admission: &TenantAdmission<'_>) -> io::Result<Option<JobRow>>`.
+  - **A18:** `pub struct TableReadRefusal(pub Refusal)`, with `Display`, `Debug`,
+    `std::error::Error` and `pub fn of(e: &io::Error) -> Option<&TableReadRefusal>`, as
+    `TableWriteRefusal` has; `Tx::over(snapshot: &'a Snapshot, schema: &'a Schema)`; and the
+    read refusal's text, fixed (one line; `{read}` is `ScopedTx::get`, `ScopedTx::scan`,
+    `ScopedTx::scan_by`, `ScopedTx::scan_from` or `across_tenants().scan`): "table \"{table}\" is
+    registered as `{registered}`, but this transaction read it through `{reader}` ({read}) — two
+    Row types declare TABLE = \"{table}\", and a read keys on the table name and the raw tenant
+    id, so it returns the registered type's rows, from the registered scope type's tenant of
+    the same id when the two types' scoped_by differ; the read was refused and returned nothing
+    — read `{registered}` instead, or give `{reader}` a table name of its own (a #[table] type's
+    table name is its struct name)"
   - The read diagnostic, fixed:
     - message: "`{R}` is one of the platform's tables, and a transaction does not read it"
     - label: "`{R}` is read through `Db::snapshot`, never through a transaction"
@@ -7993,8 +8030,210 @@ fn the_dispatchers_job_read_sees_a_settle_staged_earlier_in_its_batch() {
 ```
 
 Seeds `0x7C00_0901` and `0x7C00_0902` appear nowhere else in the tree
-(`git grep -n "0x7C00_09"` is empty at e749823). Both tests run with `FaultConfig::none()`
-(`fresh_db`), so the seed names the store and nothing else.
+(`git grep -n "0x7C00_09"` is empty at e749823 and at 57e5df5). Both tests run with
+`FaultConfig::none()` (`fresh_db`), so the seed names the store and nothing else.
+
+**A18's pins.** Both name `TableReadRefusal`, which Step 4 adds, so their red is Step 10's N7 and
+N8. Seeds `0x5A17_0011` and `0x5A17_0012` continue S2's series (`0x5A17_0001` to `0x5A17_0010`
+are taken at 57e5df5, and `git grep -n "0x5A17_001[1-9]"` is empty there). Both run with
+`FaultConfig::none()`, so the seed names the store and nothing else.
+
+In `crates/charpente/tests/tenant.rs`, add `use charpente_core::db::TableReadRefusal;` to the
+imports, and after `a_delete_through_the_same_table_under_another_scope_type_is_refused`:
+
+```rust
+/// The refusal a read through `firm_note::Note` gets, spelled out apart from
+/// the product's `format!`, as `firm_note_refusal` is for a write.
+fn firm_note_read_refusal(read: &str) -> String {
+    let registered = std::any::type_name::<Note>();
+    let reader = std::any::type_name::<firm_note::Note>();
+    format!(
+        "table \"Note\" is registered as `{registered}`, but this transaction read it through \
+         `{reader}` ({read}) — two Row types declare TABLE = \"Note\", and a read keys on the \
+         table name and the raw tenant id, so it returns the registered type's rows, from the \
+         registered scope type's tenant of the same id when the two types' scoped_by differ; \
+         the read was refused and returned nothing — read `{registered}` instead, or give \
+         `{reader}` a table name of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
+/// Amendment A18, the read half of the two tests above. A read admitted for
+/// `Firm` 7 through `firm_note::Note` keys on the table name and the raw scope
+/// id, so it returned `Team` 7's note. Each scoped read through it, and an
+/// `across_tenants` scan, is refused before it reads and returns nothing; the
+/// registered type still reads `Team` 7's row. `firm_note::Note` declares no
+/// index, so `scan_by` reaches its type check and nothing else: without the
+/// check it panics naming the missing index.
+#[test]
+fn a_read_through_the_same_table_under_another_scope_type_is_refused() {
+    let sim = Sim::with_faults(0x5A17_0011, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(7), &admission)
+                .put(&Note {
+                    id: Id::from_raw(1),
+                    text: "Team 7's note".to_string(),
+                });
+            Ok::<(), ApiError>(())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+
+    let refused = |e: std::io::Error| {
+        assert!(
+            TableReadRefusal::of(&e).is_some(),
+            "a TableReadRefusal, not another io error: {e}"
+        );
+        e.to_string()
+    };
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let cap = group.cross_tenant_cap();
+    let as_firm = group
+        .stage(|tx| {
+            let firm = tx.admit_scope(Id::<Firm>::from_raw(7), &admission);
+            Ok::<_, ApiError>((
+                firm.get::<firm_note::Note>(Id::from_raw(1))
+                    .map(|note| note.map(|note| note.text))
+                    .map_err(refused),
+                firm.scan::<firm_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                firm.scan_by::<firm_note::Note>("text", &"Team 7's note".to_string())
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                firm.scan_from::<firm_note::Note>(0, 10)
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            ))
+        })
+        .unwrap();
+    let across = group
+        .stage(|tx| {
+            Ok::<_, ApiError>(
+                tx.across_tenants::<Firm>(&cap)
+                    .scan::<firm_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            )
+        })
+        .unwrap();
+    let as_team = group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(7), &admission)
+                .get::<Note>(Id::from_raw(1))
+                .map(|note| note.map(|note| note.text))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+    assert_eq!(
+        (as_firm, across, as_team),
+        (
+            (
+                Err(firm_note_read_refusal("ScopedTx::get")),
+                Err(firm_note_read_refusal("ScopedTx::scan")),
+                Err(firm_note_read_refusal("ScopedTx::scan_by")),
+                Err(firm_note_read_refusal("ScopedTx::scan_from")),
+            ),
+            Err(firm_note_read_refusal("across_tenants().scan")),
+            Some("Team 7's note".to_string()),
+        )
+    );
+}
+```
+
+In `crates/charpente/tests/kernel.rs`, `mod scoped_jobs`, after
+`a_failing_scoped_job_keeps_its_tenant_through_every_retry_to_dead`:
+
+```rust
+    /// `Filed`'s twin under the same name: the same identifier and field, so
+    /// the same `TABLE`, in a module of its own. The `Schema` registers
+    /// `super::Filed` (amendment A18).
+    mod filed_alias {
+        use super::*;
+
+        #[table(scoped_by = Desk)]
+        pub struct Filed {
+            pub id: Id<Filed>,
+            pub note: u64,
+        }
+    }
+
+    /// Reads its desk's row 1 through `filed_alias::Filed`, and fails on
+    /// nothing else.
+    #[job(scoped_by = Desk, retry(max = 1, backoff = "1s"))]
+    pub struct PeeksFiled {}
+
+    impl PeeksFiled {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+            tx.get::<filed_alias::Filed>(Id::from_raw(1))?;
+            Ok(())
+        }
+    }
+
+    /// Amendment A18 in a job. The read refusal comes back through the
+    /// handler's `?` as `JobError::Io`, the variant a platform fault takes, but
+    /// it is the handler's own deterministic bug: an attempt that dead-letters
+    /// with the refusal as its `last_error`, never a fault that stops the
+    /// dispatcher on every restart.
+    #[test]
+    fn a_scoped_job_reading_through_another_rust_type_dead_letters_by_name() {
+        let sim = Sim::with_faults(0x5A17_0012, FaultConfig::none());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Filed>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![PeeksFiled]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 7, PeeksFiled {});
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let outcome = dispatcher.run_due(db, 1_000).map_err(|e| e.to_string());
+        assert!(
+            matches!(outcome, Ok(JobOutcome::Dead { attempts: 1, .. })),
+            "the refused read is an attempt, dead at its first: {outcome:?}"
+        );
+        let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+        let (registered, reader) = (
+            std::any::type_name::<Filed>(),
+            std::any::type_name::<filed_alias::Filed>(),
+        );
+        assert_eq!(
+            (row.status, row.attempts, row.last_error, db.poisoned()),
+            (
+                JobStatus::Dead,
+                1,
+                Some(format!(
+                    "table \"Filed\" is registered as `{registered}`, but this transaction read \
+                     it through `{reader}` (ScopedTx::get) — two Row types declare TABLE = \
+                     \"Filed\", and a read keys on the table name and the raw tenant id, so it \
+                     returns the registered type's rows, from the registered scope type's \
+                     tenant of the same id when the two types' scoped_by differ; the read was \
+                     refused and returned nothing — read `{registered}` instead, or give \
+                     `{reader}` a table name of its own (a #[table] type's table name is its \
+                     struct name)"
+                )),
+                false,
+            )
+        );
+    }
+```
 
 - [ ] **Step 3: Core — the read seal (`table.rs`)**
 
@@ -8438,6 +8677,121 @@ print("row docs updated")
 EOF
 ```
 
+**A18: the scoped reads check their `Row` type.** `Tx` holds the `Schema` its `Group` stages
+against, and each scoped read compares its type with the registered one before it reads, as
+`Group::stage` compares a write's (db.rs:4003-4043 at 57e5df5). `TableReadRefusal` sits beside
+`TableWriteRefusal` and carries the same four impls:
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+read_refusal = '''
+/// A scoped read the `Schema` disagrees with about its table's `Row` type
+/// (tenancy-completion amendment A18): a `ScopedTx` read, or an
+/// `across_tenants` scan, through a Rust type other than the one
+/// `Schema::table` registered under its `TABLE`, compared by `TypeId`. A read
+/// keys on the table name and the raw scope id, so before this check a
+/// same-named type with another `scoped_by` read the registered scope type's
+/// tenant of the same id. Returned by the read itself, before it reads, so no
+/// row reaches the caller. Its own type for `TableWriteRefusal`'s reason: a
+/// job handler's `?` hands it to the dispatcher as `JobError::Io`, and
+/// `kernel/dispatch.rs` classifies it as an attempt, not a platform fault.
+pub struct TableReadRefusal(pub Refusal);
+
+impl fmt::Display for TableReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// `Refusal`'s `Debug`, for the same reason.
+impl fmt::Debug for TableReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for TableReadRefusal {}
+
+impl TableReadRefusal {
+    /// `Some` only for THIS refusal, as `JobShapeRefusal::of`.
+    pub fn of(e: &io::Error) -> Option<&TableReadRefusal> {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<TableReadRefusal>())
+    }
+}
+'''
+refuse_read_as = '''    /// Amendment A18: a scoped read goes through the `Row` type the `Schema`
+    /// registered for its table, compared by `TypeId`, as `Group::stage`
+    /// holds a put or delete to. Checked before the read, so a refused read
+    /// returns no row. A table the `Schema` does not register is not checked:
+    /// no registered type is there to read as.
+    fn refuse_read_as<R: Row>(&self, read: &str) -> io::Result<()> {
+        let Some(ops) = self.schema.tables.get(R::TABLE) else {
+            return Ok(());
+        };
+        if ops.row_type == TypeId::of::<R>() {
+            return Ok(());
+        }
+        let (table, registered, reader) = (R::TABLE, ops.row_name, std::any::type_name::<R>());
+        Err(io::Error::other(TableReadRefusal(Refusal(format!(
+            "table \\"{table}\\" is registered as `{registered}`, but this transaction read it \\
+             through `{reader}` ({read}) — two Row types declare TABLE = \\"{table}\\", and a read \\
+             keys on the table name and the raw tenant id, so it returns the registered type's \\
+             rows, from the registered scope type's tenant of the same id when the two types' \\
+             scoped_by differ; the read was refused and returned nothing — read `{registered}` \\
+             instead, or give `{reader}` a table name of its own (a #[table] type's table name \\
+             is its struct name)"
+        )))))
+    }
+
+'''
+write_of = (
+    "    pub fn of(e: &io::Error) -> Option<&TableWriteRefusal> {\n"
+    "        e.get_ref()\n"
+    "            .and_then(|inner| inner.downcast_ref::<TableWriteRefusal>())\n"
+    "    }\n"
+    "}\n"
+)
+opened = "    opened_scope: Option<(TypeId, &'static str, u64)>,\n}\n"
+over = "    pub(crate) fn over(snapshot: &'a Snapshot) -> Tx<'a> {\n        Tx {\n            snapshot,\n"
+edits = [
+    (write_of, write_of + read_refusal),
+    (opened, opened[:-2] + "    /// The `Schema` the `Group` stages against: a scoped read checks its\n"
+     "    /// `Row` type against the one registered for its table (amendment A18).\n"
+     "    schema: &'a Schema,\n}\n"),
+    (over, over.replace("snapshot: &'a Snapshot)", "snapshot: &'a Snapshot, schema: &'a Schema)")
+     + "            schema,\n"),
+    ("            let mut tx = Tx::over(&self.snapshot);\n",
+     "            let mut tx = Tx::over(&self.snapshot, &self.db.engine.machine().schema);\n"),
+    ("impl Tx<'_> {\n    fn get_in<", "impl Tx<'_> {\n" + refuse_read_as + "    fn get_in<"),
+]
+for method, alternative, read in [
+    ("get_in", "View::get", "ScopedTx::get"),
+    ("scan_in", "View::scan", "ScopedTx::scan"),
+    ("scan_by_in", "View::scan_by", "ScopedTx::scan_by"),
+    ("scan_from_in", "View::scan_from", "ScopedTx::scan_from"),
+]:
+    line = f'        assert_scoped::<R>("{method}", "{alternative}");\n'
+    edits.append((line, line + f'        self.refuse_read_as::<R>("{read}")?;\n'))
+across = '        assert_scoped::<R>("across_tenants().scan", "View::scan");\n'
+edits.append((across, across + '        self.tx.refuse_read_as::<R>("across_tenants().scan")?;\n'))
+for old, new in edits:
+    assert s.count(old) == 1, f"A18 anchor moved: {old[:70]!r}"
+    s = s.replace(old, new)
+open(p, "w").write(s)
+print("A18: scoped reads checked")
+EOF
+grep -c 'refuse_read_as::<R>(' crates/charpente-core/src/db.rs
+```
+
+Expected: `A18: scoped reads checked`, then `5`. `Tx::over` has one caller, `Group::stage`, and
+the three immutable borrows it takes there (`self.snapshot`, `self.overlay`, `self.db`'s schema)
+end with the block, as the two before them did. The refusal is an `io::Error` from the read, not
+an exit of `Group::stage`, so the dispatcher's `Io` assert after `stage` is unchanged; Step 5
+classifies it where a handler's `?` delivers it.
+
 ```zsh
 cargo check -p charpente-core
 ```
@@ -8450,7 +8804,8 @@ crates/charpente-core/src/db.rs` when this plan was drafted.
 
 Six sites read a job row through `tx.get(Id::<JobRow>::from_raw(…))?` inside a group that
 already minted an admission. They are the whole set: `git grep -n "Id::<JobRow>"` at e749823
-finds exactly these six. The sweep:
+finds exactly these six, and so does it at 57e5df5 (dispatch.rs:270, :430; kernel.rs:3871,
+:3878; replication.rs:10730, :10936). The sweep:
 
 ```zsh
 python3 - <<'EOF'
@@ -8509,6 +8864,42 @@ print("dispatch comments updated")
 EOF
 ```
 
+**A18: a job's read refusal is an attempt.** A job handler's `?` turns the read's `io::Error`
+into `JobError::Io`, which the dispatcher treats as a platform fault: the row stays Pending and
+the error stops the kernel, on every restart. In `dispatch.rs`, the attempt classification
+after the handler's stage (`let attempt = match attempt`, :361 at 57e5df5) gains an arm, and the
+`charpente_core::db` import gains the type (each `old` must match once; stop if not):
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente/src/kernel/dispatch.rs"
+s = open(p).read()
+tail = "            other => other,\n        };\n        match attempt {\n"
+arm = (
+    "            // A read the `Schema` disagrees with about its table's `Row` type\n"
+    "            // (`TableReadRefusal`, amendment A18) is refused by the read itself,\n"
+    "            // so it arrives here through the handler's `?` as `JobError::Io`, the\n"
+    "            // variant a platform fault takes. It is the handler's own\n"
+    "            // deterministic bug, like the two refusals above: an attempt, never a\n"
+    "            // fault that would stop the dispatcher on every restart.\n"
+    "            Err(TxError::App(JobError::Io(e))) if TableReadRefusal::of(&e).is_some() => {\n"
+    "                Err(TxError::App(JobError::App(e.to_string())))\n"
+    "            }\n"
+)
+imp = "JobShapeRefusal, ScopedTx, TableWriteRefusal,"
+for old in (tail, imp):
+    assert s.count(old) == 1, f"dispatch.rs moved: {old!r}"
+s = s.replace(tail, arm + tail).replace(imp, "JobShapeRefusal, ScopedTx, TableReadRefusal, TableWriteRefusal,")
+open(p, "w").write(s)
+print("A18: the dispatcher classifies a read refusal")
+EOF
+cargo fmt --all
+```
+
+A route needs no change: a handler's `?` turns the `io::Error` into `ApiError::Internal` with
+its text (`http/mod.rs:395-398` at 57e5df5), a 500 carrying the refusal, as `TableWriteRefusal`
+gets from `tx_error_response`.
+
 - [ ] **Step 6: The oracle reads the queue through a snapshot, the handler-level pin moves to core, and the fixtures stop reading**
 
 **`crates/charpente/tests/kernel.rs`, `job_tenancy::jobs_stay_in_their_tenant`.** Replace:
@@ -8555,7 +8946,7 @@ with:
 ```
 
 The error text does not change on any path. `begin_group`'s first action is the same
-`store.snapshot()` that `Db::snapshot` makes (`db.rs:2787-2796`, `:2809-2811` at e749823), and
+`store.snapshot()` that `Db::snapshot` makes (`db.rs:3035-3044`, `:3057-3059` at 57e5df5; `:2787-2796`, `:2809-2811` at e749823), and
 both old and new map an IO error by `e.to_string()`. Reads draw nothing from the sim's fault
 stream, so the universes are the same universes. Step 12's `job-tenancy` baseline is the check.
 
@@ -8583,16 +8974,18 @@ for old, new in [
 open(p, "w").write(s)
 print("section deleted")
 EOF
-grep -n "EventRow\|event\b\|0x60C1_0007" crates/charpente/tests/group_commit.rs
+grep -nE "EventRow|#\[event|[{ ,]event[,}]|0x60C1_0007" crates/charpente/tests/group_commit.rs
 ```
 
-Expected: `section deleted`, then no output from the grep. At e749823 the section held the only
+Expected: `section deleted`, then no output from the grep. (A bare `event\b` also matches
+two comments that stay, :286's `"reply" event` and :454's `prevent`, at e749823 as at
+57e5df5, so the grep names the code forms instead.) At e749823 the section held the only
 uses of `event` and `EventRow` in this file; `JobRow`, `WireU64`, `jobs!` and `routes!` are
 still used elsewhere in it. If Task 1 respelled the `use charpente::{…}` line (it sweeps
 `#[event]` attributes, not imports), fix the first pair's `old` to the line as it stands.
 
 **`crates/charpente-core/tests/engine.rs`.** Replace `a_job_row_is_still_read_through_view` and
-its doc (`:468-478` at e749823) with:
+its doc (`:473-483` at 57e5df5; `:468-478` at e749823) with:
 
 ```rust
 /// The platform's tables are read through a `Snapshot` and nothing else
@@ -8777,6 +9170,8 @@ cargo test -p charpente --test kernel a_retried_pending_job_still_refuses_and_a_
 cargo test -p charpente --test kernel job_tenancy::
 cargo test -p charpente --test replication foreign
 cargo test -p charpente --test group_commit
+cargo test -p charpente --test tenant a_read_through_the_same_table_under_another_scope_type_is_refused
+cargo test -p charpente --test kernel scoped_jobs::a_scoped_job_reading_through_another_rust_type
 ```
 
 Expected: all green. The first line runs both refusal-text tests (write and read). The group
@@ -8850,9 +9245,18 @@ Expected: `test result: ok. 1 passed`.
 
 - [ ] **Step 10: Mutation-prove the seal, its text, and the batch reads**
 
-Commit nothing yet. Each mutation is applied by a script, measured, and reverted with
-`git checkout -- <file>`. After each revert, `git status --short` must show only this task's
-uncommitted work. Trybuild's output is colored, so each trybuild command strips the escape codes
+Commit nothing yet, and save the implementation first. None of this task is committed, so a
+bare `git checkout -- <file>` would restore Task 8's commit and discard this task's work in that
+file (Task 8's Step 9 saves its patch for the same reason):
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+git diff crates/charpente-core/src crates/charpente/src > $D/task9-impl.patch
+```
+
+Each mutation is applied by a script, measured, and reverted by checking the file out and
+re-applying its part of that patch. After each revert, `git status --short` must show only this
+task's uncommitted work. Trybuild's output is colored, so each trybuild command strips the escape codes
 with `perl` before `grep`.
 
 **N1: widen the platform's read impl to every reader.** This is the seal itself.
@@ -8866,7 +9270,7 @@ assert s.count(old) == 1
 open(p, "w").write(s.replace(old, "impl<V: ?Sized, R> ScopeReadableBy<V, R> for PlatformOwned {}\n"))
 EOF
 cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
-git checkout -- crates/charpente-core/src/table.rs
+git checkout -- crates/charpente-core/src/table.rs && git apply --include=crates/charpente-core/src/table.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
 ```
 
 Expected (measured on a scratch copy):
@@ -8899,7 +9303,7 @@ for p, n in [("crates/charpente-core/src/table.rs", 2), ("crates/charpente-core/
     open(p, "w").write(s.replace(old, "fn scan_by<R: UnscopedRow>("))
 EOF
 cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
-git checkout -- crates/charpente-core/src/table.rs crates/charpente-core/src/db.rs
+git checkout -- crates/charpente-core/src/table.rs crates/charpente-core/src/db.rs && git apply --include=crates/charpente-core/src/table.rs --include=crates/charpente-core/src/db.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
 ```
 
 Expected: exactly `test tests/compile_fail/event_row_read_on_bare_tx.rs [should fail to compile]
@@ -8921,7 +9325,7 @@ EOF
 D=.superpowers/sdd/2026-09-30-tenancy-completion
 cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | tee $D/task9-n3.log | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
 grep -c "^error\[E0080\]" $D/task9-n3.log
-git checkout -- crates/charpente-core/src/db.rs
+git checkout -- crates/charpente-core/src/db.rs && git apply --include=crates/charpente-core/src/db.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
 ```
 
 Expected: exactly `platform_table_names_borrowed_for_reads.rs … mismatch`, and `7`: the
@@ -8941,7 +9345,7 @@ open(p, "w").write(s[:a] + "        Some(1) => {}\n" + s[b:])
 EOF
 cargo test -p charpente-core --lib each_platform_table_name_is_refused_for_a_read 2>&1 | grep -E "^  left|^ right|^test result"
 cargo test -p charpente-macros --test trybuild 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | grep -E "^test tests/.* \.\.\. (error|mismatch)|Expected test case"
-git checkout -- crates/charpente-core/src/db.rs
+git checkout -- crates/charpente-core/src/db.rs && git apply --include=crates/charpente-core/src/db.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
 ```
 
 Expected: `left: None`, and `right: Some("this Row's TABLE is \"charpente.events\", the
@@ -8961,7 +9365,7 @@ open(p, "w").write(s[:a] + "        self.snapshot.get_any(id)\n" + s[a + len("  
 EOF
 cargo test -p charpente-core --test group_commit 2>&1 | grep -E "\.\.\. FAILED|^  left|^ right|^test result"
 cargo test -p charpente --test kernel 2>&1 | grep -E "^test result"
-git checkout -- crates/charpente-core/src/db.rs
+git checkout -- crates/charpente-core/src/db.rs && git apply --include=crates/charpente-core/src/db.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
 ```
 
 Expected:
@@ -8975,7 +9379,8 @@ test result: ok. 72 passed; 0 failed; …
 ```
 
 The `kernel` count is whatever the file holds when this task runs; 72 was measured at e749823 plus
-Tasks 8 and 9. It passing is a finding for the record, not a failure. The dispatcher suites do not
+Tasks 8 and 9. At 57e5df5 the file holds 78 `#[test]`s where e749823's held 72, and A18 adds one,
+so expect a larger number. It passing is a finding for the record, not a failure. The dispatcher suites do not
 notice a job read that ignores its batch, so the core test is this property's only oracle.
 Record that in the commit message.
 
@@ -9015,7 +9420,7 @@ assert s.count(old) == 1, "Tx::enqueue's body moved: re-derive the mutation"
 open(p, "w").write(s.replace(old, new))
 EOF
 cargo test -p charpente-core --test group_commit an_enqueue_is_invisible 2>&1 | grep -E "\.\.\. FAILED|got Some|^test result"
-git checkout -- crates/charpente-core/src/db.rs
+git checkout -- crates/charpente-core/src/db.rs && git apply --include=crates/charpente-core/src/db.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
 ```
 
 Expected: `an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits ... FAILED`, the
@@ -9023,14 +9428,53 @@ panic text ending `— got Some((0, "ping"))`, and `test result: FAILED. 0 passe
 `Tx::enqueue`'s body is no longer the one-line delegation (an earlier task may have changed it),
 put the same eight-field `JobRow` and overlay insert before whatever it now does.
 
+**N7 (A18): `ScopedTx::get` reads without its type check.**
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente-core/src/db.rs"
+s = open(p).read()
+old = '        self.refuse_read_as::<R>("ScopedTx::get")?;\n'
+assert s.count(old) == 1
+open(p, "w").write(s.replace(old, ""))
+EOF
+cargo test -p charpente --test tenant a_read_through_the_same_table_under_another_scope_type_is_refused 2>&1 | grep -E "Team 7's note|^test result"
+git checkout -- crates/charpente-core/src/db.rs && git apply --include=crates/charpente-core/src/db.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
+```
+
+Expected: red at the `assert_eq!`, whose left side opens `Ok(Some("Team 7's note"))` where the
+refusal is pinned: `Firm` 7's read returned `Team` 7's row, which is A18 itself. Then `test
+result: FAILED. 0 passed; 1 failed`. Deleting any of the other four calls is red the same way, at
+its own element (`scan_by`'s as a panic naming the missing index).
+
+**N8 (A18): the dispatcher treats a read refusal as a platform fault.**
+
+```zsh
+python3 - <<'EOF'
+p = "crates/charpente/src/kernel/dispatch.rs"
+s = open(p).read()
+a = s.index("            Err(TxError::App(JobError::Io(e))) if TableReadRefusal::of(&e).is_some() => {\n")
+b = s.index("            }\n", a) + len("            }\n")
+open(p, "w").write(s[:a] + s[b:])
+EOF
+cargo test -p charpente --test kernel scoped_jobs::a_scoped_job_reading_through_another_rust_type 2>&1 | grep -E "dead at its first|^test result"
+git checkout -- crates/charpente/src/kernel/dispatch.rs && git apply --include=crates/charpente/src/kernel/dispatch.rs .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch
+```
+
+Expected: red at the first assert, "the refused read is an attempt, dead at its first:
+Err(\"table \\\"Filed\\\" is registered as …\")": `run_due` returned the refusal as a platform
+fault, the error that stops a kernel. Then `test result: FAILED. 0 passed; 1 failed`. The now
+unused import is a warning, not an error, under `cargo test`.
+
 Then confirm the tree is back:
 
 ```zsh
 git diff --stat
+git diff crates/charpente-core/src crates/charpente/src | cmp - .superpowers/sdd/2026-09-30-tenancy-completion/task9-impl.patch && echo "implementation intact"
 cargo test -p charpente-core --test group_commit 2>&1 | grep -E "^test result"
 ```
 
-Expected: the diff stat is this task's work only, and `test result: ok. 9 passed` (or the file's
+Expected: the diff stat is this task's work only, `implementation intact`, and `test result: ok. 9 passed` (or the file's
 count at that point, with both new tests passing).
 
 - [ ] **Step 11: Docs — GUIDE §3, §4, §6, §16, DESIGN §2, §3, §8, and the pinned floor**
@@ -9252,8 +9696,56 @@ EOF
 git grep -n "any transaction can read\|every transaction's to read\|reads the queue like any other table\|Nor does it cover the platform" -- docs/GUIDE.md DESIGN.md README.md
 ```
 
-Expected: `docs updated; PINNED_FLOOR 28 -> 30` (or the floor Tasks 2-8 left, plus two). The grep
-prints nothing: no stale claim that a transaction reads a platform table is left. Then:
+Expected: `docs updated; PINNED_FLOOR 31 -> 33`: 57e5df5's 29, raised by one in Task 3 and one in
+Task 5 (the script reads the value, so a different start is not a failure). The grep prints
+nothing: no stale claim that a transaction reads a platform table is left.
+
+**A18's docs.** Neither text is a pinned block, so `PINNED_FLOOR` does not move for them. Each
+`old` is S2's text at 57e5df5, which no earlier task of this plan edits:
+
+```zsh
+python3 - <<'EOF'
+edits = {
+"docs/GUIDE.md": [
+("""either is an attempt, retried and then dead-lettered. The broader
+""",
+"""either is an attempt, retried and then dead-lettered. A read through such a
+type, a `ScopedTx` read or an `across_tenants` scan, is refused too, by the
+read itself, as a `TableReadRefusal`
+(`charpente::core::db::TableReadRefusal::of`). It names the table, the type
+that read and the registered one, offers the same two fixes, and returns no
+row. It reaches your code through the read's `io::Result`, so a route that
+returns it with `?` answers a 500 carrying its text, and in a job handler it
+is an attempt. The broader
+"""),
+],
+"DESIGN.md": [
+("""The check covers writes, not reads: a scoped read through a same-named type with another
+`scoped_by` still keys on the table name and the raw scope id, so it reads the registered
+scope type's tenant of the same id.
+""",
+"""Reads are held to the same type (spec 2026-09-30-tenancy-completion, amendment A18). A scoped
+read keys on the table name and the raw scope id, so a read through a same-named type with
+another `scoped_by` read the registered scope type's tenant of the same id. Each `ScopedTx`
+read and `across_tenants` scan now compares its `Row` type with the registered one first and
+refuses a mismatch by name (`TableReadRefusal`), returning no row; in a job handler that is an
+attempt, as the write refusal is.
+"""),
+],
+}
+for path, pairs in edits.items():
+    s = open(path).read()
+    for old, new in pairs:
+        assert s.count(old) == 1, f"{path}: {s.count(old)} x {old[:70]!r}"
+        s = s.replace(old, new)
+    open(path, "w").write(s)
+print("A18 docs updated")
+EOF
+```
+
+Expected: `A18 docs updated`.
+
+Then:
 
 ```zsh
 cargo build -p guide-examples 2>&1 | tail -1
@@ -9323,7 +9815,8 @@ Why these packages:
 - `realtime`, `tenant` and `archive` read the event log and scoped tables through snapshots.
 - `invoicing` and `sim-fixture` are apps built on `View`'s generic reads, the over-refusal risk.
   At e749823 plus Tasks 8 and 9 in a scratch copy, these six packages plus `ts-fixture-app`
-  counted 44 of 44 `test result: ok`.
+  counted 44 of 44 `test result: ok`; count again, since 57e5df5's suites differ.
+- `tenant` and `kernel` also hold A18's two pins.
 
 The controller's full workspace gate follows.
 
@@ -9336,7 +9829,7 @@ git add crates/charpente-core/src/table.rs crates/charpente-core/src/db.rs \
   crates/charpente-core/tests/group_commit.rs crates/charpente-core/tests/engine.rs \
   crates/charpente/src/kernel/dispatch.rs \
   crates/charpente/tests/kernel.rs crates/charpente/tests/replication.rs \
-  crates/charpente/tests/group_commit.rs \
+  crates/charpente/tests/group_commit.rs crates/charpente/tests/tenant.rs \
   crates/charpente-macros/tests/compile_fail/job_row_read_on_bare_tx.rs \
   crates/charpente-macros/tests/compile_fail/job_row_read_on_bare_tx.stderr \
   crates/charpente-macros/tests/compile_fail/event_row_read_on_bare_tx.rs \
@@ -9356,7 +9849,7 @@ git add crates/charpente-core/src/table.rs crates/charpente-core/src/db.rs \
   crates/charpente-macros/tests/compile_fail/job_row_untenanted_on_bare_tx.stderr \
   crates/charpente-macros/tests/compile_fail/scoped_read_from_bare_tx.stderr \
   crates/guide-examples/tests/doc_truth.rs docs/GUIDE.md DESIGN.md
-git commit -m "feat(tenancy): a transaction does not read the platform's tables — View's reads bound R: ReadableBy<Self>, which JobRow/EventRow/SchemaVersion meet for Snapshot alone, text names the table and db.snapshot(); a borrowed TABLE name is refused per Tx read (A13); the dispatcher reads its batch's job rows through admission-gated Tx::get_job; the group-commit visibility pin moves to core (A14, seed 0x7C00_0901); scoped-read pin changes one quoted line (A15); 5 compile-fail + 1 compile-pass new, <N> re-pinned; <M>/6 mutations red (N5: kernel suites blind, core test is the only oracle); <K> of <K> gate lines ok; 11 baselines reproduce"
+git commit -m "feat(tenancy): a transaction does not read the platform's tables — View's reads bound R: ReadableBy<Self>, which JobRow/EventRow/SchemaVersion meet for Snapshot alone, text names the table and db.snapshot(); a borrowed TABLE name is refused per Tx read (A13); the dispatcher reads its batch's job rows through admission-gated Tx::get_job; the group-commit visibility pin moves to core (A14, seed 0x7C00_0901); scoped-read pin changes one quoted line (A15); a ScopedTx or across_tenants read through another Rust type of a registered table is refused as TableReadRefusal, an attempt in a job (A18); 5 compile-fail + 1 compile-pass new, <N> re-pinned; <M>/8 mutations red (N5: kernel suites blind, core test is the only oracle); <K> of <K> gate lines ok; 11 baselines reproduce"
 ```
 
 ---
