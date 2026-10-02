@@ -55,7 +55,7 @@
 - **A13 — a transaction's read of a `Row` whose `TABLE` borrows a platform table's name is refused at build, like the write.** A typed bound covers `JobRow`/`EventRow`/`SchemaVersion` themselves, but not an app's hand-written `Row` with `TABLE = "charpente.jobs"` and `Scope = Unscoped`, the door C-2's FR-C1 closed for writes. `Tx`'s four `View` methods evaluate `const { refuse_platform_read(R::TABLE) }`, the read twin of `put`'s `refuse_platform_table`. This is a post-monomorphization E0080 that `cargo build`/`cargo test` report and `cargo check` does not, FR-C2a's accepted limitation, now for reads too.
 - **A14 — DESIGN §2's group-commit visibility pin moves to core.** `enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch` (`crates/charpente/tests/group_commit.rs`) reads `JobRow`/`EventRow` from handlers, which Task 9 makes compile errors. The property still exists where the dispatcher reads the queue inside a batch. So Task 9 deletes that test and its routes, pins the job half in `crates/charpente-core/tests/group_commit.rs` through `Tx::get_job`, and states the emit half in DESIGN §2: no transaction can read an emit any more.
 - **A15 — one quoted `View` declaration line re-pins.** Spec §3 keeps `View`'s existing diagnostics for scoped tables byte-identical. The message, the label, both `help:` blocks, every `note:` and the error count are identical. The line rustc quotes from `View::scan`'s declaration cannot be, because the bound sits on it. So `compile_fail/scoped_read_from_bare_tx.stderr`'s `fn scan<R: UnscopedRow>(…)` becomes `fn scan<R: UnscopedRow + ReadableBy<Self>>(…)`, the only `.stderr` in the tree that quotes a `View` declaration.
-- **A16 — resume validation refuses, by name, a cursor on a row of another tenancy.** When `row.scope != sub.scope` (another tenant's event on a tenant feed, a global event on a tenant feed, or a tenant's event on a global subscription), the resume gets a 409 checked after the seq check and before the reshape check: `cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; re-sync current state through reads, then reconnect without a cursor`. It names no tenant and no event. Validation still does not refuse a cursor on a same-tenancy row the feed does not admit (another event type, another app key), which payload-shapes spec §3 pins. So no global feed's behaviour, and no global baseline, moves. `Subscription::admits` stays the one predicate: delivery uses it to skip, and validation uses it to gate the reshape refusal. This makes spec §9's "a resume across the boundary is refused, not misdelivered" exact.
+- **A16 — resume validation refuses, by name, a cursor on a row of another tenancy.** When `row.scope != sub.scope` (another tenant's event on a tenant feed, a global event on a tenant feed, or a tenant's event on a global subscription), the resume gets a 409 checked after the seq check and before the reshape check: `cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently`. Its remedy is D4's, copied verbatim from `validate_subscribe`'s other 409s (`kernel/mod.rs:966-1066` at 57e5df5); this plan first gave the read-first order ("re-sync current state through reads, then reconnect without a cursor"), which D4 replaced everywhere on main because it misses the changes that land between the two steps (LEDGER, D4). It names no tenant and no event. Validation still does not refuse a cursor on a same-tenancy row the feed does not admit (another event type, another app key), which payload-shapes spec §3 pins. So no global feed's behaviour, and no global baseline, moves. `Subscription::admits` stays the one predicate: delivery uses it to skip, and validation uses it to gate the reshape refusal. This makes spec §9's "a resume across the boundary is refused, not misdelivered" exact.
 - **A17 — `Subscription.entries` and `SubEntry` become crate-private (Task 11).** With them `pub`, a handler admitted to `Team` 1 could push an `Org`-scoped event's `SubEntry` into its own feed. Delivery would then admit `Org` 1's rows of that event: same name, same shape, same raw id. The typed bounds and the NAME-mixing fingerprint never see a hand-pushed entry, and exit criterion 1 forbids that read. The one out-of-crate user, `realtime.rs`'s failing-encoder test, moves into a `#[cfg(test)]` module in `kernel/tail.rs`. A compile-fail fixture pins the privacy. `Subscription.key` and `.cursor` stay public: a key is an app filter (spec §2.3), and the tenant rides in the private `scope`.
 - **A18 — a scoped read goes through the `Row` type registered for its table (Task 9).** Since S2 (LEDGER 2026-10-01, "error text and schema safety"), `Group::stage` refuses a put or delete through any Rust type other than the one `Schema::table` registered under its `TABLE` (`TableWriteRefusal`). A read is not checked: `ScopedTx<Firm>::get` through a same-named `#[table(scoped_by = Firm)]` type keys on the table name and the raw scope id, so it reads the registered `Team` table's row of the same id (DESIGN §4 states this residual). A13 seals only the platform tables' names, so this is new. `Tx` holds the `Schema` its `Group` stages against, and each scoped read (`ScopedTx`'s `get`/`scan`/`scan_by`/`scan_from`, and `AllTenants::scan`) compares `TypeId::of::<R>()` with the registered `row_type` before it reads. A mismatch returns `TableReadRefusal`, an `io::Error` like `TableWriteRefusal`, naming the table, the type that read, the registered type and S2's two fixes. The read returns nothing, so no row reaches the caller. In a job handler the refusal comes back through the handler's `?` as `JobError::Io`, and the dispatcher classifies it as an attempt, never a platform fault. A route's `?` answers it with a 500 carrying its text (`ApiError`'s `From<io::Error>`). `Tx`'s own `View` reads are not checked: they read unscoped tables, which every handler may read, and an unscoped type naming a scoped table opens the other key layout and fails loudly (`unscoped_open_err`). A table the `Schema` does not register is not checked either, since no registered type is there to read as. *Drafted when this plan was amended against 57e5df5, and not compiled then: Task 9 measures it.*
 
@@ -9858,25 +9858,25 @@ git commit -m "feat(tenancy): a transaction does not read the platform's tables 
 
 **Files:**
 - Modify `crates/charpente-core/src/db.rs`:
-  - the module doc's record-format list (lines 14–29 at e749823);
+  - the module doc's record-format list (lines 14–29 at 57e5df5, as at e749823);
   - `struct Emit` (new), replacing `TxEffects.emits`' tuple;
   - `Effect::Emit.scope`;
   - `encode_record` / `decode_record`;
-  - the apply arm's `Effect::Emit` (2096 at e749823);
+  - the apply arm's `Effect::Emit` (2207 at 57e5df5; 2096 at e749823);
   - `Tx::push_emit` (new, private), `Tx::emit` / `Tx::emit_keyed`;
-  - the `Tenant` trait's doc (1466–1475 at e749823);
+  - the `Tenant` trait's doc (1577–1586 at 57e5df5; 1466–1475 at e749823);
   - `ScopedTx::event_key` (deleted), `ScopedTx::emit`, `ScopedTx::emit_keyed` (new);
   - the unit tests that push or expect emits (`effects_fixture`, `record_roundtrip_is_canonical`, `keyed_emit_roundtrips`, `a_pre_shape_enqueue_and_emit_decode_with_no_shape`, `shaped_enqueue_and_emit_bytes_are_pinned`), `decode_refuses_unknown_tags`, and the new `scoped_emit_bytes_are_pinned_with_tenant_zero`.
 - Modify `crates/charpente-core/src/event.rs`: `EventRow.scope`, its codec, its tests.
-- Modify `crates/charpente-core/src/table.rs`: `Writer::materialize_event(…, scope)` (1416 at e749823).
+- Modify `crates/charpente-core/src/table.rs`: `Writer::materialize_event(…, scope)` (1479 at 57e5df5; 1416 at e749823).
 - Modify `crates/charpente/src/repl/mod.rs`: `PROTO_VERSION` 4 → 5.
 - Modify `crates/charpente/src/http/mod.rs`: `Subscription` (its private `scope`, `admits`, `and`'s widening assert), `sub_entry`/`push_entry` (new, private), `TenantFeed<S>`, `Subscribe<S>`, the unit tests.
 - Modify `crates/charpente/src/lib.rs`: `pub use http::Subscribe;`.
-- Modify `crates/charpente/src/kernel/tail.rs`: `deliver_unit`'s filter (140–147 at e749823).
-- Modify `crates/charpente/src/kernel/mod.rs`: `validate_subscribe` (952–1057 at e749823).
-- Modify `crates/charpente/tests/realtime.rs`: the tenant section (4586–5390 at e749823), `Client`, `decode_event_row`, `failing_feed_glue`, the imports.
-- Modify `crates/charpente/tests/replication.rs`: the Hello version tests (2694–2791 at e749823) and `a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name` (3172–3219 at e749823), which ships tag 11 as "a tag this binary does not know" and now ships 12.
-- Modify `crates/charpente/tests/tenant.rs` (the three `memo_feed*` handlers, the `Org` doc at 44–49), `crates/charpente/tests/kernel.rs` (the `Org` doc at 2179–2184), `crates/charpente-macros/tests/compile_pass/route_public_scope.rs` (its `feed`), `examples/invoicing/src/bin/tenant_node.rs` (`create_doc`'s comment, `feed`), `crates/edge-harness/tests/tenant_wire.rs` (the doc at 429–431).
+- Modify `crates/charpente/src/kernel/tail.rs`: `deliver_unit`'s filter (140–147 at 57e5df5, as at e749823).
+- Modify `crates/charpente/src/kernel/mod.rs`: `validate_subscribe` (952–1067 at 57e5df5; 952–1057 at e749823; D4 rewrote its four re-sync remedies in between).
+- Modify `crates/charpente/tests/realtime.rs`: the tenant section (5222–6349 at 57e5df5, which S3b grew by a re-sync, five `Client` unit tests and three pinned-seed tests; 4586–5390 at e749823), `Client` (`:1454` at 57e5df5), `decode_event_row` (`:2107`), `failing_feed_glue` (`:3025`), the imports.
+- Modify `crates/charpente/tests/replication.rs`: the Hello version tests (2905–3002 at 57e5df5; 2694–2791 at e749823) and `a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name` (3383–3430 at 57e5df5; 3172–3219 at e749823), which ships tag 11 as "a tag this binary does not know" and now ships 12.
+- Modify `crates/charpente/tests/tenant.rs` (the three `memo_feed*` handlers, the `Org` doc at 44–49), `crates/charpente/tests/kernel.rs` (the `Org` doc at 2298–2303 at 57e5df5; 2179–2184 at e749823), `crates/charpente-macros/tests/compile_pass/route_public_scope.rs` (its `feed`), `examples/invoicing/src/bin/tenant_node.rs` (`create_doc`'s comment, `feed`), `crates/edge-harness/tests/tenant_wire.rs` (the doc at 429–431).
 - Test: `crates/charpente-core/tests/materialize.rs`, and every file above.
 - Docs: `docs/GUIDE.md` §11 and §16; `DESIGN.md` §3, §4, §5, §6, §8; `PLAN.md`'s M2 paragraph; `crates/guide-examples/tests/doc_truth.rs` (`PINNED_FLOOR` +2).
 
@@ -9899,7 +9899,7 @@ git commit -m "feat(tenancy): a transaction does not read the platform's tables 
   - `pub trait Subscribe<S> { fn subscription<Ev: Event + serde::Serialize>(&self) -> TenantFeed<S>; }`, `impl<S: Tenant> Subscribe<S> for ScopedTx<'_, '_, S>`, re-exported as `charpente::Subscribe`.
   - Texts, fixed wording, pinned byte-exact:
     - `Subscription::and: event "{name}" is added to a tenant feed after .into() — Subscription::and adds global events, and a tenant feed receives only its own tenant's events, so this one could never arrive; add the tenant's events with TenantFeed::and before .into(), and serve global events on a subscription of their own`
-    - `cursor {id}.{seq} sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; re-sync current state through reads, then reconnect without a cursor` (a 409; it names no tenant and no event)
+    - `cursor {id}.{seq} sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently` (a 409; it names no tenant and no event; its remedy is D4's, copied verbatim from `validate_subscribe`'s other 409s, amendment A16)
     - `TenantFeed::and: event "{name}" is already in this subscription — …`, the duplicate-name text with its method named; `Subscription::and`'s own duplicate text stays byte-identical.
     - `row decode: {n} bytes after an EventRow's payload — the shape and the tenant scope after it are 8 bytes each, present or absent, so the stored row is corrupt` (replaces "…a shape is 8 bytes or absent…")
     - `EventRow {id}: a tenant scope is encoded after the shape, so a scoped row must carry one — only tag 0x0b writes a scope, and 0x0b always carries the shape`
@@ -9909,7 +9909,7 @@ git commit -m "feat(tenancy): a transaction does not read the platform's tables 
 - `tenant`: `MemoNoted` is never emitted; its feeds only subscribe.
 - `kernel`, `job-tenancy`, `migrations`, `migrations-scoped`: nothing emits.
 - `realtime-flagship`, `realtime-shapes`, `realtime-follower`: every emit is on a bare `Tx` (`0x09`, unchanged), and the scope column their `Client` gains is `None` on every row they read, so `matches` answers as before.
-- `archive-scoped`: it emits `Ping` on the bare `Tx` after its temporary `ScopedTx` (archive.rs 8268 at e749823).
+- `archive-scoped`: it emits `Ping` on the bare `Tx` after its temporary `ScopedTx` (archive.rs 8356 at 57e5df5; 8268 at e749823).
 - `invoicing`: `emit_keyed` on a bare `Tx` only (routes.rs:254, jobs.rs:46). Its `tenant_node` bin, which does emit inside a scope, is not in the sim app.
 
 A `MOVED` on any of those ten is a finding: stop.
@@ -9954,7 +9954,7 @@ Exact edits, each one site:
 - `scoped_feed`: `emits(Ping)` → `emits(OrgPing)`; `Subscription::of::<Ping>()` → `Subscription::of::<OrgPing>()`.
 - `literal_feed`: the same two edits.
 - `emit_leaky_ping`: `Ping { n: body.n }` → `OrgPing { n: body.n }`.
-- `scoped_realtime_workload` and `scoped_twin_run`: `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` → `Client::new(ORG_PING_ONLY, Some(SCOPED_TENANT_A_KEY))`.
+- `scoped_realtime_workload_judged` and `scoped_twin_run` (`realtime.rs:5606` and `:6286` at 57e5df5; S3b split `scoped_realtime_workload` into a wrapper that passes `durable_corruption_fired` to `scoped_realtime_workload_judged`, which holds the client): `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` → `Client::new(ORG_PING_ONLY, Some(SCOPED_TENANT_A_KEY))`. The five S3b `Client` unit tests (`:6076`, `:6104`, `:6136`, `:6171`, `:6234`) make the same call and stay on `PING_ONLY`: they emit nothing, and every ledger row they insert is named `ping`. Step 6 moves them onto the tenant.
 - `scoped_key_oracle`: `if *name != "ping"` → `if *name != "org_ping"`.
 - `a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event`: its three expected vectors' `"ping"` → `"org_ping"` (Step 2 replaces this test).
 
@@ -9964,7 +9964,7 @@ Run the section's deterministic tests:
 cargo test -p charpente --test realtime -- a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event the_scoped_oracle_catches_an_emit_that_drops_the_scope_key scoped_realtime_frame_traces_replay_identically_for_the_same_seed
 ```
 
-Expected: 3 passed. Do not run the swarm `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing` here: its bytes moved (a longer event name), and Step 8 measures it once, at the end.
+Expected: 3 passed. Do not run the swarm `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing` here: its bytes moved (a longer event name), and Step 8 measures it once, at the end. Nor the three S3b tests that run `scoped_realtime_workload` at a pinned seed (`a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced`, `a_cut_nothing_explains_fails_the_scoped_universe_by_name` and `a_settled_client_owed_nothing_and_delivered_nothing_gives_up`): the same bytes moved under them, and Step 8 judges them too.
 
 - [ ] **Step 2: Write the tests that are red at the Task 9 commit**
 
@@ -10125,8 +10125,10 @@ fn delivered(handle: &SimSinkHandle) -> Vec<String> {
 fn tenancy_409(row: &EventRow) -> String {
     format!(
         "cursor {} sits on an event outside this feed's tenancy — a cursor resumes only the \
-         feed that delivered it, and this feed never delivers that event; re-sync current \
-         state through reads, then reconnect without a cursor",
+         feed that delivered it, and this feed never delivers that event; reconnect without a \
+         cursor, wait for the stream to open, then read current state from the same node, \
+         holding every frame that arrives until that read is installed and then applying the \
+         held frames and every later one over it in order, idempotently",
         cursor_of(row)
     )
 }
@@ -10346,7 +10348,7 @@ Expected: all four FAIL. Quote each panic in the report:
 
 - [ ] **Step 3: The record, the row and its materialization**
 
-`crates/charpente-core/src/db.rs`, the module doc: replace the lines from "`0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`" through "`Some(0)` is `0x0a`." (lines 16–29 at e749823) with:
+`crates/charpente-core/src/db.rs`, the module doc: replace the lines from "`0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`" through "`Some(0)` is `0x0a`." (lines 16–29 at 57e5df5, as at e749823) with:
 
 ```rust
 //! `0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
@@ -10445,7 +10447,7 @@ with `emits: Vec<Emit>,`.
             },
 ```
 
-The apply arm (`Db::apply`'s `Effect::Emit`, 2096 at e749823):
+The apply arm (`Db::apply`'s `Effect::Emit`, 2207 at 57e5df5; 2096 at e749823):
 
 ```rust
                     Effect::Emit {
@@ -10494,7 +10496,7 @@ and replace `Tx::emit` and `Tx::emit_keyed` with
     }
 ```
 
-The `Tenant` trait's doc: replace the sentence "The one thing it does read off a scope is its decimal form, as the subscription key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering out, never resolving in." (it spans 1473–1475 at e749823; Task 2 may have rewrapped it, so re-locate it by text) with:
+The `Tenant` trait's doc: replace the sentence "The one thing it does read off a scope is its decimal form, as the subscription key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering out, never resolving in." (it spans 1583–1586 at 57e5df5, 1473–1475 at e749823; Task 2 may have rewrapped it, so re-locate it by text) with:
 
 ```rust
 /// What it records of a scope is its raw id — beside a scoped enqueue
@@ -11231,7 +11233,7 @@ In the unit `mod tests`, add:
 pub use http::Subscribe;
 ```
 
-`crates/charpente/src/kernel/tail.rs`, `deliver_unit`: the doc's "read up to `TAIL_BATCH_EVENTS` rows from `next_id`, filter, push" becomes "read up to `TAIL_BATCH_EVENTS` rows from `next_id`, filter (`Subscription::admits`: a name it carries, its tenancy, its key), push". In the row loop, replace the key check and the entry lookup (lines 142–147 at e749823) with:
+`crates/charpente/src/kernel/tail.rs`, `deliver_unit`: the doc's "read up to `TAIL_BATCH_EVENTS` rows from `next_id`, filter, push" becomes "read up to `TAIL_BATCH_EVENTS` rows from `next_id`, filter (`Subscription::admits`: a name it carries, its tenancy, its key), push". In the row loop, replace the key check and the entry lookup (lines 142–147 at 57e5df5, as at e749823) with:
 
 ```rust
         // The one predicate resume validation asks too (`validate_subscribe`).
@@ -11264,8 +11266,10 @@ pub use http::Subscribe;
                     &format!(
                         "cursor {} sits on an event outside this feed's tenancy — a cursor \
                          resumes only the feed that delivered it, and this feed never delivers \
-                         that event; re-sync current state through reads, then reconnect \
-                         without a cursor",
+                         that event; reconnect without a cursor, wait for the stream to open, \
+                         then read current state from the same node, holding every frame that \
+                         arrives until that read is installed and then applying the held frames \
+                         and every later one over it in order, idempotently",
                         cursor.wire()
                     ),
                 ));
@@ -11280,7 +11284,7 @@ pub use http::Subscribe;
             {
 ```
 
-The body of that `if` (the reshaped 409) is unchanged.
+The body of that `if` (the reshaped 409) is unchanged. The new 409's remedy is D4's, word for word as the four 409s around it give it at 57e5df5 (`kernel/mod.rs:976`, `:1009`, `:1041` and `:1058` at 57e5df5; amendment A16).
 
 ```zsh
 cargo test -p charpente --lib 2>&1 | tee .superpowers/sdd/2026-09-30-tenancy-completion/task10-lib.log | grep -E "^test result|FAILED|panicked"
@@ -11631,7 +11635,7 @@ fn emit_leaky_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), A
 }
 ```
 
-`scoped_realtime_workload`: its doc's sentence "`Client` is reused verbatim — keyed to `SCOPED_TENANT_A_KEY`, its `matches`/`first_unaccounted` already demand every A-keyed ledger row above the floor be received, and its `try_match` already rejects a delivered row whose key is not A's — and `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have." becomes "`Client` is reused — in tenant A (`Client::in_tenant`), its `matches`/`first_unaccounted` demand every tenant-A ledger row above the floor be received, and its `try_match` rejects a delivered row recorded in another tenancy — and `scoped_tenant_oracle` adds the payload-versus-row arms `Client` cannot have." Its first line becomes
+`scoped_realtime_workload`: its doc's "one subscriber keyed to tenant A" becomes "one tenant-A feed", and its sentence "`Client` is reused verbatim — keyed to `SCOPED_TENANT_A_KEY`, its `matches`/`first_unaccounted` already demand every A-keyed ledger row above the floor be received, and its `try_match` already rejects a delivered row whose key is not A's — and `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have." becomes "`Client` is reused — in tenant A (`Client::in_tenant`), its `matches`/`first_unaccounted` demand every tenant-A ledger row above the floor be received, and its `try_match` rejects a delivered row recorded in another tenancy — and `scoped_tenant_oracle` adds the payload-versus-row arms `Client` cannot have." The rest is in `scoped_realtime_workload_judged`, which S3b split out to hold the client (`realtime.rs:5602` at 57e5df5). Its first line becomes
 
 ```rust
     let mut client = Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
@@ -11677,6 +11681,8 @@ the oracle call becomes `scoped_tenant_oracle(&client.ledger, &client.trace, SCO
 ```
 
 `scoped_twin_run`: its doc's "one subscriber keyed to tenant A" becomes "one tenant-A feed"; its return type becomes `(Ledger, ScopedTrace)`; its client becomes `Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A)`.
+
+S3b's five `Client` unit tests (`a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed`, `a_cut_id_re_minted_for_the_subscriber_is_owed_again`, `a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_content`, `without_durable_corruption_a_cut_is_not_resynced` and `an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing`, `realtime.rs:6076`, `:6104`, `:6136`, `:6171` and `:6234` at 57e5df5; they landed after this plan was written) build a tenant-A client on the deleted key and insert three-field ledger rows. Each `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` becomes `Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A)`. Each `let key = Some(SCOPED_TENANT_A_KEY.to_string());` is deleted, and each ledger insert `("ping", <that key>, json)` becomes `("ping", None, Some(SCOPED_TENANT_A), json)`: the row is recorded in tenant A, with no app key. Tenant B's row in `an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing`, `("ping", Some("tenant-b".to_string()), "b's".to_string())`, becomes `("ping", None, Some(SCOPED_TENANT_B), "b's".to_string())`. The tenant-A client withholds it by tenancy, as it withheld it by key, so every assertion and message in the five stays as it is.
 
 Replace `the_scoped_oracle_catches_an_emit_that_drops_the_scope_key` with
 
@@ -11802,7 +11808,7 @@ Expected: the grep prints only `crates/charpente/tests/realtime.rs`'s `literal_f
 
 ```zsh
 D=.superpowers/sdd/2026-09-30-tenancy-completion
-cargo test -p charpente --test realtime -- --skip a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing 2>&1 | tee $D/task10-realtime.log | grep -E "^test result|FAILED|panicked"
+cargo test -p charpente --test realtime -- --skip a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing --skip a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced --skip a_cut_nothing_explains_fails_the_scoped_universe_by_name --skip a_settled_client_owed_nothing_and_delivered_nothing_gives_up 2>&1 | tee $D/task10-realtime.log | grep -E "^test result|FAILED|panicked"
 cargo test -p charpente --test tenant --test kernel --test http 2>&1 | tee $D/task10-others.log | grep -E "^test result|FAILED|panicked"
 cargo test -p charpente-core 2>&1 | grep -E "^test result|FAILED|panicked"
 cargo test -p charpente --lib 2>&1 | grep -E "^test result|FAILED|panicked"
@@ -11810,7 +11816,7 @@ cargo test -p charpente-macros --test trybuild 2>&1 | grep -E "^test result|FAIL
 cargo test -p invoicing 2>&1 | grep -E "^test result|FAILED"
 ```
 
-Expected: every line `test result: ok`, the four new realtime tests, the rewritten fireability test and the replay test `scoped_realtime_frame_traces_replay_identically_for_the_same_seed` included. The tenant swarm is skipped here; Step 8 runs it under the baseline driver.
+Expected: every line `test result: ok`, the four new realtime tests, the rewritten fireability test and the replay test `scoped_realtime_frame_traces_replay_identically_for_the_same_seed` included. S3b's five `Client` unit tests are included too. The tenant swarm and the three pinned-seed tests over its workload are skipped here: Step 8 runs the swarm under the baseline driver and judges the three.
 
 Save the implementation, so each mutation reverts exactly:
 
@@ -11884,12 +11890,26 @@ diff $D/cov-realtime-tenant-task10.txt $D/cov-realtime-tenant-task10b.txt && pri
 cat $D/cov-realtime-tenant-task10.txt
 ```
 
-Expected: both runs print `exit 0, passing-test lines 1` for the test and `MOVED` against the pre-task base, so each call prints `exit 1` — by design, for this label only; the diff prints `reproduced identically`; the recording shows every required key (`tenant:both-tenants-emitted`, `tenant:own-backlog-verified`, `tenant:foreign-backlog-not-delivered`, `realtime:resume-backlog`, `realtime:stall-drop`, `fault:subscriber_stall`) and its verdict line. Two runs that differ are a determinism finding: stop.
+Expected: both runs print `exit 0, passing-test lines 1` for the test and `MOVED` against the pre-task base, so each call prints `exit 1` — by design, for this label only; the diff prints `reproduced identically`; the recording shows every required key (`boot:booted-after-retry`, `tenant:both-tenants-emitted`, `tenant:own-backlog-verified`, `tenant:foreign-backlog-not-delivered`, `realtime:resume-backlog`, `realtime:stall-drop`, `fault:subscriber_stall`) and its verdict line. Two runs that differ are a determinism finding: stop.
 
-The floors (`SCOPED_BOTH_TENANTS_FLOOR` 75, `SCOPED_OWN_BACKLOG_FLOOR` 78, `SCOPED_FOREIGN_SKIPPED_FLOOR` 80, `SCOPED_RESUME_BACKLOG_FLOOR` 125 at e749823):
-- A measured count at or above its floor: leave the floor alone (a floor is a minimum; raising one that is not failing is a separate decision).
-- A measured count below its floor (the run printed `passing-test lines 0` and the log names the floor): lower that floor to exactly the measured count, and extend the doc comment above `SCOPED_BOTH_TENANTS_FLOOR` with a second table headed "**Re-measured 2026-09-30** (tenancy completion Task 10: every emit is now recorded under tag `0x0b` with its tenant, and the event is `org_ping`, so every universe's bytes moved)" listing `| key | was | now |` for all four keys. Then re-run `zsh $D/baselines.sh task10c realtime-tenant` and confirm `passing-test lines 1` and a recording identical to `task10`'s.
-- A count more than 15% below its floor is not a number to lower: it is a coverage loss. Stop and report the four counts.
+The floors and the cap: `SCOPED_BOTH_TENANTS_FLOOR` 106, `SCOPED_OWN_BACKLOG_FLOOR` 96, `SCOPED_FOREIGN_SKIPPED_FLOOR` 99, `SCOPED_RESUME_BACKLOG_FLOOR` 206 and `SCOPED_GAVE_UP_CEILING` 23 at 57e5df5 (`realtime.rs:5971-5987`; 75, 78, 80, 125 and no cap at e749823). These are re-measured at execution: the source's value is the operand. They are judged by the re-key rules under Global Constraints (GUIDE §8, "Re-basing a pinned property"), which replace this step's earlier rule of lowering a floor to its measured count unless it fell more than 15%:
+- This task renames every universe of the batch. So the before-and-after comparison runs whatever the pinned counts read: the property at the Task 9 commit (in a worktree of its own, with its own `CARGO_TARGET_DIR`) and at this task's tree, over the same ten or more fresh bases (`CHARPENTE_BASE_SEED`). For both sides, record each floored key's per-base counts and the passes covering it.
+- If a floor's count at the pinned base did not fall, leave the floor alone (a floor is a minimum; raising one that is not failing is a separate decision). If it fell, re-set it to its new exact count only if its after-mean is within one Welch standard error of its before-mean. Beyond that, the fall is the finding: stop, and report both distributions.
+- The cap may rise only if the passes covering each floored key did not fall by more than one Welch standard error. It is then re-set to its new exact count, and the cap's doc above `FLAGSHIP_GAVE_UP_CEILING` names the change. Otherwise the rise is the finding: stop.
+- For each re-set, add a table to the doc comment above `SCOPED_BOTH_TENANTS_FLOOR`, after the 2026-10-01 one. Head it "**Re-measured <date>** (tenancy completion Task 10: every emit is now recorded under tag `0x0b` with its tenant, and the event is `org_ping`, so every universe's bytes moved)", list `| key | was | now |` for the four floors and the cap, and record both distributions. Then re-run `zsh $D/baselines.sh task10c realtime-tenant`, and confirm `passing-test lines 1` and a recording identical to `task10`'s.
+
+The three S3b pinned-seed tests over the same workload are `a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced`, `a_cut_nothing_explains_fails_the_scoped_universe_by_name` and `a_settled_client_owed_nothing_and_delivered_nothing_gives_up`'s scoped row (`realtime.rs:6014`, `:6049` and `:6203` at 57e5df5; seeds `0x083b_d434_c717_d60c` and `0xb1c2_07a8_e3ca_62dd`, re-measure at execution). This task renames their universes too, so each pinned seed may now name a different universe (memory `pinned-seed-names-a-universe`):
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test realtime -- a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced a_cut_nothing_explains_fails_the_scoped_universe_by_name a_settled_client_owed_nothing_and_delivered_nothing_gives_up 2>&1 | tee $D/task10-pinned.log | grep -E "^test |test result|panicked"
+```
+
+Each asserts its reason, so a renamed universe fails at that assertion instead of passing. Re-find each failing seed by the method its doc records:
+- For the first two: a durable-corruption cut of a ledgered tenant-A id that is re-minted for tenant B. Run `scoped_realtime_workload_judged(sim, |_| false)` over the doc's bases. A cut then fails "ledger id N was recorded off this node", and the seed is the universe whose cut id was re-minted rather than left absent.
+- For the third: the first scoped universe at the batch's base that gives up "the settled client was owed nothing and delivered nothing".
+
+Re-pin each seed, and update its doc to what was measured: the seed, base, universe, cut id, and the "23 scoped universes" count. The cut id appears in the first two tests' assertions as well. Never loosen an assertion to keep an old seed. If the doc's scan width holds no universe of that shape, stop and report.
 
 Re-base the one label that moved, so Tasks 11 and 12 reproduce the new bytes:
 
@@ -11899,7 +11919,7 @@ mv $D/cov-realtime-tenant-base.txt $D/cov-realtime-tenant-base-pre-task10.txt
 cp $D/cov-realtime-tenant-task10.txt $D/cov-realtime-tenant-base.txt
 ```
 
-and write both the old and new counts into `progress.md`.
+and write both the old and new counts into `progress.md`, with the old and new pinned seeds.
 
 - [ ] **Step 9: The wire oracle over real TCP**
 
@@ -12089,7 +12109,7 @@ The tenancy refusal, exactly:
 
 <!-- pinned -->
 ```text
-cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; re-sync current state through reads, then reconnect without a cursor
+cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently
 ```
 ````
 
@@ -12231,7 +12251,7 @@ git add crates/charpente-core/src/db.rs crates/charpente-core/src/event.rs crate
   examples/invoicing/src/bin/tenant_node.rs crates/edge-harness/tests/tenant_wire.rs \
   crates/guide-examples/tests/doc_truth.rs docs/GUIDE.md DESIGN.md PLAN.md
 git status --short
-git commit -m "feat(tenancy-completion): an event records its tenant apart from its key — tag 0x0b, EventRow.scope, PROTO_VERSION 5; the tenant feed (Subscribe, TenantFeed) and one predicate (Subscription::admits) for delivery and resume; a cursor from another tenancy is refused by name, and a tenant feed widened after .into() panics by name; <M> of 15 mutations red; realtime-tenant re-measured over 128 universes twice, identical (<floors kept | floor was→now>); the ten other baselines reproduced"
+git commit -m "feat(tenancy-completion): an event records its tenant apart from its key — tag 0x0b, EventRow.scope, PROTO_VERSION 5; the tenant feed (Subscribe, TenantFeed) and one predicate (Subscription::admits) for delivery and resume; a cursor from another tenancy is refused by name, and a tenant feed widened after .into() panics by name; <M> of 15 mutations red; realtime-tenant re-measured over 128 universes twice, identical (<floors and cap kept | key was→now>; <pinned seeds kept | seed was→now>); the ten other baselines reproduced"
 ```
 
 `git status --short` after the add must show nothing unstaged under this task's paths. No `Co-Authored-By` trailer (CLAUDE.md).
