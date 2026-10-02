@@ -12,7 +12,7 @@ use sim_fixture::{BumpCounter, FixtureCounter, NoteAdded};
 charpente_sim::sim_tests! {
     counter_roundtrip require ["restart"],
     fixture_replays,
-    acked_counter_survives_rounds require ["restart"],
+    acked_counter_survives_rounds require ["restart", "fixture:acked-rows-checked"],
     counter_bump_job_changes_the_row,
     counter_bump_job_leaves_the_row_readable,
     sometimes_fails,
@@ -244,6 +244,9 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
                 }
                 Err(e) => return Err(e.to_string()),
             }
+        }
+        if !acked.is_empty() {
+            sim.cover("fixture:acked-rows-checked");
         }
         checked_any |= !acked.is_empty();
         Ok(())

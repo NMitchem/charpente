@@ -585,6 +585,19 @@ fn a_migration_universe_whose_budget_runs_out_gives_up_by_name() {
     }
 }
 
+/// The give-up caps and reach floors of the two migration properties, exact
+/// at their pinned bases (S3b review round 2, 2026-10-02). S3b item 4 made a
+/// universe whose seeding or open-and-migrate budget ran out give up instead
+/// of passing as inconclusive: plain 0 -> 12, scoped 0 -> 1. A give-up is
+/// never failed, so without a cap a batch that drifted to giving up
+/// everything would stay green (GUIDE §8). Each floors the key marked when
+/// the migration completed, right before its rows are compared with the
+/// twin: 116 and 127.
+const PLAIN_GAVE_UP_CEILING: u64 = 12;
+const PLAIN_COMPLETED_FLOOR: u64 = 116;
+const SCOPED_GAVE_UP_CEILING: u64 = 1;
+const SCOPED_COMPLETED_FLOOR: u64 = 127;
+
 // Finding 3 (migrations T9 interlude addendum — dossier
 // .superpowers/sdd/migrations-t9-interlude.md): seed 0x6b436e3ea995cb6f.
 // Mechanism, verified: a `Store::open` failure triggers discard-and-rebuild (then
@@ -607,7 +620,9 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
         128,
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| migration_universe(sim, &twin),
-        require: ["migrations:resumed-to-completion"]
+        require: ["migrations:resumed-to-completion"],
+        floor: [("migrations:resumed-to-completion", PLAIN_COMPLETED_FLOOR)],
+        ceiling: [("universe:gave-up", PLAIN_GAVE_UP_CEILING)]
     );
 }
 
@@ -1560,7 +1575,12 @@ fn migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninter
         128,
         |_cfg: &mut FaultConfig| {},
         |sim: &mut Sim| scoped_migration_universe(sim, rows_per_scope, &scopes, &twin),
-        require: ["migrations:scoped-resumed-to-completion"]
+        require: ["migrations:scoped-resumed-to-completion"],
+        floor: [(
+            "migrations:scoped-resumed-to-completion",
+            SCOPED_COMPLETED_FLOOR
+        )],
+        ceiling: [("universe:gave-up", SCOPED_GAVE_UP_CEILING)]
     );
 }
 

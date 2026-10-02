@@ -2400,6 +2400,13 @@ fn realtime_workload_judged(
         return Err(client.unsettled_report());
     }
     client.give_up_if_nothing_adjudicated(sim);
+    // The reach key the flagship's floor reads: one mark per frame the client
+    // delivered and checked, in a universe that kept its verdict.
+    if sim.gave_up().is_none() {
+        for _ in &client.trace {
+            sim.cover("realtime:frame-verified");
+        }
+    }
     Ok(client.trace)
 }
 
@@ -2452,7 +2459,9 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
             "realtime:gap",
             "realtime:stall-drop",
             "fault:subscriber_stall"
-        ]
+        ],
+        floor: [("realtime:frame-verified", FLAGSHIP_FRAMES_VERIFIED_FLOOR)],
+        ceiling: [("universe:gave-up", FLAGSHIP_GAVE_UP_CEILING)]
     );
 }
 
@@ -5832,7 +5841,8 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
                 SCOPED_FOREIGN_SKIPPED_FLOOR
             ),
             ("realtime:resume-backlog", SCOPED_RESUME_BACKLOG_FLOOR)
-        ]
+        ],
+        ceiling: [("universe:gave-up", SCOPED_GAVE_UP_CEILING)]
     );
 }
 
@@ -5893,6 +5903,19 @@ const SCOPED_BOTH_TENANTS_FLOOR: u64 = 106;
 const SCOPED_OWN_BACKLOG_FLOOR: u64 = 96;
 const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 99;
 const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 206;
+
+/// The give-up caps of the two settled-client properties, exact at their
+/// pinned bases (S3b review round 2, 2026-10-02). S3b items 1, 3 and 7 made
+/// these universes give up where they passed: the flagship 3 -> 26, the
+/// scoped sibling 0 -> 23, most of them clients owed nothing and delivered
+/// nothing (item 7). A give-up is never failed, so without a cap a batch that
+/// drifted to giving up everything would stay green (GUIDE §8). The scoped
+/// sibling floors its reach keys above; the flagship floors
+/// `realtime:frame-verified`, one mark per frame a client delivered and
+/// checked in a universe that kept its verdict: 1,049 at its base.
+const FLAGSHIP_GAVE_UP_CEILING: u64 = 26;
+const FLAGSHIP_FRAMES_VERIFIED_FLOOR: u64 = 1049;
+const SCOPED_GAVE_UP_CEILING: u64 = 23;
 
 /// Found 2026-09-30 by S3's fresh-base scan, at seed `0x20851976ea4bae36`
 /// (base `0x5E1F0013`). A misdirected write moved event id 5's WAL frame (seq

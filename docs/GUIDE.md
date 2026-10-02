@@ -2517,15 +2517,26 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   and it cross-checks the reported count exactly. `ceiling:
   [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
   caps it: the batch fails when more than N universes gave up, naming the key,
-  the count and the cap. Nine of the platform's own 31 swarm properties carry
-  one: kernel's exactly-once and job-tenancy properties, and the flagship
-  properties of tenant, transactions, http, group_commit, typed_tables and
-  archive's two convergence properties. The rest (realtime, replication,
-  migrations, auth, the WAL suite, and kernel's job-shape property) carry none
-  yet, so a drift in their give-up rates is visible only in the split. A give-up is
+  the count and the cap. Eighteen of the platform's own swarm properties carry
+  one:
+  - kernel's exactly-once and job-tenancy properties;
+  - the flagship properties of tenant, transactions, http, group_commit and
+    typed_tables, and archive's two convergence properties;
+  - realtime's flagship and scoped settled-client properties, migrations' two,
+    and the WAL suite's bit-flip, misdirected-write, read-error, dir-entry and
+    gc properties.
+
+  The rest carry none yet, so a drift in their give-up rates is visible only in
+  the split: realtime's mixed-shapes and follower properties, replication's,
+  auth's, kernel's job-shape property, transactions' crashed-reseed property,
+  engine's, and the WAL fault matrix (floored, not capped: its base is ambient
+  and it never gave up in 10 fresh batches, so the cap rule gives 0). A give-up is
   reported and never failed, so without a cap a property can drift toward
   adjudicating nothing with every batch green; a floor on the key would bound
-  give-ups from below, which guards nothing.
+  give-ups from below, which guards nothing. An app's `sim_tests!` takes no
+  `ceiling:`. Its property `require`s instead the key its verdict marks, past
+  every give-up arm. That fails a batch in which no universe reached a
+  verdict, but not one whose rate merely drifted.
 - A cap bounds what a property fails to conclude, not how much it checks, so
   pair it with a `floor: [("key", N)]` on the key that counts its checks
   (written before `ceiling:`, on either macro). A change that skips a round's
