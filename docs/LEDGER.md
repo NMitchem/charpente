@@ -6673,13 +6673,66 @@ can apply in between. 1 of 64 fresh bases failed.
 **Follow-ups.**
 - **State a cursorless tail's start in the stream.** Additive and non-breaking (an opening SSE
   comment, say), so clients and oracles can see where "from now" fell. Not a pre-publish blocker.
-- **Reword the remedy texts subscribe-first.** The three 409s, the `charpente.gap` and
-  `charpente.reshaped` frames' `fix`, and the TS client runtime still read "re-sync current state
-  through reads, then reconnect without a cursor", the order the window test shows leaves a gap.
-  This is product and wire surface.
-- **The switchover's HandOff resend is dead for a caught-up reconnect.** `drive_switchover`
-  resends to a reconnected target only once its acked seq reaches the primary's. A target that
-  reconnects already caught up never acks again, because a write-stopped primary ships nothing.
-  Counting a Hello position the primary has verified as acked would likely turn most of those 229
-  stalls into completed switchovers. Not attempted: it is a product liveness change outside D4's
-  items.
+- **Reword the remedy texts subscribe-first.** Done in round 2 (below).
+- **The switchover's HandOff resend is dead for a caught-up reconnect.** Done in round 2 (below).
+
+## 2026-10-02 — D4 round 2: a target that reconnects caught up is handed off again, and every re-sync text gives the order that loses nothing
+
+**Why.** Both were ruled pre-publish product bugs from D4's concerns. The switchover's HandOff
+resend never fired for a target that reconnected already caught up, so a transient disconnect or
+reboot during a hand-off left no node writable until an operator acted. The remedy texts gave the
+read-first order D4's window test shows loses events. Branch `d4-fixes`; `d4-impl-report.md`,
+"Round 2".
+
+**Shipped.**
+- **The resend (repl).** A session records the position its `Hello` carried once
+  `decide_hello` verified it (a `Frames` answer). `drive_switchover` counts that position as
+  acked, for the drain's HandOff and for the HandedOff resend. The retention pin is unchanged.
+  - **Seed first.** A deterministic pin
+    (`a_switchover_target_that_restarts_before_taking_the_hand_off_is_sent_it_again`) was red on
+    the parent, a stall at seq 9, and is green with the fix.
+  - **Inversions, all red:** dropping the position from the caught-up test (the resend
+    re-killed); recording the position one too high; recording it one too low.
+  - **Over 64 fresh bases,** the switchover property's never-promoted stalls went 229 → 32, its
+    drain aborts 174 → 45, and its `CtrlOk`s 6,206 → 6,410.
+  - **Every one of the 32 remaining stalls has a traced cause:**
+    - 17 had the HandOff still in flight at the deadline. Driven 60 s on, every one became
+      primary on its own.
+    - 15 had the target's role write fail inside `accept_handoff`, and its reboot outlasted the
+      window. Of those, 1 reconnected 0.57 s before the deadline, but the primary's next step was
+      the deadline itself.
+- **The stall text stays true.** "has not taken" replaces "never took", and "confirmed it holds"
+  replaces "acked". GUIDE §10 separates the in-flight case from the down-past-the-deadline case,
+  and `a_hand_off_in_flight_at_the_deadline_can_land_after_the_stall_reply` probes the first.
+- **The remedy order.** Every site now gives the proven order: reconnect without a cursor, wait
+  for the stream to open, then re-sync through reads from the same node, applying each frame
+  idempotently. The sites:
+  - the kernel's four 409s;
+  - the `charpente.gap` and `charpente.reshaped` frames;
+  - the TS runtime's `CursorRefused`;
+  - GUIDE §11 and §14, and DESIGN §6.
+
+  The TS client gains `SubscribeOptions.onOpen`, without which "wait for the stream to open" is
+  not something a TS caller can do. Each text is pinned exactly, and each pin was shown to catch
+  the old wording at its site.
+
+**Moved.** The switchover pinned batch: `repl:logical-converged` 104 → 106, `stalled` 6 → 2, and
+one give-up (`role-file-torn`, from a universe that now completes its switchover). The GUIDE §8
+re-measure over the same 64 bases:
+
+| Measure (per base) | Before | After | Change |
+|---|---|---|---|
+| Reach mean | 96.97 | 100.16 | +2.16 Welch SE |
+| Give-ups | 2.94 | 3.05 | +0.36 SE |
+
+`SWITCHOVER_CONVERGED_FLOOR` is re-set from 88 to 90. Every other replication and realtime test's
+output is byte-identical to the round-1 tip.
+
+**Follow-ups.**
+- **The drain and the hand-off share one 30 s deadline.** A slow drain can leave a HandOff a
+  fraction of a second to be confirmed. This caused 17 of the 32 remaining stalls. All 17 resolve
+  on their own, but the CLI has already reported a stall by then. Giving HandedOff its own window
+  changes the CLI's wait, which is bounded by the same constant.
+- **A caught-up reconnect is acted on at the primary's next step,** which can be up to one
+  heartbeat later. In 1 universe in 16,384 the deadline came first. Making a due resend count as
+  `has_work` would close it.
