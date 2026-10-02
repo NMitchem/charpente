@@ -130,9 +130,11 @@ export type Result<T, E> =
  * stored event does not decode (corrupt bytes, or a change inside a type one
  * of its fields holds) or does not encode as JSON, and its detail names the
  * server-side fix (GUIDE §11). None of the three may be resumed from: subscribe
- * without a cursor, and once `onOpen` fires, re-sync through reads from the same
- * node, applying each frame idempotently (GUIDE §11: the reverse order loses
- * the events that land between the two steps).
+ * without a cursor, and once `onOpen` fires, read current state from the same
+ * node, holding every frame until that read is installed and then applying the
+ * held frames and every later one over it in order, idempotently (GUIDE §11:
+ * reading first loses the events that land between the two steps, and
+ * installing the read when it arrives overwrites the ones whose frames beat it).
  *
  * `closed` is the ordinary end of the response body.
  *
@@ -168,8 +170,10 @@ export class CursorRefused extends Error {
       "another timeline's events under ids this client has already used, which is the " +
       "misattribution the cursor's seq half exists to detect. " +
       "At a reshaped event, resuming would skip the one event the server refused to decode. " +
-      "Reconnect without a cursor, wait for the stream to open (onOpen), then re-sync " +
-      "current state through reads from the same node, applying each frame idempotently.",
+      "Reconnect without a cursor, wait for the stream to open (onOpen), then read current " +
+      "state from the same node, holding every frame that arrives until that read is " +
+      "installed and then applying the held frames and every later one over it in order, " +
+      "idempotently.",
     );
   }
 }
@@ -242,8 +246,12 @@ export interface SubscribeOptions<Ev> {
   /**
    * Called once, when the server has accepted the subscribe and before any
    * frame: the stream's start is fixed, so a read sent from here on is served
-   * after it. A re-sync reads here, from the same node, and applies each frame
-   * idempotently over what the read returned (GUIDE §11).
+   * after it. A re-sync reads here, from the same node. It is not awaited, and
+   * frames dispatch as they arrive, so a frame (even `onEnd`) can reach the
+   * caller before that read returns: hold every frame until the read is
+   * installed, then apply the held frames and every later one over it in order,
+   * idempotently. Installing the read when it arrives overwrites the changes
+   * whose frames beat it, and nothing delivers them again (GUIDE §11).
    */
   onOpen?: (() => void) | undefined;
   /**

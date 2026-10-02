@@ -453,15 +453,16 @@ fn every_early_exit_sits_inside_the_try_whose_finally_cancels_the_reader() {
 
 /// `CursorRefused` names the re-sync remedy in the order that loses no event:
 /// subscribe, wait for the stream to open (`onOpen`), then read from the same
-/// node and apply frames idempotently (GUIDE §11, realtime.rs's
-/// `the_resync_remedy_*` window tests). The read-first order it used to give
-/// misses the changes that land between the two steps.
+/// node, holding frames until the read is installed and applying them over it
+/// (GUIDE §11, realtime.rs's `the_resync_remedy_*` tests). The read-first order
+/// it used to give misses the changes that land between the two steps, and
+/// installing the read on arrival overwrites the ones whose frames beat it.
 #[test]
 fn the_cursor_refusal_gives_the_resync_order_that_loses_nothing() {
     let ts = emit_client(&fixture_contract());
     assert!(
         ts.contains(
-            "      \"Reconnect without a cursor, wait for the stream to open (onOpen), then re-sync \" +\n      \"current state through reads from the same node, applying each frame idempotently.\","
+            "      \"Reconnect without a cursor, wait for the stream to open (onOpen), then read current \" +\n      \"state from the same node, holding every frame that arrives until that read is \" +\n      \"installed and then applying the held frames and every later one over it in order, \" +\n      \"idempotently.\","
         ),
         "{ts}"
     );
@@ -469,6 +470,33 @@ fn the_cursor_refusal_gives_the_resync_order_that_loses_nothing() {
         !ts.contains("Re-sync current state through reads, then reconnect"),
         "{ts}"
     );
+    assert!(
+        !ts.contains("re-sync \" +\n      \"current state through reads from the same node"),
+        "the round-2 text gave the request order but not the apply order: {ts}"
+    );
+}
+
+/// The `onOpen` and `StreamEnd` docs give the order a re-sync APPLIES things
+/// in, not only the order it sends them (D4 round 3, review I2): `onOpen` is not
+/// awaited, so a frame can beat the read started there, and installing the read
+/// on arrival overwrites it (`client-runtime.test.ts`, realtime.rs's
+/// `the_resync_remedy_ends_at_the_nodes_state_when_frames_wait_for_the_read`).
+#[test]
+fn the_on_open_and_stream_end_docs_give_the_order_a_resync_applies_in() {
+    let ts = emit_client(&fixture_contract())
+        .replace("\n   * ", " ")
+        .replace("\n * ", " ");
+    for sentence in [
+        "It is not awaited, and frames dispatch as they arrive, so a frame (even `onEnd`) can \
+         reach the caller before that read returns: hold every frame until the read is \
+         installed, then apply the held frames and every later one over it in order, \
+         idempotently.",
+        "once `onOpen` fires, read current state from the same node, holding every frame until \
+         that read is installed and then applying the held frames and every later one over it \
+         in order, idempotently",
+    ] {
+        assert!(ts.contains(sentence), "missing {sentence:?} in {ts}");
+    }
 }
 
 /// A stream route with a path param. Its params come first and `opts` last,

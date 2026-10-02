@@ -140,8 +140,10 @@ test("a refused cursor never fires onOpen, and names the subscribe-first re-sync
   if (!(refused instanceof CursorRefused)) throw new Error("expected CursorRefused: " + String(refused));
   assert.ok(
     refused.message.endsWith(
-      "Reconnect without a cursor, wait for the stream to open (onOpen), then re-sync " +
-        "current state through reads from the same node, applying each frame idempotently.",
+      "Reconnect without a cursor, wait for the stream to open (onOpen), then read current " +
+        "state from the same node, holding every frame that arrives until that read is " +
+        "installed and then applying the held frames and every later one over it in order, " +
+        "idempotently.",
     ),
     refused.message,
   );
@@ -209,7 +211,7 @@ test("a reshaped frame ends the stream by name, and nothing after it is delivere
   const detail = {
     event: "invoice_paid",
     id: 1,
-    fix: "reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently",
+    fix: "reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently",
   };
   const { restore } = stubSseResponse([
     { event: "invoice_paid", data: invoicePaid, id: "0.1" },

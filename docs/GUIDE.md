@@ -4513,9 +4513,10 @@ apart. Resume validation at subscribe time checks, in order:
 
   ```text
   cursor 1.0 is below this node's retention floor 8 — events that old are
-  gone; reconnect without a cursor, wait for the stream to open, then re-sync
-  current state through reads from the same node, applying each frame
-  idempotently
+  gone; reconnect without a cursor, wait for the stream to open, then read
+  current state from the same node, holding every frame that arrives until
+  that read is installed and then applying the held frames and every later
+  one over it in order, idempotently
   ```
 
 - **Corrupt** — the retained row at that id exists, but its own bytes fail to
@@ -4534,8 +4535,10 @@ apart. Resume validation at subscribe time checks, in order:
   ```text
   cursor 999.1 diverged from this node's timeline (next event id is 10) —
   your history came from another primary; reconnect without a cursor, wait
-  for the stream to open, then re-sync current state through reads from the
-  same node, applying each frame idempotently
+  for the stream to open, then read current state from the same node,
+  holding every frame that arrives until that read is installed and then
+  applying the held frames and every later one over it in order,
+  idempotently
   ```
 
   or the retained row at that id carries a different seq than the client
@@ -4545,34 +4548,55 @@ apart. Resume validation at subscribe time checks, in order:
   ```text
   cursor 8.42 diverged from this node's timeline (event 8 here has seq 3,
   not 42) — your history came from another primary; reconnect without a
-  cursor, wait for the stream to open, then re-sync current state through
-  reads from the same node, applying each frame idempotently
+  cursor, wait for the stream to open, then read current state from the
+  same node, holding every frame that arrives until that read is installed
+  and then applying the held frames and every later one over it in order,
+  idempotently
   ```
 
 - **Reshaped** — the retained row at that id is an event this subscription carries,
   written under a different shape of it (see "Changing an event" below).
 
 Three of these four named errors end with the identical fix: reconnect with no
-cursor at all, wait for the stream to open, then re-sync current state through
-ordinary reads from the same node, applying each frame idempotently — a fresh
-"from now" subscribe never revalidates against history it doesn't have. The
+cursor at all, wait for the stream to open, then read current state from the
+same node with ordinary reads, holding every frame that arrives until that read
+is installed and then applying the held frames and every later one over it in
+order, idempotently — a fresh "from now" subscribe never revalidates against
+history it doesn't have. The
 corrupt-row case does not: reconnecting without a cursor does not un-corrupt
 the stored bytes, so its fix is to restore this node from its archive or
 re-seed it from its primary instead.
 
-**The order is the fix.** Subscribe first and read second, from the node that
-serves the stream. A change that lands between the stream opening and the read
-being served arrives by both routes, which is why each frame must be safe to
-apply twice. Read first and subscribe second, and a change that lands after the
-read is served and before the subscribe is served reaches the client by neither
-route: it is not in what the read returned, and the tail starts after it.
+**The order is the fix**, twice over. The first order is the requests'.
+Subscribe first and read second, from the node that serves the stream. A change
+that lands between the stream opening and the read being served arrives by both
+routes, which is why each frame must be safe to apply twice. Read first and
+subscribe second, and a change that lands after the read is served and before
+the subscribe is served reaches the client by neither route: it is not in what
+the read returned, and the tail starts after it.
+
+The second order is the one the client applies their results in. Frames keep
+arriving while the read is in flight, on another connection, so the frame of a
+change that landed after the read was served can reach the client before the
+read does. Install the read when it arrives and it overwrites that change, and
+nothing delivers it again. So hold every frame that arrives until the read is
+installed, install it, then apply the held frames and every later one over it,
+in stream order and idempotently.
+
 `realtime.rs`'s
 `the_resync_remedy_subscribe_first_then_read_misses_no_change_in_any_window`
 lands one change in each of the five windows around the two requests, on a
 follower and on a primary, and every change arrives.
 `the_resync_remedy_read_first_then_subscribe_misses_the_changes_between_its_steps`
-shows the read-first order missing exactly those two windows. The TypeScript
-client's `onOpen` (§14) is the moment to read.
+shows the read-first order missing exactly those two windows.
+`the_resync_remedy_ends_at_the_nodes_state_when_frames_wait_for_the_read`
+judges the state the client ends in, over every order the read and the frames
+can arrive in: holding the frames ends at the node's state, and
+`installing_the_read_on_arrival_or_reading_first_ends_short_of_the_nodes_state`
+shows installing the read on arrival ending without the last change. The
+TypeScript client's `onOpen` (§14) is the moment to read, and it is not
+awaited: frames, and even `onEnd`, can reach the caller before that read
+returns.
 
 ### Delivery: one bounded path, no live/catch-up modes
 
@@ -4593,7 +4617,7 @@ as a frame instead of a rejected request:
 ```text
 id: 1.0
 event: charpente.gap
-data: {"floor":4,"tail":1,"fix":"reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently"}
+data: {"floor":4,"tail":1,"fix":"reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently"}
 
 ```
 
@@ -4645,7 +4669,7 @@ or crashing decode, and its connection closes — the `charpente.gap` lifecycle.
 <!-- pinned -->
 ```text
 event: charpente.reshaped
-data: {"event":"<event>","id":<id>,"fix":"reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently"}
+data: {"event":"<event>","id":<id>,"fix":"reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently"}
 ```
 
 A client that ignores the frame — a browser's `EventSource` reconnects on its own,
@@ -4654,7 +4678,7 @@ past an event it never received:
 
 <!-- pinned -->
 ```text
-cursor <id>.<seq> sits on an "<event>" event written under a different shape of that event (recorded <recorded>; this binary <fingerprint>) — this binary will not decode it; reconnect without a cursor, wait for the stream to open, then re-sync current state through reads from the same node, applying each frame idempotently
+cursor <id>.<seq> sits on an "<event>" event written under a different shape of that event (recorded <recorded>; this binary <fingerprint>) — this binary will not decode it; reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently
 ```
 
 `<recorded>` reads `none — written before event shapes were tagged` for a row emitted
@@ -6029,10 +6053,14 @@ which carries four kinds:
   the emitting code.
 
 None of `gap`, `reshaped` or `error` may be auto-resumed from: subscribe again with no
-cursor, and once its `onOpen` fires, re-sync current state through reads from the same
-node, applying each frame idempotently (§11 says why the order matters). `onOpen` is
-optional and fires once, when the server has accepted the subscribe and before any
-frame; a refused subscribe never fires it. `onEnd` is deliberately not a
+cursor, and once its `onOpen` fires, read current state from the same node, holding
+every frame `onEvent` receives until that read is installed and then applying the held
+frames and every later one over it in order, idempotently (§11 says why both orders
+matter). `onOpen` is optional and fires once, when the server has accepted the
+subscribe and before any frame; a refused subscribe never fires it. It is not awaited,
+so a frame, and even `onEnd`, can reach the caller before a read started there returns
+(`client-runtime.test.ts`, "frames that beat the re-sync's read must be held and
+applied over it"). `onEnd` is deliberately not a
 catch-all — `CursorRefused`, `StreamRejected`, and `UndeclaredEvent` are thrown, not
 passed to it, so teardown that must run on every exit belongs in `.finally()` on the
 promise the generated subscribe method (`feed` in the fixture) returns.
