@@ -6570,3 +6570,59 @@ e8eb74e differs from ac37b18 by exactly the D1/S5 LEDGER commit (d98eda2), byte 
 - `examples/invoicing`'s binaries print a refused `--data-dir` in Rust's Debug form (their `main`
   returns `io::Result`); apps on `launch` get the named line.
 - 3a81ba7's message counts 45 filesystem calls in the power-cut sweep; at the tip it is 53.
+
+## 2026-10-01 — the replication rig answers a laggard by re-seeding it and drops no error: a correct refusal was failing universes, or passing them having checked nothing
+
+**Why.** S5's fresh-base measurement stopped on a non-injected failure in
+`wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower` ("diverged: the follower
+holds a proven record at seq 21, but this primary has GC'd every record below its retained base
+31"), which D1's clean-sync rule had re-keyed into view. Sub-project D3. Workspace as above
+(`d3-report.md` the diagnosis, `d3-impl-report.md` rounds 1–6 and the merge, `d3-review.md`).
+Branch `d3-repl-laggard`, merged at bb0eaed.
+
+**The diagnosis.** Not a product bug, and older than D1. After the rig restores primary p as the
+survivor f's follower, each crash releases p's retention pin and f garbage-collects past it; p's
+next Hello lands below f's base and gets Design B's designed "diverged behind" refusal (DESIGN §5).
+The rig had no arm for it: the universe failed when the refusal hit a request, and passed — having
+checked nothing past that point — when it hit a convergence step. Seed `0xa1d1c3332d5b0668` fails
+identically at 796bff2. About 1 in 3,700–7,400 universes; the gate's pinned base never met it.
+
+**Shipped.**
+- **A laggard refusal of p re-seeds p from f** (`repl:laggard-reseeded`), gated on
+  `f.recoveries == 0` with its implied conditions asserted. What keeps a re-seed off a fork is f's
+  handshake prefix check (Design B), not the rig's wipe: the reviewer found the wipe dropping failed
+  directory syncs and p reopening with 8 records against f's 1, and f's handshake refused it each
+  time. The wipe now retries until whole and synced, and a non-empty reopen after it fails by name.
+- **No error of either node is dropped.** Every site routes through `route_p_error`, the survivor's
+  promise scan no longer extends its promises with an empty default, and a source census
+  (`above_horizon_universe_routes_every_error_of_p`) bans the dropping idioms and matches each arm's
+  shape. It found three drops on its first runs, one of them `let _ = corrupt_last_wal_frame`, which
+  counted `above-horizon-cut` coverage for a corruption that never happened (68 false claims over 57
+  bases).
+- **A restore-needed refusal is excused only by a fault on that node's own disk**
+  (`unexplained_restore_needed`): a below-horizon refusal by `SimHost::durable_corruption_fired()`
+  or the rig's own forced CRC flip that round, an entry-loss gap by `SimHost::dir_entry_loss_fired()`
+  — both new, drawing nothing, byte-identical replay. A universe-wide checker had excused a refusal
+  of f by a bit flip on p. Otherwise the universe fails by name.
+- A sacrificial write lost to a reboot skips that round's forced cut and claims nothing; the
+  survivor-lag give-up has its own key (`:survivor-refused-behind`, 4.8% of universes, previously
+  filed as faults on the survivor).
+
+**Numbers.** 57 fresh bases (7,296 universes), c8dbfe8 → merge: failures 2 → 0, reach
+(`promised-nonempty`) +0.02 SE, swallowed or dropped errors 54 → 0. Reviewer, 256 own bases: 0
+failures (c8dbfe8 fails 2). Pinned base byte-identical apart from the key split; the other four
+replication properties unchanged.
+
+**Review.** Independent opus review: MERGE AFTER FIXES (0 C, 2 I, 5 M: the census missed five
+rewrites; the re-seed remedy was itself unrouted). Scoped re-review: MERGE (0 C, 0 I, 5 M; four
+fixed, one to S3b).
+
+**Gate.** Branch at a563e95 (main 8e1370b merged in): fmt and clippy clean, 91/91 `test result:
+ok`, 1,697 passed, 0 failed; 58 bases 0 failures. Main's tree at bb0eaed is byte-identical to that
+gated tree. The branch's first merge commit carried a doc-fix title; it was rebuilt under its true
+title (392f863) with the identical tree before landing.
+
+**Follow-ups (S3b item 8).** The per-host markers explain a refusal for a node's whole life, so a
+fault before a re-seed wipe still excuses the re-seeded node (the reviewer: 0 of 6,231 outcomes
+change if baselined at the wipe, and 325 excuses become checks); `recover_kernel_node`'s gap gate,
+shared with the other replication properties, is still universe-wide.
