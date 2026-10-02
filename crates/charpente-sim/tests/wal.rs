@@ -210,13 +210,11 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
 ///
 /// The fault matrix's base is ambient. Over 10 fresh bases (0xF3A70001..0A,
 /// 512 each) it gave up 0 times and checked a prefix 496-508 times (mean
-/// 501.3, sample sd 3.3), so its floor is the mean less 4 sd. Twice the
-/// largest give-up count is 0, a cap that one legitimately exhausted universe
-/// would fail, so its cap takes GUIDE §8's zero-give-up rule instead: 3/N
-/// bounds the per-universe rate (95%, N = 5,120 universes seen with none), so
-/// a batch of n = 512 expects at most lambda = 512 x 3 / 5,120 = 0.3, and the
-/// cap is the smallest k with P(Poisson(0.3) > k) < 1e-4. P(> 3) is 2.7e-4 and
-/// P(> 4) is 1.6e-5, so k = 4.
+/// 501.3, sample sd 3.3), so its floor is the mean less 4 sd. Its cap follows
+/// GUIDE §8's ambient rule, the larger of twice the largest count (0) and the
+/// Poisson cap. With x = 0 give-ups over N = 5,120 universes, U(0) = 2.996, so
+/// a batch of n = 512 has lambda = 512 x 2.996 / 5,120 = 0.30. P(> 3) is
+/// 2.6e-4 and P(> 4) is 1.6e-5, so k = 4.
 const FAULT_MATRIX_GAVE_UP_CEILING: u64 = 4;
 const FAULT_MATRIX_PREFIX_FLOOR: u64 = 488;
 const DIR_ENTRY_GAVE_UP_CEILING: u64 = 0;

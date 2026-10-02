@@ -3256,27 +3256,35 @@ That is also why every capped property floors its reach key: without one, the
 next change that costs it reach passes with every cap still met.
 
 At a pinned base both bounds are exact counts. At an ambient base, where the
-counts move batch to batch, both are margins over ten or more fresh batches: a
-give-up cap is twice the largest count, and a reach floor is the mean less
-four standard deviations, which flakes about once in thirty thousand batches if
-the counts are near normal, and fails any batch that falls further.
+counts move batch to batch, both are margins over ten or more fresh batches.
 
-Twice the largest count fails when no fresh batch gave up at all. The cap it
-gives is 0, and one legitimately exhausted universe would fail it. In that
-case only:
-- take the rule of three: with N universes observed and none giving up, 3/N
-  bounds the per-universe give-up rate at 95%;
-- a batch of n universes then expects at most lambda = n x 3 / N give-ups;
-- the cap is the smallest k with P(Poisson(lambda) > k) < 1e-4.
+An ambient give-up cap is the larger of two numbers:
+- twice the largest fresh-batch count;
+- the smallest k with P(Poisson(lambda) > k) < 1e-4, where
+  lambda = n x U(x) / N. Here n is the universes in one batch, N the universes
+  over all the fresh batches, and x the give-ups among them. U(x) is the exact
+  one-sided 95% Poisson upper bound for x: 2.996 for x = 0, 4.744 for 1, and
+  6.296 for 2.
 
-For example, the WAL fault matrix gave up in none of its 10 fresh batches of
-512, so N = 5,120, n = 512 and lambda = 512 x 3 / 5,120 = 0.3. P(> 3) is
-2.7e-4 and P(> 4) is 1.6e-5, so its cap is 4. Twice the largest count stands
-whenever any fresh batch gave up.
+The second number matters where give-ups are rare. When no batch gave up,
+twice the largest count is 0, which one legitimately exhausted universe fails.
+When one batch gave up once, it is 2, which a healthy batch fails about once
+in eighty. Where counts are large the first number is the larger, and the
+second only confirms it.
 
-So an ambient floor catches a collapse, not a drift. Kernel exactly-once's
-`job:done` spreads by about 4% of its mean (sd 19.1 on 485.2), so its floor
-sits about 16% below the mean. A fall half that size trips about one batch in
+Two worked examples for the WAL fault matrix, whose 10 fresh batches of
+n = 512 make N = 5,120:
+- **x = 0**, as measured. lambda = 512 x 2.996 / 5,120 = 0.30. P(> 3) is
+  2.6e-4 and P(> 4) is 1.6e-5, so k = 4, and the cap is max(0, 4) = 4.
+- **x = 1**, as ten bases including 0x9E7C000A would have read: one batch gave
+  up once. lambda = 512 x 4.744 / 5,120 = 0.47. P(> 4) is 1.4e-4 and P(> 5) is
+  1.1e-5, so k = 5, and the cap is max(2, 5) = 5, not 2.
+
+An ambient reach floor is the mean less four standard deviations. That flakes
+about once in thirty thousand batches if the counts are near normal, and fails
+any batch that falls further. So an ambient floor catches a collapse, not a
+drift. Kernel exactly-once's `job:done` spreads by about 4% of its mean (sd
+19.1 on 485.2), so its floor sits about 16% below the mean. A fall half that size trips about one batch in
 forty, which a change can pass by luck. The before-and-after comparison above
 is the instrument that sees a move that small, so it runs whenever a change
 could move an ambient floor's rate, as it does for a cap, and not only when a

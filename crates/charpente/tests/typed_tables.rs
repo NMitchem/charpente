@@ -744,7 +744,9 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
 /// review I1): it was 74 while round 0's check of an empty model, which
 /// cannot fail, still counted as a verdict. Re-measured 2026-10-01 for S5 with
 /// D1: 10 fresh batches gave up 28-50 times, mean 39.2, sd 6.9, so the cap is
-/// 100, 8.8 standard deviations above the mean.
+/// 100, 8.8 standard deviations above the mean. GUIDE §8's Poisson cap on
+/// those batches (x = 392 over N = 2,560, n = 256, lambda = 42.6) is 69, under
+/// 100 (2026-10-02).
 const TABLES_GAVE_UP_CEILING: u64 = 100;
 
 /// The reach floor, a margin like the cap (GUIDE §8): recoveries that checked

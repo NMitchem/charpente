@@ -2760,7 +2760,9 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
 /// S5's parent on the same bases `job:done` rose 358.3 -> 485.2 (+15.7 SE) and
 /// passes that covered no `job:done` fell 50.5 -> 22.5 per batch. The new
 /// give-ups are universes whose store, once it held jobs, never booted again
-/// under their fault rate, which used to pass having checked nothing.
+/// under their fault rate, which used to pass having checked nothing. GUIDE
+/// §8's Poisson cap on those batches (x = 226 over N = 2,560, n = 256,
+/// lambda = 25.2) is 46, under 62 (2026-10-02).
 const KERNEL_GAVE_UP_CEILING: u64 = 62;
 
 /// The reach floor, a margin like the cap (GUIDE §8): with the round boots

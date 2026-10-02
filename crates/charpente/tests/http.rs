@@ -1461,6 +1461,8 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
 /// the round boots aimed and 64 final attempts (S5 review I1): 10 fresh
 /// batches gave up 6-14 times, mean 10.0, sd 2.8, so the cap is 28, 6.5
 /// standard deviations above the mean (16.0 at S5's parent, same bases).
+/// GUIDE §8's Poisson cap on those batches (x = 100 over N = 2,560, n = 256,
+/// lambda = 11.8) is 27, under 28 (2026-10-02).
 const HTTP_GAVE_UP_CEILING: u64 = 28;
 
 /// The reach floor: rounds whose recovered state was checked against every
