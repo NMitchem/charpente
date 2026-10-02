@@ -183,7 +183,7 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    /// Wire form "<id>.<seq>". `None` for an unparseable string — the caller
+    /// Wire form `"<id>.<seq>"`. `None` for an unparseable string — the caller
     /// maps that to the 400 below, never a silent from-now.
     pub fn parse(s: &str) -> Option<Cursor> {
         let (id, seq) = s.split_once('.')?;

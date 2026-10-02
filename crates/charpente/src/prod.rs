@@ -577,7 +577,7 @@ impl File for ProdFile {
 // ---------------------------------------------------------------- Net
 
 /// TCP with the trait's message framing: every message travels as
-/// [len: u32 le][bytes]. Sockets are non-blocking to match the poll-shaped
+/// `[len: u32 le][bytes]`. Sockets are non-blocking to match the poll-shaped
 /// trait; send spins briefly on a full kernel buffer.
 pub struct ProdNet;
 
