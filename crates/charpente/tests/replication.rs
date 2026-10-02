@@ -6859,9 +6859,10 @@ fn restored_laggard(sim: &Sim) -> (KNode, KNode, u64) {
 /// retained window is refused as diverged behind (Design B, DESIGN §5). That
 /// is the designed answer, and the refusal names the remedy for a true
 /// laggard: re-seed it from a fresh data dir. `route_p_error` answers it with
-/// exactly that re-seed instead of failing the universe. Its records are a
-/// prefix of `f`'s by construction: it was wiped and seeded from `f`, and `f`
-/// never recovered, so `f`'s log never cut.
+/// exactly that re-seed (the rig's own action) instead of failing the
+/// universe. Its records are a prefix of `f`'s. The proof is `f`'s handshake,
+/// not the wipe: the rebuild converged only once `f` accepted its `Hello`
+/// (Design B's prefix check), and `f` never recovered, so `f`'s log never cut.
 #[test]
 fn a_restored_follower_refused_as_a_laggard_is_reseeded_not_failed() {
     let sim = Sim::with_faults(LAGGARD_RESEED_SEED, FaultConfig::none());
