@@ -89,7 +89,7 @@
   - `echo ====` is a zsh error; use `echo '----'`.
   - `timeout` does not exist on this machine; bound a run with perl `alarm` if needed.
 - **Error text is product surface (hard rule 5).** Every message below is fixed wording, pinned byte-exact by a test that spells it out independently of the product's `format!`. Do not "improve" a message without changing its pin and its GUIDE quote in the same commit.
-  - **Operator texts keep main's forms (S5, S3b, D4).** A text that tells a client to re-sync gives D4's order, copied from main's kernel 409s (`validate_subscribe`, `kernel/mod.rs:966-1066` at `57e5df5`), never paraphrased: "reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently". A text that prescribes clearing a data directory goes through `repl::role::reseed_steps` (`repl/role.rs:114`), which names "restart it configured as a follower of …". This plan adds one re-sync text (A16's 409); it adds no re-seed text.
+  - **Operator texts keep main's forms (S5, S3b, D4).** A text that tells a client to re-sync gives D4's order, copied from main's kernel 409s (`validate_subscribe`, `kernel/mod.rs:966-1066` at `57e5df5`), never paraphrased: "reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently". A text that prescribes clearing a data directory, or restoring a node from a replica or backup, carries the follower-config step: through `repl::role::reseed_steps` (`repl/role.rs:114`, "restart it configured as a follower of …") in the replication layer, or `RESTORE_IS_A_RESEED` (`db.rs:191`) in core. This plan adds one re-sync text (A16's 409); it adds no re-seed or restore text.
 - **Docs in the same commit as the behaviour (hard rule 6).**
   - `docs/GUIDE.md`'s ```rust blocks are compiled by `crates/guide-examples/build.rs`, **each block as its own module**, so every block must carry its own `use`s and types. Check them alone with `cargo build -p guide-examples`.
   - A ` ```text` block preceded by `<!-- pinned -->` is checked by `crates/guide-examples/tests/doc_truth.rs`. **Every non-blank pinned line's fragments must appear in some `.rs` under `crates/` or `examples/`.** A fragment is the text between `<lowercase placeholder>`s, trimmed, 16 or more characters. The check applies Rust's literal rules: a `\` + newline continuation vanishes, `\"` becomes `"`, and `\n` becomes a newline.
@@ -2899,9 +2899,9 @@ git commit -m "feat(tenancy): an app refuses two tenant types under one NAME, or
 **Files:**
 - Modify `crates/charpente-core/src/db.rs`:
   - add `pub const fn scoped_fingerprint` after `trait Tenant`, and its unit test in `mod tests`;
-  - `pending_job_shape_refusal`'s foreign line (~3118–3124);
-  - `Group::stage`'s scope-type cause (the refusal Task 2 wrote) and the comment above its loop;
-  - `Job::FINGERPRINT`'s doc (~99–108).
+  - `pending_job_shape_refusal`'s foreign line (~3366–3372; its mistenanted line below, which S3b gave `RESTORE_IS_A_RESEED`, is not touched);
+  - `Group::stage`'s scope-type cause (the refusal Task 2 wrote) and the comment above its enqueue loop;
+  - `Job::FINGERPRINT`'s doc (~100–109).
 - Modify `crates/charpente-macros/src/job.rs`: the `FINGERPRINT` emission (~298–302) and the module doc (~7–9).
 - Modify `crates/charpente-macros/src/fingerprint.rs`: delete `compute_job` (~42–67), and delete its test `a_scoped_jobs_fingerprint_mixes_its_scope_and_a_global_ones_does_not` (~163–180, with its doc comment).
 - Modify docs only:
@@ -2916,10 +2916,10 @@ git commit -m "feat(tenancy): an app refuses two tenant types under one NAME, or
   - `crates/charpente/tests/replication.rs`: `ping_refusal`.
 - Docs:
   - `docs/GUIDE.md`:
-    - §6: the foreign-shape pinned block (~1709), the tenancy-shape paragraph (~1711–1717), the "Presence is not the whole" paragraph (~1768–1778), the scope-type pinned block's cause, and the residual (~1786–1802);
-    - §12 (~4361–4363);
+    - §6: the foreign-shape pinned block (~1761), the tenancy-shape paragraph (~1763–1769), the "Presence is not the whole" paragraph (~1820–1830), the scope-type pinned block's cause, and the residual (~1838–1854);
+    - §12 (~4855–4857);
     - §16: Task 2's NAME bullet;
-  - `DESIGN.md`: §3's Jobs bullet (~628–641) and §6's Queue bullet (~1271–1274).
+  - `DESIGN.md`: §3's Jobs bullet (~808–821) and §6's Queue bullet (~1638–1641).
 
 **Interfaces:**
 - Consumes, from Task 2:
@@ -2930,7 +2930,7 @@ git commit -m "feat(tenancy): an app refuses two tenant types under one NAME, or
   - `pub const fn charpente_core::db::scoped_fingerprint(fold: u64, tenant: &str) -> u64`. Task 11 emits a scoped event's `FINGERPRINT` through it, with the tenant's name from `tenant_name` (A7);
   - the foreign-shape refusal's restore clause, which now names the tenant type's `NAME`;
   - the scope-type refusal's `#[job]` cause, which now names another tenant type with the same `NAME`.
-- Byte identity. Every in-tree `scoped_by` path on a `#[job]` is one identifier: `Desk`, `Org` or `Shop` (census by grep at e749823; the compile-fail fixtures add `Team`). Every in-tree NAME is its identifier (A4). So no pre-existing job's fingerprint changes, Step 1 pins that through the macro, and every Task 1 baseline must reproduce. Three fingerprints move by design:
+- Byte identity. Every in-tree `scoped_by` path on a `#[job]` is one identifier: `Desk`, `Org` or `Shop` (census by grep at e749823, identical at 57e5df5; the compile-fail fixtures add `Team`). Every in-tree NAME is its identifier (A4). So no pre-existing job's fingerprint changes, Step 1 pins that through the macro, and every Task 1 baseline must reproduce. Three fingerprints move by design:
   - `spelled_alike::File`, 0xaac8_d6b2_01d1_f744 → 0x29b7_f8fb_f0ec_8fa5, because its tenant type's NAME is `Board`;
   - Task 2's `Invoice`, whose path is `billing::Org`;
   - `describe.rs`'s `Audit`, whose path is `renamed::Org`.
@@ -3475,7 +3475,7 @@ Expected: all green. In the scratch copy, `kernel` was 79/79 and `replication`'s
 
 In `crates/charpente-core/src/db.rs`:
 - `Job::FINGERPRINT`'s doc: after "computes it from the fields (the helper `#[table]` uses).", add "A `#[job(scoped_by = Org)]` job's continues that fold over `Org`'s `Tenant::NAME` (`scoped_fingerprint`), so its tenant's identity is part of its shape."
-- The comment above `Group::stage`'s loop: replace "or a `#[job]` whose `scoped_by`\n        // path spells another type alike, which the fingerprint cannot tell\n        // apart)" with "or a `#[job]` whose `scoped_by`\n        // names another tenant type with the same `NAME`, which the\n        // fingerprint cannot tell apart)".
+- The comment above `Group::stage`'s enqueue loop: replace "or a `#[job]` whose `scoped_by`\n        // path spells another type alike, which the fingerprint cannot tell\n        // apart)" with "or a `#[job]` whose `scoped_by`\n        // names another tenant type with the same `NAME`, which the\n        // fingerprint cannot tell apart)".
 
 In `crates/charpente/src/kernel/dispatch.rs`, `JobDef.scope_type`'s doc: replace "or a `#[job]` whose `scoped_by` path spells another type the same way, enqueued in that type's tenant (job-tenancy final review N1)." with "or a `#[job]` whose `scoped_by` names another tenant type with the same `NAME`, enqueued in that type's tenant (job-tenancy final review N1; tenancy-completion spec §4)."
 
@@ -3533,11 +3533,12 @@ cargo test -p guide-examples --test doc_truth --test describe_contract
 ```
 
 Expected:
-- The `grep` prints exactly 4 lines, down from 20 before this step (both counts measured in the scratch copy). The 4 are:
+- The `grep` prints exactly 7 lines, down from 23 before this step (4 and 20 in the scratch copy at e749823; S2 added the other three). The 7 are:
   - `tenant.rs`'s `TenantScope` doc (Task 2's `tenant_name` sentence, beside "spelled out");
   - GUIDE §6's and §12's new sentences;
-  - DESIGN §6's new sentence.
-- Every line the step removed claimed that a fingerprint follows a `scoped_by` path's spelling. A fifth line is a claim this task made false: rewrite it to the `NAME`.
+  - DESIGN §6's new sentence;
+  - S2's three, which stay as written: DESIGN.md §4's "`FINGERPRINT` too: a fingerprint folds field names and type spellings, not `scoped_by` and not …" (~1180) and `TableWriteRefusal`'s doc in db.rs (~300–301). They describe a `#[table]` fingerprint, which this plan does not change, and they are why `Group::stage` compares a writer's `TypeId` (LEDGER 2026-10-01, S2).
+- Every line the step removed claimed that a job's fingerprint follows a `scoped_by` path's spelling. An eighth line is a claim this task made false: rewrite it to the `NAME`.
 - Both test binaries are green. The two changed pinned blocks' fragments are substrings of Step 5's product strings, and `PINNED_FLOOR` does not change.
 
 - [ ] **Step 7: Run the task's tests, and measure byte identity**
@@ -3565,7 +3566,7 @@ zsh $D/baselines.sh task4 invoicing; print -r -- "exit ${?}"
 
 Each label must print `reproduces the base`, and each call `exit 0`.
 
-Expected: every baseline `identical`, and no `DIFFERS`. The one this task could move is `kernel.rs`'s `job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from` swarm, whose `Shop`-scoped jobs record their fingerprint in every enqueue. `Shop`'s NAME is `"Shop"`, so its bytes are unchanged, and Step 1 is the same claim for `Desk`. A `DIFFERS` is a finding: stop.
+Expected: no `MOVED` line. The one this task could move is `kernel.rs`'s `job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from` swarm, whose `Shop`-scoped jobs record their fingerprint in every enqueue. `Shop`'s NAME is `"Shop"`, so its bytes are unchanged, and Step 1 is the same claim for `Desk`. A `MOVED` is a finding: stop.
 
 - [ ] **Step 8: Gate and commit**
 
@@ -3609,11 +3610,11 @@ git commit -m "feat(tenancy): a scoped job's fingerprint continues its field fol
 
 **Files:**
 - Modify `crates/charpente/src/kernel/dispatch.rs`:
-  - the `charpente_core::db` import (`:9-11`);
-  - `JobDef.scoped_by`'s doc (`:73-81`, last sentence only; Task 2 rewrote its first);
-  - `JobScope`'s doc, struct and `open` (`:110-131`);
-  - the scope-presence comment in `run_due_into` (`:301-313`);
-  - the `JobScope` literal (`:326-329`).
+  - the `charpente_core::db` import (`:9-12`);
+  - `JobDef.scoped_by`'s doc (`:75-83`, last sentence only; Task 2 rewrote its first);
+  - `JobScope`'s doc, struct and `open` (`:112-133`);
+  - the scope-presence comment in `run_due_into` (`:303-315`);
+  - the `JobScope` literal (`:328-331`).
 - Modify `crates/charpente/src/tenant.rs`: one clause in the module doc.
 - Test: `crates/charpente/tests/kernel.rs`, `mod scoped_jobs`. After
   `a_job_name_registered_under_two_declarations_panics_naming_both`, add:
@@ -3645,8 +3646,8 @@ git commit -m "feat(tenancy): a scoped job's fingerprint continues its field fol
     ```
 
     `{declared}` is `scoped_by = <scope_name>`, or `global` for `None`, in the idiom the
-    presence assert at `dispatch.rs:323-324` already uses. The assert runs inside the glue's
-    `catch_unwind` (`dispatch.rs:330-341`). So a failure is an attempt whose `last_error` is
+    presence assert at `dispatch.rs:325-326` already uses. The assert runs inside the glue's
+    `catch_unwind` (`dispatch.rs:332-343`). So a failure is an attempt whose `last_error` is
     `handler panicked: ` followed by that text. It retries and dead-letters, and never stops
     the kernel.
 
@@ -3850,7 +3851,7 @@ add:
 Notes for the implementer:
 - `n` is odd in both runtime tests on purpose. An even `File` enqueues a `Stamp` and a `Tally`
   from its `run`, and `hand_built_app` mounts neither.
-- `BoardFile` (`kernel.rs:808-827`) copies `<File as Job>::FINGERPRINT`, so it survives Task 4's
+- `BoardFile` (`kernel.rs:893-912`) copies `<File as Job>::FINGERPRINT`, so it survives Task 4's
   fingerprint change unmodified.
 - `Board` is `#[table(scoped_by = Board)]`-capable because its `impl Tenant` has
   `Who = Principal, Error = ApiError`.
@@ -3881,11 +3882,12 @@ Expected (quote each in the task report):
 
 In `crates/charpente/src/kernel/dispatch.rs`:
 
-Add `Tenant` to the core import:
+Add `Tenant` to the core import. S2 added `TableWriteRefusal` to it for the dispatcher's `Io` assert (`dispatch.rs:362-368`: `Group::stage`'s two refusals, `JobShapeRefusal` and `TableWriteRefusal`, are each an attempt); it stays. At rustfmt's default width the import becomes:
 
 ```rust
 use charpente_core::db::{
-    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, Tenant, TenantAdmission, Tx, TxError,
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableWriteRefusal, Tenant, TenantAdmission,
+    Tx, TxError,
 };
 ```
 
@@ -4106,8 +4108,8 @@ contains `` (`JobDef.scope_type`, a `TypeId`) ``). Directly after that sentence,
 > A hand-built `JobDef` (its fields are public) can still pair a glue with a `scope_type` that glue does not open; `JobScope::open` asserts the type the glue opens is `JobDef.scope_type`, inside the glue's `catch_unwind`, so that job's every attempt fails by name and it dead-letters with nothing written (spec 2026-09-30-tenancy-completion §7).
 
 **`crates/guide-examples/tests/doc_truth.rs`.** Raise `PINNED_FLOOR` by exactly one from its
-value at the commit this task starts from (28 at `e749823`; Tasks 1-4 may have raised it —
-read it, add one). §6 gained one pinned block.
+value at the commit this task starts from (29 at `57e5df5`, 28 at `e749823`; Task 3 raises it
+to 30, so this makes it 31 — read it, add one). §6 gained one pinned block.
 
 ```zsh
 cargo build -p guide-examples
@@ -4159,8 +4161,8 @@ git commit -m "fix(tenancy): JobScope::open asserts the scope type it opens — 
 
 **Files:**
 - Modify `crates/charpente/src/http/app.rs`: `Ctx::anonymous_scope`, meaning its doc and its
-  non-`auth` `format!` (`:133-174` at `e749823`, re-located after Task 2 by the fragment
-  `if every caller may act inside this tenant`).
+  non-`auth` `format!` (`:133-174` at `e749823`, `:134-175` at `57e5df5`, re-located after Task 2
+  by the fragment `if every caller may act inside this tenant`).
 - Modify `crates/charpente-macros/src/route.rs`: `undeclared_capability` and its doc
   (`:194-220`, re-located by name). Whatever Task 2 left in its `stance` computation goes
   with it.
@@ -4181,7 +4183,7 @@ git commit -m "fix(tenancy): JobScope::open asserts the scope type it opens — 
       `statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_write`;
     - (g)'s doc;
     - a new route `write_memo_cross`, mounted in `memo_app`, and a new test.
-  - `crates/charpente/tests/kernel.rs`: `job_tenancy::PEEK_REFUSED` (`:4792-4800`).
+  - `crates/charpente/tests/kernel.rs`: `job_tenancy::PEEK_REFUSED` (`:5573-5581`).
   - `crates/charpente-macros/tests/compile_fail/`:
     - create `route_emits_undeclared_capability.rs` and its `.stderr`;
     - re-pin `across_tenants_without_capability.stderr`, `enqueue_in_without_capability.stderr`
@@ -4444,8 +4446,8 @@ fn main() {}
 ```
 
 **The class (A11): one fixture per refusal whose author's attribute carries the argument a
-restated fix would drop.** Three already exist at `e749823`, and each one's re-pin in Step 4
-is the evidence:
+restated fix would drop.** Three already exist at `e749823` and at `57e5df5`, and each one's
+re-pin in Step 4 is the evidence:
 - `job_bare.rs`: `RetryOnly` is `#[job(retry(max = 3, backoff = "10s"))]` and
   `CapabilityOnly` is `#[job(cross_tenant)]`.
 - `helpdesk_table_no_tenancy.rs`: `#[table(version = 2)]`.
