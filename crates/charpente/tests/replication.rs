@@ -5077,12 +5077,18 @@ struct KNode {
     /// recovered — a fault on it makes the universe inconclusive, because the
     /// single-follower promise needs one clean copy.
     recoverable: bool,
-    /// The rig itself corrupted this node's WAL at least once
-    /// (`corrupt_last_wal_frame`, the sanctioned `bit_flip` stand-in), or
-    /// tried to: a failed attempt's write can still land at the crash. That
-    /// is a fault injected on this node's disk like any other, so it explains
-    /// a below-horizon refusal of it (`unexplained_restore_needed`, D3 round
-    /// 5). The sim's own markers cannot see it.
+    /// The rig's forced CRC flip (`corrupt_last_wal_frame`, the sanctioned
+    /// `bit_flip` stand-in) ran on this node's WAL in the current round. It
+    /// is part of the property's fault model, a fault injected on this node's
+    /// disk like any other, so it explains a below-horizon refusal of it
+    /// (`unexplained_restore_needed`). The sim's own markers cannot see it.
+    /// - **Recorded on the attempt.** A failure at the helper's `sync` leaves
+    ///   its write pending, and the round's crash can still land it. A failure
+    ///   before the write cannot land, and recording it then changed no
+    ///   outcome in the D3 re-review's measurement.
+    /// - **Cleared at the top of every round and after a re-seed's wipe.** The
+    ///   round's crash settles the write, and the wipe deletes it (D3 re-review
+    ///   m6).
     corrupted_by_rig: bool,
 }
 
@@ -5980,6 +5986,8 @@ fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
         }
     };
     wiped?;
+    // The wipe deleted every byte the rig ever corrupted.
+    p.corrupted_by_rig = false;
     p.repl_cfg = follower_cfg("p:1", "f:1");
     p.flipped = true;
     p.recoveries += 1;
@@ -6185,12 +6193,12 @@ fn route_promise_scan(
 /// 5; the rule of S5 R-M3 and S3b item 0). `recover_kernel_node` raises the
 /// refusal in two forms, and each has exactly one explanation:
 /// - **"corrupted below the horizon"** is explained by durable corruption on
-///   that node: a `bit_flip` or `misdirected_write`
-///   (`SimHost::durable_corruption_fired`), or the rig's own
-///   `corrupt_last_wal_frame` (`KNode::corrupted_by_rig`). The rig's
-///   corruption was the explanation the first cut of this rule missed. At
-///   the pinned base, seed `0x78f5713c6b6cd7cd` corrupted the sacrificial
-///   frame after the checkpoint had covered it, and the universe failed.
+///   that node, from any of the three byte-level faults in the property's
+///   fault model: a `bit_flip` or `misdirected_write`
+///   (`SimHost::durable_corruption_fired`), or the rig's forced CRC flip this
+///   round (`KNode::corrupted_by_rig`). Seed `0x78f5713c6b6cd7cd` pins a
+///   refusal that only the rig's flip explains: it landed on a sacrificial
+///   frame the checkpoint had already covered.
 /// - **"log directory gapped by entry loss"** is explained by entry loss on
 ///   that node: `SimHost::dir_entry_loss_fired`.
 ///
@@ -6254,8 +6262,9 @@ fn unexplained_restore_needed(node: &KNode, e: &str) -> Option<String> {
 /// - `p` is only ever a follower after `restore_p_from_survivor` re-seeded it
 ///   from `f`. That re-seed converged only once `f` accepted `p`'s `Hello`:
 ///   Design B's prefix check at `p`'s position, or a snapshot seed of an empty
-///   `p`. A `p` the wipe failed to empty is refused there, and the re-seed
-///   gives up (`route_reseed_convergence`); this arm never sees it.
+///   `p`. The wipe before it retries until it is whole and synced, and a `p`
+///   that still reopens non-empty fails by name at `reseed_p`'s freshness
+///   check, before that handshake runs. This arm never sees it.
 /// - Since then `p` has appended nothing but frames `f` shipped. A shipped
 ///   gap re-`Hello`s, which is checked again, and a follower's own recovery
 ///   cut only shortens its prefix.
@@ -6318,6 +6327,18 @@ fn is_diverged_behind(e: &str) -> bool {
 /// The above-horizon promise with a follower (spec §4 property 8): media
 /// corruption on the primary never loses an acked record its follower had
 /// converged on. The universe is `above_horizon_universe`.
+///
+/// **Its fault model on the nodes' disks**, besides the swarm's transient IO
+/// faults and crashes, is three kinds of durable damage:
+/// - the swarm's `bit_flip`, overridden to 0.02;
+/// - the swarm's `misdirected_write`, overridden to 0.005;
+/// - the rig's own forced CRC flip of `p`'s sacrificial frame each round
+///   (`corrupt_last_wal_frame`, recorded on `p` as `corrupted_by_rig`).
+///
+/// When it is enabled, the swarm's `dir_entry_loss` is a fourth, damaging
+/// directory entries rather than bytes. `unexplained_restore_needed` checks
+/// every restore-needed refusal against this model, on the refused node's own
+/// disk. A refusal the model does not explain fails by name.
 ///
 /// **How the rig answers a laggard (sub-project D3).**
 /// - **How the refusal arises.** After a restore, `p` is `f`'s follower, and
@@ -6470,6 +6491,10 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     let mut promised: std::collections::BTreeSet<u64> = Default::default();
 
     for round in 0..8u64 {
+        // The rig's corruption explains a refusal of p only in the round it
+        // was made: the round's crash settles its write, and a later round
+        // starts from what recovery made of it.
+        p.corrupted_by_rig = false;
         for k in 0..3u64 {
             let id = round * 3 + k;
             match drive_request(
@@ -7096,12 +7121,12 @@ fn fault_a_bystander(sim: &Sim) {
 }
 
 /// D3 round 5, seed `0x78f5713c6b6cd7cd`, a universe of the pinned base. The
-/// rig's own forced corruption (`corrupt_last_wal_frame`) lands on a
-/// sacrificial frame the checkpoint has already covered, so recovery refuses
-/// `p` below the horizon. No sim fault fires anywhere in this universe, so
-/// that corruption is the only explanation. It is one, and `p` is restored.
-/// The first cut of round 5's per-node rule did not count it, and failed this
-/// universe.
+/// rig's forced CRC flip (`corrupt_last_wal_frame`), one of the property's
+/// three byte-level faults, lands on a sacrificial frame the checkpoint has
+/// already covered, so recovery refuses `p` below the horizon (frame 15 at
+/// horizon 15). No sim fault fires anywhere in this universe, so the rig's
+/// flip is the only explanation in the fault model. It is one, and `p` is
+/// restored.
 #[test]
 fn a_below_horizon_refusal_the_rigs_own_corruption_explains_is_restored() {
     let (sim, r) = replay_above_horizon(0x78f5_713c_6b6c_d7cd);
@@ -7430,15 +7455,20 @@ fn route_p_error_returns_an_unrecognised_error_unchanged() {
 ///   - `spawn_kernel_node`, `assert_survivor_holds` and `bump_exactly_once`
 ///     appear only as `…)?;` statements;
 ///   - one result is consumed on purpose: the corruption helper's `.is_ok()`
-///     (a failed corruption forces no cut).
+///     (a failed corruption forces no cut);
+///   - `corrupted_by_rig` is cleared at the top of every round and set only
+///     right before the rig's corruption.
 /// - **In `sacrificial_cut`:**
 ///   - its error and its silence without a reboot are both routed, and its
 ///     only `Err` pattern is the routed arm;
+///   - each of its four match arms is matched whole, so an arm cannot route
+///     only some of its errors (D3 re-review m9);
 ///   - the one unrouted outcome, the skip, is gated on `p` having rebooted.
 /// - **In `reseed_p` and `wipe_data_dir`:**
 ///   - every wipe step is `?`-propagated into a wipe loop whose only `Ok` is
 ///     a whole, synced wipe;
 ///   - a non-empty reopen is checked, and fails by name rather than giving up;
+///   - the wipe clears `corrupted_by_rig`;
 ///   - the convergence is bound and handed whole to `route_reseed_convergence`.
 ///
 /// `route_p_error` itself is not read here.
@@ -7615,6 +7645,41 @@ fn above_horizon_universe_routes_every_error_of_p() {
             sacrificial.matches("Err(").count(),
             sacrificial.matches("Err(e) => {").count() + sacrificial.matches("route_p_error(").count(),
             3,
+        ),
+        (
+            "each of sacrificial_cut's match arms is whole, so none can route only some errors",
+            sacrificial.matches(" => ").count(),
+            [
+                "Ok(Some((status, _))) => Ok(status == 200),",
+                "Ok(None) if p.recoveries != recoveries => {\n\
+                 sim.cover(\"repl:sacrificial-lost-to-reboot\");\nOk(false)\n}",
+                "Ok(None) => {\nsim.cover(\"repl:inconclusive:request-no-response\");\n\
+                 let silent = format!(\n\"{INCONCLUSIVE}: the sacrificial write to p went \
+                 unanswered without p rebooting\"\n);\n\
+                 route_p_error(sim, p, f, Err(silent))?;\nOk(false)\n}",
+                "Err(e) => {\nroute_p_error(sim, p, f, Err(e))?;\nOk(false)\n}",
+            ]
+            .iter()
+            .map(|arm| sacrificial.matches(arm).count())
+            .sum(),
+            4,
+        ),
+        (
+            "the rig's corruption explains a refusal only in its own round",
+            universe.matches("corrupted_by_rig").count(),
+            universe
+                .matches("for round in 0..8u64 {\np.corrupted_by_rig = false;")
+                .count()
+                + universe.matches("p.corrupted_by_rig |= forced_cut;").count(),
+            2,
+        ),
+        (
+            "the re-seed's wipe clears the rig's corruption it deleted",
+            reseed.matches("corrupted_by_rig").count(),
+            reseed
+                .matches("\nwiped?;\np.corrupted_by_rig = false;")
+                .count(),
+            1,
         ),
         (
             "sacrificial_cut's skip is gated on p having rebooted",

@@ -1247,12 +1247,13 @@ only where the follower is provably a prefix of the primary. That proof is this 
 not the rig's wipe. The rebuild converged only once the primary accepted the follower's
 `Hello` (the prefix check at its position, or a snapshot seed of an empty follower). Since
 then the follower has appended only shipped frames, and the primary never recovered, so it
-never cut its log. A follower the wipe failed to empty would be refused by that check; the
-property gives such a re-seed up by name before it gets there. A refusal inside a re-seed's
-own convergence gives up as `repl:inconclusive:reseed-refused-behind`. Once the primary has
-recovered, a diverged-behind refusal stays a failure. For the designated survivor it is a
-give-up of its own, `repl:inconclusive:survivor-refused-behind`, because re-seeding the
-survivor would void the promise it underwrites. A restore-needed refusal of either node is
+never cut its log. The re-seed's wipe retries until it is whole and synced, and a follower
+that still reopens non-empty fails by name at the property's freshness check, before that
+handshake runs. A refusal inside a re-seed's own convergence gives up as
+`repl:inconclusive:reseed-refused-behind`. Once the primary has recovered, a diverged-behind
+refusal stays a failure. For the designated survivor it is a give-up of its own,
+`repl:inconclusive:survivor-refused-behind`, because re-seeding the survivor would void the
+promise it underwrites. A restore-needed refusal of either node is
 answered (restored, or given up) only when a fault injected on that node's own disk explains
 it: durable corruption for a below-horizon refusal, entry loss for a gapped log directory.
 Otherwise it fails as the platform durability bug it would be.
