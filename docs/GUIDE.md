@@ -2517,20 +2517,19 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   and it cross-checks the reported count exactly. `ceiling:
   [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
   caps it: the batch fails when more than N universes gave up, naming the key,
-  the count and the cap. Eighteen of the platform's own swarm properties carry
+  the count and the cap. Nineteen of the platform's own swarm properties carry
   one:
   - kernel's exactly-once and job-tenancy properties;
   - the flagship properties of tenant, transactions, http, group_commit and
     typed_tables, and archive's two convergence properties;
   - realtime's flagship and scoped settled-client properties, migrations' two,
-    and the WAL suite's bit-flip, misdirected-write, read-error, dir-entry and
-    gc properties.
+    and the WAL suite's fault-matrix, bit-flip, misdirected-write, read-error,
+    dir-entry and gc properties.
 
   The rest carry none yet, so a drift in their give-up rates is visible only in
   the split: realtime's mixed-shapes and follower properties, replication's,
   auth's, kernel's job-shape property, transactions' crashed-reseed property,
-  engine's, and the WAL fault matrix (floored, not capped: its base is ambient
-  and it never gave up in 10 fresh batches, so the cap rule gives 0). A give-up is
+  and engine's. A give-up is
   reported and never failed, so without a cap a property can drift toward
   adjudicating nothing with every batch green; a floor on the key would bound
   give-ups from below, which guards nothing. An app's `sim_tests!` takes no
@@ -3261,6 +3260,19 @@ counts move batch to batch, both are margins over ten or more fresh batches: a
 give-up cap is twice the largest count, and a reach floor is the mean less
 four standard deviations, which flakes about once in thirty thousand batches if
 the counts are near normal, and fails any batch that falls further.
+
+Twice the largest count fails when no fresh batch gave up at all. The cap it
+gives is 0, and one legitimately exhausted universe would fail it. In that
+case only:
+- take the rule of three: with N universes observed and none giving up, 3/N
+  bounds the per-universe give-up rate at 95%;
+- a batch of n universes then expects at most lambda = n x 3 / N give-ups;
+- the cap is the smallest k with P(Poisson(lambda) > k) < 1e-4.
+
+For example, the WAL fault matrix gave up in none of its 10 fresh batches of
+512, so N = 5,120, n = 512 and lambda = 512 x 3 / 5,120 = 0.3. P(> 3) is
+2.7e-4 and P(> 4) is 1.6e-5, so its cap is 4. Twice the largest count stands
+whenever any fresh batch gave up.
 
 So an ambient floor catches a collapse, not a drift. Kernel exactly-once's
 `job:done` spreads by about 4% of its mean (sd 19.1 on 485.2), so its floor
