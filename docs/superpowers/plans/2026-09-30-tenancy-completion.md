@@ -9874,6 +9874,7 @@ git commit -m "feat(tenancy): a transaction does not read the platform's tables 
 - Modify `crates/charpente/src/lib.rs`: `pub use http::Subscribe;`.
 - Modify `crates/charpente/src/kernel/tail.rs`: `deliver_unit`'s filter (140–147 at 57e5df5, as at e749823).
 - Modify `crates/charpente/src/kernel/mod.rs`: `validate_subscribe` (952–1067 at 57e5df5; 952–1057 at e749823; D4 rewrote its four re-sync remedies in between).
+- Modify `crates/charpente-tsgen/src/runtime.rs`: `CursorRefused`'s doc and message (102–124 at 57e5df5), which gain A16's cause. Modify `crates/charpente-tsgen/tests/routes.rs`: the pin on those causes (117–149). Regenerate `ts-fixture/src/generated/client.ts` (Step 10; ruling 2026-10-02).
 - Modify `crates/charpente/tests/realtime.rs`: the tenant section (5222–6349 at 57e5df5, which S3b grew by a re-sync, five `Client` unit tests and three pinned-seed tests; 4586–5390 at e749823), `Client` (`:1454` at 57e5df5), `decode_event_row` (`:2107`), `failing_feed_glue` (`:3025`), the imports.
 - Modify `crates/charpente/tests/replication.rs`: the Hello version tests (2905–3002 at 57e5df5; 2694–2791 at e749823) and `a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name` (3383–3430 at 57e5df5; 3172–3219 at e749823), which ships tag 11 as "a tag this binary does not know" and now ships 12.
 - Modify `crates/charpente/tests/tenant.rs` (the three `memo_feed*` handlers, the `Org` doc at 44–49), `crates/charpente/tests/kernel.rs` (the `Org` doc at 2298–2303 at 57e5df5; 2179–2184 at e749823), `crates/charpente-macros/tests/compile_pass/route_public_scope.rs` (its `feed`), `examples/invoicing/src/bin/tenant_node.rs` (`create_doc`'s comment, `feed`), `crates/edge-harness/tests/tenant_wire.rs` (the doc at 429–431).
@@ -12216,6 +12217,138 @@ cargo test -p guide-examples --no-fail-fast 2>&1 | grep -E "^test result|FAILED|
 
 Expected: the grep prints nothing; the build succeeds (the new compiled block included); every `test result: ok`, `doc_truth` counting the two new pinned blocks at the raised floor.
 
+**The TS client's `CursorRefused`** (ruling 2026-10-02 on the S1 amendment). A16 adds a fourth
+409 to `validate_subscribe`. The generated client's doc for that refusal still counts three causes
+(`crates/charpente-tsgen/src/runtime.rs:102–108` at 57e5df5, emitted into
+`ts-fixture/src/generated/client.ts:157–163`), and its message names a consequence for each of
+the three. Hard rule 5 holds the message to every path that raises it, so both gain A16's cause.
+The remedy sentence does not change; it is already D4's.
+
+Pin first. In `crates/charpente-tsgen/tests/routes.rs`, the test that pins the message's causes is
+`the_no_auto_resume_rule_is_in_the_thrown_errors_message_not_only_a_comment` (117–149 at
+57e5df5). It dates from payload shapes; the D4 pin below it,
+`the_cursor_refusal_gives_the_resync_order_that_loses_nothing`, pins the remedy and stays as it
+is. No test pins the doc block today, so this one gains that assert too:
+
+```zsh
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('crates/charpente-tsgen/tests/routes.rs')
+s = p.read_text()
+old = '''    // Hard rule 5: the message must be true for EVERY path that raises it.
+    // `validate_subscribe` (charpente/src/kernel/mod.rs) answers 409 for a
+    // cursor below the retention floor — "events that old are gone" — for the
+    // two divergence cases, and for a cursor sitting on a reshaped row.
+    // Naming a single cause ("the history behind that cursor came from
+    // another primary") for all three would be false on the retention path,
+    // so the message spells out all three explicitly instead.
+    assert!(
+        body.contains("retention floor")
+            && body.contains("divergence")
+            && body.contains(
+                "At a reshaped event, resuming would skip the one event the server refused to decode."
+            ),
+        "the 409 message must name all three of its causes (floor, divergence, reshaped): {body}"
+    );
+'''
+new = '''    // Hard rule 5: the message must be true for EVERY path that raises it.
+    // `validate_subscribe` (charpente/src/kernel/mod.rs) answers 409 for a
+    // cursor below the retention floor — "events that old are gone" — for the
+    // two divergence cases, for a cursor sitting on a reshaped row, and for a
+    // cursor on a row outside the feed's tenancy (tenancy-completion A16).
+    // Naming a single cause ("the history behind that cursor came from
+    // another primary") for all four would be false on the retention path,
+    // so the message spells out all four explicitly instead.
+    assert!(
+        body.contains("retention floor")
+            && body.contains("divergence")
+            && body.contains(
+                "At a reshaped event, resuming would skip the one event the server refused to decode."
+            )
+            && body.contains(
+                "At an event outside this feed's tenancy, the cursor is not one this feed delivered, "
+            ),
+        "the 409 message must name all four of its causes (floor, divergence, reshaped, \\
+         tenancy): {body}"
+    );
+    // The doc above the class counts the same causes and says where they are,
+    // so a reader of the generated source is not told there are three.
+    let doc = r#"/**
+ * The server refused the cursor: HTTP 409 (DESIGN §6). FOUR different causes
+ * raise this, and only the server's `detail` distinguishes them: below the
+ * retention floor; diverged history; the event at the cursor was written
+ * under a different shape of its type; or the event at the cursor is outside
+ * this feed's tenancy (another tenant's, a global one on a tenant's feed, or
+ * a tenant's on a global one). All four are in `validate_subscribe`.
+ * The rule is in the message on purpose — it is what a developer reads at 3am.
+ */
+export class CursorRefused extends Error {"#;
+    assert!(ts.contains(doc), "CursorRefused's doc must count and name all four causes: {ts}");
+    assert!(!ts.contains("THREE different causes"), "{ts}");
+'''
+assert s.count(old) == 1, 'the causes pin moved: read the test before editing by hand'
+p.write_text(s.replace(old, new))
+EOF
+cargo test -p charpente-tsgen --test routes -- the_no_auto_resume_rule_is_in_the_thrown_errors_message_not_only_a_comment --exact 2>&1 | grep -E "panicked|all four|^test result"
+```
+
+Expected: `test result: FAILED. 0 passed; 1 failed`, at "the 409 message must name all four of
+its causes (floor, divergence, reshaped, tenancy)".
+
+Then the text. In `crates/charpente-tsgen/src/runtime.rs`, the doc block becomes the one the pin
+quotes, and the message gains one sentence before its remedy:
+
+```zsh
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('crates/charpente-tsgen/src/runtime.rs')
+s = p.read_text()
+edits = [
+    (''' * The server refused the cursor: HTTP 409 (DESIGN §6). THREE different causes
+ * raise this, and only the server's `detail` distinguishes them: below the
+ * retention floor; diverged history; or the event at the cursor was written
+ * under a different shape of its type. All three are in `validate_subscribe`.
+''', ''' * The server refused the cursor: HTTP 409 (DESIGN §6). FOUR different causes
+ * raise this, and only the server's `detail` distinguishes them: below the
+ * retention floor; diverged history; the event at the cursor was written
+ * under a different shape of its type; or the event at the cursor is outside
+ * this feed's tenancy (another tenant's, a global one on a tenant's feed, or
+ * a tenant's on a global one). All four are in `validate_subscribe`.
+'''),
+    ('''      "At a reshaped event, resuming would skip the one event the server refused to decode. " +
+''', '''      "At a reshaped event, resuming would skip the one event the server refused to decode. " +
+      "At an event outside this feed's tenancy, the cursor is not one this feed delivered, " +
+      "so it says nothing about what this feed has sent, and resuming from it could skip " +
+      "this feed's own events before it. " +
+'''),
+]
+for old, new in edits:
+    assert s.count(old) == 1, f'runtime.rs text not found verbatim:\n{old}'
+    s = s.replace(old, new)
+p.write_text(s)
+EOF
+cargo test -p charpente-tsgen --no-fail-fast 2>&1 | grep -E "^test result|FAILED|panicked"
+```
+
+Expected: every `test result: ok`, the causes pin and D4's remedy pin among them. The new
+sentence sits before "Reconnect without a cursor", so the message still ends with D4's remedy,
+which `ts-fixture/src/client-runtime.test.ts` checks with `endsWith`.
+
+Regenerate the committed client, and check it:
+
+```zsh
+cargo build -p charpente-cli
+./target/debug/charpente gen-client --dir crates/ts-fixture-app --out ts-fixture/src/generated/client.ts
+git diff --stat crates/charpente-tsgen/src/runtime.rs ts-fixture/src/generated/client.ts
+./target/debug/charpente check-client --dir crates/ts-fixture-app --out ts-fixture/src/generated/client.ts; echo "check-client exit $?"
+```
+
+Expected:
+- The two files' `--stat` lines agree: the client changed by exactly what `runtime.rs` did
+  (8 insertions and 3 deletions each, by this step's two edits). Any other change in the client
+  is drift an earlier task left there: stop and report it.
+- `check-client exit 0`.
+
 - [ ] **Step 11: Gate and commit**
 
 Foreground, per package, appended to one log, then counted:
@@ -12232,13 +12365,18 @@ cargo test -p charpente --test realtime --no-fail-fast 2>&1 | tee -a $L | grep '
 cargo test -p charpente --test replication --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
 cargo test -p charpente --test tenant --test kernel --test http --test archive --test describe --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
 cargo test -p charpente-macros --test trybuild --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p charpente-tsgen --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
+cargo test -p ts-fixture-app --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
 cargo test -p invoicing --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
 cargo build -p guide-examples 2>&1 | tee -a $L | tail -2
 cargo test -p guide-examples --no-fail-fast 2>&1 | tee -a $L | grep '^test result'
 print -r -- "result lines $(grep -c '^test result:' $L), ok lines $(grep -c '^test result: ok' $L), FAILED lines $(grep -c FAILED $L)"
+cargo build -p charpente-cli 2>&1 | tail -1
+./target/debug/charpente check-client --dir crates/ts-fixture-app --out ts-fixture/src/generated/client.ts; print -r -- "check-client exit $?"
+(cd ts-fixture && npm ci && npm run check && npm run test) > $D/t10-npm.log 2>&1; print -r -- "npm exit $?"
 ```
 
-Expected: `fmt exit 0`, `clippy exit 0`; the two `result` counts equal; `FAILED lines 0`. The realtime run includes the re-measured tenant swarm. State the counts in the report; never infer them from the absence of `FAILED`. No test file was added, so CLAUDE.md's lists do not change.
+Expected: `fmt exit 0`, `clippy exit 0`; the two `result` counts equal; `FAILED lines 0`; `check-client exit 0` and `npm exit 0` (the TS gate, ci.yml's `ts-client` job: invoke the pinned binaries through `npm run`, never a bare `npx`). The realtime run includes the re-measured tenant swarm. State the counts in the report; never infer them from the absence of `FAILED`. No test file was added, so CLAUDE.md's lists do not change.
 
 The controller runs the full workspace gate (background, counted) before marking the task done. Re-check `git status` and `git log -1` (another session may be writing this tree), then:
 
@@ -12249,9 +12387,11 @@ git add crates/charpente-core/src/db.rs crates/charpente-core/src/event.rs crate
   crates/charpente/tests/realtime.rs crates/charpente/tests/replication.rs crates/charpente/tests/tenant.rs \
   crates/charpente/tests/kernel.rs crates/charpente-macros/tests/compile_pass/route_public_scope.rs \
   examples/invoicing/src/bin/tenant_node.rs crates/edge-harness/tests/tenant_wire.rs \
-  crates/guide-examples/tests/doc_truth.rs docs/GUIDE.md DESIGN.md PLAN.md
+  crates/guide-examples/tests/doc_truth.rs docs/GUIDE.md DESIGN.md PLAN.md \
+  crates/charpente-tsgen/src/runtime.rs crates/charpente-tsgen/tests/routes.rs \
+  ts-fixture/src/generated/client.ts
 git status --short
-git commit -m "feat(tenancy-completion): an event records its tenant apart from its key — tag 0x0b, EventRow.scope, PROTO_VERSION 5; the tenant feed (Subscribe, TenantFeed) and one predicate (Subscription::admits) for delivery and resume; a cursor from another tenancy is refused by name, and a tenant feed widened after .into() panics by name; <M> of 15 mutations red; realtime-tenant re-measured over 128 universes twice, identical (<floors and cap kept | key was→now>; <pinned seeds kept | seed was→now>); the ten other baselines reproduced"
+git commit -m "feat(tenancy-completion): an event records its tenant apart from its key — tag 0x0b, EventRow.scope, PROTO_VERSION 5; the tenant feed (Subscribe, TenantFeed) and one predicate (Subscription::admits) for delivery and resume; a cursor from another tenancy is refused by name, and a tenant feed widened after .into() panics by name; <M> of 15 mutations red; realtime-tenant re-measured over 128 universes twice, identical (<floors and cap kept | key was→now>; <pinned seeds kept | seed was→now>); the ten other baselines reproduced; the TS client's CursorRefused counts and names four causes"
 ```
 
 `git status --short` after the add must show nothing unstaged under this task's paths. No `Co-Authored-By` trailer (CLAUDE.md).
@@ -15098,7 +15238,11 @@ Why `realtime.rs`, and not `tenant.rs` or a new file:
   - The replay-faithfulness check
     `replaying_the_tail_with_the_products_scope_rule_is_the_kernels_own_delivery`.
   - Six named victims, all prefixed `tenancy_feeds::the_oracle_names_`.
-  - Task 14 quotes the base, N, the floors, the cap and the fresh-base counts.
+  - The crash countdown, calibrated to this workload over ten fresh bases (Step 4b).
+  - Two pinned-seed tests of the cut re-sync, found in Step 4c:
+    `a_cut_durable_corruption_explains_is_resynced_and_every_feed_keeps_its_verdict` and
+    `a_cut_nothing_explains_fails_the_tenancy_universe_by_name`.
+  - Task 14 quotes the base, N, the countdown, the floors, the cap and the fresh-base counts.
 
 The property, stated once. Three shops (0, 1 and 2) emit scoped `note`s, and the app emits
 global `note`s: the same NAME and the same fields, told apart by tenancy only. Four feeds
@@ -15108,12 +15252,21 @@ reconnect through the full fault matrix: the global feed and one feed per shop.
 2. *A shop feed's delivered set is exactly that shop's rows.* No frame carries another origin,
    and every row of the feed's own origin in `[floor, scanned)` was delivered and verified
    against the store. Membership is checked, not a high-water mark, so an interior skip fails.
-   `floor` moves only on a bare subscribe. Retention is at its default (65,536), so nothing
-   ages out and no gap excuses anything.
+   `floor` rises only on a bare subscribe, and only a cut lowers it (below). Retention is at
+   its default (65,536), so nothing ages out and no gap excuses anything.
 3. *A resume from a row outside a feed's tenancy is refused by name* (A16). Each round, each
    feed may send a probe: a resume whose cursor is the newest scanned row of another shop, or
    of the other kind. The probe must be answered with A16's 409, exactly. Accepted, or refused
    under any other text, it is a finding.
+
+A cut is re-synced, never excused, as the flagship's is (S3 I2; S3b item 3, "re-sync rather
+than excuse"). Every subscribe reads the node's `next_event_id` first, its boundary. An id
+the ledger scanned, or a feed was delivered, at or above that boundary was cut by a recovery.
+Where durable corruption explains the cut, the ledger and every feed forget the cut ids and
+the universe keeps checking: a re-mint is owed again, under its new content, to the feed of
+its own origin. A cut nothing explains is a lost event, and fails at that boundary. A cut can
+still end in a give-up only where no re-sync is possible: no subscribe read a head after the
+last recovery, because every later boot or subscribe fell to fault fallout.
 
 The payload names the emitting tenant (`origin`), independently of `EventRow.scope`. So the
 oracle never takes the column under test at its word. The sibling's `SCOPED_N_STRIDE` exists
@@ -15176,18 +15329,19 @@ The module below already carries what changed under these functions between e749
 - `settle_boot`'s `durable_refusal` arm (S5 re-review R-M2, S3b item 0) is in
   `tenancy_settle_boot`;
 - the epoch boot goes through `checks::boot_through_fallout` with `BOOT_TRIES` (S5);
-- the crash countdown is the flagship's range re-sized for redb 4.3.0 (D1; DESIGN §1,
-  "countdowns");
+- the crash countdown starts at the flagship's range, re-sized for redb 4.3.0 (D1; DESIGN §1,
+  "countdowns"), and Step 4b calibrates it to this workload;
 - `sim.quiesce_subscriber_stalls()` runs before the settle (S3b);
 - a universe that adjudicated nothing gives up (S3b item 7);
-- a cut, or a ledger row the store no longer holds, is excused only where durable corruption
-  fired (S3b item 1). Anywhere else it fails as a lost event.
+- a cut a fault explains is re-synced at the next boundary, and the universe keeps checking
+  (`Client::resync_if_cut`, S3b items 1 and 3), here over the ledger the four feeds share
+  (`Universe::resync_if_cut`). A cut nothing explains fails there as a lost event, and a
+  drain never excuses a divergence;
+- the `cut_explained` parameter, as `tenancy_universe_judged`'s, so a pinned seed can stand a
+  cut in for one nothing explains (Step 4c).
 
-The flagship re-syncs its client's ledger at a cut a fault explains (`Client::resync_if_cut`).
-This module gives the universe up there instead, by name and under its cap, because its four
-feeds share one ledger (`read_answer`'s doc). `realtime_workload_judged`'s re-sync and its
-`realtime:settle-clean` and `realtime:frame-verified` marks belong to `Client`, and are not
-copied.
+`realtime_workload_judged`'s `realtime:settle-clean` and `realtime:frame-verified` marks
+belong to `Client`, and are not copied.
 - Every diff exits `0` at 57e5df5. A `1` means a change landed after it. Apply it to the copy
   as above, and quote the diff in the report.
 - `realtime_app` has not changed since e749823, and `open_tenancy` mirrors its store config.
@@ -15210,6 +15364,10 @@ Append to the end of `crates/charpente/tests/realtime.rs`:
 //    checked by membership, so an interior skip cannot pass;
 // 3. a resume whose cursor sits on a row outside the feed's tenancy is refused
 //    by name. It is never positioned past and never misdelivered.
+//
+// A cut durable corruption explains is re-synced at the next boundary and the
+// feeds keep checking, as in the flagship (S3b item 3). A cut nothing explains
+// is a lost event.
 //
 // Its own module, base seed and workload (R56): the flagship and the scoped
 // sibling keep their bytes. The three notes share one NAME and one field list,
@@ -15593,8 +15751,10 @@ mod tenancy_feeds {
     /// - A `Mismatch` compares a delivery with the ledger. The ledger goes
     ///   stale in exactly one sanctioned way: durable corruption cut a scanned
     ///   event above the checkpoint horizon, and its id was re-minted (the
-    ///   cases `Client::diverged_ledger_entry` lists). So a mismatch is probed
-    ///   before it is reported.
+    ///   cases `Client::diverged_ledger_entry` lists). The boundary re-sync
+    ///   (`Universe::resync_if_cut`) removes that staleness before a re-mint
+    ///   can be delivered, so a mismatch always fails. It is probed first
+    ///   only so the report can name the divergence.
     #[derive(Debug)]
     enum Fail {
         Finding(String),
@@ -15739,8 +15899,8 @@ mod tenancy_feeds {
     struct FeedClient {
         feed: Feed,
         /// Ids below this are forfeit: a bare subscribe's `next_event_id` at
-        /// push time. Nothing else moves it. Nothing ages out, and a timeline
-        /// cut gives the universe up.
+        /// push time. Nothing else raises it, and nothing ages out. A timeline
+        /// cut lowers it to the cut (`Universe::resync_to_head`).
         floor: u64,
         /// Delivered frames not yet compared with the ledger, oldest first.
         pending: VecDeque<(u64, &'static str, String)>,
@@ -15935,10 +16095,12 @@ mod tenancy_feeds {
     enum Pushed {
         /// A feed's own (re)subscribe. `boundary` is `next_event_id` read just
         /// before the push, which is exactly where a bare subscribe starts.
+        /// `sent` is the cursor it resumed from.
         Subscribe {
             client: usize,
             was_bare: bool,
             boundary: u64,
+            sent: Option<Cursor>,
         },
         /// A resume from a row outside the feed's tenancy, which must be
         /// refused by name. It queues no stall closure, because a refused
@@ -15959,18 +16121,15 @@ mod tenancy_feeds {
         Refused,
     }
 
-    /// The flagship's classification. A diverged 409 after durable corruption
-    /// is a cut. The flagship re-syncs its one client's ledger there
-    /// (`Client::resync_if_cut`, S3b). Four feeds share this ledger, so this
-    /// universe gives up instead, by name and under the property's cap: a cut
-    /// is a universe that no longer adjudicates set equality. A diverged 409
-    /// where no durable corruption fired is `Refused`, and fails: nothing
-    /// excuses it (S3b item 1).
-    fn read_answer(status: u16, raw: &str, durable_fired: bool) -> Answer {
+    /// The flagship's classification. A diverged 409 where a fault explains a
+    /// cut is a `Cut`: the subscribe was sent from a cursor on an id the
+    /// node's recovery cut, and `absorb` checks that against its boundary. A
+    /// diverged 409 nothing explains is `Refused`, and fails (S3b item 1).
+    fn read_answer(status: u16, raw: &str, cut_explained: bool) -> Answer {
         if status == 200 {
             return Answer::Connected;
         }
-        if status == 409 && raw.contains("diverged from this node's timeline") && durable_fired {
+        if status == 409 && raw.contains("diverged from this node's timeline") && cut_explained {
             return Answer::Cut;
         }
         if is_fault_fallout(raw) {
@@ -15982,13 +16141,12 @@ mod tenancy_feeds {
     /// How a probe was answered.
     /// - `Refused`: by A16's name.
     /// - `Unanswered`: fault fallout; nothing is counted.
-    /// - `Cut`: durable corruption took the probe's row off this node's
-    ///   timeline, and the universe gives up.
+    /// A probe is pushed after its round's boundary re-sync, so its cursor is a
+    /// row the node holds, and a diverged answer is a finding like any other.
     #[derive(Debug, PartialEq)]
     enum ProbeAnswer {
         Refused,
         Unanswered,
-        Cut,
     }
 
     /// The third property's verdict on one probe's answer.
@@ -15999,7 +16157,6 @@ mod tenancy_feeds {
         status: u16,
         raw: &str,
         text: &str,
-        durable_fired: bool,
     ) -> Result<ProbeAnswer, String> {
         if status == 409 && text == tenancy_409(cursor) {
             return Ok(ProbeAnswer::Refused);
@@ -16017,23 +16174,13 @@ mod tenancy_feeds {
                  refused by name, never resumed past"
             ));
         }
-        match read_answer(status, raw, durable_fired) {
-            Answer::Cut => Ok(ProbeAnswer::Cut),
+        match read_answer(status, raw, false) {
             Answer::Retry => Ok(ProbeAnswer::Unanswered),
-            Answer::Connected | Answer::Refused => Err(format!(
+            Answer::Connected | Answer::Cut | Answer::Refused => Err(format!(
                 "{asked} and was answered {status}: {text} — a cursor on a row outside this \
                  feed's tenancy is refused as outside it, by that name and no other"
             )),
         }
-    }
-
-    fn cut_reason(feed: Feed, text: &str) -> String {
-        format!(
-            "{} was answered 409: {text} — durable corruption cut an event this ledger scanned \
-             off this node's timeline, so the feeds' delivered sets can no longer be compared \
-             with it and nothing here adjudicates",
-            feed.label()
-        )
     }
 
     /// The next unclaimed sink. Only a 200 subscribe opens one, and sinks are
@@ -16054,37 +16201,119 @@ mod tenancy_feeds {
     struct Universe {
         ledger: Ledger,
         clients: Vec<FeedClient>,
+        /// `Client::cut_explained`: whether a fault explains a cut of this
+        /// node's timeline. The property passes `durable_corruption_fired`; a
+        /// pinned seed passes `|_| false` to stand a cut in for one nothing
+        /// explains (Step 4c).
+        cut_explained: fn(&Sim) -> bool,
+        /// Whether a subscribe has read the node's head since the last boot. A
+        /// cut is re-synced at that read, so without one none can be.
+        head_read: bool,
     }
 
     impl Universe {
-        fn new() -> Universe {
+        fn new(cut_explained: fn(&Sim) -> bool) -> Universe {
             Universe {
                 ledger: Ledger::default(),
                 clients: FEEDS.iter().map(|&feed| FeedClient::new(feed)).collect(),
+                cut_explained,
+                head_read: false,
             }
         }
 
-        /// A fresh kernel carries no tail over.
+        /// A fresh kernel carries no tail over, and its head is not read yet.
         fn disconnect_all(&mut self) {
+            self.head_read = false;
             for client in &mut self.clients {
                 client.need_subscribe = true;
                 client.handle = None;
             }
         }
 
-        /// Pushes one round, in this order:
-        /// 1. Every feed without a live tail resubscribes from its cursor.
-        /// 2. In an epoch round, each feed draws once, and one draw in four
-        ///    sends a probe.
-        /// 3. In an epoch round, the emits.
-        /// A settle round pushes the subscribes only.
-        fn push_round(
+        /// `Client::resync_to_head`, over the ledger the four feeds share. It
+        /// forgets every id at or above `head`, the `next_event_id` of a node
+        /// whose timeline a recovery cut back to it, so the next scan re-reads
+        /// those ids from the timeline the node now holds. A ledger row there
+        /// describes an event that no longer exists, and a frame delivered
+        /// there came from the lost timeline. A `verified` mark there would
+        /// excuse whatever is re-minted at that id, and a `floor` above `head`
+        /// would forfeit it. A feed delivered an id at or above `head` also
+        /// loses its cursor, and its `last_id` drops to `head - 1`. A re-mint
+        /// can take the cut event's id and seq, which a cursor's seq cannot
+        /// tell apart, so resuming from it could skip the re-mint; the feed
+        /// resubscribes bare instead. The old `last_id` would refuse the
+        /// re-mint's delivery as out of order. What survives is the state for
+        /// ids the node still holds. Nothing is forgiven.
+        fn resync_to_head(&mut self, head: u64) {
+            self.ledger.rows.retain(|&id, _| id < head);
+            self.ledger.next_scan_id = self.ledger.next_scan_id.min(head);
+            for c in &mut self.clients {
+                c.pending.retain(|&(id, ..)| id < head);
+                c.verified.retain(|&id| id < head);
+                c.floor = c.floor.min(head);
+                if c.last_id.is_some_and(|id| id >= head) {
+                    c.last_id = head.checked_sub(1);
+                    c.cursor = None;
+                }
+            }
+        }
+
+        /// `Client::resync_if_cut` over the shared ledger (S3b item 3). `head`
+        /// is a boundary `push_subscribe` read, and that counter only advances
+        /// on commit. So an id the ledger scanned, or a feed was delivered, at
+        /// or above it is one a recovery cut. Where a fault explains the cut,
+        /// the universe re-syncs and keeps checking. A cut id that was never
+        /// re-minted is no longer owed. One that was is owed again, under its
+        /// new content, to the feed of its own origin, so a re-mint that is
+        /// never delivered FAILS. A cut nothing explains is a lost event, and
+        /// fails here, where it is first seen.
+        fn resync_if_cut(&mut self, sim: &Sim, head: u64) -> Result<(), String> {
+            self.head_read = true;
+            let scanned = self.ledger.rows.range(head..).next().map(|(&id, _)| id);
+            let delivered = self
+                .clients
+                .iter()
+                .filter_map(|c| c.last_id)
+                .filter(|&id| id >= head)
+                .min();
+            let Some(id) = scanned.into_iter().chain(delivered).min() else {
+                return Ok(());
+            };
+            if !(self.cut_explained)(sim) {
+                return Err(format!(
+                    "event id {id} was recorded or delivered off this node, but its \
+                     next_event_id is now {head}: a recovery cut a committed event, and no \
+                     fault on this node explains the cut, so this node lost an event it had \
+                     committed"
+                ));
+            }
+            self.resync_to_head(head);
+            sim.cover("realtime:ledger-resynced");
+            Ok(())
+        }
+
+        /// Every boundary this round's subscribes read, re-synced in push order.
+        /// It runs after `push_subscribes` and before `push_traffic` and
+        /// `kernel.run`, so no probe is built from a cut row and no emit can
+        /// re-mint a cut id first.
+        fn resync_at_boundaries(&mut self, sim: &Sim, pushed: &[Pushed]) -> Result<(), String> {
+            for p in pushed {
+                if let Pushed::Subscribe { boundary, .. } = *p {
+                    self.resync_if_cut(sim, boundary)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// A round's first half: every feed without a live tail resubscribes
+        /// from its cursor. Each subscribe reads the node's head first, its
+        /// `boundary`, which `resync_at_boundaries` then re-syncs a cut to.
+        fn push_subscribes(
             &self,
             sim: &Sim,
             kernel: &Kernel,
             source: &mut SimSource,
             t: &mut u64,
-            epoch: bool,
         ) -> Result<Vec<Pushed>, String> {
             let mut pushed = Vec::new();
             for (client, c) in self.clients.iter().enumerate() {
@@ -16097,12 +16326,19 @@ mod tenancy_feeds {
                     client,
                     was_bare,
                     boundary,
+                    sent: c.cursor,
                 });
                 *t += SEC;
             }
-            if !epoch {
-                return Ok(pushed);
-            }
+            Ok(pushed)
+        }
+
+        /// An epoch round's second half, pushed after the boundary re-sync:
+        /// each feed draws once, and one draw in four sends a probe; then the
+        /// emits. A settle round pushes none of it. The draws follow the
+        /// subscribes' stall draws, as they did before the split.
+        fn push_traffic(&self, sim: &Sim, source: &mut SimSource, t: &mut u64) -> Vec<Pushed> {
+            let mut pushed = Vec::new();
             for (client, c) in self.clients.iter().enumerate() {
                 let draw = sim.entropy().next_u64();
                 if !draw.is_multiple_of(4) {
@@ -16159,13 +16395,15 @@ mod tenancy_feeds {
                 pushed.push(Pushed::Emit);
                 *t += SEC;
             }
-            Ok(pushed)
+            pushed
         }
 
-        /// Scans the ledger and drains every feed against it. `Ok(true)` means
-        /// the universe gave up, and every caller returns at once:
-        /// `Sim::give_up` is terminal for the universe.
-        fn sync_and_drain(&mut self, sim: &Sim, db: &Db) -> Result<bool, String> {
+        /// Scans the ledger and drains every feed against it. Every divergence
+        /// fails, as in the flagship's `sync_and_drain_naming_divergence`: every
+        /// recovery is followed by subscribes whose boundaries re-sync a cut a
+        /// fault explains, so a drain never meets one, and a cut nothing
+        /// explains is a lost event.
+        fn sync_and_drain(&mut self, sim: &Sim, db: &Db) -> Result<(), String> {
             let checked = match self.ledger.sync(db) {
                 Ok(()) => self
                     .clients
@@ -16174,28 +16412,22 @@ mod tenancy_feeds {
                 Err(fail) => Err(fail),
             };
             match checked {
-                Ok(()) => Ok(false),
+                Ok(()) => Ok(()),
                 Err(Fail::Finding(e)) => Err(e),
-                Err(Fail::Mismatch(e)) => match self.ledger.diverged_entry(db) {
-                    // Excused only where durable corruption fired on this
-                    // node's disk (S3b item 1).
-                    Some((id, recorded, stored)) if durable_corruption_fired(sim) => {
-                        sim.give_up(format!(
-                            "ledger diverged at event id {id}: recorded {recorded} when scanned, \
-                             store now holds {stored} — this node's timeline no longer holds \
-                             the recorded event (durable corruption cut it above the checkpoint \
-                             horizon) and any row now at this id is a re-mint, so nothing here \
-                             adjudicates delivery ({e})"
-                        ));
-                        Ok(true)
-                    }
-                    Some((id, recorded, stored)) => Err(format!(
+                Err(Fail::Mismatch(e)) => Err(match self.ledger.diverged_entry(db) {
+                    Some((id, recorded, stored)) if !(self.cut_explained)(sim) => format!(
                         "ledger id {id} was recorded off this node as {recorded}, but the store \
                          now holds {stored}, and no fault on this node explains the change, so \
                          this node lost an event it had committed ({e})"
-                    )),
-                    None => Err(e),
-                },
+                    ),
+                    Some((id, recorded, stored)) => format!(
+                        "ledger diverged at event id {id}: recorded {recorded} when scanned, \
+                         store now holds {stored}, a cut no boundary re-synced: every recovery \
+                         is followed by subscribes whose boundaries re-sync a cut a fault \
+                         explains, so a drain should never meet one ({e})"
+                    ),
+                    None => e,
+                }),
             }
         }
 
@@ -16211,10 +16443,8 @@ mod tenancy_feeds {
             sinks: &SinkHandles,
             sinks_taken: &mut usize,
         ) -> Result<(), String> {
-            if self.sync_and_drain(sim, db)? {
-                return Ok(());
-            }
-            let fired = durable_corruption_fired(sim);
+            self.sync_and_drain(sim, db)?;
+            let explained = (self.cut_explained)(sim);
             for (p, (status, body)) in pushed.iter().zip(responses) {
                 let raw = String::from_utf8_lossy(body).to_string();
                 let text = response_text(body);
@@ -16228,15 +16458,30 @@ mod tenancy_feeds {
                         client,
                         was_bare,
                         boundary,
-                    } => match read_answer(*status, &raw, fired) {
+                        sent,
+                    } => match read_answer(*status, &raw, explained) {
                         Answer::Connected => {
                             let handle = take_sink(sinks, sinks_taken);
                             self.clients[client].connected(handle, was_bare, boundary);
                         }
                         Answer::Retry => {}
+                        // The flagship's diverged-409 arm (S3b item 3). This
+                        // subscribe was sent from a cursor on an id the node's
+                        // recovery cut. The boundary re-sync has already
+                        // cleared that cursor, so the feed resubscribes bare.
+                        // A cursor below the head its own boundary read was
+                        // not cut, so its 409 is a finding.
                         Answer::Cut => {
-                            sim.give_up(cut_reason(self.clients[client].feed, &text));
-                            return Ok(());
+                            let cut = sent.is_some_and(|cursor| cursor.id >= boundary);
+                            if !cut {
+                                return Err(format!(
+                                    "{} was answered 409: {text} — but it subscribed from \
+                                     cursor {:?}, below the node's head {boundary}, so no cut \
+                                     explains the refusal",
+                                    self.clients[client].feed.label(),
+                                    sent.map(|cursor| cursor.wire())
+                                ));
+                            }
                         }
                         Answer::Refused => {
                             return Err(format!(
@@ -16251,13 +16496,9 @@ mod tenancy_feeds {
                         origin,
                     } => {
                         let feed = self.clients[client].feed;
-                        match probe_verdict(feed, cursor, origin, *status, &raw, &text, fired)? {
+                        match probe_verdict(feed, cursor, origin, *status, &raw, &text)? {
                             ProbeAnswer::Refused => self.clients[client].count_refusal(origin),
                             ProbeAnswer::Unanswered => {}
-                            ProbeAnswer::Cut => {
-                                sim.give_up(cut_reason(feed, &text));
-                                return Ok(());
-                            }
                         }
                     }
                 }
@@ -16278,7 +16519,7 @@ mod tenancy_feeds {
                     c.handle = None;
                 }
             }
-            self.sync_and_drain(sim, db).map(|_| ())
+            self.sync_and_drain(sim, db)
         }
 
         fn settled(&self) -> bool {
@@ -16412,14 +16653,24 @@ mod tenancy_feeds {
         Ok(None)
     }
 
-    /// One universe. It has `realtime_workload`'s shape:
+    /// One universe, with `durable_corruption_fired` explaining a cut.
+    fn tenancy_universe(sim: &mut Sim) -> Result<TenancyTrace, String> {
+        tenancy_universe_judged(sim, durable_corruption_fired)
+    }
+
+    /// One universe. It has `realtime_workload_judged`'s shape:
     /// - `EPOCHS` crash-bounded sessions of `ROUNDS_PER_EPOCH` rounds each;
     /// - then a settle phase that reconnects every feed until each has caught
-    ///   up, or the universe gives up for the flagship's two reasons.
-    /// Every arm that classifies a fault is the flagship's. On success it
-    /// returns every feed's frame trace, the replay check's oracle.
-    fn tenancy_universe(sim: &mut Sim) -> Result<TenancyTrace, String> {
-        let mut u = Universe::new();
+    ///   up, or the universe gives up for the flagship's reasons.
+    /// Every arm that classifies a fault is the flagship's, and every boundary
+    /// re-syncs a cut `cut_explained` answers for (`Universe::resync_if_cut`).
+    /// On success it returns every feed's frame trace, the replay check's
+    /// oracle.
+    fn tenancy_universe_judged(
+        sim: &mut Sim,
+        cut_explained: fn(&Sim) -> bool,
+    ) -> Result<TenancyTrace, String> {
+        let mut u = Universe::new(cut_explained);
 
         for _epoch in 0..EPOCHS {
             // A give-up already recorded means this universe adjudicated
@@ -16428,8 +16679,8 @@ mod tenancy_feeds {
                 return Ok(u.trace());
             }
             let entropy = sim.entropy();
-            // The flagship's range, sized to redb 4.3.0's disk-op volume per
-            // round (DESIGN §1, "countdowns").
+            // The flagship's range until Step 4b calibrates this workload's own
+            // (DESIGN §1, "countdowns") and writes it here with its measured rate.
             sim.crash_disk_after(50 + entropy.next_u64() % 399);
             let Some(app) =
                 boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || tenancy_app(sim))
@@ -16461,7 +16712,7 @@ mod tenancy_feeds {
             for _round in 0..ROUNDS_PER_EPOCH {
                 // `push_subscribe` reads `next_event_id` off the live `Db`, so
                 // a latched store fails it: classified as `kernel.run` is.
-                let pushed = match u.push_round(sim, &kernel, &mut source, &mut t, true) {
+                let mut pushed = match u.push_subscribes(sim, &kernel, &mut source, &mut t) {
                     Ok(pushed) => pushed,
                     Err(e) if is_fault_fallout(&e) => {
                         sim.restart();
@@ -16470,6 +16721,8 @@ mod tenancy_feeds {
                     }
                     Err(e) => return Err(format!("push_subscribe failed non-injected: {e}")),
                 };
+                u.resync_at_boundaries(sim, &pushed)?;
+                pushed.extend(u.push_traffic(sim, &mut source, &mut t));
                 let run_result = kernel.run(&mut source);
                 let new_responses = {
                     let guard = responses
@@ -16513,7 +16766,6 @@ mod tenancy_feeds {
         // adjudicating nothing. The epochs keep exercising stall-drop and resume.
         sim.quiesce_subscriber_stalls();
         let mut clean_attempts = 0u32;
-        let mut rolled_back: Option<(u64, String, String)> = None;
         for _attempt in 0..SETTLE_ATTEMPTS {
             if sim.gave_up().is_some() {
                 return Ok(u.trace());
@@ -16534,7 +16786,7 @@ mod tenancy_feeds {
             let mut sinks_taken = 0usize;
             let mut t = sim.now().as_nanos();
 
-            let pushed = match u.push_round(sim, &kernel, &mut source, &mut t, false) {
+            let pushed = match u.push_subscribes(sim, &kernel, &mut source, &mut t) {
                 Ok(pushed) => pushed,
                 Err(e) if is_fault_fallout(&e) => {
                     sim.restart();
@@ -16542,6 +16794,7 @@ mod tenancy_feeds {
                 }
                 Err(e) => return Err(format!("settle push_subscribe failed non-injected: {e}")),
             };
+            u.resync_at_boundaries(sim, &pushed)?;
             let run_result = kernel.run(&mut source);
             let new_responses = responses
                 .lock()
@@ -16563,9 +16816,6 @@ mod tenancy_feeds {
                 u.disconnect_all();
             } else {
                 clean_attempts += 1;
-                if rolled_back.is_none() && !u.settled() {
-                    rolled_back = u.ledger.diverged_entry(kernel.app().db());
-                }
             }
             if sim.gave_up().is_some() {
                 return Ok(u.trace());
@@ -16573,26 +16823,22 @@ mod tenancy_feeds {
         }
 
         if !u.settled() {
-            // Two give-ups. A scanned row the store has rolled back past can
-            // never be delivered, and is excused only where durable corruption
-            // fired (S3b item 1); anywhere else it fails below as a lost event.
-            // Zero clean attempts means there was no node to catch up FROM.
-            if let Some((id, recorded, stored)) = rolled_back
-                && durable_corruption_fired(sim)
-            {
-                sim.give_up(format!(
-                    "ledger id {id} is behind this node's timeline: recorded {recorded} when \
-                     scanned, store now says {stored} — this node's timeline no longer holds \
-                     the recorded event (durable corruption cut it above the checkpoint \
-                     horizon), so it can never be delivered and nothing here adjudicates ({})",
-                    u.unsettled_report()
-                ));
-                return Ok(u.trace());
-            }
+            // One give-up, the flagship's: zero clean attempts means there was
+            // no node to catch up FROM. There is no cut give-up. Every boundary
+            // re-syncs a cut a fault explains, so a row the node rolled back
+            // past is one nothing explains, which failed at its boundary. The
+            // one cut no re-sync can reach is a recovery after which no
+            // subscribe read a head, and this give-up names it.
             if clean_attempts == 0 {
+                let why = if u.head_read {
+                    "there was no node to catch up from"
+                } else {
+                    "no subscribe read a head after the last recovery, so a cut it made could \
+                     not be re-synced, and there was no node to catch up from"
+                };
                 sim.give_up(format!(
                     "no settle attempt completed without fault fallout over {SETTLE_ATTEMPTS} \
-                     attempts — there was no node to catch up from ({})",
+                     attempts — {why} ({})",
                     u.unsettled_report()
                 ));
                 return Ok(u.trace());
@@ -16675,9 +16921,24 @@ Notes for the implementer, each checked against the code the module copies:
   credits them (GUIDE §8, "every capped property floors its reach key").
   `boot:booted-after-retry` is required as the flagship and the sibling require it (S5), so
   the boot retries do more than run.
-- The crash countdown is the flagship's range. DESIGN §1 ("countdowns") calibrates a range to
-  its own workload's disk-op volume, and this plan does not recalibrate it. Step 4 reports
-  `fault:crash` beside the flagship's, and a large gap is for the controller.
+- The crash countdown starts at the flagship's range. DESIGN §1 ("countdowns") calibrates a
+  range to its own workload, so Step 4b measures this one over ten fresh bases and writes the
+  range it chooses before Step 5 sets any floor or the cap.
+- A cut is re-synced at the next boundary, as the flagship's is, and covers
+  `realtime:ledger-resynced`. The key is not required, as it is not in the flagship: a cut
+  needs durable corruption above the checkpoint horizon and a recovery after it. So Step 4c
+  pins the re-sync by a seed and its reason.
+- `push_round` is two functions, `push_subscribes` and `push_traffic`, so that the boundary
+  re-sync lands between them, before any probe is built and before `kernel.run`. The split
+  moves no entropy draw.
+- `Universe::resync_to_head` clears the cursor of a feed delivered an id at or above the
+  head, and drops its `last_id` to `head - 1`. The flagship's `Client::resync_to_head` keeps
+  both, and relies on the server refusing the old cursor as diverged. Here that cursor is
+  kept only in the subscribe already in flight (`Pushed::Subscribe::sent`). A later
+  resubscribe, after a fault-fallout answer, could otherwise resume past a re-mint that took
+  the cut event's id and seq.
+- The remaining give-ups are the zero-clean-attempts give-up, which names the one cut no
+  re-sync can reach, and the nothing-adjudicated one. Step 5's cap measures exactly those.
 - `realtime:stall-drop` and `fault:subscriber_stall` are required but not floored. Their rate
   belongs to a fault axis the flagship already pins, and a second exact pin would turn one
   finding into two failing properties. This is the sibling's documented reason.
@@ -16857,7 +17118,8 @@ Inside `mod tenancy_feeds`, after `the_tenancy_workload_replays_identically_for_
                 });
                 break;
             }
-            let note = global_note::Note::decode(&mut &row.payload[..]).expect("a twin row decodes");
+            let note = global_note::Note::decode(&mut &row.payload[..])
+                .expect("a twin row decodes");
             frames.push(EventFrame {
                 id: row.id.raw(),
                 seq: row.seq,
@@ -17244,7 +17506,7 @@ Inside `mod tenancy_feeds`, after Step 2's tests:
             let raw = String::from_utf8_lossy(&recorded[i].1).to_string();
             let origin = ledger.rows[&cursor.id].origin;
             assert_eq!(
-                probe_verdict(feed, cursor, origin, 409, &raw, &text, false),
+                probe_verdict(feed, cursor, origin, 409, &raw, &text),
                 Ok(ProbeAnswer::Refused)
             );
         }
@@ -17270,13 +17532,13 @@ Inside `mod tenancy_feeds`, after Step 2's tests:
             let (status, text) = replay_resume(&rows, Feed::Shop(1), cursor, scope_equal)
                 .expect_err("the control: the product's rule refuses it");
             assert_eq!(
-                probe_verdict(Feed::Shop(1), cursor, origin, status, &text, &text, false),
+                probe_verdict(Feed::Shop(1), cursor, origin, status, &text, &text),
                 Ok(ProbeAnswer::Refused)
             );
         }
         assert_eq!(replay_resume(&rows, Feed::Shop(1), same, scope_blind), Ok(1));
         assert_eq!(
-            probe_verdict(Feed::Shop(1), same, 0, 200, "", "", false),
+            probe_verdict(Feed::Shop(1), same, 0, 200, "", ""),
             Err(format!(
                 "shop 1's feed resumed from cursor 0.{} — event id 0, a note emitted inside shop \
                  0 — and was accepted: a cursor on a row outside this feed's tenancy is refused \
@@ -17290,7 +17552,7 @@ Inside `mod tenancy_feeds`, after Step 2's tests:
             Err((409, reshaped.clone()))
         );
         assert_eq!(
-            probe_verdict(Feed::Shop(1), other, GLOBAL_ORIGIN, 409, &reshaped, &reshaped, false),
+            probe_verdict(Feed::Shop(1), other, GLOBAL_ORIGIN, 409, &reshaped, &reshaped),
             Err(format!(
                 "shop 1's feed resumed from cursor 1.{} — event id 1, a note emitted as a global \
                  event — and was answered 409: {reshaped} — a cursor on a row outside this \
@@ -17424,8 +17686,7 @@ Expected:
   gave up`.
 - Every floor is still `1` and the cap is still the universe count here, so the batch checks
   `require:` and nothing more.
-- Read `fault:crash` from both coverage blocks, and record the two counts (see the countdown
-  note under Step 1).
+- Read `fault:crash` from both coverage blocks, and record the two counts. Step 4b uses them.
 
 The rule for N:
 - Keep 128, the realtime properties' standard, if the new batch's user+sys time is at most
@@ -17451,6 +17712,312 @@ report, replay it with `--nocapture`, and quote which oracle message fired.
   the platform is wrong. Report both readings.
 - Do not loosen the oracle, and do not add a give-up to make a failure go away. A give-up is
   for a universe that adjudicated nothing, never for one that adjudicated wrongly.
+
+- [ ] **Step 4b: Calibrate the crash countdown to this workload, over ten fresh bases**
+
+The module arms the flagship's range, `50 + rand % 399`. DESIGN §1 ("countdowns") sizes a range
+to its own workload: a round's crash fires only if the round runs past the drawn op count. This
+workload's rounds are not the flagship's: four feeds, probes, and one to four emits. So its
+range is measured here, before Step 5 sets any floor or the cap. Every number this step writes
+comes from the runs below.
+
+The scenario the countdown exists to reach is a feed resuming across a crash. The node restarts
+mid-epoch, and a feed resubscribes from its cursor while the node has moved past it
+(`realtime:resume-backlog`, a floored key). A crash too many costs verdicts instead: a universe
+that crashes too often gives up, or delivers too little to cover a reach key. So each candidate
+is judged on five rates per universe, each a mean over ten fresh bases (GUIDE §8):
+- `fault:crash`;
+- `realtime:resume-backlog`;
+- `tenancy:every-shop-delivered`;
+- `tenancy:global-delivered`;
+- the give-ups.
+
+There are five candidates: the flagship's range, and its `A` and `B` scaled by 0.5, 0.75, 1.5
+and 2.0 and rounded half up. Each runs at the ten fresh bases `0x5C0B_CA01`..`0x5C0B_CA0A` under
+`CHARPENTE_BASE_SEED`. That skips `require:`, `floor:` and `ceiling:`, so these runs measure and
+gate nothing. A failing universe still fails, and follows Step 4's procedure. The flagship runs
+once at the same ten bases, for its own crash rate. That is 60 batches, so the controller runs
+them in the background.
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+R=crates/charpente/tests/realtime.rs
+T=tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix
+cp $R $D/t13-realtime-before-4b.rs
+for cand in "25 200" "38 299" "50 399" "75 599" "100 798"; do
+  parts=(${=cand})
+  python3 - ${parts[1]} ${parts[2]} <<'EOF'
+import pathlib, re, sys
+p = pathlib.Path('crates/charpente/tests/realtime.rs')
+head, sep, tail = p.read_text().partition('mod tenancy_feeds {')
+assert sep, 'mod tenancy_feeds not found'
+new = f'sim.crash_disk_after({sys.argv[1]} + entropy.next_u64() % {sys.argv[2]});'
+tail, n = re.subn(r'sim\.crash_disk_after\(\d+ \+ entropy\.next_u64\(\) % \d+\);', new, tail)
+assert n == 1, f'expected one countdown in tenancy_feeds, found {n}'
+p.write_text(head + sep + tail)
+EOF
+  for b in 1 2 3 4 5 6 7 8 9 A; do
+    log=$D/t13-cal-${parts[1]}-${parts[2]}-0x5C0B_CA0$b.log
+    CHARPENTE_BASE_SEED=0x5C0B_CA0$b cargo test -p charpente --test realtime -- $T --exact --nocapture > $log 2>&1
+    print -r -- "$(grep -c '^test result: ok. 1 passed' $log)  ${parts[1]} + rand % ${parts[2]} @ 0x5C0B_CA0$b"
+  done
+done
+cp $D/t13-realtime-before-4b.rs $R
+cmp $R $D/t13-realtime-before-4b.rs && echo "realtime.rs restored"
+for b in 1 2 3 4 5 6 7 8 9 A; do
+  log=$D/t13-cal-flagship-0x5C0B_CA0$b.log
+  CHARPENTE_BASE_SEED=0x5C0B_CA0$b cargo test -p charpente --test realtime -- reconnecting_client_misses_nothing_under_the_fault_matrix --exact --nocapture > $log 2>&1
+  print -r -- "$(grep -c '^test result: ok. 1 passed' $log)  flagship @ 0x5C0B_CA0$b"
+done
+```
+
+Expected: 60 lines that each start with `1`, and `realtime.rs restored`. A `0` is a failing
+batch: follow Step 4's procedure before going on. The restore is a `cp`, never a `mv`: a file
+restored with its old mtime lets cargo reuse the last candidate's build.
+
+The rule the script below applies:
+1. A candidate is admissible if neither `*-delivered` rate falls more than one Welch standard
+   error below the flagship range's, and its give-up rate rises no more than one above it. That
+   is GUIDE §8's instrument: a range may not buy crashes with verdicts.
+2. Among the admissible candidates, take the highest `realtime:resume-backlog` rate. If the
+   flagship's range is within one Welch standard error of it, keep the flagship's range: the
+   difference is noise.
+3. If the chosen range's `fault:crash` rate is below the flagship's own at the same bases, the
+   script prints a `FINDING`. Record it beside the choice. It does not override the rule.
+
+The script writes the chosen range, and its measured rates, into the module:
+
+```zsh
+python3 - <<'EOF'
+import pathlib, re, statistics as st
+D = pathlib.Path('.superpowers/sdd/2026-09-30-tenancy-completion')
+R = pathlib.Path('crates/charpente/tests/realtime.rs')
+BASES = [f'0x5C0B_CA0{b}' for b in '123456789A']
+KEYS = ['fault:crash', 'realtime:resume-backlog', 'tenancy:every-shop-delivered',
+        'tenancy:global-delivered']
+BL = 'realtime:resume-backlog'
+def rates(name):
+    t = (D / name).read_text()
+    assert re.search(r'^test result: ok\. 1 passed', t, re.M), f'{name}: the batch did not pass'
+    v = re.search(r'(\d+) of (\d+) universes reached a verdict, (\d+) gave up', t)
+    n, gave = int(v.group(2)), int(v.group(3))
+    block = t.split('coverage over', 1)[1]
+    cov = {m.group(1): int(m.group(2)) for m in re.finditer(r'^  (\S+): (\d+)$', block, re.M)}
+    out = {k: cov.get(k, 0) / n for k in KEYS}
+    out['gave-up'] = gave / n
+    return out
+CANDS = [(25, 200), (38, 299), (50, 399), (75, 599), (100, 798)]
+REF = (50, 399)
+per = {c: [rates(f't13-cal-{c[0]}-{c[1]}-{b}.log') for b in BASES] for c in CANDS}
+flagship = [rates(f't13-cal-flagship-{b}.log')['fault:crash'] for b in BASES]
+def col(c, k):
+    return [r[k] for r in per[c]]
+def se(a, b):
+    return (st.variance(a) / len(a) + st.variance(b) / len(b)) ** 0.5
+print(f'flagship fault:crash per universe: {st.mean(flagship):.3f} (sd {st.stdev(flagship):.3f})')
+for c in CANDS:
+    print(f'{c[0]:>3} + rand % {c[1]:<3}  ' + '  '.join(
+        f'{k} {st.mean(col(c, k)):.3f} (sd {st.stdev(col(c, k)):.3f})'
+        for k in KEYS + ['gave-up']))
+def admissible(c):
+    reach = all(st.mean(col(c, k)) >= st.mean(col(REF, k)) - se(col(c, k), col(REF, k))
+                for k in ['tenancy:every-shop-delivered', 'tenancy:global-delivered'])
+    g = 'gave-up'
+    return reach and st.mean(col(c, g)) <= st.mean(col(REF, g)) + se(col(c, g), col(REF, g))
+ok = [c for c in CANDS if admissible(c)]
+best = max(ok, key=lambda c: st.mean(col(c, BL)))
+if st.mean(col(REF, BL)) >= st.mean(col(best, BL)) - se(col(REF, BL), col(best, BL)):
+    best = REF
+crash, backlog, fcrash = st.mean(col(best, 'fault:crash')), st.mean(col(best, BL)), st.mean(flagship)
+print(f'admissible: {ok}; chosen: {best[0]} + rand % {best[1]}')
+if crash < fcrash:
+    print(f'FINDING: the chosen range crashes {crash:.3f} times per universe, the flagship {fcrash:.3f}')
+head, sep, tail = R.read_text().partition('mod tenancy_feeds {')
+old = ("            // The flagship's range until Step 4b calibrates this workload's own\n"
+       "            // (DESIGN §1, \"countdowns\") and writes it here with its measured rate.\n")
+assert tail.count(old) == 1, 'the countdown comment moved: edit it by hand'
+tail = tail.replace(old,
+    f"            // Calibrated to this workload over ten fresh bases (plan Task 13 Step\n"
+    f"            // 4b; DESIGN §1, \"countdowns\"): {best[0]} + rand % {best[1]} reached\n"
+    f"            // realtime:resume-backlog {backlog:.2f} and fault:crash {crash:.2f} times\n"
+    f"            // per universe, where the flagship crashed {fcrash:.2f} at the same bases.\n")
+tail, n = re.subn(r'sim\.crash_disk_after\(\d+ \+ entropy\.next_u64\(\) % \d+\);',
+                  f'sim.crash_disk_after({best[0]} + entropy.next_u64() % {best[1]});', tail)
+assert n == 1, f'expected one countdown in tenancy_feeds, found {n}'
+R.write_text(head + sep + tail)
+EOF
+cargo fmt --all --check; echo "fmt exit $?"
+```
+
+Expected:
+- the flagship's line, then five candidate rows;
+- `admissible: […]; chosen: A + rand % B`, and a `FINDING` line only if rule 3 fired;
+- `fmt exit 0`.
+
+Record in `$D/progress.md`: the table, the chosen range, its two rates, and any `FINDING`. The
+comment above the countdown now carries the range and rates. If the range changed, re-run
+Step 4's two timings and apply its rule for N again. Step 5's floors and cap are measured with
+the range now in the file.
+
+- [ ] **Step 4c: Pin the cut re-sync by a seed and its reason**
+
+The re-sync (`Universe::resync_if_cut`) is not a required key: a cut needs durable corruption
+above the checkpoint horizon and a recovery after it. The flagship pins its own re-sync by seed
+and reason instead (`a_ledgered_event_cut_and_re_minted_is_resynced_and_its_re_mint_is_owed`
+and `a_cut_nothing_explains_fails_the_scoped_universe_by_name`), and so does this step. A seed
+names a universe, and the countdown draws that universe's crashes, so this step comes after
+Step 4b.
+
+Find the universe with a scan. Add it at the end of `mod tenancy_feeds`, run it, then delete
+it before the commit. It derives each universe exactly as the swarm runner does
+(`run_universe_with_adjust` in charpente-sim; this property's adjust is a no-op). It covers the
+property's base, then up to 48 fresh bases, and stops after the first base that holds a
+universe that re-synced a cut and reached a verdict. `128` is the universe count; use Step 4's
+N if it changed.
+
+```rust
+    /// Scratch for plan Task 13 Step 4c. Delete it before the commit.
+    #[test]
+    #[ignore]
+    fn scan_for_a_resynced_cut() {
+        for base in std::iter::once(TENANCY_BASE).chain(0x5C0B_D001..=0x5C0B_D030) {
+            let mut state = base;
+            let mut found = false;
+            for universe in 0..128u32 {
+                let seed = charpente_sim::rng::splitmix64(&mut state);
+                let mut s = seed;
+                let cfg_seed = charpente_sim::rng::splitmix64(&mut s);
+                let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+                charpente_sim::sample_extended_fields(seed, &mut cfg);
+                let mut sim = Sim::with_faults(seed, cfg);
+                let verdict = tenancy_universe(&mut sim).map(|_| ());
+                if sim.coverage().contains_key("realtime:ledger-resynced") {
+                    found |= verdict.is_ok() && sim.gave_up().is_none();
+                    let fired = |k: &str| sim.coverage().get(k).copied().unwrap_or(0);
+                    println!(
+                        "{base:#x} u{universe} {seed:#018x}: {verdict:?}, gave up {:?}, \
+                         bit_flip {}, misdirected_write {}",
+                        sim.gave_up(),
+                        fired("fault:bit_flip"),
+                        fired("fault:misdirected_write")
+                    );
+                }
+            }
+            if found {
+                break;
+            }
+        }
+    }
+```
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+cargo test -p charpente --test realtime -- tenancy_feeds::scan_for_a_resynced_cut --exact --ignored --nocapture 2>&1 | tee $D/t13-resync-scan.log | grep -E "^0x|^test result"
+```
+
+Expected: one or more lines, the last base's holding at least one `Ok(()), gave up None`. Take
+the first such line's seed. An `Err(…)` line is a universe the property batch at that base
+fails too: follow Step 4's procedure. If no base yields a verdict line, stop and report the
+counts to the controller. The property then cannot show its re-sync reaching a verdict, and
+that is the controller's ruling to make. The flagship's own pin search took 48 bases, which is
+the precedent for this one's reach.
+
+Then add the two pins after the scan, with the seed verbatim in both `SEED` constants. Each
+doc names the base, the universe and the durable-corruption fault the scan printed:
+
+```rust
+    /// A cut durable corruption explains is re-synced at the next boundary,
+    /// and every feed keeps its verdict (plan Task 13 Step 4c; the flagship's
+    /// `a_ledgered_event_cut_and_re_minted_is_resynced_and_its_re_mint_is_owed`).
+    /// Found by scanning for a universe that covers `realtime:ledger-resynced`
+    /// and reaches a verdict: base <base>, universe <u>, where <the fault> fired.
+    #[test]
+    fn a_cut_durable_corruption_explains_is_resynced_and_every_feed_keeps_its_verdict() {
+        const SEED: u64 = <the scan's seed>;
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        tenancy_universe(&mut sim)
+            .expect("a cut durable corruption explains must not fail the universe");
+        assert_eq!(
+            sim.gave_up(),
+            None,
+            "re-synced to the node's timeline, it reaches a verdict"
+        );
+        assert!(
+            durable_corruption_fired(&sim)
+                && sim.coverage().contains_key("realtime:ledger-resynced"),
+            "this universe's reason is a cut by durable corruption, seen and re-synced: {:?}",
+            sim.coverage()
+        );
+    }
+
+    /// The same universe with its cut standing in for one nothing explains
+    /// (`cut_explained` answers false). That is a lost event, which fails by
+    /// name at the boundary that first sees it, and is never a give-up.
+    #[test]
+    fn a_cut_nothing_explains_fails_the_tenancy_universe_by_name() {
+        const SEED: u64 = <the same seed>;
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        let err = tenancy_universe_judged(&mut sim, |_| false)
+            .expect_err("a cut nothing explains is a lost event");
+        assert!(
+            err.contains("off this node, but its next_event_id is now")
+                && err.contains("no fault on this node explains the cut"),
+            "{err}"
+        );
+        assert!(
+            durable_corruption_fired(&sim),
+            "the stand-in hides a reason that did fire"
+        );
+        assert_eq!(
+            sim.gave_up(),
+            None,
+            "a lost event is a failure, never a give-up"
+        );
+    }
+```
+
+Prove the first pin reaches the re-sync, RED first, on a copy of the file:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+R=crates/charpente/tests/realtime.rs
+cp $R $D/t13-realtime-before-4c-red.rs
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('crates/charpente/tests/realtime.rs')
+s = p.read_text()
+old = '            self.resync_to_head(head);\n            sim.cover("realtime:ledger-resynced");\n'
+assert s.count(old) == 1, 'the re-sync moved: find it by hand'
+p.write_text(s.replace(old, '            sim.give_up("a cut, given up as before the re-sync");\n            return Ok(());\n'))
+EOF
+cargo test -p charpente --test realtime -- tenancy_feeds::a_cut_durable_corruption_explains_is_resynced_and_every_feed_keeps_its_verdict --exact 2>&1 | grep -E "panicked|left|right|^test result"
+cp $D/t13-realtime-before-4c-red.rs $R
+cmp $R $D/t13-realtime-before-4c-red.rs && echo "realtime.rs restored"
+```
+
+Expected: `test result: FAILED`, at the `sim.gave_up()` assert (`left: Some("a cut, given up as
+before the re-sync")`), then `realtime.rs restored`.
+
+Then delete `scan_for_a_resynced_cut`, and run both pins:
+
+```zsh
+D=.superpowers/sdd/2026-09-30-tenancy-completion
+grep -c "fn scan_for_a_resynced_cut" crates/charpente/tests/realtime.rs
+cargo test -p charpente --test realtime -- tenancy_feeds::a_cut_ --nocapture 2>&1 | tee $D/t13-resync-pins.log | grep -E "^test |^test result"
+```
+
+Expected: `0`, then both tests `ok` and `test result: ok. 2 passed`. Task 14's LEDGER entry
+records the seed with its reason.
 
 - [ ] **Step 5: Measure the floors, twice, and write them**
 
@@ -17566,7 +18133,7 @@ Re-check `git status` and `git log -1`: another session may have committed. Then
 ```zsh
 git status --short
 git add crates/charpente/tests/realtime.rs
-git commit -m "test(tenancy): realtime tenancy under the fault matrix — a global feed receives no scoped row, a shop's feed exactly its own rows, and a resume from outside a feed's tenancy is refused by name (base 0x5C0B_0001, N universes, K gave up, the cap; floors F; 3N fresh over 0x5C0B_A001/B002/C003); six named victims, the replay-faithfulness check, and the tenant-zero and two-tenant-type pins"
+git commit -m "test(tenancy): realtime tenancy under the fault matrix — a global feed receives no scoped row, a shop's feed exactly its own rows, and a resume from outside a feed's tenancy is refused by name (base 0x5C0B_0001, N universes, K gave up, the cap; floors F; 3N fresh over 0x5C0B_A001/B002/C003); a cut durable corruption explains is re-synced, not excused, and pinned with its stand-in; the crash countdown calibrated over ten fresh bases (A + rand % B); six named victims, the replay-faithfulness check, and the tenant-zero and two-tenant-type pins"
 ```
 
 Fill in the message's slots with measured values:
@@ -17574,6 +18141,7 @@ Fill in the message's slots with measured values:
 - K: the gave-up count from Step 5.
 - F: the eight floor counts as `key=count`.
 - 3N: the fresh total.
+- A and B: the countdown Step 4b chose.
 
 No other file may be staged.
 
@@ -17648,7 +18216,8 @@ test names and quoted message, in `$D/progress.md`. Task 14 carries them into th
   - Tasks 1–13 as landed.
   - The plan's base commit, which Task 1 Step 1 wrote into `$D/progress.md`.
   - Task 1's workspace `test result:` baseline.
-  - Task 13's base, N, gave-up count, floors, give-up cap, fresh total, and its M1–M8 results.
+  - Task 13's base, N, crash countdown, gave-up count, floors, give-up cap, fresh total, its
+    re-sync pins, and its M1–M8 results.
 - Produces:
   - DECISIONS §12's corrected remedy.
   - A stale-phrase sweep with zero hits.
@@ -18432,6 +19001,9 @@ subject differs. Read `git log --oneline $BASE..HEAD` and pass the two shas by h
 - **Seeds and universes:**
   - Task 13's base `0x5C0B_0001`, its N, and how N was set (both CPU timings).
   - Its verdict line, its gave-up count, its eight floors and its give-up cap.
+  - Its crash countdown: Step 4b's table of five candidates over ten fresh bases, the range it
+    chose, and that range's rates (and any `FINDING` line).
+  - Its cut re-sync pins (Step 4c): the seed, its base and universe, and the fault that cut.
   - Its fresh total.
   - Step 5's table (Commit | Property | Bases | Universes | Gave up) and its totals.
   - The RED-first re-verification of the two kernel pins, `0x0f34c969dfd340b0` and
