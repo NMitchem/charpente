@@ -2660,17 +2660,24 @@ impl Db {
     ///   text kept: a restart retries the same file. One of these no restart
     ///   fixes, and its text says so: a store file cut shorter than redb's
     ///   header with the magic number intact, which only damage outside the
-    ///   crash model leaves (`Store::open` names it, DESIGN §4).
+    ///   crash model leaves. `Store::open` names the damage and this the fix,
+    ///   by the log beside it: remove the file while the log reaches seq 0,
+    ///   restore from a replica once it is compacted (DESIGN §4).
     ///
     /// The recovery-horizon rule (DESIGN §2, segment-mgmt T4): the store's
     /// `applied_seq` is the durable horizon threaded into `Engine::recover`,
     /// so a corrupt frame at-or-below it is a named hard error rather than a
     /// cut. The other half of the same rule lives here, before recovery
-    /// runs at all — if the log's base_seq is already past the horizon
-    /// (`applied_seq + 1`), an entire prefix of acknowledged records has
-    /// vanished from both the store and the log; that is never a shape
-    /// `checkpoint`'s own gc produces, so it is refused rather than silently
-    /// replayed from wherever the log happens to start.
+    /// runs at all — if the replay would start past the store's own next
+    /// seq (`applied_seq + 1`, or seq 0 for a store holding no records), an
+    /// entire prefix of acknowledged records has vanished from both the
+    /// store and the log; that is never a shape `checkpoint`'s own gc
+    /// produces, so it is refused rather than silently replayed from
+    /// wherever the log happens to start. The breadcrumb never lifts that
+    /// bound: it outlives the store by design, but it holds a horizon, not
+    /// the records below the log's base (DESIGN §2). An empty log beside a
+    /// checkpointed store replays from the horizon, so there a breadcrumb
+    /// past the store refuses too.
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
         // The jobs, events, and schema-versions tables are platform-owned; an
         // app registering any itself hits the existing duplicate-registration
@@ -2689,10 +2696,33 @@ impl Db {
                 // fault a restart retries (follow-up 21; found by the S4
                 // review, an injected fsync failure inside `Store::open`).
                 let Some(rejected) = StoreRejected::of(&e) else {
-                    // `Store::open` already named a file cut too short to
-                    // open, with its own fix; a restart is not it.
+                    // `Store::open` named a file cut too short to open, which
+                    // no restart fixes. Its fix is the log's: removal rebuilds
+                    // the store only from a log that still reaches seq 0
+                    // (S5 R-I1).
                     if e.kind() == io::ErrorKind::UnexpectedEof {
-                        return Err(e);
+                        let prefix = format!("{}/", cfg.wal.dir);
+                        let base = match disk.list(&prefix)?.first() {
+                            Some(first) => Some(parse_segment_name(&cfg.wal.dir, first)?),
+                            None => None,
+                        };
+                        let fix = match base {
+                            Some(0) => format!(
+                                "The log beside it still reaches seq 0, so remove {} and \
+                                 restart: the next boot rebuilds the store from the log",
+                                cfg.store_path
+                            ),
+                            Some(base) => format!(
+                                "The log beside it starts at seq {base}, so this store holds \
+                                 the only copy of the records below it and cannot be rebuilt: \
+                                 restore this node from a replica or backup"
+                            ),
+                            None => "The log beside it is empty, so this store holds the only \
+                                     copy of its records and cannot be rebuilt: restore this \
+                                     node from a replica or backup"
+                                .to_string(),
+                        };
+                        return Err(io::Error::new(e.kind(), format!("{e}. {fix} (DESIGN §4)")));
                     }
                     return Err(io::Error::new(
                         e.kind(),
@@ -2773,53 +2803,93 @@ impl Db {
         // Recovery-horizon rule, vanished-prefix half (segment-mgmt T4; T2/T3
         // review adjudication). Checkpoint-driven gc can only ever leave the
         // log's floor at or below its own checkpoint's applied_seq + 1 (T2's
-        // safety proof) — never above it. So base_seq > that boundary is not
-        // a shape gc produces: it means the records between the horizon and
-        // the base are gone from the log AND never reached the store —
-        // corruption or entry loss, not something rebuild-from-WAL can
-        // recover from. Peeked here, before Engine::recover runs, so the
+        // safety proof) — never above it. So a replay that would start past
+        // the store's own next seq means the records between them are gone
+        // from the log AND the store: nothing can rebuild them. Measured
+        // against the store, never the breadcrumb (S5 R2-M1): the breadcrumb
+        // outlives the store by design and holds a horizon, not the records
+        // below the log's base, so a store removed by hand (or by a re-seed a
+        // crash cut short, seed 0x64a183075fd398b9) or an older copy put back
+        // over a newer breadcrumb used to pass a check against it and panic
+        // in the replay. Peeked here, before Engine::recover runs, so the
         // hard error mutates nothing (same peek style as the unopenable-store
-        // branch above; `None` reads as horizon `0`, so a fresh store paired
-        // with any compacted log is rejected the same way).
+        // branch above).
+        let next = skip_through.map_or(0, |applied| applied + 1);
         let horizon = witness.map_or(0, |applied| applied + 1);
         let prefix = format!("{}/", cfg.wal.dir);
-        match disk.list(&prefix)?.first() {
-            Some(first) => {
-                let base = parse_segment_name(&cfg.wal.dir, first)?;
-                if base > horizon {
-                    return Err(io::Error::other(format!(
-                        "log base_seq is {base} but the store's durable horizon is only \
-                         {horizon} — acknowledged records between the horizon and the base \
-                         exist in neither the store nor the log; this is corruption or entry \
-                         loss, never a state Db::checkpoint's own gc can produce; restore this \
-                         node from a replica or backup (DESIGN §2)"
-                    )));
-                }
-            }
-            // A checkpointed store beside an EMPTY log directory: the
-            // mid-seed-finish crash shape (found by replication T6, seed
-            // 0xcaef83b2feb5edf5). `Seeder::finish` checkpoints the store at
-            // N and only then lays the seed segment and barriers its name —
-            // a crash between the two leaves exactly this state. It proves
-            // nothing was lost: every other route to a checkpointed store
-            // leaves at least one name-barriered segment (a segment's
-            // directory entry is barriered before any frame lands in it —
-            // DESIGN §2's fence 2), so no record above the horizon can have
-            // been acknowledged. Lay the segment `finish` would have — base
-            // = applied_seq + 1 (this fn's `horizon` local; §2 calls
-            // applied_seq itself the horizon, so in §2's words base =
-            // horizon + 1), nothing to replay — instead of letting
-            // `Wal::open` start a fresh log at 0 and trip the
-            // outran-durable-truth assert below. Safe only because the store
-            // was durable when `applied_seq` was read: a failed seed leaves it
-            // in the page cache, and nothing here syncs it — redb 4.3.0's
-            // writable open does (DESIGN §4, pinned by `a_seeded_store_a_-
-            // restarted_node_lays_its_segment_from_survives_the_next_power_loss`).
-            None if skip_through.is_some() => {
-                disk.open(&segment_name(&cfg.wal.dir, horizon))?;
-                disk.sync_dir(&prefix)?;
-            }
-            None => {}
+        let log_base = match disk.list(&prefix)?.first() {
+            Some(first) => Some(parse_segment_name(&cfg.wal.dir, first)?),
+            None => None,
+        };
+        // Where the replay starts: the log's base, or for an empty log beside
+        // a checkpointed store the segment the arm below lays at the horizon.
+        let replay_from = match log_base {
+            Some(base) => Some(base),
+            None if skip_through.is_some() => Some(horizon),
+            None => None,
+        };
+        if let Some(from) = replay_from
+            && from > next
+        {
+            let (held, cause) = match skip_through {
+                None => (
+                    "holds no records".to_string(),
+                    "Removing the store by hand leaves this state, and so does a re-seed a \
+                     crash cut short",
+                ),
+                Some(applied) => (
+                    format!(
+                        "holds records only through seq {applied}, the durable horizon its own \
+                         checkpoint vouches for"
+                    ),
+                    "Putting back an older copy of the store without its log leaves this \
+                     state, and so do corruption and entry loss",
+                ),
+            };
+            let log = match log_base {
+                Some(base) => format!("the log beside it starts at seq {base}"),
+                None => format!(
+                    "the log beside it is empty, and the horizon breadcrumb records a \
+                     checkpoint through seq {}",
+                    from - 1
+                ),
+            };
+            return Err(io::Error::other(format!(
+                "table store {} {held}, but {log}: the acknowledged records from seq {next} to \
+                 seq {} exist in neither the store nor the log, so the store cannot be rebuilt \
+                 from the log. {cause}; restore this node from a replica or backup. For a \
+                 follower, or a primary once a follower is promoted in its place, that is a \
+                 re-seed: stop the node, delete its data dir, and restart it configured as a \
+                 follower of the current primary so it snapshot-seeds from it, never with a \
+                 primary config: the durable role file that outranks config is deleted with \
+                 the data dir, so a cleared node started as a primary comes up as a second \
+                 writable primary (DESIGN §4)",
+                cfg.store_path,
+                from - 1
+            )));
+        }
+        // A checkpointed store beside an EMPTY log directory: the
+        // mid-seed-finish crash shape (found by replication T6, seed
+        // 0xcaef83b2feb5edf5). `Seeder::finish` checkpoints the store at
+        // N and only then lays the seed segment and barriers its name —
+        // a crash between the two leaves exactly this state. It proves
+        // nothing was lost: every other route to a checkpointed store
+        // leaves at least one name-barriered segment (a segment's
+        // directory entry is barriered before any frame lands in it —
+        // DESIGN §2's fence 2), so no record above the horizon can have
+        // been acknowledged. Lay the segment `finish` would have — base
+        // = applied_seq + 1, this fn's `next`, which the refusal above has
+        // made equal to the horizon (§2 calls applied_seq itself the
+        // horizon, so in §2's words base = horizon + 1), nothing to replay
+        // — instead of letting `Wal::open` start a fresh log at 0 and trip
+        // the outran-durable-truth assert below. Safe only because the
+        // store was durable when `applied_seq` was read: a failed seed
+        // leaves it in the page cache, and nothing here syncs it — redb
+        // 4.3.0's writable open does (DESIGN §4, pinned by `a_seeded_store_-
+        // a_restarted_node_lays_its_segment_from_survives_the_next_power_loss`).
+        if log_base.is_none() && skip_through.is_some() {
+            disk.open(&segment_name(&cfg.wal.dir, next))?;
+            disk.sync_dir(&prefix)?;
         }
         // Seed the replay-time version map (the two-pass gate) from the
         // CHECKPOINTED store; tail records update it live as their
@@ -2846,6 +2916,15 @@ impl Db {
             versions,
             saw_below: BTreeSet::new(),
         };
+        // Negative space: a replay starts at or below the store's own next
+        // seq. Starting past it applies records across a gap, and the store
+        // panics at the first one; the refusal above must have caught this.
+        assert!(
+            replay_from.is_none_or(|from| from <= next),
+            "Db::open is about to replay a log starting at seq {replay_from:?} into a store whose \
+             next seq is {next} — a replay must start at or below the store's own next seq, and \
+             the vanished-prefix refusal above must have caught this"
+        );
         let mut engine = Engine::recover(disk, cfg.wal.clone(), machine, witness)?;
         // Recovery replay must not leak into the kernel's incremental feed —
         // the dispatcher rebuilds its due-heap from a Pending scan at open.

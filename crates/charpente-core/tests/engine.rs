@@ -3592,9 +3592,11 @@ fn redbs_verdicts_on_the_bytes_are_rejections_by_reason() {
 /// is the disk's and redb built no verdict: not a rejection, and `Db::open`
 /// keeps the file. But no restart fixes it, and no crash leaves it, since redb
 /// makes the file's length durable before it writes the magic, so the text
-/// names the file, the cut and the fix in place of "restart to retry". The
-/// fix it names holds: with the file removed, the next boot rebuilds the
-/// store from the log.
+/// names the file, the cut and the fix in place of "restart to retry". This
+/// log still starts at seq 0, so the fix it names is removal, and it holds:
+/// with the file removed, the next boot rebuilds the store from the log. A
+/// compacted log names the restore instead (S5 R-I1; transactions.rs pins
+/// both cases with rows).
 #[test]
 fn a_store_cut_shorter_than_redbs_header_is_named_kept_and_fixed_by_removal() {
     for len in [9u64, 100, 319] {
@@ -3630,7 +3632,7 @@ fn a_store_cut_shorter_than_redbs_header_is_named_kept_and_fixed_by_removal() {
             );
             assert!(
                 text.contains("the file was cut outside the crash model")
-                    && text.contains("Remove tables.redb and restart")
+                    && text.contains("still reaches seq 0, so remove tables.redb and restart")
                     && !text.contains("Restart to retry"),
                 "{len} bytes, boot {boot}: the text must name the cut and its fix, not a retry: \
                  {text}"
@@ -4095,9 +4097,9 @@ fn a_recovery_whose_log_sync_fails_replays_nothing() {
 /// branch is safe only if the store is durable before it is read. Nothing in
 /// charpente syncs it there: redb 4.3.0's own open does (DESIGN §4). Without
 /// that, the power loss below leaves a store at `None` beside a log based at 6,
-/// and the next open refuses the node outright ("acknowledged records between
-/// the horizon and the base exist in neither the store nor the log"). This pins
-/// the dependency, so a redb that stops syncing at open turns it red.
+/// and the next open refuses the node outright ("the acknowledged records from
+/// seq 0 to seq 5 exist in neither the store nor the log"). This pins the
+/// dependency, so a redb that stops syncing at open turns it red.
 /// (D1 review M7.)
 #[test]
 fn a_seeded_store_a_restarted_node_lays_its_segment_from_survives_the_next_power_loss() {

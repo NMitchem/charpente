@@ -144,6 +144,17 @@ non-sim impl) pays it as two fsyncs the trait names nowhere: the temp file befor
 the parent directory after it. Dropping the first resurrects the key holding zeros; dropping
 the second loses an acked object outright.
 
+**Amended 2026-10-01 (D2):** two fsyncs were not enough. The directories a PUT creates were
+never synced into their parents, so an acked PUT under a new generation prefix could lose
+its whole subdirectory to a power loss; and a PUT that failed after its rename left an object
+the next process could GET from the page cache and act on, which the next power loss could
+take away. The contract is now stated for every impl — an object a `Get` or `List` returns
+is durable, and an acknowledged `Put` is durable (io.rs) — and `FsObjectStore` syncs every
+directory from the key's up to the bucket root's parent on every PUT, creates the bucket root
+but never a directory above it (a root whose parent is missing is refused by name, when the
+store is built and again on every PUT), and syncs
+before a GET or LIST returns (DESIGN §1).
+
 Ordering between distinct keys is **not** guaranteed; §2's write ordering depends on that
 being explicit rather than assumed.
 

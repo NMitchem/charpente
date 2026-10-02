@@ -803,7 +803,7 @@ impl Sim {
     }
 
     /// Power-cycles the disk: every unsynced write independently survives,
-    /// tears, or vanishes (see `disk::collapse`), open handles die, and any
+    /// tears, or vanishes (see `disk::collapse`), open file handles die, and any
     /// pending crash countdown is cleared. Called after a crash — or without
     /// one; a clean power cycle collapses the page cache the same way. A
     /// process restart that keeps the page cache is `restart_process`.

@@ -445,6 +445,21 @@ fn witness_io_error(action: &str, path: &str, e: io::Error) -> io::Error {
     )
 }
 
+/// A failed witness write. Its outcome is unknown, as for the role file: the
+/// page cache can already hold the new set, and the next boot makes whatever
+/// the slots hold durable and enforces it.
+fn witness_write_error(path: &str, e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!(
+            "writing the witness file \"{path}\": {e} — the new witness set may already be in \
+             force: the file can hold it, and the next boot enforces whatever set the witness \
+             files hold; fix the underlying disk problem and restart, then check the witness set \
+             the node booted with before treating the change as failed"
+        ),
+    )
+}
+
 fn slot_reason(s: &SlotState) -> &'static str {
     match s {
         SlotState::Empty => "absent",
@@ -509,15 +524,14 @@ pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
     let path = witness_path(target);
     let file = disk
         .open(&path)
-        .map_err(|e| witness_io_error("writing", &path, e))?;
+        .map_err(|e| witness_write_error(&path, e))?;
     file.write_at(0, bytes)
-        .map_err(|e| witness_io_error("writing", &path, e))?;
+        .map_err(|e| witness_write_error(&path, e))?;
     file.set_len(bytes.len() as u64)
-        .map_err(|e| witness_io_error("writing", &path, e))?;
-    file.sync()
-        .map_err(|e| witness_io_error("writing", &path, e))?;
+        .map_err(|e| witness_write_error(&path, e))?;
+    file.sync().map_err(|e| witness_write_error(&path, e))?;
     disk.sync_dir(&path)
-        .map_err(|e| witness_io_error("writing", &path, e))?;
+        .map_err(|e| witness_write_error(&path, e))?;
     Ok(())
 }
 
@@ -703,6 +717,32 @@ mod tests {
             booted,
             "the witness set a restarted node booted with shrank at the next power loss — a \
              slot read trusted bytes it never made durable"
+        );
+    }
+
+    /// Hard rule 5 for an outcome that is unknown, as for the role file: a
+    /// witness write that failed may still be in force after the restart the
+    /// error asks for, and a promote clears the set before it flips the role.
+    #[test]
+    fn a_failed_witness_write_says_the_new_set_may_already_be_in_force() {
+        let sim = Sim::with_faults(0xD2_0C02, FaultConfig::none());
+        open_witnesses(&sim.disk()).unwrap();
+        let msg = store_witnesses(&failing(&sim, true, false), &["b:1".to_string()])
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "writing the witness file",
+            "injected fsync failure",
+            "may already be in force",
+            "restart",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+        }
+        sim.restart_process(); // the restart the error asks for
+        assert_eq!(
+            open_witnesses(&sim.disk()).unwrap(),
+            vec!["b:1".to_string()],
+            "the restart boots with the set the failed write left — what the error must warn of"
         );
     }
 

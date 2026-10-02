@@ -121,11 +121,28 @@ file and the write-ahead log's segments live under one root directory, as
 flat relative names (`tables.redb`; WAL segments are named by their
 zero-padded 20-digit base sequence, so the first is
 `wal/00000000000000000000.log`); subdirectories are created on demand.
+**The data directory's parent must exist, and the node must be able to read
+it.** `ProdDisk::new` creates the data directory itself when it is absent, and
+never a directory above it: `./data` works on a fresh checkout, while
+`/srv/app/node` with no `/srv/app` is refused at startup by name (`charpente
+failed to start: the data directory "/srv/app/node" has no parent directory:
+"/srv/app" is not an existing directory, ...`). Create the parent when you
+provision the machine, and make it durable before the node starts — a bare
+`mkdir -p` leaves the new entries in the page cache, so follow it with `sync`.
+The reason is durability: an acknowledged write rests on every directory entry
+above it. Every directory barrier fsyncs the whole chain from the directory it
+names up to the data directory; `ProdDisk::new` fsyncs the data directory's
+parent, which holds the data directory's own entry, at every start, before
+anything is acknowledged; and the parent's own entry is yours. That start sync
+also means a parent the node cannot read stops the start there, under the same
+line, rather than inside your app's first barrier. An empty path is
+refused by name too. `restore --to` follows the same rule.
 
 ```rust
 use charpente::prod::ProdDisk;
 
-/// Opens the app's one data directory, creating it if it doesn't exist yet.
+/// Opens the app's one data directory, creating it if it doesn't exist yet
+/// (its parent must).
 fn open_data_dir(path: &str) -> std::io::Result<ProdDisk> {
     ProdDisk::new(path)
 }
@@ -449,8 +466,10 @@ manual upgrade, or not a redb file), and any other open failure — an IO
 error from the disk — is returned by `Db::open` with the site and the fix
 named and the store left as it was, so retrying the open is the fix. The one
 exception says so in its text: a store file cut shorter than redb's header,
-which no crash leaves and no retry fixes, so the fix it names is removing
-the file (DESIGN §4). That rebuild only works
+which no crash leaves and no retry fixes. Its fix depends on the log beside
+it, and the text names the right one: while the log still reaches seq 0,
+remove the file and the next boot rebuilds it; once the log is compacted,
+restore the node from a replica or backup (DESIGN §4). A rebuild only works
 while the log still holds everything back
 to seq 0, though: `Db::checkpoint(&mut self)` durably persists the store,
 then deletes WAL segments below the checkpoint (`DbConfig::retain_segments`
@@ -462,7 +481,12 @@ rebuild, naming the fix: restore from a replica/backup, or widen
 `retain_segments` (for a store whose bytes name an older redb file format, it
 says that no charpente release wrote one, so the version byte is damage, and
 names redb 2.6's `Database::upgrade()` for a format-2 file something else
-wrote). `Db::open` then recovers the write-ahead log and replays
+wrote). A store whose records stop short of the log's base is refused the same
+way, by name, whatever the horizon breadcrumb beside it says: a store file that
+is missing, or holds no records, beside a compacted log, or an older copy put
+back without its log. Removing or replacing the store is never a fix once the
+log is compacted. For a follower the text names the re-seed instead, with the
+config it must restart under (§10). `Db::open` then recovers the write-ahead log and replays
 every durable record after the store's last checkpoint back into it, so a
 reopened `Db` reflects every transaction that ever committed, even one the
 store hadn't caught up to when the process died. Recovery can itself fail
@@ -2674,14 +2698,25 @@ for these before hand-rolling the same logic a fourth time:
   fallout, and what it means is yours to say: a workload whose only node
   never came up gives up by name (`counter_survives` above), and a round
   restarts and moves on. The one `None` the helper names itself is a boot
-  refused for durable corruption at or below the store's horizon: no restart
-  clears bytes on the disk, so it stops at once, marks `boot:durable-refusal`
-  and gives the universe up under that name. Use it at every boot, a round
+  refused for durable corruption at or below the store's horizon
+  (`durable_refusal`, next): no restart clears bytes on the disk, so it stops
+  at once, marks `boot:durable-refusal` and gives the universe up under that
+  name. Where no durable corruption fired, the same refusal is a finding and
+  comes back as `Err(e)`, unchanged. Use it at every boot, a round
   loop's included: an injected fault inside the table store's open is
   returned by `Db::open` as the error it is, and the next boot opens the same
   file, so a phase that gives up or skips on its first faulted boot throws
   away work a restart would have recovered. A round loop's next round does
   boot again, but the round it skipped is work the property never checks.
+- `durable_refusal(sim: &Sim, text: &str) -> Result<bool, String>` — the
+  same rule for a loop that boots on its own, such as a final verification's
+  reopen loop: call it on each fallout before booting again. `Ok(false)`: not
+  a durable refusal, carry on. `Ok(true)`: a refusal in a universe where
+  durable corruption fired, already given up under its own name and marked
+  `boot:durable-refusal`, so end the loop. `Err(..)`: a refusal where none
+  fired, which nothing excuses, so fail with the text it names. A loop that
+  retries a durable refusal spends its whole budget on bytes no restart
+  clears, then gives up claiming the attempts all hit injected faults.
 - `dir_entry_loss_fired(sim: &Sim) -> bool` — the same fire-time-marked
   discipline for the `dir_entry_loss` axis (a pending directory create
   vanished, or a pending removal resurrected). A workload that routes
@@ -2708,6 +2743,8 @@ pub fn boot_through_fallout<T, E: std::fmt::Display>(
     is_fallout: impl Fn(&str) -> bool,
     boot: impl FnMut() -> Result<T, E>,
 ) -> Result<Option<T>, E>
+
+pub fn durable_refusal(sim: &Sim, text: &str) -> Result<bool, String>
 
 pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
     seed: u64,
@@ -3142,13 +3179,17 @@ of the time, which errs toward stopping to look.
 
 A cap that rises after such a change asks a different question, because a
 give-up is not a lost verdict when the same universe used to pass having
-checked nothing. So judge the rise by what the property checked, over the same
-ten or more fresh bases: its reach key (the key its `floor:` counts) and its
-vacuous passes (universes that passed without covering that key). If reach did
-not fall by more than one Welch standard error and vacuous passes did not
-rise, the new give-ups replaced vacuous passes, and the cap is re-set by its
-own convention, with both distributions recorded. If reach fell by more than
-one standard error, the rise is the finding. A pinned cap can read the same
+checked nothing. So judge the rise by the verdicts the property reached, over
+the same ten or more fresh bases: count its passes that covered its reach key
+(the key its `floor:` counts), and beside them its vacuous passes (universes
+that passed without covering that key). A cap may rise only if the passes
+covering the reach key did not fall by more than one Welch standard error.
+Then the new give-ups replaced vacuous passes, not verdicts, and the cap is
+re-set by its own convention, with both distributions recorded. If those
+passes fell by more than one standard error, the rise is the finding. Neither
+the reach key's own count nor the vacuous passes can decide it alone: 20 more
+give-ups beside 1 fewer vacuous pass means 19 passes that checked something
+became give-ups. A pinned cap can read the same
 number on both binaries while the rate behind it moved, so the test runs
 whenever the change could have moved it, not only when the pinned count did.
 That is also why every capped property floors its reach key: without one, the
@@ -3159,6 +3200,14 @@ counts move batch to batch, both are margins over ten or more fresh batches: a
 give-up cap is twice the largest count, and a reach floor is the mean less
 four standard deviations, which flakes about once in thirty thousand batches if
 the counts are near normal, and fails any batch that falls further.
+
+So an ambient floor catches a collapse, not a drift. Kernel exactly-once's
+`job:done` spreads by about 4% of its mean (sd 19.1 on 485.2), so its floor
+sits about 16% below the mean. A fall half that size trips about one batch in
+forty, which a change can pass by luck. The before-and-after comparison above
+is the instrument that sees a move that small, so it runs whenever a change
+could move an ambient floor's rate, as it does for a cap, and not only when a
+batch goes red.
 
 The directory barrier used to be the worst offender, because `sync_dir` is the
 call a *durability* fix is most likely to add — one such fix moved floors in
@@ -3782,11 +3831,13 @@ asks each witness one question, "are you a primary now?", and:
 - every witness answers *not a primary* → the gate opens and writes resume;
 - a witness answers *as a primary* → it was promoted or handed off to while
   this node was down, so this node **refuses to serve at all** and says so,
-  naming both remedies (re-seed this node from a fresh data dir if the other
-  timeline is the one to keep; or stop the other node, clear this node's
-  witness set, and restart it if these records are). It never demotes itself:
-  it cannot know which timeline you want, and the writes it acked are not the
-  platform's to discard;
+  naming both remedies (if the other timeline is the one to keep, re-seed
+  this node: clear its data directory and restart it configured as a follower
+  of the other node, never with its primary config, which brings the cleared
+  node up as a second writable primary; or stop the other node, clear this
+  node's witness set, and restart it if these records are). It never demotes
+  itself: it cannot know which timeline you want, and the writes it acked are
+  not the platform's to discard;
 - a witness cannot be reached, or answers something that says nothing about
   its role (a mismatched peer secret, protocol version, or schema digest — or
   bytes this node cannot decode at all, which is what you get when something
@@ -3891,9 +3942,17 @@ switchover chain (one this primary never shipped to) is invisible to it; the
 verdict is a refusal to run, not a repair; and any write the resurrected box
 acked before you noticed is still destroyed by the only remedy there is. So:
 promote the follower, then treat the old box as a *new* node — stop it, clear
-its data directory, and let it re-seed as a follower of the new primary. A
-switchover does not have this hazard at all (the handed-off primary demotes
-itself durably); it is specific to promote (DESIGN §5).
+its data directory, and restart it **configured as a follower of the new
+primary**, so it re-seeds from it. Change its startup config before that
+restart: with the role file gone, config alone decides the role, and a cleared
+node started with a primary config comes up as a second writable primary that
+no witness gate can see, because the witness set goes with the directory too.
+A switchover does not have the restart hazard (the handed-off primary demotes
+itself durably), but its durable demotion lives in that same role file: wipe a
+switchover-demoted primary and restart it with its old primary config, and it
+too comes up as a second writable primary. Every re-seed, after a promote or
+a switchover, restarts the cleared node configured as a follower of the
+current primary (DESIGN §5).
 
 Both travel as control messages over the replication port, issued with the
 `charpente` CLI:
@@ -3922,9 +3981,12 @@ forwarded verbatim:
 
 When a follower's own local copy is unrecoverable — media corruption below its
 checkpoint horizon, or a log directory a crash left gapped — the fix is not a
-local repair but a restore: promote a healthy replica and re-seed the damaged
-node from it as a fresh follower (its snapshot rebuilds the whole state, no
-log replay). This is the promise a single node cannot make and a replicated
+local repair but a restore: re-seed the damaged node from a healthy replica as
+a fresh follower, promoting the replica first if the damaged node was the
+primary. Clear the damaged node's data directory and restart it configured as
+a follower of the current primary, never with a primary config (the promote
+warning above says why), and its snapshot rebuilds the whole state, no log
+replay. This is the promise a single node cannot make and a replicated
 deployment can: a record one node loses to media corruption survives on
 another.
 
@@ -3934,7 +3996,8 @@ the primary has GC'd the frames that would prove the follower's records are a
 prefix of its timeline, so it refuses to re-seed it automatically — naming
 both positions and both remedies — rather than risk silently overwriting a
 follower that is actually *ahead* of a primary that forked behind it. If the
-follower truly just lagged, stop it, clear its data directory, and restart it;
+follower truly just lagged, stop it, clear its data directory, and restart it
+configured as a follower of the primary, never with a primary config;
 it re-seeds from a snapshot and converges.
 charpente's own replication suite applies that remedy itself in exactly one
 case: a follower it rebuilt from the surviving primary, provided the primary has
@@ -4819,11 +4882,14 @@ never `serve_replicated`, so neither a witness conflict nor a strict-witness dea
 happen here; those are `charpente::serve_replicated`-only stops) comes from one of three
 distinct moments, each with its own line on stderr:
 
-- **Before any kernel exists.** Opening the platform IO handles (`ProdDisk::new`,
-  `ProdEntropy::new`) or `build` (`App::open`) fails — a table-gate barrier from a schema
-  this binary cannot open, or an ordinary platform IO failure (the disk root,
-  `/dev/urandom`, the store): `charpente refused to start: ...`/`charpente failed to start
-  — fix the store/log and restart: ...`. Or the HTTP bind fails, which `serve` attempts
+- **Before any kernel exists.** The data directory cannot be opened — its parent is missing
+  or the node cannot read it (§1), the path is empty, or it is not a directory you can
+  create: `charpente failed to start: the data directory "<path>" ...` or `charpente failed
+  to start: could not fsync directory "<parent>" ...`, naming the cause and the fix. Or opening
+  `/dev/urandom` (`ProdEntropy::new`) or `build` (`App::open`) fails — a table-gate barrier
+  from a schema this binary cannot open, or an ordinary platform IO failure (the store, the
+  log): `charpente refused to start: ...`/`charpente failed to start — fix the store/log and
+  restart: ...`. Or the HTTP bind fails, which `serve` attempts
   before it spawns the kernel thread: `charpente failed to start — could not bind <addr>:
   <the OS error> — free that address, or change the one the app passes to launch`.
 - **The kernel stops on its own account** — a Pending job of a foreign shape (§6), a
@@ -5934,7 +6000,7 @@ fn run_archive(app: App) -> std::io::Result<()> {
         read_budget_bytes: 8 << 20,
     };
     // Blocks: the kernel runs on this thread until it returns.
-    serve::archive(app, Box::new(FsObjectStore::new("/mnt/archive")), cfg)
+    serve::archive(app, Box::new(FsObjectStore::new("/mnt/archive")?), cfg)
 }
 ```
 
@@ -5969,12 +6035,21 @@ one kernel step is never a 64 MiB read.
 Two things to know before you deploy this:
 
 **`FsObjectStore` is the only production `ObjectStore` that ships.** It writes objects as
-files under a root directory, atomically (temp file, sync, rename, sync the parent). A real
-bucket — S3, GCS, Azure Blob — needs an `ObjectStore` implementation you write against the
-trait in `charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore`
-first: whole-object PUTs give a caller nothing to barrier, so the trait has no `sync`
-method, and an implementation still owes whatever its own substrate needs to make an acked
-PUT survive a crash — silently, because nothing in the trait can ask for it.
+files under a root directory, atomically (temp file, sync, rename, then sync every directory
+from the object's up to the root's parent), and it syncs an object and those directories
+before a GET or LIST returns it. Point the root at a directory whose parent exists and the
+node can read: a PUT creates the root but never its parent, so `FsObjectStore::new` refuses
+by name, when the store is built, a root whose parent is not an existing directory (and an
+empty path) — the `?` above, which stops the node before it starts. Provision the parent as
+you would the data directory's (§1), durably. A PUT still refuses the root by name if the
+parent is removed while the node runs, and under `serve::archive` that refusal is retried like
+any failed PUT. A real bucket — S3, GCS,
+Azure Blob — needs an `ObjectStore` implementation you write against the trait in
+`charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore` first:
+whole-object PUTs give a caller nothing to barrier, so the trait has no `sync` method, and
+every implementation still owes the trait's contract — an object a GET or LIST returns is
+durable, and an acknowledged PUT is durable — silently, because nothing in the trait can ask
+for it.
 
 **`serve::archive` is not a sidecar.** There is no `Repl` in it, so the node it runs is a
 primary in every respect except its edges: it runs the app's jobs and cron while it
@@ -6042,7 +6117,8 @@ Every app binary that calls `charpente::launch` has the verb already:
 usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]
        --from BUCKET    the archive's root directory (the bucket an archive wrote)
        --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim
-       --to DIR         the data directory to rebuild (default: this app's own data directory)
+       --to DIR         the data directory to rebuild (default: this app's own data directory; its
+                        parent must exist)
        --force          discard a destination timeline the archive cannot prove is its own
 ```
 

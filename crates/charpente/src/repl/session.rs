@@ -16,7 +16,7 @@ use charpente_core::log::frame_crc;
 use crate::Db;
 use crate::auth::{ct_eq_hex, hash_token};
 use crate::repl::protocol::{Msg, decode, encode};
-use crate::repl::role::Role;
+use crate::repl::role::{Role, reseed_steps};
 use crate::repl::witnesses::{MAX_WITNESS_ADDRESS_BYTES, valid_witness_address};
 use crate::repl::{
     FRAMES_BATCH_BYTES, HEARTBEAT_NANOS, HELLO_DEADLINE_NANOS, MAX_MESSAGE_BYTES, PROTO_VERSION,
@@ -850,8 +850,8 @@ fn diverged_ahead(pos_seq: u64, pos_crc: u32, last: Option<u64>) -> String {
         "{DIVERGED_LABEL}: the follower is ahead at seq {pos_seq} (crc {pos_crc:#010x}) but this \
          primary's last durable position is {ours} (crc n/a) — the follower holds records this \
          primary never had (or lost), a forked timeline that can never be merged; re-seed the \
-         follower from a fresh data dir (stop it, delete its data dir, restart to snapshot-seed \
-         from this primary)"
+         follower from a fresh data dir ({})",
+        reseed_steps("this primary")
     )
 }
 
@@ -860,8 +860,8 @@ fn diverged_crc(pos_seq: u64, pos_crc: u32, last: u64, ours: u32) -> String {
         "{DIVERGED_LABEL}: the follower's frame at seq {pos_seq} has crc {pos_crc:#010x} but \
          this primary's frame at the same seq has crc {ours:#010x} (this primary is at seq \
          {last}) — the logs share a seq but not its bytes, a forked timeline that can never be \
-         merged; re-seed the follower from a fresh data dir (stop it, delete its data dir, \
-         restart to snapshot-seed from this primary)"
+         merged; re-seed the follower from a fresh data dir ({})",
+        reseed_steps("this primary")
     )
 }
 
@@ -878,9 +878,10 @@ fn diverged_behind(pos_seq: u64, base: u64) -> String {
          below seq {pos_seq} to compare, this primary cannot prove the follower's records are a \
          prefix of its own timeline, and re-seeding here would silently overwrite whatever the \
          follower holds; if the follower merely lagged past the retained window, re-seed it \
-         deliberately from a fresh data dir (stop it, delete its data dir, restart to \
-         snapshot-seed from this primary); if instead this primary forked below the follower \
-         (recovered past an above-horizon corruption cut and kept serving), promote the \
-         follower and re-seed this node from it"
+         deliberately from a fresh data dir ({}); if instead this primary forked below the \
+         follower (recovered past an above-horizon corruption cut and kept serving), promote \
+         the follower and re-seed this node from it the same way, configured as a follower of \
+         the promoted node",
+        reseed_steps("this primary")
     )
 }

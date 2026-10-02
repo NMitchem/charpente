@@ -1006,7 +1006,9 @@ impl StoreRejected {
 /// open on that read. It is not a rejection, since the disk said it and redb
 /// built no verdict, but no restart fixes it either, and redb makes the
 /// file's length durable before it writes the magic (`page_manager.rs:1181-1200`),
-/// so no crash leaves one: the file was cut outside the crash model.
+/// so no crash leaves one: the file was cut outside the crash model. Its fix
+/// depends on the log beside the store, which only `Db::open` sees, so
+/// `Db::open` names it.
 fn open_error(e: redb::DatabaseError, path: &str) -> io::Error {
     use redb::{DatabaseError, StorageError};
     if let DatabaseError::Storage(StorageError::Io(io)) = &e
@@ -1020,10 +1022,7 @@ fn open_error(e: redb::DatabaseError, path: &str) -> io::Error {
                  found its magic number, so this is not a file it rejects; but no crash \
                  leaves a store this short, since redb makes the file's length durable before \
                  it writes the magic, so the file was cut outside the crash model and every \
-                 boot will fail the same way. Remove {path} and restart: the next boot \
-                 rebuilds the store from the log, or refuses by name if the log no longer \
-                 reaches seq 0, and then this node is restored from a replica or backup \
-                 (DESIGN §4)"
+                 boot will fail the same way"
             ),
         );
     }

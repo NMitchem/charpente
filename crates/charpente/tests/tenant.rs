@@ -979,10 +979,15 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
         let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), ledger_schema()) {
             Ok(db) => db,
             Err(e) => {
-                if !is_injected(&e.to_string()) {
+                let text = e.to_string();
+                if !is_injected(&text) {
                     return Err(format!(
                         "final recovery failed with a non-injected error: {e}"
                     ));
+                }
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                if charpente_sim::checks::durable_refusal(sim, &text)? {
+                    return Ok(());
                 }
                 sim.restart();
                 continue;
@@ -1031,6 +1036,39 @@ const TENANT_MULTI_TENANT_WRITE_FLOOR: u64 = 1091;
 /// this repo uses: a property that must not flake batch to batch does not
 /// take an ambient seed. Fresh bases are run and recorded rather than
 /// swapped in here.
+/// A durable refusal at the final recovery ends it at once, by name (S5 re-review
+/// R-M2). Seed `0x15725b7dd3ceaac5`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("the final recovery never ran the oracle").
+#[test]
+fn a_durable_refusal_at_the_final_recovery_ends_it_at_once_by_name() {
+    const SEED: u64 = 0x1572_5b7d_d3ce_aac5;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = tenant_universe(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
+
 #[test]
 fn every_scoped_read_returns_only_its_own_tenants_rows() {
     run_universes_swarm_with!(

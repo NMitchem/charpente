@@ -10,6 +10,8 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 
+mod support;
+
 use charpente::archive::manifest::{
     Manifest, SnapshotMeta, TableBatches, decode_snapshot_batch, manifest_key, segment_key,
     snapshot_batch_key, snapshot_meta_key,
@@ -9145,9 +9147,9 @@ mod fs_object_store {
     use charpente_core::io::{Entropy, ObjectDone, ObjectOp, ObjectStore};
 
     /// A fresh, empty directory nobody else is using. `FsObjectStore::new`
-    /// does not create it — a store pointed at an absent bucket must answer
-    /// NotFound, not blow up — so the ones that need it created let a PUT
-    /// do the creating.
+    /// checks its parent and does not create it — a store pointed at an
+    /// absent bucket must answer NotFound, not blow up — so the ones that
+    /// need it created let a PUT do the creating.
     fn tmp(tag: &str) -> PathBuf {
         let mut suffix = [0u8; 8];
         ProdEntropy::new().unwrap().fill(&mut suffix);
@@ -9206,16 +9208,127 @@ mod fs_object_store {
     #[test]
     fn put_then_get_roundtrips() {
         let root = tmp("roundtrip");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "bk/000/segments/1.log", &[1, 2, 3]).unwrap();
         assert_eq!(get(&s, "bk/000/segments/1.log").unwrap(), vec![1, 2, 3]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// On the real filesystem: a store over a bucket root whose parent does
+    /// not exist is refused when it is built, by name, with nothing created.
+    /// Not left to the first PUT: an archive reads the missing root as a
+    /// fresh bucket and absorbs every refused PUT, so the node would run
+    /// with no backup and nothing on stderr.
+    #[test]
+    fn a_bucket_root_whose_parent_is_missing_is_refused_when_the_store_is_built() {
+        let missing = tmp("missing-parent");
+        let root = missing.join("bucket");
+        let Err(err) = FsObjectStore::new(root.clone()) else {
+            panic!("a store was built over a bucket root whose parent is missing")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the bucket root \"{root}\" has no parent directory: \"{parent}\" is not an \
+                 existing directory, and charpente never creates a directory above the bucket \
+                 root — an acknowledged PUT rests on every directory entry above it, and \
+                 charpente vouches only for the entries it creates and fsyncs. Create \
+                 \"{parent}\" when you provision the machine and make it durable before the \
+                 node starts (for example, run `sync` after creating it), or point at a \
+                 bucket root whose parent exists",
+                root = root.display(),
+                parent = missing.display()
+            )
+        );
+        assert!(
+            !missing.exists(),
+            "the refusal created {}",
+            missing.display()
+        );
+
+        // A parent that exists as a regular file is no directory either: a
+        // check for mere existence would build this store, and every PUT
+        // would then fail "Not a directory" and be absorbed, silently.
+        let file = tmp("file-parent");
+        std::fs::write(&file, b"").unwrap();
+        let root = file.join("bucket");
+        let built = FsObjectStore::new(root.clone());
+        let still_a_file = file.is_file();
+        std::fs::remove_file(&file).unwrap();
+        let Err(err) = built else {
+            panic!("a store was built over a bucket root whose parent is a regular file")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the bucket root \"{root}\" has no parent directory: \"{parent}\" is not an \
+                 existing directory, and charpente never creates a directory above the bucket \
+                 root — an acknowledged PUT rests on every directory entry above it, and \
+                 charpente vouches only for the entries it creates and fsyncs. Create \
+                 \"{parent}\" when you provision the machine and make it durable before the \
+                 node starts (for example, run `sync` after creating it), or point at a \
+                 bucket root whose parent exists",
+                root = root.display(),
+                parent = file.display()
+            )
+        );
+        assert!(still_a_file, "the refusal replaced {}", file.display());
+    }
+
+    /// An empty path names no bucket root: refused when the store is built,
+    /// where it used to panic inside the PUT the kernel's thread polls.
+    #[test]
+    fn an_empty_bucket_root_is_refused_when_the_store_is_built() {
+        let Err(err) = FsObjectStore::new("") else {
+            panic!("a store was built over an empty bucket root")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(
+            err.to_string(),
+            "the bucket root path is empty — name the directory to use (a relative path is \
+             taken from the working directory)"
+        );
+    }
+
+    /// A parent removed after the store was built: every PUT still refuses
+    /// the root by name, and creates nothing (GUIDE's archive section).
+    #[test]
+    fn a_put_under_a_bucket_root_whose_parent_was_removed_is_refused_by_name() {
+        let missing = tmp("removed-parent");
+        std::fs::create_dir(&missing).unwrap();
+        let root = missing.join("bucket");
+        let s = FsObjectStore::new(root.clone()).unwrap();
+        std::fs::remove_dir(&missing).unwrap();
+        let first = put(&s, "p/k", b"v").expect_err("a PUT created the bucket root's parent");
+        let again =
+            put(&s, "p/k", b"v").expect_err("a retried PUT created the bucket root's parent");
+        let exists = missing.exists();
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(first.kind(), io::ErrorKind::NotFound, "{first}");
+        assert_eq!(
+            first.to_string(),
+            format!(
+                "object PUT \"p/k\" failed: the bucket root \"{root}\" has no parent \
+                 directory: \"{parent}\" is not an existing directory, and charpente never \
+                 creates a directory above the bucket root — an acknowledged PUT rests on \
+                 every directory entry above it, and charpente vouches only for the entries \
+                 it creates and fsyncs. Create \"{parent}\" when you provision the machine \
+                 and make it durable before the node starts (for example, run `sync` after \
+                 creating it), or point at a bucket root whose parent exists",
+                root = root.display(),
+                parent = missing.display()
+            )
+        );
+        assert_eq!(again.to_string(), first.to_string());
+        assert!(!exists, "the refusal created {}", missing.display());
+    }
+
     #[test]
     fn list_is_sorted_and_prefix_scoped() {
         let root = tmp("list");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         for k in ["p/b", "p/a", "q/c"] {
             put(&s, k, &[]).unwrap();
         }
@@ -9230,7 +9343,7 @@ mod fs_object_store {
 
     #[test]
     fn get_absent_key_is_not_found_and_names_the_key() {
-        let s = FsObjectStore::new(tmp("absent"));
+        let s = FsObjectStore::new(tmp("absent")).unwrap();
         let e = get(&s, "nope").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
         assert!(
@@ -9242,7 +9355,7 @@ mod fs_object_store {
     #[test]
     fn delete_removes_the_object() {
         let root = tmp("delete");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "a", &[9]).unwrap();
         s.start(ObjectOp::Delete { key: "a".into() }).unwrap();
         assert!(matches!(drain(&s).unwrap(), ObjectDone::Delete));
@@ -9261,7 +9374,7 @@ mod fs_object_store {
     #[test]
     #[should_panic(expected = "operation already in flight")]
     fn second_start_before_poll_asserts() {
-        let s = FsObjectStore::new(tmp("inflight"));
+        let s = FsObjectStore::new(tmp("inflight")).unwrap();
         s.start(ObjectOp::Get { key: "a".into() }).unwrap();
         let _ = s.start(ObjectOp::Get { key: "b".into() });
     }
@@ -9290,10 +9403,10 @@ mod fs_object_store {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tmp("atomic");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "a", &[1; 4096]).unwrap();
 
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        crate::support::chmod_that_bites(&root, 0o555);
         let e = put(&s, "a", &[2; 4096]).unwrap_err();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -9316,10 +9429,10 @@ mod fs_object_store {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tmp("fresh");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "seed", &[0]).unwrap(); // creates the bucket directory
 
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        crate::support::chmod_that_bites(&root, 0o555);
         assert!(put(&s, "new", &[1, 2, 3]).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -9344,7 +9457,7 @@ mod fs_object_store {
     #[test]
     fn a_temp_left_by_a_crash_is_never_served_or_listed() {
         let root = tmp("residue");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "gen/seg", &[1; 64]).unwrap();
         std::fs::write(root.join("gen/seg.tmp"), [2u8; 64]).unwrap();
 
@@ -9367,34 +9480,34 @@ mod fs_object_store {
     #[test]
     #[should_panic(expected = "reserves")]
     fn a_key_ending_in_tmp_is_refused() {
-        let s = FsObjectStore::new(tmp("reserved"));
+        let s = FsObjectStore::new(tmp("reserved")).unwrap();
         let _ = s.start(ObjectOp::Get {
             key: "a/b.tmp".into(),
         });
     }
 
     /// Step 4 of the atomic PUT — the fsync of the parent directory that
-    /// makes the rename durable — has a cheap oracle for its PRESENCE even
-    /// though its durability has none. `File::open(dir, O_RDONLY)` needs
-    /// read permission on the directory, so a parent at `0o333` (write and
-    /// traverse, no read) fails that one call and only that one: creating
-    /// `<key>.tmp` needs w+x, writing it needs neither, and the rename needs
-    /// w+x. Removing the fsync is otherwise a GREEN mutation — measured, at
-    /// review: the rest of this module stays 11/0 with it gone.
+    /// makes the rename durable — on a real filesystem. `File::open(dir,
+    /// O_RDONLY)` needs read permission on the directory, so a parent at
+    /// `0o333` (write and traverse, no read) fails that one call and only
+    /// that one: creating `<key>.tmp` needs w+x, writing it needs neither,
+    /// and the rename needs w+x.
     ///
-    /// It pins presence and call site, not durability. That is exactly the
-    /// mutation the next author is likeliest to make ("why are we opening a
-    /// directory?"), which is the same argument that put
-    /// `every_op_completes_on_the_first_poll` in this file.
+    /// It pins presence, call site and the error's words, not durability:
+    /// removing the fsync was a GREEN mutation for every test in this module
+    /// (measured at review, 11/0). Durability is held by the crash model in
+    /// `charpente::prod`'s tests (`CrashFs`), which cuts the power after the
+    /// PUT and goes red without this fsync or any other on the way down to
+    /// the key (D2, 2026-10-01).
     #[test]
     fn a_put_that_cannot_fsync_its_directory_reports_the_failure() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tmp("dirsync");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         put(&s, "k", &[1; 16]).unwrap(); // creates the bucket directory
 
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o333)).unwrap();
+        crate::support::chmod_that_bites(&root, 0o333);
         let result = put(&s, "k", &[2; 16]);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -9403,11 +9516,19 @@ mod fs_object_store {
              directory entry is not durable is an object that can vanish across a crash",
         );
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains(&format!("could not fsync directory \"{}\"", root.display()))
+                && msg.contains("ObjectStore's contract"),
+            "a failed directory fsync must name the directory and the contract: {msg}"
+        );
 
         // The THIRD outcome the trait's two-outcome sentence does not list:
         // this PUT failed and the key holds the NEW value. Benign, and
         // exactly archive spec §7's "PUT lands but the ack is lost" row —
-        // the archive's retry is idempotent. Pinned so it is a known
+        // the archive's retry is idempotent. And the GET that sees it has
+        // made it durable first: an object a GET returns is durable (the
+        // trait's contract), whoever reads it. Pinned so it is a known
         // property of this impl rather than a surprise.
         assert_eq!(
             get(&s, "k").unwrap(),
@@ -9425,7 +9546,7 @@ mod fs_object_store {
     #[test]
     fn every_op_completes_on_the_first_poll() {
         let root = tmp("firstpoll");
-        let s = FsObjectStore::new(root.clone());
+        let s = FsObjectStore::new(root.clone()).unwrap();
         for op in [
             ObjectOp::Put {
                 key: "k".into(),

@@ -2029,7 +2029,10 @@ fn diverged_follower_is_refused_by_name() {
             "but this primary's last durable position is seq {last} (crc n/a) — the follower \
              holds records this primary never had (or lost), a forked timeline that can never \
              be merged; re-seed the follower from a fresh data dir (stop it, delete its data \
-             dir, restart to snapshot-seed from this primary)"
+             dir, and restart it configured as a follower of this primary so it snapshot-seeds \
+             from it, never with a primary config: the durable role file that outranks config \
+             is deleted with the data dir, so a cleared node started as a primary comes up as a \
+             second writable primary)"
         )),
         "refusal must name the primary's last durable seq {last} and the fix: {err}"
     );
@@ -2277,7 +2280,10 @@ fn a_seeded_follower_with_zero_frames_refuses_a_lossy_primary() {
             "but this primary's last durable position is seq {p_last_after} (crc n/a) — the \
              follower holds records this primary never had (or lost), a forked timeline that \
              can never be merged; re-seed the follower from a fresh data dir (stop it, delete \
-             its data dir, restart to snapshot-seed from this primary)"
+             its data dir, and restart it configured as a follower of this primary so it \
+             snapshot-seeds from it, never with a primary config: the durable role file that \
+             outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary)"
         )),
         "refusal must name the primary's last {p_last_after} and the fix: {err}"
     );
@@ -2455,10 +2461,13 @@ fn expected_diverged_behind(pos_seq: u64, base: u64) -> String {
          {pos_seq} to compare, this primary cannot prove the follower's records are a prefix of \
          its own timeline, and re-seeding here would silently overwrite whatever the follower \
          holds; if the follower merely lagged past the retained window, re-seed it deliberately \
-         from a fresh data dir (stop it, delete its data dir, restart to snapshot-seed from this \
-         primary); if instead this primary forked below the follower (recovered past an \
-         above-horizon corruption cut and kept serving), promote the follower and re-seed this \
-         node from it"
+         from a fresh data dir (stop it, delete its data dir, and restart it configured as a \
+         follower of this primary so it snapshot-seeds from it, never with a primary config: the \
+         durable role file that outranks config is deleted with the data dir, so a cleared node \
+         started as a primary comes up as a second writable primary); if instead this primary \
+         forked below the follower (recovered past an above-horizon corruption cut and kept \
+         serving), promote the follower and re-seed this node from it the same way, configured \
+         as a follower of the promoted node"
     )
 }
 
@@ -2573,6 +2582,167 @@ fn a_converged_follower_below_a_forked_primarys_base_is_refused_not_rewound() {
         fp_before,
         "the follower's data must be untouched — no silent re-seed from the forked primary"
     );
+}
+
+/// `diverged_crc`'s text, pinned (S5 R2-I1: a pin for each refusal text that
+/// prescribes a re-seed). A follower forked at a seq the primary also holds,
+/// with different bytes, is refused by CRC, and the fix names the config the
+/// cleared follower must restart under. This test computes neither CRC
+/// (error-suite T8's CRC carve-out), so the text is pinned on both sides of
+/// them.
+#[test]
+fn a_follower_forked_at_a_seq_the_primary_holds_is_refused_by_crc_naming_the_reseed_config() {
+    let sim = Sim::with_faults(0x5E5F_1002, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    let fork = p.db.as_ref().unwrap().last_applied().expect("p committed") + 1;
+
+    // Each side writes a different record at the same seq: the follower as a
+    // wrongly-promoted node would, the primary as it keeps serving.
+    sim.partition("p", "f");
+    {
+        let fdb = f.db.as_mut().unwrap();
+        fdb.allow_writes();
+        fdb.transact(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(999),
+                kind: 0,
+                weight: 1,
+            });
+            Ok::<(), io::Error>(())
+        })
+        .expect("the forking write commits locally");
+    }
+    commit_widget(&sim, &mut p, 10).unwrap();
+    assert_eq!(p.db.as_ref().unwrap().last_applied(), Some(fork));
+    assert_eq!(f.db.as_ref().unwrap().last_applied(), Some(fork));
+
+    sim.repair("p", "f");
+    recover_node(&sim, &mut f).unwrap();
+    // Both sit at `fork`, so `converged` holds already: drive until the refusal.
+    let err = run_until(&sim, &mut [&mut p, &mut f], |_| false, CONVERGE_BUDGET)
+        .expect_err("a follower forked at a seq the primary holds must be refused, never merged");
+    assert!(
+        err.starts_with(&format!(
+            "f step: diverged: the follower's frame at seq {fork} has crc 0x"
+        )),
+        "{err}"
+    );
+    assert!(
+        err.ends_with(&format!(
+            " (this primary is at seq {fork}) — the logs share a seq but not its bytes, a forked \
+             timeline that can never be merged; re-seed the follower from a fresh data dir (stop \
+             it, delete its data dir, and restart it configured as a follower of this primary so \
+             it snapshot-seeds from it, never with a primary config: the durable role file that \
+             outranks config is deleted with the data dir, so a cleared node started as a \
+             primary comes up as a second writable primary)"
+        )),
+        "{err}"
+    );
+}
+
+/// The re-seed the refusals prescribe, on the node it is most dangerous for
+/// (S5 R2-I1, the reviewer's probe): a former primary demoted by a
+/// switchover, whose durable role file says follower while its startup
+/// config still says primary. Its store is removed beside its compacted log,
+/// and the boot refuses by name, naming the step. Followed as named (the data
+/// dir deleted, the node restarted configured as a follower of the current
+/// primary), it re-seeds and converges. The second arm deletes the data dir
+/// and restarts the node with its old primary config, which the texts warn
+/// against: the role file that outranked that config went with the data dir,
+/// so the node comes up as a second writable primary and acks a write. That
+/// arm pins the warning's truth. A fence that closed the hazard would turn it
+/// red, and the texts would change with it.
+#[test]
+fn a_wiped_switchover_demoted_primary_rejoins_only_when_restarted_configured_as_a_follower() {
+    for as_follower in [true, false] {
+        let sim = Sim::with_faults(0x2EB1_0013, FaultConfig::none());
+        let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+        let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+        for i in 0..30u64 {
+            commit_widget(&sim, &mut p, i).unwrap();
+        }
+        run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+        p.flipped = true;
+        f.flipped = true;
+        let mut cli = CtrlConn::open(
+            &sim,
+            "p:1",
+            &Msg::CtrlSwitchover {
+                to: "f:1".to_string(),
+                secret: None,
+            },
+        )
+        .unwrap();
+        let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+        assert!(matches!(reply, Msg::CtrlOk { .. }), "switchover: {reply:?}");
+        let follower_of_f = Role::Follower {
+            primary: "f:1".to_string(),
+        };
+        assert_eq!(
+            p.repl.role(),
+            &follower_of_f,
+            "the switchover demoted p durably"
+        );
+        // f moves on as the primary. p is not driven again: f compacts past
+        // p's position, so p's next Hello would be refused as diverged behind.
+        for i in 30..40u64 {
+            commit_widget(&sim, &mut f, i).unwrap();
+        }
+        p.db.as_mut().unwrap().checkpoint().unwrap();
+        let base = p.db.as_ref().unwrap().log_base();
+        assert!(base > 0, "setup must compact p's log past seq 0");
+
+        p.db = None;
+        let disk = p.host.disk();
+        disk.remove("tables.redb").unwrap();
+        disk.sync_dir("tables.redb").unwrap();
+        p.host.restart();
+        let err = reopen(&sim, &mut p).expect_err("a compacted log beside no store must not boot");
+        assert!(
+            err.contains(&format!(
+                "but the log beside it starts at seq {base}: the acknowledged records from seq 0"
+            )) && err.contains(
+                "stop the node, delete its data dir, and restart it configured as a follower of \
+                 the current primary"
+            ),
+            "the refusal must name the step: {err}"
+        );
+
+        for name in disk.list("").unwrap() {
+            disk.remove(&name).unwrap();
+        }
+        disk.sync_dir("").unwrap();
+        p.host.restart();
+        if as_follower {
+            p.repl_cfg = follower_cfg("p:1", "f:1");
+            reopen(&sim, &mut p).unwrap();
+            assert_eq!(p.repl.role(), &follower_of_f);
+            let seeds = total_seeds(&p);
+            for i in 40..50u64 {
+                commit_widget(&sim, &mut f, i).unwrap();
+            }
+            run_until(&sim, &mut [&mut f, &mut p], converged, CONVERGE_BUDGET).unwrap();
+            assert!(total_seeds(&p) > seeds, "p must re-seed from f");
+            assert_converged(&sim, &mut f, &mut p).unwrap();
+            assert_eq!(
+                commit_widget(&sim, &mut p, 1000)
+                    .map_err(|e| e.starts_with("commit refused: not primary of ")),
+                Err(true),
+                "the re-seeded node must refuse writes as a follower"
+            );
+        } else {
+            reopen(&sim, &mut p).unwrap();
+            assert_eq!(p.repl.role(), &Role::Primary);
+            assert_eq!(f.repl.role(), &Role::Primary);
+            commit_widget(&sim, &mut p, 1000)
+                .expect("a cleared node started as a primary acks writes beside the real one");
+        }
+    }
 }
 
 /// Design B's deliberate cost, pinned so it is a choice and not an accident: a
@@ -8599,9 +8769,12 @@ fn a_resurrected_primary_refuses_by_name_when_its_witness_answers_as_a_primary()
          while it was down, so this node is not the primary any more. It has NOT demoted itself \
          — it cannot know which timeline you want to keep, and the writes it acked are not the \
          platform's to discard. If f:1 holds the timeline to keep, re-seed this node from a \
-         fresh data dir (stop it, delete its data dir, restart to snapshot-seed from f:1); if \
-         instead this node's records are the ones to keep, stop f:1, then clear this node's \
-         witness set (GUIDE §10) and restart it."
+         fresh data dir (stop it, delete its data dir, and restart it configured as a follower \
+         of f:1 so it snapshot-seeds from it, never with a primary config: the durable role \
+         file that outranks config is deleted with the data dir, so a cleared node started as \
+         a primary comes up as a second writable primary); if instead this node's records are \
+         the ones to keep, stop f:1, then clear this node's witness set (GUIDE §10) and \
+         restart it."
     );
 
     // The probe must not make its target record it (the probe Hellos with no

@@ -18,7 +18,7 @@ const KNOWN_FLAGS: &[&str] = &["--dir", "--bin", "--from", "--to", "--prefix"];
 pub const USAGE: &str = "usage: charpente restore --from BUCKET --prefix PREFIX [--to DIR] [--dir PATH] [--bin NAME] [--force]\n       \
 --from BUCKET    the archive's root directory (the bucket an archive wrote)\n       \
 --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim\n       \
---to DIR         the data directory to rebuild (default: the app's own data directory)\n       \
+--to DIR         the data directory to rebuild (default: the app's own data directory; its\n                        parent must exist)\n       \
 --dir PATH       the app crate to build and run the restore with (default: .)\n       \
 --force          discard a destination timeline the archive cannot prove is its own\n\
 \n\

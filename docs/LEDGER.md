@@ -6325,3 +6325,248 @@ clean whole-workspace count is the gate after S3 merges.
 - The refusal's `.table::<…>()` hint prints the crate's own name (`charpente_core::…`) where
   in-crate code spells `crate::…`. Cosmetic.
 - `encode_record` carries a stale "only writers" comment that predates S2.
+
+## 2026-10-01 — test and instrument quality: a pass needs a verdict, a give-up is counted and capped, and the harness stops excusing what it cannot see
+
+**Why.** Follow-ups 1, 9, 13, 14, 19 and 22 of the job-tenancy and redb 4.3.0 entries: sub-project
+S3 of landing the follow-ups before 0.1.0. One principle carried it, and was sharpened by two
+reviews: **a verdict needs a check that could have failed.** A give-up is honest; a pass that
+checked nothing, or a give-up wide enough to swallow a real failure, is the defect. Workspace
+`.superpowers/sdd/2026-09-30-publish-readiness/` (`s3-brief.md`, `s3-fix-brief.md`,
+`s3-report.md`, `s3-review.md`). Branch `s3-tests`, merged at 796bff2.
+
+**Shipped.**
+- **`ceiling:`** (84ab5f6, follow-up 1). A swarm batch can cap a key: a give-up count above its
+  cap fails the batch naming the key, the count and the cap. Nine properties carry one (GUIDE §8
+  names them). Pinned bases are capped at their exact count; ambient ones at twice the largest of
+  10 fresh batches.
+- **Retry and excuse arms that ran out or were excused give up instead of passing** (99a3c38,
+  eebc453, aa8feed, 7fd70ab, 159c6b8; follow-up 9). Tenant, transactions, http, group_commit's
+  coda, typed_tables, archive's four arms, five durable-corruption excuse arms, transactions'
+  round recovery and snapshots (classified instead of `Err(_) => restart`), migrations ×2,
+  sim-fixture and invoicing. Give-ups that read 0 per 256 now read what they are. GUIDE §8 says
+  an excused universe gives up.
+- **A verdict needs a check that could have failed** (a800501, 25a1be1; review I1, M3).
+  typed_tables counted round 0's check of a fresh store against an empty model; it now needs a
+  final check over at least one logged record, after a final reopen loop of 32 (+5.7% CPU —
+  a800501's message says +8.5%, which was computed against a wrong baseline; corrected in a
+  comment at 3e8805e). group_commit's coda over a zero watermark (39 of 256 at the pinned base
+  never acked anything) gives up.
+- **Budgets raised only where they rescue** (cd86eb5, d34d391, 6a44419): the kernel's final
+  check 8 → 64; tenant, transactions, http 8 → 16; group_commit's coda 8 → 64 and its round
+  boundaries 8 → 16, with skipped boundaries capped (`oracle:round-unreachable` 20) because the
+  coda does not cover them (review I3, on `verify_watermark`'s own doc); archive's restore and
+  verify 32 → 64, two floors raised to their new exact counts (234 → 237, 236 → 240). No floor
+  was lowered.
+- **typed_tables rebuilds a store redb rejects** (867dfc2): a torn store creation had bricked
+  231 of 2,048 universes, hidden by `Err(_) => restart`. Every round error is now classified;
+  only redb-rejected bytes are rebuilt, as `Db::open` does. Pinned 0x5fc2c8c0905ed653 and
+  0xc7886d7a51eefcef by reason.
+- **Realtime re-syncs to the node's timeline after a durable cut** (dda1380, fe18840; follow-up
+  22's sibling, review I2). The first fix (387edf5) gave up when every owed id had been cut and
+  re-minted for another tenant; the review showed nothing held that gate in the loosening
+  direction. The re-sync at every boundary read makes that excuse unreachable, so it was deleted:
+  a cut id re-minted for the SUBSCRIBED tenant and never delivered now fails. Reviewer: 128 fresh
+  bases, 0 failures, 32 give-ups, 81 re-syncs.
+- **A realtime settle runs with subscriber stalls quiesced** (b1f110e, follow-up 22): a stall can
+  no longer drop the only clean attempt. Flagship over 64 fresh bases: 1 failure → 0.
+- **Smaller:** two kernel-refusal lib tests fail by name in 10 s instead of hanging (2fc5a56,
+  follow-up 14); the ctl dead-port test connects to `127.0.0.1:0` (20298fd, follow-up 19 — the
+  port race that failed main's gate at c947730); `charpente test --mutants` times one `cargo test`
+  over the test set and passes 5× as `--timeout` whenever the set differs from the mutated file's
+  package, after checking `cargo mutants --version` (2b40475, de3d4fb, 010ed1b; follow-up 13).
+
+**Review.** Independent opus review: MERGE AFTER FIXES, 0 Critical, 3 Important (I1, I2, I3
+above), 7 Minor. One fix round (with the controller's sweep folded in), then a scoped re-review:
+MERGE, all 10 addressed, re-run by the reviewer at three bases each.
+
+**Gate.** Branch at 159c6b8: fmt and clippy clean, 86/86 `test result: ok`, 1,579 passed, 0
+FAILED (3e8805e changes one comment; typed_tables re-ran 28/28). Main at 796bff2: fmt and clippy clean, 86/86 `test result: ok`, 1,596 passed, 0 FAILED —
+the first whole-workspace gate of this effort with no failure (the ctl port race is gone).
+
+**Follow-ups — S3b, before S1.** The census of the same class outside this branch's scope, ruled
+into one bounded sub-project:
+- **O1 (first).** The realtime settle-check give-up never checks whether durable corruption fired
+  (scoped `realtime.rs:5295`, flagship `:2328`, and the drain-error check). With the re-sync it
+  fires 0 times in 16,384 universes under corruption, so only a non-injected cut — a platform
+  durability bug — can reach it; with the re-sync disabled as a stand-in, 33 universes gave up
+  there and 1 failed. Give up there only when corruption fired.
+- GUIDE §8's `counter_survives` gives up on any `transact` error (review N1).
+- The flagship settle probe's re-mint residual (`realtime.rs:2308`); migrations' four
+  "inconclusive" arms (13 + 10 universes counted as verdicts); invoicing's 17 and sim-fixture
+  `verify`'s 3 fault-fallout `Ok` returns; group_commit's round budget 16 → 32 (5 skipped at +19%
+  CPU, inside the +25% rule the controller misapplied without the 32 data point).
+- Not blockers, noted: ambient caps at 2× max would not catch a regression to 8 attempts; the
+  kernel's 64-reopen budget exceeds the +25% bound set later.
+
+## 2026-10-01 — WAL recovery syncs before it replays: a frame from a process that died before its fsync was applied, made durable in the store, and lost at the next power cut
+
+**Why.** Found by S5's fresh-base measurement (its concern 2), on main at c947730: the realtime
+mixed-shapes property panicked "store applied_seq 0 is ahead of the durable log end None — the
+store outran durable truth" at 2 of 6 fresh bases (`CHARPENTE_SEED=0x5d889f4c1a9ac543`; 2 in
+~9,000 universes over 50 bases at 74ddf90). Sub-project D1 of
+landing the follow-ups before 0.1.0. Workspace `.superpowers/sdd/2026-09-30-publish-readiness/`
+(`d1-report.md`, `d1-fix-report.md`, `d1-review.md`). Branch `d1-wal-sync`, merged through
+`s5-open` at 125226d.
+
+**The bug.** `Wal::open` replayed every frame it could READ and never `File::sync`ed a segment, so
+a frame written by a process that died before its WAL fsync succeeded was applied to the store and
+made durable there (by `persist_store_at_open`, or by redb's close on any drop); the next power loss
+dropped the frame from the log. A real `kill -9` plus a power loss reproduces it with no injected
+fault. Latent since the WAL's first commit (`cfef3ea`, 2026-07-01, which syncs only the cut's
+truncation); `persist_store_at_open` dates from `575ac9d` (2026-07-18). Reproduced by mechanism at
+848c799, 89bd4e6, c07ceef and 74ddf90 — not a redb-bump regression. No property modelled a process
+restart with the page cache intact; `shapes_boot`'s `continue` reached it by accident.
+
+**Shipped.**
+- **Recovery syncs each segment before it replays it** (25e5ee6), with four deterministic pins and a
+  class property, `the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`
+  (engine.rs, base `0xD1F0_000E`, pinned where both wrong fixes go red).
+- **`Sim::restart_process`** (ffd50b4): a process restart that keeps the page cache — every open file
+  handle dies, pending writes and directory entries survive. Public, GUIDE §8.
+- **The clean-sync rule** (56d10e6): a sync on a file with nothing pending draws no fault, so the new
+  syncs re-key only universes that had something to lose. Every pinned floor and pin was still
+  re-measured (S5 rounds 4–8).
+- **Role and witness boot reads sync first** (271cb9b, review I3): the same class one layer up — the
+  durable role file and the witness slots were trusted before their bytes were.
+- DESIGN §2 states what the sync does NOT close (review I1): the Linux fsync-EIO case, where a failed
+  sync can mark pages clean; the fix narrows it to what the kernel reports honestly.
+
+**Review.** Independent opus review: MERGE AFTER FIXES (I1 docs overclaimed, I2 non-tail segment,
+I3 role/witness, M1–M7); one fix round; MERGE. M7 recorded: `Db::open`'s laid-segment branch rests
+on redb 4.3.0 syncing at open.
+
+**Follow-ups.**
+- Hosts (replication nodes) have no `restart_process`; only the global disk does.
+- The fsync-EIO residual is documented, not closed.
+- Any future boot read that adds a disk op re-keys replication's universes.
+- The clean-sync rule's re-key exposed a replication rig gap older than D1 (D3, below).
+
+## 2026-10-01 — store-open classification: Db::open discards or refuses only a store whose bytes redb rejects, a store behind its log is refused by name, and every re-seed text says to restart the node as a follower
+
+**Why.** The 2026-09-30 store-open ruling: before this, ANY `Store::open` error led to discard and
+rebuild, or on a compacted log to a "restore from a replica" refusal — including a transient IO
+error a restart would clear. Sub-project S5. Workspace as above (`s5-brief.md`, `s5-report.md`
+rounds 1–10, `s5-review.md` with three re-reviews, `s5-cov/`). Branch `s5-open`, merged at 125226d.
+
+**Shipped.**
+- **`StoreRejected`** (8b7d8eb): only a store whose bytes redb 4.3.0 rejects (Corrupted,
+  UpgradeRequired, magic mismatch) is discarded, or refused on a compacted log; every other error
+  bubbles, named by site and fix (review M5). The variant table is DESIGN §4, checked row by row
+  against redb's source; a FromDisk marker keeps a disk error from passing as a redb verdict.
+- **A store behind its log is refused by name, never replayed into** (0005f99, 3315e58; review
+  R-I1, R2-M1). One rule: refuse when replay would start past the store's own next seq, whatever
+  the `tables.redb.horizon` breadcrumb says; the same bound is asserted before recovery. Before, the
+  breadcrumb lifted the horizon past the vanished-prefix check and the boot panicked "Store::apply_batch
+  reached seq 18 but expected 0". **Reachable without an operator:** a crash inside `Seeder::new`
+  between barriering the store's removal and the breadcrumb's (seed `0x64a183075fd398b9`); the
+  property `a_reseed_cut_short_by_a_crash_boots_a_whole_timeline_or_refuses_by_name`
+  (transactions.rs, base `0x5EED_C0A1`) judges each boot against the disk state the crash left and
+  requires the exact refusal text.
+- **Every text that prescribes clearing a data directory says to restart the node configured as a
+  follower of the current primary** (5449d8b; review R2-I1), through one clause,
+  `repl::role::reseed_steps`. The old texts ("stop it, delete its data dir, restart to snapshot-seed
+  from …") followed literally on a switchover-demoted primary whose config still said primary
+  brought up a SECOND WRITABLE PRIMARY that acked a write: clearing the directory deletes the durable
+  role file that outranks config. A two-arm pin holds both the remedy and the warning.
+- **Boots go through injected faults the way a supervised restart would**
+  (`checks::boot_through_fallout`, `Sim::disk_crashed`), and **a durable refusal ends every
+  recovery loop at once by name, given up only where durable corruption fired**
+  (`checks::durable_refusal`, review M6, R-M2, R-M3).
+- **Round loops are aimed and floored** (review I1: S5 had cost group_commit −5.1 SE, tenant −5.0
+  SE, kernel exactly-once −3.5 SE of reach with nothing noticing — those properties had no reach
+  floor and their caps were re-set upward). Reach parent → merge: group_commit 823 → 1,059,
+  tenant 720 → 1,083, kernel exactly-once 365 → 495, job_tenancy 247 → 346 (reviewer's own bases).
+  Every capped property now floors its reach key; `run_universes_swarm!` takes `floor:`.
+
+**Rules (GUIDE §8; controller rulings, revisable).** After a re-key a floor may be re-set down only
+if the after-mean is within one Welch SE of the before-mean over the same ≥10 fresh bases; a cap
+may rise only if the passes covering the property's reach key did not fall by more than one SE
+(a give-up that replaced a vacuous pass is the principle working — aiming kernel exactly-once cut
+vacuous passes 66 → 23 per batch while give-ups rose); an ambient floor sits at mean − 4 sd and
+catches a collapse (~16% for kernel exactly-once), the before/after test catches drift.
+
+**Review.** Independent opus whole-branch review: MERGE AFTER FIXES (0 C, 2 I, 6 M). Three scoped
+re-reviews; the last MERGE (0 C, 0 I, 1 M carried to S3b).
+
+**Gate.** Branch at 00a3321: fmt and clippy clean, 91/91 `test result: ok`, 1,640 passed, 0 failed.
+Main at 125226d: fmt and clippy clean, 86/86 `test result: ok`, 1,640 passed, 0 failed.
+
+**Follow-ups.**
+- **S3b, first:** eight "restore … from a replica or backup" texts lack the follower-config step
+  (db.rs ×6, log.rs, role.rs's torn-role text, which in-model appears only after a role flip).
+- **For Noah (design):** an interrupted re-seed now refuses by name instead of panicking, and the
+  operator re-seeds it by hand; self-healing would need a durable seeding-intent marker (a re-key of
+  every seeding universe). And protection from a second primary after a wipe rests on the operator's
+  config; DESIGN acknowledges the witness gate is bounded — a structural fence is a design change.
+- The swarm runner does not report vacuous passes; the two cap rises it justified need S5's scanner
+  re-run at the next re-key.
+- Several pinned scenarios are now rare (group_commit never-acked 9/256, unreachable round 3/256,
+  realtime never-booted 1 in 14,336): the next re-key needs wide scans.
+- `cargo doc -D warnings` fails on two pre-existing intra-doc links (prod.rs, http/mod.rs).
+
+## 2026-10-01 — the filesystem stores return and acknowledge only durable objects: an acked PUT under a new prefix, and an acked write on a fresh node, no longer vanish at the next power cut
+
+**Why.** D1's class — a boot or a reader trusting bytes the page cache held but the disk did not —
+found one layer up by D1's reviewer, in `charpente::prod`. Sub-project D2. Workspace
+`.superpowers/sdd/2026-09-30-publish-readiness/` (`d2-brief.md`, `d2-report.md` rounds 1–6 and the
+merge, `d2-review.md` with two re-reviews). Branch `d2-objstore`, merged at e8eb74e.
+
+**The bugs.**
+- **`FsObjectStore`, the archive's filesystem bucket** (402bca5). A PUT created missing directories
+  and never synced their entries into their parents — the comment said "the retry re-creates it",
+  but no retry follows an acknowledgement. Every generation roll wrote `<gen>/snapshot` and
+  `<gen>/segments` under unsynced directories and then deleted the previous generation: a power cut
+  could leave a bucket with neither. A GET or LIST could return an object whose name was not yet
+  durable.
+- **`ProdDisk`, the production `Disk`** (3a81ba7). On a fresh node `Store::open` synced the data
+  directory before `wal/` existed and the WAL's barrier synced only `wal/`, so every write acked
+  before the first checkpoint rested on an unsynced `wal` entry. A clean stop masks it (redb's
+  shutdown commit makes the rows durable in the store), so only a power cut shows it.
+
+**Shipped.**
+- An object a GET or LIST returns, and an acknowledged PUT, is durable; `ObjectStore`'s contract in
+  io.rs says so in one sentence (and that nothing is owed for a Delete). A barrier syncs from the
+  prefix's directory up to the data directory; `ProdDisk::new` syncs the data directory's own entry
+  at every start, so an unreadable parent fails at start under its own line (fadd9d8). Each sync has
+  exactly one owner and one pin that goes red under its inversion (fa7cca8; two were found unpinned
+  by the second re-review).
+- **Neither store ever creates a directory above the data directory or the bucket root** (d400b1f,
+  a controller ruling): a directory created up there can only be made durable by fsyncing every
+  ancestor to `/`, which fails on unreadable ancestors and on squashfs. A missing parent is refused
+  by name, telling the operator to create it at provisioning time and make it durable. A behaviour
+  change before 0.1.0: a deep `--data-dir` that used to be created is now refused.
+- **`FsObjectStore::new` is fallible** (affb516, review I1): a bucket root whose parent is missing
+  is refused when the store is built. Before, the archive read the missing manifest as a fresh
+  bucket, every PUT was refused and absorbed, and a low-write node ran with no backup and nothing on
+  stderr (a probe: 97 of 200 PUTs refused, no gap notice, no stop). An empty path is refused by name
+  instead of panicking the kernel thread (review I2).
+- A refused `restore` removes only a destination it created, through `remove_empty_dir`, which
+  syncs the removal; permission-based pins assert their precondition and say "this pin needs a
+  non-root runner" rather than failing as if durability broke. A failed role or witness write says
+  the change may already have happened (d42919c). `ProdDisk` keeps `Send + Sync + UnwindSafe`,
+  asserted at compile time.
+- **The oracle.** The simulator cannot express an unsynced directory entry (`Disk` has no rename and
+  a flat namespace), so prod.rs gained a private `Fs` seam and a test-only crash model, `CrashFs`,
+  that keeps only what a sync took, each directory on its own; a process restart keeps everything.
+  Its limits are stated: unsynced state is lost totally and deterministically, and the Linux
+  fsync-EIO case is not modelled.
+
+**Review.** Independent opus review: MERGE AFTER FIXES (0 C, 3 I, 7 M). Two scoped re-reviews; the
+second found two syncs unpinned, and the controller ran both new pins' inversions itself (one first
+tripped a precondition, so a faithful created-only inversion was built: red at its own assertion).
+
+**Gate.** Branch at ac37b18 (main 125226d merged in): fmt and clippy clean, 91/91 `test result: ok`,
+1,678 passed, 0 failed; edge-harness ignored suites (smoke, acked_durable) 5/5. The merge at
+e8eb74e differs from ac37b18 by exactly the D1/S5 LEDGER commit (d98eda2), byte for byte.
+
+**Follow-ups.**
+- **Cost is unmeasured** and quotable only through docs/BENCH.md: the reviewer's estimate on macOS
+  (F_FULLFSYNC) is ~60,000 syncs for a 10M-row snapshot upload (~300 s against ~100 s before),
+  restore +~300 s, and a LIST over 10 generations ~500 s (nothing calls LIST today). The per-commit
+  path makes no directory syncs.
+- A bucket root's parent removed after the store is built makes the archive silent again
+  (documented residual).
+- `examples/invoicing`'s binaries print a refused `--data-dir` in Rust's Debug form (their `main`
+  returns `io::Result`); apps on `launch` get the named line.
+- 3a81ba7's message counts 45 filesystem calls in the power-cut sweep; at the tip it is 53.

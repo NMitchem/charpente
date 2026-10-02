@@ -31,7 +31,8 @@ use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, Row, View};
 use charpente_sim::checks::{
-    FaultReason, boot_through_fallout, classify, durable_corruption_fired, is_fault_fallout,
+    FaultReason, boot_through_fallout, classify, durable_corruption_fired, durable_refusal,
+    is_fault_fallout,
 };
 use charpente_sim::{FaultConfig, Sim, SimEntropy, SimHost, run_universes_swarm_with};
 use serde::{Deserialize, Serialize};
@@ -2085,6 +2086,10 @@ fn settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
                 if !is_fault_fallout(&e.to_string()) {
                     return Err(format!("settle open failed non-injected: {e}"));
                 }
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(None);
+                }
                 continue;
             }
         };
@@ -2358,6 +2363,40 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
 
 // ------------------------------------------------------------------ tests
 
+/// A durable refusal at the settle phase's boot ends it at once, by name (S5 re-review
+/// R-M2). Seed `0x28a2433c2792b1b9`, at the batch's base, meets one there. No restart
+/// clears it, and the loop used to spend its whole budget on it, then give
+/// up as though every attempt had hit an injected fault ("no settle attempt
+/// completed without fault fallout over 12 attempts").
+#[test]
+fn a_durable_refusal_at_the_settle_boot_ends_it_at_once_by_name() {
+    const SEED: u64 = 0x28a2_433c_2792_b1b9;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    if let Err(e) = realtime_workload(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    assert_eq!(
+        sim.coverage().get("boot:durable-refusal"),
+        Some(&1),
+        "seed {SEED:#x}: {:?}",
+        sim.coverage()
+    );
+    let reason = sim
+        .gave_up()
+        .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    assert!(
+        reason.starts_with(
+            "the boot was refused for durable corruption at or below the store's horizon"
+        ),
+        "seed {SEED:#x} must give up for the refusal, at once: {reason}"
+    );
+}
+
 #[test]
 fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     run_universes_swarm_with!(
@@ -2375,7 +2414,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0xaf1ba92646f937ea` (base `0xA11CE002`, universe 452).
+/// Seed `0xe9110992f2280d36` (base `0xA11CE013`, universe 289).
 ///
 /// **This pin has been re-found three times, and that is worth knowing before
 /// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
@@ -2393,10 +2432,16 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// 124) stopped when `Db::open` stopped discarding a store over an IO error
 /// (2026-10-01): that universe now reaches a verdict. `0xd0fce29ba31210d0`
 /// (universe 281) stopped the same day, when the epochs began booting through
-/// restarts and WAL recovery began syncing before replay (S5 with D1). This
-/// one is the only universe of 512 at that base that gives up for this reason,
-/// and with the zero-clean-attempts give-up removed it fails "client never
-/// caught up", which is the regression.
+/// restarts and WAL recovery began syncing before replay (S5 with D1).
+/// `0xaf1ba92646f937ea` (base `0xA11CE002`, universe 452) stopped too, when the
+/// settle boot began ending at once on a boot refused for durable corruption
+/// (S5 re-review R-M2): every one of its boots had been that refusal, so it
+/// now gives up under the refusal's name. This one, found by scanning 14,336
+/// universes over the 28 bases `0xA11CE002` to `0xA11CE01D` for a give-up
+/// naming no node to catch up from, is the only one of them; it meets no
+/// durable refusal, and
+/// with the zero-clean-attempts give-up removed it fails "client never caught
+/// up", which is the regression.
 ///
 /// The scenario: every one of `SETTLE_ATTEMPTS` attempts ends with `settle_boot`
 /// returning `None`. The node never booted once, so the client never had a single
@@ -2410,7 +2455,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
 /// give up rather than report a miss it never had the chance to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0xaf1b_a926_46f9_37ea;
+    const SEED: u64 = 0xe911_0992_f228_0d36;
     // Reconstruct this universe exactly as the swarm runner derives it.
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -5115,6 +5160,10 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
             Err(e) => {
                 if !is_fault_fallout(&e.to_string()) {
                     return Err(format!("settle open failed non-injected: {e}"));
+                }
+                // No restart clears a durable refusal (S5 re-review R-M2).
+                if durable_refusal(sim, &e.to_string())? {
+                    return Ok(None);
                 }
                 continue;
             }
