@@ -4548,6 +4548,38 @@ fn drive_client_to_settled(
                 sim.cover("rt:inconclusive:target-no-kernel");
                 format!("{INCONCLUSIVE}: target has no kernel")
             })?;
+            // A bare subscribe's tail starts at the node's `next_event_id`
+            // when the node SERVES it (`validate_subscribe`), not when it was
+            // sent: a shipped record can apply on a follower in between, and a
+            // floor read at send time then owes events no tail delivers (seeds
+            // 0x4aad5f8abb5ca6ef, sent at 3 and served at 4, and
+            // 0xcae37b21150fa7c8, sent at 0 and served at 4). This read IS the
+            // tail's start: the round that produced the reply stepped the
+            // target once, a step runs one arm, and a subscribe ends its
+            // request batch, so nothing has committed or applied there since.
+            // The send-time read stays a lower bound.
+            let subscribe_info = match subscribe_info {
+                (true, sent) if resp.0 == 200 => match kernel.app().db().next_event_id() {
+                    Ok(start) => {
+                        if start > sent {
+                            sim.cover("realtime:bare-start-advanced");
+                        }
+                        (true, start.max(sent))
+                    }
+                    Err(e) if is_fault_fallout(&e.to_string()) => {
+                        recover_rt_node(sim, node)?;
+                        client.need_subscribe = true;
+                        client.current_handle = None;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "reading a bare subscribe's start failed non-injected: {e}"
+                        ));
+                    }
+                },
+                other => other,
+            };
             client.absorb(
                 sim,
                 kernel.app().db(),
@@ -4849,6 +4881,41 @@ fn every_rt_recover_exhausted_sub_key_is_reachable_and_distinct() {
     let before = keys.len();
     keys.dedup();
     assert_eq!(before, keys.len(), "two fault families share a sub-key");
+}
+
+/// The two universes D4 found failing "client never caught up" (bases
+/// `0x5E1F0105` and `0xD4F2002D`). Each re-subscribed bare on the follower
+/// while a shipped event was in flight, so the event applied after the
+/// request was sent and before the node served it. The client's floor came
+/// from the send, the tail started at the serve, and the client was owed an
+/// event no tail delivers. Both now take the floor at the serve, under
+/// `realtime:bare-start-advanced`, and settle. A seed names a universe: if one
+/// stops covering the key, re-find the scenario by mechanism.
+#[test]
+fn a_bare_follower_subscribe_owes_what_its_tail_starts_at_not_what_it_sent() {
+    for seed in [0x4aad_5f8a_bb5c_a6ef_u64, 0xcae3_7b21_150f_a7c8] {
+        let mut state = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        no_media_corruption(&mut cfg);
+        let mut sim = Sim::with_faults(seed, cfg);
+        let r = multi_node_realtime_universe(&mut sim);
+        assert_eq!(finish_rt_universe(&sim, r), Ok(()), "seed {seed:#x}");
+        assert_eq!(sim.gave_up(), None, "seed {seed:#x} reaches a verdict");
+        let coverage = sim.coverage();
+        assert_eq!(
+            coverage.get("realtime:bare-start-advanced"),
+            Some(&1),
+            "seed {seed:#x}: for this reason, or the seed no longer names the scenario: \
+             {coverage:?}"
+        );
+        assert_eq!(
+            coverage.get("realtime:failover-resume"),
+            Some(&1),
+            "seed {seed:#x}: and the client settled through the failover: {coverage:?}"
+        );
+    }
 }
 
 #[test]
