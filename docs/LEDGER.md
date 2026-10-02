@@ -6856,3 +6856,16 @@ only additions.
 - **Refusing an `Ack` beyond what its session has shipped** would be defence in depth against a
   non-conformant peer. It needs its own analysis first: a legitimate follower may ack, on a new
   session, records an earlier session shipped, and refusing that would stall a real drain.
+- **The re-sync remedy text (~240 characters) is repeated by hand at every site.** Each site is
+  pinned exactly, so drift fails a test; one shared constant would make it one place to change.
+- **For Noah (API): the runtime could hold the frames itself.** If `onOpen` may return a Promise
+  and the TS runtime buffers frames until it settles, no client hand-rolls the hold-and-apply
+  order. Additive: an `onOpen` that returns nothing keeps today's behaviour.
+
+**Review and gate (D4 as a whole).** Independent opus review of `c110cee..0c91203`: MERGE AFTER
+FIXES (0 C, 2 I, 7 M). Scoped re-review of round 3: MERGE (0 C, 0 I, 2 M; both fixed in round 4,
+and the controller re-ran the N2 pin red with the old text and green with the fix). Full gate at
+76a9893: fmt and clippy clean, 86/86 `test result: ok`, 1,739 passed, 0 failed; TS check-client,
+`npm run check`, `npm run test` 22/22. Round 4 changed one product text and its pin, re-run at
+0c736a8: replication, charpente lib and guide-examples 10/10 ok, 334 passed; TS 22/22. Branch
+`d4-fixes`, merged at 22e0c48; main's tree is byte-identical to 0c736a8.
