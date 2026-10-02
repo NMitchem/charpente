@@ -20,7 +20,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-30-tenancy-completion-design.md` (commit `e749823`, approved by Noah on 2026-09-30). Read it first; the plan argues from it. Where this plan differs, the difference is listed under "Spec amendments" below, and Task 1 writes those into the spec.
 
-**Base:** `main` at or after `57e5df5`, which holds sub-projects S4 (redb 4.3.0, the open fence dropped), S2 (`Group::stage`'s `TableWriteRefusal`, `migrate_schema`'s batch-size-0 refusal, the drift-probe text), S3 (give-ups, `ceiling:`, budgets, the mutants baseline, test deadlines), S5 with D1 (`StoreRejected`, WAL recovery syncs before replay, `Sim::restart_process`, `checks::boot_through_fallout`/`durable_refusal`, `floor:` on every capped property, every re-seed text names the follower step), D2 (the filesystem stores), D3 (the replication rig's laggard re-seed), S3b (the vacuous-pass census, the per-host fault markers, one ambient cap rule) and D4 (the re-sync remedy order, "from now", `SubscribeOptions.onOpen`, the switchover stall texts). The plan was written at `e749823` and amended against `57e5df5` on 2026-10-02 (`.superpowers/sdd/2026-09-30-publish-readiness/s1-amend-report.md`; LEDGER 2026-10-01 and 2026-10-02 are the record of what landed). Line numbers in this plan are cited **at `57e5df5`** and are for orientation only; a citation explicitly marked "at e749823" is the plan's original measurement, kept where it records what the plan's author saw. Any later merge can move them again, so an implementer re-locates every site **by symbol** before editing. Task 1 records the base sha it ran on.
+**Base:** `main` at or after `dec346b`, which holds sub-projects S4 (redb 4.3.0, the open fence dropped), S2 (`Group::stage`'s `TableWriteRefusal`, `migrate_schema`'s batch-size-0 refusal, the drift-probe text), S3 (give-ups, `ceiling:`, budgets, the mutants baseline, test deadlines), S5 with D1 (`StoreRejected`, WAL recovery syncs before replay, `Sim::restart_process`, `checks::boot_through_fallout`/`durable_refusal`, `floor:` on every capped property, every re-seed text names the follower step), D2 (the filesystem stores), D3 (the replication rig's laggard re-seed), S3b (the vacuous-pass census, the per-host fault markers, one ambient cap rule), D4 (the re-sync remedy order, "from now", `SubscribeOptions.onOpen`, the switchover stall texts) and D5 (the realtime flagship client trims its `last_id` across a cut, and its 409-diverged arm asks `cut_explained`). The plan was written at `e749823`, amended against `57e5df5` on 2026-10-02, and brought current to `dec346b` the same day (`.superpowers/sdd/2026-09-30-publish-readiness/s1-amend-report.md`; LEDGER 2026-10-01 and 2026-10-02 are the record of what landed). Line numbers in this plan are cited **at `57e5df5`** and are for orientation only. D5 touched only `crates/charpente/tests/realtime.rs` and `docs/LEDGER.md` (`git diff --stat 57e5df5 dec346b`), so every other citation holds unchanged at `dec346b`. D5's first insertion in `realtime.rs` falls after its line 1509, so each `realtime.rs` citation past that line is re-cited **at `dec346b`** and says so, with its 57e5df5 line beside it. A citation explicitly marked "at e749823" is the plan's original measurement, kept where it records what the plan's author saw. Any later merge can move them again, so an implementer re-locates every site **by symbol** before editing. Task 1 records the base sha it ran on.
 
 **Working directory for mid-flight state:** `.superpowers/sdd/2026-09-30-tenancy-completion/` (gitignored). Put these there:
 - `progress.md`;
@@ -165,8 +165,9 @@ No new test files, so the `test result:` count Task 1 measures holds to Task 14,
   `EventArgs`, `ACCEPTED_FORMS` and `impl Parse for EventArgs`.
 - Modify `crates/charpente-macros/src/lib.rs`: the `event` attribute entry (lines 238–253;
   charpente-macros is unchanged from e749823 to 57e5df5), which today refuses any argument.
-- Modify every `#[event]` attribute site, 33 in Rust (lines at 57e5df5; 32 at e749823, and D4
-  added `Marked` at realtime.rs:6370 in 5c9192e):
+- Modify every `#[event]` attribute site, 33 in Rust (lines at 57e5df5, and at dec346b for
+  `realtime.rs`, which D5 moved; 32 at e749823, and D4 added `Marked`, realtime.rs:6455 at
+  dec346b and 6370 at 57e5df5, in 5c9192e):
   - `crates/sim-fixture/src/lib.rs:20`
   - `crates/charpente-cli/templates/lib.rs:27`
   - `crates/bench-harness/src/lib.rs:45`
@@ -177,7 +178,8 @@ No new test files, so the `test result:` count Task 1 measures holds to Task 14,
   - `crates/charpente/tests/describe.rs:87,95`
   - `crates/charpente/tests/kernel.rs:3207`
   - `crates/charpente/tests/http.rs:1072`
-  - `crates/charpente/tests/realtime.rs:48,53,66,71,77,89,96,103,3066,3164,6370`
+  - `crates/charpente/tests/realtime.rs:48,53,66,71,77,89,96,103,3129,3227,6455` (at dec346b;
+    3066, 3164 and 6370 at 57e5df5)
   - `crates/charpente-macros/tests/compile_fail/route_duplicate_emits_name.rs:15`
   - `crates/charpente-macros/tests/compile_fail/route_duplicate_emits_clause.rs:16,21`
   - `crates/charpente-macros/tests/compile_fail/route_emits_on_non_sse.rs:15`
@@ -10072,7 +10074,7 @@ git commit -m "feat(tenancy): a transaction does not read the platform's tables 
 - Modify `crates/charpente/src/kernel/tail.rs`: `deliver_unit`'s filter (140–147 at 57e5df5, as at e749823).
 - Modify `crates/charpente/src/kernel/mod.rs`: `validate_subscribe` (952–1067 at 57e5df5; 952–1057 at e749823; D4 rewrote its four re-sync remedies in between).
 - Modify `crates/charpente-tsgen/src/runtime.rs`: `CursorRefused`'s doc and message (102–124 at 57e5df5), which gain A16's cause. Modify `crates/charpente-tsgen/tests/routes.rs`: the pin on those causes (117–149). Regenerate `ts-fixture/src/generated/client.ts` (Step 10; ruling 2026-10-02).
-- Modify `crates/charpente/tests/realtime.rs`: the tenant section (5222–6349 at 57e5df5, which S3b grew by a re-sync, five `Client` unit tests and three pinned-seed tests; 4586–5390 at e749823), `Client` (`:1454` at 57e5df5), `decode_event_row` (`:2107`), `failing_feed_glue` (`:3025`), the imports.
+- Modify `crates/charpente/tests/realtime.rs`: the tenant section (5285–6434 at dec346b, 5222–6349 at 57e5df5; S3b grew it by a re-sync, five `Client` unit tests and three pinned-seed tests, and D5 by one more `Client` unit test; 4586–5390 at e749823), `Client` (`:1454` at both), `decode_event_row` (`:2126` at dec346b; `:2107` at 57e5df5), `failing_feed_glue` (`:3088`; `:3025`), the imports.
 - Modify `crates/charpente/tests/replication.rs`: the Hello version tests (2905–3002 at 57e5df5; 2694–2791 at e749823) and `a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name` (3383–3430 at 57e5df5; 3172–3219 at e749823), which ships tag 11 as "a tag this binary does not know" and now ships 12.
 - Modify `crates/charpente/tests/tenant.rs` (the three `memo_feed*` handlers, the `Org` doc at 44–49), `crates/charpente/tests/kernel.rs` (the `Org` doc at 2298–2303 at 57e5df5; 2179–2184 at e749823), `crates/charpente-macros/tests/compile_pass/route_public_scope.rs` (its `feed`), `examples/invoicing/src/bin/tenant_node.rs` (`create_doc`'s comment, `feed`), `crates/edge-harness/tests/tenant_wire.rs` (the doc at 429–431).
 - Test: `crates/charpente-core/tests/materialize.rs`, and every file above.
@@ -10152,7 +10154,7 @@ Exact edits, each one site:
 - `scoped_feed`: `emits(Ping)` → `emits(OrgPing)`; `Subscription::of::<Ping>()` → `Subscription::of::<OrgPing>()`.
 - `literal_feed`: the same two edits.
 - `emit_leaky_ping`: `Ping { n: body.n }` → `OrgPing { n: body.n }`.
-- `scoped_realtime_workload_judged` and `scoped_twin_run` (`realtime.rs:5606` and `:6286` at 57e5df5; S3b split `scoped_realtime_workload` into a wrapper that passes `durable_corruption_fired` to `scoped_realtime_workload_judged`, which holds the client): `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` → `Client::new(ORG_PING_ONLY, Some(SCOPED_TENANT_A_KEY))`. The five S3b `Client` unit tests (`:6076`, `:6104`, `:6136`, `:6171`, `:6234`) make the same call and stay on `PING_ONLY`: they emit nothing, and every ledger row they insert is named `ping`. Step 6 moves them onto the tenant.
+- `scoped_realtime_workload_judged` and `scoped_twin_run` (`realtime.rs:5669` and `:6371` at dec346b, `:5606` and `:6286` at 57e5df5; S3b split `scoped_realtime_workload` into a wrapper that passes `durable_corruption_fired` to `scoped_realtime_workload_judged`, which holds the client): `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` → `Client::new(ORG_PING_ONLY, Some(SCOPED_TENANT_A_KEY))`. The five S3b `Client` unit tests (`:6139`, `:6189`, `:6221`, `:6256`, `:6319` at dec346b) make the same call and stay on `PING_ONLY`: they emit nothing, and every ledger row they insert is named `ping`. Step 6 moves them onto the tenant. D5's `a_cut_trims_last_id_to_the_last_id_the_node_still_holds` (`:6168`) builds `Client::new(PING_ONLY, None)` and inserts no ledger row, so neither step changes it.
 - `scoped_key_oracle`: `if *name != "ping"` → `if *name != "org_ping"`.
 - `a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event`: its three expected vectors' `"ping"` → `"org_ping"` (Step 2 replaces this test).
 
@@ -11723,10 +11725,13 @@ In `absorb`, the durable-corruption arm's guard becomes
                 // (amendment A16). Same cause, same prune.
                 409 if (text.contains("diverged from this node's timeline")
                     || text.contains("outside this feed's tenancy"))
-                    && durable_corruption_fired(sim) =>
+                    && (self.cut_explained)(sim) =>
 ```
 
-with its body unchanged. Neither change moves the flagship, the shapes swarm or the follower: all three read only global rows through global subscriptions (`mode_scope` and every row's `scope` are `None`), and none can meet the tenancy 409.
+with its body unchanged. The judge stays D5's `(self.cut_explained)(sim)` (`realtime.rs:1934` at
+dec346b), which replaced `durable_corruption_fired(sim)` there. Going back to the latter would
+undo D5's routing: the client's own judge, whether a pinned seed's `|_| false` stand-in or a
+later per-cut judge, decides this arm as it decides `resync_if_cut`. Neither change moves the flagship, the shapes swarm or the follower: all three read only global rows through global subscriptions (`mode_scope` and every row's `scope` are `None`), and none can meet the tenancy 409.
 
 The sibling's header (the block under `// ===… the scoped sibling under the full fault matrix`): its first paragraph becomes
 
@@ -11833,7 +11838,7 @@ fn emit_leaky_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), A
 }
 ```
 
-`scoped_realtime_workload`: its doc's "one subscriber keyed to tenant A" becomes "one tenant-A feed", and its sentence "`Client` is reused verbatim — keyed to `SCOPED_TENANT_A_KEY`, its `matches`/`first_unaccounted` already demand every A-keyed ledger row above the floor be received, and its `try_match` already rejects a delivered row whose key is not A's — and `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have." becomes "`Client` is reused — in tenant A (`Client::in_tenant`), its `matches`/`first_unaccounted` demand every tenant-A ledger row above the floor be received, and its `try_match` rejects a delivered row recorded in another tenancy — and `scoped_tenant_oracle` adds the payload-versus-row arms `Client` cannot have." The rest is in `scoped_realtime_workload_judged`, which S3b split out to hold the client (`realtime.rs:5602` at 57e5df5). Its first line becomes
+`scoped_realtime_workload`: its doc's "one subscriber keyed to tenant A" becomes "one tenant-A feed", and its sentence "`Client` is reused verbatim — keyed to `SCOPED_TENANT_A_KEY`, its `matches`/`first_unaccounted` already demand every A-keyed ledger row above the floor be received, and its `try_match` already rejects a delivered row whose key is not A's — and `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have." becomes "`Client` is reused — in tenant A (`Client::in_tenant`), its `matches`/`first_unaccounted` demand every tenant-A ledger row above the floor be received, and its `try_match` rejects a delivered row recorded in another tenancy — and `scoped_tenant_oracle` adds the payload-versus-row arms `Client` cannot have." The rest is in `scoped_realtime_workload_judged`, which S3b split out to hold the client (`realtime.rs:5665` at dec346b, `:5602` at 57e5df5). Its first line becomes
 
 ```rust
     let mut client = Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
@@ -11880,7 +11885,7 @@ the oracle call becomes `scoped_tenant_oracle(&client.ledger, &client.trace, SCO
 
 `scoped_twin_run`: its doc's "one subscriber keyed to tenant A" becomes "one tenant-A feed"; its return type becomes `(Ledger, ScopedTrace)`; its client becomes `Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A)`.
 
-S3b's five `Client` unit tests (`a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed`, `a_cut_id_re_minted_for_the_subscriber_is_owed_again`, `a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_content`, `without_durable_corruption_a_cut_is_not_resynced` and `an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing`, `realtime.rs:6076`, `:6104`, `:6136`, `:6171` and `:6234` at 57e5df5; they landed after this plan was written) build a tenant-A client on the deleted key and insert three-field ledger rows. Each `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` becomes `Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A)`. Each `let key = Some(SCOPED_TENANT_A_KEY.to_string());` is deleted, and each ledger insert `("ping", <that key>, json)` becomes `("ping", None, Some(SCOPED_TENANT_A), json)`: the row is recorded in tenant A, with no app key. Tenant B's row in `an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing`, `("ping", Some("tenant-b".to_string()), "b's".to_string())`, becomes `("ping", None, Some(SCOPED_TENANT_B), "b's".to_string())`. The tenant-A client withholds it by tenancy, as it withheld it by key, so every assertion and message in the five stays as it is.
+S3b's five `Client` unit tests (`a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed`, `a_cut_id_re_minted_for_the_subscriber_is_owed_again`, `a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_content`, `without_durable_corruption_a_cut_is_not_resynced` and `an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing`, `realtime.rs:6139`, `:6189`, `:6221`, `:6256` and `:6319` at dec346b, `:6076` to `:6234` at 57e5df5; they landed after this plan was written) build a tenant-A client on the deleted key and insert three-field ledger rows. Each `Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY))` becomes `Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A)`. Each `let key = Some(SCOPED_TENANT_A_KEY.to_string());` is deleted, and each ledger insert `("ping", <that key>, json)` becomes `("ping", None, Some(SCOPED_TENANT_A), json)`: the row is recorded in tenant A, with no app key. Tenant B's row in `an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing`, `("ping", Some("tenant-b".to_string()), "b's".to_string())`, becomes `("ping", None, Some(SCOPED_TENANT_B), "b's".to_string())`. The tenant-A client withholds it by tenancy, as it withheld it by key, so every assertion and message in the five stays as it is.
 
 Replace `the_scoped_oracle_catches_an_emit_that_drops_the_scope_key` with
 
@@ -12090,13 +12095,13 @@ cat $D/cov-realtime-tenant-task10.txt
 
 Expected: both runs print `exit 0, passing-test lines 1` for the test and `MOVED` against the pre-task base, so each call prints `exit 1` — by design, for this label only; the diff prints `reproduced identically`; the recording shows every required key (`boot:booted-after-retry`, `tenant:both-tenants-emitted`, `tenant:own-backlog-verified`, `tenant:foreign-backlog-not-delivered`, `realtime:resume-backlog`, `realtime:stall-drop`, `fault:subscriber_stall`) and its verdict line. Two runs that differ are a determinism finding: stop.
 
-The floors and the cap: `SCOPED_BOTH_TENANTS_FLOOR` 106, `SCOPED_OWN_BACKLOG_FLOOR` 96, `SCOPED_FOREIGN_SKIPPED_FLOOR` 99, `SCOPED_RESUME_BACKLOG_FLOOR` 206 and `SCOPED_GAVE_UP_CEILING` 23 at 57e5df5 (`realtime.rs:5971-5987`; 75, 78, 80, 125 and no cap at e749823). These are re-measured at execution: the source's value is the operand. They are judged by the re-key rules under Global Constraints (GUIDE §8, "Re-basing a pinned property"), which replace this step's earlier rule of lowering a floor to its measured count unless it fell more than 15%:
+The floors and the cap: `SCOPED_BOTH_TENANTS_FLOOR` 106, `SCOPED_OWN_BACKLOG_FLOOR` 96, `SCOPED_FOREIGN_SKIPPED_FLOOR` 99, `SCOPED_RESUME_BACKLOG_FLOOR` 206 and `SCOPED_GAVE_UP_CEILING` 23 at dec346b, unchanged from 57e5df5 (`realtime.rs:6034-6050` at dec346b, `:5971-5987` at 57e5df5; 75, 78, 80, 125 and no cap at e749823). These are re-measured at execution: the source's value is the operand. They are judged by the re-key rules under Global Constraints (GUIDE §8, "Re-basing a pinned property"), which replace this step's earlier rule of lowering a floor to its measured count unless it fell more than 15%:
 - This task renames every universe of the batch. So the before-and-after comparison runs whatever the pinned counts read: the property at the Task 9 commit (in a worktree of its own, with its own `CARGO_TARGET_DIR`) and at this task's tree, over the same ten or more fresh bases (`CHARPENTE_BASE_SEED`). For both sides, record each floored key's per-base counts and the passes covering it.
 - If a floor's count at the pinned base did not fall, leave the floor alone (a floor is a minimum; raising one that is not failing is a separate decision). If it fell, re-set it to its new exact count only if its after-mean is within one Welch standard error of its before-mean. Beyond that, the fall is the finding: stop, and report both distributions.
 - The cap may rise only if the passes covering each floored key did not fall by more than one Welch standard error. It is then re-set to its new exact count, and the cap's doc above `FLAGSHIP_GAVE_UP_CEILING` names the change. Otherwise the rise is the finding: stop.
 - For each re-set, add a table to the doc comment above `SCOPED_BOTH_TENANTS_FLOOR`, after the 2026-10-01 one. Head it "**Re-measured <date>** (tenancy completion Task 10: every emit is now recorded under tag `0x0b` with its tenant, and the event is `org_ping`, so every universe's bytes moved)", list `| key | was | now |` for the four floors and the cap, and record both distributions. Then re-run `zsh $D/baselines.sh task10c realtime-tenant`, and confirm `passing-test lines 1` and a recording identical to `task10`'s.
 
-The three S3b pinned-seed tests over the same workload are `a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced`, `a_cut_nothing_explains_fails_the_scoped_universe_by_name` and `a_settled_client_owed_nothing_and_delivered_nothing_gives_up`'s scoped row (`realtime.rs:6014`, `:6049` and `:6203` at 57e5df5; seeds `0x083b_d434_c717_d60c` and `0xb1c2_07a8_e3ca_62dd`, re-measure at execution). This task renames their universes too, so each pinned seed may now name a different universe (memory `pinned-seed-names-a-universe`):
+The three S3b pinned-seed tests over the same workload are `a_ledgered_event_cut_by_durable_corruption_and_re_minted_elsewhere_is_resynced`, `a_cut_nothing_explains_fails_the_scoped_universe_by_name` and `a_settled_client_owed_nothing_and_delivered_nothing_gives_up`'s scoped row (`realtime.rs:6077`, `:6112` and `:6288` at dec346b, `:6014`, `:6049` and `:6203` at 57e5df5; seeds `0x083b_d434_c717_d60c` and `0xb1c2_07a8_e3ca_62dd`, re-measure at execution). This task renames their universes too, so each pinned seed may now name a different universe (memory `pinned-seed-names-a-universe`):
 
 ```zsh
 D=.superpowers/sdd/2026-09-30-tenancy-completion
@@ -13770,7 +13775,7 @@ fn an_event_scoped_by_the_apps_own_tenant_type_mounts() {
 
 The collision test's text assumes that Task 3 names the type already in the census first and the newcomer second. `memo_app`'s `App::open` registers `Memo`'s `Org`, so that is `tenant::Org` first. If Task 3's pinned order is the other way, swap the two names, and say so in the report. `accounts::Org` is local to this file, because Task 3's same-`NAME` fixtures, wherever they live, are not reachable from an integration test binary.
 
-**The shared-raw-id property, end to end.** The fingerprint test above pins values. This one pins what the scoped fingerprint is FOR, spec §6's "Two scope types sharing a raw id no longer collide". `Org` 1 and `Team` 1 share a raw id, and their two events share a `NAME`. So `Team`'s row matches `Org` 1's feed on name and on scope, and only its shape tells it apart. In `crates/charpente/tests/realtime.rs`, after the last item of Task 10's scoped section (before D4's `// ===… the re-sync remedy's order` section, `:6351` at 57e5df5), add:
+**The shared-raw-id property, end to end.** The fingerprint test above pins values. This one pins what the scoped fingerprint is FOR, spec §6's "Two scope types sharing a raw id no longer collide". `Org` 1 and `Team` 1 share a raw id, and their two events share a `NAME`. So `Team`'s row matches `Org` 1's feed on name and on scope, and only its shape tells it apart. In `crates/charpente/tests/realtime.rs`, after the last item of Task 10's scoped section (before D4's `// ===… the re-sync remedy's order` section, `:6436` at dec346b, `:6351` at 57e5df5), add:
 
 ```rust
 // ======================= two tenant types, one raw id (spec §6)
@@ -15465,6 +15470,17 @@ its own origin. A cut nothing explains is a lost event, and fails at that bounda
 still end in a give-up only where no re-sync is possible: no subscribe read a head after the
 last recovery, because every later boot or subscribe fell to fault fallout.
 
+**Known limitation: the cut judge is not per cut** (D5's follow-up, LEDGER 2026-10-02). The
+property's `cut_explained` is `durable_corruption_fired`, the flagship's judge, which holds from
+the node's first durable corruption on. Once one has fired, every later cut is explained,
+whatever caused it, and its re-sync also trims the feeds' `last_id`. D5 bounds that trim as
+exactly as safe as `cut_explained` is precise. So a lost event after the first durable
+corruption passes here, as it does in the flagship. A per-cut judge ("corruption fired on this
+node since the cut ids were recorded") needs a design first: 16 of D5's 20,480 universes saw a
+cut with no new flip of any kind since the previous boundary check, and a naive freshness judge
+would fail them. Until it lands this property shares the flagship's judge, and Step 4c's pins
+stand a cut in for one nothing explains by passing `|_| false`.
+
 The payload names the emitting tenant (`origin`), independently of `EventRow.scope`. So the
 oracle never takes the column under test at its word. The sibling's `SCOPED_N_STRIDE` exists
 for the same reason. The ledger arm then checks the durable row's own `scope` and `shape`
@@ -15489,6 +15505,7 @@ grep -n "Subscribe" crates/charpente/src/lib.rs
 grep -c "pub scope: Option<u64>" crates/charpente-core/src/event.rs
 grep -c "sits on an event outside this feed's tenancy" crates/charpente/src/kernel/mod.rs
 grep -c "ceiling:" crates/charpente-sim/src/lib.rs
+grep -c "if self.last_id >= Some(head) {" $R
 ```
 
 Expected:
@@ -15500,6 +15517,10 @@ Expected:
 - For `ceiling:`: positive (7 at 57e5df5; 0 at e749823, before S3 added the arm). The property
   below carries a `ceiling:` on `universe:gave-up` beside its reach floors (GUIDE §8,
   "Re-basing a pinned property"), and Step 5 measures it.
+- `1` for D5's `last_id` trim in the flagship's `Client::resync_to_head` (`realtime.rs:1731` at
+  dec346b), which `Universe::resync_to_head` makes too. `0` means main no longer holds D5:
+  stop and report, since the flagship then fails correct universes after a cut (seed
+  `0xe0779a282feb80eb`) and Task 14's sweep would meet that failure.
 
 Each pattern escapes its `(`: an unescaped one is an ERE error (`grep: parentheses not
 balanced`, exit 2), which `$(grep -c …)` prints as an empty count.
@@ -15521,7 +15542,8 @@ done
 ```
 
 The module below already carries what changed under these functions between e749823 and
-57e5df5 (amended 2026-10-02). `realtime_workload` is now a wrapper that passes
+57e5df5 (amended 2026-10-02). D5 (dec346b) changed none of the three; it changed `Client`,
+whose `last_id` trim `Universe::resync_to_head` already makes (Step 1's notes for the implementer). `realtime_workload` is now a wrapper that passes
 `durable_corruption_fired` to `realtime_workload_judged` (S3b), so the copy follows the latter:
 - `settle_boot`'s `durable_refusal` arm (S5 re-review R-M2, S3b item 0) is in
   `tenancy_settle_boot`;
@@ -15539,7 +15561,8 @@ The module below already carries what changed under these functions between e749
 
 `realtime_workload_judged`'s `realtime:settle-clean` and `realtime:frame-verified` marks
 belong to `Client`, and are not copied.
-- Every diff exits `0` at 57e5df5. A `1` means a change landed after it. Apply it to the copy
+- Every diff exits `0` at 57e5df5 and at dec346b, where D5 changed none of the three. A `1`
+  means a change landed after dec346b. Apply it to the copy
   as above, and quote the diff in the report.
 - `realtime_app` has not changed since e749823, and `open_tenancy` mirrors its store config.
 
@@ -16401,7 +16424,10 @@ mod tenancy_feeds {
         /// `Client::cut_explained`: whether a fault explains a cut of this
         /// node's timeline. The property passes `durable_corruption_fired`; a
         /// pinned seed passes `|_| false` to stand a cut in for one nothing
-        /// explains (Step 4c).
+        /// explains (Step 4c). It is not a per-cut judge:
+        /// `durable_corruption_fired` holds from the node's first durable
+        /// corruption on, so it explains every later cut, whatever caused it
+        /// (LEDGER 2026-10-02, D5's per-cut-judge follow-up).
         cut_explained: fn(&Sim) -> bool,
         /// Whether a subscribe has read the node's head since the last boot. A
         /// cut is re-synced at that read, so without one none can be.
@@ -16435,7 +16461,9 @@ mod tenancy_feeds {
         /// there came from the lost timeline. A `verified` mark there would
         /// excuse whatever is re-minted at that id, and a `floor` above `head`
         /// would forfeit it. A feed delivered an id at or above `head` also
-        /// loses its cursor, and its `last_id` drops to `head - 1`. A re-mint
+        /// loses its cursor, and its `last_id` drops to `head - 1`, D5's trim
+        /// in `Client::resync_to_head`, which is exactly as safe as
+        /// `cut_explained` is precise. A re-mint
         /// can take the cut event's id and seq, which a cursor's seq cannot
         /// tell apart, so resuming from it could skip the re-mint; the feed
         /// resubscribes bare instead. The old `last_id` would refuse the
@@ -17129,15 +17157,20 @@ Notes for the implementer, each checked against the code the module copies:
   re-sync lands between them, before any probe is built and before `kernel.run`. The split
   moves no entropy draw.
 - `Universe::resync_to_head` clears the cursor of a feed delivered an id at or above the
-  head, and drops its `last_id` to `head - 1`. At 57e5df5 the flagship's
-  `Client::resync_to_head` keeps both, and relies on the server refusing the old cursor as
-  diverged. That fails a correct universe. A cut of an id the client was delivered sends it
-  bare after the 409, and its stale `last_id` fails the first re-mint:
-  `CHARPENTE_SEED=0xe0779a282feb80eb` (base `0x5C0F0858`), "duplicate or out-of-order event id
-  3 received — a resumed tail must never redeliver an id at or before the last one seen
-  (previous id 3)". This was run in S1 amendment review I1. Sub-project D5 fixes the flagship
-  on main by trimming `last_id` as this module does. Here that cursor is
-  kept only in the subscribe already in flight (`Pushed::Subscribe::sent`). A later
+  head, and drops its `last_id` to `head - 1`. The trim is D5's, in the flagship's
+  `Client::resync_to_head` (`realtime.rs:1731` at dec346b): `if self.last_id >= Some(head)
+  { self.last_id = head.checked_sub(1); }`. The guard is the same, because `Option` orders
+  `None` below every `Some`, so `last_id >= Some(head)` is `last_id.is_some_and(|id| id >=
+  head)`. The operand is the same, so a head of 0 leaves nothing seen. D5 pins it by
+  `a_cut_trims_last_id_to_the_last_id_the_node_still_holds` (`:6168`) and by seed
+  `0xe0779a282feb80eb` (`a_bare_tail_after_a_cut_may_start_below_the_last_id_the_client_saw`,
+  `:2503`). That is the universe S1 amendment review I1 found failing on 57e5df5: "duplicate
+  or out-of-order event id 3 received — a resumed tail must never redeliver an id at or
+  before the last one seen (previous id 3)". D5's bound holds here unchanged: the trim is
+  exactly as safe as `cut_explained` is precise (the known limitation above). The flagship
+  keeps its cursor in `resync_to_head` and relies on its 409-diverged arm to clear it. Here
+  `resync_to_head` clears it, and the cursor is kept only in the subscribe already in flight
+  (`Pushed::Subscribe::sent`). A later
   resubscribe, after a fault-fallout answer, could otherwise resume past a re-mint that took
   the cut event's id and seq.
 - The remaining give-ups are the zero-clean-attempts give-up, which names the one cut no
@@ -18672,8 +18705,9 @@ This script was run read-only at e749823. Its phrase half counted 97 hits across
 its six checks read `34 2 1 2 0 0`. That run is the evidence that each phrase, and each
 check's pattern, detects the state it exists to catch.
 
-It was re-run read-only at 57e5df5 when the plan was amended (2026-10-02). It swept 377 files:
-97 hits across 23 files, and checks `35 2 1 2 0 0`. The extra bare `#[event]` is the one D4
+It was re-run read-only at 57e5df5 when the plan was amended (2026-10-02), and again at dec346b
+(D5), whose output is byte-identical. It swept 377 files: 97 hits across 23 files, and checks
+`35 2 1 2 0 0`. The extra bare `#[event]` is the one D4
 added to `realtime.rs`, which Task 1 converts. At 57e5df5 the phrase `'last segment'` also
 matched `crates/charpente/tests/auth.rs:616` ("the last segment", S3b's 33e64f2). That comment
 is about the WAL's newest segment file, not a type path. So the phrase is split in two above,
