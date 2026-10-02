@@ -599,8 +599,9 @@ Recovery removes the orphans first — highest base first, each `sync_dir`-barri
 exactly as `gc` removes ascending — and truncates last, so every crash-intermediate is a
 contiguous prefix, recovery re-finds the same cut, and it is idempotent at every crash
 point (found by replication seed 0x4177819b4a2ba984; the test-side restore path that had
-masked it now gates on `checks::dir_entry_loss_fired`, so a platform-created gap fails
-loud again).
+masked it now gates on entry loss having fired on the refused node's own disk since its
+last re-seed wipe, `SimHost::dir_entry_loss_count`, so a platform-created gap fails loud
+again).
 
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
@@ -1858,7 +1859,9 @@ Charpente treats the coding agent as the primary developer persona:
   `dir_entry_loss_fired`, which excuse a shortfall only in universes where that fault
   actually fired. `SimHost::durable_corruption_fired` and `SimHost::dir_entry_loss_fired`
   are the same two scoped to a host, for a multi-node workload whose excuse must name the
-  node the fault fired on. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
+  node the fault fired on, and `SimHost::durable_corruption_count`/`dir_entry_loss_count`
+  are their counts, so a workload that wipes a host's data reads them at the wipe and
+  excuses a later refusal only by a fault since then. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
   build/usage/infrastructure error.
 - **The edge harness (v0, implemented; `crates/edge-harness`).** The sim owns everything
   below the IO traits; the edge harness owns everything above them that only a real

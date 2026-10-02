@@ -2715,7 +2715,11 @@ for these before hand-rolling the same logic a fourth time:
   media corruption still lives on the follower. In a multi-node workload,
   ask `SimHost::durable_corruption_fired()` instead. It answers the same
   question for one host's disk, so a refusal on one node is excused only by
-  corruption that fired on that node, never by a fault on another.
+  corruption that fired on that node, never by a fault on another. A workload
+  that wipes a host's data (a re-seed) reads
+  `SimHost::durable_corruption_count()` and `dir_entry_loss_count()` at the
+  wipe, and excuses a later refusal only when the count has grown since: the
+  wipe deleted every byte an earlier fault touched.
 - `boot_through_fallout(sim: &Sim, tries: u32, is_fallout: impl Fn(&str) -> bool, boot: impl FnMut() -> Result<T, E>) -> Result<Option<T>, E>`
   — boots the way a supervised process does: `boot`, and on an error your
   `is_fallout` accepts, boot again, `tries` boots in all. Each retry marks

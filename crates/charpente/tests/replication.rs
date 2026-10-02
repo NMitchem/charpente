@@ -5264,6 +5264,26 @@ struct KNode {
     ///   round's crash settles the write, and the wipe deletes it (D3 re-review
     ///   m6).
     corrupted_by_rig: bool,
+    /// `host`'s durable-corruption and entry-loss counts at its last data-dir
+    /// wipe (`reseed_p`), zero until one. The wipe deletes every byte an
+    /// earlier fault touched, so only a fault since then explains a refusal of
+    /// this node (S3b item 8, D3 re-review m7): `corruption_since_wipe`,
+    /// `entry_loss_since_wipe`.
+    corruption_at_wipe: u64,
+    entry_loss_at_wipe: u64,
+}
+
+impl KNode {
+    /// Durable corruption (`bit_flip`, `misdirected_write`) fired on this
+    /// node's own disk since its last wipe.
+    fn corruption_since_wipe(&self) -> bool {
+        self.host.durable_corruption_count() > self.corruption_at_wipe
+    }
+
+    /// Entry loss fired on this node's own disk since its last wipe.
+    fn entry_loss_since_wipe(&self) -> bool {
+        self.host.dir_entry_loss_count() > self.entry_loss_at_wipe
+    }
 }
 
 /// Build the App + Repl + Kernel for one host, with the same torn-role
@@ -5413,6 +5433,8 @@ fn spawn_kernel_node_with_schema(
                     flipped: false,
                     recoverable,
                     corrupted_by_rig: false,
+                    corruption_at_wipe: 0,
+                    entry_loss_at_wipe: 0,
                 });
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
@@ -5507,8 +5529,11 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             // leaves a durable gap, so this restore excuse is legitimate only
             // when entry loss could have caused the gap. A gap in a universe
             // where the axis never fired is a platform regression — it falls
-            // through to the loud bug arm below, not this mask.
-            Err(e) if e.contains("refusing to guess") && dir_entry_loss_fired(sim) => {
+            // through to the loud bug arm below, not this mask. Asked of this
+            // node's own disk since its last wipe (S3b item 8): entry loss on
+            // another node, or before a wipe that deleted the gapped
+            // directory, cannot have caused this gap.
+            Err(e) if e.contains("refusing to guess") && node.entry_loss_since_wipe() => {
                 return Err(format!(
                     "{RESTORE_NEEDED}: {} log directory gapped by entry loss",
                     node.name
@@ -6162,6 +6187,10 @@ fn reseed_p(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
     wiped?;
     // The wipe deleted every byte the rig ever corrupted.
     p.corrupted_by_rig = false;
+    // And every byte an earlier sim fault touched: only a fault since then
+    // explains a refusal of the re-seeded p.
+    p.corruption_at_wipe = p.host.durable_corruption_count();
+    p.entry_loss_at_wipe = p.host.dir_entry_loss_count();
     p.repl_cfg = follower_cfg("p:1", "f:1");
     p.flipped = true;
     p.recoveries += 1;
@@ -6369,12 +6398,15 @@ fn route_promise_scan(
 /// - **"corrupted below the horizon"** is explained by durable corruption on
 ///   that node, from any of the three byte-level faults in the property's
 ///   fault model: a `bit_flip` or `misdirected_write`
-///   (`SimHost::durable_corruption_fired`), or the rig's forced CRC flip this
+///   (`KNode::corruption_since_wipe`), or the rig's forced CRC flip this
 ///   round (`KNode::corrupted_by_rig`). Seed `0x78f5713c6b6cd7cd` pins a
 ///   refusal that only the rig's flip explains: it landed on a sacrificial
 ///   frame the checkpoint had already covered.
 /// - **"log directory gapped by entry loss"** is explained by entry loss on
-///   that node: `SimHost::dir_entry_loss_fired`.
+///   that node: `KNode::entry_loss_since_wipe`.
+///
+/// Each counts only faults since the node's last re-seed wipe, which deleted
+/// every byte an earlier fault touched (S3b item 8, D3 re-review m7).
 ///
 /// The universe-wide checkers will not do: this property faults `p` on most
 /// rounds, so they would excuse a refusal of one node on the strength of a
@@ -6389,23 +6421,20 @@ fn unexplained_restore_needed(node: &KNode, e: &str) -> Option<String> {
     );
     let (explained, fault) = if e.contains("corrupted below the horizon") {
         (
-            node.host.durable_corruption_fired() || node.corrupted_by_rig,
+            node.corruption_since_wipe() || node.corrupted_by_rig,
             "durable corruption (bit_flip, misdirected_write, or the rig's own \
              corrupt_last_wal_frame)",
         )
     } else if e.contains("log directory gapped by entry loss") {
-        (
-            node.host.dir_entry_loss_fired(),
-            "entry loss (dir_entry_loss)",
-        )
+        (node.entry_loss_since_wipe(), "entry loss (dir_entry_loss)")
     } else {
         (false, "known fault")
     };
     (!explained).then(|| {
         format!(
-            "{e}, but no {fault} fired on {}'s disk: a restore-needed refusal that nothing \
-             injected on that node explains is a platform durability bug (DESIGN §2), not \
-             fallout",
+            "{e}, but no {fault} fired on {}'s disk since its last re-seed wipe, if any: a \
+             restore-needed refusal that nothing injected on that node explains is a \
+             platform durability bug (DESIGN §2), not fallout",
             node.name
         )
     })
@@ -7508,6 +7537,125 @@ fn a_restore_needed_refusal_of_p_with_a_fault_on_p_restores_it() {
     );
 }
 
+/// S3b item 8 (D3 re-review m7). A re-seed wipe deletes every byte an earlier
+/// fault touched, so a refusal of the re-seeded `p` is explained only by a
+/// fault since that wipe. Here a real bit flip on `p` is answered by the
+/// restore, as in the twin above, which re-seeds `p` through `reseed_p`.
+/// Afterwards `p`'s lifetime marker still reads true, and the same refusal,
+/// with nothing fired since the wipe, fails by name. Until item 8 the lifetime
+/// marker explained it. In a second world a flip after the baseline does
+/// explain it. In a third, entry loss on `p` before its re-seed explains no
+/// later gap of the re-seeded `p`.
+#[test]
+fn a_fault_before_a_re_seed_wipe_explains_no_later_refusal_of_that_node() {
+    let refusal = format!("{RESTORE_NEEDED}: p corrupted below the horizon");
+    let flips = FaultConfig {
+        bit_flip: 1.0,
+        ..FaultConfig::none()
+    };
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, flips.clone());
+    let (mut p, mut f) = sacrificial_pair(&sim);
+    let refused = recover_kernel_node(&sim, &mut p).expect_err("p's reopen is refused");
+    assert_eq!(
+        refused, refusal,
+        "as in the twin, or this pin reaches nothing"
+    );
+    sim.quiesce_disk_faults(); // the restore, and everything after, runs fault-free
+    route_p_error(&sim, &mut p, &mut f, Err(refused)).expect("p is restored from f");
+    assert!(
+        p.host.durable_corruption_fired() && !p.corrupted_by_rig,
+        "p's disk took a flip before its wipe, and the rig touched nothing"
+    );
+    let failure = unexplained_restore_needed(&p, &refusal)
+        .expect("a fault before the wipe explains nothing after it");
+    assert!(
+        failure.contains("fired on p's disk since its last re-seed wipe"),
+        "{failure}"
+    );
+
+    let sim = Sim::with_faults(LAGGARD_RESEED_SEED, flips);
+    let (mut p, _f) = sacrificial_pair(&sim);
+    p.host.restart();
+    p.corruption_at_wipe = p.host.durable_corruption_count(); // as `reseed_p` does
+    assert!(
+        p.corruption_at_wipe > 0 && unexplained_restore_needed(&p, &refusal).is_some(),
+        "a flip before the baseline explains nothing"
+    );
+    p.host.restart();
+    assert!(
+        p.corruption_since_wipe() && unexplained_restore_needed(&p, &refusal).is_none(),
+        "a flip since the baseline explains the refusal"
+    );
+
+    let gapped = format!("{RESTORE_NEEDED}: p log directory gapped by entry loss");
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            dir_entry_loss: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (mut p, mut f) = sacrificial_pair(&sim);
+    p.host
+        .disk()
+        .open("wal/unsynced")
+        .expect("p creates a file whose directory entry is never synced");
+    p.host.restart();
+    assert!(
+        p.host.dir_entry_loss_fired() && unexplained_restore_needed(&p, &gapped).is_none(),
+        "entry loss fired on p, so a gap of p is explained before any wipe"
+    );
+    sim.quiesce_disk_faults();
+    restore_p_from_survivor(&sim, &mut p, &mut f).expect("p is re-seeded from f");
+    let failure = unexplained_restore_needed(&p, &gapped)
+        .expect("entry loss before the wipe explains no gap after it");
+    assert!(
+        failure.contains("no entry loss (dir_entry_loss) fired on p's disk since its last"),
+        "{failure}"
+    );
+}
+
+/// S3b item 8. `recover_kernel_node` excuses a gapped log directory only by
+/// entry loss on the recovered node's own disk since its last wipe. Here a
+/// middle segment of `p`'s WAL is deleted by hand, so nothing injected explains the gap,
+/// while entry loss fires on a bystander, so the universe counts as having lost
+/// an entry. The recovery fails, naming the gap, instead of answering
+/// RESTORE_NEEDED. Until item 8 the arm asked the universe-wide
+/// `checks::dir_entry_loss_fired`, and it would have answered RESTORE_NEEDED
+/// here.
+#[test]
+fn a_gap_on_one_node_is_not_excused_by_entry_loss_on_another() {
+    let sim = Sim::with_faults(
+        LAGGARD_RESEED_SEED,
+        FaultConfig {
+            dir_entry_loss: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let (mut p, _f) = sacrificial_pair(&sim);
+    let disk = p.host.disk();
+    let mut segments = disk.list("wal/").expect("p has a WAL");
+    segments.sort();
+    assert!(
+        segments.len() >= 3,
+        "p holds a segment between two others, or this pin cannot gap it: {segments:?}"
+    );
+    disk.remove(&segments[1])
+        .expect("a middle segment of p's log is removed");
+    disk.sync_dir("wal/").expect("and the removal made durable");
+    fault_a_bystander(&sim);
+    sim.quiesce_disk_faults();
+    assert!(
+        dir_entry_loss_fired(&sim) && !p.host.dir_entry_loss_fired(),
+        "the universe lost an entry, p did not"
+    );
+    let refused = recover_kernel_node(&sim, &mut p).expect_err("p's gapped log is refused");
+    assert!(
+        refused.starts_with("recover p: ") && refused.contains("refusing to guess"),
+        "a gap nothing on p explains fails by name; got: {refused}"
+    );
+}
+
 /// D3 round 5 (round 3's concern 1). A gapped log directory is explained only
 /// by entry loss on that node's own disk, and a below-horizon refusal only by
 /// durable corruption there. The survivor's promise scan holds both: each
@@ -7643,7 +7791,8 @@ fn route_p_error_returns_an_unrecognised_error_unchanged() {
 ///   - every wipe step is `?`-propagated into a wipe loop whose only `Ok` is
 ///     a whole, synced wipe;
 ///   - a non-empty reopen is checked, and fails by name rather than giving up;
-///   - the wipe clears `corrupted_by_rig`;
+///   - the wipe clears `corrupted_by_rig` and baselines `p`'s fault counts
+///     (S3b item 8);
 ///   - the convergence is bound and handed whole to `route_reseed_convergence`.
 ///
 /// `route_p_error` itself is not read here.
@@ -7855,6 +8004,19 @@ fn above_horizon_universe_routes_every_error_of_p() {
                 .matches("\nwiped?;\np.corrupted_by_rig = false;")
                 .count(),
             1,
+        ),
+        (
+            "the re-seed's wipe baselines p's own fault counts, right after it",
+            reseed.matches("_at_wipe = ").count(),
+            reseed
+                .matches(
+                    "p.corrupted_by_rig = false;\n\
+                     p.corruption_at_wipe = p.host.durable_corruption_count();\n\
+                     p.entry_loss_at_wipe = p.host.dir_entry_loss_count();",
+                )
+                .count()
+                * 2,
+            2,
         ),
         (
             "sacrificial_cut's skip is gated on p having rebooted",
