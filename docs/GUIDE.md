@@ -2350,9 +2350,14 @@ charpente_sim::sim_tests! {
 
 /// `sim_tests!` workloads return `Result<(), String>` — this one delegates
 /// to a helper that returns the interesting value instead, so the
-/// determinism checker below can reuse the exact same logic.
+/// determinism checker below can reuse the exact same logic. `None` asserted
+/// nothing, and a pass needs a verdict, so it gives the universe up ("Giving
+/// up" below).
 fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
-    counter_roundtrip_result(sim).map(|_| ())
+    if counter_roundtrip_result(sim)?.is_none() {
+        sim.give_up("nothing to assert: the write never acked, or a boot never came up");
+    }
+    Ok(())
 }
 
 /// `replays_identically` is the determinism oracle: it runs `workload` twice
@@ -3000,9 +3005,14 @@ fn check_invariants(app: &App, acked: u64) -> Result<(), String> {
 /// seconds, each enqueueing a job; an hourly cron schedule ticks twice
 /// before the two-hour horizon; then the durable end-state is checked.
 fn whole_app(sim: &mut Sim) -> Result<(), String> {
+    // Each fault-fallout exit gives up: the universe checked nothing, and a
+    // pass needs a verdict ("Giving up" above).
     let app = match build_app(sim) {
         Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the app never booted: {e}"));
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
     };
 
@@ -3017,7 +3027,10 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
 
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(kernel) => kernel,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("Kernel::new hit fault fallout: {e}"));
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
     };
     // The same event loop `serve` runs in production. An `Err` here means
@@ -3045,8 +3058,12 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
         Ok(()) => Ok(()),
         // The oracle's own reads go through the same faulted disk (e.g. the
         // store can latch after an earlier injected write error): fallout
-        // ends the universe with nothing to assert; anything else is real.
-        Err(msg) if is_fault_fallout(&msg) => Ok(()),
+        // ends the universe with nothing asserted, a give-up; anything else is
+        // real.
+        Err(msg) if is_fault_fallout(&msg) => {
+            sim.give_up(format!("the invariant check hit fault fallout: {msg}"));
+            Ok(())
+        }
         Err(msg) => Err(msg),
     }
 }

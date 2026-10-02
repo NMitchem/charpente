@@ -75,6 +75,14 @@ retired: a run now ends with its verdict/give-up split — `N verdict(s), M gave
 up, no failures` — instead of "all green", because "green" was equally true of
 a universe that gave up and one that adjudicated. Since 2026-10-01
 `acked_writes_survive_restart` calls `Sim::give_up` when durable corruption cut
-an acknowledged write. The app's other fault-fallout paths still return `Ok`
-without giving up, so the give-up count it reports is a lower bound. See
-docs/GUIDE.md's "Giving up" section.)
+an acknowledged write. Since 2026-10-02 every fault-fallout exit of the app's
+fault-injected properties gives up too, as does a universe that ended with
+nothing to check (no write acked, no finalize or receipt to count, no reminder
+fired), so a verdict is a universe that checked something. At master seed
+0x53b00051, 256 universes each, the four such properties reach 125
+(`acked_writes_survive_restart`), 120 (`receipts_exactly_once`), 93
+(`overdue_reminders_over_months`) and 118
+(`api_key_authorizes_then_revoked_is_rejected`) verdicts.
+`app_replays_deterministically` compares both worlds' durable state
+even after a faulted boot, so it always reaches a verdict. See docs/GUIDE.md's
+"Giving up" section.)
