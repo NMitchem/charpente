@@ -194,7 +194,8 @@ pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
 /// collapses the disk as usual, and `verify` checks that every id acked so
 /// far (not just this round's) is still present. A `verify` failure fails
 /// the whole check, prefixed with the round and seed so a repro can target
-/// the exact round.
+/// the exact round. A run in which no round acked anything checked nothing,
+/// and gives the universe up by name (`Sim::give_up`) instead of passing.
 ///
 /// **Takes `&mut Sim`, not a seed, and the distinction is load-bearing** —
 /// unlike [`replays_identically`] above, which takes a seed because it needs
@@ -239,6 +240,13 @@ pub fn acked_implies_durable(
         verify(sim, &acked).map_err(|e| {
             format!("acked-implies-durable violated after round {round} under seed {seed:#x}: {e}")
         })?;
+    }
+    // Every `verify` above ran over an empty list, so none could have failed.
+    if acked.is_empty() {
+        sim.give_up(format!(
+            "acked-implies-durable: no round acked anything in {rounds} rounds, so there was \
+             no claim to check"
+        ));
     }
     Ok(())
 }
@@ -669,6 +677,34 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("drive failed in round 1"), "{err}");
         assert!(err.contains("boom"), "{err}");
+    }
+
+    /// A run in which no round acked anything checked nothing: `verify` ran
+    /// over an empty list every round. It gives up by name rather than pass.
+    #[test]
+    fn acked_implies_durable_gives_up_when_nothing_was_ever_acked() {
+        let mut sim = Sim::new(0xACE0);
+        acked_implies_durable(&mut sim, 3, |_sim: &mut Sim| Ok(vec![]), toy_verify).unwrap();
+        assert_eq!(
+            sim.gave_up().as_deref(),
+            Some(
+                "acked-implies-durable: no round acked anything in 3 rounds, so there was no claim to check"
+            )
+        );
+    }
+
+    /// One ack in any round is a claim, and the run reaches a verdict on it.
+    #[test]
+    fn acked_implies_durable_reaches_a_verdict_on_a_single_ack() {
+        let mut sim = Sim::new(0xACE1);
+        let mut drive = toy_drive(true);
+        let mut round = 0;
+        let once = move |sim: &mut Sim| {
+            round += 1;
+            if round == 2 { drive(sim) } else { Ok(vec![]) }
+        };
+        acked_implies_durable(&mut sim, 3, once, toy_verify).unwrap();
+        assert_eq!(sim.gave_up(), None);
     }
 
     #[test]

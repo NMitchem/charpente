@@ -2684,7 +2684,8 @@ for these before hand-rolling the same logic a fourth time:
   one round of work and returns the ids it promised are durable (classifying
   its own faults with `is_fault_fallout`, same as above), the sim restarts,
   and `verify` checks every id acked *so far* survived. A failure names the
-  round it broke on. **Pass it your own `sim`, not `sim.seed()`** — it restarts
+  round it broke on. A run where no round acked anything gives the universe
+  up by name, since no `verify` could have failed. **Pass it your own `sim`, not `sim.seed()`** — it restarts
   the world you give it, so `require: ["restart"]` over it fires, the excuse
   helpers below read the same world your workload ran in, and your universe's
   fault config actually applies. Until 2026-09-05 it took a seed and built its
