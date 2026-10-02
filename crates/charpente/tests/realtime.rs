@@ -1541,6 +1541,30 @@ impl Client {
         self.pending.is_empty() && self.first_unaccounted().is_none()
     }
 
+    /// True when a settled client checked nothing: no frame was delivered, and
+    /// no ledgered row lay in its subscription's window `[floor,
+    /// next_scan_id)`, so nothing was owed and nothing could have been
+    /// withheld. A row the subscription does not match, left undelivered,
+    /// is a check its filter passed, so it counts (S3b item 7, S5 review I2).
+    fn adjudicated_nothing(&self) -> bool {
+        let lo = self.floor.min(self.next_scan_id);
+        self.trace.is_empty() && self.ledger.range(lo..self.next_scan_id).next().is_none()
+    }
+
+    /// The give-up for `adjudicated_nothing`, which each settled workload ends
+    /// with. It comes after the coverage keys, which count the universe's
+    /// shape and stay as they were.
+    fn give_up_if_nothing_adjudicated(&self, sim: &Sim) {
+        if self.adjudicated_nothing() {
+            sim.give_up(format!(
+                "the settled client was owed nothing and delivered nothing: no ledgered row \
+                 lay in its subscription's window [{}, {}), so nothing was adjudicated",
+                self.floor.min(self.next_scan_id),
+                self.next_scan_id
+            ));
+        }
+    }
+
     /// The first matching (subscribed-filter-passing) ledger id in `[floor,
     /// next_scan_id)` that has not been content-verified — `None` at
     /// quiescence. `settled()`'s worker, factored out so a diagnostic can
@@ -2375,7 +2399,7 @@ fn realtime_workload_judged(
         }
         return Err(client.unsettled_report());
     }
-
+    client.give_up_if_nothing_adjudicated(sim);
     Ok(client.trace)
 }
 
@@ -5617,7 +5641,7 @@ fn scoped_realtime_workload_judged(
     {
         sim.cover("tenant:foreign-backlog-not-delivered");
     }
-
+    client.give_up_if_nothing_adjudicated(sim);
     Ok(client.trace)
 }
 
@@ -5958,6 +5982,63 @@ fn without_durable_corruption_a_cut_is_not_resynced() {
         "no corruption fired, so id 5 is still owed"
     );
     assert!(!sim.coverage().contains_key("realtime:ledger-resynced"));
+}
+
+/// A settled universe whose client was owed nothing and delivered nothing gives
+/// up instead of passing (S3b item 7, S5 review I2): its settle checked an empty
+/// window. One seed per workload, each the first at its batch's base, plus
+/// `0xe9110992f2280d36`, whose client was owed only an event durable corruption
+/// cut, so the re-sync at its boundary left nothing owed (item 3). At the
+/// pinned bases 23 flagship and 23 scoped universes give up this way; before,
+/// each passed.
+#[test]
+fn a_settled_client_owed_nothing_and_delivered_nothing_gives_up() {
+    for (seed, scoped) in [
+        (0x8d90_5371_e979_b020_u64, false),
+        (0xe911_0992_f228_0d36, false),
+        (0xb1c2_07a8_e3ca_62dd, true),
+    ] {
+        let mut state = seed;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(seed, &mut cfg);
+        let mut sim = Sim::with_faults(seed, cfg);
+        let trace = if scoped {
+            scoped_realtime_workload(&mut sim)
+        } else {
+            realtime_workload(&mut sim)
+        }
+        .unwrap_or_else(|e| panic!("seed {seed:#x}: {e}"));
+        assert!(trace.is_empty(), "seed {seed:#x}: {trace:?}");
+        let reason = sim
+            .gave_up()
+            .unwrap_or_else(|| panic!("seed {seed:#x}: an empty settle must give up, not pass"));
+        assert!(
+            reason.starts_with("the settled client was owed nothing and delivered nothing"),
+            "seed {seed:#x}: {reason}"
+        );
+    }
+}
+
+/// The window decides, not the trace alone: a row the subscription does not
+/// match, sitting in the window undelivered, is a check its filter passed.
+#[test]
+fn an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing() {
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    assert!(client.adjudicated_nothing(), "empty ledger, empty trace");
+    client
+        .ledger
+        .insert(0, ("ping", Some("tenant-b".to_string()), "b's".to_string()));
+    client.next_scan_id = 1;
+    assert!(
+        client.settled() && !client.adjudicated_nothing(),
+        "tenant B's row was in the window and withheld"
+    );
+    client.floor = 1;
+    assert!(
+        client.adjudicated_nothing(),
+        "below the floor it was never subscribed to"
+    );
 }
 
 /// Floors pinned at an exact measurement are only meaningful if the batch is
