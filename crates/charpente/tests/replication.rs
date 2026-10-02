@@ -7057,16 +7057,16 @@ fn a_reseed_refused_behind_before_it_converges_gives_up_under_its_own_key() {
 fn a_reseed_whose_wipe_met_a_failed_barrier_wipes_again_and_reopens_empty() {
     let (sim, r) = replay_above_horizon(0xa38c_1195_b634_3381);
     let coverage = sim.coverage();
+    assert_eq!(
+        r,
+        Ok(()),
+        "every re-seed reopened empty, so the universe did not fail: {coverage:?}"
+    );
     let retried = coverage.get("repl:reseed-wipe-retried").copied();
     assert!(
         retried.unwrap_or(0) > 0,
         "the wipe met an injected fault and was redone, or the seed no longer names the \
          scenario: {coverage:?}"
-    );
-    assert_eq!(
-        r,
-        Ok(()),
-        "every re-seed reopened empty, so the universe did not fail: {coverage:?}"
     );
 }
 
