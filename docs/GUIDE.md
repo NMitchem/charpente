@@ -121,11 +121,28 @@ file and the write-ahead log's segments live under one root directory, as
 flat relative names (`tables.redb`; WAL segments are named by their
 zero-padded 20-digit base sequence, so the first is
 `wal/00000000000000000000.log`); subdirectories are created on demand.
+**The data directory's parent must exist, and the node must be able to read
+it.** `ProdDisk::new` creates the data directory itself when it is absent, and
+never a directory above it: `./data` works on a fresh checkout, while
+`/srv/app/node` with no `/srv/app` is refused at startup by name (`charpente
+failed to start: the data directory "/srv/app/node" has no parent directory:
+"/srv/app" is not an existing directory, ...`). Create the parent when you
+provision the machine, and make it durable before the node starts — a bare
+`mkdir -p` leaves the new entries in the page cache, so follow it with `sync`.
+The reason is durability: an acknowledged write rests on every directory entry
+above it. Every directory barrier fsyncs the whole chain from the directory it
+names up to the data directory; `ProdDisk::new` fsyncs the data directory's
+parent, which holds the data directory's own entry, at every start, before
+anything is acknowledged; and the parent's own entry is yours. That start sync
+also means a parent the node cannot read stops the start there, under the same
+line, rather than inside your app's first barrier. An empty path is
+refused by name too. `restore --to` follows the same rule.
 
 ```rust
 use charpente::prod::ProdDisk;
 
-/// Opens the app's one data directory, creating it if it doesn't exist yet.
+/// Opens the app's one data directory, creating it if it doesn't exist yet
+/// (its parent must).
 fn open_data_dir(path: &str) -> std::io::Result<ProdDisk> {
     ProdDisk::new(path)
 }
@@ -4854,11 +4871,14 @@ never `serve_replicated`, so neither a witness conflict nor a strict-witness dea
 happen here; those are `charpente::serve_replicated`-only stops) comes from one of three
 distinct moments, each with its own line on stderr:
 
-- **Before any kernel exists.** Opening the platform IO handles (`ProdDisk::new`,
-  `ProdEntropy::new`) or `build` (`App::open`) fails — a table-gate barrier from a schema
-  this binary cannot open, or an ordinary platform IO failure (the disk root,
-  `/dev/urandom`, the store): `charpente refused to start: ...`/`charpente failed to start
-  — fix the store/log and restart: ...`. Or the HTTP bind fails, which `serve` attempts
+- **Before any kernel exists.** The data directory cannot be opened — its parent is missing
+  or the node cannot read it (§1), the path is empty, or it is not a directory you can
+  create: `charpente failed to start: the data directory "<path>" ...` or `charpente failed
+  to start: could not fsync directory "<parent>" ...`, naming the cause and the fix. Or opening
+  `/dev/urandom` (`ProdEntropy::new`) or `build` (`App::open`) fails — a table-gate barrier
+  from a schema this binary cannot open, or an ordinary platform IO failure (the store, the
+  log): `charpente refused to start: ...`/`charpente failed to start — fix the store/log and
+  restart: ...`. Or the HTTP bind fails, which `serve` attempts
   before it spawns the kernel thread: `charpente failed to start — could not bind <addr>:
   <the OS error> — free that address, or change the one the app passes to launch`.
 - **The kernel stops on its own account** — a Pending job of a foreign shape (§6), a
@@ -5969,7 +5989,7 @@ fn run_archive(app: App) -> std::io::Result<()> {
         read_budget_bytes: 8 << 20,
     };
     // Blocks: the kernel runs on this thread until it returns.
-    serve::archive(app, Box::new(FsObjectStore::new("/mnt/archive")), cfg)
+    serve::archive(app, Box::new(FsObjectStore::new("/mnt/archive")?), cfg)
 }
 ```
 
@@ -6004,12 +6024,21 @@ one kernel step is never a 64 MiB read.
 Two things to know before you deploy this:
 
 **`FsObjectStore` is the only production `ObjectStore` that ships.** It writes objects as
-files under a root directory, atomically (temp file, sync, rename, sync the parent). A real
-bucket — S3, GCS, Azure Blob — needs an `ObjectStore` implementation you write against the
-trait in `charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore`
-first: whole-object PUTs give a caller nothing to barrier, so the trait has no `sync`
-method, and an implementation still owes whatever its own substrate needs to make an acked
-PUT survive a crash — silently, because nothing in the trait can ask for it.
+files under a root directory, atomically (temp file, sync, rename, then sync every directory
+from the object's up to the root's parent), and it syncs an object and those directories
+before a GET or LIST returns it. Point the root at a directory whose parent exists and the
+node can read: a PUT creates the root but never its parent, so `FsObjectStore::new` refuses
+by name, when the store is built, a root whose parent is not an existing directory (and an
+empty path) — the `?` above, which stops the node before it starts. Provision the parent as
+you would the data directory's (§1), durably. A PUT still refuses the root by name if the
+parent is removed while the node runs, and under `serve::archive` that refusal is retried like
+any failed PUT. A real bucket — S3, GCS,
+Azure Blob — needs an `ObjectStore` implementation you write against the trait in
+`charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore` first:
+whole-object PUTs give a caller nothing to barrier, so the trait has no `sync` method, and
+every implementation still owes the trait's contract — an object a GET or LIST returns is
+durable, and an acknowledged PUT is durable — silently, because nothing in the trait can ask
+for it.
 
 **`serve::archive` is not a sidecar.** There is no `Repl` in it, so the node it runs is a
 primary in every respect except its edges: it runs the app's jobs and cron while it
@@ -6077,7 +6106,8 @@ Every app binary that calls `charpente::launch` has the verb already:
 usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]
        --from BUCKET    the archive's root directory (the bucket an archive wrote)
        --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim
-       --to DIR         the data directory to rebuild (default: this app's own data directory)
+       --to DIR         the data directory to rebuild (default: this app's own data directory; its
+                        parent must exist)
        --force          discard a destination timeline the archive cannot prove is its own
 ```
 

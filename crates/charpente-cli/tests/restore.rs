@@ -107,13 +107,16 @@ fn a_crate_with_no_binary_names_restore_not_describe() {
 #[test]
 fn an_absent_bucket_reaches_the_app_and_is_refused_with_its_own_text() {
     let dest = scratch("absent-bucket");
+    // Absent, under a parent that exists: the app builds its store, and the
+    // refusal is the archive's own "no manifest".
+    let bucket = scratch("absent-bucket-from");
     let out = charpente()
         .args([
             "restore",
             "--dir",
             &invoicing_dir(),
             "--from",
-            "/does/not/exist/charpente-no-such-bucket",
+            bucket.to_str().unwrap(),
             "--prefix",
             "node-a",
             "--to",

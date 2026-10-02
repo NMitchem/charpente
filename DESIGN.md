@@ -144,6 +144,54 @@ alongside it — a probability cannot guarantee the delete-fails-FOREVER shape i
 And `SimObjectStore` completes each operation in the `poll` that takes it, so object-store
 latency is not modelled at all.
 
+**What an object store owes, and what tests it** (2026-10-01). An object a `Get` or `List`
+returns is durable, and an acknowledged `Put` is durable (`ObjectStore`'s trait doc).
+`SimObjectStore` is that contract as a model: it has no page cache, so nothing it returns or
+acknowledges can vanish, and the archive's properties test the archive against the contract
+through it. The production store over a filesystem, `FsObjectStore`, has to earn it with
+fsyncs — of the object and of every directory from its key's directory up to the bucket
+root's parent, on every `Put` and before every `Get` or `List` returns (prod.rs). Before
+2026-10-01 it did not: a `Put` that failed after its rename left an object a later process
+could read back from the page cache and the next power loss could take away, and an
+acknowledged `Put` under a new prefix could lose its whole subdirectory to a power loss,
+because the directories it created were never synced into their parents. Its oracle is not the simulator. `Disk` has no rename, so
+a `Put` through it could not be atomic; its `open` creates, so a `Get` through it would; and
+its names are a flat namespace whose `sync_dir` makes every name under a prefix durable, so
+`SimDisk` cannot express a directory whose own entry was never synced, the shape the second
+defect needs. Giving `Disk` those would change a core trait — 23 implementations, and a
+directory tree in `SimDisk`'s crash model — to serve one store. The oracle is a crash model of the filesystem calls `FsObjectStore` makes (`CrashFs`,
+prod.rs's tests): the POSIX minimum, where a power loss keeps only what a sync took, each
+directory on its own, and a process restart keeps everything. Every durability decision sits
+above that seam, so the model runs the code production runs; it cuts the power after every
+call of a workload and pins each sync by name. `ProdDisk` runs over the same seam and model,
+for the reason `SimDisk` could not catch its defect: `SimDisk`'s flat names keep `Disk`'s
+contract as written, and only a directory tree can show the production impl falling short of
+it. Until 2026-10-01 it did fall short. `ProdDisk` created the data directory, any directory
+above it and `wal/` without syncing any of them into its parent, and a barrier fsynced only
+the one directory holding its prefix, so on a fresh node every write acknowledged before the
+first checkpoint rested on a `wal` entry the next power loss dropped (§2's barrier). The
+boundary of what charpente vouches for is the root's parent: `ProdDisk` creates the data
+directory and `FsObjectStore` the bucket root, and neither ever creates a directory above it
+— a root whose parent is missing is refused by name, because an entry created up there would
+lie on no sync's chain, and a boot that failed before syncing it would leave it for the next
+boot to trust (ruled 2026-10-01 over fsyncing every ancestor to `/`, which fails on unreadable
+ancestors and on filesystems with no directory fsync, and still cannot vouch for an
+operator's own unsynced `mkdir -p`, so the refusal tells the operator to make the parent durable
+when they provision it). `FsObjectStore::new` refuses such a root when the store is built, not
+at its first PUT: an archive reads a missing root as a fresh bucket and absorbs a refused PUT,
+so a node would otherwise run with no backup and no line on stderr. Each entry in `ProdDisk`'s
+tree has exactly one sync that carries it, and each is pinned by inverting it: a name under the
+data directory is carried by the barrier, which syncs up to and including the data directory;
+the data directory's own entry by `ProdDisk::new`, which fsyncs its parent at every start,
+whichever boot created it and before anything can be acknowledged (no barrier climbs above the
+data directory, and none creates it); the parent's own entry by the operator. That start sync
+also makes a parent the node cannot read fail at startup, under the data directory's line. The
+model
+states its own limits (prod.rs, `Fs`): a power loss drops all unsynced state, deterministically
+and in full, so it finds a missing or misplaced sync and not a bug that needs some unsynced
+state to survive; and its kernel never marks a page clean after a failed fsync, so the EIO
+residual (§2) is out of its reach, as it is out of `SimDisk`'s.
+
 **The store's crash surface, and the countdowns.** Every `Store::apply` commits at
 `Durability::None`, and redb 4.3.0 keeps such a commit's pages in its own write buffer
 (`write_barrier()` issues no file write, `cached_file.rs:594`) until a checkpoint — or until
@@ -211,8 +259,8 @@ operation.
 
 **A process restart is not a power cycle.** `Sim::restart` power-cycles: the
 page cache collapses under the crash model before anything reopens.
-`Sim::restart_process` (2026-10-01) restarts only the process. Open handles die
-and nothing else happens: every unsynced write and directory entry stays pending
+`Sim::restart_process` (2026-10-01) restarts only the process. Open file handles
+die and nothing else happens: every unsynced write and directory entry stays pending
 and readable by the next open, and the next power cycle still collapses it. That
 is what a supervisor sees after a kill, a crash or an exit, and it is the only
 way to reach "the next process read back what the dead one never made durable".
@@ -449,6 +497,9 @@ that a boot acts on syncs first, or has a stated reason it need not:
 - Restore's frontier probe reads the destination's segments unsynced because it decides
   only to refuse or to replace. A refusal writes nothing, and replacing discards every
   local byte.
+- One layer up, the bucket: `FsObjectStore` syncs every object a `Get` or `List` returns,
+  and the directories down to it, before returning it (§1). An archive that opens and
+  adopts its manifest acts on that `Get`.
 The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::read_log`,
 M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
 back one that fails — a frame corrupted on disk after append must never travel. That
@@ -518,7 +569,16 @@ rotated-in segment's name (or a store file's, at creation) could vanish on power
 taking acknowledged records with it, or a removed name could resurrect one a recovery
 already discarded. `Disk::sync_dir(prefix)` is the barrier: on `Ok`, every prior
 create/remove of a name starting with `prefix` is durable — same flat-namespace prefix
-contract as `list`. The prod impl fsyncs the holding directory; the sim tracks pending
+contract as `list`. The prod impl fsyncs every directory a name under the prefix sits in and
+every directory above them up to and including the data directory — the whole chain on every
+barrier, because a boot that created a directory and failed before syncing it leaves one that
+exists without being durable. The data directory's own entry is `ProdDisk::new`'s, synced into
+its parent at every start, and nothing is created above the data directory (a data directory
+whose parent is missing is refused by name, §1), so between them the barrier and the start
+sync carry every entry the prod impl creates. Until 2026-10-01 it fsynced only the holding directory, and on a fresh
+node the store's creation synced the data directory before `wal/` existed, so writes
+acknowledged before the first checkpoint rested on an unsynced `wal` entry (held by `CrashFs`,
+§1). The sim tracks pending
 creates/removes and, only when `FaultConfig.dir_entry_loss > 0.0`, independently rolls
 each pending entry at crash (an affected create vanishes even if its bytes synced; an
 affected remove resurrects the file with its last durable content) — zero rng draws when
@@ -1324,7 +1384,10 @@ sync that fails at boot fails the boot by name. The pins are in `repl/role.rs` a
 `repl/witnesses.rs`: `a_role_a_restarted_node_boots_as_survives_the_next_power_loss`,
 `a_witness_set_a_restarted_node_boots_with_survives_the_next_power_loss`, and for each the
 name (`…_name_a_restarted_node_trusts_…`) and failed-sync (`…_whose_sync_fails_at_boot_is_not_trusted`)
-twins.
+twins. So a failed role or witness write has an unknown outcome, and its error says so: the
+change may already have happened, because the restart it asks for boots as whatever the
+file holds (2026-10-01; `a_failed_role_write_says_the_flip_may_already_have_happened` and
+its witness twin).
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through
