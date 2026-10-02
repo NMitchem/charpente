@@ -12262,10 +12262,10 @@ git commit -m "feat(tenancy-completion): an event records its tenant apart from 
 
 **Files:**
 - Modify `crates/charpente-core/src/db.rs`:
-  - `pub trait Event` (118–129 at `e749823`): its doc and `type Scope`;
-  - the `use crate::table::{…}` list (52–55): add `UnscopedEvent`;
+  - `pub trait Event` (119–129 at 57e5df5; 118–129 at `e749823`): its doc and `type Scope`;
+  - the `use crate::table::{…}` list (52–55, at both shas; S5 added `StoreRejected` to it): add `UnscopedEvent`;
   - `Tx::push_emit` (new, private), which replaces the emit body Task 10 left;
-  - `Tx::emit` / `Tx::emit_keyed` (1094–1110), bounded on `UnscopedEvent`;
+  - `Tx::emit` / `Tx::emit_keyed` (1205–1221 at 57e5df5; 1094–1110 at `e749823`), bounded on `UnscopedEvent`;
   - `ScopedTx::emit` / `ScopedTx::emit_keyed` (Task 10's), bounded on `Event<Scope = S>`.
 - Modify `crates/charpente-core/src/table.rs`: `sealed::NotScopedEvent`, `NoEventTenant` and `UnscopedEvent` (new). They go after `impl<J: crate::db::Job> UnscopedJob for J …` (543).
 - Modify `crates/charpente-macros/src/event.rs`:
@@ -12279,11 +12279,11 @@ git commit -m "feat(tenancy-completion): an event records its tenant apart from 
   - Task 10's `Subscribe::subscription` (trait and impl) and `TenantFeed::and` are bounded on `Event<Scope = S>`;
   - `struct SubEntry` (206) and `Subscription.entries` (220) become `pub(crate)`.
 - Modify `crates/charpente/src/kernel/tail.rs`: a new `#[cfg(test)] mod tests` that holds the failing-encoder test moved out of `realtime.rs`.
-- Add `type Scope = Unscoped;` to the four hand-written `impl Event` blocks at `e749823`:
+- Add `type Scope = Unscoped;` to the four hand-written `impl Event` blocks (the same four at 57e5df5 and at `e749823`; lines at 57e5df5):
   - `crates/charpente-core/tests/materialize.rs:49`;
-  - `crates/charpente/tests/transactions.rs:70`;
-  - `crates/charpente/tests/realtime.rs:1246`;
-  - `crates/charpente/src/serve.rs:1268`.
+  - `crates/charpente/tests/transactions.rs:79` (70 at `e749823`);
+  - `crates/charpente/tests/realtime.rs:1251` (1246);
+  - `crates/charpente/src/serve.rs:1281` (1268).
 
   Add `type Scope` also to every hand `impl Event` Task 10 added: the core test's `OrgEvent` and `TestEvent`, and `http::tests`' `UnitPing`/`UnitPong`/`UnitOrg` (Task 10 leaves them for this task). The compiler names each one (E0046).
 - The `EventDef` literal at `crates/charpente/tests/describe.rs:823` gains the three new fields.
@@ -13145,9 +13145,9 @@ Expected: `1 passed`, then `0`. The `grep -c` prints `0` and exits 1 on no match
 
 **Hand-written events.** In each of the four `impl Event` blocks at `e749823`, add `type Scope = Unscoped;` after `const FINGERPRINT`, with the comment `// A global event: it belongs to no tenant.`:
 - `crates/charpente-core/tests/materialize.rs:49` (`TestEvent`), which already imports `Unscoped`;
-- `crates/charpente/tests/transactions.rs:70` (`InvoiceFinalized`), which already imports `Unscoped`;
-- `crates/charpente/tests/realtime.rs:1246` (`Quoted`). Its `use charpente_core::table::{Codec, Row, View};` becomes `use charpente_core::table::{Codec, Row, Unscoped, View};`;
-- `crates/charpente/src/serve.rs:1268` (`Ping`, in `mod tests`), which already imports `Unscoped` (`serve.rs:656`).
+- `crates/charpente/tests/transactions.rs:79` (`InvoiceFinalized`; 70 at `e749823`), which already imports `Unscoped`;
+- `crates/charpente/tests/realtime.rs:1251` (`Quoted`; 1246 at `e749823`). Its `use charpente_core::table::{Codec, Row, View};` becomes `use charpente_core::table::{Codec, Row, Unscoped, View};`;
+- `crates/charpente/src/serve.rs:1281` (`Ping`, in `mod tests`; 1268 at `e749823`), which already imports `Unscoped` (`serve.rs:656`).
 
 Task 10 added more hand impls. Each takes `type Scope` by what its test does with it:
 - The core test's `OrgEvent`, which Task 10 emits on a `ScopedTx<TestOrg>`, takes `type Scope = TestOrg;`. Its hand-written `FINGERPRINT` literal stays as written: only `#[event]` computes a scoped fingerprint, and a hand-written impl states its own, as a hand-written `Row` does.
@@ -13212,7 +13212,7 @@ struct DocCreated {
 /// moves, because `scoped_fingerprint` mixes in `Org`'s `NAME`.
 ```
 
-   Task 10 also used `OrgPing` on the global side, on purpose, to show at run time that a global row and a tenant's row of one name never cross: `literal_feed` and `global_feed` (`Subscription::of::<OrgPing>()`), `emit_global_org_ping`, and `NotifyOrg::run`'s `(*tx)`/`(**tx).emit(OrgPing …)`. Those take the global twin. Directly after `OrgPing`'s declaration, add:
+   Task 10 also used `OrgPing` on the global side, on purpose, to show at run time that a global row and a tenant's row of one name never cross: `literal_feed` and `global_feed` (`Subscription::of::<OrgPing>()`), `emit_global_ping_in_scope`, and `NotifyOrg::run`'s `(*tx)`/`(**tx).emit(OrgPing …)`. Those take the global twin. Directly after `OrgPing`'s declaration, add:
 
 ```rust
 /// `OrgPing`'s global twin (tenancy-completion spec §6). `OrgPing` is scoped
@@ -13239,7 +13239,7 @@ use global_twin::OrgPing as GlobalOrgPing;
 
    The twin's field list must be `OrgPing`'s, whatever Task 10 declared. `n: WireU64` above is `Ping`'s, which Task 10 copied. If `OrgPing` has other fields, copy them, or the twin's global rows stop being Task 10's bytes. Then, at each global-side site, `OrgPing` becomes `GlobalOrgPing`:
    - `literal_feed`'s and `global_feed`'s `emits(OrgPing)` and `Subscription::of::<OrgPing>()`;
-   - `emit_global_org_ping`'s `tx.emit(OrgPing { … })`;
+   - `emit_global_ping_in_scope`'s `(*tx).emit(OrgPing { … })`;
    - `NotifyOrg::run`'s `(**tx).emit(OrgPing { … })`, and any `(*tx).emit(OrgPing { … })`.
 
    `widened_feed`'s `.and::<Pong>()` names the global `Pong`. If `widened_feed` is a global feed, it is unchanged. If it is a tenant feed (`tx.subscription::<OrgPing>().and::<Pong>()`), the `.and::<Pong>()` is E0271: a tenant feed names its own tenant's events only, and a global `Pong` there is now `tenant_feed_of_another_scopes_event`'s compile error. In that case its test pinned at run time that a tenant feed never delivers a global row. Keep that pin with the twin rule, mirrored: a `mod org_twin { #[event(scoped_by = Org)] pub struct Pong { pub n: WireU64 } }`, imported `as OrgPong`, in the feed's `.and::<…>()` and its `emits(...)`, while the global `Pong`'s emits stay as they are. Record which case held in the report.
@@ -13433,7 +13433,7 @@ fn an_event_scoped_by_the_apps_own_tenant_type_mounts() {
 
 The collision test's text assumes that Task 3 names the type already in the census first and the newcomer second. `memo_app`'s `App::open` registers `Memo`'s `Org`, so that is `tenant::Org` first. If Task 3's pinned order is the other way, swap the two names, and say so in the report. `accounts::Org` is local to this file, because Task 3's same-`NAME` fixtures, wherever they live, are not reachable from an integration test binary.
 
-**The shared-raw-id property, end to end.** The fingerprint test above pins values. This one pins what the scoped fingerprint is FOR, spec §6's "Two scope types sharing a raw id no longer collide". `Org` 1 and `Team` 1 share a raw id, and their two events share a `NAME`. So `Team`'s row matches `Org` 1's feed on name and on scope, and only its shape tells it apart. In `crates/charpente/tests/realtime.rs`, after the last item of Task 10's scoped section, add:
+**The shared-raw-id property, end to end.** The fingerprint test above pins values. This one pins what the scoped fingerprint is FOR, spec §6's "Two scope types sharing a raw id no longer collide". `Org` 1 and `Team` 1 share a raw id, and their two events share a `NAME`. So `Team`'s row matches `Org` 1's feed on name and on scope, and only its shape tells it apart. In `crates/charpente/tests/realtime.rs`, after the last item of Task 10's scoped section (before D4's `// ===… the re-sync remedy's order` section, `:6351` at 57e5df5), add:
 
 ```rust
 // ======================= two tenant types, one raw id (spec §6)
@@ -13580,7 +13580,7 @@ fn a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_deliver
 }
 ```
 
-`EventRow.scope` is Task 10's field. `Subscribe` is in the `use charpente::{…}` list because Task 10's tenant feeds use it; if it is not, add it. `run_script`, `frames_of` and `reshaped_frame` are the file's helpers (`realtime.rs:344`, `:403`, `:417` at `e749823`). The frames assertion comes before the shape assertion on purpose. Under Step 9's mutations 1 and 2 the two shapes are equal, and the red must show the leak, a delivered `{"n":"7"}`, rather than the setup check. Its three routes name `Org` and `Team`, two tenant types under two `NAME`s, so Task 3's census admits the app.
+`EventRow.scope` is Task 10's field. `Subscribe` is in the `use charpente::{…}` list because Task 10's tenant feeds use it; if it is not, add it. `run_script`, `frames_of` and `reshaped_frame` are the file's helpers (`realtime.rs:347`, `:406`, `:420` at 57e5df5; `:344`, `:403`, `:417` at `e749823`). Since D4, `reshaped_frame` spells the fix with D4's re-sync remedy, which is what `kernel/tail.rs` sends. The frames assertion comes before the shape assertion on purpose. Under Step 9's mutations 1 and 2 the two shapes are equal, and the red must show the leak, a delivered `{"n":"7"}`, rather than the setup check. Its three routes name `Org` and `Team`, two tenant types under two `NAME`s, so Task 3's census admits the app.
 
 Run:
 
@@ -14320,7 +14320,7 @@ Expected:
   - `no_event_tenant_impl_from_an_app`: E0277 "the trait bound `Org: table::sealed::NotATenant` is not satisfied" at `impl NoEventTenant<Noted> for Org {}`, with the sealed-trait note naming `Unscoped` and `PlatformOwned`.
   - `subscription_entries_are_crate_private`: exactly two errors. E0603 "struct `SubEntry` is private" at the path in `widen`'s signature, with rustc's "the struct `SubEntry` is defined here" note. E0616 "field `entries` of struct `Subscription` is private" at `feed.entries`. A scratch crate with the same visibilities printed exactly these two on rustc 1.95.0.
 
-Commit nothing yet. Save the implementation, then apply each mutation alone, run the named test, and quote the failure. Restore each with `git checkout -- <file>` and `git apply` of the saved patch. After each restore, check that `git diff --stat` matches the saved patch's:
+Commit nothing yet. Save the implementation, then apply each mutation alone, run the named test, and quote the failure. Restore each with `git checkout -- <file> && git apply --include=<file> $D/task11-impl.patch`, naming the one mutated file both times: a `git apply` of the whole patch fails on the four files that still hold it, and applies nothing. After each restore, check that `git diff --stat` matches the saved patch's:
 
 ```zsh
 D=.superpowers/sdd/2026-09-30-tenancy-completion
@@ -14341,7 +14341,7 @@ git diff crates/charpente-core/src/db.rs crates/charpente-core/src/table.rs \
 8. `db.rs`: `ScopedTx::emit` passes `None` for the scope. Run `cargo test -p charpente --test realtime -- scoped shared_raw`. Expected: the scoped workload's tests and the shared-raw test panic with the same contract text, naming "org_ping" and `None`. The assert is live on the scoped path. Name each failing test in the report.
 9. `table.rs`: drop `+ sealed::NotScopedEvent` from `UnscopedEvent`'s supertraits. Run `cargo test -p charpente-macros --test trybuild`. Expected: `unscoped_event_impl_from_an_app` compiles, and trybuild reports it expected a failure. The seal is load-bearing, not decoration.
 10. `http/mod.rs`: `pub(crate) entries` and `pub(crate) struct SubEntry` go back to `pub`. Run `cargo test -p charpente-macros --test trybuild`. Expected: `subscription_entries_are_crate_private` compiles, and trybuild reports it expected a failure. Nothing else in the workspace notices, which is why the fixture exists.
-11. `http/mod.rs`: in Task 10's `Subscription::admits`, drop the `scope == self.scope` conjunct. Run the tests that hold Step 6's converted global-side sites (`literal_feed`, `global_feed`, `emit_global_org_ping`, `NotifyOrg`), and name each in the report. Expected: each is red, with a frame delivered, or a `charpente.reshaped` end, where it expected none. This mutation proves the twin conversion kept those tests' bite. A test that stays green lost it: stop and report it before going on. `http/mod.rs` is in the saved patch, so the restore brings the predicate back with the rest.
+11. `http/mod.rs`: in Task 10's `Subscription::admits`, drop the `scope == self.scope` conjunct. Run the tests that hold Step 6's converted global-side sites (`literal_feed`, `global_feed`, `emit_global_ping_in_scope`, `NotifyOrg`), and name each in the report. Expected: each is red, with a frame delivered, or a `charpente.reshaped` end, where it expected none. This mutation proves the twin conversion kept those tests' bite. A test that stays green lost it: stop and report it before going on. `http/mod.rs` is in the saved patch, so the restore brings the predicate back with the rest.
 
 12. `event.rs`: in the scoped arm's fingerprint, pass the scope path's last segment as a string in place of `<#path as ::charpente::core::db::Tenant>::NAME`. Insert `let last = path.segments.last().expect("a path has a segment").ident.to_string();` at the top of the arm, and use `#last` in the `scoped_fingerprint` call. Run `cargo test -p charpente --test tenant -- a_scoped_events_fingerprint_mixes_its_tenants_name`. Expected: it fails at the `billing` assertion, "billing::Org's NAME, never the `Org` its path is spelled with". Every A4 case, and the shared-raw-id test (`Org` and `Team` spell differently), stays green. That is why the `billing` case exists. Apply the same substitution to `scoped_by_name` instead, and the same test fails at "the def names the tenant by NAME too".
 
@@ -14367,7 +14367,7 @@ zsh $D/baselines.sh task11 migrations migrations-scoped; print -r -- "exit ${?}"
 zsh $D/baselines.sh task11 invoicing; print -r -- "exit ${?}"
 ```
 
-Expected: every label prints `exit 0, passing-test lines 1` and `reproduces the base`, and every call prints `exit 0`. `realtime-tenant`'s base is the recording Task 10 Step 10 re-based after it moved that universe by design. If Task 10 kept that recording under its own suffix, not as `cov-realtime-tenant-base.txt`, the driver's `MOVED` for this one label is a comparison against the wrong file. Diff by hand against Task 10's (`diff $D/cov-realtime-tenant-<task-10 suffix>.txt $D/cov-realtime-tenant-task11.txt && print -r -- identical`), and quote which file was the reference. Every other label compares with Task 1's base directly.
+Expected: every label prints `exit 0, passing-test lines 1` and `reproduces the base`, and every call prints `exit 0`. `realtime-tenant`'s base is the recording Task 10 Step 8 re-based after it moved that universe by design. If Task 10 kept that recording under its own suffix, not as `cov-realtime-tenant-base.txt`, the driver's `MOVED` for this one label is a comparison against the wrong file. Diff by hand against Task 10's (`diff $D/cov-realtime-tenant-<task-10 suffix>.txt $D/cov-realtime-tenant-task11.txt && print -r -- identical`), and quote which file was the reference. Every other label compares with Task 1's base directly.
 
 A `MOVED` line against the right reference is a finding: stop and adjudicate it (memory `pinned-seed-names-a-universe`) before touching any oracle. `invoicing` has no reason to move: `DocCreated` lives in `src/bin/tenant_node.rs`, outside the library the app's sim drives, and both of the library's events are global.
 
@@ -14627,14 +14627,14 @@ In the paragraph after the blocks, "The job pair, `NoJobTenant` and `UnscopedJob
 
 > - **Events.** `#[event(global)]` or `#[event(scoped_by = Org)]` structs. Neither tenancy is the default, and a bare `#[event]` is a compile error naming both. `tx.emit(...)` is typed, and subscribers (server-side and client-side codegen) consume typed streams off the log. A global event is emitted on a bare `Tx` (`Tx::emit`/`emit_keyed` take global events only) and tailed by `Subscription::of`. A scoped event is emitted only on its tenant's `ScopedTx`, which records the tenant beside it (§6). It is tailed only by that tenant's feed, `tx.subscription::<Ev>()` on the same handle. Every mismatch is an unsatisfied bound. A scoped event on a bare `Tx` or in a global `Subscription` names the fix (`NoEventTenant`, sealed with `UnscopedEvent`). A global or other-tenant event on a `ScopedTx` or a tenant feed is E0271. A scoped event's fingerprint continues its fields' fold with its tenant's `Tenant::NAME`, so a change of tenancy is a change of shape (spec 2026-09-30-tenancy-completion §4, §6). An event payload is itself a wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`. `events![…]`/`App::mount_events` register the type for `describe`, and its scope for the mount-time tenant census. Delivery deliberately has NO registry: `Subscription::of::<Ev>()` and `tx.subscription::<Ev>()` capture their encoders statically at the subscribe site, which is what makes "unregistered event at delivery" inexpressible rather than an error case.
 
-**Task 10's raw-id limit sentences.** Task 10 Step 11 wrote one sentence in each of four places. Each says a tenant feed matches its tenant by raw id alone, so two tenant types whose ids coincide share each other's same-named events. That is true at Task 10, and this task closes it. Find each with:
+**Task 10's raw-id limit sentences.** Task 10 Step 10 wrote one sentence in each of four places. Each says a tenant feed matches its tenant by raw id alone, so two tenant types whose ids coincide share each other's same-named events. That is true at Task 10, and this task closes it. Find each with:
 
 ```zsh
 grep -n 'raw id' docs/GUIDE.md DESIGN.md PLAN.md
 ```
 
-Compare the hits against the four sentences Task 10 Step 11 quotes, and replace each with the text for its file below. A hit that is not one of Task 10's sentences stays.
-- GUIDE §11 (the tenant-feed part of "The SSE route and `Subscription`"): "A tenant feed matches its tenant by type as well as by id. Its events are declared `scoped_by` that type, and each one's fingerprint carries the type's `Tenant::NAME`. So where two tenant types' raw ids coincide, one type's events never reach the other's feed. A same-named event of the other type meets the feed as a foreign shape and ends it with `charpente.reshaped`, never decoded. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets that."
+Compare the hits against the four sentences Task 10 Step 10 quotes, and replace each with the text for its file below. A hit that is not one of Task 10's sentences stays.
+- GUIDE §11 ("Emitting inside a tenant, and the tenant feed", where Task 10 Step 10 (a) put it): "A tenant feed matches its tenant by type as well as by id. Its events are declared `scoped_by` that type, and each one's fingerprint carries the type's `Tenant::NAME`. So where two tenant types' raw ids coincide, one type's events never reach the other's feed. A same-named event of the other type meets the feed as a foreign shape and ends it with `charpente.reshaped`, never decoded. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets that."
 - GUIDE §16 ("Realtime", or wherever Task 10 put it): "Two tenant types whose raw ids coincide no longer share events: an event names its tenant type (`#[event(scoped_by = Org)]`), and its fingerprint carries that type's `Tenant::NAME` (§11)."
 - DESIGN §8: "Closed by declaration (spec 2026-09-30-tenancy-completion §6). An event names its tenant type, the emit and subscribe bounds check it, and a scoped event's fingerprint mixes the type's `Tenant::NAME`. So a raw id two tenant types share never carries one's events into the other's feed. A same-named event of the other type is a foreign shape there: it ends that tail (payload-shapes spec §3) and is never decoded."
 - `PLAN.md`: "Closed by the tenancy-completion plan's Task 11: an event declares its tenant type, and a scoped event's fingerprint mixes that type's `Tenant::NAME`."
@@ -14653,7 +14653,7 @@ Compare the hits against the four sentences Task 10 Step 11 quotes, and replace 
 - "the route says `auth`, the table says which tenant owns its rows, the job says it acts inside that tenant, and a route, table or job that says none of this does not compile." becomes "the route says `auth`, the table says which tenant owns its rows, the job says it acts inside that tenant, the event says which tenant's feed carries it, and a route, table, job or event that says none of this does not compile."
 - "a table and a job say `scoped_by` or `global`, and none is a default." becomes "a table, a job and an event say `scoped_by` or `global`, and none is a default."
 
-**`crates/guide-examples/tests/doc_truth.rs`.** Read the floor Task 10 committed (`grep -n "const PINNED_FLOOR" crates/guide-examples/tests/doc_truth.rs`) and add 2 for §11's two new pinned blocks. The commit message records both values. It was 28 at `e749823`.
+**`crates/guide-examples/tests/doc_truth.rs`.** Read the floor Task 10 committed (`grep -n "const PINNED_FLOOR" crates/guide-examples/tests/doc_truth.rs`) and add 2 for §11's two new pinned blocks. The commit message records both values. It was 28 at `e749823` and is 29 at 57e5df5 (D4's stalled-switchover block); Tasks 3, 5, 9 and 10 add 1, 1, 2 and 2, so Task 10 leaves 35 and this task makes it 37.
 
 ```zsh
 cargo build -p guide-examples
@@ -14693,7 +14693,7 @@ Expected:
 - the two `test result` counts are equal and non-zero, and the report states the number;
 - the `FAILED` count is `0`. `grep -c` prints `0` and exits 1 on no match; the printed `0` is the result.
 
-`tenant_wire` runs `tenant_node` over real TCP, so it is the wire check that `DocCreated`'s feed still carries exactly its org's frames under the new declaration. `--lib` carries the moved failing-encoder test, and `http` carries Task 10's global-feed sites if any live there. The controller then runs the full workspace gate in the background and counts it against Task 1's measured baseline. This task adds no test file, so the count is unchanged.
+`tenant_wire`'s feed test, `a_tenants_feed_never_receives_another_tenants_events_over_sse`, is `#[ignore]`d (`crates/edge-harness/tests/tenant_wire.rs:433`, at both shas), so the gate line above does not run it. Run it as Task 10 Step 9 does, after its two release builds: `cargo test -p edge-harness --test tenant_wire -- a_tenants_feed_never_receives_another_tenants_events_over_sse --exact --ignored`. Expected: `1 passed`. That is the wire check that `DocCreated`'s feed still carries exactly its org's frames under the new declaration. `--lib` carries the moved failing-encoder test, and `http` carries Task 10's global-feed sites if any live there. The controller then runs the full workspace gate in the background and counts it against Task 1's measured baseline. This task adds no test file, so the count is unchanged.
 
 Re-check `git status` and `git log -1`: another session may be writing this tree. Stage every path this task names by name. Stage the two fixture directories whole, after `git status --short` confirms they hold only this task's 27 new files and the four modified ones Step 9 lists:
 
