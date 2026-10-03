@@ -1,4 +1,4 @@
-error: `Bare` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+error: `Bare` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
  --> tests/compile_fail/job_bare.rs:7:1
   |
 7 | #[job]
@@ -6,7 +6,7 @@ error: `Bare` declares no tenancy — a job says which: write `#[job(scoped_by =
   |
   = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error: `RetryOnly` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+error: `RetryOnly` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
   --> tests/compile_fail/job_bare.rs:10:1
    |
 10 | #[job(retry(max = 3, backoff = "10s"))]
@@ -14,7 +14,7 @@ error: `RetryOnly` declares no tenancy — a job says which: write `#[job(scoped
    |
    = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error: `CapabilityOnly` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+error: `CapabilityOnly` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
   --> tests/compile_fail/job_bare.rs:13:1
    |
 13 | #[job(cross_tenant)]

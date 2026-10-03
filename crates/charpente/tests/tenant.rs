@@ -158,6 +158,23 @@ fn write_team_memo(tx: &mut Tx, team: Id<Team>, ctx: &Ctx) -> Result<WireU64, Ap
     Ok(WireU64(tx.scope().raw()))
 }
 
+/// Declares `cross_tenant` beside plain `public`. Tenancy-completion spec §7,
+/// item 12: rule 3's 401 must not tell the author to drop that flag — its fix
+/// used to quote `#[route(POST "/memo-cross/:org", public(Org))]`, which does
+/// not compile beside the `cap` argument below.
+#[route(POST "/memo-cross/:org", public, cross_tenant)]
+fn write_memo_cross(
+    tx: &mut Tx,
+    org: Id<Org>,
+    cap: &CrossTenant,
+    ctx: &Ctx,
+) -> Result<WireU64, ApiError> {
+    memo_write(tx, org, ctx)?;
+    Ok(WireU64(
+        tx.across_tenants::<Org>(cap).scan::<Memo>()?.len() as u64
+    ))
+}
+
 /// Reads one tenant's rows back, so the refused tenant's emptiness is checked
 /// on the store and not only on the counters.
 #[route(GET "/memo/:org", auth)]
@@ -233,6 +250,7 @@ fn memo_app(seed: u64) -> (Sim, App) {
         write_memo_public,
         write_memo_open,
         write_team_memo,
+        write_memo_cross,
         count_memos,
         memo_feed,
         memo_feed_open,
@@ -368,7 +386,8 @@ fn an_anonymous_caller_on_a_plain_public_route_that_opens_a_scope_gets_the_named
          the tenant scope `Org` for a caller with no credential; only a route declared \
          `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
          charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(POST \"/memo-public/:org\", public(Org))]`"
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
     );
     assert_eq!(
         authorize_calls(),
@@ -397,21 +416,29 @@ fn a_credentialed_caller_on_a_plain_public_route_is_asked_about_once() {
 }
 
 /// Oracle 2 (g). Rule 3 on a stream: the site in the 401 is the word the
-/// route was declared with, `SSE`, not the `GET` it is served on — the fix it
-/// quotes must be an attribute the author can paste.
+/// route was declared with, `SSE`, not the `GET` it is served on. The route
+/// also declares `emits(MemoNoted)`, and the author's fix keeps it: the 401
+/// names the stance to change in place and restates no attribute
+/// (tenancy-completion spec §7, item 12).
 #[test]
 fn an_anonymous_subscriber_that_opens_a_scope_gets_the_401_naming_the_stream() {
     let (_sim, mut app) = memo_app(0x7E4A_1707);
     reset_counters();
     let refused = app.handle(Request::new(Method::Get, format!("/memo-feed/{ADMITTED}")));
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    let text = error_text(&refused);
     assert_eq!(
-        error_text(&refused),
+        text,
         "authentication required — `SSE /memo-feed/:org` is declared `public` and opened the \
          tenant scope `Org` for a caller with no credential; only a route declared \
          `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
          charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(SSE \"/memo-feed/:org\", public(Org))]`"
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
+    );
+    assert!(
+        !text.contains("#[route(SSE"),
+        "the fix restates no attribute, so `emits(MemoNoted)` cannot drop out of it: {text}"
     );
     assert_eq!(authorize_calls(), Vec::<String>::new());
 }
@@ -489,9 +516,41 @@ fn public_scope_for_one_scope_type_does_not_admit_another() {
          opened the tenant scope `Team` for a caller with no credential; only a route \
          declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
          charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(POST \"/memo-team/:team\", public(Team))]`"
+         declare `public(Team)` in place of `public(Org)` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
     );
     assert_eq!(bodies_entered(), 0);
+}
+
+/// Item 12. On a `public, cross_tenant` route the 401 names the stance to
+/// change and keeps the route's other flags, so the `cross_tenant` its `cap`
+/// argument needs survives the author's fix.
+#[test]
+fn the_401_on_a_cross_tenant_route_keeps_the_flag_in_its_fix() {
+    let (_sim, mut app) = memo_app(0x7C06_0601);
+    reset_counters();
+    let refused = app.handle(Request::new(
+        Method::Post,
+        format!("/memo-cross/{ADMITTED}"),
+    ));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    let text = error_text(&refused);
+    assert_eq!(
+        text,
+        "authentication required — `POST /memo-cross/:org` is declared `public` and opened \
+         the tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
+    );
+    assert!(
+        !text.contains("#[route(POST"),
+        "the fix restates no attribute, so `cross_tenant` cannot drop out of it: {text}"
+    );
+    assert_eq!(authorize_calls(), Vec::<String>::new());
+    assert_eq!(bodies_entered(), 0, "nothing below the scope line ran");
+    assert_eq!(app.db().last_applied(), None, "and nothing was written");
 }
 
 /// Spec §4: the `emits(...)` drift probe meets the three rules exactly as a
@@ -1768,7 +1827,8 @@ fn statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_wri
          opened the tenant scope `Org` for a caller with no credential; only a route declared \
          `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
          charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(POST \"/orgs/:org/incidents\", public(Org))]`"
+         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+         attribute, keeping its other flags"
     );
     assert_eq!(
         app.db().last_applied(),
@@ -1883,7 +1943,8 @@ fn the_401_tells_two_tenant_types_spelled_alike_apart_by_their_names() {
          opened the tenant scope `CrmOrg` for a caller with no credential; only a route \
          declared `public(CrmOrg)` admits one. Send \"Authorization: Bearer <token>\" or the \
          charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(POST \"/crm-leads\", public(CrmOrg))]`"
+         declare `public(CrmOrg)` in place of `public(BillingOrg)` in this route's \
+         `#[route(…)]` attribute, keeping its other flags"
     );
 }
 
@@ -1899,8 +1960,8 @@ fn the_401_names_a_generic_tenant_type_by_its_name() {
         "authentication required — `POST /wrapped` is declared `public` and opened the tenant \
          scope `Wrap` for a caller with no credential; only a route declared `public(Wrap)` \
          admits one. Send \"Authorization: Bearer <token>\" or the charpente_session cookie, \
-         or, if every caller may act inside this tenant here, declare \
-         `#[route(POST \"/wrapped\", public(Wrap))]`"
+         or, if every caller may act inside this tenant here, declare `public(Wrap)` in \
+         place of `public` in this route's `#[route(…)]` attribute, keeping its other flags"
     );
 }
 

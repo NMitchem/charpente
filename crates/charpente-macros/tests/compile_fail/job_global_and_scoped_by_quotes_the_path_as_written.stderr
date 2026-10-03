@@ -1,0 +1,5 @@
+error: `global` and `scoped_by = tenancy::Org` on one job — a job is one or the other; drop one
+  --> tests/compile_fail/job_global_and_scoped_by_quotes_the_path_as_written.rs:25:15
+   |
+25 | #[job(global, scoped_by = tenancy::Org)]
+   |               ^^^^^^^^^

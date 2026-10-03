@@ -178,6 +178,8 @@ a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant` or `emits(Ev
 write `#[route(METHOD "/path", auth | public | public(<Scope>))]` — e.g. #[route(GET "/notes/:id", auth)]
 ```
 
+> **Superseded 2026-10-03** by the same §7: `undeclared_capability` renders no stance. It names the route by method and path and tells the author to add `cross_tenant` to that attribute, keeping its other flags (GUIDE §9). This block's first line, the neither-stance refusal, no longer restates the attribute either: it says to add `auth`, `public` or `public(Org)` to the flags of `#[route(POST "/agents/:id", …)]`, keeping any it already has (GUIDE §5 pins the text).
+
 **Semantics.** `stage_or_subscribe` mints `group.tenant_admission()` for a route that
 declared `public(S)`, and only for one. It does so beside the `CrossTenant` it already mints
 (`http/app.rs:733`). `build_ctx` stores three things privately in `Ctx`: that admission,
@@ -194,6 +196,8 @@ the contract, the site, and both fixes, the caller's and the author's:
 ```text
 authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `#[route(POST "/orgs/:org/incidents", public(Org))]`
 ```
+
+> **Superseded 2026-10-03** by `2026-09-30-tenancy-completion-design.md` §7 (item 12): the author's fix no longer restates the attribute, which dropped a route's `cross_tenant` and `emits(…)`. It now ends ``declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags`` (GUIDE §5 pins the text).
 
 The scope is `S`'s type name cut to its last segment, as `decode_body` renders a type. The
 `emits(...)` drift probe honours `public(S)` exactly as it honours `cross_tenant`
@@ -216,6 +220,8 @@ assert; `global` emits `type Scope = Unscoped`. `scoped_by` composes with `cross
 `retry(...)` given twice — write it once
 a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
 ```
+
+> **Superseded 2026-10-03** by `2026-09-30-tenancy-completion-design.md` §7 (item 12's class): the first line no longer restates the attribute, which dropped a job's `cross_tenant` and `retry(…)`. It says to add `scoped_by = Org` or `global` to its `#[job(…)]`, keeping any arguments it already has (GUIDE §6 pins the text).
 
 The first refusal spans the attribute (`Span::call_site()`), as `#[table]`'s does. The last
 replaces `ACCEPTED_FORMS`. That also retires GUIDE §9's `#[job]` block, which has already
@@ -263,6 +269,8 @@ the table marker's note gains a job case:
             tx.scan::<Invoice>()?
         in a job, declare `#[job(scoped_by = Org)]` and read through the `ScopedTx` its `run` receives
 ```
+
+> **Superseded 2026-10-03** by the same §7: the job case reads ``in a job, write `scoped_by = Org` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives``.
 
 **Dispatch.** `JobDef` gains `pub scoped_by: Option<&'static str>`, and `JobGlue` becomes
 `fn(&mut Tx, &[u8], Option<&CrossTenant>, Option<JobScope<'_>>) -> Result<(), JobError>`.

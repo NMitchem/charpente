@@ -12,7 +12,7 @@ help: the trait `NoTenant<Invoice>` is not implemented for `Org`
    = note: open the tenant scope first — in a handler, `Org`'s own `Tenant::authorize` runs there for a credentialed caller:
                let tx = tx.scope::<Org>(scope, ctx)?;
                tx.scan::<Invoice>()?
-           in a job, declare `#[job(scoped_by = Org)]` and read through the `ScopedTx` its `run` receives
+           in a job, write `scoped_by = Org` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives
 help: the trait `NoTenant<R>` is implemented for `Unscoped`
   --> $WORKSPACE/crates/charpente-core/src/table.rs
    |

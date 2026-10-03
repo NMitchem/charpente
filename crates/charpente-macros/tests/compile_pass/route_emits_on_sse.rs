@@ -1,6 +1,6 @@
 // Positive control for compile_fail/route_emits_on_non_sse.rs: the identical
 // `emits(NoteAdded)` declaration on an SSE route — which is the remedy that
-// error prescribes verbatim ("make this `#[route(SSE \"…\")]`"). It proves
+// error prescribes ("change this route's method to `SSE`"). It proves
 // the rejection is caused by the route not being a stream, not by an
 // unrelated bound, import, or typo in the event type.
 //

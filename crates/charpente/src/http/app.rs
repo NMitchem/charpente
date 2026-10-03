@@ -134,7 +134,12 @@ impl Ctx {
     /// Rule 3's refusal: a caller with no credential reached a scope line
     /// that its route did not declare `public(S)` for. Names the contract,
     /// the site, and both fixes, the caller's and the author's (hard rule 5)
-    /// — except on an `auth` route, where the author has no fix to make.
+    /// — except on an `auth` route, where the author has no fix to make. The
+    /// author's fix names the change, `public(S)` in place of the route's
+    /// stance, and restates no attribute: a restated one dropped whatever
+    /// else the route declared (`cross_tenant`, `emits(…)`, any later flag),
+    /// so a pasted fix either stopped compiling or silently lost a
+    /// declaration (tenancy-completion spec §7, item 12).
     pub(crate) fn anonymous_scope<S: Tenant>(&self) -> ApiError {
         let Stance {
             method,
@@ -169,7 +174,8 @@ impl Ctx {
              opened the tenant scope `{scope}` for a caller with no credential; only a route \
              declared `public({scope})` admits one. Send \"Authorization: Bearer <token>\" or \
              the charpente_session cookie, or, if every caller may act inside this tenant \
-             here, declare `#[route({method} \"{pattern}\", public({scope}))]`"
+             here, declare `public({scope})` in place of `{declared}` in this route's \
+             `#[route(…)]` attribute, keeping its other flags"
         ))
     }
 

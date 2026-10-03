@@ -1,0 +1,5 @@
+error: `global` and `scoped_by = tenancy::Org` on one table — a table is one or the other; drop one
+  --> tests/compile_fail/table_global_and_scoped_by_quotes_the_path_as_written.rs:25:9
+   |
+25 | #[table(global, scoped_by = tenancy::Org)]
+   |         ^^^^^^

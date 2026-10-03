@@ -2047,7 +2047,10 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   (a principal, through `authorize`) or by declaration (`public(Org)` on the route, or the
   operator's `TenantAdmission`), never by an anonymous `None`. A caller with no credential
   at a scope line its route did not declare `public(Org)` for gets a named 401 (spec
-  2026-09-27-job-tenancy §4). A job acts inside a tenant only by declaring
+  2026-09-27-job-tenancy §4), whose fix names the stance to change in place and restates no
+  attribute, so a route's other flags survive it. Every declaration refusal names its fix the
+  same way: the words to add or change, keeping the rest (spec 2026-09-30-tenancy-completion
+  §7). A job acts inside a tenant only by declaring
   `#[job(scoped_by = Org)]`, and then only inside the tenant its enqueuer opened or its
   fan-out named, because no app code can write the job row that carries that tenant and
   an enqueue in a tenant of any other scope type is refused (§3's Jobs bullet). A table that declares neither

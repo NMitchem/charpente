@@ -261,11 +261,11 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         return Err(Error::new(
             proc_macro2::Span::call_site(),
             format!(
-                "`{name_str}` declares no tenancy — a job says which: write \
-                 `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from \
-                 inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), \
-                 or `#[job(global)]` if it belongs to no tenant (the only kind cron can \
-                 schedule). Neither is the default."
+                "`{name_str}` declares no tenancy — a job says which. Add one of these to its \
+                 `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it \
+                 acts inside one tenant (it is enqueued from inside that tenant's scope, and its \
+                 `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no \
+                 tenant (the only kind cron can schedule). Neither is the default."
             ),
         ));
     };

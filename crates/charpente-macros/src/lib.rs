@@ -30,10 +30,10 @@ pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
         return Error::new(
             proc_macro2::Span::call_site(),
             format!(
-                "`{name}` declares no tenancy — a table says which: write \
-                 `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key \
-                 becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` \
-                 if its rows belong to no tenant. Neither is the default."
+                "`{name}` declares no tenancy — a table says which. Add one of these to its \
+                 `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every \
+                 row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot \
+                 read it), or `global` if its rows belong to no tenant. Neither is the default."
             ),
         )
         .to_compile_error()

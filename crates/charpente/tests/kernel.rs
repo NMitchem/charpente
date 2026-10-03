@@ -6235,15 +6235,17 @@ mod job_tenancy {
     const UNAUTHORIZED: &str = "authentication required — send \"Authorization: Bearer \
                                 <token>\" or the charpente_session cookie";
 
-    /// Task 3's anonymous-scope 401 for the plain-`public` route, spelled out
-    /// rather than taken from the product's `format!`.
+    /// Rule 3's anonymous-scope 401 for the plain-`public` route, spelled out
+    /// rather than taken from the product's `format!` (job-tenancy Task 3;
+    /// its fix clause is tenancy-completion spec §7's, item 12).
     const PEEK_REFUSED: &str = "authentication required — `POST /shop/peek` is declared \
                                 `public` and opened the tenant scope `Shop` for a caller with \
                                 no credential; only a route declared `public(Shop)` admits \
                                 one. Send \"Authorization: Bearer <token>\" or the \
                                 charpente_session cookie, or, if every caller may act inside \
-                                this tenant here, declare `#[route(POST \"/shop/peek\", \
-                                public(Shop))]`";
+                                this tenant here, declare `public(Shop)` in place of `public` \
+                                in this route's `#[route(…)]` attribute, keeping its other \
+                                flags";
 
     /// Every reply, as the wire saw it. A 200 names its request's nonce, so a
     /// credential-free request that was admitted where it must be refused is

@@ -398,8 +398,8 @@ pub trait Row: Sized + 'static {
             there for a credentialed caller:\n    \
             let tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
             tx.scan::<{R}>()?\n\
-            in a job, declare `#[job(scoped_by = {Self})]` and read through the `ScopedTx` its \
-            `run` receives"
+            in a job, write `scoped_by = {Self}` in place of `global` in its `#[job(…)]`, \
+            keeping its other arguments, and read through the `ScopedTx` its `run` receives"
 )]
 pub trait NoTenant<R>: sealed::NotATenant {}
 

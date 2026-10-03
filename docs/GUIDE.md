@@ -336,7 +336,7 @@ declaration with no tenancy stance:
 
 <!-- pinned -->
 ```text
-`<table>` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+`<table>` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.
 `global` and `scoped_by = <scope>` on one table — a table is one or the other; drop one
 `global` given twice — write it once
 ```
@@ -1144,12 +1144,14 @@ The rule-3 401, for a `POST /orgs/:org/incidents` declared plain `public`:
 
 <!-- pinned -->
 ```text
-authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `#[route(POST "/orgs/:org/incidents", public(Org))]`
+authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags
 ```
 
 The site is the word the route was declared with (`SSE` for a stream) and its pattern;
 the scope is its tenant type's `NAME` (§16). Both fixes are there: the caller's (send a credential)
-and the author's (declare the tenant public, if that really is the policy). §16's "Who
+and the author's (declare the tenant public, if that really is the policy). The author's
+names the change to make where the stance is written and restates no attribute, so a route's
+other flags, `cross_tenant` or `emits(…)`, stay as they are. §16's "Who
 reaches a tenant" shows the three side by side.
 
 ### `ApiError` and status mapping
@@ -1346,7 +1348,7 @@ first is the one every route meets once:
 
 <!-- pinned -->
 ```text
-`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), `#[route(<method> "<path>", public)]` to serve anonymous callers, or `#[route(<method> "<path>", public(Org))]` to also let every caller act inside the `Org` tenant it opens. None is the default.
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(<method> "<path>", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
 `auth` and `public` on one route — a route is one or the other; drop one
 `public` given twice — write it once
 ```
@@ -1901,7 +1903,7 @@ one every job meets once, and the next three are its neighbours:
 
 <!-- pinned -->
 ```text
-`<job>` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+`<job>` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
 `global` and `scoped_by = <scope>` on one job — a job is one or the other; drop one
 `global` given twice — write it once
 `scoped_by` given twice — write it once
@@ -3450,7 +3452,7 @@ Nine ways `#[table]` rejects a struct — §2 pins the first three and walks
 through the other six on a `Ping` example:
 
 ```text
-`<table>` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+`<table>` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.
 `global` and `scoped_by = <scope>` on one table — a table is one or the other; drop one
 `global` given twice — write it once
 missing `id: Id<Ping>` field — every #[table] row needs a typed primary key (add `id: Id<Ping>`)
@@ -3461,7 +3463,8 @@ the `id` field of a #[table] must be `Id<Ping>` — a typed id, never a bare int
 #[table] structs cannot be generic — a table is one concrete row shape; make `Ping` non-generic
 ```
 
-In order: No tenancy declared — write `scoped_by = …` or `global`. Both at
+In order: No tenancy declared — add `scoped_by = …` or `global` to the attribute,
+keeping its other arguments. Both at
 once — drop one. `global` twice — once. No `id` field at all — add one.
 `id` present but not `Id<Self>` — type it. `#[index]` on `id` itself —
 remove it, `id` is already the primary key. Not a braced struct with named
@@ -3485,7 +3488,7 @@ fields on a table with durable data; add new fields, or write a v1 schema
 ### `#[route]` argument-convention violations (`charpente-macros/src/route.rs`, compile time)
 
 ```text
-`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), `#[route(<method> "<path>", public)]` to serve anonymous callers, or `#[route(<method> "<path>", public(Org))]` to also let every caller act inside the `Org` tenant it opens. None is the default.
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(<method> "<path>", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
 `auth` and `public` on one route — a route is one or the other; drop one
 `public` given twice — write it once
 a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is missing it
@@ -3496,12 +3499,12 @@ unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id", auth)]
 a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, `#[route(GET "/orgs/:org/status", public(Org))]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
 `public(...)` names exactly one tenant scope type — write `public(Org)`, or plain `public` if anonymous callers enter no tenant here
-emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
+emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...), or change this route's method to `SSE`, keeping its path and flags
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
 emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
 `auth` given twice — write it once
 `cross_tenant` given twice — write it once
-`revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue", public)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", public, cross_tenant)]`, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
+`revenue` takes `cap: &CrossTenant`, but its `#[route(GET "/admin/revenue", …)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Add `cross_tenant` to that attribute's flags, keeping the others, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
 `emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
@@ -3530,7 +3533,7 @@ the pattern and it's gone.
 ### `#[job]` tenancy, retry-syntax and shape violations (`charpente-macros/src/job.rs`, compile time)
 
 ```text
-`NotifySubscribers` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+`NotifySubscribers` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
 `global` and `scoped_by = Org` on one job — a job is one or the other; drop one
 `global` given twice — write it once
 `scoped_by` given twice — write it once
@@ -6795,7 +6798,7 @@ error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) a
    = note: open the tenant scope first — in a handler, `Org`'s own `Tenant::authorize` runs there for a credentialed caller:
                let tx = tx.scope::<Org>(scope, ctx)?;
                tx.scan::<Invoice>()?
-           in a job, declare `#[job(scoped_by = Org)]` and read through the `ScopedTx` its `run` receives
+           in a job, write `scoped_by = Org` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives
 ```
 
 `scoped_by` naming a type with no membership check:
@@ -6927,8 +6930,9 @@ Four properties make this a capability rather than an escape hatch:
 
 - **You cannot take the argument without the declaration.** A handler that
   writes `cap: &CrossTenant` on a route that did not say `cross_tenant` is a
-  macro error naming the contract, the site and the fix — it reconstructs the
-  attribute you should have written. §9's `#[route]` list quotes it verbatim.
+  macro error naming the contract, the site and the fix — it names the route by
+  its method and path and tells you to add `cross_tenant` to that attribute,
+  keeping its other flags. §9's `#[route]` list quotes it verbatim.
 
 - **You cannot forge the token.** `CrossTenant`'s field is private and its only
   constructor hangs off `Db::begin_group`, which a handler never holds —
