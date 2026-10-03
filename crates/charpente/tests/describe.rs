@@ -84,7 +84,7 @@ fn get_org_widget(tx: &mut Tx, org: String, id: Id<Widget>) -> Result<WidgetView
 /// exactly the JSON a subscriber receives, so it is a wire type — the
 /// `Wire` derive `#[event]` emits refuses a bare 64-bit integer here for the
 /// same reason a route body's does.
-#[event]
+#[event(global)]
 struct WidgetAdded {
     org: WireU64,
 }
@@ -92,7 +92,7 @@ struct WidgetAdded {
 /// A second event, with a payload shape unlike `WidgetAdded`'s — the two are
 /// registered in REVERSE name order below, which is what makes
 /// `Contract.events`' sort a real assertion rather than a coincidence.
-#[event]
+#[event(global)]
 struct WidgetRemoved {
     id: Id<Widget>,
 }

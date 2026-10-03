@@ -100,7 +100,7 @@ mod legacy {
     }
 }
 
-#[event]
+#[event(global)]
 struct DocCreated {
     doc: Id<Doc>,
     /// The tenant-unique marker the wire oracle keys on. Both tenants use the

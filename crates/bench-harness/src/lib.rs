@@ -42,7 +42,7 @@ pub struct Slot {
 /// `slot: WireU64`, unlike `Bump.slot` below: an `#[event]` payload crosses
 /// the wire (it IS the SSE frame body), so a bare 64-bit integer is a
 /// compile error in it; a `#[job]` payload never leaves the process.
-#[event]
+#[event(global)]
 pub struct SlotBumped {
     pub slot: WireU64,
 }

@@ -2016,7 +2016,7 @@ fn adopted_state_survives_a_commit_failure_correctly_per_arm() {
 
 // --------------------------------- Step 5b.2: enqueues/emits invisible mid-batch
 
-#[event]
+#[event(global)]
 struct Tick {
     n: WireU64,
 }

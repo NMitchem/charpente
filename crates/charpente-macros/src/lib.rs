@@ -237,15 +237,8 @@ pub fn job(args: TokenStream, input: TokenStream) -> TokenStream {
 
 #[proc_macro_attribute]
 pub fn event(args: TokenStream, input: TokenStream) -> TokenStream {
+    let event::EventArgs = parse_macro_input!(args as event::EventArgs);
     let input = parse_macro_input!(input as DeriveInput);
-    if !args.is_empty() {
-        return Error::new(
-            input.ident.span(),
-            "write `#[event]` with no arguments; the name derives from the type",
-        )
-        .to_compile_error()
-        .into();
-    }
     match event::expand(input) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),

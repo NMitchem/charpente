@@ -3204,7 +3204,7 @@ fn session_sweep_deletes_expired_rows_on_tick() {
 use charpente::event;
 use charpente::http::{Ctx, Cursor, Subscription};
 
-#[event]
+#[event(global)]
 struct Bumped {
     n: WireU64,
 }

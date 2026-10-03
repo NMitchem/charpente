@@ -561,7 +561,7 @@ impl Job for SendReceipt {
     // are covered in a later section.
 }
 
-#[event]
+#[event(global)]
 struct InvoiceFinalized {
     invoice: Id<Invoice>,
 }
@@ -3568,6 +3568,20 @@ the poisoned-engine story below:
 platform IO failure during the handler (not an attempt): <e>
 ```
 
+### `#[event]` declaration violations (`charpente-macros/src/event.rs`, compile time)
+
+```text
+`global` given twice — write it once
+an event declares `global` — write `#[event(global)]`; its name derives from the type
+#[event] applies to structs — enums and unions cannot be events
+#[event] structs cannot be generic — an event is one concrete payload shape; make `Baz` non-generic
+#[event] needs named fields — `Baz` must be a braced struct
+```
+
+The first refuses the tenancy word given twice. Any other argument — `#[event(name = "x")]`,
+say — hits the second: an event's `NAME` is its type's snake_case, never an argument (§11).
+The last three are the struct-shape checks `#[table]` and `#[job]` make.
+
 ### Router mount conflict (`charpente/src/http/router.rs`, `App::mount` time)
 
 ```text
@@ -4158,12 +4172,12 @@ dispatcher reads `charpente.jobs`.
 use charpente::wire::WireU64;
 use charpente::{Event, event};
 
-#[event]
+#[event(global)]
 struct HTTPEvent {
     code: u16,
 }
 
-#[event]
+#[event(global)]
 struct InvoicePDFSent {
     invoice: WireU64,
 }
@@ -4172,6 +4186,11 @@ fn names() -> (&'static str, &'static str) {
     (HTTPEvent::NAME, InvoicePDFSent::NAME) // ("http_event", "invoice_pdf_sent")
 }
 ```
+
+An event declares its tenancy. Every event in this guide is `#[event(global)]`: its type is
+not tied to a tenant. The word changes nothing about the event — its `NAME`, its fingerprint
+and its stored bytes are exactly what a bare `#[event]` produced — and it may be written
+once. §16 covers events inside a tenant.
 
 `#[event]` derives five things a plain struct doesn't have: `Codec` (the log/table
 format — the same machinery `#[table]`/`#[job]` use), `impl Event` (`NAME`, the wire
@@ -4211,7 +4230,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::wire::WireU64;
 use charpente::{Schema, event, events};
 
-#[event]
+#[event(global)]
 struct NoteAdded {
     note: WireU64,
 }
@@ -4350,7 +4369,7 @@ use serde::{Deserialize, Serialize};
 // An `#[event]` payload IS a wire type — it is exactly the JSON a
 // subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
 // `WireU64` a route body would.
-#[event]
+#[event(global)]
 struct Ping {
     n: WireU64,
 }
@@ -4728,7 +4747,7 @@ const SEC: u64 = 1_000_000_000;
 // An `#[event]` payload IS a wire type — it is exactly the JSON a
 // subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
 // `WireU64` a route body would.
-#[event]
+#[event(global)]
 struct Ping {
     n: WireU64,
 }

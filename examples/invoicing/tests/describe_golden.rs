@@ -11,14 +11,32 @@
 //! walk with no fault-injection concern of its own — the T2 fixture's own
 //! rationale).
 
+use charpente::Event;
 use charpente::describe::to_json;
 use charpente::http::App;
 use charpente_sim::{FaultConfig, Sim};
+use invoicing::jobs::ReceiptSent;
+use invoicing::routes::InvoiceFinalized;
 
 fn fixture_app() -> App {
     let sim = Sim::with_faults(0x2EC5_0001, FaultConfig::none());
     invoicing::build_app(Box::new(sim.disk()), Box::new(sim.entropy()))
         .expect("fixture app must build under FaultConfig::none()")
+}
+
+/// Tenancy-completion spec §11: `examples/invoicing`'s two events are global,
+/// and their stored rows must not change shape when they say so — the launch
+/// run replays this demo's log. The literals are FNV-1a over charpente's own
+/// rendering of each field list (`"invoice\0Id < Invoice >\0"` and
+/// `"invoice\0Id < Invoice >\0amount_cents\0WireI64\0"`), run green at the
+/// plan's base, before either event said `global`.
+#[test]
+fn the_invoicing_events_fingerprints_do_not_move() {
+    assert_eq!(
+        <InvoiceFinalized as Event>::FINGERPRINT,
+        0x7034_25fd_804c_6200
+    );
+    assert_eq!(<ReceiptSent as Event>::FINGERPRINT, 0x133d_31e7_fc9e_acca);
 }
 
 // 13 tables (7 app: AppClock, Customer, IdCounter, Invoice, LineItem,

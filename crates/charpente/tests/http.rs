@@ -1069,7 +1069,7 @@ fn routes_macro_collects_descriptors() {
 
 // ---------------------------------------------------- realtime (T4)
 
-#[event]
+#[event(global)]
 struct NoteAdded {
     note: WireU64,
 }

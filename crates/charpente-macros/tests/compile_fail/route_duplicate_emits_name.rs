@@ -12,7 +12,7 @@
 use charpente::wire::WireU64;
 use charpente::{event, route};
 
-#[event]
+#[event(global)]
 struct NoteAdded {
     n: WireU64,
 }

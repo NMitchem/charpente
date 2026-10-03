@@ -820,7 +820,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   nothing refuses either case, so the operator drains such a job (runs the binary that
   enqueued its Pending rows until they are Done or Dead) before the deploy (final review
   N1, NB2).
-- **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
+- **Events.** `#[event(global)]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log. An event payload is itself a
   wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
   — and `events![…]`/`App::mount_events` register the type for `describe` only.

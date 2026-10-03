@@ -19,12 +19,12 @@ use charpente::http::{ApiError, Ctx, Cursor, Subscription};
 use charpente::wire::WireU64;
 use charpente::{Tx, event, route};
 
-#[event]
+#[event(global)]
 struct NoteAdded {
     n: WireU64,
 }
 
-#[event]
+#[event(global)]
 struct NoteRemoved {
     n: WireU64,
 }

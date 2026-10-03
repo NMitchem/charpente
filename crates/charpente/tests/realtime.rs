@@ -45,12 +45,12 @@ const SEC: u64 = 1_000_000_000;
 // 64-bit integer only crosses the wire as a string. The stored `Codec` bytes
 // are unchanged — `WireU64`'s codec IS `u64`'s — so only the frame JSON
 // differs ({"n":"3"} rather than {"n":3}).
-#[event]
+#[event(global)]
 struct Ping {
     n: WireU64,
 }
 
-#[event]
+#[event(global)]
 struct Pong {
     n: WireU64,
 }
@@ -63,18 +63,18 @@ mod shapes_v1 {
     use charpente::event;
     use charpente::wire::WireU64;
 
-    #[event]
+    #[event(global)]
     pub struct IncidentOpened {
         pub n: WireU64,
     }
 
-    #[event]
+    #[event(global)]
     pub struct Swapped {
         pub a: WireU64,
         pub b: WireU64,
     }
 
-    #[event]
+    #[event(global)]
     pub struct Dropped {
         pub a: WireU64,
         pub b: WireU64,
@@ -86,21 +86,21 @@ mod shapes_v2 {
     use charpente::wire::WireU64;
 
     /// v1 plus a field — the statuspage review's C-1 change.
-    #[event]
+    #[event(global)]
     pub struct IncidentOpened {
         pub n: WireU64,
         pub severity: WireU64,
     }
 
     /// v1 with its two same-typed fields swapped.
-    #[event]
+    #[event(global)]
     pub struct Swapped {
         pub b: WireU64,
         pub a: WireU64,
     }
 
     /// v1 with its trailing field dropped.
-    #[event]
+    #[event(global)]
     pub struct Dropped {
         pub a: WireU64,
     }
@@ -163,6 +163,23 @@ fn an_events_fingerprint_follows_its_fields_not_its_name() {
     // The control: identical fields fingerprint identically whatever the
     // name — NAME carries identity, FINGERPRINT carries shape.
     assert_eq!(<Ping as Event>::FINGERPRINT, <Pong as Event>::FINGERPRINT);
+}
+
+/// Tenancy-completion spec §6 and amendment A1: a `global` event's
+/// fingerprint is exactly the fold a bare `#[event]` computed, so no stored
+/// row of an existing event changes shape when its declaration gains
+/// `global`, and the scoped fingerprint the plan's Task 11 adds leaves global
+/// events alone. The literals are FNV-1a over charpente's own rendering —
+/// `"n\0WireU64\0"` and `"a\0WireU64\0b\0WireU64\0"` — and were run green at
+/// the plan's base, before any event said `global`.
+#[test]
+fn a_global_events_fingerprint_is_the_bare_events_fingerprint() {
+    assert_eq!(<Ping as Event>::FINGERPRINT, 0x9caf_3f93_9b10_65e1);
+    assert_eq!(<Pong as Event>::FINGERPRINT, 0x9caf_3f93_9b10_65e1);
+    assert_eq!(
+        <shapes_v1::Swapped as Event>::FINGERPRINT,
+        0x26f3_bd60_2fcd_ef46
+    );
 }
 
 #[derive(WireDerive, Serialize, Deserialize)]
@@ -3126,7 +3143,7 @@ impl RouteDef for FailingFeed {
     }
 }
 
-#[event]
+#[event(global)]
 struct NoteAdded {
     n: WireU64,
 }
@@ -3224,7 +3241,7 @@ impl Serialize for Poisoned {
     }
 }
 
-#[event]
+#[event(global)]
 struct PoisonedEvent {
     field: Poisoned,
 }
@@ -6452,7 +6469,7 @@ struct Latest {
     n: u64,
 }
 
-#[event]
+#[event(global)]
 struct Marked {
     n: WireU64,
 }

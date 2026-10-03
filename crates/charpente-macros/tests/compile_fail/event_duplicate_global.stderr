@@ -1,0 +1,5 @@
+error: `global` given twice — write it once
+ --> tests/compile_fail/event_duplicate_global.rs:7:17
+  |
+7 | #[event(global, global)]
+  |                 ^^^^^^

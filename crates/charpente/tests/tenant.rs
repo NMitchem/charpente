@@ -164,7 +164,7 @@ fn count_memos(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError
     Ok(WireU64(tx.scan::<Memo>()?.len() as u64))
 }
 
-#[event]
+#[event(global)]
 struct MemoNoted {
     n: WireU64,
 }

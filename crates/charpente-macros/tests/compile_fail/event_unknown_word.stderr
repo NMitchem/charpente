@@ -1,0 +1,5 @@
+error: an event declares `global` — write `#[event(global)]`; its name derives from the type
+ --> tests/compile_fail/event_unknown_word.rs:5:9
+  |
+5 | #[event(name = "renamed")]
+  |         ^^^^

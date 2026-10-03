@@ -34,7 +34,7 @@ const WRITER: &str = "node-a:9000";
 /// ships the Db's event counter" and "the archive ships a zero" are the same
 /// assertion — measured: a `next_event_id: 0` mutation survived a fully green
 /// suite until this existed.
-#[event]
+#[event(global)]
 struct Ping {
     // `WireU64`, not a bare `u64`, since main's `Wire` bound landed: an event
     // payload IS the JSON a client sees, and a u64 above 2^53 loses precision

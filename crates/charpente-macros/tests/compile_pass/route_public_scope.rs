@@ -34,7 +34,7 @@ struct Incident {
     title: String,
 }
 
-#[event]
+#[event(global)]
 struct IncidentOpened {
     n: WireU64,
 }

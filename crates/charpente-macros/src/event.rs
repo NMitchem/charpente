@@ -1,5 +1,5 @@
-//! `#[event]` (DESIGN.md §6, realtime spec): turns a struct into a typed
-//! realtime event — a field-wise `Codec` impl (mirrors `#[job]`'s payload
+//! `#[event(global)]` (DESIGN.md §6, realtime spec, tenancy-completion spec
+//! §6): turns a struct into a typed realtime event — a field-wise `Codec` impl (mirrors `#[job]`'s payload
 //! codec), `impl Event` carrying the name (snake_case of the type name) and
 //! the payload's structural fingerprint (`fingerprint::compute`), a
 //! `Serialize` derive emitted through the `::charpente::serde` re-export
@@ -18,8 +18,46 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
+use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
-use syn::{Data, DeriveInput, Error, Fields};
+use syn::{Data, DeriveInput, Error, Fields, Ident, Token};
+
+const ACCEPTED_FORMS: &str =
+    "an event declares `global` — write `#[event(global)]`; its name derives from the type";
+
+/// The attribute's arguments. `global` is its one word, read only to refuse a
+/// repeat or anything else: it expands to nothing, because a `global` event is
+/// what a bare `#[event]` was (tenancy-completion amendment A1). The plan's
+/// Task 11 adds `scoped_by = <Type>` and refuses the bare form.
+pub(crate) struct EventArgs;
+
+impl Parse for EventArgs {
+    fn parse(input: ParseStream) -> syn::Result<EventArgs> {
+        let mut global = false;
+        while !input.is_empty() {
+            let word: Ident = input
+                .parse()
+                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+            if word != "global" {
+                return Err(Error::new(word.span(), ACCEPTED_FORMS));
+            }
+            if global {
+                return Err(Error::new(
+                    word.span(),
+                    "`global` given twice — write it once",
+                ));
+            }
+            global = true;
+            if input.is_empty() {
+                break;
+            }
+            input
+                .parse::<Token![,]>()
+                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+        }
+        Ok(EventArgs)
+    }
+}
 
 pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let name = &input.ident;
