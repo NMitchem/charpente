@@ -494,7 +494,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         #[allow(non_snake_case)]
         fn #glue_name(
             tx: &mut ::charpente::Tx,
-            ctx: &::charpente::http::Ctx,
+            ctx: &::charpente::http::Ctx<'_>,
             captures: &[::std::string::String],
             body: &[u8],
         ) -> ::std::result::Result<::charpente::http::Response, ::charpente::http::ApiError> {
@@ -837,7 +837,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         #[allow(non_snake_case)]
         fn #glue_name(
             tx: &mut ::charpente::Tx,
-            ctx: &::charpente::http::Ctx,
+            ctx: &::charpente::http::Ctx<'_>,
             captures: &[::std::string::String],
             cursor: ::std::option::Option<::charpente::http::Cursor>,
         ) -> ::std::result::Result<::charpente::http::Subscription, ::charpente::http::ApiError> {

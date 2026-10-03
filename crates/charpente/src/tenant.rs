@@ -49,7 +49,8 @@
 //! tenant by declaration. GUIDE §6 and DESIGN.md §3's Jobs bullet state that
 //! residual and the drain that avoids it. Operator code that must act inside one tenant — seeding, a test oracle —
 //! opens it with a `TenantAdmission` minted from a `Group` (`Tx::admit_scope`),
-//! the seal `CrossTenant` already carries, which is the operator's standing
+//! the seal `CrossTenant` already carries, and its tie to
+//! the `Group` that minted it, which is the operator's standing
 //! made explicit rather than an exception to the guarantee. *(Corrected
 //! 2026-09-27, job-tenancy spec: the earlier remedy named a `Ctx` that no code
 //! outside a handler holds.)*
@@ -119,7 +120,7 @@ pub trait Scoped<'a> {
     fn scope<S: TenantScope>(
         &mut self,
         scope: Id<S>,
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
     ) -> Result<ScopedTx<'_, 'a, S>, ApiError>;
 }
 
@@ -138,7 +139,7 @@ impl<'a> Scoped<'a> for Tx<'a> {
     fn scope<S: TenantScope>(
         &mut self,
         scope: Id<S>,
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
     ) -> Result<ScopedTx<'_, 'a, S>, ApiError> {
         if let Some(admission) = ctx.public_admission::<S>() {
             return Ok(self.admit_scope(scope, admission));

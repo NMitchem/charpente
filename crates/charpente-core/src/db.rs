@@ -1066,8 +1066,8 @@ impl<'a> Tx<'a> {
     /// Operator code that holds a `Group` can: it is trusted by that
     /// standing (job-tenancy spec §3, §7), since whoever holds the `Db`
     /// already holds the store.
-    pub fn settle_job(&mut self, row: &JobRow, admission: &TenantAdmission) {
-        let TenantAdmission(()) = admission;
+    pub fn settle_job(&mut self, row: &JobRow, admission: &TenantAdmission<'_>) {
+        let TenantAdmission(_) = admission;
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
         self.effects
@@ -1232,9 +1232,9 @@ impl<'a> Tx<'a> {
         &mut self,
         scope: Id<S>,
         job: impl Job<Scope = S>,
-        cap: &CrossTenant,
+        cap: &CrossTenant<'_>,
     ) {
-        let CrossTenant(()) = cap;
+        let CrossTenant(_) = cap;
         self.push_enqueue(Some((scope.raw(), S::NAME)), None, job);
     }
 
@@ -1753,9 +1753,9 @@ impl<'a> Tx<'a> {
     pub fn admit_scope<S: Tenant>(
         &mut self,
         scope: Id<S>,
-        admission: &TenantAdmission,
+        admission: &TenantAdmission<'_>,
     ) -> ScopedTx<'_, 'a, S> {
-        let TenantAdmission(()) = admission;
+        let TenantAdmission(_) = admission;
         let Ok(scoped) = self.enter_scope(scope, |_| Ok::<(), std::convert::Infallible>(()));
         scoped
     }
@@ -1933,18 +1933,27 @@ impl<'a, S> std::ops::DerefMut for ScopedTx<'_, 'a, S> {
 /// group borrows is the operator, who already reaches every tenant through
 /// `Db::snapshot` (ruling R48).
 ///
-/// `Clone` because the platform hands the same request's token to the `Ctx`
-/// and to the handler argument; cloning widens nothing, since holding one at
-/// all IS the capability.
-#[derive(Clone)]
-pub struct CrossTenant(());
+/// Tied to the `Group` that minted it, and not `Clone` (tenancy-completion
+/// spec §5): `'g` is that group's borrow of the `Db`, so a token cannot
+/// outlive the borrow — not into a `static` or a `thread_local!`, both of
+/// which need `'static`, and not into the `Db`'s next group, which needs the
+/// `Db` back. The platform keeps the one token in the request's `Ctx` and
+/// hands the handler `&CrossTenant`, which it can neither copy into a token
+/// of its own nor keep. Only a `Db` borrowed for `'static` — a leaked one —
+/// mints a `'static` token: that is the operator, whose standing
+/// `Db::snapshot` already is (ruling R48), building a bypass on purpose.
+pub struct CrossTenant<'g>(std::marker::PhantomData<&'g ()>);
 
 impl<'a> Group<'a> {
     /// Mints the token the platform hands a route or job that declared
     /// `cross_tenant`. See `CrossTenant`: this is the only constructor, and
     /// it takes a `&Group` because that is a handle a handler never has.
-    pub fn cross_tenant_cap(&self) -> CrossTenant {
-        CrossTenant(())
+    ///
+    /// The token borrows what the group borrows (`'a`, the `Db`), not the
+    /// group itself: every holder mints first and then stages in the same
+    /// group, which a token borrowing `&self` would forbid.
+    pub fn cross_tenant_cap(&self) -> CrossTenant<'a> {
+        CrossTenant(std::marker::PhantomData)
     }
 }
 
@@ -1970,16 +1979,19 @@ impl<'a> Group<'a> {
 /// explicit at a scope line instead of leaving it an exception to the
 /// guarantee.
 ///
-/// `Clone` for `CrossTenant`'s reason: holding one at all is the admission,
-/// so a copy widens nothing.
-#[derive(Clone)]
-pub struct TenantAdmission(());
+/// Tied to its `Group` and not `Clone`, exactly as `CrossTenant` is: a
+/// `public(S)` route's admission stays in that request's `Ctx`, the
+/// dispatcher's lives for one job run, and an operator's for the `Db`
+/// borrow its group holds — none of them in a `static` or a
+/// `thread_local!`.
+pub struct TenantAdmission<'g>(std::marker::PhantomData<&'g ()>);
 
 impl<'a> Group<'a> {
     /// Mints the admission `Tx::admit_scope` takes. The only constructor;
-    /// see `TenantAdmission`.
-    pub fn tenant_admission(&self) -> TenantAdmission {
-        TenantAdmission(())
+    /// see `TenantAdmission`. Borrows what the group borrows, as
+    /// `cross_tenant_cap` does, for the same reason.
+    pub fn tenant_admission(&self) -> TenantAdmission<'a> {
+        TenantAdmission(std::marker::PhantomData)
     }
 }
 
@@ -1992,8 +2004,8 @@ impl<'a> Tx<'a> {
     /// No `Tenant::authorize` runs here, and none could: there is no single
     /// tenant to ask about. The declaration is the authorization, and it is
     /// auditable because `charpente describe` enumerates it.
-    pub fn across_tenants<S: 'static>(&self, cap: &CrossTenant) -> AllTenants<'_, 'a, S> {
-        let CrossTenant(()) = cap;
+    pub fn across_tenants<S: 'static>(&self, cap: &CrossTenant<'_>) -> AllTenants<'_, 'a, S> {
+        let CrossTenant(_) = cap;
         AllTenants {
             tx: self,
             scope: std::marker::PhantomData,

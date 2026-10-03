@@ -354,7 +354,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         Tenancy::ScopedBy(path) => {
             let (cap_ty, cap_arg) = if cross_tenant {
                 (
-                    quote! { , &::charpente::CrossTenant },
+                    quote! { , &::charpente::CrossTenant<'_> },
                     quote! { , #cap_expect },
                 )
             } else {
@@ -425,7 +425,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                 fn __charpente_job_glue(
                     tx: &mut ::charpente::Tx,
                     payload: &[u8],
-                    cap: ::std::option::Option<&::charpente::CrossTenant>,
+                    cap: ::std::option::Option<&::charpente::CrossTenant<'_>>,
                     scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
                 ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
                     let _ = cap; // an undeclared job is handed None and uses none of it

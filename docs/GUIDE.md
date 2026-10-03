@@ -750,7 +750,11 @@ decodes, and dispatches to it:
   glue's actual bound); a type borrowing from the input won't compile, and
   neither will one missing `#[derive(Wire)]`.
 - Then, optionally, a trailing argument named exactly `ctx`, typed `&Ctx`
-  (session access — see Sessions below).
+  (session access — see Sessions below). `Ctx` borrows from the request's
+  group (`Ctx<'g>`), and `&Ctx` elides that, so a handler never names it. A
+  helper that returns something borrowed out of a `Ctx` must say which
+  borrow: `fn subject_of<'c>(ctx: &'c Ctx) -> Option<&'c str>`. Left elided,
+  it is `error[E0106]: missing lifetime specifier`.
 
 The handler returns `Result<T, ApiError>` where `T: serde::Serialize + Wire`
 — the `Result<_, _>` shape itself is enforced too, and named (a bare return
@@ -6926,7 +6930,7 @@ impl Rollup {
 }
 ```
 
-Four properties make this a capability rather than an escape hatch:
+Five properties make this a capability rather than an escape hatch:
 
 - **You cannot take the argument without the declaration.** A handler that
   writes `cap: &CrossTenant` on a route that did not say `cross_tenant` is a
@@ -6938,6 +6942,15 @@ Four properties make this a capability rather than an escape hatch:
   constructor hangs off `Db::begin_group`, which a handler never holds —
   `CrossTenant(())` is `error[E0423]: cannot initialize a tuple struct which
   contains private fields`.
+- **You cannot keep the token.** It is tied to the group the request or job
+  runs in (`CrossTenant<'g>`) and is not `Clone`. A handler is handed
+  `&CrossTenant`; `cap.clone()` only copies that reference (rustc says so:
+  "`CrossTenant<'_>` does not implement `Clone`, so `&CrossTenant<'_>` was
+  cloned instead"), so there is no token of its own to park. Operator code
+  that mints one from `Db::begin_group` cannot park it either: a `static`
+  or a `thread_local!` needs `'static`, and the token lives only as long as
+  the group's borrow of the `Db` —
+  `error[E0521]: borrowed data escapes outside of function`.
 - **The result carries the tenant.** `AllTenants::scan` yields
   `Vec<(Id<Org>, Ledger)>`, never `Vec<Ledger>`, so a cross-tenant answer cannot
   be handed to code expecting one tenant's data without a visible `.map`. The
@@ -7029,7 +7042,7 @@ hands to `launch`, so it holds `App::db()` — and a `Db` reaches every tenant:
 `Db::snapshot()` exposes scoped and raw reads that take a scope on the caller's
 word with no `authorize` on the path (replication seeding, the archive and
 `restore` are built on them), and `Db::begin_group` can mint the `CrossTenant`
-token. Whoever holds the `Db` holds the store, with the same standing as
+token, for the length of that group's borrow. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
 
 **Nor does it cover the platform's own tables.** The job queue (`JobRow`) and the event
@@ -7107,7 +7120,9 @@ No `authorize` runs there. The operator has no principal to ask about, and alrea
 holds the store. The admission carries the seal `CrossTenant` carries: its field is
 private and `Group::tenant_admission` is its only constructor. So a handler, which holds
 a `Tx` and a `Ctx` and never a `Group`, cannot mint one; `TenantAdmission(())` is
-`error[E0423]`. The one-scope rule is the same contract whichever way a scope was
+`error[E0423]`. Nor can anyone keep one: like `CrossTenant`, a `TenantAdmission`
+borrows what its group borrows and is not `Clone`, so it goes out of reach with the group's
+borrow of the `Db`, and a `static` or `thread_local!` refuses it. The one-scope rule is the same contract whichever way a scope was
 entered. Do not build an app-internal helper that takes a raw scope and reads through
 `Db::snapshot`: that is the one shape that looks tenant-aware and is not.
 

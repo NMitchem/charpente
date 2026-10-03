@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/capability_tokens_are_not_clone.rs:12:30
+   |
+12 |     let owned: CrossTenant = cap.clone();
+   |                -----------   ^^^^^^^^^^^ expected `CrossTenant<'_>`, found `&CrossTenant<'_>`
+   |                |
+   |                expected due to this
+   |
+note: `CrossTenant<'_>` does not implement `Clone`, so `&CrossTenant<'_>` was cloned instead
+  --> tests/compile_fail/capability_tokens_are_not_clone.rs:12:30
+   |
+12 |     let owned: CrossTenant = cap.clone();
+   |                              ^^^
+
+error[E0599]: no method named `clone` found for struct `TenantAdmission<'g>` in the current scope
+  --> tests/compile_fail/capability_tokens_are_not_clone.rs:20:27
+   |
+20 |     let _copy = admission.clone();
+   |                           ^^^^^ method not found in `TenantAdmission<'_>`

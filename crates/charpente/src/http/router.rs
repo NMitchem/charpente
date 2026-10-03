@@ -12,14 +12,15 @@ use crate::http::{ApiError, Cursor, Method, Response, Subscription};
 /// The glue signature a plain `#[route(METHOD …)]` generates: parse captures
 /// and body, call the handler, encode the response. Runs inside the
 /// request's transaction.
-pub type Glue = fn(&mut Tx, &Ctx, &[String], &[u8]) -> Result<Response, ApiError>;
+pub type Glue = fn(&mut Tx, &Ctx<'_>, &[String], &[u8]) -> Result<Response, ApiError>;
 
 /// The glue signature `#[route(SSE …)]` generates: parse captures and the
 /// platform-extracted cursor, call the handler, return the typed
 /// subscription. Never a `Response` — an SSE route only makes sense
 /// dispatched through the kernel (`App::handle_or_subscribe`'s
 /// `Handled::Subscribe`), which has a sink to hand the tail.
-pub type SubGlue = fn(&mut Tx, &Ctx, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
+pub type SubGlue =
+    fn(&mut Tx, &Ctx<'_>, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
 
 /// A path param's name paired with its fn-deferred wire schema (`Route::params`'s
 /// element type — factored out so the field itself stays under clippy's

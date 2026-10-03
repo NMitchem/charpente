@@ -1,0 +1,63 @@
+error[E0521]: borrowed data escapes outside of function
+  --> tests/compile_fail/capability_tokens_cannot_be_parked.rs:23:13
+   |
+21 | fn park_the_capability(db: &mut Db) -> std::io::Result<()> {
+   |                        --  - let's call the lifetime of this reference `'1`
+   |                        |
+   |                        `db` is a reference that is only valid in the function body
+22 |     let group = db.begin_group()?;
+23 |     let _ = PARKED_CAP.set(group.cross_tenant_cap());
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |             |
+   |             `db` escapes the function body here
+   |             argument requires that `'1` must outlive `'static`
+   |
+   = note: requirement occurs because of the type `OnceLock<CrossTenant<'_>>`, which makes the generic argument `CrossTenant<'_>` invariant
+   = note: the struct `OnceLock<T>` is invariant over the parameter `T`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0521]: borrowed data escapes outside of function
+  --> tests/compile_fail/capability_tokens_cannot_be_parked.rs:29:13
+   |
+27 | fn park_the_admission(db: &mut Db) -> std::io::Result<()> {
+   |                       --  - let's call the lifetime of this reference `'1`
+   |                       |
+   |                       `db` is a reference that is only valid in the function body
+28 |     let group = db.begin_group()?;
+29 |     let _ = PARKED_ADMISSION.set(group.tenant_admission());
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |             |
+   |             `db` escapes the function body here
+   |             argument requires that `'1` must outlive `'static`
+   |
+   = note: requirement occurs because of the type `OnceLock<TenantAdmission<'_>>`, which makes the generic argument `TenantAdmission<'_>` invariant
+   = note: the struct `OnceLock<T>` is invariant over the parameter `T`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0521]: borrowed data escapes outside of function
+  --> tests/compile_fail/capability_tokens_cannot_be_parked.rs:35:5
+   |
+33 | fn hold_the_capability(db: &mut Db) -> std::io::Result<()> {
+   |                        --  - let's call the lifetime of this reference `'1`
+   |                        |
+   |                        `db` is a reference that is only valid in the function body
+34 |     let group = db.begin_group()?;
+35 |     HELD_CAP.with(|held| *held.borrow_mut() = Some(group.cross_tenant_cap()));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |     |
+   |     `db` escapes the function body here
+   |     argument requires that `'1` must outlive `'static`
+
+error[E0521]: borrowed data escapes outside of function
+  --> tests/compile_fail/capability_tokens_cannot_be_parked.rs:41:5
+   |
+39 | fn hold_the_admission(db: &mut Db) -> std::io::Result<()> {
+   |                       --  - let's call the lifetime of this reference `'1`
+   |                       |
+   |                       `db` is a reference that is only valid in the function body
+40 |     let group = db.begin_group()?;
+41 |     HELD_ADMISSION.with(|held| *held.borrow_mut() = Some(group.tenant_admission()));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |     |
+   |     `db` escapes the function body here
+   |     argument requires that `'1` must outlive `'static`

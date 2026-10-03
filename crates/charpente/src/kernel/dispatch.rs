@@ -112,7 +112,7 @@ pub struct JobDef {
 /// argument is `Some` exactly for a scoped job: the tenant its row carries,
 /// which only the dispatcher can construct.
 pub type JobGlue =
-    fn(&mut Tx, &[u8], Option<&CrossTenant>, Option<JobScope<'_>>) -> Result<(), JobError>;
+    fn(&mut Tx, &[u8], Option<&CrossTenant<'_>>, Option<JobScope<'_>>) -> Result<(), JobError>;
 
 /// The tenant a scoped job was enqueued in, handed to its glue by the
 /// dispatcher and by nothing else (job-tenancy spec §5). Its fields are
@@ -123,7 +123,7 @@ pub type JobGlue =
 /// held the enqueuer's to (tenancy-completion spec §7).
 pub struct JobScope<'j> {
     id: u64,
-    admission: &'j TenantAdmission,
+    admission: &'j TenantAdmission<'j>,
     /// The mounted `JobDef`'s `name`, `scope_type` and `scoped_by`, copied
     /// at dispatch: what `open` holds the glue's scope type to, and what its
     /// refusal names.

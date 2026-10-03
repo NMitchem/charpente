@@ -78,7 +78,13 @@ pub struct Session {
 /// and `session_ttl` are the clock reading `handle_or_subscribe` took for
 /// this request and the app's configured TTL — both needed to mint
 /// `expires_at`.
-pub struct Ctx {
+///
+/// `'g` is the request's group: `Ctx` holds the tokens minted from it (the
+/// `CrossTenant` of a `cross_tenant` route, the `TenantAdmission` of a
+/// `public(S)` route), so neither it nor anything borrowed out of it
+/// outlives that group (tenancy-completion spec §5). Handlers write
+/// `ctx: &Ctx`; the lifetime is elided.
+pub struct Ctx<'g> {
     principal: Option<Principal>,
     /// Compat cache for `session()`: the `Session` row, re-looked-up during
     /// `build_ctx`, only when `principal.via == Via::Session(_)` — `None`
@@ -92,15 +98,15 @@ pub struct Ctx {
     /// §3) — the token `Tx::across_tenants` requires. `None` on every other
     /// route, which is why `cap()` is an `Option`: an undeclared route
     /// carries no capability, not a dormant one.
-    cap: Option<CrossTenant>,
+    cap: Option<CrossTenant<'g>>,
     /// The matched route's stance (job-tenancy spec §4): the admission a
     /// `public(S)` route carries, and the site and declaration rule 3's 401
     /// quotes. Private, and never exposed — a handler cannot reach the
     /// admission, only `Scoped::scope` can.
-    stance: Stance,
+    stance: Stance<'g>,
 }
 
-impl Ctx {
+impl<'g> Ctx<'g> {
     /// The resolution ladder's output (auth T4) — `None` on a route without
     /// `auth` and no credential presented.
     pub fn principal(&self) -> Option<&Principal> {
@@ -114,7 +120,7 @@ impl Ctx {
     /// on a route that never declared the capability, so this accessor is a
     /// reflective read ("did this request come in declared?"), not the
     /// route to the token.
-    pub fn cap(&self) -> Option<&CrossTenant> {
+    pub fn cap(&self) -> Option<&CrossTenant<'g>> {
         self.cap.as_ref()
     }
 
@@ -122,7 +128,7 @@ impl Ctx {
     /// request carries when its route declared `public(S)` for exactly this
     /// `S`. `None` otherwise, including on a `public(Org)` route that opens
     /// some other scope type, which then meets rules 2 and 3 like any route.
-    pub(crate) fn public_admission<S: 'static>(&self) -> Option<&TenantAdmission> {
+    pub(crate) fn public_admission<S: 'static>(&self) -> Option<&TenantAdmission<'g>> {
         match &self.stance.public {
             Some((declared, admission)) if (declared.type_id)() == TypeId::of::<S>() => {
                 Some(admission)
@@ -269,7 +275,7 @@ impl Declared {
     }
 
     /// Mints the admission for a `public(S)` route, and only for one.
-    fn admitted(self, group: &Group) -> Stance {
+    fn admitted<'g>(self, group: &Group<'g>) -> Stance<'g> {
         Stance {
             method: self.method,
             pattern: self.pattern,
@@ -282,14 +288,14 @@ impl Declared {
 }
 
 /// What `Scoped::scope` reads off the route to apply its three rules.
-struct Stance {
+struct Stance<'g> {
     method: &'static str,
     pattern: &'static str,
     /// Recorded for the 401's text only (amendment A11): the drift probe
     /// does not enforce `auth`, so an `auth` stream route that opens a scope
     /// meets rule 3 there, and its text must name the real stance.
     auth: bool,
-    public: Option<(PublicScope, TenantAdmission)>,
+    public: Option<(PublicScope, TenantAdmission<'g>)>,
 }
 
 // ---------------------------------------------------------------- app
@@ -972,7 +978,7 @@ impl<'a> StagedDispatch<'a> {
                         now,
                         session_ttl,
                         oidc,
-                        cap.clone(),
+                        cap,
                         stance,
                     )?;
                     glue(tx, &ctx, &captures, &request.body)
@@ -989,7 +995,7 @@ impl<'a> StagedDispatch<'a> {
                         now,
                         session_ttl,
                         oidc,
-                        cap.clone(),
+                        cap,
                         stance,
                     )?;
                     glue(tx, &ctx, &captures, cursor)
@@ -1026,7 +1032,7 @@ pub enum Handled {
 // `crate::repl::session`'s ladder carries the same allow for the same
 // reason.
 #[allow(clippy::too_many_arguments)]
-fn build_ctx(
+fn build_ctx<'g>(
     tx: &mut Tx,
     presented: &Presented,
     auth_required: bool,
@@ -1034,9 +1040,9 @@ fn build_ctx(
     now: u64,
     session_ttl: u64,
     oidc: Option<&OidcVerifier>,
-    cap: Option<CrossTenant>,
-    stance: Stance,
-) -> Result<Ctx, ApiError> {
+    cap: Option<CrossTenant<'g>>,
+    stance: Stance<'g>,
+) -> Result<Ctx<'g>, ApiError> {
     let principal = resolve(tx, presented, oidc, now).map_err(|reject| match reject {
         AuthReject::Unrecognized => ApiError::UnrecognizedCredential,
         AuthReject::Expired => ApiError::SessionExpired,

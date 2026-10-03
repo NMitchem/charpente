@@ -786,7 +786,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   `public(Org)` declares that every caller, credentialed or not, may act inside the `Org`
   tenant the handler opens, with no `authorize` (spec 2026-09-27-job-tenancy §4). On any
   other route, a scope line reached with no credential is a named 401, so `authorize` is
-  only ever asked about a real principal.
+  only ever asked about a real principal. Both capability tokens, `CrossTenant<'g>` and `TenantAdmission<'g>`, borrow what the `Group` that minted them borrows and are not `Clone`, so neither can be parked in a `static` or a `thread_local!` past its group (spec 2026-09-30-tenancy-completion §5).
 - **Jobs.** `#[job(global)]` or `#[job(scoped_by = Org)]` structs, with typed payloads and
   a typed retry policy. Neither tenancy is the default, and a bare `#[job]` is a compile
   error naming both. A `global` job's `run` takes `&mut Tx`; a scoped job's takes the
@@ -2082,7 +2082,7 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   the guarantee's boundary is the typed surface handed to handlers and jobs: whoever holds
   the `Db` reaches every tenant through `Db::snapshot`'s scoped and raw reads, which take a
   scope on the caller's word because replication seeding and the archive are built on them,
-  and can mint a `CrossTenant` through `begin_group`. A `Db` holder has the standing of
+  and can mint a `CrossTenant` through `begin_group`, for the length of that group's borrow of the `Db`. A `Db` holder has the standing of
   whoever holds the data directory — an operator, not a request (DECISIONS §12, ratified
   2026-09-05; the `App::mount` notch that would make even the operator path enumerable is
   recorded there as available and unbuilt, under §11's trigger).
