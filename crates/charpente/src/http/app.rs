@@ -155,8 +155,11 @@ impl<'g> Ctx<'g> {
         } = &self.stance;
         // The tenant type's identity (tenancy-completion spec §4). A final
         // `::` component read two types spelled alike as one, and a generic as
-        // `B>`.
+        // `B>`. `type_name` is printed beside it for the reader only, as the
+        // source path the attribute is written with (final review M7): a
+        // `NAME` need not be any path's spelling, and it is never compared.
         let scope = S::NAME;
+        let scope_type = std::any::type_name::<S>();
         if *auth {
             // `build_ctx` refuses a request to an `auth` route that carries no
             // credential before its handler runs, so only a caller that does
@@ -165,15 +168,23 @@ impl<'g> Ctx<'g> {
             // to every caller so that a test can read it.
             return ApiError::AnonymousScope(format!(
                 "authentication required — `{method} {pattern}` is declared `auth` and opened \
-                 the tenant scope `{scope}` for a caller with no credential; the route requires \
-                 a credential, so a request without one is refused before its handler runs, \
-                 and a caller that presents none, as the emits(...) drift probe does, cannot \
-                 run it — leave this route out of the drift test"
+                 the tenant scope `{scope}` (the tenant type `{scope_type}`) for a caller with \
+                 no credential; the route requires a credential, so a request without one is \
+                 refused before its handler runs, and a caller that presents none, as the \
+                 emits(...) drift probe does, cannot run it — leave this route out of the \
+                 drift test"
             ));
         }
-        let declared = match public {
-            Some((scope, _)) => format!("public({})", scope.name),
-            None => "public".to_string(),
+        let (declared, paths) = match public {
+            Some((declared, _)) => (
+                format!("public({})", declared.name),
+                format!(
+                    "`{scope}` is `{scope_type}`, and `{}` is `{}`",
+                    declared.name,
+                    (declared.type_name)()
+                ),
+            ),
+            None => ("public".to_string(), format!("`{scope}` is `{scope_type}`")),
         };
         ApiError::AnonymousScope(format!(
             "authentication required — `{method} {pattern}` is declared `{declared}` and \
@@ -181,7 +192,8 @@ impl<'g> Ctx<'g> {
              declared `public({scope})` admits one. Send \"Authorization: Bearer <token>\" or \
              the charpente_session cookie, or, if every caller may act inside this tenant \
              here, declare `public({scope})` in place of `{declared}` in this route's \
-             `#[route(…)]` attribute, keeping its other flags"
+             `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by \
+             its NAME; in the attribute, write its path: {paths}"
         ))
     }
 

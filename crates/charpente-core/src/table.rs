@@ -1561,9 +1561,11 @@ impl Writer<'_> {
             assert_eq!(
                 scope,
                 UNSCOPED,
-                "Writer::delete: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) but \
-                 was called with scope {scope} — pass table::UNSCOPED for an unscoped table",
-                R::TABLE
+                "Writer::delete: table \"{}\" is not tenant-scoped (Row::Scope = {}) but was \
+                 called with scope {scope} — pass table::UNSCOPED for a table that is not \
+                 tenant-scoped",
+                R::TABLE,
+                std::any::type_name::<R::Scope>()
             );
             let mut rows = self
                 .txn
@@ -1855,9 +1857,11 @@ impl Writer<'_> {
             assert_eq!(
                 scope,
                 UNSCOPED,
-                "Writer::put: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) but was \
-                 called with scope {scope} — pass table::UNSCOPED for an unscoped table",
-                R::TABLE
+                "Writer::put: table \"{}\" is not tenant-scoped (Row::Scope = {}) but was \
+                 called with scope {scope} — pass table::UNSCOPED for a table that is not \
+                 tenant-scoped",
+                R::TABLE,
+                std::any::type_name::<R::Scope>()
             );
             let mut rows = self
                 .txn
@@ -2036,9 +2040,10 @@ impl Snapshot {
     pub fn get_scoped<R: Row>(&self, scope: u64, id: Id<R>) -> io::Result<Option<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::get_scoped: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — \
-             use View::get for an unscoped table",
-            R::TABLE
+            "Snapshot::get_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — use \
+             View::get for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
             Ok(rows) => rows,
@@ -2061,9 +2066,10 @@ impl Snapshot {
     pub fn scan_scoped<R: Row>(&self, scope: u64) -> io::Result<Vec<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::scan_scoped: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) \
-             — use View::scan for an unscoped table",
-            R::TABLE
+            "Snapshot::scan_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — use \
+             View::scan for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
             Ok(rows) => rows,
@@ -2096,9 +2102,10 @@ impl Snapshot {
     ) -> io::Result<Vec<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::scan_from_scoped: table \"{}\" is not tenant-scoped (Row::Scope = \
-             Unscoped) — use View::scan_from for an unscoped table",
-            R::TABLE
+            "Snapshot::scan_from_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — \
+             use View::scan_from for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
             Ok(rows) => rows,
@@ -2139,9 +2146,10 @@ impl Snapshot {
     ) -> io::Result<Vec<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::scan_by_scoped: table \"{}\" is not tenant-scoped (Row::Scope = \
-             Unscoped) — use View::scan_by for an unscoped table",
-            R::TABLE
+            "Snapshot::scan_by_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — \
+             use View::scan_by for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let index = R::INDEXES
             .iter()

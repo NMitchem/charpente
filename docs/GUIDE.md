@@ -962,8 +962,11 @@ handler, carrying:
   (`Via::Session(id)`, `Via::ApiKey(id)`, or `Via::Oidc`). Read the subject
   from here on any `auth` route, whatever the credential kind. A `Principal`
   is read-only to your code: its fields are private, so the only principals
-  are the ones the ladder produced, and `Tenant::authorize` can trust the one
-  it is handed.
+  are the ones the ladder produced. It is not `Clone` either, so the only one
+  your code holds is the `&Principal` this request's `Ctx` lends, which ends
+  with the request: no principal can be parked in a `static` for a later
+  request to hand `tx.open_scope`. So `Tenant::authorize` can trust the one
+  it is handed: the ladder produced it, for the request that is asking.
 - `ctx.session() -> Option<&Session>` — a compatibility accessor: the
   `Session` row, but only when the principal authenticated `via` a session
   (bearer or cookie); `None` for an API-key or OIDC principal.
@@ -1160,15 +1163,18 @@ The rule-3 401, for a `POST /orgs/:org/incidents` declared plain `public`:
 
 <!-- pinned -->
 ```text
-authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags
+authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by its NAME; in the attribute, write its path: `Org` is `<path>`
 ```
 
 The site is the word the route was declared with (`SSE` for a stream) and its pattern;
 the scope is its tenant type's `NAME` (§16). Both fixes are there: the caller's (send a credential)
 and the author's (declare the tenant public, if that really is the policy). The author's
 names the change to make where the stance is written and restates no attribute, so a route's
-other flags, `cross_tenant` or `emits(…)`, stay as they are. §16's "Who
-reaches a tenant" shows the three side by side.
+other flags, `cross_tenant` or `emits(…)`, stay as they are. A `NAME` need not be how your
+source spells the type (`billing::Org` and `crm::Org` take two), so the text ends with each
+named type's `std::any::type_name` (`<path>` above), which says which type to write in the
+attribute. On a route declared `public(BillingOrg)` that opened `CrmOrg`, it names both. §16's
+"Who reaches a tenant" shows the three side by side.
 
 ### `ApiError` and status mapping
 
@@ -1877,11 +1883,13 @@ opens a different scope type than `scope_type` names, and so does a `JobDef` who
 the enqueuer to `scope_type`, and a scoped job's glue opens its row's tenant through
 `JobScope::open`, which asserts that the type it opens is `scope_type`. The assert runs
 inside the attempt, so the job retries and then dead-letters, and nothing runs in either
-tenant. Its `last_error`, for `File`'s `JobDef` carrying a `Board` job's glue, is:
+tenant. Its `last_error`, for `File`'s `JobDef` carrying a `Board` job's glue, is below.
+`<path>` is `Board`'s `std::any::type_name`, printed beside its `NAME` so that a glue whose
+type shares the declared `NAME` still reads as two types:
 
 <!-- pinned -->
 ```text
-handler panicked: contract: the glue mounted for job "File" opened its tenant 31 as `Board`, but that `JobDef` declares `scoped_by = Desk` with a `scope_type` that is not `Board` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken from another job, or another type's `TypeId`); this attempt wrote nothing, and every retry fails the same way — mount File through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)
+handler panicked: contract: the glue mounted for job "File" opened its tenant 31 as `Board` (the tenant type `<path>`), but that `JobDef` declares `scoped_by = Desk` with a `scope_type` that is not `<path>` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken from another job, or another type's `TypeId`); this attempt wrote nothing, and every retry fails the same way — mount File through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)
 ```
 
 A `JobDef` whose glue and `scope_type` name the same other type passes the assert. Nothing
@@ -4387,11 +4395,11 @@ The tenant rides the record beside the event, apart from any app key. `tx.emit_k
 
 A scoped event's fingerprint continues its fields' fold with its tenant's `Tenant::NAME` (§16). So moving an event between `global` and `scoped_by`, or between two tenant types, is a change of shape, handled like any other ("Changing an event", below). Two same-named events scoped by two tenant types never share a shape, because the tenant census gives every tenant type the app mounts its own `NAME` (§16). So where the two types' raw ids coincide, one's row is never delivered to the other's feed. It meets that feed as a foreign shape, which ends the feed with `charpente.reshaped` rather than decoding. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets this.
 
-The bound alone would not hold that for a hand-written `impl Event`, which states its own `FINGERPRINT`. One declared `type Scope = Team`, with `NAME` and `FINGERPRINT` copied from `Org`'s event, meets every `Team` bound. Emitted in `Team` 1, or subscribed in `Team` 1's feed, it would write into or read from `Org` 1's feed. So every typed site that names an event type also checks its shape at build time, against the tenancy its own bound names. `Event::PAYLOAD_FINGERPRINT` is the payload's field fold before any tenant is mixed in: `#[event(scoped_by = Org)]` states it, and for a global event it defaults to `FINGERPRINT`. `ScopedTx::emit`/`emit_keyed`, `tx.subscription::<Ev>()` and `TenantFeed::and` require `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, S::NAME)` for their own `S`. `Tx::emit`/`emit_keyed`, `Subscription::of` and `Subscription::and` require `FINGERPRINT == PAYLOAD_FINGERPRINT`. The check is a `const` block, so a violation fails the build, as rustc's E0080 naming the instantiation (`ScopedTx::<'_, '_, Team>::emit::<Spy>`, say), never a request. Like every post-monomorphization error, `cargo build` and `cargo test` report it and `cargo check` does not. The two texts, scoped and global:
+The bound alone would not hold that for a hand-written `impl Event`, which states its own `FINGERPRINT`. One declared `type Scope = Team`, with `NAME` and `FINGERPRINT` copied from `Org`'s event, meets every `Team` bound. Emitted in `Team` 1, or subscribed in `Team` 1's feed, it would write into or read from `Org` 1's feed. So every typed site that names an event type also checks its shape at build time, against the tenancy its own bound names. `Event::PAYLOAD_FINGERPRINT` is the payload's field fold before any tenant is mixed in: `#[event(scoped_by = Org)]` states it, and for a global event it defaults to `FINGERPRINT`, so a hand-written scoped impl states it too, or the default fails the check below. `ScopedTx::emit`/`emit_keyed`, `tx.subscription::<Ev>()` and `TenantFeed::and` require `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, S::NAME)` for their own `S`. `Tx::emit`/`emit_keyed`, `Subscription::of` and `Subscription::and` require `FINGERPRINT == PAYLOAD_FINGERPRINT`. The check is a `const` block, so a violation fails the build, as rustc's E0080 naming the instantiation (`ScopedTx::<'_, '_, Team>::emit::<Spy>`, say), never a request. Like every post-monomorphization error, `cargo build` and `cargo test` report it and `cargo check` does not. The two texts, scoped and global:
 
 <!-- pinned -->
 ```text
-contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its rows would read as another tenant type's event; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
+contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not; the likely causes are a hand-written `impl Event` that states `FINGERPRINT` but not `PAYLOAD_FINGERPRINT`, which then defaults to `FINGERPRINT` (a scoped event states both), or one whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes, either of which would let its rows read as another tenant type's event; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
 contract: a global event's recorded shape is its payload's field fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is `Unscoped` — and this event's two differ, so its rows would read as another event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to it (docs/GUIDE.md §11, "An event's tenancy")
 ```
 
@@ -4406,7 +4414,7 @@ impl Event for InvoiceVoided {
 }
 ```
 
-Two limits stay outside the check, stated rather than engineered around. First, a `PAYLOAD_FINGERPRINT` chosen so that its mix with `Team`'s `NAME` equals `Org`'s fingerprint passes it. FNV-1a is not a cryptographic hash, so such a value can be computed, and computing it is building a bypass on purpose, with the operator's standing (DECISIONS §12). Second, the `NAME` the check mixes is only as unique as the tenant census makes it. A tenant type the app reaches only through an event it never mounts is outside the census. So two tenant types under one `NAME`, one of them never mounted, mix alike, and their same-named, same-field events share a shape. Mount every event with `events![…]` (next subsection), and `mount_events` refuses the pair before the app serves.
+Two limits stay outside the check, stated rather than engineered around. First, a `PAYLOAD_FINGERPRINT` chosen so that its mix with `Team`'s `NAME` equals `Org`'s fingerprint passes it. FNV-1a is not a cryptographic hash, so such a value can be computed, and computing it is a bypass built on purpose in app code, which no type check refuses: it needs no `Db`, only a hand-written `impl Event` and the arithmetic. Second, the `NAME` the check mixes is only as unique as the tenant census makes it. A tenant type the app reaches only through an event it never mounts is outside the census. So two tenant types under one `NAME`, one of them never mounted, mix alike, and their same-named, same-field events share a shape. Mount every event with `events![…]` (next subsection), and `mount_events` refuses the pair before the app serves.
 
 What `#[event]` rejects, all compile errors naming the contract and the fix. The first is the one every event meets once, and the next three are its neighbours (§9 lists the rest):
 
@@ -6942,7 +6950,7 @@ fn memos_by_author(
 Four things that fall out of that, worth stating plainly:
 
 - **`scoped_by` without an `impl Tenant` does not compile**, at the struct.
-- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). A scoped job's and a scoped event's fingerprint mixes it (§6, §11), so moving a job or an event to a tenant type of another `NAME` is a shape change, and renaming a `NAME` is one for every scoped job and event of that type. The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs, and the app refuses to mount them under one (below). A generic tenant impl gives every instantiation one NAME.
+- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). The 401 and `JobScope::open`'s assert (§6) print the type's `std::any::type_name` beside it, so a reader can find the type; that text is never compared. A scoped job's and a scoped event's fingerprint mixes it (§6, §11), so moving a job or an event to a tenant type of another `NAME` is a shape change, and renaming a `NAME` is one for every scoped job and event of that type. The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs, and the app refuses to mount them under one (below). A generic tenant impl gives every instantiation one NAME.
 - **The scope type is never inspected.** `authorize` is the only hook, and
   what the platform records of a scope is its raw id, beside a scoped job or
   event (below). Nothing parses a key back into a tenant.
@@ -6952,7 +6960,8 @@ Four things that fall out of that, worth stating plainly:
 
 **One `NAME`, one tenant type.** The app refuses to mount two tenant types under one
 `NAME`, or a tenant type whose `NAME` is empty, before it serves. It collects every tenant
-type it names: its scoped tables at `App::open`, its `public(S)` routes at `mount`, its
+type it names: its `#[table(scoped_by = …)]` tables at `App::open` (a hand-written scoped
+`Row` carries no `NAME`, so it is not collected), its `public(S)` routes at `mount`, its
 scoped jobs at `mount_jobs`, and its scoped events at `mount_events`. `<name>` is the shared `NAME`; `<type>` and `<other type>` are
 the two types as `std::any::type_name` renders them, the one named first first:
 
@@ -6984,7 +6993,9 @@ A tenant is entered one of two ways, and never on an anonymous caller's word:
 
 - **By membership.** On an `auth` or `public` route, `tx.scope` runs your `authorize`
   about the caller's principal. A caller with no credential gets the 401 from §5, not a
-  call to `authorize` with nobody in it.
+  call to `authorize` with nobody in it. Nor can a request borrow another's word:
+  `Principal` is not `Clone` (§5), so no principal outlives its request, and the only one a
+  handler can pass to `tx.open_scope` is its own caller's.
 - **By declaration.** `public(Org)` on the route says every caller may act inside the org
   the handler opens. `tx.scope::<Org>` then admits without asking. The operator path in
   "Where the guarantee stops" below is the other declared way in.
@@ -7230,15 +7241,16 @@ Two tenant types whose raw ids coincide no longer share events: an event names i
 tenant type (`#[event(scoped_by = Org)]`), its fingerprint carries that type's
 `Tenant::NAME`, and every emit and feed site checks that it does, at build time, against
 the tenant its bound names (§11). Two limits are stated there: a hand-written
-`PAYLOAD_FINGERPRINT` computed to collide on purpose, with the operator's standing
-(DECISIONS §12), and two tenant types under one `NAME` when one is reached only through an
-event the app never mounts. Mounting every event with `events![…]` closes the second.
+`PAYLOAD_FINGERPRINT` computed to collide on purpose, a bypass built on purpose in app code,
+which no type check refuses, and two tenant types under one `NAME` when one is reached only
+through an event the app never mounts. Mounting every event with `events![…]` closes the
+second.
 
 The declaration is what makes it one mechanism. An event declared `scoped_by = Org`
 compiles only where an `Org` tenant is named: its `emit` on a `ScopedTx<Org>`, and its
 feed from the same handle. So a tenant's event cannot be emitted into no tenant, a global
-feed cannot name one, and a hand-written event cannot claim another tenant type's shape.
-§11 shows each refusal.
+feed cannot name one, and a hand-written event cannot claim another tenant type's shape,
+except by that computed collision. §11 shows each refusal.
 
 ### Reading across every tenant: the `cross_tenant` capability
 
@@ -7439,8 +7451,9 @@ transaction that reads a job row is the dispatcher's own: `Tx::get_job` takes th
 `TenantAdmission` only a `Group` mints, which no handler or job holds.
 
 The read seal is on the table's name as well as its type, as the write seal is. A
-hand-written `Row` whose `TABLE` is one of the three names fails to build at each `Tx` read
-the binary can reach, reported by `cargo build` and not `cargo check`:
+hand-written `Row` whose `TABLE` is one of the three names, scoped or not, fails to build at
+each read the binary can reach, on a bare `Tx`, a `ScopedTx` or an `across_tenants` scan,
+reported by `cargo build` and not `cargo check`:
 
 <!-- pinned -->
 ```text

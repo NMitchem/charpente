@@ -332,8 +332,18 @@ impl Subscription {
     /// rather than being skipped.
     pub(crate) fn admits(&self, name: &str, key: Option<&str>, scope: Option<u64>) -> bool {
         self.entries.iter().any(|e| e.name == name)
-            && scope == self.scope
+            && self.holds_tenancy(scope)
             && (self.key.is_none() || self.key.as_deref() == key)
+    }
+
+    /// The tenancy rule, written once: a row recorded with `row_scope` (`None`
+    /// for a global emit, the tenant for a scoped one) is of this
+    /// subscription's tenancy exactly when the two are equal, so `None` is
+    /// never `Some(0)`. `admits` asks it for delivery, and `validate_subscribe`
+    /// asks it alone, after the seq check and before the reshape check, to
+    /// refuse a cursor on another tenancy's row (amendment A16).
+    pub(crate) fn holds_tenancy(&self, row_scope: Option<u64>) -> bool {
+        row_scope == self.scope
     }
 }
 

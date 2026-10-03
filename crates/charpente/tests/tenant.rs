@@ -379,12 +379,16 @@ fn an_anonymous_caller_on_a_plain_public_route_that_opens_a_scope_gets_the_named
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /memo-public/:org` is declared `public` and opened \
-         the tenant scope `Org` for a caller with no credential; only a route declared \
-         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-         attribute, keeping its other flags"
+        format!(
+            "authentication required — `POST /memo-public/:org` is declared `public` and \
+             opened the tenant scope `Org` for a caller with no credential; only a route \
+             declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
+             the attribute, write its path: `Org` is `{}`",
+            std::any::type_name::<Org>()
+        )
     );
     assert_eq!(
         authorize_calls(),
@@ -426,12 +430,16 @@ fn an_anonymous_subscriber_that_opens_a_scope_gets_the_401_naming_the_stream() {
     let text = error_text(&refused);
     assert_eq!(
         text,
-        "authentication required — `SSE /memo-feed/:org` is declared `public` and opened the \
-         tenant scope `Org` for a caller with no credential; only a route declared \
-         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-         attribute, keeping its other flags"
+        format!(
+            "authentication required — `SSE /memo-feed/:org` is declared `public` and opened \
+             the tenant scope `Org` for a caller with no credential; only a route declared \
+             `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
+             the attribute, write its path: `Org` is `{}`",
+            std::any::type_name::<Org>()
+        )
     );
     assert!(
         !text.contains("#[route(SSE"),
@@ -509,12 +517,17 @@ fn public_scope_for_one_scope_type_does_not_admit_another() {
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /memo-team/:team` is declared `public(Org)` and \
-         opened the tenant scope `Team` for a caller with no credential; only a route \
-         declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `public(Team)` in place of `public(Org)` in this route's `#[route(…)]` \
-         attribute, keeping its other flags"
+        format!(
+            "authentication required — `POST /memo-team/:team` is declared `public(Org)` and \
+             opened the tenant scope `Team` for a caller with no credential; only a route \
+             declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Team)` in place of `public(Org)` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
+             the attribute, write its path: `Team` is `{}`, and `Org` is `{}`",
+            std::any::type_name::<Team>(),
+            std::any::type_name::<Org>()
+        )
     );
     assert_eq!(bodies_entered(), 0);
 }
@@ -534,12 +547,16 @@ fn the_401_on_a_cross_tenant_route_keeps_the_flag_in_its_fix() {
     let text = error_text(&refused);
     assert_eq!(
         text,
-        "authentication required — `POST /memo-cross/:org` is declared `public` and opened \
-         the tenant scope `Org` for a caller with no credential; only a route declared \
-         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-         attribute, keeping its other flags"
+        format!(
+            "authentication required — `POST /memo-cross/:org` is declared `public` and \
+             opened the tenant scope `Org` for a caller with no credential; only a route \
+             declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
+             the attribute, write its path: `Org` is `{}`",
+            std::any::type_name::<Org>()
+        )
     );
     assert!(
         !text.contains("#[route(POST"),
@@ -576,17 +593,17 @@ fn the_drift_probe_meets_the_three_rules_as_a_request_does() {
     // its message, with no Rust `Debug` syntax around it.
     assert_eq!(
         app.subscription_event_names("memo_feed_auth"),
-        Err(
+        Err(format!(
             "route `memo_feed_auth`'s subscribe handler answered 401 under the emits(...) drift \
              probe, so what it subscribes to cannot be read — a handler that rejects a \
              credential-free request with `0` for every :param is not probeable; the 401 reads: \
              authentication required — `SSE /memo-feed-auth/:org` is declared `auth` and opened \
-             the tenant scope `Org` for a caller with no credential; the route requires a \
-             credential, so a request without one is refused before its handler runs, and a \
-             caller that presents none, as the emits(...) drift probe does, cannot run it — \
-             leave this route out of the drift test"
-                .to_string()
-        )
+             the tenant scope `Org` (the tenant type `{}`) for a caller with no credential; the \
+             route requires a credential, so a request without one is refused before its \
+             handler runs, and a caller that presents none, as the emits(...) drift probe does, \
+             cannot run it — leave this route out of the drift test",
+            std::any::type_name::<Org>()
+        ))
     );
 }
 
@@ -1842,6 +1859,37 @@ fn a_read_through_the_same_table_under_another_scope_type_is_refused() {
     );
 }
 
+/// A route that reads through `firm_note::Note`, whose table is registered
+/// as `Note`, and returns the read's error with `?`.
+#[route(GET "/firm-note/:firm", public(Firm))]
+fn read_firm_note(tx: &mut Tx, firm: Id<Firm>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Firm>(firm, ctx)?;
+    let note = tx.get::<firm_note::Note>(Id::from_raw(1))?;
+    Ok(WireU64(note.map_or(0, |note| note.id.raw())))
+}
+
+/// Final review triage T9, GUIDE §4's claim at the route: a handler that
+/// returns a `TableReadRefusal` with `?` answers a 500 whose body carries
+/// the refusal's own text, as a `TableWriteRefusal` does.
+#[test]
+fn a_route_returning_a_read_refusal_answers_a_500_with_its_text() {
+    let sim = Sim::with_faults(0x5A17_0014, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![read_firm_note]);
+    let refused = get(&mut app, "/firm-note/7");
+    assert_eq!(refused.status, 500, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        note_read_refusal::<firm_note::Note>("ScopedTx::get")
+    );
+}
+
 /// `Note` declared `global`: the same identifier and fields, so the same
 /// `TABLE`, and no tenant at all. Its reads are `Tx`'s own `View` reads.
 mod global_note {
@@ -2026,12 +2074,16 @@ fn statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_wri
     // the guide's text here.
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /orgs/:org/incidents` is declared `public` and \
-         opened the tenant scope `Org` for a caller with no credential; only a route declared \
-         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-         attribute, keeping its other flags"
+        format!(
+            "authentication required — `POST /orgs/:org/incidents` is declared `public` and \
+             opened the tenant scope `Org` for a caller with no credential; only a route \
+             declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
+             the attribute, write its path: `Org` is `{}`",
+            std::any::type_name::<statuspage::Org>()
+        )
     );
     assert_eq!(
         app.db().last_applied(),
@@ -2134,7 +2186,10 @@ fn rendering_app(seed: u64) -> (Sim, App) {
 }
 
 /// Spec §4 and the re-review's NB1 (a), at the 401: the route's stance and
-/// the scope it opened are two different types spelled `Org`.
+/// the scope it opened are two different types spelled `Org`. Each is named
+/// by its NAME, and the fix gives each NAME its type's path, since neither
+/// NAME is source text (final review M7): the route is written
+/// `public(billing::Org)`, and the fix is `public(crm::Org)`.
 #[test]
 fn the_401_tells_two_tenant_types_spelled_alike_apart_by_their_names() {
     let (_sim, mut app) = rendering_app(0x7E4A_1710);
@@ -2142,17 +2197,24 @@ fn the_401_tells_two_tenant_types_spelled_alike_apart_by_their_names() {
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /crm-leads` is declared `public(BillingOrg)` and \
-         opened the tenant scope `CrmOrg` for a caller with no credential; only a route \
-         declared `public(CrmOrg)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `public(CrmOrg)` in place of `public(BillingOrg)` in this route's \
-         `#[route(…)]` attribute, keeping its other flags"
+        format!(
+            "authentication required — `POST /crm-leads` is declared `public(BillingOrg)` and \
+             opened the tenant scope `CrmOrg` for a caller with no credential; only a route \
+             declared `public(CrmOrg)` admits one. Send \"Authorization: Bearer <token>\" or \
+             the charpente_session cookie, or, if every caller may act inside this tenant \
+             here, declare `public(CrmOrg)` in place of `public(BillingOrg)` in this route's \
+             `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by \
+             its NAME; in the attribute, write its path: `CrmOrg` is `{}`, and `BillingOrg` is \
+             `{}`",
+            std::any::type_name::<crm::Org>(),
+            std::any::type_name::<billing::Org>()
+        )
     );
 }
 
 /// Spec §4 and NB1 (b), at the 401: a generic tenant type renders its NAME,
-/// never a cut of its `type_name` (`Alpha>`).
+/// never a cut of its `type_name` (`Alpha>`). The path beside it is the whole
+/// `type_name`, generic arguments and all.
 #[test]
 fn the_401_names_a_generic_tenant_type_by_its_name() {
     let (_sim, mut app) = rendering_app(0x7E4A_1711);
@@ -2160,11 +2222,16 @@ fn the_401_names_a_generic_tenant_type_by_its_name() {
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /wrapped` is declared `public` and opened the tenant \
-         scope `Wrap` for a caller with no credential; only a route declared `public(Wrap)` \
-         admits one. Send \"Authorization: Bearer <token>\" or the charpente_session cookie, \
-         or, if every caller may act inside this tenant here, declare `public(Wrap)` in \
-         place of `public` in this route's `#[route(…)]` attribute, keeping its other flags"
+        format!(
+            "authentication required — `POST /wrapped` is declared `public` and opened the \
+             tenant scope `Wrap` for a caller with no credential; only a route declared \
+             `public(Wrap)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Wrap)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
+             the attribute, write its path: `Wrap` is `{}`",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
+        )
     );
 }
 

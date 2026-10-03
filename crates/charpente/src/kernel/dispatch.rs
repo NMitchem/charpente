@@ -154,14 +154,16 @@ impl JobScope<'_> {
         assert!(
             TypeId::of::<S>() == self.scope_type,
             "contract: the glue mounted for job \"{job}\" opened its tenant {id} as \
-             `{opened}`, but that `JobDef` declares `{declared}` with a `scope_type` that is \
-             not `{opened}` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees \
-             with its #[job] (a glue taken from another job, or another type's `TypeId`); \
-             this attempt wrote nothing, and every retry fails the same way — mount {job} \
-             through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)",
+             `{opened}` (the tenant type `{opened_type}`), but that `JobDef` declares \
+             `{declared}` with a `scope_type` that is not `{opened_type}` — a hand-built \
+             `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken \
+             from another job, or another type's `TypeId`); this attempt wrote nothing, and \
+             every retry fails the same way — mount {job} through `jobs![…]`, which builds its \
+             `JobDef` from its #[job] (GUIDE §6)",
             job = self.job,
             id = self.id,
             opened = <S as Tenant>::NAME,
+            opened_type = std::any::type_name::<S>(),
             declared = self.scope_name.map_or_else(
                 || "global".to_string(),
                 |name| format!("scoped_by = {name}")

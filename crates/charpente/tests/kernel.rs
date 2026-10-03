@@ -1677,17 +1677,18 @@ mod scoped_jobs {
         );
         let row = snap.scan::<JobRow>().unwrap().remove(0);
         assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(31)));
+        let board = std::any::type_name::<Board>();
         assert_eq!(
-            row.last_error.as_deref(),
-            Some(
+            row.last_error,
+            Some(format!(
                 "handler panicked: contract: the glue mounted for job \"File\" opened its \
-                 tenant 31 as `Board`, but that `JobDef` declares `scoped_by = Desk` with a \
-                 `scope_type` that is not `Board` — a hand-built `JobDef` whose `glue` or \
-                 `scope_type` disagrees with its #[job] (a glue taken from another job, or \
-                 another type's `TypeId`); this attempt wrote nothing, and every retry fails \
-                 the same way — mount File through `jobs![…]`, which builds its `JobDef` from \
-                 its #[job] (GUIDE §6)"
-            )
+                 tenant 31 as `Board` (the tenant type `{board}`), but that `JobDef` declares \
+                 `scoped_by = Desk` with a `scope_type` that is not `{board}` — a hand-built \
+                 `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken \
+                 from another job, or another type's `TypeId`); this attempt wrote nothing, and \
+                 every retry fails the same way — mount File through `jobs![…]`, which builds \
+                 its `JobDef` from its #[job] (GUIDE §6)"
+            ))
         );
     }
 
@@ -1733,17 +1734,18 @@ mod scoped_jobs {
         );
         let row = snap.scan::<JobRow>().unwrap().remove(0);
         assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(13)));
+        let desk = std::any::type_name::<Desk>();
         assert_eq!(
-            row.last_error.as_deref(),
-            Some(
+            row.last_error,
+            Some(format!(
                 "handler panicked: contract: the glue mounted for job \"File\" opened its \
-                 tenant 13 as `Desk`, but that `JobDef` declares `scoped_by = Board` with a \
-                 `scope_type` that is not `Desk` — a hand-built `JobDef` whose `glue` or \
-                 `scope_type` disagrees with its #[job] (a glue taken from another job, or \
-                 another type's `TypeId`); this attempt wrote nothing, and every retry fails \
-                 the same way — mount File through `jobs![…]`, which builds its `JobDef` from \
-                 its #[job] (GUIDE §6)"
-            )
+                 tenant 13 as `Desk` (the tenant type `{desk}`), but that `JobDef` declares \
+                 `scoped_by = Board` with a `scope_type` that is not `{desk}` — a hand-built \
+                 `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken \
+                 from another job, or another type's `TypeId`); this attempt wrote nothing, and \
+                 every retry fails the same way — mount File through `jobs![…]`, which builds \
+                 its `JobDef` from its #[job] (GUIDE §6)"
+            ))
         );
     }
 
@@ -6318,15 +6320,20 @@ mod job_tenancy {
 
     /// Rule 3's anonymous-scope 401 for the plain-`public` route, spelled out
     /// rather than taken from the product's `format!` (job-tenancy Task 3;
-    /// its fix clause is tenancy-completion spec §7's, item 12).
-    const PEEK_REFUSED: &str = "authentication required — `POST /shop/peek` is declared \
-                                `public` and opened the tenant scope `Shop` for a caller with \
-                                no credential; only a route declared `public(Shop)` admits \
-                                one. Send \"Authorization: Bearer <token>\" or the \
-                                charpente_session cookie, or, if every caller may act inside \
-                                this tenant here, declare `public(Shop)` in place of `public` \
-                                in this route's `#[route(…)]` attribute, keeping its other \
-                                flags";
+    /// its fix clause is tenancy-completion spec §7's, item 12, and the type
+    /// path beside the NAME is the final review's M7).
+    fn peek_refused() -> String {
+        format!(
+            "authentication required — `POST /shop/peek` is declared `public` and opened the \
+             tenant scope `Shop` for a caller with no credential; only a route declared \
+             `public(Shop)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Shop)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
+             the attribute, write its path: `Shop` is `{}`",
+            std::any::type_name::<Shop>()
+        )
+    }
 
     /// Every reply, as the wire saw it. A 200 names its request's nonce, so a
     /// credential-free request that was admitted where it must be refused is
@@ -6357,7 +6364,7 @@ mod job_tenancy {
                 let body: serde_json::Value =
                     serde_json::from_slice(body).map_err(|e| e.to_string())?;
                 let text = body["error"].as_str().unwrap_or_default();
-                if text == UNAUTHORIZED || text == PEEK_REFUSED {
+                if text == UNAUTHORIZED || text == peek_refused() {
                     sim.cover("tenant:anonymous_refused");
                     Ok(())
                 } else {

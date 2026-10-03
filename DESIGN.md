@@ -784,7 +784,8 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   `cross_tenant` is the declared capability to enumerate a scoped table across every tenant
   (tenant-scoping spec §3): the kernel mints a `CrossTenant` token for a route that declared
   it, `#[route]` fills the handler's `cap` argument from it, and `Tx::across_tenants::<S>
-  (cap)` requires one — so a handler on a route that did not declare it cannot compile the
+  (cap)`, for a tenant type `S` (`S: Tenant`, so neither scope marker), requires one — so a
+  handler on a route that did not declare it cannot compile the
   call, and `#[job(…, cross_tenant)]` says the same for a background rollup (whose `run` then
   takes the token after `tx`). The rows come back PAIRED WITH THEIR SCOPE —
   `AllTenants::scan` yields `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` — so a
@@ -819,8 +820,8 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   `Tx::put_schema_version`, whose record is the one `tx.put` wrote. No app code reads
   any of the three through a transaction either (spec 2026-09-30-tenancy-completion §3): `View`'s reads bound
   `R: ReadableBy<Self>`, which a platform table meets for a `Snapshot` alone; a
-  hand-written `Row` borrowing one of the names fails to build at each reachable `Tx`
-  read; and the dispatcher's in-batch read of a job row is `Tx::get_job`, which takes
+  hand-written `Row` borrowing one of the names, scoped or not, fails to build at each
+  reachable read, on a `Tx`, a `ScopedTx` or an `across_tenants` scan; and the dispatcher's in-batch read of a job row is `Tx::get_job`, which takes
   the same `TenantAdmission` as `settle_job`. An enqueue whose
   tenant presence disagrees with the mounted declaration (a hand-written `impl Job` or
   `JobDef`) is refused by name, and so is a Pending row that disagrees, before dispatch
@@ -2140,7 +2141,8 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   other type is a foreign shape there: it ends that tail (payload-shapes spec §3) and is
   never decoded. Two residuals sit outside the check. A `PAYLOAD_FINGERPRINT` chosen so its
   mix collides with another type's fingerprint (FNV-1a is computable backwards) is a bypass
-  built on purpose, with the operator's standing (DECISIONS §12). And a tenant type reached
+  built on purpose in app code, which no type check refuses: it needs no `Db`, only a
+  hand-written `impl Event` and the arithmetic. And a tenant type reached
   only through an event the app never mounts is outside the `NAME` census, so it can share
   a `NAME`, and therefore a shape, with another type: mount every event with `events![…]`.
   **One limit travels with it, documented rather than engineered around:**

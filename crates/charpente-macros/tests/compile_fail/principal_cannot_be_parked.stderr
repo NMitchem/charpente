@@ -1,0 +1,28 @@
+error[E0277]: the trait bound `Principal: Clone` is not satisfied
+  --> tests/compile_fail/principal_cannot_be_parked.rs:43:47
+   |
+43 |     *PARKED.lock().unwrap() = ctx.principal().cloned();
+   |                                               ^^^^^^ the trait `Clone` is not implemented for `Principal`
+   |
+note: required by a bound in `std::option::Option::<&T>::cloned`
+  --> $RUST/core/src/option.rs
+   |
+   |     pub fn cloned(self) -> Option<T>
+   |            ------ required by a bound in this associated function
+   |     where
+   |         T: Clone,
+   |            ^^^^^ required by this bound in `Option::<&T>::cloned`
+
+error[E0308]: mismatched types
+  --> tests/compile_fail/principal_cannot_be_parked.rs:50:27
+   |
+50 |     let held: Principal = ctx.principal().expect("auth route").clone();
+   |               ---------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Principal`, found `&Principal`
+   |               |
+   |               expected due to this
+   |
+note: `Principal` does not implement `Clone`, so `&Principal` was cloned instead
+  --> tests/compile_fail/principal_cannot_be_parked.rs:50:27
+   |
+50 |     let held: Principal = ctx.principal().expect("auth route").clone();
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

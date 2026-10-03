@@ -1,4 +1,4 @@
-error[E0080]: evaluation panicked: contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its rows would read as another tenant type's event; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
+error[E0080]: evaluation panicked: contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not; the likely causes are a hand-written `impl Event` that states `FINGERPRINT` but not `PAYLOAD_FINGERPRINT`, which then defaults to `FINGERPRINT` (a scoped event states both), or one whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes, either of which would let its rows read as another tenant type's event; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
  --> $WORKSPACE/crates/charpente/src/http/mod.rs
   |
   |         const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
@@ -15,9 +15,9 @@ note: inside `charpente::charpente_core::db::refuse_scoped_event_shape`
   | /         panic!(
   | |             "contract: a scoped event's recorded shape is its payload's field fold mixed with its \
   | |              declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, \
-  | |              <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its \
+  | |              <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not; the \
 ... |
-  | |              Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |              <S as Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
   | |         );
   | |_________- in this macro invocation
 
@@ -33,7 +33,7 @@ note: the above error was encountered while instantiating `fn <ScopedTx<'_, '_, 
 97 |     Ok(tx.subscription::<Spy>().cursor(cursor).into())
    |        ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error[E0080]: evaluation panicked: contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its rows would read as another tenant type's event; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
+error[E0080]: evaluation panicked: contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not; the likely causes are a hand-written `impl Event` that states `FINGERPRINT` but not `PAYLOAD_FINGERPRINT`, which then defaults to `FINGERPRINT` (a scoped event states both), or one whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes, either of which would let its rows read as another tenant type's event; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
  --> $WORKSPACE/crates/charpente/src/http/mod.rs
   |
   |         const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
@@ -50,9 +50,9 @@ note: inside `charpente::charpente_core::db::refuse_scoped_event_shape`
   | /         panic!(
   | |             "contract: a scoped event's recorded shape is its payload's field fold mixed with its \
   | |              declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, \
-  | |              <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its \
+  | |              <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not; the \
 ... |
-  | |              Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |              <S as Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
   | |         );
   | |_________- in this macro invocation
 

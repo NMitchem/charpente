@@ -1028,8 +1028,8 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
             // tenant and no event (amendment A16). A row of the feed's own
             // tenancy that it does not admit, another name or another key, is
             // not refused: it is never delivered either way (payload-shapes
-            // spec §3).
-            if row.scope != sub.scope {
+            // spec §3). `holds_tenancy` is the rule `admits` delivers by.
+            if !sub.holds_tenancy(row.scope) {
                 return Err(Response::error(
                     409,
                     &format!(
