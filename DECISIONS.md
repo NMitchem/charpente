@@ -347,12 +347,19 @@ name only.
 **What an app is told, and where.** DESIGN §8 states the boundary in its limits paragraph;
 `crates/charpente/src/tenant.rs`'s module doc states it at the code; GUIDE §16 states it to
 app authors, with the remedy: code outside a handler never takes a scope on its own word. A
-job declares `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened; operator
-code that must act inside one tenant — seeding, a test oracle — opens it with a
-`TenantAdmission` minted from a `Group`, the seal `CrossTenant` already carries, which is the
-operator's standing made explicit rather than an exception to the guarantee. *(Corrected
-2026-09-27, job-tenancy spec: the earlier remedy named a `Ctx` that no code outside a handler
-holds.)*
+job declares `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened, or that its
+fan-out named. Which tenant *type* that is travels inside the job's fingerprint as the type's
+declared `Tenant::NAME`: a binary that mounts the job under a tenant type of another `NAME`
+meets the foreign-shape refusal at startup, by name, and two binaries whose tenant types share
+a `NAME` share a tenant by declaration, as two structs sharing a `TABLE` share a table
+(tenancy-completion spec §2 ruling 2, §4). Operator code that must act inside one tenant —
+seeding, a test oracle — opens it with a `TenantAdmission` minted from a `Group`, the seal
+`CrossTenant` already carries, which is the operator's standing made explicit rather than an
+exception to the guarantee. *(Corrected 2026-09-27, job-tenancy spec: the earlier remedy named
+a `Ctx` that no code outside a handler holds.)* *(Corrected 2026-10-03, tenancy-completion spec §7
+item 7: the remedy named only the tenant the enqueuer opened, leaving out a declared fan-out's
+`Tx::enqueue_in`, and did not say how a job's tenant type is identified across two binaries.
+The decision is unchanged.)*
 
 **The question that held this open, and its answer.** Should a future release put the raw
 reads behind a named, `describe`-visible operator capability — the §11 shape applied one

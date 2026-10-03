@@ -2575,13 +2575,13 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   and it cross-checks the reported count exactly. `ceiling:
   [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
   caps it: the batch fails when more than N universes gave up, naming the key,
-  the count and the cap. Nineteen of the platform's own swarm properties carry
+  the count and the cap. Twenty of the platform's own swarm properties carry
   one:
   - kernel's exactly-once and job-tenancy properties;
   - the flagship properties of tenant, transactions, http, group_commit and
     typed_tables, and archive's two convergence properties;
-  - realtime's flagship and scoped settled-client properties, migrations' two,
-    and the WAL suite's fault-matrix, bit-flip, misdirected-write, read-error,
+  - realtime's flagship, scoped settled-client and tenant-feed properties,
+    migrations' two, and the WAL suite's fault-matrix, bit-flip, misdirected-write, read-error,
     dir-entry and gc properties.
 
   The rest carry none yet, so a drift in their give-up rates is visible only in
