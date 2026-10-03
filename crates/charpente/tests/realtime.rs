@@ -7943,6 +7943,10 @@ mod tenancy_feeds {
 
     // --------------------------------------------------------- feed client
 
+    /// Set when a tail's queued stall closure returns `true`, which is the
+    /// one way the sim sink refuses a frame (`tenancy_push_subscribe`).
+    type StallFlag = Arc<Mutex<bool>>;
+
     /// One feed's reconnecting subscriber, across one universe.
     struct FeedClient {
         feed: Feed,
@@ -7962,6 +7966,9 @@ mod tenancy_feeds {
         /// the cursor it resumed from (`None` for a bare subscribe). Read
         /// only to name a miss (`caught_up_while_live`).
         opened: Option<(u64, Option<Cursor>)>,
+        /// The live tail's stall flag: whether its sink ever refused a frame.
+        /// Read only when the tail closes (`closed_by_a_stall`).
+        stall: Option<StallFlag>,
         frames_consumed: usize,
         last_id: Option<u64>,
         /// Probes refused by A16's name: from another shop's row, and from a
@@ -7983,6 +7990,7 @@ mod tenancy_feeds {
                 need_subscribe: true,
                 handle: None,
                 opened: None,
+                stall: None,
                 frames_consumed: 0,
                 last_id: None,
                 refused_same_kind: 0,
@@ -8047,6 +8055,11 @@ mod tenancy_feeds {
                 return Ok(());
             };
             let how = match sent {
+                Some(cursor) if id <= cursor.id => format!(
+                    "resuming from cursor {}; event id {id} lies at or below that cursor, so an \
+                     earlier tail of this feed skipped it",
+                    cursor.wire()
+                ),
                 Some(cursor) => format!("resuming from cursor {}", cursor.wire()),
                 None => "bare".to_string(),
             };
@@ -8059,6 +8072,65 @@ mod tenancy_feeds {
                 self.feed.label(),
                 emitted(ledger.rows[&id].origin),
                 ledger.next_scan_id
+            ))
+        }
+
+        /// Why a closed tail closed (plan Task 13 fix round 2; re-review R1).
+        /// `absorb` books a closed tail as a stall drop and the feed
+        /// reconnects. A feed with no cursor reconnects bare, and the floor
+        /// rule then forfeits every row the dropped tail owed, so a tail the
+        /// node drops for no reason would pass as vacuously as I1's fail-closed
+        /// feed. The product closes a `SimSinkHandle` in exactly these places:
+        /// - `Kernel::step`'s tail arm `swap_remove`s a tail when
+        ///   `deliver_unit` returns `Ok(false)` (`kernel/mod.rs`,
+        ///   `Ready::Tail`), which drops its boxed `SimSink`; `impl Drop for
+        ///   SimSink` is the only writer of `closed`. `deliver_unit`
+        ///   (`kernel/tail.rs`) returns `Ok(false)` only:
+        ///   - after a terminal frame: `charpente.gap` (the retention floor
+        ///     passed the tail), `charpente.error` (a row that does not decode,
+        ///     or a payload that does not encode) or `charpente.reshaped` (a
+        ///     row of another shape). `take_frames` fails the universe on each
+        ///     before this is asked. A terminal frame the stall refused arrives
+        ///     as no frame, and then the stall fired;
+        ///   - when a frame's send is refused: `SimSink::send` returns `Full`
+        ///     exactly when its stall closure returns `true`, and never returns
+        ///     `Closed`.
+        /// - Dropping the `Kernel` drops every tail. `absorb` never sees that:
+        ///   it runs while its run's kernel is alive, and `disconnect_all`
+        ///   clears every handle before a new kernel's first `absorb`.
+        ///
+        /// So a tail that closed with its stall unfired and no terminal frame
+        /// was dropped silently, and that fails by name. The flag is the
+        /// queued stall closure's own record of returning `true`
+        /// (`tenancy_push_subscribe`): no entropy draw and no disk read.
+        fn closed_by_a_stall(&self) -> Result<(), String> {
+            let stalled = self.stall.as_ref().is_some_and(|flag| {
+                *flag
+                    .lock()
+                    .expect("stall flag lock poisoned by an earlier panic")
+            });
+            if stalled {
+                return Ok(());
+            }
+            let (boundary, sent) = self
+                .opened
+                .expect("a feed holds a handle only for a tail it opened (`connected`)");
+            let how = match sent {
+                Some(cursor) => format!("resuming from cursor {}", cursor.wire()),
+                None => "bare".to_string(),
+            };
+            let from = match self.cursor {
+                Some(cursor) => format!("from cursor {}", cursor.wire()),
+                None => "bare".to_string(),
+            };
+            Err(format!(
+                "{}'s tail was dropped by the node with no stall and no terminal frame: it \
+                 subscribed at boundary {boundary} ({how}) and now reconnects {from} — a node \
+                 drops a live tail only when its sink refuses a frame (the stall closure) or \
+                 after a terminal frame (charpente.gap, charpente.reshaped, charpente.error), so \
+                 this drop is silent, and a bare reconnect after it forfeits every row the tail \
+                 owed",
+                self.feed.label()
             ))
         }
 
@@ -8164,6 +8236,7 @@ mod tenancy_feeds {
             was_bare: bool,
             boundary: u64,
             sent: Option<Cursor>,
+            stall: StallFlag,
         ) {
             self.need_subscribe = false;
             if was_bare {
@@ -8171,6 +8244,7 @@ mod tenancy_feeds {
             }
             self.handle = Some(handle);
             self.opened = Some((boundary, sent));
+            self.stall = Some(stall);
             self.frames_consumed = 0;
         }
 
@@ -8326,6 +8400,13 @@ mod tenancy_feeds {
         /// Whether a subscribe has read the node's head since the last boot. A
         /// cut is re-synced at that read, so without one none can be.
         head_read: bool,
+        /// One flag per stall closure queued on the current `SimSource`, in
+        /// queue order. `SimSource` pops one closure per SSE upgrade, FIFO
+        /// (`SimReply::stream`), and only a feed's own subscribe queues one (a
+        /// probe queues none), so the k-th sink `take_sink` hands out runs the
+        /// k-th closure. A refused subscribe leaves its closure for the next
+        /// upgrade, which is why the flag is matched by sink, not by request.
+        stall_flags: Vec<StallFlag>,
     }
 
     impl Universe {
@@ -8335,12 +8416,16 @@ mod tenancy_feeds {
                 clients: FEEDS.iter().map(|&feed| FeedClient::new(feed)).collect(),
                 cut_explained,
                 head_read: false,
+                stall_flags: Vec::new(),
             }
         }
 
         /// A fresh kernel carries no tail over, and its head is not read yet.
+        /// Its source's stall queue goes with it: every `SimSource` is created
+        /// right after this call, and every call ends the source before it.
         fn disconnect_all(&mut self) {
             self.head_read = false;
+            self.stall_flags.clear();
             for client in &mut self.clients {
                 client.need_subscribe = true;
                 client.handle = None;
@@ -8428,7 +8513,7 @@ mod tenancy_feeds {
         /// from its cursor. Each subscribe reads the node's head first, its
         /// `boundary`, which `resync_at_boundaries` then re-syncs a cut to.
         fn push_subscribes(
-            &self,
+            &mut self,
             sim: &Sim,
             kernel: &Kernel,
             source: &mut SimSource,
@@ -8439,8 +8524,9 @@ mod tenancy_feeds {
                 if !c.need_subscribe {
                     continue;
                 }
-                let (was_bare, boundary) =
-                    push_subscribe(sim, kernel, source, c.feed.path(), c.cursor, *t)?;
+                let (was_bare, boundary, stall) =
+                    tenancy_push_subscribe(sim, kernel, source, c.feed.path(), c.cursor, *t)?;
+                self.stall_flags.push(stall);
                 pushed.push(Pushed::Subscribe {
                     client,
                     was_bare,
@@ -8580,8 +8666,13 @@ mod tenancy_feeds {
                         sent,
                     } => match read_answer(*status, &raw, explained) {
                         Answer::Connected => {
+                            let stall = self
+                                .stall_flags
+                                .get(*sinks_taken)
+                                .cloned()
+                                .expect("every own subscribe queued one stall closure, FIFO");
                             let handle = take_sink(sinks, sinks_taken);
-                            self.clients[client].connected(handle, was_bare, boundary, sent);
+                            self.clients[client].connected(handle, was_bare, boundary, sent, stall);
                         }
                         Answer::Retry => {}
                         // The flagship's diverged-409 arm (S3b item 3). This
@@ -8630,8 +8721,10 @@ mod tenancy_feeds {
                 c.take_frames(&self.ledger, &frames[c.frames_consumed..])?;
                 c.frames_consumed = frames.len();
                 if handle.closed() {
-                    // Our stall closure is the only source of `Full`, and a
-                    // live kernel drops a tail for nothing else here.
+                    // A terminal frame already failed above, so the one
+                    // legitimate close left is a stall (`closed_by_a_stall`'s
+                    // census). Anything else is a silent drop.
+                    c.closed_by_a_stall()?;
                     sim.cover("realtime:stall-drop");
                     sim.cover("fault:subscriber_stall");
                     c.need_subscribe = true;
@@ -8746,6 +8839,52 @@ mod tenancy_feeds {
                 sim.cover("tenancy:mixed-record-delivered");
             }
         }
+    }
+
+    /// `push_subscribe`, copied rather than parameterized so the flagship keeps
+    /// its bytes (R56), with one change: the stall closure it queues records
+    /// each `true` it returns in the flag it hands back. The wrapper calls the
+    /// closure exactly as before, so no entropy draw moves.
+    fn tenancy_push_subscribe(
+        sim: &Sim,
+        kernel: &Kernel,
+        source: &mut SimSource,
+        path: &'static str,
+        cursor: Option<Cursor>,
+        t: u64,
+    ) -> Result<(bool, u64, StallFlag), String> {
+        let entropy = sim.entropy();
+        let fired: StallFlag = Arc::new(Mutex::new(false));
+        let flag = fired.clone();
+        let mut stall = stall_closure(entropy, sim.subscriber_stall());
+        source.push_stall(Box::new(move || {
+            let stalled = stall();
+            if stalled {
+                *flag
+                    .lock()
+                    .expect("stall flag lock poisoned by an earlier panic") = true;
+            }
+            stalled
+        }));
+        let boundary = kernel
+            .app()
+            .db()
+            .next_event_id()
+            .map_err(|e| format!("next_event_id read failed: {e}"))?;
+        let (req, was_bare) = match cursor {
+            Some(c) => {
+                if boundary > c.id + 1 {
+                    sim.cover("realtime:resume-backlog");
+                }
+                (
+                    Request::new(Method::Get, format!("{path}?cursor={}", c.wire())),
+                    false,
+                )
+            }
+            None => (Request::new(Method::Get, path), true),
+        };
+        source.push_at(t, req);
+        Ok((was_bare, boundary, fired))
     }
 
     /// `settle_boot` over `tenancy_app`. It is copied rather than
@@ -9485,12 +9624,13 @@ mod tenancy_feeds {
         // then has nothing to name (review I1). The live check names it while
         // the tail is open, here a bare tail at boundary 0.
         let (_global_sink, global_tail) = SimSink::new(Box::new(|| false));
-        global.connected(global_tail, true, 0, None);
+        global.connected(global_tail, true, 0, None, Arc::new(Mutex::new(false)));
         global
             .caught_up_while_live(&ledger)
             .expect("the control: the global feed's open tail has every global row");
+        let stalled: StallFlag = Arc::new(Mutex::new(false));
         let (shop_sink, shop_tail) = SimSink::new(Box::new(|| false));
-        shop.connected(shop_tail, true, 0, None);
+        shop.connected(shop_tail, true, 0, None, stalled.clone());
         assert_eq!(
             shop.caught_up_while_live(&ledger),
             Err(
@@ -9506,6 +9646,24 @@ mod tenancy_feeds {
         drop(shop_sink);
         shop.caught_up_while_live(&ledger)
             .expect("a dropped tail owes nothing yet: its rows are still owed at the settle");
+        // Unless nothing explains the drop. A tail the node closes with no
+        // stall and no terminal frame is the other fail-closed door (re-review
+        // R1): the feed would reconnect bare and forfeit what it was owed.
+        assert_eq!(
+            shop.closed_by_a_stall(),
+            Err(
+                "shop 1's feed's tail was dropped by the node with no stall and no terminal \
+                 frame: it subscribed at boundary 0 (bare) and now reconnects bare — a node \
+                 drops a live tail only when its sink refuses a frame (the stall closure) or \
+                 after a terminal frame (charpente.gap, charpente.reshaped, charpente.error), \
+                 so this drop is silent, and a bare reconnect after it forfeits every row the \
+                 tail owed"
+                    .to_string()
+            )
+        );
+        *stalled.lock().expect("stall flag lock") = true;
+        shop.closed_by_a_stall()
+            .expect("the control: a tail its stall closed is legitimately closed");
     }
 
     /// Victim: an interior skip. Shop 1's real frames, with id 5 removed, are
@@ -9526,6 +9684,24 @@ mod tenancy_feeds {
             shop.unsettled_report(&ledger),
             "shop 1's feed never caught up: ledger scanned below id 8, floor 0, 0 frame(s) \
              unverified, first own row never delivered Some(5), cursor id Some(7)"
+        );
+        // On the round: a tail resumed from cursor 7 is open, and the hole at
+        // 5 lies below that cursor, so an earlier tail skipped it (re-review m1).
+        let cursor = shop.cursor.expect("shop 1 holds a cursor");
+        let (_sink, tail) = SimSink::new(Box::new(|| false));
+        shop.connected(tail, false, 8, Some(cursor), Arc::new(Mutex::new(false)));
+        assert_eq!(
+            shop.caught_up_while_live(&ledger),
+            Err(format!(
+                "shop 1's feed never received event id 5, a note emitted inside shop 1, on a live \
+                 tail: it subscribed at boundary 8 (resuming from cursor 7.{}; event id 5 lies at \
+                 or below that cursor, so an earlier tail of this feed skipped it), the ledger \
+                 scanned below id 8, and kernel.run returned to idle with the tail still open — a \
+                 tail open on a node that ran to idle has been sent every committed row its \
+                 subscription admits, so a feed's delivered set is exactly its own rows, and this \
+                 one is missing",
+                cursor.seq
+            ))
         );
     }
 
