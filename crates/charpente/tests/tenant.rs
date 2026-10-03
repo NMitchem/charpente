@@ -32,9 +32,10 @@ use charpente::{
     CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, TenantAdmission, Tx,
     TxError, event, job, jobs, route, routes, table,
 };
+use charpente_core::db::TableReadRefusal;
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Id, Row};
+use charpente_core::table::{Codec, Id, Row, View};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 
 /// The scope type whose membership check actually refuses. Every other
@@ -1727,6 +1728,212 @@ fn a_delete_through_the_same_table_under_another_scope_type_is_refused() {
             true,
             false,
             Some("Team 7's note".to_string())
+        )
+    );
+}
+
+/// The refusal a read through `Reader` gets, spelled out apart from the
+/// product's `format!`, as `firm_note_refusal` is for a write.
+fn note_read_refusal<Reader>(read: &str) -> String {
+    let registered = std::any::type_name::<Note>();
+    let reader = std::any::type_name::<Reader>();
+    format!(
+        "table \"Note\" is registered as `{registered}`, but this transaction read it through \
+         `{reader}` ({read}) — two Row types declare TABLE = \"Note\", and a read keys on the \
+         table name and the raw tenant id, so it returns the registered type's rows, from the \
+         registered scope type's tenant of the same id when the two types' scoped_by differ; \
+         the read was refused and returned nothing — read `{registered}` instead, or give \
+         `{reader}` a table name of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
+/// Amendment A18, the read half of the two tests above. A read admitted for
+/// `Firm` 7 through `firm_note::Note` keys on the table name and the raw scope
+/// id, so it returned `Team` 7's note. Each scoped read through it, and an
+/// `across_tenants` scan, is refused before it reads and returns nothing; the
+/// registered type still reads `Team` 7's row. `firm_note::Note` declares no
+/// index, so `scan_by` reaches its type check and nothing else: without the
+/// check it panics naming the missing index.
+#[test]
+fn a_read_through_the_same_table_under_another_scope_type_is_refused() {
+    let sim = Sim::with_faults(0x5A17_0011, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(7), &admission)
+                .put(&Note {
+                    id: Id::from_raw(1),
+                    text: "Team 7's note".to_string(),
+                });
+            Ok::<(), ApiError>(())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+
+    let refused = |e: std::io::Error| {
+        assert!(
+            TableReadRefusal::of(&e).is_some(),
+            "a TableReadRefusal, not another io error: {e}"
+        );
+        e.to_string()
+    };
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let cap = group.cross_tenant_cap();
+    let as_firm = group
+        .stage(|tx| {
+            let firm = tx.admit_scope(Id::<Firm>::from_raw(7), &admission);
+            Ok::<_, ApiError>((
+                firm.get::<firm_note::Note>(Id::from_raw(1))
+                    .map(|note| note.map(|note| note.text))
+                    .map_err(refused),
+                firm.scan::<firm_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                firm.scan_by::<firm_note::Note>("text", &"Team 7's note".to_string())
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                firm.scan_from::<firm_note::Note>(0, 10)
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            ))
+        })
+        .unwrap();
+    let across = group
+        .stage(|tx| {
+            Ok::<_, ApiError>(
+                tx.across_tenants::<Firm>(&cap)
+                    .scan::<firm_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            )
+        })
+        .unwrap();
+    let as_team = group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(7), &admission)
+                .get::<Note>(Id::from_raw(1))
+                .map(|note| note.map(|note| note.text))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+    assert_eq!(
+        (as_firm, across, as_team),
+        (
+            (
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::get")),
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::scan")),
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::scan_by")),
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::scan_from")),
+            ),
+            Err(note_read_refusal::<firm_note::Note>(
+                "across_tenants().scan"
+            )),
+            Some("Team 7's note".to_string()),
+        )
+    );
+}
+
+/// `Note` declared `global`: the same identifier and fields, so the same
+/// `TABLE`, and no tenant at all. Its reads are `Tx`'s own `View` reads.
+mod global_note {
+    use super::*;
+
+    #[table(global)]
+    pub(super) struct Note {
+        pub(super) id: Id<Note>,
+        pub(super) text: String,
+    }
+}
+
+/// Amendment A18 on `Tx`'s own `View` reads (S1 amendment review I2). An
+/// unscoped read keys on the table name and `UNSCOPED`, which is 0. Once the
+/// row is in the store, a `global` type naming a scoped table fails to open it
+/// (`unscoped_open_err`). Before commit, `Tx` reads the transaction's and the
+/// group's overlays first, so `global_note::Note` read `Team` 0's note staged
+/// earlier in the same batch. Each of the four reads is refused before it
+/// reads and returns nothing; the registered type still reads `Team` 0's row.
+/// `global_note::Note` declares no index, so without the check `scan_by`
+/// panics naming the missing index.
+#[test]
+fn a_transactions_read_through_a_global_twin_is_refused_before_commit() {
+    let sim = Sim::with_faults(0x5A17_0013, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(0), &admission)
+                .put(&Note {
+                    id: Id::from_raw(1),
+                    text: "Team 0's note".to_string(),
+                });
+            Ok::<(), ApiError>(())
+        })
+        .unwrap();
+    let refused = |e: std::io::Error| {
+        assert!(
+            TableReadRefusal::of(&e).is_some(),
+            "a TableReadRefusal, not another io error: {e}"
+        );
+        e.to_string()
+    };
+    let in_batch = group
+        .stage(|tx| {
+            Ok::<_, ApiError>((
+                tx.get::<global_note::Note>(Id::from_raw(1))
+                    .map(|note| note.map(|note| note.text))
+                    .map_err(refused),
+                tx.scan::<global_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                tx.scan_by::<global_note::Note>("text", &"Team 0's note".to_string())
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                tx.scan_from::<global_note::Note>(0, 10)
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            ))
+        })
+        .unwrap();
+    let as_team = group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(0), &admission)
+                .get::<Note>(Id::from_raw(1))
+                .map(|note| note.map(|note| note.text))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+    assert_eq!(
+        (in_batch, as_team),
+        (
+            (
+                Err(note_read_refusal::<global_note::Note>("Tx::get")),
+                Err(note_read_refusal::<global_note::Note>("Tx::scan")),
+                Err(note_read_refusal::<global_note::Note>("Tx::scan_by")),
+                Err(note_read_refusal::<global_note::Note>("Tx::scan_from")),
+            ),
+            Some("Team 0's note".to_string()),
         )
     );
 }

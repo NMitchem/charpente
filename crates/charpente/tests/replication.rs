@@ -10729,7 +10729,7 @@ fn promote_over_a_foreign_finished_ping(seed: u64, status: JobStatus) {
     group
         .stage(|tx| {
             let mut job = tx
-                .get(Id::<JobRow>::from_raw(0))?
+                .get_job(Id::from_raw(0), &admission)?
                 .expect("the enqueued ping");
             job.status = status;
             tx.settle_job(&job, &admission);
@@ -10935,7 +10935,7 @@ fn a_kernel_switchover_onto_foreign_pending_jobs_stops_the_target_by_name() {
         group
             .stage(|tx| {
                 let mut job = tx
-                    .get(Id::<JobRow>::from_raw(0))?
+                    .get_job(Id::from_raw(0), &admission)?
                     .expect("the enqueued ping");
                 job.due_at = u64::MAX / 2;
                 tx.settle_job(&job, &admission);

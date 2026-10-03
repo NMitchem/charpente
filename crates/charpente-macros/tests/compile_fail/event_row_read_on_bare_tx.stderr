@@ -1,0 +1,71 @@
+error[E0277]: `EventRow` is one of the platform's tables, and a transaction does not read it
+  --> tests/compile_fail/event_row_read_on_bare_tx.rs:13:32
+   |
+13 |     let _page = tx.scan_from::<EventRow>(after.raw() + 1, 50)?;
+   |                    ---------   ^^^^^^^^ `EventRow` is read through `Db::snapshot`, never through a transaction
+   |                    |
+   |                    required by a bound introduced by this call
+   |
+   = help: the trait `ScopeReadableBy<Tx<'_>, EventRow>` is not implemented for `charpente::charpente_core::table::PlatformOwned`
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+               db.snapshot()?.scan::<EventRow>()?
+   = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+help: the trait `ScopeReadableBy<V, R>` is implemented for `charpente::charpente_core::table::PlatformOwned`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `EventRow` to implement `ReadableBy<Tx<'_>>`
+note: required by a bound in `scan_from`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   |     fn scan_from<R: UnscopedRow + ReadableBy<Self>>(
+   |                                   ^^^^^^^^^^^^^^^^ required by this bound in `View::scan_from`
+
+error[E0277]: `EventRow` is one of the platform's tables, and a transaction does not read it
+  --> tests/compile_fail/event_row_read_on_bare_tx.rs:19:25
+   |
+19 |     let _row = tx.get::<EventRow>(event)?;
+   |                   ---   ^^^^^^^^ `EventRow` is read through `Db::snapshot`, never through a transaction
+   |                   |
+   |                   required by a bound introduced by this call
+   |
+   = help: the trait `ScopeReadableBy<Tx<'_>, EventRow>` is not implemented for `charpente::charpente_core::table::PlatformOwned`
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+               db.snapshot()?.scan::<EventRow>()?
+   = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+help: the trait `ScopeReadableBy<V, R>` is implemented for `charpente::charpente_core::table::PlatformOwned`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `EventRow` to implement `ReadableBy<Tx<'_>>`
+note: required by a bound in `charpente::View::get`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   |     fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>>;
+   |                             ^^^^^^^^^^^^^^^^ required by this bound in `View::get`
+
+error[E0277]: `EventRow` is one of the platform's tables, and a transaction does not read it
+  --> tests/compile_fail/event_row_read_on_bare_tx.rs:25:30
+   |
+25 |     let _paid = tx.scan_by::<EventRow>("name", &"InvoicePaid".to_string())?;
+   |                    -------   ^^^^^^^^ `EventRow` is read through `Db::snapshot`, never through a transaction
+   |                    |
+   |                    required by a bound introduced by this call
+   |
+   = help: the trait `ScopeReadableBy<Tx<'_>, EventRow>` is not implemented for `charpente::charpente_core::table::PlatformOwned`
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+               db.snapshot()?.scan::<EventRow>()?
+   = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+help: the trait `ScopeReadableBy<V, R>` is implemented for `charpente::charpente_core::table::PlatformOwned`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `EventRow` to implement `ReadableBy<Tx<'_>>`
+note: required by a bound in `scan_by`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   |     fn scan_by<R: UnscopedRow + ReadableBy<Self>>(
+   |                                 ^^^^^^^^^^^^^^^^ required by this bound in `View::scan_by`

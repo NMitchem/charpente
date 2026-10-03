@@ -7,8 +7,8 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use charpente_core::db::{
-    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableWriteRefusal, Tenant, TenantAdmission,
-    Tx, TxError,
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableReadRefusal, TableWriteRefusal, Tenant,
+    TenantAdmission, Tx, TxError,
 };
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
@@ -21,8 +21,10 @@ use crate::tenant::TenantScope;
 /// enqueueing another shape of a mounted job or for writing a table the
 /// `Schema` disagrees with) — a real attempt that feeds
 /// retry budget and lands in the row's `last_error`. `Io` is a platform fault
-/// surfaced through the handler's reads — NOT an attempt: the job stays
-/// Pending, nothing is recorded, the error bubbles (restart-and-recover).
+/// surfaced through the handler's reads — NOT an attempt, a `TableReadRefusal`
+/// excepted: it is the handler's own deterministic bug, an attempt. Otherwise
+/// the job stays Pending, nothing is recorded, the error bubbles
+/// (restart-and-recover).
 /// Folding Io into the retry path would let injected faults Dead-letter
 /// healthy jobs.
 pub enum JobError {
@@ -300,11 +302,14 @@ impl Dispatcher {
         // the dispatcher's admission (job-tenancy spec §5), minted from the
         // `Group` no glue ever holds. The same admission is the token
         // `Tx::settle_job` takes, so the dispatcher's two job-row writes (the
-        // Done mark and the failure record) are ones no app code can make.
+        // Done mark and the failure record) are ones no app code can make. It
+        // is also the token `Tx::get_job` takes, the one read of a job row
+        // inside a batch: no transaction reads the queue otherwise
+        // (tenancy-completion spec §3).
         let admission = group.tenant_admission();
         let attempt = group.stage(|tx| {
             let mut row = tx
-                .get(Id::<JobRow>::from_raw(id))?
+                .get_job(Id::from_raw(id), &admission)?
                 .unwrap_or_else(|| panic!("dispatcher invariant: due job {id} has no row"));
             assert_eq!(
                 row.status,
@@ -411,14 +416,25 @@ impl Dispatcher {
                 );
                 Err(TxError::App(JobError::App(e.to_string())))
             }
+            // A read the `Schema` disagrees with about its table's `Row` type
+            // (`TableReadRefusal`, amendment A18) is refused by the read itself,
+            // so it arrives here through the handler's `?` as `JobError::Io`, the
+            // variant a platform fault takes. It is the handler's own
+            // deterministic bug, like the two refusals above: an attempt, never a
+            // fault that would stop the dispatcher on every restart.
+            Err(TxError::App(JobError::Io(e))) if TableReadRefusal::of(&e).is_some() => {
+                Err(TxError::App(JobError::App(e.to_string())))
+            }
             other => other,
         };
         match attempt {
             Ok(()) => Ok(JobOutcome::Done { id }),
             // Platform faults — the transaction machinery's own, or one the
-            // handler's reads surfaced — are NOT attempts: the row is
-            // untouched and Pending, the heap entry comes back, no ledger
-            // write, and the error bubbles (restart-and-recover).
+            // handler's reads surfaced — are NOT attempts, a `TableReadRefusal`
+            // excepted: it is the handler's own deterministic bug, an attempt,
+            // classified above. The row is untouched and Pending, the heap
+            // entry comes back, no ledger write, and the error bubbles
+            // (restart-and-recover).
             Err(TxError::Io(e)) | Err(TxError::App(JobError::Io(e))) => {
                 self.due.insert((due_at, id)); // still Pending in the store
                 Err(e)
@@ -462,15 +478,15 @@ impl Dispatcher {
                 // separate `db.snapshot()` re-read the way this used to
                 // work: `Group` deliberately exposes no snapshot accessor
                 // (spec §1 has no group-snapshot escape hatch), and reading
-                // `row.name` through `tx` here is strictly MORE correct
-                // anyway — `tx` sees this batch's own earlier writes through
+                // `row.name` through `tx.get_job` here is strictly MORE correct
+                // anyway — it sees this batch's own earlier writes through
                 // the group overlay, where a bare snapshot would not. This
                 // also deletes one of the two `expect("row existed a moment
                 // ago")` sites the old shape needed.
                 let defs = &self.defs;
                 let staged = group.stage(|tx| {
                     let mut row = tx
-                        .get(Id::<JobRow>::from_raw(id))?
+                        .get_job(Id::from_raw(id), &admission)?
                         .expect("row existed a moment ago");
                     let retry = defs
                         .get(row.name.as_str())

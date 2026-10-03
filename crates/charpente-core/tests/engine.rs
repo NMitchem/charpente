@@ -484,16 +484,22 @@ fn the_platform_tables_are_platform_owned() {
     assert_platform::<SchemaVersion>();
 }
 
-/// The job-tenancy write seal takes writes away from `JobRow` and nothing
-/// else: a transaction still reads it through `View` (`UnscopedRow`, which
-/// GUIDE §8's oracles and the dispatcher's own scan rely on), and it still
-/// stores under the bare `u64` key (`an_unscoped_table_still_writes_a_bare_u64_key`
-/// below). That `Tx::put`/`Tx::delete` refuse it is pinned by the
-/// `job_row_*` compile-fail fixtures in `charpente-macros`.
+/// The platform's tables are read through a `Snapshot` and nothing else
+/// (tenancy-completion spec §3). Each is still an `UnscopedRow`, keyed by
+/// bare id, and `ReadableBy<Snapshot>` holds for it, which §8's oracles and
+/// every operator read rely on. That a `Tx` read of one does not compile is
+/// pinned by the `*_read_on_bare_tx` compile-fail fixtures in
+/// `charpente-macros`, and that `Tx::put`/`delete` refuse it by the
+/// `*_written_on_bare_tx` and `job_row_*` ones.
 #[test]
-fn a_job_row_is_still_read_through_view() {
-    fn assert_readable<R: charpente_core::table::UnscopedRow>() {}
+fn a_platform_row_is_read_through_a_snapshot() {
+    fn assert_readable<
+        R: charpente_core::table::UnscopedRow + charpente_core::table::ReadableBy<Snapshot>,
+    >() {
+    }
     assert_readable::<JobRow>();
+    assert_readable::<EventRow>();
+    assert_readable::<SchemaVersion>();
 }
 
 // `scoped_key`'s ordering property is pinned by `table.rs`'s own

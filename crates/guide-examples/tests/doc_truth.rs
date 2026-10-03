@@ -56,7 +56,9 @@ use std::path::{Path, PathBuf};
 /// the stalled switchover's `CtrlErr` (2026-10-02); 30 with its tenant-NAME
 /// refusals block (2026-10-03); 31 with `JobScope::open`'s scope-type
 /// refusal (2026-10-03).
-const PINNED_FLOOR: usize = 31;
+/// 33 with tenancy-completion's platform-table read note and borrowed-name read
+/// refusals (2026-10-03).
+const PINNED_FLOOR: usize = 33;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

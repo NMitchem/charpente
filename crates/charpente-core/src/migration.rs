@@ -89,11 +89,12 @@ pub struct SchemaVersion {
 }
 
 // `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
-// code writes one — `Tx::put`/`Tx::delete` refuse it at compile time, since
-// the migration gate trusts these rows for each table's version and a
-// migration's resume point. First-write adoption (`Group::stage`) and the
-// migration executor (`Tx::put_schema_version`) write them (tenancy-completion
-// spec §3).
+// code reads or writes one through a transaction — `View`'s reads on a `Tx`
+// and `Tx::put`/`Tx::delete` refuse it at compile time, since the migration
+// gate trusts these rows for each table's version and a migration's resume
+// point. First-write adoption (`Group::stage`) and the migration executor
+// (`Tx::put_schema_version`) write them, and a `Snapshot` reads them
+// (tenancy-completion spec §3).
 impl Row for SchemaVersion {
     type Scope = crate::table::PlatformOwned;
     const TABLE: &'static str = "charpente.schema_versions";

@@ -50,8 +50,8 @@ use crate::io::{Disk, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
-    Codec, Id, IndexDef, Rejection, Row, RowShape, Snapshot, Store, StoreRejected, UnscopedJob,
-    UnscopedRow, View, WritableRow, Writer,
+    Codec, Id, IndexDef, ReadableBy, Rejection, Row, RowShape, Snapshot, Store, StoreRejected,
+    UnscopedJob, UnscopedRow, View, WritableRow, Writer,
 };
 
 // ---------------------------------------------------------------- config
@@ -335,6 +335,43 @@ impl TableWriteRefusal {
     pub fn of(e: &io::Error) -> Option<&TableWriteRefusal> {
         e.get_ref()
             .and_then(|inner| inner.downcast_ref::<TableWriteRefusal>())
+    }
+}
+
+/// A read the `Schema` disagrees with about its table's `Row` type
+/// (tenancy-completion amendment A18): a `Tx` or `ScopedTx` read, or an
+/// `across_tenants` scan, through a Rust type other than the one
+/// `Schema::table` registered under its `TABLE`, compared by `TypeId`. A read
+/// keys on the table name and the raw scope id, so before this check a
+/// same-named type with another `scoped_by` read the registered scope type's
+/// tenant of the same id, and a `#[table(global)]` one read tenant 0's rows
+/// staged earlier in its own batch (`UNSCOPED` is 0). Returned by the read
+/// itself, before it reads, so no row reaches the caller. Its own type for
+/// `TableWriteRefusal`'s reason: a
+/// job handler's `?` hands it to the dispatcher as `JobError::Io`, and
+/// `kernel/dispatch.rs` classifies it as an attempt, not a platform fault.
+pub struct TableReadRefusal(pub Refusal);
+
+impl fmt::Display for TableReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// `Refusal`'s `Debug`, for the same reason.
+impl fmt::Debug for TableReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for TableReadRefusal {}
+
+impl TableReadRefusal {
+    /// `Some` only for THIS refusal, as `JobShapeRefusal::of`.
+    pub fn of(e: &io::Error) -> Option<&TableReadRefusal> {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<TableReadRefusal>())
     }
 }
 
@@ -1006,6 +1043,41 @@ const fn refuse_platform_table(table: &str) {
     }
 }
 
+/// The read twin of `refuse_platform_table` (tenancy-completion amendment A13):
+/// `Tx`'s four `View` reads evaluate it in a `const` block per read row type.
+/// `View`'s `ReadableBy` bound refuses the platform's own row types; this
+/// refuses any other `Row` whose `TABLE` borrows one of their names, which a
+/// bound on the row type cannot see. Post-monomorphization, like the write
+/// refusal: `cargo build` and `cargo test` report it, and `cargo check` does
+/// not.
+const fn refuse_platform_read(table: &str) {
+    match platform_table(table) {
+        None => {}
+        Some(0) => panic!(
+            "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+             does not read the platform's tables, because the queue holds every tenant's job \
+             payloads and the tenant each one runs in; give this table a name of its own, and \
+             read the queue through `db.snapshot()` from code that holds the `Db`"
+        ),
+        Some(1) => panic!(
+            "this Row's TABLE is \"charpente.events\", the platform's event log — a transaction \
+             does not read the platform's tables, because the log holds every tenant's events; \
+             give this table a name of its own, and read the log through `db.snapshot()` from \
+             code that holds the `Db`, or subscribe to its events"
+        ),
+        Some(2) => panic!(
+            "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+             — a transaction does not read the platform's tables, because the record is the \
+             migration gate's own state; give this table a name of its own, and read the record \
+             through `db.snapshot()` from code that holds the `Db`"
+        ),
+        Some(_) => panic!(
+            "PLATFORM_TABLES names a table refuse_platform_read has no text for — give it an arm \
+             of its own"
+        ),
+    }
+}
+
 /// The transaction handle: reads see this transaction's own buffered
 /// writes first, then the enclosing group's accumulated writes (`group`,
 /// below), then the store snapshot the group began from — a three-level
@@ -1025,6 +1097,9 @@ pub struct Tx<'a> {
     /// transaction opens ONE scope (spec §8). `enter_scope` asserts against
     /// this: it compares the `TypeId` and the id, and prints the other two.
     opened_scope: Option<(TypeId, &'static str, &'static str, u64)>,
+    /// The `Schema` the `Group` stages against: a read checks its
+    /// `Row` type against the one registered for its table (amendment A18).
+    schema: &'a Schema,
 }
 
 impl<'a> Tx<'a> {
@@ -1034,9 +1109,10 @@ impl<'a> Tx<'a> {
     /// writes silently — exactly the bug class `examples/invoicing/DEMO.md`
     /// exists to show app code cannot express. `transact` and
     /// `Group::stage` (below) are the only routes to a live `Tx`.
-    pub(crate) fn over(snapshot: &'a Snapshot) -> Tx<'a> {
+    pub(crate) fn over(snapshot: &'a Snapshot, schema: &'a Schema) -> Tx<'a> {
         Tx {
             snapshot,
+            schema,
             group: None,
             effects: TxEffects::default(),
             opened_scope: None,
@@ -1131,6 +1207,51 @@ impl<'a> Tx<'a> {
             .entry(crate::migration::SchemaVersion::TABLE)
             .or_default()
             .insert((UNSCOPED, row.id.raw()), Some(bytes));
+    }
+
+    /// The dispatcher's read of a job row inside its batch: the row a due
+    /// job's attempt runs, and again in the failure stage, which must see what
+    /// an earlier stage of the same batch settled (dispatch.rs, the
+    /// retry-policy read). `View` refuses `JobRow` on a `Tx` at compile time,
+    /// because the queue holds every tenant's payloads and tenants, and
+    /// `Group` exposes no snapshot, so this is the one door. It reads exactly
+    /// as `View::get` does: this transaction's writes, then the group's, then
+    /// the snapshot.
+    ///
+    /// It takes a `TenantAdmission`, which only a `Group` mints, for
+    /// `settle_job`'s reason: no handler and no job's glue holds one, so no
+    /// app code can call this. Operator code that holds a `Group` can.
+    pub fn get_job(
+        &self,
+        id: Id<JobRow>,
+        admission: &TenantAdmission<'_>,
+    ) -> io::Result<Option<JobRow>> {
+        let TenantAdmission(_) = admission;
+        self.get_any(id)
+    }
+
+    /// `View::get`'s read without `View`'s bounds: this transaction's own
+    /// writes, then the group's, then the snapshot. Private: `View::get`
+    /// (after its refusals) and `Tx::get_job` are its only callers.
+    fn get_any<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        match self
+            .effects
+            .overlay
+            .get(R::TABLE)
+            .and_then(|t| t.get(&(UNSCOPED, id.raw())))
+        {
+            Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
+            Some(None) => Ok(None),
+            None => match self
+                .group
+                .and_then(|g| g.get(R::TABLE))
+                .and_then(|t| t.get(&(UNSCOPED, id.raw())))
+            {
+                Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
+                Some(None) => Ok(None),
+                None => self.snapshot.get_any(id),
+            },
+        }
     }
 
     /// Stages a row on a SCOPED table under `scope` — the primitive
@@ -1436,30 +1557,17 @@ fn index_on<R: Row>(index_name: &str) -> &'static IndexDef<R> {
 }
 
 impl View for Tx<'_> {
-    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
-        match self
-            .effects
-            .overlay
-            .get(R::TABLE)
-            .and_then(|t| t.get(&(UNSCOPED, id.raw())))
-        {
-            Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
-            Some(None) => Ok(None),
-            None => match self
-                .group
-                .and_then(|g| g.get(R::TABLE))
-                .and_then(|t| t.get(&(UNSCOPED, id.raw())))
-            {
-                Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
-                Some(None) => Ok(None),
-                None => self.snapshot.get(id),
-            },
-        }
+    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::get")?;
+        self.get_any(id)
     }
 
-    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {
+    fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::scan")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
-        for row in self.snapshot.scan::<R>()? {
+        for row in self.snapshot.scan_any::<R>()? {
             merged.insert(row.id().raw(), row);
         }
         merge_overlay_rows(
@@ -1472,13 +1580,19 @@ impl View for Tx<'_> {
         Ok(merged.into_values().collect())
     }
 
-    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
+    fn scan_by<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::scan_by")?;
         let index = index_on::<R>(index_name);
         let mut wanted = Vec::new();
         key.encode(&mut wanted);
 
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
-        for row in self.snapshot.scan_by::<R>(index_name, key)? {
+        for row in self.snapshot.scan_by_any::<R>(index_name, key)? {
             merged.insert(row.id().raw(), row);
         }
         merge_overlay_by_index(
@@ -1498,9 +1612,15 @@ impl View for Tx<'_> {
         Ok(merged.into_values().collect())
     }
 
-    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+    fn scan_from<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::scan_from")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
-        for row in self.snapshot.scan::<R>()? {
+        for row in self.snapshot.scan_any::<R>()? {
             if row.id().raw() >= from_id {
                 merged.insert(row.id().raw(), row);
             }
@@ -1537,12 +1657,39 @@ impl View for Tx<'_> {
 /// table the unscoped write path never creates — a wrong answer, not an
 /// error.
 impl Tx<'_> {
+    /// Amendment A18: a read goes through the `Row` type the `Schema`
+    /// registered for its table, compared by `TypeId`, as `Group::stage`
+    /// holds a put or delete to. `Tx`'s own `View` reads call it too: before
+    /// commit they read the batch's overlays, where an unscoped type's key
+    /// `(UNSCOPED, id)` is tenant 0's. Checked before the read, so a refused read
+    /// returns no row. A table the `Schema` does not register is not checked:
+    /// no registered type is there to read as.
+    fn refuse_read_as<R: Row>(&self, read: &str) -> io::Result<()> {
+        let Some(ops) = self.schema.tables.get(R::TABLE) else {
+            return Ok(());
+        };
+        if ops.row_type == TypeId::of::<R>() {
+            return Ok(());
+        }
+        let (table, registered, reader) = (R::TABLE, ops.row_name, std::any::type_name::<R>());
+        Err(io::Error::other(TableReadRefusal(Refusal(format!(
+            "table \"{table}\" is registered as `{registered}`, but this transaction read it \
+             through `{reader}` ({read}) — two Row types declare TABLE = \"{table}\", and a read \
+             keys on the table name and the raw tenant id, so it returns the registered type's \
+             rows, from the registered scope type's tenant of the same id when the two types' \
+             scoped_by differ; the read was refused and returned nothing — read `{registered}` \
+             instead, or give `{reader}` a table name of its own (a #[table] type's table name \
+             is its struct name)"
+        )))))
+    }
+
     fn get_in<S: 'static, R: Row<Scope = S>>(
         &self,
         scope: Id<S>,
         id: Id<R>,
     ) -> io::Result<Option<R>> {
         assert_scoped::<R>("get_in", "View::get");
+        self.refuse_read_as::<R>("ScopedTx::get")?;
         let key = (scope.raw(), id.raw());
         match self.effects.overlay.get(R::TABLE).and_then(|t| t.get(&key)) {
             Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
@@ -1561,6 +1708,7 @@ impl Tx<'_> {
 
     fn scan_in<S: 'static, R: Row<Scope = S>>(&self, scope: Id<S>) -> io::Result<Vec<R>> {
         assert_scoped::<R>("scan_in", "View::scan");
+        self.refuse_read_as::<R>("ScopedTx::scan")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan_scoped::<R>(scope.raw())? {
             merged.insert(row.id().raw(), row);
@@ -1587,6 +1735,7 @@ impl Tx<'_> {
         key: &impl Codec,
     ) -> io::Result<Vec<R>> {
         assert_scoped::<R>("scan_by_in", "View::scan_by");
+        self.refuse_read_as::<R>("ScopedTx::scan_by")?;
         let index = index_on::<R>(index_name);
         let mut wanted = Vec::new();
         key.encode(&mut wanted);
@@ -1622,6 +1771,7 @@ impl Tx<'_> {
         limit: usize,
     ) -> io::Result<Vec<R>> {
         assert_scoped::<R>("scan_from_in", "View::scan_from");
+        self.refuse_read_as::<R>("ScopedTx::scan_from")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan_scoped::<R>(scope.raw())? {
             if row.id().raw() >= from_id {
@@ -2093,6 +2243,7 @@ impl<S: 'static> AllTenants<'_, '_, S> {
     /// overwrite another's in the answer.
     pub fn scan<R: Row<Scope = S>>(&self) -> io::Result<Vec<(Id<S>, R)>> {
         assert_scoped::<R>("across_tenants().scan", "View::scan");
+        self.tx.refuse_read_as::<R>("across_tenants().scan")?;
         let mut merged: BTreeMap<(u64, u64), R> = BTreeMap::new();
         for (scope, id, bytes) in self.tx.snapshot.scan_raw(R::TABLE, true)? {
             merged.insert((scope, id), R::decode_row(&bytes)?);
@@ -4113,7 +4264,7 @@ impl<'a> Group<'a> {
         // `transact`/`Group::stage` as the only two callers); the group
         // level is patched on right after, same-module field access.
         let (out, mut effects) = {
-            let mut tx = Tx::over(&self.snapshot);
+            let mut tx = Tx::over(&self.snapshot, &self.db.engine.machine().schema);
             tx.group = Some(&self.overlay);
             let out = f(&mut tx).map_err(TxError::App)?;
             (out, tx.effects)
@@ -4745,6 +4896,54 @@ mod tests {
                 refusal_text(refuse_platform_table, table),
                 None,
                 "{table:?} is not a platform table's name, so an app may use it"
+            );
+        }
+    }
+
+    /// Amendment A13: a `Row` that borrows a platform table's name is refused
+    /// for a read as for a write, and each table's text names that table and
+    /// the operator's path. Literals spelled apart from the source's.
+    #[test]
+    fn each_platform_table_name_is_refused_for_a_read_by_its_own_text() {
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.jobs").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a \
+                 transaction does not read the platform's tables, because the queue holds \
+                 every tenant's job payloads and the tenant each one runs in; give this table \
+                 a name of its own, and read the queue through `db.snapshot()` from code that \
+                 holds the `Db`"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.events").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.events\", the platform's event log — a \
+                 transaction does not read the platform's tables, because the log holds every \
+                 tenant's events; give this table a name of its own, and read the log through \
+                 `db.snapshot()` from code that holds the `Db`, or subscribe to its events"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.schema_versions").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.schema_versions\", the platform's migration \
+                 record — a transaction does not read the platform's tables, because the \
+                 record is the migration gate's own state; give this table a name of its own, \
+                 and read the record through `db.snapshot()` from code that holds the `Db`"
+            )
+        );
+        for table in [
+            "Invoice",
+            "charpente.jobs2",
+            "charpente.event",
+            "Charpente.Events",
+            "",
+        ] {
+            assert_eq!(
+                refusal_text(refuse_platform_read, table),
+                None,
+                "{table:?} is not a platform table's name, so an app may read it"
             );
         }
     }

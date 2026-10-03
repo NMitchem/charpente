@@ -1,7 +1,8 @@
 // Job rows are the platform's (job-tenancy final review C1): a handler that
 // nulled a scoped job's `scope` left a row the dispatcher would open no
 // tenant for, and at 79ae1c0 one anonymous request stopped the kernel on it,
-// again at every restart. The write is refused, so the row cannot be made.
+// again at every restart. The read and the write are both refused, so the
+// row can be neither found nor made.
 use charpente::auth::Principal;
 use charpente::core::job::JobRow;
 use charpente::http::ApiError;

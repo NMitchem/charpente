@@ -30,9 +30,8 @@ use charpente::kernel::{
     EventSink, JobError, Kernel, Reply, RequestSource, Respond, SimSource, Step, Wake,
 };
 use charpente::wire::WireU64;
-use charpente::{Schema, Tx, event, job, jobs, route, routes, table};
+use charpente::{Schema, Tx, job, jobs, route, routes, table};
 use charpente_core::db::Db;
-use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, File, Instant};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
@@ -2012,127 +2011,6 @@ fn adopted_state_survives_a_commit_failure_correctly_per_arm() {
              happened"
         );
     }
-}
-
-// --------------------------------- Step 5b.2: enqueues/emits invisible mid-batch
-
-#[event(global)]
-struct Tick {
-    n: WireU64,
-}
-
-#[job(global)]
-struct QuietJob {}
-
-impl QuietJob {
-    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
-        Ok(())
-    }
-}
-
-#[route(POST "/enqueue", public)]
-fn enqueue_quiet(tx: &mut Tx) -> Result<(), ApiError> {
-    tx.enqueue(QuietJob {});
-    Ok(())
-}
-
-#[route(GET "/job-count", public)]
-fn job_count(tx: &mut Tx) -> Result<WireU64, ApiError> {
-    Ok(WireU64(tx.scan::<JobRow>()?.len() as u64))
-}
-
-#[route(POST "/emit-tick", public)]
-fn emit_tick(tx: &mut Tx) -> Result<(), ApiError> {
-    tx.emit(Tick { n: WireU64(1) });
-    Ok(())
-}
-
-#[route(GET "/event-count", public)]
-fn event_count(tx: &mut Tx) -> Result<WireU64, ApiError> {
-    Ok(WireU64(tx.scan::<EventRow>()?.len() as u64))
-}
-
-/// T8a Step 5b.2 (task-8-preflight.md C-12): the group overlay carries
-/// ROWS only — enqueues, emits and migrate_puts are not in it — so a
-/// transaction batched behind a sibling's enqueue/emit does not see it,
-/// where pre-batching it would have (each transaction applied before the
-/// next took its snapshot). `JobRow`/`EventRow` materialize at APPLY, from
-/// the log record's enqueue/emit sections, not from anything
-/// `Group::stage` merges into its read overlay.
-///
-/// C-12's correction: the T4-review citation this step originally leaned
-/// on ("every JobRow/EventRow read in production goes through a Snapshot,
-/// never a Tx") is STALE as of T7 — `Dispatcher::run_due_into` reads
-/// `JobRow` through `tx` at `dispatch.rs:179`/`:268`. The conclusion still
-/// holds (those reads touch pre-existing rows; a sibling's fresh enqueue is
-/// not due until `drain_enqueued` runs after the arm, `kernel/mod.rs:602`),
-/// so this property is real and this test — not that stale citation — is
-/// what proves it.
-#[test]
-fn enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch() {
-    let sim = Sim::with_faults(0x60C1_0007, FaultConfig::none());
-    let app = App::open(
-        Box::new(sim.disk()),
-        Schema::new(),
-        Box::new(sim.entropy()),
-        AppConfig::default(),
-    )
-    .unwrap()
-    .mount(routes![enqueue_quiet, job_count, emit_tick, event_count])
-    .mount_jobs(jobs![QuietJob]);
-    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
-    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
-    source.push_at(0, Request::new(Method::Post, "/enqueue"));
-    source.push_at(0, Request::new(Method::Get, "/job-count"));
-    source.push_at(0, Request::new(Method::Post, "/emit-tick"));
-    source.push_at(0, Request::new(Method::Get, "/event-count"));
-    let responses = source.responses();
-
-    let step = kernel.step(&mut source).unwrap();
-    assert!(matches!(step, Step::Worked));
-    assert_eq!(
-        kernel.stats().requests,
-        4,
-        "all four must land in ONE batch — the invisibility this test pins only exists across \
-         a batch; pre-batching, each transaction applied before the next ran"
-    );
-
-    let bodies: Vec<(u16, String)> = responses
-        .lock()
-        .expect("responses lock poisoned by an earlier panic")
-        .iter()
-        .map(|(status, body)| (*status, String::from_utf8_lossy(body).to_string()))
-        .collect();
-    assert_eq!(bodies[0].0, 200, "the enqueue itself: {bodies:?}");
-    assert_eq!(
-        bodies[1],
-        // job_count/event_count now return WireU64 (task 5): a 64-bit
-        // integer is ALWAYS string-encoded on the wire, so the body is the
-        // JSON string `"0"`, not the bare number `0`.
-        (200, "\"0\"".to_string()),
-        "a sibling's enqueue, staged earlier in this same batch, must be INVISIBLE to a later \
-         transaction's tx: {bodies:?}"
-    );
-    assert_eq!(bodies[2].0, 200, "the emit itself: {bodies:?}");
-    assert_eq!(
-        bodies[3],
-        (200, "\"0\"".to_string()),
-        "a sibling's emit, staged earlier in this same batch, must be INVISIBLE the same way: \
-         {bodies:?}"
-    );
-
-    let app = kernel.into_app();
-    let snap = app.db().snapshot().unwrap();
-    assert_eq!(
-        snap.scan::<JobRow>().unwrap().len(),
-        1,
-        "the job DID materialize at apply, once the batch committed"
-    );
-    assert_eq!(
-        snap.scan::<EventRow>().unwrap().len(),
-        1,
-        "the event DID materialize at apply, once the batch committed"
-    );
 }
 
 // ======================================================================

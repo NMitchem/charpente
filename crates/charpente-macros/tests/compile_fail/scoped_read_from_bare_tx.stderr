@@ -24,6 +24,6 @@ help: the trait `NoTenant<R>` is implemented for `Unscoped`
 note: required by a bound in `charpente::View::scan`
   --> $WORKSPACE/crates/charpente-core/src/table.rs
    |
-   |     fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>>;
+   |     fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
    |                ^^^^^^^^^^^ required by this bound in `View::scan`
    = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

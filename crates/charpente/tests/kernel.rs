@@ -478,6 +478,81 @@ mod scoped_jobs {
         assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(7)));
     }
 
+    /// `Filed`'s twin under the same name: the same identifier and field, so
+    /// the same `TABLE`, in a module of its own. The `Schema` registers
+    /// `super::Filed` (amendment A18).
+    mod filed_alias {
+        use super::*;
+
+        #[table(scoped_by = Desk)]
+        pub struct Filed {
+            pub id: Id<Filed>,
+            pub note: u64,
+        }
+    }
+
+    /// Reads its desk's row 1 through `filed_alias::Filed`, and fails on
+    /// nothing else.
+    #[job(scoped_by = Desk, retry(max = 1, backoff = "1s"))]
+    pub struct PeeksFiled {}
+
+    impl PeeksFiled {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+            tx.get::<filed_alias::Filed>(Id::from_raw(1))?;
+            Ok(())
+        }
+    }
+
+    /// Amendment A18 in a job. The read refusal comes back through the
+    /// handler's `?` as `JobError::Io`, the variant a platform fault takes, but
+    /// it is the handler's own deterministic bug: an attempt that dead-letters
+    /// with the refusal as its `last_error`, never a fault that stops the
+    /// dispatcher on every restart.
+    #[test]
+    fn a_scoped_job_reading_through_another_rust_type_dead_letters_by_name() {
+        let sim = Sim::with_faults(0x5A17_0012, FaultConfig::none());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Filed>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![PeeksFiled]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 7, PeeksFiled {});
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let outcome = dispatcher.run_due(db, 1_000).map_err(|e| e.to_string());
+        assert!(
+            matches!(outcome, Ok(JobOutcome::Dead { attempts: 1, .. })),
+            "the refused read is an attempt, dead at its first: {outcome:?}"
+        );
+        let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+        let (registered, reader) = (
+            std::any::type_name::<Filed>(),
+            std::any::type_name::<filed_alias::Filed>(),
+        );
+        assert_eq!(
+            (row.status, row.attempts, row.last_error, db.poisoned()),
+            (
+                JobStatus::Dead,
+                1,
+                Some(format!(
+                    "table \"Filed\" is registered as `{registered}`, but this transaction read \
+                     it through `{reader}` (ScopedTx::get) — two Row types declare TABLE = \
+                     \"Filed\", and a read keys on the table name and the raw tenant id, so it \
+                     returns the registered type's rows, from the registered scope type's \
+                     tenant of the same id when the two types' scoped_by differ; the read was \
+                     refused and returned nothing — read `{registered}` instead, or give \
+                     `{reader}` a table name of its own (a #[table] type's table name is its \
+                     struct name)"
+                )),
+                false,
+            )
+        );
+    }
+
     /// A scoped job's follow-up inherits its tenant, and keeps its key,
     /// through `ScopedTx::enqueue_keyed`; a global job it enqueues through the
     /// deref carries none.
@@ -4531,14 +4606,14 @@ fn a_retried_pending_job_still_refuses_and_a_dead_one_does_not() {
     group
         .stage(|tx| {
             let mut dead = tx
-                .get(Id::<JobRow>::from_raw(0))?
+                .get_job(Id::from_raw(0), &admission)?
                 .expect("the first receipt");
             dead.status = JobStatus::Dead;
             dead.attempts = 5;
             dead.last_error = Some("the mail relay refused it".to_string());
             tx.settle_job(&dead, &admission);
             let mut retried = tx
-                .get(Id::<JobRow>::from_raw(1))?
+                .get_job(Id::from_raw(1), &admission)?
                 .expect("the second receipt");
             retried.attempts = 2;
             retried.due_at = 60 * SEC;
@@ -6043,8 +6118,9 @@ mod job_tenancy {
     ///
     /// `f` is handed the group, not one `Tx`, because a transaction opens ONE
     /// scope (spec §8): each shop's reads are a `stage` of their own. Every
-    /// stage reads the group's one snapshot, so the job rows and every
-    /// shop's rows are a single image, and a stage that writes nothing
+    /// stage reads the group's one snapshot, so every shop's rows are one
+    /// image, the one `jobs_stay_in_their_tenant`'s snapshot of the queue saw
+    /// just before, and a stage that writes nothing
     /// leaves the group as it found it.
     fn admitted_read<T>(
         db: &mut Db,
@@ -6135,11 +6211,17 @@ mod job_tenancy {
     /// its marker names. A stripped request's nonce appears nowhere it
     /// should have been refused.
     fn jobs_stay_in_their_tenant(db: &mut Db) -> Result<Seen, String> {
+        // The job queue is the platform's, and no transaction reads it
+        // (tenancy-completion spec §3), so the oracle reads it the operator's
+        // way, through a snapshot. Taken just before the group begins, it is
+        // the image the group's own snapshot holds: nothing commits in
+        // between, since the oracle holds `db`.
+        let jobs = db
+            .snapshot()
+            .and_then(|snap| snap.scan::<JobRow>())
+            .map_err(|e| e.to_string())?;
         admitted_read(db, |group, admission| {
             let mut seen = Seen::default();
-            let jobs = group
-                .stage(|tx| tx.scan::<JobRow>().map_err(|e| e.to_string()))
-                .map_err(staged)?;
             for row in jobs {
                 let id = row.id.raw();
                 if !matches!(row.name.as_str(), "Fulfil" | "Notify" | "Restock") {

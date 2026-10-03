@@ -421,8 +421,9 @@ Registering the same table type twice is a contract panic ("Schema: table
 `Db::open` registers three tables of its own before yours — the job queue
 `charpente.jobs`, the event log `charpente.events` and the migration record
 `charpente.schema_versions` — so registering any of them yourself hits the same
-panic. They are the platform's: no transaction writes one (§6, "Job rows are the
-platform's").
+panic. They are the platform's: no app code reads or writes one (§6, "Job rows are
+the platform's"; §16, "Where the guarantee stops"), and code that holds the `Db` reads
+them through `db.snapshot()`.
 
 `DbConfig` names the WAL's directory and segment rotation size, and the
 table store's file name:
@@ -517,7 +518,9 @@ writes first, then any writes already staged in the same commit batch —
 `transact` runs a batch of exactly one, so that level is always empty here —
 then the store snapshot the batch began from. `Tx` implements `View` (`get`,
 `scan`, `scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as
-it does on a `Snapshot`. On `Ok`, every buffered write, enqueue, and emit
+it does on a `Snapshot`, for every table of the app's own. The platform's own
+tables are read through a `Snapshot` alone (§16, "Where the guarantee stops").
+On `Ok`, every buffered write, enqueue, and emit
 commits as ONE durable log record — all or nothing — and only then applies
 to the store. On `Err(TxError::App(_))`, nothing happened at all: no log
 position consumed, nothing written. On `Err(TxError::Io(_))` the outcome is
@@ -668,7 +671,14 @@ names the type that wrote and the registered one: write the registered type,
 or give the other one another name. Either refusal comes before anything was
 written, so a retry cannot succeed. The HTTP layer answers
 either with a 500 carrying the refusal's own text, and in a job handler
-either is an attempt, retried and then dead-lettered. The broader
+either is an attempt, retried and then dead-lettered. A read through such a
+type, a `Tx` or `ScopedTx` read or an `across_tenants` scan, is refused too,
+by the read itself, as a `TableReadRefusal`
+(`charpente::core::db::TableReadRefusal::of`). It names the table, the type
+that read and the registered one, offers the same two fixes, and returns no
+row. It reaches your code through the read's `io::Result`, so a route that
+returns it with `?` answers a 500 carrying its text, and in a job handler it
+is an attempt. The broader
 `Refusal::of` is not that predicate: it also matches a refusal apply raises
 after the log sync (a replicated record decoded under a mismatched shape),
 whose record may already be durable.
@@ -1578,12 +1588,13 @@ the note shown in "What `#[job]` rejects". Cron takes `global` jobs only (§7), 
 tick has no tenant. A sweep that must act in every tenant fans out instead (§7).
 
 **Job rows are the platform's.** The tenant a job runs in is the one its row carries, and
-the dispatcher opens it without asking anyone, so no app code writes a job row. A
-transaction reads the queue like any other table (`tx.get::<JobRow>`, `tx.scan::<JobRow>()`,
-as §8's oracles do), but `tx.put` or `tx.delete` of a `JobRow` does not compile. Only the
+the dispatcher opens it without asking anyone, so no app code writes a job row. The
+queue holds every tenant's payloads, so no app code reads one either: `tx.get`, `tx.scan`,
+`tx.put` and `tx.delete` of a `JobRow` do not compile, and §8's oracles read the queue
+through `db.snapshot()` (the read's text is in §16, "Where the guarantee stops"). Only the
 enqueue family creates a job row, and only the dispatcher settles one. There is no
 app-side cancel either: a job runs until it is Done or Dead. The platform's two other
-tables are sealed against writes the same way. The event log (`EventRow`, §11) is what
+tables are sealed the same way, against reads and writes. The event log (`EventRow`, §11) is what
 every subscription's feed is read from, so only an emit writes an event row. The
 migration record (`SchemaVersion`, §12) is what the migration gate trusts for each table's
 version, so only a table's first write and `Db::migrate_schema` write one. rustc prints
@@ -1753,7 +1764,9 @@ the message, and:
 
 On `Err(JobError::Io(e))` — a platform fault the handler's own reads
 surfaced, or one from the transaction machinery itself — none of this
-happens: it is **not an attempt**. The row stays Pending, untouched, and
+happens: it is **not an attempt**, a `TableReadRefusal` excepted: it is
+the handler's own deterministic bug, an attempt (§4). Otherwise the row
+stays Pending, untouched, and
 the error bubbles up (restart-and-recover, same as a request-path `Io`
 failure in §5) instead of silently burning retry budget on a healthy job
 that just hit a bad disk. `JobError::Io`'s own `Display` names this:
@@ -6550,9 +6563,9 @@ enqueued the job — had to hand back. A job's handle is its enqueuer's because 
 app code can write the job row that carries its tenant, and an enqueue inside a tenant of
 another scope type is refused (§6). A scoped read attempted on a bare `Tx` is a compile error, not a 500
 and not a leak. (What that guarantee does *not* cover — an operator holding the
-`Db`, and the platform's own job queue and event log, which any transaction can read
-across every tenant — is "Where the guarantee stops" below, and it is a boundary, not an
-oversight.)
+`Db` — is "Where the guarantee stops" below, and it is a boundary, not an oversight.
+The platform's own job queue and event log, which hold every tenant's rows, are inside
+it: no transaction reads them.)
 
 The shape of an app that uses it:
 
@@ -6852,6 +6865,21 @@ error[E0277]: `NotifySubscribers` is a tenant-scoped job (`#[job(scoped_by = Org
            cron (`App::schedule`) enqueues on a bare `Tx`, so it schedules `global` jobs only
 ```
 
+A read of one of the platform's tables, on a bare `Tx` or through a `ScopedTx`'s deref
+("Where the guarantee stops", below):
+
+```text
+error[E0277]: `JobRow` is one of the platform's tables, and a transaction does not read it
+  --> src/admin.rs:12:26
+   |
+12 |     let jobs = tx.scan::<JobRow>()?;
+   |                   ----   ^^^^^^ `JobRow` is read through `Db::snapshot`, never through a transaction
+   |
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+               db.snapshot()?.scan::<JobRow>()?
+   = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+```
+
 There is no one-line way out of any of them. The marker the message hangs on
 (`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are both
 sealed by a supertrait no other crate can name, so `impl UnscopedRow for
@@ -6865,7 +6893,11 @@ one through the job queue: a scoped job runs in the tenant its row carries, and
 platform's"). So a bare `Tx` cannot move a job into another tenant, forge one
 there, or cancel one there. Nor is there one through the event log: `tx.put` or
 `tx.delete` of an `EventRow` does not compile either (§6), so no handler publishes,
-into a tenant's feed, an event no emit made there.
+into a tenant's feed, an event no emit made there. Nor does any transaction read the job
+queue, the event log or the migration record, so no handler pages through another
+tenant's jobs or events: `ScopeReadableBy`, the marker that read's message hangs on, is
+sealed like `NoTenant`, and `ReadableBy`, the trait `View` bounds on, has one blanket impl
+that an app's own impl conflicts with.
 
 ### Realtime: one mechanism, not two
 
@@ -7060,20 +7092,44 @@ word with no `authorize` on the path (replication seeding, the archive and
 token, for the length of that group's borrow. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
 
-**Nor does it cover the platform's own tables.** The job queue (`JobRow`) and the event
-log (`EventRow`) are unscoped platform tables, and any transaction reads them with
-`tx.get` and `tx.scan` across every tenant: a job's payload and, for a scoped job, the
-tenant id it runs in; an event's payload and its `key`, which for an emit inside a scope
-is that tenant's id. Those reads stay open, because the dispatcher and §8's sim oracles
-are built on them; what is sealed is *writing* one — a job row, an event row or a
-schema-version row (§6). So a route that exposes
-either table — an admin job list, an activity feed built on `scan` rather than a
-`Subscription` — must filter by its own scope before it answers. A raw id is shared across
-scope types, so keep the job rows of jobs declared `scoped_by` the route's own scope type
-(the row's `name` is the job; `describe` lists each job's `scoped_by`) whose `scope` is the
-id of the tenant it opened, and the event rows whose `key` is its `tx.event_key()`, which
-has the subscription key's limit when an app has more than one scope type (§16,
-"Realtime").
+**It covers the platform's own tables too.** The job queue (`JobRow`) holds every tenant's
+job payloads and the tenant each job runs in, the event log (`EventRow`) holds every
+tenant's events, and the migration record (`SchemaVersion`) is the migration gate's own
+state. No transaction reads one, whether a handler's or a job's, on a bare `Tx` or through
+a `ScopedTx`'s deref, and none writes one (§6). rustc prints this for a read of any of the
+three, with your row type in place of `<row>`:
+
+<!-- pinned -->
+```text
+`<row>` is one of the platform's tables, and a transaction does not read it
+`<row>` is read through `Db::snapshot`, never through a transaction
+the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+    db.snapshot()?.scan::<<row>>()?
+a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+```
+
+So an admin job list or an activity feed is a table of the app's own, written in the same
+transaction as the enqueue or the emit and scoped like any other, or, for a live feed, a
+`Subscription` (§11). Operator code reads the platform's tables through `db.snapshot()`, as
+§8's oracles do, since whoever holds the `Db` holds every tenant already. The one
+transaction that reads a job row is the dispatcher's own: `Tx::get_job` takes the
+`TenantAdmission` only a `Group` mints, which no handler or job holds.
+
+The read seal is on the table's name as well as its type, as the write seal is. A
+hand-written `Row` whose `TABLE` is one of the three names fails to build at each `Tx` read
+the binary can reach, reported by `cargo build` and not `cargo check`:
+
+<!-- pinned -->
+```text
+this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+this Row's TABLE is "charpente.events", the platform's event log — a transaction does not read the platform's tables, because the log holds every tenant's events; give this table a name of its own, and read the log through `db.snapshot()` from code that holds the `Db`, or subscribe to its events
+this Row's TABLE is "charpente.schema_versions", the platform's migration record — a transaction does not read the platform's tables, because the record is the migration gate's own state; give this table a name of its own, and read the record through `db.snapshot()` from code that holds the `Db`
+```
+
+**Sessions and API keys are the app's own.** `Session` and `ApiKey` (§5) are ordinary
+`#[table(global)]` tables that `App::open` registers for you, and a handler reads and
+writes them like any other global table. They carry no tenant data, and revoking a key is
+`tx.delete::<ApiKey>(id)`, an ordinary write, by design.
 
 **Code outside a handler never takes a scope on its own word.** A job declares
 `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened or its fan-out

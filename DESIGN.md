@@ -675,16 +675,17 @@ and session rows are all in the overlay. Platform-allocated ids (`next_job_id`,
 at apply in seq order, which is what keeps ids byte-identical on a follower that has no
 overlay at all.
 
-**The overlay carries rows only, and that is the one user-visible semantic group commit
-changed.** Enqueues, emits and migrate-puts are not in it, so a transaction batched *behind*
-a sibling's `enqueue` or `emit` does not see it — where before batching it would have, since
-each transaction applied before the next took its snapshot. `JobRow` and `EventRow`
-materialize at APPLY from the log record's enqueue/emit sections, never from anything
-`Group::stage` merges. Read-your-own-writes across a batch therefore means rows, not queue
-and event effects. Pinned by
-`enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch`
-(`crates/charpente/tests/group_commit.rs`, seed `0x60C1_0007`), which also asserts all four
-requests land in one batch — the property exists only across a batch.
+**The overlay carries rows only.** Enqueues, emits and migrate-puts are not in it, so a
+transaction batched *behind* a sibling's `enqueue` or `emit` does not see it — where before
+batching it would have, since each transaction applied before the next took its snapshot.
+`JobRow` and `EventRow` materialize at APPLY from the log record's enqueue/emit sections,
+never from anything `Group::stage` merges. Read-your-own-writes across a batch therefore
+means rows, not queue and event effects. This was the one semantic group commit changed
+that an app could see, and it no longer can: no transaction reads the platform's tables
+(§3's Jobs bullet). Inside the platform it still holds, and the dispatcher's
+`Tx::get_job` reads through the same overlay. Pinned by
+`an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits`
+(`crates/charpente-core/tests/group_commit.rs`, seed `0x7C00_0901`).
 
 Scope that panic claim to the batch's *state*: the group is safe, but there
 is no `catch_unwind` on the request path, so a panicking **route** handler still unwinds out
@@ -796,7 +797,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   `Tx::enqueue` and cron take `global` jobs only, and a scoped job at either is an
   unsatisfied bound whose text names the fix. Enqueue sites and handler signatures are
   checked against each other (spec 2026-09-27-job-tenancy §5). **Job rows are the
-  platform's to write, and every transaction's to read**, because the dispatcher opens
+  platform's to write and to read**, because the dispatcher opens
   the tenant a row carries without asking anyone: `JobRow`'s `Row::Scope` is the sealed
   `PlatformOwned`, so `Tx::put`/`Tx::delete` of one is an unsatisfied bound naming the
   enqueue family; a hand-written `Row` that borrows the `charpente.jobs` name fails to
@@ -808,7 +809,12 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   named in `PLATFORM_TABLES`, so an app can forge neither an event into a tenant's feed nor a
   table's version past its migration. Apply writes an event row from an emit effect, and the
   migration executor writes schema-version rows through the crate-private
-  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. An enqueue whose
+  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. No transaction reads
+  any of the three either (spec 2026-09-30-tenancy-completion §3): `View`'s reads bound
+  `R: ReadableBy<Self>`, which a platform table meets for a `Snapshot` alone; a
+  hand-written `Row` borrowing one of the names fails to build at each reachable `Tx`
+  read; and the dispatcher's in-batch read of a job row is `Tx::get_job`, which takes
+  the same `TenantAdmission` as `settle_job`. An enqueue whose
   tenant presence disagrees with the mounted declaration (a hand-written `impl Job` or
   `JobDef`) is refused by name, and so is a Pending row that disagrees, before dispatch
   starts (job-tenancy final review C1, M4). So is an enqueue in a tenant of another scope
@@ -1199,9 +1205,14 @@ exists (`TableWriteRefusal`), naming the table, the type that wrote and the regi
 as it refuses an enqueue under a foreign job shape; a job handler's transaction that hits it
 is an attempt, and a request gets a 500 with its text. Apply's refusals stay for records from
 elsewhere: shipped, or written by another binary and replayed under a `Schema` that disagrees.
-The check covers writes, not reads: a scoped read through a same-named type with another
-`scoped_by` still keys on the table name and the raw scope id, so it reads the registered
-scope type's tenant of the same id.
+Reads are held to the same type (spec 2026-09-30-tenancy-completion, amendment A18). A scoped
+read keys on the table name and the raw scope id, so a read through a same-named type with
+another `scoped_by` read the registered scope type's tenant of the same id. A `Tx` read through
+a same-named `#[table(global)]` type read tenant 0's rows staged earlier in its batch, since the
+overlays key an unscoped row as tenant 0. Each `Tx` and `ScopedTx` read and `across_tenants`
+scan now compares its `Row` type with the registered one first and refuses a mismatch by name
+(`TableReadRefusal`), returning no row; in a job handler that is an attempt, as the write
+refusal is.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path.
@@ -2082,7 +2093,7 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   The operator acts inside one tenant with a `TenantAdmission` minted from a `Group`
   (`Tx::admit_scope`), sealed the way `CrossTenant` is. No `authorize` runs, because the
   operator has no principal and already holds the store (DECISIONS §12).
-  **Three limits travel with it, documented rather than engineered around.** The subscription
+  **Two limits travel with it, documented rather than engineered around.** The subscription
   key is the scope's decimal id, so two DIFFERENT scope types sharing a raw id share a key —
   an app with more than one scope type keys its subscriptions per scope type as well. And
   the guarantee's boundary is the typed surface handed to handlers and jobs: whoever holds
@@ -2092,15 +2103,12 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   whoever holds the data directory — an operator, not a request (DECISIONS §12, ratified
   2026-09-05; the `App::mount` notch that would make even the operator path enumerable is
   recorded there as available and unbuilt, under §11's trigger).
-  And the platform's own tables are not scoped: the job queue and the event log are read
-  through `get`/`scan` by any transaction, across every tenant — a job's payload and, for a
-  scoped job, its tenant id; an event's payload and its `key`, which inside a scope is the
-  tenant's id. The dispatcher and the sim oracles are built on those reads, so they stay
-  open; what is sealed is writing one — a job row, an event row or a schema-version row
-  (§3's Jobs bullet). A route that exposes either
-  table must filter by its own scope before it answers — for a job row, by the job (its
-  `name`, whose `scoped_by` names the scope type) as well as its tenant id, since two scope
-  types can share a raw id.
+  The platform's own tables are inside the boundary, not a limit on it: no app code
+  reads or writes the job queue, the event log or the migration record (§3's Jobs bullet),
+  so no handler or job reaches another tenant's jobs or events through them, and the
+  operator and the sim oracles read them through `Db::snapshot`. `Session` and `ApiKey`
+  stay app-owned `#[table(global)]` tables (spec 2026-09-30-tenancy-completion §2): they
+  carry no tenant data, and revocation is `tx.delete::<ApiKey>(id)` by design.
   Out of scope and staying out: nested scopes, cross-tenant writes in one transaction,
   platform-derived tenancy, and forced retrofitting of existing tables. API-key
   scopes/permissions are subject-only in v1 — this feature answers *which tenant*, never
