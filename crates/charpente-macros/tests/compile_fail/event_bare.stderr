@@ -1,0 +1,7 @@
+error: `NoteAdded` declares no tenancy — an event says which, and neither is the default: add `global` or `scoped_by = <Tenant>` to this attribute's arguments, keeping its others. `scoped_by = <Tenant>` if it belongs to one tenant (it is emitted from inside that tenant's scope, and only that tenant's feed receives it); `global` if it belongs to no tenant (it is emitted on a bare `Tx`, and only a global `Subscription::of` feed receives it).
+ --> tests/compile_fail/event_bare.rs:8:1
+  |
+8 | #[event]
+  | ^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `event` (in Nightly builds, run with -Z macro-backtrace for more info)

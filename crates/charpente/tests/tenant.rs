@@ -29,8 +29,8 @@ use charpente::http::{
 use charpente::kernel::JobError;
 use charpente::wire::WireU64;
 use charpente::{
-    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Subscribe, Tenant,
-    TenantAdmission, Tx, TxError, event, job, jobs, route, routes, table,
+    CrossTenant, Db, DbConfig, Event, Schema, Scoped, ScopedTx, Snapshot, Subscribe, Tenant,
+    TenantAdmission, Tx, TxError, event, events, job, jobs, route, routes, table,
 };
 use charpente_core::db::TableReadRefusal;
 use charpente_core::io::Entropy;
@@ -183,7 +183,10 @@ fn count_memos(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError
     Ok(WireU64(tx.scan::<Memo>()?.len() as u64))
 }
 
-#[event(global)]
+/// Scoped by `Org`: the three feeds below build it on `Org`'s `ScopedTx`, so
+/// each carries the one org its scope line admitted (tenancy-completion spec
+/// §6).
+#[event(scoped_by = Org)]
 struct MemoNoted {
     n: WireU64,
 }
@@ -2459,4 +2462,178 @@ fn a_jobdef_whose_scope_type_disagrees_with_its_type_name_is_refused_naming_the_
             std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
         )
     );
+}
+
+// ----------------------------------------- event tenancy (spec §4, §6)
+
+/// Three events with one `NAME` ("noted") and one field list: a global one,
+/// one scoped by `Org`, one scoped by `Team`. Only their declarations
+/// differ, so only their fingerprints can tell their rows apart.
+mod noted_global {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(global)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+mod noted_org {
+    use super::Org;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    /// `pub(super)`, not `pub`: the root `Org` is private, and an `impl
+    /// Event`'s `type Scope` may not name a type less visible than the event
+    /// (E0446).
+    #[event(scoped_by = Org)]
+    pub(super) struct Noted {
+        pub n: WireU64,
+    }
+}
+
+mod noted_team {
+    use super::Team;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    /// `pub(super)` for `noted_org::Noted`'s reason.
+    #[event(scoped_by = Team)]
+    pub(super) struct Noted {
+        pub n: WireU64,
+    }
+}
+
+/// Scoped by Task 2's `billing::Org`, whose `NAME` ("BillingOrg") is not its
+/// identifier. Every other tenant type here follows A4 (`NAME` equals the
+/// identifier), so this is the one case that tells "mixes the tenant's
+/// `NAME`" from "mixes the scope type's final `::` component", which is
+/// `Org` here.
+mod noted_billing {
+    use super::billing::Org;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(scoped_by = Org)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+/// Tenancy-completion spec §4, §6: a scoped event's fingerprint is its
+/// fields' fold continued by `scoped_fingerprint` with its tenant's `NAME`.
+/// A `global` event and its `scoped_by` twin never share a shape. Nor do two
+/// same-named events scoped by two tenant types whose raw ids may coincide,
+/// which is what closes DESIGN §8's shared-raw-id limit for events. The
+/// literals are FNV-1a over `"n\0WireU64\0"`, then continued over
+/// `"#scoped_by\0Org\0"` and `"#scoped_by\0Team\0"`. They were computed
+/// independently of the macro. The `scoped_fingerprint` lines pin the
+/// operands, the fold and the `NAME`, and not only that the values differ.
+/// The `billing` lines pin that the operand is the `NAME`, not a spelling
+/// of the path, in the fingerprint and in the def that `describe` and the
+/// tenant census read.
+#[test]
+fn a_scoped_events_fingerprint_mixes_its_tenants_name() {
+    use charpente::describe::EventEntry;
+
+    let global = <noted_global::Noted as Event>::FINGERPRINT;
+    let org = <noted_org::Noted as Event>::FINGERPRINT;
+    let team = <noted_team::Noted as Event>::FINGERPRINT;
+    let billing = <noted_billing::Noted as Event>::FINGERPRINT;
+    assert_eq!(
+        global, 0x9caf_3f93_9b10_65e1,
+        "a global event's is the bare fold"
+    );
+    assert_eq!(org, 0xeb60_a110_53ba_40dc);
+    assert_eq!(team, 0x4874_6e82_94a2_6e7d);
+    assert_eq!(
+        org,
+        charpente::core::db::scoped_fingerprint(global, <Org as Tenant>::NAME),
+        "the fold continued by the tenant's NAME, and nothing else"
+    );
+    assert_eq!(
+        billing,
+        charpente::core::db::scoped_fingerprint(global, "BillingOrg"),
+        "billing::Org's NAME, never the `Org` its path is spelled with"
+    );
+    assert_ne!(billing, org, "billing::Org and Org are two tenants");
+    assert_eq!(
+        <noted_billing::Noted as EventEntry>::def().scoped_by,
+        Some("BillingOrg"),
+        "the def names the tenant by NAME too"
+    );
+    assert_eq!(
+        (
+            <noted_global::Noted as Event>::NAME,
+            <noted_org::Noted as Event>::NAME,
+            <noted_team::Noted as Event>::NAME,
+            <noted_billing::Noted as Event>::NAME
+        ),
+        ("noted", "noted", "noted", "noted"),
+        "one NAME: only the fingerprint tells the four apart"
+    );
+}
+
+/// An `Org` of another module, under the root `Org`'s `NAME`. This is what an
+/// app gets when two modules each declare a tenant type and both follow the
+/// identifier convention. Named through an event beside the root `Org`, it
+/// must be refused at mount like the table, route and job cases Task 3 pins.
+/// (Not `billing`: Task 2's `billing::Org` in this file is named
+/// "BillingOrg" on purpose, and a second module of that name would clash.)
+mod accounts {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::wire::WireU64;
+    use charpente::{Id, Tenant, Tx, event, table};
+
+    #[table(global)]
+    pub struct Org {
+        pub id: Id<Org>,
+        pub name: String,
+    }
+
+    impl Tenant for Org {
+        const NAME: &'static str = "Org";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    #[event(scoped_by = Org)]
+    pub struct InvoiceNoted {
+        pub n: WireU64,
+    }
+}
+
+/// Tenancy-completion spec §4: an event's scope joins the mount-time tenant
+/// census. `memo_app` already names the root `Org` (`Memo`'s scope, and its
+/// `public(Org)` routes). `accounts::InvoiceNoted` names `accounts::Org` under
+/// the same `NAME`. The two types would share every scoped fingerprint's
+/// tenant half, so the app is refused at this call, before it serves, by
+/// name, with both full type names. The literal is Task 3's pinned text,
+/// spelled out here.
+#[test]
+#[should_panic(
+    expected = "two tenant types are named \"Org\": tenant::Org and tenant::accounts::Org — a \
+                tenant's NAME is its identity (it is inside every scoped job's and event's \
+                fingerprint), so give each type its own `const NAME` in its `impl Tenant`"
+)]
+fn an_event_scoped_by_a_second_type_under_one_name_is_refused_at_mount() {
+    let (_sim, app) = memo_app(0x7E4A_E7E1);
+    let _ = app.mount_events(events![accounts::InvoiceNoted]);
+}
+
+/// The control: one tenant type, named through a table (`Memo`), the
+/// `public(Org)` routes and a scoped event (`MemoNoted`), is one tenant and
+/// mounts. Without it, a census that refused every scoped event would pass
+/// the test above.
+#[test]
+fn an_event_scoped_by_the_apps_own_tenant_type_mounts() {
+    let (_sim, app) = memo_app(0x7E4A_E7E2);
+    let app = app.mount_events(events![MemoNoted]);
+    let events: Vec<&str> = app.describe().events.iter().map(|e| e.name).collect();
+    assert_eq!(events, vec!["memo_noted"]);
 }

@@ -427,6 +427,7 @@ mod sealed {
     pub trait NotATenant: Owned {}
     pub trait NotScoped {}
     pub trait NotScopedJob {}
+    pub trait NotScopedEvent {}
     pub trait AppOwned {}
     pub trait Writable {}
     /// `ScopeReadableBy`'s seal: the scope types the read seal is about.
@@ -580,6 +581,52 @@ impl<J: crate::db::Job> sealed::NotScopedJob for J where J::Scope: NoJobTenant<J
 pub trait UnscopedJob: crate::db::Job + sealed::NotScopedJob {}
 
 impl<J: crate::db::Job> UnscopedJob for J where J::Scope: NoJobTenant<J> {}
+
+/// The event twin of `NoJobTenant` (tenancy-completion spec §6). `Unscoped`
+/// implements it for every event type, and no other scope type implements
+/// it at all. It carries the refusal for a `#[event(scoped_by = …)]` event
+/// used where no tenant is named: `Tx::emit`/`Tx::emit_keyed` on a bare `Tx`,
+/// or a global `Subscription::of`/`and`. It hangs on the SCOPE type for
+/// `NoTenant`'s reason: an associated-type mismatch cannot carry a custom
+/// diagnostic. `{Ev}` puts the event's name in the text, as `{J}` puts the
+/// job's.
+///
+/// SEALED by `NotATenant`, the same seal, and `UnscopedEvent` below by its
+/// own. Either one alone would leave the other as a one-line, orphan-legal
+/// opt-out (`impl NoEventTenant<Noted> for Org {}`, or
+/// `impl UnscopedEvent for Noted {}`).
+#[diagnostic::on_unimplemented(
+    message = "`{Ev}` is a tenant-scoped event (`#[event(scoped_by = {Self})]`), and a bare `Tx` \
+               or a global `Subscription` names no tenant",
+    label = "`{Ev}` is scoped by `{Self}`",
+    note = "emit it and subscribe to it inside the tenant it belongs to:\n    \
+            let mut tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
+            tx.emit(event); // recorded in this tenant\n\
+            and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):\n    \
+            Ok(tx.subscription::<{Ev}>().cursor(cursor).into())\n\
+            a job that emits it takes `scoped_by = {Self}` in place of `global` among its \
+            `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its \
+            `run` receives"
+)]
+pub trait NoEventTenant<Ev>: sealed::NotATenant {}
+
+impl<Ev> NoEventTenant<Ev> for Unscoped {}
+
+/// `UnscopedEvent`'s seal, derived from `Event::Scope` by the same condition
+/// `UnscopedEvent` uses, so the seal admits exactly the events the bound
+/// admits.
+impl<Ev: crate::db::Event> sealed::NotScopedEvent for Ev where Ev::Scope: NoEventTenant<Ev> {}
+
+/// An event with no tenant: exactly the `Event`s whose `Scope` is
+/// `Unscoped`, derived from `Event::Scope` as `UnscopedJob` is from
+/// `Job::Scope`. It bounds `Tx::emit`, `Tx::emit_keyed`, `Subscription::of`
+/// and `Subscription::and`. So a scoped event at any of them is an
+/// unsatisfied bound whose text names the fix. It never becomes an event
+/// recorded in no tenant, or a global feed that names a tenant's event.
+/// Sealed for `UnscopedRow`'s reason.
+pub trait UnscopedEvent: crate::db::Event + sealed::NotScopedEvent {}
+
+impl<Ev: crate::db::Event> UnscopedEvent for Ev where Ev::Scope: NoEventTenant<Ev> {}
 
 /// Which readers `V` may read a row of scope `Self` through `View`: the read
 /// half of the seal `PlatformOwned` describes (tenancy-completion spec §3).

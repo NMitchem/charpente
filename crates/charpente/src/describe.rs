@@ -9,6 +9,7 @@
 //! event-name order, routes/jobs/cron in registration order — no `HashMap`
 //! anywhere in this path.
 
+use std::any::TypeId;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -141,13 +142,27 @@ pub struct EventInfo {
 /// none: `Subscription::of::<Ev>()` captures its encoder statically at the
 /// subscribe site, so "unregistered event at delivery" is inexpressible
 /// rather than an error case (realtime spec §3). DESCRIBE has this one, and
-/// it is read by `App::describe` and by nothing else — no type under
-/// `kernel/` or in `charpente-core` may name it, which is what keeps the
-/// delivery property mechanically true instead of merely intended.
+/// it is read by `App::describe`, and by `App::mount_events`' tenant census
+/// at mount, and by nothing else — no type under `kernel/` or in
+/// `charpente-core` may name it, which is what keeps the delivery property
+/// mechanically true instead of merely intended.
 pub struct EventDef {
     pub name: &'static str,
     pub payload: &'static str,
     pub register_types: fn(&mut TypeRegistry),
+    /// `#[event(scoped_by = Org)]`: the tenant this event belongs to, by its
+    /// scope type's `Tenant::NAME`; `None` for a `global` event
+    /// (tenancy-completion spec §6, §8). `describe` lists it, and
+    /// `App::mount_events` puts it into the app's tenant census.
+    pub scoped_by: Option<&'static str>,
+    /// `TypeId::of::<<Ev as Event>::Scope>()`. The census refuses two tenant
+    /// types under one `NAME` by comparing these (spec §4).
+    pub scope_type: TypeId,
+    /// `std::any::type_name` of the same type, for the census's refusal texts
+    /// only: it words a refusal and never decides one, which `scope_type`
+    /// does. Never persisted: the compiler's printer is not an identity
+    /// (spec §1).
+    pub scope_type_name: &'static str,
 }
 
 /// Implemented by the marker impl `#[event]` emits, so `events![a, b]`

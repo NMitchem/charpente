@@ -1,0 +1,18 @@
+error[E0271]: type mismatch resolving `<RotaChanged as Event>::Scope == Org`
+  --> tests/compile_fail/scoped_tx_emits_another_scopes_event.rs:45:13
+   |
+45 |     tx.emit(RotaChanged {});
+   |        ---- ^^^^^^^^^^^^^^ type mismatch resolving `<RotaChanged as Event>::Scope == Org`
+   |        |
+   |        required by a bound introduced by this call
+   |
+note: expected this to be `Org`
+  --> tests/compile_fail/scoped_tx_emits_another_scopes_event.rs:39:21
+   |
+39 | #[event(scoped_by = Team)]
+   |                     ^^^^
+note: required by a bound in `ScopedTx::<'_, 'a, S>::emit`
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev) {
+   |                           ^^^^^^^^^ required by this bound in `ScopedTx::<'_, 'a, S>::emit`

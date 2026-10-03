@@ -824,6 +824,9 @@ fn mounting_an_event_whose_payload_names_no_type_panics() {
                 name: "anonymous",
                 payload: "",
                 register_types: |_| {},
+                scoped_by: None,
+                scope_type: std::any::TypeId::of::<charpente::core::table::Unscoped>(),
+                scope_type_name: std::any::type_name::<charpente::core::table::Unscoped>(),
             }
         }
     }

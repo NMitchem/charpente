@@ -79,6 +79,8 @@ impl Codec for InvoiceFinalized {
 impl Event for InvoiceFinalized {
     const NAME: &'static str = "invoice_finalized";
     const FINGERPRINT: u64 = 0x7E57_0002;
+    // A global event: it belongs to no tenant.
+    type Scope = Unscoped;
 }
 
 fn invoice(id: u64, org: u64, amount_cents: i64) -> Invoice {

@@ -173,8 +173,9 @@ the oracle, and the oracle is the product.
   sharing an id space *and* an index key, 256 universes at a pinned base plus 768 over
   three fresh ones — with two naive victims that fail it by name, a tenant-feed realtime
   sibling, and a two-tenant wire oracle over real TCP in the edge harness.
-  **Two limits travel with it.** An event row records its tenant's raw id, so two
-  different scope types sharing a raw id share a tenant in the event log. And the guarantee's boundary is the
+  The event log's shared-raw-id limit is closed by the tenancy-completion plan's Task 11:
+  an event declares its tenant type, and a scoped event's fingerprint mixes that type's
+  `Tenant::NAME`. **One limit travels with it:** the guarantee's boundary is the
   typed surface handed to handlers and jobs: a `Db` holder reaches every tenant and can
   mint the cross-tenant capability, with the standing of whoever holds the data directory —
   an operator, not a request (DECISIONS §12, ratified 2026-09-05).

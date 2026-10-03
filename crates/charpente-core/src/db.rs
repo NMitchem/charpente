@@ -55,7 +55,7 @@ use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
     Codec, Id, IndexDef, ReadableBy, Rejection, Row, RowShape, Snapshot, Store, StoreRejected,
-    UnscopedJob, UnscopedRow, View, WritableRow, Writer,
+    UnscopedEvent, UnscopedJob, UnscopedRow, View, WritableRow, Writer,
 };
 
 // ---------------------------------------------------------------- config
@@ -125,13 +125,23 @@ pub trait Job: Codec {
 /// A realtime event (DESIGN.md §6). Emits materialize into `charpente.events`
 /// at apply, the same way enqueues materialize `JobRow` — subscribers read
 /// through the ranged scan (`View::scan_from`), not the log directly.
-/// v0: implemented by hand; `#[event]` will derive it.
+/// `#[event(global)]` and `#[event(scoped_by = Org)]` derive it; a hand-written
+/// impl states all three items below.
 pub trait Event: Codec {
     const NAME: &'static str;
     /// The payload's structural fingerprint, as for `Job::FINGERPRINT`:
     /// recorded beside every emit. Delivery decodes a stored event only
-    /// under the shape it was written with (payload-shapes spec §3).
+    /// under the shape it was written with (payload-shapes spec §3). For a
+    /// `#[event(scoped_by = Org)]` event it also covers the tenant's
+    /// `Tenant::NAME` (`scoped_fingerprint`), so a change of tenancy is a
+    /// change of shape.
     const FINGERPRINT: u64;
+    /// The tenant scope type a `#[event(scoped_by = Org)]` event belongs to,
+    /// or `Unscoped` for a `#[event(global)]` one (tenancy-completion spec
+    /// §6). No default, for `Job::Scope`'s reason: a hand-written impl states
+    /// it, or it would slip past the emit and subscribe bounds unseen.
+    /// `'static` because `push_emit` compares it by `TypeId`.
+    type Scope: 'static;
 }
 
 /// Why a transaction did not return `Ok`: the application's own rejection,
@@ -1417,21 +1427,6 @@ impl<'a> Tx<'a> {
         });
     }
 
-    /// The one body `Tx::emit`, `Tx::emit_keyed` and `ScopedTx`'s two emits
-    /// share. `scope` is the emitting `ScopedTx`'s tenant, `None` on a bare
-    /// `Tx`; it is recorded beside `key`, never in it.
-    fn push_emit<Ev: Event>(&mut self, scope: Option<u64>, key: Option<String>, event: Ev) {
-        let mut payload = Vec::new();
-        event.encode(&mut payload);
-        self.effects.emits.push(Emit {
-            event: Ev::NAME,
-            payload,
-            key,
-            shape: Ev::FINGERPRINT,
-            scope,
-        });
-    }
-
     /// Enqueues a `global` job into this transaction's record. A
     /// `#[job(scoped_by = Org)]` job does not compile here: it names a
     /// tenant, and a bare `Tx` names none (`NoJobTenant`'s note says where to
@@ -1469,15 +1464,46 @@ impl<'a> Tx<'a> {
         self.push_enqueue(Some((scope.raw(), S::NAME)), None, job);
     }
 
-    pub fn emit<Ev: Event>(&mut self, event: Ev) {
+    /// The one body of the emit family (tenancy-completion spec §6). `scope`
+    /// is the tenant a scoped event belongs to, and `None` for a `global`
+    /// one. The public methods' bounds decide which, and this asserts that
+    /// they agree with the event's own declaration. A scoped event is never
+    /// recorded without its tenant, where every global feed would receive it,
+    /// and a global one never with one (hard rule 4) — `push_enqueue`'s
+    /// assert, for the other effect that carries a tenant.
+    fn push_emit<Ev: Event>(&mut self, scope: Option<u64>, key: Option<String>, event: Ev) {
+        assert_eq!(
+            scope.is_some(),
+            TypeId::of::<Ev::Scope>() != TypeId::of::<crate::table::Unscoped>(),
+            "contract: event \"{}\" was emitted with tenant {scope:?}, but a scoped event \
+             carries its tenant and a global one none — the emit family's bounds guarantee \
+             this, so reaching here is a platform bug",
+            Ev::NAME
+        );
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.effects.emits.push(Emit {
+            event: Ev::NAME,
+            payload,
+            key,
+            shape: Ev::FINGERPRINT,
+            scope,
+        });
+    }
+
+    /// Emits a `global` event into this transaction's record (tag `0x09`). A
+    /// `#[event(scoped_by = Org)]` event does not compile here: it belongs to
+    /// a tenant, and a bare `Tx` names none (`NoEventTenant`'s note says
+    /// where to emit it instead).
+    pub fn emit<Ev: UnscopedEvent>(&mut self, event: Ev) {
         self.push_emit(None, None, event);
     }
 
-    /// Emits with an opaque app key (a user's subject, a room) — the
-    /// exact-match filter `Subscription::key` matches against. Mirrors
-    /// `enqueue_keyed`. A tenant is not a key: an event of a tenant is
-    /// emitted on the `ScopedTx`, which records the tenant beside the key.
-    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
+    /// `emit`, with an app key: an exact-match narrowing filter that
+    /// `Subscription::key` selects on (a per-user feed, say). Never a tenant.
+    /// A tenant is an event's declared scope, recorded apart from any key
+    /// (tenancy-completion spec §2.3).
+    pub fn emit_keyed<Ev: UnscopedEvent>(&mut self, key: impl Into<String>, event: Ev) {
         self.push_emit(None, Some(key.into()), event);
     }
 }
@@ -2100,28 +2126,21 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         self.tx.delete_in(self.scope, id)
     }
 
-    /// `Tx::emit`, recorded in this tenant: the row carries the tenant's id
-    /// in a field of its own (tag `0x0b`), with no key, so only a feed of
-    /// this tenant receives it (tenancy-completion spec §6). A transaction
-    /// that had to be admitted to reach a tenant's rows cannot hand that
-    /// tenant's event to a subscription outside it, and no string names the
-    /// tenant.
-    ///
-    /// This shadows the `Tx::emit` the `DerefMut` would otherwise reach. An
-    /// emit that genuinely belongs to no tenant is written `(*tx).emit(…)` in
-    /// a handler that owns its `ScopedTx`, and `(**tx).emit(…)` in a scoped
-    /// job's `run`, which holds `&mut ScopedTx` — the explicit deref an
-    /// unscoped table access takes. It is recorded with no tenant.
-    pub fn emit<Ev: Event>(&mut self, event: Ev) {
+    /// Emits an event scoped by this tenant's type, recorded with this tenant
+    /// (tag `0x0b`), so only this tenant's feed receives it
+    /// (tenancy-completion spec §6). This shadows `Tx::emit` the way
+    /// `enqueue` shadows `Tx::enqueue`. A `global` event emitted inside a
+    /// scope is written `(*tx).emit(event)` in a handler that owns its
+    /// `ScopedTx`, and `(**tx).emit(event)` in a scoped job's `run`, which
+    /// holds `&mut ScopedTx`.
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev) {
         let scope = self.scope.raw();
         self.tx.push_emit(Some(scope), None, event);
     }
 
-    /// `emit`, with the app's own key beside the tenant: a tenant feed
-    /// narrowed by `.key(…)` receives it. The key is the app's filter, never
-    /// the tenant. This shadows `Tx::emit_keyed`, as `emit` shadows
-    /// `Tx::emit`.
-    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
+    /// `emit`, with `Tx::emit_keyed`'s app key. The tenant is still this
+    /// scope, recorded beside the key, never in it.
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev) {
         let scope = self.scope.raw();
         self.tx.push_emit(Some(scope), Some(key.into()), event);
     }

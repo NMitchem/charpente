@@ -347,9 +347,10 @@ pub struct App {
     oidc: Option<Arc<OidcVerifier>>,
     /// Every tenant type this app names, by `NAME`: its `TypeId`, and its
     /// `type_name` for the refusal's text. Filled by `App::open` from the
-    /// schema's scoped tables, by `mount` from `public(S)` routes, and by
-    /// `mount_jobs` from scoped jobs, through `note_tenant`, which refuses a
-    /// second type under a seen `NAME` (tenancy-completion spec §4).
+    /// schema's scoped tables, by `mount` from `public(S)` routes, by
+    /// `mount_jobs` from scoped jobs, and by `mount_events` from scoped
+    /// events, through `note_tenant`, which refuses a second type under a
+    /// seen `NAME` (tenancy-completion spec §4).
     tenants: BTreeMap<&'static str, (TypeId, &'static str)>,
 }
 
@@ -404,8 +405,8 @@ impl App {
     /// Records one tenant type this app names, and refuses a second type
     /// under a `NAME` already seen, or an empty `NAME`, by name, before the
     /// app serves (tenancy-completion spec §4). A tenant's `NAME` is its
-    /// identity: it is mixed into every scoped job's fingerprint, so two types
-    /// under one `NAME` are one tenant to every shape check. This is the one
+    /// identity: it is mixed into every scoped job's and event's fingerprint,
+    /// so two types under one `NAME` are one tenant to every shape check. This is the one
     /// place the texts live. `App::open`, `mount` and `mount_jobs` call it,
     /// and `mount_events` does for scoped events. The same `type_name` under
     /// one `NAME` with two `TypeId`s is not two tenant types but a hand-built
@@ -489,10 +490,16 @@ impl App {
     /// Registers `#[event]` descriptors for `describe` (mount-time
     /// duplicate-name panic — each event type is mounted once, like jobs).
     ///
-    /// This registry is describe-only, and mounting is therefore optional:
-    /// an unregistered `#[event]` still emits and still delivers, it just
-    /// does not appear in `Contract.events` (nor its payload in
-    /// `Contract.types`), so a generated client cannot see it.
+    /// A scoped event's tenant type joins the app's tenant census here, as a
+    /// scoped table's does at `App::open` and a scoped job's at `mount_jobs`
+    /// (tenancy-completion spec §4). Two types under one `Tenant::NAME`, or
+    /// an empty `NAME`, are refused at this call, before the app serves.
+    ///
+    /// Delivery never reads this registry, and mounting is therefore
+    /// optional: an unregistered `#[event]` still emits and still delivers,
+    /// it just does not appear in `Contract.events` (nor its payload in
+    /// `Contract.types`), so a generated client cannot see it, and its
+    /// tenant type is not in the census.
     pub fn mount_events(mut self, defs: Vec<EventDef>) -> App {
         for def in defs {
             assert!(
@@ -513,6 +520,9 @@ impl App {
                  and pass its WIRE_NAME",
                 def.name
             );
+            if let Some(scope_name) = def.scoped_by {
+                self.note_tenant(scope_name, def.scope_type, def.scope_type_name);
+            }
             self.event_defs.push(def);
         }
         self

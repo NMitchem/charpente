@@ -35,7 +35,7 @@ struct Incident {
     title: String,
 }
 
-#[event(global)]
+#[event(scoped_by = Org)]
 struct IncidentOpened {
     n: WireU64,
 }

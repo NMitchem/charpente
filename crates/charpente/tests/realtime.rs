@@ -11,8 +11,7 @@ use std::time::Duration;
 use charpente::auth::Principal;
 use charpente::event;
 use charpente::http::{
-    ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Route, RouteDef,
-    RouteGlue, Subscription,
+    ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Subscription,
 };
 use charpente::kernel::{
     ERROR_FRAME, EventFrame, EventSink, JobError, Kernel, RESHAPED_FRAME, RecordedResponses,
@@ -30,7 +29,7 @@ use charpente_core::db::{Db, Event};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Row, View};
+use charpente_core::table::{Codec, Row, Unscoped, View};
 use charpente_sim::checks::{
     FaultReason, boot_through_fallout, classify, durable_corruption_fired, durable_refusal,
     is_fault_fallout,
@@ -1269,6 +1268,8 @@ impl Codec for Quoted {
 impl Event for Quoted {
     const NAME: &'static str = "say \"hi\"";
     const FINGERPRINT: u64 = 0x7E57_0A11;
+    // A global event: it belongs to no tenant.
+    type Scope = Unscoped;
 }
 
 #[route(SSE "/quoted", public)]
@@ -3029,7 +3030,8 @@ fn the_harness_refuses_a_diverged_409_without_durable_corruption() {
 ///
 /// Found the honest way — by an existing test going red — but by
 /// `tail_encode_error_is_whole_node_fatal` (since renamed
-/// `an_unencodable_event_fails_its_tail_not_the_node`), whose name promises
+/// `an_unencodable_event_fails_its_tail_not_the_node`, now in
+/// `kernel/tail.rs`'s unit tests), whose name promises
 /// nothing about batch ordering, so the property gets its own pin here
 /// rather than living on as a side effect of that one.
 #[test]
@@ -3127,121 +3129,12 @@ fn a_delivered_frame_carries_its_64_bit_field_as_a_decimal_string() {
     );
 }
 
-/// Spec §3/§6.5: an encode failure fails its own tail, never the node — this
-/// test was `tail_encode_error_is_whole_node_fatal`, the pin of the decision
-/// payload shapes reversed (docs/LEDGER.md:286's per-tail follow-up). The
-/// failing encoder is hand-built (`FailingFeed`), which covers an encoder
-/// that fails regardless of the payload's type — no shape check, no field
-/// ever read. `a_real_events_serialize_failure_fails_its_tail_not_the_node`
-/// (below) covers the other case, a real `#[event]` whose own field
-/// `Serialize` impl fails on its own bytes. The stream ends with
-/// `charpente.error`, and the node keeps serving.
-struct FailingFeed;
-
-fn failing_feed_glue(
-    _tx: &mut Tx,
-    _ctx: &Ctx,
-    _captures: &[String],
-    cursor: Option<Cursor>,
-) -> Result<Subscription, ApiError> {
-    let mut sub = Subscription::of::<NoteAdded>().cursor(cursor);
-    sub.entries[0].encode_json =
-        |_: &[u8]| -> io::Result<String> { Err(io::Error::other("encode exploded")) };
-    Ok(sub)
-}
-
-impl RouteDef for FailingFeed {
-    fn route() -> Route {
-        // Untyped glue, not a described route: a hand-written `RouteDef`
-        // with no typed handler (Amendment D, task-5-brief.md).
-        Route {
-            method: Method::Get,
-            pattern: "/feed-failing",
-            auth: false,
-            public_scope: None,
-            cross_tenant: false,
-            name: "FailingFeed",
-            glue: RouteGlue::Sse(failing_feed_glue),
-            params: &[],
-            request: None,
-            response: || TypeSchema::Null,
-            error: || <ApiError as Wire>::reference(),
-            register_types: |_| {},
-            emits: &[],
-        }
-    }
-}
-
-#[event(global)]
-struct NoteAdded {
-    n: WireU64,
-}
-
-#[derive(WireDerive, Serialize, Deserialize)]
-struct NoteBody {
-    n: WireU64,
-}
-
-#[route(POST "/note", public)]
-fn emit_note(tx: &mut Tx, body: NoteBody) -> Result<(), ApiError> {
-    tx.emit(NoteAdded { n: body.n });
-    Ok(())
-}
-
-#[test]
-fn an_unencodable_event_fails_its_tail_not_the_node() {
-    let sim = Sim::with_faults(0x2EB2_FA11, FaultConfig::none());
-    let app = App::open(
-        Box::new(sim.disk()),
-        Schema::new(),
-        Box::new(sim.entropy()),
-        AppConfig::default(),
-    )
-    .unwrap()
-    .mount(vec![FailingFeed::route()])
-    .mount(routes![emit_note]);
-    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
-    let (_, sinks) = run_script(
-        &mut kernel,
-        &sim,
-        vec![
-            Request::new(Method::Get, "/feed-failing"),
-            Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(1) }),
-        ],
-    );
-    let rows: Vec<EventRow> = kernel
-        .app()
-        .db()
-        .snapshot()
-        .unwrap()
-        .scan_from(0, 8)
-        .unwrap();
-    assert_eq!(
-        frames_of(&sinks.lock().unwrap()[0]),
-        vec![(
-            rows[0].id.raw(),
-            rows[0].seq,
-            "charpente.error".to_string(),
-            format!(
-                r#"{{"event":"note_added","id":{},"error":"encode exploded"}}"#,
-                rows[0].id.raw()
-            ),
-        )],
-        "one terminal error frame naming the event and the row"
-    );
-    let (responses, _) = run_script(
-        &mut kernel,
-        &sim,
-        vec![Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(2) })],
-    );
-    assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
-}
-
 /// A field type whose `Serialize` always fails: `#[event]`
 /// only requires `Codec`/`Wire`/`Serialize` on its fields (charpente-macros
 /// event.rs), and `Wire` is an open `pub trait`, so a hand-written field type
 /// can make `Subscription::of`'s REAL encoder fail on its own bytes — not
-/// `FailingFeed`'s hand-built stub. `Codec`/`Wire` are modeled on `WireU64`:
+/// the hand-built stub `kernel/tail.rs`'s unit test uses. `Codec`/`Wire` are
+/// modeled on `WireU64`:
 /// a fixed-shape carrier with nothing to decide, so only `Serialize` is
 /// interesting here.
 #[derive(Clone, Copy)]
@@ -3287,9 +3180,11 @@ fn feed_poisoned(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subsc
     Ok(Subscription::of::<PoisonedEvent>().cursor(cursor))
 }
 
-/// The same `charpente.error` frame `an_unencodable_event_…` pins, but
+/// The same `charpente.error` frame `kernel/tail.rs`'s
+/// `an_unencodable_event_fails_its_tail_not_the_node` pins, but
 /// reached through a REAL `#[event]`/`Subscription::of` encoder (`ev_json`,
-/// http/mod.rs) rather than `FailingFeed`'s hand-built stub — this is what
+/// http/mod.rs) rather than the hand-built stub in `kernel/tail.rs`'s unit
+/// test — this is what
 /// pins the JSON-encode failure text GUIDE §11 quotes
 /// (`event <name> failed JSON encoding: <message> — every #[event] payload
 /// must be plainly JSON (GUIDE §11); fix the emitting code`), spelled out
@@ -5364,12 +5259,38 @@ impl Tenant for Org {
 
 /// The tenant section's own event: every emit inside a scope in this file is
 /// an `OrgPing`, and `Ping` stays the flagship's global event. It has
-/// `Ping`'s shape and its own type, so that its tenancy can be declared on it
-/// (tenancy-completion Task 11) without touching the flagship.
-#[event(global)]
+/// `Ping`'s shape and its own type, so that its tenancy is declared on it
+/// without touching the flagship.
+///
+/// Scoped by `Org` (tenancy-completion spec §6): emitted only on an org's
+/// `ScopedTx`, and received only by that org's feed. Its fields and `NAME`
+/// are Task 10's, so every record is Task 10's length. Only the 8-byte shape
+/// moves, because `scoped_fingerprint` mixes in `Org`'s `NAME`.
+#[event(scoped_by = Org)]
 struct OrgPing {
     n: WireU64,
 }
+
+/// `OrgPing`'s global twin (tenancy-completion spec §6). `OrgPing` is scoped
+/// by `Org`, so it can no longer be emitted on a bare `Tx` or named in a
+/// global feed. The tests that pin "a global row and a tenant's row of one
+/// name never cross" need one of each. After typing, the only way an app
+/// gets that pair is two types with one identifier in two modules, which is
+/// this. It keeps the identifier, so its `NAME` is `"org_ping"`. Its fields
+/// are `OrgPing`'s, so its fingerprint is the bare fold Task 10's global
+/// `OrgPing` had, and every record these sites write keeps Task 10's bytes.
+/// Imported under an alias because `emits(...)` takes an identifier, not a
+/// path.
+mod global_twin {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(global)]
+    pub struct OrgPing {
+        pub n: WireU64,
+    }
+}
+use global_twin::OrgPing as GlobalOrgPing;
 
 #[derive(WireDerive, Serialize, Deserialize)]
 struct ScopedEmitBody {
@@ -5406,7 +5327,7 @@ fn scoped_feed(
 /// id — the tenant-id key a scoped emit used to attach. A key is an app filter
 /// and never a tenant, so this feed receives no event recorded in a tenant,
 /// whatever it is keyed with (tenancy-completion spec §2.3).
-#[route(SSE "/literal-feed/:key", public, emits(OrgPing))]
+#[route(SSE "/literal-feed/:key", public, emits(GlobalOrgPing))]
 fn literal_feed(
     tx: &mut Tx,
     key: String,
@@ -5414,7 +5335,7 @@ fn literal_feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
-    Ok(Subscription::of::<OrgPing>().key(key).cursor(cursor))
+    Ok(Subscription::of::<GlobalOrgPing>().key(key).cursor(cursor))
 }
 
 /// The explicit deref inside a scope: a global event, recorded with no
@@ -5423,7 +5344,7 @@ fn literal_feed(
 #[route(POST "/global-ping-in-scope", public(Org))]
 fn emit_global_ping_in_scope(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
     let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
-    (*tx).emit(OrgPing { n: body.n });
+    (*tx).emit(GlobalOrgPing { n: body.n });
     Ok(())
 }
 
@@ -5445,7 +5366,7 @@ struct NotifyOrg {
 impl NotifyOrg {
     fn run(self, tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
         tx.emit(OrgPing { n: WireU64(self.n) });
-        (**tx).emit(OrgPing {
+        (**tx).emit(GlobalOrgPing {
             n: WireU64(self.n + 1),
         });
         Ok(())
@@ -5454,10 +5375,10 @@ impl NotifyOrg {
 
 /// A global subscription with no key: every global `org_ping`, and no event
 /// recorded in a tenant, tenant 0 included — `None` is not `Some(0)`.
-#[route(SSE "/global-feed", public, emits(OrgPing))]
+#[route(SSE "/global-feed", public, emits(GlobalOrgPing))]
 fn global_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
-    Ok(Subscription::of::<OrgPing>().cursor(cursor))
+    Ok(Subscription::of::<GlobalOrgPing>().cursor(cursor))
 }
 
 /// A tenant feed widened after `.into()` — the shape `Subscription::and`
@@ -6772,6 +6693,151 @@ fn the_scoped_oracle_catches_an_emit_recorded_in_the_wrong_tenant() {
     assert!(
         err.contains(&format!("ScopedTx<Org>({SCOPED_TENANT_B})")),
         "the failure must name the emitting scope: {err}"
+    );
+}
+
+// ======================= two tenant types, one raw id (spec §6)
+
+/// A second tenant type. Its raw ids coincide with `Org`'s, since both are
+/// plain `u64`s an app picks, which is the case DESIGN §8 named as a limit
+/// before events declared their tenant.
+#[table(global)]
+struct Team {
+    id: Id<Team>,
+    name: String,
+}
+
+impl Tenant for Team {
+    const NAME: &'static str = "Team";
+    type Who = Principal;
+    type Error = ApiError;
+
+    /// Always allows: the routes below are `public(Team)`, and this property
+    /// is about delivery, not membership.
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+/// `Team`'s event under `OrgPing`'s identifier: the same `NAME`
+/// (`"org_ping"`) and the same field fold. Only the tenant `NAME` its
+/// fingerprint carries tells its rows from `OrgPing`'s.
+mod team_scoped {
+    use super::Team;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    /// `pub(super)`, not `pub`: `Team` is private, and an `impl Event`'s
+    /// `type Scope` may not name a type less visible than the event (E0446).
+    #[event(scoped_by = Team)]
+    pub(super) struct OrgPing {
+        pub n: WireU64,
+    }
+}
+
+#[derive(WireDerive, Serialize, Deserialize)]
+struct SharedRawBody {
+    tenant: WireU64,
+    n: WireU64,
+}
+
+#[route(POST "/shared-raw/org-ping", public(Org))]
+fn shared_raw_org_ping(tx: &mut Tx, body: SharedRawBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.tenant.0), ctx)?;
+    tx.emit(OrgPing { n: body.n });
+    Ok(())
+}
+
+#[route(POST "/shared-raw/team-ping", public(Team))]
+fn shared_raw_team_ping(tx: &mut Tx, body: SharedRawBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Team>(Id::from_raw(body.tenant.0), ctx)?;
+    tx.emit(team_scoped::OrgPing { n: body.n });
+    Ok(())
+}
+
+#[route(SSE "/shared-raw/org-feed/:org", public(Org), emits(OrgPing))]
+fn shared_raw_org_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<OrgPing>().cursor(cursor).into())
+}
+
+/// Tenancy-completion spec §6: "Two scope types sharing a raw id no longer
+/// collide: the event's fingerprint mixes its tenant's NAME, so a row emitted
+/// under the other type is a foreign shape." Here, `Team` 1's row matches
+/// `Org` 1's feed on name and on raw scope. The feed gets `Org`'s own ping,
+/// and then, at `Team`'s row, the `charpente.reshaped` end that
+/// payload-shapes spec §3 gives any foreign shape: `Team`'s payload is never
+/// decoded into `Org`'s feed. The end itself is the residual cost, and
+/// `mount_events`' refusal of two events with one name rules it out for an
+/// app that mounts every event it emits. With the two fingerprints equal (a
+/// scoped event hashing only its fields), this feed delivered `Team`'s
+/// `{"n":"7"}` as `Org`'s.
+#[test]
+fn a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered() {
+    let sim = Sim::with_faults(0x2EB1_1B0B, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![
+        shared_raw_org_ping,
+        shared_raw_team_ping,
+        shared_raw_org_feed
+    ]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/shared-raw/org-feed/1"),
+            Request::new(Method::Post, "/shared-raw/org-ping").json(&SharedRawBody {
+                tenant: WireU64(1),
+                n: WireU64(9),
+            }),
+            Request::new(Method::Post, "/shared-raw/team-ping").json(&SharedRawBody {
+                tenant: WireU64(1),
+                n: WireU64(7),
+            }),
+        ],
+    );
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 8)
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.scope))
+            .collect::<Vec<_>>(),
+        vec![("org_ping", Some(1)), ("org_ping", Some(1))],
+        "the colliding case: one NAME, one raw tenant id, two tenant types"
+    );
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![
+            (
+                rows[0].id.raw(),
+                rows[0].seq,
+                "org_ping".to_string(),
+                r#"{"n":"9"}"#.to_string()
+            ),
+            reshaped_frame(&rows[1]),
+        ],
+        "Org 1's own ping, then the foreign-shape end at Team 1's row; never Team's payload"
+    );
+    assert_ne!(
+        rows[0].shape, rows[1].shape,
+        "only the tenant NAME inside each fingerprint tells the two rows apart"
     );
 }
 

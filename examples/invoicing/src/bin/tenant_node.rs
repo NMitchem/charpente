@@ -103,7 +103,10 @@ mod legacy {
     }
 }
 
-#[event(global)]
+/// Scoped by `Org`: `create_doc` emits it on its org's `ScopedTx`, and only
+/// that org's `feed` receives it (tenancy-completion spec §6). The wire
+/// oracle (`edge-harness`'s `tenant_wire`) checks exactly that over TCP.
+#[event(scoped_by = Org)]
 struct DocCreated {
     doc: Id<Doc>,
     /// The tenant-unique marker the wire oracle keys on. Both tenants use the

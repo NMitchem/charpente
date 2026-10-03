@@ -49,6 +49,8 @@ impl Codec for TestEvent {
 impl Event for TestEvent {
     const NAME: &'static str = "test_event";
     const FINGERPRINT: u64 = 0x7E57_000A;
+    // A global event: it belongs to no tenant.
+    type Scope = Unscoped;
 }
 
 /// The tenant the scoped-emit test opens; it admits everyone.
@@ -63,8 +65,10 @@ impl Tenant for TestOrg {
 }
 
 /// The event emitted inside `TestOrg`'s scope: its own type beside
-/// `TestEvent`, so the plan's Task 11 can declare its scope without touching
-/// the test's body.
+/// `TestEvent`, scoped by `TestOrg` (tenancy-completion spec §6), so
+/// `ScopedTx::emit` takes it and a bare `Tx` does not. Its hand-written
+/// `FINGERPRINT` is a literal, as a hand-written `Row`'s shape is: only
+/// `#[event]` computes a scoped fingerprint.
 struct OrgEvent {
     n: u32,
 }
@@ -81,6 +85,7 @@ impl Codec for OrgEvent {
 impl Event for OrgEvent {
     const NAME: &'static str = "org_event";
     const FINGERPRINT: u64 = 0x7E57_000B;
+    type Scope = TestOrg;
 }
 
 #[test]

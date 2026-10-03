@@ -1283,6 +1283,8 @@ mod tests {
     impl Event for Ping {
         const NAME: &'static str = "ping";
         const FINGERPRINT: u64 = 0x7E57_0007;
+        // A global event: it belongs to no tenant.
+        type Scope = Unscoped;
     }
 
     fn emit_ping_glue(

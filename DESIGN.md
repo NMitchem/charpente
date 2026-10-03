@@ -841,15 +841,24 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   tenant by declaration. Nothing refuses either, so the operator drains such a job (runs
   the binary that enqueued its Pending rows until they are Done or Dead) before a deploy
   that mounts a scoped job the running binary does not (final review N1, NB2).
-- **Events.** `#[event(global)]` structs; `tx.emit(...)` is typed; subscribers (server-side and
-  client-side codegen) consume typed streams off the log. An event payload is itself a
-  wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
-  — and `events![…]`/`App::mount_events` register the type for `describe` only.
-  Delivery deliberately has NO registry: `Subscription::of::<Ev>()` captures its encoder
-  statically at the subscribe site, which is what makes "unregistered event at delivery"
-  inexpressible rather than an error case. An event emitted on a `ScopedTx` is recorded in
-  that tenant (§4's `0x0b`), and a tenant feed — `tx.subscription::<Ev>()` on the same
-  handle — delivers only events recorded in its tenant (§6, §8).
+- **Events.** `#[event(global)]` or `#[event(scoped_by = Org)]` structs. Neither tenancy is
+  the default, and a bare `#[event]` is a compile error naming both. `tx.emit(...)` is typed,
+  and subscribers (server-side and client-side codegen) consume typed streams off the log.
+  A global event is emitted on a bare `Tx` (`Tx::emit`/`emit_keyed` take global events
+  only) and tailed by `Subscription::of`. A scoped event is emitted only on its tenant's
+  `ScopedTx`, which records the tenant beside it (§4's `0x0b`, §6). It is tailed only by
+  that tenant's feed, `tx.subscription::<Ev>()` on the same handle. Every mismatch is an
+  unsatisfied bound. A scoped event on a bare `Tx` or in a global `Subscription` names the
+  fix (`NoEventTenant`, sealed with `UnscopedEvent`). A global or other-tenant event on a
+  `ScopedTx` or a tenant feed is E0271. A scoped event's fingerprint continues its fields'
+  fold with its tenant's `Tenant::NAME`, so a change of tenancy is a change of shape (spec
+  2026-09-30-tenancy-completion §4, §6). An event payload is itself a wire type (it is
+  exactly the JSON a subscriber receives), so `#[event]` derives `Wire`.
+  `events![…]`/`App::mount_events` register the type for `describe`, and its scope for the
+  mount-time tenant census. Delivery deliberately has NO registry: `Subscription::of::<Ev>()`
+  and `tx.subscription::<Ev>()` capture their encoders statically at the subscribe site,
+  which is what makes "unregistered event at delivery" inexpressible rather than an error
+  case.
 - **Wire.** `Wire` is the trait describing what a type looks like once serde has
   encoded it — the mechanism behind the client-side codegen named above and behind
   `Id<T>`'s promise to never be a bare u64. `#[derive(Wire)]` implements it for a
@@ -1692,9 +1701,12 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   event's own field (record tag `0x0b`, §4), apart from the key, so tenancy has one
   mechanism rather than two that can disagree. A tenant feed is built from the same scope
   (`tx.subscription::<Ev>()`, below), and one predicate, `Subscription::admits` — a name
-  the subscription carries, exactly its tenancy, a key it passes — decides delivery and
-  gates resume validation alike: a tenant's feed never receives another tenant's event or
-  a global one, and a global subscription never receives a tenant's. Apply materializes
+  the subscription carries, exactly its tenancy, a key it passes — decides delivery: a
+  tenant's feed never receives another tenant's event or a global one, and a global
+  subscription never receives a tenant's. Resume validation asks the same predicate
+  before it refuses a reshaped cursor, and checks tenancy on its own first: a cursor on a
+  row whose recorded tenant is not the subscription's is refused whatever the row's name
+  and key (amendment A16), because no feed of this tenancy delivered it. Apply materializes
   each into the built-in `charpente.events` table
   (`EventRow { id, seq, name, key, payload, shape, scope }`); `id` comes from a
   `next_event_id` meta-counter bumped in call order — the `next_job_id` pattern exactly, so
@@ -2113,10 +2125,13 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   The operator acts inside one tenant with a `TenantAdmission` minted from a `Group`
   (`Tx::admit_scope`), sealed the way `CrossTenant` is. No `authorize` runs, because the
   operator has no principal and already holds the store (DECISIONS §12).
-  **Two limits travel with it, documented rather than engineered around.** An event row
-  records its tenant's raw id, so two DIFFERENT scope types sharing a raw id share a tenant
-  in the event log — an app with more than one scope type gives each scope type's feeds
-  event types of their own. And
+  The event log's shared-raw-id limit is closed by declaration (spec
+  2026-09-30-tenancy-completion §6). An event names its tenant type, the emit and subscribe
+  bounds check it, and a scoped event's fingerprint mixes the type's `Tenant::NAME`. So a
+  raw id two tenant types share never carries one's events into the other's feed. A
+  same-named event of the other type is a foreign shape there: it ends that tail
+  (payload-shapes spec §3) and is never decoded.
+  **One limit travels with it, documented rather than engineered around:**
   the guarantee's boundary is the typed surface handed to handlers and jobs: whoever holds
   the `Db` reaches every tenant through `Db::snapshot`'s scoped and raw reads, which take a
   scope on the caller's word because replication seeding and the archive are built on them,
