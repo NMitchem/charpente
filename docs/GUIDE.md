@@ -1759,15 +1759,16 @@ opening, a completed switchover), and `promote` checks before it changes anythin
 
 <!-- pinned -->
 ```text
-<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore <job>'s old fields and its `global`/`scoped_by` declaration and give the new shape its own #[job] type under a new name (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore whichever of <job>'s fields, its `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give the new shape its own #[job] type under a new name (GUIDE §6)
 ```
 
-A job's tenancy is part of its shape. `scoped_by` is fingerprinted with the fields, as
-it is spelled, so moving a job between `global` and `scoped_by`, or respelling its
-`scoped_by` path, is refused the same way. A deploy therefore never hands a row enqueued
-with no tenant to a scoped `run`, or one enqueued in a tenant to a global one. A path that
-keeps its spelling but comes to name another type is not a shape change, and nothing
-refuses it: see below, after the scope-type refusal, for what to do before such a deploy.
+A job's tenancy is part of its shape. A `scoped_by` job's fingerprint continues its
+fields' fold over its tenant type's `NAME` (§16), so moving a job between `global` and
+`scoped_by`, or to a tenant type with another `NAME`, is refused the same way. A deploy
+therefore never hands a row enqueued with no tenant to a scoped `run`, one enqueued in a
+tenant to a global one, or one enqueued in a tenant of one `NAME` to a job of another.
+Respelling the `scoped_by` path is not a shape change while it names a type of the same
+`NAME`: see below, after the scope-type refusal, for what that leaves unchecked.
 
 At most five ids are listed, then `…`. A job enqueued before shapes were recorded reads
 `recorded none — enqueued before job shapes were tagged`, and it is refused the same way:
@@ -1821,11 +1822,13 @@ job "<job>" was enqueued with <presence>, but this binary mounts <job> as <decla
 
 Presence is not the whole of a tenant. A row records the tenant's id and not the scope type
 it is an id of, and the dispatcher opens that id as the type the mounted job declares. The
-fingerprint cannot tell two scope types apart either: it hashes the `scoped_by` path as it
-is spelled, so a `#[job(scoped_by = Desk)]` in a module that says `use super::Board as
-Desk;` fingerprints exactly like the real `Desk` one, and a hand-written `impl Job` can copy
-both constants under any `type Scope`. Enqueued inside a `Board` tenant, either would run
-the mounted job in the `Desk` with the same id, a tenant nothing opened or named for it. So an
+fingerprint tells two scope types apart only by their `NAME`s. A `#[job(scoped_by = Desk)]`
+in a module that says `use super::Board as Desk;` fingerprints with `Board`'s `NAME`, so it
+is refused as another shape. But a `#[job]` whose `scoped_by` names another tenant type
+with the same `NAME` fingerprints alike, and a hand-written `impl Job` can copy both
+constants under any `type Scope`. Enqueued inside a tenant of that other type, either would
+run the mounted job in the same id of the type it declares, a tenant nothing opened or
+named for it. So an
 enqueue whose job's scope type is not the one the mounted job declares refuses its
 transaction the same way. `<scope>` is the enqueuing job's tenant type's `NAME` and `<declared>` the
 mounted one's (§16); `<id>` is the tenant id. The two NAMEs can be equal. A hand-built `JobDef` that
@@ -1834,26 +1837,28 @@ the text says "with another scope type" and lists that cause:
 
 <!-- pinned -->
 ```text
-job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` with another scope type under the same shape (<shape>) — a job row records its tenant's id and not its type, so tenant <id> would be read as the mounted declaration's type, not the one it was enqueued in; either a type standing in for <job>'s #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose `scoped_by` spells another scope type the same way), or a hand-written `JobDef` mounts <job> under a `scope_type` its #[job] does not declare; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
+job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` with another scope type under the same shape (<shape>) — a job row records its tenant's id and not its type, so tenant <id> would be read as the mounted declaration's type, not the one it was enqueued in; either a type standing in for <job>'s #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose `scoped_by` names another tenant type with the same `NAME`), or a hand-written `JobDef` mounts <job> under a `scope_type` its #[job] does not declare; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
 ```
 
-This one has no startup twin, because a row carries no type to compare. The check runs
-where both types are known, at the enqueue, in a binary that mounts the job. So a Pending
-row enqueued by any other binary is dispatched, by the next binary that mounts the name, in
-the scope type that binary declares, and nothing checks the type. That covers two cases:
+This one has no startup twin, because a row carries no type to compare, only the `NAME`
+its fingerprint mixes. The check runs where both types are known, at the enqueue, in a
+binary that mounts the job. At startup the dispatching binary compares a Pending row's
+shape, so a row whose job named a tenant type of another `NAME` is refused there by the
+foreign-shape refusal above. That covers the refactor that turns a job module's `use
+billing::Org;` into `use crm::Org;`, whenever the two types' NAMEs differ. What a later
+binary that mounts the name dispatches unchecked, in the scope type it declares, is a row
+whose shape matches:
 
-- a row enqueued by a binary that did not mount the job name at all;
-- a row enqueued by a binary that mounted it under a `scoped_by` path spelled the same way
-  but naming another type. This one needs no stand-in, only a refactor: a job module whose
-  `use billing::Org;` becomes `use crm::Org;` keeps the path `Org` and so keeps the
-  fingerprint, and a job enqueued in `billing::Org` 25 before the deploy runs in `crm::Org`
-  25 after it.
+- a row a hand-written `impl Job` enqueued from a binary that did not mount the job name,
+  copying the job's `NAME` and `FINGERPRINT` under another `type Scope`;
+- a row enqueued under a tenant type with the same `NAME` as the mounted one. A `NAME` is
+  the tenant's identity, so this is the same tenant by declaration: giving a type another
+  type's `NAME` declares it that tenant.
 
 Where the recorded shape matches the mounted one, neither is refused, at startup or at
 dispatch. So before a deploy that mounts a scoped job the running binary does not mount,
-or that makes a scoped job's `scoped_by` path name another type, drain that job: run the
-binary that enqueued its Pending rows until every one is Done or Dead, the first way
-through a shape change below.
+drain that job: run the binary that enqueued its Pending rows until every one is Done or
+Dead, the first way through a shape change below.
 
 There are two ways through a shape change:
 
@@ -4875,9 +4880,10 @@ its type, not the type's definition.
 The tokens are hashed as written, rendered by charpente itself with one space between
 tokens: `Vec<u8>` and `std::vec::Vec<u8>` are different shapes to it, so respelling a
 field's type is a shape change, and a compiler upgrade never is.
-A job's `scoped_by` path is fingerprinted the same way, as written, so moving a job
-between `global` and `scoped_by`, or respelling its path, is a shape change, and a path
-that keeps its spelling but comes to name another type is not (§6).
+A `scoped_by` job's fingerprint also carries its tenant type's `NAME` (§16), not its path:
+moving a job between `global` and `scoped_by`, or to a tenant type with another `NAME`, is
+a shape change, and respelling the path, to the same type or to another with the same
+`NAME`, is not (§6).
 A change inside a type a field holds — a new variant on an enum, a field added to a
 nested struct — leaves the fingerprint unchanged, for tables and for
 `#[event]`/`#[job]` payloads alike (§6, §11). Such a
@@ -6603,7 +6609,7 @@ fn memos_by_author(
 Four things that fall out of that, worth stating plainly:
 
 - **`scoped_by` without an `impl Tenant` does not compile**, at the struct.
-- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs. A generic tenant impl gives every instantiation one NAME.
+- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). A scoped job's fingerprint mixes it (§6), so moving a job to a tenant type of another `NAME` is a shape change, and renaming a `NAME` is one for every scoped job of that type. The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs. A generic tenant impl gives every instantiation one NAME.
 - **The scope type is never inspected.** `authorize` is the only hook, and the
   one thing the platform reads off a scope is its decimal form, as a
   subscription key (below). Nothing parses a key back into a tenant.

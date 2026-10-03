@@ -98,8 +98,10 @@ impl Default for DbConfig {
 pub trait Job: Codec {
     const NAME: &'static str;
     /// The payload's structural fingerprint — `#[job]` computes it from the
-    /// fields (the helper `#[table]` uses). Recorded beside every enqueue. A
-    /// Pending job is decoded only by a binary whose `FINGERPRINT` matches:
+    /// fields (the helper `#[table]` uses). A `#[job(scoped_by = Org)]` job's
+    /// continues that fold over `Org`'s `Tenant::NAME` (`scoped_fingerprint`),
+    /// so its tenant's identity is part of its shape. Recorded beside every
+    /// enqueue. A Pending job is decoded only by a binary whose `FINGERPRINT` matches:
     /// a Pending job of a foreign shape is refused before dispatch can start
     /// (`Db::pending_job_shape_refusal`), an enqueue under another shape of a
     /// mounted name refuses its transaction (`Group::stage`), and dispatch
@@ -1615,6 +1617,28 @@ pub trait Tenant: Sized + 'static {
     /// declared instead: `Tx::admit_scope`, whose `TenantAdmission` only a
     /// `Group` mints.
     fn authorize(tx: &Tx<'_>, who: &Self::Who, scope: Id<Self>) -> Result<(), Self::Error>;
+}
+
+/// A scoped job's fingerprint (tenancy-completion spec §4): the payload's field
+/// fold `fold`, which is `#[job]`'s fingerprint for a `global` job (FNV-1a over
+/// `name\0<type tokens>\0` per field), continued over `#scoped_by\0`, the tenant
+/// type's `NAME` and `\0`. FNV-1a is streaming, so this is one hash over the
+/// concatenated bytes. A tenant type whose `NAME` is the `scoped_by` path's one
+/// identifier therefore fingerprints exactly as the path's rendering did (plan
+/// amendment A4). A `const fn`, so `#[job]` can emit `FINGERPRINT` as a constant
+/// over `Tenant::NAME`, which macro expansion cannot read. No identifier begins
+/// with `#`, so no field list can produce the suffix.
+pub const fn scoped_fingerprint(fold: u64, tenant: &str) -> u64 {
+    const fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+        let mut i = 0;
+        while i < bytes.len() {
+            hash ^= bytes[i] as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            i += 1;
+        }
+        hash
+    }
+    mix(mix(mix(fold, b"#scoped_by\0"), tenant.as_bytes()), b"\0")
 }
 
 impl<'a> Tx<'a> {
@@ -3398,9 +3422,9 @@ impl Db {
                     "{} Pending \"{name}\" job(s) (ids {}) were enqueued under a different shape \
                      of {name} (recorded {}; this binary {:#x}) — this binary will not decode \
                      them; run the binary that enqueued them until they are Done or Dead, then \
-                     deploy this one, or restore {name}'s old fields and its \
-                     `global`/`scoped_by` declaration and give the new shape its own #[job] type \
-                     under a new name (GUIDE §6)",
+                     deploy this one, or restore whichever of {name}'s fields, its \
+                     `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and \
+                     give the new shape its own #[job] type under a new name (GUIDE §6)",
                     ids.len(),
                     listed(&ids),
                     recorded.join(", "),
@@ -4099,8 +4123,8 @@ impl<'a> Group<'a> {
         // dispatcher opens that id as the type the mounted job declares, so
         // a stand-in enqueued in another scope type's tenant (an `impl Job`
         // copying `NAME` and `FINGERPRINT`, or a `#[job]` whose `scoped_by`
-        // path spells another type alike, which the fingerprint cannot tell
-        // apart) would run in the same id of the declared type, not in the
+        // names another tenant type with the same `NAME`, which the
+        // fingerprint cannot tell apart) would run in the same id of the declared type, not in the
         // tenant it was enqueued in. This is the only place both types are
         // known (job-tenancy final review N1). A hand-built `JobDef` whose
         // `scope_type` is not its `#[job]`'s trips the same check on the honest
@@ -4163,8 +4187,9 @@ impl<'a> Group<'a> {
                          its type, so tenant {} would be read as the mounted declaration's type, \
                          not the one it was enqueued in; either a type standing in for {name}'s \
                          #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose \
-                         `scoped_by` spells another scope type the same way), or a hand-written \
-                         `JobDef` mounts {name} under a `scope_type` its #[job] does not declare; \
+                         `scoped_by` names another tenant type with the same `NAME`), or a \
+                         hand-written `JobDef` mounts {name} under a `scope_type` its #[job] does \
+                         not declare; \
                          the transaction was refused and nothing was written, so a retry cannot \
                          succeed — enqueue the mounted {name} from a `{declared}` scope, give the \
                          other type its own name, or mount {name} as its #[job] declares it \
@@ -4507,6 +4532,32 @@ impl Seeder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan amendment A4, proved before `#[job]` calls `scoped_fingerprint`.
+    /// Continuing a field fold over `#scoped_by\0` + NAME + `\0` reproduces
+    /// the one-pass hash the macro computes today over the path's rendering,
+    /// wherever NAME is that one identifier. The literals are today's:
+    /// `0xaac8_d6b2_01d1_f744` is `kernel.rs`'s `scoped_jobs::File`
+    /// (`{ n: u64 }`, `scoped_by = Desk`), which that suite pins through the
+    /// macro, and `0xdeec_7a41_f1a3_46af` is a `{ n: u64 }` job
+    /// `scoped_by = Org` (job-tenancy final re-review, P1's `Report`).
+    #[test]
+    fn a_scoped_fingerprint_continues_the_field_fold_through_the_tenant_name() {
+        let fold = crate::migration::fnv1a_hash(b"n\0u64\0");
+        assert_eq!(fold, 0x2515_f249_2b16_f628);
+        assert_eq!(scoped_fingerprint(fold, "Desk"), 0xaac8_d6b2_01d1_f744);
+        assert_eq!(scoped_fingerprint(fold, "Org"), 0xdeec_7a41_f1a3_46af);
+        assert_eq!(
+            scoped_fingerprint(fold, "Org"),
+            crate::migration::fnv1a_hash(b"n\0u64\0#scoped_by\0Org\0")
+        );
+        assert_ne!(
+            scoped_fingerprint(fold, "Org"),
+            scoped_fingerprint(fold, "Team")
+        );
+        const IN_A_CONST: u64 = scoped_fingerprint(0x2515_f249_2b16_f628, "Desk");
+        assert_eq!(IN_A_CONST, 0xaac8_d6b2_01d1_f744);
+    }
 
     /// An `io::Error` carrying a refusal prints, under `Debug`, exactly what
     /// one carrying the bare text does — `main`'s `Error: …` line for a

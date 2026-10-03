@@ -39,11 +39,14 @@
 //! `Tx::settle_job`), and `Group::stage` refuses an enqueue inside a tenant of
 //! another scope type than the job's mounted `#[job]` declares, since the row
 //! records the tenant's id and not its type. That check holds within one
-//! binary: a Pending row enqueued by another binary (one that did not mount the
-//! job, or mounted it under a `scoped_by` path spelled alike but naming another
-//! type) runs, unchecked, in the type the dispatching binary declares. GUIDE §6
-//! and DESIGN.md §3's Jobs bullet state that residual and the drain that avoids
-//! it. Operator code that must act inside one tenant — seeding, a test oracle —
+//! binary. Across binaries, a job's fingerprint carries its tenant type's
+//! `NAME`, so a Pending row enqueued under a tenant type of another `NAME` is
+//! refused at startup as a foreign shape. What still runs unchecked, in the type
+//! the dispatching binary declares, is a row whose shape matches: one a
+//! hand-written `impl Job` enqueued from a binary that did not mount the job, or
+//! one enqueued under another tenant type with the same `NAME`, which is that
+//! tenant by declaration. GUIDE §6 and DESIGN.md §3's Jobs bullet state that
+//! residual and the drain that avoids it. Operator code that must act inside one tenant — seeding, a test oracle —
 //! opens it with a `TenantAdmission` minted from a `Group` (`Tx::admit_scope`),
 //! the seal `CrossTenant` already carries, which is the operator's standing
 //! made explicit rather than an exception to the guarantee. *(Corrected

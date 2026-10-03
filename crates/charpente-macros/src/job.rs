@@ -5,8 +5,9 @@
 //! turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
 //! the id: a job payload has no primary key), `impl Job` carrying the name,
-//! the payload's structural fingerprint (`fingerprint::compute_job`, which
-//! mixes in `scoped_by`), the scope type and the retry policy, and the
+//! the payload's structural fingerprint (`fingerprint::compute`, continued over
+//! the tenant type's `NAME` by `charpente_core::db::scoped_fingerprint` for a
+//! `scoped_by` job), the scope type and the retry policy, and the
 //! `JobEntry` glue `jobs![]` collects. Errors name the accepted forms (hard
 //! rule 5).
 
@@ -296,11 +297,22 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         .map(|f| f.ident.clone().expect("named fields have idents"))
         .collect();
     let field_types: Vec<_> = fields.named.iter().map(|f| f.ty.clone()).collect();
-    let scoped_path = match tenancy {
-        Tenancy::Global => None,
-        Tenancy::ScopedBy(path) => Some(path),
+    // A `global` job's fingerprint is its field fold's hash. A scoped job's
+    // continues that fold over its tenant type's `NAME`, in
+    // `charpente_core::db::scoped_fingerprint` (tenancy-completion spec §4):
+    // a constant the compiler evaluates, because expansion cannot read `NAME`.
+    // `tenant_name`'s bound is the one `JobDef.scoped_by` already carries at
+    // this span, so a scope type with no `Tenant` impl gains no error.
+    let fold = crate::fingerprint::compute(&field_idents, &field_types);
+    let fingerprint = match tenancy {
+        Tenancy::Global => quote! { #fold },
+        Tenancy::ScopedBy(path) => quote! {
+            ::charpente::core::db::scoped_fingerprint(
+                #fold,
+                ::charpente::tenant::tenant_name::<#path>(),
+            )
+        },
     };
-    let fingerprint = crate::fingerprint::compute_job(&field_idents, &field_types, scoped_path);
 
     let max = args.max;
     let backoff_millis = args.backoff_millis;

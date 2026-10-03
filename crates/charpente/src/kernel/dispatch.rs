@@ -86,9 +86,9 @@ pub struct JobDef {
     /// tenant id and not its type, and this job's glue opens the id as this
     /// type, so `Group::stage` refuses a scoped enqueue whose job's scope
     /// type is any other: a stand-in copying this job's `NAME` and
-    /// `FINGERPRINT`, or a `#[job]` whose `scoped_by` path spells another
-    /// type the same way, enqueued in that type's tenant (job-tenancy final
-    /// review N1).
+    /// `FINGERPRINT`, or a `#[job]` whose `scoped_by` names another tenant
+    /// type with the same `NAME`, enqueued in that type's tenant (job-tenancy
+    /// final review N1; tenancy-completion spec §4).
     pub scope_type: TypeId,
     /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
     /// asserts a row's recorded shape equals it before the glue decodes

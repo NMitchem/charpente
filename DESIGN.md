@@ -806,19 +806,21 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   tenant presence disagrees with the mounted declaration (a hand-written `impl Job` or
   `JobDef`) is refused by name, and so is a Pending row that disagrees, before dispatch
   starts (job-tenancy final review C1, M4). So is an enqueue in a tenant of another scope
-  type than the mounted job declares (`JobDef.scope_type`, a `TypeId`): a row records a
-  tenant id and not its type, and the fingerprint hashes the `scoped_by` path as spelled, so
-  a stand-in copying `NAME` and `FINGERPRINT`, or a `#[job]` whose path spells another type
-  alike, would otherwise run the job in the same id of the declared type. The check needs
-  both types, so it runs at enqueue only. A Pending row enqueued by any other binary has no
-  type to check when a later binary that mounts the name dispatches it, in the scope type
-  that binary declares. The enqueuing binary may not have mounted the name at all, or it may
-  have mounted it under a `scoped_by` path spelled alike but naming another type: a refactor
-  that turns a job module's `use billing::Org` into `use crm::Org` keeps the fingerprint,
-  so the job's Pending rows run in the same ids of `crm::Org`. Where the shape matches,
-  nothing refuses either case, so the operator drains such a job (runs the binary that
-  enqueued its Pending rows until they are Done or Dead) before the deploy (final review
-  N1, NB2).
+  type than the mounted job declares (`JobDef.scope_type`, a `TypeId`). A row records a
+  tenant id and not its type, and the fingerprint carries only the tenant type's `NAME`. So
+  a stand-in copying `NAME` and `FINGERPRINT`, or a `#[job]` whose `scoped_by` names another
+  tenant type with the same `NAME`, would otherwise run the job in the same id of the
+  declared type. The check needs both types, so it runs at enqueue only. Across binaries the
+  fingerprint carries the tenant's `NAME` (spec 2026-09-30-tenancy-completion §4). So a
+  Pending row enqueued under a tenant type of another `NAME` is refused at startup as a
+  foreign shape; that includes the refactor that turns a job module's `use billing::Org`
+  into `use crm::Org`. A row whose shape matches has no type to check when a later binary
+  that mounts the name dispatches it, in the scope type that binary declares. That is
+  either a row a hand-written `impl Job` enqueued from a binary that did not mount the
+  name, or one enqueued under another tenant type with the same `NAME`, which is that
+  tenant by declaration. Nothing refuses either, so the operator drains such a job (runs
+  the binary that enqueued its Pending rows until they are Done or Dead) before a deploy
+  that mounts a scoped job the running binary does not (final review N1, NB2).
 - **Events.** `#[event(global)]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log. An event payload is itself a
   wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
@@ -1634,10 +1636,10 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   `#[job]` item; handler panics are absorbed into the same path). At-least-once execution
   plus idempotency-key observability is the framing M1's external-effect handlers need; v0
   handlers are pure state and don't need it yet. Every enqueue records the payload type's
-  structural fingerprint (§3). A scoped job's fingerprint also covers its `scoped_by` path
-  as spelled, so moving a job between `global` and `scoped_by`, or respelling its path, is
-  refused like a change of fields; a path that keeps its spelling but comes to name another
-  type is not (§3's Jobs bullet). The kernel refuses to dispatch while a Pending job of a
+  structural fingerprint (§3). A scoped job's fingerprint also carries its tenant
+  type's `NAME`, so moving a job between `global` and `scoped_by`, or to a tenant type of
+  another `NAME`, is refused like a change of fields; respelling its path to a type of the
+  same `NAME` is not (§3's Jobs bullet). The kernel refuses to dispatch while a Pending job of a
   mounted type carries another shape, naming the job, its ids and both shapes. It checks at
   startup and wherever its write gate opens, and `promote` checks before its durable flip.
   A switchover is never refused at the hand-off, which is the primary's point of no return
