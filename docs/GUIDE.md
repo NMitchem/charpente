@@ -1163,7 +1163,7 @@ The rule-3 401, for a `POST /orgs/:org/incidents` declared plain `public`:
 
 <!-- pinned -->
 ```text
-authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by its NAME; in the attribute, write its path: `Org` is `<path>`
+authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by its NAME; name the type in the attribute: `Org` is the tenant type `<path>`
 ```
 
 The site is the word the route was declared with (`SSE` for a stream) and its pattern;
@@ -6961,8 +6961,8 @@ Four things that fall out of that, worth stating plainly:
 **One `NAME`, one tenant type.** The app refuses to mount two tenant types under one
 `NAME`, or a tenant type whose `NAME` is empty, before it serves. It collects every tenant
 type it names: its `#[table(scoped_by = …)]` tables at `App::open` (a hand-written scoped
-`Row` carries no `NAME`, so it is not collected), its `public(S)` routes at `mount`, its
-scoped jobs at `mount_jobs`, and its scoped events at `mount_events`. `<name>` is the shared `NAME`; `<type>` and `<other type>` are
+`Row` is collected only if it states `SCOPE_NAME`; by default it carries no `NAME`), its
+`public(S)` routes at `mount`, its scoped jobs at `mount_jobs`, and its scoped events at `mount_events`. `<name>` is the shared `NAME`; `<type>` and `<other type>` are
 the two types as `std::any::type_name` renders them, the one named first first:
 
 <!-- pinned -->

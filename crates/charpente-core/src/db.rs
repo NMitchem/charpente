@@ -581,10 +581,10 @@ impl Schema {
 
     /// Every registered table's tenant type, as `(NAME, TypeId, type_name)`,
     /// in `TABLE` order: the tables `App::open` checks for two tenant types
-    /// under one `NAME` (tenancy-completion spec §4). Only
-    /// `#[table(scoped_by = …)]` rows carry a `NAME`
-    /// (`Row::SCOPE_NAME`). A hand-written scoped `Row` keeps `None`, and
-    /// is not listed.
+    /// under one `NAME` (tenancy-completion spec §4). A row carries a `NAME`
+    /// (`Row::SCOPE_NAME`) when `#[table(scoped_by = …)]` states it, or when a
+    /// hand-written scoped `Row` does; one left at the default `None` is not
+    /// listed.
     pub fn table_tenants(&self) -> Vec<(&'static str, TypeId, &'static str)> {
         self.tables
             .values()

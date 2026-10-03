@@ -760,10 +760,10 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   per handler — which runs the app's `authorize` (or, on a route declared `public(Org)`,
   admits by that declaration) before it returns the `ScopedTx` that
   `get`/`scan`/`scan_from`/`scan_by`/`put`/`delete` live on. `authorize(tx, who: &Principal,
-  scope)` is asked only about a principal the resolution ladder produced (`Principal`'s
-  fields are private): a caller with no credential is a 401 at the scope line, and the
-  declared ways in, `public(Org)` and the operator's `TenantAdmission`, ask nobody (spec
-  2026-09-27-job-tenancy §3). Both the marker
+  scope)` is asked only about a principal the resolution ladder produced, for the request
+  that asks (`Principal`'s fields are private, and it is not `Clone`): a caller with no
+  credential is a 401 at the scope line, and the declared ways in, `public(Org)` and the
+  operator's `TenantAdmission`, ask nobody (spec 2026-09-27-job-tenancy §3). Both the marker
   (`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are sealed, so an app
   cannot re-open a scoped table with one orphan-legal line; a scoped read on a bare `Tx` is an
   unsatisfied trait bound whose text names the table, its scope, and the `tx.scope` line to

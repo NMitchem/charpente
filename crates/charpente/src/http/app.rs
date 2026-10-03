@@ -155,9 +155,11 @@ impl<'g> Ctx<'g> {
         } = &self.stance;
         // The tenant type's identity (tenancy-completion spec §4). A final
         // `::` component read two types spelled alike as one, and a generic as
-        // `B>`. `type_name` is printed beside it for the reader only, as the
-        // source path the attribute is written with (final review M7): a
-        // `NAME` need not be any path's spelling, and it is never compared.
+        // `B>`. `type_name` is printed beside it for the reader only, to say
+        // which type the attribute names (final review M7): a `NAME` need not
+        // be any path's spelling, and it is never compared. It is not offered
+        // as a path to paste (final re-review N1): it leads with the defining
+        // crate's name, which does not resolve inside that crate (E0433).
         let scope = S::NAME;
         let scope_type = std::any::type_name::<S>();
         if *auth {
@@ -175,16 +177,19 @@ impl<'g> Ctx<'g> {
                  drift test"
             ));
         }
-        let (declared, paths) = match public {
+        let (declared, types) = match public {
             Some((declared, _)) => (
                 format!("public({})", declared.name),
                 format!(
-                    "`{scope}` is `{scope_type}`, and `{}` is `{}`",
+                    "`{scope}` is the tenant type `{scope_type}`, and `{}` is `{}`",
                     declared.name,
                     (declared.type_name)()
                 ),
             ),
-            None => ("public".to_string(), format!("`{scope}` is `{scope_type}`")),
+            None => (
+                "public".to_string(),
+                format!("`{scope}` is the tenant type `{scope_type}`"),
+            ),
         };
         ApiError::AnonymousScope(format!(
             "authentication required — `{method} {pattern}` is declared `{declared}` and \
@@ -193,7 +198,7 @@ impl<'g> Ctx<'g> {
              the charpente_session cookie, or, if every caller may act inside this tenant \
              here, declare `public({scope})` in place of `{declared}` in this route's \
              `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by \
-             its NAME; in the attribute, write its path: {paths}"
+             its NAME; name the type in the attribute: {types}"
         ))
     }
 

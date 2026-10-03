@@ -385,8 +385,8 @@ fn an_anonymous_caller_on_a_plain_public_route_that_opens_a_scope_gets_the_named
              declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
              charpente_session cookie, or, if every caller may act inside this tenant here, \
              declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
-             the attribute, write its path: `Org` is `{}`",
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
             std::any::type_name::<Org>()
         )
     );
@@ -436,8 +436,8 @@ fn an_anonymous_subscriber_that_opens_a_scope_gets_the_401_naming_the_stream() {
              `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
              charpente_session cookie, or, if every caller may act inside this tenant here, \
              declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
-             the attribute, write its path: `Org` is `{}`",
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
             std::any::type_name::<Org>()
         )
     );
@@ -523,8 +523,8 @@ fn public_scope_for_one_scope_type_does_not_admit_another() {
              declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
              charpente_session cookie, or, if every caller may act inside this tenant here, \
              declare `public(Team)` in place of `public(Org)` in this route's `#[route(…)]` \
-             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
-             the attribute, write its path: `Team` is `{}`, and `Org` is `{}`",
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Team` is the tenant type `{}`, and `Org` is `{}`",
             std::any::type_name::<Team>(),
             std::any::type_name::<Org>()
         )
@@ -553,8 +553,8 @@ fn the_401_on_a_cross_tenant_route_keeps_the_flag_in_its_fix() {
              declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
              charpente_session cookie, or, if every caller may act inside this tenant here, \
              declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
-             the attribute, write its path: `Org` is `{}`",
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
             std::any::type_name::<Org>()
         )
     );
@@ -2080,8 +2080,8 @@ fn statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_wri
              declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
              charpente_session cookie, or, if every caller may act inside this tenant here, \
              declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
-             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
-             the attribute, write its path: `Org` is `{}`",
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
             std::any::type_name::<statuspage::Org>()
         )
     );
@@ -2204,8 +2204,8 @@ fn the_401_tells_two_tenant_types_spelled_alike_apart_by_their_names() {
              the charpente_session cookie, or, if every caller may act inside this tenant \
              here, declare `public(CrmOrg)` in place of `public(BillingOrg)` in this route's \
              `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by \
-             its NAME; in the attribute, write its path: `CrmOrg` is `{}`, and `BillingOrg` is \
-             `{}`",
+             its NAME; name the type in the attribute: `CrmOrg` is the tenant type `{}`, and \
+             `BillingOrg` is `{}`",
             std::any::type_name::<crm::Org>(),
             std::any::type_name::<billing::Org>()
         )
@@ -2228,8 +2228,8 @@ fn the_401_names_a_generic_tenant_type_by_its_name() {
              `public(Wrap)` admits one. Send \"Authorization: Bearer <token>\" or the \
              charpente_session cookie, or, if every caller may act inside this tenant here, \
              declare `public(Wrap)` in place of `public` in this route's `#[route(…)]` \
-             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
-             the attribute, write its path: `Wrap` is `{}`",
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Wrap` is the tenant type `{}`",
             std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
         )
     );

@@ -6329,8 +6329,8 @@ mod job_tenancy {
              `public(Shop)` admits one. Send \"Authorization: Bearer <token>\" or the \
              charpente_session cookie, or, if every caller may act inside this tenant here, \
              declare `public(Shop)` in place of `public` in this route's `#[route(…)]` \
-             attribute, keeping its other flags. A tenant type is named here by its NAME; in \
-             the attribute, write its path: `Shop` is `{}`",
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Shop` is the tenant type `{}`",
             std::any::type_name::<Shop>()
         )
     }
