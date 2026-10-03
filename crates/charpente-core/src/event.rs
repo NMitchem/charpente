@@ -10,8 +10,8 @@ use crate::table::{Codec, Id, IndexDef, Row};
 
 /// An event as the platform stores it. `seq` is the log seq of the
 /// committing transaction, so every event emitted by one transaction shares
-/// one `seq`; `key` is the opaque scoping key from `Tx::emit_keyed` (e.g. an
-/// org id) — later realtime tasks filter subscriptions on it.
+/// one `seq`; `key` is the app's opaque filter from `emit_keyed` (a user's
+/// subject, a room), never a tenant, which is `scope`.
 pub struct EventRow {
     pub id: Id<EventRow>,
     pub seq: u64,
@@ -19,11 +19,20 @@ pub struct EventRow {
     pub key: Option<String>,
     pub payload: Vec<u8>,
     /// The emitting type's `Event::FINGERPRINT`, from the record's `0x09`
-    /// tag; `None` for a row applied from a pre-shape `0x03` record. Encoded
-    /// LAST and only when `Some`, so a row written before this field existed
-    /// decodes unchanged: the payload before it is length-prefixed, and
-    /// nothing follows it (payload-shapes spec §2).
+    /// or `0x0b` tag; `None` for a row applied from a pre-shape `0x03`
+    /// record. Encoded after `payload` and only when `Some`, so a row written
+    /// before this field existed decodes unchanged: the payload before it is
+    /// length-prefixed, and only `scope` below can follow it (payload-shapes
+    /// spec §2).
     pub shape: Option<u64>,
+    /// The tenant of the `ScopedTx` the event was emitted on, from the
+    /// record's `0x0b` tag. `None` for an emit on a bare `Tx` (`0x09`) and for
+    /// a row applied from a pre-shape record. Encoded after `shape`, and only
+    /// when `Some`. A scoped row always has a shape, because only `0x0b`
+    /// writes a scope, so every row written before this field existed decodes
+    /// unchanged. `Some(0)` is tenant 0: presence, not value
+    /// (tenancy-completion spec §6, the `JobRow.scope` precedent).
+    pub scope: Option<u64>,
 }
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
@@ -51,6 +60,15 @@ impl Row for EventRow {
         if let Some(shape) = self.shape {
             shape.encode(out);
         }
+        if let Some(scope) = self.scope {
+            assert!(
+                self.shape.is_some(),
+                "EventRow {}: a tenant scope is encoded after the shape, so a scoped row must \
+                 carry one — only tag 0x0b writes a scope, and 0x0b always carries the shape",
+                self.id.raw()
+            );
+            scope.encode(out);
+        }
     }
 
     fn decode_row(bytes: &[u8]) -> io::Result<EventRow> {
@@ -60,15 +78,17 @@ impl Row for EventRow {
         let name = String::decode(input)?;
         let key = Option::<String>::decode(input)?;
         let payload = Vec::<u8>::decode(input)?;
-        let shape = match input.len() {
-            0 => None,
-            8 => Some(u64::decode(input)?),
+        let (shape, scope) = match input.len() {
+            0 => (None, None),
+            8 => (Some(u64::decode(input)?), None),
+            16 => (Some(u64::decode(input)?), Some(u64::decode(input)?)),
             n => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "row decode: {n} bytes after an EventRow's payload — a shape is 8 bytes \
-                         or absent, so the stored row is corrupt"
+                        "row decode: {n} bytes after an EventRow's payload — the shape and the \
+                         tenant scope after it are 8 bytes each, present or absent, so the \
+                         stored row is corrupt"
                     ),
                 ));
             }
@@ -80,6 +100,7 @@ impl Row for EventRow {
             key,
             payload,
             shape,
+            scope,
         })
     }
 }
@@ -97,6 +118,7 @@ mod tests {
             key: Some("org-7".into()),
             payload: vec![1, 2, 3],
             shape: Some(0xFEED),
+            scope: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -107,6 +129,7 @@ mod tests {
         assert_eq!(back.key, row.key);
         assert_eq!(back.payload, row.payload);
         assert_eq!(back.shape, row.shape);
+        assert_eq!(back.scope, row.scope);
     }
 
     /// A row written before `shape` existed ends exactly after its payload:
@@ -120,6 +143,7 @@ mod tests {
             key: None,
             payload: vec![1, 2, 3],
             shape: None,
+            scope: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -142,6 +166,7 @@ mod tests {
             key: None,
             payload: vec![1, 2, 3],
             shape: Some(0xFEED),
+            scope: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -151,8 +176,85 @@ mod tests {
             .expect("3 bytes where a shape should be");
         assert_eq!(
             err.to_string(),
-            "row decode: 3 bytes after an EventRow's payload — a shape is 8 bytes or absent, \
-             so the stored row is corrupt"
+            "row decode: 3 bytes after an EventRow's payload — the shape and the tenant scope \
+             after it are 8 bytes each, present or absent, so the stored row is corrupt"
         );
+    }
+
+    /// Tenancy-completion spec §6: a scoped row carries its tenant after its
+    /// shape, and tenant 0 round-trips as `Some(0)`, never as "no tenant".
+    /// The global row is the control: its bytes end at the shape.
+    #[test]
+    fn a_scoped_event_row_roundtrips_its_tenant_zero_included() {
+        let row = |scope| EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: Some("room-9".into()),
+            payload: vec![1, 2, 3],
+            shape: Some(0xFEED),
+            scope,
+        };
+        let mut global = Vec::new();
+        row(None).encode_row(&mut global);
+        for scope in [Some(0), Some(7)] {
+            let mut bytes = Vec::new();
+            row(scope).encode_row(&mut bytes);
+            assert_eq!(
+                bytes.len(),
+                global.len() + 8,
+                "the tenant is eight more bytes"
+            );
+            let back = EventRow::decode_row(&bytes).unwrap();
+            assert_eq!((back.key.as_deref(), back.scope), (Some("room-9"), scope));
+        }
+        assert_eq!(EventRow::decode_row(&global).unwrap().scope, None);
+    }
+
+    /// A tear inside the tenant is named like a tear inside the shape.
+    #[test]
+    fn a_torn_event_row_scope_is_a_named_decode_error() {
+        let row = EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: None,
+            payload: vec![1, 2, 3],
+            shape: Some(0xFEED),
+            scope: Some(3),
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        bytes.truncate(bytes.len() - 5);
+        let err = EventRow::decode_row(&bytes)
+            .err()
+            .expect("11 bytes where a shape and a scope should be");
+        assert_eq!(
+            err.to_string(),
+            "row decode: 11 bytes after an EventRow's payload — the shape and the tenant scope \
+             after it are 8 bytes each, present or absent, so the stored row is corrupt"
+        );
+    }
+
+    /// Negative space (hard rule 4): the tail is positional, so a scope with
+    /// no shape before it would decode as a shape. The encoder refuses to
+    /// write one.
+    #[test]
+    #[should_panic(
+        expected = "EventRow 3: a tenant scope is encoded after the shape, so a \
+                               scoped row must carry one — only tag 0x0b writes a scope, and \
+                               0x0b always carries the shape"
+    )]
+    fn a_scope_without_a_shape_is_refused_at_encode() {
+        let row = EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: None,
+            payload: vec![],
+            shape: None,
+            scope: Some(3),
+        };
+        row.encode_row(&mut Vec::new());
     }
 }

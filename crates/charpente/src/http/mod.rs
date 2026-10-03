@@ -19,8 +19,9 @@ pub(crate) use app::io_failure_response;
 
 use std::collections::BTreeMap;
 use std::io;
+use std::marker::PhantomData;
 
-use charpente_core::db::Event;
+use charpente_core::db::{Event, ScopedTx, Tenant};
 use charpente_core::table::Id;
 
 use crate::auth::OidcReject;
@@ -214,55 +215,78 @@ pub struct SubEntry {
 
 /// What an SSE route handler returns: which event types to tail (compile-
 /// checked — names never appear as strings in app code), an optional
-/// exact-match scoping key, and the resume cursor (the handler passes
-/// through, or clamps, what the platform extracted from the request).
+/// exact-match app key, the resume cursor (the handler passes through, or
+/// clamps, what the platform extracted from the request), and — private —
+/// the tenancy it delivers: `None` for a global subscription
+/// (`Subscription::of`), the tenant for a tenant feed (`Subscribe`). No app
+/// code can set or read it, so no string ever names a tenant.
 pub struct Subscription {
     pub entries: Vec<SubEntry>,
     pub key: Option<String>,
     pub cursor: Option<Cursor>,
+    pub(crate) scope: Option<u64>,
+}
+
+/// `Ev`'s delivery entry, captured statically.
+fn sub_entry<Ev: Event + serde::Serialize>() -> SubEntry {
+    SubEntry {
+        name: Ev::NAME,
+        encode_json: ev_json::<Ev>,
+        fingerprint: Ev::FINGERPRINT,
+    }
+}
+
+/// Adds `Ev`'s entry, refusing a second of one `NAME`: delivery matches a
+/// row to the first entry of its name, so a second could never be delivered
+/// — two `#[event]` types in different modules with the same type identifier
+/// share a `NAME`. `method` names the caller in the refusal.
+fn push_entry<Ev: Event + serde::Serialize>(entries: &mut Vec<SubEntry>, method: &str) {
+    assert!(
+        !entries.iter().any(|e| e.name == Ev::NAME),
+        "{method}: event \"{}\" is already in this subscription — an event appears once, and \
+         two #[event] types sharing a NAME (the type's snake_case) would leave the second \
+         undeliverable; give the other type its own name (GUIDE §11, \"Changing an event\")",
+        Ev::NAME
+    );
+    entries.push(sub_entry::<Ev>());
 }
 
 impl Subscription {
+    /// A global subscription: it delivers events emitted on a bare `Tx`, and
+    /// never an event recorded in a tenant. A tenant's feed is
+    /// `tx.subscription::<Ev>()` on its `ScopedTx` (`Subscribe`).
     pub fn of<Ev: Event + serde::Serialize>() -> Subscription {
         Subscription {
-            entries: vec![SubEntry {
-                name: Ev::NAME,
-                encode_json: ev_json::<Ev>,
-                fingerprint: Ev::FINGERPRINT,
-            }],
+            entries: vec![sub_entry::<Ev>()],
             key: None,
             cursor: None,
+            scope: None,
         }
     }
 
-    /// Adds another event type. Panics if one of that `NAME` is already
-    /// here: delivery matches a row to the first entry of its name, so a
-    /// second could never be delivered — two `#[event]` types in different
-    /// modules with the same type identifier share a `NAME`.
+    /// Adds another global event type. Panics if one of that `NAME` is
+    /// already here, and panics on a tenant feed: a tenant feed receives only
+    /// events recorded in its tenant, so an event added after `.into()` could
+    /// never arrive. The tenant's own events go on `TenantFeed::and`, before
+    /// the conversion.
     pub fn and<Ev: Event + serde::Serialize>(mut self) -> Subscription {
         assert!(
-            !self.entries.iter().any(|e| e.name == Ev::NAME),
-            "Subscription::and: event \"{}\" is already in this subscription — an event appears \
-             once, and two #[event] types sharing a NAME (the type's snake_case) would leave the \
-             second undeliverable; give the other type its own name (GUIDE §11, \"Changing an \
-             event\")",
+            self.scope.is_none(),
+            "Subscription::and: event \"{}\" is added to a tenant feed after .into() — \
+             Subscription::and adds global events, and a tenant feed receives only its own \
+             tenant's events, so this one could never arrive; add the tenant's events with \
+             TenantFeed::and before .into(), and serve global events on a subscription of \
+             their own",
             Ev::NAME
         );
-        self.entries.push(SubEntry {
-            name: Ev::NAME,
-            encode_json: ev_json::<Ev>,
-            fingerprint: Ev::FINGERPRINT,
-        });
+        push_entry::<Ev>(&mut self.entries, "Subscription::and");
         self
     }
 
-    /// An exact-match scoping filter (e.g. an org id) — the handler owns
-    /// access control; the platform never parses the key.
-    ///
-    /// For a tenant feed, pass `ScopedTx::event_key` rather than spelling the
-    /// tenant out here: that is the same key `ScopedTx::emit` attaches, so the
-    /// subscription and the emitter cannot drift apart (spec §4, "one tenancy
-    /// mechanism, not two").
+    /// An exact-match app filter (a user's subject, a room) — the handler
+    /// owns access control; the platform never parses the key. A key is not
+    /// a tenant: a tenant feed is built from its scope (`Subscribe`), and
+    /// delivery compares tenancy on its own (`admits`).
     pub fn key(mut self, key: impl Into<String>) -> Subscription {
         self.key = Some(key.into());
         self
@@ -271,6 +295,78 @@ impl Subscription {
     pub fn cursor(mut self, cursor: Option<Cursor>) -> Subscription {
         self.cursor = cursor;
         self
+    }
+
+    /// The one predicate that says what this subscription delivers
+    /// (tenancy-completion spec §6, "Delivering"): a name it carries, exactly
+    /// its tenancy (`None` is not `Some(0)`), and its key if it has one.
+    /// `deliver_unit` skips every row it refuses, and `validate_subscribe`
+    /// asks it before refusing a reshaped cursor. The shape check stays
+    /// separate because a row this admits but cannot decode ends the tail
+    /// rather than being skipped.
+    pub(crate) fn admits(&self, name: &str, key: Option<&str>, scope: Option<u64>) -> bool {
+        self.entries.iter().any(|e| e.name == name)
+            && scope == self.scope
+            && (self.key.is_none() || self.key.as_deref() == key)
+    }
+}
+
+/// A tenant's feed under construction: `tx.subscription::<Ev>()` on a
+/// `ScopedTx<S>` (`Subscribe`), narrowed with `.and`, `.key` and `.cursor`,
+/// and converted with `.into()` into the handler's `Subscription`, which
+/// carries the tenant (amendment A3). `S` says whose tenant it is; the id
+/// itself is in the `Subscription`, where no app code can read or set it.
+pub struct TenantFeed<S> {
+    sub: Subscription,
+    tenant: PhantomData<fn() -> S>,
+}
+
+impl<S> TenantFeed<S> {
+    /// Adds another of the tenant's event types. It pushes to the feed's own
+    /// entries, never through `Subscription::and`, which refuses a tenant
+    /// feed; a second event of one `NAME` is refused as it is there.
+    pub fn and<Ev: Event + serde::Serialize>(mut self) -> TenantFeed<S> {
+        push_entry::<Ev>(&mut self.sub.entries, "TenantFeed::and");
+        self
+    }
+
+    /// `Subscription::key`: the app's own filter, within the tenant.
+    pub fn key(mut self, key: impl Into<String>) -> TenantFeed<S> {
+        self.sub.key = Some(key.into());
+        self
+    }
+
+    pub fn cursor(mut self, cursor: Option<Cursor>) -> TenantFeed<S> {
+        self.sub.cursor = cursor;
+        self
+    }
+}
+
+impl<S> From<TenantFeed<S>> for Subscription {
+    fn from(feed: TenantFeed<S>) -> Subscription {
+        feed.sub
+    }
+}
+
+/// Builds a tenant's feed from the scope that admitted the subscriber
+/// (tenancy-completion spec §6, "Subscribing"): `tx.subscription::<Ev>()` on
+/// a `ScopedTx<S>`. A trait so the platform crate can give the core's
+/// `ScopedTx` this method; `use charpente::Subscribe` brings it into scope.
+pub trait Subscribe<S> {
+    fn subscription<Ev: Event + serde::Serialize>(&self) -> TenantFeed<S>;
+}
+
+impl<S: Tenant> Subscribe<S> for ScopedTx<'_, '_, S> {
+    fn subscription<Ev: Event + serde::Serialize>(&self) -> TenantFeed<S> {
+        TenantFeed {
+            sub: Subscription {
+                entries: vec![sub_entry::<Ev>()],
+                key: None,
+                cursor: None,
+                scope: Some(self.scope().raw()),
+            },
+            tenant: PhantomData,
+        }
     }
 }
 
@@ -487,7 +583,108 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::marker::PhantomData;
+
     use super::*;
+    use crate::event;
+    use crate::wire::WireU64;
+
+    #[event(global)]
+    struct UnitPing {
+        n: WireU64,
+    }
+
+    #[event(global)]
+    struct UnitPong {
+        n: WireU64,
+    }
+
+    /// A scope type for `TenantFeed<S>`, which bounds nothing on `S`.
+    struct UnitOrg;
+
+    fn unit_sub(key: Option<&str>, scope: Option<u64>) -> Subscription {
+        Subscription {
+            entries: vec![sub_entry::<UnitPing>()],
+            key: key.map(str::to_string),
+            cursor: None,
+            scope,
+        }
+    }
+
+    /// Tenancy-completion spec §6, "Delivering": the one predicate delivery
+    /// and resume validation both ask. Every clause is exercised alone, and
+    /// tenant 0 is a tenant.
+    #[test]
+    fn admits_is_the_name_and_the_tenant_and_the_key() {
+        let global = unit_sub(None, None);
+        assert!(global.admits("unit_ping", None, None));
+        assert!(
+            global.admits("unit_ping", Some("k"), None),
+            "a feed with no key passes every key"
+        );
+        assert!(
+            !global.admits("unit_pong", None, None),
+            "a name it does not carry"
+        );
+        assert!(
+            !global.admits("unit_ping", None, Some(0)),
+            "tenant 0's row is not global: None is not Some(0)"
+        );
+        let tenant_zero = unit_sub(None, Some(0));
+        assert!(tenant_zero.admits("unit_ping", None, Some(0)));
+        assert!(
+            !tenant_zero.admits("unit_ping", None, None),
+            "a global row never reaches a tenant feed"
+        );
+        assert!(
+            !tenant_zero.admits("unit_ping", None, Some(1)),
+            "another tenant's row"
+        );
+        let keyed = unit_sub(Some("k"), Some(7));
+        assert!(keyed.admits("unit_ping", Some("k"), Some(7)));
+        assert!(
+            !keyed.admits("unit_ping", None, Some(7)),
+            "a keyed feed never receives an unkeyed row"
+        );
+        assert!(!keyed.admits("unit_ping", Some("j"), Some(7)));
+        assert!(
+            !keyed.admits("unit_ping", Some("k"), Some(8)),
+            "the right key in the wrong tenant"
+        );
+    }
+
+    /// `TenantFeed::and` adds to its inner entries directly, so
+    /// `Subscription::and`'s widening assert never fires for it.
+    #[test]
+    fn a_tenant_feeds_and_adds_without_the_widening_assert() {
+        let feed = TenantFeed::<UnitOrg> {
+            sub: unit_sub(None, Some(0)),
+            tenant: PhantomData,
+        }
+        .and::<UnitPong>()
+        .key("k");
+        let sub: Subscription = feed.into();
+        assert_eq!(
+            sub.entries.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec!["unit_ping", "unit_pong"]
+        );
+        assert_eq!((sub.key.as_deref(), sub.scope), (Some("k"), Some(0)));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "TenantFeed::and: event \"unit_ping\" is already in this subscription — an \
+                    event appears once, and two #[event] types sharing a NAME (the type's \
+                    snake_case) would leave the second undeliverable; give the other type its \
+                    own name (GUIDE §11, \"Changing an event\")"
+    )]
+    fn a_tenant_feed_refuses_two_events_of_one_name() {
+        let _ = TenantFeed::<UnitOrg> {
+            sub: unit_sub(None, Some(0)),
+            tenant: PhantomData,
+        }
+        .and::<UnitPing>();
+    }
 
     #[test]
     fn method_parse_and_name_roundtrip() {

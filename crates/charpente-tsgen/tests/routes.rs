@@ -129,18 +129,40 @@ fn the_no_auto_resume_rule_is_in_the_thrown_errors_message_not_only_a_comment() 
     // Hard rule 5: the message must be true for EVERY path that raises it.
     // `validate_subscribe` (charpente/src/kernel/mod.rs) answers 409 for a
     // cursor below the retention floor — "events that old are gone" — for the
-    // two divergence cases, and for a cursor sitting on a reshaped row.
+    // two divergence cases, for a cursor sitting on a reshaped row, and for a
+    // cursor on a row outside the feed's tenancy (tenancy-completion A16).
     // Naming a single cause ("the history behind that cursor came from
-    // another primary") for all three would be false on the retention path,
-    // so the message spells out all three explicitly instead.
+    // another primary") for all four would be false on the retention path,
+    // so the message spells out all four explicitly instead.
     assert!(
         body.contains("retention floor")
             && body.contains("divergence")
             && body.contains(
                 "At a reshaped event, resuming would skip the one event the server refused to decode."
+            )
+            && body.contains(
+                "At an event outside this feed's tenancy, the cursor is not one this feed delivered, "
             ),
-        "the 409 message must name all three of its causes (floor, divergence, reshaped): {body}"
+        "the 409 message must name all four of its causes (floor, divergence, reshaped, \
+         tenancy): {body}"
     );
+    // The doc above the class counts the same causes and says where they are,
+    // so a reader of the generated source is not told there are three.
+    let doc = r#"/**
+ * The server refused the cursor: HTTP 409 (DESIGN §6). FOUR different causes
+ * raise this, and only the server's `detail` distinguishes them: below the
+ * retention floor; diverged history; the event at the cursor was written
+ * under a different shape of its type; or the event at the cursor is outside
+ * this feed's tenancy (another tenant's, a global one on a tenant's feed, or
+ * a tenant's on a global one). All four are in `validate_subscribe`.
+ * The rule is in the message on purpose — it is what a developer reads at 3am.
+ */
+export class CursorRefused extends Error {"#;
+    assert!(
+        ts.contains(doc),
+        "CursorRefused's doc must count and name all four causes: {ts}"
+    );
+    assert!(!ts.contains("THREE different causes"), "{ts}");
     assert!(
         !body.contains("the history behind that cursor came from another primary"),
         "the message must not assert divergence unconditionally — the retention 409 \

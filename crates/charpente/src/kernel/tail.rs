@@ -85,7 +85,8 @@ pub struct Tail {
 }
 
 /// One bounded unit: read up to `TAIL_BATCH_EVENTS` rows from `next_id`,
-/// filter, push. Returns whether the tail survives. The floor check runs
+/// filter (`Subscription::admits`: a name it carries, its tenancy, its key),
+/// push. Returns whether the tail survives. The floor check runs
 /// FIRST: a tail that fell behind retention gets the terminal gap frame and
 /// dies — deterministic, part of the unit, independent of whatever the sink
 /// reports for that final send (the tail is dying either way, so the send's
@@ -139,12 +140,16 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
     };
     for row in rows {
         tail.next_id = row.id.raw() + 1;
-        if tail.sub.key.is_some() && tail.sub.key.as_deref() != row.key.as_deref() {
+        // The one predicate resume validation asks too (`validate_subscribe`).
+        if !tail.sub.admits(&row.name, row.key.as_deref(), row.scope) {
             continue;
         }
-        let Some(entry) = tail.sub.entries.iter().find(|e| e.name == row.name) else {
-            continue;
-        };
+        let entry = tail
+            .sub
+            .entries
+            .iter()
+            .find(|e| e.name == row.name)
+            .expect("admits matched this row's name to one of the subscription's entries");
         // Names are escaped as JSON strings in both terminal frames below:
         // `Event::NAME` is hand-writable and may hold any character.
         if row.shape != Some(entry.fingerprint) {

@@ -14,19 +14,23 @@
 //! `0x08 [job][payload][key: Option<String>][shape: u64 le]` shaped enqueue,
 //! `0x09 [event][payload][key: Option<String>][shape: u64 le]` shaped emit,
 //! `0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
-//! scoped enqueue, for a `#[job(scoped_by = …)]` job (job-tenancy spec §6) —
-//! strings and byte fields length-prefixed per the `Codec` layout; `0x0b` is
+//! scoped enqueue, for a `#[job(scoped_by = …)]` job (job-tenancy spec §6),
+//! `0x0b [event][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
+//! scoped emit, an event emitted on a `ScopedTx` (tenancy-completion spec §6)
+//! — strings and byte fields length-prefixed per the `Codec` layout; `0x0c` is
 //! the next free tag. `0x02`/`0x03` (the same without the shape) still
 //! decode, with the shape unknown, and are never written — `TxEffects` holds
 //! a bare shape, so a shapeless enqueue or emit cannot be represented.
-//! `0x05`/`0x06`/`0x07` and `0x0a` are the ONLY tags that carry a
+//! `0x05`/`0x06`/`0x07`, `0x0a` and `0x0b` are the ONLY tags that carry a
 //! scope. A table effect's is chosen by the table's own `Row::Scope`, not by
 //! the scope value (tenant 0 is a legal tenant, so a scoped table's records
 //! always use `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at
 //! scope 0). A scoped enqueue is `0x0a` rather than a widened `0x08` for the
 //! same reason, chosen by the job's own `Job::Scope` through the enqueue
-//! family, and the same presence-not-value rule applies: an enqueue carrying
-//! `Some(0)` is `0x0a`.
+//! family; a scoped emit is `0x0b` rather than a widened `0x09`, chosen by the
+//! `ScopedTx` it was emitted on. The same presence-not-value rule applies to
+//! both: an enqueue or emit carrying `Some(0)` is `0x0a` or `0x0b`. An emit's
+//! tenant is never folded into its key, which stays the app's own filter.
 //! A binary that does not know a tag refuses it by name (`decode_record`'s
 //! unknown-tag error) rather than misreading a wider record. `0x07` is a
 //! NEW tag rather than a widened `0x04`, the same choice `0x05`/`0x06` made
@@ -659,9 +663,10 @@ enum Effect {
         id: u64,
     },
     // `shape`: `None` for the pre-shape tags `0x02`/`0x03`, `Some` for
-    // `0x08`/`0x09`/`0x0a` — the wire presence, like `scope` above. `None` is
-    // foreign to every check downstream (payload-shapes spec §2). `scope`:
-    // `Some` exactly for `0x0a`, the scoped enqueue (job-tenancy spec §6).
+    // `0x08`/`0x09`/`0x0a`/`0x0b` — the wire presence, like `scope` above.
+    // `None` is foreign to every check downstream (payload-shapes spec §2).
+    // `scope`: `Some` exactly for `0x0a`, the scoped enqueue (job-tenancy
+    // spec §6).
     Enqueue {
         job: String,
         payload: Vec<u8>,
@@ -669,11 +674,14 @@ enum Effect {
         shape: Option<u64>,
         scope: Option<u64>,
     },
+    // `scope`: `Some` exactly for `0x0b`, the scoped emit (tenancy-completion
+    // spec §6) — presence, not value, as for `Enqueue` above.
     Emit {
         event: String,
         payload: Vec<u8>,
         key: Option<String>,
         shape: Option<u64>,
+        scope: Option<u64>,
     },
     // `scope`: same presence-not-value convention as `Put`/`Delete` above —
     // `None` for tag `0x04` (unscoped), `Some` for tag `0x07` (scoped).
@@ -733,6 +741,20 @@ struct EnqueuedTenant {
     scope_name: &'static str,
 }
 
+/// One buffered emit. `shape` is bare because a shapeless emit cannot be
+/// represented (payload-shapes amendment A2). `scope` is the tenant of the
+/// `ScopedTx` it was emitted on, `None` for an emit on a bare `Tx`: presence,
+/// not value, selects tag `0x0b`, so `Some(0)` is tenant 0. It is never
+/// folded into `key`, which stays the app's own filter (tenancy-completion
+/// spec §2.3).
+struct Emit {
+    event: &'static str,
+    payload: Vec<u8>,
+    key: Option<String>,
+    shape: u64,
+    scope: Option<u64>,
+}
+
 /// A transaction's buffered effects: the collapsed per-table overlay
 /// (`None` = tombstone) plus enqueues and emits in call order. `scoped_tables`
 /// names which of `overlay`'s tables `encode_record` must tag `0x05`/`0x06`
@@ -758,9 +780,7 @@ struct TxEffects {
     // reads it.
     written_as: BTreeSet<(&'static str, &'static str, bool, TypeId)>,
     enqueues: Vec<Enqueue>,
-    // The emit shape is a bare `u64`, so a shapeless emit cannot be
-    // represented (payload-shapes amendment A2).
-    emits: Vec<(&'static str, Vec<u8>, Option<String>, u64)>,
+    emits: Vec<Emit>,
     migrate_puts: Vec<(&'static str, Option<u64>, u64, Vec<u8>)>,
 }
 
@@ -845,12 +865,22 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
             tenant.id.encode(&mut out);
         }
     }
-    for (event, payload, key, shape) in &effects.emits {
-        out.push(9);
+    for Emit {
+        event,
+        payload,
+        key,
+        shape,
+        scope,
+    } in &effects.emits
+    {
+        out.push(if scope.is_some() { 11 } else { 9 });
         encode_bytes(event.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
         shape.encode(&mut out);
+        if let Some(tenant) = scope {
+            tenant.encode(&mut out);
+        }
     }
     for (table, scope, id, row) in &effects.migrate_puts {
         match scope {
@@ -899,6 +929,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: None,
+                scope: None,
             },
             4 => Effect::MigratePut {
                 table: String::decode(input)?,
@@ -934,9 +965,17 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
+                scope: None,
             },
             10 => Effect::Enqueue {
                 job: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
+                scope: Some(u64::decode(input)?),
+            },
+            11 => Effect::Emit {
+                event: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
@@ -1378,6 +1417,21 @@ impl<'a> Tx<'a> {
         });
     }
 
+    /// The one body `Tx::emit`, `Tx::emit_keyed` and `ScopedTx`'s two emits
+    /// share. `scope` is the emitting `ScopedTx`'s tenant, `None` on a bare
+    /// `Tx`; it is recorded beside `key`, never in it.
+    fn push_emit<Ev: Event>(&mut self, scope: Option<u64>, key: Option<String>, event: Ev) {
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.effects.emits.push(Emit {
+            event: Ev::NAME,
+            payload,
+            key,
+            shape: Ev::FINGERPRINT,
+            scope,
+        });
+    }
+
     /// Enqueues a `global` job into this transaction's record. A
     /// `#[job(scoped_by = Org)]` job does not compile here: it names a
     /// tenant, and a bare `Tx` names none (`NoJobTenant`'s note says where to
@@ -1416,21 +1470,15 @@ impl<'a> Tx<'a> {
     }
 
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
-        let mut payload = Vec::new();
-        event.encode(&mut payload);
-        self.effects
-            .emits
-            .push((Ev::NAME, payload, None, Ev::FINGERPRINT));
+        self.push_emit(None, None, event);
     }
 
-    /// Emits with an opaque scoping key (e.g. an org id) — the exact-match
-    /// filter `Subscription::key` matches against. Mirrors `enqueue_keyed`.
+    /// Emits with an opaque app key (a user's subject, a room) — the
+    /// exact-match filter `Subscription::key` matches against. Mirrors
+    /// `enqueue_keyed`. A tenant is not a key: an event of a tenant is
+    /// emitted on the `ScopedTx`, which records the tenant beside the key.
     pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
-        let mut payload = Vec::new();
-        event.encode(&mut payload);
-        self.effects
-            .emits
-            .push((Ev::NAME, payload, Some(key.into()), Ev::FINGERPRINT));
+        self.push_emit(None, Some(key.into()), event);
     }
 }
 
@@ -1830,10 +1878,10 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 /// below, and only with a principal — and never DERIVES a scope: the tenant
 /// is named by the app at the one `tx.scope::<S>(…)` line and nowhere else,
 /// and no key is ever parsed back into one (the standing `emit_keyed`
-/// ruling, DESIGN.md §6). The one
-/// thing it does read off a scope is its decimal form, as the subscription
-/// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering
-/// out, never resolving in.
+/// ruling, DESIGN.md §6).
+/// What it records of a scope is its raw id — beside a scoped enqueue
+/// (`0x0a`) and a scoped emit (`0x0b`), apart from any app key
+/// (tenancy-completion spec §6) — recording out, never resolving in.
 pub trait Tenant: Sized + 'static {
     /// This tenant type's identity: persisted inside every scoped job's and
     /// scoped event's fingerprint, and rendered wherever a scope type is
@@ -2052,37 +2100,30 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         self.tx.delete_in(self.scope, id)
     }
 
-    /// The subscription key every event emitted on this handle carries: the
-    /// scope's decimal id. Public because it is the SAME encoding on both
-    /// sides of the exact match — an SSE handler keys its `Subscription` with
-    /// it, so emitter and subscriber cannot drift into two spellings of one
-    /// tenant (spec §4).
-    ///
-    /// Decimal rather than anything type-qualified because this key is
-    /// DURABLE: it is stored in `EventRow.key`, shipped by replication, and
-    /// exact-matched when a subscriber resumes. That rules out `type_name` and
-    /// `TypeId`, neither of which the compiler promises to keep stable across
-    /// builds — a key whose spelling moved under a binary upgrade would make
-    /// every pre-upgrade backlog event silently invisible to a reconnecting
-    /// subscriber. The consequence, stated rather than hidden: two DIFFERENT
-    /// scope types sharing a raw id share a key, so an app with more than one
-    /// scope type keys its subscriptions per scope type as well.
-    pub fn event_key(&self) -> String {
-        self.scope.raw().to_string()
-    }
-
-    /// `Tx::emit`, keyed by this tenant — spec §4's "one tenancy mechanism,
-    /// not two". A transaction that had to pass `authorize` to reach a
-    /// tenant's rows cannot then hand that tenant's event to a subscription
-    /// keyed to another one, so an app that has locked its queries down does
-    /// not leak through a subscription.
+    /// `Tx::emit`, recorded in this tenant: the row carries the tenant's id
+    /// in a field of its own (tag `0x0b`), with no key, so only a feed of
+    /// this tenant receives it (tenancy-completion spec §6). A transaction
+    /// that had to be admitted to reach a tenant's rows cannot hand that
+    /// tenant's event to a subscription outside it, and no string names the
+    /// tenant.
     ///
     /// This shadows the `Tx::emit` the `DerefMut` would otherwise reach. An
-    /// emit that genuinely belongs to no tenant is written `(*tx).emit(…)` —
-    /// the same explicit deref an unscoped table access takes.
+    /// emit that genuinely belongs to no tenant is written `(*tx).emit(…)` in
+    /// a handler that owns its `ScopedTx`, and `(**tx).emit(…)` in a scoped
+    /// job's `run`, which holds `&mut ScopedTx` — the explicit deref an
+    /// unscoped table access takes. It is recorded with no tenant.
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
-        let key = self.event_key();
-        self.tx.emit_keyed(key, event);
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), None, event);
+    }
+
+    /// `emit`, with the app's own key beside the tenant: a tenant feed
+    /// narrowed by `.key(…)` receives it. The key is the app's filter, never
+    /// the tenant. This shadows `Tx::emit_keyed`, as `emit` shadows
+    /// `Tx::emit`.
+    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), Some(key.into()), event);
     }
 
     /// Enqueues a job scoped by this tenant's type; it runs in this tenant
@@ -2512,8 +2553,9 @@ impl StateMachine for TableMachine {
                         payload,
                         key,
                         shape,
+                        scope,
                     } => {
-                        w.materialize_event(seq, event, payload, key.as_deref(), *shape)?;
+                        w.materialize_event(seq, event, payload, key.as_deref(), *shape, *scope)?;
                     }
                 }
             }
@@ -4965,9 +5007,13 @@ mod tests {
             shape: 0x5E4D,
             scope: None,
         });
-        effects
-            .emits
-            .push(("invoice_finalized", vec![7], None, 0xE7E7));
+        effects.emits.push(Emit {
+            event: "invoice_finalized",
+            payload: vec![7],
+            key: None,
+            shape: 0xE7E7,
+            scope: None,
+        });
         effects
     }
 
@@ -5003,7 +5049,8 @@ mod tests {
                     event: "invoice_finalized".into(),
                     payload: vec![7],
                     key: None,
-                    shape: Some(0xE7E7)
+                    shape: Some(0xE7E7),
+                    scope: None,
                 },
             ]
         );
@@ -5051,13 +5098,20 @@ mod tests {
     #[test]
     fn keyed_emit_roundtrips() {
         let mut effects = TxEffects::default();
-        effects.emits.push((
-            "invoice_finalized",
-            vec![1],
-            Some("org-7".to_string()),
-            0xE7E7,
-        ));
-        effects.emits.push(("ping", vec![2], None, 0x9196));
+        effects.emits.push(Emit {
+            event: "invoice_finalized",
+            payload: vec![1],
+            key: Some("org-7".to_string()),
+            shape: 0xE7E7,
+            scope: None,
+        });
+        effects.emits.push(Emit {
+            event: "ping",
+            payload: vec![2],
+            key: None,
+            shape: 0x9196,
+            scope: None,
+        });
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
             decoded,
@@ -5066,13 +5120,15 @@ mod tests {
                     event: "invoice_finalized".into(),
                     payload: vec![1],
                     key: Some("org-7".into()),
-                    shape: Some(0xE7E7)
+                    shape: Some(0xE7E7),
+                    scope: None,
                 },
                 Effect::Emit {
                     event: "ping".into(),
                     payload: vec![2],
                     key: None,
-                    shape: Some(0x9196)
+                    shape: Some(0x9196),
+                    scope: None,
                 },
             ]
         );
@@ -5144,7 +5200,8 @@ mod tests {
                     event: "pong".into(),
                     payload: vec![9],
                     key: None,
-                    shape: None
+                    shape: None,
+                    scope: None,
                 },
             ]
         );
@@ -5162,9 +5219,13 @@ mod tests {
             shape: 0x0102_0304_0506_0708,
             scope: None,
         });
-        effects
-            .emits
-            .push(("pong", vec![9], None, 0x1112_1314_1516_1718));
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![9],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: None,
+        });
         assert_eq!(
             encode_record(&effects),
             vec![
@@ -5189,7 +5250,8 @@ mod tests {
                     event: "pong".into(),
                     payload: vec![9],
                     key: None,
-                    shape: Some(0x1112_1314_1516_1718)
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: None,
                 },
             ]
         );
@@ -5249,6 +5311,80 @@ mod tests {
                     payload: vec![9],
                     key: None,
                     shape: Some(0x0102_0304_0506_0708),
+                    scope: None,
+                },
+            ]
+        );
+    }
+
+    /// Tenancy-completion spec §6, the `0x0a` precedent: the scoped emit,
+    /// pinned as literal bytes. It is the `0x09` layout under tag `0x0b`,
+    /// plus the tenant as eight little-endian bytes, at tenant 0, because
+    /// presence and not value selects the tag. A keyed scoped emit carries
+    /// the app's key where `0x09` carries it and the tenant after the shape,
+    /// apart from the key. A global emit in the same record is still `0x09`,
+    /// byte for byte, with nothing after its shape.
+    #[test]
+    fn scoped_emit_bytes_are_pinned_with_tenant_zero() {
+        let mut effects = TxEffects::default();
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![9],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: Some(0),
+        });
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![8],
+            key: Some("r".to_string()),
+            shape: 0x1112_1314_1516_1718,
+            scope: Some(0x0102),
+        });
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![7],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: None,
+        });
+        assert_eq!(
+            encode_record(&effects),
+            vec![
+                3, 0, 0, 0, // three effects
+                11, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 9, 0, // scoped, no key
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape
+                0, 0, 0, 0, 0, 0, 0, 0, // its tenant: 0, a real tenant
+                11, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 8, // scoped, keyed
+                1, 1, 0, 0, 0, b'r', // the app's key "r", where 0x09 carries a key
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape
+                0x02, 0x01, 0, 0, 0, 0, 0, 0, // its tenant, apart from the key
+                9, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 7, 0, // global emit
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape, nothing after
+            ]
+        );
+        assert_eq!(
+            decode_record(&encode_record(&effects)).unwrap(),
+            vec![
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![9],
+                    key: None,
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: Some(0),
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![8],
+                    key: Some("r".into()),
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: Some(0x0102),
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![7],
+                    key: None,
+                    shape: Some(0x1112_1314_1516_1718),
                     scope: None,
                 },
             ]
@@ -5415,14 +5551,14 @@ mod tests {
         assert!(Refusal::of(&err).is_some(), "{err}");
     }
 
-    /// `0x0b`, the next free tag: `0x0a` is the scoped enqueue.
+    /// `0x0c`, the next free tag: `0x0b` is the scoped emit.
     #[test]
     fn decode_refuses_unknown_tags() {
         let mut out = Vec::new();
         1u32.encode(&mut out);
-        out.push(11);
+        out.push(12);
         let err = decode_record(&out).unwrap_err();
-        assert!(err.to_string().contains("unknown effect tag 11"), "{err}");
+        assert!(err.to_string().contains("unknown effect tag 12"), "{err}");
     }
 
     #[test]

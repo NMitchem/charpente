@@ -163,17 +163,18 @@ the oracle, and the oracle is the product.
   down — WAL effects, replication, archive, `restore`, snapshot seeding, and
   `migrate_schema`'s watermark — and a binary compiled against the unscoped shape of a
   scoped table refuses the record by name rather than misreading it. Realtime is the same mechanism rather than a second
-  one: `emit` inside a scope is keyed by the scope. Enumerating every tenant is a
+  one: an emit inside a scope records the scope's tenant, apart from any app key, and a
+  tenant feed built from the scope receives only its tenant's events. Enumerating every tenant is a
   **declared capability**, not an escape hatch — `#[route(…, cross_tenant)]` /
   `#[job(…, cross_tenant)]` mint the token `Tx::across_tenants` requires, rows come back
   paired with their scope, and `charpente describe` turns "audit the cross-tenant reads"
   into a mechanical inventory (DECISIONS §11). The flagship oracle is
   `every_scoped_read_returns_only_its_own_tenants_rows` — all four read paths, two tenants
   sharing an id space *and* an index key, 256 universes at a pinned base plus 768 over
-  three fresh ones — with two naive victims that fail it by name, a scope-keyed realtime
+  three fresh ones — with two naive victims that fail it by name, a tenant-feed realtime
   sibling, and a two-tenant wire oracle over real TCP in the edge harness.
-  **Two limits travel with it.** The subscription key is the scope's decimal id, so two
-  different scope types sharing a raw id share a key. And the guarantee's boundary is the
+  **Two limits travel with it.** An event row records its tenant's raw id, so two
+  different scope types sharing a raw id share a tenant in the event log. And the guarantee's boundary is the
   typed surface handed to handlers and jobs: a `Db` holder reaches every tenant and can
   mint the cross-tenant capability, with the standing of whoever holds the data directory —
   an operator, not a request (DECISIONS §12, ratified 2026-09-05).

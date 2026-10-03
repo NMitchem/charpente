@@ -1586,6 +1586,8 @@ impl Writer<'_> {
     /// Materializes one emit effect as an `EventRow`, id from the monotonic
     /// `next_event_id` meta counter — bumped in this same store transaction,
     /// so ids are deterministic across replay. Platform apply-path surface.
+    /// `scope` is the record's tenant for a scoped emit (`0x0b`), carried
+    /// into the row unchanged.
     pub fn materialize_event(
         &mut self,
         seq: u64,
@@ -1593,6 +1595,7 @@ impl Writer<'_> {
         payload: &[u8],
         key: Option<&str>,
         shape: Option<u64>,
+        scope: Option<u64>,
     ) -> io::Result<u64> {
         let mut meta = self.txn.open_table(META).map_err(redb_err)?;
         let id = meta
@@ -1611,6 +1614,7 @@ impl Writer<'_> {
                 key: key.map(str::to_string),
                 payload: payload.to_vec(),
                 shape,
+                scope,
             },
         )?;
         Ok(id)

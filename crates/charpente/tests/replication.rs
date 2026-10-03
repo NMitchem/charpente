@@ -2943,8 +2943,8 @@ fn hello_declaring_protocol_version_1_is_refused_by_name() {
 
 /// PROTO_VERSION 3 (payload shapes): a version-2 binary writes `0x02`/`0x03`
 /// and cannot read `0x08`/`0x09`, so it is refused at Hello, by name, before a
-/// single frame ships (spec amendment A3). (Protocol 4 since job tenancy; the
-/// version-3 test follows.)
+/// single frame ships (spec amendment A3). (Protocol 5 since event tenancy; the
+/// version-3 and version-4 tests follow.)
 #[test]
 fn hello_declaring_protocol_version_2_is_refused_by_name() {
     let sim = Sim::with_faults(0x2EB1_0006 ^ 2, FaultConfig::none());
@@ -2965,9 +2965,9 @@ fn hello_declaring_protocol_version_2_is_refused_by_name() {
     match reply {
         Msg::Refuse { message } => assert_eq!(
             message,
-            "replication protocol version mismatch: this node speaks protocol version 4, but \
+            "replication protocol version mismatch: this node speaks protocol version 5, but \
              the peer's Hello declared version 2 — upgrade the older binary so both speak the \
-             expected version 4"
+             expected version 5"
         ),
         other => panic!("expected Refuse, got {other:?}"),
     }
@@ -2975,7 +2975,8 @@ fn hello_declaring_protocol_version_2_is_refused_by_name() {
 
 /// PROTO_VERSION 4 (job tenancy, spec §6): a version-3 binary cannot read the
 /// scoped enqueue tag `0x0a`, so it is refused at Hello, by name, before a
-/// single frame ships — not at its first scoped job.
+/// single frame ships — not at its first scoped job. (Protocol 5 since event
+/// tenancy; the version-4 test follows.)
 #[test]
 fn hello_declaring_protocol_version_3_is_refused_by_name() {
     let sim = Sim::with_faults(0x2EB1_0006 ^ 3, FaultConfig::none());
@@ -2996,9 +2997,41 @@ fn hello_declaring_protocol_version_3_is_refused_by_name() {
     match reply {
         Msg::Refuse { message } => assert_eq!(
             message,
-            "replication protocol version mismatch: this node speaks protocol version 4, but \
+            "replication protocol version mismatch: this node speaks protocol version 5, but \
              the peer's Hello declared version 3 — upgrade the older binary so both speak the \
-             expected version 4"
+             expected version 5"
+        ),
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+
+/// PROTO_VERSION 5 (tenancy completion, spec §6): a version-4 binary cannot
+/// read the scoped emit tag `0x0b`, nor an `EventRow`'s trailing tenant, so
+/// it is refused at Hello, by name, before a single frame ships — not at its
+/// first scoped emit.
+#[test]
+fn hello_declaring_protocol_version_4_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_0006 ^ 4, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: 4,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest: 0,
+        },
+    )
+    .unwrap();
+    match reply {
+        Msg::Refuse { message } => assert_eq!(
+            message,
+            "replication protocol version mismatch: this node speaks protocol version 5, but \
+             the peer's Hello declared version 4 — upgrade the older binary so both speak the \
+             expected version 5"
         ),
         other => panic!("expected Refuse, got {other:?}"),
     }
@@ -3384,18 +3417,18 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
 /// Task 1's dangling World-A obligation, discharged (tenant-scoping Task 6b,
 /// Step 4): "a follower on an older binary refuses [a wider record] by
 /// name." No genuinely older binary runs in-process, so the oracle is a
-/// follower fed a tag THIS binary does not know either — tag 11 (`0x0b`),
-/// one past job tenancy's `0x0a` (scoped enqueue). This test's own doc
+/// follower fed a tag THIS binary does not know either — tag 12 (`0x0c`),
+/// one past event tenancy's `0x0b` (scoped emit). This test's own doc
 /// comment predicted exactly this collision when it was written against tag
 /// 7 (Task 6b): "so this stays true whichever tag a later task (6c or
-/// beyond) claims next" — tag 11 is simply one past the highest tag any
-/// mounted feature claims today (job tenancy's `0x0a` collided with the
-/// prior tag-10 fixture and moved it here, DESIGN §4). Proves the
+/// beyond) claims next" — tag 12 is simply one past the highest tag any
+/// mounted feature claims today (job tenancy's `0x0a` moved the fixture from
+/// 10 to 11, and event tenancy's `0x0b` from 11 to 12, DESIGN §4). Proves the
 /// unknown-tag refusal is wired through the REAL `apply_shipped` path, not
 /// just `decode_record`'s own unit test (`db::tests::decode_refuses_unknown_
 /// tags`) — and, like the sibling test above, that it refuses the WHOLE
 /// batch: two good records ship in the same `Frames` batch ahead of the
-/// tag-11 one, and neither must land.
+/// tag-12 one, and neither must land.
 #[test]
 fn a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name() {
     let sim = Sim::with_faults(0x6B00_0004, FaultConfig::none());
@@ -3416,11 +3449,11 @@ fn a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by
     }
     let mut frames = db_a.read_log(0, usize::MAX).unwrap();
     assert_eq!(frames.len(), 2);
-    frames.push((2, vec![1u8, 0, 0, 0, 11]));
+    frames.push((2, vec![1u8, 0, 0, 0, 12]));
 
     let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), make_schema()).unwrap();
     let err = db_b.apply_shipped(&frames).unwrap_err();
-    assert!(err.to_string().contains("unknown effect tag 11"), "{err}");
+    assert!(err.to_string().contains("unknown effect tag 12"), "{err}");
     assert_eq!(
         db_b.last_applied(),
         None,

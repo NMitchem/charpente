@@ -37,7 +37,8 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::repl::ReplConfig;
 use charpente::repl::role::Role;
 use charpente::{
-    Id, Schema, Scoped, Tenant, Tx, View, Wire as WireDerive, event, route, routes, serve, table,
+    Id, Schema, Scoped, Subscribe, Tenant, Tx, View, Wire as WireDerive, event, route, routes,
+    serve, table,
 };
 use serde::{Deserialize, Serialize};
 
@@ -156,8 +157,8 @@ fn create_doc(
         text: body.text,
     };
     tx.put(&row);
-    // `ScopedTx::emit`, so the event carries this tenant's key without the
-    // handler naming it twice (spec §4).
+    // `ScopedTx::emit`, so the event is recorded in this tenant, apart from
+    // any key (tenancy-completion spec §6).
     tx.emit(DocCreated {
         doc: row.id,
         text: row.text.clone(),
@@ -187,9 +188,9 @@ fn list_docs_by_tag(
         .collect())
 }
 
-/// One tenant's event feed, keyed by the scope the subscriber just proved
-/// membership of — the same key `ScopedTx::emit` attaches, so emitter and
-/// subscriber cannot drift into two spellings of one tenant.
+/// One tenant's event feed, built from the scope the subscriber just proved
+/// membership of: it carries that tenant, and delivers only events recorded
+/// in it.
 #[route(SSE "/orgs/:org/feed", auth)]
 fn feed(
     tx: &mut Tx,
@@ -198,9 +199,7 @@ fn feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<DocCreated>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<DocCreated>().cursor(cursor).into())
 }
 
 /// `--legacy-unscoped`'s only route: every `Doc` row this node holds, with no

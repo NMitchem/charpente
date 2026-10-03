@@ -427,8 +427,8 @@ fn a_tenants_session_never_receives_another_tenants_rows_over_http() {
 }
 
 /// SSE: two live subscriptions on one node, one per tenant. Every event is
-/// emitted through `ScopedTx::emit`, so it carries its tenant's key; each
-/// feed is keyed by the scope its own subscriber proved membership of.
+/// emitted through `ScopedTx::emit`, so it is recorded in its tenant; each
+/// feed is built from the scope its own subscriber proved membership of.
 #[test]
 #[ignore]
 fn a_tenants_feed_never_receives_another_tenants_events_over_sse() {

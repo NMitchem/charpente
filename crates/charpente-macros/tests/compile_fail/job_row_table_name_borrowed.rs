@@ -8,9 +8,9 @@
 // does not, and it fires for the writes the binary can reach — which is why
 // `main` mounts both routes, as an app does. A write nothing reaches is
 // never compiled into the binary, so it can never run either. The routes
-// build the row they forge rather than read it: no transaction reads the
-// queue (job_row_read_on_bare_tx.rs), and a read's type-check error would
-// stop the build before any of these four.
+// build the row they forge rather than read it: no app code reads the
+// queue through a transaction (job_row_read_on_bare_tx.rs), and a read's
+// type-check error would stop the build before any of these four.
 use std::io;
 
 use charpente::auth::Principal;

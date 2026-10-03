@@ -3,8 +3,8 @@
 // handler that could re-put a Pending row with another tenant would run the
 // job there: this anonymous route, with no scope line and no `cross_tenant`,
 // moved an org-1 job into org 9 at 79ae1c0. The read is refused too (no
-// transaction reads the platform's tables), and so is the write, each
-// with a note that names its fix.
+// app code reads the platform's tables through a transaction), and so is
+// the write, each with a note that names its fix.
 use charpente::auth::Principal;
 use charpente::core::job::JobRow;
 use charpente::http::ApiError;

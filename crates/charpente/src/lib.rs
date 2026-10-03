@@ -35,3 +35,7 @@ pub use launch::launch;
 // `Wire` (from `charpente-macros`) already gets. The macros' output names
 // `::charpente::tenant::tenant_name::<S>()`, whose bound is `TenantScope`.
 pub use tenant::{Scoped, TenantScope};
+// Re-exported at the root so a tenant-feed handler writes
+// `use charpente::Subscribe;` beside `Scoped`, the other trait a scoped
+// handler brings into scope.
+pub use http::Subscribe;

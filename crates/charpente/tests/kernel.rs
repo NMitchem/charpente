@@ -3034,9 +3034,8 @@ impl Flaky {
 /// The scope type for the swarm's tenant-scoped table. A bare marker, not a
 /// `#[table]`: a tenant type owes a `NAME` (its identity, unique in the app)
 /// and `authorize`, and the platform
-/// never DERIVES a scope — it only renders one, as the subscription key
-/// `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
-/// `emit_keyed` ruling, DESIGN.md §6).
+/// never DERIVES a scope — it only records one, beside a scoped job or event
+/// (the standing `emit_keyed` ruling, DESIGN.md §6).
 struct Org;
 
 impl Tenant for Org {
@@ -6211,11 +6210,11 @@ mod job_tenancy {
     /// its marker names. A stripped request's nonce appears nowhere it
     /// should have been refused.
     fn jobs_stay_in_their_tenant(db: &mut Db) -> Result<Seen, String> {
-        // The job queue is the platform's, and no transaction reads it
-        // (tenancy-completion spec §3), so the oracle reads it the operator's
-        // way, through a snapshot. Taken just before the group begins, it is
-        // the image the group's own snapshot holds: nothing commits in
-        // between, since the oracle holds `db`.
+        // The job queue is the platform's, and no app code reads it through a
+        // transaction (tenancy-completion spec §3), so the oracle reads it the
+        // operator's way, through a snapshot. Taken just before the group
+        // begins, it is the image the group's own snapshot holds: nothing
+        // commits in between, since the oracle holds `db`.
         let jobs = db
             .snapshot()
             .and_then(|snap| snap.scan::<JobRow>())

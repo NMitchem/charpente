@@ -608,7 +608,10 @@ again).
 `0x01 [table][id]`, enqueue `0x08 [job][payload][key: Option<String>][shape: u64]`,
 emit `0x09 [event][payload][key: Option<String>][shape: u64]`, scoped enqueue
 `0x0a [job][payload][key: Option<String>][shape: u64][scope: u64]` (a
-`#[job(scoped_by = …)]` job's tenant, spec 2026-09-27-job-tenancy §6), migrate-put
+`#[job(scoped_by = …)]` job's tenant, spec 2026-09-27-job-tenancy §6), scoped emit
+`0x0b [event][payload][key: Option<String>][shape: u64][scope: u64]` (an event emitted
+on a `ScopedTx`, its tenant beside the app's key, spec 2026-09-30-tenancy-completion §6),
+migrate-put
 `0x04 [table][id: u64][row]` (§3's `MigratePut`, below), strings and byte
 fields length-prefixed per the row codec. The shape is the payload type's
 structural fingerprint (§3). The pre-shape `0x02`/`0x03` (the same without the
@@ -625,8 +628,12 @@ scoping. A scoped table's `MigratePut` (tenant-scoping Task 6c) is
 bytes for an unscoped table stay exactly as above. The scoped enqueue is a
 new tag rather than a widened `0x08` for the same reason, chosen by presence
 and never by the tenant's value, so tenant 0 is `0x0a` too; its `JobRow`
-carries the tenant as a trailing `scope`, absent for every other row. `0x0b`
-is the next free tag. A binary that does not know a tag (older, or a later
+carries the tenant as a trailing `scope`, absent for every other row. The
+scoped emit is a new tag rather than a widened `0x09` for the same reason,
+chosen by presence and never by the tenant's value, so tenant 0 is `0x0b` too
+and a global emit stays `0x09` byte for byte; its `EventRow` carries the
+tenant as a trailing `scope`, absent for every other row. `0x0c` is the next
+free tag. A binary that does not know a tag (older, or a later
 one it hasn't caught up to) refuses it by name rather than misreading a
 wider record.
 Table effects are the transaction's collapsed write set in (table, scope,
@@ -681,8 +688,8 @@ batching it would have, since each transaction applied before the next took its 
 `JobRow` and `EventRow` materialize at APPLY from the log record's enqueue/emit sections,
 never from anything `Group::stage` merges. Read-your-own-writes across a batch therefore
 means rows, not queue and event effects. This was the one semantic group commit changed
-that an app could see, and it no longer can: no transaction reads the platform's tables
-(§3's Jobs bullet). Inside the platform it still holds, and the dispatcher's
+that an app could see, and it no longer can: no app code reads the platform's tables
+through a transaction (§3's Jobs bullet). Inside the platform it still holds, and the dispatcher's
 `Tx::get_job` reads through the same overlay. Pinned by
 `an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits`
 (`crates/charpente-core/tests/group_commit.rs`, seed `0x7C00_0901`).
@@ -809,8 +816,8 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   named in `PLATFORM_TABLES`, so an app can forge neither an event into a tenant's feed nor a
   table's version past its migration. Apply writes an event row from an emit effect, and the
   migration executor writes schema-version rows through the crate-private
-  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. No transaction reads
-  any of the three either (spec 2026-09-30-tenancy-completion §3): `View`'s reads bound
+  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. No app code reads
+  any of the three through a transaction either (spec 2026-09-30-tenancy-completion §3): `View`'s reads bound
   `R: ReadableBy<Self>`, which a platform table meets for a `Snapshot` alone; a
   hand-written `Row` borrowing one of the names fails to build at each reachable `Tx`
   read; and the dispatcher's in-batch read of a job row is `Tx::get_job`, which takes
@@ -840,7 +847,9 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   — and `events![…]`/`App::mount_events` register the type for `describe` only.
   Delivery deliberately has NO registry: `Subscription::of::<Ev>()` captures its encoder
   statically at the subscribe site, which is what makes "unregistered event at delivery"
-  inexpressible rather than an error case.
+  inexpressible rather than an error case. An event emitted on a `ScopedTx` is recorded in
+  that tenant (§4's `0x0b`), and a tenant feed — `tx.subscription::<Ev>()` on the same
+  handle — delivers only events recorded in its tenant (§6, §8).
 - **Wire.** `Wire` is the trait describing what a type looks like once serde has
   encoded it — the mechanism behind the client-side codegen named above and behind
   `Id<T>`'s promise to never be a bare u64. `#[derive(Wire)]` implements it for a
@@ -1383,10 +1392,10 @@ Vec<(u64, Vec<u8>)> }` (tag 5, unchanged since before tenant scoping), a scoped 
 rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
 older binary already expects); the receiving side checks the message against its own
 schema's word for that table and refuses a mismatch by name rather than importing a row
-under the wrong scope. `PROTO_VERSION` is 4 — a message body's shape changing is what
+under the wrong scope. `PROTO_VERSION` is 5 — a message body's shape changing is what
 bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
-made it 3, job tenancy's `0x0a` made it 4, and a `Hello` declaring an older version is
-refused by name. The follower
+made it 3, job tenancy's `0x0a` made it 4, event tenancy's `0x0b` made it 5, and a
+`Hello` declaring an older version is refused by name. The follower
 buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot
 replace a `Db` it only borrows, so the CALLER (the kernel arm, T8) runs
 `Repl::run_seed(db, clock)`, which consumes the `Db` through `into_seeder`, replays the
@@ -1677,13 +1686,17 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   virtual time makes "run this monthly job 120 times" a subsecond test.
 - **Realtime.** `tx.emit(event)`/`tx.emit_keyed(key, event)` writes a typed event into the
   committing log record alongside the transaction's other effects — `key` is an opaque
-  scoping filter (an org id, typically), carried but never interpreted inside the
-  deterministic boundary. Inside a tenant scope the key is not the app's to remember:
-  `ScopedTx::emit` supplies it from the scope itself (`ScopedTx::event_key`, the scope's
-  decimal id), so tenancy has one mechanism rather than two that can disagree — an SSE
-  handler keys its `Subscription` with the same `event_key`, and a subscription keyed to
-  one tenant never receives another's event. Apply materializes each into the built-in
-  `charpente.events` table (`EventRow { id, seq, name, key, payload }`); `id` comes from a
+  app filter (a user's subject, a room), carried but never interpreted inside the
+  deterministic boundary, and never a tenant. Inside a tenant scope the tenant is not the
+  app's to remember: `ScopedTx::emit`/`emit_keyed` record the scope's tenant in the
+  event's own field (record tag `0x0b`, §4), apart from the key, so tenancy has one
+  mechanism rather than two that can disagree. A tenant feed is built from the same scope
+  (`tx.subscription::<Ev>()`, below), and one predicate, `Subscription::admits` — a name
+  the subscription carries, exactly its tenancy, a key it passes — decides delivery and
+  gates resume validation alike: a tenant's feed never receives another tenant's event or
+  a global one, and a global subscription never receives a tenant's. Apply materializes
+  each into the built-in `charpente.events` table
+  (`EventRow { id, seq, name, key, payload, shape, scope }`); `id` comes from a
   `next_event_id` meta-counter bumped in call order — the `next_job_id` pattern exactly, so
   ids are strictly monotonic, order-isomorphic to log position, and byte-identical on
   followers.
@@ -1699,14 +1712,19 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   promoted follower's new writes — can mint the same event id for two different events; a
   bare id cannot detect that. Resume validation reads the retained row at `id == c` and
   requires its `seq == s`; a mismatch is a named divergence, never a silent
-  misattribution — the same shape as replication's diverged-`Hello` refusal (§5).
+  misattribution — the same shape as replication's diverged-`Hello` refusal (§5). A
+  cursor on a row of another tenancy than the subscription's is refused by name too: a
+  cursor resumes only the feed that delivered it.
 - **The subscription surface.** `#[route(SSE "/path")]` is a route flavor whose handler is
   an ordinary transaction (session auth via `Ctx` like any route) returning a typed
   `Subscription`: `Subscription::of::<Ev>().and::<Ev2>()` names event types compile-checked
-  (never as strings in app code), `.key(...)` is an optional exact-match filter, and
+  (never as strings in app code), `.key(...)` is an optional exact-match app filter, and
   `.cursor(cursor)` takes the platform-extracted resume point (the handler passes it
   through, or clamps it — access control is the handler's own session/row logic, not the
-  platform's). The platform extracts the client's cursor before the handler runs:
+  platform's). A tenant's feed is `tx.subscription::<Ev>()` on its `ScopedTx` (the
+  `Subscribe` trait): a `TenantFeed<S>` carrying the tenant, which no app code can set or
+  read, converted with `.into()`; `Subscription::and` refuses by name to widen one after
+  the conversion. The platform extracts the client's cursor before the handler runs:
   `Last-Event-ID` header wins (browser-native SSE resume), else a `cursor` query
   parameter, else `None` ("from now"); an unparseable cursor is a 400 and the handler never
   runs. "From now" is the node's `next_event_id` when it SERVES the subscribe
@@ -1736,7 +1754,8 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
 - **Kernel delivery is one path, no modes.** A validated subscribe registers a `Tail`
   (`{ subscription, sink, next_id }`) on the fifth ready source (§1) — eligible the instant
   a commit advances `next_event_id` past it, never a timer. One unit of work reads up to
-  `TAIL_BATCH_EVENTS` rows from `next_id`, filters by name and key, JSON-encodes matches
+  `TAIL_BATCH_EVENTS` rows from `next_id`, filters by name, tenancy and key
+  (`Subscription::admits`), JSON-encodes matches
   through the encoder each `Subscription::of::<Ev>()` captured statically at the subscribe
   site (there is no runtime event registry — "unregistered event at delivery" is
   inexpressible, not an error case), and pushes frames to a driver-supplied sink: a bounded
@@ -2078,8 +2097,9 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   scope: the tenant is named by the app at that one line, or for a fan-out in
   `enqueue_in`'s argument, and nowhere else; a scoped job's record carries that name, and
   no key is ever parsed back into one. Realtime is the same mechanism rather than a second one —
-  `emit` inside a scope is `emit_keyed` with the scope's key (§6), which retires
-  `emit_keyed`'s hand-rolled scoping key as the stopgap it was. The composite key travels
+  an emit inside a scope records the scope's tenant beside the event (§6), a tenant feed
+  is built from the scope, and delivery compares the two exactly; `emit_keyed`'s key stays
+  the app's own filter and is never a tenant. The composite key travels
   the whole way down: WAL effects, replication, the archive, `restore`, snapshot seeding
   and `migrate_schema`'s watermark all carry the scope, and a binary compiled against the
   unscoped shape of a scoped table refuses the record **by name** rather than misreading it.
@@ -2093,9 +2113,10 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   The operator acts inside one tenant with a `TenantAdmission` minted from a `Group`
   (`Tx::admit_scope`), sealed the way `CrossTenant` is. No `authorize` runs, because the
   operator has no principal and already holds the store (DECISIONS §12).
-  **Two limits travel with it, documented rather than engineered around.** The subscription
-  key is the scope's decimal id, so two DIFFERENT scope types sharing a raw id share a key —
-  an app with more than one scope type keys its subscriptions per scope type as well. And
+  **Two limits travel with it, documented rather than engineered around.** An event row
+  records its tenant's raw id, so two DIFFERENT scope types sharing a raw id share a tenant
+  in the event log — an app with more than one scope type gives each scope type's feeds
+  event types of their own. And
   the guarantee's boundary is the typed surface handed to handlers and jobs: whoever holds
   the `Db` reaches every tenant through `Db::snapshot`'s scoped and raw reads, which take a
   scope on the caller's word because replication seeding and the archive are built on them,

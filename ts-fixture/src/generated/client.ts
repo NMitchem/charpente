@@ -155,10 +155,12 @@ export type StreamEnd =
   | { kind: "closed" };
 
 /**
- * The server refused the cursor: HTTP 409 (DESIGN §6). THREE different causes
+ * The server refused the cursor: HTTP 409 (DESIGN §6). FOUR different causes
  * raise this, and only the server's `detail` distinguishes them: below the
- * retention floor; diverged history; or the event at the cursor was written
- * under a different shape of its type. All three are in `validate_subscribe`.
+ * retention floor; diverged history; the event at the cursor was written
+ * under a different shape of its type; or the event at the cursor is outside
+ * this feed's tenancy (another tenant's, a global one on a tenant's feed, or
+ * a tenant's on a global one). All four are in `validate_subscribe`.
  * The rule is in the message on purpose — it is what a developer reads at 3am.
  */
 export class CursorRefused extends Error {
@@ -170,6 +172,9 @@ export class CursorRefused extends Error {
       "another timeline's events under ids this client has already used, which is the " +
       "misattribution the cursor's seq half exists to detect. " +
       "At a reshaped event, resuming would skip the one event the server refused to decode. " +
+      "At an event outside this feed's tenancy, the cursor is not one this feed delivered, " +
+      "so it says nothing about what this feed has sent, and resuming from it could skip " +
+      "this feed's own events before it. " +
       "Reconnect without a cursor, wait for the stream to open (onOpen), then read current " +
       "state from the same node, holding every frame that arrives until that read is " +
       "installed and then applying the held frames and every later one over it in order, " +

@@ -29,8 +29,8 @@ use charpente::http::{
 use charpente::kernel::JobError;
 use charpente::wire::WireU64;
 use charpente::{
-    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, TenantAdmission, Tx,
-    TxError, event, job, jobs, route, routes, table,
+    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Subscribe, Tenant,
+    TenantAdmission, Tx, TxError, event, job, jobs, route, routes, table,
 };
 use charpente_core::db::TableReadRefusal;
 use charpente_core::io::Entropy;
@@ -46,9 +46,8 @@ use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 /// A `#[table]` rather than a bare marker only so `Id<Org>` can be a route
 /// path parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing
 /// reads the table. A scope type owes its `NAME` and `authorize`, and the
-/// platform never DERIVES a scope — it only renders one, as the subscription
-/// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
-/// `emit_keyed` ruling, DESIGN.md §6).
+/// platform never DERIVES a scope — it only records one, beside a scoped job
+/// or event (the standing `emit_keyed` ruling, DESIGN.md §6).
 #[table(global)]
 struct Org {
     id: Id<Org>,
@@ -200,9 +199,7 @@ fn memo_feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<MemoNoted>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<MemoNoted>().cursor(cursor).into())
 }
 
 #[route(SSE "/memo-feed-open/:org", public(Org), emits(MemoNoted))]
@@ -213,9 +210,7 @@ fn memo_feed_open(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<MemoNoted>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<MemoNoted>().cursor(cursor).into())
 }
 
 #[route(SSE "/memo-feed-auth/:org", auth, emits(MemoNoted))]
@@ -226,9 +221,7 @@ fn memo_feed_auth(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<MemoNoted>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<MemoNoted>().cursor(cursor).into())
 }
 
 #[route(POST "/memo-login", public)]

@@ -5,7 +5,7 @@
 // trybuild runs `main`, so its assertions are part of the pin.
 use charpente::http::{ApiError, Ctx, Cursor, RouteDef, Subscription};
 use charpente::wire::WireU64;
-use charpente::{CrossTenant, Id, Scoped, Tx, event, route, table};
+use charpente::{CrossTenant, Id, Scoped, Subscribe, Tx, event, route, table};
 
 mod tenancy {
     use charpente::auth::Principal;
@@ -67,9 +67,7 @@ fn feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<IncidentOpened>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<IncidentOpened>().cursor(cursor).into())
 }
 
 fn main() {
