@@ -1,0 +1,145 @@
+error[E0080]: evaluation panicked: contract: a global event's recorded shape is its payload's field fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is `Unscoped` — and this event's two differ, so its rows would read as another event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to it (docs/GUIDE.md §11, "An event's tenancy")
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::emit::<Notice>::{constant#0}` failed inside this call
+  |
+note: inside `charpente::charpente_core::db::refuse_global_event_shape`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  | /         panic!(
+  | |             "contract: a global event's recorded shape is its payload's field fold alone — \
+  | |              `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is \
+  | |              `Unscoped` — and this event's two differ, so its rows would read as another event \
+... |
+  | |              to it (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::emit::<Notice>`
+  --> tests/compile_fail/forged_global_event_shape.rs:72:5
+   |
+72 | /     tx.emit(Notice {
+73 | |         invoice: WireU64(1),
+74 | |     });
+   | |______^
+
+error[E0080]: evaluation panicked: contract: a global event's recorded shape is its payload's field fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is `Unscoped` — and this event's two differ, so its rows would read as another event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to it (docs/GUIDE.md §11, "An event's tenancy")
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::emit_keyed::<Notice, &str>::{constant#0}` failed inside this call
+  |
+note: inside `charpente::charpente_core::db::refuse_global_event_shape`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  | /         panic!(
+  | |             "contract: a global event's recorded shape is its payload's field fold alone — \
+  | |              `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is \
+  | |              `Unscoped` — and this event's two differ, so its rows would read as another event \
+... |
+  | |              to it (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::emit_keyed::<Notice, &str>`
+  --> tests/compile_fail/forged_global_event_shape.rs:75:5
+   |
+75 | /     tx.emit_keyed("user:7", Notice {
+76 | |         invoice: WireU64(2),
+77 | |     });
+   | |______^
+
+error[E0080]: evaluation panicked: contract: a global event's recorded shape is its payload's field fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is `Unscoped` — and this event's two differ, so its rows would read as another event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to it (docs/GUIDE.md §11, "An event's tenancy")
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::http::Subscription::of::<Notice>::{constant#0}` failed inside this call
+  |
+note: inside `charpente::charpente_core::db::refuse_global_event_shape`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  | /         panic!(
+  | |             "contract: a global event's recorded shape is its payload's field fold alone — \
+  | |              `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is \
+  | |              `Unscoped` — and this event's two differ, so its rows would read as another event \
+... |
+  | |              to it (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Subscription::of::<Notice>`
+  --> tests/compile_fail/forged_global_event_shape.rs:84:18
+   |
+84 |     let _alone = Subscription::of::<Notice>();
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: contract: a global event's recorded shape is its payload's field fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is `Unscoped` — and this event's two differ, so its rows would read as another event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to it (docs/GUIDE.md §11, "An event's tenancy")
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::http::Subscription::and::<Notice>::{constant#0}` failed inside this call
+  |
+note: inside `charpente::charpente_core::db::refuse_global_event_shape`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  | /         panic!(
+  | |             "contract: a global event's recorded shape is its payload's field fold alone — \
+  | |              `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is \
+  | |              `Unscoped` — and this event's two differ, so its rows would read as another event \
+... |
+  | |              to it (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Subscription::and::<Notice>`
+  --> tests/compile_fail/forged_global_event_shape.rs:85:8
+   |
+85 |       Ok(Subscription::of::<SystemNotice>()
+   |  ________^
+86 | |         .and::<Notice>()
+   | |________________________^

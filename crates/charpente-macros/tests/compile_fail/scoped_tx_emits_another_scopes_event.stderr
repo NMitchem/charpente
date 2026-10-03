@@ -14,5 +14,5 @@ note: expected this to be `Org`
 note: required by a bound in `ScopedTx::<'_, 'a, S>::emit`
   --> $WORKSPACE/crates/charpente-core/src/db.rs
    |
-   |     pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev) {
+   |     pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev)
    |                           ^^^^^^^^^ required by this bound in `ScopedTx::<'_, 'a, S>::emit`

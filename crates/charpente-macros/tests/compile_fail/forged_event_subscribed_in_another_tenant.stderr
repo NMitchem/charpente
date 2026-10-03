@@ -1,0 +1,69 @@
+error[E0080]: evaluation panicked: contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its rows would read as another tenant type's event; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `<charpente::ScopedTx<'_, '_, tenancy::Team> as charpente::Subscribe<tenancy::Team>>::subscription::<Spy>::{constant#0}` failed inside this call
+  |
+note: inside `charpente::charpente_core::db::refuse_scoped_event_shape`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  | /         panic!(
+  | |             "contract: a scoped event's recorded shape is its payload's field fold mixed with its \
+  | |              declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, \
+  | |              <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its \
+... |
+  | |              Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn <ScopedTx<'_, '_, Team> as charpente::Subscribe<Team>>::subscription::<Spy>`
+  --> tests/compile_fail/forged_event_subscribed_in_another_tenant.rs:97:8
+   |
+97 |     Ok(tx.subscription::<Spy>().cursor(cursor).into())
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its rows would read as another tenant type's event; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::http::TenantFeed::<tenancy::Team>::and::<Spy>::{constant#0}` failed inside this call
+  |
+note: inside `charpente::charpente_core::db::refuse_scoped_event_shape`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  | /         panic!(
+  | |             "contract: a scoped event's recorded shape is its payload's field fold mixed with its \
+  | |              declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, \
+  | |              <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its \
+... |
+  | |              Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
+  | |         );
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente/src/http/mod.rs
+  |
+  |         const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn TenantFeed::<Team>::and::<Spy>`
+   --> tests/compile_fail/forged_event_subscribed_in_another_tenant.rs:108:8
+    |
+108 |     Ok(tx.subscription::<TeamNote>().and::<Spy>().cursor(cursor).into())
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

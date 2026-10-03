@@ -136,6 +136,17 @@ pub trait Event: Codec {
     /// `Tenant::NAME` (`scoped_fingerprint`), so a change of tenancy is a
     /// change of shape.
     const FINGERPRINT: u64;
+    /// The payload's own field fold, before any tenant is mixed in. For a
+    /// `#[event(global)]` event it is `FINGERPRINT` itself, which is the
+    /// default, so a global hand-written impl states only `FINGERPRINT`. For a
+    /// `#[event(scoped_by = Org)]` event, `FINGERPRINT` is
+    /// `scoped_fingerprint(PAYLOAD_FINGERPRINT, <Org as Tenant>::NAME)`.
+    /// Every typed emit and subscribe site checks that equation at build
+    /// time, against the tenant its own bound names
+    /// (`refuse_scoped_event_shape`, `refuse_global_event_shape`). So a
+    /// hand-written impl cannot carry another tenant type's `FINGERPRINT` into
+    /// its own tenant's feed, which the declared bound alone would let it do.
+    const PAYLOAD_FINGERPRINT: u64 = Self::FINGERPRINT;
     /// The tenant scope type a `#[event(scoped_by = Org)]` event belongs to,
     /// or `Unscoped` for a `#[event(global)]` one (tenancy-completion spec
     /// §6). No default, for `Job::Scope`'s reason: a hand-written impl states
@@ -1496,6 +1507,7 @@ impl<'a> Tx<'a> {
     /// a tenant, and a bare `Tx` names none (`NoEventTenant`'s note says
     /// where to emit it instead).
     pub fn emit<Ev: UnscopedEvent>(&mut self, event: Ev) {
+        const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
         self.push_emit(None, None, event);
     }
 
@@ -1504,6 +1516,7 @@ impl<'a> Tx<'a> {
     /// A tenant is an event's declared scope, recorded apart from any key
     /// (tenancy-completion spec §2.3).
     pub fn emit_keyed<Ev: UnscopedEvent>(&mut self, key: impl Into<String>, event: Ev) {
+        const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
         self.push_emit(None, Some(key.into()), event);
     }
 }
@@ -1949,6 +1962,56 @@ pub const fn scoped_fingerprint(fold: u64, tenant: &str) -> u64 {
     mix(mix(mix(fold, b"#scoped_by\0"), tenant.as_bytes()), b"\0")
 }
 
+/// The scoped emit and subscribe sites' check (tenancy-completion spec §6):
+/// an event scoped by `S` is recorded under its payload's fold mixed with
+/// `S`'s `NAME`, and nothing else. `ScopedTx::emit`/`emit_keyed`,
+/// `Subscribe::subscription` and `TenantFeed::and` evaluate it in a `const`
+/// block per event type, with `S` from their own bound. A hand-written
+/// `impl Event` that copies another tenant type's `NAME` and `FINGERPRINT`
+/// under its own `type Scope` therefore fails the build, where it would
+/// otherwise read or write that type's feed at every raw id the two types
+/// share. Jobs refuse the like at `Group::stage` against the mounted def;
+/// events cannot, because delivery deliberately has no registry (realtime
+/// spec §3). Post-monomorphization, like `refuse_platform_read`. Public only
+/// because the platform crate's subscribe sites evaluate it too.
+#[doc(hidden)]
+pub const fn refuse_scoped_event_shape(fingerprint: u64, payload: u64, tenant: &str) {
+    if fingerprint != scoped_fingerprint(payload, tenant) {
+        panic!(
+            "contract: a scoped event's recorded shape is its payload's field fold mixed with its \
+             declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, \
+             <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its \
+             rows would read as another tenant type's event; the likely cause is a hand-written \
+             `impl Event` whose `FINGERPRINT` was copied from another event type, or whose \
+             `type Scope` names another tenant than the one its `FINGERPRINT` mixes; fix: \
+             derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its \
+             fields' fold and `FINGERPRINT` to \
+             `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as \
+             Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
+        );
+    }
+}
+
+/// `refuse_scoped_event_shape`'s twin at the global sites, `Tx::emit`/
+/// `emit_keyed` and `Subscription::of`/`and`: a global event is recorded
+/// under its payload's fold alone, so `FINGERPRINT` equals
+/// `PAYLOAD_FINGERPRINT`, which is its default.
+#[doc(hidden)]
+pub const fn refuse_global_event_shape(fingerprint: u64, payload: u64) {
+    if fingerprint != payload {
+        panic!(
+            "contract: a global event's recorded shape is its payload's field fold alone — \
+             `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is \
+             `Unscoped` — and this event's two differ, so its rows would read as another event \
+             type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was \
+             copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and \
+             its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set \
+             `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults \
+             to it (docs/GUIDE.md §11, \"An event's tenancy\")"
+        );
+    }
+}
+
 impl<'a> Tx<'a> {
     /// The one body both scope constructors share (job-tenancy spec §3). The
     /// one-scope contract is checked FIRST, because it is decidable without
@@ -2132,15 +2195,25 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
     /// `enqueue` shadows `Tx::enqueue`. A `global` event emitted inside a
     /// scope is written `(*tx).emit(event)` in a handler that owns its
     /// `ScopedTx`, and `(**tx).emit(event)` in a scoped job's `run`, which
-    /// holds `&mut ScopedTx`.
-    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev) {
+    /// holds `&mut ScopedTx`. The `const` block checks that the event's
+    /// `FINGERPRINT` mixes this tenant type's `NAME`
+    /// (`refuse_scoped_event_shape`).
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev)
+    where
+        S: Tenant,
+    {
+        const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
         let scope = self.scope.raw();
         self.tx.push_emit(Some(scope), None, event);
     }
 
     /// `emit`, with `Tx::emit_keyed`'s app key. The tenant is still this
     /// scope, recorded beside the key, never in it.
-    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev) {
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev)
+    where
+        S: Tenant,
+    {
+        const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
         let scope = self.scope.raw();
         self.tx.push_emit(Some(scope), Some(key.into()), event);
     }
@@ -5007,6 +5080,80 @@ mod tests {
                 "{table:?} is not a platform table's name, so an app may read it"
             );
         }
+    }
+
+    fn shape_refusal(check: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
+        std::panic::catch_unwind(check).err().map(|payload| {
+            match payload.downcast::<&'static str>() {
+                Ok(text) => (*text).to_string(),
+                Err(payload) => *payload
+                    .downcast::<String>()
+                    .expect("a refusal panics with its text"),
+            }
+        })
+    }
+
+    /// Tenancy-completion spec §6 (Task 11 fix round 1): a scoped event's
+    /// shape is its payload fold mixed with its declared tenant's `NAME`, and
+    /// a global event's is the fold alone. Each operand moves alone: the
+    /// declared tenant passes, and another tenant's `NAME`, a fingerprint
+    /// copied unmixed, or another payload fold is refused. Literals spelled
+    /// apart from the source's.
+    #[test]
+    fn an_events_shape_is_its_payload_fold_mixed_with_its_declared_tenant() {
+        const SCOPED: &str = "contract: a scoped event's recorded shape is its payload's field \
+            fold mixed with its declared tenant's NAME — `FINGERPRINT == \
+            scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped \
+            by `S` — and this event's is not, so its rows would read as another tenant type's \
+            event; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was \
+            copied from another event type, or whose `type Scope` names another tenant than the \
+            one its `FINGERPRINT` mixes; fix: derive it with `#[event(scoped_by = S)]`, or set \
+            `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to \
+            `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as \
+            Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")";
+        const GLOBAL: &str = "contract: a global event's recorded shape is its payload's field \
+            fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` \
+            is `Unscoped` — and this event's two differ, so its rows would read as another \
+            event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` \
+            was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and \
+            its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set \
+            `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to \
+            it (docs/GUIDE.md §11, \"An event's tenancy\")";
+        let fold = 0x7E57_0E0E;
+        let org = scoped_fingerprint(fold, "Org");
+        assert_eq!(
+            shape_refusal(|| refuse_scoped_event_shape(org, fold, "Org")),
+            None,
+            "an event scoped by Org, at an Org site"
+        );
+        for (fingerprint, payload, tenant, why) in [
+            (org, fold, "Team", "Org's fingerprint at a Team site"),
+            (
+                org,
+                org,
+                "Org",
+                "a fingerprint copied with no payload fold of its own",
+            ),
+            (org, fold ^ 1, "Org", "another payload fold"),
+            (fold, fold, "Org", "an unmixed fingerprint at a scoped site"),
+        ] {
+            assert_eq!(
+                shape_refusal(|| refuse_scoped_event_shape(fingerprint, payload, tenant))
+                    .as_deref(),
+                Some(SCOPED),
+                "{why}"
+            );
+        }
+        assert_eq!(
+            shape_refusal(|| refuse_global_event_shape(fold, fold)),
+            None,
+            "a global event: its payload fold is its fingerprint"
+        );
+        assert_eq!(
+            shape_refusal(|| refuse_global_event_shape(org, fold)).as_deref(),
+            Some(GLOBAL),
+            "a scoped event's two fingerprints under a global declaration"
+        );
     }
 
     fn effects_fixture() -> TxEffects {

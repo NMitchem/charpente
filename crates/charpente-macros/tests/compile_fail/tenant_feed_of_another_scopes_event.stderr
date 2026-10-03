@@ -12,7 +12,7 @@ note: expected this to be `Org`
 note: required by a bound in `TenantFeed::<S>::and`
   --> $WORKSPACE/crates/charpente/src/http/mod.rs
    |
-   |     pub fn and<Ev: Event<Scope = S> + serde::Serialize>(mut self) -> TenantFeed<S> {
+   |     pub fn and<Ev: Event<Scope = S> + serde::Serialize>(mut self) -> TenantFeed<S>
    |                          ^^^^^^^^^ required by this bound in `TenantFeed::<S>::and`
 
 error[E0271]: type mismatch resolving `<SystemNotice as Event>::Scope == Org`

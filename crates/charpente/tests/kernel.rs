@@ -1757,10 +1757,10 @@ mod scoped_jobs {
     #[test]
     #[should_panic(
         expected = "two registrations of the tenant type kernel::scoped_jobs::Desk (NAME \"Desk\") \
-                    are different types — a hand-built `JobDef` whose `scope_type` and \
-                    `scope_type_name` name different types (build it from its `#[job]`'s \
-                    `def()`, or set both fields from the type its `scoped_by` names), or two \
-                    versions of one crate in the build (unify them)"
+                    are different types — a hand-built `JobDef` or `EventDef` whose `scope_type` \
+                    and `scope_type_name` name different types (build it from its `#[job]`'s or \
+                    `#[event]`'s `def()`, or set both fields from the type its `scoped_by` \
+                    names), or two versions of one crate in the build (unify them)"
     )]
     fn the_re_reviews_p5_jobdef_is_refused_at_mount() {
         let sim = Sim::with_faults(0x7C05_0503, FaultConfig::none());

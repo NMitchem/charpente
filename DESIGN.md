@@ -852,7 +852,9 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   fix (`NoEventTenant`, sealed with `UnscopedEvent`). A global or other-tenant event on a
   `ScopedTx` or a tenant feed is E0271. A scoped event's fingerprint continues its fields'
   fold with its tenant's `Tenant::NAME`, so a change of tenancy is a change of shape (spec
-  2026-09-30-tenancy-completion §4, §6). An event payload is itself a wire type (it is
+  2026-09-30-tenancy-completion §4, §6). `Event::PAYLOAD_FINGERPRINT` is that bare fold
+  (the default, `FINGERPRINT`, for a global event), and every typed emit and subscribe site
+  checks the equation in a `const` block against the tenant its bound names (§8). An event payload is itself a wire type (it is
   exactly the JSON a subscriber receives), so `#[event]` derives `Wire`.
   `events![…]`/`App::mount_events` register the type for `describe`, and its scope for the
   mount-time tenant census. Delivery deliberately has NO registry: `Subscription::of::<Ev>()`
@@ -2127,10 +2129,19 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   operator has no principal and already holds the store (DECISIONS §12).
   The event log's shared-raw-id limit is closed by declaration (spec
   2026-09-30-tenancy-completion §6). An event names its tenant type, the emit and subscribe
-  bounds check it, and a scoped event's fingerprint mixes the type's `Tenant::NAME`. So a
-  raw id two tenant types share never carries one's events into the other's feed. A
-  same-named event of the other type is a foreign shape there: it ends that tail
-  (payload-shapes spec §3) and is never decoded.
+  bounds check it, and a scoped event's fingerprint mixes the type's `Tenant::NAME`. Every
+  typed emit and subscribe site also checks, in a `const` block, that the fingerprint is
+  `scoped_fingerprint(PAYLOAD_FINGERPRINT, S::NAME)` for the `S` its bound names, or the
+  payload fold alone for a global event, so a hand-written `impl Event` cannot copy another
+  type's `NAME` and `FINGERPRINT` under its own `type Scope`. Delivery has no registry to
+  check against at run time, which is why the check is static. So a raw id two tenant
+  types share never carries one's events into the other's feed. A same-named event of the
+  other type is a foreign shape there: it ends that tail (payload-shapes spec §3) and is
+  never decoded. Two residuals sit outside the check. A `PAYLOAD_FINGERPRINT` chosen so its
+  mix collides with another type's fingerprint (FNV-1a is computable backwards) is a bypass
+  built on purpose, with the operator's standing (DECISIONS §12). And a tenant type reached
+  only through an event the app never mounts is outside the `NAME` census, so it can share
+  a `NAME`, and therefore a shape, with another type: mount every event with `events![…]`.
   **One limit travels with it, documented rather than engineered around:**
   the guarantee's boundary is the typed surface handed to handlers and jobs: whoever holds
   the `Db` reaches every tenant through `Db::snapshot`'s scoped and raw reads, which take a

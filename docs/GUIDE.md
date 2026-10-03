@@ -4380,12 +4380,33 @@ fn maintenance_feed(
 
 Every mismatch is a compile error, never a feed that silently receives nothing:
 - A scoped event on a bare `Tx` (`tx.emit`, `tx.emit_keyed`), or in a global feed (`Subscription::of`, `.and`), names no tenant. rustc prints the note below.
-- A global event through `ScopedTx::emit` is E0271, expected `Org`, found `Unscoped`. A global event emitted from inside a scope is written `(*tx).emit(ev)` in a handler, and `(**tx).emit(ev)` in a scoped job's `run`, which holds `&mut ScopedTx`.
-- An event scoped by another type, through `ScopedTx::emit`, `tx.subscription::<Ev>()` or its `.and::<Ev2>()`, is E0271, expected `Org`. So is a global event on a tenant feed.
+- A global event through `ScopedTx::emit` is E0271, "type mismatch resolving `<SystemNotice as Event>::Scope == Org`", with "expected this to be `Org`" pointing at the event's `#[event(global)]`. A global event emitted from inside a scope is written `(*tx).emit(ev)` in a handler, and `(**tx).emit(ev)` in a scoped job's `run`, which holds `&mut ScopedTx`.
+- An event scoped by another type, through `ScopedTx::emit`, `tx.subscription::<Ev>()` or its `.and::<Ev2>()`, is the same E0271, its "expected this to be `Org`" pointing at that event's own `#[event(scoped_by = …)]`. So is a global event on a tenant feed.
 
 The tenant rides the record beside the event, apart from any app key. `tx.emit_keyed(key, ev)` inside a scope records both, and `.key(…)` on either kind of feed narrows it further by that app key (a per-user feed, say). A key never names a tenant.
 
-A scoped event's fingerprint continues its fields' fold with its tenant's `Tenant::NAME` (§16). So moving an event between `global` and `scoped_by`, or between two tenant types, is a change of shape, handled like any other ("Changing an event", below). Two same-named events scoped by two tenant types never share a shape. So where the two types' raw ids coincide, one's row is never delivered to the other's feed. It meets that feed as a foreign shape, which ends the feed with `charpente.reshaped` rather than decoding. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets this.
+A scoped event's fingerprint continues its fields' fold with its tenant's `Tenant::NAME` (§16). So moving an event between `global` and `scoped_by`, or between two tenant types, is a change of shape, handled like any other ("Changing an event", below). Two same-named events scoped by two tenant types never share a shape, because the tenant census gives every tenant type the app mounts its own `NAME` (§16). So where the two types' raw ids coincide, one's row is never delivered to the other's feed. It meets that feed as a foreign shape, which ends the feed with `charpente.reshaped` rather than decoding. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets this.
+
+The bound alone would not hold that for a hand-written `impl Event`, which states its own `FINGERPRINT`. One declared `type Scope = Team`, with `NAME` and `FINGERPRINT` copied from `Org`'s event, meets every `Team` bound. Emitted in `Team` 1, or subscribed in `Team` 1's feed, it would write into or read from `Org` 1's feed. So every typed site that names an event type also checks its shape at build time, against the tenancy its own bound names. `Event::PAYLOAD_FINGERPRINT` is the payload's field fold before any tenant is mixed in: `#[event(scoped_by = Org)]` states it, and for a global event it defaults to `FINGERPRINT`. `ScopedTx::emit`/`emit_keyed`, `tx.subscription::<Ev>()` and `TenantFeed::and` require `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, S::NAME)` for their own `S`. `Tx::emit`/`emit_keyed`, `Subscription::of` and `Subscription::and` require `FINGERPRINT == PAYLOAD_FINGERPRINT`. The check is a `const` block, so a violation fails the build, as rustc's E0080 naming the instantiation (`ScopedTx::<'_, '_, Team>::emit::<Spy>`, say), never a request. Like every post-monomorphization error, `cargo build` and `cargo test` report it and `cargo check` does not. The two texts, scoped and global:
+
+<!-- pinned -->
+```text
+contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not, so its rows would read as another tenant type's event; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
+contract: a global event's recorded shape is its payload's field fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is `Unscoped` — and this event's two differ, so its rows would read as another event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to it (docs/GUIDE.md §11, "An event's tenancy")
+```
+
+A global event's text guards consistency, not a door: `Subscription::admits` already keeps every global feed off every tenant's rows. A hand-written scoped event that passes the check is shaped exactly as `#[event]` would shape it:
+
+```rust,ignore
+impl Event for InvoiceVoided {
+    const NAME: &'static str = "invoice_voided";
+    const PAYLOAD_FINGERPRINT: u64 = 0x5e3a_91c4_07d2_6b18; // its fields' fold (§12's helper); illustrative
+    const FINGERPRINT: u64 = scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <Org as Tenant>::NAME);
+    type Scope = Org;
+}
+```
+
+Two limits stay outside the check, stated rather than engineered around. First, a `PAYLOAD_FINGERPRINT` chosen so that its mix with `Team`'s `NAME` equals `Org`'s fingerprint passes it. FNV-1a is not a cryptographic hash, so such a value can be computed, and computing it is building a bypass on purpose, with the operator's standing (DECISIONS §12). Second, the `NAME` the check mixes is only as unique as the tenant census makes it. A tenant type the app reaches only through an event it never mounts is outside the census. So two tenant types under one `NAME`, one of them never mounted, mix alike, and their same-named, same-field events share a shape. Mount every event with `events![…]` (next subsection), and `mount_events` refuses the pair before the app serves.
 
 What `#[event]` rejects, all compile errors naming the contract and the fix. The first is the one every event meets once, and the next three are its neighbours (§9 lists the rest):
 
@@ -4580,8 +4601,10 @@ Subscription::and: event "<name>" is added to a tenant feed after .into() — Su
 ```
 
 A tenant feed matches its tenant by type as well as by id. Its events are declared
-`scoped_by` that type, and each one's fingerprint carries the type's `Tenant::NAME`. So
-where two tenant types' raw ids coincide, one type's events never reach the other's feed.
+`scoped_by` that type (the bound), each one's fingerprint carries the type's `Tenant::NAME`,
+and the feed's builders check at build time that it does, so a hand-written impl cannot
+copy another type's ("An event's tenancy", above, with its two stated limits). So where
+two tenant types' raw ids coincide, one type's events never reach the other's feed.
 A same-named event of the other type meets the feed as a foreign shape and ends it with
 `charpente.reshaped`, never decoded. `mount_events` refuses two events with one name, so
 an app that mounts every event it emits never meets that.
@@ -5318,7 +5341,11 @@ tail a differently-versioned binary cannot prove is safe to decode.
 is invisible to the gate — writing `Row` by hand instead of using `#[table]` silently
 opts that table out of drift protection. Use `#[table]`. `Job::FINGERPRINT` and
 `Event::FINGERPRINT` have no such default: a hand-written `impl Job` or `impl Event`
-does not compile without one.
+does not compile without one. A hand-written `impl Event` also has
+`Event::PAYLOAD_FINGERPRINT`, its fields' fold before any tenant is mixed in, which
+defaults to `FINGERPRINT`, and every emit and subscribe site checks at build time that
+`FINGERPRINT` is that fold mixed with its declared tenant's `NAME`, or the fold alone for
+a global event (§11, "An event's tenancy").
 
 ## 13. describe — the machine-readable contract
 
@@ -6931,7 +6958,7 @@ the two types as `std::any::type_name` renders them, the one named first first:
 ```text
 two tenant types are named "<name>": <type> and <other type> — a tenant's NAME is its identity (it is inside every scoped job's and event's fingerprint), so give each type its own `const NAME` in its `impl Tenant`
 tenant type <type> has an empty NAME — give its `impl Tenant` a `const NAME` that names it
-two registrations of the tenant type <type> (NAME "<name>") are different types — a hand-built `JobDef` whose `scope_type` and `scope_type_name` name different types (build it from its `#[job]`'s `def()`, or set both fields from the type its `scoped_by` names), or two versions of one crate in the build (unify them)
+two registrations of the tenant type <type> (NAME "<name>") are different types — a hand-built `JobDef` or `EventDef` whose `scope_type` and `scope_type_name` name different types (build it from its `#[job]`'s or `#[event]`'s `def()`, or set both fields from the type its `scoped_by` names), or two versions of one crate in the build (unify them)
 ```
 
 The usual cause is two types spelled alike in two modules, such as `billing::Org` and
@@ -6939,8 +6966,15 @@ The usual cause is two types spelled alike in two modules, such as `billing::Org
 impl mounted at two instantiations, such as `Wrap<Alpha>` and `Wrap<Gamma>`, whose one impl
 gives both one `NAME`. The same type named through a table, a route, a job and an event is
 one tenant type, and mounts. The third line is the same type under one `NAME` with two `TypeId`s: not two
-tenant types, but a hand-built `JobDef` whose `scope_type` disagrees with its
-`scope_type_name`, or two versions of one crate.
+tenant types, but a hand-built `JobDef` or `EventDef` whose `scope_type` disagrees with its
+`scope_type_name`, or two versions of one crate. A hand-built `EventDef` whose `scoped_by`
+and `scope_type` disagree, a tenant in one and none in the other, is refused before it
+reaches the census:
+
+<!-- pinned -->
+```text
+contract: event "<name>" was mounted with `scoped_by: <scoped_by>` and `scope_type` <type> — an `EventDef` names its tenant in both, or, for a global event, in neither (`Unscoped`), so this hand-built def would <consequence>; fix: build it from its `#[event]`'s `def()`, or set `scoped_by`, `scope_type` and `scope_type_name` from the one type its `type Scope` names
+```
 
 ### Who reaches a tenant: membership or declaration
 
@@ -7169,9 +7203,12 @@ there, or cancel one there. Nor is there one through the event log: `tx.put` or
 each recorded with the tenant it was emitted in, or with none. A tenant feed delivers only rows
 recorded in its own tenant (`Subscription::admits`), and a same-named event emitted in
 another tenant type at the same raw id carries that type's `NAME` in its fingerprint, so
-the feed meets it as a foreign shape and never decodes it. So no handler publishes, into
-a tenant's feed, an event no emit made in that tenant (§11, "An event's tenancy: `global`
-or `scoped_by`"). Nor does any app code read the job queue, the event log or the migration record
+the feed meets it as a foreign shape and never decodes it. Each emit and feed site checks
+that fingerprint at build time against the tenant its bound names, so a hand-written
+`impl Event` cannot borrow another type's. So no handler publishes, into a tenant's feed,
+an event no emit made in that tenant (§11, "An event's tenancy: `global` or `scoped_by`",
+which states the check's two limits: a payload fold computed on purpose to collide, and a
+tenant type left out of the census by an event never mounted). Nor does any app code read the job queue, the event log or the migration record
 through a transaction, so no handler pages through another tenant's jobs or events:
 `ScopeReadableBy`, the marker that read's message hangs on, is sealed like `NoTenant`,
 and `ReadableBy`, the trait `View` bounds on, has one blanket impl that an app's own impl
@@ -7188,13 +7225,18 @@ and it never spells a tenant as a string. §11 ("Emitting inside a tenant, and t
 feed") carries the code for both sides.
 
 Two tenant types whose raw ids coincide no longer share events: an event names its
-tenant type (`#[event(scoped_by = Org)]`), and its fingerprint carries that type's
-`Tenant::NAME` (§11).
+tenant type (`#[event(scoped_by = Org)]`), its fingerprint carries that type's
+`Tenant::NAME`, and every emit and feed site checks that it does, at build time, against
+the tenant its bound names (§11). Two limits are stated there: a hand-written
+`PAYLOAD_FINGERPRINT` computed to collide on purpose, with the operator's standing
+(DECISIONS §12), and two tenant types under one `NAME` when one is reached only through an
+event the app never mounts. Mounting every event with `events![…]` closes the second.
 
 The declaration is what makes it one mechanism. An event declared `scoped_by = Org`
 compiles only where an `Org` tenant is named: its `emit` on a `ScopedTx<Org>`, and its
-feed from the same handle. So a tenant's event cannot be emitted into no tenant, and a
-global feed cannot name one. §11 shows each refusal.
+feed from the same handle. So a tenant's event cannot be emitted into no tenant, a global
+feed cannot name one, and a hand-written event cannot claim another tenant type's shape.
+§11 shows each refusal.
 
 ### Reading across every tenant: the `cross_tenant` capability
 

@@ -59,8 +59,10 @@ use std::path::{Path, PathBuf};
 /// 33 with tenancy-completion's platform-table read note and borrowed-name read
 /// refusals (2026-10-03); 35 with event tenancy's widened-tenant-feed panic
 /// and its cross-tenancy cursor 409 (2026-10-03); 37 with `#[event]`'s
-/// tenancy refusals and the `NoEventTenant` note (2026-10-03).
-const PINNED_FLOOR: usize = 37;
+/// tenancy refusals and the `NoEventTenant` note (2026-10-03); 39 with the
+/// event-shape refusals and the hand-built `EventDef` tenancy refusal
+/// (2026-10-03).
+const PINNED_FLOOR: usize = 39;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

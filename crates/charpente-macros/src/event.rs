@@ -192,14 +192,21 @@ pub(crate) fn expand(args: EventArgs, input: DeriveInput) -> syn::Result<TokenSt
     // the house diagnostic for a scope type with no `Tenant` impl (A7): a
     // scoped event's tenant is opened by `tx.scope::<Org>(…, ctx)` on both
     // sides, which needs the app's own membership check.
-    let (scope_ty, fingerprint, scoped_by_name) = match tenancy {
+    //
+    // A scoped event also states its bare fold as `PAYLOAD_FINGERPRINT`, which
+    // every scoped emit and subscribe site checks `FINGERPRINT` against with
+    // the tenant its bound names. A global event leaves it at its default,
+    // `FINGERPRINT`, so its expansion is unchanged.
+    let (scope_ty, payload_fingerprint, fingerprint, scoped_by_name) = match tenancy {
         Tenancy::Global => (
             quote! { ::charpente::core::table::Unscoped },
+            quote! {},
             quote! { #fold },
             quote! { ::std::option::Option::None },
         ),
         Tenancy::ScopedBy(path) => (
             quote! { #path },
+            quote! { const PAYLOAD_FINGERPRINT: u64 = #fold; },
             quote! {
                 ::charpente::core::db::scoped_fingerprint(
                     #fold,
@@ -232,6 +239,7 @@ pub(crate) fn expand(args: EventArgs, input: DeriveInput) -> syn::Result<TokenSt
         impl ::charpente::core::db::Event for #name {
             const NAME: &'static str = #event_name;
             const FINGERPRINT: u64 = #fingerprint;
+            #payload_fingerprint
             type Scope = #scope_ty;
         }
 

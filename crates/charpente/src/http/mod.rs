@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::marker::PhantomData;
 
-use charpente_core::db::{Event, ScopedTx, Tenant};
+use charpente_core::db::{
+    Event, ScopedTx, Tenant, refuse_global_event_shape, refuse_scoped_event_shape,
+};
 use charpente_core::table::Id;
 use charpente_core::table::UnscopedEvent;
 
@@ -228,10 +230,14 @@ pub(crate) struct SubEntry {
 ///
 /// Its entries are crate-private (tenancy-completion spec §6). Only
 /// `Subscription::of`/`and` and a tenant feed's `subscription`/`and` add
-/// one, each bounded by the event's declared tenancy. A public list would
-/// let a handler admitted to one tenant push an entry naming another tenant
-/// type's event, its `NAME` and `FINGERPRINT` copied from the type, and read
-/// that tenant's rows wherever the two types' raw ids coincide.
+/// one, each bounded by the event's declared tenancy and checking, in a
+/// `const` block, that the event's `FINGERPRINT` is that tenancy's
+/// (`refuse_scoped_event_shape`, `refuse_global_event_shape`). That check
+/// is what stops a hand-written `impl Event` that copies another tenant
+/// type's `NAME` and `FINGERPRINT`. Privacy stops the door no type stands
+/// behind: a public list would let a handler admitted to one tenant push an
+/// entry holding those two values by hand, which no bound or check sees, and
+/// read that tenant's rows wherever the two types' raw ids coincide.
 pub struct Subscription {
     pub(crate) entries: Vec<SubEntry>,
     pub key: Option<String>,
@@ -274,6 +280,7 @@ impl Subscription {
     /// never an event recorded in a tenant. A tenant's feed is
     /// `tx.subscription::<Ev>()` on its `ScopedTx` (`Subscribe`).
     pub fn of<Ev: UnscopedEvent + serde::Serialize>() -> Subscription {
+        const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
         Subscription {
             entries: vec![sub_entry::<Ev>()],
             key: None,
@@ -288,6 +295,7 @@ impl Subscription {
     /// never arrive. The tenant's own events go on `TenantFeed::and`, before
     /// the conversion.
     pub fn and<Ev: UnscopedEvent + serde::Serialize>(mut self) -> Subscription {
+        const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
         assert!(
             self.scope.is_none(),
             "Subscription::and: event \"{}\" is added to a tenant feed after .into() — \
@@ -343,7 +351,11 @@ impl<S> TenantFeed<S> {
     /// Adds another of the tenant's event types. It pushes to the feed's own
     /// entries, never through `Subscription::and`, which refuses a tenant
     /// feed; a second event of one `NAME` is refused as it is there.
-    pub fn and<Ev: Event<Scope = S> + serde::Serialize>(mut self) -> TenantFeed<S> {
+    pub fn and<Ev: Event<Scope = S> + serde::Serialize>(mut self) -> TenantFeed<S>
+    where
+        S: Tenant,
+    {
+        const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
         push_entry::<Ev>(&mut self.sub.entries, "TenantFeed::and");
         self
     }
@@ -380,6 +392,7 @@ pub trait Subscribe<S> {
 
 impl<S: Tenant> Subscribe<S> for ScopedTx<'_, '_, S> {
     fn subscription<Ev: Event<Scope = S> + serde::Serialize>(&self) -> TenantFeed<S> {
+        const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
         TenantFeed {
             sub: Subscription {
                 entries: vec![sub_entry::<Ev>()],

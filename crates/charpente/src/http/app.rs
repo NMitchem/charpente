@@ -13,7 +13,7 @@ use charpente_core::db::{
     TenantAdmission, Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
-use charpente_core::table::{Id, UnscopedJob, View};
+use charpente_core::table::{Id, Unscoped, UnscopedJob, View};
 use charpente_macros::table;
 
 use crate::auth::sweep::{self, SessionSweep};
@@ -410,8 +410,9 @@ impl App {
     /// place the texts live. `App::open`, `mount` and `mount_jobs` call it,
     /// and `mount_events` does for scoped events. The same `type_name` under
     /// one `NAME` with two `TypeId`s is not two tenant types but a hand-built
-    /// `JobDef` whose `scope_type` disagrees with its `scope_type_name`, or
-    /// two versions of one crate, and is refused with that cause.
+    /// `JobDef` or `EventDef` whose `scope_type` disagrees with its
+    /// `scope_type_name`, or two versions of one crate, and is refused with
+    /// that cause.
     fn note_tenant(&mut self, name: &'static str, type_id: TypeId, type_name: &'static str) {
         assert!(
             !name.is_empty(),
@@ -422,9 +423,10 @@ impl App {
         assert!(
             seen == type_id || seen_name != type_name,
             "two registrations of the tenant type {type_name} (NAME \"{name}\") are different \
-             types — a hand-built `JobDef` whose `scope_type` and `scope_type_name` name \
-             different types (build it from its `#[job]`'s `def()`, or set both fields from the \
-             type its `scoped_by` names), or two versions of one crate in the build (unify them)"
+             types — a hand-built `JobDef` or `EventDef` whose `scope_type` and \
+             `scope_type_name` name different types (build it from its `#[job]`'s or \
+             `#[event]`'s `def()`, or set both fields from the type its `scoped_by` names), or \
+             two versions of one crate in the build (unify them)"
         );
         assert!(
             seen == type_id,
@@ -500,6 +502,13 @@ impl App {
     /// it just does not appear in `Contract.events` (nor its payload in
     /// `Contract.types`), so a generated client cannot see it, and its
     /// tenant type is not in the census.
+    ///
+    /// A def's `scoped_by` and `scope_type` agree, or it is refused by name:
+    /// a scoped def names its tenant in both (`scope_type` other than
+    /// `Unscoped`), and a global one in neither. `#[event]`'s `def()` always
+    /// agrees, so a disagreement is a hand-built `EventDef`, which would
+    /// otherwise skip the census or list a scoped event as global. Whether
+    /// `scope_type` and `scope_type_name` name one type is `note_tenant`'s.
     pub fn mount_events(mut self, defs: Vec<EventDef>) -> App {
         for def in defs {
             assert!(
@@ -519,6 +528,22 @@ impl App {
                  \"anonymous/inline\" marker; make the payload a #[derive(Wire)] type \
                  and pass its WIRE_NAME",
                 def.name
+            );
+            assert!(
+                def.scoped_by.is_some() == (def.scope_type != TypeId::of::<Unscoped>()),
+                "contract: event \"{}\" was mounted with `scoped_by: {:?}` and `scope_type` \
+                 {} — an `EventDef` names its tenant in both, or, for a global event, in \
+                 neither (`Unscoped`), so this hand-built def would {}; fix: build it from its \
+                 `#[event]`'s `def()`, or set `scoped_by`, `scope_type` and `scope_type_name` \
+                 from the one type its `type Scope` names",
+                def.name,
+                def.scoped_by,
+                def.scope_type_name,
+                if def.scoped_by.is_some() {
+                    "enter the tenant census under a type that is no tenant"
+                } else {
+                    "skip the tenant census and be described as global"
+                }
             );
             if let Some(scope_name) = def.scoped_by {
                 self.note_tenant(scope_name, def.scope_type, def.scope_type_name);

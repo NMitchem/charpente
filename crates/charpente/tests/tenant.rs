@@ -2456,10 +2456,90 @@ fn a_jobdef_whose_scope_type_disagrees_with_its_type_name_is_refused_naming_the_
         refusal,
         format!(
             "two registrations of the tenant type {} (NAME \"Wrap\") are different types — a \
-             hand-built `JobDef` whose `scope_type` and `scope_type_name` name different types \
-             (build it from its `#[job]`'s `def()`, or set both fields from the type its \
-             `scoped_by` names), or two versions of one crate in the build (unify them)",
+             hand-built `JobDef` or `EventDef` whose `scope_type` and `scope_type_name` name \
+             different types (build it from its `#[job]`'s or `#[event]`'s `def()`, or set both \
+             fields from the type its `scoped_by` names), or two versions of one crate in the \
+             build (unify them)",
             std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
+        )
+    );
+}
+
+/// The event twin of the case above (Task 11 fix round 1, review I1). Every
+/// `EventDef` field is public, so an app can hand-build one whose
+/// `scope_type` disagrees with its `scope_type_name`. `mount_events` hands
+/// it to the same census, whose refusal must name the `EventDef` as the
+/// cause it can be.
+#[event(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaNoted {
+    n: WireU64,
+}
+
+#[test]
+fn an_eventdef_whose_scope_type_disagrees_with_its_type_name_is_refused_naming_the_cause() {
+    use charpente::describe::EventEntry;
+
+    let sim = Sim::with_faults(0x7E4A_1719, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        let mut def = <AlphaNoted as EventEntry>::def();
+        def.scope_type = std::any::TypeId::of::<wrapped::Wrap<wrapped::Gamma>>();
+        identity_app(&sim, Schema::new().table::<AlphaNote>()).mount_events(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "two registrations of the tenant type {} (NAME \"Wrap\") are different types — a \
+             hand-built `JobDef` or `EventDef` whose `scope_type` and `scope_type_name` name \
+             different types (build it from its `#[job]`'s or `#[event]`'s `def()`, or set both \
+             fields from the type its `scoped_by` names), or two versions of one crate in the \
+             build (unify them)",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
+        )
+    );
+}
+
+/// Review M2 (hard rule 4): an `EventDef` whose `scoped_by` and
+/// `scope_type` disagree is refused at `mount_events`, naming the event,
+/// both fields and the fix, in both directions. A scoped type with no
+/// `scoped_by` would otherwise skip the census and be described as global,
+/// and a `scoped_by` over `Unscoped` would put a non-tenant in the census.
+#[test]
+fn an_eventdef_whose_scoped_by_and_scope_type_disagree_is_refused_at_mount() {
+    use charpente::describe::EventEntry;
+
+    let sim = Sim::with_faults(0x7E4A_171A, FaultConfig::none());
+    let unscoped = std::any::type_name::<charpente::core::table::Unscoped>();
+    let refusal = mount_refusal(|| {
+        let mut def = <noted_org::Noted as EventEntry>::def();
+        def.scoped_by = None;
+        identity_app(&sim, Schema::new()).mount_events(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "contract: event \"noted\" was mounted with `scoped_by: None` and `scope_type` {} \
+             — an `EventDef` names its tenant in both, or, for a global event, in neither \
+             (`Unscoped`), so this hand-built def would skip the tenant census and be \
+             described as global; fix: build it from its `#[event]`'s `def()`, or set \
+             `scoped_by`, `scope_type` and `scope_type_name` from the one type its `type \
+             Scope` names",
+            std::any::type_name::<Org>()
+        )
+    );
+    let refusal = mount_refusal(|| {
+        let mut def = <noted_global::Noted as EventEntry>::def();
+        def.scoped_by = Some("Org");
+        identity_app(&sim, Schema::new()).mount_events(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "contract: event \"noted\" was mounted with `scoped_by: Some(\"Org\")` and \
+             `scope_type` {unscoped} — an `EventDef` names its tenant in both, or, for a global \
+             event, in neither (`Unscoped`), so this hand-built def would enter the tenant \
+             census under a type that is no tenant; fix: build it from its `#[event]`'s \
+             `def()`, or set `scoped_by`, `scope_type` and `scope_type_name` from the one type \
+             its `type Scope` names"
         )
     );
 }
@@ -2532,7 +2612,8 @@ mod noted_billing {
 /// operands, the fold and the `NAME`, and not only that the values differ.
 /// The `billing` lines pin that the operand is the `NAME`, not a spelling
 /// of the path, in the fingerprint and in the def that `describe` and the
-/// tenant census read.
+/// tenant census read. `PAYLOAD_FINGERPRINT` is the bare fold for all four
+/// (Task 11 fix round 1).
 #[test]
 fn a_scoped_events_fingerprint_mixes_its_tenants_name() {
     use charpente::describe::EventEntry;
@@ -2558,6 +2639,17 @@ fn a_scoped_events_fingerprint_mixes_its_tenants_name() {
         "billing::Org's NAME, never the `Org` its path is spelled with"
     );
     assert_ne!(billing, org, "billing::Org and Org are two tenants");
+    assert_eq!(
+        (
+            <noted_global::Noted as Event>::PAYLOAD_FINGERPRINT,
+            <noted_org::Noted as Event>::PAYLOAD_FINGERPRINT,
+            <noted_team::Noted as Event>::PAYLOAD_FINGERPRINT,
+            <noted_billing::Noted as Event>::PAYLOAD_FINGERPRINT
+        ),
+        (global, global, global, global),
+        "every one states the bare fold as its payload fold, which the emit and \
+         subscribe sites check its FINGERPRINT against"
+    );
     assert_eq!(
         <noted_billing::Noted as EventEntry>::def().scoped_by,
         Some("BillingOrg"),

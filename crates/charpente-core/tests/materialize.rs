@@ -14,7 +14,7 @@
 
 use std::io;
 
-use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Tenant, Tx};
+use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Tenant, Tx, scoped_fingerprint};
 use charpente_core::event::EventRow;
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::table::{Codec, Id, Unscoped, View};
@@ -67,8 +67,9 @@ impl Tenant for TestOrg {
 /// The event emitted inside `TestOrg`'s scope: its own type beside
 /// `TestEvent`, scoped by `TestOrg` (tenancy-completion spec §6), so
 /// `ScopedTx::emit` takes it and a bare `Tx` does not. Its hand-written
-/// `FINGERPRINT` is a literal, as a hand-written `Row`'s shape is: only
-/// `#[event]` computes a scoped fingerprint.
+/// payload fold is a literal, as a hand-written `Row`'s shape is, and its
+/// `FINGERPRINT` mixes `TestOrg`'s `NAME` into it, as `#[event]` would:
+/// `ScopedTx::emit` checks exactly that equation.
 struct OrgEvent {
     n: u32,
 }
@@ -84,7 +85,8 @@ impl Codec for OrgEvent {
 }
 impl Event for OrgEvent {
     const NAME: &'static str = "org_event";
-    const FINGERPRINT: u64 = 0x7E57_000B;
+    const PAYLOAD_FINGERPRINT: u64 = 0x7E57_000B;
+    const FINGERPRINT: u64 = scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, TestOrg::NAME);
     type Scope = TestOrg;
 }
 
