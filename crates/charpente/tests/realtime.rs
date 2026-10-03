@@ -7958,6 +7958,10 @@ mod tenancy_feeds {
         cursor: Option<Cursor>,
         need_subscribe: bool,
         handle: Option<SimSinkHandle>,
+        /// Where the live tail opened: the boundary its subscribe read, and
+        /// the cursor it resumed from (`None` for a bare subscribe). Read
+        /// only to name a miss (`caught_up_while_live`).
+        opened: Option<(u64, Option<Cursor>)>,
         frames_consumed: usize,
         last_id: Option<u64>,
         /// Probes refused by A16's name: from another shop's row, and from a
@@ -7978,6 +7982,7 @@ mod tenancy_feeds {
                 cursor: None,
                 need_subscribe: true,
                 handle: None,
+                opened: None,
                 frames_consumed: 0,
                 last_id: None,
                 refused_same_kind: 0,
@@ -8002,6 +8007,59 @@ mod tenancy_feeds {
 
         fn settled(&self, ledger: &Ledger) -> bool {
             self.pending.is_empty() && self.first_undelivered(ledger).is_none()
+        }
+
+        /// The missing half of set equality, asked while it can fail (plan
+        /// Task 13 fix round 1; review I1). `settled` alone is vacuous for a
+        /// feed the platform never delivers to: with no cursor it resubscribes
+        /// bare at every reconnect, each bare subscribe raises `floor` to its
+        /// boundary, and the settle's own reconnect then empties the window.
+        ///
+        /// Asked only after a `kernel.run` that returned `Ok`, and only of a
+        /// feed whose tail is still open. The platform guarantees exactly this
+        /// there:
+        /// - `Kernel::run` returns `Ok` only from `Step::Idle`, and a step is
+        ///   idle only when no tail in `Kernel::tails` is behind
+        ///   (`next_id < next_event_id`);
+        /// - `deliver_unit` moves a tail past every row in id order and sends
+        ///   each row its subscription admits; a refused send (`Full`, the
+        ///   stall closure) or a terminal frame drops the tail, and its sink
+        ///   with it, which is exactly `SimSinkHandle::closed`.
+        ///
+        /// So an open tail has had every admitted row from its start to the
+        /// head accepted by its sink, and `absorb` has drained each one the
+        /// ledger scanned. Below its start, a bare tail starts at `floor`
+        /// itself, and a resumed one right after its cursor, the last frame it
+        /// accepted in id order, so every own row in `[floor, cursor]` was
+        /// accepted before. Every own row in `[floor, next_scan_id)` is
+        /// therefore verified. A row legitimately still owed is never asked
+        /// about: a stall or a terminal frame closes the tail (`absorb` drops
+        /// the handle), a failed run is not asked, and a row the ledger has
+        /// not scanned is outside the window. No disk read, no entropy draw.
+        fn caught_up_while_live(&self, ledger: &Ledger) -> Result<(), String> {
+            let (Some(handle), Some((boundary, sent))) = (&self.handle, self.opened) else {
+                return Ok(());
+            };
+            if handle.closed() {
+                return Ok(());
+            }
+            let Some(id) = self.first_undelivered(ledger) else {
+                return Ok(());
+            };
+            let how = match sent {
+                Some(cursor) => format!("resuming from cursor {}", cursor.wire()),
+                None => "bare".to_string(),
+            };
+            Err(format!(
+                "{} never received event id {id}, a note emitted {}, on a live tail: it \
+                 subscribed at boundary {boundary} ({how}), the ledger scanned below id {}, and \
+                 kernel.run returned to idle with the tail still open — a tail open on a node \
+                 that ran to idle has been sent every committed row its subscription admits, so \
+                 a feed's delivered set is exactly its own rows, and this one is missing",
+                self.feed.label(),
+                emitted(ledger.rows[&id].origin),
+                ledger.next_scan_id
+            ))
         }
 
         fn unsettled_report(&self, ledger: &Ledger) -> String {
@@ -8100,12 +8158,19 @@ mod tenancy_feeds {
             Ok(())
         }
 
-        fn connected(&mut self, handle: SimSinkHandle, was_bare: bool, boundary: u64) {
+        fn connected(
+            &mut self,
+            handle: SimSinkHandle,
+            was_bare: bool,
+            boundary: u64,
+            sent: Option<Cursor>,
+        ) {
             self.need_subscribe = false;
             if was_bare {
                 self.floor = self.floor.max(boundary);
             }
             self.handle = Some(handle);
+            self.opened = Some((boundary, sent));
             self.frames_consumed = 0;
         }
 
@@ -8516,7 +8581,7 @@ mod tenancy_feeds {
                     } => match read_answer(*status, &raw, explained) {
                         Answer::Connected => {
                             let handle = take_sink(sinks, sinks_taken);
-                            self.clients[client].connected(handle, was_bare, boundary);
+                            self.clients[client].connected(handle, was_bare, boundary, sent);
                         }
                         Answer::Retry => {}
                         // The flagship's diverged-409 arm (S3b item 3). This
@@ -8578,6 +8643,14 @@ mod tenancy_feeds {
 
         fn settled(&self) -> bool {
             self.clients.iter().all(|c| c.settled(&self.ledger))
+        }
+
+        /// `FeedClient::caught_up_while_live` over every feed, after a
+        /// `kernel.run` that returned `Ok` and its `absorb`.
+        fn live_feeds_caught_up(&self) -> Result<(), String> {
+            self.clients
+                .iter()
+                .try_for_each(|c| c.caught_up_while_live(&self.ledger))
         }
 
         /// `Client::adjudicated_nothing` over four feeds (S3b item 7; GUIDE §8,
@@ -8798,6 +8871,9 @@ mod tenancy_feeds {
                     &sinks,
                     &mut sinks_taken,
                 )?;
+                if run_result.is_ok() {
+                    u.live_feeds_caught_up()?;
+                }
                 if let Err(e) = run_result {
                     if !is_fault_fallout(&e.to_string()) {
                         return Err(format!("kernel.run failed non-injected: {e}"));
@@ -8867,6 +8943,9 @@ mod tenancy_feeds {
                 &sinks,
                 &mut sinks_taken,
             )?;
+            if run_result.is_ok() {
+                u.live_feeds_caught_up()?;
+            }
             if let Err(e) = run_result {
                 if !is_fault_fallout(&e.to_string()) {
                     return Err(format!("settle kernel.run failed non-injected: {e}"));
@@ -9369,7 +9448,9 @@ mod tenancy_feeds {
 
     /// Victim, the fail-closed direction: tenant feeds admit nothing. Nothing
     /// arrives, so the leak check cannot see it. Set equality's missing half
-    /// must, and it names the first row that never came.
+    /// must, and it names the first row that never came: at the settle
+    /// (`unsettled_report`), and on the round, while the tail is open
+    /// (`caught_up_while_live`).
     #[test]
     fn the_oracle_names_a_tenant_feed_that_receives_none_of_its_own_rows() {
         let (_sim, kernel, rows, _) = twin();
@@ -9398,6 +9479,33 @@ mod tenancy_feeds {
             "shop 1's feed never caught up: ledger scanned below id 8, floor 0, 0 frame(s) \
              unverified, first own row never delivered Some(2), cursor id None"
         );
+        // In a universe this feed never holds `floor 0` until the settle: with
+        // no cursor it resubscribes bare at every reconnect, each bare
+        // subscribe raises its floor to its boundary, and the report above
+        // then has nothing to name (review I1). The live check names it while
+        // the tail is open, here a bare tail at boundary 0.
+        let (_global_sink, global_tail) = SimSink::new(Box::new(|| false));
+        global.connected(global_tail, true, 0, None);
+        global
+            .caught_up_while_live(&ledger)
+            .expect("the control: the global feed's open tail has every global row");
+        let (shop_sink, shop_tail) = SimSink::new(Box::new(|| false));
+        shop.connected(shop_tail, true, 0, None);
+        assert_eq!(
+            shop.caught_up_while_live(&ledger),
+            Err(
+                "shop 1's feed never received event id 2, a note emitted inside shop 1, on a \
+                 live tail: it subscribed at boundary 0 (bare), the ledger scanned below id 8, \
+                 and kernel.run returned to idle with the tail still open — a tail open on a \
+                 node that ran to idle has been sent every committed row its subscription \
+                 admits, so a feed's delivered set is exactly its own rows, and this one is \
+                 missing"
+                    .to_string()
+            )
+        );
+        drop(shop_sink);
+        shop.caught_up_while_live(&ledger)
+            .expect("a dropped tail owes nothing yet: its rows are still owed at the settle");
     }
 
     /// Victim: an interior skip. Shop 1's real frames, with id 5 removed, are
