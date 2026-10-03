@@ -1,7 +1,7 @@
 error[E0277]: `JobRow` rows are the platform's, and app code cannot write them
-  --> tests/compile_fail/job_row_untenanted_on_bare_tx.rs:28:12
+  --> tests/compile_fail/job_row_untenanted_on_bare_tx.rs:29:12
    |
-28 |     tx.put(&row);
+29 |     tx.put(&row);
    |        --- ^^^^ `JobRow` is written only by the platform
    |        |
    |        required by a bound introduced by this call

@@ -1,7 +1,7 @@
 error[E0277]: `JobRow` rows are the platform's, and app code cannot write them
-  --> tests/compile_fail/job_row_redirected_on_bare_tx.rs:30:12
+  --> tests/compile_fail/job_row_redirected_on_bare_tx.rs:31:12
    |
-30 |     tx.put(&row);
+31 |     tx.put(&row);
    |        --- ^^^^ `JobRow` is written only by the platform
    |        |
    |        required by a bound introduced by this call

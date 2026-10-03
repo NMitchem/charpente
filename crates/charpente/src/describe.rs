@@ -83,8 +83,8 @@ pub struct RouteInfo {
     pub name: &'static str,
     pub auth: bool,
     /// `#[route(…, public(Org))]`: the tenant scope this route admits every
-    /// caller to, with no `authorize` (job-tenancy spec §4), by the scope
-    /// type's name. `None` for `auth` and plain `public`. Beside `auth`
+    /// caller to, with no `authorize` (job-tenancy spec §4), by the tenant
+    /// type's `Tenant::NAME`. `None` for `auth` and plain `public`. Beside `auth`
     /// because together they answer "who reaches what here": `auth=false`
     /// with `None` is plain public, and with `Some` it admits everyone to
     /// that tenant.
@@ -168,7 +168,7 @@ pub struct JobInfo {
     pub name: &'static str,
     pub retry: RetryInfo,
     /// `#[job(scoped_by = Org)]`: the tenant scope this job acts in, by the
-    /// scope type's name; `None` for a `global` job (job-tenancy spec §8).
+    /// tenant type's `Tenant::NAME`; `None` for a `global` job (job-tenancy spec §8).
     pub scoped_by: Option<&'static str>,
     /// `cross_tenant` on a job (`#[job(global, cross_tenant)]`, say) — see
     /// `RouteInfo::cross_tenant`. The inventory

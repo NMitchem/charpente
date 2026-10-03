@@ -9,15 +9,16 @@ help: the trait `TenantScope` is not implemented for `Org`
   |
 3 | #[table(global)]
   | ^^^^^^^^^^^^^^^^
-  = note: a tenant scope needs the app's own membership check; add:
+  = note: a tenant scope needs a name and the app's own membership check; add:
           impl Tenant for Org {
+              const NAME: &'static str = "Org";
               type Who = Principal;
               type Error = ApiError;
               fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> { … }
           }
-note: required by a bound in `__charpente_assert_tenant_scope`
- --> tests/compile_fail/table_scoped_by_missing_tenant_scope.rs:9:1
+note: required by a bound in `charpente::tenant::tenant_name`
+ --> $WORKSPACE/crates/charpente/src/tenant.rs
   |
-9 | #[table(scoped_by = Org)]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__charpente_assert_tenant_scope`
+  | pub const fn tenant_name<S: TenantScope>() -> &'static str {
+  |                             ^^^^^^^^^^^ required by this bound in `tenant_name`
   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

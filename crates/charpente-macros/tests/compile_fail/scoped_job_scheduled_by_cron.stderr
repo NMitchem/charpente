@@ -1,7 +1,7 @@
 error[E0277]: `MaintenanceSweep` is a tenant-scoped job (`#[job(scoped_by = Org)]`) and a bare `Tx` names no tenant to run it in
-  --> tests/compile_fail/scoped_job_scheduled_by_cron.rs:36:10
+  --> tests/compile_fail/scoped_job_scheduled_by_cron.rs:37:10
    |
-36 |         .schedule("maintenance-sweep", Duration::from_secs(3600), || {
+37 |         .schedule("maintenance-sweep", Duration::from_secs(3600), || {
    |          ^^^^^^^^ `MaintenanceSweep` is scoped by `Org`
    |
 help: the trait `NoJobTenant<MaintenanceSweep>` is not implemented for `Org`

@@ -103,7 +103,8 @@ pub struct EmittedEvent {
 /// membership check as on any route.
 #[derive(Clone, Copy, Debug)]
 pub struct PublicScope {
-    /// The scope type's last path segment, as the macro's refusals render it.
+    /// The scope type's `Tenant::NAME`, which `describe` lists and the 401
+    /// renders (tenancy-completion spec §4).
     pub name: &'static str,
     /// The scope type's `TypeId`, behind a fn pointer like `response` and
     /// `error`, so a `Route` stays plain `'static` data and fn pointers.

@@ -3,6 +3,8 @@
 //! sequence, computed at expansion time (spec §1). A deliberate, exact
 //! duplicate of `charpente_core::migration::fnv1a_hash` — proc-macros run in
 //! the host compiler and cannot call core's compiled code.
+//! `path_as_written` quotes a path back into a compile-time refusal, from the
+//! same rendering.
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::Type;
@@ -93,10 +95,46 @@ fn render(tokens: TokenStream, words: &mut Vec<String>) {
     }
 }
 
+/// A path as its author wrote it — `crate::tenancy::Org`, `Wrap<Desk>` — for a
+/// compile-time refusal that quotes an attribute back (tenancy-completion
+/// plan amendment A8). These are `render`'s words, with a space only between
+/// two words that are both identifiers or literals, so the result reads as
+/// source. It is never a tenant's identity: that is `Tenant::NAME`, a
+/// constant of the compiled type, which expansion cannot read.
+pub(crate) fn path_as_written(path: &syn::Path) -> String {
+    let wordlike = |c: char| c.is_alphanumeric() || c == '_';
+    let mut words = Vec::new();
+    render(path.to_token_stream(), &mut words);
+    let mut out = String::new();
+    for word in words {
+        if out.ends_with(wordlike) && word.starts_with(wordlike) {
+            out.push(' ');
+        }
+        out.push_str(&word);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use syn::parse_quote;
+
+    /// A8: a refusal quotes the scope path whole, as written. The last
+    /// segment alone (`Org`, `Wrap`) is what `route::scope_name` printed,
+    /// and it could not tell `billing::Org` from `crm::Org`.
+    #[test]
+    fn a_path_is_quoted_as_written_not_cut_at_its_last_segment() {
+        let cases: [(syn::Path, &str); 4] = [
+            (parse_quote!(Org), "Org"),
+            (parse_quote!(crate::tenancy::Org), "crate::tenancy::Org"),
+            (parse_quote!(Wrap<Desk>), "Wrap<Desk>"),
+            (parse_quote!(G<&'static str>), "G<&'static str>"),
+        ];
+        for (path, written) in cases {
+            assert_eq!(path_as_written(&path), written);
+        }
+    }
 
     #[test]
     fn compute_is_deterministic_and_order_sensitive() {

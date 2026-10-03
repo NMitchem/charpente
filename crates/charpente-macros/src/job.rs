@@ -238,11 +238,12 @@ fn parse_backoff(lit: &LitStr) -> syn::Result<u64> {
 }
 
 /// `global` and `scoped_by` on one job, reported at whichever came second.
-/// Names the scope by its last segment, as the other tenancy refusals do.
+/// Quotes the scope path as written (plan amendment A8): a tenant type's
+/// `NAME` is a constant of the compiled type, which expansion cannot read.
 fn global_and_scoped_by(path: &syn::Path) -> String {
     format!(
         "`global` and `scoped_by = {}` on one job — a job is one or the other; drop one",
-        crate::route::scope_name(path)
+        crate::fingerprint::path_as_written(path)
     )
 }
 
@@ -320,7 +321,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
     // whose `run` takes a bare `Tx` would compile and run in no tenant. The
     // binding makes that a compile error, pinned by
     // `compile_fail/scoped_job_run_takes_bare_tx.rs`.
-    let (scope_ty, tenant_scope_assert, scoped_by_name, run_call) = match tenancy {
+    let (scope_ty, scoped_by_name, run_call) = match tenancy {
         Tenancy::Global => {
             let call = if cross_tenant {
                 quote! { job.run(tx, #cap_expect) }
@@ -329,7 +330,6 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
             };
             (
                 quote! { ::charpente::core::table::Unscoped },
-                quote! {},
                 quote! { ::std::option::Option::None },
                 quote! {
                     let _ = scope; // a global job is handed no tenant
@@ -338,7 +338,6 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
             )
         }
         Tenancy::ScopedBy(path) => {
-            let scope_name = crate::route::scope_name(path);
             let (cap_ty, cap_arg) = if cross_tenant {
                 (
                     quote! { , &::charpente::CrossTenant },
@@ -350,12 +349,8 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
             (
                 quote! { #path },
                 quote! {
-                    const _: () = {
-                        const fn __charpente_assert_tenant_scope<T: ::charpente::TenantScope>() {}
-                        __charpente_assert_tenant_scope::<#path>();
-                    };
+                    ::std::option::Option::Some(::charpente::tenant::tenant_name::<#path>())
                 },
-                quote! { ::std::option::Option::Some(#scope_name) },
                 quote! {
                     let scope = scope.expect(
                         "job declares scoped_by but the dispatcher passed no JobScope — the \
@@ -388,7 +383,6 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
 
     Ok(quote! {
         #input
-        #tenant_scope_assert
 
         impl ::charpente::core::table::Codec for #name {
             fn encode(&self, out: &mut ::std::vec::Vec<u8>) {

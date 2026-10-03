@@ -1148,7 +1148,7 @@ authentication required — `POST /orgs/:org/incidents` is declared `public` and
 ```
 
 The site is the word the route was declared with (`SSE` for a stream) and its pattern;
-the scope is the type's own name. Both fixes are there: the caller's (send a credential)
+the scope is its tenant type's `NAME` (§16). Both fixes are there: the caller's (send a credential)
 and the author's (declare the tenant public, if that really is the policy). §16's "Who
 reaches a tenant" shows the three side by side.
 
@@ -1502,6 +1502,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
@@ -1826,12 +1827,14 @@ Desk;` fingerprints exactly like the real `Desk` one, and a hand-written `impl J
 both constants under any `type Scope`. Enqueued inside a `Board` tenant, either would run
 the mounted job in the `Desk` with the same id, a tenant nothing opened or named for it. So an
 enqueue whose job's scope type is not the one the mounted job declares refuses its
-transaction the same way. `<scope>` is the enqueuing job's scope type and `<declared>` the
-mounted one's, by their last path segments; `<id>` is the tenant id:
+transaction the same way. `<scope>` is the enqueuing job's tenant type's `NAME` and `<declared>` the
+mounted one's (§16); `<id>` is the tenant id. The two NAMEs can be equal. A hand-built `JobDef` that
+names one type and carries another's `scope_type` is refused here on the honest enqueue, which is why
+the text says "with another scope type" and lists that cause:
 
 <!-- pinned -->
 ```text
-job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` under the same shape (<shape>), so it would run in `<declared>` <id>, not in the tenant it was enqueued in — a type standing in for <job>'s #[job] was enqueued: a hand-written `impl Job`, or a #[job] whose `scoped_by` spells another scope type the same way; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, or give the other type its own name (GUIDE §6)
+job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` with another scope type under the same shape (<shape>) — a job row records its tenant's id and not its type, so tenant <id> would be read as the mounted declaration's type, not the one it was enqueued in; either a type standing in for <job>'s #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose `scoped_by` spells another scope type the same way), or a hand-written `JobDef` mounts <job> under a `scope_type` its #[job] does not declare; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
 ```
 
 This one has no startup twin, because a row carries no type to compare. The check runs
@@ -2044,6 +2047,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
@@ -5011,8 +5015,8 @@ does not compile without one.
 
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, migration chain, and whether it's tenant-scoped),
-every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, whether it declared `cross_tenant`, whether it's an SSE stream),
-every registered event (name, payload type — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, whether it declared `cross_tenant`), every cron entry
+every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, by that tenant type's `NAME`, whether it declared `cross_tenant`, whether it's an SSE stream),
+every registered event (name, payload type — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`), every cron entry
 (name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
@@ -6530,7 +6534,7 @@ use charpente::http::{ApiError, Ctx};
 use charpente::wire::WireU64;
 use charpente::{Id, Scoped, Tenant, Tx, route, table};
 
-/// The scope type. It owes exactly one thing — `authorize`. It is a `#[table]`
+/// The scope type. It owes two things: its `NAME` and `authorize`. It is a `#[table]`
 /// here only so `Id<Org>` can appear as a route path parameter (`Id<T>`'s wire
 /// impl is bounded on `T: Row`); a scope that never crosses the wire can be a
 /// bare marker struct instead.
@@ -6541,6 +6545,10 @@ struct Org {
 }
 
 impl Tenant for Org {
+    /// Its identity: persisted inside every scoped job's fingerprint and
+    /// printed wherever a scope is named. Renaming it is a change of
+    /// identity, like renaming a table.
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 
@@ -6592,9 +6600,10 @@ fn memos_by_author(
 }
 ```
 
-Three things that fall out of that, worth stating plainly:
+Four things that fall out of that, worth stating plainly:
 
 - **`scoped_by` without an `impl Tenant` does not compile**, at the struct.
+- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs. A generic tenant impl gives every instantiation one NAME.
 - **The scope type is never inspected.** `authorize` is the only hook, and the
   one thing the platform reads off a scope is its decimal form, as a
   subscription key (below). Nothing parses a key back into a tenant.
@@ -6626,6 +6635,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
@@ -6710,10 +6720,10 @@ transaction is a contract violation and panics by name — including through the
 deref — rather than quietly performing a cross-tenant write:
 
 ```text
-contract: a transaction opens ONE tenant scope (spec §8) — this one already opened myapp::Org(1) and is now asked for myapp::Org(2); run the second tenant's work in its own transaction
+contract: a transaction opens ONE tenant scope (spec §8) — this one already opened `Org` 1 (myapp::Org) and is now asked for `Org` 2 (myapp::Org); run the second tenant's work in its own transaction
 ```
 
-(The scope type prints as `std::any::type_name` renders it, module path
+(Each tenant prints as its type's `NAME` and its id, then its type as `std::any::type_name` renders it, module path
 included.)
 
 Re-opening the *same* scope is a no-op. Cross-tenant *writes* in one
@@ -6751,8 +6761,9 @@ error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
 9 | #[table(scoped_by = Org)]
   |                     ^^^ no `impl Tenant for Org`
   |
-  = note: a tenant scope needs the app's own membership check; add:
+  = note: a tenant scope needs a name and the app's own membership check; add:
           impl Tenant for Org {
+              const NAME: &'static str = "Org";
               type Who = Principal;
               type Error = ApiError;
               fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> { … }
@@ -6828,6 +6839,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
@@ -6911,7 +6923,7 @@ Four properties make this a capability rather than an escape hatch:
   `public_scope` names the tenant a `public(Org)` route admits every caller to, and
   `none` otherwise, while a job's `scoped_by` names the tenant it acts in. So "who
   reaches a tenant without a membership check" and "what acts inside one" are
-  inventories too, in JSON as a name or `null`.
+  inventories too, in JSON as the tenant type's `NAME` or `null`.
 
   The elided `tables:` section carries the matching signal for the table
   itself: `Ledger`'s entry reports `scoped=true` (`Org`'s own entry, and every
@@ -7004,6 +7016,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {

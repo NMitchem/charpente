@@ -345,6 +345,13 @@ pub trait Row: Sized + 'static {
     /// table out of the versioning gate and the replication digest —
     /// hand-written platform impls are unaffected by this sub-project.
     const FINGERPRINT: Option<u64> = None;
+    /// The `Tenant::NAME` of `Scope`, for a row scoped by a tenant type.
+    /// `#[table(scoped_by = Org)]` sets `Some(Org::NAME)`. Every other row
+    /// keeps `None`: `#[table(global)]` and the platform's hand-written rows
+    /// alike. A constant, because this crate cannot bound `Scope: Tenant`: an
+    /// unscoped row's scope is `Unscoped`. It has a default, unlike `Scope`,
+    /// because associated-const defaults are stable.
+    const SCOPE_NAME: Option<&'static str> = None;
     fn id(&self) -> Id<Self>;
     fn encode_row(&self, out: &mut Vec<u8>);
     fn decode_row(bytes: &[u8]) -> io::Result<Self>;

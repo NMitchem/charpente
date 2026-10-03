@@ -260,6 +260,7 @@ mod scoped_jobs {
     }
 
     impl Tenant for Desk {
+        const NAME: &'static str = "Desk";
         type Who = Principal;
         type Error = ApiError;
         /// Never asked: every test here enqueues through the operator path or
@@ -882,6 +883,7 @@ mod scoped_jobs {
     pub struct Board;
 
     impl Tenant for Board {
+        const NAME: &'static str = "Board";
         type Who = Principal;
         type Error = ApiError;
         fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Board>) -> Result<(), ApiError> {
@@ -956,17 +958,7 @@ mod scoped_jobs {
         let err = refused_in_board(db, 13, BoardFile { n: 7 });
         assert_eq!(
             err.to_string(),
-            format!(
-                "job \"File\" was enqueued in a `Board` tenant, but this binary mounts File as \
-                 `scoped_by = Desk` under the same shape ({:#x}), so it would run in `Desk` 13, \
-                 not in the tenant it was enqueued in — a type standing in for File's #[job] \
-                 was enqueued: a hand-written `impl Job`, or a #[job] whose \
-                 `scoped_by` spells another scope type the same way; the transaction was \
-                 refused and nothing was written, so a retry cannot succeed — enqueue the \
-                 mounted File from a `Desk` scope, or give the other type its own name \
-                 (GUIDE §6)",
-                <File as Job>::FINGERPRINT
-            )
+            scope_type_refusal("File", "Board", "Desk", <File as Job>::FINGERPRINT, 13)
         );
         assert!(
             charpente::core::db::JobShapeRefusal::of(&err).is_some(),
@@ -1002,17 +994,7 @@ mod scoped_jobs {
         let err = refused_in_board(db, 14, spelled_alike::File { n: 8 });
         assert_eq!(
             err.to_string(),
-            format!(
-                "job \"File\" was enqueued in a `Board` tenant, but this binary mounts File as \
-                 `scoped_by = Desk` under the same shape ({:#x}), so it would run in `Desk` 14, \
-                 not in the tenant it was enqueued in — a type standing in for File's #[job] \
-                 was enqueued: a hand-written `impl Job`, or a #[job] whose \
-                 `scoped_by` spells another scope type the same way; the transaction was \
-                 refused and nothing was written, so a retry cannot succeed — enqueue the \
-                 mounted File from a `Desk` scope, or give the other type its own name \
-                 (GUIDE §6)",
-                <File as Job>::FINGERPRINT
-            )
+            scope_type_refusal("File", "Board", "Desk", <File as Job>::FINGERPRINT, 14)
         );
         assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
         assert!(db.drain_enqueued().is_empty());
@@ -1036,6 +1018,224 @@ mod scoped_jobs {
         let db = app.db_for_tests();
         db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Desk>())))]);
         db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Board>())))]);
+    }
+
+    // ------------------------------- a scope type renders as its NAME
+    //
+    // Tenancy-completion spec §4 and the job-tenancy final re-review's NB1.
+    // The scope-type refusal named each side by its final `::` component,
+    // which failed three ways: two types spelled `Org` in two modules read as a
+    // contradiction; a generic scope type rendered as `Desk>`; and a
+    // hand-built `JobDef` was not among the causes. Each side now renders
+    // its tenant type's `NAME`.
+
+    /// Two tenant types spelled `Org`, in two modules, with two NAMEs.
+    pub mod billing {
+        use super::*;
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "BillingOrg";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                panic!("a job has no principal — billing::Org::authorize is never asked")
+            }
+        }
+    }
+
+    pub mod crm {
+        use super::*;
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "CrmOrg";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                panic!("a job has no principal — crm::Org::authorize is never asked")
+            }
+        }
+    }
+
+    /// A generic scope type: its one impl gives every instantiation one NAME.
+    pub struct Wrap<B>(std::marker::PhantomData<B>);
+
+    impl<B: 'static> Tenant for Wrap<B> {
+        const NAME: &'static str = "Wrap";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Wrap<B>>) -> Result<(), ApiError> {
+            panic!("a job has no principal — Wrap::authorize is never asked")
+        }
+    }
+
+    #[job(scoped_by = billing::Org)]
+    pub struct Invoice {
+        pub n: u64,
+    }
+
+    impl Invoice {
+        fn run(self, _tx: &mut ScopedTx<'_, '_, billing::Org>) -> Result<(), JobError> {
+            let _ = self.n;
+            Ok(())
+        }
+    }
+
+    /// Copies `Invoice`'s `NAME` and `FINGERPRINT` under `crm::Org`.
+    struct CrmInvoice {
+        n: u64,
+    }
+
+    impl Codec for CrmInvoice {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+        fn decode(input: &mut &[u8]) -> std::io::Result<CrmInvoice> {
+            Ok(CrmInvoice {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Job for CrmInvoice {
+        const NAME: &'static str = "Invoice";
+        const FINGERPRINT: u64 = <Invoice as Job>::FINGERPRINT;
+        type Scope = crm::Org;
+    }
+
+    /// Copies `File`'s `NAME` and `FINGERPRINT` under `Wrap<Desk>`.
+    struct WrapFile {
+        n: u64,
+    }
+
+    impl Codec for WrapFile {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+        fn decode(input: &mut &[u8]) -> std::io::Result<WrapFile> {
+            Ok(WrapFile {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Job for WrapFile {
+        const NAME: &'static str = "File";
+        const FINGERPRINT: u64 = <File as Job>::FINGERPRINT;
+        type Scope = Wrap<Desk>;
+    }
+
+    /// The scope-type refusal (`Group::stage`), spelled out here rather than
+    /// taken from the product's `format!`, so the comparison pins the words.
+    fn scope_type_refusal(
+        job: &str,
+        enqueued: &str,
+        declared: &str,
+        shape: u64,
+        id: u64,
+    ) -> String {
+        format!(
+            "job \"{job}\" was enqueued in a `{enqueued}` tenant, but this binary mounts {job} as \
+             `scoped_by = {declared}` with another scope type under the same shape ({shape:#x}) \
+             — a job row records its tenant's id and not its type, so tenant {id} would be read \
+             as the mounted declaration's type, not the one it was enqueued in; either a type \
+             standing in for {job}'s #[job] was enqueued (a hand-written `impl Job`, or a \
+             #[job] whose `scoped_by` spells another scope type the same way), or a \
+             hand-written `JobDef` mounts {job} under a `scope_type` its #[job] does not \
+             declare; the transaction was refused and nothing was written, so a retry cannot \
+             succeed — enqueue the mounted {job} from a `{declared}` scope, give the other type \
+             its own name, or mount {job} as its #[job] declares it (GUIDE §6)"
+        )
+    }
+
+    /// Enqueues `job` inside tenant `tenant` of its own scope type through
+    /// the operator path, and returns the stage's refusal.
+    fn refused_in<S: Tenant, J: Job<Scope = S>>(
+        db: &mut Db,
+        tenant: u64,
+        job: J,
+    ) -> std::io::Error {
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        let staged = group.stage(|tx| {
+            tx.admit_scope(Id::<S>::from_raw(tenant), &admission)
+                .enqueue(job);
+            Ok::<(), std::io::Error>(())
+        });
+        group.commit().unwrap();
+        match staged {
+            Err(TxError::Io(e)) => e,
+            Err(other) => panic!("expected the stage refusal, got {other:?}"),
+            Ok(()) => panic!(
+                "a \"{}\" row enqueued in a tenant of another scope type reached the store",
+                J::NAME
+            ),
+        }
+    }
+
+    /// NB1 (a): `billing::Org` and `crm::Org` are both spelled `Org`, and
+    /// the refusal names them apart.
+    #[test]
+    fn a_stand_in_under_a_same_spelled_scope_type_is_refused_naming_both_tenant_names() {
+        let sim = Sim::with_faults(0x5C0B_00FA, FaultConfig::none());
+        let mut app = only_jobs_app(&sim, jobs![Invoice]);
+        let db = app.db_for_tests();
+        let err = refused_in(db, 21, CrmInvoice { n: 1 });
+        assert_eq!(
+            err.to_string(),
+            scope_type_refusal(
+                "Invoice",
+                "CrmOrg",
+                "BillingOrg",
+                <Invoice as Job>::FINGERPRINT,
+                21
+            )
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+    }
+
+    /// NB1 (b): a generic scope type renders its NAME, never a cut of its
+    /// `type_name` (`Desk>`).
+    #[test]
+    fn a_stand_in_under_a_generic_scope_type_is_refused_by_the_generic_types_name() {
+        let (_sim, mut app) = desk_app(0x5C0B_00FB);
+        let db = app.db_for_tests();
+        let err = refused_in(db, 17, WrapFile { n: 7 });
+        assert_eq!(
+            err.to_string(),
+            scope_type_refusal("File", "Wrap", "Desk", <File as Job>::FINGERPRINT, 17)
+        );
+    }
+
+    /// NB1 (c), the re-review's P6. A hand-built `JobDef` whose `scope_type`
+    /// is not its `#[job]`'s refuses the honest enqueue. So the `JobDef` is
+    /// named among the causes, and "mount it as its #[job] declares it" among
+    /// the fixes. The app mounts no table: a table that named `Desk` would
+    /// meet the mount-time tenant-name check first (Task 3).
+    #[test]
+    fn a_jobdef_whose_scope_type_is_not_its_jobs_is_named_as_a_cause() {
+        let sim = Sim::with_faults(0x5C0B_00FC, FaultConfig::none());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(vec![JobDef {
+            scope_type: TypeId::of::<Board>(),
+            ..<File as JobEntry>::def()
+        }]);
+        let db = app.db_for_tests();
+        let err = refused_in(db, 13, File { n: 7 });
+        assert_eq!(
+            err.to_string(),
+            scope_type_refusal("File", "Desk", "Desk", <File as Job>::FINGERPRINT, 13)
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
     }
 }
 
@@ -2304,6 +2504,7 @@ impl Flaky {
 struct Org;
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 
@@ -5174,6 +5375,7 @@ mod job_tenancy {
     struct Shop;
 
     impl Tenant for Shop {
+        const NAME: &'static str = "Shop";
         type Who = Principal;
         type Error = ApiError;
         /// Membership: a shop's own key, and no other.

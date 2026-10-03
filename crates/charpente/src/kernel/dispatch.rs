@@ -72,8 +72,8 @@ pub struct JobDef {
     /// rollups that need it. `describe` lists it beside the route flag, so the
     /// cross-tenant inventory covers jobs too.
     pub cross_tenant: bool,
-    /// `#[job(scoped_by = Org)]` — the scope type's last path segment, as
-    /// `describe` lists it; `None` for a `global` job. `App::mount_jobs`
+    /// `#[job(scoped_by = Org)]` — the scope type's `Tenant::NAME`, as
+    /// `describe` lists it and the refusals render it; `None` for a `global` job. `App::mount_jobs`
     /// registers it beside `fingerprint` and `scope_type`: `Group::stage`
     /// refuses an enqueue whose tenant presence disagrees with it, startup
     /// refuses a Pending row that does, and dispatch asserts that a row

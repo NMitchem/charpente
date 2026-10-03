@@ -1,7 +1,7 @@
 error[E0423]: cannot initialize a tuple struct which contains private fields
-  --> tests/compile_fail/tenant_admission_cannot_be_forged.rs:34:42
+  --> tests/compile_fail/tenant_admission_cannot_be_forged.rs:35:42
    |
-34 |     let tx = tx.admit_scope::<Org>(org, &TenantAdmission(()));
+35 |     let tx = tx.admit_scope::<Org>(org, &TenantAdmission(()));
    |                                          ^^^^^^^^^^^^^^^
    |
 note: constructor is not visible here due to private fields

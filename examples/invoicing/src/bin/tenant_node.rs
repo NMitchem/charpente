@@ -62,6 +62,7 @@ struct Org {
 /// nothing else), so a caller asking for another tenant's rows is refused
 /// here, in app code, before any scoped read exists.
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 

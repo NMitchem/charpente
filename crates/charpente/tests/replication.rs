@@ -1212,6 +1212,7 @@ impl Row for SeedLedger {
 }
 
 impl charpente::Tenant for SeedOrg {
+    const NAME: &'static str = "SeedOrg";
     type Who = str;
     type Error = io::Error;
 

@@ -43,7 +43,7 @@ use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 ///
 /// A `#[table]` rather than a bare marker only so `Id<Org>` can be a route
 /// path parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing
-/// reads the table. A scope type owes nothing but `authorize`, and the
+/// reads the table. A scope type owes its `NAME` and `authorize`, and the
 /// platform never DERIVES a scope — it only renders one, as the subscription
 /// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
 /// `emit_keyed` ruling, DESIGN.md §6).
@@ -90,6 +90,7 @@ fn bodies_entered() -> u64 {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 
@@ -549,6 +550,7 @@ struct Firm {
 }
 
 impl Tenant for Firm {
+    const NAME: &'static str = "Firm";
     type Who = Principal;
     type Error = ApiError;
 
@@ -1332,6 +1334,7 @@ struct Team {
 }
 
 impl Tenant for Team {
+    const NAME: &'static str = "Team";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
@@ -1692,6 +1695,7 @@ mod statuspage {
     }
 
     impl Tenant for Org {
+        const NAME: &'static str = "Org";
         type Who = Principal;
         type Error = ApiError;
 
@@ -1769,5 +1773,130 @@ fn statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_wri
         app.db().last_applied(),
         None,
         "the store is unchanged: no incident, and no record of one"
+    );
+}
+
+// ------------------------------------- a scope type renders as its NAME
+
+/// Two tenant types spelled `Org`, in two modules, with two NAMEs
+/// (tenancy-completion spec §4). `authorize` answers `Ok` for everyone:
+/// every test below is about a caller with no credential, and `authorize`
+/// is never asked about one.
+mod billing {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        const NAME: &'static str = "BillingOrg";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+mod crm {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        const NAME: &'static str = "CrmOrg";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+/// A generic tenant type: its one impl gives every instantiation one NAME.
+mod wrapped {
+    use std::marker::PhantomData;
+
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Wrap<B>(PhantomData<B>);
+
+    impl<B: 'static> Tenant for Wrap<B> {
+        const NAME: &'static str = "Wrap";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Wrap<B>>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    pub struct Alpha;
+}
+
+/// Declared `public(billing::Org)`, but it opens `crm::Org`. Rule 3 applies
+/// to a caller with no credential, and the 401 must tell the two `Org`s
+/// apart. Path-parameter-free: `Id<S>` is a wire type only for `S: Row`.
+#[route(POST "/crm-leads", public(billing::Org))]
+fn write_crm_lead(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<crm::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+/// Opens a tenant of a generic tenant type on a plain `public` route.
+#[route(POST "/wrapped", public)]
+fn write_wrapped(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<wrapped::Wrap<wrapped::Alpha>>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+fn rendering_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![write_crm_lead, write_wrapped]);
+    (sim, app)
+}
+
+/// Spec §4 and the re-review's NB1 (a), at the 401: the route's stance and
+/// the scope it opened are two different types spelled `Org`.
+#[test]
+fn the_401_tells_two_tenant_types_spelled_alike_apart_by_their_names() {
+    let (_sim, mut app) = rendering_app(0x7E4A_1710);
+    let refused = app.handle(Request::new(Method::Post, "/crm-leads"));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `POST /crm-leads` is declared `public(BillingOrg)` and \
+         opened the tenant scope `CrmOrg` for a caller with no credential; only a route \
+         declared `public(CrmOrg)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `#[route(POST \"/crm-leads\", public(CrmOrg))]`"
+    );
+}
+
+/// Spec §4 and NB1 (b), at the 401: a generic tenant type renders its NAME,
+/// never a cut of its `type_name` (`Alpha>`).
+#[test]
+fn the_401_names_a_generic_tenant_type_by_its_name() {
+    let (_sim, mut app) = rendering_app(0x7E4A_1711);
+    let refused = app.handle(Request::new(Method::Post, "/wrapped"));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `POST /wrapped` is declared `public` and opened the tenant \
+         scope `Wrap` for a caller with no credential; only a route declared `public(Wrap)` \
+         admits one. Send \"Authorization: Bearer <token>\" or the charpente_session cookie, \
+         or, if every caller may act inside this tenant here, declare \
+         `#[route(POST \"/wrapped\", public(Wrap))]`"
     );
 }

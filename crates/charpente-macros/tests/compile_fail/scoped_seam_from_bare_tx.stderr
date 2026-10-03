@@ -1,7 +1,7 @@
 error[E0624]: method `get_in` is private
-  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:34:16
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:35:16
    |
-34 |       let _ = tx.get_in(other, Id::<Invoice>::from_raw(7))?;
+35 |       let _ = tx.get_in(other, Id::<Invoice>::from_raw(7))?;
    |                  ^^^^^^ private method
    |
   ::: $WORKSPACE/crates/charpente-core/src/db.rs
@@ -14,9 +14,9 @@ error[E0624]: method `get_in` is private
    | |______________________________- private method defined here
 
 error[E0624]: method `scan_by_in` is private
-  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:35:16
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:36:16
    |
-35 |       let _ = tx.scan_by_in::<Org, Invoice>(other, "by_total", &1u32)?;
+36 |       let _ = tx.scan_by_in::<Org, Invoice>(other, "by_total", &1u32)?;
    |                  ^^^^^^^^^^ private method
    |
   ::: $WORKSPACE/crates/charpente-core/src/db.rs
@@ -30,9 +30,9 @@ error[E0624]: method `scan_by_in` is private
    | |___________________________- private method defined here
 
 error[E0624]: method `scan_from_in` is private
-  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:36:16
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:37:16
    |
-36 |       let _ = tx.scan_from_in::<Org, Invoice>(other, 0, 10)?;
+37 |       let _ = tx.scan_from_in::<Org, Invoice>(other, 0, 10)?;
    |                  ^^^^^^^^^^^^ private method
    |
   ::: $WORKSPACE/crates/charpente-core/src/db.rs
@@ -46,9 +46,9 @@ error[E0624]: method `scan_from_in` is private
    | |___________________________- private method defined here
 
 error[E0624]: method `scan_in` is private
-  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:37:11
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:38:11
    |
-37 |     Ok(tx.scan_in::<Org, Invoice>(other)?)
+38 |     Ok(tx.scan_in::<Org, Invoice>(other)?)
    |           ^^^^^^^ private method
    |
   ::: $WORKSPACE/crates/charpente-core/src/db.rs
@@ -57,9 +57,9 @@ error[E0624]: method `scan_in` is private
    |     ------------------------------------------------------------------------------------ private method defined here
 
 error[E0624]: method `put_in` is private
-  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:41:8
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:42:8
    |
-41 |     tx.put_in(
+42 |     tx.put_in(
    |        ^^^^^^ private method
    |
   ::: $WORKSPACE/crates/charpente-core/src/db.rs
@@ -68,9 +68,9 @@ error[E0624]: method `put_in` is private
    |     -------------------------------------------------------------------------- private method defined here
 
 error[E0624]: method `delete_in` is private
-  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:48:8
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:49:8
    |
-48 |     tx.delete_in(other, Id::<Invoice>::from_raw(7));
+49 |     tx.delete_in(other, Id::<Invoice>::from_raw(7));
    |        ^^^^^^^^^ private method
    |
   ::: $WORKSPACE/crates/charpente-core/src/db.rs

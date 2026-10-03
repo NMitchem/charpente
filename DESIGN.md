@@ -746,8 +746,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   becomes the `(scope, id)` composite (every secondary-index entry gains the same prefix) —
   a tenant is a key prefix, not a `where` clause someone has to remember. A
   `#[table(global)]` gets `type Scope = Unscoped`; a table that declares neither is a
-  compile error (the Tables bullet above). The scope type owes exactly one thing, an
-  `impl Tenant` with its own `authorize`; `scoped_by` without one is a compile error at the
+  compile error (the Tables bullet above). The scope type owes an `impl Tenant` with two items: `NAME`, its identity, rendered wherever a scope is named (spec 2026-09-30-tenancy-completion §4), and its own `authorize`; `scoped_by` without one is a compile error at the
   struct. The six scope-taking primitives on `Tx` are private to `charpente-core`, so the
   ONE way to reach a scoped row is `tx.scope::<Org>(org, ctx)?` — the single auditable line
   per handler — which runs the app's `authorize` (or, on a route declared `public(Org)`,
@@ -1780,7 +1779,7 @@ Charpente treats the coding agent as the primary developer persona:
   `#[table(scoped_by = …)]`, carried straight from the registry's own `TableOps::scoped`,
   the same value `Db::table_scoped` already exposes to the archive/replication callers),
   routes (method, pattern, name,
-  whether it declared `auth` (`false` is a declared `public`, never an omission), **the scope a `public(Org)` route admits every caller to (`public_scope`, a type name or `null`)**,
+  whether it declared `auth` (`false` is a declared `public`, never an omission), **the scope a `public(Org)` route admits every caller to (`public_scope`, the tenant type's `NAME` or `null`)**,
   **whether it declared `cross_tenant`** — which is what turns
   "audit the cross-tenant reads" into a mechanical inventory — whether it's an SSE stream,
   **plus, since the TS-client-codegen
@@ -1793,7 +1792,7 @@ Charpente treats the coding agent as the primary developer persona:
   stream route that has not adopted the declaration**), **`events` — every `#[event]` type
   registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
   sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
-  choice, so nothing static can know it)**, jobs (name, retry policy, **`scoped_by`, the scope type a job acts in or `null`**, `cross_tenant`), cron
+  choice, so nothing static can know it)**, jobs (name, retry policy, **`scoped_by`, the `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
   field order is

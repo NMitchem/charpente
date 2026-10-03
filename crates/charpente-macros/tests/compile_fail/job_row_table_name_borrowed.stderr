@@ -28,9 +28,9 @@ note: erroneous constant encountered
   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 note: the above error was encountered while instantiating `fn Tx::<'_>::put::<Queue>`
-  --> tests/compile_fail/job_row_table_name_borrowed.rs:70:5
+  --> tests/compile_fail/job_row_table_name_borrowed.rs:71:5
    |
-70 |     tx.put(&Queue(row));
+71 |     tx.put(&Queue(row));
    |     ^^^^^^^^^^^^^^^^^^^
 
 error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — job rows are the platform's: only the enqueue family writes one, because the dispatcher runs a job in the tenant its row names; give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)
@@ -63,9 +63,9 @@ note: erroneous constant encountered
   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 note: the above error was encountered while instantiating `fn Tx::<'_>::delete::<Queue>`
-  --> tests/compile_fail/job_row_table_name_borrowed.rs:71:5
+  --> tests/compile_fail/job_row_table_name_borrowed.rs:72:5
    |
-71 |     tx.delete::<Queue>(Id::from_raw(job.raw() + 1));
+72 |     tx.delete::<Queue>(Id::from_raw(job.raw() + 1));
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — job rows are the platform's: only the enqueue family writes one, because the dispatcher runs a job in the tenant its row names; give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)
@@ -98,9 +98,9 @@ note: erroneous constant encountered
   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::put::<OrgQueue>`
-  --> tests/compile_fail/job_row_table_name_borrowed.rs:79:5
+  --> tests/compile_fail/job_row_table_name_borrowed.rs:80:5
    |
-79 |     tx.put(&OrgQueue(row));
+80 |     tx.put(&OrgQueue(row));
    |     ^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — job rows are the platform's: only the enqueue family writes one, because the dispatcher runs a job in the tenant its row names; give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)
@@ -133,7 +133,7 @@ note: erroneous constant encountered
   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::delete::<OrgQueue>`
-  --> tests/compile_fail/job_row_table_name_borrowed.rs:80:5
+  --> tests/compile_fail/job_row_table_name_borrowed.rs:81:5
    |
-80 |     tx.delete::<OrgQueue>(Id::from_raw(job.raw() + 1));
+81 |     tx.delete::<OrgQueue>(Id::from_raw(job.raw() + 1));
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1120,6 +1120,7 @@ struct Ledger {
 }
 
 impl charpente::Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = charpente::auth::Principal;
     type Error = ApiError;
     fn authorize(
@@ -1320,6 +1321,71 @@ fn to_human_carries_public_scope_and_scoped_by() {
     ] {
         assert!(out.contains(line), "missing {line:?} in:\n{out}");
     }
+}
+
+/// A tenant type whose NAME is not its identifier (tenancy-completion spec
+/// §4, §8), so a listing that cut a path at its last segment would read
+/// `Org` here. It is mounted by its own app, so `capability_app`'s golden is
+/// untouched.
+mod renamed {
+    pub struct Org;
+
+    impl charpente::Tenant for Org {
+        const NAME: &'static str = "Workspace";
+        type Who = charpente::auth::Principal;
+        type Error = charpente::http::ApiError;
+        fn authorize(
+            _tx: &charpente::Tx,
+            _who: &charpente::auth::Principal,
+            _scope: charpente::Id<Org>,
+        ) -> Result<(), charpente::http::ApiError> {
+            Ok(())
+        }
+    }
+}
+
+#[route(GET "/workspace/ledger", public(renamed::Org))]
+fn workspace_ledger(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<renamed::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(tx.scope().raw()))
+}
+
+#[job(scoped_by = renamed::Org)]
+struct Audit {
+    day: u64,
+}
+
+impl Audit {
+    fn run(self, tx: &mut ScopedTx<'_, '_, renamed::Org>) -> Result<(), JobError> {
+        let _ = (self.day, tx.scope());
+        Ok(())
+    }
+}
+
+/// `describe` names a route's `public_scope` and a job's `scoped_by` by the
+/// tenant type's `NAME`. That is the identity the fingerprint mixes, not a
+/// spelling of the type's path.
+#[test]
+fn describe_names_a_tenant_scope_by_its_tenant_types_name() {
+    let sim = Sim::with_faults(0x2EC2_0003, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![workspace_ledger])
+    .mount_jobs(jobs![Audit]);
+    let c = app.describe();
+    let route = c
+        .routes
+        .iter()
+        .find(|r| r.name == "workspace_ledger")
+        .unwrap();
+    assert_eq!(route.public_scope, Some("Workspace"));
+    let job = c.jobs.iter().find(|j| j.name == "Audit").unwrap();
+    assert_eq!(job.scoped_by, Some("Workspace"));
 }
 
 // ------------------------------------------------------------- table scope

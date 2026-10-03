@@ -196,11 +196,7 @@ fn parse_table_args(args: TokenStream) -> syn::Result<TableArgs> {
         }
     }
     if let (Some(span), Some(path)) = (global, &scoped_by) {
-        let scope = &path
-            .segments
-            .last()
-            .expect("a parsed path has a segment")
-            .ident;
+        let scope = crate::fingerprint::path_as_written(path);
         return Err(syn::Error::new(
             span,
             format!(

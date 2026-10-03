@@ -430,8 +430,8 @@ pub struct SealedSegment {
 }
 
 /// A mounted job's declared tenancy, as `Db::register_job_shapes` takes it:
-/// `None` for a `global` job, or the `scoped_by` scope's name (as
-/// `JobDef.scoped_by` and `describe` spell it) with its `TypeId`
+/// `None` for a `global` job, or the `scoped_by` scope type's `Tenant::NAME`
+/// (`JobDef.scoped_by`, as `describe` lists it) with its `TypeId`
 /// (`JobDef.scope_type`). The `TypeId` is compared in memory only and never
 /// recorded, so it may differ between builds without touching the log.
 pub type DeclaredTenancy = Option<(&'static str, TypeId)>;
@@ -663,7 +663,7 @@ struct EnqueuedTenant {
     id: u64,
     /// `TypeId::of::<J::Scope>()`, compared with the mounted declaration's.
     scope_type: TypeId,
-    /// `type_name::<J::Scope>()`, for the refusal's text only.
+    /// The scope type's `Tenant::NAME`, for the refusal's text only.
     scope_name: &'static str,
 }
 
@@ -960,9 +960,10 @@ pub struct Tx<'a> {
     group: Option<&'a GroupOverlay>,
     effects: TxEffects,
     /// The tenant scope this transaction opened, as
-    /// `(TypeId::of::<S>(), type_name::<S>(), scope.raw())`. A transaction
-    /// opens ONE scope (spec §8); `open_scope` asserts against this.
-    opened_scope: Option<(TypeId, &'static str, u64)>,
+    /// `(TypeId::of::<S>(), S::NAME, type_name::<S>(), scope.raw())`. A
+    /// transaction opens ONE scope (spec §8). `enter_scope` asserts against
+    /// this: it compares the `TypeId` and the id, and prints the other two.
+    opened_scope: Option<(TypeId, &'static str, &'static str, u64)>,
 }
 
 impl<'a> Tx<'a> {
@@ -1129,19 +1130,25 @@ impl<'a> Tx<'a> {
     }
 
     /// The one body of the enqueue family (job-tenancy spec §5–§6). `scope`
-    /// is the tenant a scoped job runs in, and `None` for a `global` one.
-    /// The public methods' bounds decide which, and this asserts that they
-    /// agree with the job's own declaration, so a scoped job is never
-    /// written without its tenant and a global one never with one (hard
-    /// rule 4).
-    fn push_enqueue<J: Job>(&mut self, scope: Option<u64>, key: Option<String>, job: J) {
+    /// is the tenant a scoped job runs in, with its tenant type's `NAME` for
+    /// `Group::stage`'s refusal; it is `None` for a `global` job. The public
+    /// methods' bounds decide which. This asserts that they agree with the
+    /// job's own declaration, so a scoped job is never written without its
+    /// tenant and a global one never with one (hard rule 4).
+    fn push_enqueue<J: Job>(
+        &mut self,
+        scope: Option<(u64, &'static str)>,
+        key: Option<String>,
+        job: J,
+    ) {
         assert_eq!(
             scope.is_some(),
             TypeId::of::<J::Scope>() != TypeId::of::<crate::table::Unscoped>(),
-            "contract: job \"{}\" was enqueued with tenant {scope:?}, but a scoped job carries \
+            "contract: job \"{}\" was enqueued with tenant {:?}, but a scoped job carries \
              its tenant and a global one none — the enqueue family's bounds guarantee this, so \
              reaching here is a platform bug",
-            J::NAME
+            J::NAME,
+            scope.map(|(id, _)| id)
         );
         if let Some(key) = &key {
             assert!(
@@ -1157,10 +1164,10 @@ impl<'a> Tx<'a> {
             payload,
             key,
             shape: J::FINGERPRINT,
-            scope: scope.map(|id| EnqueuedTenant {
+            scope: scope.map(|(id, name)| EnqueuedTenant {
                 id,
                 scope_type: TypeId::of::<J::Scope>(),
-                scope_name: std::any::type_name::<J::Scope>(),
+                scope_name: name,
             }),
         });
     }
@@ -1199,7 +1206,7 @@ impl<'a> Tx<'a> {
         cap: &CrossTenant,
     ) {
         let CrossTenant(()) = cap;
-        self.push_enqueue(Some(scope.raw()), None, job);
+        self.push_enqueue(Some((scope.raw(), S::NAME)), None, job);
     }
 
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
@@ -1565,9 +1572,10 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 
 /// The app's own membership check for a tenant scope: "may this caller act
 /// as this tenant?" (spec §1). `#[table(scoped_by = Org)]` requires an impl
-/// for `Org` — enforced by a macro-emitted const assert, the same shape
-/// `#[table(version = …)]` uses to require a `TableMigration` impl
-/// (DESIGN §3).
+/// for `Org` — enforced through the macros' `tenant_name::<S>()` call,
+/// whose bound is `TenantScope` (tenancy-completion plan amendment A7).
+/// `#[table(version = …)]` requires a `TableMigration` impl by a const
+/// assert instead (DESIGN §3).
 ///
 /// Generic over `Who` and `Error` because the deterministic core cannot name
 /// `charpente::auth::Principal` or `charpente::http::ApiError` — DESIGN §8
@@ -1575,6 +1583,12 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 /// (ruling R2, amended by R45). An app writes the platform's specialization,
 /// `charpente::TenantScope` (`Who = Principal`, `Error = ApiError`), which is
 /// blanket-implemented for every such impl and carries the house diagnostic.
+///
+/// A tenant type names itself with `NAME`, as a table does with `TABLE`.
+/// That is a declared identity, never the compiler's printer: `type_name`
+/// cuts a generic at the wrong place and cannot tell two types spelled alike
+/// apart (tenancy-completion spec §4). No two tenant types of one app may
+/// share a `NAME`.
 ///
 /// The platform calls `authorize` in exactly one place, `Tx::open_scope`
 /// below, and only with a principal — and never DERIVES a scope: the tenant
@@ -1585,6 +1599,11 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 /// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering
 /// out, never resolving in.
 pub trait Tenant: Sized + 'static {
+    /// This tenant type's identity: persisted inside every scoped job's and
+    /// scoped event's fingerprint, and rendered wherever a scope type is
+    /// named. Renaming it is a change of identity, as renaming a table's
+    /// `TABLE` is.
+    const NAME: &'static str;
     /// Whoever is asking. `?Sized` so an app can key membership on an
     /// unsized witness (a `str` subject) as readily as on a struct.
     type Who: ?Sized;
@@ -1610,16 +1629,23 @@ impl<'a> Tx<'a> {
         scope: Id<S>,
         admit: impl FnOnce(&Tx<'a>) -> Result<(), E>,
     ) -> Result<ScopedTx<'_, 'a, S>, E> {
-        let opening = (TypeId::of::<S>(), std::any::type_name::<S>(), scope.raw());
+        let opening = (
+            TypeId::of::<S>(),
+            S::NAME,
+            std::any::type_name::<S>(),
+            scope.raw(),
+        );
         if let Some(prev) = self.opened_scope {
             assert!(
-                (prev.0, prev.2) == (opening.0, opening.2),
+                (prev.0, prev.3) == (opening.0, opening.3),
                 "contract: a transaction opens ONE tenant scope (spec §8) — this one already \
-                 opened {}({}) and is now asked for {}({}); run the second tenant's work in its \
-                 own transaction",
+                 opened `{}` {} ({}) and is now asked for `{}` {} ({}); run the second \
+                 tenant's work in its own transaction",
                 prev.1,
+                prev.3,
                 prev.2,
                 opening.1,
+                opening.3,
                 opening.2
             );
         }
@@ -1807,14 +1833,20 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
     /// `(*tx).enqueue(job)` in a handler that owns its `ScopedTx`, and
     /// `(**tx).enqueue(job)` in a scoped job's `run`, which holds
     /// `&mut ScopedTx`.
-    pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J) {
-        let scope = self.scope.raw();
+    pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J)
+    where
+        S: Tenant,
+    {
+        let scope = (self.scope.raw(), S::NAME);
         self.tx.push_enqueue(Some(scope), None, job);
     }
 
     /// `enqueue`, with `Tx::enqueue_keyed`'s idempotency key.
-    pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J) {
-        let scope = self.scope.raw();
+    pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J)
+    where
+        S: Tenant,
+    {
+        let scope = (self.scope.raw(), S::NAME);
         self.tx.push_enqueue(Some(scope), Some(key.into()), job);
     }
 }
@@ -4070,7 +4102,9 @@ impl<'a> Group<'a> {
         // path spells another type alike, which the fingerprint cannot tell
         // apart) would run in the same id of the declared type, not in the
         // tenant it was enqueued in. This is the only place both types are
-        // known (job-tenancy final review N1).
+        // known (job-tenancy final review N1). A hand-built `JobDef` whose
+        // `scope_type` is not its `#[job]`'s trips the same check on the honest
+        // enqueue, so the refusal names that cause too (final re-review NB1).
         let job_shapes = &self.db.engine.machine().schema.job_shapes;
         for Enqueue {
             job: name,
@@ -4114,23 +4148,27 @@ impl<'a> Group<'a> {
             if let (Some(tenant), Some((declared, declared_type))) = (scope, scoped_by)
                 && tenant.scope_type != declared_type
             {
-                // The last path segment, as `decode_body` renders a type.
-                let enqueued = tenant
-                    .scope_name
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(tenant.scope_name);
+                // Each side is named by its tenant type's `NAME`
+                // (tenancy-completion spec §4). A final `::` component read two
+                // types spelled alike as one, and a generic as `B>`. The two
+                // NAMEs are equal when the mounted `JobDef` names one type and
+                // carries another's `scope_type`. That is why the text says
+                // "with another scope type", and why it lists that cause.
+                let enqueued = tenant.scope_name;
                 return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
                     format!(
                         "job \"{name}\" was enqueued in a `{enqueued}` tenant, but this binary \
-                         mounts {name} as `scoped_by = {declared}` under the same shape \
-                         ({shape:#x}), so it would run in `{declared}` {}, not in the tenant it \
-                         was enqueued in — a type standing in for {name}'s #[job] was \
-                         enqueued: a hand-written `impl Job`, or a #[job] whose \
-                         `scoped_by` spells another scope type the same way; the transaction was \
-                         refused and nothing was written, so a retry cannot succeed — enqueue the \
-                         mounted {name} from a `{declared}` scope, or give the other type its \
-                         own name (GUIDE §6)",
+                         mounts {name} as `scoped_by = {declared}` with another scope type under \
+                         the same shape ({shape:#x}) — a job row records its tenant's id and not \
+                         its type, so tenant {} would be read as the mounted declaration's type, \
+                         not the one it was enqueued in; either a type standing in for {name}'s \
+                         #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose \
+                         `scoped_by` spells another scope type the same way), or a hand-written \
+                         `JobDef` mounts {name} under a `scope_type` its #[job] does not declare; \
+                         the transaction was refused and nothing was written, so a retry cannot \
+                         succeed — enqueue the mounted {name} from a `{declared}` scope, give the \
+                         other type its own name, or mount {name} as its #[job] declares it \
+                         (GUIDE §6)",
                         tenant.id
                     ),
                 )))));

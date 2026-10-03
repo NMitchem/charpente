@@ -544,6 +544,7 @@ struct TestOrg;
 /// type's `?Sized` is exercised somewhere; `Error = io::Error` so a refusal
 /// composes with the `?` the staged closures below already use.
 impl Tenant for TestOrg {
+    const NAME: &'static str = "TestOrg";
     type Who = str;
     type Error = io::Error;
 
@@ -2752,6 +2753,7 @@ static AUDITED_SCOPES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 struct AuditOrg;
 
 impl Tenant for AuditOrg {
+    const NAME: &'static str = "AuditOrg";
     type Who = str;
     type Error = io::Error;
 
@@ -3321,6 +3323,7 @@ static ADMIT_ORG_AUTHORIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 struct AdmitOrg;
 
 impl Tenant for AdmitOrg {
+    const NAME: &'static str = "AdmitOrg";
     type Who = str;
     type Error = io::Error;
 
@@ -3434,6 +3437,46 @@ fn an_opened_then_admitted_second_tenant_is_the_same_violation() {
         let _second = tx.admit_scope(Id::<TestOrg>::from_raw(2), &admission);
         Ok::<(), io::Error>(())
     });
+}
+
+/// Tenancy-completion spec §4. The one-scope contract's text names each
+/// tenant by its type's `NAME` and its id, then its full `type_name`, so two
+/// scope types spelled alike never print as one. Both scopes are admitted:
+/// `admit_scope` asks no `authorize`, so `AUDITED_SCOPES` is untouched.
+#[test]
+fn a_second_scope_names_both_tenants_by_name_and_type() {
+    let sim = Sim::with_faults(0x7F00_0008, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = group.stage(|tx| {
+            {
+                let _first = tx.admit_scope(Id::<TestOrg>::from_raw(1), &admission);
+            }
+            let _second = tx.admit_scope(Id::<AuditOrg>::from_raw(2), &admission);
+            Ok::<(), io::Error>(())
+        });
+    }))
+    .expect_err("a second tenant on one transaction is a contract violation");
+    let msg = panicked
+        .downcast_ref::<String>()
+        .map_or_else(String::new, String::clone);
+    assert_eq!(
+        msg,
+        format!(
+            "contract: a transaction opens ONE tenant scope (spec §8) — this one already \
+             opened `TestOrg` 1 ({}) and is now asked for `AuditOrg` 2 ({}); run the second \
+             tenant's work in its own transaction",
+            std::any::type_name::<TestOrg>(),
+            std::any::type_name::<AuditOrg>()
+        )
+    );
 }
 
 /// A store gracefully closed, then its file length mangled by hand into one

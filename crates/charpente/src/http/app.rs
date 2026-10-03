@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{
-    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableWriteRefusal, TenantAdmission,
-    Tx, TxError,
+    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableWriteRefusal, Tenant,
+    TenantAdmission, Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, UnscopedJob, View};
@@ -135,18 +135,17 @@ impl Ctx {
     /// that its route did not declare `public(S)` for. Names the contract,
     /// the site, and both fixes, the caller's and the author's (hard rule 5)
     /// — except on an `auth` route, where the author has no fix to make.
-    pub(crate) fn anonymous_scope<S>(&self) -> ApiError {
+    pub(crate) fn anonymous_scope<S: Tenant>(&self) -> ApiError {
         let Stance {
             method,
             pattern,
             auth,
             public,
         } = &self.stance;
-        // The last path segment, as `decode_body` renders a type.
-        let scope = std::any::type_name::<S>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("the scope type");
+        // The tenant type's identity (tenancy-completion spec §4). A final
+        // `::` component read two types spelled alike as one, and a generic as
+        // `B>`.
+        let scope = S::NAME;
         if *auth {
             // `build_ctx` refuses a request to an `auth` route that carries no
             // credential before its handler runs, so only a caller that does

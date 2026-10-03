@@ -19,6 +19,7 @@ struct Team {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
@@ -27,6 +28,7 @@ impl Tenant for Org {
 }
 
 impl Tenant for Team {
+    const NAME: &'static str = "Team";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {

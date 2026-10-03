@@ -22,6 +22,7 @@ struct Invoice {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = charpente::http::ApiError;
     fn authorize(

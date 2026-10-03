@@ -64,6 +64,7 @@ struct ScopedOrg {
 }
 
 impl charpente::Tenant for ScopedOrg {
+    const NAME: &'static str = "ScopedOrg";
     type Who = charpente::auth::Principal;
     type Error = charpente::http::ApiError;
 
@@ -7426,6 +7427,7 @@ impl Row for ConvLedger {
 }
 
 impl charpente::Tenant for ConvOrg {
+    const NAME: &'static str = "ConvOrg";
     type Who = str;
     type Error = std::convert::Infallible;
 

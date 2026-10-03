@@ -201,7 +201,7 @@ fn undeclared_capability(name: &str, args: &RouteArgs, pat: &PatType) -> Error {
     let path = args.path.value();
     // `expand` refused a route with neither flag before reaching here.
     let stance = match &args.public_scope {
-        Some(path) => format!(", public({})", scope_name(path)),
+        Some(path) => format!(", public({})", crate::fingerprint::path_as_written(path)),
         None if args.auth => ", auth".to_string(),
         None => ", public".to_string(),
     };
@@ -226,38 +226,21 @@ fn arg_name(pat: &PatType) -> Option<String> {
     }
 }
 
-/// A scope path's last segment — `Org` for `public(crate::tenancy::Org)` — as
-/// `PublicScope.name` carries it and the refusals render it.
-pub(crate) fn scope_name(path: &syn::Path) -> String {
-    path.segments
-        .last()
-        .expect("syn parses a path with at least one segment")
-        .ident
-        .to_string()
-}
-
-/// `public(Scope)`'s two emissions: the `PublicScope` the `Route` carries, and
-/// `#[table(scoped_by = …)]`'s `TenantScope` const assert, so a scope type
-/// with no membership check is refused with the same diagnostic here as there.
-fn public_scope_tokens(args: &RouteArgs) -> (TokenStream, TokenStream) {
+/// `public(Scope)`'s emission: the `PublicScope` the `Route` carries. `name`
+/// is read through `::charpente::tenant::tenant_name`. Its `TenantScope`
+/// bound refuses a scope type with no membership check, with the same
+/// diagnostic `#[table(scoped_by = …)]` gives, spanned at the path inside
+/// `public(...)`.
+fn public_scope_tokens(args: &RouteArgs) -> TokenStream {
     let Some(path) = &args.public_scope else {
-        return (quote! { ::std::option::Option::None }, quote! {});
+        return quote! { ::std::option::Option::None };
     };
-    let name = scope_name(path);
-    (
-        quote! {
-            ::std::option::Option::Some(::charpente::http::PublicScope {
-                name: #name,
-                type_id: ::std::any::TypeId::of::<#path>,
-            })
-        },
-        quote! {
-            const _: () = {
-                const fn __charpente_assert_tenant_scope<T: ::charpente::TenantScope>() {}
-                __charpente_assert_tenant_scope::<#path>();
-            };
-        },
-    )
+    quote! {
+        ::std::option::Option::Some(::charpente::http::PublicScope {
+            name: ::charpente::tenant::tenant_name::<#path>(),
+            type_id: ::std::any::TypeId::of::<#path>,
+        })
+    }
 }
 
 pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
@@ -465,7 +448,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         quote!()
     };
     let auth = args.auth;
-    let (public_scope, tenant_scope_assert) = public_scope_tokens(&args);
+    let public_scope = public_scope_tokens(&args);
     let cross_tenant = args.cross_tenant;
     let pattern_lit = &args.path;
 
@@ -507,7 +490,6 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     Ok(quote! {
         #func
-        #tenant_scope_assert
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -788,7 +770,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         quote!()
     };
     let auth = args.auth;
-    let (public_scope, tenant_scope_assert) = public_scope_tokens(&args);
+    let public_scope = public_scope_tokens(&args);
     let cross_tenant = args.cross_tenant;
     let pattern_lit = &args.path;
 
@@ -851,7 +833,6 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     Ok(quote! {
         #func
-        #tenant_scope_assert
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
