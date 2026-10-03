@@ -27,8 +27,12 @@ pub struct EventRow {
 }
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
+// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code writes one — `Tx::put`/`Tx::delete` refuse it at compile time, since
+// every subscription's feed is read from these rows. Apply writes one per
+// emit effect, and nothing else does (tenancy-completion spec §3).
 impl Row for EventRow {
-    type Scope = crate::table::Unscoped;
+    type Scope = crate::table::PlatformOwned;
     const TABLE: &'static str = "charpente.events";
     const INDEXES: &'static [IndexDef<EventRow>] = &[];
 

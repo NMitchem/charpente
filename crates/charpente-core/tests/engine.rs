@@ -22,12 +22,14 @@ use charpente_core::db::{
     Db, DbConfig, Refusal, Schema, Seeder, TableWriteRefusal, Tenant, Tx, TxError,
 };
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
+use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
 use charpente_core::table::{
-    Codec, Id, IndexDef, Rejection, Row, Snapshot, Store, StoreRejected, UNSCOPED, Unscoped, View,
+    Codec, Id, IndexDef, PlatformOwned, Rejection, Row, Snapshot, Store, StoreRejected, UNSCOPED,
+    Unscoped, View,
 };
 use charpente_sim::checks::{FaultReason, classify, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
@@ -459,15 +461,27 @@ fn submit_batch_advances_last_applied_to_the_last_frame_that_actually_applied() 
 /// Task 2 (tenant scoping): `Row::Scope` defaults every existing table to
 /// `Unscoped`, byte-identically. `engine.rs` has no `#[table]` type of its
 /// own to test against (`#[table]` emits `::charpente::` paths and core
-/// cannot depend on that crate), so this uses `SchemaVersion` — one of
-/// core's own hand-written `Row` impls (DESIGN §3) — as the stand-in the
-/// brief's `Widget` comment calls for ("any existing #[table] type in the
-/// test module works here"). It used `JobRow` until the job-tenancy write
-/// seal gave that table `PlatformOwned`; the next test pins what that kept.
+/// cannot depend on that crate), so this uses this file's hand-written
+/// `Widget` as the stand-in the brief's comment calls for ("any existing
+/// #[table] type in the test module works here"). It used `JobRow`, then
+/// `SchemaVersion`, until each became the platform's (`PlatformOwned`).
 #[test]
 fn an_ordinary_table_is_unscoped_by_default() {
     fn assert_unscoped<R: Row<Scope = Unscoped>>() {}
-    assert_unscoped::<SchemaVersion>();
+    assert_unscoped::<Widget>();
+}
+
+/// The platform's three tables share the scope that seals them
+/// (tenancy-completion spec §3). A type-level pin: it stops compiling, not
+/// running, if one of them goes back to `Unscoped`. The refusal an app meets
+/// is pinned by the `job_row_*`, `event_row_*` and `schema_version_*`
+/// compile-fail fixtures in `charpente-macros`.
+#[test]
+fn the_platform_tables_are_platform_owned() {
+    fn assert_platform<R: Row<Scope = PlatformOwned>>() {}
+    assert_platform::<JobRow>();
+    assert_platform::<EventRow>();
+    assert_platform::<SchemaVersion>();
 }
 
 /// The job-tenancy write seal takes writes away from `JobRow` and nothing

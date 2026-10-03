@@ -1755,3 +1755,112 @@ fn migration_commits_exactly_one_migrate_put_per_row_across_overlapping_scopes()
         assert_eq!(r.label, "migrated");
     }
 }
+
+/// Every `SchemaVersion` Put in `frames`, as `(tag, table, row bytes)`. It
+/// walks every effect of a migration record: an unscoped (`0x00`) or scoped
+/// (`0x05`) Put, or a `MigratePut` (`0x04` unscoped, `0x07` scoped). A
+/// migration record carries nothing else, so any other tag is a loud panic
+/// rather than a misread field boundary (`count_migrate_puts`' rule).
+fn schema_version_puts(frames: &[(u64, Vec<u8>)]) -> Vec<(u8, String, Vec<u8>)> {
+    let mut puts = Vec::new();
+    for (seq, payload) in frames {
+        let input = &mut &payload[..];
+        let n = u32::decode(input).unwrap();
+        for _ in 0..n {
+            let tag = u8::decode(input).unwrap();
+            match tag {
+                0x00 | 0x05 => {
+                    let table = String::decode(input).unwrap();
+                    if tag == 0x05 {
+                        let _scope = u64::decode(input).unwrap();
+                    }
+                    let row = Vec::<u8>::decode(input).unwrap();
+                    if table == SchemaVersion::TABLE {
+                        puts.push((tag, table, row));
+                    }
+                }
+                0x04 => {
+                    let _table = String::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                }
+                0x07 => {
+                    let _table = String::decode(input).unwrap();
+                    let _scope = u64::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                }
+                other => panic!(
+                    "schema_version_puts: record {seq} carries effect tag {other:#04x}, which a \
+                     migration record never does"
+                ),
+            }
+        }
+        assert!(
+            input.is_empty(),
+            "schema_version_puts: record {seq} has {} bytes left after its {n} effects — a \
+             tag's field layout above disagrees with db.rs's wire format",
+            input.len()
+        );
+    }
+    puts
+}
+
+/// `SchemaVersion` is the platform's (tenancy-completion spec §3): `Tx::put`
+/// refuses it, and `Db::migrate_table` writes its watermark and close-out
+/// through the crate-private `Tx::put_schema_version`. That door must write
+/// the record `tx.put` wrote before it existed: an unscoped (`0x00`) Put of
+/// the row's codec bytes, one per migration batch and one at the close-out.
+/// Green before the door existed; it pins that nothing moved.
+#[test]
+fn migrate_schema_records_each_schema_version_as_an_unscoped_put() {
+    let sim = Sim::with_faults(0x2EB7_6001, FaultConfig::none());
+    seed_scoped_v1(&sim, 4, &[0, 1, 2]);
+    let schema = Schema::new()
+        .table::<ScopedWidgetV2>()
+        .migration::<ScopedWidgetV2>("ScopedWidget");
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig {
+            migration_batch_size: 5,
+            ..cfg()
+        },
+        schema,
+    )
+    .unwrap();
+    let before = db.last_applied().map_or(0, |s| s + 1);
+    db.migrate_schema().unwrap();
+
+    // Twelve rows in (scope, id) order, five per batch: each batch's
+    // watermark is its last row, then the close-out bumps the version.
+    let expected: Vec<(u8, String, Vec<u8>)> = [
+        (1, Some((1, 0)), Some(2)),
+        (1, Some((2, 1)), Some(2)),
+        (1, Some((2, 3)), Some(2)),
+        (2, None, None),
+    ]
+    .into_iter()
+    .map(|(version, migrating_through, migrating_to)| {
+        let mut bytes = Vec::new();
+        Row::encode_row(
+            &SchemaVersion {
+                id: schema_version_id("ScopedWidget"),
+                table: "ScopedWidget".to_string(),
+                version,
+                fingerprint: 0x8282,
+                migrating_through,
+                migrating_to,
+            },
+            &mut bytes,
+        );
+        (0x00, "charpente.schema_versions".to_string(), bytes)
+    })
+    .collect();
+    let frames = db.read_log(before, usize::MAX).unwrap();
+    assert_eq!(
+        schema_version_puts(&frames),
+        expected,
+        "migrate_schema's schema-version writes moved: each must be the unscoped Put `tx.put` \
+         wrote, byte for byte"
+    );
+}

@@ -802,7 +802,13 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   enqueue family; a hand-written `Row` that borrows the `charpente.jobs` name fails to
   build at each reachable write (a `const` check, reported by `cargo build`, not `cargo
   check`); and the dispatcher's Done mark and failure record go through
-  `Tx::settle_job`, which takes a `TenantAdmission` only a `Group` mints. An enqueue whose
+  `Tx::settle_job`, which takes a `TenantAdmission` only a `Group` mints. The event log and
+  the migration record are sealed against writes the same way (spec
+  2026-09-30-tenancy-completion §3): `EventRow` and `SchemaVersion` are `PlatformOwned` and
+  named in `PLATFORM_TABLES`, so an app can forge neither an event into a tenant's feed nor a
+  table's version past its migration. Apply writes an event row from an emit effect, and the
+  migration executor writes schema-version rows through the crate-private
+  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. An enqueue whose
   tenant presence disagrees with the mounted declaration (a hand-written `impl Job` or
   `JobDef`) is refused by name, and so is a Pending row that disagrees, before dispatch
   starts (job-tenancy final review C1, M4). So is an enqueue in a tenant of another scope
@@ -2090,7 +2096,8 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   through `get`/`scan` by any transaction, across every tenant — a job's payload and, for a
   scoped job, its tenant id; an event's payload and its `key`, which inside a scope is the
   tenant's id. The dispatcher and the sim oracles are built on those reads, so they stay
-  open; what is sealed is writing a job row (§3's Jobs bullet). A route that exposes either
+  open; what is sealed is writing one — a job row, an event row or a schema-version row
+  (§3's Jobs bullet). A route that exposes either
   table must filter by its own scope before it answers — for a job row, by the job (its
   `name`, whose `scoped_by` names the scope type) as well as its tenant id, since two scope
   types can share a raw id.

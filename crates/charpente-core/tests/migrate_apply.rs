@@ -10,8 +10,9 @@
 //! needs a `Disk` and the only impl is `charpente-sim`'s — which, per
 //! `tests/materialize.rs`'s header, cannot unify inside `charpente-core`'s
 //! own `--cfg test` compilation. `Tx::migrate_put` is `pub(crate)` and so
-//! unreachable from here, so the one migration record is hand-encoded (the
-//! frozen tag-4 wire shape) and driven through the public `Db::apply_shipped`
+//! unreachable from here, and `SchemaVersion` is the platform's, so `Tx::put`
+//! refuses it: the migration records are hand-encoded (the frozen tag-4
+//! `MigratePut` and tag-0 Put wire shapes) and driven through the public `Db::apply_shipped`
 //! — which is exactly the follower apply path, one of the three (primary,
 //! replay, follower) the design requires rebuild identically at the same
 //! log position.
@@ -84,6 +85,31 @@ fn migrate_put_record(table: &str, id: u64, row: &[u8]) -> Vec<u8> {
     out
 }
 
+// A one-effect unscoped Put (`0x00`) of a `SchemaVersion` row, hand-encoded
+// to the frozen wire shape (`db::encode_record`): `[n=1: u32 le][tag=0]
+// [table: u32 len + bytes][row: u32 len + bytes]`. `SchemaVersion` is the
+// platform's, so `Tx::put` refuses it; this ships the row the way a follower
+// receives the migration executor's.
+fn schema_version_record(row: &SchemaVersion) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    row.encode_row(&mut bytes);
+    let mut out = Vec::new();
+    1u32.encode(&mut out);
+    out.push(0);
+    (SchemaVersion::TABLE.len() as u32).encode(&mut out);
+    out.extend_from_slice(SchemaVersion::TABLE.as_bytes());
+    (bytes.len() as u32).encode(&mut out);
+    out.extend_from_slice(&bytes);
+    out
+}
+
+// Applies one hand-encoded record at the next log position, through the
+// follower apply path.
+fn ship(db: &mut Db, record: Vec<u8>) {
+    let next = db.last_applied().map_or(0, |l| l + 1);
+    db.apply_shipped(&[(next, record)]).unwrap();
+}
+
 #[test]
 fn migrate_put_overwrites_without_indexing_then_close_out_rebuilds() {
     let sim = Sim::with_faults(0x2EB7_00F4, FaultConfig::none());
@@ -91,31 +117,33 @@ fn migrate_put_overwrites_without_indexing_then_close_out_rebuilds() {
     let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), schema).unwrap();
 
     // Seed: one Widget keyed "old", and the in-flight migration marker for
-    // its table (migrating_to Some, version still at the old value).
+    // its table (migrating_to Some, version still at the old value). The
+    // marker is the platform's row, so it is shipped, not put.
     db.transact(|tx: &mut Tx| {
         tx.put(&Widget {
             id: Id::from_raw(7),
             key: "old".to_string(),
         });
-        tx.put(&SchemaVersion {
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    ship(
+        &mut db,
+        schema_version_record(&SchemaVersion {
             id: schema_version_id("Widget"),
             table: "Widget".to_string(),
             version: 1,
             fingerprint: 0,
             migrating_through: Some((0, 7)),
             migrating_to: Some(2),
-        });
-        Ok::<(), ()>(())
-    })
-    .unwrap();
+        }),
+    );
 
     // Apply the decode-free migration write: row 7's bytes become "new".
-    let next = db.last_applied().map_or(0, |l| l + 1);
-    db.apply_shipped(&[(
-        next,
+    ship(
+        &mut db,
         migrate_put_record("Widget", 7, &widget_bytes(7, "new")),
-    )])
-    .unwrap();
+    );
 
     // After MigratePut alone: the row decodes to "new" (put_raw overwrote the
     // bytes) but the index is untouched — it still has only the "old" entry,
@@ -140,18 +168,17 @@ fn migrate_put_overwrites_without_indexing_then_close_out_rebuilds() {
 
     // Close out the migration: a SchemaVersion Put clearing migrating_to and
     // bumping the version. This must rebuild Widget's indexes at apply.
-    db.transact(|tx: &mut Tx| {
-        tx.put(&SchemaVersion {
+    ship(
+        &mut db,
+        schema_version_record(&SchemaVersion {
             id: schema_version_id("Widget"),
             table: "Widget".to_string(),
             version: 2,
             fingerprint: 0,
             migrating_through: None,
             migrating_to: None,
-        });
-        Ok::<(), ()>(())
-    })
-    .unwrap();
+        }),
+    );
 
     // The rebuild fired: the index now reflects the migrated bytes.
     let snap = db.snapshot().unwrap();

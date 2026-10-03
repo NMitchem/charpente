@@ -752,10 +752,12 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         let scoped = effects.scoped_tables.contains(table);
         for (&(scope, id), entry) in entries {
             if !scoped {
-                // `Tx::put`/`Tx::delete` are the overlay's only writers
-                // (besides the SchemaVersion adoption row, always UNSCOPED)
-                // and populate `scoped_tables` in lockstep with the overlay
-                // — negative space, not a resolvable input.
+                // A table outside `scoped_tables` is written only UNSCOPED:
+                // by `Tx::put`/`Tx::delete`, `Tx::settle_job`,
+                // `Tx::put_schema_version` and the SchemaVersion adoption
+                // row. The scoped writers, `put_in`/`delete_in`, populate
+                // `scoped_tables` in lockstep with the overlay — negative
+                // space, not a resolvable input.
                 assert_eq!(
                     scope, UNSCOPED,
                     "record encode: table \"{table}\" id {id} carries scope {scope} but is not \
@@ -929,19 +931,29 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
 
 // ---------------------------------------------------------------- tx
 
-/// The tables only the platform writes, by name. `JobRow`'s own type is
-/// refused by `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a
-/// record's effect by TABLE NAME, so any other `Row` whose `TABLE` borrows
-/// one of these would write rows the dispatcher trusts. The app-facing
-/// writes (`Tx::put`/`delete`, `ScopedTx::put`/`delete`) refuse such a type
-/// in a `const` block. That refusal is a post-monomorphization error: `cargo
-/// build` and `cargo test` report it at the app's call site, and `cargo
-/// check`, which never monomorphizes, does not. No binary that performs the
-/// write can be built. Sealing another platform table is its name here plus
-/// its `type Scope = PlatformOwned`.
-const PLATFORM_TABLES: [&str; 1] = [JobRow::TABLE];
+/// The tables only the platform writes, by name: the job queue, the event
+/// log and the migration record. Each one's own type is refused by
+/// `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a record's
+/// effect by TABLE NAME, so any other `Row` whose `TABLE` borrows one of
+/// these would write rows the platform trusts: the dispatcher a job's
+/// tenant, every subscription its feed, the migration gate a table's
+/// version. The app-facing writes (`Tx::put`/`delete`, `ScopedTx::put`/
+/// `delete`) refuse such a type in a `const` block. That refusal is a
+/// post-monomorphization error: `cargo build` and `cargo test` report it at
+/// the app's call site, and `cargo check`, which never monomorphizes, does
+/// not. No binary that performs the write can be built. Sealing another
+/// platform table is its name here, its `type Scope = PlatformOwned`, and an
+/// arm of its own in `refuse_platform_table` and under `AppWritable`.
+const PLATFORM_TABLES: [&str; 3] = [
+    JobRow::TABLE,
+    EventRow::TABLE,
+    crate::migration::SchemaVersion::TABLE,
+];
 
-const fn is_platform_table(table: &str) -> bool {
+/// Which of `PLATFORM_TABLES` `table` names, by index, or `None` for a table
+/// of the app's own. A whole-name match: `charpente.jobs2` is not
+/// `charpente.jobs`.
+const fn platform_table(table: &str) -> Option<usize> {
     let table = table.as_bytes();
     let mut i = 0;
     while i < PLATFORM_TABLES.len() {
@@ -952,25 +964,45 @@ const fn is_platform_table(table: &str) -> bool {
                 j += 1;
             }
             if j == name.len() {
-                return true;
+                return Some(i);
             }
         }
         i += 1;
     }
-    false
+    None
 }
 
 /// `PLATFORM_TABLES`' refusal, evaluated in a `const` block per written row
-/// type, so it fails the build rather than a request.
+/// type, so it fails the build rather than a request. Each text names the
+/// table it matched and the one way that table's rows are written.
 const fn refuse_platform_table(table: &str) {
-    if is_platform_table(table) {
-        panic!(
+    match platform_table(table) {
+        None => {}
+        Some(0) => panic!(
             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
              platform's: only the enqueue family writes one, because the dispatcher runs a job \
              in the tenant its row names; give this table a name of its own, and run a job by \
              enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
              `cross_tenant` route or job)"
-        );
+        ),
+        Some(1) => panic!(
+            "this Row's TABLE is \"charpente.events\", the platform's event log — event rows are \
+             the platform's: only an emit writes one, because every subscription's feed is read \
+             from them; give this table a name of its own, and publish an event by emitting it \
+             (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+        ),
+        Some(2) => panic!(
+            "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+             — schema-version rows are the platform's: only a table's first write and \
+             `Db::migrate_schema` write one, because the migration gate trusts them for each \
+             table's version and a migration's resume point; give this table a name of its \
+             own, and change a table's version by declaring it (`#[table(version = N)]` with \
+             its `TableMigration`), which the kernel migrates at startup"
+        ),
+        Some(_) => panic!(
+            "PLATFORM_TABLES names a table refuse_platform_table has no text for — give it an \
+             arm of its own"
+        ),
     }
 }
 
@@ -1017,9 +1049,9 @@ impl<'a> Tx<'a> {
     /// which is a stronger statement than any assertion here could make.
     /// Scoped writes go through `put_in` (or, in an app, `ScopedTx::put`).
     ///
-    /// The same bound refuses a platform row (`JobRow`), and the `const`
-    /// block refuses any other row type whose `TABLE` borrows a platform
-    /// table's name (`PLATFORM_TABLES`).
+    /// The same bound refuses a platform row (`JobRow`, `EventRow`,
+    /// `SchemaVersion`), and the `const` block refuses any other row type
+    /// whose `TABLE` borrows a platform table's name (`PLATFORM_TABLES`).
     pub fn put<R: WritableRow>(&mut self, row: &R) {
         const { refuse_platform_table(R::TABLE) };
         let mut bytes = Vec::new();
@@ -1073,6 +1105,30 @@ impl<'a> Tx<'a> {
         self.effects
             .overlay
             .entry(JobRow::TABLE)
+            .or_default()
+            .insert((UNSCOPED, row.id.raw()), Some(bytes));
+    }
+
+    /// The migration executor's write of a table's schema-version row: its
+    /// watermark while a migration runs, and its close-out when it ends
+    /// (`Db::migrate_table`). `Tx::put` refuses `SchemaVersion` at compile
+    /// time, because the migration gate trusts these rows for each table's
+    /// version and a migration's resume point. This is `put`'s body without
+    /// that bound, and crate-private, so no app code reaches it. Its record is
+    /// the one `tx.put` wrote before the seal, byte for byte (`migrations.rs`,
+    /// `migrate_schema_records_each_schema_version_as_an_unscoped_put`).
+    pub(crate) fn put_schema_version(&mut self, row: &crate::migration::SchemaVersion) {
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        self.effects.written_as.insert((
+            crate::migration::SchemaVersion::TABLE,
+            std::any::type_name::<crate::migration::SchemaVersion>(),
+            false,
+            TypeId::of::<crate::migration::SchemaVersion>(),
+        ));
+        self.effects
+            .overlay
+            .entry(crate::migration::SchemaVersion::TABLE)
             .or_default()
             .insert((UNSCOPED, row.id.raw()), Some(bytes));
     }
@@ -1294,8 +1350,9 @@ fn merge_overlay_rows<R: Row>(
         } else {
             // Negative space (hard rule 4): an unscoped table's overlay is
             // written only by `Tx::put`/`Tx::delete` (both `R: WritableRow`),
-            // `Tx::settle_job` and the SchemaVersion adoption row, all of
-            // which stage `UNSCOPED`. A skip here would turn a staging bug into a
+            // `Tx::settle_job`, `Tx::put_schema_version` and the SchemaVersion
+            // adoption row, all of which stage `UNSCOPED`. A skip here would turn
+            // a staging bug into a
             // silently missing row instead of a loud one.
             assert_eq!(
                 entry_scope,
@@ -3871,7 +3928,7 @@ impl Db {
             drop(snap);
             if batch.is_empty() {
                 self.transact(|tx| -> Result<(), io::Error> {
-                    tx.put(&crate::migration::SchemaVersion {
+                    tx.put_schema_version(&crate::migration::SchemaVersion {
                         id: vid,
                         table: table.to_string(),
                         version: to,
@@ -3912,7 +3969,7 @@ impl Db {
                 for (scope, id, bytes) in migrated {
                     tx.migrate_put(table, scoped.then_some(scope), id, bytes);
                 }
-                tx.put(&crate::migration::SchemaVersion {
+                tx.put_schema_version(&crate::migration::SchemaVersion {
                     id: vid,
                     table: table.to_string(),
                     version: from, // not done until the close-out above
@@ -4140,13 +4197,16 @@ impl<'a> Group<'a> {
         // `written_as` does not record, and `Db::open` registers it on every
         // path, so no table reaches the record unchecked.
         assert!(
-            effects
-                .overlay
-                .keys()
-                .all(|table| schema.tables.contains_key(table)),
-            "Group::stage: a transaction wrote a table the Schema does not register and \
-             TxEffects::written_as did not record — every overlay writer but Tx::settle_job \
-             records its Row type there"
+            effects.overlay.keys().all(|table| {
+                *table == JobRow::TABLE
+                    || effects
+                        .written_as
+                        .iter()
+                        .any(|&(written, ..)| written == *table)
+            }),
+            "Group::stage: a transaction wrote a table TxEffects::written_as did not record, so \
+             the check above never saw it — every overlay writer but Tx::settle_job (whose \
+             JobRow Db::open registers on every path) records its Row type there"
         );
         // A mounted job name has one shape and one tenancy. `NAME` is the
         // bare type identifier, so a second `#[job]` type of the same name
@@ -4617,6 +4677,76 @@ mod tests {
             ),
             bare
         );
+    }
+
+    /// The text `refuse` panics with for `table`, or `None` when it admits
+    /// the table. The refusals are `const fn`s whose `panic!` is a build
+    /// error in an app; called here at run time, the same `panic!` unwinds
+    /// with the same text.
+    fn refusal_text(refuse: fn(&str), table: &str) -> Option<String> {
+        std::panic::catch_unwind(|| refuse(table))
+            .err()
+            .map(|payload| match payload.downcast::<&'static str>() {
+                Ok(text) => (*text).to_string(),
+                Err(payload) => *payload
+                    .downcast::<String>()
+                    .expect("a refusal panics with its text"),
+            })
+    }
+
+    /// Spec §3: each platform table's write refusal names that table and its
+    /// one write path, and a name that is not a platform table's, however
+    /// close, is admitted. Literals spelled apart from the source's
+    /// continuation lines, so a reflowed literal that changed a word is red.
+    #[test]
+    fn each_platform_table_name_is_refused_by_its_own_text() {
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.jobs").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows \
+                 are the platform's: only the enqueue family writes one, because the \
+                 dispatcher runs a job in the tenant its row names; give this table a name of \
+                 its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, \
+                 or `tx.enqueue_in` from a `cross_tenant` route or job)"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.events").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.events\", the platform's event log — event \
+                 rows are the platform's: only an emit writes one, because every \
+                 subscription's feed is read from them; give this table a name of its own, \
+                 and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` \
+                 of the tenant it belongs to)"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.schema_versions").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.schema_versions\", the platform's migration \
+                 record — schema-version rows are the platform's: only a table's first write \
+                 and `Db::migrate_schema` write one, because the migration gate trusts them \
+                 for each table's version and a migration's resume point; give this table a \
+                 name of its own, and change a table's version by declaring it \
+                 (`#[table(version = N)]` with its `TableMigration`), which the kernel \
+                 migrates at startup"
+            )
+        );
+        for table in [
+            "Invoice",
+            "charpente",
+            "charpente.job",
+            "charpente.jobs2",
+            "charpente.event",
+            "Charpente.Jobs",
+            "",
+        ] {
+            assert_eq!(
+                refusal_text(refuse_platform_table, table),
+                None,
+                "{table:?} is not a platform table's name, so an app may use it"
+            );
+        }
     }
 
     fn effects_fixture() -> TxEffects {

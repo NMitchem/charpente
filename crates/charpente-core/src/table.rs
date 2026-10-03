@@ -295,18 +295,23 @@ pub trait RowShape: Sized {
 /// Marker for a table whose rows are not tenant-scoped. The default.
 pub struct Unscoped;
 
-/// The scope marker of a platform table: `charpente.jobs`, whose rows the
-/// dispatcher trusts for a job's tenant (job-tenancy spec §6). Keyed like
-/// `Unscoped`, by bare id, and read like it (`NoTenant` holds, so `View`
-/// reads it). What it withholds is the write: `Tx::put`/`Tx::delete` bound
-/// `R: WritableRow`, which a row of this scope fails, by name. Only the
-/// enqueue family and the dispatcher's `Tx::settle_job` write a job row.
+/// The scope marker of the platform's tables: `charpente.jobs`, whose rows
+/// the dispatcher trusts for a job's tenant (job-tenancy spec §6),
+/// `charpente.events`, which every subscription's feed is read from, and
+/// `charpente.schema_versions`, which the migration gate trusts for each
+/// table's version (tenancy-completion spec §3). Keyed like `Unscoped`, by
+/// bare id, and read like it (`NoTenant` holds, so `View` reads it). What it
+/// withholds is the write: `Tx::put`/`Tx::delete` bound `R: WritableRow`,
+/// which a row of this scope fails, by name. Only the platform writes one:
+/// the enqueue family and the dispatcher's `Tx::settle_job` a job row, apply
+/// an event row, first-write adoption and `Tx::put_schema_version` a
+/// schema-version row.
 ///
 /// `#[doc(hidden)]` so rustc's "the trait is implemented for" hint under
 /// `NoTenant`'s diagnostic keeps naming `Unscoped` alone: this is not a
 /// scope an app table can take. Sealing another platform table is its
-/// `type Scope = PlatformOwned` plus its name in `db.rs`'s
-/// `PLATFORM_TABLES`.
+/// `type Scope = PlatformOwned`, its name in `db.rs`'s `PLATFORM_TABLES`,
+/// and its own text there and under `AppWritable`.
 #[doc(hidden)]
 pub struct PlatformOwned;
 
@@ -466,7 +471,14 @@ impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
 /// Job rows are the platform's because the dispatcher trusts `JobRow.scope`
 /// for the tenant a scoped job runs in: a row that app code could write would
 /// run a job in any tenant, with no principal and no declaration (job-tenancy
-/// final review C1). SEALED by `AppOwned`, which only `Unscoped` carries.
+/// final review C1). Event rows are the platform's because every
+/// subscription's feed is read from them, so a forged one reaches another
+/// tenant's subscriber. Schema-version rows are the platform's because the
+/// migration gate trusts them, so a forged one skips a table's migration
+/// (tenancy-completion spec §3). One bound refuses all three row types, and
+/// rustc cannot pick a note by type, so the diagnostic carries one note per
+/// table, each naming its own. SEALED by `AppOwned`, which only `Unscoped`
+/// carries.
 #[diagnostic::on_unimplemented(
     message = "`{R}` rows are the platform's, and app code cannot write them",
     label = "`{R}` is written only by the platform",
@@ -478,7 +490,16 @@ impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
             let mut tx = tx.scope::<Org>(scope, ctx)?;\n    \
             tx.enqueue(job);\n\
             or from a `cross_tenant` route or job, naming the tenant:\n    \
-            tx.enqueue_in::<Org>(scope, job, cap);"
+            tx.enqueue_in::<Org>(scope, job, cap);",
+    note = "event rows are the platform's: only an emit writes one, because every \
+            subscription's feed is read from them — to publish an event, emit it with \
+            `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant \
+            it belongs to",
+    note = "schema-version rows are the platform's: only a table's first write and \
+            `Db::migrate_schema` write one, because the migration gate trusts them for each \
+            table's version and a migration's resume point — to change a table's version, \
+            declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel \
+            migrates at startup"
 )]
 pub trait AppWritable<R>: sealed::AppOwned {}
 
@@ -706,7 +727,7 @@ fn scoped_open_err(table: &str, e: redb::TableError) -> io::Error {
 /// whichever door they knocked on — the mirror of `scoped_open_err` above.
 /// Twelve functions open an unscoped row table; `gc_events`' event-table
 /// open is unreachable by this disagreement (`EventRow::Scope` is
-/// `Unscoped` at compile time and its only writer, `materialize_event`,
+/// `PlatformOwned`, keyed as `Unscoped` is, and its only writer, `materialize_event`,
 /// always calls `put` under `UNSCOPED`, so its rows table can never be
 /// created composite-keyed) and stays on `redb_err`; the other ELEVEN —
 /// every one reachable through a `pub` entry point — now route through
@@ -764,7 +785,8 @@ pub const UNSCOPED: u64 = 0;
 /// in release builds exactly as `R::VERSION`/`R::FINGERPRINT` do.
 ///
 /// `PlatformOwned` is keyed exactly as `Unscoped` is: it seals writes, not
-/// the key, so `charpente.jobs` stores byte-identically to before the seal.
+/// the key, so `charpente.jobs`, `charpente.events` and
+/// `charpente.schema_versions` store byte-identically to before the seal.
 pub(crate) fn row_is_scoped<R: Row>() -> bool {
     let scope = std::any::TypeId::of::<R::Scope>();
     scope != std::any::TypeId::of::<Unscoped>() && scope != std::any::TypeId::of::<PlatformOwned>()

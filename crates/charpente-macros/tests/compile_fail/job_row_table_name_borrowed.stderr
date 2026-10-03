@@ -12,13 +12,14 @@ note: inside `db::refuse_platform_table`
   |
  ::: $WORKSPACE/crates/charpente-core/src/db.rs
   |
-  | /         panic!(
+  |           Some(0) => panic!(
+  |  ____________________-
   | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
   | |              platform's: only the enqueue family writes one, because the dispatcher runs a job \
   | |              in the tenant its row names; give this table a name of its own, and run a job by \
   | |              enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
   | |              `cross_tenant` route or job)"
-  | |         );
+  | |         ),
   | |_________- in this macro invocation
 
 note: erroneous constant encountered
@@ -47,13 +48,14 @@ note: inside `db::refuse_platform_table`
   |
  ::: $WORKSPACE/crates/charpente-core/src/db.rs
   |
-  | /         panic!(
+  |           Some(0) => panic!(
+  |  ____________________-
   | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
   | |              platform's: only the enqueue family writes one, because the dispatcher runs a job \
   | |              in the tenant its row names; give this table a name of its own, and run a job by \
   | |              enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
   | |              `cross_tenant` route or job)"
-  | |         );
+  | |         ),
   | |_________- in this macro invocation
 
 note: erroneous constant encountered
@@ -82,13 +84,14 @@ note: inside `db::refuse_platform_table`
   |
  ::: $WORKSPACE/crates/charpente-core/src/db.rs
   |
-  | /         panic!(
+  |           Some(0) => panic!(
+  |  ____________________-
   | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
   | |              platform's: only the enqueue family writes one, because the dispatcher runs a job \
   | |              in the tenant its row names; give this table a name of its own, and run a job by \
   | |              enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
   | |              `cross_tenant` route or job)"
-  | |         );
+  | |         ),
   | |_________- in this macro invocation
 
 note: erroneous constant encountered
@@ -117,13 +120,14 @@ note: inside `db::refuse_platform_table`
   |
  ::: $WORKSPACE/crates/charpente-core/src/db.rs
   |
-  | /         panic!(
+  |           Some(0) => panic!(
+  |  ____________________-
   | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
   | |              platform's: only the enqueue family writes one, because the dispatcher runs a job \
   | |              in the tenant its row names; give this table a name of its own, and run a job by \
   | |              enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
   | |              `cross_tenant` route or job)"
-  | |         );
+  | |         ),
   | |_________- in this macro invocation
 
 note: erroneous constant encountered

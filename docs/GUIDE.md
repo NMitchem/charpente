@@ -418,9 +418,11 @@ fn open(data_dir: &str) -> std::io::Result<Db> {
 
 Registering the same table type twice is a contract panic ("Schema: table
 \"Counter\" registered twice — register each #[table] type once").
-`Db::open` registers one table of its own before yours — the platform's job
-queue, `charpente.jobs` — so registering that table yourself hits the same
-panic.
+`Db::open` registers three tables of its own before yours — the job queue
+`charpente.jobs`, the event log `charpente.events` and the migration record
+`charpente.schema_versions` — so registering any of them yourself hits the same
+panic. They are the platform's: no transaction writes one (§6, "Job rows are the
+platform's").
 
 `DbConfig` names the WAL's directory and segment rotation size, and the
 table store's file name:
@@ -1580,8 +1582,13 @@ the dispatcher opens it without asking anyone, so no app code writes a job row. 
 transaction reads the queue like any other table (`tx.get::<JobRow>`, `tx.scan::<JobRow>()`,
 as §8's oracles do), but `tx.put` or `tx.delete` of a `JobRow` does not compile. Only the
 enqueue family creates a job row, and only the dispatcher settles one. There is no
-app-side cancel either: a job runs until it is Done or Dead. rustc prints this, with your
-row type in place of `<row>`:
+app-side cancel either: a job runs until it is Done or Dead. The platform's two other
+tables are sealed against writes the same way. The event log (`EventRow`, §11) is what
+every subscription's feed is read from, so only an emit writes an event row. The
+migration record (`SchemaVersion`, §12) is what the migration gate trusts for each table's
+version, so only a table's first write and `Db::migrate_schema` write one. rustc prints
+this for a write of any of the three, with your row type in place of `<row>`, and one note
+per table, since one bound refuses all three:
 
 <!-- pinned -->
 ```text
@@ -1593,17 +1600,21 @@ for a `global` job; for a `scoped_by` job, inside the tenant it acts in:
     tx.enqueue(job);
 or from a `cross_tenant` route or job, naming the tenant:
     tx.enqueue_in::<Org>(scope, job, cap);
+event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
+schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
 ```
 
 The seal is on the table's name as well as its type, because apply routes a write by
-table name. A hand-written `Row` whose `TABLE` is `"charpente.jobs"` fails to build at
-each write the binary can reach, and rustc names the call site. It is a
+table name. A hand-written `Row` whose `TABLE` is one of the three names fails to build
+at each write the binary can reach, and rustc names the call site and the table. It is a
 post-monomorphization error, so `cargo build` and `cargo test` report it, and `cargo
 check` does not:
 
 <!-- pinned -->
 ```text
 this Row's TABLE is "charpente.jobs", the platform's job queue — job rows are the platform's: only the enqueue family writes one, because the dispatcher runs a job in the tenant its row names; give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)
+this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
+this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
 ```
 
 ### Registering jobs: `jobs![...]` and `mount_jobs`
@@ -3647,8 +3658,9 @@ mint budget (§5's auth section): `create_session` and `create_api_key` share
 one pre-transaction entropy draw, so a request that mints a second credential
 of either kind panics. The fourth (§3) is `Schema::table::<R>()` — called
 twice for the same `#[table]` type when building the `Schema` passed to
-`Db::open`, including registering `Session`, `ApiKey`, or `charpente.jobs`
-yourself (`App::open`/`Db::open` already register those). Fix in every case:
+`Db::open`, including registering `Session`, `ApiKey`, or one of the platform's
+tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`) yourself
+(`App::open`/`Db::open` already register those). Fix in every case:
 register that name/type exactly once, and mint at most one credential per
 request.
 
@@ -6851,7 +6863,9 @@ private to the core, so there is no back door on a bare `Tx` either. Nor is ther
 one through the job queue: a scoped job runs in the tenant its row carries, and
 `tx.put` or `tx.delete` of a `JobRow` does not compile (§6, "Job rows are the
 platform's"). So a bare `Tx` cannot move a job into another tenant, forge one
-there, or cancel one there.
+there, or cancel one there. Nor is there one through the event log: `tx.put` or
+`tx.delete` of an `EventRow` does not compile either (§6), so no handler publishes,
+into a tenant's feed, an event no emit made there.
 
 ### Realtime: one mechanism, not two
 
@@ -6950,7 +6964,8 @@ Five properties make this a capability rather than an escape hatch:
   that mints one from `Db::begin_group` cannot park it either: a `static`
   or a `thread_local!` needs `'static`, and the token lives only as long as
   the group's borrow of the `Db` —
-  `error[E0521]: borrowed data escapes outside of function`.
+  `error[E0521]: borrowed data escapes outside of function` — unless it leaks its
+  `Db` (`Box::leak`), which is the operator's standing used on purpose.
 - **The result carries the tenant.** `AllTenants::scan` yields
   `Vec<(Id<Org>, Ledger)>`, never `Vec<Ledger>`, so a cross-tenant answer cannot
   be handed to code expecting one tenant's data without a visible `.map`. The
@@ -7050,7 +7065,8 @@ log (`EventRow`) are unscoped platform tables, and any transaction reads them wi
 `tx.get` and `tx.scan` across every tenant: a job's payload and, for a scoped job, the
 tenant id it runs in; an event's payload and its `key`, which for an emit inside a scope
 is that tenant's id. Those reads stay open, because the dispatcher and §8's sim oracles
-are built on them; what is sealed is *writing* a job row (§6). So a route that exposes
+are built on them; what is sealed is *writing* one — a job row, an event row or a
+schema-version row (§6). So a route that exposes
 either table — an admin job list, an activity feed built on `scan` rather than a
 `Subscription` — must filter by its own scope before it answers. A raw id is shared across
 scope types, so keep the job rows of jobs declared `scoped_by` the route's own scope type
@@ -7122,7 +7138,8 @@ private and `Group::tenant_admission` is its only constructor. So a handler, whi
 a `Tx` and a `Ctx` and never a `Group`, cannot mint one; `TenantAdmission(())` is
 `error[E0423]`. Nor can anyone keep one: like `CrossTenant`, a `TenantAdmission`
 borrows what its group borrows and is not `Clone`, so it goes out of reach with the group's
-borrow of the `Db`, and a `static` or `thread_local!` refuses it. The one-scope rule is the same contract whichever way a scope was
+borrow of the `Db`, and a `static` or `thread_local!` refuses it — unless operator code
+leaks its `Db`, which is the operator's standing used on purpose. The one-scope rule is the same contract whichever way a scope was
 entered. Do not build an app-internal helper that takes a raw scope and reads through
 `Db::snapshot`: that is the one shape that looks tenant-aware and is not.
 
