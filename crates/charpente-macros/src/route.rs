@@ -239,6 +239,7 @@ fn public_scope_tokens(args: &RouteArgs) -> TokenStream {
         ::std::option::Option::Some(::charpente::http::PublicScope {
             name: ::charpente::tenant::tenant_name::<#path>(),
             type_id: ::std::any::TypeId::of::<#path>,
+            type_name: ::std::any::type_name::<#path>,
         })
     }
 }

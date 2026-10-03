@@ -747,7 +747,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   a tenant is a key prefix, not a `where` clause someone has to remember. A
   `#[table(global)]` gets `type Scope = Unscoped`; a table that declares neither is a
   compile error (the Tables bullet above). The scope type owes an `impl Tenant` with two items: `NAME`, its identity, rendered wherever a scope is named (spec 2026-09-30-tenancy-completion §4), and its own `authorize`; `scoped_by` without one is a compile error at the
-  struct. The six scope-taking primitives on `Tx` are private to `charpente-core`, so the
+  struct, and two tenant types under one `NAME`, or an empty `NAME`, are refused when the app mounts them. The six scope-taking primitives on `Tx` are private to `charpente-core`, so the
   ONE way to reach a scoped row is `tx.scope::<Org>(org, ctx)?` — the single auditable line
   per handler — which runs the app's `authorize` (or, on a route declared `public(Org)`,
   admits by that declaration) before it returns the `ScopedTx` that
@@ -814,7 +814,8 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   fingerprint carries the tenant's `NAME` (spec 2026-09-30-tenancy-completion §4). So a
   Pending row enqueued under a tenant type of another `NAME` is refused at startup as a
   foreign shape; that includes the refactor that turns a job module's `use billing::Org`
-  into `use crm::Org`. A row whose shape matches has no type to check when a later binary
+  into `use crm::Org`, whenever the two types' NAMEs differ (under the NAME-equals-identifier
+  convention both may be "Org", and one app that mounts both is refused at mount). A row whose shape matches has no type to check when a later binary
   that mounts the name dispatches it, in the scope type that binary declares. That is
   either a row a hand-written `impl Job` enqueued from a binary that did not mount the
   name, or one enqueued under another tenant type with the same `NAME`, which is that

@@ -26,10 +26,11 @@ use charpente::auth::Principal;
 use charpente::http::{
     ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Response, Subscription,
 };
+use charpente::kernel::JobError;
 use charpente::wire::WireU64;
 use charpente::{
     CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, TenantAdmission, Tx,
-    TxError, event, route, routes, table,
+    TxError, event, job, jobs, route, routes, table,
 };
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
@@ -1836,6 +1837,8 @@ mod wrapped {
     }
 
     pub struct Alpha;
+
+    pub struct Gamma;
 }
 
 /// Declared `public(billing::Org)`, but it opens `crm::Org`. Rule 3 applies
@@ -1898,5 +1901,301 @@ fn the_401_names_a_generic_tenant_type_by_its_name() {
          admits one. Send \"Authorization: Bearer <token>\" or the charpente_session cookie, \
          or, if every caller may act inside this tenant here, declare \
          `#[route(POST \"/wrapped\", public(Wrap))]`"
+    );
+}
+
+// --------------------------------------------- one NAME, one tenant type
+
+/// Two tenant types that both follow the convention, `NAME` = identifier, and
+/// so both claim `"Org"` (tenancy-completion spec §4). An app that names both,
+/// through any two of its mount paths, is refused before it serves.
+mod twins {
+    pub mod north {
+        use charpente::auth::Principal;
+        use charpente::http::ApiError;
+        use charpente::{Id, Tenant, Tx};
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "Org";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                Ok(())
+            }
+        }
+    }
+
+    pub mod south {
+        use charpente::auth::Principal;
+        use charpente::http::ApiError;
+        use charpente::{Id, Tenant, Tx};
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "Org";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A tenant type whose `NAME` names nothing.
+mod nameless {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        const NAME: &'static str = "";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+#[table(scoped_by = twins::north::Org)]
+struct NorthBill {
+    id: Id<NorthBill>,
+    cents: u64,
+}
+
+#[table(scoped_by = twins::south::Org)]
+struct SouthLead {
+    id: Id<SouthLead>,
+    cents: u64,
+}
+
+#[table(scoped_by = nameless::Org)]
+struct Unnamed {
+    id: Id<Unnamed>,
+    cents: u64,
+}
+
+#[route(POST "/south-leads", public(twins::south::Org))]
+fn open_south_lead(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<twins::south::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+#[job(scoped_by = twins::south::Org)]
+struct Nurture {
+    n: u64,
+}
+
+impl Nurture {
+    fn run(self, tx: &mut ScopedTx<'_, '_, twins::south::Org>) -> Result<(), JobError> {
+        let _ = (self.n, tx.scope());
+        Ok(())
+    }
+}
+
+/// One generic tenant impl, two instantiations: one NAME, `"Wrap"`, for two
+/// types. The Review Focus case.
+#[table(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaNote {
+    id: Id<AlphaNote>,
+    cents: u64,
+}
+
+#[table(scoped_by = wrapped::Wrap<wrapped::Gamma>)]
+struct GammaNote {
+    id: Id<GammaNote>,
+    cents: u64,
+}
+
+/// `public(Wrap<Alpha>)`: every caller may act inside the `Wrap<Alpha>` it
+/// opens. It writes the table and enqueues the job that name the same type.
+#[route(POST "/alpha-notes", public(wrapped::Wrap<wrapped::Alpha>))]
+fn open_alpha_note(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let mut tx = tx.scope::<wrapped::Wrap<wrapped::Alpha>>(Id::from_raw(1), ctx)?;
+    tx.put(&AlphaNote {
+        id: Id::from_raw(1),
+        cents: 5,
+    });
+    tx.enqueue(AlphaDigest { n: 1 });
+    Ok(WireU64(1))
+}
+
+#[job(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaDigest {
+    n: u64,
+}
+
+impl AlphaDigest {
+    fn run(self, tx: &mut ScopedTx<'_, '_, wrapped::Wrap<wrapped::Alpha>>) -> Result<(), JobError> {
+        let _ = (self.n, tx.scan::<AlphaNote>()?);
+        Ok(())
+    }
+}
+
+fn identity_app(sim: &Sim, schema: Schema) -> App {
+    App::open(
+        Box::new(sim.disk()),
+        schema,
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+}
+
+/// Runs an app's mount calls and returns what they panicked with.
+fn mount_refusal(build: impl FnOnce() -> App) -> String {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(build());
+    }))
+    .expect_err("the app mounted two tenant types under one NAME, or a nameless one");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "a panic payload that is not a String".to_string())
+}
+
+/// The uniqueness refusal, spelled out here rather than taken from the
+/// product's `format!`, so the comparison pins the words.
+fn two_named(name: &str, first: &str, second: &str) -> String {
+    format!(
+        "two tenant types are named \"{name}\": {first} and {second} — a tenant's NAME is its \
+         identity (it is inside every scoped job's and event's fingerprint), so give each type \
+         its own `const NAME` in its `impl Tenant`"
+    )
+}
+
+/// The two twins' full `type_name`s, in the order a refusal names them.
+fn north_then_south() -> (&'static str, &'static str) {
+    (
+        std::any::type_name::<twins::north::Org>(),
+        std::any::type_name::<twins::south::Org>(),
+    )
+}
+
+/// Two scoped tables. `App::open` notes them in `TABLE` order, so the first
+/// type named is `NorthBill`'s.
+#[test]
+fn two_tenant_types_under_one_name_are_refused_when_their_tables_open() {
+    let sim = Sim::with_faults(0x7E4A_1712, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(
+            &sim,
+            Schema::new().table::<NorthBill>().table::<SouthLead>(),
+        )
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+/// A scoped table, then a `public(S)` route of the other type.
+#[test]
+fn a_public_route_naming_a_second_tenant_type_under_one_name_is_refused_at_mount() {
+    let sim = Sim::with_faults(0x7E4A_1713, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(&sim, Schema::new().table::<NorthBill>()).mount(routes![open_south_lead])
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+/// A scoped table, then a scoped job of the other type.
+#[test]
+fn a_scoped_job_naming_a_second_tenant_type_under_one_name_is_refused_at_mount() {
+    let sim = Sim::with_faults(0x7E4A_1714, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(&sim, Schema::new().table::<NorthBill>()).mount_jobs(jobs![Nurture])
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+#[test]
+fn a_tenant_type_with_an_empty_name_is_refused_when_its_table_opens() {
+    let sim = Sim::with_faults(0x7E4A_1715, FaultConfig::none());
+    let refusal = mount_refusal(|| identity_app(&sim, Schema::new().table::<Unnamed>()));
+    assert_eq!(
+        refusal,
+        format!(
+            "tenant type {} has an empty NAME — give its `impl Tenant` a `const NAME` that \
+             names it",
+            std::any::type_name::<nameless::Org>()
+        )
+    );
+}
+
+/// Review Focus: a generic tenant impl gives every instantiation one NAME.
+/// An app that mounts two instantiations mounts two tenant types under
+/// `"Wrap"`, and the refusal names both in full, since their NAME cannot
+/// tell them apart.
+#[test]
+fn two_instantiations_of_one_generic_tenant_type_are_refused_naming_both() {
+    let sim = Sim::with_faults(0x7E4A_1716, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(
+            &sim,
+            Schema::new().table::<AlphaNote>().table::<GammaNote>(),
+        )
+    });
+    assert_eq!(
+        refusal,
+        two_named(
+            "Wrap",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>(),
+            std::any::type_name::<wrapped::Wrap<wrapped::Gamma>>()
+        )
+    );
+}
+
+/// The positive control. One tenant type, `Wrap<Alpha>`, named through every
+/// mount path that exists: a scoped table (`App::open`), a `public(S)` route
+/// (`mount`) and a scoped job (`mount_jobs`). The app mounts, serves, and
+/// renders the type as `"Wrap"`. A check that refused any second sighting,
+/// not only a second type, would fail here.
+#[test]
+fn one_tenant_type_named_through_a_table_a_route_and_a_job_mounts() {
+    let sim = Sim::with_faults(0x7E4A_1717, FaultConfig::none());
+    let mut app = identity_app(&sim, Schema::new().table::<AlphaNote>())
+        .mount(routes![open_alpha_note])
+        .mount_jobs(jobs![AlphaDigest]);
+    let c = app.describe();
+    let route = c
+        .routes
+        .iter()
+        .find(|r| r.name == "open_alpha_note")
+        .unwrap();
+    assert_eq!(route.public_scope, Some("Wrap"));
+    let job = c.jobs.iter().find(|j| j.name == "AlphaDigest").unwrap();
+    assert_eq!(job.scoped_by, Some("Wrap"));
+    let served = app.handle(Request::new(Method::Post, "/alpha-notes"));
+    assert_eq!(served.status, 200, "{}", body_text(&served));
+}
+
+/// The same `type_name` under one NAME with two `TypeId`s is not two tenant
+/// types: a hand-built `JobDef` whose `scope_type` names a different type
+/// than its `scope_type_name` and `scoped_by` do. The refusal must name that
+/// cause, not prescribe a second `const NAME` for one type.
+#[test]
+fn a_jobdef_whose_scope_type_disagrees_with_its_type_name_is_refused_naming_the_cause() {
+    let sim = Sim::with_faults(0x7E4A_1718, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        let mut def = <AlphaDigest as charpente::kernel::JobEntry>::def();
+        def.scope_type = std::any::TypeId::of::<wrapped::Wrap<wrapped::Gamma>>();
+        identity_app(&sim, Schema::new().table::<AlphaNote>()).mount_jobs(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "two registrations of the tenant type {} (NAME \"Wrap\") are different types — a \
+             hand-built `JobDef` whose `scope_type` and `scope_type_name` name different types \
+             (build it from its `#[job]`'s `def()`, or set both fields from one type), or two \
+             versions of one crate in the build (unify them)",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
+        )
     );
 }

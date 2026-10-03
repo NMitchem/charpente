@@ -1225,7 +1225,7 @@ mod scoped_jobs {
     /// is not its `#[job]`'s refuses the honest enqueue. So the `JobDef` is
     /// named among the causes, and "mount it as its #[job] declares it" among
     /// the fixes. The app mounts no table: a table that named `Desk` would
-    /// meet the mount-time tenant-name check first (Task 3).
+    /// meet the mount-time tenant-name check first.
     #[test]
     fn a_jobdef_whose_scope_type_is_not_its_jobs_is_named_as_a_cause() {
         let sim = Sim::with_faults(0x5C0B_00FC, FaultConfig::none());
@@ -1411,8 +1411,8 @@ mod scoped_jobs {
     /// The residual, stated (GUIDE §6). A tenant type's `NAME` is its
     /// identity, so two tenant types with one `NAME` are one tenant to the
     /// fingerprint, whatever their paths. `App` refuses to mount both in one
-    /// app (Task 3). Across a deploy, giving a type another's `NAME` declares
-    /// it that tenant.
+    /// app: mounting refuses the second type under a seen `NAME`. Across a
+    /// deploy, giving a type another's `NAME` declares it that tenant.
     mod shared_name {
         use charpente::auth::Principal;
         use charpente::http::ApiError;
@@ -2757,7 +2757,8 @@ impl Flaky {
 }
 
 /// The scope type for the swarm's tenant-scoped table. A bare marker, not a
-/// `#[table]`: a scope type owes nothing but `authorize`, and the platform
+/// `#[table]`: a tenant type owes a `NAME` (its identity, unique in the app)
+/// and `authorize`, and the platform
 /// never DERIVES a scope — it only renders one, as the subscription key
 /// `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
 /// `emit_keyed` ruling, DESIGN.md §6).

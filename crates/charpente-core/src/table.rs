@@ -350,7 +350,9 @@ pub trait Row: Sized + 'static {
     /// keeps `None`: `#[table(global)]` and the platform's hand-written rows
     /// alike. A constant, because this crate cannot bound `Scope: Tenant`: an
     /// unscoped row's scope is `Unscoped`. It has a default, unlike `Scope`,
-    /// because associated-const defaults are stable.
+    /// because associated-const defaults are stable. `Schema::table` records
+    /// it, and `App::open` refuses two tenant types under one name
+    /// (tenancy-completion spec §4, plan amendment A2).
     const SCOPE_NAME: Option<&'static str> = None;
     fn id(&self) -> Id<Self>;
     fn encode_row(&self, out: &mut Vec<u8>);

@@ -5310,8 +5310,8 @@ fn every_stream_routes_declared_emits_matches_its_subscription() {
 
 /// The scope type. A `#[table]` only so `Id<Org>` can be a route path
 /// parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing reads the
-/// table and it is not registered in any `Schema`. A scope type owes nothing
-/// but `authorize`.
+/// table and it is not registered in any `Schema`. A tenant type owes a `NAME`
+/// (its identity, unique in the app) and `authorize`.
 #[table(global)]
 struct Org {
     id: Id<Org>,

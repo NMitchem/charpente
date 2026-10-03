@@ -303,6 +303,8 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
     // a constant the compiler evaluates, because expansion cannot read `NAME`.
     // `tenant_name`'s bound is the one `JobDef.scoped_by` already carries at
     // this span, so a scope type with no `Tenant` impl gains no error.
+    // `cross_tenant` is not mixed in: it changes neither the stored bytes nor
+    // decode.
     let fold = crate::fingerprint::compute(&field_idents, &field_types);
     let fingerprint = match tenancy {
         Tenancy::Global => quote! { #fold },
@@ -448,6 +450,9 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     cross_tenant: #cross_tenant,
                     scoped_by: #scoped_by_name,
                     scope_type: ::std::any::TypeId::of::<
+                        <#name as ::charpente::core::db::Job>::Scope,
+                    >(),
+                    scope_type_name: ::std::any::type_name::<
                         <#name as ::charpente::core::db::Job>::Scope,
                     >(),
                     fingerprint: <#name as ::charpente::core::db::Job>::FINGERPRINT,

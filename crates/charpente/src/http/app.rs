@@ -333,6 +333,12 @@ pub struct App {
     /// hands `StagedDispatch` a plain `&OidcVerifier` via `as_deref()`, and
     /// nothing in the crate clones this field any more. A `Box` would do.
     oidc: Option<Arc<OidcVerifier>>,
+    /// Every tenant type this app names, by `NAME`: its `TypeId`, and its
+    /// `type_name` for the refusal's text. Filled by `App::open` from the
+    /// schema's scoped tables, by `mount` from `public(S)` routes, and by
+    /// `mount_jobs` from scoped jobs, through `note_tenant`, which refuses a
+    /// second type under a seen `NAME` (tenancy-completion spec §4).
+    tenants: BTreeMap<&'static str, (TypeId, &'static str)>,
 }
 
 impl App {
@@ -350,6 +356,7 @@ impl App {
         entropy: Box<dyn Entropy>,
         config: AppConfig,
     ) -> io::Result<App> {
+        let table_tenants = schema.table_tenants();
         let mut db = Db::open(
             disk,
             config.db.clone(),
@@ -364,7 +371,7 @@ impl App {
             sweep.fingerprint,
             sweep.scoped_by.map(|scope| (scope, sweep.scope_type)),
         )]);
-        Ok(App {
+        let mut app = App {
             db: Some(db),
             entropy,
             config,
@@ -374,10 +381,50 @@ impl App {
             event_defs: Vec::new(),
             cron_entries: vec![sweep::platform_cron_entry()],
             oidc: None,
-        })
+            tenants: BTreeMap::new(),
+        };
+        for (name, type_id, type_name) in table_tenants {
+            app.note_tenant(name, type_id, type_name);
+        }
+        Ok(app)
+    }
+
+    /// Records one tenant type this app names, and refuses a second type
+    /// under a `NAME` already seen, or an empty `NAME`, by name, before the
+    /// app serves (tenancy-completion spec §4). A tenant's `NAME` is its
+    /// identity: it is mixed into every scoped job's fingerprint, so two types
+    /// under one `NAME` are one tenant to every shape check. This is the one
+    /// place the texts live. `App::open`, `mount` and `mount_jobs` call it,
+    /// and `mount_events` does for scoped events. The same `type_name` under
+    /// one `NAME` with two `TypeId`s is not two tenant types but a hand-built
+    /// `JobDef` whose `scope_type` disagrees with its `scope_type_name`, or
+    /// two versions of one crate, and is refused with that cause.
+    fn note_tenant(&mut self, name: &'static str, type_id: TypeId, type_name: &'static str) {
+        assert!(
+            !name.is_empty(),
+            "tenant type {type_name} has an empty NAME — give its `impl Tenant` a `const NAME` \
+             that names it"
+        );
+        let (seen, seen_name) = *self.tenants.entry(name).or_insert((type_id, type_name));
+        assert!(
+            seen == type_id || seen_name != type_name,
+            "two registrations of the tenant type {type_name} (NAME \"{name}\") are different \
+             types — a hand-built `JobDef` whose `scope_type` and `scope_type_name` name \
+             different types (build it from its `#[job]`'s `def()`, or set both fields from one \
+             type), or two versions of one crate in the build (unify them)"
+        );
+        assert!(
+            seen == type_id,
+            "two tenant types are named \"{name}\": {seen_name} and {type_name} — a tenant's \
+             NAME is its identity (it is inside every scoped job's and event's fingerprint), so \
+             give each type its own `const NAME` in its `impl Tenant`"
+        );
     }
 
     pub fn mount(mut self, routes: Vec<Route>) -> App {
+        for scope in routes.iter().filter_map(|route| route.public_scope) {
+            self.note_tenant(scope.name, (scope.type_id)(), (scope.type_name)());
+        }
         self.router.mount(routes);
         self
     }
@@ -410,6 +457,11 @@ impl App {
                 )
             })
             .collect();
+        for def in &defs {
+            if let Some(name) = def.scoped_by {
+                self.note_tenant(name, def.scope_type, def.scope_type_name);
+            }
+        }
         for def in defs {
             assert!(
                 !self.job_defs.iter().any(|d| d.name == def.name),

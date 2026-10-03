@@ -1853,7 +1853,7 @@ whose shape matches:
   copying the job's `NAME` and `FINGERPRINT` under another `type Scope`;
 - a row enqueued under a tenant type with the same `NAME` as the mounted one. A `NAME` is
   the tenant's identity, so this is the same tenant by declaration: giving a type another
-  type's `NAME` declares it that tenant.
+  type's `NAME` declares it that tenant, and one app cannot mount both (§16).
 
 Where the recorded shape matches the mounted one, neither is refused, at startup or at
 dispatch. So before a deploy that mounts a scoped job the running binary does not mount,
@@ -6609,13 +6609,34 @@ fn memos_by_author(
 Four things that fall out of that, worth stating plainly:
 
 - **`scoped_by` without an `impl Tenant` does not compile**, at the struct.
-- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). A scoped job's fingerprint mixes it (§6), so moving a job to a tenant type of another `NAME` is a shape change, and renaming a `NAME` is one for every scoped job of that type. The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs. A generic tenant impl gives every instantiation one NAME.
+- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). A scoped job's fingerprint mixes it (§6), so moving a job to a tenant type of another `NAME` is a shape change, and renaming a `NAME` is one for every scoped job of that type. The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs, and the app refuses to mount them under one (below). A generic tenant impl gives every instantiation one NAME.
 - **The scope type is never inspected.** `authorize` is the only hook, and the
   one thing the platform reads off a scope is its decimal form, as a
   subscription key (below). Nothing parses a key back into a tenant.
 - **Ids stay globally unique and app-minted.** The key prefix is what separates
   tenants, not id re-use, so two tenants may hold the same `Id<Memo>` and the
   same `#[index]` value without colliding.
+
+**One `NAME`, one tenant type.** The app refuses to mount two tenant types under one
+`NAME`, or a tenant type whose `NAME` is empty, before it serves. It collects every tenant
+type it names: its scoped tables at `App::open`, its `public(S)` routes at `mount`, and its
+scoped jobs at `mount_jobs`. `<name>` is the shared `NAME`; `<type>` and `<other type>` are
+the two types as `std::any::type_name` renders them, the one named first first:
+
+<!-- pinned -->
+```text
+two tenant types are named "<name>": <type> and <other type> — a tenant's NAME is its identity (it is inside every scoped job's and event's fingerprint), so give each type its own `const NAME` in its `impl Tenant`
+tenant type <type> has an empty NAME — give its `impl Tenant` a `const NAME` that names it
+two registrations of the tenant type <type> (NAME "<name>") are different types — a hand-built `JobDef` whose `scope_type` and `scope_type_name` name different types (build it from its `#[job]`'s `def()`, or set both fields from one type), or two versions of one crate in the build (unify them)
+```
+
+The usual cause is two types spelled alike in two modules, such as `billing::Org` and
+`crm::Org`: both follow the convention, so both claim `"Org"`. The other is a generic tenant
+impl mounted at two instantiations, such as `Wrap<Alpha>` and `Wrap<Gamma>`, whose one impl
+gives both one `NAME`. The same type named through a table, a route and a job is one tenant
+type, and mounts. The third line is the same type under one `NAME` with two `TypeId`s: not two
+tenant types, but a hand-built `JobDef` whose `scope_type` disagrees with its
+`scope_type_name`, or two versions of one crate.
 
 ### Who reaches a tenant: membership or declaration
 

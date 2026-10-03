@@ -90,6 +90,9 @@ pub struct JobDef {
     /// type with the same `NAME`, enqueued in that type's tenant (job-tenancy
     /// final review N1; tenancy-completion spec §4).
     pub scope_type: TypeId,
+    /// `type_name::<J::Scope>()`, for `App`'s tenant-name refusal only (it
+    /// names the type a `scoped_by` NAME stands for); never recorded.
+    pub scope_type_name: &'static str,
     /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
     /// asserts a row's recorded shape equals it before the glue decodes
     /// (payload-shapes spec §4).

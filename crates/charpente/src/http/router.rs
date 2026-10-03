@@ -109,6 +109,9 @@ pub struct PublicScope {
     /// The scope type's `TypeId`, behind a fn pointer like `response` and
     /// `error`, so a `Route` stays plain `'static` data and fn pointers.
     pub type_id: fn() -> TypeId,
+    /// The scope type's `type_name`, for `App`'s tenant-name refusal only.
+    /// A fn pointer, like `type_id`.
+    pub type_name: fn() -> &'static str,
 }
 
 /// Implemented by the marker struct `#[route]` emits next to each handler,

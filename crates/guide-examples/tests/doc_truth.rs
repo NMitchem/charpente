@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 /// borrowed-table-name refusal and its two tenancy-mismatch refusals (one
 /// block, 2026-09-29); 28 with its scope-type refusal (2026-09-29); 29 with
 /// the stalled switchover's `CtrlErr` (2026-10-02).
-const PINNED_FLOOR: usize = 29;
+const PINNED_FLOOR: usize = 30;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

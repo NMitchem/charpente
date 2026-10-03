@@ -386,6 +386,14 @@ struct TableOps {
     // `IndexDef<R>` is generic per-`Row`, so no `&'static [&'static str]` of
     // names exists to borrow — projected once at registration time instead.
     index_names: Vec<&'static str>,
+    // `Row::SCOPE_NAME`, with the scope type's `TypeId` and `type_name`:
+    // what `App::open` needs to refuse two tenant types under one `NAME`
+    // (tenancy-completion spec §4, plan amendment A2). The name is
+    // `Some` only for a `#[table(scoped_by = …)]` row. The `type_name` is for
+    // the refusal's text only and is never recorded.
+    scope_name: Option<&'static str>,
+    scope_type: TypeId,
+    scope_type_name: &'static str,
 }
 
 fn apply_put<R: Row>(w: &mut Writer<'_>, scope: u64, row: &[u8]) -> io::Result<()> {
@@ -472,6 +480,9 @@ impl Schema {
                 row_type: TypeId::of::<R>(),
                 row_name: std::any::type_name::<R>(),
                 index_names: R::INDEXES.iter().map(|d| d.name).collect(),
+                scope_name: R::SCOPE_NAME,
+                scope_type: TypeId::of::<R::Scope>(),
+                scope_type_name: std::any::type_name::<R::Scope>(),
             },
         );
         assert!(
@@ -487,6 +498,22 @@ impl Schema {
     /// and iterates this to know which tables to `Snapshot::scan_raw`.
     pub fn table_names(&self) -> Vec<&'static str> {
         self.tables.keys().copied().collect()
+    }
+
+    /// Every registered table's tenant type, as `(NAME, TypeId, type_name)`,
+    /// in `TABLE` order: the tables `App::open` checks for two tenant types
+    /// under one `NAME` (tenancy-completion spec §4). Only
+    /// `#[table(scoped_by = …)]` rows carry a `NAME`
+    /// (`Row::SCOPE_NAME`). A hand-written scoped `Row` keeps `None`, and
+    /// is not listed.
+    pub fn table_tenants(&self) -> Vec<(&'static str, TypeId, &'static str)> {
+        self.tables
+            .values()
+            .filter_map(|ops| {
+                ops.scope_name
+                    .map(|name| (name, ops.scope_type, ops.scope_type_name))
+            })
+            .collect()
     }
 
     /// Registers one migration step for `table` (which must already be
@@ -1590,7 +1617,7 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 /// That is a declared identity, never the compiler's printer: `type_name`
 /// cuts a generic at the wrong place and cannot tell two types spelled alike
 /// apart (tenancy-completion spec §4). No two tenant types of one app may
-/// share a `NAME`.
+/// share a `NAME`: `App` refuses them, and an empty `NAME`, when it mounts them.
 ///
 /// The platform calls `authorize` in exactly one place, `Tx::open_scope`
 /// below, and only with a principal — and never DERIVES a scope: the tenant

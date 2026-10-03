@@ -50,7 +50,8 @@ const USAGE: &str = "usage: tenant_node --addr A --data-dir D [--legacy-unscoped
 
 /// The scope type. A `#[table]` so `Id<Org>` can be a path parameter
 /// (`Id<R>`'s `Wire` impl is bounded on `R: Row`); no `Org` row is ever
-/// written — a scope type owes nothing but `authorize`.
+/// written — a tenant type owes a `NAME` (its identity, unique in the app) and
+/// `authorize`.
 #[table(global)]
 struct Org {
     id: Id<Org>,

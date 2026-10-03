@@ -760,6 +760,7 @@ mod tests {
             cross_tenant: false,
             scoped_by: None,
             scope_type: std::any::TypeId::of::<charpente_core::table::Unscoped>(),
+            scope_type_name: std::any::type_name::<charpente_core::table::Unscoped>(),
             fingerprint: 0x7E57_0702,
             glue: noop_glue,
         }]);
@@ -862,6 +863,7 @@ mod tests {
             cross_tenant: false,
             scoped_by: None,
             scope_type: std::any::TypeId::of::<charpente_core::table::Unscoped>(),
+            scope_type_name: std::any::type_name::<charpente_core::table::Unscoped>(),
             fingerprint: 0x7E57_0704,
             glue: cron_foreign_shape_glue,
         }])
