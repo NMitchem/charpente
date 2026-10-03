@@ -126,12 +126,14 @@ pub struct EventInfo {
     /// An `#[event]` payload is exactly the JSON a subscriber receives, so
     /// it is a wire type like any route's response.
     pub payload: &'static str,
-    /// Always `false`, populated honestly rather than guessed: `emit` vs
-    /// `emit_keyed` is a CALL-SITE choice (`tx.emit_keyed(org, ev)`), not a
-    /// property of the event type, so nothing static can know it. Inventing
-    /// a declaration for it would be a design change, not an implementation
-    /// detail — the field stays so the contract's shape is ready for one.
-    pub keyed: bool,
+    /// `#[event(scoped_by = Org)]`: the tenant this event belongs to, by its
+    /// tenant type's `Tenant::NAME`; `None` for a `#[event(global)]` one
+    /// (tenancy-completion spec §8). It says which feeds can carry the event:
+    /// a scoped event reaches only its own tenant's feed, and a global one
+    /// only `Subscription::of` feeds. It replaces the old always-false key
+    /// flag. An app key is a call-site filter no static contract can know,
+    /// while an event's tenancy is a declaration on its type.
+    pub scoped_by: Option<&'static str>,
 }
 
 /// One registered event type: the descriptor `events![…]` collects (explicit
@@ -318,7 +320,7 @@ fn event_info(def: &EventDef) -> EventInfo {
     EventInfo {
         name: def.name,
         payload: def.payload,
-        keyed: false,
+        scoped_by: def.scoped_by,
     }
 }
 
@@ -448,7 +450,14 @@ pub fn to_human(c: &Contract) -> String {
     }
     writeln!(out, "events:").unwrap();
     for e in &c.events {
-        writeln!(out, "  {} payload={} keyed={}", e.name, e.payload, e.keyed).unwrap();
+        writeln!(
+            out,
+            "  {} payload={} scoped_by={}",
+            e.name,
+            e.payload,
+            e.scoped_by.unwrap_or("none")
+        )
+        .unwrap();
     }
     writeln!(out, "jobs:").unwrap();
     for j in &c.jobs {

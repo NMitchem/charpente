@@ -4467,10 +4467,12 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 ```
 
 That app's `Contract.events` carries one entry — `{"name": "note_added",
-"payload": "NoteAdded", "keyed": false}` — and `NoteAdded`'s own field schema
-joins `"types"` beside the route types (§13). `keyed` is always `false`, and
-honestly so: `tx.emit` versus `tx.emit_keyed` is a *call-site* choice, not a
-property of the event type, so nothing static can know it.
+"payload": "NoteAdded", "scoped_by": null}` — and `NoteAdded`'s own field schema
+joins `"types"` beside the route types (§13). `scoped_by` is `null` because `NoteAdded` is `global`. For an
+`#[event(scoped_by = Org)]` it names the tenant type by its `Tenant::NAME`
+(`"Org"`). An event's tenancy is a declaration on its type, so the contract
+states it. An app key is a call-site choice (`tx.emit_keyed`), so the contract
+lists no keys.
 
 Mounting the same event type twice — in one `mount_events` call, or across
 several — panics at mount time: `"event \"note_added\" registered twice —
@@ -5352,7 +5354,7 @@ a global event (§11, "An event's tenancy").
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, migration chain, and whether it's tenant-scoped),
 every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, by that tenant type's `NAME`, whether it declared `cross_tenant`, whether it's an SSE stream),
-every registered event (name, payload type — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`), every cron entry
+every registered event (name, payload type, and the tenant it belongs to if it is `scoped_by` — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`), every cron entry
 (name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
@@ -5907,12 +5909,12 @@ memorizing a list:
     {
       "name": "invoice_finalized",
       "payload": "InvoiceFinalized",
-      "keyed": false
+      "scoped_by": null
     },
     {
       "name": "receipt_sent",
       "payload": "ReceiptSent",
-      "keyed": false
+      "scoped_by": null
     }
   ],
   "types": [

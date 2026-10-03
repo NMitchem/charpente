@@ -224,8 +224,8 @@ fn feed_ping(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscript
 
 /// `emits(...)` describes WHICH event types reach the stream, not which rows
 /// pass `.key(...)` — the key is a per-emit call-site value the contract
-/// cannot know (same reason `EventInfo.keyed` is always false), so a keyed
-/// feed declares the same two types the unkeyed one does.
+/// cannot know, so a keyed feed declares the same two types the unkeyed one
+/// does.
 #[route(SSE "/feed-keyed", public, emits(Ping, Pong))]
 fn feed_keyed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);

@@ -338,12 +338,12 @@ const GOLDEN: &str = r#"{
     {
       "name": "widget_added",
       "payload": "WidgetAdded",
-      "keyed": false
+      "scoped_by": null
     },
     {
       "name": "widget_removed",
       "payload": "WidgetRemoved",
-      "keyed": false
+      "scoped_by": null
     }
   ],
   "types": [
@@ -764,22 +764,22 @@ fn the_contract_enumerates_events_with_their_payload_types() {
 /// `contract_json_shape_is_pinned`); an `assert!(is_sorted)` on a
 /// one-event fixture would not.
 ///
-/// `keyed` is pinned false here too, for both events: `emit` vs
-/// `emit_keyed` is a call-site choice, so nothing static can know it and
-/// the contract must not pretend otherwise.
+/// `scoped_by` is pinned `None` here, for both events: both are
+/// `#[event(global)]`. The scoped half is
+/// `describe_names_every_scoped_event`'s.
 #[test]
-fn events_render_in_name_order_and_report_keyed_false() {
+fn events_render_in_name_order_and_report_their_tenancy() {
     let c = fixture_app().describe();
-    let rendered: Vec<(&str, &str, bool)> = c
+    let rendered: Vec<(&str, &str, Option<&str>)> = c
         .events
         .iter()
-        .map(|e| (e.name, e.payload, e.keyed))
+        .map(|e| (e.name, e.payload, e.scoped_by))
         .collect();
     assert_eq!(
         rendered,
         vec![
-            ("widget_added", "WidgetAdded", false),
-            ("widget_removed", "WidgetRemoved", false),
+            ("widget_added", "WidgetAdded", None),
+            ("widget_removed", "WidgetRemoved", None),
         ]
     );
 }
@@ -792,8 +792,8 @@ fn to_human_pins_the_events_section() {
     let out = charpente::describe::to_human(&fixture_app().describe());
     assert!(
         out.contains(
-            "events:\n  widget_added payload=WidgetAdded keyed=false\n  \
-             widget_removed payload=WidgetRemoved keyed=false\n"
+            "events:\n  widget_added payload=WidgetAdded scoped_by=none\n  \
+             widget_removed payload=WidgetRemoved scoped_by=none\n"
         ),
         "{out}"
     );
@@ -1194,6 +1194,14 @@ impl Reconcile {
     }
 }
 
+/// An event that belongs to one org (tenancy-completion spec §6).
+/// `describe` names the tenant it belongs to, and that is the inventory
+/// "which feeds can carry this org's events".
+#[event(scoped_by = Org)]
+struct LedgerPosted {
+    cents: WireU64,
+}
+
 fn capability_app() -> App {
     let sim = Sim::with_faults(0x2EC2_0002, FaultConfig::none());
     App::open(
@@ -1205,6 +1213,7 @@ fn capability_app() -> App {
     .unwrap()
     .mount(routes![admin_revenue, admin_plain, org_ledger])
     .mount_jobs(jobs![Rollup, Ping, Reconcile])
+    .mount_events(events![WidgetAdded, LedgerPosted])
 }
 
 /// What turns "audit the cross-tenant reads" from a grep someone must
@@ -1326,6 +1335,35 @@ fn to_human_carries_public_scope_and_scoped_by() {
     }
 }
 
+/// Tenancy-completion spec §8: `describe` names the tenant each event
+/// belongs to, by its tenant type's `NAME`, where it used to carry a key flag
+/// that was always `false`. `WidgetAdded`'s `None` is the floor: without it,
+/// a field that always said "Org" would pass.
+#[test]
+fn describe_names_every_scoped_event() {
+    let c = capability_app().describe();
+    let events: Vec<(&str, Option<&str>)> =
+        c.events.iter().map(|e| (e.name, e.scoped_by)).collect();
+    assert_eq!(
+        events,
+        vec![("ledger_posted", Some("Org")), ("widget_added", None)]
+    );
+}
+
+/// The human dump carries it, after the payload, as the tenant's `NAME` or
+/// `none`.
+#[test]
+fn to_human_carries_an_events_scoped_by() {
+    let out = charpente::describe::to_human(&capability_app().describe());
+    assert!(
+        out.contains(
+            "events:\n  ledger_posted payload=LedgerPosted scoped_by=Org\n  \
+             widget_added payload=WidgetAdded scoped_by=none\n"
+        ),
+        "{out}"
+    );
+}
+
 /// A tenant type whose NAME is not its identifier (tenancy-completion spec
 /// §4, §8), so a listing that cut a path at its last segment would read
 /// `Org` here. It is mounted by its own app, so `capability_app`'s golden is
@@ -1389,6 +1427,40 @@ fn describe_names_a_tenant_scope_by_its_tenant_types_name() {
     assert_eq!(route.public_scope, Some("Workspace"));
     let job = c.jobs.iter().find(|j| j.name == "Audit").unwrap();
     assert_eq!(job.scoped_by, Some("Workspace"));
+}
+
+/// Scoped by Task 2's `renamed::Org`, whose `NAME` is "Workspace" and whose
+/// identifier is `Org`. It is the event half of
+/// `describe_names_a_tenant_scope_by_its_tenant_types_name`. Every other
+/// scoped event here follows A4 (`NAME` equals the identifier), so only this
+/// one tells "renders the tenant's `NAME`" from "renders the type's final
+/// `::` component". Mounted by its own app, like that test's route and job, so
+/// `capability_app`'s golden is untouched.
+#[event(scoped_by = renamed::Org)]
+struct AuditPosted {
+    day: WireU64,
+}
+
+#[test]
+fn describe_names_an_events_tenant_by_its_tenant_types_name() {
+    let sim = Sim::with_faults(0x2EC2_000A, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_events(events![AuditPosted]);
+    let c = app.describe();
+    let events: Vec<(&str, Option<&str>)> =
+        c.events.iter().map(|e| (e.name, e.scoped_by)).collect();
+    assert_eq!(events, vec![("audit_posted", Some("Workspace"))]);
+    let out = charpente::describe::to_human(&c);
+    assert!(
+        out.contains("  audit_posted payload=AuditPosted scoped_by=Workspace\n"),
+        "{out}"
+    );
 }
 
 // ------------------------------------------------------------- table scope

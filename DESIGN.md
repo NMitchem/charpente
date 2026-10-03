@@ -1843,9 +1843,10 @@ Charpente treats the coding agent as the primary developer persona:
   `#[route(SSE …, emits(Ev, …))]`, each an `EmittedEvent { event, payload }` holding the
   SSE frame's name and the payload type's name, empty on every non-stream route and on a
   stream route that has not adopted the declaration**), **`events` — every `#[event]` type
-  registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
-  sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
-  choice, so nothing static can know it)**, jobs (name, retry policy, **`scoped_by`, the `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`), cron
+  registered with `mount_events(events![…])` as `EventInfo { name, payload, scoped_by }`,
+  sorted by event name (`scoped_by` is the tenant type's `Tenant::NAME` for a
+  `#[event(scoped_by = Org)]` event and `null` for a global one; an app key is a call-site
+  filter, so the contract lists no keys)**, jobs (name, retry policy, **`scoped_by`, the `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
   field order is
