@@ -410,8 +410,8 @@ impl App {
             seen == type_id || seen_name != type_name,
             "two registrations of the tenant type {type_name} (NAME \"{name}\") are different \
              types — a hand-built `JobDef` whose `scope_type` and `scope_type_name` name \
-             different types (build it from its `#[job]`'s `def()`, or set both fields from one \
-             type), or two versions of one crate in the build (unify them)"
+             different types (build it from its `#[job]`'s `def()`, or set both fields from the \
+             type its `scoped_by` names), or two versions of one crate in the build (unify them)"
         );
         assert!(
             seen == type_id,

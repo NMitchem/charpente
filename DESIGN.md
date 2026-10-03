@@ -810,7 +810,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   tenant id and not its type, and the fingerprint carries only the tenant type's `NAME`. So
   a stand-in copying `NAME` and `FINGERPRINT`, or a `#[job]` whose `scoped_by` names another
   tenant type with the same `NAME`, would otherwise run the job in the same id of the
-  declared type. The check needs both types, so it runs at enqueue only. Across binaries the
+  declared type. The check needs both types, so it runs at enqueue only. A hand-built `JobDef` (its fields are public) can still pair a glue with a `scope_type` that glue does not open; `JobScope::open` asserts the type the glue opens is `JobDef.scope_type`, inside the glue's `catch_unwind`, so that job's every attempt fails by name and it dead-letters with nothing written (spec 2026-09-30-tenancy-completion §7). Across binaries the
   fingerprint carries the tenant's `NAME` (spec 2026-09-30-tenancy-completion §4). So a
   Pending row enqueued under a tenant type of another `NAME` is refused at startup as a
   foreign shape; that includes the refactor that turns a job module's `use billing::Org`

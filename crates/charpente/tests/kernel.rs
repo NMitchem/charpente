@@ -1497,6 +1497,206 @@ mod scoped_jobs {
             )
         );
     }
+
+    // --------------------------- a hand-built `JobDef` whose glue disagrees
+    //
+    // Tenancy-completion spec §7, item 4 (job-tenancy final-fix re-review 2,
+    // P4 and P5). `JobDef`'s fields are public, so a hand-built one can pair a
+    // glue with a `scope_type` that glue does not open. `Group::stage` holds
+    // the enqueuer to `scope_type`, and the glue opens the row's tenant as
+    // whatever type it names, so the two can disagree only at dispatch.
+    // `JobScope::open` asserts they agree, inside the glue's `catch_unwind`:
+    // an attempt that retries and dead-letters, never a kernel stop.
+
+    /// A table in `Board`'s tenants, so a job that runs in one leaves a row
+    /// these tests can look for.
+    #[table(scoped_by = Board)]
+    pub struct Pinned {
+        pub id: Id<Pinned>,
+        pub note: u64,
+    }
+
+    /// A `Board` job whose payload decodes exactly as `File`'s does, so its
+    /// glue, swapped into `File`'s `JobDef`, runs a `File` row in `Board`.
+    #[job(scoped_by = Board)]
+    pub struct Pin {
+        pub n: u64,
+    }
+
+    impl Pin {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Board>) -> Result<(), JobError> {
+            tx.put(&Pinned {
+                id: Id::from_raw(self.n),
+                note: self.n,
+            });
+            Ok(())
+        }
+    }
+
+    /// An app that mounts one hand-built `JobDef` and both tenants' tables.
+    fn hand_built_app(sim: &Sim, def: JobDef) -> App {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Filed>().table::<Pinned>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(vec![def])
+    }
+
+    /// Runs the queue until it is empty, each attempt at its own due time,
+    /// and returns what every attempt came to.
+    fn attempts_until_rest(dispatcher: &mut Dispatcher, db: &mut Db) -> Vec<(&'static str, u32)> {
+        let mut seen = Vec::new();
+        loop {
+            dispatcher.note_enqueued(db.drain_enqueued());
+            let Some(now) = dispatcher.next_deadline() else {
+                return seen;
+            };
+            seen.push(match dispatcher.run_due(db, now).unwrap() {
+                JobOutcome::Done { .. } => ("done", 0),
+                JobOutcome::Retried { attempts, .. } => ("retried", attempts),
+                JobOutcome::Dead { attempts, .. } => ("dead", attempts),
+            });
+        }
+    }
+
+    /// Every attempt a `File` row gets under `File`'s own retry policy, the
+    /// last one dead-lettering it.
+    fn retried_then_dead() -> Vec<(&'static str, u32)> {
+        let max = <File as Job>::RETRY.max;
+        (1..max)
+            .map(|n| ("retried", n))
+            .chain([("dead", max)])
+            .collect()
+    }
+
+    /// P4. `File`'s `JobDef` with `Pin`'s glue. `File` enqueued in `Desk` 31
+    /// is accepted, since the def's `scope_type` is `Desk`'s, and the glue
+    /// would open `Board` 31, a tenant nothing opened or named for it.
+    #[test]
+    fn a_jobdef_carrying_another_jobs_glue_dead_letters_before_it_writes_in_another_scope_type() {
+        let sim = Sim::with_faults(0x7C05_0501, FaultConfig::none());
+        let def = JobDef {
+            glue: <Pin as JobEntry>::def().glue,
+            ..<File as JobEntry>::def()
+        };
+        let mut app = hand_built_app(&sim, def);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 31, File { n: 31 });
+        let attempts = attempts_until_rest(&mut dispatcher, db);
+
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            snap.scan_raw(Pinned::TABLE, true).unwrap(),
+            Vec::<(u64, u64, Vec<u8>)>::new(),
+            "no row in any Board tenant: the job was enqueued in Desk 31, and Board 31 is a \
+             tenant nothing opened or named for it"
+        );
+        assert_eq!(
+            attempts,
+            retried_then_dead(),
+            "an attempt, retried and then dead-lettered — never a kernel stop"
+        );
+        let row = snap.scan::<JobRow>().unwrap().remove(0);
+        assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(31)));
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(
+                "handler panicked: contract: the glue mounted for job \"File\" opened its \
+                 tenant 31 as `Board`, but that `JobDef` declares `scoped_by = Desk` with a \
+                 `scope_type` that is not `Board` — a hand-built `JobDef` whose `glue` or \
+                 `scope_type` disagrees with its #[job] (a glue taken from another job, or \
+                 another type's `TypeId`); this attempt wrote nothing, and every retry fails \
+                 the same way — mount File through `jobs![…]`, which builds its `JobDef` from \
+                 its #[job] (GUIDE §6)"
+            )
+        );
+    }
+
+    /// P5, in the form that survives mount: `File`'s glue under a `JobDef`
+    /// whose `scoped_by` and `scope_type` both name `Board`. They agree with
+    /// each other and not with the glue. `Group::stage` holds the enqueuer to
+    /// `Board`, so a "File" enqueued in `Board` 13 is accepted, and `File`'s
+    /// glue would open `Desk` 13, a tenant nothing opened or named for it.
+    #[test]
+    fn a_jobdef_naming_a_scope_type_its_glue_does_not_open_dead_letters_before_it_writes() {
+        let sim = Sim::with_faults(0x7C05_0502, FaultConfig::none());
+        let def = JobDef {
+            scoped_by: Some(<Board as Tenant>::NAME),
+            scope_type: TypeId::of::<Board>(),
+            ..<File as JobEntry>::def()
+        };
+        let mut app = hand_built_app(&sim, def);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx| {
+                tx.admit_scope(Id::<Board>::from_raw(13), &admission)
+                    .enqueue(BoardFile { n: 13 });
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().unwrap();
+        let attempts = attempts_until_rest(&mut dispatcher, db);
+
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            snap.scan_raw(Filed::TABLE, true).unwrap(),
+            Vec::<(u64, u64, Vec<u8>)>::new(),
+            "no row in any Desk tenant: the job was enqueued in Board 13, and Desk 13 is a \
+             tenant nothing opened or named for it"
+        );
+        assert_eq!(
+            attempts,
+            retried_then_dead(),
+            "an attempt, retried and then dead-lettered — never a kernel stop"
+        );
+        let row = snap.scan::<JobRow>().unwrap().remove(0);
+        assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(13)));
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(
+                "handler panicked: contract: the glue mounted for job \"File\" opened its \
+                 tenant 13 as `Desk`, but that `JobDef` declares `scoped_by = Board` with a \
+                 `scope_type` that is not `Desk` — a hand-built `JobDef` whose `glue` or \
+                 `scope_type` disagrees with its #[job] (a glue taken from another job, or \
+                 another type's `TypeId`); this attempt wrote nothing, and every retry fails \
+                 the same way — mount File through `jobs![…]`, which builds its `JobDef` from \
+                 its #[job] (GUIDE §6)"
+            )
+        );
+    }
+
+    /// P5 exactly as the re-review built it: `File`'s `JobDef` with only its
+    /// `scope_type` swapped to `Board`'s. It still carries NAME `Desk` and
+    /// `Desk`'s `type_name`, beside `Filed`'s `Desk`: two registrations of one
+    /// NAME and one type name under different `TypeId`s. The hand-built-`JobDef`
+    /// branch of `App::note_tenant` refuses the app at mount, before anything
+    /// can be enqueued, naming that cause and the right fix. This is the whole
+    /// text, with the real `type_name` rendering from this test binary.
+    #[test]
+    #[should_panic(
+        expected = "two registrations of the tenant type kernel::scoped_jobs::Desk (NAME \"Desk\") \
+                    are different types — a hand-built `JobDef` whose `scope_type` and \
+                    `scope_type_name` name different types (build it from its `#[job]`'s \
+                    `def()`, or set both fields from the type its `scoped_by` names), or two \
+                    versions of one crate in the build (unify them)"
+    )]
+    fn the_re_reviews_p5_jobdef_is_refused_at_mount() {
+        let sim = Sim::with_faults(0x7C05_0503, FaultConfig::none());
+        let _ = hand_built_app(
+            &sim,
+            JobDef {
+                scope_type: TypeId::of::<Board>(),
+                ..<File as JobEntry>::def()
+            },
+        );
+    }
 }
 
 fn quiet_kernel_app(seed: u64) -> (Sim, App) {

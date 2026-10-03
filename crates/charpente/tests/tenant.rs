@@ -2193,8 +2193,8 @@ fn a_jobdef_whose_scope_type_disagrees_with_its_type_name_is_refused_naming_the_
         format!(
             "two registrations of the tenant type {} (NAME \"Wrap\") are different types — a \
              hand-built `JobDef` whose `scope_type` and `scope_type_name` name different types \
-             (build it from its `#[job]`'s `def()`, or set both fields from one type), or two \
-             versions of one crate in the build (unify them)",
+             (build it from its `#[job]`'s `def()`, or set both fields from the type its \
+             `scoped_by` names), or two versions of one crate in the build (unify them)",
             std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
         )
     );

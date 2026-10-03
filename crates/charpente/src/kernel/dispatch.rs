@@ -7,8 +7,8 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use charpente_core::db::{
-    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableWriteRefusal, TenantAdmission, Tx,
-    TxError,
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableWriteRefusal, Tenant, TenantAdmission,
+    Tx, TxError,
 };
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
@@ -77,9 +77,11 @@ pub struct JobDef {
     /// registers it beside `fingerprint` and `scope_type`: `Group::stage`
     /// refuses an enqueue whose tenant presence disagrees with it, startup
     /// refuses a Pending row that does, and dispatch asserts that a row
-    /// carries a tenant exactly when this is `Some`. A hand-written `JobDef`
-    /// that contradicts its own `#[job]` is therefore refused at the first
-    /// enqueue, not at dispatch.
+    /// carries a tenant exactly when this is `Some`. A hand-built `JobDef`
+    /// whose tenancy contradicts its own `#[job]` is therefore refused at the
+    /// first enqueue; one whose glue opens another scope type than
+    /// `scope_type` is refused at dispatch, as an attempt, by
+    /// `JobScope::open`.
     pub scoped_by: Option<&'static str>,
     /// `TypeId::of::<J::Scope>()`: the scope type a `scoped_by` job's row
     /// names a tenant of (`Unscoped` for a `global` job). A row records a
@@ -115,22 +117,54 @@ pub type JobGlue =
 /// The tenant a scoped job was enqueued in, handed to its glue by the
 /// dispatcher and by nothing else (job-tenancy spec §5). Its fields are
 /// private and it has no public constructor, so a glue, generated or
-/// hand-written, can open only the tenant id its row carries. `open` takes
-/// the scope type from its caller, so what holds that id to the job's own
-/// scope type is the glue: the generated one opens it as the job's
-/// `scoped_by` type, which is `JobDef.scope_type`, the type `Group::stage`
-/// held the enqueuer's to; a hand-written glue names its own.
+/// hand-written, can open only the tenant id its row carries, and only as
+/// the scope type the mounted `JobDef` declares: `open` takes the type from
+/// its caller and asserts it is `JobDef.scope_type`, the type `Group::stage`
+/// held the enqueuer's to (tenancy-completion spec §7).
 pub struct JobScope<'j> {
     id: u64,
     admission: &'j TenantAdmission,
+    /// The mounted `JobDef`'s `name`, `scope_type` and `scoped_by`, copied
+    /// at dispatch: what `open` holds the glue's scope type to, and what its
+    /// refusal names.
+    job: &'static str,
+    scope_type: TypeId,
+    scope_name: Option<&'static str>,
 }
 
 impl JobScope<'_> {
     /// Opens the enqueuer's tenant id, as scope type `S`, on the job's
-    /// transaction, by the dispatcher's admission. No `authorize` runs: a job has no principal.
-    /// Its authority is its enqueuer's, who was either inside this tenant or
-    /// declared `cross_tenant` to name it.
+    /// transaction, by the dispatcher's admission. No `authorize` runs: a job
+    /// has no principal. Its authority is its enqueuer's, who was either
+    /// inside this tenant or declared `cross_tenant` to name it.
+    ///
+    /// # Panics
+    ///
+    /// When `S` is not the mounted `JobDef.scope_type`: a hand-built `JobDef`
+    /// whose glue opens another scope type than the one it declares. The
+    /// panic is inside the dispatcher's `catch_unwind`, so it is an attempt
+    /// (it retries, then dead-letters), and it comes before `admit_scope`, so
+    /// nothing runs in either tenant. A `JobDef` whose glue and `scope_type`
+    /// name the same other type passes, and cannot be told apart here; it
+    /// still runs in the tenant it was enqueued in, because `Group::stage`
+    /// held the enqueuer to that same type.
     pub fn open<'t, 'a, S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S> {
+        assert!(
+            TypeId::of::<S>() == self.scope_type,
+            "contract: the glue mounted for job \"{job}\" opened its tenant {id} as \
+             `{opened}`, but that `JobDef` declares `{declared}` with a `scope_type` that is \
+             not `{opened}` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees \
+             with its #[job] (a glue taken from another job, or another type's `TypeId`); \
+             this attempt wrote nothing, and every retry fails the same way — mount {job} \
+             through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)",
+            job = self.job,
+            id = self.id,
+            opened = <S as Tenant>::NAME,
+            declared = self.scope_name.map_or_else(
+                || "global".to_string(),
+                |name| format!("scoped_by = {name}")
+            ),
+        );
         tx.admit_scope(Id::from_raw(self.id), self.admission)
     }
 }
@@ -315,7 +349,10 @@ impl Dispatcher {
             // refusal (`Db::pending_job_shape_refusal`) names a Pending row
             // that disagrees before dispatch starts. The scope TYPE is not
             // checkable here, since the row records none: `Group::stage`
-            // refuses an enqueue under any type but `def.scope_type`.
+            // refuses an enqueue under any type but `def.scope_type`, and
+            // `JobScope::open` asserts the glue opens exactly that type —
+            // inside the `catch_unwind` below, so a hand-built `JobDef` whose
+            // glue disagrees is an attempt, not a kernel stop.
             assert_eq!(
                 row.scope.is_some(),
                 def.scoped_by.is_some(),
@@ -331,6 +368,9 @@ impl Dispatcher {
             let scope = row.scope.map(|id| JobScope {
                 id,
                 admission: &admission,
+                job: def.name,
+                scope_type: def.scope_type,
+                scope_name: def.scoped_by,
             });
             match catch_unwind(AssertUnwindSafe(|| {
                 (def.glue)(tx, &row.payload, def.cross_tenant.then_some(&cap), scope)

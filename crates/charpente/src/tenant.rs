@@ -38,7 +38,8 @@
 //! `Tx::put`/`Tx::delete` refuse it; the dispatcher settles one through
 //! `Tx::settle_job`), and `Group::stage` refuses an enqueue inside a tenant of
 //! another scope type than the job's mounted `#[job]` declares, since the row
-//! records the tenant's id and not its type. That check holds within one
+//! records the tenant's id and not its type. `JobScope::open` holds a mounted
+//! job's glue to that same type at dispatch. That check holds within one
 //! binary. Across binaries, a job's fingerprint carries its tenant type's
 //! `NAME`, so a Pending row enqueued under a tenant type of another `NAME` is
 //! refused at startup as a foreign shape. What still runs unchecked, in the type

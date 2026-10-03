@@ -1840,6 +1840,25 @@ the text says "with another scope type" and lists that cause:
 job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` with another scope type under the same shape (<shape>) — a job row records its tenant's id and not its type, so tenant <id> would be read as the mounted declaration's type, not the one it was enqueued in; either a type standing in for <job>'s #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose `scoped_by` names another tenant type with the same `NAME`), or a hand-written `JobDef` mounts <job> under a `scope_type` its #[job] does not declare; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
 ```
 
+One door is left inside a binary, and it is a hand-built `JobDef`. Its fields are public,
+so `JobDef { glue: <another job's glue>, ..<File as JobEntry>::def() }` mounts a glue that
+opens a different scope type than `scope_type` names, and so does a `JobDef` whose
+`scoped_by` and `scope_type` both name a type its glue does not open. `Group::stage` holds
+the enqueuer to `scope_type`, and a scoped job's glue opens its row's tenant through
+`JobScope::open`, which asserts that the type it opens is `scope_type`. The assert runs
+inside the attempt, so the job retries and then dead-letters, and nothing runs in either
+tenant. Its `last_error`, for `File`'s `JobDef` carrying a `Board` job's glue, is:
+
+<!-- pinned -->
+```text
+handler panicked: contract: the glue mounted for job "File" opened its tenant 31 as `Board`, but that `JobDef` declares `scoped_by = Desk` with a `scope_type` that is not `Board` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken from another job, or another type's `TypeId`); this attempt wrote nothing, and every retry fails the same way — mount File through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)
+```
+
+A `JobDef` whose glue and `scope_type` name the same other type passes the assert. Nothing
+can tell it apart, and it does not cross a tenant: `Group::stage` held the enqueuer to
+that same type, so the job runs in the tenant it was enqueued in, only with another job's
+code. `jobs![…]` builds every `JobDef` from its `#[job]`, and it is the way to mount one.
+
 This one has no startup twin, because a row carries no type to compare, only the `NAME`
 its fingerprint mixes. The check runs where both types are known, at the enqueue, in a
 binary that mounts the job. At startup the dispatching binary compares a Pending row's
@@ -6627,7 +6646,7 @@ the two types as `std::any::type_name` renders them, the one named first first:
 ```text
 two tenant types are named "<name>": <type> and <other type> — a tenant's NAME is its identity (it is inside every scoped job's and event's fingerprint), so give each type its own `const NAME` in its `impl Tenant`
 tenant type <type> has an empty NAME — give its `impl Tenant` a `const NAME` that names it
-two registrations of the tenant type <type> (NAME "<name>") are different types — a hand-built `JobDef` whose `scope_type` and `scope_type_name` name different types (build it from its `#[job]`'s `def()`, or set both fields from one type), or two versions of one crate in the build (unify them)
+two registrations of the tenant type <type> (NAME "<name>") are different types — a hand-built `JobDef` whose `scope_type` and `scope_type_name` name different types (build it from its `#[job]`'s `def()`, or set both fields from the type its `scoped_by` names), or two versions of one crate in the build (unify them)
 ```
 
 The usual cause is two types spelled alike in two modules, such as `billing::Org` and
