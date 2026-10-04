@@ -1982,6 +1982,33 @@ fn a_transactions_read_through_a_global_twin_is_refused_before_commit() {
     );
 }
 
+/// Amendment A18's refusal where `Debug` renders it (hard rule 5). An
+/// `io::Error`'s `Debug` is what `main`'s `Error: …`, an `.unwrap()`'s panic
+/// and GUIDE §8's sim check (`Err(e) => return Err(format!("{e:?}"))`) print,
+/// so a `TableReadRefusal` there must print exactly as an `io::Error`
+/// carrying its text alone does (`Refusal`'s `Debug`): the table, both types
+/// and the fix, never an empty `error: `.
+#[test]
+fn a_read_refusal_prints_its_text_under_debug() {
+    let sim = Sim::with_faults(0x5A17_0015, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let refused = db
+        .transact(|tx| tx.get::<global_note::Note>(Id::from_raw(1)).map(|_| ()))
+        .unwrap_err();
+    let TxError::App(e) = &refused else {
+        panic!("the read's own io::Error, returned through the closure: {refused:?}")
+    };
+    assert!(TableReadRefusal::of(e).is_some(), "a TableReadRefusal: {e}");
+    let text = note_read_refusal::<global_note::Note>("Tx::get");
+    let bare = TxError::<std::io::Error>::App(std::io::Error::other(text));
+    assert_eq!(format!("{refused:?}"), format!("{bare:?}"));
+}
+
 // ------------------------------------------ the statuspage regression (oracle 3)
 
 /// Job-tenancy spec §9 item 3. The statuspage experiment's tenant policy, in
