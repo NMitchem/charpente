@@ -1,6 +1,6 @@
 # Tenancy completion — design
 
-**Date:** 2026-09-30. **Status:** approved by Noah 2026-09-30; spec of record for the plan
+**Date:** 2026-09-30. **Status:** Implemented 2026-10-04 (commits `3dabf69`..`cb503cd`); plan
 `docs/superpowers/plans/2026-09-30-tenancy-completion.md`.
 **Predecessor:** the job-tenancy record (`docs/LEDGER.md` 2026-09-30, "Decisions for Noah" and
 "Unfinished work"). This spec is sub-project S1 of the pre-publish follow-ups
