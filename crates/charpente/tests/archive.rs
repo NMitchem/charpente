@@ -7783,7 +7783,7 @@ fn conv_frontier(m: &Manifest) -> u64 {
 /// RED. `kernel.rs`'s workload takes exactly this care with its
 /// `exactly_once_holds` call, and its comment records the bug that taught it
 /// to (seed 0x348270b38f166529, then 0xe653f43924f17fe8, then
-/// 0xe2d97275c15cc087, now 0x0f34c969dfd340b0).
+/// 0xe2d97275c15cc087, then 0x0f34c969dfd340b0, now 0x56731152a87514ae).
 enum ConvFail {
     /// Retryable: the matrix hit the checker. Recognized by
     /// `checks::is_fault_fallout`, never by this file's own substring list.
