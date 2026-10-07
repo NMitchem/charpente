@@ -92,14 +92,17 @@ compared when both exist.
   digest in the record. A real run after a toolchain release uses the newer stable and
   records it; the stranger's compiler is whatever a stranger would get.
 - **Container.** One per attempt, created fresh, no volumes and no bind mounts, no
-  credentials. It needs egress to the crates registry. The plan's preflight decides
-  between an egress allowlist, if it is cheap to build, and open egress with every fetch
-  checked in the log (below); the record says which.
+  credentials. The rehearsal's box has no network at all: its registry is a local
+  directory source (§5), proven by a prototype on 2026-10-06. The real run's box has the
+  default bridge network, because crates.io is the point; every fetch it makes is a
+  logged command, checked below.
 - **`./box`.** A script in the run directory, the agent's only route to the machine. It
   runs its argument in the container's shell, keeps the working directory between calls,
-  and appends one JSON line per call to the box log: sequence number, UTC start and end,
-  working directory, the command, exit code, stdout and stderr, each in full. Under §1.2
-  this log is the source of the verbatim page.
+  and appends two JSON lines per call to the box log: a start line when the call begins
+  (sequence number, UTC time, working directory, the command) and an end line when it
+  returns (sequence number, UTC time, exit code, stdout and stderr, each in full), so a
+  call killed mid-run is still on record. Under §1.2 this log is the source of the
+  verbatim page.
 - **Run directory.** A sibling of the charpente checkout, holding exactly `BRIEF.md`,
   `README.md` and `./box`. The agent works there.
 - **Sealing, checked after.** Box side: any command reading a charpente crate's sources
