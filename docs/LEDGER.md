@@ -7634,7 +7634,7 @@ gives the decision, then its cost if wrong ("not stated" where the ruling gave n
    "Deferred-item triage"): cosmetics and unwrapped lines, the unpinned borrowck claims, the test
    harness's n1–n4, and the follow-ups in 3–5 above.
 10. **CI on the merged tip:** red on `befcbde` (run 37559784616) from toolchain drift, not S1;
-    diagnosed and pinned in the 2026-10-06 entry below.
+    pinned in `11e550a`, green there (run 37561067446); the 2026-10-06 entry below.
 
 **Next.** The merge of `s1-tenancy` into `main` (`--no-ff`, ruling 1), then Noah's push and its CI
 run. The 0.1.0 publish is Noah's call.
@@ -7672,3 +7672,7 @@ oldest compiler that builds `charpente-core` rises from redb 4.3.0's 1.90 to som
 
 Gate under the pin, rustc 1.99.0: fmt 0, clippy 0, 86 of 86 `test result: ok`, 1,816 passed,
 FAILED 0, and the tested diff hashed the same before and after the run.
+
+**CI on `11e550a`: green** (run 37561067446), every step of both jobs, rustc 1.99.0 the only
+compiler in the log; the workspace step counts 86 of 86 `test result: ok` and 1,816 passed, the
+local gate's numbers exactly.
