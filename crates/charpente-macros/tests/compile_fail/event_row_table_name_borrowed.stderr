@@ -1,0 +1,145 @@
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::put::<Feed>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(1) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.events\", the platform's event log — event rows are \
+  | |              the platform's: only an emit writes one, because every subscription's feed is read \
+  | |              from them; give this table a name of its own, and publish an event by emitting it \
+  | |              (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::put::<Feed>`
+  --> tests/compile_fail/event_row_table_name_borrowed.rs:81:5
+   |
+81 | /     tx.put(&Feed {
+82 | |         id: event,
+83 | |         bytes: Vec::new(),
+84 | |     });
+   | |______^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::delete::<Feed>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(1) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.events\", the platform's event log — event rows are \
+  | |              the platform's: only an emit writes one, because every subscription's feed is read \
+  | |              from them; give this table a name of its own, and publish an event by emitting it \
+  | |              (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::delete::<Feed>`
+  --> tests/compile_fail/event_row_table_name_borrowed.rs:85:5
+   |
+85 |     tx.delete::<Feed>(Id::from_raw(event.raw() + 1));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::put::<OrgFeed>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(1) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.events\", the platform's event log — event rows are \
+  | |              the platform's: only an emit writes one, because every subscription's feed is read \
+  | |              from them; give this table a name of its own, and publish an event by emitting it \
+  | |              (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::put::<OrgFeed>`
+  --> tests/compile_fail/event_row_table_name_borrowed.rs:92:5
+   |
+92 | /     tx.put(&OrgFeed {
+93 | |         id: event,
+94 | |         bytes: Vec::new(),
+95 | |     });
+   | |______^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::delete::<OrgFeed>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(1) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.events\", the platform's event log — event rows are \
+  | |              the platform's: only an emit writes one, because every subscription's feed is read \
+  | |              from them; give this table a name of its own, and publish an event by emitting it \
+  | |              (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::delete::<OrgFeed>`
+  --> tests/compile_fail/event_row_table_name_borrowed.rs:96:5
+   |
+96 |     tx.delete::<OrgFeed>(Id::from_raw(event.raw() + 1));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

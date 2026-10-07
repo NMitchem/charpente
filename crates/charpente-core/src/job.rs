@@ -65,10 +65,11 @@ impl RetryPolicy {
 /// A job as the platform stores it. `key` is the job's stable identity to
 /// the world outside the log (spec: no platform semantics in v0).
 ///
-/// Every transaction can read one (`tx.get`, `tx.scan`), and none can write
-/// one: only the enqueue family creates a job row and only the dispatcher
-/// settles it (`Tx::settle_job`), because the dispatcher opens the tenant
-/// `scope` names without asking anyone.
+/// No app code reads or writes one (tenancy-completion spec §3). Only the
+/// enqueue family creates a job row, and only the dispatcher reads one inside
+/// a batch (`Tx::get_job`) and settles it (`Tx::settle_job`), because it
+/// opens the tenant `scope` names without asking anyone. Code that holds the
+/// `Db` reads the queue through a snapshot.
 pub struct JobRow {
     pub id: Id<JobRow>,
     pub name: String,
@@ -98,9 +99,11 @@ pub struct JobRow {
 }
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
-// `PlatformOwned`, not `Unscoped`: keyed and read as an unscoped table, but
-// no app code can write one — `Tx::put`/`Tx::delete` refuse it at compile
-// time, since the dispatcher trusts `scope` for the tenant a job runs in.
+// `PlatformOwned`, not `Unscoped`: keyed as an unscoped table, but no app
+// code reads or writes one — `View`'s reads on a `Tx` and `Tx::put`/
+// `Tx::delete` refuse it at compile time, since the queue holds every
+// tenant's payloads and the dispatcher trusts `scope` for the tenant a job
+// runs in.
 impl Row for JobRow {
     type Scope = crate::table::PlatformOwned;
     const TABLE: &'static str = "charpente.jobs";

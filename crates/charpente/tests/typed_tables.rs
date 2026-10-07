@@ -1181,6 +1181,7 @@ struct ScopedWidget {
 /// exercises the type-level wiring only; the refusing case lives in
 /// `charpente/tests/tenant.rs`.
 impl charpente::Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = charpente::auth::Principal;
     type Error = charpente::http::ApiError;
 
@@ -1207,6 +1208,44 @@ fn table_macro_emits_the_declared_scope_type() {
     scope_is::<Org, Unscoped>();
     scope_is::<Invoice, Unscoped>();
     scope_is::<ScopedWidget, Org>();
+}
+
+/// A tenant type whose `NAME` is not its identifier. A macro that emitted the
+/// path's last segment instead of the NAME would read `Org` below.
+mod renamed {
+    pub struct Org;
+
+    impl charpente::Tenant for Org {
+        const NAME: &'static str = "Workspace";
+        type Who = charpente::auth::Principal;
+        type Error = charpente::http::ApiError;
+
+        fn authorize(
+            _tx: &charpente::Tx,
+            _who: &charpente::auth::Principal,
+            _scope: charpente::core::table::Id<Org>,
+        ) -> Result<(), charpente::http::ApiError> {
+            Ok(())
+        }
+    }
+}
+
+#[charpente::table(scoped_by = renamed::Org)]
+struct RenamedWidget {
+    id: charpente::core::table::Id<RenamedWidget>,
+}
+
+/// Tenancy-completion spec §4, plan amendment A2: `#[table(scoped_by = S)]`
+/// carries `S`'s `Tenant::NAME` as `Row::SCOPE_NAME`. A table with no tenant
+/// carries the trait's default, `None`, and so do the platform's hand-written
+/// rows.
+#[test]
+fn table_macro_emits_its_tenants_name() {
+    use charpente::core::table::Row;
+    assert_eq!(<ScopedWidget as Row>::SCOPE_NAME, Some("Org"));
+    assert_eq!(<RenamedWidget as Row>::SCOPE_NAME, Some("Workspace"));
+    assert_eq!(<Invoice as Row>::SCOPE_NAME, None);
+    assert_eq!(<JobRow as Row>::SCOPE_NAME, None);
 }
 
 /// Task 4 (tenant scoping): the composite-key wiring through the REAL

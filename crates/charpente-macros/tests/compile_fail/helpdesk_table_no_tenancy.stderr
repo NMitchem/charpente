@@ -1,4 +1,4 @@
-error: `Ticket` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+error: `Ticket` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.
   --> tests/compile_fail/helpdesk_table_no_tenancy.rs:22:1
    |
 22 | #[table(version = 2)]

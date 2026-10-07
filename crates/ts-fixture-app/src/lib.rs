@@ -327,7 +327,7 @@ pub struct CostNode {
 
 // ------------------------------------------------------------------ events
 
-#[event]
+#[event(global)]
 pub struct InvoicePaid {
     pub invoice: Id<Invoice>,
     /// `WireU64`, not a bare `u64`: an event payload IS the JSON a
@@ -336,7 +336,7 @@ pub struct InvoicePaid {
     pub amount_cents: WireU64,
 }
 
-#[event]
+#[event(global)]
 pub struct InvoiceVoided {
     pub invoice: Id<Invoice>,
 }

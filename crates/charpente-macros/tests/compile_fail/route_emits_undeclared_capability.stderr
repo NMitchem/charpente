@@ -1,0 +1,5 @@
+error: `incidents` takes `cap: &CrossTenant`, but its `#[route(SSE "/incidents", …)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Add `cross_tenant` to that attribute's flags, keeping the others, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
+  --> tests/compile_fail/route_emits_undeclared_capability.rs:17:5
+   |
+17 |     cap: &charpente::CrossTenant,
+   |     ^^^

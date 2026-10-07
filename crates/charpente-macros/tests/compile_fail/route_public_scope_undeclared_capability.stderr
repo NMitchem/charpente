@@ -1,5 +1,5 @@
-error: `revenue` takes `cap: &CrossTenant`, but `#[route(GET "/orgs/:org/revenue", public(Org))]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/orgs/:org/revenue", public(Org), cross_tenant)]`, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
-  --> tests/compile_fail/route_public_scope_undeclared_capability.rs:27:5
+error: `revenue` takes `cap: &CrossTenant`, but its `#[route(GET "/orgs/:org/revenue", …)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Add `cross_tenant` to that attribute's flags, keeping the others, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
+  --> tests/compile_fail/route_public_scope_undeclared_capability.rs:28:5
    |
-27 |     cap: &charpente::CrossTenant,
+28 |     cap: &charpente::CrossTenant,
    |     ^^^

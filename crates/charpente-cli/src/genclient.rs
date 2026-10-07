@@ -310,7 +310,7 @@ mod contract {
     struct EventInfo {
         name: String,
         payload: String,
-        keyed: bool,
+        scoped_by: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -482,7 +482,7 @@ mod contract {
         real::EventInfo {
             name: leak(e.name),
             payload: leak(e.payload),
-            keyed: e.keyed,
+            scoped_by: e.scoped_by.map(leak),
         }
     }
 
@@ -621,7 +621,8 @@ mod tests {
           "error": "String",
           "emits": [{ "event": "widget_added", "payload": "WidgetAdded" }] }
       ],
-      "events": [{ "name": "widget_added", "payload": "WidgetAdded", "keyed": false }],
+      "events": [{ "name": "widget_added", "payload": "WidgetAdded", "scoped_by": "Org" },
+                 { "name": "widget_viewed", "payload": "WidgetView", "scoped_by": null }],
       "types": [
         { "name": "AdjacentEnum", "schema": { "Enum": { "Adjacent": {
             "tag": "t", "content": "c",

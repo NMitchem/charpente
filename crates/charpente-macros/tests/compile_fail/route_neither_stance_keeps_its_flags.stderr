@@ -1,0 +1,5 @@
+error: `incidents` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(SSE "/incidents", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
+  --> tests/compile_fail/route_neither_stance_keeps_its_flags.rs:14:13
+   |
+14 | #[route(SSE "/incidents", cross_tenant, emits(IncidentOpened))]
+   |             ^^^^^^^^^^^^

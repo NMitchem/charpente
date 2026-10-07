@@ -1,0 +1,59 @@
+error[E0277]: `SchemaVersion` rows are the platform's, and app code cannot write them
+  --> tests/compile_fail/schema_version_written_on_bare_tx.rs:12:12
+   |
+12 |     tx.put(row);
+   |        --- ^^^ `SchemaVersion` is written only by the platform
+   |        |
+   |        required by a bound introduced by this call
+   |
+   = help: the trait `AppWritable<SchemaVersion>` is not implemented for `charpente::charpente_core::table::PlatformOwned`
+   = note: job rows are the platform's: only the enqueue family writes one, so a job runs in the tenant its enqueuer opened or its fan-out named, and no app code cancels one — to run a job, enqueue it:
+               tx.enqueue(job);
+           for a `global` job; for a `scoped_by` job, inside the tenant it acts in:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.enqueue(job);
+           or from a `cross_tenant` route or job, naming the tenant:
+               tx.enqueue_in::<Org>(scope, job, cap);
+   = note: event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
+   = note: schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
+help: the trait `AppWritable<R>` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<R> AppWritable<R> for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `SchemaVersion` to implement `WritableRow`
+note: required by a bound in `Tx::<'a>::put`
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     pub fn put<R: WritableRow>(&mut self, row: &R) {
+   |                   ^^^^^^^^^^^ required by this bound in `Tx::<'a>::put`
+
+error[E0277]: `SchemaVersion` rows are the platform's, and app code cannot write them
+  --> tests/compile_fail/schema_version_written_on_bare_tx.rs:16:17
+   |
+16 |     tx.delete::<SchemaVersion>(id);
+   |        ------   ^^^^^^^^^^^^^ `SchemaVersion` is written only by the platform
+   |        |
+   |        required by a bound introduced by this call
+   |
+   = help: the trait `AppWritable<SchemaVersion>` is not implemented for `charpente::charpente_core::table::PlatformOwned`
+   = note: job rows are the platform's: only the enqueue family writes one, so a job runs in the tenant its enqueuer opened or its fan-out named, and no app code cancels one — to run a job, enqueue it:
+               tx.enqueue(job);
+           for a `global` job; for a `scoped_by` job, inside the tenant it acts in:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.enqueue(job);
+           or from a `cross_tenant` route or job, naming the tenant:
+               tx.enqueue_in::<Org>(scope, job, cap);
+   = note: event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
+   = note: schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
+help: the trait `AppWritable<R>` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<R> AppWritable<R> for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `SchemaVersion` to implement `WritableRow`
+note: required by a bound in `Tx::<'a>::delete`
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     pub fn delete<R: WritableRow>(&mut self, id: Id<R>) {
+   |                      ^^^^^^^^^^^ required by this bound in `Tx::<'a>::delete`

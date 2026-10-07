@@ -6969,3 +6969,671 @@ workspace suite and edge-harness `tenant_wire`: 10 refusals, all from the plan's
 legitimate read is refused. Every scripted edit (39) was chain-dry-run in task order on a copy of
 dec346b, by the amending agent and independently in part by the reviewer: 0 anchor misses. The
 first dry-run had used base files only, which is how one anchor that Task 2 rewrites slipped through.
+
+## 2026-10-04 — tenancy completion: a tenant type's NAME is its identity, an event declares its tenant, the platform's tables are sealed, and the capability tokens cannot outlive their Group
+
+**Why.** The job-tenancy entry above (2026-09-30) left eight items that change public API, the
+log record or the replication protocol, so each would be a breaking release after 0.1.0: item 2
+(`Tx`-side reads of the platform's tables, and app writes of `EventRow`), 3 (a scoped job's tenant
+*type* was its `scoped_by` path as spelled, so P2 and P3), 4 (a hand-built `JobDef` could misroute
+or invert the scope-type check, P4 and P5), 5 (`Principal: Clone`, and `TenantAdmission: Clone +
+'static`), 6 (scope types rendered by last path segment, FR-NB1), 7 (DECISIONS §12's remedy left
+out the fan-out), 11 (`charpente.schema_versions` app-writable) and 12 (the 401's fix dropped the
+route's other flags). The spec's Context names the four doors they left open: events were tenancy
+by convention (a feed with no `.key(…)` received every tenant's events, and `.key(…)` took any
+string), the platform's own tables were readable from every transaction and `EventRow` and
+`SchemaVersion` writable, a tenant type had no identity of its own, and the operator's standing
+(`CrossTenant`, `TenantAdmission`) could be cloned into a `static`. Spec
+`docs/superpowers/specs/2026-09-30-tenancy-completion-design.md` (e749823, approved by Noah
+2026-09-30; amendments A1–A19), plan `docs/superpowers/plans/2026-09-30-tenancy-completion.md`
+(f54bd4a, amended at 34c3f8b, approved 2026-10-03), fourteen tasks, executed in the order 1, 2, 4,
+3, 5–14 (A6). Branch `s1-tenancy` in the worktree `../charpente-s1` (ruling 1, below). Workspace
+`.superpowers/sdd/2026-09-30-tenancy-completion/` (gitignored); every report and log named below
+is there, and `progress.md` is the controller's ledger.
+
+**Shipped.** Twenty-one commits, `1fe461d..cb503cd`. Every task passed its own review, Task 11
+after one fix round and Task 13 after two. The controller's counted workspace gate was 86 of 86
+`test result: ok` at the base, after each of Tasks 1–13 and each fix round, and after the final
+fix wave (`gate-base.done`, `gate-task*.done`, `gate-finalfix.done`), and again at `cb503cd`
+(below); Task 14a's docs commit ran the guide gates, 8 of 8. Passed tests rose from 1,741 at
+`1fe461d` to 1,816; no test file was added, so the count of 86 holds.
+- **T1** `3dabf69`: `#[event(global)]` is accepted and swept onto every event (39 sites in 20
+  files); the global events' fingerprints are pinned; the 11 coverage baselines are recorded.
+- **T2** `65dd39f`: `Tenant::NAME` is a tenant type's identity (64 impls swept); `Row::SCOPE_NAME`;
+  every scope rendering (the stage refusal, the 401, the one-scope assert, `PublicScope`,
+  `JobDef`, `describe`) says the `NAME`; FR-NB1 a/b/c pinned red first; 26 `.stderr` re-pinned.
+- **T4** `a73625b`: a scoped job's fingerprint continues its field fold over its tenant type's
+  `NAME` (`scoped_fingerprint`), byte-identical wherever the `NAME` is the path's identifier (A4);
+  P2's `#[job]` half and P3 are refused at startup as a foreign shape.
+- **T3** `7fccbcd`: an app refuses two tenant types under one `NAME`, or an empty `NAME`, through
+  one `note_tenant` fed by `App::open`'s scoped tables, `mount`'s `public(S)` routes and
+  `mount_jobs`' scoped jobs.
+- **T5** `5761aee`: `JobScope::open` asserts the scope type it opens, so a hand-built `JobDef`
+  whose glue or `scope_type` disagrees dead-letters by name before any write (P4, P5).
+- **T6** `6d187bb`: a refusal's fix names the words to add or change and keeps the rest (item 12
+  and its class, A11); the class sweep went from 12 restated attributes to 0.
+- **T7** `20da4b2`: `CrossTenant<'g>` and `TenantAdmission<'g>` borrow what their `Group` borrows
+  and are not `Clone`; `Ctx<'g>`; handler source unchanged.
+- **T8** `abc1272`: `EventRow` and `SchemaVersion` are the platform's (`PlatformOwned`, in
+  `PLATFORM_TABLES`); `migrate_table` writes through `Tx::put_schema_version`, its record
+  byte-identical (pinned); `Group::stage` asserts every unrecorded overlay write is
+  `settle_job`'s (S2's N1).
+- **T9** `7a5b928`: a transaction does not read the platform's tables (`View`'s reads bound
+  `R: ReadableBy<Self>`, which the three platform rows meet for `Snapshot` alone); a borrowed
+  `TABLE` name is refused per read (A13); the dispatcher reads its batch's job rows through the
+  admission-gated `Tx::get_job` (A12); a read through another Rust type of a registered table is
+  refused as `TableReadRefusal` (A18).
+- **T10** `691d445`: an event records its tenant apart from its key (record tag `0x0b`,
+  `EventRow.scope`, `PROTO_VERSION` 5); the tenant feed (`Subscribe`, `TenantFeed`) and one
+  delivery predicate, `Subscription::admits`; a cursor from another tenancy is refused by name
+  (A16); a tenant feed widened after `.into()` panics by name (A3).
+- **T11** `d1ed99f`: an event declares its tenancy, `#[event(global | scoped_by = Org)]`, and a bare
+  `#[event]` is refused naming both; the sealed `NoEventTenant`/`UnscopedEvent` pair bounds the
+  bare-`Tx` emits and global subscriptions; a scoped event's fingerprint mixes
+  `tenant_name::<S>()`; `mount_events` joins the tenant census; `Subscription.entries` and
+  `SubEntry` are crate-private (A17).
+- **T11 fix round 1** `bbe45b2`: `Event::PAYLOAD_FINGERPRINT` (defaulting to `FINGERPRINT`) and a
+  `const` check at all eight typed emit and subscribe sites, so a hand-written `impl Event`
+  cannot carry another tenant type's shape (review I2); `note_tenant`'s refusal names `EventDef`
+  (I1); `mount_events` asserts `scoped_by` agrees with `scope_type` (M2).
+- **T12** `920421c`: `describe` names each event's tenant (`EventInfo.scoped_by`, replacing
+  `keyed`, which was always false).
+- **T13** `8a37222`: `tenancy_feeds`, realtime tenancy under the fault matrix (Seeds and
+  universes, below).
+- **T13 fix round 1** `06a2d5d`: clause 2's liveness half is asked after every `kernel.run` that
+  returns `Ok`, while it can fail (review I1).
+- **T13 fix round 2** `b21e576`: a tail the node drops silently fails by name; `absorb` no longer
+  books every closed tail as a stall (re-review R1).
+- **T14a** `747680f`: DECISIONS §12 corrected (below); README's four Task 11 passages verified
+  present; the stale-phrase sweep reads zero; GUIDE §8's ceiling count nineteen → twenty.
+- **Final-review fix wave** `22ed885`: C1 (`Principal` is not `Clone`, spec A19), M1–M8, M10, and
+  the triage's T3 and T9 (below).
+- **Final re-review fixes** `4c58e2d`: N1 (the 401 names the tenant type without telling the
+  author to paste a `type_name` path), N2 (the census sentence states `SCOPE_NAME`'s exception),
+  and DESIGN §3's "it is not `Clone`".
+- **T14 re-pin** `c3d600f`: ci.yml's `is_fault_fallout` RED-first replay moves to
+  `0x56731152a87514ae` (below).
+- **T14 killer test** `cb503cd`: `a_read_refusal_prints_its_text_under_debug` kills
+  `db.rs:393:9` (Mutants, below).
+
+**Noah, read this.**
+- **DECISIONS.md §12 was edited, wording only; the decision is unchanged** (`747680f`). The
+  remedy sentence at DECISIONS.md:350 now reads: "A job declares `#[job(scoped_by = Org)]` and
+  runs in the tenant its enqueuer opened, or that its fan-out named. Which tenant *type* that is
+  travels inside the job's fingerprint as the type's declared `Tenant::NAME`: a binary that mounts
+  the job under a tenant type of another `NAME` meets the foreign-shape refusal at startup, by
+  name, and two binaries whose tenant types share a `NAME` share a tenant by declaration, as two
+  structs sharing a `TABLE` share a table (tenancy-completion spec §2 ruling 2, §4)." Its
+  correction note (DECISIONS.md:359): "*(Corrected 2026-10-03, tenancy-completion spec §7 item 7:
+  the remedy named only the tenant the enqueuer opened, leaving out a declared fan-out's
+  `Tx::enqueue_in`, and did not say how a job's tenant type is identified across two binaries.
+  The decision is unchanged.)*"
+- **Changed after the final review: `Principal` is no longer `Clone`. This overrides a refusal in
+  the spec you approved.** Spec §2 ruling 5 kept `Principal: Clone`, on the premise that nothing
+  accepts a caller-supplied `Principal`, and §12 listed "Removing `Principal: Clone` (§2.5)" as
+  refused. The final review's C1 falsified the premise by probe (`final-review.md`): on a
+  `git archive 747680f` copy, an `auth` route parked `ctx.principal().cloned()` in a
+  `static Mutex<Option<Principal>>`, and a plain `public` route then ran
+  `tx.open_scope::<Org>(org, &parked)?` and scanned a scoped table. Bob, not a member of org 7
+  (`tx.scope` refused him the same read: `400 {"error":"org:8 is not a member of org 7"}`), got
+  `200 "org 7's secret"`, and so did an anonymous caller, while `describe` listed the route as
+  `public_scope=none cross_tenant=false`. `Tx::open_scope` is `pub` and takes `who: &S::Who`, so
+  a parked clone opened every tenant its subject belongs to. The fix wave (`22ed885`) made
+  `Principal` derive `Debug` only and pinned both ways to park one in
+  `compile_fail/principal_cannot_be_parked.rs` (red first: at `747680f` it compiled). Spec
+  amendment A19 records the premise, the probe, the fix and the cost; ruling 5 and §12 are
+  amended to match. Measured cost: `cargo check --workspace --all-targets` clean with no call
+  site changed; trybuild unchanged apart from the new `principal_cannot_be_parked` fixture
+  (`principal_is_read_only_to_an_app.rs` keeps its `.stderr` byte for byte). The re-review
+  (`final-rereview.md`) ran seven scratch compile-fail probes for a parked or forged principal and
+  read the remaining avenues; every one was refused, and it calls the door closed at the type
+  level. The controller ruled it (progress.md; ruling 33 below) rather than asking, because
+  DECISIONS §12's own claim is what it makes true, so it needs no DECISIONS sign-off; but it
+  reverses an explicit refusal in a spec you approved, so it is yours to re-open. Re-adding the
+  derive is additive.
+
+**The resume refusal (A16).** A cursor on a row of another tenancy — another tenant's event on a
+tenant feed, a global event on a tenant feed, or a tenant's event on a global subscription — now
+gets a 409, checked after the seq 409 and before the reshape 409: "cursor <id>.<seq> sits on an
+event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this
+feed never delivers that event; reconnect without a cursor, …", followed by D4's re-sync order
+verbatim. It names no tenant and no event. Since M4 the tenancy test is one function,
+`Subscription::holds_tenancy`, which `admits` also calls. With the check deleted (Task 13's M3)
+such a resume is accepted; it is pinned in `a_cursor_from_another_tenancy_is_refused_not_resumed`
+and `tenancy_feeds::a_resume_from_a_row_outside_the_feeds_tenancy_is_refused_by_name`, and floored
+in the swarm (93 same-kind and 101 other-kind refusals at the pinned base).
+
+**Stated, not changed (spec §2 ruling 6).** `Session` (`http/app.rs:65`), `ApiKey`
+(`auth/api_key.rs:9`) and the kernel's `CronRow` (`kernel/cron.rs:12`: schedule name, interval and
+next due) stay app-owned `#[table(global)]` tables. None holds tenant data, and revoking a key is
+`tx.delete::<ApiKey>(id)` by design (DESIGN §8). Ruling 5 is not in this list any more; see
+above.
+
+**What the final whole-branch review found.** `final-review.md` (opus, over `1fe461d..747680f`,
+17 commits): 1 Critical, 1 Important, 10 Minor. Exit criterion 1 NOT MET because of C1; the door
+census found every other door closed and pinned.
+- **C1 (Critical):** the parked `Principal`, above. Fixed in `22ed885` (A19).
+- **I1 (Important):** Task 14 as written never re-ran the `#[ignore]`d edge-harness wire oracles
+  on the final tree, and Task 10's ⚠️ (the release `tenant_node` rebuild) had been deferred to
+  that run. Now run: `cargo test -p edge-harness --test <t> -- --ignored`, 7 of 7 files ok
+  (Gate, below).
+- **M1:** the computed-collision residual (a `PAYLOAD_FINGERPRINT` chosen so its mix collides) was
+  called "the operator's standing"; it needs no `Db`. Relabelled "a bypass built on purpose in
+  app code, which no type check refuses" at GUIDE §11, §16 and DESIGN §8, and "except by that
+  computed collision" added to the two absolute sentences (GUIDE §16, db.rs).
+- **M2:** `tx.across_tenants::<PlatformOwned>(cap).scan::<JobRow>()` compiled and panicked with a
+  stale text. `across_tenants<S: Tenant>` makes it E0277 (new fixture
+  `across_tenants_of_a_scope_that_is_not_a_tenant`); the same stale "(Row::Scope = Unscoped)"
+  class was swept (`put_in`/`delete_in` share `assert_scoped`, `Writer::put`/`delete` and
+  `Snapshot::*_scoped` print the real scope; six engine.rs pins re-pinned).
+- **M3:** A13 covered `Tx`'s reads only. `ScopedTx::{get,scan,scan_by,scan_from}` and
+  `AllTenants::scan` now evaluate `refuse_platform_read` in `const` (new fixture
+  `platform_table_names_borrowed_for_scoped_reads`, five E0080).
+- **M4:** the tenancy rule was written twice. `Subscription::holds_tenancy` is now the one
+  comparison, called by `admits` and by A16.
+- **M5:** the N1 assert excused `JobRow::TABLE` unconditionally; it now also requires `JobRow` to
+  be registered (hard rule 4).
+- **M6:** the scoped event-shape refusal omitted its honest trigger (a hand impl stating
+  `FINGERPRINT` without `PAYLOAD_FINGERPRINT`); it now names it first. Two `.stderr` re-pinned,
+  not the three the ruling said: the third carries the unchanged global text.
+- **M7:** the 401 named the stance by `NAME` only; it now prints each `NAME`'s `type_name`
+  beside it. Eight tenant.rs pins and kernel.rs's `peek_refused()` re-pinned.
+- **M8:** `JobScope::open`'s text contradicted itself when two types share a `NAME`; it now prints
+  `type_name::<S>()` beside the `NAME`.
+- **M9:** cargo-mutants places no mutants inside `assert!`, so A3's assert needed a hand
+  inversion: Step 4's row 52, red.
+- **M10:** GUIDE §16's census sentence now says `#[table(scoped_by = …)]` tables.
+- **Triage fix-cheaply-now items:** T3, `Schema::table` refuses a `SCOPE_NAME` on a row with no
+  tenant type (red first: "did not panic"; one mutation per operand red); T9, the route-side 500
+  carrying `TableReadRefusal`'s text is pinned (`a_route_returning_a_read_refusal_answers_a_500_with_its_text`).
+- **The scoped re-review** (`final-rereview.md`): Approved, 0 C / 0 I; all twelve items closed and
+  pinned, full trybuild re-run in build mode 147 of 147. Its residuals N1 (M7's "write its path"
+  over-promised: a `type_name` path leads with the crate's own name, E0433 inside that crate) and
+  N2 (M10's parenthetical held only at the default) were fixed in `4c58e2d`, with the optional
+  DESIGN §3 line; N3 is the record correction below.
+
+**CI (exit criterion 4).** CI runs on the merged tip only after Noah pushes, so that run is
+pending on the push. Its result gets a one-line follow-up here when it lands.
+
+**Seeds and universes.**
+- **Task 13's property,** `tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix`
+  (`crates/charpente/tests/realtime.rs`): base `0x5C0B_0001`, N = 128. N was set by timing one
+  batch in CPU time with `/usr/bin/time -p`: user+sys 0.95 s, against 0.82 s for the flagship at
+  128 universes from `0x2EB2_0001` (1.16×, under 2×; `t13-swarm-128.log`,
+  `t13-flagship-timing.log`). Verdict line: 109 of 128 reached a verdict, 19 gave up. Floors,
+  measured twice and identical (`t13-floors-1.log`, `-2.log`): `tenancy:every-shop-delivered` 69,
+  `tenancy:global-delivered` 91, `tenancy:global-passed-a-scoped-row` 93,
+  `tenancy:shop-passed-another-shops-row` 93, `tenancy:shop-passed-a-global-row` 94,
+  `tenancy:resume-refused-on-another-shops-row` 93, `tenancy:resume-refused-on-the-other-kinds-row`
+  101, `realtime:resume-backlog` 988; give-up cap 19. Each gate was shown live: a floor of 70 and a
+  cap of 18 each failed the batch by name.
+- **The give-up rate, accepted past the brief's line.** 19 of 128 is 14.8%, and the brief said to
+  stop above one in ten. The controller accepted it (ruling 28): the line is a proxy for its own
+  rationale ("a property that mostly gives up adjudicates little"), and this one adjudicates
+  85.2%, with every floor at 69 or more. Its give-ups are GUIDE §8's two legitimate reasons, 5
+  durable refusals and 14 universes that adjudicated nothing under `write_error` saturation
+  (`t13-giveup-reasons-tenancy.log`). The flagship it is modelled on gives up 18.9% over the same
+  ten bases (242 of 1,280) against 13.5% here, and no calibrated countdown cleared 10% (best
+  12.7%). The budget lever was answered by Noah on 2026-09-07 ("raise nothing, the give-ups are
+  the fault rate").
+- **The crash countdown (Step 4b),** five candidates over the ten fresh bases
+  `0x5C0B_CA01`…`CA0A` plus the flagship, 60 batches, all passing (`t13-cal-choice.log`):
+
+  | Countdown | `fault:crash` / universe | `realtime:resume-backlog` / universe | every-shop / universe | global-delivered / universe | gave up / universe |
+  |---|---|---|---|---|---|
+  | 25 + rand % 200 | 3.484 (sd 0.140) | 7.106 (0.665) | 0.521 | 0.686 | 0.152 |
+  | 38 + rand % 299 | 2.542 (0.143) | 7.461 (0.624) | 0.540 | 0.687 | 0.148 |
+  | **50 + rand % 399** | 1.794 (0.115) | 7.718 (0.770) | 0.548 | 0.692 | 0.135 |
+  | 75 + rand % 599 | 1.049 (0.102) | 7.806 (0.574) | 0.562 | 0.704 | 0.129 |
+  | 100 + rand % 798 | 0.655 (0.069) | 7.905 (0.595) | 0.571 | 0.702 | 0.127 |
+  | flagship | 1.704 (0.146) | — | — | — | — |
+
+  Admissible: the last four. Chosen: `50 + rand % 399`, the flagship's own range, whose backlog
+  is within one Welch SE of the best candidate's. No `FINDING` line. The range did not change,
+  so Step 4's timings stand.
+- **The cut re-sync pins (Step 4c):** seed `0xbecbcb035dec0074`, base `0x5C0B_0001` universe 116,
+  where `misdirected_write` cut. `a_cut_durable_corruption_explains_is_resynced_and_every_feed_keeps_its_verdict`
+  passes with a verdict; `a_cut_nothing_explains_fails_the_tenancy_universe_by_name` fails by
+  name under `|_| false`. With the give-up stand-in applied, the universe fails at the workload's
+  `.expect` (ruling C-M9; `t13-4c-red.log`). Both pins and the stand-in's red were re-run after
+  each fix round.
+- **Task 13's fresh bases:** `0x5C0B_A001`, `B002`, `C003`, 384 universes, 351 verdicts and 33
+  give-ups, no failure; plus the 1,280 calibration universes at the chosen range. **The fix
+  rounds' sweeps:** round 1, the implementer's 14 batches (1,792 universes) and the re-review's
+  7,936 on the committed bytes; round 2, the implementer's 62 batches (7,936) and the re-review's
+  126 batches (16,128). No false failure in any of them. The fail-closed `admits` (M9) fails 77,
+  77 and 85 of 128 universes at `0x5C0B_0001`, `A001` and `B002` (0 before round 1), and the
+  silent tail drop (M10) fails 98, 96 and 102 (0 before round 2).
+- **Step 5, fresh seeds over every property S1 touches,** at `4c58e2d` (`fresh-summary.txt`; the
+  later commits change ci.yml's pin, comments and one tenant.rs test only).
+  `CHARPENTE_BASE_SEED` skips `require:`, `floor:` and `ceiling:`, so these are evidence about
+  failures only. Bases `0x5100_F001`, `F002`, `F003` for every row:
+
+  | Commit | Property | Universes | Verdicts | Gave up (F001 / F002 / F003) |
+  |---|---|---|---|---|
+  | `4c58e2d` | realtime, `tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix` | 384 | 343 | 15 / 14 / 12 |
+  | `4c58e2d` | realtime, `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing` | 384 | 327 | 17 / 18 / 22 |
+  | `4c58e2d` | realtime, `reconnecting_client_misses_nothing_under_the_fault_matrix` | 384 | 311 | 24 / 25 / 24 |
+  | `4c58e2d` | realtime, `a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix` | 540 | 505 | 15 / 10 / 10 |
+  | `4c58e2d` | realtime, `follower_tails_and_the_failover_resume_divergence_property` | 384 | 311 | 18 / 24 / 31 |
+  | `4c58e2d` | tenant, `every_scoped_read_returns_only_its_own_tenants_rows` | 768 | 743 | 11 / 7 / 7 |
+  | `4c58e2d` | kernel, `job_tenancy::every_job_runs_in_the_tenant_it_was_enqueued_from` | 768 | 700 | 16 / 35 / 17 |
+  | `4c58e2d` | kernel, `kernel_jobs_are_exactly_once_under_the_fault_matrix` | 768 | 703 | 18 / 25 / 22 |
+  | `4c58e2d` | kernel, `a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix` | 768 | 752 | 5 / 6 / 5 |
+  | `4c58e2d` | replication, `follower_converges_to_the_primary_fingerprint` | 768 | 768 | 0 / 0 / 0 |
+  | `4c58e2d` | archive, `archive_converges_with_a_scoped_table` | 768 | 729 | 19 / 10 / 10 |
+  | `4c58e2d` | migrations, `migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin` | 384 | 359 | 9 / 9 / 7 |
+  | `4c58e2d` | migrations, `…_for_a_scoped_table_and_equals_the_uninterrupted_twin` | 384 | 358 | 10 / 9 / 7 |
+
+  39 batches, every one `test result: ok. 1 passed`: 7,452 universes, 6,909 verdicts, 543 gave
+  up, 0 failures.
+- **The RED-first pins,** re-verified at `4c58e2d` in an isolated worktree
+  (`task-14-ci-report.md`). `0xf4e437494b4b8551` holds: with `drain_enqueued` deleted it is RED
+  ("dispatcher invariant: job 0 in the heap is not Pending", dispatch.rs:316), and GREEN restored.
+  `0x0f34c969dfd340b0` was **defanged**: with the classification deleted it replayed GREEN, and a
+  probe in that arm printed nothing, because S1 moved the kernel workload's bytes. It was re-found
+  by the ci.yml comment's procedure (`task-14-repin-report.md`): 10,413 universes scanned as one
+  splitmix64 stream from `0x10030000` with the classification deleted gave 5 hits, every one a
+  fault inside the checker's own reads and no other failure; the hit rate rose from 1 in 10,240
+  to 5 in 10,413. The new pin is `0x56731152a87514ae` (base `0xf162b85556dc0f8d`, universe 159),
+  committed in `c3d600f` with the ci.yml, kernel.rs and archive.rs seed-history comments. The
+  controller re-verified it on the committed tree: RED with only the pinned classification site
+  deleted ("table store (redb): I/O error: simulated crash: the disk is gone until
+  Sim::restart()"), GREEN restored. CI's four replay pins passed at `4c58e2d`
+  (`0x8bee1752811ae873` 4 tests, `0xff159ed76d2806e4` 1, `0xf4e437494b4b8551` 1, the old
+  `0x0f34c969dfd340b0` 1).
+- **Coverage baselines.** Task 1 recorded 11 at `1fe461d` (`baselines.sh`): tenant 22 lines,
+  kernel 26, job-tenancy 24, realtime-flagship 26, realtime-shapes 19, realtime-follower 27,
+  realtime-tenant 25, archive-scoped 35, migrations 17, migrations-scoped 16, invoicing 1. The
+  kernel base drops the swarm's `re-basing` header, whose first number is a random default base
+  (ruling 13). Ten reproduced byte for byte at every task, fix round and the final fix wave.
+  `realtime-tenant` moved in Task 10, by design: fault-axis counts only (`boot:retried`
+  1293 → 1289, `fault:crash` 208 → 209, and seven more), every floored key and the cap unchanged,
+  re-recorded twice identically, and over 12 fresh bases every key's mean within 0.24 Welch SE of
+  Task 9's (`task10-welch.txt`). It reproduced its new base at every later task.
+- **Seeds pinned in this work.** `0x5C0B_0001`, the tenancy property's base. `0x5C0B_5EED` and
+  `0x0BAD_5C0B_0BAD_5C0B`, its replay-identity check. `0xbecbcb035dec0074`, the two cut re-sync
+  pins (a cut durable corruption explains is re-synced and judged, not excused). `0x56731152a87514ae`,
+  ci.yml's `is_fault_fallout` RED-first pin (above). Task 10 kept S3b's `0x083bd434c717d60c`
+  (id 3 still re-minted for tenant B) and `0xb1c207a8e3ca62dd` (still the base's first owed-nothing
+  give-up, 23 of 23 give-ups for that reason), each checked by reason with a scripted probe. Every
+  other seed literal the work added is a fixed seed for a fault-free test
+  (`Sim::with_faults(seed, FaultConfig::none())`, directly or through `memo_app`, `desk_app`,
+  `two_tenant_db`, `fresh_db` or `attempt_alias_write`), which draws no fault and names no
+  universe: among them Task 9's `0x7C00_0901`/`0902` and `0x5A17_0011`–`0013` (A14, A18), the
+  final fix wave's `0x5A17_0014` (T9) and `cb503cd`'s `0x5A17_0015`.
+
+**Mutants.** `scripts/mutants.sh` (the `charpente test --mutants` verb) at `4c58e2d`,
+`--timeout 1300 --jobs 2` (ruling 38), 17 targets run smallest first by `mutants-run.zsh`
+(`mutants-summary.txt`, 2026-10-03 18:16 to 2026-10-04 03:13; a smoke run of `tenant` first took
+112 s). Every `--re` alternative was validated against `cargo mutants --list` first.
+
+| Run | File, `--re` | Commit | `--test-package` | Total | Caught | Missed | Unviable | Timeout |
+|---|---|---|---|---|---|---|---|---|
+| tenant | `tenant.rs`, whole file | `4c58e2d` | charpente | 6 | 0 | 0 | 6 | 0 |
+| event | core `event.rs`, whole file | `4c58e2d` | charpente-core, charpente | 6 | 1 | 0 | 5 | 0 |
+| dispatch | `kernel/dispatch.rs`, `JobScope\|run_due_into` | `4c58e2d` | charpente | 10 | 5 | 0 | 5 | 0 |
+| tail | `kernel/tail.rs`, `deliver_unit` | `4c58e2d` | charpente | 13 | 13 | 0 | 0 | 0 |
+| resume | `kernel/mod.rs`, `validate_subscribe\|refuse_foreign_pending_jobs` | `4c58e2d` | charpente | 18 | 15 | 1 | 2 | 0 |
+| macros-lib (added) | macros `lib.rs`, whole file | `4c58e2d` | charpente-macros, charpente | 19 | 0 | 2 | 17 | 0 |
+| db-platform (widened) | `db.rs`, `is_platform_table\|refuse_platform_table\|refuse_platform_read\|\bplatform_table\b\|refuse_(scoped\|global)_event_shape` | `4c58e2d` | charpente-core, charpente-macros | 23 | 15 | 0 | 7 | 1 |
+| migration | core `migration.rs`, whole file | `4c58e2d` | charpente-core, charpente | 24 | 15 | 0 | 9 | 0 |
+| describe | `describe.rs`, whole file | `4c58e2d` | charpente, charpente-cli | 28 | 21 | 0 | 7 | 0 |
+| macros-event | macros `event.rs` and `fingerprint.rs`, whole files | `4c58e2d` | charpente-macros, charpente | 31 | 24 | 0 | 7 | 0 |
+| subscription (widened) | `http/mod.rs`, `Subscription\|TenantFeed\|Subscribe\|admits\|sub_entry\|push_entry` | `4c58e2d` | charpente | 33 | 11 | 0 | 22 | 0 |
+| genclient | cli `genclient.rs`, whole file | `4c58e2d` | charpente-cli, charpente-tsgen | 36 | 22 | 0 | 14 | 0 |
+| app | `http/app.rs`, whole file | `4c58e2d` | charpente | 98 | 56 | 3 | 38 | 1 |
+| macros-rest | macros `job.rs`, `route.rs` and `table.rs`, whole files | `4c58e2d` | charpente-macros, charpente | 112 | 10 | 9 | 93 | 0 |
+| tsgen | `charpente-tsgen/src/*.rs`, whole files | `4c58e2d` | charpente-tsgen, ts-fixture-app | 122 | 105 | 14 | 3 | 0 |
+| db (widened) | `db.rs`, the brief's 19 alternatives plus 20 (`task-14b1-report.md`) | `4c58e2d` | charpente-core, charpente | 164 | 101 | 6 | 55 | 2 |
+| table | core `table.rs`, whole file | `4c58e2d` | charpente-core, charpente, charpente-macros | 225 | 169 | 7 | 49 | 0 |
+| **total** | | | | **968** | **583** | **42** | **339** | **4** |
+| rerun platform-table | `db.rs`, `1078:19: replace \+= with \*= in platform_table$` | `c3d600f` | charpente-macros | 1 | 1 | 0 | 0 | 0 |
+| rerun cron | `http/app.rs`, `711:9: replace App::take_cron_entries -> Vec<CronEntry> with vec!\[\]$` | `c3d600f` | invoicing | 1 | 1 | 0 | 0 | 0 |
+| rerun debug | `db.rs`, `393:9: replace <impl fmt::Debug for TableReadRefusal>::fmt …$` | `cb503cd` | charpente | 1 | 1 | 0 | 0 | 0 |
+
+- **Completeness:** `cargo mutants --list --in-diff` over S1's source diff gives 220 mutants
+  (`s1-in-diff.txt`). The brief's lists left 59 uncovered, and its `is_platform_table`
+  alternative matched nothing after Task 8's rename. Widened as the table marks
+  (`task-14b1-report.md`), the run covers in-diff 220, covered 220, uncovered 0, with no mutant in
+  two targets.
+- **In-diff MISSED: 2, both resolved.** `db.rs:393:9` (`TableReadRefusal`'s `Debug` → empty)
+  printed `App(Custom { kind: Other, error:  })` in place of the refusal; `cb503cd` pins that a
+  `TableReadRefusal` prints under `Debug` exactly as an `io::Error` carrying its text does (RED
+  under the mutant, GREEN clean, and the instrument's rerun catches it). `db.rs:1897:5`
+  (`assert_scoped` → `()`) is argued equivalent (ruling 42): all seven callers take their `S`
+  from `enter_scope<S: Tenant>` or `across_tenants<S: Tenant>`, and no crate but charpente-core
+  can implement `Tenant` for the scope markers (scratch probes: E0117 on the impl, E0277 on
+  `admit_scope`, `open_scope` and `across_tenants` with a marker). The assert stays as hard rule
+  4's negative space.
+- **TIMEOUT: 4, each shown caught.** `db.rs:1416:9` (`push_enqueue` → `()`, in-diff): caught by
+  log, six charpente lib tests FAILED before a deadline-less test hung, reproduced by hand against
+  a 204 of 204 control. `db.rs:1274:9` (`put_schema_version` → `()`, in-diff): caught by a
+  hand-built run, `migration_workload_replays_identically` fails "128 rounds without a successful
+  open+migrate"; the migration loop never ends without its watermark row, so the instrument can
+  only say TIMEOUT at any timeout (T9-R7's method). `db.rs:1078:19` (`+=` → `*=` in
+  `platform_table`): caught on rerun under `--test-package charpente-macros`, five trybuild
+  fixtures printing "constant evaluation is taking a long time". `app.rs:711:9`
+  (`take_cron_entries` → `vec![]`): caught on rerun under `--test-package invoicing`, its sim
+  failing `"reminder:sent" never occurred`.
+- **M-c and M-d re-argued** (`db.rs:2575:29` `&&` → `||` and `:2575:44` `>` → `>=`, from
+  `575ac9d`). Since Task 8 no app writes `charpente.schema_versions`: `SchemaVersion` is
+  `PlatformOwned`, a borrowed name is E0080, and `put_schema_version` is `pub(crate)`. Of the
+  platform's three writers, first-write adoption has no old row, the executor's batch row keeps
+  the version, and the close-out always raises it with a batch size of at least 1 (S2 refuses 0).
+  So M-d is unreachable, and M-c differs only by rebuilding an empty table's indexes, which
+  changes no row and no index entry. Only a store written before Task 8's seal, holding a forged
+  row, distinguishes either, and that is an outcome over an already-inconsistent store.
+- **Visible survivors on argument:** `assert_scoped`, M-c and M-d, plus one off-diff mutant argued
+  equivalent, `kernel/mod.rs:1005:22` (`validate_subscribe`'s guard `row.id.raw() == cursor.id` →
+  `true`, from `1ec91bc`). It is the one pre-S1 survivor that bears on tenancy, since it picks the
+  row A16 judges; it is equivalent on every consistent store, because ids are minted densely and
+  only a prefix is ever deleted, and even on a damaged one delivery still filters through `admits`.
+- **No `.cargo/mutants.toml` entry added.** So zero unresolved MISSED and zero unresolved TIMEOUT
+  remain over S1's 220 in-diff mutants (ruling 41).
+- **The off-diff MISSED,** 40, all blamed before `1fe461d` over each mutant's whole span
+  (`task-14-triage-logs/off-diff-blame.txt`). Apart from `kernel/mod.rs:1005:22` above, the 39 are
+  a follow-up (`task-14-triage-report.md` §4 has each row's reading):
+
+  | Mutant | Blame | Date |
+  |---|---|---|
+  | `db.rs:1717:31` replace `>=` with `<` in `<impl View for Tx>::scan_from` | `14a3684` | 2026-07-14 |
+  | `db.rs:2575:29` replace `&&` with `\|\|` in `apply_batch` (M-c, a visible survivor) | `575ac9d` | 2026-07-18 |
+  | `db.rs:2575:44` replace `>` with `>=` in `apply_batch` (M-d, a visible survivor) | `575ac9d` | 2026-07-18 |
+  | `db.rs:4157:30` delete `!` in `Db::migrate_schema` | `1137330` | 2026-09-03 |
+  | `table.rs:109:9` replace `<impl Hash for Id<T>>::hash` with `()` | `46141de` | 2026-07-02 |
+  | `table.rs:114:9` replace `<impl Debug for Id<T>>::fmt` with `Ok(Default::default())` | `46141de` | 2026-07-02 |
+  | `table.rs:1322:67` replace `+` with `*` in `Store::checkpoint` | `46141de` | 2026-07-02 |
+  | `table.rs:1363:34` replace `^` with `\|` in `Store::mix_schedule` | `55f15ec` | 2026-08-20 |
+  | `table.rs:2484:9` replace `<impl Debug for DiskBackend>::fmt` with `Ok(Default::default())` | `46141de` | 2026-07-02 |
+  | `table.rs:2518:9` replace `<impl Error for FromDisk>::source` with `None` | `8b7d8eb` | 2026-10-01 |
+  | `table.rs:99:9` replace `<impl PartialOrd for Id<T>>::partial_cmp` with `None` | `46141de` | 2026-07-02 |
+  | macros `lib.rs:66:5` replace `parse_version` with `Ok(0)` | `76ae904` (span newest `bbdfe64`, 2026-08-30) | 2026-07-17 |
+  | macros `lib.rs:66:5` replace `parse_version` with `Ok(1)` | `76ae904` (span newest `bbdfe64`, 2026-08-30) | 2026-07-17 |
+  | `route.rs:348:33` replace `>` with `>=` in `expand_http` | `65821f0` | 2026-09-04 |
+  | `route.rs:365:37` replace `\|\|` with `&&` in `expand_http` | `ae85504` | 2026-07-02 |
+  | `route.rs:667:40` replace `&&` with `\|\|` in `expand_sse` | `65821f0` | 2026-09-04 |
+  | `route.rs:671:39` replace `+` with `-` in `expand_sse` | `65821f0` | 2026-09-04 |
+  | `route.rs:687:29` replace `+` with `-` in `expand_sse` | `65821f0` | 2026-09-04 |
+  | `route.rs:895:5` replace `is_subscription_result` with `true` | `974e27d` | 2026-07-15 |
+  | `route.rs:914:9` replace `&&` with `\|\|` in `is_subscription_result` | `974e27d` | 2026-07-15 |
+  | `route.rs:915:9` replace `&&` with `\|\|` in `is_subscription_result` | `974e27d` | 2026-07-15 |
+  | `route.rs:919:5` replace `last_segment_is` with `true` | `974e27d` | 2026-07-15 |
+  | tsgen `lib.rs:50:8` delete `!` in `emit_client` | `0dc68f0` | 2026-08-26 |
+  | tsgen `revive.rs:214:66` replace `+` with `*` in `revive_expr_assuming_needed` | `01a6e75` | 2026-08-27 |
+  | tsgen `revive.rs:221:66` replace `+` with `*` in `revive_expr_assuming_needed` | `01a6e75` | 2026-08-27 |
+  | tsgen `revive.rs:508:9` delete arm `Option \| Seq \| Map` in `collect_needed_types` | `01a6e75` | 2026-08-27 |
+  | tsgen `revive.rs:518:38` replace `\|\|` with `&&` in `collect_needed_types` | `01a6e75` | 2026-08-27 |
+  | tsgen `revive.rs:535:9` delete arm `Struct` in `collect_needed_types` | `01a6e75` | 2026-08-27 |
+  | tsgen `revive.rs:540:9` delete arm `Enum` in `collect_needed_types` | `01a6e75` | 2026-08-27 |
+  | tsgen `types.rs:134:59` replace `==` with `!=` in `key` | `f3db215` | 2026-08-23 |
+  | tsgen `types.rs:134:66` replace `\|\|` with `&&` in `key` | `f3db215` | 2026-08-23 |
+  | tsgen `types.rs:134:71` replace `==` with `!=` in `key` | `f3db215` | 2026-08-23 |
+  | tsgen `types.rs:137:60` replace `\|\|` with `&&` in `key` | `f3db215` | 2026-08-23 |
+  | tsgen `types.rs:64:8` delete `!` in `emit_types` | `aedb8ac` | 2026-08-23 |
+  | tsgen `types.rs:82:9` delete arm `Option \| Seq \| Map` in `collect_id_tables` | `aedb8ac` | 2026-08-23 |
+  | tsgen `types.rs:95:9` delete arm `Enum` in `collect_id_tables` | `aedb8ac` | 2026-08-23 |
+  | `app.rs:649:9` replace `App::oidc_mounted` with `false` | `b756fa8` | 2026-07-24 |
+  | `app.rs:739:9` replace `App::put_db_for_tests` with `()` | `975c69a` | 2026-07-14 |
+  | `app.rs:930:29` replace guard `failure.invalidates(0, wrote)` with `true` in `handle_or_subscribe` | `237cd32` | 2026-08-12 |
+
+  (`db.rs` and `table.rs` are charpente-core's; `route.rs` and macros `lib.rs` are
+  charpente-macros'; `app.rs` is `crates/charpente/src/http/app.rs`.)
+- **The instrument and the `const` checks.** Mutants that a post-monomorphization `const` check
+  refuses at build are counted unviable, not caught: both `tenant_name` mutants in the tenant run
+  failed to build on the event-shape E0080.
+
+**Hand inversions** (Step 4), at `4c58e2d` in the isolated worktree `../charpente-s1-inversions`
+with its own target, one row at a time, each restored and checked by sha256 (55 of 55 matched)
+with `git status --short` empty (`task-14-inversions-report.md`, `inv-<n>.log`). **51 of 52 RED;
+row 32 EQUIVALENT, as predicted.** A pristine control after the last restore read 10 of 10
+`test result: ok`.
+
+| # | Task | Site | Inversion | Result |
+|---|---|---|---|---|
+| 1 | 2 | `ScopedTx::enqueue`'s rendered `S::NAME` | → `type_name::<S>()` | RED, kernel 4 |
+| 2 | 2 | `Ctx::anonymous_scope`'s `S::NAME` | → `""` | RED, tenant 8 (the 401 pins) |
+| 3 | 2 | `Tx::enter_scope`'s one-scope assert, both NAMEs | → `""` | RED, engine 1 |
+| 4 | 3 | `note_tenant`'s same-name assert | `==` → `!=` | RED, tenant 25, kernel 32 |
+| 5 | 3 | `note_tenant`'s empty-name check | → `false` | RED, tenant 1 |
+| 6 | 3 | `App::open`'s census feed | deleted | RED, tenant 7 |
+| 7 | 3 | `App::mount`'s `public_scope` feed | deleted | RED, tenant 1 |
+| 8 | 3 | `App::mount_jobs`' `scoped_by` feed | deleted | RED, tenant 2 |
+| 9 | 11 | `App::mount_events`' census feed | deleted | RED, tenant 2 |
+| 10 | 4 | `scoped_fingerprint` | body → the fold | RED, kernel 5, tenant 1, realtime 7 |
+| 11 | 4 | the `#scoped_by\0` mix | dropped, `NAME` kept | RED, kernel 2, tenant 1, core lib 1 (A4's literal pins) |
+| 12 | 5 | `JobScope::open`'s assert | `==` → `!=` | RED, kernel 10 |
+| 13 | 5 | the same assert's left operand | → `self.scope_type` | RED, kernel 2 |
+| 14 | 5 | `run_due_into`'s `scope_type` | → `Unscoped`'s `TypeId` | RED, kernel 8 |
+| 15 | 6 | the 401's fix clause | the pre-Task-6 text | RED, tenant 7 |
+| 16 | 7 | `CrossTenant<'g>` | `+ Clone` | RED, trybuild `capability_tokens_are_not_clone` |
+| 17 | 7 | `TenantAdmission<'g>` | `+ Clone` | RED, trybuild `capability_tokens_are_not_clone` |
+| 18 | 7 | `Group::cross_tenant_cap` | returns `CrossTenant<'static>` | RED, trybuild `capability_tokens_cannot_be_parked` |
+| 19 | 8 | `PLATFORM_TABLES` | drop `EventRow::TABLE` | RED, core lib 2, trybuild 3 |
+| 20 | 8 | `PLATFORM_TABLES` | drop `SchemaVersion::TABLE` | RED, core lib 2, trybuild 2 |
+| 21 | 8 | `EventRow`'s `Scope` | `PlatformOwned` → `Unscoped` | RED, trybuild 3 |
+| 22 | 8 | `SchemaVersion`'s `Scope` | `PlatformOwned` → `Unscoped` | RED, trybuild 3 |
+| 23 | 8 | `put_schema_version`'s record | `version ^ 1` | RED, migrations 8 |
+| 24 | 9 | `PlatformOwned`'s reader bound | drop `+ sealed::Operator` | RED, trybuild 6 |
+| 25 | 9 | `View::scan`'s bound (trait and both impls) | drop `+ ReadableBy<Self>` | RED, trybuild 5 |
+| 26 | 10 | `admits`' name clause | → `true` | RED, lib 1 |
+| 27 | 10 | `admits`' tenancy clause | → `true` | RED, lib 1, realtime 16 |
+| 28 | 10 | `admits`' key clause | → `true` | RED, lib 1, realtime 5 |
+| 29 | 10 | `deliver_unit`'s `row.scope` | → `tail.sub.scope` | RED, realtime 16 |
+| 30 | 10 | A16's left operand | `row.scope` → `sub.scope` | RED, realtime 6 |
+| 31 | 10 | A16's right operand (inlined at the call site) | → `None` | RED, realtime 10 |
+| 32 | 10 | the reshape gate's `row.scope` | → `sub.scope` | **EQUIVALENT**: green, 83 passed, 0 failed; the gate was reached 2,472 times with `row.scope == sub.scope` every time |
+| 33 | 10 | `ScopedTx::emit`'s `Some(scope)` | → `None` | RED, materialize 1, realtime 24 (at `push_emit`'s assert) |
+| 34 | 10 | `ScopedTx::emit`'s key | `None` → `Some(scope.to_string())` | RED, materialize 1, realtime 7 |
+| 35 | 10 | `ScopedTx::emit_keyed`'s key | → `None` | RED, materialize 1 (realtime green) |
+| 36 | 10 | `encode_record`'s emit tag | `is_some()` → `is_some_and(\|t\| t != 0)` | RED, core lib 1, realtime 16 |
+| 37 | 10 | the emit arm's field order | scope before shape | RED, core lib 1 |
+| 38 | 10 | `EventRow::decode_row`'s 16-byte arm | bind `None` | RED, core lib 1 |
+| 39 | 10 | `PROTO_VERSION` | 5 → 4 | RED, replication 3 |
+| 40 | 11 | `EventArgs::parse` | a bare `#[event]` → `Global` | RED, trybuild `event_bare` |
+| 41 | 11 | `Tx::emit`'s bound | `UnscopedEvent` → `Event` | RED, trybuild 1 |
+| 42 | 11 | `ScopedTx::emit`'s bound | `Event<Scope = S>` → `Event` | RED, trybuild 2 |
+| 43 | 11 | `Subscription::of`'s bound | `UnscopedEvent` → `Event` | RED, trybuild 1 |
+| 44 | 11 | `TenantFeed::and`'s bound | `Event<Scope = S>` → `Event` | RED, trybuild 1 |
+| 45 | 11 | the macro's scoped `FINGERPRINT` | `tenant_name::<#path>()` → `""` | RED by E0080: 7 errors, the tenant and realtime targets do not build (ruling 29) |
+| 46 | 12 | `event_info`'s `scoped_by` | → `None` | RED, describe 3; invoicing `describe_golden` and guide-examples `describe_contract` green (F1) |
+| 47 | 9 | `refuse_read_as`'s left operand (A18) | → `TypeId::of::<R>()` | RED, tenant 3 |
+| 48 | 9 | `refuse_read_as`'s comparison | `==` → `!=` | RED, tenant 16, kernel 28 |
+| 49 | 8 | N1, through `put_schema_version` | its `written_as.insert` deleted | RED, migrations 11 |
+| 50 | 8 | N1's `JobRow::TABLE` operand (M5's form) | → `false` | RED, kernel 38 |
+| 51 | 9 | `impl View for Tx`'s `get` check | deleted | RED, tenant 1 |
+| 52 | 10 | A3's assert in `Subscription::and` (final review M9) | deleted | RED, realtime 1 (`should_panic` did not panic) |
+| 33b | 10 | `push_emit`'s recorded scope (supplementary, not counted) | `Emit { scope: None }` | RED, realtime 21, on the pins' own assertions |
+
+- **F1, row 46,** is expected per pre-flight ruling C-I3: every event in the invoicing golden is
+  `#[event(global)]`, so no change to `event_info` can turn those two goldens red. The row is red
+  through charpente's `describe` suite, including the named pin
+  `describe_names_an_events_tenant_by_its_tenant_types_name`.
+- **Notes the report records:** row 33 is now caught at `push_emit`'s tenancy assert before any
+  record exists, so 33b moved the inversion past it; row 35 is seen only by materialize's pin,
+  since no realtime test delivers a keyed scoped emit to a keyed tenant feed; rows 27, 30 and 31
+  follow M4's shared predicate, so row 31 was inverted at A16's call site only.
+- **Task 13's mutations on its own module** (`task-13-report.md` §10 and both fix rounds), each
+  applied with a sha256 record and restored by `git checkout`: M1 `admits`' scope clause →
+  `true`, red on 8 tests; M2 `deliver_unit` passes `tail.sub.scope`, 8; M3 A16 deleted, 5 (the
+  swarm "and was accepted"); M4 `ScopedTx::emit` records `Some(scope + 1)` (ruling C-I2), 13;
+  M5 `Some(0)` for every tenant, 11; M6 `decode_row` binds `scope: None`, 12; M7 `encode_record`
+  drops tenant 0, 11. **M8**, the macro emitting `""` for `S::NAME`, no longer builds: six E0080
+  from Task 11's `const` check, which is itself the oracle catching it (ruling 29). **M8b**, the
+  same mutation inside `scoped_fingerprint` so the build stays consistent, is red on exactly the
+  brief's two tests (two tenant types, one fingerprint; shop 1's feed decodes desk 1's note).
+  **M9**, a fail-closed `admits` (tenant feeds admit nothing), 7, and the swarm fails universes at
+  fresh bases. **M10**, a silent tail drop in `tail.rs`, 9. Every count reproduced after each fix
+  round.
+
+**Docs.** The stale-phrase sweep (Task 14a, `747680f`): 33 phrases over 450 files, every one 0,
+the six checks reading 0 0 0 0 1 1 as required, so it forced no fix (F = 0); the reviewer re-ran
+it verbatim. The phrases six plan-specified comments would have carried were reworded in their
+owning tasks (ruling C-I4). README's four Task 11 passages are present once each (ruling C-B1).
+GUIDE §8's gave-up ceiling count was "Nineteen", one short after Task 13's `tenancy_feeds`
+property: Task 13's docs miss, fixed to "Twenty" in `747680f` (20 `ceiling:` invocations
+counted). The final fix wave corrected GUIDE §5 and §16, DESIGN §3, §6 and §8, the `open_scope`
+and `Principal` rustdoc and spec §2.5/§12 (A19); `4c58e2d` carried N1, N2 and DESIGN §3.
+
+**Gate** at `cb503cd`, after `cargo clean` of the six packages, run by the controller's `gate.sh`
+with `CARGO_INCREMENTAL=0` (`gate-final.done`, `gate-final.log`): fmt and clippy `-D warnings`
+exit 0; `cargo test --workspace --no-fail-fast` **86 of 86** `test result: ok`, 0 FAILED, 1,816
+passed, 0 failed, 54 ignored. CI's other steps ran at `4c58e2d` in the isolated worktree
+(`task-14-ci-report.md`; `4c58e2d..cb503cd` changes ci.yml's pin and comments, and adds one
+tenant.rs test):
+`cargo check -p charpente-core` and `cargo publish --workspace --dry-run --no-verify` (nothing
+uploaded) exit 0; the four replay pins passed; the bench passthrough guard (1) and the two launch
+guards (2) passed. The TS gate: `npm ci`, `check-client` exit 0 (not stale), samples 3 passed,
+`npm run check`, and `npm run test` 22 of 22. The guide gates: `cargo build -p guide-examples` and
+its 8 suites inside the workspace run. The edge-harness wire suite, `--ignored` (final review
+I1): 7 of 7 files `test result: ok` — smoke 3, tenant_wire 3, realtime_resume 1, failover 3, hunts
+5, acked_durable 2 — and `unopenable_store`'s one test is not ignored, so it runs in the gate. CI
+on the merged tip is pending Noah's push. This record commit is docs only, and no test reads
+PLAN.md, this file or the spec.
+
+**Controller rulings,** every `Ruling` line in `progress.md`, in order. That file is gitignored
+local state, so this list is the permanent record of what was decided on Noah's behalf. Each line
+gives the decision, then its cost if wrong ("not stated" where the ruling gave none).
+1. Execute in the worktree `../charpente-s1` on `s1-tenancy` and merge `--no-ff` after the final
+   review and counted gate, not commit on `main` as the plan said. Cost: one merge commit in place
+   of linear history.
+2. A-B1: Task 6 also re-pins Task 2's two 401 tests to the new fix text. Cost: none (literal
+   re-pins).
+3. A-I1: `note_tenant` gets a branch for an equal `type_name` with another `TypeId` (a hand-built
+   def, or two versions of one crate), with its own text. Cost: one removable branch and text.
+4. A-M3: Task 2 also rewrites lib.rs:34-36 and db.rs:1568 to say the macros name
+   `tenant_name::<S>()`. Cost: doc churn.
+5. A minors: Task 4's hex is authoritative over its decimal; Step 6 counts are orientation;
+   Task 5 inserts at the end of `mod scoped_jobs`; the base is `1fe461d`; Task 6's mutation 2
+   also runs `job_tenancy`; U1–U4 are settled by rustc in their tasks. Cost: not stated.
+6. C-B1: Task 11 owns the README edits, in its wording; Task 14 only asserts them present. Cost:
+   README wording.
+7. C-I1: Task 11's unit `UnitPing`/`UnitPong` are re-declared scoped by a minimal `UnitOrg`
+   tenant. Cost: test-only types.
+8. C-I2: Task 13's M4 becomes `Some(scope + 1)`, which slips past `push_emit`'s presence assert.
+   Cost: one mutation's target.
+9. C-I3: Task 14 row 46's two goldens are expected green (all their events are global). Cost:
+   none.
+10. C-I4: six plan-specified comments carrying swept phrases are reworded in their owning tasks,
+    so the zero-hit sweep needs no allowlist. Cost: comment wording.
+11. C minors: dispatch notes (Task 11 mutation 12's target; Task 13 Step 4 timed with
+    `--nocapture`; the 4c red may fail at `.expect`; Task 14's `--re` uses `platform_table` under
+    `--test-package charpente-macros`; row 4 inverts `==` to `!=`). Cost: not stated.
+12. Task 1 is dispatched before pre-flight B returns. Cost: a Task 1 fix round.
+13. `baselines.sh` drops the swarm's `re-basing` line, and the kernel base is re-recorded at 26
+    lines. Cost: none (the 26 coverage lines are identical either way).
+14. B-I-1: Task 10's version-4 Hello red is the schema-digest refusal, and its green after the bump
+    is the protocol-version refusal by name. Cost: none to product.
+15. B-M-1/B-M-6: Tasks 8 and 10 run `cargo fmt --all` first; rustfmt reflow is not a deviation.
+    Cost: none.
+16. B-M-2: every hand-mutation revert is verified by sha256, never `git diff --stat`. Cost: not
+    stated.
+17. B-M-4: Task 9's N5 kernel count is re-measured (78 at the base, not 72), with a slot in its
+    commit message for N5's conclusion. Cost: not stated.
+18. B-M-5: `PINNED_FLOOR`'s history dates are the commit's date. Cost: not stated.
+19. B-M-8: Task 10 also fixes realtime.rs's `Ping.n` doc and db.rs's `Effect` comment (hard rule
+    6). Cost: not stated.
+20. B-M-10: a floor that falls in Task 10 is a finding under the re-key rules (Welch SE over at
+    least 10 fresh bases), not a mismatch to paper over. Cost: not stated.
+21. B-M-11: "commit before any mutation run" binds cargo-mutants; a hand mutation may run on
+    uncommitted work only with a sha256-verified backup and revert. Cost: not stated.
+22. A-I1's text becomes "set both fields from the type its `scoped_by` names" (Task 3 review): the
+    old wording could steer to the wrong type. Cost: wording.
+23. Task 9: accept `global_job_reads_a_scoped_table.stderr`'s identical A15 re-pin. Cost: none.
+24. Task 9: GUIDE §16's two "no transaction reads" go to Task 10 as "no app code reads … through a
+    transaction". Cost: wording.
+25. Task 11 I2: a hand `impl Event` copying another tenant type's `NAME` and `FINGERPRINT` is a spec
+    gap, closed at build by `PAYLOAD_FINGERPRINT` and a `const` check (a loud no rather than a
+    silently neutralised shape). Cost: one public trait const, a static check and a fixture pair
+    to revert.
+26. Task 11 I1: `note_tenant`'s refusal names `JobDef` or `EventDef`, with a twin test. Cost: text
+    churn.
+27. Task 11 M2, M1, M3: `mount_events` asserts `scoped_by` agrees with `scope_type`; GUIDE quotes
+    rustc's text; the `NoEventTenant` note's comment stands. Cost: trivial.
+28. Task 13's 19 of 128 give-ups (14.8%) are accepted past the brief's one-in-ten line (Seeds and
+    universes, above). Cost: re-key the workload and re-measure floors, cap, the 4c seed and the
+    fresh counts, superseding `8a37222`.
+29. Task 13's M8 no longer builds and is replaced by M8b; Task 14 row 45 is expected refused at
+    build, recorded as such, not MISSED. Cost: not stated.
+30. Task 14 runs in phases, with the final whole-branch review inside it, so Steps 3–6 measure the
+    tree after the review's fixes. Cost: none beyond ordering.
+31. Task 13 I1 is fixed in its module only; the flagship keeps the same weakness, recorded for
+    Noah. Cost: one fix round.
+32. Task 13 R1 is fixed the same way: a silent tail drop fails by name. Cost: one more fix round on
+    a test module.
+33. C1 is fixed by removing `Clone` from `Principal`, red first, with spec A19; it overrides spec
+    §12's refusal, so it heads the list for Noah. Cost: re-add one derive; an app that wanted a
+    principal past its request stores `principal.subject()`.
+34. Final review I1: Task 14 runs edge-harness `--ignored`, counted; M9: A3's assert gets a hand
+    inversion row. Cost: not stated.
+35. One final fix dispatch carries C1, M1–M8, M10, T3 and T9. Cost: text and assert churn.
+36. The final review's "wrong ruling" on Task 11 I2's label is accepted: M1 relabels it, and the
+    substance stands. Cost: not stated.
+37. The re-review's N1 and N2, with the optional DESIGN §3 line, ride as Task 14b's first commit,
+    before the mutation run. Cost: none.
+38. The mutation timeout is 1300 s, not 2600: about ten times the largest test set's idle time.
+    Cost: a slow-but-caught mutant reads TIMEOUT and is rerun.
+39. No commits while the mutation run is in flight; fresh seeds run beside it; hand inversions,
+    the CI checks and the re-pin run in one isolated worktree with its own target. Cost:
+    contention slows everything, and nothing is measured on a mixed tree.
+40. The defanged `0x0f34c969dfd340b0` is re-pinned by ci.yml's own procedure, committed after the
+    mutation run. Cost: none; a defanged pin is a silent oracle loss.
+41. "0 unresolved MISSED" is held over the 220 in-diff mutants and every TIMEOUT; the 40 off-diff
+    MISSED (pre-S1 by blame) become a follow-up table unless one bears on tenancy; no exclusion
+    is added. Cost: 40 survivors stay open as a visible list.
+42. Three mutants stay visible survivors on argument (`assert_scoped`, M-c, M-d), plus the off-diff
+    `kernel/mod.rs:1005:22`; `put_schema_version`'s TIMEOUT counts as caught by a hand-built run.
+    Cost: a survivor that a later input distinguishes.
+
+**Process findings.**
+- **The disk filled mid-gate.** Task 10's first gate failed with "No space left on device" at 239
+  MiB free (`gate-task10-diskfull.log`), an infrastructure failure, not code. The worktree's
+  incremental cache (4.7 GB) was removed, `gate.sh` now exports `CARGO_INCREMENTAL=0`, and Noah
+  freed the volume to 20 GiB.
+- **A filtered trybuild run uses `cargo check`.** trybuild 1.0.118 builds only when the filtered
+  set holds a `compile_pass` case, and `cargo check` never reports a post-monomorphization E0080.
+  The fixer's first red for M3 at `747680f` was vacuous for that reason; it was re-run in build
+  mode, and every later filtered run named a `compile_pass` fixture to force it. The full suite
+  builds, so the gate's E0080 pins are real.
+- **edge-harness `acked_durable` refuses an exported `CARGO_TARGET_DIR`** (its "same path" guard),
+  and its wrong-ack build then overwrote `release/node` and the charpente rlib in the shared
+  target until cleaned; it also left a registered temporary worktree. Run it with
+  `env -u CARGO_TARGET_DIR`, as CI does.
+- **A CI pin defangs when a workload's bytes move.** `0x0f34c969dfd340b0` still passed, and with
+  its classification deleted it passed too: only the RED-first re-verification showed the pin had
+  lost its teeth. Re-verify every RED-first pin whenever its workload's bytes change.
+- **A bound on `cargo` does not bound the test.** A perl alarm around `cargo` killed cargo and
+  orphaned the spinning test binary; the triage then ran test binaries directly under the alarm.
+- **Record corrections.** `6d187bb`'s message says "13 existing .stderr": it is 12 existing
+  re-pinned plus 5 new (17 in the diff). `22ed885`'s message says "charpente 13/13": the logs show
+  14 of 14 (lib, 12 suites, doc). Task 13's report said its 14 nothing-adjudicated give-ups
+  committed no emit: 12 of the 14 committed one to four rows, each below every feed's floor by the
+  end (corrected in its fix round's report).
+
+**Follow-ups.**
+1. The two deferred items, now in PLAN's After-launch table: a cross-tenant subscription, and a
+   tenant's own jobs and events read through `ScopedTx` (spec §12).
+2. **Task 10's sibling property** `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing`
+   may now be redundant with `tenancy_feeds::every_feed_receives_exactly_its_own_scope_under_the_fault_matrix`.
+   Noah's call; not acted on.
+3. **The flagship** (`reconnecting_client_misses_nothing_under_the_fault_matrix`, realtime.rs
+   ~1958) and every property sharing its bare-resubscribe floor rule carry the per-universe
+   liveness vacuity that Task 13 fixed only in `tenancy_feeds` (I1), and the flagship's `absorb`
+   still books every closed tail as a stall (R1). Realtime-spec scope, outside S1.
+4. **`Client::absorb`'s tenancy-409 arm** (realtime.rs ~1982) is still unexercised; A16 itself is
+   pinned and floored.
+5. **The diverged 409's seq metadata side channel:** it prints `row.seq` for a row of any tenancy
+   (kernel/mod.rs ~1010), and A16 then answers whether id X is in the feed's tenancy. It exposes
+   the global log position and one membership bit, never a name, key or payload.
+6. **The 39 pre-S1 MISSED** in the table above.
+7. **Two non-tenancy test holes among them:** no test compiles a `cross_tenant` SSE route that
+   takes `cap` (`route.rs:667/671/687`; one compile-pass fixture would kill all three), and
+   `Tx::scan_from` over committed rows with a cursor above 0 is unpinned (`db.rs:1717`).
+8. **doc_truth's `FRAGMENT_MIN`** (16) leaves short pieces between placeholders unchecked.
+9. **The final review's "leave" items,** as its triage table lists them (`final-review.md`,
+   "Deferred-item triage"): cosmetics and unwrapped lines, the unpinned borrowck claims, the test
+   harness's n1–n4, and the follow-ups in 3–5 above.
+10. **CI on the merged tip:** one line here once Noah's push runs it.
+
+**Next.** The merge of `s1-tenancy` into `main` (`--no-ff`, ruling 1), then Noah's push and its CI
+run. The 0.1.0 publish is Noah's call.

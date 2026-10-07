@@ -1,0 +1,149 @@
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::put::<Versions>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(2) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+  | |              — schema-version rows are the platform's: only a table's first write and \
+  | |              `Db::migrate_schema` write one, because the migration gate trusts them for each \
+... |
+  | |              its `TableMigration`), which the kernel migrates at startup"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::put::<Versions>`
+  --> tests/compile_fail/schema_version_table_name_borrowed.rs:80:5
+   |
+80 | /     tx.put(&Versions {
+81 | |         id: row,
+82 | |         bytes: Vec::new(),
+83 | |     });
+   | |______^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::delete::<Versions>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(2) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+  | |              — schema-version rows are the platform's: only a table's first write and \
+  | |              `Db::migrate_schema` write one, because the migration gate trusts them for each \
+... |
+  | |              its `TableMigration`), which the kernel migrates at startup"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::delete::<Versions>`
+  --> tests/compile_fail/schema_version_table_name_borrowed.rs:84:5
+   |
+84 |     tx.delete::<Versions>(Id::from_raw(row.raw() + 1));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::put::<OrgVersions>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(2) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+  | |              — schema-version rows are the platform's: only a table's first write and \
+  | |              `Db::migrate_schema` write one, because the migration gate trusts them for each \
+... |
+  | |              its `TableMigration`), which the kernel migrates at startup"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::put::<OrgVersions>`
+  --> tests/compile_fail/schema_version_table_name_borrowed.rs:91:5
+   |
+91 | /     tx.put(&OrgVersions {
+92 | |         id: row,
+93 | |         bytes: Vec::new(),
+94 | |     });
+   | |______^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::delete::<OrgVersions>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(2) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+  | |              — schema-version rows are the platform's: only a table's first write and \
+  | |              `Db::migrate_schema` write one, because the migration gate trusts them for each \
+... |
+  | |              its `TableMigration`), which the kernel migrates at startup"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::delete::<OrgVersions>`
+  --> tests/compile_fail/schema_version_table_name_borrowed.rs:95:5
+   |
+95 |     tx.delete::<OrgVersions>(Id::from_raw(row.raw() + 1));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

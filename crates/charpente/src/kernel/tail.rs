@@ -85,7 +85,8 @@ pub struct Tail {
 }
 
 /// One bounded unit: read up to `TAIL_BATCH_EVENTS` rows from `next_id`,
-/// filter, push. Returns whether the tail survives. The floor check runs
+/// filter (`Subscription::admits`: a name it carries, its tenancy, its key),
+/// push. Returns whether the tail survives. The floor check runs
 /// FIRST: a tail that fell behind retention gets the terminal gap frame and
 /// dies — deterministic, part of the unit, independent of whatever the sink
 /// reports for that final send (the tail is dying either way, so the send's
@@ -139,12 +140,17 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
     };
     for row in rows {
         tail.next_id = row.id.raw() + 1;
-        if tail.sub.key.is_some() && tail.sub.key.as_deref() != row.key.as_deref() {
+        // The predicate `validate_subscribe` also asks before refusing a
+        // reshaped cursor.
+        if !tail.sub.admits(&row.name, row.key.as_deref(), row.scope) {
             continue;
         }
-        let Some(entry) = tail.sub.entries.iter().find(|e| e.name == row.name) else {
-            continue;
-        };
+        let entry = tail
+            .sub
+            .entries
+            .iter()
+            .find(|e| e.name == row.name)
+            .expect("admits matched this row's name to one of the subscription's entries");
         // Names are escaped as JSON strings in both terminal frames below:
         // `Event::NAME` is hand-writable and may hold any character.
         if row.shape != Some(entry.fingerprint) {
@@ -275,5 +281,204 @@ impl SimSinkHandle {
             .closed
             .lock()
             .expect("sim sink lock poisoned by an earlier panic")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tenancy-completion spec §6 made `Subscription.entries` crate-private,
+    //! so this is the one place a `SubEntry` is still built by hand. The test
+    //! needs exactly that: an encoder that fails whatever the payload, with
+    //! no shape check and no field ever read. Moved here from
+    //! `tests/realtime.rs` unchanged in substance. That suite's
+    //! `a_real_events_serialize_failure_fails_its_tail_not_the_node` covers
+    //! the other case, a real `#[event]` whose field refuses to serialize.
+
+    use std::io;
+
+    use charpente_core::db::{Event, Tx};
+    use charpente_core::event::EventRow;
+    use charpente_core::table::{Codec, Unscoped, View};
+    use charpente_sim::{FaultConfig, Sim};
+
+    use crate::Schema;
+    use crate::http::{
+        ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Response, Route, RouteGlue,
+        SubEntry, Subscription,
+    };
+    use crate::kernel::{Kernel, SimSource};
+    use crate::wire::{TypeSchema, Wire};
+
+    const SEC: u64 = 1_000_000_000;
+
+    struct NoteAdded {
+        n: u64,
+    }
+
+    impl Codec for NoteAdded {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+
+        fn decode(input: &mut &[u8]) -> io::Result<NoteAdded> {
+            Ok(NoteAdded {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Event for NoteAdded {
+        const NAME: &'static str = "note_added";
+        const FINGERPRINT: u64 = 0x7E57_0A0D;
+        // A global event: it belongs to no tenant.
+        type Scope = Unscoped;
+    }
+
+    fn emit_note_glue(
+        tx: &mut Tx,
+        _ctx: &Ctx,
+        captures: &[String],
+        _body: &[u8],
+    ) -> Result<Response, ApiError> {
+        let n: u64 = captures[0].parse().expect("the test sends a numeric n");
+        tx.emit(NoteAdded { n });
+        Ok(Response::json(200, &n))
+    }
+
+    fn failing_feed_glue(
+        _tx: &mut Tx,
+        _ctx: &Ctx,
+        _captures: &[String],
+        cursor: Option<Cursor>,
+    ) -> Result<Subscription, ApiError> {
+        Ok(Subscription {
+            entries: vec![SubEntry {
+                name: NoteAdded::NAME,
+                encode_json: |_: &[u8]| -> io::Result<String> {
+                    Err(io::Error::other("encode exploded"))
+                },
+                fingerprint: NoteAdded::FINGERPRINT,
+            }],
+            key: None,
+            cursor,
+            scope: None,
+        })
+    }
+
+    fn routes() -> Vec<Route> {
+        vec![
+            Route {
+                method: Method::Post,
+                pattern: "/note/:n",
+                auth: false,
+                public_scope: None,
+                cross_tenant: false,
+                name: "emit_note",
+                glue: RouteGlue::Http(emit_note_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
+            },
+            Route {
+                method: Method::Get,
+                pattern: "/feed-failing",
+                auth: false,
+                public_scope: None,
+                cross_tenant: false,
+                name: "failing_feed",
+                glue: RouteGlue::Sse(failing_feed_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
+            },
+        ]
+    }
+
+    /// Pushes `requests` at one instant and steps the kernel 16 times, every
+    /// step required to succeed: nothing a subscriber does stops the node.
+    fn run(kernel: &mut Kernel, sim: &Sim, requests: Vec<Request>) -> SimSource {
+        let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+        let t = sim.now().as_nanos();
+        for request in requests {
+            source.push_at(t, request);
+        }
+        for _ in 0..16 {
+            if let Err(e) = kernel.step(&mut source) {
+                panic!("no step may fail — nothing a subscriber does stops the node: {e}");
+            }
+        }
+        source
+    }
+
+    /// Payload-shapes spec §3/§6.5: an encode failure fails its own tail,
+    /// never the node. The stream ends with `charpente.error`, naming the
+    /// event and the row, and the node keeps serving.
+    #[test]
+    fn an_unencodable_event_fails_its_tail_not_the_node() {
+        let sim = Sim::with_faults(0x2EB2_FA11, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(routes());
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+        let source = run(
+            &mut kernel,
+            &sim,
+            vec![
+                Request::new(Method::Get, "/feed-failing"),
+                Request::new(Method::Post, "/note/1"),
+            ],
+        );
+        let rows: Vec<EventRow> = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan_from(0, 8)
+            .unwrap();
+        let sinks = source.sinks();
+        let frames: Vec<(u64, u64, String, String)> = sinks.lock().unwrap()[0]
+            .frames()
+            .iter()
+            .map(|f| (f.id, f.seq, f.name.to_string(), f.json.clone()))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![(
+                rows[0].id.raw(),
+                rows[0].seq,
+                "charpente.error".to_string(),
+                format!(
+                    r#"{{"event":"note_added","id":{},"error":"encode exploded"}}"#,
+                    rows[0].id.raw()
+                ),
+            )],
+            "one terminal error frame naming the event and the row"
+        );
+
+        let source = run(
+            &mut kernel,
+            &sim,
+            vec![Request::new(Method::Post, "/note/2")],
+        );
+        let statuses: Vec<u16> = source
+            .responses()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(statuses, vec![200], "the node keeps serving");
     }
 }

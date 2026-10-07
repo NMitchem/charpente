@@ -1,0 +1,19 @@
+error: an event declares `global` or `scoped_by = <Tenant>` and nothing else (its name derives from the type) — e.g. `#[event(global)]` or `#[event(scoped_by = Org)]`
+ --> tests/compile_fail/event_unknown_word.rs:7:17
+  |
+7 | #[event(global, cross_tenant)]
+  |                 ^^^^^^^^^^^^
+
+error: an event declares `global` or `scoped_by = <Tenant>` and nothing else (its name derives from the type) — e.g. `#[event(global)]` or `#[event(scoped_by = Org)]`
+  --> tests/compile_fail/event_unknown_word.rs:10:1
+   |
+10 | #[event(scoped_by)]
+   | ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `event` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: an event declares `global` or `scoped_by = <Tenant>` and nothing else (its name derives from the type) — e.g. `#[event(global)]` or `#[event(scoped_by = Org)]`
+  --> tests/compile_fail/event_unknown_word.rs:13:9
+   |
+13 | #[event(name = "renamed")]
+   |         ^^^^

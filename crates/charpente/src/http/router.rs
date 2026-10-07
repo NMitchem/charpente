@@ -12,14 +12,15 @@ use crate::http::{ApiError, Cursor, Method, Response, Subscription};
 /// The glue signature a plain `#[route(METHOD …)]` generates: parse captures
 /// and body, call the handler, encode the response. Runs inside the
 /// request's transaction.
-pub type Glue = fn(&mut Tx, &Ctx, &[String], &[u8]) -> Result<Response, ApiError>;
+pub type Glue = fn(&mut Tx, &Ctx<'_>, &[String], &[u8]) -> Result<Response, ApiError>;
 
 /// The glue signature `#[route(SSE …)]` generates: parse captures and the
 /// platform-extracted cursor, call the handler, return the typed
 /// subscription. Never a `Response` — an SSE route only makes sense
 /// dispatched through the kernel (`App::handle_or_subscribe`'s
 /// `Handled::Subscribe`), which has a sink to hand the tail.
-pub type SubGlue = fn(&mut Tx, &Ctx, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
+pub type SubGlue =
+    fn(&mut Tx, &Ctx<'_>, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
 
 /// A path param's name paired with its fn-deferred wire schema (`Route::params`'s
 /// element type — factored out so the field itself stays under clippy's
@@ -103,11 +104,16 @@ pub struct EmittedEvent {
 /// membership check as on any route.
 #[derive(Clone, Copy, Debug)]
 pub struct PublicScope {
-    /// The scope type's last path segment, as the macro's refusals render it.
+    /// The scope type's `Tenant::NAME`, which `describe` lists and the 401
+    /// renders (tenancy-completion spec §4).
     pub name: &'static str,
     /// The scope type's `TypeId`, behind a fn pointer like `response` and
     /// `error`, so a `Route` stays plain `'static` data and fn pointers.
     pub type_id: fn() -> TypeId,
+    /// The scope type's `type_name`, for text only: `App`'s tenant-name
+    /// refusal, and the 401 beside the `NAME`, so the author can find the type
+    /// the attribute names. Never compared. A fn pointer, like `type_id`.
+    pub type_name: fn() -> &'static str,
 }
 
 /// Implemented by the marker struct `#[route]` emits next to each handler,

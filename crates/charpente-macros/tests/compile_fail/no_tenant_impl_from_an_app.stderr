@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `Org: table::sealed::NotATenant` is not satisfied
-  --> tests/compile_fail/no_tenant_impl_from_an_app.rs:32:28
+  --> tests/compile_fail/no_tenant_impl_from_an_app.rs:33:28
    |
-32 | impl NoTenant<Invoice> for Org {}
+33 | impl NoTenant<Invoice> for Org {}
    |                            ^^^ unsatisfied trait bound
    |
 help: the trait `table::sealed::NotATenant` is not implemented for `Org`

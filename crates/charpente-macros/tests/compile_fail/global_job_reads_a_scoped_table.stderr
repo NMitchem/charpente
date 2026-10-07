@@ -1,0 +1,29 @@
+error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) and a bare `Tx` names no tenant
+  --> tests/compile_fail/global_job_reads_a_scoped_table.rs:38:27
+   |
+38 |         let _ = tx.scan::<Invoice>()?;
+   |                    ----   ^^^^^^^ `Invoice` is scoped by `Org`
+   |                    |
+   |                    required by a bound introduced by this call
+   |
+help: the trait `NoTenant<Invoice>` is not implemented for `Org`
+  --> tests/compile_fail/global_job_reads_a_scoped_table.rs:11:1
+   |
+11 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
+   = note: open the tenant scope first — in a handler, `Org`'s own `Tenant::authorize` runs there for a credentialed caller:
+               let tx = tx.scope::<Org>(scope, ctx)?;
+               tx.scan::<Invoice>()?
+           in a job, write `scoped_by = Org` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives
+help: the trait `NoTenant<R>` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<R> NoTenant<R> for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `Invoice` to implement `UnscopedRow`
+note: required by a bound in `charpente::View::scan`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   |     fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
+   |                ^^^^^^^^^^^ required by this bound in `View::scan`
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

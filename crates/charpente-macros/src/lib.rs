@@ -30,10 +30,10 @@ pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
         return Error::new(
             proc_macro2::Span::call_site(),
             format!(
-                "`{name}` declares no tenancy — a table says which: write \
-                 `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key \
-                 becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` \
-                 if its rows belong to no tenant. Neither is the default."
+                "`{name}` declares no tenancy — a table says which. Add one of these to its \
+                 `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every \
+                 row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot \
+                 read it), or `global` if its rows belong to no tenant. Neither is the default."
             ),
         )
         .to_compile_error()
@@ -196,11 +196,7 @@ fn parse_table_args(args: TokenStream) -> syn::Result<TableArgs> {
         }
     }
     if let (Some(span), Some(path)) = (global, &scoped_by) {
-        let scope = &path
-            .segments
-            .last()
-            .expect("a parsed path has a segment")
-            .ident;
+        let scope = crate::fingerprint::path_as_written(path);
         return Err(syn::Error::new(
             span,
             format!(
@@ -237,16 +233,9 @@ pub fn job(args: TokenStream, input: TokenStream) -> TokenStream {
 
 #[proc_macro_attribute]
 pub fn event(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as event::EventArgs);
     let input = parse_macro_input!(input as DeriveInput);
-    if !args.is_empty() {
-        return Error::new(
-            input.ident.span(),
-            "write `#[event]` with no arguments; the name derives from the type",
-        )
-        .to_compile_error()
-        .into();
-    }
-    match event::expand(input) {
+    match event::expand(args, input) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }

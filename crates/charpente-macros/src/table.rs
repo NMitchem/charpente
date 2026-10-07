@@ -103,25 +103,23 @@ pub(crate) fn expand(
     };
 
     // `#[table(scoped_by = Org)]`: `type Scope` names the app's scope type
-    // instead of `Unscoped`, and the const assert below forces `Org` to carry
-    // the app's own membership check — the same shape `migration_assert` above
-    // uses to force a `TableMigration` impl on a version bump. The bound is
-    // `::charpente::TenantScope`, the platform's blanket-implemented alias for
-    // `Tenant<Who = Principal, Error = ApiError>`, because it is the one that
-    // carries the house diagnostic.
-    let scope_ty = match &scoped_by {
-        Some(path) => quote! { #path },
-        None => quote! { ::charpente::core::table::Unscoped },
-    };
-    let tenant_scope_assert = if let Some(path) = &scoped_by {
-        quote! {
-            const _: () = {
-                const fn __charpente_assert_tenant_scope<T: ::charpente::TenantScope>() {}
-                __charpente_assert_tenant_scope::<#path>();
-            };
-        }
-    } else {
-        quote! {}
+    // instead of `Unscoped`, and `SCOPE_NAME` carries its `Tenant::NAME`
+    // (tenancy-completion plan amendment A2). The NAME is read through
+    // `::charpente::tenant::tenant_name`. Its `TenantScope` bound forces
+    // `Org` to carry a name and the app's own membership check, with the
+    // house diagnostic and no second error. That bound is the whole of what
+    // the former const assert did.
+    let (scope_ty, scope_name) = match &scoped_by {
+        Some(path) => (
+            quote! { #path },
+            quote! {
+                ::std::option::Option::Some(::charpente::tenant::tenant_name::<#path>())
+            },
+        ),
+        None => (
+            quote! { ::charpente::core::table::Unscoped },
+            quote! { ::std::option::Option::None },
+        ),
     };
 
     let attrs = &input.attrs;
@@ -175,6 +173,7 @@ pub(crate) fn expand(
 
         impl ::charpente::core::table::Row for #name {
             type Scope = #scope_ty;
+            const SCOPE_NAME: ::std::option::Option<&'static str> = #scope_name;
             const TABLE: &'static str = #name_str;
             const VERSION: u32 = #version;
             const FINGERPRINT: ::std::option::Option<u64> =
@@ -221,7 +220,6 @@ pub(crate) fn expand(
             }
         }
         #migration_assert
-        #tenant_scope_assert
 
         impl #name {
             #(

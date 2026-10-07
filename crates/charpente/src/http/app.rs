@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{
-    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableWriteRefusal, TenantAdmission,
-    Tx, TxError,
+    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableWriteRefusal, Tenant,
+    TenantAdmission, Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
-use charpente_core::table::{Id, UnscopedJob, View};
+use charpente_core::table::{Id, Unscoped, UnscopedJob, View};
 use charpente_macros::table;
 
 use crate::auth::sweep::{self, SessionSweep};
@@ -78,7 +78,13 @@ pub struct Session {
 /// and `session_ttl` are the clock reading `handle_or_subscribe` took for
 /// this request and the app's configured TTL — both needed to mint
 /// `expires_at`.
-pub struct Ctx {
+///
+/// `'g` is the request's group: `Ctx` holds the tokens minted from it (the
+/// `CrossTenant` of a `cross_tenant` route, the `TenantAdmission` of a
+/// `public(S)` route), so neither it nor anything borrowed out of it
+/// outlives that group (tenancy-completion spec §5). Handlers write
+/// `ctx: &Ctx`; the lifetime is elided.
+pub struct Ctx<'g> {
     principal: Option<Principal>,
     /// Compat cache for `session()`: the `Session` row, re-looked-up during
     /// `build_ctx`, only when `principal.via == Via::Session(_)` — `None`
@@ -92,15 +98,15 @@ pub struct Ctx {
     /// §3) — the token `Tx::across_tenants` requires. `None` on every other
     /// route, which is why `cap()` is an `Option`: an undeclared route
     /// carries no capability, not a dormant one.
-    cap: Option<CrossTenant>,
+    cap: Option<CrossTenant<'g>>,
     /// The matched route's stance (job-tenancy spec §4): the admission a
     /// `public(S)` route carries, and the site and declaration rule 3's 401
     /// quotes. Private, and never exposed — a handler cannot reach the
     /// admission, only `Scoped::scope` can.
-    stance: Stance,
+    stance: Stance<'g>,
 }
 
-impl Ctx {
+impl<'g> Ctx<'g> {
     /// The resolution ladder's output (auth T4) — `None` on a route without
     /// `auth` and no credential presented.
     pub fn principal(&self) -> Option<&Principal> {
@@ -114,7 +120,7 @@ impl Ctx {
     /// on a route that never declared the capability, so this accessor is a
     /// reflective read ("did this request come in declared?"), not the
     /// route to the token.
-    pub fn cap(&self) -> Option<&CrossTenant> {
+    pub fn cap(&self) -> Option<&CrossTenant<'g>> {
         self.cap.as_ref()
     }
 
@@ -122,7 +128,7 @@ impl Ctx {
     /// request carries when its route declared `public(S)` for exactly this
     /// `S`. `None` otherwise, including on a `public(Org)` route that opens
     /// some other scope type, which then meets rules 2 and 3 like any route.
-    pub(crate) fn public_admission<S: 'static>(&self) -> Option<&TenantAdmission> {
+    pub(crate) fn public_admission<S: 'static>(&self) -> Option<&TenantAdmission<'g>> {
         match &self.stance.public {
             Some((declared, admission)) if (declared.type_id)() == TypeId::of::<S>() => {
                 Some(admission)
@@ -134,19 +140,28 @@ impl Ctx {
     /// Rule 3's refusal: a caller with no credential reached a scope line
     /// that its route did not declare `public(S)` for. Names the contract,
     /// the site, and both fixes, the caller's and the author's (hard rule 5)
-    /// — except on an `auth` route, where the author has no fix to make.
-    pub(crate) fn anonymous_scope<S>(&self) -> ApiError {
+    /// — except on an `auth` route, where the author has no fix to make. The
+    /// author's fix names the change, `public(S)` in place of the route's
+    /// stance, and restates no attribute: a restated one dropped whatever
+    /// else the route declared (`cross_tenant`, `emits(…)`, any later flag),
+    /// so a pasted fix either stopped compiling or silently lost a
+    /// declaration (tenancy-completion spec §7, item 12).
+    pub(crate) fn anonymous_scope<S: Tenant>(&self) -> ApiError {
         let Stance {
             method,
             pattern,
             auth,
             public,
         } = &self.stance;
-        // The last path segment, as `decode_body` renders a type.
-        let scope = std::any::type_name::<S>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("the scope type");
+        // The tenant type's identity (tenancy-completion spec §4). A final
+        // `::` component read two types spelled alike as one, and a generic as
+        // `B>`. `type_name` is printed beside it for the reader only, to say
+        // which type the attribute names (final review M7): a `NAME` need not
+        // be any path's spelling, and it is never compared. It is not offered
+        // as a path to paste (final re-review N1): it leads with the defining
+        // crate's name, which does not resolve inside that crate (E0433).
+        let scope = S::NAME;
+        let scope_type = std::any::type_name::<S>();
         if *auth {
             // `build_ctx` refuses a request to an `auth` route that carries no
             // credential before its handler runs, so only a caller that does
@@ -155,22 +170,35 @@ impl Ctx {
             // to every caller so that a test can read it.
             return ApiError::AnonymousScope(format!(
                 "authentication required — `{method} {pattern}` is declared `auth` and opened \
-                 the tenant scope `{scope}` for a caller with no credential; the route requires \
-                 a credential, so a request without one is refused before its handler runs, \
-                 and a caller that presents none, as the emits(...) drift probe does, cannot \
-                 run it — leave this route out of the drift test"
+                 the tenant scope `{scope}` (the tenant type `{scope_type}`) for a caller with \
+                 no credential; the route requires a credential, so a request without one is \
+                 refused before its handler runs, and a caller that presents none, as the \
+                 emits(...) drift probe does, cannot run it — leave this route out of the \
+                 drift test"
             ));
         }
-        let declared = match public {
-            Some((scope, _)) => format!("public({})", scope.name),
-            None => "public".to_string(),
+        let (declared, types) = match public {
+            Some((declared, _)) => (
+                format!("public({})", declared.name),
+                format!(
+                    "`{scope}` is the tenant type `{scope_type}`, and `{}` is `{}`",
+                    declared.name,
+                    (declared.type_name)()
+                ),
+            ),
+            None => (
+                "public".to_string(),
+                format!("`{scope}` is the tenant type `{scope_type}`"),
+            ),
         };
         ApiError::AnonymousScope(format!(
             "authentication required — `{method} {pattern}` is declared `{declared}` and \
              opened the tenant scope `{scope}` for a caller with no credential; only a route \
              declared `public({scope})` admits one. Send \"Authorization: Bearer <token>\" or \
              the charpente_session cookie, or, if every caller may act inside this tenant \
-             here, declare `#[route({method} \"{pattern}\", public({scope}))]`"
+             here, declare `public({scope})` in place of `{declared}` in this route's \
+             `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by \
+             its NAME; name the type in the attribute: {types}"
         ))
     }
 
@@ -264,7 +292,7 @@ impl Declared {
     }
 
     /// Mints the admission for a `public(S)` route, and only for one.
-    fn admitted(self, group: &Group) -> Stance {
+    fn admitted<'g>(self, group: &Group<'g>) -> Stance<'g> {
         Stance {
             method: self.method,
             pattern: self.pattern,
@@ -277,14 +305,14 @@ impl Declared {
 }
 
 /// What `Scoped::scope` reads off the route to apply its three rules.
-struct Stance {
+struct Stance<'g> {
     method: &'static str,
     pattern: &'static str,
     /// Recorded for the 401's text only (amendment A11): the drift probe
     /// does not enforce `auth`, so an `auth` stream route that opens a scope
     /// meets rule 3 there, and its text must name the real stance.
     auth: bool,
-    public: Option<(PublicScope, TenantAdmission)>,
+    public: Option<(PublicScope, TenantAdmission<'g>)>,
 }
 
 // ---------------------------------------------------------------- app
@@ -334,6 +362,13 @@ pub struct App {
     /// hands `StagedDispatch` a plain `&OidcVerifier` via `as_deref()`, and
     /// nothing in the crate clones this field any more. A `Box` would do.
     oidc: Option<Arc<OidcVerifier>>,
+    /// Every tenant type this app names, by `NAME`: its `TypeId`, and its
+    /// `type_name` for the refusal's text. Filled by `App::open` from the
+    /// schema's scoped tables, by `mount` from `public(S)` routes, by
+    /// `mount_jobs` from scoped jobs, and by `mount_events` from scoped
+    /// events, through `note_tenant`, which refuses a second type under a
+    /// seen `NAME` (tenancy-completion spec §4).
+    tenants: BTreeMap<&'static str, (TypeId, &'static str)>,
 }
 
 impl App {
@@ -351,6 +386,7 @@ impl App {
         entropy: Box<dyn Entropy>,
         config: AppConfig,
     ) -> io::Result<App> {
+        let table_tenants = schema.table_tenants();
         let mut db = Db::open(
             disk,
             config.db.clone(),
@@ -365,7 +401,7 @@ impl App {
             sweep.fingerprint,
             sweep.scoped_by.map(|scope| (scope, sweep.scope_type)),
         )]);
-        Ok(App {
+        let mut app = App {
             db: Some(db),
             entropy,
             config,
@@ -375,10 +411,52 @@ impl App {
             event_defs: Vec::new(),
             cron_entries: vec![sweep::platform_cron_entry()],
             oidc: None,
-        })
+            tenants: BTreeMap::new(),
+        };
+        for (name, type_id, type_name) in table_tenants {
+            app.note_tenant(name, type_id, type_name);
+        }
+        Ok(app)
+    }
+
+    /// Records one tenant type this app names, and refuses a second type
+    /// under a `NAME` already seen, or an empty `NAME`, by name, before the
+    /// app serves (tenancy-completion spec §4). A tenant's `NAME` is its
+    /// identity: it is mixed into every scoped job's and event's fingerprint,
+    /// so two types under one `NAME` are one tenant to every shape check. This is the one
+    /// place the texts live. `App::open`, `mount` and `mount_jobs` call it,
+    /// and `mount_events` does for scoped events. The same `type_name` under
+    /// one `NAME` with two `TypeId`s is not two tenant types but a hand-built
+    /// `JobDef` or `EventDef` whose `scope_type` disagrees with its
+    /// `scope_type_name`, or two versions of one crate, and is refused with
+    /// that cause.
+    fn note_tenant(&mut self, name: &'static str, type_id: TypeId, type_name: &'static str) {
+        assert!(
+            !name.is_empty(),
+            "tenant type {type_name} has an empty NAME — give its `impl Tenant` a `const NAME` \
+             that names it"
+        );
+        let (seen, seen_name) = *self.tenants.entry(name).or_insert((type_id, type_name));
+        assert!(
+            seen == type_id || seen_name != type_name,
+            "two registrations of the tenant type {type_name} (NAME \"{name}\") are different \
+             types — a hand-built `JobDef` or `EventDef` whose `scope_type` and \
+             `scope_type_name` name different types (build it from its `#[job]`'s or \
+             `#[event]`'s `def()`, or set both fields from the type its `scoped_by` names), or \
+             two versions of one crate in the build (unify them)"
+        );
+        assert!(
+            seen == type_id,
+            "two tenant types are named \"{name}\": {seen_name} and {type_name} — a tenant's \
+             NAME is its identity (it is inside every scoped job's and event's fingerprint), so \
+             give each type its own `const NAME` in its `impl Tenant`"
+        );
     }
 
     pub fn mount(mut self, routes: Vec<Route>) -> App {
+        for scope in routes.iter().filter_map(|route| route.public_scope) {
+            self.note_tenant(scope.name, (scope.type_id)(), (scope.type_name)());
+        }
         self.router.mount(routes);
         self
     }
@@ -411,6 +489,11 @@ impl App {
                 )
             })
             .collect();
+        for def in &defs {
+            if let Some(name) = def.scoped_by {
+                self.note_tenant(name, def.scope_type, def.scope_type_name);
+            }
+        }
         for def in defs {
             assert!(
                 !self.job_defs.iter().any(|d| d.name == def.name),
@@ -426,10 +509,23 @@ impl App {
     /// Registers `#[event]` descriptors for `describe` (mount-time
     /// duplicate-name panic — each event type is mounted once, like jobs).
     ///
-    /// This registry is describe-only, and mounting is therefore optional:
-    /// an unregistered `#[event]` still emits and still delivers, it just
-    /// does not appear in `Contract.events` (nor its payload in
-    /// `Contract.types`), so a generated client cannot see it.
+    /// A scoped event's tenant type joins the app's tenant census here, as a
+    /// scoped table's does at `App::open` and a scoped job's at `mount_jobs`
+    /// (tenancy-completion spec §4). Two types under one `Tenant::NAME`, or
+    /// an empty `NAME`, are refused at this call, before the app serves.
+    ///
+    /// Delivery never reads this registry, and mounting is therefore
+    /// optional: an unregistered `#[event]` still emits and still delivers,
+    /// it just does not appear in `Contract.events` (nor its payload in
+    /// `Contract.types`), so a generated client cannot see it, and its
+    /// tenant type is not in the census.
+    ///
+    /// A def's `scoped_by` and `scope_type` agree, or it is refused by name:
+    /// a scoped def names its tenant in both (`scope_type` other than
+    /// `Unscoped`), and a global one in neither. `#[event]`'s `def()` always
+    /// agrees, so a disagreement is a hand-built `EventDef`, which would
+    /// otherwise skip the census or list a scoped event as global. Whether
+    /// `scope_type` and `scope_type_name` name one type is `note_tenant`'s.
     pub fn mount_events(mut self, defs: Vec<EventDef>) -> App {
         for def in defs {
             assert!(
@@ -450,6 +546,25 @@ impl App {
                  and pass its WIRE_NAME",
                 def.name
             );
+            assert!(
+                def.scoped_by.is_some() == (def.scope_type != TypeId::of::<Unscoped>()),
+                "contract: event \"{}\" was mounted with `scoped_by: {:?}` and `scope_type` \
+                 {} — an `EventDef` names its tenant in both, or, for a global event, in \
+                 neither (`Unscoped`), so this hand-built def would {}; fix: build it from its \
+                 `#[event]`'s `def()`, or set `scoped_by`, `scope_type` and `scope_type_name` \
+                 from the one type its `type Scope` names",
+                def.name,
+                def.scoped_by,
+                def.scope_type_name,
+                if def.scoped_by.is_some() {
+                    "enter the tenant census under a type that is no tenant"
+                } else {
+                    "skip the tenant census and be described as global"
+                }
+            );
+            if let Some(scope_name) = def.scoped_by {
+                self.note_tenant(scope_name, def.scope_type, def.scope_type_name);
+            }
             self.event_defs.push(def);
         }
         self
@@ -915,7 +1030,7 @@ impl<'a> StagedDispatch<'a> {
                         now,
                         session_ttl,
                         oidc,
-                        cap.clone(),
+                        cap,
                         stance,
                     )?;
                     glue(tx, &ctx, &captures, &request.body)
@@ -932,7 +1047,7 @@ impl<'a> StagedDispatch<'a> {
                         now,
                         session_ttl,
                         oidc,
-                        cap.clone(),
+                        cap,
                         stance,
                     )?;
                     glue(tx, &ctx, &captures, cursor)
@@ -969,7 +1084,7 @@ pub enum Handled {
 // `crate::repl::session`'s ladder carries the same allow for the same
 // reason.
 #[allow(clippy::too_many_arguments)]
-fn build_ctx(
+fn build_ctx<'g>(
     tx: &mut Tx,
     presented: &Presented,
     auth_required: bool,
@@ -977,9 +1092,9 @@ fn build_ctx(
     now: u64,
     session_ttl: u64,
     oidc: Option<&OidcVerifier>,
-    cap: Option<CrossTenant>,
-    stance: Stance,
-) -> Result<Ctx, ApiError> {
+    cap: Option<CrossTenant<'g>>,
+    stance: Stance<'g>,
+) -> Result<Ctx<'g>, ApiError> {
     let principal = resolve(tx, presented, oidc, now).map_err(|reject| match reject {
         AuthReject::Unrecognized => ApiError::UnrecognizedCredential,
         AuthReject::Expired => ApiError::SessionExpired,

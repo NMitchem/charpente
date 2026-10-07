@@ -956,13 +956,14 @@ impl Kernel {
 /// its id must carry its exact seq (checked second — a cursor ahead of
 /// everything this node has ever minted, and a cursor whose id landed on a
 /// different event than the one the client saw, are both a diverged
-/// timeline, distinguished only by the message's `{detail}`); and if the row
-/// is one this subscription would deliver (a name it carries, a key it
-/// passes), it must not be one this binary refuses to decode (checked third —
-/// payload-shapes spec §3). A retained row at the cursor whose own bytes do
-/// not decode is answered 500 by name. No cursor at all always succeeds,
-/// positioned to tail from now. Returns the tail's starting `next_id` on
-/// success.
+/// timeline, distinguished only by the message's `{detail}`); the retained
+/// row must be of the subscription's own tenancy (checked third — a cursor
+/// resumes only the feed that delivered it, amendment A16); and if the row is
+/// one this subscription would deliver (`Subscription::admits`), it must not
+/// be one this binary refuses to decode (checked fourth — payload-shapes spec
+/// §3). A retained row at the cursor whose own bytes do not decode is
+/// answered 500 by name. No cursor at all always succeeds, positioned to tail
+/// from now. Returns the tail's starting `next_id` on success.
 fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
     let next_event_id = db.next_event_id().map_err(io_500)?;
     let Some(cursor) = sub.cursor else {
@@ -1019,16 +1020,35 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
                     ),
                 ));
             }
+            // A cursor names a row of the feed that delivered it. A row of
+            // another tenancy — another tenant's event, a global event on a
+            // tenant feed, a tenant's event on a global subscription — is one
+            // this feed never delivers, so resuming from it would resume a
+            // feed this subscriber never had. Refused by name, naming no
+            // tenant and no event (amendment A16). A row of the feed's own
+            // tenancy that it does not admit, another name or another key, is
+            // not refused: it is never delivered either way (payload-shapes
+            // spec §3). `holds_tenancy` is the rule `admits` delivers by.
+            if !sub.holds_tenancy(row.scope) {
+                return Err(Response::error(
+                    409,
+                    &format!(
+                        "cursor {} sits on an event outside this feed's tenancy — a cursor \
+                         resumes only the feed that delivered it, and this feed never delivers \
+                         that event; reconnect without a cursor, wait for the stream to open, \
+                         then read current state from the same node, holding every frame that \
+                         arrives until that read is installed and then applying the held frames \
+                         and every later one over it in order, idempotently",
+                        cursor.wire()
+                    ),
+                ));
+            }
             // The row the client last saw is one this binary refuses to
             // decode. Resuming past it would skip the very event the
             // `charpente.reshaped` frame named — the frame carries this id, so
-            // a client that ignored it reconnects exactly here. A name the
-            // subscription does not carry, or a row its key filter excludes,
-            // is never delivered to it either way, and is not refused
-            // (payload-shapes spec §3).
-            let key_passes = sub.key.is_none() || sub.key.as_deref() == row.key.as_deref();
-            if let Some(entry) = sub.entries.iter().find(|e| e.name == row.name)
-                && key_passes
+            // a client that ignored it reconnects exactly here.
+            if sub.admits(&row.name, row.key.as_deref(), row.scope)
+                && let Some(entry) = sub.entries.iter().find(|e| e.name == row.name)
                 && row.shape != Some(entry.fingerprint)
             {
                 let recorded = match row.shape {

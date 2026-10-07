@@ -1,7 +1,7 @@
 error[E0277]: `Notify` is a tenant-scoped job (`#[job(scoped_by = Org)]`) and a bare `Tx` names no tenant to run it in
-  --> tests/compile_fail/unscoped_job_impl_from_an_app.rs:39:22
+  --> tests/compile_fail/unscoped_job_impl_from_an_app.rs:40:22
    |
-39 | impl UnscopedJob for Notify {}
+40 | impl UnscopedJob for Notify {}
    |                      ^^^^^^ `Notify` is scoped by `Org`
    |
 help: the trait `NoJobTenant<Notify>` is not implemented for `Org`

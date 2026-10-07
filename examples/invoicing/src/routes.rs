@@ -23,7 +23,7 @@ use charpente::wire::{WireI64, WireU64};
 use charpente::{Tx, View, Wire as WireDerive, event, route};
 use serde::{Deserialize, Serialize};
 
-#[event]
+#[event(global)]
 pub struct InvoiceFinalized {
     pub invoice: Id<Invoice>,
 }

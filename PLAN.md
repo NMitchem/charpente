@@ -163,17 +163,24 @@ the oracle, and the oracle is the product.
   down — WAL effects, replication, archive, `restore`, snapshot seeding, and
   `migrate_schema`'s watermark — and a binary compiled against the unscoped shape of a
   scoped table refuses the record by name rather than misreading it. Realtime is the same mechanism rather than a second
-  one: `emit` inside a scope is keyed by the scope. Enumerating every tenant is a
+  one: an emit inside a scope records the scope's tenant, apart from any app key, and a
+  tenant feed built from the scope receives only its tenant's events. Enumerating every tenant is a
   **declared capability**, not an escape hatch — `#[route(…, cross_tenant)]` /
   `#[job(…, cross_tenant)]` mint the token `Tx::across_tenants` requires, rows come back
   paired with their scope, and `charpente describe` turns "audit the cross-tenant reads"
   into a mechanical inventory (DECISIONS §11). The flagship oracle is
   `every_scoped_read_returns_only_its_own_tenants_rows` — all four read paths, two tenants
   sharing an id space *and* an index key, 256 universes at a pinned base plus 768 over
-  three fresh ones — with two naive victims that fail it by name, a scope-keyed realtime
+  three fresh ones — with two naive victims that fail it by name, a tenant-feed realtime
   sibling, and a two-tenant wire oracle over real TCP in the edge harness.
-  **Two limits travel with it.** The subscription key is the scope's decimal id, so two
-  different scope types sharing a raw id share a key. And the guarantee's boundary is the
+  The event log's shared-raw-id limit was closed 2026-10-04 by M3's tenancy completion. A
+  scoped event records its tenant in a field of its own, apart from its key;
+  `Subscription::admits` delivers a row only into a feed of exactly that tenancy, and a resume
+  from another tenancy's row is refused by name on the same test. A scoped event's fingerprint
+  mixes its tenant type's `Tenant::NAME`, and a build-time `PAYLOAD_FINGERPRINT` check at every
+  typed emit and subscribe site holds a hand-written `impl Event` to that mix. The `NAME` is
+  unique across the app's tenant census, which does not see a tenant type the app reaches only
+  through an event it never mounts. **One limit travels with it:** the guarantee's boundary is the
   typed surface handed to handlers and jobs: a `Db` holder reaches every tenant and can
   mint the cross-tenant capability, with the standing of whoever holds the data directory —
   an operator, not a request (DECISIONS §12, ratified 2026-09-05).
@@ -232,7 +239,11 @@ Sub-projects, in dependency order:
    `docs/superpowers/specs/2026-09-27-job-tenancy-design.md`: a job declares `global` or
    `scoped_by`, and a scoped one runs in the tenant it was enqueued from, or that its
    fan-out named; `authorize` is asked about a principal only; a route's stance, `auth`,
-   `public` or `public(Org)`, says who reaches a tenant).
+   `public` or `public(Org)`, says who reaches a tenant). Its pre-publish follow-ups closed
+   2026-10-04 (spec `docs/superpowers/specs/2026-09-30-tenancy-completion-design.md`): a tenant
+   type's `NAME` is its identity, an event declares `global` or `scoped_by` and a tenant's feed
+   is built from its scope, app code neither reads nor writes the platform's own tables, and the
+   capability tokens cannot outlive the `Group` that minted them, nor a `Principal` its request.
 4. **Claims audit** [shipped 2026-09-22; spec
    `docs/superpowers/specs/2026-09-21-claims-audit-design.md`]. The bare-metal Linux BENCH
    run owed since 2026-08-15 lands, or the README scaling paragraph is rewritten to what
@@ -249,7 +260,7 @@ build passes on the bar in sub-project 3; (c) every number in README.md and MANI
 that is a claim about charpente is in docs/BENCH.md or absent, and every other figure
 cites its source or carries no digits (held by `claims_census`).
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
@@ -257,7 +268,8 @@ and none does. They are listed with their triggers so that "is it time yet" has 
 mechanical answer. The payload-shapes three were deferred on 2026-09-24 by the spec that
 shipped detection and refusal (its §1 and §8): a foreign shape is already refused by name,
 so each waits for its trigger. The job-tenancy one was deferred on 2026-09-27 by the
-job-tenancy spec's §12.
+job-tenancy spec's §12. The tenancy-completion two were deferred on 2026-09-30
+by that spec's §12.
 
 | Item | Trigger |
 |---|---|
@@ -272,6 +284,8 @@ job-tenancy spec's §12.
 | **A deep fingerprint** — every `Codec` type carries its own shape constant, so a new variant on a nested enum changes the fingerprint of every table and payload that holds it | The first nested-type change that misdecodes in a real app or a docs-only build. |
 | **A commit-time shape lock** — a committed fingerprint file plus a check verb | The first shape change that reaches a deploy unnoticed. Apps on the generated TS client already get a CI signal for event payload changes from `check-client`'s staleness diff. |
 | **`enqueue_keyed_in`** — a keyed declared fan-out (job-tenancy spec §12) | The first fan-out whose job needs an external idempotency key. `enqueue_in` and `ScopedTx::enqueue_keyed` both exist; the keyed fan-out is the one combination deferred. |
+| **A cross-tenant subscription** — one feed over every tenant's events (tenancy-completion spec §12) | The first app that needs a feed across tenants. It arrives as a declared capability `describe` lists (DECISIONS §11), the shape `cross_tenant` already gives reads. |
+| **A tenant's own jobs and events, read through `ScopedTx`** — for a job-status or activity view (tenancy-completion spec §12) | The first app with a job-status or activity view. Until then an app keeps its own table of what it enqueued and emitted, and the platform's tables stay the operator's. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,

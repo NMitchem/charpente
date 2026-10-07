@@ -295,18 +295,26 @@ pub trait RowShape: Sized {
 /// Marker for a table whose rows are not tenant-scoped. The default.
 pub struct Unscoped;
 
-/// The scope marker of a platform table: `charpente.jobs`, whose rows the
-/// dispatcher trusts for a job's tenant (job-tenancy spec §6). Keyed like
-/// `Unscoped`, by bare id, and read like it (`NoTenant` holds, so `View`
-/// reads it). What it withholds is the write: `Tx::put`/`Tx::delete` bound
-/// `R: WritableRow`, which a row of this scope fails, by name. Only the
-/// enqueue family and the dispatcher's `Tx::settle_job` write a job row.
+/// The scope marker of the platform's tables: `charpente.jobs`, whose rows
+/// the dispatcher trusts for a job's tenant (job-tenancy spec §6),
+/// `charpente.events`, which every subscription's feed is read from, and
+/// `charpente.schema_versions`, which the migration gate trusts for each
+/// table's version (tenancy-completion spec §3). Keyed like `Unscoped`, by
+/// bare id. What it withholds is the transaction. `Tx::put`/`Tx::delete`
+/// bound `R: WritableRow`, which a row of this scope fails, by name.
+/// `View`'s reads bound `R: ReadableBy<Self>`, which it meets for `Snapshot`
+/// alone (`ScopeReadableBy`). `NoTenant` still holds for it, so a `Tx` read
+/// gets `ScopeReadableBy`'s text and never `NoTenant`'s. Only the platform
+/// writes one:
+/// the enqueue family and the dispatcher's `Tx::settle_job` a job row, apply
+/// an event row, first-write adoption and `Tx::put_schema_version` a
+/// schema-version row.
 ///
 /// `#[doc(hidden)]` so rustc's "the trait is implemented for" hint under
 /// `NoTenant`'s diagnostic keeps naming `Unscoped` alone: this is not a
 /// scope an app table can take. Sealing another platform table is its
-/// `type Scope = PlatformOwned` plus its name in `db.rs`'s
-/// `PLATFORM_TABLES`.
+/// `type Scope = PlatformOwned`, its name in `db.rs`'s `PLATFORM_TABLES`,
+/// and its own text there and under `AppWritable`.
 #[doc(hidden)]
 pub struct PlatformOwned;
 
@@ -345,6 +353,15 @@ pub trait Row: Sized + 'static {
     /// table out of the versioning gate and the replication digest —
     /// hand-written platform impls are unaffected by this sub-project.
     const FINGERPRINT: Option<u64> = None;
+    /// The `Tenant::NAME` of `Scope`, for a row scoped by a tenant type.
+    /// `#[table(scoped_by = Org)]` sets `Some(Org::NAME)`. Every other row
+    /// keeps `None`: `#[table(global)]` and the platform's hand-written rows
+    /// alike. A constant, because this crate cannot bound `Scope: Tenant`: an
+    /// unscoped row's scope is `Unscoped`. It has a default, unlike `Scope`,
+    /// because associated-const defaults are stable. `Schema::table` records
+    /// it, and `App::open` refuses two tenant types under one name
+    /// (tenancy-completion spec §4, plan amendment A2).
+    const SCOPE_NAME: Option<&'static str> = None;
     fn id(&self) -> Id<Self>;
     fn encode_row(&self, out: &mut Vec<u8>);
     fn decode_row(bytes: &[u8]) -> io::Result<Self>;
@@ -389,8 +406,8 @@ pub trait Row: Sized + 'static {
             there for a credentialed caller:\n    \
             let tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
             tx.scan::<{R}>()?\n\
-            in a job, declare `#[job(scoped_by = {Self})]` and read through the `ScopedTx` its \
-            `run` receives"
+            in a job, write `scoped_by = {Self}` in place of `global` in its `#[job(…)]`, \
+            keeping its other arguments, and read through the `ScopedTx` its `run` receives"
 )]
 pub trait NoTenant<R>: sealed::NotATenant {}
 
@@ -401,15 +418,22 @@ impl<R> NoTenant<R> for PlatformOwned {}
 /// The seals. Private, so both supertrait obligations are unsatisfiable
 /// outside this crate however the orphan rules fall: the only scope types that
 /// will ever carry `NotATenant` are `Unscoped` and `PlatformOwned`, the only
-/// one that will ever carry `AppOwned` is `Unscoped`, and the only rows that
-/// will ever carry `NotScoped` or `Writable` are the ones whose own
+/// one that will ever carry `AppOwned` is `Unscoped`, the only ones that will
+/// ever carry `ReadScope` are those two and the app's `Tenant` types, the only
+/// reader that will ever carry `Operator` is `Snapshot`, and the only rows
+/// that will ever carry `NotScoped` or `Writable` are the ones whose own
 /// `Row::Scope` earns it.
 mod sealed {
     pub trait NotATenant: Owned {}
     pub trait NotScoped {}
     pub trait NotScopedJob {}
+    pub trait NotScopedEvent {}
     pub trait AppOwned {}
     pub trait Writable {}
+    /// `ScopeReadableBy`'s seal: the scope types the read seal is about.
+    pub trait ReadScope {}
+    /// The readers a platform table admits. `Snapshot` alone carries it.
+    pub trait Operator {}
     /// Who writes a table with no tenant: `Unscoped` for an app's own,
     /// `PlatformOwned` for the platform's. Always `Self`; see `WritableRow`
     /// for why it is asked through this projection.
@@ -457,7 +481,14 @@ impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
 /// Job rows are the platform's because the dispatcher trusts `JobRow.scope`
 /// for the tenant a scoped job runs in: a row that app code could write would
 /// run a job in any tenant, with no principal and no declaration (job-tenancy
-/// final review C1). SEALED by `AppOwned`, which only `Unscoped` carries.
+/// final review C1). Event rows are the platform's because every
+/// subscription's feed is read from them, so a forged one reaches another
+/// tenant's subscriber. Schema-version rows are the platform's because the
+/// migration gate trusts them, so a forged one skips a table's migration
+/// (tenancy-completion spec §3). One bound refuses all three row types, and
+/// rustc cannot pick a note by type, so the diagnostic carries one note per
+/// table, each naming its own. SEALED by `AppOwned`, which only `Unscoped`
+/// carries.
 #[diagnostic::on_unimplemented(
     message = "`{R}` rows are the platform's, and app code cannot write them",
     label = "`{R}` is written only by the platform",
@@ -469,7 +500,16 @@ impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
             let mut tx = tx.scope::<Org>(scope, ctx)?;\n    \
             tx.enqueue(job);\n\
             or from a `cross_tenant` route or job, naming the tenant:\n    \
-            tx.enqueue_in::<Org>(scope, job, cap);"
+            tx.enqueue_in::<Org>(scope, job, cap);",
+    note = "event rows are the platform's: only an emit writes one, because every \
+            subscription's feed is read from them — to publish an event, emit it with \
+            `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant \
+            it belongs to",
+    note = "schema-version rows are the platform's: only a table's first write and \
+            `Db::migrate_schema` write one, because the migration gate trusts them for each \
+            table's version and a migration's resume point — to change a table's version, \
+            declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel \
+            migrates at startup"
 )]
 pub trait AppWritable<R>: sealed::AppOwned {}
 
@@ -485,8 +525,8 @@ where
 
 /// A row a bare `Tx` may write: an `UnscopedRow` whose table is the app's
 /// own. This is `Tx::put`'s and `Tx::delete`'s bound, the write half of the
-/// seal `PlatformOwned` describes; reads keep `View`'s `UnscopedRow`, so a
-/// transaction still reads `JobRow`. Sealed for `UnscopedRow`'s reason.
+/// seal `PlatformOwned` describes; the read half is `ReadableBy`. Sealed for
+/// `UnscopedRow`'s reason.
 ///
 /// `AppWritable` is asked of the scope's `Owner`, a projection through
 /// `NoTenant`'s own seal, rather than of the scope type directly. A scoped
@@ -542,6 +582,107 @@ pub trait UnscopedJob: crate::db::Job + sealed::NotScopedJob {}
 
 impl<J: crate::db::Job> UnscopedJob for J where J::Scope: NoJobTenant<J> {}
 
+/// The event twin of `NoJobTenant` (tenancy-completion spec §6). `Unscoped`
+/// implements it for every event type, and no other scope type implements
+/// it at all. It carries the refusal for a `#[event(scoped_by = …)]` event
+/// used where no tenant is named: `Tx::emit`/`Tx::emit_keyed` on a bare `Tx`,
+/// or a global `Subscription::of`/`and`. It hangs on the SCOPE type for
+/// `NoTenant`'s reason: an associated-type mismatch cannot carry a custom
+/// diagnostic. `{Ev}` puts the event's name in the text, as `{J}` puts the
+/// job's.
+///
+/// SEALED by `NotATenant`, the same seal, and `UnscopedEvent` below by its
+/// own. Either one alone would leave the other as a one-line, orphan-legal
+/// opt-out (`impl NoEventTenant<Noted> for Org {}`, or
+/// `impl UnscopedEvent for Noted {}`).
+#[diagnostic::on_unimplemented(
+    message = "`{Ev}` is a tenant-scoped event (`#[event(scoped_by = {Self})]`), and a bare `Tx` \
+               or a global `Subscription` names no tenant",
+    label = "`{Ev}` is scoped by `{Self}`",
+    note = "emit it and subscribe to it inside the tenant it belongs to:\n    \
+            let mut tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
+            tx.emit(event); // recorded in this tenant\n\
+            and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):\n    \
+            Ok(tx.subscription::<{Ev}>().cursor(cursor).into())\n\
+            a job that emits it takes `scoped_by = {Self}` in place of `global` among its \
+            `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its \
+            `run` receives"
+)]
+pub trait NoEventTenant<Ev>: sealed::NotATenant {}
+
+impl<Ev> NoEventTenant<Ev> for Unscoped {}
+
+/// `UnscopedEvent`'s seal, derived from `Event::Scope` by the same condition
+/// `UnscopedEvent` uses, so the seal admits exactly the events the bound
+/// admits.
+impl<Ev: crate::db::Event> sealed::NotScopedEvent for Ev where Ev::Scope: NoEventTenant<Ev> {}
+
+/// An event with no tenant: exactly the `Event`s whose `Scope` is
+/// `Unscoped`, derived from `Event::Scope` as `UnscopedJob` is from
+/// `Job::Scope`. It bounds `Tx::emit`, `Tx::emit_keyed`, `Subscription::of`
+/// and `Subscription::and`. So a scoped event at any of them is an
+/// unsatisfied bound whose text names the fix. It never becomes an event
+/// recorded in no tenant, or a global feed that names a tenant's event.
+/// Sealed for `UnscopedRow`'s reason.
+pub trait UnscopedEvent: crate::db::Event + sealed::NotScopedEvent {}
+
+impl<Ev: crate::db::Event> UnscopedEvent for Ev where Ev::Scope: NoEventTenant<Ev> {}
+
+/// Which readers `V` may read a row of scope `Self` through `View`: the read
+/// half of the seal `PlatformOwned` describes (tenancy-completion spec §3).
+/// An app's own table is readable by every `View`: `Unscoped` for a global
+/// one, and every `S: Tenant` for a scoped one, whose rows `View`'s
+/// `UnscopedRow` bound refuses instead, so that `NoTenant`'s one diagnostic
+/// stays the one rustc prints for a scoped read. A platform table is readable
+/// by a `Snapshot` alone: a `Tx`, and so a handler, a job and a `ScopedTx`'s
+/// deref, cannot name one.
+///
+/// The platform impl is written for the sealed `Operator` reader marker, not
+/// for `Snapshot` directly, and that is load-bearing for the diagnostic. When
+/// only one impl could apply (the tenant blanket), rustc blames its nested
+/// `PlatformOwned: Tenant` and never shows this text; when two could, it
+/// reports this trait. The tenancy-completion plan's Task 9 quotes both.
+///
+/// SEALED by `ReadScope`, which only the scope types above carry.
+#[diagnostic::on_unimplemented(
+    message = "`{R}` is one of the platform's tables, and a transaction does not read it",
+    label = "`{R}` is read through `Db::snapshot`, never through a transaction",
+    note = "the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and \
+            the migration record (`SchemaVersion`) — are the platform's own state, and the \
+            first two hold every tenant's rows, so neither a handler nor a job reads them; \
+            code that holds the `Db` reads them through a snapshot:\n    \
+            db.snapshot()?.scan::<{R}>()?",
+    note = "a route that shows a job's progress or an event's history reads a table of the \
+            app's own, written in the same transaction as the enqueue or the emit, or \
+            subscribes to the events"
+)]
+pub trait ScopeReadableBy<V: ?Sized, R>: sealed::ReadScope {}
+
+impl<V: ?Sized, R> ScopeReadableBy<V, R> for Unscoped {}
+
+impl<V: ?Sized, R, S: crate::db::Tenant> ScopeReadableBy<V, R> for S {}
+
+impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}
+
+impl sealed::ReadScope for Unscoped {}
+impl sealed::ReadScope for PlatformOwned {}
+impl<S: crate::db::Tenant> sealed::ReadScope for S {}
+impl sealed::Operator for Snapshot {}
+
+/// A row the reader `V` may read through `View`, derived from `Row::Scope` by
+/// the one blanket impl below, as `UnscopedRow` is, so there is no second
+/// source of truth. `View`'s four methods bound `R: ReadableBy<Self>`. Code
+/// generic over the reader alone, like every `#[index]` accessor, needs
+/// nothing more, because an app's table is readable by every `View`. Code
+/// generic over the row type as well names it:
+/// `fn all<R: UnscopedRow + ReadableBy<Snapshot>>(snap: &Snapshot)`.
+///
+/// It needs no seal of its own: an app's `impl ReadableBy<Tx<'_>> for Alias
+/// {}` conflicts with the blanket impl (E0119).
+pub trait ReadableBy<V: ?Sized>: Row {}
+
+impl<R: Row, V: ?Sized> ReadableBy<V> for R where R::Scope: ScopeReadableBy<V, R> {}
+
 /// Read access to UNSCOPED table state — implemented by `Snapshot` (reads
 /// outside transactions) and `Tx` (reads inside one, which also see the
 /// transaction's own writes). The `#[table]` accessors are generated
@@ -554,21 +695,36 @@ impl<J: crate::db::Job> UnscopedJob for J where J::Scope: NoJobTenant<J> {}
 /// one an app writes — `ScopedTx`, which `Tx::open_scope` hands back once the
 /// app's own `Tenant::authorize` has passed. `Tx`'s own scope-taking
 /// primitives are private to `db.rs`; `ScopedTx` is their only caller.
+///
+/// Every method also bounds `R: ReadableBy<Self>`, which an app's own table
+/// meets for every reader, and a platform table (`JobRow`, `EventRow`,
+/// `SchemaVersion`) for `Snapshot` alone: a transaction does not read the
+/// platform's tables (tenancy-completion spec §3). `Tx` reads its snapshot
+/// through `Snapshot`'s crate-private `get_any` and its siblings, which carry
+/// no `ReadableBy` bound, rather than through this trait.
 pub trait View {
-    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>>;
+    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>>;
 
     /// Every row, in id order. A `Vec` for now; iterators when a real
     /// workload shows the allocation matters.
-    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>>;
+    fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>>;
 
     /// Exact-match secondary index lookup, in id order. Called through the
     /// typed accessors `#[table]` generates (`Invoice::by_org(...)`).
-    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>>;
+    fn scan_by<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>>;
 
     /// Rows with `id >= from_id`, in id order, at most `limit` — the
-    /// realtime cursor read (`charpente.events`, but usable on any table). A
-    /// `Vec` for now; see `scan`'s note.
-    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>>;
+    /// realtime cursor read (`charpente.events` through a `Snapshot`, and any
+    /// app table). A `Vec` for now; see `scan`'s note.
+    fn scan_from<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>>;
 }
 
 // ---------------------------------------------------------------- Store
@@ -697,7 +853,7 @@ fn scoped_open_err(table: &str, e: redb::TableError) -> io::Error {
 /// whichever door they knocked on — the mirror of `scoped_open_err` above.
 /// Twelve functions open an unscoped row table; `gc_events`' event-table
 /// open is unreachable by this disagreement (`EventRow::Scope` is
-/// `Unscoped` at compile time and its only writer, `materialize_event`,
+/// `PlatformOwned`, keyed as `Unscoped` is, and its only writer, `materialize_event`,
 /// always calls `put` under `UNSCOPED`, so its rows table can never be
 /// created composite-keyed) and stays on `redb_err`; the other ELEVEN —
 /// every one reachable through a `pub` entry point — now route through
@@ -755,7 +911,8 @@ pub const UNSCOPED: u64 = 0;
 /// in release builds exactly as `R::VERSION`/`R::FINGERPRINT` do.
 ///
 /// `PlatformOwned` is keyed exactly as `Unscoped` is: it seals writes, not
-/// the key, so `charpente.jobs` stores byte-identically to before the seal.
+/// the key, so `charpente.jobs`, `charpente.events` and
+/// `charpente.schema_versions` store byte-identically to before the seal.
 pub(crate) fn row_is_scoped<R: Row>() -> bool {
     let scope = std::any::TypeId::of::<R::Scope>();
     scope != std::any::TypeId::of::<Unscoped>() && scope != std::any::TypeId::of::<PlatformOwned>()
@@ -1404,9 +1561,11 @@ impl Writer<'_> {
             assert_eq!(
                 scope,
                 UNSCOPED,
-                "Writer::delete: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) but \
-                 was called with scope {scope} — pass table::UNSCOPED for an unscoped table",
-                R::TABLE
+                "Writer::delete: table \"{}\" is not tenant-scoped (Row::Scope = {}) but was \
+                 called with scope {scope} — pass table::UNSCOPED for a table that is not \
+                 tenant-scoped",
+                R::TABLE,
+                std::any::type_name::<R::Scope>()
             );
             let mut rows = self
                 .txn
@@ -1476,6 +1635,8 @@ impl Writer<'_> {
     /// Materializes one emit effect as an `EventRow`, id from the monotonic
     /// `next_event_id` meta counter — bumped in this same store transaction,
     /// so ids are deterministic across replay. Platform apply-path surface.
+    /// `scope` is the record's tenant for a scoped emit (`0x0b`), carried
+    /// into the row unchanged.
     pub fn materialize_event(
         &mut self,
         seq: u64,
@@ -1483,6 +1644,7 @@ impl Writer<'_> {
         payload: &[u8],
         key: Option<&str>,
         shape: Option<u64>,
+        scope: Option<u64>,
     ) -> io::Result<u64> {
         let mut meta = self.txn.open_table(META).map_err(redb_err)?;
         let id = meta
@@ -1501,6 +1663,7 @@ impl Writer<'_> {
                 key: key.map(str::to_string),
                 payload: payload.to_vec(),
                 shape,
+                scope,
             },
         )?;
         Ok(id)
@@ -1694,9 +1857,11 @@ impl Writer<'_> {
             assert_eq!(
                 scope,
                 UNSCOPED,
-                "Writer::put: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) but was \
-                 called with scope {scope} — pass table::UNSCOPED for an unscoped table",
-                R::TABLE
+                "Writer::put: table \"{}\" is not tenant-scoped (Row::Scope = {}) but was \
+                 called with scope {scope} — pass table::UNSCOPED for a table that is not \
+                 tenant-scoped",
+                R::TABLE,
+                std::any::type_name::<R::Scope>()
             );
             let mut rows = self
                 .txn
@@ -1722,8 +1887,14 @@ pub struct Snapshot {
     txn: redb::ReadTransaction,
 }
 
-impl View for Snapshot {
-    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
+/// `View`'s four reads without its `ReadableBy` bound, crate-private: the
+/// bodies `Snapshot`'s `View` impl delegates to, and the snapshot reads
+/// `Tx`'s `View` impl and `Tx::get_job` are built on. A `Tx` read generic
+/// over `R: ReadableBy<Tx>` cannot prove `R: ReadableBy<Snapshot>`, so it
+/// could not call `View` on its snapshot, and `get_job` reads `JobRow`,
+/// which only these reach from inside a transaction.
+impl Snapshot {
+    pub(crate) fn get_any<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1735,7 +1906,7 @@ impl View for Snapshot {
         }
     }
 
-    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {
+    pub(crate) fn scan_any<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1749,7 +1920,11 @@ impl View for Snapshot {
         Ok(out)
     }
 
-    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
+    pub(crate) fn scan_by_any<R: UnscopedRow>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
         let index = R::INDEXES
             .iter()
             .find(|i| i.name == index_name)
@@ -1774,7 +1949,7 @@ impl View for Snapshot {
                 .try_into()
                 .expect("entry carries an id");
             let id = Id::<R>::from_raw(u64::from_be_bytes(id_bytes));
-            let row = self.get(id)?.unwrap_or_else(|| {
+            let row = self.get_any(id)?.unwrap_or_else(|| {
                 panic!(
                     "index \"{}\" entry points at missing {} row {id:?} — index corruption",
                     index.name,
@@ -1789,7 +1964,11 @@ impl View for Snapshot {
     /// Silent gap semantics: if `from_id` was GC'd, this starts at the next
     /// surviving row instead of erroring — callers needing gap detection
     /// must check contiguity themselves.
-    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+    pub(crate) fn scan_from_any<R: UnscopedRow>(
+        &self,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1801,6 +1980,32 @@ impl View for Snapshot {
             out.push(R::decode_row(value.value())?);
         }
         Ok(out)
+    }
+}
+
+impl View for Snapshot {
+    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        self.get_any(id)
+    }
+
+    fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>> {
+        self.scan_any()
+    }
+
+    fn scan_by<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
+        self.scan_by_any(index_name, key)
+    }
+
+    fn scan_from<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>> {
+        self.scan_from_any(from_id, limit)
     }
 }
 
@@ -1835,9 +2040,10 @@ impl Snapshot {
     pub fn get_scoped<R: Row>(&self, scope: u64, id: Id<R>) -> io::Result<Option<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::get_scoped: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — \
-             use View::get for an unscoped table",
-            R::TABLE
+            "Snapshot::get_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — use \
+             View::get for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
             Ok(rows) => rows,
@@ -1860,9 +2066,10 @@ impl Snapshot {
     pub fn scan_scoped<R: Row>(&self, scope: u64) -> io::Result<Vec<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::scan_scoped: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) \
-             — use View::scan for an unscoped table",
-            R::TABLE
+            "Snapshot::scan_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — use \
+             View::scan for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
             Ok(rows) => rows,
@@ -1895,9 +2102,10 @@ impl Snapshot {
     ) -> io::Result<Vec<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::scan_from_scoped: table \"{}\" is not tenant-scoped (Row::Scope = \
-             Unscoped) — use View::scan_from for an unscoped table",
-            R::TABLE
+            "Snapshot::scan_from_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — \
+             use View::scan_from for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
             Ok(rows) => rows,
@@ -1938,9 +2146,10 @@ impl Snapshot {
     ) -> io::Result<Vec<R>> {
         assert!(
             row_is_scoped::<R>(),
-            "Snapshot::scan_by_scoped: table \"{}\" is not tenant-scoped (Row::Scope = \
-             Unscoped) — use View::scan_by for an unscoped table",
-            R::TABLE
+            "Snapshot::scan_by_scoped: table \"{}\" is not tenant-scoped (Row::Scope = {}) — \
+             use View::scan_by for a table that is not tenant-scoped",
+            R::TABLE,
+            std::any::type_name::<R::Scope>()
         );
         let index = R::INDEXES
             .iter()

@@ -27,7 +27,16 @@ use crate::http::Session;
 /// ladder produced (job-tenancy spec §2 R2). This is what makes
 /// `Tenant::authorize`'s `who` unforgeable: a handler reads a principal and
 /// never builds one.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone` (tenancy-completion spec §2 ruling 5, amendment A19): the one
+/// principal an app holds is the `&Principal` its request's `Ctx` lends,
+/// which cannot outlive that request. `Tx::open_scope` takes any
+/// `&Principal` as the `who` it asks `authorize` about, so a copy parked in a
+/// `static` would let a later request, on any route and with no credential
+/// of its own, open every tenant the parked principal belongs to. With no
+/// copy to park, a parked identity opens no tenant, and the `who` an app can
+/// hand `open_scope` is its own request's caller.
+#[derive(Debug)]
 pub struct Principal {
     pub(crate) subject: String,
     pub(crate) via: Via,

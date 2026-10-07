@@ -31,7 +31,11 @@ pub mod tenant;
 pub mod wire;
 
 pub use launch::launch;
-// Re-exported at the root so the `#[table(scoped_by = …)]` const assert
-// `charpente-macros` emits can name it as `::charpente::TenantScope`, the
-// same flat-path convention `Wire` (from `charpente-macros`) already gets.
+// Re-exported at the root as public API, the same flat-path convention
+// `Wire` (from `charpente-macros`) already gets. The macros' output names
+// `::charpente::tenant::tenant_name::<S>()`, whose bound is `TenantScope`.
 pub use tenant::{Scoped, TenantScope};
+// Re-exported at the root so a tenant-feed handler writes
+// `use charpente::Subscribe;` beside `Scoped`, the other trait a scoped
+// handler brings into scope.
+pub use http::Subscribe;

@@ -1,0 +1,34 @@
+error[E0271]: type mismatch resolving `<RotaChanged as Event>::Scope == Org`
+  --> tests/compile_fail/tenant_feed_of_another_scopes_event.rs:59:16
+   |
+59 |         .and::<RotaChanged>()
+   |                ^^^^^^^^^^^ type mismatch resolving `<RotaChanged as Event>::Scope == Org`
+   |
+note: expected this to be `Org`
+  --> tests/compile_fail/tenant_feed_of_another_scopes_event.rs:43:21
+   |
+43 | #[event(scoped_by = Team)]
+   |                     ^^^^
+note: required by a bound in `TenantFeed::<S>::and`
+  --> $WORKSPACE/crates/charpente/src/http/mod.rs
+   |
+   |     pub fn and<Ev: Event<Scope = S> + serde::Serialize>(mut self) -> TenantFeed<S>
+   |                          ^^^^^^^^^ required by this bound in `TenantFeed::<S>::and`
+
+error[E0271]: type mismatch resolving `<SystemNotice as Event>::Scope == Org`
+  --> tests/compile_fail/tenant_feed_of_another_scopes_event.rs:72:26
+   |
+72 |     Ok(tx.subscription::<SystemNotice>().cursor(cursor).into())
+   |                          ^^^^^^^^^^^^ type mismatch resolving `<SystemNotice as Event>::Scope == Org`
+   |
+note: expected this to be `Org`
+  --> tests/compile_fail/tenant_feed_of_another_scopes_event.rs:46:1
+   |
+46 | #[event(global)]
+   | ^^^^^^^^^^^^^^^^
+note: required by a bound in `subscription`
+  --> $WORKSPACE/crates/charpente/src/http/mod.rs
+   |
+   |     fn subscription<Ev: Event<Scope = S> + serde::Serialize>(&self) -> TenantFeed<S>;
+   |                               ^^^^^^^^^ required by this bound in `Subscribe::subscription`
+   = note: this error originates in the attribute macro `event` (in Nightly builds, run with -Z macro-backtrace for more info)

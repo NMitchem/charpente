@@ -34,7 +34,7 @@ const WRITER: &str = "node-a:9000";
 /// ships the Db's event counter" and "the archive ships a zero" are the same
 /// assertion — measured: a `next_event_id: 0` mutation survived a fully green
 /// suite until this existed.
-#[event]
+#[event(global)]
 struct Ping {
     // `WireU64`, not a bare `u64`, since main's `Wire` bound landed: an event
     // payload IS the JSON a client sees, and a u64 above 2^53 loses precision
@@ -64,6 +64,7 @@ struct ScopedOrg {
 }
 
 impl charpente::Tenant for ScopedOrg {
+    const NAME: &'static str = "ScopedOrg";
     type Who = charpente::auth::Principal;
     type Error = charpente::http::ApiError;
 
@@ -7426,6 +7427,7 @@ impl Row for ConvLedger {
 }
 
 impl charpente::Tenant for ConvOrg {
+    const NAME: &'static str = "ConvOrg";
     type Who = str;
     type Error = std::convert::Infallible;
 
@@ -7781,7 +7783,7 @@ fn conv_frontier(m: &Manifest) -> u64 {
 /// RED. `kernel.rs`'s workload takes exactly this care with its
 /// `exactly_once_holds` call, and its comment records the bug that taught it
 /// to (seed 0x348270b38f166529, then 0xe653f43924f17fe8, then
-/// 0xe2d97275c15cc087, now 0x0f34c969dfd340b0).
+/// 0xe2d97275c15cc087, then 0x0f34c969dfd340b0, now 0x56731152a87514ae).
 enum ConvFail {
     /// Retryable: the matrix hit the checker. Recognized by
     /// `checks::is_fault_fallout`, never by this file's own substring list.

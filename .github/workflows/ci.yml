@@ -85,7 +85,13 @@ jobs:
       # 0x577d001a, universe 122; the only one of 10,240 scanned) is RED with it deleted (a
       # countdown crash lands inside the checker's own reads: "table store (redb): I/O error:
       # simulated crash") and GREEN with it restored.
-      - run: CHARPENTE_SEED=0x0f34c969dfd340b0 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
+      # Re-pinned 2026-10-03: S1 (tenancy completion) moved the kernel workload's bytes and left
+      # 0x0f34c969dfd340b0 GREEN with the classification deleted. 0x56731152a87514ae (base
+      # 0xf162b85556dc0f8d, universe 159: universe 3,128 of 10,413 scanned as one splitmix64
+      # stream from base 0x10030000, which found 5 hits, every one a fault inside the checker's
+      # reads) is RED with it deleted (a countdown crash lands inside the checker's own reads:
+      # "table store (redb): I/O error: simulated crash") and GREEN with it restored.
+      - run: CHARPENTE_SEED=0x56731152a87514ae cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
       # The passthrough guard, in DEBUG with --ignored — added 2026-08-20. It is `#[ignore]`d
       # because it needs a real disk, so `cargo test --workspace` above lists it as "ignored" and
       # runs nothing: until this line existed the fix it guards was enforced by a `scripts/bench.sh

@@ -5,8 +5,9 @@
 //! turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
 //! the id: a job payload has no primary key), `impl Job` carrying the name,
-//! the payload's structural fingerprint (`fingerprint::compute_job`, which
-//! mixes in `scoped_by`), the scope type and the retry policy, and the
+//! the payload's structural fingerprint (`fingerprint::compute`, continued over
+//! the tenant type's `NAME` by `charpente_core::db::scoped_fingerprint` for a
+//! `scoped_by` job), the scope type and the retry policy, and the
 //! `JobEntry` glue `jobs![]` collects. Errors name the accepted forms (hard
 //! rule 5).
 
@@ -238,11 +239,12 @@ fn parse_backoff(lit: &LitStr) -> syn::Result<u64> {
 }
 
 /// `global` and `scoped_by` on one job, reported at whichever came second.
-/// Names the scope by its last segment, as the other tenancy refusals do.
+/// Quotes the scope path as written (plan amendment A8): a tenant type's
+/// `NAME` is a constant of the compiled type, which expansion cannot read.
 fn global_and_scoped_by(path: &syn::Path) -> String {
     format!(
         "`global` and `scoped_by = {}` on one job — a job is one or the other; drop one",
-        crate::route::scope_name(path)
+        crate::fingerprint::path_as_written(path)
     )
 }
 
@@ -259,11 +261,11 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         return Err(Error::new(
             proc_macro2::Span::call_site(),
             format!(
-                "`{name_str}` declares no tenancy — a job says which: write \
-                 `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from \
-                 inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), \
-                 or `#[job(global)]` if it belongs to no tenant (the only kind cron can \
-                 schedule). Neither is the default."
+                "`{name_str}` declares no tenancy — a job says which. Add one of these to its \
+                 `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it \
+                 acts inside one tenant (it is enqueued from inside that tenant's scope, and its \
+                 `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no \
+                 tenant (the only kind cron can schedule). Neither is the default."
             ),
         ));
     };
@@ -295,11 +297,24 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         .map(|f| f.ident.clone().expect("named fields have idents"))
         .collect();
     let field_types: Vec<_> = fields.named.iter().map(|f| f.ty.clone()).collect();
-    let scoped_path = match tenancy {
-        Tenancy::Global => None,
-        Tenancy::ScopedBy(path) => Some(path),
+    // A `global` job's fingerprint is its field fold's hash. A scoped job's
+    // continues that fold over its tenant type's `NAME`, in
+    // `charpente_core::db::scoped_fingerprint` (tenancy-completion spec §4):
+    // a constant the compiler evaluates, because expansion cannot read `NAME`.
+    // `tenant_name`'s bound is the one `JobDef.scoped_by` already carries at
+    // this span, so a scope type with no `Tenant` impl gains no error.
+    // `cross_tenant` is not mixed in: it changes neither the stored bytes nor
+    // decode.
+    let fold = crate::fingerprint::compute(&field_idents, &field_types);
+    let fingerprint = match tenancy {
+        Tenancy::Global => quote! { #fold },
+        Tenancy::ScopedBy(path) => quote! {
+            ::charpente::core::db::scoped_fingerprint(
+                #fold,
+                ::charpente::tenant::tenant_name::<#path>(),
+            )
+        },
     };
-    let fingerprint = crate::fingerprint::compute_job(&field_idents, &field_types, scoped_path);
 
     let max = args.max;
     let backoff_millis = args.backoff_millis;
@@ -320,7 +335,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
     // whose `run` takes a bare `Tx` would compile and run in no tenant. The
     // binding makes that a compile error, pinned by
     // `compile_fail/scoped_job_run_takes_bare_tx.rs`.
-    let (scope_ty, tenant_scope_assert, scoped_by_name, run_call) = match tenancy {
+    let (scope_ty, scoped_by_name, run_call) = match tenancy {
         Tenancy::Global => {
             let call = if cross_tenant {
                 quote! { job.run(tx, #cap_expect) }
@@ -329,7 +344,6 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
             };
             (
                 quote! { ::charpente::core::table::Unscoped },
-                quote! {},
                 quote! { ::std::option::Option::None },
                 quote! {
                     let _ = scope; // a global job is handed no tenant
@@ -338,10 +352,9 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
             )
         }
         Tenancy::ScopedBy(path) => {
-            let scope_name = crate::route::scope_name(path);
             let (cap_ty, cap_arg) = if cross_tenant {
                 (
-                    quote! { , &::charpente::CrossTenant },
+                    quote! { , &::charpente::CrossTenant<'_> },
                     quote! { , #cap_expect },
                 )
             } else {
@@ -350,12 +363,8 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
             (
                 quote! { #path },
                 quote! {
-                    const _: () = {
-                        const fn __charpente_assert_tenant_scope<T: ::charpente::TenantScope>() {}
-                        __charpente_assert_tenant_scope::<#path>();
-                    };
+                    ::std::option::Option::Some(::charpente::tenant::tenant_name::<#path>())
                 },
-                quote! { ::std::option::Option::Some(#scope_name) },
                 quote! {
                     let scope = scope.expect(
                         "job declares scoped_by but the dispatcher passed no JobScope — the \
@@ -388,7 +397,6 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
 
     Ok(quote! {
         #input
-        #tenant_scope_assert
 
         impl ::charpente::core::table::Codec for #name {
             fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
@@ -417,7 +425,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                 fn __charpente_job_glue(
                     tx: &mut ::charpente::Tx,
                     payload: &[u8],
-                    cap: ::std::option::Option<&::charpente::CrossTenant>,
+                    cap: ::std::option::Option<&::charpente::CrossTenant<'_>>,
                     scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
                 ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
                     let _ = cap; // an undeclared job is handed None and uses none of it
@@ -442,6 +450,9 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     cross_tenant: #cross_tenant,
                     scoped_by: #scoped_by_name,
                     scope_type: ::std::any::TypeId::of::<
+                        <#name as ::charpente::core::db::Job>::Scope,
+                    >(),
+                    scope_type_name: ::std::any::type_name::<
                         <#name as ::charpente::core::db::Job>::Scope,
                     >(),
                     fingerprint: <#name as ::charpente::core::db::Job>::FINGERPRINT,

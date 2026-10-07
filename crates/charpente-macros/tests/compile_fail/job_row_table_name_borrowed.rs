@@ -7,14 +7,17 @@
 // trybuild builds here, since this suite has pass cases), `cargo check`
 // does not, and it fires for the writes the binary can reach — which is why
 // `main` mounts both routes, as an app does. A write nothing reaches is
-// never compiled into the binary, so it can never run either.
+// never compiled into the binary, so it can never run either. The routes
+// build the row they forge rather than read it: no app code reads the
+// queue through a transaction (job_row_read_on_bare_tx.rs), and a read's
+// type-check error would stop the build before any of these four.
 use std::io;
 
 use charpente::auth::Principal;
-use charpente::core::job::JobRow;
+use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{IndexDef, Row, Unscoped};
 use charpente::http::{ApiError, Ctx};
-use charpente::{Id, Scoped, Tenant, Tx, View, route, routes, table};
+use charpente::{Id, Scoped, Tenant, Tx, route, routes, table};
 
 #[table(global)]
 struct Org {
@@ -23,6 +26,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
@@ -64,19 +68,34 @@ impl Row for OrgQueue {
     }
 }
 
+// The row a handler would forge: which job, and which tenant it runs in, are
+// the handler's choice.
+fn forged(id: u64) -> JobRow {
+    JobRow {
+        id: Id::from_raw(id),
+        name: "CloseIncident".into(),
+        payload: Vec::new(),
+        key: None,
+        status: JobStatus::Pending,
+        attempts: 0,
+        due_at: 0,
+        last_error: None,
+        shape: None,
+        scope: Some(13),
+    }
+}
+
 #[route(POST "/jobs/:job/requeue", public)]
 fn requeue(tx: &mut Tx, job: Id<JobRow>) -> Result<(), ApiError> {
-    let row = tx.get(job)?.ok_or(ApiError::NotFound)?;
-    tx.put(&Queue(row));
+    tx.put(&Queue(forged(job.raw())));
     tx.delete::<Queue>(Id::from_raw(job.raw() + 1));
     Ok(())
 }
 
 #[route(POST "/orgs/:org/jobs/:job/requeue", auth)]
 fn requeue_in(tx: &mut Tx, org: Id<Org>, job: Id<JobRow>, ctx: &Ctx) -> Result<(), ApiError> {
-    let row = tx.get(job)?.ok_or(ApiError::NotFound)?;
     let mut tx = tx.scope::<Org>(org, ctx)?;
-    tx.put(&OrgQueue(row));
+    tx.put(&OrgQueue(forged(job.raw())));
     tx.delete::<OrgQueue>(Id::from_raw(job.raw() + 1));
     Ok(())
 }

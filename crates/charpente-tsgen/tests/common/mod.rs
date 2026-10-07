@@ -164,12 +164,12 @@ pub fn fixture_contract() -> Contract {
             EventInfo {
                 name: "invoice_paid",
                 payload: "InvoicePaid",
-                keyed: false,
+                scoped_by: None,
             },
             EventInfo {
                 name: "invoice_voided",
                 payload: "InvoiceVoided",
-                keyed: false,
+                scoped_by: None,
             },
         ],
         types: vec![

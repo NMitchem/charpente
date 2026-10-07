@@ -11,25 +11,25 @@ use std::time::Duration;
 use charpente::auth::Principal;
 use charpente::event;
 use charpente::http::{
-    ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Route, RouteDef,
-    RouteGlue, SubEntry, Subscription,
+    ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Subscription,
 };
 use charpente::kernel::{
-    ERROR_FRAME, EventFrame, EventSink, Kernel, RESHAPED_FRAME, RecordedResponses, SimSink,
-    SimSinkHandle, SimSource, SinkHandles, SinkStatus, Step, TAIL_BATCH_EVENTS,
+    ERROR_FRAME, EventFrame, EventSink, JobError, Kernel, RESHAPED_FRAME, RecordedResponses,
+    SimSink, SimSinkHandle, SimSource, SinkHandles, SinkStatus, Step, TAIL_BATCH_EVENTS,
 };
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
 use charpente::wire::{TypeSchema, Wire, WireU64};
 use charpente::{
-    DbConfig, Id, Schema, Scoped, Tenant, Tx, Wire as WireDerive, route, routes, table,
+    DbConfig, Id, Schema, Scoped, ScopedTx, Subscribe, Tenant, Tx, Wire as WireDerive, job, jobs,
+    route, routes, table,
 };
 use charpente_core::db::{Db, Event};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Row, View};
+use charpente_core::table::{Codec, Row, Unscoped, View};
 use charpente_sim::checks::{
     FaultReason, boot_through_fallout, classify, durable_corruption_fired, durable_refusal,
     is_fault_fallout,
@@ -45,12 +45,12 @@ const SEC: u64 = 1_000_000_000;
 // 64-bit integer only crosses the wire as a string. The stored `Codec` bytes
 // are unchanged — `WireU64`'s codec IS `u64`'s — so only the frame JSON
 // differs ({"n":"3"} rather than {"n":3}).
-#[event]
+#[event(global)]
 struct Ping {
     n: WireU64,
 }
 
-#[event]
+#[event(global)]
 struct Pong {
     n: WireU64,
 }
@@ -63,18 +63,18 @@ mod shapes_v1 {
     use charpente::event;
     use charpente::wire::WireU64;
 
-    #[event]
+    #[event(global)]
     pub struct IncidentOpened {
         pub n: WireU64,
     }
 
-    #[event]
+    #[event(global)]
     pub struct Swapped {
         pub a: WireU64,
         pub b: WireU64,
     }
 
-    #[event]
+    #[event(global)]
     pub struct Dropped {
         pub a: WireU64,
         pub b: WireU64,
@@ -86,21 +86,21 @@ mod shapes_v2 {
     use charpente::wire::WireU64;
 
     /// v1 plus a field — the statuspage review's C-1 change.
-    #[event]
+    #[event(global)]
     pub struct IncidentOpened {
         pub n: WireU64,
         pub severity: WireU64,
     }
 
     /// v1 with its two same-typed fields swapped.
-    #[event]
+    #[event(global)]
     pub struct Swapped {
         pub b: WireU64,
         pub a: WireU64,
     }
 
     /// v1 with its trailing field dropped.
-    #[event]
+    #[event(global)]
     pub struct Dropped {
         pub a: WireU64,
     }
@@ -165,6 +165,23 @@ fn an_events_fingerprint_follows_its_fields_not_its_name() {
     assert_eq!(<Ping as Event>::FINGERPRINT, <Pong as Event>::FINGERPRINT);
 }
 
+/// Tenancy-completion spec §6 and amendment A1: a `global` event's
+/// fingerprint is exactly the fold a bare `#[event]` computed, so no stored
+/// row of an existing event changes shape when its declaration gains
+/// `global`, and the scoped fingerprint the plan's Task 11 adds leaves global
+/// events alone. The literals are FNV-1a over charpente's own rendering —
+/// `"n\0WireU64\0"` and `"a\0WireU64\0b\0WireU64\0"` — and were run green at
+/// the plan's base, before any event said `global`.
+#[test]
+fn a_global_events_fingerprint_is_the_bare_events_fingerprint() {
+    assert_eq!(<Ping as Event>::FINGERPRINT, 0x9caf_3f93_9b10_65e1);
+    assert_eq!(<Pong as Event>::FINGERPRINT, 0x9caf_3f93_9b10_65e1);
+    assert_eq!(
+        <shapes_v1::Swapped as Event>::FINGERPRINT,
+        0x26f3_bd60_2fcd_ef46
+    );
+}
+
 #[derive(WireDerive, Serialize, Deserialize)]
 struct EmitBody {
     n: WireU64,
@@ -207,8 +224,8 @@ fn feed_ping(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscript
 
 /// `emits(...)` describes WHICH event types reach the stream, not which rows
 /// pass `.key(...)` — the key is a per-emit call-site value the contract
-/// cannot know (same reason `EventInfo.keyed` is always false), so a keyed
-/// feed declares the same two types the unkeyed one does.
+/// cannot know, so a keyed feed declares the same two types the unkeyed one
+/// does.
 #[route(SSE "/feed-keyed", public, emits(Ping, Pong))]
 fn feed_keyed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
@@ -1251,6 +1268,8 @@ impl Codec for Quoted {
 impl Event for Quoted {
     const NAME: &'static str = "say \"hi\"";
     const FINGERPRINT: u64 = 0x7E57_0A11;
+    // A global event: it belongs to no tenant.
+    type Scope = Unscoped;
 }
 
 #[route(SSE "/quoted", public)]
@@ -1343,6 +1362,7 @@ fn realtime_app(sim: &Sim) -> io::Result<App> {
 }
 
 const PING_ONLY: &[&str] = &["ping"];
+const ORG_PING_ONLY: &[&str] = &["org_ping"];
 const BOTH: &[&str] = &["ping", "pong"];
 
 /// This universe's subscribe path, subscribed event names, and optional key
@@ -1428,6 +1448,10 @@ enum MatchOutcome {
     Pending,
 }
 
+/// `Client::ledger`'s shape: event id to (event name, app key, recorded
+/// tenant, the exact JSON a delivery would carry).
+type Ledger = BTreeMap<u64, (&'static str, Option<String>, Option<u64>, String)>;
+
 /// The reconnecting client's accumulated state across every epoch and
 /// reconnect in one universe: the ledger it must eventually match (keyed by
 /// event id — see below), every delivered-but-not-yet-content-verified
@@ -1454,8 +1478,12 @@ enum MatchOutcome {
 struct Client {
     mode_names: &'static [&'static str],
     mode_key: Option<&'static str>,
+    /// The tenant this client's feed was opened in, `None` for a global
+    /// subscription. A row is this client's only if its recorded tenant is
+    /// exactly this: presence, not value, so tenant 0 is `Some(0)`.
+    mode_scope: Option<u64>,
     /// Every event `sync_ledger` has read back, keyed by id.
-    ledger: BTreeMap<u64, (&'static str, Option<String>, String)>,
+    ledger: Ledger,
     /// How far `sync_ledger` has scanned `charpente.events` — server-
     /// relative, persists across reopens.
     next_scan_id: u64,
@@ -1519,6 +1547,7 @@ impl Client {
         Client {
             mode_names,
             mode_key,
+            mode_scope: None,
             ledger: BTreeMap::new(),
             next_scan_id: 0,
             gone: BTreeSet::new(),
@@ -1535,8 +1564,16 @@ impl Client {
         }
     }
 
-    fn matches(&self, name: &str, key: &Option<String>) -> bool {
+    /// This client, subscribed to a tenant feed of `tenant` rather than to a
+    /// global subscription.
+    fn in_tenant(mut self, tenant: u64) -> Client {
+        self.mode_scope = Some(tenant);
+        self
+    }
+
+    fn matches(&self, name: &str, key: &Option<String>, scope: Option<u64>) -> bool {
         self.mode_names.contains(&name)
+            && self.mode_scope == scope
             && (self.mode_key.is_none() || self.mode_key == key.as_deref())
     }
 
@@ -1585,8 +1622,8 @@ impl Client {
     /// and `BTreeMap::range` panics on an inverted bound.
     fn first_unaccounted(&self) -> Option<u64> {
         let lo = self.floor.min(self.next_scan_id);
-        for (id, (name, key, _)) in self.ledger.range(lo..self.next_scan_id) {
-            if self.matches(name, key) && !self.verified.contains(id) {
+        for (id, (name, key, scope, _)) in self.ledger.range(lo..self.next_scan_id) {
+            if self.matches(name, key, *scope) && !self.verified.contains(id) {
                 return Some(*id);
             }
         }
@@ -1639,7 +1676,7 @@ impl Client {
     fn diverged_ledger_entry(&self, db: &Db) -> Option<(u64, String, String)> {
         let snap = db.snapshot().ok()?;
         let next_event_id = snap.next_event_id().ok()?;
-        for (&id, (_, _, recorded)) in &self.ledger {
+        for (&id, (_, _, _, recorded)) in &self.ledger {
             match snap.get::<EventRow>(Id::from_raw(id)).ok()? {
                 Some(row) => {
                     let (_, stored) = decode_event_row(&row).ok()?;
@@ -1699,7 +1736,8 @@ impl Client {
         for row in rows {
             self.next_scan_id = row.id.raw() + 1;
             let (name, json) = decode_event_row(&row)?;
-            self.ledger.insert(row.id.raw(), (name, row.key, json));
+            self.ledger
+                .insert(row.id.raw(), (name, row.key, row.scope, json));
         }
         Ok(())
     }
@@ -1767,18 +1805,23 @@ impl Client {
     /// scanned yet.
     fn try_match(&self, id: u64, name: &str, json: &str) -> MatchOutcome {
         match self.ledger.get(&id) {
-            Some((exp_name, key, exp_json)) if *exp_name == name && exp_json == json => {
+            Some((exp_name, key, scope, exp_json)) if *exp_name == name && exp_json == json => {
                 // Content matches the ledger row at this id exactly — but a
                 // delivered frame is only legitimate if that row ALSO
                 // satisfies this subscription's own filter. Over-delivery
-                // (a leaked wrong-name or wrong-key row) carries genuine
-                // content at its own id, so content equality alone would
-                // silently Match it; this closes that direction.
-                if !self.matches(exp_name, key) {
+                // (a leaked wrong-name, wrong-tenant or wrong-key row) carries
+                // genuine content at its own id, so content equality alone
+                // would silently Match it; this closes that direction.
+                if !self.matches(exp_name, key, *scope) {
                     let violation = if !self.mode_names.contains(exp_name) {
                         format!(
                             "name {exp_name:?} is not in the subscribed set {:?}",
                             self.mode_names
+                        )
+                    } else if self.mode_scope != *scope {
+                        format!(
+                            "its recorded tenant {scope:?} is not the subscription's {:?}",
+                            self.mode_scope
                         )
                     } else {
                         format!(
@@ -1793,7 +1836,7 @@ impl Client {
                 }
                 MatchOutcome::Matched
             }
-            Some((exp_name, _, exp_json)) => MatchOutcome::Mismatch(format!(
+            Some((exp_name, _, _, exp_json)) => MatchOutcome::Mismatch(format!(
                 "content mismatch at event id {id}: expected ({exp_name}, {exp_json}) but \
                  received ({name}, {json})"
             )),
@@ -1930,7 +1973,13 @@ impl Client {
                     self.cursor = None;
                     self.need_subscribe = true;
                 }
-                409 if text.contains("diverged from this node's timeline")
+                // A cut that returned the log to the client's exact cursor
+                // position can also re-mint that id and seq as a row of
+                // another tenancy (the same loss, a different emit), which
+                // validation refuses by tenancy rather than by seq
+                // (amendment A16). Same cause, same prune.
+                409 if (text.contains("diverged from this node's timeline")
+                    || text.contains("outside this feed's tenancy"))
                     && (self.cut_explained)(sim) =>
                 {
                     // T6 interlude investigation (t6-realtime-interlude-
@@ -2133,8 +2182,13 @@ fn decode_event_row(row: &EventRow) -> io::Result<(&'static str, String)> {
             "pong",
             serde_json::to_string(&Pong::decode(&mut &row.payload[..])?).expect("Pong serializes"),
         )),
+        "org_ping" => Ok((
+            "org_ping",
+            serde_json::to_string(&OrgPing::decode(&mut &row.payload[..])?)
+                .expect("OrgPing serializes"),
+        )),
         other => Err(io::Error::other(format!(
-            "ledger scan found event name {other:?} — this workload only ever emits ping/pong"
+            "ledger scan found event name {other:?} — this workload only ever emits ping/pong/org_ping"
         ))),
     }
 }
@@ -2976,7 +3030,8 @@ fn the_harness_refuses_a_diverged_409_without_durable_corruption() {
 ///
 /// Found the honest way — by an existing test going red — but by
 /// `tail_encode_error_is_whole_node_fatal` (since renamed
-/// `an_unencodable_event_fails_its_tail_not_the_node`), whose name promises
+/// `an_unencodable_event_fails_its_tail_not_the_node`, now in
+/// `kernel/tail.rs`'s unit tests), whose name promises
 /// nothing about batch ordering, so the property gets its own pin here
 /// rather than living on as a side effect of that one.
 #[test]
@@ -3074,128 +3129,12 @@ fn a_delivered_frame_carries_its_64_bit_field_as_a_decimal_string() {
     );
 }
 
-/// Spec §3/§6.5: an encode failure fails its own tail, never the node — this
-/// test was `tail_encode_error_is_whole_node_fatal`, the pin of the decision
-/// payload shapes reversed (docs/LEDGER.md:286's per-tail follow-up). The
-/// failing encoder is hand-built (`FailingFeed`), which covers an encoder
-/// that fails regardless of the payload's type — no shape check, no field
-/// ever read. `a_real_events_serialize_failure_fails_its_tail_not_the_node`
-/// (below) covers the other case, a real `#[event]` whose own field
-/// `Serialize` impl fails on its own bytes. The stream ends with
-/// `charpente.error`, and the node keeps serving.
-struct FailingFeed;
-
-fn failing_feed_glue(
-    _tx: &mut Tx,
-    _ctx: &Ctx,
-    _captures: &[String],
-    cursor: Option<Cursor>,
-) -> Result<Subscription, ApiError> {
-    Ok(Subscription {
-        entries: vec![SubEntry {
-            name: "note_added",
-            encode_json: |_: &[u8]| -> io::Result<String> {
-                Err(io::Error::other("encode exploded"))
-            },
-            fingerprint: <NoteAdded as Event>::FINGERPRINT,
-        }],
-        key: None,
-        cursor,
-    })
-}
-
-impl RouteDef for FailingFeed {
-    fn route() -> Route {
-        // Untyped glue, not a described route: a hand-written `RouteDef`
-        // with no typed handler (Amendment D, task-5-brief.md).
-        Route {
-            method: Method::Get,
-            pattern: "/feed-failing",
-            auth: false,
-            public_scope: None,
-            cross_tenant: false,
-            name: "FailingFeed",
-            glue: RouteGlue::Sse(failing_feed_glue),
-            params: &[],
-            request: None,
-            response: || TypeSchema::Null,
-            error: || <ApiError as Wire>::reference(),
-            register_types: |_| {},
-            emits: &[],
-        }
-    }
-}
-
-#[event]
-struct NoteAdded {
-    n: WireU64,
-}
-
-#[derive(WireDerive, Serialize, Deserialize)]
-struct NoteBody {
-    n: WireU64,
-}
-
-#[route(POST "/note", public)]
-fn emit_note(tx: &mut Tx, body: NoteBody) -> Result<(), ApiError> {
-    tx.emit(NoteAdded { n: body.n });
-    Ok(())
-}
-
-#[test]
-fn an_unencodable_event_fails_its_tail_not_the_node() {
-    let sim = Sim::with_faults(0x2EB2_FA11, FaultConfig::none());
-    let app = App::open(
-        Box::new(sim.disk()),
-        Schema::new(),
-        Box::new(sim.entropy()),
-        AppConfig::default(),
-    )
-    .unwrap()
-    .mount(vec![FailingFeed::route()])
-    .mount(routes![emit_note]);
-    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
-    let (_, sinks) = run_script(
-        &mut kernel,
-        &sim,
-        vec![
-            Request::new(Method::Get, "/feed-failing"),
-            Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(1) }),
-        ],
-    );
-    let rows: Vec<EventRow> = kernel
-        .app()
-        .db()
-        .snapshot()
-        .unwrap()
-        .scan_from(0, 8)
-        .unwrap();
-    assert_eq!(
-        frames_of(&sinks.lock().unwrap()[0]),
-        vec![(
-            rows[0].id.raw(),
-            rows[0].seq,
-            "charpente.error".to_string(),
-            format!(
-                r#"{{"event":"note_added","id":{},"error":"encode exploded"}}"#,
-                rows[0].id.raw()
-            ),
-        )],
-        "one terminal error frame naming the event and the row"
-    );
-    let (responses, _) = run_script(
-        &mut kernel,
-        &sim,
-        vec![Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(2) })],
-    );
-    assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
-}
-
 /// A field type whose `Serialize` always fails: `#[event]`
 /// only requires `Codec`/`Wire`/`Serialize` on its fields (charpente-macros
 /// event.rs), and `Wire` is an open `pub trait`, so a hand-written field type
 /// can make `Subscription::of`'s REAL encoder fail on its own bytes — not
-/// `FailingFeed`'s hand-built stub. `Codec`/`Wire` are modeled on `WireU64`:
+/// the hand-built stub `kernel/tail.rs`'s unit test uses. `Codec`/`Wire` are
+/// modeled on `WireU64`:
 /// a fixed-shape carrier with nothing to decide, so only `Serialize` is
 /// interesting here.
 #[derive(Clone, Copy)]
@@ -3224,7 +3163,7 @@ impl Serialize for Poisoned {
     }
 }
 
-#[event]
+#[event(global)]
 struct PoisonedEvent {
     field: Poisoned,
 }
@@ -3241,9 +3180,11 @@ fn feed_poisoned(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subsc
     Ok(Subscription::of::<PoisonedEvent>().cursor(cursor))
 }
 
-/// The same `charpente.error` frame `an_unencodable_event_…` pins, but
+/// The same `charpente.error` frame `kernel/tail.rs`'s
+/// `an_unencodable_event_fails_its_tail_not_the_node` pins, but
 /// reached through a REAL `#[event]`/`Subscription::of` encoder (`ev_json`,
-/// http/mod.rs) rather than `FailingFeed`'s hand-built stub — this is what
+/// http/mod.rs) rather than the hand-built stub in `kernel/tail.rs`'s unit
+/// test — this is what
 /// pins the JSON-encode failure text GUIDE §11 quotes
 /// (`event <name> failed JSON encoding: <message> — every #[event] payload
 /// must be plainly JSON (GUIDE §11); fix the emitting code`), spelled out
@@ -5284,17 +5225,18 @@ fn every_stream_routes_declared_emits_matches_its_subscription() {
 
 // ============================================= tenant-scoped event emission
 //
-// M2 tenant-scoping spec §4, "one tenancy mechanism, not two": `emit_keyed`'s
-// exact-match subscription key and `ScopedTx`'s tenant bound are the SAME
-// mechanism, so an event emitted inside `ScopedTx<Org>(B)` carries B's key and
-// a subscription keyed to tenant A never sees it (exit criterion 6). Leaving
-// the two separate is what lets an app that has locked its queries down leak
-// through a subscription anyway.
+// Tenancy-completion spec §6, "one tenancy mechanism, not two": an event
+// emitted inside `ScopedTx<Org>(B)` is recorded in tenant B, in the row's own
+// field and apart from any app key, and a tenant feed built from
+// `ScopedTx<Org>(A)` delivers only rows recorded in A (exit criterion 1). A
+// key is the app's filter and never a tenant: a global subscription keyed
+// with a tenant's decimal id — what tenancy was before — receives nothing of
+// that tenant's.
 
 /// The scope type. A `#[table]` only so `Id<Org>` can be a route path
 /// parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing reads the
-/// table and it is not registered in any `Schema`. A scope type owes nothing
-/// but `authorize`.
+/// table and it is not registered in any `Schema`. A tenant type owes a `NAME`
+/// (its identity, unique in the app) and `authorize`.
 #[table(global)]
 struct Org {
     id: Id<Org>,
@@ -5302,17 +5244,53 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 
     /// Always allows, and the scoped routes below do not ask: they are
-    /// declared `public(Org)`. This property is about the platform's key
-    /// derivation, not the app's membership check — `charpente/tests/tenant.rs`
-    /// owns the refusing case.
+    /// declared `public(Org)`. This property is about where the platform
+    /// records a tenant, not the app's membership check —
+    /// `charpente/tests/tenant.rs` owns the refusing case.
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
 }
+
+/// The tenant section's own event: every emit inside a scope in this file is
+/// an `OrgPing`, and `Ping` stays the flagship's global event. It has
+/// `Ping`'s shape and its own type, so that its tenancy is declared on it
+/// without touching the flagship.
+///
+/// Scoped by `Org` (tenancy-completion spec §6): emitted only on an org's
+/// `ScopedTx`, and received only by that org's feed. Its fields and `NAME`
+/// are Task 10's, so every record is Task 10's length. Only the 8-byte shape
+/// moves, because `scoped_fingerprint` mixes in `Org`'s `NAME`.
+#[event(scoped_by = Org)]
+struct OrgPing {
+    n: WireU64,
+}
+
+/// `OrgPing`'s global twin (tenancy-completion spec §6). `OrgPing` is scoped
+/// by `Org`, so it can no longer be emitted on a bare `Tx` or named in a
+/// global feed. The tests that pin "a global row and a tenant's row of one
+/// name never cross" need one of each. After typing, the only way an app
+/// gets that pair is two types with one identifier in two modules, which is
+/// this. It keeps the identifier, so its `NAME` is `"org_ping"`. Its fields
+/// are `OrgPing`'s, so its fingerprint is the bare fold Task 10's global
+/// `OrgPing` had, and every record these sites write keeps Task 10's bytes.
+/// Imported under an alias because `emits(...)` takes an identifier, not a
+/// path.
+mod global_twin {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(global)]
+    pub struct OrgPing {
+        pub n: WireU64,
+    }
+}
+use global_twin::OrgPing as GlobalOrgPing;
 
 #[derive(WireDerive, Serialize, Deserialize)]
 struct ScopedEmitBody {
@@ -5321,18 +5299,20 @@ struct ScopedEmitBody {
 }
 
 /// The shape spec §1 prescribes: one `scope()` line, and every effect below it
-/// — reads, writes, and now emits — bounded to that tenant.
+/// — reads, writes, and emits — bounded to that tenant. The emit is recorded
+/// in the tenant (tag `0x0b`), with no key of the app's.
 #[route(POST "/scoped-ping", public(Org))]
 fn emit_scoped_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
     let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
-    tx.emit(Ping { n: body.n });
+    tx.emit(OrgPing { n: body.n });
     Ok(())
 }
 
-/// The subscriber half of the same mechanism: opening the scope admits the
-/// subscriber by the route's `public(Org)` declaration and yields the very key
-/// the emitter used, so the two sides cannot drift into two encodings.
-#[route(SSE "/scoped-feed/:org", public(Org), emits(Ping))]
+/// The subscriber half of the same mechanism (amendment A3): the feed is
+/// built from the scope that admitted the subscriber, so it carries that
+/// tenant and delivers only events recorded in it. No string names the
+/// tenant on either side.
+#[route(SSE "/scoped-feed/:org", public(Org), emits(OrgPing))]
 fn scoped_feed(
     tx: &mut Tx,
     org: Id<Org>,
@@ -5340,19 +5320,14 @@ fn scoped_feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<Ping>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<OrgPing>().cursor(cursor).into())
 }
 
-/// A hand-written key, with no `ScopedTx` anywhere — the pin on the ENCODING
-/// itself. Every other assertion below holds only by composition (`event_key`
-/// agrees with itself whatever it returns), so if the scope's string form
-/// silently changed, this route is the only thing here that would notice. That
-/// is not cosmetic: the key is DURABLE (`EventRow.key`), replicated, and
-/// exact-matched on resume, so a changed encoding makes every pre-upgrade
-/// backlog event invisible to a reconnecting subscriber.
-#[route(SSE "/literal-feed/:key", public, emits(Ping))]
+/// A global subscription keyed with a string spelled like a tenant's decimal
+/// id — the tenant-id key a scoped emit used to attach. A key is an app filter
+/// and never a tenant, so this feed receives no event recorded in a tenant,
+/// whatever it is keyed with (tenancy-completion spec §2.3).
+#[route(SSE "/literal-feed/:key", public, emits(GlobalOrgPing))]
 fn literal_feed(
     tx: &mut Tx,
     key: String,
@@ -5360,90 +5335,377 @@ fn literal_feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
-    Ok(Subscription::of::<Ping>().key(key).cursor(cursor))
+    Ok(Subscription::of::<GlobalOrgPing>().key(key).cursor(cursor))
 }
 
-/// Exit criterion 6. Three subscribers and two tenants, so the oracle is
-/// two-sided: tenant A's feed must carry A's event and ONLY A's, and tenant
-/// B's the same. A one-sided "A never sees B" assertion passes vacuously if a
-/// scoped emit reaches nobody at all — which is exactly the failure mode a
-/// naive fix produces, since a keyed subscription does not receive unkeyed
-/// events either.
-#[test]
-fn a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event() {
-    let sim = Sim::with_faults(0x2EB1_1005, FaultConfig::none());
-    let app = App::open(
+/// The explicit deref inside a scope: a global event, recorded with no
+/// tenant (`0x09`) although the transaction holds one (spec §6, "A global
+/// event emitted from inside a scope is `(*tx).emit(ev)`").
+#[route(POST "/global-ping-in-scope", public(Org))]
+fn emit_global_ping_in_scope(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
+    (*tx).emit(GlobalOrgPing { n: body.n });
+    Ok(())
+}
+
+/// Hands the tenant a scoped job whose `run` emits both ways.
+#[route(POST "/notify", public(Org))]
+fn enqueue_notify(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
+    tx.enqueue(NotifyOrg { n: body.n.0 });
+    Ok(())
+}
+
+/// A scoped job's `run` holds `&mut ScopedTx`: its `tx.emit` is its tenant's
+/// event, and its `(**tx).emit` is a global one.
+#[job(scoped_by = Org)]
+struct NotifyOrg {
+    n: u64,
+}
+
+impl NotifyOrg {
+    fn run(self, tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+        tx.emit(OrgPing { n: WireU64(self.n) });
+        (**tx).emit(GlobalOrgPing {
+            n: WireU64(self.n + 1),
+        });
+        Ok(())
+    }
+}
+
+/// A global subscription with no key: every global `org_ping`, and no event
+/// recorded in a tenant, tenant 0 included — `None` is not `Some(0)`.
+#[route(SSE "/global-feed", public, emits(GlobalOrgPing))]
+fn global_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<GlobalOrgPing>().cursor(cursor))
+}
+
+/// A tenant feed widened after `.into()` — the shape `Subscription::and`
+/// refuses by name, since delivery compares a row's tenancy with the feed's
+/// and a global event is never recorded in a tenant.
+#[route(SSE "/widened-feed/:org", public(Org))]
+fn widened_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    let feed: Subscription = tx.subscription::<OrgPing>().cursor(cursor).into();
+    Ok(feed.and::<Pong>())
+}
+
+/// The tenancy tests' app: default retention (nothing here may fall behind
+/// it), the scoped and global emit routes, the three feeds, and the scoped
+/// job.
+fn tenancy_app(sim: &Sim) -> App {
+    App::open(
         Box::new(sim.disk()),
         Schema::new(),
         Box::new(sim.entropy()),
         AppConfig::default(),
     )
     .unwrap()
-    .mount(routes![emit_scoped_ping, scoped_feed, literal_feed]);
-    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    .mount(routes![
+        emit_scoped_ping,
+        emit_global_ping_in_scope,
+        enqueue_notify,
+        scoped_feed,
+        literal_feed,
+        global_feed
+    ])
+    .mount_jobs(jobs![NotifyOrg])
+}
 
+/// Pushes `requests` at one instant and runs the kernel until it idles past
+/// the source's deadline: every request serviced, and every commit's rows
+/// offered to every tail, however the kernel interleaves them. (`run_script`'s
+/// fixed 16 steps cannot promise that for four tails and three commits.)
+fn run_to_idle(
+    kernel: &mut Kernel,
+    sim: &Sim,
+    requests: Vec<Request>,
+) -> (RecordedResponses, SinkHandles) {
     let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
     let t = sim.now().as_nanos();
-    source.push_at(t, Request::new(Method::Get, "/scoped-feed/1"));
-    source.push_at(t, Request::new(Method::Get, "/scoped-feed/2"));
-    source.push_at(t, Request::new(Method::Get, "/literal-feed/1"));
-    source.push_at(
-        t,
-        Request::new(Method::Post, "/scoped-ping").json(&ScopedEmitBody {
-            org: WireU64(1),
-            n: WireU64(9),
-        }),
-    );
-    source.push_at(
-        t,
-        Request::new(Method::Post, "/scoped-ping").json(&ScopedEmitBody {
-            org: WireU64(2),
-            n: WireU64(7),
-        }),
-    );
-    let sinks = source.sinks();
-
-    for _ in 0..16 {
-        kernel.step(&mut source).expect("no step may fail here");
+    for request in requests {
+        source.push_at(t, request);
     }
+    let (responses, sinks) = (source.responses(), source.sinks());
+    kernel
+        .run(&mut source)
+        .expect("no step may fail — nothing a subscriber does stops the node");
+    (responses, sinks)
+}
 
+fn org_emit(path: &str, org: u64, n: u64) -> Request {
+    Request::new(Method::Post, path).json(&ScopedEmitBody {
+        org: WireU64(org),
+        n: WireU64(n),
+    })
+}
+
+/// Each delivered frame as `"<name> <json>"`.
+fn delivered(handle: &SimSinkHandle) -> Vec<String> {
+    handle
+        .frames()
+        .iter()
+        .map(|f| format!("{} {}", f.name, f.json))
+        .collect()
+}
+
+/// The cross-tenancy 409 (amendment A16), spelled out here rather than taken
+/// from the product. It names no tenant and no event: the refusal must not
+/// tell a subscriber what another tenant's row is.
+fn tenancy_409(row: &EventRow) -> String {
+    format!(
+        "cursor {} sits on an event outside this feed's tenancy — a cursor resumes only the \
+         feed that delivered it, and this feed never delivers that event; reconnect without a \
+         cursor, wait for the stream to open, then read current state from the same node, \
+         holding every frame that arrives until that read is installed and then applying the \
+         held frames and every later one over it in order, idempotently",
+        cursor_of(row)
+    )
+}
+
+/// Spec §6, "Delivering", and exit criterion 1, over two tenants, tenant 0
+/// among them. Four subscribers: each tenant's feed, a global feed keyed with
+/// the decimal id tenancy used to be spelled as, and a global feed with no
+/// key. Three emits: one in each tenant, and one global emit made inside
+/// tenant 1's scope. The oracle is two-sided — each feed must carry exactly
+/// its own events — because a one-sided "A never sees B" passes vacuously
+/// when a scoped emit reaches nobody. Tenant 0 is a tenant: the global feed
+/// with no key receives none of its event, since `None` is not `Some(0)`.
+#[test]
+fn a_tenant_feed_receives_only_its_own_tenants_events_tenant_zero_included() {
+    let sim = Sim::with_faults(0x2EB1_1005, FaultConfig::none());
+    let mut kernel = Kernel::new(tenancy_app(&sim), Box::new(sim.clock())).unwrap();
+    let (responses, sinks) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/scoped-feed/0"),
+            Request::new(Method::Get, "/scoped-feed/1"),
+            Request::new(Method::Get, "/literal-feed/0"),
+            Request::new(Method::Get, "/global-feed"),
+            org_emit("/scoped-ping", 0, 9),
+            org_emit("/scoped-ping", 1, 7),
+            org_emit("/global-ping-in-scope", 1, 5),
+        ],
+    );
+    assert_eq!(statuses(&responses), vec![200; 7]);
     let handles = sinks.lock().expect("sinks lock");
-    assert_eq!(handles.len(), 3, "three subscribes opened three sinks");
-    let delivered = |i: usize| {
-        handles[i]
-            .frames()
-            .iter()
-            .map(|f| (f.name, f.json.clone()))
-            .collect::<Vec<_>>()
-    };
+    assert_eq!(handles.len(), 4, "four subscribes opened four sinks");
+    assert_eq!(
+        delivered(&handles[0]),
+        vec![r#"org_ping {"n":"9"}"#],
+        "tenant 0's feed: its own event — not tenant 1's, not the global one"
+    );
+    assert_eq!(
+        delivered(&handles[1]),
+        vec![r#"org_ping {"n":"7"}"#],
+        "tenant 1's feed: its own event — the global emit made in its scope is not its event"
+    );
+    assert_eq!(
+        delivered(&handles[2]),
+        Vec::<String>::new(),
+        "a global feed keyed \"0\" receives nothing: a key is an app filter, and tenant 0's \
+         event is recorded in tenant 0 with no key"
+    );
+    assert_eq!(
+        delivered(&handles[3]),
+        vec![r#"org_ping {"n":"5"}"#],
+        "a global feed with no key receives the global event only — tenant 0's event is \
+         recorded Some(0), and None is not Some(0)"
+    );
+}
 
+/// Spec §6: a scoped job's `run` holds `&mut ScopedTx`, so its `tx.emit` is
+/// recorded in its tenant, with no key, and its `(**tx).emit` is recorded
+/// with no tenant — reaching global subscribers and never the tenant's feed.
+/// Tenant 0 again.
+#[test]
+fn a_scoped_jobs_emits_are_its_tenants_and_its_deref_emits_are_global() {
+    let sim = Sim::with_faults(0x2EB1_1006, FaultConfig::none());
+    let mut kernel = Kernel::new(tenancy_app(&sim), Box::new(sim.clock())).unwrap();
+    let (responses, sinks) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/scoped-feed/0"),
+            Request::new(Method::Get, "/global-feed"),
+            org_emit("/notify", 0, 40),
+        ],
+    );
+    assert_eq!(statuses(&responses), vec![200; 3]);
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 16)
+        .unwrap();
     assert_eq!(
-        delivered(0),
-        vec![("ping", r#"{"n":"9"}"#.to_string())],
-        "tenant A's feed: its own emit, and NOT tenant B's n=7"
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.key.as_deref(), r.scope))
+            .collect::<Vec<_>>(),
+        vec![("org_ping", None, Some(0)), ("org_ping", None, None)],
+        "the job's own emit is recorded in tenant 0 with no key; its deref emit is global — \
+         tag 0x09, no tenant"
+    );
+    let handles = sinks.lock().expect("sinks lock");
+    assert_eq!(
+        delivered(&handles[0]),
+        vec![r#"org_ping {"n":"40"}"#],
+        "tenant 0's feed: the job's own emit"
     );
     assert_eq!(
-        delivered(1),
-        vec![("ping", r#"{"n":"7"}"#.to_string())],
-        "tenant B's feed: its own emit, and NOT tenant A's n=9"
+        delivered(&handles[1]),
+        vec![r#"org_ping {"n":"41"}"#],
+        "the global feed: the job's deref emit, and not its tenant's"
+    );
+}
+
+/// Amendment A16, spec §9's "a resume across the boundary is refused, not
+/// misdelivered". A cursor names a row of the feed that delivered it; a
+/// cursor on a row of another tenancy — another tenant's event, a global
+/// event on a tenant feed, a tenant's event on a global feed — is one this
+/// feed never delivered, so it is refused by name rather than resumed. The
+/// two controls resume, and each delivers exactly its own tenancy's later
+/// rows.
+#[test]
+fn a_cursor_from_another_tenancy_is_refused_not_resumed() {
+    let sim = Sim::with_faults(0x2EB1_1007, FaultConfig::none());
+    let mut kernel = Kernel::new(tenancy_app(&sim), Box::new(sim.clock())).unwrap();
+    let (responses, _) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            org_emit("/scoped-ping", 0, 10),
+            org_emit("/scoped-ping", 1, 11),
+            org_emit("/global-ping-in-scope", 1, 12),
+            org_emit("/scoped-ping", 0, 13),
+            org_emit("/global-ping-in-scope", 0, 14),
+        ],
+    );
+    assert_eq!(statuses(&responses), vec![200; 5]);
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 16)
+        .unwrap();
+    assert_eq!(rows.len(), 5, "every emit is one row");
+
+    let (responses, sinks) = run_to_idle(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(
+                Method::Get,
+                format!("/scoped-feed/0?cursor={}", cursor_of(&rows[1])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/scoped-feed/0?cursor={}", cursor_of(&rows[2])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/global-feed?cursor={}", cursor_of(&rows[0])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/scoped-feed/0?cursor={}", cursor_of(&rows[0])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/global-feed?cursor={}", cursor_of(&rows[2])),
+            ),
+        ],
+    );
+    let responses = responses.lock().unwrap().clone();
+    assert_eq!(
+        responses.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![409, 409, 409, 200, 200],
+        "three cursors from another tenancy refused, two of the feed's own resumed: {:?}",
+        responses
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+    );
+    for (i, row) in [(0, &rows[1]), (1, &rows[2]), (2, &rows[0])] {
+        assert_eq!(error_text(&responses[i].1), tenancy_409(row));
+    }
+    let handles = sinks.lock().unwrap();
+    assert_eq!(
+        handles.len(),
+        2,
+        "only the two resumed subscribes opened sinks"
     );
     assert_eq!(
-        delivered(2),
-        vec![("ping", r#"{"n":"9"}"#.to_string())],
-        "a subscription keyed to the literal string \"1\" sees exactly what the \
-         ScopedTx<Org>(1) emit produced — the scope's key encoding, pinned"
+        frames_of(&handles[0]),
+        vec![(
+            rows[3].id.raw(),
+            rows[3].seq,
+            "org_ping".to_string(),
+            r#"{"n":"13"}"#.to_string()
+        )],
+        "tenant 0's feed resumes past its own row to its own next row — not tenant 1's, not \
+         the global ones"
+    );
+    assert_eq!(
+        frames_of(&handles[1]),
+        vec![(
+            rows[4].id.raw(),
+            rows[4].seq,
+            "org_ping".to_string(),
+            r#"{"n":"14"}"#.to_string()
+        )],
+        "the global feed resumes past a global row to the next global row — not tenant 0's"
+    );
+}
+
+/// A tenant feed widened after `.into()` could never deliver what `.and`
+/// adds: delivery compares a row's tenancy with the feed's, and
+/// `Subscription::and` adds global events. So the handler that writes it
+/// panics by name, with the fix, the way a duplicate `NAME` does.
+/// `TenantFeed::and`, the tenant's own way to add an event, never trips it
+/// (`http::tests::a_tenant_feeds_and_adds_without_the_widening_assert`).
+#[test]
+#[should_panic(
+    expected = "Subscription::and: event \"pong\" is added to a tenant feed after .into() — \
+                Subscription::and adds global events, and a tenant feed receives only its own \
+                tenant's events, so this one could never arrive; add the tenant's events with \
+                TenantFeed::and before .into(), and serve global events on a subscription of \
+                their own"
+)]
+fn a_tenant_feed_widened_after_into_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_1008, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![widened_feed]);
+    let _ = app.handle_or_subscribe(
+        Request::new(Method::Get, "/widened-feed/1"),
+        sim.now().as_nanos(),
     );
 }
 
 // ======================= the scoped sibling under the full fault matrix
 //
-// Hard rule 3 for `ScopedTx::emit`/`ScopedTx::event_key`. The unit property
-// above runs one kernel under `FaultConfig::none()`, and the key those two
-// functions derive is DURABLE — `db.rs` stores it in `EventRow.key`, ships it
-// by replication, and exact-matches it when a subscriber resumes. A crash
-// between emit and durability, a WAL replay, a retention gap and a dropped
-// tail must all preserve it, and none of those happen in a universe with no
-// faults in it.
+// Hard rule 3 for `ScopedTx::emit` and the tenant feed. The unit properties
+// above run one kernel under `FaultConfig::none()`, and the tenant an emit
+// records is DURABLE — `db.rs` stores it in `EventRow.scope`, ships it by
+// replication, and compares it when a subscriber resumes. A crash between
+// emit and durability, a WAL replay, a retention gap and a dropped tail must
+// all preserve it, and none of those happen in a universe with no faults in
+// it.
 //
 // A SIBLING of `reconnecting_client_misses_nothing_under_the_fault_matrix`
 // rather than a widening of it — the ruling R56 already settled for
@@ -5454,15 +5716,15 @@ fn a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event() {
 //
 // **What this sibling can prove that the flagship structurally cannot.** The
 // flagship's `Client` checks every delivered frame against `charpente.events`
-// — the very row whose `key` column is the thing in question — so an emit
-// that writes the WRONG key writes it into the oracle's own ground truth and
-// the oracle agrees with it. That is not hypothetical: `event_key` returning
-// a constant (Task 11's own mutation) makes every tenant's event carry tenant
-// A's key, and a `Client` keyed to A then expects them all, receives them all
-// and settles. The discriminator added here is that each event's payload
-// carries the tenant that emitted it, independently of the key
-// (`SCOPED_N_STRIDE`), so `scoped_key_oracle` can compare the durable key
-// against the emitting scope instead of against itself.
+// — the very row whose `scope` column is the thing in question — so an emit
+// that records the WRONG tenant writes it into the oracle's own ground truth,
+// and the oracle agrees with it: a `ScopedTx::emit` recording a constant
+// tenant lands every tenant's event in tenant A, and a `Client` of tenant A's
+// feed then expects them all, receives them all and settles. The
+// discriminator added here is that each event's payload carries the tenant
+// that emitted it, independently of the row (`SCOPED_N_STRIDE`), so
+// `scoped_tenant_oracle` can compare the durable tenant against the emitting
+// scope instead of against itself.
 
 /// The sibling's own base seed (R56: its own base, not the flagship's).
 const SCOPED_REALTIME_BASE: u64 = 0x2EB2_5C09;
@@ -5472,26 +5734,20 @@ const SCOPED_REALTIME_BASE: u64 = 0x2EB2_5C09;
 /// `tenant:both-tenants-emitted` is required for.
 const SCOPED_TENANT_A: u64 = 1;
 const SCOPED_TENANT_B: u64 = 2;
-/// `ScopedTx::event_key`'s encoding for `SCOPED_TENANT_A`, written out
-/// literally rather than derived — the same reason `literal_feed` exists.
-const SCOPED_TENANT_A_KEY: &str = "1";
 const SCOPED_FEED_A: &str = "/scoped-feed/1";
 
-/// Each event's payload declares its own emitting tenant: `Ping.n` is
+/// Each event's payload declares its own emitting tenant: `OrgPing.n` is
 /// `org * SCOPED_N_STRIDE + r`. This is the entire reason the property has
 /// teeth — see the section header. The stride is far above any `r` so the
 /// division is exact.
 const SCOPED_N_STRIDE: u64 = 1_000_000;
 
-/// `Client::ledger`'s shape — event id to (event name, subscription key,
-/// the exact JSON a delivery would carry) — and `Client::trace`'s, the
-/// frames a subscriber actually received. Named because the twin helper
-/// below hands both back at once.
-type ScopedLedger = BTreeMap<u64, (&'static str, Option<String>, String)>;
+/// `Client::trace`'s shape: the frames a subscriber actually received. Named
+/// because the twin helper below hands it back beside the ledger.
 type ScopedTrace = Vec<(u64, &'static str, String)>;
 
-/// The tenant a delivered/stored `ping` payload declares, read back out of
-/// the JSON the subscriber actually received rather than out of the key.
+/// The tenant a delivered or stored `org_ping` payload declares, read back out
+/// of the JSON rather than out of the row.
 fn declared_org(json: &str) -> Result<u64, String> {
     let v: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("ping payload {json:?} is not JSON: {e}"))?;
@@ -5507,43 +5763,43 @@ fn declared_org(json: &str) -> Result<u64, String> {
 
 /// The sibling's own oracle, on top of everything `Client` already checks
 /// (strictly-increasing ids, no missing own-tenant backlog, no over-delivery
-/// against the ledger's own key). Both arms compare the durable key against
-/// the tenant the PAYLOAD declares, which is the only thing in this file that
-/// does not take `EventRow.key` at its word.
+/// against the ledger's own recorded tenant). Both arms compare the durable
+/// row against the tenant the PAYLOAD declares, which is the only thing in
+/// this file that does not take `EventRow.scope` at its word.
 ///
 /// Delivery first, because that is the leak the property is named for; the
 /// ledger arm behind it catches the same corruption one layer earlier, at the
 /// row, including for events the subscriber never asked for. The meta-test
 /// fires both arms separately.
-fn scoped_key_oracle(
-    ledger: &ScopedLedger,
+fn scoped_tenant_oracle(
+    ledger: &Ledger,
     trace: &[(u64, &'static str, String)],
-    subscriber_key: &str,
+    subscriber: u64,
 ) -> Result<(), String> {
     for (id, name, json) in trace {
         if *name == "charpente.gap" {
             continue;
         }
         let org = declared_org(json)?;
-        if org.to_string() != subscriber_key {
+        if org != subscriber {
             return Err(format!(
-                "cross-tenant delivery: a subscriber keyed to tenant {subscriber_key:?} \
-                 received event id {id}, which was emitted inside ScopedTx<Org>({org})"
+                "cross-tenant delivery: a feed of tenant {subscriber} received event id {id}, \
+                 which was emitted inside ScopedTx<Org>({org})"
             ));
         }
     }
-    for (id, (name, key, json)) in ledger {
-        if *name != "ping" {
+    for (id, (name, key, scope, json)) in ledger {
+        if *name != "org_ping" {
             continue;
         }
         let org = declared_org(json)?;
-        let expected = org.to_string();
-        if key.as_deref() != Some(expected.as_str()) {
+        if (key.as_deref(), *scope) != (None, Some(org)) {
             return Err(format!(
-                "event id {id} was emitted inside ScopedTx<Org>({org}) but its durable \
-                 EventRow.key reads {key:?}, not {expected:?} — the scope did not survive \
-                 commit, replay and readback, so a subscriber resuming on an exact key match \
-                 gets another tenant's backlog or loses its own"
+                "event id {id} was emitted inside ScopedTx<Org>({org}) but its durable row \
+                 reads EventRow.scope {scope:?} and EventRow.key {key:?}, not Some({org}) and \
+                 None — the tenant did not survive commit, replay and readback apart from the \
+                 app's key, so a tenant feed resuming on it gets another tenant's backlog or \
+                 loses its own"
             ));
         }
     }
@@ -5551,17 +5807,16 @@ fn scoped_key_oracle(
 }
 
 /// The naive victim, as a route rather than a core mutation so it can sit in
-/// the suite permanently. It opens the scope exactly as `emit_scoped_ping`
-/// does — the declaration still admits, and the row-level tenant bound still
-/// holds — and then reaches past `ScopedTx::emit` through the `DerefMut` to
-/// `Tx::emit_keyed` with a FIXED key. That is precisely what `event_key`
-/// returning a constant produces, and it is the direction that LEAKS: the
-/// unkeyed `(*tx).emit(…)` naive fix fails closed instead (Task 11's commit
-/// message), so it is not the interesting victim.
+/// the suite permanently. It opens a real scope and emits through
+/// `ScopedTx::emit`, but in tenant A whatever tenant the request names —
+/// exactly what a `ScopedTx::emit` recording a constant tenant produces, and
+/// the direction that LEAKS: tenant B's event is recorded in tenant A, so
+/// tenant A's feed receives it and the row agrees with the delivery. Only the
+/// payload (`SCOPED_N_STRIDE`) says otherwise, which is the oracle's point.
 #[route(POST "/leaky-ping", public(Org))]
 fn emit_leaky_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
-    let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
-    tx.emit_keyed(SCOPED_TENANT_A_KEY.to_string(), Ping { n: body.n });
+    let mut tx = tx.scope::<Org>(Id::from_raw(SCOPED_TENANT_A), ctx)?;
+    tx.emit(OrgPing { n: body.n });
     Ok(())
 }
 
@@ -5594,7 +5849,7 @@ fn scoped_realtime_app(sim: &Sim) -> io::Result<App> {
 
 /// One emit: whichever tenant this draw picks, with the tenant folded into
 /// the payload (`SCOPED_N_STRIDE`) so the oracle has a source of truth that
-/// is not the key.
+/// is not the row.
 fn pick_scoped_emit(sim: &Sim) -> ScopedEmitBody {
     let e = sim.entropy();
     let org = if e.next_u64().is_multiple_of(2) {
@@ -5647,11 +5902,11 @@ fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
 
 /// One universe of the scoped sibling: same epoch/round/settle shape as
 /// `realtime_workload`, with two tenants emitting into one node and one
-/// subscriber keyed to tenant A. `Client` is reused verbatim — keyed to
-/// `SCOPED_TENANT_A_KEY`, its `matches`/`first_unaccounted` already demand
-/// every A-keyed ledger row above the floor be received, and its `try_match`
-/// already rejects a delivered row whose key is not A's — and
-/// `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have.
+/// tenant-A feed. `Client` is reused — in tenant A (`Client::in_tenant`), its
+/// `matches`/`first_unaccounted` demand every tenant-A ledger row above the
+/// floor be received, and its `try_match` rejects a delivered row recorded in
+/// another tenancy — and `scoped_tenant_oracle` adds the payload-versus-row
+/// arms `Client` cannot have.
 /// Returns the frame trace, so the replay check has an oracle.
 fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     scoped_realtime_workload_judged(sim, durable_corruption_fired)
@@ -5666,7 +5921,7 @@ fn scoped_realtime_workload_judged(
     sim: &mut Sim,
     cut_explained: fn(&Sim) -> bool,
 ) -> Result<ScopedTrace, String> {
-    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let mut client = Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
     client.cut_explained = cut_explained;
     // Every boundary `push_subscribe` reads goes through `resync_if_cut`. Each
     // recovery is followed by a subscribe before any emit, so every cut is
@@ -5857,23 +6112,23 @@ fn scoped_realtime_workload_judged(
         }
         return Err(client.unsettled_report());
     }
-    scoped_key_oracle(&client.ledger, &client.trace, SCOPED_TENANT_A_KEY)?;
+    scoped_tenant_oracle(&client.ledger, &client.trace, SCOPED_TENANT_A)?;
 
     // Coverage. Every key here is a way this property can go quietly
     // vacuous, which is why each is a `require:` and a measured `floor:`
     // rather than a report.
     let mut saw_a = false;
     let mut saw_b = false;
-    for (id, (_, key, _)) in &client.ledger {
-        match key.as_deref() {
+    for (id, (_, _, scope, _)) in &client.ledger {
+        match *scope {
             None => {
                 return Err(format!(
-                    "event id {id} carries no subscription key at all — every emit in this \
-                     workload goes through `ScopedTx::emit`, so an unkeyed row means the \
-                     scope was dropped on the way to the log"
+                    "event id {id} carries no tenant at all — every emit in this workload goes \
+                     through `ScopedTx::emit`, so a row with no tenant means the scope was \
+                     dropped on the way to the log"
                 ));
             }
-            Some(k) if k == SCOPED_TENANT_A_KEY => saw_a = true,
+            Some(SCOPED_TENANT_A) => saw_a = true,
             Some(_) => saw_b = true,
         }
     }
@@ -5883,18 +6138,16 @@ fn scoped_realtime_workload_judged(
     if !client.verified.is_empty() {
         sim.cover("tenant:own-backlog-verified");
     }
-    // The "and none of tenant B's" half, made non-vacuous: a B-keyed row sat
-    // in the very window `settled()` scanned and was never delivered. Without
-    // this the property could settle over universes where B's rows all aged
-    // out before the subscriber was ever exposed to them.
+    // The "and none of tenant B's" half, made non-vacuous: a row of another
+    // tenant sat in the very window `settled()` scanned and was never
+    // delivered. Without this the property could settle over universes where
+    // B's rows all aged out before the subscriber was ever exposed to them.
     let received: BTreeSet<u64> = client.trace.iter().map(|&(id, ..)| id).collect();
     let lo = client.floor.min(client.next_scan_id);
     if client
         .ledger
         .range(lo..client.next_scan_id)
-        .any(|(id, (_, key, _))| {
-            key.as_deref() != Some(SCOPED_TENANT_A_KEY) && !received.contains(id)
-        })
+        .any(|(id, (_, _, scope, _))| *scope != Some(SCOPED_TENANT_A) && !received.contains(id))
     {
         sim.cover("tenant:foreign-backlog-not-delivered");
     }
@@ -6139,10 +6392,12 @@ fn a_cut_nothing_explains_fails_the_scoped_universe_by_name() {
 fn a_cut_drops_only_the_ids_it_cut_and_the_rest_stay_owed() {
     let sim = Sim::with_faults(0x2EB2_0901, FaultConfig::none());
     sim.cover("fault:misdirected_write");
-    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let mut client = Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
     for id in [3, 5] {
-        let key = Some(SCOPED_TENANT_A_KEY.to_string());
-        client.ledger.insert(id, ("ping", key, format!("old {id}")));
+        client.ledger.insert(
+            id,
+            ("ping", None, Some(SCOPED_TENANT_A), format!("old {id}")),
+        );
     }
     client.next_scan_id = 6;
 
@@ -6189,11 +6444,11 @@ fn a_cut_trims_last_id_to_the_last_id_the_node_still_holds() {
 fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
     let sim = Sim::with_faults(0x2EB2_0902, FaultConfig::none());
     sim.cover("fault:misdirected_write");
-    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
-    let key = Some(SCOPED_TENANT_A_KEY.to_string());
-    client
-        .ledger
-        .insert(5, ("ping", key.clone(), "old 5".to_string()));
+    let mut client = Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
+    client.ledger.insert(
+        5,
+        ("ping", None, Some(SCOPED_TENANT_A), "old 5".to_string()),
+    );
     client.verified.insert(5);
     client.next_scan_id = 6;
     // A bare reconnect above the cut forfeited everything below 6.
@@ -6205,7 +6460,10 @@ fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
 
     client.resync_if_cut(&sim, 5).unwrap();
     // What the next `sync_ledger` reads: id 5 re-minted for tenant A.
-    client.ledger.insert(5, ("ping", key, "new 5".to_string()));
+    client.ledger.insert(
+        5,
+        ("ping", None, Some(SCOPED_TENANT_A), "new 5".to_string()),
+    );
     client.next_scan_id = 6;
     assert_eq!(
         client.first_unaccounted(),
@@ -6221,11 +6479,11 @@ fn a_cut_id_re_minted_for_the_subscriber_is_owed_again() {
 fn a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_content() {
     let sim = Sim::with_faults(0x2EB2_0904, FaultConfig::none());
     sim.cover("fault:misdirected_write");
-    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
-    let key = Some(SCOPED_TENANT_A_KEY.to_string());
-    client
-        .ledger
-        .insert(6, ("ping", key.clone(), "old 6".to_string()));
+    let mut client = Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
+    client.ledger.insert(
+        6,
+        ("ping", None, Some(SCOPED_TENANT_A), "old 6".to_string()),
+    );
     client.gone.insert(5);
     client.pending.push_back((5, "ping", "old 5".to_string()));
     client.next_scan_id = 7;
@@ -6238,7 +6496,10 @@ fn a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_cont
         "the re-mint's frame waits for the re-scan: a cut id is not confirmed by id"
     );
     // What the next `sync_ledger` reads: id 5 re-minted for tenant A.
-    client.ledger.insert(5, ("ping", key, "new 5".to_string()));
+    client.ledger.insert(
+        5,
+        ("ping", None, Some(SCOPED_TENANT_A), "new 5".to_string()),
+    );
     client.next_scan_id = 6;
     assert_eq!(
         client.drain(),
@@ -6255,9 +6516,11 @@ fn a_frame_from_the_lost_timeline_is_dropped_and_the_re_mint_is_verified_by_cont
 #[test]
 fn without_durable_corruption_a_cut_is_not_resynced() {
     let sim = Sim::with_faults(0x2EB2_0903, FaultConfig::none());
-    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
-    let key = Some(SCOPED_TENANT_A_KEY.to_string());
-    client.ledger.insert(5, ("ping", key, "old 5".to_string()));
+    let mut client = Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
+    client.ledger.insert(
+        5,
+        ("ping", None, Some(SCOPED_TENANT_A), "old 5".to_string()),
+    );
     client.next_scan_id = 6;
 
     let err = client
@@ -6317,11 +6580,11 @@ fn a_settled_client_owed_nothing_and_delivered_nothing_gives_up() {
 /// match, sitting in the window undelivered, is a check its filter passed.
 #[test]
 fn an_undelivered_row_the_filter_withheld_is_a_verdict_not_nothing() {
-    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let mut client = Client::new(PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
     assert!(client.adjudicated_nothing(), "empty ledger, empty trace");
     client
         .ledger
-        .insert(0, ("ping", Some("tenant-b".to_string()), "b's".to_string()));
+        .insert(0, ("ping", None, Some(SCOPED_TENANT_B), "b's".to_string()));
     client.next_scan_id = 1;
     assert!(
         client.settled() && !client.adjudicated_nothing(),
@@ -6342,11 +6605,11 @@ fn scoped_realtime_frame_traces_replay_identically_for_the_same_seed() {
     charpente_sim::checks::replays_identically(0x2EB2_5C0D, scoped_realtime_workload).unwrap();
 }
 
-/// One clean kernel, one subscriber keyed to tenant A, one emit per tenant
+/// One clean kernel, one tenant-A feed, one emit per tenant
 /// through `route` — the twin the fireability proof needs, so victim and
 /// control face identical bytes and differ in nothing but which emit route
 /// ran.
-fn scoped_twin_run(route: &'static str) -> (ScopedLedger, ScopedTrace) {
+fn scoped_twin_run(route: &'static str) -> (Ledger, ScopedTrace) {
     let sim = Sim::with_faults(0x2EB1_5C09, FaultConfig::none());
     let app = scoped_realtime_app(&sim).unwrap();
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
@@ -6368,7 +6631,7 @@ fn scoped_twin_run(route: &'static str) -> (ScopedLedger, ScopedTrace) {
         kernel.step(&mut source).expect("no step may fail here");
     }
 
-    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    let mut client = Client::new(ORG_PING_ONLY, None).in_tenant(SCOPED_TENANT_A);
     client.sync_ledger(kernel.app().db()).unwrap();
     let trace = sinks.lock().expect("sinks lock")[0]
         .frames()
@@ -6385,11 +6648,11 @@ fn scoped_twin_run(route: &'static str) -> (ScopedLedger, ScopedTrace) {
 /// rejected something" would not distinguish a working discriminator from an
 /// oracle that rejects everything.
 ///
-/// The victim is `emit_leaky_ping`: a real `ScopedTx`, then `Tx::emit_keyed`
-/// with a fixed key through the `DerefMut` — the leak direction, and exactly
-/// the shape a constant `event_key` produces.
+/// The victim is `emit_leaky_ping`: a real `ScopedTx::emit`, in tenant A
+/// whatever tenant the request names — the leak direction, and exactly the
+/// shape a `ScopedTx::emit` recording a constant tenant produces.
 #[test]
-fn the_scoped_oracle_catches_an_emit_that_drops_the_scope_key() {
+fn the_scoped_oracle_catches_an_emit_recorded_in_the_wrong_tenant() {
     // ---- control: the correct route, on these exact bytes ----
     let (ledger, trace) = scoped_twin_run("/scoped-ping");
     assert_eq!(
@@ -6402,7 +6665,7 @@ fn the_scoped_oracle_catches_an_emit_that_drops_the_scope_key() {
         1,
         "tenant A's feed must have received exactly its own event: {trace:?}"
     );
-    scoped_key_oracle(&ledger, &trace, SCOPED_TENANT_A_KEY)
+    scoped_tenant_oracle(&ledger, &trace, SCOPED_TENANT_A)
         .expect("the correct scoped emit must pass the property's own oracle");
 
     // ---- victim: the same bytes, the naive emit ----
@@ -6414,7 +6677,7 @@ fn the_scoped_oracle_catches_an_emit_that_drops_the_scope_key() {
         "the leak itself: tenant A's feed received BOTH tenants' events"
     );
 
-    let err = scoped_key_oracle(&ledger, &trace, SCOPED_TENANT_A_KEY)
+    let err = scoped_tenant_oracle(&ledger, &trace, SCOPED_TENANT_A)
         .expect_err("the delivery arm must reject a cross-tenant frame");
     assert!(err.contains("cross-tenant delivery"), "{err}");
     assert!(
@@ -6424,12 +6687,157 @@ fn the_scoped_oracle_catches_an_emit_that_drops_the_scope_key() {
 
     // The ledger arm, fired on its own: the corruption is in the durable row
     // whatever the subscriber happened to receive.
-    let err = scoped_key_oracle(&ledger, &[], SCOPED_TENANT_A_KEY)
-        .expect_err("the ledger arm must reject a row whose key is not its emitting scope");
-    assert!(err.contains("EventRow.key"), "{err}");
+    let err = scoped_tenant_oracle(&ledger, &[], SCOPED_TENANT_A)
+        .expect_err("the ledger arm must reject a row whose tenant is not its emitting scope");
+    assert!(err.contains("EventRow.scope"), "{err}");
     assert!(
         err.contains(&format!("ScopedTx<Org>({SCOPED_TENANT_B})")),
         "the failure must name the emitting scope: {err}"
+    );
+}
+
+// ======================= two tenant types, one raw id (spec §6)
+
+/// A second tenant type. Its raw ids coincide with `Org`'s, since both are
+/// plain `u64`s an app picks, which is the case DESIGN §8 named as a limit
+/// before events declared their tenant.
+#[table(global)]
+struct Team {
+    id: Id<Team>,
+    name: String,
+}
+
+impl Tenant for Team {
+    const NAME: &'static str = "Team";
+    type Who = Principal;
+    type Error = ApiError;
+
+    /// Always allows: the routes below are `public(Team)`, and this property
+    /// is about delivery, not membership.
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+/// `Team`'s event under `OrgPing`'s identifier: the same `NAME`
+/// (`"org_ping"`) and the same field fold. Only the tenant `NAME` its
+/// fingerprint carries tells its rows from `OrgPing`'s.
+mod team_scoped {
+    use super::Team;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    /// `pub(super)`, not `pub`: `Team` is private, and an `impl Event`'s
+    /// `type Scope` may not name a type less visible than the event (E0446).
+    #[event(scoped_by = Team)]
+    pub(super) struct OrgPing {
+        pub n: WireU64,
+    }
+}
+
+#[derive(WireDerive, Serialize, Deserialize)]
+struct SharedRawBody {
+    tenant: WireU64,
+    n: WireU64,
+}
+
+#[route(POST "/shared-raw/org-ping", public(Org))]
+fn shared_raw_org_ping(tx: &mut Tx, body: SharedRawBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.tenant.0), ctx)?;
+    tx.emit(OrgPing { n: body.n });
+    Ok(())
+}
+
+#[route(POST "/shared-raw/team-ping", public(Team))]
+fn shared_raw_team_ping(tx: &mut Tx, body: SharedRawBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Team>(Id::from_raw(body.tenant.0), ctx)?;
+    tx.emit(team_scoped::OrgPing { n: body.n });
+    Ok(())
+}
+
+#[route(SSE "/shared-raw/org-feed/:org", public(Org), emits(OrgPing))]
+fn shared_raw_org_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<OrgPing>().cursor(cursor).into())
+}
+
+/// Tenancy-completion spec §6: "Two scope types sharing a raw id no longer
+/// collide: the event's fingerprint mixes its tenant's NAME, so a row emitted
+/// under the other type is a foreign shape." Here, `Team` 1's row matches
+/// `Org` 1's feed on name and on raw scope. The feed gets `Org`'s own ping,
+/// and then, at `Team`'s row, the `charpente.reshaped` end that
+/// payload-shapes spec §3 gives any foreign shape: `Team`'s payload is never
+/// decoded into `Org`'s feed. The end itself is the residual cost, and
+/// `mount_events`' refusal of two events with one name rules it out for an
+/// app that mounts every event it emits. With the two fingerprints equal (a
+/// scoped event hashing only its fields), this feed delivered `Team`'s
+/// `{"n":"7"}` as `Org`'s.
+#[test]
+fn a_same_named_event_of_another_tenant_type_at_a_shared_raw_id_is_never_delivered() {
+    let sim = Sim::with_faults(0x2EB1_1B0B, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![
+        shared_raw_org_ping,
+        shared_raw_team_ping,
+        shared_raw_org_feed
+    ]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/shared-raw/org-feed/1"),
+            Request::new(Method::Post, "/shared-raw/org-ping").json(&SharedRawBody {
+                tenant: WireU64(1),
+                n: WireU64(9),
+            }),
+            Request::new(Method::Post, "/shared-raw/team-ping").json(&SharedRawBody {
+                tenant: WireU64(1),
+                n: WireU64(7),
+            }),
+        ],
+    );
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 8)
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.scope))
+            .collect::<Vec<_>>(),
+        vec![("org_ping", Some(1)), ("org_ping", Some(1))],
+        "the colliding case: one NAME, one raw tenant id, two tenant types"
+    );
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![
+            (
+                rows[0].id.raw(),
+                rows[0].seq,
+                "org_ping".to_string(),
+                r#"{"n":"9"}"#.to_string()
+            ),
+            reshaped_frame(&rows[1]),
+        ],
+        "Org 1's own ping, then the foreign-shape end at Team 1's row; never Team's payload"
+    );
+    assert_ne!(
+        rows[0].shape, rows[1].shape,
+        "only the tenant NAME inside each fingerprint tells the two rows apart"
     );
 }
 
@@ -6452,7 +6860,7 @@ struct Latest {
     n: u64,
 }
 
-#[event]
+#[event(global)]
 struct Marked {
     n: WireU64,
 }
@@ -6987,4 +7395,2652 @@ fn last_id_trim_rate_scan() {
         }
     }
     eprintln!("SCAN base={base:#x} bf={bf} universes={per} failures={fails}");
+}
+
+// ============================================= tenancy under the full fault matrix
+//
+// Tenancy-completion spec §9, the realtime oracle (plan Task 13). A tenant feed
+// is built from its scope (`tx.subscription::<Ev>()`), a scoped event records
+// its tenant apart from its key (`EventRow.scope`), and ONE predicate says what
+// a tail delivers (`Subscription::admits`). Three shops emit scoped notes, the
+// app emits global ones, and four feeds reconnect through the fault matrix:
+//
+// 1. a global subscription receives no scoped row;
+// 2. a shop's feed receives exactly that shop's rows. This is set equality,
+//    checked by membership, so an interior skip cannot pass;
+// 3. a resume whose cursor sits on a row outside the feed's tenancy is refused
+//    by name. It is never positioned past and never misdelivered.
+//
+// A cut durable corruption explains is re-synced at the next boundary and the
+// feeds keep checking, as in the flagship (S3b item 3). A cut nothing explains
+// is a lost event.
+//
+// Its own module, base seed and workload (R56): the flagship and the scoped
+// sibling keep their bytes. The three notes share one NAME and one field list,
+// so no name or key filter can tell them apart. Only tenancy can, so only
+// tenancy is under test.
+mod tenancy_feeds {
+    use super::*;
+    use charpente::Subscribe;
+
+    // ------------------------------------------------------------- tenants
+
+    /// A tenant type. It is a `#[table]` only so `Id<Shop>` can be a route
+    /// path parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`). No
+    /// `Schema` registers it, and nothing reads it.
+    #[table(global)]
+    pub(crate) struct Shop {
+        id: Id<Shop>,
+        name: String,
+    }
+
+    impl Tenant for Shop {
+        const NAME: &'static str = "Shop";
+        type Who = Principal;
+        type Error = ApiError;
+
+        /// Never asked. Every scoped route here declares `public(Shop)`, and
+        /// the declaration admits (job-tenancy spec §4, rule 1).
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Shop>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    /// A second tenant type whose ids are the same raw numbers as `Shop`'s.
+    /// That is the one way two rows can agree on `EventRow.scope` and still
+    /// belong to two tenants. Only `two_tenant_types_app` mounts it.
+    pub(crate) struct Desk;
+
+    impl Tenant for Desk {
+        const NAME: &'static str = "Desk";
+        type Who = Principal;
+        type Error = ApiError;
+
+        /// Never asked, for the reason `Shop::authorize` gives.
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Desk>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    // -------------------------------------------------------------- events
+    //
+    // Three events, one `NAME` (`note`, the snake_case of `Note`) and one field
+    // list: a global one, one scoped by `Shop`, one scoped by `Desk`. What tells
+    // them apart is tenancy alone. That is the recorded `EventRow.scope`, and
+    // the fingerprint, which for a scoped event mixes its tenant type's `NAME`
+    // (spec §4). `origin` is the emitter's own word for the tenant it emitted
+    // in: a shop id, or `GLOBAL_ORIGIN`. The oracle reads it instead of
+    // `EventRow.scope`, which is the column under test. Items are `pub(crate)`
+    // so a scoped event's `type Scope` never names a type less visible than the
+    // event itself.
+
+    mod global_note {
+        use charpente::event;
+        use charpente::wire::WireU64;
+
+        #[event(global)]
+        pub(crate) struct Note {
+            pub(crate) origin: WireU64,
+            pub(crate) n: WireU64,
+        }
+    }
+
+    mod shop_note {
+        use super::Shop;
+        use charpente::event;
+        use charpente::wire::WireU64;
+
+        #[event(scoped_by = Shop)]
+        pub(crate) struct Note {
+            pub(crate) origin: WireU64,
+            pub(crate) n: WireU64,
+        }
+    }
+
+    mod desk_note {
+        use super::Desk;
+        use charpente::event;
+        use charpente::wire::WireU64;
+
+        #[event(scoped_by = Desk)]
+        pub(crate) struct Note {
+            pub(crate) origin: WireU64,
+            pub(crate) n: WireU64,
+        }
+    }
+
+    const GLOBAL_FP: u64 = <global_note::Note as Event>::FINGERPRINT;
+    const SHOP_FP: u64 = <shop_note::Note as Event>::FINGERPRINT;
+    const DESK_FP: u64 = <desk_note::Note as Event>::FINGERPRINT;
+
+    // ----------------------------------------------------------- the world
+
+    /// This property's own base seed (R56).
+    const TENANCY_BASE: u64 = 0x5C0B_0001;
+    /// The `origin` a global note carries. No shop id here reaches it.
+    const GLOBAL_ORIGIN: u64 = 1_000;
+    /// The tenants. Shop 0 is one on purpose: `Some(0)` is a tenant and `None`
+    /// is none, and a rule that reads the one as the other is a named victim.
+    const SHOPS: [u64; 3] = [0, 1, 2];
+    const GLOBAL_FEED: &str = "/tenancy/global";
+    const SHOP_FEEDS: [&str; 3] = ["/tenancy/feed/0", "/tenancy/feed/1", "/tenancy/feed/2"];
+    /// Every feed, global first. `Universe::clients` and the twin's sinks
+    /// follow this order.
+    const FEEDS: [Feed; 4] = [Feed::Global, Feed::Shop(0), Feed::Shop(1), Feed::Shop(2)];
+
+    /// Floors, each the exact count measured at `TENANCY_BASE` over the
+    /// property's universe count. Plan Task 13 Step 5 wrote them from two
+    /// consecutive batches that agreed key for key. No margin is subtracted:
+    /// a drop is a finding, not a number to lower.
+    const TENANCY_EVERY_SHOP_FLOOR: u64 = 69;
+    const TENANCY_GLOBAL_DELIVERED_FLOOR: u64 = 91;
+    const TENANCY_GLOBAL_PASSED_FLOOR: u64 = 93;
+    const TENANCY_SHOP_PASSED_SHOP_FLOOR: u64 = 93;
+    const TENANCY_SHOP_PASSED_GLOBAL_FLOOR: u64 = 94;
+    const TENANCY_REFUSED_SAME_KIND_FLOOR: u64 = 93;
+    const TENANCY_REFUSED_OTHER_KIND_FLOOR: u64 = 101;
+    const TENANCY_RESUME_BACKLOG_FLOOR: u64 = 988;
+    /// The give-up cap, exact at `TENANCY_BASE` like the floors, and written
+    /// by Step 5 from the same two batches. A give-up is never failed, so
+    /// without a cap a batch that drifted to giving up everything would stay
+    /// green (GUIDE §8). The reach keys it pairs with are the two
+    /// `*-delivered` floors, which only a universe that kept its verdict
+    /// credits.
+    const TENANCY_GAVE_UP_CEILING: u64 = 19;
+
+    /// One emit request. `/tenancy/announce` ignores `shop`, and
+    /// `/tenancy/desk-note` reads it as the desk's id.
+    #[derive(WireDerive, Serialize, Deserialize)]
+    struct TenancyEmit {
+        shop: WireU64,
+        n: WireU64,
+    }
+
+    // -------------------------------------------------------------- routes
+
+    /// A shop's note. One `scope()` line, and the emit below it is that shop's.
+    #[route(POST "/tenancy/note", public(Shop))]
+    fn tenancy_note(tx: &mut Tx, body: TenancyEmit, ctx: &Ctx) -> Result<(), ApiError> {
+        let mut tx = tx.scope::<Shop>(Id::from_raw(body.shop.0), ctx)?;
+        tx.emit(shop_note::Note {
+            origin: body.shop,
+            n: body.n,
+        });
+        Ok(())
+    }
+
+    /// The app's own announcement, in no tenant.
+    #[route(POST "/tenancy/announce", public)]
+    fn tenancy_announce(tx: &mut Tx, body: TenancyEmit) -> Result<(), ApiError> {
+        tx.emit(global_note::Note {
+            origin: WireU64(GLOBAL_ORIGIN),
+            n: body.n,
+        });
+        Ok(())
+    }
+
+    /// A shop's note and a global announcement in ONE record. The result is
+    /// two rows with one seq, one scoped and one not, and only the scope column
+    /// tells them apart. The global emit goes through the explicit deref, the
+    /// idiom spec §6 keeps.
+    #[route(POST "/tenancy/note-and-announce", public(Shop))]
+    fn tenancy_note_and_announce(
+        tx: &mut Tx,
+        body: TenancyEmit,
+        ctx: &Ctx,
+    ) -> Result<(), ApiError> {
+        let mut tx = tx.scope::<Shop>(Id::from_raw(body.shop.0), ctx)?;
+        tx.emit(shop_note::Note {
+            origin: body.shop,
+            n: body.n,
+        });
+        (*tx).emit(global_note::Note {
+            origin: WireU64(GLOBAL_ORIGIN),
+            n: WireU64(body.n.0 + 1),
+        });
+        Ok(())
+    }
+
+    /// A desk's note: the same NAME and fields as a shop's, under another
+    /// tenant type whose ids share the shops' raw numbers.
+    #[route(POST "/tenancy/desk-note", public(Desk))]
+    fn tenancy_desk_note(tx: &mut Tx, body: TenancyEmit, ctx: &Ctx) -> Result<(), ApiError> {
+        let mut tx = tx.scope::<Desk>(Id::from_raw(body.shop.0), ctx)?;
+        tx.emit(desk_note::Note {
+            origin: body.shop,
+            n: body.n,
+        });
+        Ok(())
+    }
+
+    /// A shop's feed, built from the scope (A3). No key names the tenant.
+    #[route(SSE "/tenancy/feed/:shop", public(Shop))]
+    fn tenancy_shop_feed(
+        tx: &mut Tx,
+        shop: Id<Shop>,
+        ctx: &Ctx,
+        cursor: Option<Cursor>,
+    ) -> Result<Subscription, ApiError> {
+        let tx = tx.scope::<Shop>(shop, ctx)?;
+        Ok(tx.subscription::<shop_note::Note>().cursor(cursor).into())
+    }
+
+    /// The global feed: the same NAME, the global event.
+    #[route(SSE "/tenancy/global", public)]
+    fn tenancy_global_feed(
+        tx: &mut Tx,
+        ctx: &Ctx,
+        cursor: Option<Cursor>,
+    ) -> Result<Subscription, ApiError> {
+        let _ = (tx, ctx);
+        Ok(Subscription::of::<global_note::Note>().cursor(cursor))
+    }
+
+    /// `realtime_app`'s store, at the DEFAULT event retention (65,536).
+    /// Nothing ages out in a universe here, so no `charpente.gap` and no
+    /// retention 409 can excuse a missing row. `checkpoint_every: 2` matches
+    /// the flagship, so the durable-corruption window is as narrow as there.
+    fn open_tenancy(sim: &Sim) -> io::Result<App> {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig {
+                body_cap: 1 << 20,
+                db: DbConfig {
+                    wal: WalConfig {
+                        dir: "wal".to_string(),
+                        segment_bytes: 4096,
+                    },
+                    store_path: "tables.redb".to_string(),
+                    checkpoint_every: 2,
+                    ..DbConfig::default()
+                },
+                ..AppConfig::default()
+            },
+        )
+    }
+
+    fn tenancy_app(sim: &Sim) -> io::Result<App> {
+        Ok(open_tenancy(sim)?.mount(routes![
+            tenancy_note,
+            tenancy_announce,
+            tenancy_note_and_announce,
+            tenancy_shop_feed,
+            tenancy_global_feed
+        ]))
+    }
+
+    /// `Shop` and `Desk` in one app: two tenant NAMEs, so Task 3's uniqueness
+    /// check admits it.
+    fn two_tenant_types_app(sim: &Sim) -> io::Result<App> {
+        Ok(open_tenancy(sim)?.mount(routes![tenancy_note, tenancy_desk_note, tenancy_shop_feed]))
+    }
+
+    // --------------------------------------------------------------- feeds
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Feed {
+        Global,
+        Shop(u64),
+    }
+
+    impl Feed {
+        /// The `origin` every row this feed delivers must carry.
+        fn origin(self) -> u64 {
+            match self {
+                Feed::Global => GLOBAL_ORIGIN,
+                Feed::Shop(s) => s,
+            }
+        }
+
+        /// The tenant this feed's subscription carries, spelled as
+        /// `EventRow.scope` spells it.
+        fn scope(self) -> Option<u64> {
+            match self {
+                Feed::Global => None,
+                Feed::Shop(s) => Some(s),
+            }
+        }
+
+        fn path(self) -> &'static str {
+            match self {
+                Feed::Global => GLOBAL_FEED,
+                Feed::Shop(s) => SHOP_FEEDS[s as usize],
+            }
+        }
+
+        fn fingerprint(self) -> u64 {
+            match self {
+                Feed::Global => GLOBAL_FP,
+                Feed::Shop(_) => SHOP_FP,
+            }
+        }
+
+        fn label(self) -> String {
+            match self {
+                Feed::Global => "the global feed".to_string(),
+                Feed::Shop(s) => format!("shop {s}'s feed"),
+            }
+        }
+
+        /// The half of the property a leak on this feed breaks.
+        fn rule(self) -> &'static str {
+            match self {
+                Feed::Global => "a global subscription receives no scoped row",
+                Feed::Shop(_) => "a tenant's feed receives only its own tenant's scoped rows",
+            }
+        }
+
+        /// Whether a row of `origin` belongs to another tenant of this feed's
+        /// own kind (another shop's, on a shop feed), as opposed to the other
+        /// kind.
+        fn same_kind(self, origin: u64) -> bool {
+            matches!(self, Feed::Shop(s) if origin != s && origin != GLOBAL_ORIGIN)
+        }
+    }
+
+    /// "inside shop 2", or "as a global event".
+    fn emitted(origin: u64) -> String {
+        if origin == GLOBAL_ORIGIN {
+            "as a global event".to_string()
+        } else {
+            format!("inside shop {origin}")
+        }
+    }
+
+    /// The origin a delivered note's own payload declares.
+    fn origin_of(json: &str) -> Option<u64> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        v.get("origin")?.as_str()?.parse().ok()
+    }
+
+    /// A `Response::error` body's `error` text, or the raw body if it is not
+    /// one. A probe's answer is read, never assumed well-formed.
+    fn response_text(body: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(body).to_string())
+    }
+
+    /// A16's refusal. It is spelled out here rather than taken from the
+    /// product, so a comparison pins the wording.
+    fn tenancy_409(cursor: Cursor) -> String {
+        format!(
+            "cursor {} sits on an event outside this feed's tenancy — a cursor resumes only \
+             the feed that delivered it, and this feed never delivers that event; reconnect \
+             without a cursor, wait for the stream to open, then read current state from the \
+             same node, holding every frame that arrives until that read is installed and then \
+             applying the held frames and every later one over it in order, idempotently",
+            cursor.wire()
+        )
+    }
+
+    // -------------------------------------------------------------- ledger
+
+    /// One scanned row: what `charpente.events` durably holds at that id.
+    #[derive(Clone, Debug)]
+    struct Noted {
+        seq: u64,
+        /// The emitting tenant, as the payload declares it.
+        origin: u64,
+        /// `EventRow.scope` and `EventRow.shape` as recorded: under test.
+        scope: Option<u64>,
+        shape: Option<u64>,
+        /// The exact JSON a delivery of this row carries.
+        json: String,
+    }
+
+    /// Why a check failed.
+    /// - A `Finding` is this property's subject and is never excused.
+    /// - A `Mismatch` compares a delivery with the ledger. The ledger goes
+    ///   stale in exactly one sanctioned way: durable corruption cut a scanned
+    ///   event above the checkpoint horizon, and its id was re-minted (the
+    ///   cases `Client::diverged_ledger_entry` lists). The boundary re-sync
+    ///   (`Universe::resync_if_cut`) removes that staleness before a re-mint
+    ///   can be delivered, so a mismatch always fails. It is probed first
+    ///   only so the report can name the divergence.
+    #[derive(Debug)]
+    enum Fail {
+        Finding(String),
+        Mismatch(String),
+    }
+
+    /// Every row scanned so far, shared by the four feeds: one store, one
+    /// truth.
+    #[derive(Default)]
+    struct Ledger {
+        rows: BTreeMap<u64, Noted>,
+        next_scan_id: u64,
+    }
+
+    impl Ledger {
+        /// Reads every row committed since the last scan and checks what each
+        /// one recorded. A scan that fails on an injected fault is skipped, and
+        /// the next one picks its rows up. Ids are dense and nothing ages out
+        /// at the default retention, so a scan's first row is `next_scan_id`
+        /// itself.
+        fn sync(&mut self, db: &Db) -> Result<(), Fail> {
+            let from = self.next_scan_id;
+            let rows = match db
+                .snapshot()
+                .and_then(|snap| snap.scan_from::<EventRow>(from, 4096))
+            {
+                Ok(rows) => rows,
+                Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+                Err(e) => {
+                    return Err(Fail::Finding(format!(
+                        "ledger scan failed non-injected: {e}"
+                    )));
+                }
+            };
+            if let Some(first) = rows.first()
+                && first.id.raw() != from
+            {
+                return Err(Fail::Finding(format!(
+                    "the ledger scan from id {from} returned id {} first — event ids are dense \
+                     and nothing ages out at the default retention, so no id may be missing",
+                    first.id.raw()
+                )));
+            }
+            for row in &rows {
+                let noted = decode_note(row)?;
+                check_recorded(row.id.raw(), &noted).map_err(Fail::Finding)?;
+                self.next_scan_id = row.id.raw() + 1;
+                self.rows.insert(row.id.raw(), noted);
+            }
+            Ok(())
+        }
+
+        /// `Client::diverged_ledger_entry`, over this ledger. It returns the
+        /// first scanned id whose stored content changed, or that the store
+        /// rolled back past. It is called only on an error path, so a passing
+        /// universe pays no extra disk op and its fault schedule does not move.
+        fn diverged_entry(&self, db: &Db) -> Option<(u64, String, String)> {
+            let snap = db.snapshot().ok()?;
+            let next_event_id = snap.next_event_id().ok()?;
+            for (&id, noted) in &self.rows {
+                match snap.get::<EventRow>(Id::from_raw(id)).ok()? {
+                    Some(row) => {
+                        let stored = decode_note(&row).ok()?;
+                        if stored.json != noted.json {
+                            return Some((id, noted.json.clone(), stored.json));
+                        }
+                    }
+                    // A recorded id at or above `next_event_id` is one the
+                    // store has rolled back past. An absent id below it cannot
+                    // occur at the default retention, and is not excused here.
+                    None if id >= next_event_id => {
+                        return Some((
+                            id,
+                            noted.json.clone(),
+                            format!("ABSENT — store rolled back to next_event_id {next_event_id}"),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+            None
+        }
+    }
+
+    /// A stored row as this workload wrote it: a note whose payload decodes
+    /// under the shared field list. All three `Note` types encode alike.
+    fn decode_note(row: &EventRow) -> Result<Noted, Fail> {
+        let id = row.id.raw();
+        if row.name != "note" {
+            return Err(Fail::Finding(format!(
+                "event id {id} is named {:?} — this workload emits only notes",
+                row.name
+            )));
+        }
+        let note = global_note::Note::decode(&mut &row.payload[..]).map_err(|e| {
+            Fail::Finding(format!(
+                "event id {id} is a note whose payload does not decode: {e}"
+            ))
+        })?;
+        Ok(Noted {
+            seq: row.seq,
+            origin: note.origin.0,
+            scope: row.scope,
+            shape: row.shape,
+            json: serde_json::to_string(&note).expect("a note serializes"),
+        })
+    }
+
+    /// The ledger arm. The durable row must record the tenant and the shape
+    /// its payload says it was emitted with. It catches a wrong tenant at the
+    /// row, whether or not any feed was ever exposed to that row.
+    fn check_recorded(id: u64, noted: &Noted) -> Result<(), String> {
+        let (scope, shape) = if noted.origin == GLOBAL_ORIGIN {
+            (None, GLOBAL_FP)
+        } else {
+            (Some(noted.origin), SHOP_FP)
+        };
+        if noted.scope != scope {
+            return Err(format!(
+                "event id {id} is a note emitted {}, but its durable EventRow.scope reads {:?}, \
+                 not {scope:?} — the tenant did not survive commit, replay and readback",
+                emitted(noted.origin),
+                noted.scope
+            ));
+        }
+        if noted.shape != Some(shape) {
+            let recorded = match noted.shape {
+                Some(s) => format!("{s:#x}"),
+                None => "none".to_string(),
+            };
+            return Err(format!(
+                "event id {id} is a note emitted {}, but its recorded shape is {recorded}, not \
+                 {shape:#x} — a scoped event's fingerprint mixes its tenant's NAME, a global \
+                 one's does not",
+                emitted(noted.origin)
+            ));
+        }
+        Ok(())
+    }
+
+    // --------------------------------------------------------- feed client
+
+    /// Set when a tail's queued stall closure returns `true`, which is the
+    /// one way the sim sink refuses a frame (`tenancy_push_subscribe`).
+    type StallFlag = Arc<Mutex<bool>>;
+
+    /// One feed's reconnecting subscriber, across one universe.
+    struct FeedClient {
+        feed: Feed,
+        /// Ids below this are forfeit: a bare subscribe's `next_event_id` at
+        /// push time. Nothing else raises it, and nothing ages out. A timeline
+        /// cut lowers it to the cut (`Universe::resync_to_head`).
+        floor: u64,
+        /// Delivered frames not yet compared with the ledger, oldest first.
+        pending: VecDeque<(u64, &'static str, String)>,
+        /// Every delivered id the ledger confirmed. This is the delivered set,
+        /// and it is compared by membership.
+        verified: BTreeSet<u64>,
+        cursor: Option<Cursor>,
+        need_subscribe: bool,
+        handle: Option<SimSinkHandle>,
+        /// Where the live tail opened: the boundary its subscribe read, and
+        /// the cursor it resumed from (`None` for a bare subscribe). Read
+        /// only to name a miss (`caught_up_while_live`).
+        opened: Option<(u64, Option<Cursor>)>,
+        /// The live tail's stall flag: whether its sink ever refused a frame.
+        /// Read only when the tail closes (`closed_by_a_stall`).
+        stall: Option<StallFlag>,
+        frames_consumed: usize,
+        last_id: Option<u64>,
+        /// Probes refused by A16's name: from another shop's row, and from a
+        /// row of the other kind.
+        refused_same_kind: u64,
+        refused_other_kind: u64,
+        /// Every frame accepted, terminal ones included: the replay oracle.
+        trace: Vec<(u64, &'static str, String)>,
+    }
+
+    impl FeedClient {
+        fn new(feed: Feed) -> FeedClient {
+            FeedClient {
+                feed,
+                floor: 0,
+                pending: VecDeque::new(),
+                verified: BTreeSet::new(),
+                cursor: None,
+                need_subscribe: true,
+                handle: None,
+                opened: None,
+                stall: None,
+                frames_consumed: 0,
+                last_id: None,
+                refused_same_kind: 0,
+                refused_other_kind: 0,
+                trace: Vec::new(),
+            }
+        }
+
+        /// The missing half of set equality: the first scanned row of this
+        /// feed's own origin, at or above its floor, that was never verified
+        /// as delivered. `take_frames`'s leak check is the other half.
+        fn first_undelivered(&self, ledger: &Ledger) -> Option<u64> {
+            let lo = self.floor.min(ledger.next_scan_id);
+            ledger
+                .rows
+                .range(lo..ledger.next_scan_id)
+                .find(|&(id, noted)| {
+                    noted.origin == self.feed.origin() && !self.verified.contains(id)
+                })
+                .map(|(&id, _)| id)
+        }
+
+        fn settled(&self, ledger: &Ledger) -> bool {
+            self.pending.is_empty() && self.first_undelivered(ledger).is_none()
+        }
+
+        /// The missing half of set equality, asked while it can fail (plan
+        /// Task 13 fix round 1; review I1). `settled` alone is vacuous for a
+        /// feed the platform never delivers to: with no cursor it resubscribes
+        /// bare at every reconnect, each bare subscribe raises `floor` to its
+        /// boundary, and the settle's own reconnect then empties the window.
+        ///
+        /// Asked only after a `kernel.run` that returned `Ok`, and only of a
+        /// feed whose tail is still open. The platform guarantees exactly this
+        /// there:
+        /// - `Kernel::run` returns `Ok` only from `Step::Idle`, and a step is
+        ///   idle only when no tail in `Kernel::tails` is behind
+        ///   (`next_id < next_event_id`);
+        /// - `deliver_unit` moves a tail past every row in id order and sends
+        ///   each row its subscription admits; a refused send (`Full`, the
+        ///   stall closure) or a terminal frame drops the tail, and its sink
+        ///   with it, which is exactly `SimSinkHandle::closed`.
+        ///
+        /// So an open tail has had every admitted row from its start to the
+        /// head accepted by its sink, and `absorb` has drained each one the
+        /// ledger scanned. Below its start, a bare tail starts at `floor`
+        /// itself, and a resumed one right after its cursor, the last frame it
+        /// accepted in id order, so every own row in `[floor, cursor]` was
+        /// accepted before. Every own row in `[floor, next_scan_id)` is
+        /// therefore verified. A row legitimately still owed is never asked
+        /// about: a stall or a terminal frame closes the tail (`absorb` drops
+        /// the handle), a failed run is not asked, and a row the ledger has
+        /// not scanned is outside the window. No disk read, no entropy draw.
+        fn caught_up_while_live(&self, ledger: &Ledger) -> Result<(), String> {
+            let (Some(handle), Some((boundary, sent))) = (&self.handle, self.opened) else {
+                return Ok(());
+            };
+            if handle.closed() {
+                return Ok(());
+            }
+            let Some(id) = self.first_undelivered(ledger) else {
+                return Ok(());
+            };
+            let how = match sent {
+                Some(cursor) if id <= cursor.id => format!(
+                    "resuming from cursor {}; event id {id} lies at or below that cursor, so an \
+                     earlier tail of this feed skipped it",
+                    cursor.wire()
+                ),
+                Some(cursor) => format!("resuming from cursor {}", cursor.wire()),
+                None => "bare".to_string(),
+            };
+            Err(format!(
+                "{} never received event id {id}, a note emitted {}, on a live tail: it \
+                 subscribed at boundary {boundary} ({how}), the ledger scanned below id {}, and \
+                 kernel.run returned to idle with the tail still open — a tail open on a node \
+                 that ran to idle has been sent every committed row its subscription admits, so \
+                 a feed's delivered set is exactly its own rows, and this one is missing",
+                self.feed.label(),
+                emitted(ledger.rows[&id].origin),
+                ledger.next_scan_id
+            ))
+        }
+
+        /// Why a closed tail closed (plan Task 13 fix round 2; re-review R1).
+        /// `absorb` books a closed tail as a stall drop and the feed
+        /// reconnects. A feed with no cursor reconnects bare, and the floor
+        /// rule then forfeits every row the dropped tail owed, so a tail the
+        /// node drops for no reason would pass as vacuously as I1's fail-closed
+        /// feed. The product closes a `SimSinkHandle` in exactly these places:
+        /// - `Kernel::step`'s tail arm `swap_remove`s a tail when
+        ///   `deliver_unit` returns `Ok(false)` (`kernel/mod.rs`,
+        ///   `Ready::Tail`), which drops its boxed `SimSink`; `impl Drop for
+        ///   SimSink` is the only writer of `closed`. `deliver_unit`
+        ///   (`kernel/tail.rs`) returns `Ok(false)` only:
+        ///   - after a terminal frame: `charpente.gap` (the retention floor
+        ///     passed the tail), `charpente.error` (a row that does not decode,
+        ///     or a payload that does not encode) or `charpente.reshaped` (a
+        ///     row of another shape). `take_frames` fails the universe on each
+        ///     before this is asked. A terminal frame the stall refused arrives
+        ///     as no frame, and then the stall fired;
+        ///   - when a frame's send is refused: `SimSink::send` returns `Full`
+        ///     exactly when its stall closure returns `true`, and never returns
+        ///     `Closed`.
+        /// - Dropping the `Kernel` drops every tail. `absorb` never sees that:
+        ///   it runs while its run's kernel is alive, and `disconnect_all`
+        ///   clears every handle before a new kernel's first `absorb`.
+        ///
+        /// So a tail that closed with its stall unfired and no terminal frame
+        /// was dropped silently, and that fails by name. The flag is the
+        /// queued stall closure's own record of returning `true`
+        /// (`tenancy_push_subscribe`): no entropy draw and no disk read.
+        fn closed_by_a_stall(&self) -> Result<(), String> {
+            let stalled = self.stall.as_ref().is_some_and(|flag| {
+                *flag
+                    .lock()
+                    .expect("stall flag lock poisoned by an earlier panic")
+            });
+            if stalled {
+                return Ok(());
+            }
+            let (boundary, sent) = self
+                .opened
+                .expect("a feed holds a handle only for a tail it opened (`connected`)");
+            let how = match sent {
+                Some(cursor) => format!("resuming from cursor {}", cursor.wire()),
+                None => "bare".to_string(),
+            };
+            let from = match self.cursor {
+                Some(cursor) => format!("from cursor {}", cursor.wire()),
+                None => "bare".to_string(),
+            };
+            Err(format!(
+                "{}'s tail was dropped by the node with no stall and no terminal frame: it \
+                 subscribed at boundary {boundary} ({how}) and now reconnects {from} — a node \
+                 drops a live tail only when its sink refuses a frame (the stall closure) or \
+                 after a terminal frame (charpente.gap, charpente.reshaped, charpente.error), so \
+                 this drop is silent, and a bare reconnect after it forfeits every row the tail \
+                 owed",
+                self.feed.label()
+            ))
+        }
+
+        fn unsettled_report(&self, ledger: &Ledger) -> String {
+            format!(
+                "{} never caught up: ledger scanned below id {}, floor {}, {} frame(s) \
+                 unverified, first own row never delivered {:?}, cursor id {:?}",
+                self.feed.label(),
+                ledger.next_scan_id,
+                self.floor,
+                self.pending.len(),
+                self.first_undelivered(ledger),
+                self.cursor.map(|c| c.id)
+            )
+        }
+
+        /// Takes the frames this feed's sink accepted since the last call.
+        /// The leak check reads the frame's own payload, so it needs no
+        /// ledger and is never excused. A terminal frame is always a finding
+        /// here, because every row a feed admits carries that feed's own
+        /// shape.
+        fn take_frames(&mut self, ledger: &Ledger, frames: &[EventFrame]) -> Result<(), String> {
+            let label = self.feed.label();
+            for frame in frames {
+                self.trace.push((frame.id, frame.name, frame.json.clone()));
+                if frame.name == "charpente.gap" {
+                    return Err(format!(
+                        "{label} got charpente.gap with event retention at its default — \
+                         nothing ages out in this workload: {}",
+                        frame.json
+                    ));
+                }
+                if frame.name == ERROR_FRAME {
+                    return Err(format!(
+                        "{label} ended on {ERROR_FRAME} at event id {}: {} — every note in this \
+                         workload decodes under its own shape",
+                        frame.id, frame.json
+                    ));
+                }
+                if frame.name == RESHAPED_FRAME {
+                    let row = match ledger.rows.get(&frame.id) {
+                        Some(noted) => format!("a note emitted {}", emitted(noted.origin)),
+                        None => "a row the ledger has not scanned".to_string(),
+                    };
+                    return Err(format!(
+                        "tenancy leak: {label} ended on {RESHAPED_FRAME} at event id {}, {row} — \
+                         every note this feed admits carries this feed's own shape, so a \
+                         terminal frame here is a row outside this feed's tenancy that the \
+                         platform admitted",
+                        frame.id
+                    ));
+                }
+                let Some(origin) = origin_of(&frame.json) else {
+                    return Err(format!(
+                        "{label} received event id {} whose payload is not a note: {}",
+                        frame.id, frame.json
+                    ));
+                };
+                if origin != self.feed.origin() {
+                    return Err(format!(
+                        "tenancy leak: {label} received event id {}, a note emitted {} — {}",
+                        frame.id,
+                        emitted(origin),
+                        self.feed.rule()
+                    ));
+                }
+                assert_strictly_increasing(frame.id, &mut self.last_id)?;
+                self.pending
+                    .push_back((frame.id, frame.name, frame.json.clone()));
+                self.cursor = Some(Cursor {
+                    id: frame.id,
+                    seq: frame.seq,
+                });
+            }
+            Ok(())
+        }
+
+        /// Compares every pending frame the ledger has scanned. A frame the
+        /// ledger has not reached waits for a later scan.
+        fn drain(&mut self, ledger: &Ledger) -> Result<(), Fail> {
+            while let Some((id, name, json)) = self.pending.front() {
+                let Some(noted) = ledger.rows.get(id) else {
+                    break;
+                };
+                if *name != "note" || noted.json != *json {
+                    return Err(Fail::Mismatch(format!(
+                        "content mismatch at event id {id}: the store holds (note, {}) but {} \
+                         received ({name}, {json})",
+                        noted.json,
+                        self.feed.label()
+                    )));
+                }
+                let id = *id;
+                self.pending.pop_front();
+                self.verified.insert(id);
+            }
+            Ok(())
+        }
+
+        fn connected(
+            &mut self,
+            handle: SimSinkHandle,
+            was_bare: bool,
+            boundary: u64,
+            sent: Option<Cursor>,
+            stall: StallFlag,
+        ) {
+            self.need_subscribe = false;
+            if was_bare {
+                self.floor = self.floor.max(boundary);
+            }
+            self.handle = Some(handle);
+            self.opened = Some((boundary, sent));
+            self.stall = Some(stall);
+            self.frames_consumed = 0;
+        }
+
+        fn count_refusal(&mut self, origin: u64) {
+            if self.feed.same_kind(origin) {
+                self.refused_same_kind += 1;
+            } else {
+                self.refused_other_kind += 1;
+            }
+        }
+
+        /// A probe's cursor: the newest scanned row outside this feed's
+        /// tenancy. When `same_kind` asks for it (a shop feed only), that is
+        /// another shop's row; otherwise a row of the other kind. Whichever
+        /// exists is the fallback. Returns the cursor and the row's origin.
+        fn foreign_cursor(&self, ledger: &Ledger, same_kind: bool) -> Option<(Cursor, u64)> {
+            let own = self.feed.origin();
+            let newest = |wanted: &dyn Fn(u64) -> bool| {
+                ledger
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|(_, noted)| wanted(noted.origin))
+                    .map(|(&id, noted)| (Cursor { id, seq: noted.seq }, noted.origin))
+            };
+            newest(&|o: u64| o != own && self.feed.same_kind(o) == same_kind)
+                .or_else(|| newest(&|o: u64| o != own))
+        }
+    }
+
+    // ------------------------------------------------------------ universe
+
+    /// What one pushed request was, in push order. That is the order the
+    /// kernel answers in.
+    enum Pushed {
+        /// A feed's own (re)subscribe. `boundary` is `next_event_id` read just
+        /// before the push, which is exactly where a bare subscribe starts.
+        /// `sent` is the cursor it resumed from.
+        Subscribe {
+            client: usize,
+            was_bare: bool,
+            boundary: u64,
+            sent: Option<Cursor>,
+        },
+        /// A resume from a row outside the feed's tenancy, which must be
+        /// refused by name. It queues no stall closure, because a refused
+        /// resume opens no sink.
+        Probe {
+            client: usize,
+            cursor: Cursor,
+            origin: u64,
+        },
+        Emit,
+    }
+
+    /// How a feed's own subscribe was answered.
+    enum Answer {
+        Connected,
+        Retry,
+        Cut,
+        Refused,
+    }
+
+    /// The flagship's classification. A diverged 409 where a fault explains a
+    /// cut is a `Cut`: the subscribe was sent from a cursor on an id the
+    /// node's recovery cut, and `absorb` checks that against its boundary. A
+    /// diverged 409 nothing explains is `Refused`, and fails (S3b item 1).
+    fn read_answer(status: u16, raw: &str, cut_explained: bool) -> Answer {
+        if status == 200 {
+            return Answer::Connected;
+        }
+        if status == 409 && raw.contains("diverged from this node's timeline") && cut_explained {
+            return Answer::Cut;
+        }
+        if is_fault_fallout(raw) {
+            return Answer::Retry;
+        }
+        Answer::Refused
+    }
+
+    /// How a probe was answered.
+    /// - `Refused`: by A16's name.
+    /// - `Unanswered`: fault fallout; nothing is counted.
+    ///
+    /// A probe is pushed after its round's boundary re-sync, so its cursor is a
+    /// row the node holds, and a diverged answer is a finding like any other.
+    #[derive(Debug, PartialEq)]
+    enum ProbeAnswer {
+        Refused,
+        Unanswered,
+    }
+
+    /// The third property's verdict on one probe's answer.
+    fn probe_verdict(
+        feed: Feed,
+        cursor: Cursor,
+        origin: u64,
+        status: u16,
+        raw: &str,
+        text: &str,
+    ) -> Result<ProbeAnswer, String> {
+        if status == 409 && text == tenancy_409(cursor) {
+            return Ok(ProbeAnswer::Refused);
+        }
+        let asked = format!(
+            "{} resumed from cursor {} — event id {}, a note emitted {} —",
+            feed.label(),
+            cursor.wire(),
+            cursor.id,
+            emitted(origin)
+        );
+        if status == 200 {
+            return Err(format!(
+                "{asked} and was accepted: a cursor on a row outside this feed's tenancy is \
+                 refused by name, never resumed past"
+            ));
+        }
+        match read_answer(status, raw, false) {
+            Answer::Retry => Ok(ProbeAnswer::Unanswered),
+            Answer::Connected | Answer::Cut | Answer::Refused => Err(format!(
+                "{asked} and was answered {status}: {text} — a cursor on a row outside this \
+                 feed's tenancy is refused as outside it, by that name and no other"
+            )),
+        }
+    }
+
+    /// The next unclaimed sink. Only a 200 subscribe opens one, and sinks are
+    /// recorded in answer order.
+    fn take_sink(sinks: &SinkHandles, taken: &mut usize) -> SimSinkHandle {
+        let handle = sinks
+            .lock()
+            .expect("sink handles lock poisoned by an earlier panic")
+            .get(*taken)
+            .cloned()
+            .expect("every 200 subscribe opened exactly one sink, in answer order");
+        *taken += 1;
+        handle
+    }
+
+    type TenancyTrace = Vec<(usize, u64, &'static str, String)>;
+
+    struct Universe {
+        ledger: Ledger,
+        clients: Vec<FeedClient>,
+        /// `Client::cut_explained`: whether a fault explains a cut of this
+        /// node's timeline. The property passes `durable_corruption_fired`; a
+        /// pinned seed passes `|_| false` to stand a cut in for one nothing
+        /// explains (Step 4c). It is not a per-cut judge:
+        /// `durable_corruption_fired` holds from the node's first durable
+        /// corruption on, so it explains every later cut, whatever caused it
+        /// (LEDGER 2026-10-02, D5's per-cut-judge follow-up).
+        cut_explained: fn(&Sim) -> bool,
+        /// Whether a subscribe has read the node's head since the last boot. A
+        /// cut is re-synced at that read, so without one none can be.
+        head_read: bool,
+        /// One flag per stall closure queued on the current `SimSource`, in
+        /// queue order. `SimSource` pops one closure per SSE upgrade, FIFO
+        /// (`SimReply::stream`), and only a feed's own subscribe queues one (a
+        /// probe queues none), so the k-th sink `take_sink` hands out runs the
+        /// k-th closure. A refused subscribe leaves its closure for the next
+        /// upgrade, which is why the flag is matched by sink, not by request.
+        stall_flags: Vec<StallFlag>,
+    }
+
+    impl Universe {
+        fn new(cut_explained: fn(&Sim) -> bool) -> Universe {
+            Universe {
+                ledger: Ledger::default(),
+                clients: FEEDS.iter().map(|&feed| FeedClient::new(feed)).collect(),
+                cut_explained,
+                head_read: false,
+                stall_flags: Vec::new(),
+            }
+        }
+
+        /// A fresh kernel carries no tail over, and its head is not read yet.
+        /// Its source's stall queue goes with it: every `SimSource` is created
+        /// right after this call, and every call ends the source before it.
+        fn disconnect_all(&mut self) {
+            self.head_read = false;
+            self.stall_flags.clear();
+            for client in &mut self.clients {
+                client.need_subscribe = true;
+                client.handle = None;
+            }
+        }
+
+        /// `Client::resync_to_head`, over the ledger the four feeds share. It
+        /// forgets every id at or above `head`, the `next_event_id` of a node
+        /// whose timeline a recovery cut back to it, so the next scan re-reads
+        /// those ids from the timeline the node now holds. A ledger row there
+        /// describes an event that no longer exists, and a frame delivered
+        /// there came from the lost timeline. A `verified` mark there would
+        /// excuse whatever is re-minted at that id, and a `floor` above `head`
+        /// would forfeit it. A feed delivered an id at or above `head` also
+        /// loses its cursor, and its `last_id` drops to `head - 1`, D5's trim
+        /// in `Client::resync_to_head`, which is exactly as safe as
+        /// `cut_explained` is precise. A re-mint
+        /// can take the cut event's id and seq, which a cursor's seq cannot
+        /// tell apart, so resuming from it could skip the re-mint; the feed
+        /// resubscribes bare instead. The old `last_id` would refuse the
+        /// re-mint's delivery as out of order. What survives is the state for
+        /// ids the node still holds. Nothing is forgiven.
+        fn resync_to_head(&mut self, head: u64) {
+            self.ledger.rows.retain(|&id, _| id < head);
+            self.ledger.next_scan_id = self.ledger.next_scan_id.min(head);
+            for c in &mut self.clients {
+                c.pending.retain(|&(id, ..)| id < head);
+                c.verified.retain(|&id| id < head);
+                c.floor = c.floor.min(head);
+                if c.last_id.is_some_and(|id| id >= head) {
+                    c.last_id = head.checked_sub(1);
+                    c.cursor = None;
+                }
+            }
+        }
+
+        /// `Client::resync_if_cut` over the shared ledger (S3b item 3). `head`
+        /// is a boundary `push_subscribe` read, and that counter only advances
+        /// on commit. So an id the ledger scanned, or a feed was delivered, at
+        /// or above it is one a recovery cut. Where a fault explains the cut,
+        /// the universe re-syncs and keeps checking. A cut id that was never
+        /// re-minted is no longer owed. One that was is owed again, under its
+        /// new content, to the feed of its own origin, so a re-mint that is
+        /// never delivered FAILS. A cut nothing explains is a lost event, and
+        /// fails here, where it is first seen.
+        fn resync_if_cut(&mut self, sim: &Sim, head: u64) -> Result<(), String> {
+            self.head_read = true;
+            let scanned = self.ledger.rows.range(head..).next().map(|(&id, _)| id);
+            let delivered = self
+                .clients
+                .iter()
+                .filter_map(|c| c.last_id)
+                .filter(|&id| id >= head)
+                .min();
+            let Some(id) = scanned.into_iter().chain(delivered).min() else {
+                return Ok(());
+            };
+            if !(self.cut_explained)(sim) {
+                return Err(format!(
+                    "event id {id} was recorded or delivered off this node, but its \
+                     next_event_id is now {head}: a recovery cut a committed event, and no \
+                     fault on this node explains the cut, so this node lost an event it had \
+                     committed"
+                ));
+            }
+            self.resync_to_head(head);
+            sim.cover("realtime:ledger-resynced");
+            Ok(())
+        }
+
+        /// Every boundary this round's subscribes read, re-synced in push order.
+        /// It runs after `push_subscribes` and before `push_traffic` and
+        /// `kernel.run`, so no probe is built from a cut row and no emit can
+        /// re-mint a cut id first.
+        fn resync_at_boundaries(&mut self, sim: &Sim, pushed: &[Pushed]) -> Result<(), String> {
+            for p in pushed {
+                if let Pushed::Subscribe { boundary, .. } = *p {
+                    self.resync_if_cut(sim, boundary)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// A round's first half: every feed without a live tail resubscribes
+        /// from its cursor. Each subscribe reads the node's head first, its
+        /// `boundary`, which `resync_at_boundaries` then re-syncs a cut to.
+        fn push_subscribes(
+            &mut self,
+            sim: &Sim,
+            kernel: &Kernel,
+            source: &mut SimSource,
+            t: &mut u64,
+        ) -> Result<Vec<Pushed>, String> {
+            let mut pushed = Vec::new();
+            for (client, c) in self.clients.iter().enumerate() {
+                if !c.need_subscribe {
+                    continue;
+                }
+                let (was_bare, boundary, stall) =
+                    tenancy_push_subscribe(sim, kernel, source, c.feed.path(), c.cursor, *t)?;
+                self.stall_flags.push(stall);
+                pushed.push(Pushed::Subscribe {
+                    client,
+                    was_bare,
+                    boundary,
+                    sent: c.cursor,
+                });
+                *t += SEC;
+            }
+            Ok(pushed)
+        }
+
+        /// An epoch round's second half, pushed after the boundary re-sync:
+        /// each feed draws once, and one draw in four sends a probe; then the
+        /// emits. A settle round pushes none of it. The draws follow the
+        /// subscribes' stall draws, as they did before the split.
+        fn push_traffic(&self, sim: &Sim, source: &mut SimSource, t: &mut u64) -> Vec<Pushed> {
+            let mut pushed = Vec::new();
+            for (client, c) in self.clients.iter().enumerate() {
+                let draw = sim.entropy().next_u64();
+                if !draw.is_multiple_of(4) {
+                    continue;
+                }
+                let same_kind = (draw >> 2).is_multiple_of(2);
+                let Some((cursor, origin)) = c.foreign_cursor(&self.ledger, same_kind) else {
+                    continue;
+                };
+                source.push_at(
+                    *t,
+                    Request::new(
+                        Method::Get,
+                        format!("{}?cursor={}", c.feed.path(), cursor.wire()),
+                    ),
+                );
+                pushed.push(Pushed::Probe {
+                    client,
+                    cursor,
+                    origin,
+                });
+                *t += SEC;
+            }
+            let n_emits = 1 + sim.entropy().next_u64() % 4;
+            for _ in 0..n_emits {
+                let e = sim.entropy();
+                let pick = e.next_u64() % 8;
+                let shop = SHOPS[(e.next_u64() % 3) as usize];
+                let n = WireU64(e.next_u64() % 1000);
+                let (route, body) = match pick {
+                    0 | 1 => (
+                        "/tenancy/announce",
+                        TenancyEmit {
+                            shop: WireU64(GLOBAL_ORIGIN),
+                            n,
+                        },
+                    ),
+                    2 => (
+                        "/tenancy/note-and-announce",
+                        TenancyEmit {
+                            shop: WireU64(shop),
+                            n,
+                        },
+                    ),
+                    _ => (
+                        "/tenancy/note",
+                        TenancyEmit {
+                            shop: WireU64(shop),
+                            n,
+                        },
+                    ),
+                };
+                source.push_at(*t, Request::new(Method::Post, route).json(&body));
+                pushed.push(Pushed::Emit);
+                *t += SEC;
+            }
+            pushed
+        }
+
+        /// Scans the ledger and drains every feed against it. Every divergence
+        /// fails, as in the flagship's `sync_and_drain_naming_divergence`: every
+        /// recovery is followed by subscribes whose boundaries re-sync a cut a
+        /// fault explains, so a drain never meets one, and a cut nothing
+        /// explains is a lost event.
+        fn sync_and_drain(&mut self, sim: &Sim, db: &Db) -> Result<(), String> {
+            let checked = match self.ledger.sync(db) {
+                Ok(()) => self
+                    .clients
+                    .iter_mut()
+                    .try_for_each(|c| c.drain(&self.ledger)),
+                Err(fail) => Err(fail),
+            };
+            match checked {
+                Ok(()) => Ok(()),
+                Err(Fail::Finding(e)) => Err(e),
+                Err(Fail::Mismatch(e)) => Err(match self.ledger.diverged_entry(db) {
+                    Some((id, recorded, stored)) if !(self.cut_explained)(sim) => format!(
+                        "ledger id {id} was recorded off this node as {recorded}, but the store \
+                         now holds {stored}, and no fault on this node explains the change, so \
+                         this node lost an event it had committed ({e})"
+                    ),
+                    Some((id, recorded, stored)) => format!(
+                        "ledger diverged at event id {id}: recorded {recorded} when scanned, \
+                         store now holds {stored}, a cut no boundary re-synced: every recovery \
+                         is followed by subscribes whose boundaries re-sync a cut a fault \
+                         explains, so a drain should never meet one ({e})"
+                    ),
+                    None => e,
+                }),
+            }
+        }
+
+        /// Absorbs one round. `responses` is what the kernel recorded for this
+        /// round's `pushed`, in the same order. A crash can cut its tail short,
+        /// and the zip then stops early.
+        fn absorb(
+            &mut self,
+            sim: &Sim,
+            db: &Db,
+            pushed: &[Pushed],
+            responses: &[(u16, Vec<u8>)],
+            sinks: &SinkHandles,
+            sinks_taken: &mut usize,
+        ) -> Result<(), String> {
+            self.sync_and_drain(sim, db)?;
+            let explained = (self.cut_explained)(sim);
+            for (p, (status, body)) in pushed.iter().zip(responses) {
+                let raw = String::from_utf8_lossy(body).to_string();
+                let text = response_text(body);
+                match *p {
+                    Pushed::Emit => {
+                        if *status != 200 && !is_fault_fallout(&raw) {
+                            return Err(format!("unexpected emit response {status}: {text}"));
+                        }
+                    }
+                    Pushed::Subscribe {
+                        client,
+                        was_bare,
+                        boundary,
+                        sent,
+                    } => match read_answer(*status, &raw, explained) {
+                        Answer::Connected => {
+                            let stall = self
+                                .stall_flags
+                                .get(*sinks_taken)
+                                .cloned()
+                                .expect("every own subscribe queued one stall closure, FIFO");
+                            let handle = take_sink(sinks, sinks_taken);
+                            self.clients[client].connected(handle, was_bare, boundary, sent, stall);
+                        }
+                        Answer::Retry => {}
+                        // The flagship's diverged-409 arm (S3b item 3). This
+                        // subscribe was sent from a cursor on an id the node's
+                        // recovery cut. The boundary re-sync has already
+                        // cleared that cursor, so the feed resubscribes bare.
+                        // A cursor below the head its own boundary read was
+                        // not cut, so its 409 is a finding.
+                        Answer::Cut => {
+                            let cut = sent.is_some_and(|cursor| cursor.id >= boundary);
+                            if !cut {
+                                return Err(format!(
+                                    "{} was answered 409: {text} — but it subscribed from \
+                                     cursor {:?}, below the node's head {boundary}, so no cut \
+                                     explains the refusal",
+                                    self.clients[client].feed.label(),
+                                    sent.map(|cursor| cursor.wire())
+                                ));
+                            }
+                        }
+                        Answer::Refused => {
+                            return Err(format!(
+                                "unexpected subscribe response {status} for {}: {text}",
+                                self.clients[client].feed.label()
+                            ));
+                        }
+                    },
+                    Pushed::Probe {
+                        client,
+                        cursor,
+                        origin,
+                    } => {
+                        let feed = self.clients[client].feed;
+                        match probe_verdict(feed, cursor, origin, *status, &raw, &text)? {
+                            ProbeAnswer::Refused => self.clients[client].count_refusal(origin),
+                            ProbeAnswer::Unanswered => {}
+                        }
+                    }
+                }
+            }
+            for c in &mut self.clients {
+                let Some(handle) = c.handle.clone() else {
+                    continue;
+                };
+                let frames = handle.frames();
+                c.take_frames(&self.ledger, &frames[c.frames_consumed..])?;
+                c.frames_consumed = frames.len();
+                if handle.closed() {
+                    // A terminal frame already failed above, so the one
+                    // legitimate close left is a stall (`closed_by_a_stall`'s
+                    // census). Anything else is a silent drop.
+                    c.closed_by_a_stall()?;
+                    sim.cover("realtime:stall-drop");
+                    sim.cover("fault:subscriber_stall");
+                    c.need_subscribe = true;
+                    c.handle = None;
+                }
+            }
+            self.sync_and_drain(sim, db)
+        }
+
+        fn settled(&self) -> bool {
+            self.clients.iter().all(|c| c.settled(&self.ledger))
+        }
+
+        /// `FeedClient::caught_up_while_live` over every feed, after a
+        /// `kernel.run` that returned `Ok` and its `absorb`.
+        fn live_feeds_caught_up(&self) -> Result<(), String> {
+            self.clients
+                .iter()
+                .try_for_each(|c| c.caught_up_while_live(&self.ledger))
+        }
+
+        /// `Client::adjudicated_nothing` over four feeds (S3b item 7; GUIDE §8,
+        /// "a verdict needs a check that could have failed"): no feed was
+        /// delivered a frame, none had a scanned row in its window, and no
+        /// probe was refused by name.
+        fn adjudicated_nothing(&self) -> bool {
+            let next = self.ledger.next_scan_id;
+            self.clients.iter().all(|c| {
+                c.trace.is_empty()
+                    && c.refused_same_kind + c.refused_other_kind == 0
+                    && self
+                        .ledger
+                        .rows
+                        .range(c.floor.min(next)..next)
+                        .next()
+                        .is_none()
+            })
+        }
+
+        fn unsettled_report(&self) -> String {
+            self.clients
+                .iter()
+                .filter(|c| !c.settled(&self.ledger))
+                .map(|c| c.unsettled_report(&self.ledger))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn trace(&self) -> TenancyTrace {
+            self.clients
+                .iter()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    c.trace
+                        .iter()
+                        .map(move |(id, name, json)| (i, *id, *name, json.clone()))
+                })
+                .collect()
+        }
+
+        /// Coverage, credited once per universe that reached a verdict, so each
+        /// count reads as a number of universes. Every key is a way this
+        /// property could go quietly vacuous.
+        fn credit(&self, sim: &Sim) {
+            let next = self.ledger.next_scan_id;
+            let passed = |c: &FeedClient| -> Vec<u64> {
+                let lo = c.floor.min(next);
+                self.ledger
+                    .rows
+                    .range(lo..next)
+                    .map(|(_, noted)| noted.origin)
+                    .collect()
+            };
+            let seqs = |c: &FeedClient| -> BTreeSet<u64> {
+                c.verified
+                    .iter()
+                    .filter_map(|id| self.ledger.rows.get(id).map(|noted| noted.seq))
+                    .collect()
+            };
+            let global = &self.clients[0];
+            let shops = &self.clients[1..];
+            if shops.iter().all(|c| !c.verified.is_empty()) {
+                sim.cover("tenancy:every-shop-delivered");
+            }
+            if !global.verified.is_empty() {
+                sim.cover("tenancy:global-delivered");
+            }
+            // At a verdict every own row in a feed's window was delivered, and
+            // no other row ever was. So a foreign row in the window is one the
+            // feed was exposed to and did not receive: the "receives none"
+            // half, made non-vacuous.
+            if passed(global).iter().any(|&o| o != GLOBAL_ORIGIN) {
+                sim.cover("tenancy:global-passed-a-scoped-row");
+            }
+            if shops
+                .iter()
+                .any(|c| passed(c).iter().any(|&o| c.feed.same_kind(o)))
+            {
+                sim.cover("tenancy:shop-passed-another-shops-row");
+            }
+            if shops.iter().any(|c| passed(c).contains(&GLOBAL_ORIGIN)) {
+                sim.cover("tenancy:shop-passed-a-global-row");
+            }
+            if shops.iter().any(|c| c.refused_same_kind > 0) {
+                sim.cover("tenancy:resume-refused-on-another-shops-row");
+            }
+            if self.clients.iter().any(|c| c.refused_other_kind > 0) {
+                sim.cover("tenancy:resume-refused-on-the-other-kinds-row");
+            }
+            let global_seqs = seqs(global);
+            if shops.iter().any(|c| !seqs(c).is_disjoint(&global_seqs)) {
+                sim.cover("tenancy:mixed-record-delivered");
+            }
+        }
+    }
+
+    /// `push_subscribe`, copied rather than parameterized so the flagship keeps
+    /// its bytes (R56), with one change: the stall closure it queues records
+    /// each `true` it returns in the flag it hands back. The wrapper calls the
+    /// closure exactly as before, so no entropy draw moves.
+    fn tenancy_push_subscribe(
+        sim: &Sim,
+        kernel: &Kernel,
+        source: &mut SimSource,
+        path: &'static str,
+        cursor: Option<Cursor>,
+        t: u64,
+    ) -> Result<(bool, u64, StallFlag), String> {
+        let entropy = sim.entropy();
+        let fired: StallFlag = Arc::new(Mutex::new(false));
+        let flag = fired.clone();
+        let mut stall = stall_closure(entropy, sim.subscriber_stall());
+        source.push_stall(Box::new(move || {
+            let stalled = stall();
+            if stalled {
+                *flag
+                    .lock()
+                    .expect("stall flag lock poisoned by an earlier panic") = true;
+            }
+            stalled
+        }));
+        let boundary = kernel
+            .app()
+            .db()
+            .next_event_id()
+            .map_err(|e| format!("next_event_id read failed: {e}"))?;
+        let (req, was_bare) = match cursor {
+            Some(c) => {
+                if boundary > c.id + 1 {
+                    sim.cover("realtime:resume-backlog");
+                }
+                (
+                    Request::new(Method::Get, format!("{path}?cursor={}", c.wire())),
+                    false,
+                )
+            }
+            None => (Request::new(Method::Get, path), true),
+        };
+        source.push_at(t, req);
+        Ok((was_bare, boundary, fired))
+    }
+
+    /// `settle_boot` over `tenancy_app`. It is copied rather than
+    /// parameterized so the flagship's function keeps its bytes (R56). Every
+    /// word of `settle_boot`'s rationale applies unchanged.
+    fn tenancy_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
+        for try_n in 0..SETTLE_BOOT_TRIES {
+            if try_n > 0 && try_n.is_multiple_of(SETTLE_CYCLE_EVERY) {
+                sim.restart();
+            }
+            let app = match tenancy_app(sim) {
+                Ok(app) => app,
+                Err(e) => {
+                    // No restart clears a durable refusal (S5 re-review R-M2), and
+                    // only a fired durable-corruption fault excuses one (S3b item 0).
+                    if durable_refusal(sim, &e.to_string())? {
+                        return Ok(None);
+                    }
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("settle open failed non-injected: {e}"));
+                    }
+                    continue;
+                }
+            };
+            match Kernel::new(app, Box::new(sim.clock())) {
+                Ok(kernel) => return Ok(Some(kernel)),
+                Err(e) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("settle Kernel::new failed non-injected: {e}"));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// One universe, with `durable_corruption_fired` explaining a cut.
+    fn tenancy_universe(sim: &mut Sim) -> Result<TenancyTrace, String> {
+        tenancy_universe_judged(sim, durable_corruption_fired)
+    }
+
+    /// One universe. It has `realtime_workload_judged`'s shape:
+    /// - `EPOCHS` crash-bounded sessions of `ROUNDS_PER_EPOCH` rounds each;
+    /// - then a settle phase that reconnects every feed until each has caught
+    ///   up, or the universe gives up for the flagship's reasons.
+    ///
+    /// Every arm that classifies a fault is the flagship's, and every boundary
+    /// re-syncs a cut `cut_explained` answers for (`Universe::resync_if_cut`).
+    /// On success it returns every feed's frame trace, the replay check's
+    /// oracle.
+    fn tenancy_universe_judged(
+        sim: &mut Sim,
+        cut_explained: fn(&Sim) -> bool,
+    ) -> Result<TenancyTrace, String> {
+        let mut u = Universe::new(cut_explained);
+
+        for _epoch in 0..EPOCHS {
+            // A give-up already recorded means this universe adjudicated
+            // nothing. Carrying on can only turn it into a failure.
+            if sim.gave_up().is_some() {
+                return Ok(u.trace());
+            }
+            let entropy = sim.entropy();
+            // Calibrated to this workload over ten fresh bases (plan Task 13 Step
+            // 4b; DESIGN §1, "countdowns"): 50 + rand % 399 reached
+            // realtime:resume-backlog 7.72 and fault:crash 1.79 times
+            // per universe, where the flagship crashed 1.70 at the same bases.
+            sim.crash_disk_after(50 + entropy.next_u64() % 399);
+            let Some(app) =
+                boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || tenancy_app(sim))
+                    .map_err(|e| format!("open failed non-injected: {e}"))?
+            else {
+                sim.restart();
+                continue;
+            };
+            let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+                Ok(k) => k,
+                Err(e) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("Kernel::new failed non-injected: {e}"));
+                    }
+                    sim.restart();
+                    continue;
+                }
+            };
+            u.disconnect_all();
+
+            let mut source =
+                SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 2000 * SEC);
+            let sinks = source.sinks();
+            let responses = source.responses();
+            let mut resp_idx = 0usize;
+            let mut sinks_taken = 0usize;
+            let mut t = sim.now().as_nanos();
+
+            for _round in 0..ROUNDS_PER_EPOCH {
+                // `push_subscribe` reads `next_event_id` off the live `Db`, so
+                // a latched store fails it: classified as `kernel.run` is.
+                let mut pushed = match u.push_subscribes(sim, &kernel, &mut source, &mut t) {
+                    Ok(pushed) => pushed,
+                    Err(e) if is_fault_fallout(&e) => {
+                        sim.restart();
+                        u.disconnect_all();
+                        break;
+                    }
+                    Err(e) => return Err(format!("push_subscribe failed non-injected: {e}")),
+                };
+                u.resync_at_boundaries(sim, &pushed)?;
+                pushed.extend(u.push_traffic(sim, &mut source, &mut t));
+                let run_result = kernel.run(&mut source);
+                let new_responses = {
+                    let guard = responses
+                        .lock()
+                        .expect("responses lock poisoned by an earlier panic");
+                    guard[resp_idx..].to_vec()
+                };
+                resp_idx += new_responses.len();
+                u.absorb(
+                    sim,
+                    kernel.app().db(),
+                    &pushed,
+                    &new_responses,
+                    &sinks,
+                    &mut sinks_taken,
+                )?;
+                if run_result.is_ok() {
+                    u.live_feeds_caught_up()?;
+                }
+                if let Err(e) = run_result {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("kernel.run failed non-injected: {e}"));
+                    }
+                    sim.restart();
+                    u.disconnect_all();
+                    break;
+                }
+                // Below the `run_result` check, as in `realtime_workload`: a
+                // failure observed before a give-up outranks it.
+                if sim.gave_up().is_some() {
+                    return Ok(u.trace());
+                }
+            }
+        }
+
+        // Settle, as in `realtime_workload`. No emits and no probes: boot a
+        // node through the remaining faults and let every feed catch up. The
+        // retries add chances to RECEIVE and nothing else. `verified` grows
+        // only through `drain`, which matches a frame the server delivered, so
+        // no attempt count can excuse a row that was skipped.
+        //
+        // No subscriber stalls in the settle, as in `realtime_workload_judged`
+        // (S3b): a stall that drops a clean attempt's tail leaves that attempt
+        // adjudicating nothing. The epochs keep exercising stall-drop and resume.
+        sim.quiesce_subscriber_stalls();
+        let mut clean_attempts = 0u32;
+        for _attempt in 0..SETTLE_ATTEMPTS {
+            if sim.gave_up().is_some() {
+                return Ok(u.trace());
+            }
+            if u.settled() {
+                break;
+            }
+            let Some(mut kernel) = tenancy_settle_boot(sim)? else {
+                sim.restart();
+                continue;
+            };
+            u.disconnect_all();
+
+            let mut source =
+                SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 2000 * SEC);
+            let sinks = source.sinks();
+            let responses = source.responses();
+            let mut sinks_taken = 0usize;
+            let mut t = sim.now().as_nanos();
+
+            let pushed = match u.push_subscribes(sim, &kernel, &mut source, &mut t) {
+                Ok(pushed) => pushed,
+                Err(e) if is_fault_fallout(&e) => {
+                    sim.restart();
+                    continue;
+                }
+                Err(e) => return Err(format!("settle push_subscribe failed non-injected: {e}")),
+            };
+            u.resync_at_boundaries(sim, &pushed)?;
+            let run_result = kernel.run(&mut source);
+            let new_responses = responses
+                .lock()
+                .expect("responses lock poisoned by an earlier panic")
+                .clone();
+            u.absorb(
+                sim,
+                kernel.app().db(),
+                &pushed,
+                &new_responses,
+                &sinks,
+                &mut sinks_taken,
+            )?;
+            if run_result.is_ok() {
+                u.live_feeds_caught_up()?;
+            }
+            if let Err(e) = run_result {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle kernel.run failed non-injected: {e}"));
+                }
+                sim.restart();
+                u.disconnect_all();
+            } else {
+                clean_attempts += 1;
+            }
+            if sim.gave_up().is_some() {
+                return Ok(u.trace());
+            }
+        }
+
+        if !u.settled() {
+            // One give-up, the flagship's: zero clean attempts means there was
+            // no node to catch up FROM. There is no cut give-up. Every boundary
+            // re-syncs a cut a fault explains, so a row the node rolled back
+            // past is one nothing explains, which failed at its boundary. The
+            // one cut no re-sync can reach is a recovery after which no
+            // subscribe read a head, and this give-up names it.
+            if clean_attempts == 0 {
+                let why = if u.head_read {
+                    "there was no node to catch up from"
+                } else {
+                    "no subscribe read a head after the last recovery, so a cut it made could \
+                     not be re-synced, and there was no node to catch up from"
+                };
+                sim.give_up(format!(
+                    "no settle attempt completed without fault fallout over {SETTLE_ATTEMPTS} \
+                     attempts — {why} ({})",
+                    u.unsettled_report()
+                ));
+                return Ok(u.trace());
+            }
+            return Err(u.unsettled_report());
+        }
+        if u.adjudicated_nothing() {
+            sim.give_up(
+                "every feed settled owed nothing, delivered nothing and refused no probe, so \
+                 nothing was adjudicated",
+            );
+            return Ok(u.trace());
+        }
+        u.credit(sim);
+        Ok(u.trace())
+    }
+
+    /// Tenancy-completion spec §9, the realtime property. The base is pinned
+    /// because the floors are rates measured at it. Fresh bases are the
+    /// correctness sweep (plan Task 13 Step 7, Task 14 Step 5).
+    #[test]
+    fn every_feed_receives_exactly_its_own_scope_under_the_fault_matrix() {
+        run_universes_swarm_with!(
+            TENANCY_BASE,
+            128,
+            |_cfg: &mut FaultConfig| {},
+            |sim: &mut Sim| tenancy_universe(sim).map(|_trace| ()),
+            require: [
+                "boot:booted-after-retry",
+                "tenancy:every-shop-delivered",
+                "tenancy:global-delivered",
+                "tenancy:global-passed-a-scoped-row",
+                "tenancy:shop-passed-another-shops-row",
+                "tenancy:shop-passed-a-global-row",
+                "tenancy:resume-refused-on-another-shops-row",
+                "tenancy:resume-refused-on-the-other-kinds-row",
+                "tenancy:mixed-record-delivered",
+                "realtime:resume-backlog",
+                "realtime:stall-drop",
+                "fault:subscriber_stall"
+            ],
+            floor: [
+                ("tenancy:every-shop-delivered", TENANCY_EVERY_SHOP_FLOOR),
+                ("tenancy:global-delivered", TENANCY_GLOBAL_DELIVERED_FLOOR),
+                ("tenancy:global-passed-a-scoped-row", TENANCY_GLOBAL_PASSED_FLOOR),
+                (
+                    "tenancy:shop-passed-another-shops-row",
+                    TENANCY_SHOP_PASSED_SHOP_FLOOR
+                ),
+                ("tenancy:shop-passed-a-global-row", TENANCY_SHOP_PASSED_GLOBAL_FLOOR),
+                (
+                    "tenancy:resume-refused-on-another-shops-row",
+                    TENANCY_REFUSED_SAME_KIND_FLOOR
+                ),
+                (
+                    "tenancy:resume-refused-on-the-other-kinds-row",
+                    TENANCY_REFUSED_OTHER_KIND_FLOOR
+                ),
+                ("realtime:resume-backlog", TENANCY_RESUME_BACKLOG_FLOOR)
+            ],
+            ceiling: [("universe:gave-up", TENANCY_GAVE_UP_CEILING)]
+        );
+    }
+
+    /// The floors are exact measurements, and that means something only if
+    /// the batch is reproducible. The second seed is the flagship's style of
+    /// "any other seed".
+    #[test]
+    fn the_tenancy_workload_replays_identically_for_the_same_seed() {
+        for seed in [0x5C0B_5EED, 0x0BAD_5C0B_0BAD_5C0B] {
+            charpente_sim::checks::replays_identically(seed, tenancy_universe).unwrap();
+        }
+    }
+
+    // ------------------------------------------------- the fault-free twin
+
+    /// `(route, shop, n)`, pushed in order at one instant after the four bare
+    /// subscribes. There is one record per request, with ids in emit order:
+    /// 0 shop 0 · 1 global · 2 shop 1 · 3 shop 2 and 4 global (one record, one
+    /// seq) · 5 shop 1 · 6 shop 0 · 7 shop 1.
+    const TWIN_SCRIPT: [(&str, u64, u64); 7] = [
+        ("/tenancy/note", 0, 10),
+        ("/tenancy/announce", GLOBAL_ORIGIN, 11),
+        ("/tenancy/note", 1, 12),
+        ("/tenancy/note-and-announce", 2, 13),
+        ("/tenancy/note", 1, 15),
+        ("/tenancy/note", 0, 16),
+        ("/tenancy/note", 1, 17),
+    ];
+
+    /// Steps the kernel until nothing is ready, at most 256 times. Each
+    /// subscribe is its own batch and each tail delivers in its own step, so a
+    /// fixed step count would tie these tests to the batching.
+    fn run_quiet(
+        kernel: &mut Kernel,
+        sim: &Sim,
+        requests: Vec<Request>,
+    ) -> (RecordedResponses, SinkHandles) {
+        let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+        let t = sim.now().as_nanos();
+        for request in requests {
+            source.push_at(t, request);
+        }
+        let (responses, sinks) = (source.responses(), source.sinks());
+        for _ in 0..256 {
+            match kernel
+                .step(&mut source)
+                .expect("no step may fail on a fault-free node")
+            {
+                Step::Worked => {}
+                Step::Idle { .. } => return (responses, sinks),
+            }
+        }
+        panic!("the kernel was still working after 256 steps");
+    }
+
+    /// One fault-free node: the four feeds subscribed bare, in `FEEDS` order,
+    /// then `TWIN_SCRIPT`. Returns the node (still serving, for the resume
+    /// tests), every stored row, and each feed's frames in `FEEDS` order.
+    fn twin() -> (Sim, Kernel, Vec<EventRow>, Vec<Vec<EventFrame>>) {
+        let sim = Sim::with_faults(0x5C0B_7317, FaultConfig::none());
+        let mut kernel = Kernel::new(tenancy_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+        let mut requests: Vec<Request> = FEEDS
+            .iter()
+            .map(|feed| Request::new(Method::Get, feed.path()))
+            .collect();
+        for (route, shop, n) in TWIN_SCRIPT {
+            requests.push(Request::new(Method::Post, route).json(&TenancyEmit {
+                shop: WireU64(shop),
+                n: WireU64(n),
+            }));
+        }
+        let (responses, sinks) = run_quiet(&mut kernel, &sim, requests);
+        assert_eq!(
+            statuses(&responses),
+            vec![200; 11],
+            "four subscribes and seven emits, each answered 200"
+        );
+        let frames: Vec<Vec<EventFrame>> = sinks
+            .lock()
+            .expect("sinks lock")
+            .iter()
+            .map(|h| h.frames())
+            .collect();
+        assert_eq!(frames.len(), 4, "four subscribes opened four sinks");
+        let rows: Vec<EventRow> = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan_from(0, 64)
+            .unwrap();
+        assert_eq!(rows.len(), 8, "seven requests wrote eight notes");
+        (sim, kernel, rows, frames)
+    }
+
+    /// The oracle's ledger over the twin's store, scanned and checked.
+    fn synced(kernel: &Kernel) -> Ledger {
+        let mut ledger = Ledger::default();
+        ledger
+            .sync(kernel.app().db())
+            .expect("the twin's rows record what their payloads say");
+        assert_eq!(ledger.next_scan_id, 8);
+        ledger
+    }
+
+    /// Frames as comparable tuples. `EventFrame` has no `PartialEq`.
+    fn project(frames: &[EventFrame]) -> Vec<(u64, u64, &'static str, String)> {
+        frames
+            .iter()
+            .map(|f| (f.id, f.seq, f.name, f.json.clone()))
+            .collect()
+    }
+
+    fn cursor_at(rows: &[EventRow], index: usize) -> Cursor {
+        Cursor {
+            id: rows[index].id.raw(),
+            seq: rows[index].seq,
+        }
+    }
+
+    fn resume(feed: Feed, cursor: Cursor) -> Request {
+        Request::new(
+            Method::Get,
+            format!("{}?cursor={}", feed.path(), cursor.wire()),
+        )
+    }
+
+    /// What a feed admits, as a function of the feed's tenant and the row's.
+    /// The product has one rule: `Subscription::admits`'s scope clause, which
+    /// is also A16's check on a resume. The others are the victims the oracle
+    /// must name.
+    type ScopeRule = fn(Option<u64>, Option<u64>) -> bool;
+
+    /// The product's rule: `row.scope == subscription.scope`.
+    fn scope_equal(feed: Option<u64>, row: Option<u64>) -> bool {
+        feed == row
+    }
+
+    /// The scope clause dropped.
+    fn scope_blind(_feed: Option<u64>, _row: Option<u64>) -> bool {
+        true
+    }
+
+    /// Tenant 0 read as no tenant.
+    fn zero_is_no_tenant(feed: Option<u64>, row: Option<u64>) -> bool {
+        feed.filter(|&s| s != 0) == row.filter(|&s| s != 0)
+    }
+
+    /// The fail-closed direction: a tenant feed admits nothing.
+    fn tenants_admit_nothing(feed: Option<u64>, row: Option<u64>) -> bool {
+        feed.is_none() && row.is_none()
+    }
+
+    /// `deliver_unit` (kernel/tail.rs) over `rows`, with the scope clause
+    /// replaced by `rule`:
+    /// - a row the rule does not admit is skipped;
+    /// - an admitted row of another shape ends the tail on
+    ///   `charpente.reshaped`;
+    /// - every other admitted row is delivered.
+    ///
+    /// Every row here is a note and no feed is keyed, so the name and key
+    /// clauses always pass.
+    fn replay_tail(rows: &[EventRow], feed: Feed, rule: ScopeRule) -> Vec<EventFrame> {
+        let mut frames = Vec::new();
+        for row in rows {
+            if !rule(feed.scope(), row.scope) {
+                continue;
+            }
+            if row.shape != Some(feed.fingerprint()) {
+                frames.push(EventFrame {
+                    id: row.id.raw(),
+                    seq: row.seq,
+                    name: RESHAPED_FRAME,
+                    json: reshaped_frame(row).3,
+                });
+                break;
+            }
+            let note =
+                global_note::Note::decode(&mut &row.payload[..]).expect("a twin row decodes");
+            frames.push(EventFrame {
+                id: row.id.raw(),
+                seq: row.seq,
+                name: "note",
+                json: serde_json::to_string(&note).expect("a note serializes"),
+            });
+        }
+        frames
+    }
+
+    /// `validate_subscribe` (kernel/mod.rs) from its seq check on, over
+    /// `rows`, with A16's tenancy comparison replaced by `rule`:
+    /// - a cursor on a row the rule does not admit is refused by A16's name;
+    /// - an admitted row of another shape is refused as reshaped;
+    /// - anything else resumes at the next id.
+    fn replay_resume(
+        rows: &[EventRow],
+        feed: Feed,
+        cursor: Cursor,
+        rule: ScopeRule,
+    ) -> Result<u64, (u16, String)> {
+        let row = rows
+            .iter()
+            .find(|r| r.id.raw() == cursor.id)
+            .expect("the cursor names a twin row");
+        if !rule(feed.scope(), row.scope) {
+            return Err((409, tenancy_409(cursor)));
+        }
+        if row.shape != Some(feed.fingerprint()) {
+            return Err((409, reshaped_409(row, feed.fingerprint())));
+        }
+        Ok(cursor.id + 1)
+    }
+
+    /// The three notes are one NAME and one field list, with three
+    /// fingerprints. Tenancy is the only difference, and the fingerprint sees
+    /// it.
+    #[test]
+    fn the_three_notes_share_a_name_and_differ_only_in_tenancy() {
+        assert_eq!(<global_note::Note as Event>::NAME, "note");
+        assert_eq!(<shop_note::Note as Event>::NAME, "note");
+        assert_eq!(<desk_note::Note as Event>::NAME, "note");
+        assert_ne!(
+            GLOBAL_FP, SHOP_FP,
+            "a scoped event's fingerprint mixes its tenant's NAME"
+        );
+        assert_ne!(
+            SHOP_FP, DESK_FP,
+            "two tenant types, two fingerprints for one field list"
+        );
+        assert_ne!(GLOBAL_FP, DESK_FP);
+    }
+
+    /// The control every victim below is measured against. On a fault-free
+    /// node each feed receives exactly its own notes, the rows record their
+    /// tenants, and the oracle passes on those bytes.
+    #[test]
+    fn each_feed_receives_exactly_its_own_notes_on_a_fault_free_node() {
+        let (_sim, kernel, rows, frames) = twin();
+        assert_eq!(
+            rows.iter().map(|r| r.scope).collect::<Vec<_>>(),
+            vec![
+                Some(0),
+                None,
+                Some(1),
+                Some(2),
+                None,
+                Some(1),
+                Some(0),
+                Some(1)
+            ],
+            "a shop's note records its shop, tenant 0 included; a global note records none"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.shape).collect::<Vec<_>>(),
+            vec![
+                Some(SHOP_FP),
+                Some(GLOBAL_FP),
+                Some(SHOP_FP),
+                Some(SHOP_FP),
+                Some(GLOBAL_FP),
+                Some(SHOP_FP),
+                Some(SHOP_FP),
+                Some(SHOP_FP)
+            ]
+        );
+        assert_eq!(
+            rows[3].seq, rows[4].seq,
+            "note-and-announce is one record: its two rows share a seq"
+        );
+        assert_ne!(rows[2].seq, rows[3].seq);
+        let expected: [&[(u64, &str)]; 4] = [
+            &[
+                (1, r#"{"origin":"1000","n":"11"}"#),
+                (4, r#"{"origin":"1000","n":"14"}"#),
+            ],
+            &[
+                (0, r#"{"origin":"0","n":"10"}"#),
+                (6, r#"{"origin":"0","n":"16"}"#),
+            ],
+            &[
+                (2, r#"{"origin":"1","n":"12"}"#),
+                (5, r#"{"origin":"1","n":"15"}"#),
+                (7, r#"{"origin":"1","n":"17"}"#),
+            ],
+            &[(3, r#"{"origin":"2","n":"13"}"#)],
+        ];
+        let ledger = synced(&kernel);
+        for (i, feed) in FEEDS.iter().enumerate() {
+            let got: Vec<(u64, &str, &str)> = frames[i]
+                .iter()
+                .map(|f| (f.id, f.name, f.json.as_str()))
+                .collect();
+            let want: Vec<(u64, &str, &str)> = expected[i]
+                .iter()
+                .map(|&(id, json)| (id, "note", json))
+                .collect();
+            assert_eq!(got, want, "{}", feed.label());
+            let mut client = FeedClient::new(*feed);
+            client
+                .take_frames(&ledger, &frames[i])
+                .expect("the kernel's own delivery passes the oracle");
+            client
+                .drain(&ledger)
+                .expect("every delivered frame matches the store");
+            assert!(
+                client.settled(&ledger),
+                "{}",
+                client.unsettled_report(&ledger)
+            );
+        }
+    }
+
+    /// The replay is evidence only if, under the product's own rule, it IS the
+    /// kernel's delivery, frame for frame, on every feed.
+    #[test]
+    fn replaying_the_tail_with_the_products_scope_rule_is_the_kernels_own_delivery() {
+        let (_sim, _kernel, rows, frames) = twin();
+        for (i, feed) in FEEDS.iter().enumerate() {
+            assert_eq!(
+                project(&replay_tail(&rows, *feed, scope_equal)),
+                project(&frames[i]),
+                "{}",
+                feed.label()
+            );
+        }
+    }
+
+    // ---------------------------------------------------- the named victims
+
+    /// The text a terminal frame on a feed produces, spelled out.
+    fn reshaped_leak(feed: &str, id: u64, what: &str) -> String {
+        format!(
+            "tenancy leak: {feed} ended on charpente.reshaped at event id {id}, a note emitted \
+             {what} — every note this feed admits carries this feed's own shape, so a terminal \
+             frame here is a row outside this feed's tenancy that the platform admitted"
+        )
+    }
+
+    /// Victim: `admits` with its scope clause dropped. Every feed is named. A
+    /// cross-kind row ends the tail on a shape the feed does not carry, and a
+    /// same-kind row arrives as content whose payload names another shop. The
+    /// control is the product's rule on the same bytes.
+    #[test]
+    fn the_oracle_names_a_scope_blind_delivery_on_every_feed() {
+        let (_sim, kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let expected = [
+            (
+                Feed::Global,
+                reshaped_leak("the global feed", 0, "inside shop 0"),
+            ),
+            (
+                Feed::Shop(0),
+                reshaped_leak("shop 0's feed", 1, "as a global event"),
+            ),
+            (
+                Feed::Shop(1),
+                "tenancy leak: shop 1's feed received event id 0, a note emitted inside shop 0 \
+                 — a tenant's feed receives only its own tenant's scoped rows"
+                    .to_string(),
+            ),
+            (
+                Feed::Shop(2),
+                "tenancy leak: shop 2's feed received event id 0, a note emitted inside shop 0 \
+                 — a tenant's feed receives only its own tenant's scoped rows"
+                    .to_string(),
+            ),
+        ];
+        for (feed, text) in expected {
+            FeedClient::new(feed)
+                .take_frames(&ledger, &replay_tail(&rows, feed, scope_equal))
+                .expect("the control: the product's rule on these bytes passes");
+            let err = FeedClient::new(feed)
+                .take_frames(&ledger, &replay_tail(&rows, feed, scope_blind))
+                .expect_err("a scope-blind rule must fail the oracle");
+            assert_eq!(err, text);
+        }
+    }
+
+    /// Victim: a rule that reads tenant 0 as no tenant. It is named on exactly
+    /// the two feeds it touches. Shops 1 and 2 still pass on the same bytes, so
+    /// the oracle blames the confusion, not the workload.
+    #[test]
+    fn the_oracle_names_a_rule_that_reads_tenant_zero_as_no_tenant() {
+        let (_sim, kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let expected = [
+            (
+                Feed::Global,
+                Some(reshaped_leak("the global feed", 0, "inside shop 0")),
+            ),
+            (
+                Feed::Shop(0),
+                Some(reshaped_leak("shop 0's feed", 1, "as a global event")),
+            ),
+            (Feed::Shop(1), None),
+            (Feed::Shop(2), None),
+        ];
+        for (feed, text) in expected {
+            let verdict = FeedClient::new(feed)
+                .take_frames(&ledger, &replay_tail(&rows, feed, zero_is_no_tenant));
+            match text {
+                None => verdict.expect("a feed tenant 0 never reaches still passes"),
+                Some(text) => assert_eq!(verdict.expect_err("tenant 0 read as none"), text),
+            }
+        }
+    }
+
+    /// Victim, the fail-closed direction: tenant feeds admit nothing. Nothing
+    /// arrives, so the leak check cannot see it. Set equality's missing half
+    /// must, and it names the first row that never came: at the settle
+    /// (`unsettled_report`), and on the round, while the tail is open
+    /// (`caught_up_while_live`).
+    #[test]
+    fn the_oracle_names_a_tenant_feed_that_receives_none_of_its_own_rows() {
+        let (_sim, kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let mut global = FeedClient::new(Feed::Global);
+        global
+            .take_frames(
+                &ledger,
+                &replay_tail(&rows, Feed::Global, tenants_admit_nothing),
+            )
+            .unwrap();
+        global.drain(&ledger).unwrap();
+        assert!(
+            global.settled(&ledger),
+            "the control: this rule leaves the global feed whole: {}",
+            global.unsettled_report(&ledger)
+        );
+        let frames = replay_tail(&rows, Feed::Shop(1), tenants_admit_nothing);
+        assert!(frames.is_empty(), "shop 1 receives nothing under this rule");
+        let mut shop = FeedClient::new(Feed::Shop(1));
+        shop.take_frames(&ledger, &frames).unwrap();
+        shop.drain(&ledger).unwrap();
+        assert!(!shop.settled(&ledger));
+        assert_eq!(
+            shop.unsettled_report(&ledger),
+            "shop 1's feed never caught up: ledger scanned below id 8, floor 0, 0 frame(s) \
+             unverified, first own row never delivered Some(2), cursor id None"
+        );
+        // In a universe this feed never holds `floor 0` until the settle: with
+        // no cursor it resubscribes bare at every reconnect, each bare
+        // subscribe raises its floor to its boundary, and the report above
+        // then has nothing to name (review I1). The live check names it while
+        // the tail is open, here a bare tail at boundary 0.
+        let (_global_sink, global_tail) = SimSink::new(Box::new(|| false));
+        global.connected(global_tail, true, 0, None, Arc::new(Mutex::new(false)));
+        global
+            .caught_up_while_live(&ledger)
+            .expect("the control: the global feed's open tail has every global row");
+        let stalled: StallFlag = Arc::new(Mutex::new(false));
+        let (shop_sink, shop_tail) = SimSink::new(Box::new(|| false));
+        shop.connected(shop_tail, true, 0, None, stalled.clone());
+        assert_eq!(
+            shop.caught_up_while_live(&ledger),
+            Err(
+                "shop 1's feed never received event id 2, a note emitted inside shop 1, on a \
+                 live tail: it subscribed at boundary 0 (bare), the ledger scanned below id 8, \
+                 and kernel.run returned to idle with the tail still open — a tail open on a \
+                 node that ran to idle has been sent every committed row its subscription \
+                 admits, so a feed's delivered set is exactly its own rows, and this one is \
+                 missing"
+                    .to_string()
+            )
+        );
+        drop(shop_sink);
+        shop.caught_up_while_live(&ledger)
+            .expect("a dropped tail owes nothing yet: its rows are still owed at the settle");
+        // Unless nothing explains the drop. A tail the node closes with no
+        // stall and no terminal frame is the other fail-closed door (re-review
+        // R1): the feed would reconnect bare and forfeit what it was owed.
+        assert_eq!(
+            shop.closed_by_a_stall(),
+            Err(
+                "shop 1's feed's tail was dropped by the node with no stall and no terminal \
+                 frame: it subscribed at boundary 0 (bare) and now reconnects bare — a node \
+                 drops a live tail only when its sink refuses a frame (the stall closure) or \
+                 after a terminal frame (charpente.gap, charpente.reshaped, charpente.error), \
+                 so this drop is silent, and a bare reconnect after it forfeits every row the \
+                 tail owed"
+                    .to_string()
+            )
+        );
+        *stalled.lock().expect("stall flag lock") = true;
+        shop.closed_by_a_stall()
+            .expect("the control: a tail its stall closed is legitimately closed");
+    }
+
+    /// Victim: an interior skip. Shop 1's real frames, with id 5 removed, are
+    /// strictly increasing, and each one matches the store. Only membership
+    /// sees the hole; a high-water mark would not.
+    #[test]
+    fn the_oracle_names_an_interior_skip_on_a_shop_feed() {
+        let (_sim, kernel, _, frames) = twin();
+        let ledger = synced(&kernel);
+        let skipped: Vec<EventFrame> = frames[2].iter().filter(|f| f.id != 5).cloned().collect();
+        assert_eq!(skipped.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2, 7]);
+        let mut shop = FeedClient::new(Feed::Shop(1));
+        shop.take_frames(&ledger, &skipped)
+            .expect("each remaining frame is shop 1's own, in order");
+        shop.drain(&ledger)
+            .expect("each remaining frame matches the store");
+        assert_eq!(
+            shop.unsettled_report(&ledger),
+            "shop 1's feed never caught up: ledger scanned below id 8, floor 0, 0 frame(s) \
+             unverified, first own row never delivered Some(5), cursor id Some(7)"
+        );
+        // On the round: a tail resumed from cursor 7 is open, and the hole at
+        // 5 lies below that cursor, so an earlier tail skipped it (re-review m1).
+        let cursor = shop.cursor.expect("shop 1 holds a cursor");
+        let (_sink, tail) = SimSink::new(Box::new(|| false));
+        shop.connected(tail, false, 8, Some(cursor), Arc::new(Mutex::new(false)));
+        assert_eq!(
+            shop.caught_up_while_live(&ledger),
+            Err(format!(
+                "shop 1's feed never received event id 5, a note emitted inside shop 1, on a live \
+                 tail: it subscribed at boundary 8 (resuming from cursor 7.{}; event id 5 lies at \
+                 or below that cursor, so an earlier tail of this feed skipped it), the ledger \
+                 scanned below id 8, and kernel.run returned to idle with the tail still open — a \
+                 tail open on a node that ran to idle has been sent every committed row its \
+                 subscription admits, so a feed's delivered set is exactly its own rows, and this \
+                 one is missing",
+                cursor.seq
+            ))
+        );
+    }
+
+    /// Victim: a durable row that recorded the wrong tenant or the wrong
+    /// shape. The ledger arm names it at the row, whether or not any feed ever
+    /// read that row.
+    #[test]
+    fn the_oracle_names_a_row_that_recorded_the_wrong_tenant_or_shape() {
+        let (_sim, kernel, _, _) = twin();
+        let ledger = synced(&kernel);
+        for (id, noted) in &ledger.rows {
+            check_recorded(*id, noted)
+                .expect("the control: every twin row records its own tenant and shape");
+        }
+        let with = |id: u64, scope: Option<u64>, shape: Option<u64>| Noted {
+            scope,
+            shape,
+            ..ledger.rows[&id].clone()
+        };
+        let cases = [
+            (
+                2,
+                with(2, Some(2), Some(SHOP_FP)),
+                "event id 2 is a note emitted inside shop 1, but its durable EventRow.scope \
+                 reads Some(2), not Some(1) — the tenant did not survive commit, replay and \
+                 readback"
+                    .to_string(),
+            ),
+            (
+                0,
+                with(0, None, Some(SHOP_FP)),
+                "event id 0 is a note emitted inside shop 0, but its durable EventRow.scope \
+                 reads None, not Some(0) — the tenant did not survive commit, replay and \
+                 readback"
+                    .to_string(),
+            ),
+            (
+                1,
+                with(1, Some(0), Some(GLOBAL_FP)),
+                "event id 1 is a note emitted as a global event, but its durable \
+                 EventRow.scope reads Some(0), not None — the tenant did not survive commit, \
+                 replay and readback"
+                    .to_string(),
+            ),
+            (
+                1,
+                with(1, None, Some(SHOP_FP)),
+                format!(
+                    "event id 1 is a note emitted as a global event, but its recorded shape is \
+                     {SHOP_FP:#x}, not {GLOBAL_FP:#x} — a scoped event's fingerprint mixes its \
+                     tenant's NAME, a global one's does not"
+                ),
+            ),
+            (
+                5,
+                with(5, Some(1), None),
+                format!(
+                    "event id 5 is a note emitted inside shop 1, but its recorded shape is \
+                     none, not {SHOP_FP:#x} — a scoped event's fingerprint mixes its tenant's \
+                     NAME, a global one's does not"
+                ),
+            ),
+        ];
+        for (id, noted, text) in cases {
+            assert_eq!(check_recorded(id, &noted), Err(text));
+        }
+    }
+
+    /// The third property on the real kernel (A16). Four resumes are refused by
+    /// name and open no tail:
+    /// - from another shop's row;
+    /// - from a global row, on a shop feed;
+    /// - from a shop's row, on the global feed;
+    /// - from the global half of a mixed record, on another shop's feed.
+    ///
+    /// A resume from the feed's own row is the control. The replay helper and
+    /// the oracle's verdict are checked against the kernel's own answers.
+    #[test]
+    fn a_resume_from_a_row_outside_the_feeds_tenancy_is_refused_by_name() {
+        let (sim, mut kernel, rows, _) = twin();
+        let ledger = synced(&kernel);
+        let probes = [
+            (Feed::Shop(1), 0usize),
+            (Feed::Shop(1), 1),
+            (Feed::Global, 3),
+            (Feed::Shop(0), 4),
+        ];
+        let mut requests: Vec<Request> = probes
+            .iter()
+            .map(|&(feed, index)| resume(feed, cursor_at(&rows, index)))
+            .collect();
+        requests.push(resume(Feed::Shop(1), cursor_at(&rows, 2)));
+        requests.push(resume(Feed::Global, cursor_at(&rows, 1)));
+        let (responses, sinks) = run_quiet(&mut kernel, &sim, requests);
+        assert_eq!(statuses(&responses), vec![409, 409, 409, 409, 200, 200]);
+        let recorded = responses.lock().unwrap().clone();
+        for (i, &(feed, index)) in probes.iter().enumerate() {
+            let cursor = cursor_at(&rows, index);
+            let text = error_text(&recorded[i].1);
+            assert_eq!(
+                text,
+                format!(
+                    "cursor {index}.{} sits on an event outside this feed's tenancy — a cursor \
+                     resumes only the feed that delivered it, and this feed never delivers that \
+                     event; reconnect without a cursor, wait for the stream to open, then read \
+                     current state from the same node, holding every frame that arrives until \
+                     that read is installed and then applying the held frames and every later \
+                     one over it in order, idempotently",
+                    rows[index].seq
+                ),
+                "{} from row {index}",
+                feed.label()
+            );
+            assert_eq!(tenancy_409(cursor), text, "the oracle's copy of A16's text");
+            assert_eq!(
+                replay_resume(&rows, feed, cursor, scope_equal),
+                Err((409, text.clone())),
+                "the replay agrees with the kernel"
+            );
+            let raw = String::from_utf8_lossy(&recorded[i].1).to_string();
+            let origin = ledger.rows[&cursor.id].origin;
+            assert_eq!(
+                probe_verdict(feed, cursor, origin, 409, &raw, &text),
+                Ok(ProbeAnswer::Refused)
+            );
+        }
+        assert_eq!(
+            replay_resume(&rows, Feed::Shop(1), cursor_at(&rows, 2), scope_equal),
+            Ok(3)
+        );
+        assert_eq!(
+            replay_resume(&rows, Feed::Global, cursor_at(&rows, 1), scope_equal),
+            Ok(2)
+        );
+        let handles = sinks.lock().unwrap();
+        assert_eq!(handles.len(), 2, "a refused resume opens no tail");
+        let ids = |h: &SimSinkHandle| h.frames().iter().map(|f| f.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&handles[0]),
+            vec![5, 7],
+            "shop 1 resumes past its own row 2"
+        );
+        assert_eq!(
+            ids(&handles[1]),
+            vec![4],
+            "the global feed resumes past its own row 1"
+        );
+    }
+
+    /// Victim: A16's check made scope-blind.
+    /// - From another shop's row, which carries this feed's shape, the resume
+    ///   is accepted.
+    /// - From a global row, it is refused under the wrong name, as reshaped.
+    ///
+    /// The oracle names both. The product's rule is the control.
+    #[test]
+    fn the_oracle_names_a_resume_a_scope_blind_check_lets_through() {
+        let (_sim, _kernel, rows, _) = twin();
+        let (same, other) = (cursor_at(&rows, 0), cursor_at(&rows, 1));
+        for (cursor, origin) in [(same, 0), (other, GLOBAL_ORIGIN)] {
+            let (status, text) = replay_resume(&rows, Feed::Shop(1), cursor, scope_equal)
+                .expect_err("the control: the product's rule refuses it");
+            assert_eq!(
+                probe_verdict(Feed::Shop(1), cursor, origin, status, &text, &text),
+                Ok(ProbeAnswer::Refused)
+            );
+        }
+        assert_eq!(
+            replay_resume(&rows, Feed::Shop(1), same, scope_blind),
+            Ok(1)
+        );
+        assert_eq!(
+            probe_verdict(Feed::Shop(1), same, 0, 200, "", ""),
+            Err(format!(
+                "shop 1's feed resumed from cursor 0.{} — event id 0, a note emitted inside shop \
+                 0 — and was accepted: a cursor on a row outside this feed's tenancy is refused \
+                 by name, never resumed past",
+                rows[0].seq
+            ))
+        );
+        let reshaped = reshaped_409(&rows[1], SHOP_FP);
+        assert_eq!(
+            replay_resume(&rows, Feed::Shop(1), other, scope_blind),
+            Err((409, reshaped.clone()))
+        );
+        assert_eq!(
+            probe_verdict(
+                Feed::Shop(1),
+                other,
+                GLOBAL_ORIGIN,
+                409,
+                &reshaped,
+                &reshaped
+            ),
+            Err(format!(
+                "shop 1's feed resumed from cursor 1.{} — event id 1, a note emitted as a global \
+                 event — and was answered 409: {reshaped} — a cursor on a row outside this \
+                 feed's tenancy is refused as outside it, by that name and no other",
+                rows[1].seq
+            ))
+        );
+    }
+
+    /// Two tenant types share raw id 1 and the NAME `note`. The fingerprint
+    /// mixes each type's `NAME` (spec §6: "a row emitted under the other type
+    /// is a foreign shape"). So a `Shop(1)` feed:
+    /// - never decodes `Desk(1)`'s note: its tail ends on `charpente.reshaped`
+    ///   at that row;
+    /// - refuses a resume from that row as reshaped.
+    ///
+    /// Both rows record the same raw scope. Nothing but the fingerprint tells
+    /// them apart.
+    #[test]
+    fn a_row_of_another_tenant_type_sharing_the_raw_id_is_a_foreign_shape() {
+        let sim = Sim::with_faults(0x5C0B_DE51, FaultConfig::none());
+        let mut kernel =
+            Kernel::new(two_tenant_types_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+        let emit = |route: &str, n: u64| {
+            Request::new(Method::Post, route).json(&TenancyEmit {
+                shop: WireU64(1),
+                n: WireU64(n),
+            })
+        };
+        let (responses, sinks) = run_quiet(
+            &mut kernel,
+            &sim,
+            vec![
+                Request::new(Method::Get, Feed::Shop(1).path()),
+                emit("/tenancy/note", 20),
+                emit("/tenancy/desk-note", 21),
+                emit("/tenancy/note", 22),
+            ],
+        );
+        assert_eq!(statuses(&responses), vec![200; 4]);
+        let rows: Vec<EventRow> = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan_from(0, 8)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|r| r.scope).collect::<Vec<_>>(),
+            vec![Some(1); 3],
+            "Shop(1) and Desk(1) record the same raw tenant id"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.shape).collect::<Vec<_>>(),
+            vec![Some(SHOP_FP), Some(DESK_FP), Some(SHOP_FP)]
+        );
+        assert_eq!(
+            frames_of(&sinks.lock().unwrap()[0]),
+            vec![
+                (
+                    0,
+                    rows[0].seq,
+                    "note".to_string(),
+                    r#"{"origin":"1","n":"20"}"#.to_string()
+                ),
+                reshaped_frame(&rows[1]),
+            ],
+            "shop 1's feed gets its own note, then ends at desk 1's, never decoding it"
+        );
+        let (responses, sinks) = run_quiet(
+            &mut kernel,
+            &sim,
+            [1, 0, 2]
+                .into_iter()
+                .map(|index| resume(Feed::Shop(1), cursor_at(&rows, index)))
+                .collect(),
+        );
+        assert_eq!(statuses(&responses), vec![409, 200, 200]);
+        assert_eq!(
+            error_text(&responses.lock().unwrap()[0].1),
+            reshaped_409(&rows[1], SHOP_FP)
+        );
+        let handles = sinks.lock().unwrap();
+        assert_eq!(frames_of(&handles[0]), vec![reshaped_frame(&rows[1])]);
+        assert_eq!(frames_of(&handles[1]), vec![]);
+    }
+
+    /// A cut durable corruption explains is re-synced at the next boundary,
+    /// and every feed keeps its verdict (plan Task 13 Step 4c; the flagship's
+    /// `a_ledgered_event_cut_and_re_minted_is_resynced_and_its_re_mint_is_owed`).
+    /// Found by scanning for a universe that covers `realtime:ledger-resynced`
+    /// and reaches a verdict: base 0x5C0B_0001, universe 116, where
+    /// `misdirected_write` fired.
+    #[test]
+    fn a_cut_durable_corruption_explains_is_resynced_and_every_feed_keeps_its_verdict() {
+        const SEED: u64 = 0xbecb_cb03_5dec_0074;
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        tenancy_universe(&mut sim)
+            .expect("a cut durable corruption explains must not fail the universe");
+        assert_eq!(
+            sim.gave_up(),
+            None,
+            "re-synced to the node's timeline, it reaches a verdict"
+        );
+        assert!(
+            durable_corruption_fired(&sim)
+                && sim.coverage().contains_key("realtime:ledger-resynced"),
+            "this universe's reason is a cut by durable corruption, seen and re-synced: {:?}",
+            sim.coverage()
+        );
+    }
+
+    /// The same universe with its cut standing in for one nothing explains
+    /// (`cut_explained` answers false). That is a lost event, which fails by
+    /// name at the boundary that first sees it, and is never a give-up.
+    #[test]
+    fn a_cut_nothing_explains_fails_the_tenancy_universe_by_name() {
+        const SEED: u64 = 0xbecb_cb03_5dec_0074;
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        let err = tenancy_universe_judged(&mut sim, |_| false)
+            .expect_err("a cut nothing explains is a lost event");
+        assert!(
+            err.contains("off this node, but its next_event_id is now")
+                && err.contains("no fault on this node explains the cut"),
+            "{err}"
+        );
+        assert!(
+            durable_corruption_fired(&sim),
+            "the stand-in hides a reason that did fire"
+        );
+        assert_eq!(
+            sim.gave_up(),
+            None,
+            "a lost event is a failure, never a give-up"
+        );
+    }
 }

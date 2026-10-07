@@ -1,6 +1,6 @@
 // Fan-out is the `cross_tenant` capability's (job-tenancy spec §2 R5): a
 // route that never declared it has no `&CrossTenant` to hand `enqueue_in`,
-// and `#[route]` refuses the argument, reconstructing the attribute to write.
+// and `#[route]` refuses the argument, naming the one flag to add.
 // `CrossTenant` and `WireU64` are named by path for
 // `across_tenants_without_capability.rs`'s reason.
 use charpente::auth::Principal;
@@ -15,6 +15,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {

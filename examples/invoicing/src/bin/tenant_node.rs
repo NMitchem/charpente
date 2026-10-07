@@ -37,7 +37,8 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::repl::ReplConfig;
 use charpente::repl::role::Role;
 use charpente::{
-    Id, Schema, Scoped, Tenant, Tx, View, Wire as WireDerive, event, route, routes, serve, table,
+    Id, Schema, Scoped, Subscribe, Tenant, Tx, View, Wire as WireDerive, event, route, routes,
+    serve, table,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +51,8 @@ const USAGE: &str = "usage: tenant_node --addr A --data-dir D [--legacy-unscoped
 
 /// The scope type. A `#[table]` so `Id<Org>` can be a path parameter
 /// (`Id<R>`'s `Wire` impl is bounded on `R: Row`); no `Org` row is ever
-/// written — a scope type owes nothing but `authorize`.
+/// written — a tenant type owes a `NAME` (its identity, unique in the app) and
+/// `authorize`.
 #[table(global)]
 struct Org {
     id: Id<Org>,
@@ -62,6 +64,7 @@ struct Org {
 /// nothing else), so a caller asking for another tenant's rows is refused
 /// here, in app code, before any scoped read exists.
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 
@@ -100,7 +103,10 @@ mod legacy {
     }
 }
 
-#[event]
+/// Scoped by `Org`: `create_doc` emits it on its org's `ScopedTx`, and only
+/// that org's `feed` receives it (tenancy-completion spec §6). The wire
+/// oracle (`edge-harness`'s `tenant_wire`) checks exactly that over TCP.
+#[event(scoped_by = Org)]
 struct DocCreated {
     doc: Id<Doc>,
     /// The tenant-unique marker the wire oracle keys on. Both tenants use the
@@ -154,8 +160,8 @@ fn create_doc(
         text: body.text,
     };
     tx.put(&row);
-    // `ScopedTx::emit`, so the event carries this tenant's key without the
-    // handler naming it twice (spec §4).
+    // `ScopedTx::emit`, so the event is recorded in this tenant, apart from
+    // any key (tenancy-completion spec §6).
     tx.emit(DocCreated {
         doc: row.id,
         text: row.text.clone(),
@@ -185,9 +191,9 @@ fn list_docs_by_tag(
         .collect())
 }
 
-/// One tenant's event feed, keyed by the scope the subscriber just proved
-/// membership of — the same key `ScopedTx::emit` attaches, so emitter and
-/// subscriber cannot drift into two spellings of one tenant.
+/// One tenant's event feed, built from the scope the subscriber just proved
+/// membership of: it carries that tenant, and delivers only events recorded
+/// in it.
 #[route(SSE "/orgs/:org/feed", auth)]
 fn feed(
     tx: &mut Tx,
@@ -196,9 +202,7 @@ fn feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<DocCreated>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<DocCreated>().cursor(cursor).into())
 }
 
 /// `--legacy-unscoped`'s only route: every `Doc` row this node holds, with no

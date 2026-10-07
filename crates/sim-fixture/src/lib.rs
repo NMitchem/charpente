@@ -17,7 +17,7 @@ pub struct FixtureCounter {
 /// exactly the JSON a subscriber receives, so `#[event]`'s `Wire` derive
 /// holds it to the same rule a route's types obey — a row id crosses the
 /// wire as its branded `Id<T>`.
-#[event]
+#[event(global)]
 pub struct NoteAdded {
     pub note: Id<FixtureCounter>,
 }

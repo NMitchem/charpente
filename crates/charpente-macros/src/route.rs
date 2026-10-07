@@ -193,28 +193,25 @@ const PUBLIC_SCOPE_ARITY: &str = "`public(...)` names exactly one tenant scope t
 
 /// The refusal for a handler that takes the capability token on a route
 /// that never declared it — the compile error tenant-scoping spec §3 calls
-/// for. Names the contract, the site (the argument's own span, at the call
-/// site) and the fix (hard rule 5). Shared by both route flavors so the two
-/// cannot drift.
+/// for. Names the contract, the site (the argument's own span, and the route
+/// by its method and path) and the fix (hard rule 5). The fix names the one
+/// flag to add and restates no attribute, so the route's other flags — its
+/// stance, `emits(…)`, any later one — cannot drop out of a pasted fix
+/// (tenancy-completion spec §7, item 12). Shared by both route flavors so the
+/// two cannot drift.
 fn undeclared_capability(name: &str, args: &RouteArgs, pat: &PatType) -> Error {
     let method = &args.method;
     let path = args.path.value();
-    // `expand` refused a route with neither flag before reaching here.
-    let stance = match &args.public_scope {
-        Some(path) => format!(", public({})", scope_name(path)),
-        None if args.auth => ", auth".to_string(),
-        None => ", public".to_string(),
-    };
     Error::new(
         pat.span(),
         format!(
-            "`{name}` takes `cap: &CrossTenant`, but `#[route({method} \"{path}\"{stance})]` \
+            "`{name}` takes `cap: &CrossTenant`, but its `#[route({method} \"{path}\", …)]` \
              does not declare `cross_tenant` — enumerating a scoped table across every \
              tenant (`tx.across_tenants`) and fanning a job out into a tenant the route \
              names (`tx.enqueue_in`) are one declared capability, and `charpente describe` \
-             lists every route that declared it. Write \
-             `#[route({method} \"{path}\"{stance}, cross_tenant)]`, or drop the `cap` \
-             argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`"
+             lists every route that declared it. Add `cross_tenant` to that attribute's \
+             flags, keeping the others, or drop the `cap` argument and read or enqueue in \
+             one tenant through `tx.scope::<Org>(org, ctx)?`"
         ),
     )
 }
@@ -226,38 +223,22 @@ fn arg_name(pat: &PatType) -> Option<String> {
     }
 }
 
-/// A scope path's last segment — `Org` for `public(crate::tenancy::Org)` — as
-/// `PublicScope.name` carries it and the refusals render it.
-pub(crate) fn scope_name(path: &syn::Path) -> String {
-    path.segments
-        .last()
-        .expect("syn parses a path with at least one segment")
-        .ident
-        .to_string()
-}
-
-/// `public(Scope)`'s two emissions: the `PublicScope` the `Route` carries, and
-/// `#[table(scoped_by = …)]`'s `TenantScope` const assert, so a scope type
-/// with no membership check is refused with the same diagnostic here as there.
-fn public_scope_tokens(args: &RouteArgs) -> (TokenStream, TokenStream) {
+/// `public(Scope)`'s emission: the `PublicScope` the `Route` carries. `name`
+/// is read through `::charpente::tenant::tenant_name`. Its `TenantScope`
+/// bound refuses a scope type with no membership check, with the same
+/// diagnostic `#[table(scoped_by = …)]` gives, spanned at the path inside
+/// `public(...)`.
+fn public_scope_tokens(args: &RouteArgs) -> TokenStream {
     let Some(path) = &args.public_scope else {
-        return (quote! { ::std::option::Option::None }, quote! {});
+        return quote! { ::std::option::Option::None };
     };
-    let name = scope_name(path);
-    (
-        quote! {
-            ::std::option::Option::Some(::charpente::http::PublicScope {
-                name: #name,
-                type_id: ::std::any::TypeId::of::<#path>,
-            })
-        },
-        quote! {
-            const _: () = {
-                const fn __charpente_assert_tenant_scope<T: ::charpente::TenantScope>() {}
-                __charpente_assert_tenant_scope::<#path>();
-            };
-        },
-    )
+    quote! {
+        ::std::option::Option::Some(::charpente::http::PublicScope {
+            name: ::charpente::tenant::tenant_name::<#path>(),
+            type_id: ::std::any::TypeId::of::<#path>,
+            type_name: ::std::any::type_name::<#path>,
+        })
+    }
 }
 
 pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
@@ -269,11 +250,11 @@ pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> 
             args.path.span(),
             format!(
                 "`{name}` declares neither `auth` nor `public` — a route says which callers \
-                 reach it: write `#[route({method} \"{path}\", auth)]` to require a principal \
-                 (`ctx.principal()` is `Some`), `#[route({method} \"{path}\", public)]` to \
-                 serve anonymous callers, or `#[route({method} \"{path}\", public(Org))]` to \
-                 also let every caller act inside the `Org` tenant it opens. None is the \
-                 default."
+                 reach it. Add one of these to the flags of its \
+                 `#[route({method} \"{path}\", …)]`, keeping any it already has: `auth` to \
+                 require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous \
+                 callers, or `public(Org)` to also let every caller act inside the `Org` tenant \
+                 it opens. None is the default."
             ),
         ));
     }
@@ -281,7 +262,8 @@ pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> 
         return Err(Error::new(
             args.path.span(),
             "emits(...) applies to SSE routes only — a plain route returns one response, \
-             not a stream of events; drop emits(...) or make this `#[route(SSE \"…\")]`",
+             not a stream of events; drop emits(...), or change this route's method to `SSE`, \
+             keeping its path and flags",
         ));
     }
     if args.method == "SSE" {
@@ -465,7 +447,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         quote!()
     };
     let auth = args.auth;
-    let (public_scope, tenant_scope_assert) = public_scope_tokens(&args);
+    let public_scope = public_scope_tokens(&args);
     let cross_tenant = args.cross_tenant;
     let pattern_lit = &args.path;
 
@@ -507,13 +489,12 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     Ok(quote! {
         #func
-        #tenant_scope_assert
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
         fn #glue_name(
             tx: &mut ::charpente::Tx,
-            ctx: &::charpente::http::Ctx,
+            ctx: &::charpente::http::Ctx<'_>,
             captures: &[::std::string::String],
             body: &[u8],
         ) -> ::std::result::Result<::charpente::http::Response, ::charpente::http::ApiError> {
@@ -788,7 +769,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         quote!()
     };
     let auth = args.auth;
-    let (public_scope, tenant_scope_assert) = public_scope_tokens(&args);
+    let public_scope = public_scope_tokens(&args);
     let cross_tenant = args.cross_tenant;
     let pattern_lit = &args.path;
 
@@ -851,13 +832,12 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     Ok(quote! {
         #func
-        #tenant_scope_assert
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
         fn #glue_name(
             tx: &mut ::charpente::Tx,
-            ctx: &::charpente::http::Ctx,
+            ctx: &::charpente::http::Ctx<'_>,
             captures: &[::std::string::String],
             cursor: ::std::option::Option<::charpente::http::Cursor>,
         ) -> ::std::result::Result<::charpente::http::Subscription, ::charpente::http::ApiError> {

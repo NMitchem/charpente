@@ -67,7 +67,7 @@ impl SendReceipt {
 /// argued: since task 6 `#[event]` derives `Wire`, so a bare `i64` here is a
 /// compile error — the money field crosses this feed exactly like
 /// `LineItemView.unit_amount_cents` crosses a route response.
-#[event]
+#[event(global)]
 pub struct ReceiptSent {
     pub invoice: Id<Invoice>,
     pub amount_cents: WireI64,

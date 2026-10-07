@@ -336,7 +336,7 @@ declaration with no tenancy stance:
 
 <!-- pinned -->
 ```text
-`<table>` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+`<table>` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.
 `global` and `scoped_by = <scope>` on one table — a table is one or the other; drop one
 `global` given twice — write it once
 ```
@@ -418,9 +418,12 @@ fn open(data_dir: &str) -> std::io::Result<Db> {
 
 Registering the same table type twice is a contract panic ("Schema: table
 \"Counter\" registered twice — register each #[table] type once").
-`Db::open` registers one table of its own before yours — the platform's job
-queue, `charpente.jobs` — so registering that table yourself hits the same
-panic.
+`Db::open` registers three tables of its own before yours — the job queue
+`charpente.jobs`, the event log `charpente.events` and the migration record
+`charpente.schema_versions` — so registering any of them yourself hits the same
+panic. They are the platform's: no app code reads or writes one (§6, "Job rows are
+the platform's"; §16, "Where the guarantee stops"), and code that holds the `Db` reads
+them through `db.snapshot()`.
 
 `DbConfig` names the WAL's directory and segment rotation size, and the
 table store's file name:
@@ -515,7 +518,9 @@ writes first, then any writes already staged in the same commit batch —
 `transact` runs a batch of exactly one, so that level is always empty here —
 then the store snapshot the batch began from. `Tx` implements `View` (`get`,
 `scan`, `scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as
-it does on a `Snapshot`. On `Ok`, every buffered write, enqueue, and emit
+it does on a `Snapshot`, for every table of the app's own. The platform's own
+tables are read through a `Snapshot` alone (§16, "Where the guarantee stops").
+On `Ok`, every buffered write, enqueue, and emit
 commits as ONE durable log record — all or nothing — and only then applies
 to the store. On `Err(TxError::App(_))`, nothing happened at all: no log
 position consumed, nothing written. On `Err(TxError::Io(_))` the outcome is
@@ -561,7 +566,7 @@ impl Job for SendReceipt {
     // are covered in a later section.
 }
 
-#[event]
+#[event(global)]
 struct InvoiceFinalized {
     invoice: Id<Invoice>,
 }
@@ -669,7 +674,14 @@ either with a 500 carrying the refusal's own text, and in a job handler
 either is an attempt, retried and then dead-lettered. The broader
 `Refusal::of` is not that predicate: it also matches a refusal apply raises
 after the log sync (a replicated record decoded under a mismatched shape),
-whose record may already be durable.
+whose record may already be durable. A read through a type other than the
+registered one, a `Tx` or `ScopedTx` read or an `across_tenants` scan, is
+refused too, by the read itself, as a `TableReadRefusal`
+(`charpente::core::db::TableReadRefusal::of`). It names the table, the type
+that read and the registered one, offers the same two fixes, and returns no
+row. It reaches your code through the read's `io::Result`, so a route that
+returns it with `?` answers a 500 carrying its text, and in a job handler it
+is an attempt.
 `NotPrimary { primary }` fires only when `f` had at least one effect to
 write and this node has been marked a read-only follower
 (`Db::forbid_writes`, DESIGN §5) — reads and effect-free transactions never
@@ -750,7 +762,11 @@ decodes, and dispatches to it:
   glue's actual bound); a type borrowing from the input won't compile, and
   neither will one missing `#[derive(Wire)]`.
 - Then, optionally, a trailing argument named exactly `ctx`, typed `&Ctx`
-  (session access — see Sessions below).
+  (session access — see Sessions below). `Ctx` borrows from the request's
+  group (`Ctx<'g>`), and `&Ctx` elides that, so a handler never names it. A
+  helper that returns something borrowed out of a `Ctx` must say which
+  borrow: `fn subject_of<'c>(ctx: &'c Ctx) -> Option<&'c str>`. Left elided,
+  it is `error[E0106]: missing lifetime specifier`.
 
 The handler returns `Result<T, ApiError>` where `T: serde::Serialize + Wire`
 — the `Result<_, _>` shape itself is enforced too, and named (a bare return
@@ -946,8 +962,11 @@ handler, carrying:
   (`Via::Session(id)`, `Via::ApiKey(id)`, or `Via::Oidc`). Read the subject
   from here on any `auth` route, whatever the credential kind. A `Principal`
   is read-only to your code: its fields are private, so the only principals
-  are the ones the ladder produced, and `Tenant::authorize` can trust the one
-  it is handed.
+  are the ones the ladder produced. It is not `Clone` either, so the only one
+  your code holds is the `&Principal` this request's `Ctx` lends, which ends
+  with the request: no principal can be parked in a `static` for a later
+  request to hand `tx.open_scope`. So `Tenant::authorize` can trust the one
+  it is handed: the ladder produced it, for the request that is asking.
 - `ctx.session() -> Option<&Session>` — a compatibility accessor: the
   `Session` row, but only when the principal authenticated `via` a session
   (bearer or cookie); `None` for an API-key or OIDC principal.
@@ -1144,13 +1163,18 @@ The rule-3 401, for a `POST /orgs/:org/incidents` declared plain `public`:
 
 <!-- pinned -->
 ```text
-authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `#[route(POST "/orgs/:org/incidents", public(Org))]`
+authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `public(Org)` in place of `public` in this route's `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by its NAME; name the type in the attribute: `Org` is the tenant type `<path>`
 ```
 
 The site is the word the route was declared with (`SSE` for a stream) and its pattern;
-the scope is the type's own name. Both fixes are there: the caller's (send a credential)
-and the author's (declare the tenant public, if that really is the policy). §16's "Who
-reaches a tenant" shows the three side by side.
+the scope is its tenant type's `NAME` (§16). Both fixes are there: the caller's (send a credential)
+and the author's (declare the tenant public, if that really is the policy). The author's
+names the change to make where the stance is written and restates no attribute, so a route's
+other flags, `cross_tenant` or `emits(…)`, stay as they are. A `NAME` need not be how your
+source spells the type (`billing::Org` and `crm::Org` take two), so the text ends with each
+named type's `std::any::type_name` (`<path>` above), which says which type to write in the
+attribute. On a route declared `public(BillingOrg)` that opened `CrmOrg`, it names both. §16's
+"Who reaches a tenant" shows the three side by side.
 
 ### `ApiError` and status mapping
 
@@ -1346,7 +1370,7 @@ first is the one every route meets once:
 
 <!-- pinned -->
 ```text
-`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), `#[route(<method> "<path>", public)]` to serve anonymous callers, or `#[route(<method> "<path>", public(Org))]` to also let every caller act inside the `Org` tenant it opens. None is the default.
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(<method> "<path>", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
 `auth` and `public` on one route — a route is one or the other; drop one
 `public` given twice — write it once
 ```
@@ -1502,6 +1526,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
@@ -1569,12 +1594,18 @@ the note shown in "What `#[job]` rejects". Cron takes `global` jobs only (§7), 
 tick has no tenant. A sweep that must act in every tenant fans out instead (§7).
 
 **Job rows are the platform's.** The tenant a job runs in is the one its row carries, and
-the dispatcher opens it without asking anyone, so no app code writes a job row. A
-transaction reads the queue like any other table (`tx.get::<JobRow>`, `tx.scan::<JobRow>()`,
-as §8's oracles do), but `tx.put` or `tx.delete` of a `JobRow` does not compile. Only the
+the dispatcher opens it without asking anyone, so no app code writes a job row. The
+queue holds every tenant's payloads, so no app code reads one either: `tx.get`, `tx.scan`,
+`tx.put` and `tx.delete` of a `JobRow` do not compile, and §8's oracles read the queue
+through `db.snapshot()` (the read's text is in §16, "Where the guarantee stops"). Only the
 enqueue family creates a job row, and only the dispatcher settles one. There is no
-app-side cancel either: a job runs until it is Done or Dead. rustc prints this, with your
-row type in place of `<row>`:
+app-side cancel either: a job runs until it is Done or Dead. The platform's two other
+tables are sealed the same way, against reads and writes. The event log (`EventRow`, §11) is what
+every subscription's feed is read from, so only an emit writes an event row. The
+migration record (`SchemaVersion`, §12) is what the migration gate trusts for each table's
+version, so only a table's first write and `Db::migrate_schema` write one. rustc prints
+this for a write of any of the three, with your row type in place of `<row>`, and one note
+per table, since one bound refuses all three:
 
 <!-- pinned -->
 ```text
@@ -1586,17 +1617,21 @@ for a `global` job; for a `scoped_by` job, inside the tenant it acts in:
     tx.enqueue(job);
 or from a `cross_tenant` route or job, naming the tenant:
     tx.enqueue_in::<Org>(scope, job, cap);
+event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
+schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
 ```
 
 The seal is on the table's name as well as its type, because apply routes a write by
-table name. A hand-written `Row` whose `TABLE` is `"charpente.jobs"` fails to build at
-each write the binary can reach, and rustc names the call site. It is a
+table name. A hand-written `Row` whose `TABLE` is one of the three names fails to build
+at each write the binary can reach, and rustc names the call site and the table. It is a
 post-monomorphization error, so `cargo build` and `cargo test` report it, and `cargo
 check` does not:
 
 <!-- pinned -->
 ```text
 this Row's TABLE is "charpente.jobs", the platform's job queue — job rows are the platform's: only the enqueue family writes one, because the dispatcher runs a job in the tenant its row names; give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)
+this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
+this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
 ```
 
 ### Registering jobs: `jobs![...]` and `mount_jobs`
@@ -1735,7 +1770,9 @@ the message, and:
 
 On `Err(JobError::Io(e))` — a platform fault the handler's own reads
 surfaced, or one from the transaction machinery itself — none of this
-happens: it is **not an attempt**. The row stays Pending, untouched, and
+happens: it is **not an attempt**, a `TableReadRefusal` excepted: it is
+the handler's own deterministic bug, an attempt (§4). Otherwise the row
+stays Pending, untouched, and
 the error bubbles up (restart-and-recover, same as a request-path `Io`
 failure in §5) instead of silently burning retry budget on a healthy job
 that just hit a bad disk. `JobError::Io`'s own `Display` names this:
@@ -1758,15 +1795,16 @@ opening, a completed switchover), and `promote` checks before it changes anythin
 
 <!-- pinned -->
 ```text
-<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore <job>'s old fields and its `global`/`scoped_by` declaration and give the new shape its own #[job] type under a new name (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore whichever of <job>'s fields, its `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give the new shape its own #[job] type under a new name (GUIDE §6)
 ```
 
-A job's tenancy is part of its shape. `scoped_by` is fingerprinted with the fields, as
-it is spelled, so moving a job between `global` and `scoped_by`, or respelling its
-`scoped_by` path, is refused the same way. A deploy therefore never hands a row enqueued
-with no tenant to a scoped `run`, or one enqueued in a tenant to a global one. A path that
-keeps its spelling but comes to name another type is not a shape change, and nothing
-refuses it: see below, after the scope-type refusal, for what to do before such a deploy.
+A job's tenancy is part of its shape. A `scoped_by` job's fingerprint continues its
+fields' fold over its tenant type's `NAME` (§16), so moving a job between `global` and
+`scoped_by`, or to a tenant type with another `NAME`, is refused the same way. A deploy
+therefore never hands a row enqueued with no tenant to a scoped `run`, one enqueued in a
+tenant to a global one, or one enqueued in a tenant of one `NAME` to a job of another.
+Respelling the `scoped_by` path is not a shape change while it names a type of the same
+`NAME`: see below, after the scope-type refusal, for what that leaves unchecked.
 
 At most five ids are listed, then `…`. A job enqueued before shapes were recorded reads
 `recorded none — enqueued before job shapes were tagged`, and it is refused the same way:
@@ -1820,37 +1858,64 @@ job "<job>" was enqueued with <presence>, but this binary mounts <job> as <decla
 
 Presence is not the whole of a tenant. A row records the tenant's id and not the scope type
 it is an id of, and the dispatcher opens that id as the type the mounted job declares. The
-fingerprint cannot tell two scope types apart either: it hashes the `scoped_by` path as it
-is spelled, so a `#[job(scoped_by = Desk)]` in a module that says `use super::Board as
-Desk;` fingerprints exactly like the real `Desk` one, and a hand-written `impl Job` can copy
-both constants under any `type Scope`. Enqueued inside a `Board` tenant, either would run
-the mounted job in the `Desk` with the same id, a tenant nothing opened or named for it. So an
+fingerprint tells two scope types apart only by their `NAME`s. A `#[job(scoped_by = Desk)]`
+in a module that says `use super::Board as Desk;` fingerprints with `Board`'s `NAME`, so it
+is refused as another shape. But a `#[job]` whose `scoped_by` names another tenant type
+with the same `NAME` fingerprints alike, and a hand-written `impl Job` can copy both
+constants under any `type Scope`. Enqueued inside a tenant of that other type, either would
+run the mounted job in the same id of the type it declares, a tenant nothing opened or
+named for it. So an
 enqueue whose job's scope type is not the one the mounted job declares refuses its
-transaction the same way. `<scope>` is the enqueuing job's scope type and `<declared>` the
-mounted one's, by their last path segments; `<id>` is the tenant id:
+transaction the same way. `<scope>` is the enqueuing job's tenant type's `NAME` and `<declared>` the
+mounted one's (§16); `<id>` is the tenant id. The two NAMEs can be equal. A hand-built `JobDef` that
+names one type and carries another's `scope_type` is refused here on the honest enqueue, which is why
+the text says "with another scope type" and lists that cause:
 
 <!-- pinned -->
 ```text
-job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` under the same shape (<shape>), so it would run in `<declared>` <id>, not in the tenant it was enqueued in — a type standing in for <job>'s #[job] was enqueued: a hand-written `impl Job`, or a #[job] whose `scoped_by` spells another scope type the same way; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, or give the other type its own name (GUIDE §6)
+job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` with another scope type under the same shape (<shape>) — a job row records its tenant's id and not its type, so tenant <id> would be read as the mounted declaration's type, not the one it was enqueued in; either a type standing in for <job>'s #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose `scoped_by` names another tenant type with the same `NAME`), or a hand-written `JobDef` mounts <job> under a `scope_type` its #[job] does not declare; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
 ```
 
-This one has no startup twin, because a row carries no type to compare. The check runs
-where both types are known, at the enqueue, in a binary that mounts the job. So a Pending
-row enqueued by any other binary is dispatched, by the next binary that mounts the name, in
-the scope type that binary declares, and nothing checks the type. That covers two cases:
+One door is left inside a binary, and it is a hand-built `JobDef`. Its fields are public,
+so `JobDef { glue: <another job's glue>, ..<File as JobEntry>::def() }` mounts a glue that
+opens a different scope type than `scope_type` names, and so does a `JobDef` whose
+`scoped_by` and `scope_type` both name a type its glue does not open. `Group::stage` holds
+the enqueuer to `scope_type`, and a scoped job's glue opens its row's tenant through
+`JobScope::open`, which asserts that the type it opens is `scope_type`. The assert runs
+inside the attempt, so the job retries and then dead-letters, and nothing runs in either
+tenant. Its `last_error`, for `File`'s `JobDef` carrying a `Board` job's glue, is below.
+`<path>` is `Board`'s `std::any::type_name`, printed beside its `NAME` so that a glue whose
+type shares the declared `NAME` still reads as two types:
 
-- a row enqueued by a binary that did not mount the job name at all;
-- a row enqueued by a binary that mounted it under a `scoped_by` path spelled the same way
-  but naming another type. This one needs no stand-in, only a refactor: a job module whose
-  `use billing::Org;` becomes `use crm::Org;` keeps the path `Org` and so keeps the
-  fingerprint, and a job enqueued in `billing::Org` 25 before the deploy runs in `crm::Org`
-  25 after it.
+<!-- pinned -->
+```text
+handler panicked: contract: the glue mounted for job "File" opened its tenant 31 as `Board` (the tenant type `<path>`), but that `JobDef` declares `scoped_by = Desk` with a `scope_type` that is not `<path>` — a hand-built `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken from another job, or another type's `TypeId`); this attempt wrote nothing, and every retry fails the same way — mount File through `jobs![…]`, which builds its `JobDef` from its #[job] (GUIDE §6)
+```
+
+A `JobDef` whose glue and `scope_type` name the same other type passes the assert. Nothing
+can tell it apart, and it does not cross a tenant: `Group::stage` held the enqueuer to
+that same type, so the job runs in the tenant it was enqueued in, only with another job's
+code. `jobs![…]` builds every `JobDef` from its `#[job]`, and it is the way to mount one.
+
+This one has no startup twin, because a row carries no type to compare, only the `NAME`
+its fingerprint mixes. The check runs where both types are known, at the enqueue, in a
+binary that mounts the job. At startup the dispatching binary compares a Pending row's
+shape, so a row whose job named a tenant type of another `NAME` is refused there by the
+foreign-shape refusal above. That covers the refactor that turns a job module's `use
+billing::Org;` into `use crm::Org;`, whenever the two types' NAMEs differ. What a later
+binary that mounts the name dispatches unchecked, in the scope type it declares, is a row
+whose shape matches:
+
+- a row a hand-written `impl Job` enqueued from a binary that did not mount the job name,
+  copying the job's `NAME` and `FINGERPRINT` under another `type Scope`;
+- a row enqueued under a tenant type with the same `NAME` as the mounted one. A `NAME` is
+  the tenant's identity, so this is the same tenant by declaration: giving a type another
+  type's `NAME` declares it that tenant, and one app cannot mount both (§16).
 
 Where the recorded shape matches the mounted one, neither is refused, at startup or at
 dispatch. So before a deploy that mounts a scoped job the running binary does not mount,
-or that makes a scoped job's `scoped_by` path name another type, drain that job: run the
-binary that enqueued its Pending rows until every one is Done or Dead, the first way
-through a shape change below.
+drain that job: run the binary that enqueued its Pending rows until every one is Done or
+Dead, the first way through a shape change below.
 
 There are two ways through a shape change:
 
@@ -1874,7 +1939,7 @@ one every job meets once, and the next three are its neighbours:
 
 <!-- pinned -->
 ```text
-`<job>` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+`<job>` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
 `global` and `scoped_by = <scope>` on one job — a job is one or the other; drop one
 `global` given twice — write it once
 `scoped_by` given twice — write it once
@@ -2044,6 +2109,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
@@ -2517,13 +2583,13 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   and it cross-checks the reported count exactly. `ceiling:
   [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
   caps it: the batch fails when more than N universes gave up, naming the key,
-  the count and the cap. Nineteen of the platform's own swarm properties carry
+  the count and the cap. Twenty of the platform's own swarm properties carry
   one:
   - kernel's exactly-once and job-tenancy properties;
   - the flagship properties of tenant, transactions, http, group_commit and
     typed_tables, and archive's two convergence properties;
-  - realtime's flagship and scoped settled-client properties, migrations' two,
-    and the WAL suite's fault-matrix, bit-flip, misdirected-write, read-error,
+  - realtime's flagship, scoped settled-client and tenant-feed properties,
+    migrations' two, and the WAL suite's fault-matrix, bit-flip, misdirected-write, read-error,
     dir-entry and gc properties.
 
   The rest carry none yet, so a drift in their give-up rates is visible only in
@@ -3422,7 +3488,7 @@ Nine ways `#[table]` rejects a struct — §2 pins the first three and walks
 through the other six on a `Ping` example:
 
 ```text
-`<table>` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+`<table>` declares no tenancy — a table says which. Add one of these to its `#[table(…)]`, keeping any arguments it already has: `scoped_by = Org` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `global` if its rows belong to no tenant. Neither is the default.
 `global` and `scoped_by = <scope>` on one table — a table is one or the other; drop one
 `global` given twice — write it once
 missing `id: Id<Ping>` field — every #[table] row needs a typed primary key (add `id: Id<Ping>`)
@@ -3433,7 +3499,8 @@ the `id` field of a #[table] must be `Id<Ping>` — a typed id, never a bare int
 #[table] structs cannot be generic — a table is one concrete row shape; make `Ping` non-generic
 ```
 
-In order: No tenancy declared — write `scoped_by = …` or `global`. Both at
+In order: No tenancy declared — add `scoped_by = …` or `global` to the attribute,
+keeping its other arguments. Both at
 once — drop one. `global` twice — once. No `id` field at all — add one.
 `id` present but not `Id<Self>` — type it. `#[index]` on `id` itself —
 remove it, `id` is already the primary key. Not a braced struct with named
@@ -3457,7 +3524,7 @@ fields on a table with durable data; add new fields, or write a v1 schema
 ### `#[route]` argument-convention violations (`charpente-macros/src/route.rs`, compile time)
 
 ```text
-`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), `#[route(<method> "<path>", public)]` to serve anonymous callers, or `#[route(<method> "<path>", public(Org))]` to also let every caller act inside the `Org` tenant it opens. None is the default.
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(<method> "<path>", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
 `auth` and `public` on one route — a route is one or the other; drop one
 `public` given twice — write it once
 a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is missing it
@@ -3468,12 +3535,12 @@ unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id", auth)]
 a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, `#[route(GET "/orgs/:org/status", public(Org))]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
 `public(...)` names exactly one tenant scope type — write `public(Org)`, or plain `public` if anonymous callers enter no tenant here
-emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
+emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...), or change this route's method to `SSE`, keeping its path and flags
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
 emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
 `auth` given twice — write it once
 `cross_tenant` given twice — write it once
-`revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue", public)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", public, cross_tenant)]`, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
+`revenue` takes `cap: &CrossTenant`, but its `#[route(GET "/admin/revenue", …)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant (`tx.across_tenants`) and fanning a job out into a tenant the route names (`tx.enqueue_in`) are one declared capability, and `charpente describe` lists every route that declared it. Add `cross_tenant` to that attribute's flags, keeping the others, or drop the `cap` argument and read or enqueue in one tenant through `tx.scope::<Org>(org, ctx)?`
 `emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
@@ -3502,7 +3569,7 @@ the pattern and it's gone.
 ### `#[job]` tenancy, retry-syntax and shape violations (`charpente-macros/src/job.rs`, compile time)
 
 ```text
-`NotifySubscribers` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+`NotifySubscribers` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
 `global` and `scoped_by = Org` on one job — a job is one or the other; drop one
 `global` given twice — write it once
 `scoped_by` given twice — write it once
@@ -3568,6 +3635,28 @@ the poisoned-engine story below:
 platform IO failure during the handler (not an attempt): <e>
 ```
 
+### `#[event]` declaration violations (`charpente-macros/src/event.rs`, compile time)
+
+```text
+`NoteAdded` declares no tenancy — an event says which, and neither is the default: add `global` or `scoped_by = <Tenant>` to this attribute's arguments, keeping its others. `scoped_by = <Tenant>` if it belongs to one tenant (it is emitted from inside that tenant's scope, and only that tenant's feed receives it); `global` if it belongs to no tenant (it is emitted on a bare `Tx`, and only a global `Subscription::of` feed receives it).
+`global` and `scoped_by = Org` on one event — an event is one or the other; drop one
+`global` given twice — write it once
+`scoped_by` given twice — write it once
+an event declares `global` or `scoped_by = <Tenant>` and nothing else (its name derives from the type) — e.g. `#[event(global)]` or `#[event(scoped_by = Org)]`
+#[event] applies to structs — enums and unions cannot be events
+#[event] structs cannot be generic — an event is one concrete payload shape; make `Baz` non-generic
+#[event] needs named fields — `Baz` must be a braced struct
+```
+
+The first is the one every event meets: an event declares its tenancy, and a bare
+`#[event]` names both answers. The next three refuse both tenancies at once, or a word
+given twice. Anything else the attribute does not recognise hits the accepted-forms
+message. That includes a job's words (`cross_tenant`, `retry(...)`), a `scoped_by` with
+no type, and a name: an event's `NAME` is its type's snake_case, never an argument
+(§11). The last three are the struct-shape checks `#[table]` and `#[job]` make. A scoped
+event emitted on a bare `Tx`, or named in a global `Subscription`, is a trait-bound error
+rather than a macro one; §11 pins its note.
+
 ### Router mount conflict (`charpente/src/http/router.rs`, `App::mount` time)
 
 ```text
@@ -3598,8 +3687,9 @@ mint budget (§5's auth section): `create_session` and `create_api_key` share
 one pre-transaction entropy draw, so a request that mints a second credential
 of either kind panics. The fourth (§3) is `Schema::table::<R>()` — called
 twice for the same `#[table]` type when building the `Schema` passed to
-`Db::open`, including registering `Session`, `ApiKey`, or `charpente.jobs`
-yourself (`App::open`/`Db::open` already register those). Fix in every case:
+`Db::open`, including registering `Session`, `ApiKey`, or one of the platform's
+tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`) yourself
+(`App::open`/`Db::open` already register those). Fix in every case:
 register that name/type exactly once, and mint at most one credential per
 request.
 
@@ -4158,12 +4248,12 @@ dispatcher reads `charpente.jobs`.
 use charpente::wire::WireU64;
 use charpente::{Event, event};
 
-#[event]
+#[event(global)]
 struct HTTPEvent {
     code: u16,
 }
 
-#[event]
+#[event(global)]
 struct InvoicePDFSent {
     invoice: WireU64,
 }
@@ -4173,15 +4263,14 @@ fn names() -> (&'static str, &'static str) {
 }
 ```
 
-`#[event]` derives five things a plain struct doesn't have: `Codec` (the log/table
+An `#[event(...)]` says which tenancy the event has (next subsection), and derives five things a plain struct doesn't have: `Codec` (the log/table
 format — the same machinery `#[table]`/`#[job]` use), `impl Event` (`NAME`, the wire
 and delivery-filter name), `serde::Serialize` (the JSON a subscriber receives),
 `Wire` (that JSON's schema, so `charpente describe` and a generated client can name
 the payload type — which is also why a bare `u64`/`i64` field is a compile error
 here, exactly as in a route's request or response: use `Id<T>` for a row id, or
 `WireU64`/`WireI64`), and an `EventEntry` impl so `events![...]` can collect the type
-(next section). It also derives `Event::FINGERPRINT`, a structural fingerprint of the
-payload's fields (§12's helper), recorded beside every emit; delivery decodes a stored
+(next section). It also derives `Event::Scope`, the tenant type the event belongs to (`Unscoped` for a global one), and `Event::FINGERPRINT`, a structural fingerprint of the payload's fields (§12's helper) that a scoped event continues with its tenant's `NAME`, recorded beside every emit; delivery decodes a stored
 event only under the shape it was written with (see "Changing an event" below). A
 `#[job]` payload has no `Wire` requirement, because it never leaves the process — only
 an event's payload is itself a wire document.
@@ -4194,16 +4283,174 @@ next word: `NoteAdded` → `note_added`; `HTTPEvent` → `http_event` (the run `
 stays together, splitting only where the trailing `E` turns out to start `Event`);
 `InvoicePDFSent` → `invoice_pdf_sent` (`PDF` stays together, `S` starts `Sent`).
 
+### An event's tenancy: `global` or `scoped_by`
+
+An event says which tenancy it has, and neither is the default:
+- `#[event(global)]` belongs to no tenant. It is emitted on a bare `Tx` (from inside a scope, through the explicit deref `(*tx).emit(…)`), and only a global `Subscription::of` feed receives it.
+- `#[event(scoped_by = Org)]` belongs to one tenant. It is emitted only on that tenant's `ScopedTx`, which records the tenant beside the event, and only that tenant's feed receives it. That feed is built from the same `ScopedTx` the subscriber's scope line returned.
+
+A bare `#[event]` is a compile error naming both. The two sides are checked against each other by type, so no string names a tenant anywhere in the app:
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::wire::WireU64;
+use charpente::{Id, Scoped, Subscribe, Tenant, Tx, Wire, event, route, table};
+use serde::{Deserialize, Serialize};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("org:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
+                "not a member of org {}",
+                scope.raw()
+            )))
+        }
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Invoice {
+    id: Id<Invoice>,
+    paid: bool,
+}
+
+/// Belongs to one org: only that org's feed receives it.
+#[event(scoped_by = Org)]
+struct InvoicePaid {
+    invoice: Id<Invoice>,
+}
+
+/// Belongs to no org: every global feed receives it.
+#[event(global)]
+struct MaintenanceScheduled {
+    minutes: WireU64,
+}
+
+#[derive(Wire, Serialize, Deserialize)]
+struct MaintenanceBody {
+    minutes: WireU64,
+}
+
+#[route(POST "/orgs/:org/invoices/:id/pay", auth)]
+fn pay(tx: &mut Tx, org: Id<Org>, id: Id<Invoice>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    let mut invoice = tx.get(id)?.ok_or(ApiError::NotFound)?;
+    invoice.paid = true;
+    tx.put(&invoice);
+    tx.emit(InvoicePaid { invoice: id }); // recorded with this org
+    Ok(())
+}
+
+#[route(POST "/maintenance", auth)]
+fn schedule_maintenance(tx: &mut Tx, body: MaintenanceBody) -> Result<(), ApiError> {
+    tx.emit(MaintenanceScheduled {
+        minutes: body.minutes,
+    }); // recorded with no org
+    Ok(())
+}
+
+/// One org's feed. The scope line admits the subscriber, and the feed built
+/// from what it returns carries that org: it receives this org's
+/// `InvoicePaid` rows and nothing else.
+#[route(SSE "/orgs/:org/feed", auth, emits(InvoicePaid))]
+fn org_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<InvoicePaid>().cursor(cursor).into())
+}
+
+#[route(SSE "/maintenance/feed", public, emits(MaintenanceScheduled))]
+fn maintenance_feed(
+    tx: &mut Tx,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<MaintenanceScheduled>().cursor(cursor))
+}
+```
+
+Every mismatch is a compile error, never a feed that silently receives nothing:
+- A scoped event on a bare `Tx` (`tx.emit`, `tx.emit_keyed`), or in a global feed (`Subscription::of`, `.and`), names no tenant. rustc prints the note below.
+- A global event through `ScopedTx::emit` is E0271, "type mismatch resolving `<SystemNotice as Event>::Scope == Org`", with "expected this to be `Org`" pointing at the event's `#[event(global)]`. A global event emitted from inside a scope is written `(*tx).emit(ev)` in a handler, and `(**tx).emit(ev)` in a scoped job's `run`, which holds `&mut ScopedTx`.
+- An event scoped by another type, through `ScopedTx::emit`, `tx.subscription::<Ev>()` or its `.and::<Ev2>()`, is the same E0271, its "expected this to be `Org`" pointing at that event's own `#[event(scoped_by = …)]`. So is a global event on a tenant feed.
+
+The tenant rides the record beside the event, apart from any app key. `tx.emit_keyed(key, ev)` inside a scope records both, and `.key(…)` on either kind of feed narrows it further by that app key (a per-user feed, say). A key never names a tenant.
+
+A scoped event's fingerprint continues its fields' fold with its tenant's `Tenant::NAME` (§16). So moving an event between `global` and `scoped_by`, or between two tenant types, is a change of shape, handled like any other ("Changing an event", below). Two same-named events scoped by two tenant types never share a shape, because the tenant census gives every tenant type the app mounts its own `NAME` (§16). So where the two types' raw ids coincide, one's row is never delivered to the other's feed. It meets that feed as a foreign shape, which ends the feed with `charpente.reshaped` rather than decoding. `mount_events` refuses two events with one name, so an app that mounts every event it emits never meets this.
+
+The bound alone would not hold that for a hand-written `impl Event`, which states its own `FINGERPRINT`. One declared `type Scope = Team`, with `NAME` and `FINGERPRINT` copied from `Org`'s event, meets every `Team` bound. Emitted in `Team` 1, or subscribed in `Team` 1's feed, it would write into or read from `Org` 1's feed. So every typed site that names an event type also checks its shape at build time, against the tenancy its own bound names. `Event::PAYLOAD_FINGERPRINT` is the payload's field fold before any tenant is mixed in: `#[event(scoped_by = Org)]` states it, and for a global event it defaults to `FINGERPRINT`, so a hand-written scoped impl states it too, or the default fails the check below. `ScopedTx::emit`/`emit_keyed`, `tx.subscription::<Ev>()` and `TenantFeed::and` require `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, S::NAME)` for their own `S`. `Tx::emit`/`emit_keyed`, `Subscription::of` and `Subscription::and` require `FINGERPRINT == PAYLOAD_FINGERPRINT`. The check is a `const` block, so a violation fails the build, as rustc's E0080 naming the instantiation (`ScopedTx::<'_, '_, Team>::emit::<Spy>`, say), never a request. Like every post-monomorphization error, `cargo build` and `cargo test` report it and `cargo check` does not. The two texts, scoped and global:
+
+<!-- pinned -->
+```text
+contract: a scoped event's recorded shape is its payload's field fold mixed with its declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not; the likely causes are a hand-written `impl Event` that states `FINGERPRINT` but not `PAYLOAD_FINGERPRINT`, which then defaults to `FINGERPRINT` (a scoped event states both), or one whose `FINGERPRINT` was copied from another event type, or whose `type Scope` names another tenant than the one its `FINGERPRINT` mixes, either of which would let its rows read as another tenant type's event; fix: derive it with `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` (docs/GUIDE.md §11, "An event's tenancy")
+contract: a global event's recorded shape is its payload's field fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is `Unscoped` — and this event's two differ, so its rows would read as another event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to it (docs/GUIDE.md §11, "An event's tenancy")
+```
+
+A global event's text guards consistency, not a door: `Subscription::admits` already keeps every global feed off every tenant's rows. A hand-written scoped event that passes the check is shaped exactly as `#[event]` would shape it:
+
+```rust,ignore
+impl Event for InvoiceVoided {
+    const NAME: &'static str = "invoice_voided";
+    const PAYLOAD_FINGERPRINT: u64 = 0x5e3a_91c4_07d2_6b18; // its fields' fold (§12's helper); illustrative
+    const FINGERPRINT: u64 = scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <Org as Tenant>::NAME);
+    type Scope = Org;
+}
+```
+
+Two limits stay outside the check, stated rather than engineered around. First, a `PAYLOAD_FINGERPRINT` chosen so that its mix with `Team`'s `NAME` equals `Org`'s fingerprint passes it. FNV-1a is not a cryptographic hash, so such a value can be computed, and computing it is a bypass built on purpose in app code, which no type check refuses: it needs no `Db`, only a hand-written `impl Event` and the arithmetic. Second, the `NAME` the check mixes is only as unique as the tenant census makes it. A tenant type the app reaches only through an event it never mounts is outside the census. So two tenant types under one `NAME`, one of them never mounted, mix alike, and their same-named, same-field events share a shape. Mount every event with `events![…]` (next subsection), and `mount_events` refuses the pair before the app serves.
+
+What `#[event]` rejects, all compile errors naming the contract and the fix. The first is the one every event meets once, and the next three are its neighbours (§9 lists the rest):
+
+<!-- pinned -->
+```text
+`<event>` declares no tenancy — an event says which, and neither is the default: add `global` or `scoped_by = <Tenant>` to this attribute's arguments, keeping its others. `scoped_by = <Tenant>` if it belongs to one tenant (it is emitted from inside that tenant's scope, and only that tenant's feed receives it); `global` if it belongs to no tenant (it is emitted on a bare `Tx`, and only a global `Subscription::of` feed receives it).
+`global` and `scoped_by = <scope>` on one event — an event is one or the other; drop one
+`global` given twice — write it once
+`scoped_by` given twice — write it once
+```
+
+A scoped event where no tenant is named is an unsatisfied bound. rustc prints this note with your event and scope in place of `<event>` and `<scope>` (§16 shows it rendered):
+
+<!-- pinned -->
+```text
+`<event>` is a tenant-scoped event (`#[event(scoped_by = <scope>)]`), and a bare `Tx` or a global `Subscription` names no tenant
+emit it and subscribe to it inside the tenant it belongs to:
+    let mut tx = tx.scope::<<scope>>(scope, ctx)?;
+    tx.emit(event); // recorded in this tenant
+and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):
+    Ok(tx.subscription::<<event>>().cursor(cursor).into())
+a job that emits it takes `scoped_by = <scope>` in place of `global` among its `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its `run` receives
+```
+
 ### Registering events: `events![...]` and `mount_events`
 
 Like `jobs![...]`, `events![...]` collects descriptors explicitly and
 `App::mount_events(...)` registers them — but for a different purpose. This
 registry is read by `charpente describe` (and by the client generator
-downstream of it) and by **nothing on the delivery path**: emitting and
-subscribing work exactly the same whether or not an event is registered,
-because a `Subscription::of::<Ev>()` captures its encoder at the subscribe
-site. What registration buys is that the event, and its payload type, appear
-in the contract at all:
+downstream of it), by the mount-time tenant census (a scoped event's tenant type
+joins it, §16, "One `NAME`, one tenant type"), and by **nothing on the delivery
+path**: emitting and subscribing work exactly the same whether or not an event is
+registered, because `Subscription::of::<Ev>()` and `tx.subscription::<Ev>()` capture
+their encoders at the subscribe site. What registration buys is that the event, and
+its payload type, appear in the contract at all, and that its tenant type is checked
+against every other the app names:
 
 ```rust
 use charpente::http::{App, AppConfig};
@@ -4211,7 +4458,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::wire::WireU64;
 use charpente::{Schema, event, events};
 
-#[event]
+#[event(global)]
 struct NoteAdded {
     note: WireU64,
 }
@@ -4228,10 +4475,12 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 ```
 
 That app's `Contract.events` carries one entry — `{"name": "note_added",
-"payload": "NoteAdded", "keyed": false}` — and `NoteAdded`'s own field schema
-joins `"types"` beside the route types (§13). `keyed` is always `false`, and
-honestly so: `tx.emit` versus `tx.emit_keyed` is a *call-site* choice, not a
-property of the event type, so nothing static can know it.
+"payload": "NoteAdded", "scoped_by": null}` — and `NoteAdded`'s own field schema
+joins `"types"` beside the route types (§13). `scoped_by` is `null` because `NoteAdded` is `global`. For an
+`#[event(scoped_by = Org)]` it names the tenant type by its `Tenant::NAME`
+(`"Org"`). An event's tenancy is a declaration on its type, so the contract
+states it. An app key is a call-site choice (`tx.emit_keyed`), so the contract
+lists no keys.
 
 Mounting the same event type twice — in one `mount_events` call, or across
 several — panics at mount time: `"event \"note_added\" registered twice —
@@ -4241,58 +4490,139 @@ each #[event] type is mounted once"`. The name in that message is the event's
 ### Emitting: `tx.emit` and `tx.emit_keyed`
 
 ```rust,ignore
-pub fn emit<Ev: Event>(&mut self, event: Ev)
-pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev)
-```
-
-Both buffer into the transaction's effects exactly like `enqueue`/`enqueue_keyed` —
-nothing is visible to a subscriber until the transaction's one log record commits.
-`emit_keyed`'s key is an opaque scoping filter (an org id, a tenant id, a room name —
-whatever a `Subscription` should be allowed to narrow on); the platform never parses
-it, only exact-matches it at delivery (`Subscription::key`, below). The match rule is
-exact on both sides, and it is the load-bearing multi-tenant scoping rule, so
-precisely: an *unkeyed* subscription (no `.key(...)`) receives every event of its
-types, keyed or not; a *keyed* subscription receives only events whose key is an
-exact match — which means a keyed subscription does **not** receive `tx.emit`
-(unkeyed) events, since no key equals the absence of one. Scope a tenant feed by
-emitting *everything* that tenant should see with `emit_keyed` and its key; reserve
-bare `tx.emit` for events only an unkeyed (global) subscription should tail.
-
-Inside a tenant scope you do not choose. `tx.emit` on a `ScopedTx` — the handle
-`tx.scope::<Org>(org, ctx)?` returns — is *itself* keyed, with the scope's own
-key, so a transaction that had to be admitted to reach a tenant's rows
-cannot hand that tenant's event to another tenant's subscription:
-
-```rust,ignore
-pub fn event_key(&self) -> String   // on ScopedTx: the scope's decimal id
-pub fn emit<Ev: Event>(&mut self, event: Ev)  // == emit_keyed(event_key(), event)
-```
-
-The subscriber side uses the same `event_key`, so the two sides cannot drift
-into two spellings of one tenant:
-
-```rust,ignore
-#[route(SSE "/feed/:org", auth, emits(NoteAdded))]
-fn feed(tx: &mut Tx, org: Id<Org>, ctx: &Ctx, cursor: Option<Cursor>)
-    -> Result<Subscription, ApiError>
-{
-    let tx = tx.scope::<Org>(org, ctx)?;   // authorizes the subscriber, too
-    Ok(Subscription::of::<NoteAdded>().key(tx.event_key()).cursor(cursor))
+impl Tx<'_> {
+    pub fn emit<Ev: UnscopedEvent>(&mut self, event: Ev);                            // a global event
+    pub fn emit_keyed<Ev: UnscopedEvent>(&mut self, key: impl Into<String>, event: Ev);
+}
+impl<S> ScopedTx<'_, '_, S> {
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev);                        // an event scoped by S
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev);
 }
 ```
 
-An emit that genuinely belongs to no tenant is written `(*tx).emit(…)` — the
-same explicit deref an unscoped table access takes. Two notes on the key
-itself: it is a decimal id and nothing more, so two *different* scope types
-sharing a raw id share a key (an app with more than one scope type keys its
-subscriptions per scope type as well); and it is durable — stored in
-`EventRow.key` and exact-matched on resume — which is why it is not built from
-a type name that a compiler upgrade could respell.
+`UnscopedEvent` is exactly the events declared `global`. It is sealed, so `impl UnscopedEvent for InvoicePaid {}` is itself refused (§16).
 
-This is the realtime face of tenant scoping, and it is documented here rather
-than twice: §16 covers the mechanism it belongs to — declaring `scoped_by`,
-writing the scope's `authorize`, and the cross-tenant capability — and points
-back here for the emit and subscribe shapes above.
+Both buffer into the transaction's effects exactly like `enqueue`/`enqueue_keyed` —
+nothing is visible to a subscriber until the transaction's one log record commits.
+`emit_keyed`'s key is an app filter (a user's subject, a room name — whatever a
+`Subscription` should be allowed to narrow on); the platform never parses it, only
+exact-matches it at delivery (`Subscription::key`, below). The match rule is exact on
+both sides: an *unkeyed* subscription (no `.key(...)`) receives every event of its
+types, keyed or not; a *keyed* subscription receives only events whose key is an exact
+match — which means a keyed subscription does **not** receive `tx.emit` (unkeyed)
+events, since no key equals the absence of one. A key is not a tenant: which tenant an
+event belongs to is recorded by the scope it was emitted in (next), never spelled as a
+string.
+
+### Emitting inside a tenant, and the tenant feed
+
+Inside a tenant scope you do not choose. `tx.emit` and `tx.emit_keyed` on a `ScopedTx`
+— the handle `tx.scope::<Org>(org, ctx)?` returns — record the scope's tenant in the
+event's own row, apart from any key, so a transaction that had to be admitted to reach a
+tenant's rows cannot hand that tenant's event to anyone outside it:
+
+```rust,ignore
+// on ScopedTx<'_, '_, S>:
+pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev)                                // recorded in this tenant
+pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev)  // the same, plus the app's key
+```
+
+A tenant's feed is built from the same scope: `tx.subscription::<Ev>()` on the
+`ScopedTx` (the `charpente::Subscribe` trait) returns a `TenantFeed` carrying that
+tenant, and `.into()` makes it the handler's `Subscription`:
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::wire::WireU64;
+use charpente::{Id, Scoped, Subscribe, Tenant, Tx, Wire, event, route, table};
+use serde::{Deserialize, Serialize};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("member:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
+                "not a member of org {}",
+                scope.raw()
+            )))
+        }
+    }
+}
+
+#[event(scoped_by = Org)]
+struct NoteAdded {
+    n: WireU64,
+}
+
+#[derive(Wire, Serialize, Deserialize)]
+struct NoteBody {
+    n: WireU64,
+}
+
+/// Recorded in `org`: the row carries the tenant, apart from any key.
+#[route(POST "/orgs/:org/notes", auth)]
+fn add_note(tx: &mut Tx, org: Id<Org>, body: NoteBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.emit(NoteAdded { n: body.n });
+    Ok(())
+}
+
+/// `org`'s feed: the scope that admitted the subscriber builds it, so it
+/// delivers only events recorded in `org`.
+#[route(SSE "/orgs/:org/feed", auth, emits(NoteAdded))]
+fn feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(tx.subscription::<NoteAdded>().cursor(cursor).into())
+}
+```
+
+Delivery compares tenancy exactly. A tenant's feed receives only the events recorded in
+its own tenant — never another tenant's, never a global one — and a global subscription
+(`Subscription::of`) never receives an event recorded in a tenant, tenant 0 included,
+whatever key it narrows on. Nothing in the app spells a tenant as a string, on either
+side. `.key(...)` still narrows a tenant feed further, by the app's own key.
+
+An emit that genuinely belongs to no tenant is written `(*tx).emit(…)` — the same
+explicit deref an unscoped table access takes — and `(**tx).emit(…)` in a scoped job's
+`run`, which holds `&mut ScopedTx`. It is recorded with no tenant and reaches global
+subscriptions only. A tenant feed carries only the events `TenantFeed::and` added before
+`.into()`: `Subscription::and` adds global events, so on a tenant feed it panics rather
+than build a subscription that could never deliver what it names:
+
+<!-- pinned -->
+```text
+Subscription::and: event "<name>" is added to a tenant feed after .into() — Subscription::and adds global events, and a tenant feed receives only its own tenant's events, so this one could never arrive; add the tenant's events with TenantFeed::and before .into(), and serve global events on a subscription of their own
+```
+
+A tenant feed matches its tenant by type as well as by id. Its events are declared
+`scoped_by` that type (the bound), each one's fingerprint carries the type's `Tenant::NAME`,
+and the feed's builders check at build time that it does, so a hand-written impl cannot
+copy another type's ("An event's tenancy", above, with its two stated limits). So where
+two tenant types' raw ids coincide, one type's events never reach the other's feed.
+A same-named event of the other type meets the feed as a foreign shape and ends it with
+`charpente.reshaped`, never decoded. `mount_events` refuses two events with one name, so
+an app that mounts every event it emits never meets that.
+
+This is the realtime face of tenant scoping, and it is documented here rather than twice:
+§16 covers the mechanism it belongs to — declaring `scoped_by`, writing the scope's
+`authorize`, and the cross-tenant capability — and points back here for the emit and
+subscribe shapes above.
 
 One contract rides along with the `Serialize` derive: every `#[event]` payload must be
 plainly JSON. serde_json writes a map key quoted when it serializes as a string, a
@@ -4350,7 +4680,7 @@ use serde::{Deserialize, Serialize};
 // An `#[event]` payload IS a wire type — it is exactly the JSON a
 // subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
 // `WireU64` a route body would.
-#[event]
+#[event(global)]
 struct Ping {
     n: WireU64,
 }
@@ -4366,9 +4696,11 @@ fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// A real handler would narrow `.key(...)` to the caller's own org, read off
-/// `ctx.session()` exactly like any other route's access control — the
-/// platform enforces nothing about the key beyond the exact-match filter.
+/// A real handler would narrow `.key(...)` to the caller's own subject, read
+/// off `ctx.session()` exactly like any other route's access control — the
+/// platform enforces nothing about the key beyond the exact-match filter. A
+/// tenant's feed is built from its scope instead ("Emitting inside a tenant",
+/// above).
 ///
 /// `emits(Ping)` declares what this stream carries, for the contract and the
 /// generated client — see "Declaring what a stream carries" below.
@@ -4390,12 +4722,23 @@ fn build_app(sim: &Sim) -> std::io::Result<App> {
 ```
 
 ```rust,ignore
-impl Subscription {
-    pub fn of<Ev: Event + serde::Serialize>() -> Subscription;
-    pub fn and<Ev: Event + serde::Serialize>(self) -> Subscription;
+impl Subscription {                             // a global feed
+    pub fn of<Ev: UnscopedEvent + serde::Serialize>() -> Subscription;
+    pub fn and<Ev: UnscopedEvent + serde::Serialize>(self) -> Subscription; // another global event
     pub fn key(self, key: impl Into<String>) -> Subscription;
     pub fn cursor(self, cursor: Option<Cursor>) -> Subscription;
 }
+
+pub trait Subscribe<S> {                        // on ScopedTx<'_, '_, S>: a tenant feed; `use charpente::Subscribe`
+    fn subscription<Ev: Event<Scope = S> + serde::Serialize>(&self) -> TenantFeed<S>;
+}
+
+impl<S> TenantFeed<S> {                         // charpente::http::TenantFeed
+    pub fn and<Ev: Event<Scope = S> + serde::Serialize>(self) -> TenantFeed<S>;
+    pub fn key(self, key: impl Into<String>) -> TenantFeed<S>;
+    pub fn cursor(self, cursor: Option<Cursor>) -> TenantFeed<S>;
+}
+// impl<S> From<TenantFeed<S>> for Subscription: a tenant feed ends `.into()`.
 ```
 
 `Subscription::of::<Ping>()` names the event type as a Rust type, not a string — a typo
@@ -4404,7 +4747,8 @@ type to the same tail, and panics, naming the event, if one of its `NAME` is alr
 there (see "Changing an event" below); `.key(...)` narrows delivery to one exact-match
 value; `.cursor(...)` takes the resume point the platform already extracted (next) — the
 handler can pass it straight through, as `feed` does above, or clamp it to some
-app-level boundary.
+app-level boundary. A `Subscription` from `of` is global; one converted from a
+`TenantFeed` carries its tenant, which no app code can set or read.
 
 ### Declaring what a stream carries
 
@@ -4560,10 +4904,23 @@ apart. Resume validation at subscribe time checks, in order:
   idempotently
   ```
 
+- **Another tenancy** — the retained row at that id is an event of another tenancy than
+  this subscription's: another tenant's event on a tenant feed, a global event on a
+  tenant feed, or a tenant's event on a global subscription. A cursor resumes only the
+  feed that delivered it, so this one is refused rather than resumed, and the refusal
+  names no tenant and no event (below).
+
 - **Reshaped** — the retained row at that id is an event this subscription carries,
   written under a different shape of it (see "Changing an event" below).
 
-Three of these four named errors end with the identical fix: reconnect with no
+The tenancy refusal, exactly:
+
+<!-- pinned -->
+```text
+cursor <id>.<seq> sits on an event outside this feed's tenancy — a cursor resumes only the feed that delivered it, and this feed never delivers that event; reconnect without a cursor, wait for the stream to open, then read current state from the same node, holding every frame that arrives until that read is installed and then applying the held frames and every later one over it in order, idempotently
+```
+
+Four of these five named errors end with the identical fix: reconnect with no
 cursor at all, wait for the stream to open, then read current state from the
 same node with ordinary reads, holding every frame that arrives until that read
 is installed and then applying the held frames and every later one over it in
@@ -4609,8 +4966,13 @@ returns.
 A validated subscribe joins the kernel's ready set as a `Tail` — data-gated, never a
 timer (DESIGN §1): it becomes eligible the instant some commit advances
 `charpente.events` past its position. One unit of delivery reads up to
-`TAIL_BATCH_EVENTS` (64) rows, filters by the subscription's names and key,
-JSON-encodes matches, and pushes frames to the connection's sink. There is no
+`TAIL_BATCH_EVENTS` (64) rows, filters by the subscription's names, its tenancy and its
+key — one predicate, which resume validation also asks before it refuses a reshaped
+cursor — JSON-encodes matches, and pushes frames to the connection's sink. Validation's
+tenancy refusal, checked before that, compares only the row's recorded tenant with the
+subscription's, whatever the row's name and key: a row of another tenancy is one no feed
+of this tenancy delivered, so it is refused even where the predicate would skip it for
+its name or key. There is no
 separate "catch up" mode and no separate "live push" path — a freshly-resumed
 subscription with thousands of events queued and a brand-new one sitting at "now"
 are served by the exact same code, just starting at different positions.
@@ -4691,7 +5053,9 @@ cursor <id>.<seq> sits on an "<event>" event written under a different shape of 
 before shapes were recorded, and such a row is refused like any other foreign one. A
 cursor on a foreign row of an event the subscription does not carry, or one its key
 filter excludes, is not refused: the subscription would never deliver that row anyway.
-The node keeps serving throughout, and every other tail is untouched.
+A cursor on a row of another tenancy is refused either way ("Cursor semantics", above):
+no feed of this subscription's tenancy ever delivered it. The node keeps serving
+throughout, and every other tail is untouched.
 
 **To keep exact resume across a deploy, do not change an existing event's fields.** Add
 a new `#[event]` type under a new name, with the new fields, emit it from the new code,
@@ -4728,7 +5092,7 @@ const SEC: u64 = 1_000_000_000;
 // An `#[event]` payload IS a wire type — it is exactly the JSON a
 // subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
 // `WireU64` a route body would.
-#[event]
+#[event(global)]
 struct Ping {
     n: WireU64,
 }
@@ -4852,9 +5216,10 @@ its type, not the type's definition.
 The tokens are hashed as written, rendered by charpente itself with one space between
 tokens: `Vec<u8>` and `std::vec::Vec<u8>` are different shapes to it, so respelling a
 field's type is a shape change, and a compiler upgrade never is.
-A job's `scoped_by` path is fingerprinted the same way, as written, so moving a job
-between `global` and `scoped_by`, or respelling its path, is a shape change, and a path
-that keeps its spelling but comes to name another type is not (§6).
+A `scoped_by` job's fingerprint also carries its tenant type's `NAME` (§16), not its path:
+moving a job between `global` and `scoped_by`, or to a tenant type with another `NAME`, is
+a shape change, and respelling the path, to the same type or to another with the same
+`NAME`, is not (§6).
 A change inside a type a field holds — a new variant on an enum, a field added to a
 nested struct — leaves the fingerprint unchanged, for tables and for
 `#[event]`/`#[job]` payloads alike (§6, §11). Such a
@@ -4986,14 +5351,18 @@ tail a differently-versioned binary cannot prove is safe to decode.
 is invisible to the gate — writing `Row` by hand instead of using `#[table]` silently
 opts that table out of drift protection. Use `#[table]`. `Job::FINGERPRINT` and
 `Event::FINGERPRINT` have no such default: a hand-written `impl Job` or `impl Event`
-does not compile without one.
+does not compile without one. A hand-written `impl Event` also has
+`Event::PAYLOAD_FINGERPRINT`, its fields' fold before any tenant is mixed in, which
+defaults to `FINGERPRINT`, and every emit and subscribe site checks at build time that
+`FINGERPRINT` is that fold mixed with its declared tenant's `NAME`, or the fold alone for
+a global event (§11, "An event's tenancy").
 
 ## 13. describe — the machine-readable contract
 
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, migration chain, and whether it's tenant-scoped),
-every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, whether it declared `cross_tenant`, whether it's an SSE stream),
-every registered event (name, payload type — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, whether it declared `cross_tenant`), every cron entry
+every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, by that tenant type's `NAME`, whether it declared `cross_tenant`, whether it's an SSE stream),
+every registered event (name, payload type, and the tenant it belongs to if it is `scoped_by` — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`), every cron entry
 (name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
@@ -5548,12 +5917,12 @@ memorizing a list:
     {
       "name": "invoice_finalized",
       "payload": "InvoiceFinalized",
-      "keyed": false
+      "scoped_by": null
     },
     {
       "name": "receipt_sent",
       "payload": "ReceiptSent",
-      "keyed": false
+      "scoped_by": null
     }
   ],
   "types": [
@@ -6483,9 +6852,9 @@ enqueued the job — had to hand back. A job's handle is its enqueuer's because 
 app code can write the job row that carries its tenant, and an enqueue inside a tenant of
 another scope type is refused (§6). A scoped read attempted on a bare `Tx` is a compile error, not a 500
 and not a leak. (What that guarantee does *not* cover — an operator holding the
-`Db`, and the platform's own job queue and event log, which any transaction can read
-across every tenant — is "Where the guarantee stops" below, and it is a boundary, not an
-oversight.)
+`Db` — is "Where the guarantee stops" below, and it is a boundary, not an oversight.
+The platform's own job queue and event log, which hold every tenant's rows, are inside
+it: no app code reads them through a transaction.)
 
 The shape of an app that uses it:
 
@@ -6502,6 +6871,7 @@ The shape of an app that uses it:
 - `#[job(scoped_by = Org)]` on every job that acts inside one tenant, and
   `#[job(global)]` on every job that belongs to none. A scoped job's `run`
   receives the `ScopedTx` of the tenant it was enqueued from.
+- `#[event(scoped_by = Org)]` on every event that belongs to one tenant, and `#[event(global)]` on every event that belongs to none. A scoped event is emitted on its tenant's `ScopedTx`, and only that tenant's feed, built on the same handle, receives it (§11).
 
 ### Declaring a scope and a scoped table
 
@@ -6511,7 +6881,7 @@ use charpente::http::{ApiError, Ctx};
 use charpente::wire::WireU64;
 use charpente::{Id, Scoped, Tenant, Tx, route, table};
 
-/// The scope type. It owes exactly one thing — `authorize`. It is a `#[table]`
+/// The scope type. It owes two things: its `NAME` and `authorize`. It is a `#[table]`
 /// here only so `Id<Org>` can appear as a route path parameter (`Id<T>`'s wire
 /// impl is bounded on `T: Row`); a scope that never crosses the wire can be a
 /// bare marker struct instead.
@@ -6522,6 +6892,10 @@ struct Org {
 }
 
 impl Tenant for Org {
+    /// Its identity: persisted inside every scoped job's fingerprint and
+    /// printed wherever a scope is named. Renaming it is a change of
+    /// identity, like renaming a table.
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 
@@ -6573,15 +6947,45 @@ fn memos_by_author(
 }
 ```
 
-Three things that fall out of that, worth stating plainly:
+Four things that fall out of that, worth stating plainly:
 
 - **`scoped_by` without an `impl Tenant` does not compile**, at the struct.
-- **The scope type is never inspected.** `authorize` is the only hook, and the
-  one thing the platform reads off a scope is its decimal form, as a
-  subscription key (below). Nothing parses a key back into a tenant.
+- **A tenant type names itself.** `const NAME` is its identity, as `TABLE` is a table's. Everything that names a scope prints it: the stage refusal (§6), the 401 (§5), `describe` (§13). The 401 and `JobScope::open`'s assert (§6) print the type's `std::any::type_name` beside it, so a reader can find the type; that text is never compared. A scoped job's and a scoped event's fingerprint mixes it (§6, §11), so moving a job or an event to a tenant type of another `NAME` is a shape change, and renaming a `NAME` is one for every scoped job and event of that type. The convention is the type's own identifier. Two types in one app whose identifiers are alike (`billing::Org` and `crm::Org`) need two NAMEs, and the app refuses to mount them under one (below). A generic tenant impl gives every instantiation one NAME.
+- **The scope type is never inspected.** `authorize` is the only hook, and
+  what the platform records of a scope is its raw id, beside a scoped job or
+  event (below). Nothing parses a key back into a tenant.
 - **Ids stay globally unique and app-minted.** The key prefix is what separates
   tenants, not id re-use, so two tenants may hold the same `Id<Memo>` and the
   same `#[index]` value without colliding.
+
+**One `NAME`, one tenant type.** The app refuses to mount two tenant types under one
+`NAME`, or a tenant type whose `NAME` is empty, before it serves. It collects every tenant
+type it names: its `#[table(scoped_by = …)]` tables at `App::open` (a hand-written scoped
+`Row` is collected only if it states `SCOPE_NAME`; by default it carries no `NAME`), its
+`public(S)` routes at `mount`, its scoped jobs at `mount_jobs`, and its scoped events at `mount_events`. `<name>` is the shared `NAME`; `<type>` and `<other type>` are
+the two types as `std::any::type_name` renders them, the one named first first:
+
+<!-- pinned -->
+```text
+two tenant types are named "<name>": <type> and <other type> — a tenant's NAME is its identity (it is inside every scoped job's and event's fingerprint), so give each type its own `const NAME` in its `impl Tenant`
+tenant type <type> has an empty NAME — give its `impl Tenant` a `const NAME` that names it
+two registrations of the tenant type <type> (NAME "<name>") are different types — a hand-built `JobDef` or `EventDef` whose `scope_type` and `scope_type_name` name different types (build it from its `#[job]`'s or `#[event]`'s `def()`, or set both fields from the type its `scoped_by` names), or two versions of one crate in the build (unify them)
+```
+
+The usual cause is two types spelled alike in two modules, such as `billing::Org` and
+`crm::Org`: both follow the convention, so both claim `"Org"`. The other is a generic tenant
+impl mounted at two instantiations, such as `Wrap<Alpha>` and `Wrap<Gamma>`, whose one impl
+gives both one `NAME`. The same type named through a table, a route, a job and an event is
+one tenant type, and mounts. The third line is the same type under one `NAME` with two `TypeId`s: not two
+tenant types, but a hand-built `JobDef` or `EventDef` whose `scope_type` disagrees with its
+`scope_type_name`, or two versions of one crate. A hand-built `EventDef` whose `scoped_by`
+and `scope_type` disagree, a tenant in one and none in the other, is refused before it
+reaches the census:
+
+<!-- pinned -->
+```text
+contract: event "<name>" was mounted with `scoped_by: <scoped_by>` and `scope_type` <type> — an `EventDef` names its tenant in both, or, for a global event, in neither (`Unscoped`), so this hand-built def would <consequence>; fix: build it from its `#[event]`'s `def()`, or set `scoped_by`, `scope_type` and `scope_type_name` from the one type its `type Scope` names
+```
 
 ### Who reaches a tenant: membership or declaration
 
@@ -6589,7 +6993,9 @@ A tenant is entered one of two ways, and never on an anonymous caller's word:
 
 - **By membership.** On an `auth` or `public` route, `tx.scope` runs your `authorize`
   about the caller's principal. A caller with no credential gets the 401 from §5, not a
-  call to `authorize` with nobody in it.
+  call to `authorize` with nobody in it. Nor can a request borrow another's word:
+  `Principal` is not `Clone` (§5), so no principal outlives its request, and the only one a
+  handler can pass to `tx.open_scope` is its own caller's.
 - **By declaration.** `public(Org)` on the route says every caller may act inside the org
   the handler opens. `tx.scope::<Org>` then admits without asking. The operator path in
   "Where the guarantee stops" below is the other declared way in.
@@ -6607,6 +7013,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
@@ -6664,10 +7071,12 @@ impl<S> ScopedTx<'_, '_, S> {
     pub fn scan_from<R: Row<Scope = S>>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>>;
     pub fn put<R: Row<Scope = S>>(&mut self, row: &R);
     pub fn delete<R: Row<Scope = S>>(&mut self, id: Id<R>);
-    pub fn emit<Ev: Event>(&mut self, event: Ev);      // keyed by the scope — §11
-    pub fn event_key(&self) -> String;                 // the scope's decimal id
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev);                          // records this tenant — §11
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev);
 }
 ```
+
+`use charpente::Subscribe;` adds `tx.subscription::<Ev>()`, the tenant feed (§11).
 
 Every one of those reads and writes is bounded to the tenant the handle names.
 The type parameter travels with it: a `ScopedTx<'_, '_, OrgA>` is not a
@@ -6683,7 +7092,7 @@ exists but its bound fails:
 let tx = tx.scope::<Org>(org, ctx)?;
 tx.scan::<Memo>()?;          // scoped:   Memo is scoped_by = Org
 (*tx).scan::<Region>()?;     // global: Region has no tenant
-(*tx).emit(SystemNotice {}); // an event that genuinely belongs to no tenant
+(*tx).emit(SystemNotice {}); // an #[event(global)]: it belongs to no tenant
 ```
 
 **One scope per transaction.** Opening a *second, different* tenant on the same
@@ -6691,10 +7100,10 @@ transaction is a contract violation and panics by name — including through the
 deref — rather than quietly performing a cross-tenant write:
 
 ```text
-contract: a transaction opens ONE tenant scope (spec §8) — this one already opened myapp::Org(1) and is now asked for myapp::Org(2); run the second tenant's work in its own transaction
+contract: a transaction opens ONE tenant scope (spec §8) — this one already opened `Org` 1 (myapp::Org) and is now asked for `Org` 2 (myapp::Org); run the second tenant's work in its own transaction
 ```
 
-(The scope type prints as `std::any::type_name` renders it, module path
+(Each tenant prints as its type's `NAME` and its id, then its type as `std::any::type_name` renders it, module path
 included.)
 
 Re-opening the *same* scope is a no-op. Cross-tenant *writes* in one
@@ -6720,7 +7129,7 @@ error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) a
    = note: open the tenant scope first — in a handler, `Org`'s own `Tenant::authorize` runs there for a credentialed caller:
                let tx = tx.scope::<Org>(scope, ctx)?;
                tx.scan::<Invoice>()?
-           in a job, declare `#[job(scoped_by = Org)]` and read through the `ScopedTx` its `run` receives
+           in a job, write `scoped_by = Org` in place of `global` in its `#[job(…)]`, keeping its other arguments, and read through the `ScopedTx` its `run` receives
 ```
 
 `scoped_by` naming a type with no membership check:
@@ -6732,8 +7141,9 @@ error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
 9 | #[table(scoped_by = Org)]
   |                     ^^^ no `impl Tenant for Org`
   |
-  = note: a tenant scope needs the app's own membership check; add:
+  = note: a tenant scope needs a name and the app's own membership check; add:
           impl Tenant for Org {
+              const NAME: &'static str = "Org";
               type Who = Principal;
               type Error = ApiError;
               fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> { … }
@@ -6757,36 +7167,90 @@ error[E0277]: `NotifySubscribers` is a tenant-scoped job (`#[job(scoped_by = Org
            cron (`App::schedule`) enqueues on a bare `Tx`, so it schedules `global` jobs only
 ```
 
+A scoped event emitted on a bare `Tx`:
+
+```text
+error[E0277]: `IncidentOpened` is a tenant-scoped event (`#[event(scoped_by = Org)]`), and a bare `Tx` or a global `Subscription` names no tenant
+  --> src/incidents.rs:35:13
+   |
+35 |     tx.emit(event);
+   |        ---- ^^^^^ `IncidentOpened` is scoped by `Org`
+   |
+   = note: emit it and subscribe to it inside the tenant it belongs to:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.emit(event); // recorded in this tenant
+           and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):
+               Ok(tx.subscription::<IncidentOpened>().cursor(cursor).into())
+           a job that emits it takes `scoped_by = Org` in place of `global` among its `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its `run` receives
+```
+
+A read of one of the platform's tables, on a bare `Tx` or through a `ScopedTx`'s deref
+("Where the guarantee stops", below):
+
+```text
+error[E0277]: `JobRow` is one of the platform's tables, and a transaction does not read it
+  --> src/admin.rs:12:26
+   |
+12 |     let jobs = tx.scan::<JobRow>()?;
+   |                   ----   ^^^^^^ `JobRow` is read through `Db::snapshot`, never through a transaction
+   |
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+               db.snapshot()?.scan::<JobRow>()?
+   = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+```
+
 There is no one-line way out of any of them. The marker the message hangs on
 (`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are both
 sealed by a supertrait no other crate can name, so `impl UnscopedRow for
 Invoice {}` — orphan-legal, and the obvious workaround — is itself a compile
 error telling you to open the scope. The job pair, `NoJobTenant` and
-`UnscopedJob`, is sealed the same way. The six scope-taking primitives underneath
+`UnscopedJob`, and the event pair, `NoEventTenant` and `UnscopedEvent`, are sealed the
+same way. The six scope-taking primitives underneath
 (`get_in`, `scan_in`, `scan_by_in`, `scan_from_in`, `put_in`, `delete_in`) are
 private to the core, so there is no back door on a bare `Tx` either. Nor is there
 one through the job queue: a scoped job runs in the tenant its row carries, and
 `tx.put` or `tx.delete` of a `JobRow` does not compile (§6, "Job rows are the
 platform's"). So a bare `Tx` cannot move a job into another tenant, forge one
-there, or cancel one there.
+there, or cancel one there. Nor is there one through the event log: `tx.put` or
+`tx.delete` of an `EventRow` does not compile either (§6), so its only rows are emits,
+each recorded with the tenant it was emitted in, or with none. A tenant feed delivers only rows
+recorded in its own tenant (`Subscription::admits`), and a same-named event emitted in
+another tenant type at the same raw id carries that type's `NAME` in its fingerprint, so
+the feed meets it as a foreign shape and never decodes it. Each emit and feed site checks
+that fingerprint at build time against the tenant its bound names, so a hand-written
+`impl Event` cannot borrow another type's. So no handler publishes, into a tenant's feed,
+an event no emit made in that tenant (§11, "An event's tenancy: `global` or `scoped_by`",
+which states the check's two limits: a payload fold computed on purpose to collide, and a
+tenant type left out of the census by an event never mounted). Nor does any app code read the job queue, the event log or the migration record
+through a transaction, so no handler pages through another tenant's jobs or events:
+`ScopeReadableBy`, the marker that read's message hangs on, is sealed like `NoTenant`,
+and `ReadableBy`, the trait `View` bounds on, has one blanket impl that an app's own impl
+conflicts with.
 
 ### Realtime: one mechanism, not two
 
-`tx.emit` on a `ScopedTx` is automatically keyed with the scope, and an SSE
-handler keys its `Subscription` with the same `tx.event_key()`. A subscription
-keyed to one tenant therefore never receives another tenant's event, for the
-same reason its queries cannot cross — the app did not have to remember a
-second rule. §11 ("Emitting: `tx.emit` and `tx.emit_keyed`") carries the code
-for both sides.
+`tx.emit` on a `ScopedTx` records the scope's tenant in the event's row, apart from any
+key, and a tenant feed — `tx.subscription::<Ev>()` on the handle — delivers only rows
+recorded in its own tenant. A tenant's feed therefore never receives another tenant's
+event or a global one, and a global subscription never receives a tenant's, for the
+same reason its queries cannot cross: the app did not have to remember a second rule,
+and it never spells a tenant as a string. §11 ("Emitting inside a tenant, and the tenant
+feed") carries the code for both sides.
 
-**The limit that travels with it:** `event_key` is the scope's *decimal id* and
-nothing more. Two **different scope types** sharing a raw id therefore share a
-subscription key. It is decimal rather than type-qualified on purpose — the key
-is durable (stored in `EventRow.key`, shipped by replication, exact-matched on
-resume), so it cannot be built from a type name that a compiler or binary
-upgrade could respell without making every pre-upgrade backlog event invisible
-to a reconnecting subscriber. An app with more than one scope type should key
-its subscriptions per scope type as well.
+Two tenant types whose raw ids coincide no longer share events: an event names its
+tenant type (`#[event(scoped_by = Org)]`), its fingerprint carries that type's
+`Tenant::NAME`, and every emit and feed site checks that it does, at build time, against
+the tenant its bound names (§11). Two limits are stated there: a hand-written
+`PAYLOAD_FINGERPRINT` computed to collide on purpose, a bypass built on purpose in app code,
+which no type check refuses, and two tenant types under one `NAME` when one is reached only
+through an event the app never mounts. Mounting every event with `events![…]` closes the
+second.
+
+The declaration is what makes it one mechanism. An event declared `scoped_by = Org`
+compiles only where an `Org` tenant is named: its `emit` on a `ScopedTx<Org>`, and its
+feed from the same handle. So a tenant's event cannot be emitted into no tenant, a global
+feed cannot name one, and a hand-written event cannot claim another tenant type's shape,
+except by that computed collision. §11 shows each refusal.
 
 ### Reading across every tenant: the `cross_tenant` capability
 
@@ -6809,6 +7273,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
@@ -6846,17 +7311,28 @@ impl Rollup {
 }
 ```
 
-Four properties make this a capability rather than an escape hatch:
+Five properties make this a capability rather than an escape hatch:
 
 - **You cannot take the argument without the declaration.** A handler that
   writes `cap: &CrossTenant` on a route that did not say `cross_tenant` is a
-  macro error naming the contract, the site and the fix — it reconstructs the
-  attribute you should have written. §9's `#[route]` list quotes it verbatim.
+  macro error naming the contract, the site and the fix — it names the route by
+  its method and path and tells you to add `cross_tenant` to that attribute,
+  keeping its other flags. §9's `#[route]` list quotes it verbatim.
 
 - **You cannot forge the token.** `CrossTenant`'s field is private and its only
   constructor hangs off `Db::begin_group`, which a handler never holds —
   `CrossTenant(())` is `error[E0423]: cannot initialize a tuple struct which
   contains private fields`.
+- **You cannot keep the token.** It is tied to the group the request or job
+  runs in (`CrossTenant<'g>`) and is not `Clone`. A handler is handed
+  `&CrossTenant`; `cap.clone()` only copies that reference (rustc says so:
+  "`CrossTenant<'_>` does not implement `Clone`, so `&CrossTenant<'_>` was
+  cloned instead"), so there is no token of its own to park. Operator code
+  that mints one from `Db::begin_group` cannot park it either: a `static`
+  or a `thread_local!` needs `'static`, and the token lives only as long as
+  the group's borrow of the `Db` —
+  `error[E0521]: borrowed data escapes outside of function` — unless it leaks its
+  `Db` (`Box::leak`), which is the operator's standing used on purpose.
 - **The result carries the tenant.** `AllTenants::scan` yields
   `Vec<(Id<Org>, Ledger)>`, never `Vec<Ledger>`, so a cross-tenant answer cannot
   be handed to code expecting one tenant's data without a visible `.map`. The
@@ -6892,7 +7368,7 @@ Four properties make this a capability rather than an escape hatch:
   `public_scope` names the tenant a `public(Org)` route admits every caller to, and
   `none` otherwise, while a job's `scoped_by` names the tenant it acts in. So "who
   reaches a tenant without a membership check" and "what acts inside one" are
-  inventories too, in JSON as a name or `null`.
+  inventories too, in JSON as the tenant type's `NAME` or `null`.
 
   The elided `tables:` section carries the matching signal for the table
   itself: `Ledger`'s entry reports `scoped=true` (`Org`'s own entry, and every
@@ -6948,22 +7424,48 @@ hands to `launch`, so it holds `App::db()` — and a `Db` reaches every tenant:
 `Db::snapshot()` exposes scoped and raw reads that take a scope on the caller's
 word with no `authorize` on the path (replication seeding, the archive and
 `restore` are built on them), and `Db::begin_group` can mint the `CrossTenant`
-token. Whoever holds the `Db` holds the store, with the same standing as
+token, for the length of that group's borrow. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
 
-**Nor does it cover the platform's own tables.** The job queue (`JobRow`) and the event
-log (`EventRow`) are unscoped platform tables, and any transaction reads them with
-`tx.get` and `tx.scan` across every tenant: a job's payload and, for a scoped job, the
-tenant id it runs in; an event's payload and its `key`, which for an emit inside a scope
-is that tenant's id. Those reads stay open, because the dispatcher and §8's sim oracles
-are built on them; what is sealed is *writing* a job row (§6). So a route that exposes
-either table — an admin job list, an activity feed built on `scan` rather than a
-`Subscription` — must filter by its own scope before it answers. A raw id is shared across
-scope types, so keep the job rows of jobs declared `scoped_by` the route's own scope type
-(the row's `name` is the job; `describe` lists each job's `scoped_by`) whose `scope` is the
-id of the tenant it opened, and the event rows whose `key` is its `tx.event_key()`, which
-has the subscription key's limit when an app has more than one scope type (§16,
-"Realtime").
+**It covers the platform's own tables too.** The job queue (`JobRow`) holds every tenant's
+job payloads and the tenant each job runs in, the event log (`EventRow`) holds every
+tenant's events, and the migration record (`SchemaVersion`) is the migration gate's own
+state. No app code reads or writes one through a transaction, whether a handler's or a
+job's, on a bare `Tx` or through a `ScopedTx`'s deref (§6). rustc prints this for a read of any of the
+three, with your row type in place of `<row>`:
+
+<!-- pinned -->
+```text
+`<row>` is one of the platform's tables, and a transaction does not read it
+`<row>` is read through `Db::snapshot`, never through a transaction
+the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+    db.snapshot()?.scan::<<row>>()?
+a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
+```
+
+So an admin job list or an activity feed is a table of the app's own, written in the same
+transaction as the enqueue or the emit and scoped like any other, or, for a live feed, a
+`Subscription` (§11). Operator code reads the platform's tables through `db.snapshot()`, as
+§8's oracles do, since whoever holds the `Db` holds every tenant already. The one
+transaction that reads a job row is the dispatcher's own: `Tx::get_job` takes the
+`TenantAdmission` only a `Group` mints, which no handler or job holds.
+
+The read seal is on the table's name as well as its type, as the write seal is. A
+hand-written `Row` whose `TABLE` is one of the three names, scoped or not, fails to build at
+each read the binary can reach, on a bare `Tx`, a `ScopedTx` or an `across_tenants` scan,
+reported by `cargo build` and not `cargo check`:
+
+<!-- pinned -->
+```text
+this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+this Row's TABLE is "charpente.events", the platform's event log — a transaction does not read the platform's tables, because the log holds every tenant's events; give this table a name of its own, and read the log through `db.snapshot()` from code that holds the `Db`, or subscribe to its events
+this Row's TABLE is "charpente.schema_versions", the platform's migration record — a transaction does not read the platform's tables, because the record is the migration gate's own state; give this table a name of its own, and read the record through `db.snapshot()` from code that holds the `Db`
+```
+
+**Sessions and API keys are the app's own.** `Session` and `ApiKey` (§5) are ordinary
+`#[table(global)]` tables that `App::open` registers for you, and a handler reads and
+writes them like any other global table. They carry no tenant data, and revoking a key is
+`tx.delete::<ApiKey>(id)`, an ordinary write, by design.
 
 **Code outside a handler never takes a scope on its own word.** A job declares
 `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened or its fan-out
@@ -6985,6 +7487,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
@@ -7025,7 +7528,10 @@ No `authorize` runs there. The operator has no principal to ask about, and alrea
 holds the store. The admission carries the seal `CrossTenant` carries: its field is
 private and `Group::tenant_admission` is its only constructor. So a handler, which holds
 a `Tx` and a `Ctx` and never a `Group`, cannot mint one; `TenantAdmission(())` is
-`error[E0423]`. The one-scope rule is the same contract whichever way a scope was
+`error[E0423]`. Nor can anyone keep one: like `CrossTenant`, a `TenantAdmission`
+borrows what its group borrows and is not `Clone`, so it goes out of reach with the group's
+borrow of the `Db`, and a `static` or `thread_local!` refuses it — unless operator code
+leaks its `Db`, which is the operator's standing used on purpose. The one-scope rule is the same contract whichever way a scope was
 entered. Do not build an app-internal helper that takes a raw scope and reads through
 `Db::snapshot`: that is the one shape that looks tenant-aware and is not.
 

@@ -1,0 +1,174 @@
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::get::<Queue>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_read`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(0) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+  | |              does not read the platform's tables, because the queue holds every tenant's job \
+  | |              payloads and the tenant each one runs in; give this table a name of its own, and \
+  | |              read the queue through `db.snapshot()` from code that holds the `Db`"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::get::<Queue>`
+  --> tests/compile_fail/platform_table_names_borrowed_for_scoped_reads.rs:63:16
+   |
+63 |     let _one = tx.scope::<Org>(org, ctx)?.get(job)?;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::scan::<Queue>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_read`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(0) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+  | |              does not read the platform's tables, because the queue holds every tenant's job \
+  | |              payloads and the tenant each one runs in; give this table a name of its own, and \
+  | |              read the queue through `db.snapshot()` from code that holds the `Db`"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::scan::<Queue>`
+  --> tests/compile_fail/platform_table_names_borrowed_for_scoped_reads.rs:69:16
+   |
+69 |     let _all = tx.scope::<Org>(org, ctx)?.scan::<Queue>()?;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::scan_by::<Queue, std::vec::Vec<u8>>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_read`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(0) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+  | |              does not read the platform's tables, because the queue holds every tenant's job \
+  | |              payloads and the tenant each one runs in; give this table a name of its own, and \
+  | |              read the queue through `db.snapshot()` from code that holds the `Db`"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::scan_by::<Queue, Vec<u8>>`
+  --> tests/compile_fail/platform_table_names_borrowed_for_scoped_reads.rs:76:18
+   |
+76 |     let _empty = tx.scan_by::<Queue>("by_bytes", &Vec::<u8>::new())?;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::scan_from::<Queue>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_read`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(0) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+  | |              does not read the platform's tables, because the queue holds every tenant's job \
+  | |              payloads and the tenant each one runs in; give this table a name of its own, and \
+  | |              read the queue through `db.snapshot()` from code that holds the `Db`"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::scan_from::<Queue>`
+  --> tests/compile_fail/platform_table_names_borrowed_for_scoped_reads.rs:82:17
+   |
+82 |     let _page = tx.scope::<Org>(org, ctx)?.scan_from::<Queue>(0, 10)?;
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::AllTenants::<'_, '_, Org>::scan::<Queue>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_read`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(0) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+  | |              does not read the platform's tables, because the queue holds every tenant's job \
+  | |              payloads and the tenant each one runs in; give this table a name of its own, and \
+  | |              read the queue through `db.snapshot()` from code that holds the `Db`"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn AllTenants::<'_, '_, Org>::scan::<Queue>`
+  --> tests/compile_fail/platform_table_names_borrowed_for_scoped_reads.rs:88:18
+   |
+88 |     let _every = tx.across_tenants::<Org>(cap).scan::<Queue>()?;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

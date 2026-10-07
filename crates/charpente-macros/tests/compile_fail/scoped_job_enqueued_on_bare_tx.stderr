@@ -1,7 +1,7 @@
 error[E0277]: `NotifySubscribers` is a tenant-scoped job (`#[job(scoped_by = Org)]`) and a bare `Tx` names no tenant to run it in
-  --> tests/compile_fail/scoped_job_enqueued_on_bare_tx.rs:49:16
+  --> tests/compile_fail/scoped_job_enqueued_on_bare_tx.rs:50:16
    |
-49 |     tx.enqueue(NotifySubscribers { incident: id.raw() });
+50 |     tx.enqueue(NotifySubscribers { incident: id.raw() });
    |        ------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `NotifySubscribers` is scoped by `Org`
    |        |
    |        required by a bound introduced by this call

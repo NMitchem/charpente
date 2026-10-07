@@ -441,12 +441,12 @@ const GOLDEN: &str = r#"{
     {
       "name": "invoice_finalized",
       "payload": "InvoiceFinalized",
-      "keyed": false
+      "scoped_by": null
     },
     {
       "name": "receipt_sent",
       "payload": "ReceiptSent",
-      "keyed": false
+      "scoped_by": null
     }
   ],
   "types": [

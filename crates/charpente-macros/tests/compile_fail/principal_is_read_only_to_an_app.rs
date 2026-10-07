@@ -10,8 +10,8 @@
 // crate has no path to either). Nor can it keep a real, ladder-produced
 // principal and overwrite one of its fields once it holds one — GUIDE's "a
 // `Principal` is read-only to your code" is the field privacy on `subject`
-// and `via`, checked here on a `.clone()` of a genuine principal rather
-// than a fresh struct literal.
+// and `via`, checked here on a genuine principal (`.clone()` copies only the
+// reference: `Principal` is not `Clone`) rather than a fresh struct literal.
 use charpente::http::{ApiError, Ctx};
 use charpente::{Tx, route};
 

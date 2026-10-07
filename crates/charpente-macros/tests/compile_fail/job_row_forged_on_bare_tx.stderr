@@ -1,16 +1,16 @@
 error[E0277]: `JobRow` rows are the platform's, and app code cannot write them
-  --> tests/compile_fail/job_row_forged_on_bare_tx.rs:43:12
+  --> tests/compile_fail/job_row_forged_on_bare_tx.rs:44:12
    |
-43 |       tx.put(&JobRow {
+44 |       tx.put(&JobRow {
    |  ________---_^
    | |        |
    | |        required by a bound introduced by this call
-44 | |         id: Id::from_raw(500),
-45 | |         name: "CloseIncident".into(),
-46 | |         payload,
+45 | |         id: Id::from_raw(500),
+46 | |         name: "CloseIncident".into(),
+47 | |         payload,
 ...  |
-53 | |         scope: Some(13),
-54 | |     });
+54 | |         scope: Some(13),
+55 | |     });
    | |_____^ `JobRow` is written only by the platform
    |
    = help: the trait `AppWritable<JobRow>` is not implemented for `charpente::charpente_core::table::PlatformOwned`
@@ -21,6 +21,8 @@ error[E0277]: `JobRow` rows are the platform's, and app code cannot write them
                tx.enqueue(job);
            or from a `cross_tenant` route or job, naming the tenant:
                tx.enqueue_in::<Org>(scope, job, cap);
+   = note: event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
+   = note: schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
 help: the trait `AppWritable<R>` is implemented for `Unscoped`
   --> $WORKSPACE/crates/charpente-core/src/table.rs
    |

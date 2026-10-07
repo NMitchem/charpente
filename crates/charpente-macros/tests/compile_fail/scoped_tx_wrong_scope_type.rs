@@ -24,6 +24,7 @@ struct OrgB {
 }
 
 impl Tenant for OrgA {
+    const NAME: &'static str = "OrgA";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<OrgA>) -> Result<(), ApiError> {
@@ -32,6 +33,7 @@ impl Tenant for OrgA {
 }
 
 impl Tenant for OrgB {
+    const NAME: &'static str = "OrgB";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<OrgB>) -> Result<(), ApiError> {

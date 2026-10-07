@@ -24,7 +24,7 @@ pub struct NewNote {
 }
 
 /// The realtime event a subscriber receives when a note lands.
-#[event]
+#[event(global)]
 pub struct NoteAdded {
     pub note: Id<Note>,
 }

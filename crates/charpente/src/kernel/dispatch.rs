@@ -7,8 +7,8 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use charpente_core::db::{
-    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableWriteRefusal, TenantAdmission, Tx,
-    TxError,
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableReadRefusal, TableWriteRefusal, Tenant,
+    TenantAdmission, Tx, TxError,
 };
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
@@ -21,8 +21,10 @@ use crate::tenant::TenantScope;
 /// enqueueing another shape of a mounted job or for writing a table the
 /// `Schema` disagrees with) — a real attempt that feeds
 /// retry budget and lands in the row's `last_error`. `Io` is a platform fault
-/// surfaced through the handler's reads — NOT an attempt: the job stays
-/// Pending, nothing is recorded, the error bubbles (restart-and-recover).
+/// surfaced through the handler's reads — NOT an attempt, a `TableReadRefusal`
+/// excepted: it is the handler's own deterministic bug, an attempt. Otherwise
+/// the job stays Pending, nothing is recorded, the error bubbles
+/// (restart-and-recover).
 /// Folding Io into the retry path would let injected faults Dead-letter
 /// healthy jobs.
 pub enum JobError {
@@ -72,24 +74,29 @@ pub struct JobDef {
     /// rollups that need it. `describe` lists it beside the route flag, so the
     /// cross-tenant inventory covers jobs too.
     pub cross_tenant: bool,
-    /// `#[job(scoped_by = Org)]` — the scope type's last path segment, as
-    /// `describe` lists it; `None` for a `global` job. `App::mount_jobs`
+    /// `#[job(scoped_by = Org)]` — the scope type's `Tenant::NAME`, as
+    /// `describe` lists it and the refusals render it; `None` for a `global` job. `App::mount_jobs`
     /// registers it beside `fingerprint` and `scope_type`: `Group::stage`
     /// refuses an enqueue whose tenant presence disagrees with it, startup
     /// refuses a Pending row that does, and dispatch asserts that a row
-    /// carries a tenant exactly when this is `Some`. A hand-written `JobDef`
-    /// that contradicts its own `#[job]` is therefore refused at the first
-    /// enqueue, not at dispatch.
+    /// carries a tenant exactly when this is `Some`. A hand-built `JobDef`
+    /// whose tenancy contradicts its own `#[job]` is therefore refused at the
+    /// first enqueue; one whose glue opens another scope type than
+    /// `scope_type` is refused at dispatch, as an attempt, by
+    /// `JobScope::open`.
     pub scoped_by: Option<&'static str>,
     /// `TypeId::of::<J::Scope>()`: the scope type a `scoped_by` job's row
     /// names a tenant of (`Unscoped` for a `global` job). A row records a
     /// tenant id and not its type, and this job's glue opens the id as this
     /// type, so `Group::stage` refuses a scoped enqueue whose job's scope
     /// type is any other: a stand-in copying this job's `NAME` and
-    /// `FINGERPRINT`, or a `#[job]` whose `scoped_by` path spells another
-    /// type the same way, enqueued in that type's tenant (job-tenancy final
-    /// review N1).
+    /// `FINGERPRINT`, or a `#[job]` whose `scoped_by` names another tenant
+    /// type with the same `NAME`, enqueued in that type's tenant (job-tenancy
+    /// final review N1; tenancy-completion spec §4).
     pub scope_type: TypeId,
+    /// `type_name::<J::Scope>()`, for `App`'s tenant-name refusal only (it
+    /// names the type a `scoped_by` NAME stands for); never recorded.
+    pub scope_type_name: &'static str,
     /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
     /// asserts a row's recorded shape equals it before the glue decodes
     /// (payload-shapes spec §4).
@@ -107,27 +114,61 @@ pub struct JobDef {
 /// argument is `Some` exactly for a scoped job: the tenant its row carries,
 /// which only the dispatcher can construct.
 pub type JobGlue =
-    fn(&mut Tx, &[u8], Option<&CrossTenant>, Option<JobScope<'_>>) -> Result<(), JobError>;
+    fn(&mut Tx, &[u8], Option<&CrossTenant<'_>>, Option<JobScope<'_>>) -> Result<(), JobError>;
 
 /// The tenant a scoped job was enqueued in, handed to its glue by the
 /// dispatcher and by nothing else (job-tenancy spec §5). Its fields are
 /// private and it has no public constructor, so a glue, generated or
-/// hand-written, can open only the tenant id its row carries. `open` takes
-/// the scope type from its caller, so what holds that id to the job's own
-/// scope type is the glue: the generated one opens it as the job's
-/// `scoped_by` type, which is `JobDef.scope_type`, the type `Group::stage`
-/// held the enqueuer's to; a hand-written glue names its own.
+/// hand-written, can open only the tenant id its row carries, and only as
+/// the scope type the mounted `JobDef` declares: `open` takes the type from
+/// its caller and asserts it is `JobDef.scope_type`, the type `Group::stage`
+/// held the enqueuer's to (tenancy-completion spec §7).
 pub struct JobScope<'j> {
     id: u64,
-    admission: &'j TenantAdmission,
+    admission: &'j TenantAdmission<'j>,
+    /// The mounted `JobDef`'s `name`, `scope_type` and `scoped_by`, copied
+    /// at dispatch: what `open` holds the glue's scope type to, and what its
+    /// refusal names.
+    job: &'static str,
+    scope_type: TypeId,
+    scope_name: Option<&'static str>,
 }
 
 impl JobScope<'_> {
     /// Opens the enqueuer's tenant id, as scope type `S`, on the job's
-    /// transaction, by the dispatcher's admission. No `authorize` runs: a job has no principal.
-    /// Its authority is its enqueuer's, who was either inside this tenant or
-    /// declared `cross_tenant` to name it.
+    /// transaction, by the dispatcher's admission. No `authorize` runs: a job
+    /// has no principal. Its authority is its enqueuer's, who was either
+    /// inside this tenant or declared `cross_tenant` to name it.
+    ///
+    /// # Panics
+    ///
+    /// When `S` is not the mounted `JobDef.scope_type`: a hand-built `JobDef`
+    /// whose glue opens another scope type than the one it declares. The
+    /// panic is inside the dispatcher's `catch_unwind`, so it is an attempt
+    /// (it retries, then dead-letters), and it comes before `admit_scope`, so
+    /// nothing runs in either tenant. A `JobDef` whose glue and `scope_type`
+    /// name the same other type passes, and cannot be told apart here; it
+    /// still runs in the tenant it was enqueued in, because `Group::stage`
+    /// held the enqueuer to that same type.
     pub fn open<'t, 'a, S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S> {
+        assert!(
+            TypeId::of::<S>() == self.scope_type,
+            "contract: the glue mounted for job \"{job}\" opened its tenant {id} as \
+             `{opened}` (the tenant type `{opened_type}`), but that `JobDef` declares \
+             `{declared}` with a `scope_type` that is not `{opened_type}` — a hand-built \
+             `JobDef` whose `glue` or `scope_type` disagrees with its #[job] (a glue taken \
+             from another job, or another type's `TypeId`); this attempt wrote nothing, and \
+             every retry fails the same way — mount {job} through `jobs![…]`, which builds its \
+             `JobDef` from its #[job] (GUIDE §6)",
+            job = self.job,
+            id = self.id,
+            opened = <S as Tenant>::NAME,
+            opened_type = std::any::type_name::<S>(),
+            declared = self.scope_name.map_or_else(
+                || "global".to_string(),
+                |name| format!("scoped_by = {name}")
+            ),
+        );
         tx.admit_scope(Id::from_raw(self.id), self.admission)
     }
 }
@@ -263,11 +304,14 @@ impl Dispatcher {
         // the dispatcher's admission (job-tenancy spec §5), minted from the
         // `Group` no glue ever holds. The same admission is the token
         // `Tx::settle_job` takes, so the dispatcher's two job-row writes (the
-        // Done mark and the failure record) are ones no app code can make.
+        // Done mark and the failure record) are ones no app code can make. It
+        // is also the token `Tx::get_job` takes, the one read of a job row
+        // inside a batch: no transaction reads the queue otherwise
+        // (tenancy-completion spec §3).
         let admission = group.tenant_admission();
         let attempt = group.stage(|tx| {
             let mut row = tx
-                .get(Id::<JobRow>::from_raw(id))?
+                .get_job(Id::from_raw(id), &admission)?
                 .unwrap_or_else(|| panic!("dispatcher invariant: due job {id} has no row"));
             assert_eq!(
                 row.status,
@@ -312,7 +356,10 @@ impl Dispatcher {
             // refusal (`Db::pending_job_shape_refusal`) names a Pending row
             // that disagrees before dispatch starts. The scope TYPE is not
             // checkable here, since the row records none: `Group::stage`
-            // refuses an enqueue under any type but `def.scope_type`.
+            // refuses an enqueue under any type but `def.scope_type`, and
+            // `JobScope::open` asserts the glue opens exactly that type —
+            // inside the `catch_unwind` below, so a hand-built `JobDef` whose
+            // glue disagrees is an attempt, not a kernel stop.
             assert_eq!(
                 row.scope.is_some(),
                 def.scoped_by.is_some(),
@@ -328,6 +375,9 @@ impl Dispatcher {
             let scope = row.scope.map(|id| JobScope {
                 id,
                 admission: &admission,
+                job: def.name,
+                scope_type: def.scope_type,
+                scope_name: def.scoped_by,
             });
             match catch_unwind(AssertUnwindSafe(|| {
                 (def.glue)(tx, &row.payload, def.cross_tenant.then_some(&cap), scope)
@@ -368,14 +418,25 @@ impl Dispatcher {
                 );
                 Err(TxError::App(JobError::App(e.to_string())))
             }
+            // A read the `Schema` disagrees with about its table's `Row` type
+            // (`TableReadRefusal`, amendment A18) is refused by the read itself,
+            // so it arrives here through the handler's `?` as `JobError::Io`, the
+            // variant a platform fault takes. It is the handler's own
+            // deterministic bug, like the two refusals above: an attempt, never a
+            // fault that would stop the dispatcher on every restart.
+            Err(TxError::App(JobError::Io(e))) if TableReadRefusal::of(&e).is_some() => {
+                Err(TxError::App(JobError::App(e.to_string())))
+            }
             other => other,
         };
         match attempt {
             Ok(()) => Ok(JobOutcome::Done { id }),
             // Platform faults — the transaction machinery's own, or one the
-            // handler's reads surfaced — are NOT attempts: the row is
-            // untouched and Pending, the heap entry comes back, no ledger
-            // write, and the error bubbles (restart-and-recover).
+            // handler's reads surfaced — are NOT attempts, a `TableReadRefusal`
+            // excepted: it is the handler's own deterministic bug, an attempt,
+            // classified above. The row is untouched and Pending, the heap
+            // entry comes back, no ledger write, and the error bubbles
+            // (restart-and-recover).
             Err(TxError::Io(e)) | Err(TxError::App(JobError::Io(e))) => {
                 self.due.insert((due_at, id)); // still Pending in the store
                 Err(e)
@@ -419,15 +480,15 @@ impl Dispatcher {
                 // separate `db.snapshot()` re-read the way this used to
                 // work: `Group` deliberately exposes no snapshot accessor
                 // (spec §1 has no group-snapshot escape hatch), and reading
-                // `row.name` through `tx` here is strictly MORE correct
-                // anyway — `tx` sees this batch's own earlier writes through
+                // `row.name` through `tx.get_job` here is strictly MORE correct
+                // anyway — it sees this batch's own earlier writes through
                 // the group overlay, where a bare snapshot would not. This
                 // also deletes one of the two `expect("row existed a moment
                 // ago")` sites the old shape needed.
                 let defs = &self.defs;
                 let staged = group.stage(|tx| {
                     let mut row = tx
-                        .get(Id::<JobRow>::from_raw(id))?
+                        .get_job(Id::from_raw(id), &admission)?
                         .expect("row existed a moment ago");
                     let retry = defs
                         .get(row.name.as_str())

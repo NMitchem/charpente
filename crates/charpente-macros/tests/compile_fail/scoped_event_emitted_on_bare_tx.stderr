@@ -1,0 +1,31 @@
+error[E0277]: `IncidentOpened` is a tenant-scoped event (`#[event(scoped_by = Org)]`), and a bare `Tx` or a global `Subscription` names no tenant
+  --> tests/compile_fail/scoped_event_emitted_on_bare_tx.rs:35:13
+   |
+35 |     tx.emit(event);
+   |        ---- ^^^^^ `IncidentOpened` is scoped by `Org`
+   |        |
+   |        required by a bound introduced by this call
+   |
+help: the trait `NoEventTenant<IncidentOpened>` is not implemented for `Org`
+  --> tests/compile_fail/scoped_event_emitted_on_bare_tx.rs:9:1
+   |
+ 9 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
+   = note: emit it and subscribe to it inside the tenant it belongs to:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.emit(event); // recorded in this tenant
+           and, in an SSE handler, that tenant's feed (`use charpente::Subscribe;`):
+               Ok(tx.subscription::<IncidentOpened>().cursor(cursor).into())
+           a job that emits it takes `scoped_by = Org` in place of `global` among its `#[job(…)]` arguments, keeping the others, and emits through the `ScopedTx` its `run` receives
+help: the trait `NoEventTenant<Ev>` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<Ev> NoEventTenant<Ev> for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `IncidentOpened` to implement `UnscopedEvent`
+note: required by a bound in `Tx::<'a>::emit`
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     pub fn emit<Ev: UnscopedEvent>(&mut self, event: Ev) {
+   |                     ^^^^^^^^^^^^^ required by this bound in `Tx::<'a>::emit`
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

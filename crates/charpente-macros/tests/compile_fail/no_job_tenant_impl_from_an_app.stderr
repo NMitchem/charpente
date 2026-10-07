@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `Org: table::sealed::NotATenant` is not satisfied
-  --> tests/compile_fail/no_job_tenant_impl_from_an_app.rs:39:30
+  --> tests/compile_fail/no_job_tenant_impl_from_an_app.rs:40:30
    |
-39 | impl NoJobTenant<Notify> for Org {}
+40 | impl NoJobTenant<Notify> for Org {}
    |                              ^^^ unsatisfied trait bound
    |
 help: the trait `table::sealed::NotATenant` is not implemented for `Org`

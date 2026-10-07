@@ -40,13 +40,14 @@ pub mod witnesses;
 /// and checked against the peer's (spec §5's version-mismatch surface).
 /// Bumps whenever a message body's shape changes — tenant-scoping's
 /// `ScopedSnapshotRows` (tag 14) made it 2; payload shapes' `0x08`/`0x09`
-/// record tags made it 3; job tenancy's `0x0a` scoped enqueue makes it 4, so
-/// a version-3 binary is refused at Hello rather than at its first scoped
-/// job. The same change reaches a follower a second way: `JobRow`'s row codec
-/// gained a trailing `scope`, and seeding ships platform table rows, so a
-/// version-3 follower would also meet a scoped row's 16-byte tail, which its
-/// decoder calls corrupt.
-pub const PROTO_VERSION: u8 = 4;
+/// record tags made it 3; job tenancy's `0x0a` scoped enqueue made it 4;
+/// event tenancy's `0x0b` scoped emit makes it 5, so a version-4 binary is
+/// refused at Hello rather than at its first scoped emit. The same change
+/// reaches a follower a second way: `JobRow`'s row codec gained a trailing
+/// `scope` at 4 and `EventRow`'s at 5, and seeding ships platform table rows,
+/// so an older follower would also meet a scoped row's 16-byte tail, which
+/// its decoder calls corrupt.
+pub const PROTO_VERSION: u8 = 5;
 
 /// The hard ceiling on one encoded `Msg` on the wire: one `MAX_RECORD_BYTES`
 /// frame (16 MiB) plus envelope overhead (spec Global Constraints).

@@ -9,6 +9,7 @@
 //! event-name order, routes/jobs/cron in registration order — no `HashMap`
 //! anywhere in this path.
 
+use std::any::TypeId;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -83,8 +84,8 @@ pub struct RouteInfo {
     pub name: &'static str,
     pub auth: bool,
     /// `#[route(…, public(Org))]`: the tenant scope this route admits every
-    /// caller to, with no `authorize` (job-tenancy spec §4), by the scope
-    /// type's name. `None` for `auth` and plain `public`. Beside `auth`
+    /// caller to, with no `authorize` (job-tenancy spec §4), by the tenant
+    /// type's `Tenant::NAME`. `None` for `auth` and plain `public`. Beside `auth`
     /// because together they answer "who reaches what here": `auth=false`
     /// with `None` is plain public, and with `Some` it admits everyone to
     /// that tenant.
@@ -125,12 +126,14 @@ pub struct EventInfo {
     /// An `#[event]` payload is exactly the JSON a subscriber receives, so
     /// it is a wire type like any route's response.
     pub payload: &'static str,
-    /// Always `false`, populated honestly rather than guessed: `emit` vs
-    /// `emit_keyed` is a CALL-SITE choice (`tx.emit_keyed(org, ev)`), not a
-    /// property of the event type, so nothing static can know it. Inventing
-    /// a declaration for it would be a design change, not an implementation
-    /// detail — the field stays so the contract's shape is ready for one.
-    pub keyed: bool,
+    /// `#[event(scoped_by = Org)]`: the tenant this event belongs to, by its
+    /// tenant type's `Tenant::NAME`; `None` for a `#[event(global)]` one
+    /// (tenancy-completion spec §8). It says which feeds can carry the event:
+    /// a scoped event reaches only its own tenant's feed, and a global one
+    /// only `Subscription::of` feeds. It replaces the old always-false key
+    /// flag. An app key is a call-site filter no static contract can know,
+    /// while an event's tenancy is a declaration on its type.
+    pub scoped_by: Option<&'static str>,
 }
 
 /// One registered event type: the descriptor `events![…]` collects (explicit
@@ -141,13 +144,27 @@ pub struct EventInfo {
 /// none: `Subscription::of::<Ev>()` captures its encoder statically at the
 /// subscribe site, so "unregistered event at delivery" is inexpressible
 /// rather than an error case (realtime spec §3). DESCRIBE has this one, and
-/// it is read by `App::describe` and by nothing else — no type under
-/// `kernel/` or in `charpente-core` may name it, which is what keeps the
-/// delivery property mechanically true instead of merely intended.
+/// it is read by `App::describe`, and by `App::mount_events`' tenant census
+/// at mount, and by nothing else — no type under `kernel/` or in
+/// `charpente-core` may name it, which is what keeps the delivery property
+/// mechanically true instead of merely intended.
 pub struct EventDef {
     pub name: &'static str,
     pub payload: &'static str,
     pub register_types: fn(&mut TypeRegistry),
+    /// `#[event(scoped_by = Org)]`: the tenant this event belongs to, by its
+    /// scope type's `Tenant::NAME`; `None` for a `global` event
+    /// (tenancy-completion spec §6, §8). `describe` lists it, and
+    /// `App::mount_events` puts it into the app's tenant census.
+    pub scoped_by: Option<&'static str>,
+    /// `TypeId::of::<<Ev as Event>::Scope>()`. The census refuses two tenant
+    /// types under one `NAME` by comparing these (spec §4).
+    pub scope_type: TypeId,
+    /// `std::any::type_name` of the same type, for the census's refusal texts
+    /// only: it words a refusal and never decides one, which `scope_type`
+    /// does. Never persisted: the compiler's printer is not an identity
+    /// (spec §1).
+    pub scope_type_name: &'static str,
 }
 
 /// Implemented by the marker impl `#[event]` emits, so `events![a, b]`
@@ -168,7 +185,7 @@ pub struct JobInfo {
     pub name: &'static str,
     pub retry: RetryInfo,
     /// `#[job(scoped_by = Org)]`: the tenant scope this job acts in, by the
-    /// scope type's name; `None` for a `global` job (job-tenancy spec §8).
+    /// tenant type's `Tenant::NAME`; `None` for a `global` job (job-tenancy spec §8).
     pub scoped_by: Option<&'static str>,
     /// `cross_tenant` on a job (`#[job(global, cross_tenant)]`, say) — see
     /// `RouteInfo::cross_tenant`. The inventory
@@ -303,7 +320,7 @@ fn event_info(def: &EventDef) -> EventInfo {
     EventInfo {
         name: def.name,
         payload: def.payload,
-        keyed: false,
+        scoped_by: def.scoped_by,
     }
 }
 
@@ -433,7 +450,14 @@ pub fn to_human(c: &Contract) -> String {
     }
     writeln!(out, "events:").unwrap();
     for e in &c.events {
-        writeln!(out, "  {} payload={} keyed={}", e.name, e.payload, e.keyed).unwrap();
+        writeln!(
+            out,
+            "  {} payload={} scoped_by={}",
+            e.name,
+            e.payload,
+            e.scoped_by.unwrap_or("none")
+        )
+        .unwrap();
     }
     writeln!(out, "jobs:").unwrap();
     for j in &c.jobs {

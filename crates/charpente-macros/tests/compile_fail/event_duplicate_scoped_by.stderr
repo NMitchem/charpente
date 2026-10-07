@@ -1,0 +1,5 @@
+error: `scoped_by` given twice — write it once
+ --> tests/compile_fail/event_duplicate_scoped_by.rs:7:26
+  |
+7 | #[event(scoped_by = Org, scoped_by = Org)]
+  |                          ^^^^^^^^^

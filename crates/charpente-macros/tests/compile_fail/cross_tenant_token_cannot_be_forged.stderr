@@ -1,11 +1,11 @@
 error[E0423]: cannot initialize a tuple struct which contains private fields
-  --> tests/compile_fail/cross_tenant_token_cannot_be_forged.rs:40:35
+  --> tests/compile_fail/cross_tenant_token_cannot_be_forged.rs:41:35
    |
-40 |         tx.across_tenants::<Org>(&CrossTenant(()))
+41 |         tx.across_tenants::<Org>(&CrossTenant(()))
    |                                   ^^^^^^^^^^^
    |
 note: constructor is not visible here due to private fields
   --> $WORKSPACE/crates/charpente-core/src/db.rs
    |
-   | pub struct CrossTenant(());
-   |                        ^^ private field
+   | pub struct CrossTenant<'g>(std::marker::PhantomData<&'g ()>);
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field

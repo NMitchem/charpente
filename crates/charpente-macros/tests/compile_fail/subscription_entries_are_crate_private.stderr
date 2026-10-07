@@ -1,0 +1,17 @@
+error[E0603]: struct `SubEntry` is private
+  --> tests/compile_fail/subscription_entries_are_crate_private.rs:15:58
+   |
+15 | fn widen(mut feed: Subscription, entry: charpente::http::SubEntry) -> Subscription {
+   |                                                          ^^^^^^^^ private struct
+   |
+note: the struct `SubEntry` is defined here
+  --> $WORKSPACE/crates/charpente/src/http/mod.rs
+   |
+   | pub(crate) struct SubEntry {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0616]: field `entries` of struct `Subscription` is private
+  --> tests/compile_fail/subscription_entries_are_crate_private.rs:16:10
+   |
+16 |     feed.entries.push(entry);
+   |          ^^^^^^^ private field

@@ -1,7 +1,7 @@
-// The capability refusal (tenant-scoping spec §3) reconstructs the attribute
-// the author should have written, so on a `public(Org)` route it keeps the
-// `public(Org)` (job-tenancy spec §4). `CrossTenant` and `WireU64` are named
-// by path for `across_tenants_without_capability.rs`'s reason.
+// The capability refusal (tenant-scoping spec §3) names the one flag to add
+// and restates no attribute, so a `public(Org)` route's stance cannot drop
+// out of the fix (tenancy-completion spec §7). `CrossTenant` and `WireU64`
+// are named by path for `across_tenants_without_capability.rs`'s reason.
 use charpente::auth::Principal;
 use charpente::http::ApiError;
 use charpente::{Id, Tenant, Tx, route, table};
@@ -13,6 +13,7 @@ struct Org {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {

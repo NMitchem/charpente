@@ -26,14 +26,16 @@ use charpente::auth::Principal;
 use charpente::http::{
     ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Response, Subscription,
 };
+use charpente::kernel::JobError;
 use charpente::wire::WireU64;
 use charpente::{
-    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, TenantAdmission, Tx,
-    TxError, event, route, routes, table,
+    CrossTenant, Db, DbConfig, Event, Schema, Scoped, ScopedTx, Snapshot, Subscribe, Tenant,
+    TenantAdmission, Tx, TxError, event, events, job, jobs, route, routes, table,
 };
+use charpente_core::db::TableReadRefusal;
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Id, Row};
+use charpente_core::table::{Codec, Id, Row, View};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 
 /// The scope type whose membership check actually refuses. Every other
@@ -43,10 +45,9 @@ use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 ///
 /// A `#[table]` rather than a bare marker only so `Id<Org>` can be a route
 /// path parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing
-/// reads the table. A scope type owes nothing but `authorize`, and the
-/// platform never DERIVES a scope — it only renders one, as the subscription
-/// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
-/// `emit_keyed` ruling, DESIGN.md §6).
+/// reads the table. A scope type owes its `NAME` and `authorize`, and the
+/// platform never DERIVES a scope — it only records one, beside a scoped job
+/// or event (the standing `emit_keyed` ruling, DESIGN.md §6).
 #[table(global)]
 struct Org {
     id: Id<Org>,
@@ -90,6 +91,7 @@ fn bodies_entered() -> u64 {
 }
 
 impl Tenant for Org {
+    const NAME: &'static str = "Org";
     type Who = Principal;
     type Error = ApiError;
 
@@ -156,6 +158,23 @@ fn write_team_memo(tx: &mut Tx, team: Id<Team>, ctx: &Ctx) -> Result<WireU64, Ap
     Ok(WireU64(tx.scope().raw()))
 }
 
+/// Declares `cross_tenant` beside plain `public`. Tenancy-completion spec §7,
+/// item 12: rule 3's 401 must not tell the author to drop that flag — its fix
+/// used to quote `#[route(POST "/memo-cross/:org", public(Org))]`, which does
+/// not compile beside the `cap` argument below.
+#[route(POST "/memo-cross/:org", public, cross_tenant)]
+fn write_memo_cross(
+    tx: &mut Tx,
+    org: Id<Org>,
+    cap: &CrossTenant,
+    ctx: &Ctx,
+) -> Result<WireU64, ApiError> {
+    memo_write(tx, org, ctx)?;
+    Ok(WireU64(
+        tx.across_tenants::<Org>(cap).scan::<Memo>()?.len() as u64
+    ))
+}
+
 /// Reads one tenant's rows back, so the refused tenant's emptiness is checked
 /// on the store and not only on the counters.
 #[route(GET "/memo/:org", auth)]
@@ -164,7 +183,10 @@ fn count_memos(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError
     Ok(WireU64(tx.scan::<Memo>()?.len() as u64))
 }
 
-#[event]
+/// Scoped by `Org`: the three feeds below build it on `Org`'s `ScopedTx`, so
+/// each carries the one org its scope line admitted (tenancy-completion spec
+/// §6).
+#[event(scoped_by = Org)]
 struct MemoNoted {
     n: WireU64,
 }
@@ -180,9 +202,7 @@ fn memo_feed(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<MemoNoted>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<MemoNoted>().cursor(cursor).into())
 }
 
 #[route(SSE "/memo-feed-open/:org", public(Org), emits(MemoNoted))]
@@ -193,9 +213,7 @@ fn memo_feed_open(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<MemoNoted>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<MemoNoted>().cursor(cursor).into())
 }
 
 #[route(SSE "/memo-feed-auth/:org", auth, emits(MemoNoted))]
@@ -206,9 +224,7 @@ fn memo_feed_auth(
     cursor: Option<Cursor>,
 ) -> Result<Subscription, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
-    Ok(Subscription::of::<MemoNoted>()
-        .key(tx.event_key())
-        .cursor(cursor))
+    Ok(tx.subscription::<MemoNoted>().cursor(cursor).into())
 }
 
 #[route(POST "/memo-login", public)]
@@ -231,6 +247,7 @@ fn memo_app(seed: u64) -> (Sim, App) {
         write_memo_public,
         write_memo_open,
         write_team_memo,
+        write_memo_cross,
         count_memos,
         memo_feed,
         memo_feed_open,
@@ -362,11 +379,16 @@ fn an_anonymous_caller_on_a_plain_public_route_that_opens_a_scope_gets_the_named
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /memo-public/:org` is declared `public` and opened \
-         the tenant scope `Org` for a caller with no credential; only a route declared \
-         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(POST \"/memo-public/:org\", public(Org))]`"
+        format!(
+            "authentication required — `POST /memo-public/:org` is declared `public` and \
+             opened the tenant scope `Org` for a caller with no credential; only a route \
+             declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
+            std::any::type_name::<Org>()
+        )
     );
     assert_eq!(
         authorize_calls(),
@@ -395,21 +417,33 @@ fn a_credentialed_caller_on_a_plain_public_route_is_asked_about_once() {
 }
 
 /// Oracle 2 (g). Rule 3 on a stream: the site in the 401 is the word the
-/// route was declared with, `SSE`, not the `GET` it is served on — the fix it
-/// quotes must be an attribute the author can paste.
+/// route was declared with, `SSE`, not the `GET` it is served on. The route
+/// also declares `emits(MemoNoted)`, and the author's fix keeps it: the 401
+/// names the stance to change in place and restates no attribute
+/// (tenancy-completion spec §7, item 12).
 #[test]
 fn an_anonymous_subscriber_that_opens_a_scope_gets_the_401_naming_the_stream() {
     let (_sim, mut app) = memo_app(0x7E4A_1707);
     reset_counters();
     let refused = app.handle(Request::new(Method::Get, format!("/memo-feed/{ADMITTED}")));
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    let text = error_text(&refused);
     assert_eq!(
-        error_text(&refused),
-        "authentication required — `SSE /memo-feed/:org` is declared `public` and opened the \
-         tenant scope `Org` for a caller with no credential; only a route declared \
-         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(SSE \"/memo-feed/:org\", public(Org))]`"
+        text,
+        format!(
+            "authentication required — `SSE /memo-feed/:org` is declared `public` and opened \
+             the tenant scope `Org` for a caller with no credential; only a route declared \
+             `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
+            std::any::type_name::<Org>()
+        )
+    );
+    assert!(
+        !text.contains("#[route(SSE"),
+        "the fix restates no attribute, so `emits(MemoNoted)` cannot drop out of it: {text}"
     );
     assert_eq!(authorize_calls(), Vec::<String>::new());
 }
@@ -483,13 +517,54 @@ fn public_scope_for_one_scope_type_does_not_admit_another() {
     assert_eq!(refused.status, 401, "{}", body_text(&refused));
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /memo-team/:team` is declared `public(Org)` and \
-         opened the tenant scope `Team` for a caller with no credential; only a route \
-         declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(POST \"/memo-team/:team\", public(Team))]`"
+        format!(
+            "authentication required — `POST /memo-team/:team` is declared `public(Org)` and \
+             opened the tenant scope `Team` for a caller with no credential; only a route \
+             declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Team)` in place of `public(Org)` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Team` is the tenant type `{}`, and `Org` is `{}`",
+            std::any::type_name::<Team>(),
+            std::any::type_name::<Org>()
+        )
     );
     assert_eq!(bodies_entered(), 0);
+}
+
+/// Item 12. On a `public, cross_tenant` route the 401 names the stance to
+/// change and keeps the route's other flags, so the `cross_tenant` its `cap`
+/// argument needs survives the author's fix.
+#[test]
+fn the_401_on_a_cross_tenant_route_keeps_the_flag_in_its_fix() {
+    let (_sim, mut app) = memo_app(0x7C06_0601);
+    reset_counters();
+    let refused = app.handle(Request::new(
+        Method::Post,
+        format!("/memo-cross/{ADMITTED}"),
+    ));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    let text = error_text(&refused);
+    assert_eq!(
+        text,
+        format!(
+            "authentication required — `POST /memo-cross/:org` is declared `public` and \
+             opened the tenant scope `Org` for a caller with no credential; only a route \
+             declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
+            std::any::type_name::<Org>()
+        )
+    );
+    assert!(
+        !text.contains("#[route(POST"),
+        "the fix restates no attribute, so `cross_tenant` cannot drop out of it: {text}"
+    );
+    assert_eq!(authorize_calls(), Vec::<String>::new());
+    assert_eq!(bodies_entered(), 0, "nothing below the scope line ran");
+    assert_eq!(app.db().last_applied(), None, "and nothing was written");
 }
 
 /// Spec §4: the `emits(...)` drift probe meets the three rules exactly as a
@@ -518,17 +593,17 @@ fn the_drift_probe_meets_the_three_rules_as_a_request_does() {
     // its message, with no Rust `Debug` syntax around it.
     assert_eq!(
         app.subscription_event_names("memo_feed_auth"),
-        Err(
+        Err(format!(
             "route `memo_feed_auth`'s subscribe handler answered 401 under the emits(...) drift \
              probe, so what it subscribes to cannot be read — a handler that rejects a \
              credential-free request with `0` for every :param is not probeable; the 401 reads: \
              authentication required — `SSE /memo-feed-auth/:org` is declared `auth` and opened \
-             the tenant scope `Org` for a caller with no credential; the route requires a \
-             credential, so a request without one is refused before its handler runs, and a \
-             caller that presents none, as the emits(...) drift probe does, cannot run it — \
-             leave this route out of the drift test"
-                .to_string()
-        )
+             the tenant scope `Org` (the tenant type `{}`) for a caller with no credential; the \
+             route requires a credential, so a request without one is refused before its \
+             handler runs, and a caller that presents none, as the emits(...) drift probe does, \
+             cannot run it — leave this route out of the drift test",
+            std::any::type_name::<Org>()
+        ))
     );
 }
 
@@ -549,6 +624,7 @@ struct Firm {
 }
 
 impl Tenant for Firm {
+    const NAME: &'static str = "Firm";
     type Who = Principal;
     type Error = ApiError;
 
@@ -1332,6 +1408,7 @@ struct Team {
 }
 
 impl Tenant for Team {
+    const NAME: &'static str = "Team";
     type Who = Principal;
     type Error = ApiError;
     fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
@@ -1668,6 +1745,270 @@ fn a_delete_through_the_same_table_under_another_scope_type_is_refused() {
     );
 }
 
+/// The refusal a read through `Reader` gets, spelled out apart from the
+/// product's `format!`, as `firm_note_refusal` is for a write.
+fn note_read_refusal<Reader>(read: &str) -> String {
+    let registered = std::any::type_name::<Note>();
+    let reader = std::any::type_name::<Reader>();
+    format!(
+        "table \"Note\" is registered as `{registered}`, but this transaction read it through \
+         `{reader}` ({read}) — two Row types declare TABLE = \"Note\", and a read keys on the \
+         table name and the raw tenant id, so it returns the registered type's rows, from the \
+         registered scope type's tenant of the same id when the two types' scoped_by differ; \
+         the read was refused and returned nothing — read `{registered}` instead, or give \
+         `{reader}` a table name of its own (a #[table] type's table name is its struct name)"
+    )
+}
+
+/// Amendment A18, the read half of the two tests above. A read admitted for
+/// `Firm` 7 through `firm_note::Note` keys on the table name and the raw scope
+/// id, so it returned `Team` 7's note. Each scoped read through it, and an
+/// `across_tenants` scan, is refused before it reads and returns nothing; the
+/// registered type still reads `Team` 7's row. `firm_note::Note` declares no
+/// index, so `scan_by` reaches its type check and nothing else: without the
+/// check it panics naming the missing index.
+#[test]
+fn a_read_through_the_same_table_under_another_scope_type_is_refused() {
+    let sim = Sim::with_faults(0x5A17_0011, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(7), &admission)
+                .put(&Note {
+                    id: Id::from_raw(1),
+                    text: "Team 7's note".to_string(),
+                });
+            Ok::<(), ApiError>(())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+
+    let refused = |e: std::io::Error| {
+        assert!(
+            TableReadRefusal::of(&e).is_some(),
+            "a TableReadRefusal, not another io error: {e}"
+        );
+        e.to_string()
+    };
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let cap = group.cross_tenant_cap();
+    let as_firm = group
+        .stage(|tx| {
+            let firm = tx.admit_scope(Id::<Firm>::from_raw(7), &admission);
+            Ok::<_, ApiError>((
+                firm.get::<firm_note::Note>(Id::from_raw(1))
+                    .map(|note| note.map(|note| note.text))
+                    .map_err(refused),
+                firm.scan::<firm_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                firm.scan_by::<firm_note::Note>("text", &"Team 7's note".to_string())
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                firm.scan_from::<firm_note::Note>(0, 10)
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            ))
+        })
+        .unwrap();
+    let across = group
+        .stage(|tx| {
+            Ok::<_, ApiError>(
+                tx.across_tenants::<Firm>(&cap)
+                    .scan::<firm_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            )
+        })
+        .unwrap();
+    let as_team = group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(7), &admission)
+                .get::<Note>(Id::from_raw(1))
+                .map(|note| note.map(|note| note.text))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+    assert_eq!(
+        (as_firm, across, as_team),
+        (
+            (
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::get")),
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::scan")),
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::scan_by")),
+                Err(note_read_refusal::<firm_note::Note>("ScopedTx::scan_from")),
+            ),
+            Err(note_read_refusal::<firm_note::Note>(
+                "across_tenants().scan"
+            )),
+            Some("Team 7's note".to_string()),
+        )
+    );
+}
+
+/// A route that reads through `firm_note::Note`, whose table is registered
+/// as `Note`, and returns the read's error with `?`.
+#[route(GET "/firm-note/:firm", public(Firm))]
+fn read_firm_note(tx: &mut Tx, firm: Id<Firm>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Firm>(firm, ctx)?;
+    let note = tx.get::<firm_note::Note>(Id::from_raw(1))?;
+    Ok(WireU64(note.map_or(0, |note| note.id.raw())))
+}
+
+/// Final review triage T9, GUIDE §4's claim at the route: a handler that
+/// returns a `TableReadRefusal` with `?` answers a 500 whose body carries
+/// the refusal's own text, as a `TableWriteRefusal` does.
+#[test]
+fn a_route_returning_a_read_refusal_answers_a_500_with_its_text() {
+    let sim = Sim::with_faults(0x5A17_0014, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![read_firm_note]);
+    let refused = get(&mut app, "/firm-note/7");
+    assert_eq!(refused.status, 500, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        note_read_refusal::<firm_note::Note>("ScopedTx::get")
+    );
+}
+
+/// `Note` declared `global`: the same identifier and fields, so the same
+/// `TABLE`, and no tenant at all. Its reads are `Tx`'s own `View` reads.
+mod global_note {
+    use super::*;
+
+    #[table(global)]
+    pub(super) struct Note {
+        pub(super) id: Id<Note>,
+        pub(super) text: String,
+    }
+}
+
+/// Amendment A18 on `Tx`'s own `View` reads (S1 amendment review I2). An
+/// unscoped read keys on the table name and `UNSCOPED`, which is 0. Once the
+/// row is in the store, a `global` type naming a scoped table fails to open it
+/// (`unscoped_open_err`). Before commit, `Tx` reads the transaction's and the
+/// group's overlays first, so `global_note::Note` read `Team` 0's note staged
+/// earlier in the same batch. Each of the four reads is refused before it
+/// reads and returns nothing; the registered type still reads `Team` 0's row.
+/// `global_note::Note` declares no index, so without the check `scan_by`
+/// panics naming the missing index.
+#[test]
+fn a_transactions_read_through_a_global_twin_is_refused_before_commit() {
+    let sim = Sim::with_faults(0x5A17_0013, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(0), &admission)
+                .put(&Note {
+                    id: Id::from_raw(1),
+                    text: "Team 0's note".to_string(),
+                });
+            Ok::<(), ApiError>(())
+        })
+        .unwrap();
+    let refused = |e: std::io::Error| {
+        assert!(
+            TableReadRefusal::of(&e).is_some(),
+            "a TableReadRefusal, not another io error: {e}"
+        );
+        e.to_string()
+    };
+    let in_batch = group
+        .stage(|tx| {
+            Ok::<_, ApiError>((
+                tx.get::<global_note::Note>(Id::from_raw(1))
+                    .map(|note| note.map(|note| note.text))
+                    .map_err(refused),
+                tx.scan::<global_note::Note>()
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                tx.scan_by::<global_note::Note>("text", &"Team 0's note".to_string())
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+                tx.scan_from::<global_note::Note>(0, 10)
+                    .map(|notes| notes.len())
+                    .map_err(refused),
+            ))
+        })
+        .unwrap();
+    let as_team = group
+        .stage(|tx| {
+            tx.admit_scope(Id::<Team>::from_raw(0), &admission)
+                .get::<Note>(Id::from_raw(1))
+                .map(|note| note.map(|note| note.text))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    group
+        .commit()
+        .unwrap_or_else(|f| panic!("commit: {}", f.error));
+    assert_eq!(
+        (in_batch, as_team),
+        (
+            (
+                Err(note_read_refusal::<global_note::Note>("Tx::get")),
+                Err(note_read_refusal::<global_note::Note>("Tx::scan")),
+                Err(note_read_refusal::<global_note::Note>("Tx::scan_by")),
+                Err(note_read_refusal::<global_note::Note>("Tx::scan_from")),
+            ),
+            Some("Team 0's note".to_string()),
+        )
+    );
+}
+
+/// Amendment A18's refusal where `Debug` renders it (hard rule 5). An
+/// `io::Error`'s `Debug` is what `main`'s `Error: …`, an `.unwrap()`'s panic
+/// and GUIDE §8's sim check (`Err(e) => return Err(format!("{e:?}"))`) print,
+/// so a `TableReadRefusal` there must print exactly as an `io::Error`
+/// carrying its text alone does (`Refusal`'s `Debug`): the table, both types
+/// and the fix, never an empty `error: `.
+#[test]
+fn a_read_refusal_prints_its_text_under_debug() {
+    let sim = Sim::with_faults(0x5A17_0015, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Note>(),
+    )
+    .unwrap();
+    let refused = db
+        .transact(|tx| tx.get::<global_note::Note>(Id::from_raw(1)).map(|_| ()))
+        .unwrap_err();
+    let TxError::App(e) = &refused else {
+        panic!("the read's own io::Error, returned through the closure: {refused:?}")
+    };
+    assert!(TableReadRefusal::of(e).is_some(), "a TableReadRefusal: {e}");
+    let text = note_read_refusal::<global_note::Note>("Tx::get");
+    let bare = TxError::<std::io::Error>::App(std::io::Error::other(text));
+    assert_eq!(format!("{refused:?}"), format!("{bare:?}"));
+}
+
 // ------------------------------------------ the statuspage regression (oracle 3)
 
 /// Job-tenancy spec §9 item 3. The statuspage experiment's tenant policy, in
@@ -1692,6 +2033,7 @@ mod statuspage {
     }
 
     impl Tenant for Org {
+        const NAME: &'static str = "Org";
         type Who = Principal;
         type Error = ApiError;
 
@@ -1759,15 +2101,725 @@ fn statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_wri
     // the guide's text here.
     assert_eq!(
         error_text(&refused),
-        "authentication required — `POST /orgs/:org/incidents` is declared `public` and \
-         opened the tenant scope `Org` for a caller with no credential; only a route declared \
-         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
-         charpente_session cookie, or, if every caller may act inside this tenant here, \
-         declare `#[route(POST \"/orgs/:org/incidents\", public(Org))]`"
+        format!(
+            "authentication required — `POST /orgs/:org/incidents` is declared `public` and \
+             opened the tenant scope `Org` for a caller with no credential; only a route \
+             declared `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Org)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Org` is the tenant type `{}`",
+            std::any::type_name::<statuspage::Org>()
+        )
     );
     assert_eq!(
         app.db().last_applied(),
         None,
         "the store is unchanged: no incident, and no record of one"
     );
+}
+
+// ------------------------------------- a scope type renders as its NAME
+
+/// Two tenant types spelled `Org`, in two modules, with two NAMEs
+/// (tenancy-completion spec §4). `authorize` answers `Ok` for everyone:
+/// every test below is about a caller with no credential, and `authorize`
+/// is never asked about one.
+mod billing {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        const NAME: &'static str = "BillingOrg";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+mod crm {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        const NAME: &'static str = "CrmOrg";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+/// A generic tenant type: its one impl gives every instantiation one NAME.
+mod wrapped {
+    use std::marker::PhantomData;
+
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Wrap<B>(PhantomData<B>);
+
+    impl<B: 'static> Tenant for Wrap<B> {
+        const NAME: &'static str = "Wrap";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Wrap<B>>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    pub struct Alpha;
+
+    pub struct Gamma;
+}
+
+/// Declared `public(billing::Org)`, but it opens `crm::Org`. Rule 3 applies
+/// to a caller with no credential, and the 401 must tell the two `Org`s
+/// apart. Path-parameter-free: `Id<S>` is a wire type only for `S: Row`.
+#[route(POST "/crm-leads", public(billing::Org))]
+fn write_crm_lead(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<crm::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+/// Opens a tenant of a generic tenant type on a plain `public` route.
+#[route(POST "/wrapped", public)]
+fn write_wrapped(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<wrapped::Wrap<wrapped::Alpha>>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+fn rendering_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![write_crm_lead, write_wrapped]);
+    (sim, app)
+}
+
+/// Spec §4 and the re-review's NB1 (a), at the 401: the route's stance and
+/// the scope it opened are two different types spelled `Org`. Each is named
+/// by its NAME, and the fix gives each NAME its type's path, since neither
+/// NAME is source text (final review M7): the route is written
+/// `public(billing::Org)`, and the fix is `public(crm::Org)`.
+#[test]
+fn the_401_tells_two_tenant_types_spelled_alike_apart_by_their_names() {
+    let (_sim, mut app) = rendering_app(0x7E4A_1710);
+    let refused = app.handle(Request::new(Method::Post, "/crm-leads"));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        format!(
+            "authentication required — `POST /crm-leads` is declared `public(BillingOrg)` and \
+             opened the tenant scope `CrmOrg` for a caller with no credential; only a route \
+             declared `public(CrmOrg)` admits one. Send \"Authorization: Bearer <token>\" or \
+             the charpente_session cookie, or, if every caller may act inside this tenant \
+             here, declare `public(CrmOrg)` in place of `public(BillingOrg)` in this route's \
+             `#[route(…)]` attribute, keeping its other flags. A tenant type is named here by \
+             its NAME; name the type in the attribute: `CrmOrg` is the tenant type `{}`, and \
+             `BillingOrg` is `{}`",
+            std::any::type_name::<crm::Org>(),
+            std::any::type_name::<billing::Org>()
+        )
+    );
+}
+
+/// Spec §4 and NB1 (b), at the 401: a generic tenant type renders its NAME,
+/// never a cut of its `type_name` (`Alpha>`). The path beside it is the whole
+/// `type_name`, generic arguments and all.
+#[test]
+fn the_401_names_a_generic_tenant_type_by_its_name() {
+    let (_sim, mut app) = rendering_app(0x7E4A_1711);
+    let refused = app.handle(Request::new(Method::Post, "/wrapped"));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        format!(
+            "authentication required — `POST /wrapped` is declared `public` and opened the \
+             tenant scope `Wrap` for a caller with no credential; only a route declared \
+             `public(Wrap)` admits one. Send \"Authorization: Bearer <token>\" or the \
+             charpente_session cookie, or, if every caller may act inside this tenant here, \
+             declare `public(Wrap)` in place of `public` in this route's `#[route(…)]` \
+             attribute, keeping its other flags. A tenant type is named here by its NAME; \
+             name the type in the attribute: `Wrap` is the tenant type `{}`",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
+        )
+    );
+}
+
+// --------------------------------------------- one NAME, one tenant type
+
+/// Two tenant types that both follow the convention, `NAME` = identifier, and
+/// so both claim `"Org"` (tenancy-completion spec §4). An app that names both,
+/// through any two of its mount paths, is refused before it serves.
+mod twins {
+    pub mod north {
+        use charpente::auth::Principal;
+        use charpente::http::ApiError;
+        use charpente::{Id, Tenant, Tx};
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "Org";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                Ok(())
+            }
+        }
+    }
+
+    pub mod south {
+        use charpente::auth::Principal;
+        use charpente::http::ApiError;
+        use charpente::{Id, Tenant, Tx};
+
+        pub struct Org;
+
+        impl Tenant for Org {
+            const NAME: &'static str = "Org";
+            type Who = Principal;
+            type Error = ApiError;
+            fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A tenant type whose `NAME` names nothing.
+mod nameless {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::{Id, Tenant, Tx};
+
+    pub struct Org;
+
+    impl Tenant for Org {
+        const NAME: &'static str = "";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+}
+
+#[table(scoped_by = twins::north::Org)]
+struct NorthBill {
+    id: Id<NorthBill>,
+    cents: u64,
+}
+
+#[table(scoped_by = twins::south::Org)]
+struct SouthLead {
+    id: Id<SouthLead>,
+    cents: u64,
+}
+
+#[table(scoped_by = nameless::Org)]
+struct Unnamed {
+    id: Id<Unnamed>,
+    cents: u64,
+}
+
+#[route(POST "/south-leads", public(twins::south::Org))]
+fn open_south_lead(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let _tx = tx.scope::<twins::south::Org>(Id::from_raw(1), ctx)?;
+    Ok(WireU64(1))
+}
+
+#[job(scoped_by = twins::south::Org)]
+struct Nurture {
+    n: u64,
+}
+
+impl Nurture {
+    fn run(self, tx: &mut ScopedTx<'_, '_, twins::south::Org>) -> Result<(), JobError> {
+        let _ = (self.n, tx.scope());
+        Ok(())
+    }
+}
+
+/// One generic tenant impl, two instantiations: one NAME, `"Wrap"`, for two
+/// types. The Review Focus case.
+#[table(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaNote {
+    id: Id<AlphaNote>,
+    cents: u64,
+}
+
+#[table(scoped_by = wrapped::Wrap<wrapped::Gamma>)]
+struct GammaNote {
+    id: Id<GammaNote>,
+    cents: u64,
+}
+
+/// `public(Wrap<Alpha>)`: every caller may act inside the `Wrap<Alpha>` it
+/// opens. It writes the table and enqueues the job that name the same type.
+#[route(POST "/alpha-notes", public(wrapped::Wrap<wrapped::Alpha>))]
+fn open_alpha_note(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let mut tx = tx.scope::<wrapped::Wrap<wrapped::Alpha>>(Id::from_raw(1), ctx)?;
+    tx.put(&AlphaNote {
+        id: Id::from_raw(1),
+        cents: 5,
+    });
+    tx.enqueue(AlphaDigest { n: 1 });
+    Ok(WireU64(1))
+}
+
+#[job(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaDigest {
+    n: u64,
+}
+
+impl AlphaDigest {
+    fn run(self, tx: &mut ScopedTx<'_, '_, wrapped::Wrap<wrapped::Alpha>>) -> Result<(), JobError> {
+        let _ = (self.n, tx.scan::<AlphaNote>()?);
+        Ok(())
+    }
+}
+
+fn identity_app(sim: &Sim, schema: Schema) -> App {
+    App::open(
+        Box::new(sim.disk()),
+        schema,
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+}
+
+/// Runs an app's mount calls and returns what they panicked with.
+fn mount_refusal(build: impl FnOnce() -> App) -> String {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(build());
+    }))
+    .expect_err("the app mounted two tenant types under one NAME, or a nameless one");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "a panic payload that is not a String".to_string())
+}
+
+/// The uniqueness refusal, spelled out here rather than taken from the
+/// product's `format!`, so the comparison pins the words.
+fn two_named(name: &str, first: &str, second: &str) -> String {
+    format!(
+        "two tenant types are named \"{name}\": {first} and {second} — a tenant's NAME is its \
+         identity (it is inside every scoped job's and event's fingerprint), so give each type \
+         its own `const NAME` in its `impl Tenant`"
+    )
+}
+
+/// The two twins' full `type_name`s, in the order a refusal names them.
+fn north_then_south() -> (&'static str, &'static str) {
+    (
+        std::any::type_name::<twins::north::Org>(),
+        std::any::type_name::<twins::south::Org>(),
+    )
+}
+
+/// Two scoped tables. `App::open` notes them in `TABLE` order, so the first
+/// type named is `NorthBill`'s.
+#[test]
+fn two_tenant_types_under_one_name_are_refused_when_their_tables_open() {
+    let sim = Sim::with_faults(0x7E4A_1712, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(
+            &sim,
+            Schema::new().table::<NorthBill>().table::<SouthLead>(),
+        )
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+/// A scoped table, then a `public(S)` route of the other type.
+#[test]
+fn a_public_route_naming_a_second_tenant_type_under_one_name_is_refused_at_mount() {
+    let sim = Sim::with_faults(0x7E4A_1713, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(&sim, Schema::new().table::<NorthBill>()).mount(routes![open_south_lead])
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+/// A scoped table, then a scoped job of the other type.
+#[test]
+fn a_scoped_job_naming_a_second_tenant_type_under_one_name_is_refused_at_mount() {
+    let sim = Sim::with_faults(0x7E4A_1714, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(&sim, Schema::new().table::<NorthBill>()).mount_jobs(jobs![Nurture])
+    });
+    let (north, south) = north_then_south();
+    assert_eq!(refusal, two_named("Org", north, south));
+}
+
+#[test]
+fn a_tenant_type_with_an_empty_name_is_refused_when_its_table_opens() {
+    let sim = Sim::with_faults(0x7E4A_1715, FaultConfig::none());
+    let refusal = mount_refusal(|| identity_app(&sim, Schema::new().table::<Unnamed>()));
+    assert_eq!(
+        refusal,
+        format!(
+            "tenant type {} has an empty NAME — give its `impl Tenant` a `const NAME` that \
+             names it",
+            std::any::type_name::<nameless::Org>()
+        )
+    );
+}
+
+/// Review Focus: a generic tenant impl gives every instantiation one NAME.
+/// An app that mounts two instantiations mounts two tenant types under
+/// `"Wrap"`, and the refusal names both in full, since their NAME cannot
+/// tell them apart.
+#[test]
+fn two_instantiations_of_one_generic_tenant_type_are_refused_naming_both() {
+    let sim = Sim::with_faults(0x7E4A_1716, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        identity_app(
+            &sim,
+            Schema::new().table::<AlphaNote>().table::<GammaNote>(),
+        )
+    });
+    assert_eq!(
+        refusal,
+        two_named(
+            "Wrap",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>(),
+            std::any::type_name::<wrapped::Wrap<wrapped::Gamma>>()
+        )
+    );
+}
+
+/// The positive control. One tenant type, `Wrap<Alpha>`, named through every
+/// mount path that exists: a scoped table (`App::open`), a `public(S)` route
+/// (`mount`) and a scoped job (`mount_jobs`). The app mounts, serves, and
+/// renders the type as `"Wrap"`. A check that refused any second sighting,
+/// not only a second type, would fail here.
+#[test]
+fn one_tenant_type_named_through_a_table_a_route_and_a_job_mounts() {
+    let sim = Sim::with_faults(0x7E4A_1717, FaultConfig::none());
+    let mut app = identity_app(&sim, Schema::new().table::<AlphaNote>())
+        .mount(routes![open_alpha_note])
+        .mount_jobs(jobs![AlphaDigest]);
+    let c = app.describe();
+    let route = c
+        .routes
+        .iter()
+        .find(|r| r.name == "open_alpha_note")
+        .unwrap();
+    assert_eq!(route.public_scope, Some("Wrap"));
+    let job = c.jobs.iter().find(|j| j.name == "AlphaDigest").unwrap();
+    assert_eq!(job.scoped_by, Some("Wrap"));
+    let served = app.handle(Request::new(Method::Post, "/alpha-notes"));
+    assert_eq!(served.status, 200, "{}", body_text(&served));
+}
+
+/// The same `type_name` under one NAME with two `TypeId`s is not two tenant
+/// types: a hand-built `JobDef` whose `scope_type` names a different type
+/// than its `scope_type_name` and `scoped_by` do. The refusal must name that
+/// cause, not prescribe a second `const NAME` for one type.
+#[test]
+fn a_jobdef_whose_scope_type_disagrees_with_its_type_name_is_refused_naming_the_cause() {
+    let sim = Sim::with_faults(0x7E4A_1718, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        let mut def = <AlphaDigest as charpente::kernel::JobEntry>::def();
+        def.scope_type = std::any::TypeId::of::<wrapped::Wrap<wrapped::Gamma>>();
+        identity_app(&sim, Schema::new().table::<AlphaNote>()).mount_jobs(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "two registrations of the tenant type {} (NAME \"Wrap\") are different types — a \
+             hand-built `JobDef` or `EventDef` whose `scope_type` and `scope_type_name` name \
+             different types (build it from its `#[job]`'s or `#[event]`'s `def()`, or set both \
+             fields from the type its `scoped_by` names), or two versions of one crate in the \
+             build (unify them)",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
+        )
+    );
+}
+
+/// The event twin of the case above (Task 11 fix round 1, review I1). Every
+/// `EventDef` field is public, so an app can hand-build one whose
+/// `scope_type` disagrees with its `scope_type_name`. `mount_events` hands
+/// it to the same census, whose refusal must name the `EventDef` as the
+/// cause it can be.
+#[event(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+struct AlphaNoted {
+    n: WireU64,
+}
+
+#[test]
+fn an_eventdef_whose_scope_type_disagrees_with_its_type_name_is_refused_naming_the_cause() {
+    use charpente::describe::EventEntry;
+
+    let sim = Sim::with_faults(0x7E4A_1719, FaultConfig::none());
+    let refusal = mount_refusal(|| {
+        let mut def = <AlphaNoted as EventEntry>::def();
+        def.scope_type = std::any::TypeId::of::<wrapped::Wrap<wrapped::Gamma>>();
+        identity_app(&sim, Schema::new().table::<AlphaNote>()).mount_events(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "two registrations of the tenant type {} (NAME \"Wrap\") are different types — a \
+             hand-built `JobDef` or `EventDef` whose `scope_type` and `scope_type_name` name \
+             different types (build it from its `#[job]`'s or `#[event]`'s `def()`, or set both \
+             fields from the type its `scoped_by` names), or two versions of one crate in the \
+             build (unify them)",
+            std::any::type_name::<wrapped::Wrap<wrapped::Alpha>>()
+        )
+    );
+}
+
+/// Review M2 (hard rule 4): an `EventDef` whose `scoped_by` and
+/// `scope_type` disagree is refused at `mount_events`, naming the event,
+/// both fields and the fix, in both directions. A scoped type with no
+/// `scoped_by` would otherwise skip the census and be described as global,
+/// and a `scoped_by` over `Unscoped` would put a non-tenant in the census.
+#[test]
+fn an_eventdef_whose_scoped_by_and_scope_type_disagree_is_refused_at_mount() {
+    use charpente::describe::EventEntry;
+
+    let sim = Sim::with_faults(0x7E4A_171A, FaultConfig::none());
+    let unscoped = std::any::type_name::<charpente::core::table::Unscoped>();
+    let refusal = mount_refusal(|| {
+        let mut def = <noted_org::Noted as EventEntry>::def();
+        def.scoped_by = None;
+        identity_app(&sim, Schema::new()).mount_events(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "contract: event \"noted\" was mounted with `scoped_by: None` and `scope_type` {} \
+             — an `EventDef` names its tenant in both, or, for a global event, in neither \
+             (`Unscoped`), so this hand-built def would skip the tenant census and be \
+             described as global; fix: build it from its `#[event]`'s `def()`, or set \
+             `scoped_by`, `scope_type` and `scope_type_name` from the one type its `type \
+             Scope` names",
+            std::any::type_name::<Org>()
+        )
+    );
+    let refusal = mount_refusal(|| {
+        let mut def = <noted_global::Noted as EventEntry>::def();
+        def.scoped_by = Some("Org");
+        identity_app(&sim, Schema::new()).mount_events(vec![def])
+    });
+    assert_eq!(
+        refusal,
+        format!(
+            "contract: event \"noted\" was mounted with `scoped_by: Some(\"Org\")` and \
+             `scope_type` {unscoped} — an `EventDef` names its tenant in both, or, for a global \
+             event, in neither (`Unscoped`), so this hand-built def would enter the tenant \
+             census under a type that is no tenant; fix: build it from its `#[event]`'s \
+             `def()`, or set `scoped_by`, `scope_type` and `scope_type_name` from the one type \
+             its `type Scope` names"
+        )
+    );
+}
+
+// ----------------------------------------- event tenancy (spec §4, §6)
+
+/// Three events with one `NAME` ("noted") and one field list: a global one,
+/// one scoped by `Org`, one scoped by `Team`. Only their declarations
+/// differ, so only their fingerprints can tell their rows apart.
+mod noted_global {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(global)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+mod noted_org {
+    use super::Org;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    /// `pub(super)`, not `pub`: the root `Org` is private, and an `impl
+    /// Event`'s `type Scope` may not name a type less visible than the event
+    /// (E0446).
+    #[event(scoped_by = Org)]
+    pub(super) struct Noted {
+        pub n: WireU64,
+    }
+}
+
+mod noted_team {
+    use super::Team;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    /// `pub(super)` for `noted_org::Noted`'s reason.
+    #[event(scoped_by = Team)]
+    pub(super) struct Noted {
+        pub n: WireU64,
+    }
+}
+
+/// Scoped by Task 2's `billing::Org`, whose `NAME` ("BillingOrg") is not its
+/// identifier. Every other tenant type here follows A4 (`NAME` equals the
+/// identifier), so this is the one case that tells "mixes the tenant's
+/// `NAME`" from "mixes the scope type's final `::` component", which is
+/// `Org` here.
+mod noted_billing {
+    use super::billing::Org;
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event(scoped_by = Org)]
+    pub struct Noted {
+        pub n: WireU64,
+    }
+}
+
+/// Tenancy-completion spec §4, §6: a scoped event's fingerprint is its
+/// fields' fold continued by `scoped_fingerprint` with its tenant's `NAME`.
+/// A `global` event and its `scoped_by` twin never share a shape. Nor do two
+/// same-named events scoped by two tenant types whose raw ids may coincide,
+/// which is what closes DESIGN §8's shared-raw-id limit for events. The
+/// literals are FNV-1a over `"n\0WireU64\0"`, then continued over
+/// `"#scoped_by\0Org\0"` and `"#scoped_by\0Team\0"`. They were computed
+/// independently of the macro. The `scoped_fingerprint` lines pin the
+/// operands, the fold and the `NAME`, and not only that the values differ.
+/// The `billing` lines pin that the operand is the `NAME`, not a spelling
+/// of the path, in the fingerprint and in the def that `describe` and the
+/// tenant census read. `PAYLOAD_FINGERPRINT` is the bare fold for all four
+/// (Task 11 fix round 1).
+#[test]
+fn a_scoped_events_fingerprint_mixes_its_tenants_name() {
+    use charpente::describe::EventEntry;
+
+    let global = <noted_global::Noted as Event>::FINGERPRINT;
+    let org = <noted_org::Noted as Event>::FINGERPRINT;
+    let team = <noted_team::Noted as Event>::FINGERPRINT;
+    let billing = <noted_billing::Noted as Event>::FINGERPRINT;
+    assert_eq!(
+        global, 0x9caf_3f93_9b10_65e1,
+        "a global event's is the bare fold"
+    );
+    assert_eq!(org, 0xeb60_a110_53ba_40dc);
+    assert_eq!(team, 0x4874_6e82_94a2_6e7d);
+    assert_eq!(
+        org,
+        charpente::core::db::scoped_fingerprint(global, <Org as Tenant>::NAME),
+        "the fold continued by the tenant's NAME, and nothing else"
+    );
+    assert_eq!(
+        billing,
+        charpente::core::db::scoped_fingerprint(global, "BillingOrg"),
+        "billing::Org's NAME, never the `Org` its path is spelled with"
+    );
+    assert_ne!(billing, org, "billing::Org and Org are two tenants");
+    assert_eq!(
+        (
+            <noted_global::Noted as Event>::PAYLOAD_FINGERPRINT,
+            <noted_org::Noted as Event>::PAYLOAD_FINGERPRINT,
+            <noted_team::Noted as Event>::PAYLOAD_FINGERPRINT,
+            <noted_billing::Noted as Event>::PAYLOAD_FINGERPRINT
+        ),
+        (global, global, global, global),
+        "every one states the bare fold as its payload fold, which the emit and \
+         subscribe sites check its FINGERPRINT against"
+    );
+    assert_eq!(
+        <noted_billing::Noted as EventEntry>::def().scoped_by,
+        Some("BillingOrg"),
+        "the def names the tenant by NAME too"
+    );
+    assert_eq!(
+        (
+            <noted_global::Noted as Event>::NAME,
+            <noted_org::Noted as Event>::NAME,
+            <noted_team::Noted as Event>::NAME,
+            <noted_billing::Noted as Event>::NAME
+        ),
+        ("noted", "noted", "noted", "noted"),
+        "one NAME: only the fingerprint tells the four apart"
+    );
+}
+
+/// An `Org` of another module, under the root `Org`'s `NAME`. This is what an
+/// app gets when two modules each declare a tenant type and both follow the
+/// identifier convention. Named through an event beside the root `Org`, it
+/// must be refused at mount like the table, route and job cases Task 3 pins.
+/// (Not `billing`: Task 2's `billing::Org` in this file is named
+/// "BillingOrg" on purpose, and a second module of that name would clash.)
+mod accounts {
+    use charpente::auth::Principal;
+    use charpente::http::ApiError;
+    use charpente::wire::WireU64;
+    use charpente::{Id, Tenant, Tx, event, table};
+
+    #[table(global)]
+    pub struct Org {
+        pub id: Id<Org>,
+        pub name: String,
+    }
+
+    impl Tenant for Org {
+        const NAME: &'static str = "Org";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    #[event(scoped_by = Org)]
+    pub struct InvoiceNoted {
+        pub n: WireU64,
+    }
+}
+
+/// Tenancy-completion spec §4: an event's scope joins the mount-time tenant
+/// census. `memo_app` already names the root `Org` (`Memo`'s scope, and its
+/// `public(Org)` routes). `accounts::InvoiceNoted` names `accounts::Org` under
+/// the same `NAME`. The two types would share every scoped fingerprint's
+/// tenant half, so the app is refused at this call, before it serves, by
+/// name, with both full type names. The literal is Task 3's pinned text,
+/// spelled out here.
+#[test]
+#[should_panic(
+    expected = "two tenant types are named \"Org\": tenant::Org and tenant::accounts::Org — a \
+                tenant's NAME is its identity (it is inside every scoped job's and event's \
+                fingerprint), so give each type its own `const NAME` in its `impl Tenant`"
+)]
+fn an_event_scoped_by_a_second_type_under_one_name_is_refused_at_mount() {
+    let (_sim, app) = memo_app(0x7E4A_E7E1);
+    let _ = app.mount_events(events![accounts::InvoiceNoted]);
+}
+
+/// The control: one tenant type, named through a table (`Memo`), the
+/// `public(Org)` routes and a scoped event (`MemoNoted`), is one tenant and
+/// mounts. Without it, a census that refused every scoped event would pass
+/// the test above.
+#[test]
+fn an_event_scoped_by_the_apps_own_tenant_type_mounts() {
+    let (_sim, app) = memo_app(0x7E4A_E7E2);
+    let app = app.mount_events(events![MemoNoted]);
+    let events: Vec<&str> = app.describe().events.iter().map(|e| e.name).collect();
+    assert_eq!(events, vec!["memo_noted"]);
 }

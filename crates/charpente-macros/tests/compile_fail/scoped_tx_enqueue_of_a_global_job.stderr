@@ -1,19 +1,19 @@
 error[E0271]: type mismatch resolving `<Audit as Job>::Scope == Org`
-  --> tests/compile_fail/scoped_tx_enqueue_of_a_global_job.rs:38:16
+  --> tests/compile_fail/scoped_tx_enqueue_of_a_global_job.rs:39:16
    |
-38 |     tx.enqueue(Audit {});
+39 |     tx.enqueue(Audit {});
    |        ------- ^^^^^^^^ type mismatch resolving `<Audit as Job>::Scope == Org`
    |        |
    |        required by a bound introduced by this call
    |
 note: expected this to be `Org`
-  --> tests/compile_fail/scoped_tx_enqueue_of_a_global_job.rs:22:1
+  --> tests/compile_fail/scoped_tx_enqueue_of_a_global_job.rs:23:1
    |
-22 | #[job(global)]
+23 | #[job(global)]
    | ^^^^^^^^^^^^^^
 note: required by a bound in `ScopedTx::<'_, 'a, S>::enqueue`
   --> $WORKSPACE/crates/charpente-core/src/db.rs
    |
-   |     pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J) {
+   |     pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J)
    |                           ^^^^^^^^^ required by this bound in `ScopedTx::<'_, 'a, S>::enqueue`
    = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)

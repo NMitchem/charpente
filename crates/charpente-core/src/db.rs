@@ -14,19 +14,23 @@
 //! `0x08 [job][payload][key: Option<String>][shape: u64 le]` shaped enqueue,
 //! `0x09 [event][payload][key: Option<String>][shape: u64 le]` shaped emit,
 //! `0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
-//! scoped enqueue, for a `#[job(scoped_by = …)]` job (job-tenancy spec §6) —
-//! strings and byte fields length-prefixed per the `Codec` layout; `0x0b` is
+//! scoped enqueue, for a `#[job(scoped_by = …)]` job (job-tenancy spec §6),
+//! `0x0b [event][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
+//! scoped emit, an event emitted on a `ScopedTx` (tenancy-completion spec §6)
+//! — strings and byte fields length-prefixed per the `Codec` layout; `0x0c` is
 //! the next free tag. `0x02`/`0x03` (the same without the shape) still
 //! decode, with the shape unknown, and are never written — `TxEffects` holds
 //! a bare shape, so a shapeless enqueue or emit cannot be represented.
-//! `0x05`/`0x06`/`0x07` and `0x0a` are the ONLY tags that carry a
+//! `0x05`/`0x06`/`0x07`, `0x0a` and `0x0b` are the ONLY tags that carry a
 //! scope. A table effect's is chosen by the table's own `Row::Scope`, not by
 //! the scope value (tenant 0 is a legal tenant, so a scoped table's records
 //! always use `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at
 //! scope 0). A scoped enqueue is `0x0a` rather than a widened `0x08` for the
 //! same reason, chosen by the job's own `Job::Scope` through the enqueue
-//! family, and the same presence-not-value rule applies: an enqueue carrying
-//! `Some(0)` is `0x0a`.
+//! family; a scoped emit is `0x0b` rather than a widened `0x09`, chosen by the
+//! `ScopedTx` it was emitted on. The same presence-not-value rule applies to
+//! both: an enqueue or emit carrying `Some(0)` is `0x0a` or `0x0b`. An emit's
+//! tenant is never folded into its key, which stays the app's own filter.
 //! A binary that does not know a tag refuses it by name (`decode_record`'s
 //! unknown-tag error) rather than misreading a wider record. `0x07` is a
 //! NEW tag rather than a widened `0x04`, the same choice `0x05`/`0x06` made
@@ -50,8 +54,8 @@ use crate::io::{Disk, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
-    Codec, Id, IndexDef, Rejection, Row, RowShape, Snapshot, Store, StoreRejected, UnscopedJob,
-    UnscopedRow, View, WritableRow, Writer,
+    Codec, Id, IndexDef, ReadableBy, Rejection, Row, RowShape, Snapshot, Store, StoreRejected,
+    UnscopedEvent, UnscopedJob, UnscopedRow, View, WritableRow, Writer,
 };
 
 // ---------------------------------------------------------------- config
@@ -98,8 +102,10 @@ impl Default for DbConfig {
 pub trait Job: Codec {
     const NAME: &'static str;
     /// The payload's structural fingerprint — `#[job]` computes it from the
-    /// fields (the helper `#[table]` uses). Recorded beside every enqueue. A
-    /// Pending job is decoded only by a binary whose `FINGERPRINT` matches:
+    /// fields (the helper `#[table]` uses). A `#[job(scoped_by = Org)]` job's
+    /// continues that fold over `Org`'s `Tenant::NAME` (`scoped_fingerprint`),
+    /// so its tenant's identity is part of its shape. Recorded beside every
+    /// enqueue. A Pending job is decoded only by a binary whose `FINGERPRINT` matches:
     /// a Pending job of a foreign shape is refused before dispatch can start
     /// (`Db::pending_job_shape_refusal`), an enqueue under another shape of a
     /// mounted name refuses its transaction (`Group::stage`), and dispatch
@@ -119,13 +125,38 @@ pub trait Job: Codec {
 /// A realtime event (DESIGN.md §6). Emits materialize into `charpente.events`
 /// at apply, the same way enqueues materialize `JobRow` — subscribers read
 /// through the ranged scan (`View::scan_from`), not the log directly.
-/// v0: implemented by hand; `#[event]` will derive it.
+/// `#[event(global)]` and `#[event(scoped_by = Org)]` derive it; a hand-written
+/// impl states all three items below.
 pub trait Event: Codec {
     const NAME: &'static str;
     /// The payload's structural fingerprint, as for `Job::FINGERPRINT`:
     /// recorded beside every emit. Delivery decodes a stored event only
-    /// under the shape it was written with (payload-shapes spec §3).
+    /// under the shape it was written with (payload-shapes spec §3). For a
+    /// `#[event(scoped_by = Org)]` event it also covers the tenant's
+    /// `Tenant::NAME` (`scoped_fingerprint`), so a change of tenancy is a
+    /// change of shape.
     const FINGERPRINT: u64;
+    /// The payload's own field fold, before any tenant is mixed in. For a
+    /// `#[event(global)]` event it is `FINGERPRINT` itself, which is the
+    /// default, so a global hand-written impl states only `FINGERPRINT`. For a
+    /// `#[event(scoped_by = Org)]` event, `FINGERPRINT` is
+    /// `scoped_fingerprint(PAYLOAD_FINGERPRINT, <Org as Tenant>::NAME)`.
+    /// Every typed emit and subscribe site checks that equation at build
+    /// time, against the tenant its own bound names
+    /// (`refuse_scoped_event_shape`, `refuse_global_event_shape`). So a
+    /// hand-written impl cannot carry another tenant type's `FINGERPRINT` into
+    /// its own tenant's feed, which the declared bound alone would let it do,
+    /// except by a `PAYLOAD_FINGERPRINT` computed so that its mix collides
+    /// (FNV-1a is not a cryptographic hash): a bypass built on purpose in app
+    /// code, which no type check refuses. A hand-written scoped impl states
+    /// both constants; left at its default, this one fails the check.
+    const PAYLOAD_FINGERPRINT: u64 = Self::FINGERPRINT;
+    /// The tenant scope type a `#[event(scoped_by = Org)]` event belongs to,
+    /// or `Unscoped` for a `#[event(global)]` one (tenancy-completion spec
+    /// §6). No default, for `Job::Scope`'s reason: a hand-written impl states
+    /// it, or it would slip past the emit and subscribe bounds unseen.
+    /// `'static` because `push_emit` compares it by `TypeId`.
+    type Scope: 'static;
 }
 
 /// Why a transaction did not return `Ok`: the application's own rejection,
@@ -336,6 +367,43 @@ impl TableWriteRefusal {
     }
 }
 
+/// A read the `Schema` disagrees with about its table's `Row` type
+/// (tenancy-completion amendment A18): a `Tx` or `ScopedTx` read, or an
+/// `across_tenants` scan, through a Rust type other than the one
+/// `Schema::table` registered under its `TABLE`, compared by `TypeId`. A read
+/// keys on the table name and the raw scope id, so before this check a
+/// same-named type with another `scoped_by` read the registered scope type's
+/// tenant of the same id, and a `#[table(global)]` one read tenant 0's rows
+/// staged earlier in its own batch (`UNSCOPED` is 0). Returned by the read
+/// itself, before it reads, so no row reaches the caller. Its own type for
+/// `TableWriteRefusal`'s reason: a
+/// job handler's `?` hands it to the dispatcher as `JobError::Io`, and
+/// `kernel/dispatch.rs` classifies it as an attempt, not a platform fault.
+pub struct TableReadRefusal(pub Refusal);
+
+impl fmt::Display for TableReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// `Refusal`'s `Debug`, for the same reason.
+impl fmt::Debug for TableReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for TableReadRefusal {}
+
+impl TableReadRefusal {
+    /// `Some` only for THIS refusal, as `JobShapeRefusal::of`.
+    pub fn of(e: &io::Error) -> Option<&TableReadRefusal> {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<TableReadRefusal>())
+    }
+}
+
 /// Collapses a `TxError` from a platform-internal transaction (the schema
 /// migration executor) into a plain `io::Error`: those transactions have no
 /// application error type worth preserving, and both `NotPrimary` and
@@ -384,6 +452,14 @@ struct TableOps {
     // `IndexDef<R>` is generic per-`Row`, so no `&'static [&'static str]` of
     // names exists to borrow — projected once at registration time instead.
     index_names: Vec<&'static str>,
+    // `Row::SCOPE_NAME`, with the scope type's `TypeId` and `type_name`:
+    // what `App::open` needs to refuse two tenant types under one `NAME`
+    // (tenancy-completion spec §4, plan amendment A2). The name is
+    // `Some` only for a `#[table(scoped_by = …)]` row. The `type_name` is for
+    // the refusal's text only and is never recorded.
+    scope_name: Option<&'static str>,
+    scope_type: TypeId,
+    scope_type_name: &'static str,
 }
 
 fn apply_put<R: Row>(w: &mut Writer<'_>, scope: u64, row: &[u8]) -> io::Result<()> {
@@ -430,8 +506,8 @@ pub struct SealedSegment {
 }
 
 /// A mounted job's declared tenancy, as `Db::register_job_shapes` takes it:
-/// `None` for a `global` job, or the `scoped_by` scope's name (as
-/// `JobDef.scoped_by` and `describe` spell it) with its `TypeId`
+/// `None` for a `global` job, or the `scoped_by` scope type's `Tenant::NAME`
+/// (`JobDef.scoped_by`, as `describe` lists it) with its `TypeId`
 /// (`JobDef.scope_type`). The `TypeId` is compared in memory only and never
 /// recorded, so it may differ between builds without touching the log.
 pub type DeclaredTenancy = Option<(&'static str, TypeId)>;
@@ -458,6 +534,19 @@ impl Schema {
     }
 
     pub fn table<R: Row>(mut self) -> Schema {
+        // `table_tenants` hands `SCOPE_NAME` to `App::open`'s tenant census,
+        // so a row that is not tenant-scoped and states one would put a tenant
+        // type in the census that no scoped row of the app has (hard rule 4).
+        assert!(
+            R::SCOPE_NAME.is_none() || crate::table::row_is_scoped::<R>(),
+            "Schema: table \"{}\" states SCOPE_NAME = {:?}, but its Row::Scope is {}, which is \
+             not a tenant type — SCOPE_NAME is the Tenant::NAME of a tenant-scoped row's scope \
+             type, and App::open adds it to the app's tenant census; fix: derive the row with \
+             #[table(scoped_by = S)], or leave SCOPE_NAME at its default, None",
+            R::TABLE,
+            R::SCOPE_NAME,
+            std::any::type_name::<R::Scope>()
+        );
         let prev = self.tables.insert(
             R::TABLE,
             TableOps {
@@ -470,6 +559,9 @@ impl Schema {
                 row_type: TypeId::of::<R>(),
                 row_name: std::any::type_name::<R>(),
                 index_names: R::INDEXES.iter().map(|d| d.name).collect(),
+                scope_name: R::SCOPE_NAME,
+                scope_type: TypeId::of::<R::Scope>(),
+                scope_type_name: std::any::type_name::<R::Scope>(),
             },
         );
         assert!(
@@ -485,6 +577,22 @@ impl Schema {
     /// and iterates this to know which tables to `Snapshot::scan_raw`.
     pub fn table_names(&self) -> Vec<&'static str> {
         self.tables.keys().copied().collect()
+    }
+
+    /// Every registered table's tenant type, as `(NAME, TypeId, type_name)`,
+    /// in `TABLE` order: the tables `App::open` checks for two tenant types
+    /// under one `NAME` (tenancy-completion spec §4). A row carries a `NAME`
+    /// (`Row::SCOPE_NAME`) when `#[table(scoped_by = …)]` states it, or when a
+    /// hand-written scoped `Row` does; one left at the default `None` is not
+    /// listed.
+    pub fn table_tenants(&self) -> Vec<(&'static str, TypeId, &'static str)> {
+        self.tables
+            .values()
+            .filter_map(|ops| {
+                ops.scope_name
+                    .map(|name| (name, ops.scope_type, ops.scope_type_name))
+            })
+            .collect()
     }
 
     /// Registers one migration step for `table` (which must already be
@@ -593,9 +701,10 @@ enum Effect {
         id: u64,
     },
     // `shape`: `None` for the pre-shape tags `0x02`/`0x03`, `Some` for
-    // `0x08`/`0x09`/`0x0a` — the wire presence, like `scope` above. `None` is
-    // foreign to every check downstream (payload-shapes spec §2). `scope`:
-    // `Some` exactly for `0x0a`, the scoped enqueue (job-tenancy spec §6).
+    // `0x08`/`0x09`/`0x0a`/`0x0b` — the wire presence, like `scope` above.
+    // `None` is foreign to every check downstream (payload-shapes spec §2).
+    // `scope`: `Some` exactly for `0x0a`, the scoped enqueue (job-tenancy
+    // spec §6).
     Enqueue {
         job: String,
         payload: Vec<u8>,
@@ -603,11 +712,14 @@ enum Effect {
         shape: Option<u64>,
         scope: Option<u64>,
     },
+    // `scope`: `Some` exactly for `0x0b`, the scoped emit (tenancy-completion
+    // spec §6) — presence, not value, as for `Enqueue` above.
     Emit {
         event: String,
         payload: Vec<u8>,
         key: Option<String>,
         shape: Option<u64>,
+        scope: Option<u64>,
     },
     // `scope`: same presence-not-value convention as `Put`/`Delete` above —
     // `None` for tag `0x04` (unscoped), `Some` for tag `0x07` (scoped).
@@ -663,8 +775,22 @@ struct EnqueuedTenant {
     id: u64,
     /// `TypeId::of::<J::Scope>()`, compared with the mounted declaration's.
     scope_type: TypeId,
-    /// `type_name::<J::Scope>()`, for the refusal's text only.
+    /// The scope type's `Tenant::NAME`, for the refusal's text only.
     scope_name: &'static str,
+}
+
+/// One buffered emit. `shape` is bare because a shapeless emit cannot be
+/// represented (payload-shapes amendment A2). `scope` is the tenant of the
+/// `ScopedTx` it was emitted on, `None` for an emit on a bare `Tx`: presence,
+/// not value, selects tag `0x0b`, so `Some(0)` is tenant 0. It is never
+/// folded into `key`, which stays the app's own filter (tenancy-completion
+/// spec §2.3).
+struct Emit {
+    event: &'static str,
+    payload: Vec<u8>,
+    key: Option<String>,
+    shape: u64,
+    scope: Option<u64>,
 }
 
 /// A transaction's buffered effects: the collapsed per-table overlay
@@ -692,9 +818,7 @@ struct TxEffects {
     // reads it.
     written_as: BTreeSet<(&'static str, &'static str, bool, TypeId)>,
     enqueues: Vec<Enqueue>,
-    // The emit shape is a bare `u64`, so a shapeless emit cannot be
-    // represented (payload-shapes amendment A2).
-    emits: Vec<(&'static str, Vec<u8>, Option<String>, u64)>,
+    emits: Vec<Emit>,
     migrate_puts: Vec<(&'static str, Option<u64>, u64, Vec<u8>)>,
 }
 
@@ -723,10 +847,12 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         let scoped = effects.scoped_tables.contains(table);
         for (&(scope, id), entry) in entries {
             if !scoped {
-                // `Tx::put`/`Tx::delete` are the overlay's only writers
-                // (besides the SchemaVersion adoption row, always UNSCOPED)
-                // and populate `scoped_tables` in lockstep with the overlay
-                // — negative space, not a resolvable input.
+                // A table outside `scoped_tables` is written only UNSCOPED:
+                // by `Tx::put`/`Tx::delete`, `Tx::settle_job`,
+                // `Tx::put_schema_version` and the SchemaVersion adoption
+                // row. The scoped writers, `put_in`/`delete_in`, populate
+                // `scoped_tables` in lockstep with the overlay — negative
+                // space, not a resolvable input.
                 assert_eq!(
                     scope, UNSCOPED,
                     "record encode: table \"{table}\" id {id} carries scope {scope} but is not \
@@ -777,12 +903,22 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
             tenant.id.encode(&mut out);
         }
     }
-    for (event, payload, key, shape) in &effects.emits {
-        out.push(9);
+    for Emit {
+        event,
+        payload,
+        key,
+        shape,
+        scope,
+    } in &effects.emits
+    {
+        out.push(if scope.is_some() { 11 } else { 9 });
         encode_bytes(event.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
         shape.encode(&mut out);
+        if let Some(tenant) = scope {
+            tenant.encode(&mut out);
+        }
     }
     for (table, scope, id, row) in &effects.migrate_puts {
         match scope {
@@ -831,6 +967,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: None,
+                scope: None,
             },
             4 => Effect::MigratePut {
                 table: String::decode(input)?,
@@ -866,9 +1003,17 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
+                scope: None,
             },
             10 => Effect::Enqueue {
                 job: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
+                scope: Some(u64::decode(input)?),
+            },
+            11 => Effect::Emit {
+                event: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
@@ -900,19 +1045,29 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
 
 // ---------------------------------------------------------------- tx
 
-/// The tables only the platform writes, by name. `JobRow`'s own type is
-/// refused by `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a
-/// record's effect by TABLE NAME, so any other `Row` whose `TABLE` borrows
-/// one of these would write rows the dispatcher trusts. The app-facing
-/// writes (`Tx::put`/`delete`, `ScopedTx::put`/`delete`) refuse such a type
-/// in a `const` block. That refusal is a post-monomorphization error: `cargo
-/// build` and `cargo test` report it at the app's call site, and `cargo
-/// check`, which never monomorphizes, does not. No binary that performs the
-/// write can be built. Sealing another platform table is its name here plus
-/// its `type Scope = PlatformOwned`.
-const PLATFORM_TABLES: [&str; 1] = [JobRow::TABLE];
+/// The tables only the platform writes, by name: the job queue, the event
+/// log and the migration record. Each one's own type is refused by
+/// `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a record's
+/// effect by TABLE NAME, so any other `Row` whose `TABLE` borrows one of
+/// these would write rows the platform trusts: the dispatcher a job's
+/// tenant, every subscription its feed, the migration gate a table's
+/// version. The app-facing writes (`Tx::put`/`delete`, `ScopedTx::put`/
+/// `delete`) refuse such a type in a `const` block. That refusal is a
+/// post-monomorphization error: `cargo build` and `cargo test` report it at
+/// the app's call site, and `cargo check`, which never monomorphizes, does
+/// not. No binary that performs the write can be built. Sealing another
+/// platform table is its name here, its `type Scope = PlatformOwned`, and an
+/// arm of its own in `refuse_platform_table` and under `AppWritable`.
+const PLATFORM_TABLES: [&str; 3] = [
+    JobRow::TABLE,
+    EventRow::TABLE,
+    crate::migration::SchemaVersion::TABLE,
+];
 
-const fn is_platform_table(table: &str) -> bool {
+/// Which of `PLATFORM_TABLES` `table` names, by index, or `None` for a table
+/// of the app's own. A whole-name match: `charpente.jobs2` is not
+/// `charpente.jobs`.
+const fn platform_table(table: &str) -> Option<usize> {
     let table = table.as_bytes();
     let mut i = 0;
     while i < PLATFORM_TABLES.len() {
@@ -923,25 +1078,80 @@ const fn is_platform_table(table: &str) -> bool {
                 j += 1;
             }
             if j == name.len() {
-                return true;
+                return Some(i);
             }
         }
         i += 1;
     }
-    false
+    None
 }
 
 /// `PLATFORM_TABLES`' refusal, evaluated in a `const` block per written row
-/// type, so it fails the build rather than a request.
+/// type, so it fails the build rather than a request. Each text names the
+/// table it matched and the one way that table's rows are written.
 const fn refuse_platform_table(table: &str) {
-    if is_platform_table(table) {
-        panic!(
+    match platform_table(table) {
+        None => {}
+        Some(0) => panic!(
             "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
              platform's: only the enqueue family writes one, because the dispatcher runs a job \
              in the tenant its row names; give this table a name of its own, and run a job by \
              enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
              `cross_tenant` route or job)"
-        );
+        ),
+        Some(1) => panic!(
+            "this Row's TABLE is \"charpente.events\", the platform's event log — event rows are \
+             the platform's: only an emit writes one, because every subscription's feed is read \
+             from them; give this table a name of its own, and publish an event by emitting it \
+             (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)"
+        ),
+        Some(2) => panic!(
+            "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+             — schema-version rows are the platform's: only a table's first write and \
+             `Db::migrate_schema` write one, because the migration gate trusts them for each \
+             table's version and a migration's resume point; give this table a name of its \
+             own, and change a table's version by declaring it (`#[table(version = N)]` with \
+             its `TableMigration`), which the kernel migrates at startup"
+        ),
+        Some(_) => panic!(
+            "PLATFORM_TABLES names a table refuse_platform_table has no text for — give it an \
+             arm of its own"
+        ),
+    }
+}
+
+/// The read twin of `refuse_platform_table` (tenancy-completion amendment A13):
+/// `Tx`'s four `View` reads evaluate it in a `const` block per read row type.
+/// `View`'s `ReadableBy` bound refuses the platform's own row types; this
+/// refuses any other `Row` whose `TABLE` borrows one of their names, which a
+/// bound on the row type cannot see. Post-monomorphization, like the write
+/// refusal: `cargo build` and `cargo test` report it, and `cargo check` does
+/// not.
+const fn refuse_platform_read(table: &str) {
+    match platform_table(table) {
+        None => {}
+        Some(0) => panic!(
+            "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a transaction \
+             does not read the platform's tables, because the queue holds every tenant's job \
+             payloads and the tenant each one runs in; give this table a name of its own, and \
+             read the queue through `db.snapshot()` from code that holds the `Db`"
+        ),
+        Some(1) => panic!(
+            "this Row's TABLE is \"charpente.events\", the platform's event log — a transaction \
+             does not read the platform's tables, because the log holds every tenant's events; \
+             give this table a name of its own, and read the log through `db.snapshot()` from \
+             code that holds the `Db`, or subscribe to its events"
+        ),
+        Some(2) => panic!(
+            "this Row's TABLE is \"charpente.schema_versions\", the platform's migration record \
+             — a transaction does not read the platform's tables, because the record is the \
+             migration gate's own state; give this table a name of its own, and read the record \
+             through `db.snapshot()` from code that holds the `Db`"
+        ),
+        Some(_) => panic!(
+            "PLATFORM_TABLES names a table refuse_platform_read has no text for — give it an arm \
+             of its own"
+        ),
     }
 }
 
@@ -960,9 +1170,13 @@ pub struct Tx<'a> {
     group: Option<&'a GroupOverlay>,
     effects: TxEffects,
     /// The tenant scope this transaction opened, as
-    /// `(TypeId::of::<S>(), type_name::<S>(), scope.raw())`. A transaction
-    /// opens ONE scope (spec §8); `open_scope` asserts against this.
-    opened_scope: Option<(TypeId, &'static str, u64)>,
+    /// `(TypeId::of::<S>(), S::NAME, type_name::<S>(), scope.raw())`. A
+    /// transaction opens ONE scope (spec §8). `enter_scope` asserts against
+    /// this: it compares the `TypeId` and the id, and prints the other two.
+    opened_scope: Option<(TypeId, &'static str, &'static str, u64)>,
+    /// The `Schema` the `Group` stages against: a read checks its
+    /// `Row` type against the one registered for its table (amendment A18).
+    schema: &'a Schema,
 }
 
 impl<'a> Tx<'a> {
@@ -972,9 +1186,10 @@ impl<'a> Tx<'a> {
     /// writes silently — exactly the bug class `examples/invoicing/DEMO.md`
     /// exists to show app code cannot express. `transact` and
     /// `Group::stage` (below) are the only routes to a live `Tx`.
-    pub(crate) fn over(snapshot: &'a Snapshot) -> Tx<'a> {
+    pub(crate) fn over(snapshot: &'a Snapshot, schema: &'a Schema) -> Tx<'a> {
         Tx {
             snapshot,
+            schema,
             group: None,
             effects: TxEffects::default(),
             opened_scope: None,
@@ -987,9 +1202,9 @@ impl<'a> Tx<'a> {
     /// which is a stronger statement than any assertion here could make.
     /// Scoped writes go through `put_in` (or, in an app, `ScopedTx::put`).
     ///
-    /// The same bound refuses a platform row (`JobRow`), and the `const`
-    /// block refuses any other row type whose `TABLE` borrows a platform
-    /// table's name (`PLATFORM_TABLES`).
+    /// The same bound refuses a platform row (`JobRow`, `EventRow`,
+    /// `SchemaVersion`), and the `const` block refuses any other row type
+    /// whose `TABLE` borrows a platform table's name (`PLATFORM_TABLES`).
     pub fn put<R: WritableRow>(&mut self, row: &R) {
         const { refuse_platform_table(R::TABLE) };
         let mut bytes = Vec::new();
@@ -1036,8 +1251,8 @@ impl<'a> Tx<'a> {
     /// Operator code that holds a `Group` can: it is trusted by that
     /// standing (job-tenancy spec §3, §7), since whoever holds the `Db`
     /// already holds the store.
-    pub fn settle_job(&mut self, row: &JobRow, admission: &TenantAdmission) {
-        let TenantAdmission(()) = admission;
+    pub fn settle_job(&mut self, row: &JobRow, admission: &TenantAdmission<'_>) {
+        let TenantAdmission(_) = admission;
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
         self.effects
@@ -1045,6 +1260,75 @@ impl<'a> Tx<'a> {
             .entry(JobRow::TABLE)
             .or_default()
             .insert((UNSCOPED, row.id.raw()), Some(bytes));
+    }
+
+    /// The migration executor's write of a table's schema-version row: its
+    /// watermark while a migration runs, and its close-out when it ends
+    /// (`Db::migrate_table`). `Tx::put` refuses `SchemaVersion` at compile
+    /// time, because the migration gate trusts these rows for each table's
+    /// version and a migration's resume point. This is `put`'s body without
+    /// that bound, and crate-private, so no app code reaches it. Its record is
+    /// the one `tx.put` wrote before the seal, byte for byte (`migrations.rs`,
+    /// `migrate_schema_records_each_schema_version_as_an_unscoped_put`).
+    pub(crate) fn put_schema_version(&mut self, row: &crate::migration::SchemaVersion) {
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        self.effects.written_as.insert((
+            crate::migration::SchemaVersion::TABLE,
+            std::any::type_name::<crate::migration::SchemaVersion>(),
+            false,
+            TypeId::of::<crate::migration::SchemaVersion>(),
+        ));
+        self.effects
+            .overlay
+            .entry(crate::migration::SchemaVersion::TABLE)
+            .or_default()
+            .insert((UNSCOPED, row.id.raw()), Some(bytes));
+    }
+
+    /// The dispatcher's read of a job row inside its batch: the row a due
+    /// job's attempt runs, and again in the failure stage, which must see what
+    /// an earlier stage of the same batch settled (dispatch.rs, the
+    /// retry-policy read). `View` refuses `JobRow` on a `Tx` at compile time,
+    /// because the queue holds every tenant's payloads and tenants, and
+    /// `Group` exposes no snapshot, so this is the one door. It reads exactly
+    /// as `View::get` does: this transaction's writes, then the group's, then
+    /// the snapshot.
+    ///
+    /// It takes a `TenantAdmission`, which only a `Group` mints, for
+    /// `settle_job`'s reason: no handler and no job's glue holds one, so no
+    /// app code can call this. Operator code that holds a `Group` can.
+    pub fn get_job(
+        &self,
+        id: Id<JobRow>,
+        admission: &TenantAdmission<'_>,
+    ) -> io::Result<Option<JobRow>> {
+        let TenantAdmission(_) = admission;
+        self.get_any(id)
+    }
+
+    /// `View::get`'s read without `View`'s bounds: this transaction's own
+    /// writes, then the group's, then the snapshot. Private: `View::get`
+    /// (after its refusals) and `Tx::get_job` are its only callers.
+    fn get_any<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        match self
+            .effects
+            .overlay
+            .get(R::TABLE)
+            .and_then(|t| t.get(&(UNSCOPED, id.raw())))
+        {
+            Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
+            Some(None) => Ok(None),
+            None => match self
+                .group
+                .and_then(|g| g.get(R::TABLE))
+                .and_then(|t| t.get(&(UNSCOPED, id.raw())))
+            {
+                Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
+                Some(None) => Ok(None),
+                None => self.snapshot.get_any(id),
+            },
+        }
     }
 
     /// Stages a row on a SCOPED table under `scope` — the primitive
@@ -1062,16 +1346,10 @@ impl<'a> Tx<'a> {
     /// `scope: Id<S>` with `R: Row<Scope = S>`, not a bare `u64`: "this scope
     /// value belongs to this table's tenant type" stays a compile error at the
     /// primitive itself, not only at `ScopedTx`'s wrapper. `S` is bounded only
-    /// `'static` here rather than `Tenant`, because the migration and replay
-    /// paths address a scoped table by scope value with no tenant hook in
-    /// hand.
+    /// `'static` here: the one caller, `ScopedTx`, holds an `S` its
+    /// constructors bounded `Tenant`, which `assert_scoped` relies on.
     fn put_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, row: &R) {
-        assert!(
-            crate::table::row_is_scoped::<R>(),
-            "Tx::put_in: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use Tx::put \
-             for an unscoped table",
-            R::TABLE
-        );
+        assert_scoped::<R>("put_in");
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
         self.effects.scoped_tables.insert(R::TABLE);
@@ -1090,12 +1368,7 @@ impl<'a> Tx<'a> {
 
     /// `delete`'s scope-taking counterpart; see `put_in`.
     fn delete_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, id: Id<R>) {
-        assert!(
-            crate::table::row_is_scoped::<R>(),
-            "Tx::delete_in: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use \
-             Tx::delete for an unscoped table",
-            R::TABLE
-        );
+        assert_scoped::<R>("delete_in");
         self.effects.scoped_tables.insert(R::TABLE);
         self.effects.written_as.insert((
             R::TABLE,
@@ -1129,19 +1402,25 @@ impl<'a> Tx<'a> {
     }
 
     /// The one body of the enqueue family (job-tenancy spec §5–§6). `scope`
-    /// is the tenant a scoped job runs in, and `None` for a `global` one.
-    /// The public methods' bounds decide which, and this asserts that they
-    /// agree with the job's own declaration, so a scoped job is never
-    /// written without its tenant and a global one never with one (hard
-    /// rule 4).
-    fn push_enqueue<J: Job>(&mut self, scope: Option<u64>, key: Option<String>, job: J) {
+    /// is the tenant a scoped job runs in, with its tenant type's `NAME` for
+    /// `Group::stage`'s refusal; it is `None` for a `global` job. The public
+    /// methods' bounds decide which. This asserts that they agree with the
+    /// job's own declaration, so a scoped job is never written without its
+    /// tenant and a global one never with one (hard rule 4).
+    fn push_enqueue<J: Job>(
+        &mut self,
+        scope: Option<(u64, &'static str)>,
+        key: Option<String>,
+        job: J,
+    ) {
         assert_eq!(
             scope.is_some(),
             TypeId::of::<J::Scope>() != TypeId::of::<crate::table::Unscoped>(),
-            "contract: job \"{}\" was enqueued with tenant {scope:?}, but a scoped job carries \
+            "contract: job \"{}\" was enqueued with tenant {:?}, but a scoped job carries \
              its tenant and a global one none — the enqueue family's bounds guarantee this, so \
              reaching here is a platform bug",
-            J::NAME
+            J::NAME,
+            scope.map(|(id, _)| id)
         );
         if let Some(key) = &key {
             assert!(
@@ -1157,10 +1436,10 @@ impl<'a> Tx<'a> {
             payload,
             key,
             shape: J::FINGERPRINT,
-            scope: scope.map(|id| EnqueuedTenant {
+            scope: scope.map(|(id, name)| EnqueuedTenant {
                 id,
                 scope_type: TypeId::of::<J::Scope>(),
-                scope_name: std::any::type_name::<J::Scope>(),
+                scope_name: name,
             }),
         });
     }
@@ -1196,28 +1475,55 @@ impl<'a> Tx<'a> {
         &mut self,
         scope: Id<S>,
         job: impl Job<Scope = S>,
-        cap: &CrossTenant,
+        cap: &CrossTenant<'_>,
     ) {
-        let CrossTenant(()) = cap;
-        self.push_enqueue(Some(scope.raw()), None, job);
+        let CrossTenant(_) = cap;
+        self.push_enqueue(Some((scope.raw(), S::NAME)), None, job);
     }
 
-    pub fn emit<Ev: Event>(&mut self, event: Ev) {
+    /// The one body of the emit family (tenancy-completion spec §6). `scope`
+    /// is the tenant a scoped event belongs to, and `None` for a `global`
+    /// one. The public methods' bounds decide which, and this asserts that
+    /// they agree with the event's own declaration. A scoped event is never
+    /// recorded without its tenant, where every global feed would receive it,
+    /// and a global one never with one (hard rule 4) — `push_enqueue`'s
+    /// assert, for the other effect that carries a tenant.
+    fn push_emit<Ev: Event>(&mut self, scope: Option<u64>, key: Option<String>, event: Ev) {
+        assert_eq!(
+            scope.is_some(),
+            TypeId::of::<Ev::Scope>() != TypeId::of::<crate::table::Unscoped>(),
+            "contract: event \"{}\" was emitted with tenant {scope:?}, but a scoped event \
+             carries its tenant and a global one none — the emit family's bounds guarantee \
+             this, so reaching here is a platform bug",
+            Ev::NAME
+        );
         let mut payload = Vec::new();
         event.encode(&mut payload);
-        self.effects
-            .emits
-            .push((Ev::NAME, payload, None, Ev::FINGERPRINT));
+        self.effects.emits.push(Emit {
+            event: Ev::NAME,
+            payload,
+            key,
+            shape: Ev::FINGERPRINT,
+            scope,
+        });
     }
 
-    /// Emits with an opaque scoping key (e.g. an org id) — the exact-match
-    /// filter `Subscription::key` matches against. Mirrors `enqueue_keyed`.
-    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
-        let mut payload = Vec::new();
-        event.encode(&mut payload);
-        self.effects
-            .emits
-            .push((Ev::NAME, payload, Some(key.into()), Ev::FINGERPRINT));
+    /// Emits a `global` event into this transaction's record (tag `0x09`). A
+    /// `#[event(scoped_by = Org)]` event does not compile here: it belongs to
+    /// a tenant, and a bare `Tx` names none (`NoEventTenant`'s note says
+    /// where to emit it instead).
+    pub fn emit<Ev: UnscopedEvent>(&mut self, event: Ev) {
+        const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+        self.push_emit(None, None, event);
+    }
+
+    /// `emit`, with an app key: an exact-match narrowing filter that
+    /// `Subscription::key` selects on (a per-user feed, say). Never a tenant.
+    /// A tenant is an event's declared scope, recorded apart from any key
+    /// (tenancy-completion spec §2.3).
+    pub fn emit_keyed<Ev: UnscopedEvent>(&mut self, key: impl Into<String>, event: Ev) {
+        const { refuse_global_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT) };
+        self.push_emit(None, Some(key.into()), event);
     }
 }
 
@@ -1258,8 +1564,9 @@ fn merge_overlay_rows<R: Row>(
         } else {
             // Negative space (hard rule 4): an unscoped table's overlay is
             // written only by `Tx::put`/`Tx::delete` (both `R: WritableRow`),
-            // `Tx::settle_job` and the SchemaVersion adoption row, all of
-            // which stage `UNSCOPED`. A skip here would turn a staging bug into a
+            // `Tx::settle_job`, `Tx::put_schema_version` and the SchemaVersion
+            // adoption row, all of which stage `UNSCOPED`. A skip here would turn
+            // a staging bug into a
             // silently missing row instead of a loud one.
             assert_eq!(
                 entry_scope,
@@ -1343,30 +1650,17 @@ fn index_on<R: Row>(index_name: &str) -> &'static IndexDef<R> {
 }
 
 impl View for Tx<'_> {
-    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
-        match self
-            .effects
-            .overlay
-            .get(R::TABLE)
-            .and_then(|t| t.get(&(UNSCOPED, id.raw())))
-        {
-            Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
-            Some(None) => Ok(None),
-            None => match self
-                .group
-                .and_then(|g| g.get(R::TABLE))
-                .and_then(|t| t.get(&(UNSCOPED, id.raw())))
-            {
-                Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
-                Some(None) => Ok(None),
-                None => self.snapshot.get(id),
-            },
-        }
+    fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::get")?;
+        self.get_any(id)
     }
 
-    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {
+    fn scan<R: UnscopedRow + ReadableBy<Self>>(&self) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::scan")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
-        for row in self.snapshot.scan::<R>()? {
+        for row in self.snapshot.scan_any::<R>()? {
             merged.insert(row.id().raw(), row);
         }
         merge_overlay_rows(
@@ -1379,13 +1673,19 @@ impl View for Tx<'_> {
         Ok(merged.into_values().collect())
     }
 
-    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
+    fn scan_by<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::scan_by")?;
         let index = index_on::<R>(index_name);
         let mut wanted = Vec::new();
         key.encode(&mut wanted);
 
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
-        for row in self.snapshot.scan_by::<R>(index_name, key)? {
+        for row in self.snapshot.scan_by_any::<R>(index_name, key)? {
             merged.insert(row.id().raw(), row);
         }
         merge_overlay_by_index(
@@ -1405,9 +1705,15 @@ impl View for Tx<'_> {
         Ok(merged.into_values().collect())
     }
 
-    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+    fn scan_from<R: UnscopedRow + ReadableBy<Self>>(
+        &self,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
+        self.refuse_read_as::<R>("Tx::scan_from")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
-        for row in self.snapshot.scan::<R>()? {
+        for row in self.snapshot.scan_any::<R>()? {
             if row.id().raw() >= from_id {
                 merged.insert(row.id().raw(), row);
             }
@@ -1437,19 +1743,46 @@ impl View for Tx<'_> {
 /// platform's on a `public(S)` route. `Id<S>` with `R: Row<Scope = S>` — see
 /// `put_in`.
 ///
-/// Each asserts `row_is_scoped::<R>()` for the same reason
-/// `Snapshot::get_scoped` does (hard rule 4): the type system rules out a
-/// scope/table mismatch but not `S = Unscoped`, and an unscoped table read
-/// through here would find no overlay entries and then open a physical
-/// table the unscoped write path never creates — a wrong answer, not an
-/// error.
+/// Each asserts `row_is_scoped::<R>()` (`assert_scoped`, hard rule 4,
+/// negative space): the type system rules out a scope/table mismatch, and
+/// `ScopedTx`'s constructors rule out a scope marker, so an unscoped table
+/// read through here would mean a seam was reopened. It would find no
+/// overlay entries and then open a physical table the unscoped write path
+/// never creates — a wrong answer, not an error.
 impl Tx<'_> {
+    /// Amendment A18: a read goes through the `Row` type the `Schema`
+    /// registered for its table, compared by `TypeId`, as `Group::stage`
+    /// holds a put or delete to. `Tx`'s own `View` reads call it too: before
+    /// commit they read the batch's overlays, where an unscoped type's key
+    /// `(UNSCOPED, id)` is tenant 0's. Checked before the read, so a refused read
+    /// returns no row. A table the `Schema` does not register is not checked:
+    /// no registered type is there to read as.
+    fn refuse_read_as<R: Row>(&self, read: &str) -> io::Result<()> {
+        let Some(ops) = self.schema.tables.get(R::TABLE) else {
+            return Ok(());
+        };
+        if ops.row_type == TypeId::of::<R>() {
+            return Ok(());
+        }
+        let (table, registered, reader) = (R::TABLE, ops.row_name, std::any::type_name::<R>());
+        Err(io::Error::other(TableReadRefusal(Refusal(format!(
+            "table \"{table}\" is registered as `{registered}`, but this transaction read it \
+             through `{reader}` ({read}) — two Row types declare TABLE = \"{table}\", and a read \
+             keys on the table name and the raw tenant id, so it returns the registered type's \
+             rows, from the registered scope type's tenant of the same id when the two types' \
+             scoped_by differ; the read was refused and returned nothing — read `{registered}` \
+             instead, or give `{reader}` a table name of its own (a #[table] type's table name \
+             is its struct name)"
+        )))))
+    }
+
     fn get_in<S: 'static, R: Row<Scope = S>>(
         &self,
         scope: Id<S>,
         id: Id<R>,
     ) -> io::Result<Option<R>> {
-        assert_scoped::<R>("get_in", "View::get");
+        assert_scoped::<R>("get_in");
+        self.refuse_read_as::<R>("ScopedTx::get")?;
         let key = (scope.raw(), id.raw());
         match self.effects.overlay.get(R::TABLE).and_then(|t| t.get(&key)) {
             Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
@@ -1467,7 +1800,8 @@ impl Tx<'_> {
     }
 
     fn scan_in<S: 'static, R: Row<Scope = S>>(&self, scope: Id<S>) -> io::Result<Vec<R>> {
-        assert_scoped::<R>("scan_in", "View::scan");
+        assert_scoped::<R>("scan_in");
+        self.refuse_read_as::<R>("ScopedTx::scan")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan_scoped::<R>(scope.raw())? {
             merged.insert(row.id().raw(), row);
@@ -1493,7 +1827,8 @@ impl Tx<'_> {
         index_name: &str,
         key: &impl Codec,
     ) -> io::Result<Vec<R>> {
-        assert_scoped::<R>("scan_by_in", "View::scan_by");
+        assert_scoped::<R>("scan_by_in");
+        self.refuse_read_as::<R>("ScopedTx::scan_by")?;
         let index = index_on::<R>(index_name);
         let mut wanted = Vec::new();
         key.encode(&mut wanted);
@@ -1528,7 +1863,8 @@ impl Tx<'_> {
         from_id: u64,
         limit: usize,
     ) -> io::Result<Vec<R>> {
-        assert_scoped::<R>("scan_from_in", "View::scan_from");
+        assert_scoped::<R>("scan_from_in");
+        self.refuse_read_as::<R>("ScopedTx::scan_from")?;
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan_scoped::<R>(scope.raw())? {
             if row.id().raw() >= from_id {
@@ -1551,13 +1887,21 @@ impl Tx<'_> {
     }
 }
 
-/// The shared body of the four scope-taking reads' `row_is_scoped` guard.
-fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
+/// The `row_is_scoped` guard shared by the six scope-taking primitives and
+/// `AllTenants::scan`. Negative space: each one's `S` is a `Tenant`, because
+/// `ScopedTx`'s only constructors (`open_scope`, `admit_scope`) and
+/// `Tx::across_tenants` bound it so, and the scope markers `Unscoped` and
+/// `PlatformOwned` implement no `Tenant`, nor can an app's impl give them one
+/// (both types and the trait are this crate's).
+fn assert_scoped<R: Row>(method: &str) {
     assert!(
         crate::table::row_is_scoped::<R>(),
-        "Tx::{method}: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use \
-         {unscoped_alternative} for an unscoped table",
-        R::TABLE
+        "Tx::{method}: table \"{}\" has `Row::Scope = {}`, a scope marker and not a tenant type, \
+         but reached a primitive bounded to one tenant type's tenants — every caller's scope \
+         type is a `Tenant` and no scope marker implements one, so this is a charpente bug, \
+         not an app's",
+        R::TABLE,
+        std::any::type_name::<R::Scope>()
     );
 }
 
@@ -1565,9 +1909,10 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 
 /// The app's own membership check for a tenant scope: "may this caller act
 /// as this tenant?" (spec §1). `#[table(scoped_by = Org)]` requires an impl
-/// for `Org` — enforced by a macro-emitted const assert, the same shape
-/// `#[table(version = …)]` uses to require a `TableMigration` impl
-/// (DESIGN §3).
+/// for `Org` — enforced through the macros' `tenant_name::<S>()` call,
+/// whose bound is `TenantScope` (tenancy-completion plan amendment A7).
+/// `#[table(version = …)]` requires a `TableMigration` impl by a const
+/// assert instead (DESIGN §3).
 ///
 /// Generic over `Who` and `Error` because the deterministic core cannot name
 /// `charpente::auth::Principal` or `charpente::http::ApiError` — DESIGN §8
@@ -1576,15 +1921,26 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 /// `charpente::TenantScope` (`Who = Principal`, `Error = ApiError`), which is
 /// blanket-implemented for every such impl and carries the house diagnostic.
 ///
+/// A tenant type names itself with `NAME`, as a table does with `TABLE`.
+/// That is a declared identity, never the compiler's printer: `type_name`
+/// cuts a generic at the wrong place and cannot tell two types spelled alike
+/// apart (tenancy-completion spec §4). No two tenant types of one app may
+/// share a `NAME`: `App` refuses them, and an empty `NAME`, when it mounts them.
+///
 /// The platform calls `authorize` in exactly one place, `Tx::open_scope`
 /// below, and only with a principal — and never DERIVES a scope: the tenant
 /// is named by the app at the one `tx.scope::<S>(…)` line and nowhere else,
 /// and no key is ever parsed back into one (the standing `emit_keyed`
-/// ruling, DESIGN.md §6). The one
-/// thing it does read off a scope is its decimal form, as the subscription
-/// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering
-/// out, never resolving in.
+/// ruling, DESIGN.md §6).
+/// What it records of a scope is its raw id — beside a scoped enqueue
+/// (`0x0a`) and a scoped emit (`0x0b`), apart from any app key
+/// (tenancy-completion spec §6) — recording out, never resolving in.
 pub trait Tenant: Sized + 'static {
+    /// This tenant type's identity: persisted inside every scoped job's and
+    /// scoped event's fingerprint, and rendered wherever a scope type is
+    /// named. Renaming it is a change of identity, as renaming a table's
+    /// `TABLE` is.
+    const NAME: &'static str;
     /// Whoever is asking. `?Sized` so an app can key membership on an
     /// unsized witness (a `str` subject) as readily as on a struct.
     type Who: ?Sized;
@@ -1596,6 +1952,79 @@ pub trait Tenant: Sized + 'static {
     /// declared instead: `Tx::admit_scope`, whose `TenantAdmission` only a
     /// `Group` mints.
     fn authorize(tx: &Tx<'_>, who: &Self::Who, scope: Id<Self>) -> Result<(), Self::Error>;
+}
+
+/// A scoped job's fingerprint (tenancy-completion spec §4): the payload's field
+/// fold `fold`, which is `#[job]`'s fingerprint for a `global` job (FNV-1a over
+/// `name\0<type tokens>\0` per field), continued over `#scoped_by\0`, the tenant
+/// type's `NAME` and `\0`. FNV-1a is streaming, so this is one hash over the
+/// concatenated bytes. A tenant type whose `NAME` is the `scoped_by` path's one
+/// identifier therefore fingerprints exactly as the path's rendering did (plan
+/// amendment A4). A `const fn`, so `#[job]` can emit `FINGERPRINT` as a constant
+/// over `Tenant::NAME`, which macro expansion cannot read. No identifier begins
+/// with `#`, so no field list can produce the suffix.
+pub const fn scoped_fingerprint(fold: u64, tenant: &str) -> u64 {
+    const fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+        let mut i = 0;
+        while i < bytes.len() {
+            hash ^= bytes[i] as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            i += 1;
+        }
+        hash
+    }
+    mix(mix(mix(fold, b"#scoped_by\0"), tenant.as_bytes()), b"\0")
+}
+
+/// The scoped emit and subscribe sites' check (tenancy-completion spec §6):
+/// an event scoped by `S` is recorded under its payload's fold mixed with
+/// `S`'s `NAME`, and nothing else. `ScopedTx::emit`/`emit_keyed`,
+/// `Subscribe::subscription` and `TenantFeed::and` evaluate it in a `const`
+/// block per event type, with `S` from their own bound. A hand-written
+/// `impl Event` that copies another tenant type's `NAME` and `FINGERPRINT`
+/// under its own `type Scope` therefore fails the build, where it would
+/// otherwise read or write that type's feed at every raw id the two types
+/// share. Jobs refuse the like at `Group::stage` against the mounted def;
+/// events cannot, because delivery deliberately has no registry (realtime
+/// spec §3). Post-monomorphization, like `refuse_platform_read`. Public only
+/// because the platform crate's subscribe sites evaluate it too.
+#[doc(hidden)]
+pub const fn refuse_scoped_event_shape(fingerprint: u64, payload: u64, tenant: &str) {
+    if fingerprint != scoped_fingerprint(payload, tenant) {
+        panic!(
+            "contract: a scoped event's recorded shape is its payload's field fold mixed with its \
+             declared tenant's NAME — `FINGERPRINT == scoped_fingerprint(PAYLOAD_FINGERPRINT, \
+             <S as Tenant>::NAME)` for an event scoped by `S` — and this event's is not; the \
+             likely causes are a hand-written `impl Event` that states `FINGERPRINT` but not \
+             `PAYLOAD_FINGERPRINT`, which then defaults to `FINGERPRINT` (a scoped event states \
+             both), or one whose `FINGERPRINT` was copied from another event type, or whose \
+             `type Scope` names another tenant than the one its `FINGERPRINT` mixes, either of \
+             which would let its rows read as another tenant type's event; fix: derive it with \
+             `#[event(scoped_by = S)]`, or set `PAYLOAD_FINGERPRINT` to its fields' fold and \
+             `FINGERPRINT` to `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, \
+             <S as Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")"
+        );
+    }
+}
+
+/// `refuse_scoped_event_shape`'s twin at the global sites, `Tx::emit`/
+/// `emit_keyed` and `Subscription::of`/`and`: a global event is recorded
+/// under its payload's fold alone, so `FINGERPRINT` equals
+/// `PAYLOAD_FINGERPRINT`, which is its default.
+#[doc(hidden)]
+pub const fn refuse_global_event_shape(fingerprint: u64, payload: u64) {
+    if fingerprint != payload {
+        panic!(
+            "contract: a global event's recorded shape is its payload's field fold alone — \
+             `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` is \
+             `Unscoped` — and this event's two differ, so its rows would read as another event \
+             type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` was \
+             copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and \
+             its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set \
+             `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults \
+             to it (docs/GUIDE.md §11, \"An event's tenancy\")"
+        );
+    }
 }
 
 impl<'a> Tx<'a> {
@@ -1610,16 +2039,23 @@ impl<'a> Tx<'a> {
         scope: Id<S>,
         admit: impl FnOnce(&Tx<'a>) -> Result<(), E>,
     ) -> Result<ScopedTx<'_, 'a, S>, E> {
-        let opening = (TypeId::of::<S>(), std::any::type_name::<S>(), scope.raw());
+        let opening = (
+            TypeId::of::<S>(),
+            S::NAME,
+            std::any::type_name::<S>(),
+            scope.raw(),
+        );
         if let Some(prev) = self.opened_scope {
             assert!(
-                (prev.0, prev.2) == (opening.0, opening.2),
+                (prev.0, prev.3) == (opening.0, opening.3),
                 "contract: a transaction opens ONE tenant scope (spec §8) — this one already \
-                 opened {}({}) and is now asked for {}({}); run the second tenant's work in its \
-                 own transaction",
+                 opened `{}` {} ({}) and is now asked for `{}` {} ({}); run the second \
+                 tenant's work in its own transaction",
                 prev.1,
+                prev.3,
                 prev.2,
                 opening.1,
+                opening.3,
                 opening.2
             );
         }
@@ -1642,12 +2078,15 @@ impl<'a> Tx<'a> {
     ///
     /// `open_scope` is generic over `Who` (this trait's own `type Who`), so
     /// this rule is about the platform's own path, `Who = Principal`: `who`
-    /// is whoever the app is asking about, `tx.scope` passes the request's
-    /// principal and nothing else can, and a caller with no principal has no
-    /// business here — it enters by a declaration (`admit_scope`), or not at
-    /// all. A scope type with a different `Who` (a `Who = str` asker, say)
-    /// names its own caller its own way; operator code with no principal at
-    /// all is an ordinary `who` for one of those.
+    /// is whoever the app is asking about, and `tx.scope` passes the
+    /// request's principal. An app holds no other: `Principal` is not
+    /// `Clone`, so the `&Principal` a request's `Ctx` lends cannot outlive
+    /// that request, and no principal parked by an earlier request reaches
+    /// this call (tenancy-completion amendment A19). A caller with no
+    /// principal has no business here — it enters by a declaration
+    /// (`admit_scope`), or not at all. A scope type with a different `Who` (a
+    /// `Who = str` asker, say) names its own caller its own way; operator
+    /// code with no principal at all is an ordinary `who` for one of those.
     ///
     /// # Panics
     ///
@@ -1676,9 +2115,9 @@ impl<'a> Tx<'a> {
     pub fn admit_scope<S: Tenant>(
         &mut self,
         scope: Id<S>,
-        admission: &TenantAdmission,
+        admission: &TenantAdmission<'_>,
     ) -> ScopedTx<'_, 'a, S> {
-        let TenantAdmission(()) = admission;
+        let TenantAdmission(_) = admission;
         let Ok(scoped) = self.enter_scope(scope, |_| Ok::<(), std::convert::Infallible>(()));
         scoped
     }
@@ -1733,12 +2172,18 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         self.scope
     }
 
+    /// This tenant's row of `R` with this id. The `const` block in each of
+    /// the four reads is `Tx`'s (amendment A13): a scoped row type whose
+    /// `TABLE` borrows a platform table's name is refused at build, as its
+    /// `put` and `delete` are.
     pub fn get<R: Row<Scope = S>>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        const { refuse_platform_read(R::TABLE) };
         self.tx.get_in(self.scope, id)
     }
 
     /// Every row of `R` belonging to this tenant, in id order.
     pub fn scan<R: Row<Scope = S>>(&self) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
         self.tx.scan_in(self.scope)
     }
 
@@ -1748,11 +2193,13 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         index_name: &str,
         key: &impl Codec,
     ) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
         self.tx.scan_by_in(self.scope, index_name, key)
     }
 
     /// This tenant's rows with `id >= from_id`, in id order, at most `limit`.
     pub fn scan_from<R: Row<Scope = S>>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+        const { refuse_platform_read(R::TABLE) };
         self.tx.scan_from_in(self.scope, from_id, limit)
     }
 
@@ -1768,37 +2215,33 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         self.tx.delete_in(self.scope, id)
     }
 
-    /// The subscription key every event emitted on this handle carries: the
-    /// scope's decimal id. Public because it is the SAME encoding on both
-    /// sides of the exact match — an SSE handler keys its `Subscription` with
-    /// it, so emitter and subscriber cannot drift into two spellings of one
-    /// tenant (spec §4).
-    ///
-    /// Decimal rather than anything type-qualified because this key is
-    /// DURABLE: it is stored in `EventRow.key`, shipped by replication, and
-    /// exact-matched when a subscriber resumes. That rules out `type_name` and
-    /// `TypeId`, neither of which the compiler promises to keep stable across
-    /// builds — a key whose spelling moved under a binary upgrade would make
-    /// every pre-upgrade backlog event silently invisible to a reconnecting
-    /// subscriber. The consequence, stated rather than hidden: two DIFFERENT
-    /// scope types sharing a raw id share a key, so an app with more than one
-    /// scope type keys its subscriptions per scope type as well.
-    pub fn event_key(&self) -> String {
-        self.scope.raw().to_string()
+    /// Emits an event scoped by this tenant's type, recorded with this tenant
+    /// (tag `0x0b`), so only this tenant's feed receives it
+    /// (tenancy-completion spec §6). This shadows `Tx::emit` the way
+    /// `enqueue` shadows `Tx::enqueue`. A `global` event emitted inside a
+    /// scope is written `(*tx).emit(event)` in a handler that owns its
+    /// `ScopedTx`, and `(**tx).emit(event)` in a scoped job's `run`, which
+    /// holds `&mut ScopedTx`. The `const` block checks that the event's
+    /// `FINGERPRINT` mixes this tenant type's `NAME`
+    /// (`refuse_scoped_event_shape`).
+    pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev)
+    where
+        S: Tenant,
+    {
+        const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), None, event);
     }
 
-    /// `Tx::emit`, keyed by this tenant — spec §4's "one tenancy mechanism,
-    /// not two". A transaction that had to pass `authorize` to reach a
-    /// tenant's rows cannot then hand that tenant's event to a subscription
-    /// keyed to another one, so an app that has locked its queries down does
-    /// not leak through a subscription.
-    ///
-    /// This shadows the `Tx::emit` the `DerefMut` would otherwise reach. An
-    /// emit that genuinely belongs to no tenant is written `(*tx).emit(…)` —
-    /// the same explicit deref an unscoped table access takes.
-    pub fn emit<Ev: Event>(&mut self, event: Ev) {
-        let key = self.event_key();
-        self.tx.emit_keyed(key, event);
+    /// `emit`, with `Tx::emit_keyed`'s app key. The tenant is still this
+    /// scope, recorded beside the key, never in it.
+    pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev)
+    where
+        S: Tenant,
+    {
+        const { refuse_scoped_event_shape(Ev::FINGERPRINT, Ev::PAYLOAD_FINGERPRINT, S::NAME) };
+        let scope = self.scope.raw();
+        self.tx.push_emit(Some(scope), Some(key.into()), event);
     }
 
     /// Enqueues a job scoped by this tenant's type; it runs in this tenant
@@ -1807,14 +2250,20 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
     /// `(*tx).enqueue(job)` in a handler that owns its `ScopedTx`, and
     /// `(**tx).enqueue(job)` in a scoped job's `run`, which holds
     /// `&mut ScopedTx`.
-    pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J) {
-        let scope = self.scope.raw();
+    pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J)
+    where
+        S: Tenant,
+    {
+        let scope = (self.scope.raw(), S::NAME);
         self.tx.push_enqueue(Some(scope), None, job);
     }
 
     /// `enqueue`, with `Tx::enqueue_keyed`'s idempotency key.
-    pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J) {
-        let scope = self.scope.raw();
+    pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J)
+    where
+        S: Tenant,
+    {
+        let scope = (self.scope.raw(), S::NAME);
         self.tx.push_enqueue(Some(scope), Some(key.into()), job);
     }
 }
@@ -1850,18 +2299,27 @@ impl<'a, S> std::ops::DerefMut for ScopedTx<'_, 'a, S> {
 /// group borrows is the operator, who already reaches every tenant through
 /// `Db::snapshot` (ruling R48).
 ///
-/// `Clone` because the platform hands the same request's token to the `Ctx`
-/// and to the handler argument; cloning widens nothing, since holding one at
-/// all IS the capability.
-#[derive(Clone)]
-pub struct CrossTenant(());
+/// Tied to the `Group` that minted it, and not `Clone` (tenancy-completion
+/// spec §5): `'g` is that group's borrow of the `Db`, so a token cannot
+/// outlive the borrow — not into a `static` or a `thread_local!`, both of
+/// which need `'static`, and not into the `Db`'s next group, which needs the
+/// `Db` back. The platform keeps the one token in the request's `Ctx` and
+/// hands the handler `&CrossTenant`, which it can neither copy into a token
+/// of its own nor keep. Only a `Db` borrowed for `'static` — a leaked one —
+/// mints a `'static` token: that is the operator, whose standing
+/// `Db::snapshot` already is (ruling R48), building a bypass on purpose.
+pub struct CrossTenant<'g>(std::marker::PhantomData<&'g ()>);
 
 impl<'a> Group<'a> {
     /// Mints the token the platform hands a route or job that declared
     /// `cross_tenant`. See `CrossTenant`: this is the only constructor, and
     /// it takes a `&Group` because that is a handle a handler never has.
-    pub fn cross_tenant_cap(&self) -> CrossTenant {
-        CrossTenant(())
+    ///
+    /// The token borrows what the group borrows (`'a`, the `Db`), not the
+    /// group itself: every holder mints first and then stages in the same
+    /// group, which a token borrowing `&self` would forbid.
+    pub fn cross_tenant_cap(&self) -> CrossTenant<'a> {
+        CrossTenant(std::marker::PhantomData)
     }
 }
 
@@ -1887,16 +2345,19 @@ impl<'a> Group<'a> {
 /// explicit at a scope line instead of leaving it an exception to the
 /// guarantee.
 ///
-/// `Clone` for `CrossTenant`'s reason: holding one at all is the admission,
-/// so a copy widens nothing.
-#[derive(Clone)]
-pub struct TenantAdmission(());
+/// Tied to its `Group` and not `Clone`, exactly as `CrossTenant` is: a
+/// `public(S)` route's admission stays in that request's `Ctx`, the
+/// dispatcher's lives for one job run, and an operator's for the `Db`
+/// borrow its group holds — none of them in a `static` or a
+/// `thread_local!`.
+pub struct TenantAdmission<'g>(std::marker::PhantomData<&'g ()>);
 
 impl<'a> Group<'a> {
     /// Mints the admission `Tx::admit_scope` takes. The only constructor;
-    /// see `TenantAdmission`.
-    pub fn tenant_admission(&self) -> TenantAdmission {
-        TenantAdmission(())
+    /// see `TenantAdmission`. Borrows what the group borrows, as
+    /// `cross_tenant_cap` does, for the same reason.
+    pub fn tenant_admission(&self) -> TenantAdmission<'a> {
+        TenantAdmission(std::marker::PhantomData)
     }
 }
 
@@ -1909,8 +2370,13 @@ impl<'a> Tx<'a> {
     /// No `Tenant::authorize` runs here, and none could: there is no single
     /// tenant to ask about. The declaration is the authorization, and it is
     /// auditable because `charpente describe` enumerates it.
-    pub fn across_tenants<S: 'static>(&self, cap: &CrossTenant) -> AllTenants<'_, 'a, S> {
-        let CrossTenant(()) = cap;
+    ///
+    /// `S: Tenant`, because only a tenant type has tenants to enumerate.
+    /// `Unscoped` and `PlatformOwned` are scope markers, not tenant types, so
+    /// `across_tenants::<PlatformOwned>()` is a compile error rather than a
+    /// handle whose `scan` could only panic on the request path.
+    pub fn across_tenants<S: Tenant>(&self, cap: &CrossTenant<'_>) -> AllTenants<'_, 'a, S> {
+        let CrossTenant(_) = cap;
         AllTenants {
             tx: self,
             scope: std::marker::PhantomData,
@@ -1940,7 +2406,9 @@ impl<S: 'static> AllTenants<'_, '_, S> {
     /// tenants, so a merge keyed by id alone would let one tenant's row
     /// overwrite another's in the answer.
     pub fn scan<R: Row<Scope = S>>(&self) -> io::Result<Vec<(Id<S>, R)>> {
-        assert_scoped::<R>("across_tenants().scan", "View::scan");
+        const { refuse_platform_read(R::TABLE) };
+        assert_scoped::<R>("across_tenants().scan");
+        self.tx.refuse_read_as::<R>("across_tenants().scan")?;
         let mut merged: BTreeMap<(u64, u64), R> = BTreeMap::new();
         for (scope, id, bytes) in self.tx.snapshot.scan_raw(R::TABLE, true)? {
             merged.insert((scope, id), R::decode_row(&bytes)?);
@@ -2209,8 +2677,9 @@ impl StateMachine for TableMachine {
                         payload,
                         key,
                         shape,
+                        scope,
                     } => {
-                        w.materialize_event(seq, event, payload, key.as_deref(), *shape)?;
+                        w.materialize_event(seq, event, payload, key.as_deref(), *shape, *scope)?;
                     }
                 }
             }
@@ -3366,9 +3835,9 @@ impl Db {
                     "{} Pending \"{name}\" job(s) (ids {}) were enqueued under a different shape \
                      of {name} (recorded {}; this binary {:#x}) — this binary will not decode \
                      them; run the binary that enqueued them until they are Done or Dead, then \
-                     deploy this one, or restore {name}'s old fields and its \
-                     `global`/`scoped_by` declaration and give the new shape its own #[job] type \
-                     under a new name (GUIDE §6)",
+                     deploy this one, or restore whichever of {name}'s fields, its \
+                     `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and \
+                     give the new shape its own #[job] type under a new name (GUIDE §6)",
                     ids.len(),
                     listed(&ids),
                     recorded.join(", "),
@@ -3776,7 +4245,7 @@ impl Db {
             drop(snap);
             if batch.is_empty() {
                 self.transact(|tx| -> Result<(), io::Error> {
-                    tx.put(&crate::migration::SchemaVersion {
+                    tx.put_schema_version(&crate::migration::SchemaVersion {
                         id: vid,
                         table: table.to_string(),
                         version: to,
@@ -3817,7 +4286,7 @@ impl Db {
                 for (scope, id, bytes) in migrated {
                     tx.migrate_put(table, scoped.then_some(scope), id, bytes);
                 }
-                tx.put(&crate::migration::SchemaVersion {
+                tx.put_schema_version(&crate::migration::SchemaVersion {
                     id: vid,
                     table: table.to_string(),
                     version: from, // not done until the close-out above
@@ -3961,7 +4430,7 @@ impl<'a> Group<'a> {
         // `transact`/`Group::stage` as the only two callers); the group
         // level is patched on right after, same-module field access.
         let (out, mut effects) = {
-            let mut tx = Tx::over(&self.snapshot);
+            let mut tx = Tx::over(&self.snapshot, &self.db.engine.machine().schema);
             tx.group = Some(&self.overlay);
             let out = f(&mut tx).map_err(TxError::App)?;
             (out, tx.effects)
@@ -4043,15 +4512,20 @@ impl<'a> Group<'a> {
         }
         // Negative space: `Tx::settle_job`'s `JobRow` is the one overlay write
         // `written_as` does not record, and `Db::open` registers it on every
-        // path, so no table reaches the record unchecked.
+        // path, so no table reaches the record unchecked. The excuse is only as
+        // good as that registration, so it is asserted beside it.
         assert!(
-            effects
-                .overlay
-                .keys()
-                .all(|table| schema.tables.contains_key(table)),
-            "Group::stage: a transaction wrote a table the Schema does not register and \
-             TxEffects::written_as did not record — every overlay writer but Tx::settle_job \
-             records its Row type there"
+            effects.overlay.keys().all(|table| {
+                (*table == JobRow::TABLE && schema.tables.contains_key(table))
+                    || effects
+                        .written_as
+                        .iter()
+                        .any(|&(written, ..)| written == *table)
+            }),
+            "Group::stage: a transaction wrote a table TxEffects::written_as did not record, or \
+             wrote the job queue under a Schema that does not register JobRow, so the check \
+             above never saw it — every overlay writer but Tx::settle_job records its Row type \
+             there, and Tx::settle_job's JobRow is one Db::open registers on every path"
         );
         // A mounted job name has one shape and one tenancy. `NAME` is the
         // bare type identifier, so a second `#[job]` type of the same name
@@ -4067,10 +4541,12 @@ impl<'a> Group<'a> {
         // dispatcher opens that id as the type the mounted job declares, so
         // a stand-in enqueued in another scope type's tenant (an `impl Job`
         // copying `NAME` and `FINGERPRINT`, or a `#[job]` whose `scoped_by`
-        // path spells another type alike, which the fingerprint cannot tell
-        // apart) would run in the same id of the declared type, not in the
+        // names another tenant type with the same `NAME`, which the
+        // fingerprint cannot tell apart) would run in the same id of the declared type, not in the
         // tenant it was enqueued in. This is the only place both types are
-        // known (job-tenancy final review N1).
+        // known (job-tenancy final review N1). A hand-built `JobDef` whose
+        // `scope_type` is not its `#[job]`'s trips the same check on the honest
+        // enqueue, so the refusal names that cause too (final re-review NB1).
         let job_shapes = &self.db.engine.machine().schema.job_shapes;
         for Enqueue {
             job: name,
@@ -4114,23 +4590,28 @@ impl<'a> Group<'a> {
             if let (Some(tenant), Some((declared, declared_type))) = (scope, scoped_by)
                 && tenant.scope_type != declared_type
             {
-                // The last path segment, as `decode_body` renders a type.
-                let enqueued = tenant
-                    .scope_name
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(tenant.scope_name);
+                // Each side is named by its tenant type's `NAME`
+                // (tenancy-completion spec §4). A final `::` component read two
+                // types spelled alike as one, and a generic as `B>`. The two
+                // NAMEs are equal when the mounted `JobDef` names one type and
+                // carries another's `scope_type`. That is why the text says
+                // "with another scope type", and why it lists that cause.
+                let enqueued = tenant.scope_name;
                 return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
                     format!(
                         "job \"{name}\" was enqueued in a `{enqueued}` tenant, but this binary \
-                         mounts {name} as `scoped_by = {declared}` under the same shape \
-                         ({shape:#x}), so it would run in `{declared}` {}, not in the tenant it \
-                         was enqueued in — a type standing in for {name}'s #[job] was \
-                         enqueued: a hand-written `impl Job`, or a #[job] whose \
-                         `scoped_by` spells another scope type the same way; the transaction was \
-                         refused and nothing was written, so a retry cannot succeed — enqueue the \
-                         mounted {name} from a `{declared}` scope, or give the other type its \
-                         own name (GUIDE §6)",
+                         mounts {name} as `scoped_by = {declared}` with another scope type under \
+                         the same shape ({shape:#x}) — a job row records its tenant's id and not \
+                         its type, so tenant {} would be read as the mounted declaration's type, \
+                         not the one it was enqueued in; either a type standing in for {name}'s \
+                         #[job] was enqueued (a hand-written `impl Job`, or a #[job] whose \
+                         `scoped_by` names another tenant type with the same `NAME`), or a \
+                         hand-written `JobDef` mounts {name} under a `scope_type` its #[job] does \
+                         not declare; \
+                         the transaction was refused and nothing was written, so a retry cannot \
+                         succeed — enqueue the mounted {name} from a `{declared}` scope, give the \
+                         other type its own name, or mount {name} as its #[job] declares it \
+                         (GUIDE §6)",
                         tenant.id
                     ),
                 )))));
@@ -4470,6 +4951,32 @@ impl Seeder {
 mod tests {
     use super::*;
 
+    /// Plan amendment A4, proved before `#[job]` calls `scoped_fingerprint`.
+    /// Continuing a field fold over `#scoped_by\0` + NAME + `\0` reproduces
+    /// the one-pass hash the macro computes today over the path's rendering,
+    /// wherever NAME is that one identifier. The literals are today's:
+    /// `0xaac8_d6b2_01d1_f744` is `kernel.rs`'s `scoped_jobs::File`
+    /// (`{ n: u64 }`, `scoped_by = Desk`), which that suite pins through the
+    /// macro, and `0xdeec_7a41_f1a3_46af` is a `{ n: u64 }` job
+    /// `scoped_by = Org` (job-tenancy final re-review, P1's `Report`).
+    #[test]
+    fn a_scoped_fingerprint_continues_the_field_fold_through_the_tenant_name() {
+        let fold = crate::migration::fnv1a_hash(b"n\0u64\0");
+        assert_eq!(fold, 0x2515_f249_2b16_f628);
+        assert_eq!(scoped_fingerprint(fold, "Desk"), 0xaac8_d6b2_01d1_f744);
+        assert_eq!(scoped_fingerprint(fold, "Org"), 0xdeec_7a41_f1a3_46af);
+        assert_eq!(
+            scoped_fingerprint(fold, "Org"),
+            crate::migration::fnv1a_hash(b"n\0u64\0#scoped_by\0Org\0")
+        );
+        assert_ne!(
+            scoped_fingerprint(fold, "Org"),
+            scoped_fingerprint(fold, "Team")
+        );
+        const IN_A_CONST: u64 = scoped_fingerprint(0x2515_f249_2b16_f628, "Desk");
+        assert_eq!(IN_A_CONST, 0xaac8_d6b2_01d1_f744);
+    }
+
     /// An `io::Error` carrying a refusal prints, under `Debug`, exactly what
     /// one carrying the bare text does — `main`'s `Error: …` line for a
     /// binary that returns one (GUIDE §10's `run_backup`) shows the text, not
@@ -4491,6 +4998,238 @@ mod tests {
         );
     }
 
+    /// The text `refuse` panics with for `table`, or `None` when it admits
+    /// the table. The refusals are `const fn`s whose `panic!` is a build
+    /// error in an app; called here at run time, the same `panic!` unwinds
+    /// with the same text.
+    fn refusal_text(refuse: fn(&str), table: &str) -> Option<String> {
+        std::panic::catch_unwind(|| refuse(table))
+            .err()
+            .map(|payload| match payload.downcast::<&'static str>() {
+                Ok(text) => (*text).to_string(),
+                Err(payload) => *payload
+                    .downcast::<String>()
+                    .expect("a refusal panics with its text"),
+            })
+    }
+
+    /// Spec §3: each platform table's write refusal names that table and its
+    /// one write path, and a name that is not a platform table's, however
+    /// close, is admitted. Literals spelled apart from the source's
+    /// continuation lines, so a reflowed literal that changed a word is red.
+    #[test]
+    fn each_platform_table_name_is_refused_by_its_own_text() {
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.jobs").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows \
+                 are the platform's: only the enqueue family writes one, because the \
+                 dispatcher runs a job in the tenant its row names; give this table a name of \
+                 its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, \
+                 or `tx.enqueue_in` from a `cross_tenant` route or job)"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.events").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.events\", the platform's event log — event \
+                 rows are the platform's: only an emit writes one, because every \
+                 subscription's feed is read from them; give this table a name of its own, \
+                 and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` \
+                 of the tenant it belongs to)"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.schema_versions").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.schema_versions\", the platform's migration \
+                 record — schema-version rows are the platform's: only a table's first write \
+                 and `Db::migrate_schema` write one, because the migration gate trusts them \
+                 for each table's version and a migration's resume point; give this table a \
+                 name of its own, and change a table's version by declaring it \
+                 (`#[table(version = N)]` with its `TableMigration`), which the kernel \
+                 migrates at startup"
+            )
+        );
+        for table in [
+            "Invoice",
+            "charpente",
+            "charpente.job",
+            "charpente.jobs2",
+            "charpente.event",
+            "Charpente.Jobs",
+            "",
+        ] {
+            assert_eq!(
+                refusal_text(refuse_platform_table, table),
+                None,
+                "{table:?} is not a platform table's name, so an app may use it"
+            );
+        }
+    }
+
+    /// Amendment A13: a `Row` that borrows a platform table's name is refused
+    /// for a read as for a write, and each table's text names that table and
+    /// the operator's path. Literals spelled apart from the source's.
+    #[test]
+    fn each_platform_table_name_is_refused_for_a_read_by_its_own_text() {
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.jobs").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.jobs\", the platform's job queue — a \
+                 transaction does not read the platform's tables, because the queue holds \
+                 every tenant's job payloads and the tenant each one runs in; give this table \
+                 a name of its own, and read the queue through `db.snapshot()` from code that \
+                 holds the `Db`"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.events").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.events\", the platform's event log — a \
+                 transaction does not read the platform's tables, because the log holds every \
+                 tenant's events; give this table a name of its own, and read the log through \
+                 `db.snapshot()` from code that holds the `Db`, or subscribe to its events"
+            )
+        );
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.schema_versions").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.schema_versions\", the platform's migration \
+                 record — a transaction does not read the platform's tables, because the \
+                 record is the migration gate's own state; give this table a name of its own, \
+                 and read the record through `db.snapshot()` from code that holds the `Db`"
+            )
+        );
+        for table in [
+            "Invoice",
+            "charpente.jobs2",
+            "charpente.event",
+            "Charpente.Events",
+            "",
+        ] {
+            assert_eq!(
+                refusal_text(refuse_platform_read, table),
+                None,
+                "{table:?} is not a platform table's name, so an app may read it"
+            );
+        }
+    }
+
+    fn shape_refusal(check: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
+        std::panic::catch_unwind(check).err().map(|payload| {
+            match payload.downcast::<&'static str>() {
+                Ok(text) => (*text).to_string(),
+                Err(payload) => *payload
+                    .downcast::<String>()
+                    .expect("a refusal panics with its text"),
+            }
+        })
+    }
+
+    /// Tenancy-completion spec §6 (Task 11 fix round 1): a scoped event's
+    /// shape is its payload fold mixed with its declared tenant's `NAME`, and
+    /// a global event's is the fold alone. Each operand moves alone: the
+    /// declared tenant passes, and another tenant's `NAME`, a fingerprint
+    /// copied unmixed, or another payload fold is refused. Literals spelled
+    /// apart from the source's.
+    #[test]
+    fn an_events_shape_is_its_payload_fold_mixed_with_its_declared_tenant() {
+        const SCOPED: &str = "contract: a scoped event's recorded shape is its payload's field \
+            fold mixed with its declared tenant's NAME — `FINGERPRINT == \
+            scoped_fingerprint(PAYLOAD_FINGERPRINT, <S as Tenant>::NAME)` for an event scoped \
+            by `S` — and this event's is not; the likely causes are a hand-written `impl Event` \
+            that states `FINGERPRINT` but not `PAYLOAD_FINGERPRINT`, which then defaults to \
+            `FINGERPRINT` (a scoped event states both), or one whose `FINGERPRINT` was copied \
+            from another event type, or whose `type Scope` names another tenant than the one \
+            its `FINGERPRINT` mixes, either of which would let its rows read as another tenant \
+            type's event; fix: derive it with `#[event(scoped_by = S)]`, or set \
+            `PAYLOAD_FINGERPRINT` to its fields' fold and `FINGERPRINT` to \
+            `charpente::core::db::scoped_fingerprint(Self::PAYLOAD_FINGERPRINT, <S as \
+            Tenant>::NAME)` (docs/GUIDE.md §11, \"An event's tenancy\")";
+        const GLOBAL: &str = "contract: a global event's recorded shape is its payload's field \
+            fold alone — `FINGERPRINT == PAYLOAD_FINGERPRINT` for an event whose `type Scope` \
+            is `Unscoped` — and this event's two differ, so its rows would read as another \
+            event type's; the likely cause is a hand-written `impl Event` whose `FINGERPRINT` \
+            was copied from a scoped event, or whose `type Scope` was changed to `Unscoped` and \
+            its `FINGERPRINT` was not; fix: derive it with `#[event(global)]`, or set \
+            `FINGERPRINT` to its fields' fold and drop `PAYLOAD_FINGERPRINT`, which defaults to \
+            it (docs/GUIDE.md §11, \"An event's tenancy\")";
+        let fold = 0x7E57_0E0E;
+        let org = scoped_fingerprint(fold, "Org");
+        assert_eq!(
+            shape_refusal(|| refuse_scoped_event_shape(org, fold, "Org")),
+            None,
+            "an event scoped by Org, at an Org site"
+        );
+        for (fingerprint, payload, tenant, why) in [
+            (org, fold, "Team", "Org's fingerprint at a Team site"),
+            (
+                org,
+                org,
+                "Org",
+                "a fingerprint copied with no payload fold of its own",
+            ),
+            (org, fold ^ 1, "Org", "another payload fold"),
+            (fold, fold, "Org", "an unmixed fingerprint at a scoped site"),
+        ] {
+            assert_eq!(
+                shape_refusal(|| refuse_scoped_event_shape(fingerprint, payload, tenant))
+                    .as_deref(),
+                Some(SCOPED),
+                "{why}"
+            );
+        }
+        assert_eq!(
+            shape_refusal(|| refuse_global_event_shape(fold, fold)),
+            None,
+            "a global event: its payload fold is its fingerprint"
+        );
+        assert_eq!(
+            shape_refusal(|| refuse_global_event_shape(org, fold)).as_deref(),
+            Some(GLOBAL),
+            "a scoped event's two fingerprints under a global declaration"
+        );
+    }
+
+    /// A hand-written `Row` that states a `SCOPE_NAME` under a scope marker.
+    /// `App::open` reads `Schema::table_tenants` into the tenant census, so
+    /// it would claim a tenant type that no scoped row of the app has.
+    struct Bogus {
+        id: Id<Bogus>,
+    }
+
+    impl Row for Bogus {
+        type Scope = crate::table::Unscoped;
+        const TABLE: &'static str = "bogus";
+        const INDEXES: &'static [IndexDef<Bogus>] = &[];
+        const SCOPE_NAME: Option<&'static str> = Some("Org");
+        fn id(&self) -> Id<Bogus> {
+            self.id
+        }
+        fn encode_row(&self, _out: &mut Vec<u8>) {}
+        fn decode_row(_bytes: &[u8]) -> io::Result<Bogus> {
+            Ok(Bogus {
+                id: Id::from_raw(0),
+            })
+        }
+    }
+
+    /// Final review triage T3 (hard rule 4): `SCOPE_NAME` is a scoped row's
+    /// tenant type's `NAME`, so a row with a scope marker that states one is
+    /// refused at registration, before it can put a tenant into the census.
+    #[test]
+    #[should_panic(
+        expected = "Schema: table \"bogus\" states SCOPE_NAME = Some(\"Org\"), but its \
+                    Row::Scope is charpente_core::table::Unscoped, which is not a tenant type \
+                    — SCOPE_NAME is the Tenant::NAME of a tenant-scoped row's scope type, and \
+                    App::open adds it to the app's tenant census; fix: derive the row with \
+                    #[table(scoped_by = S)], or leave SCOPE_NAME at its default, None"
+    )]
+    fn a_scope_name_on_a_row_with_no_tenant_is_refused_at_registration() {
+        let _ = Schema::new().table::<Bogus>();
+    }
+
     fn effects_fixture() -> TxEffects {
         let mut effects = TxEffects::default();
         let invoices = effects.overlay.entry("invoice").or_default();
@@ -4508,9 +5247,13 @@ mod tests {
             shape: 0x5E4D,
             scope: None,
         });
-        effects
-            .emits
-            .push(("invoice_finalized", vec![7], None, 0xE7E7));
+        effects.emits.push(Emit {
+            event: "invoice_finalized",
+            payload: vec![7],
+            key: None,
+            shape: 0xE7E7,
+            scope: None,
+        });
         effects
     }
 
@@ -4546,7 +5289,8 @@ mod tests {
                     event: "invoice_finalized".into(),
                     payload: vec![7],
                     key: None,
-                    shape: Some(0xE7E7)
+                    shape: Some(0xE7E7),
+                    scope: None,
                 },
             ]
         );
@@ -4594,13 +5338,20 @@ mod tests {
     #[test]
     fn keyed_emit_roundtrips() {
         let mut effects = TxEffects::default();
-        effects.emits.push((
-            "invoice_finalized",
-            vec![1],
-            Some("org-7".to_string()),
-            0xE7E7,
-        ));
-        effects.emits.push(("ping", vec![2], None, 0x9196));
+        effects.emits.push(Emit {
+            event: "invoice_finalized",
+            payload: vec![1],
+            key: Some("org-7".to_string()),
+            shape: 0xE7E7,
+            scope: None,
+        });
+        effects.emits.push(Emit {
+            event: "ping",
+            payload: vec![2],
+            key: None,
+            shape: 0x9196,
+            scope: None,
+        });
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
             decoded,
@@ -4609,13 +5360,15 @@ mod tests {
                     event: "invoice_finalized".into(),
                     payload: vec![1],
                     key: Some("org-7".into()),
-                    shape: Some(0xE7E7)
+                    shape: Some(0xE7E7),
+                    scope: None,
                 },
                 Effect::Emit {
                     event: "ping".into(),
                     payload: vec![2],
                     key: None,
-                    shape: Some(0x9196)
+                    shape: Some(0x9196),
+                    scope: None,
                 },
             ]
         );
@@ -4687,7 +5440,8 @@ mod tests {
                     event: "pong".into(),
                     payload: vec![9],
                     key: None,
-                    shape: None
+                    shape: None,
+                    scope: None,
                 },
             ]
         );
@@ -4705,9 +5459,13 @@ mod tests {
             shape: 0x0102_0304_0506_0708,
             scope: None,
         });
-        effects
-            .emits
-            .push(("pong", vec![9], None, 0x1112_1314_1516_1718));
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![9],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: None,
+        });
         assert_eq!(
             encode_record(&effects),
             vec![
@@ -4732,7 +5490,8 @@ mod tests {
                     event: "pong".into(),
                     payload: vec![9],
                     key: None,
-                    shape: Some(0x1112_1314_1516_1718)
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: None,
                 },
             ]
         );
@@ -4792,6 +5551,80 @@ mod tests {
                     payload: vec![9],
                     key: None,
                     shape: Some(0x0102_0304_0506_0708),
+                    scope: None,
+                },
+            ]
+        );
+    }
+
+    /// Tenancy-completion spec §6, the `0x0a` precedent: the scoped emit,
+    /// pinned as literal bytes. It is the `0x09` layout under tag `0x0b`,
+    /// plus the tenant as eight little-endian bytes, at tenant 0, because
+    /// presence and not value selects the tag. A keyed scoped emit carries
+    /// the app's key where `0x09` carries it and the tenant after the shape,
+    /// apart from the key. A global emit in the same record is still `0x09`,
+    /// byte for byte, with nothing after its shape.
+    #[test]
+    fn scoped_emit_bytes_are_pinned_with_tenant_zero() {
+        let mut effects = TxEffects::default();
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![9],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: Some(0),
+        });
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![8],
+            key: Some("r".to_string()),
+            shape: 0x1112_1314_1516_1718,
+            scope: Some(0x0102),
+        });
+        effects.emits.push(Emit {
+            event: "pong",
+            payload: vec![7],
+            key: None,
+            shape: 0x1112_1314_1516_1718,
+            scope: None,
+        });
+        assert_eq!(
+            encode_record(&effects),
+            vec![
+                3, 0, 0, 0, // three effects
+                11, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 9, 0, // scoped, no key
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape
+                0, 0, 0, 0, 0, 0, 0, 0, // its tenant: 0, a real tenant
+                11, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 8, // scoped, keyed
+                1, 1, 0, 0, 0, b'r', // the app's key "r", where 0x09 carries a key
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape
+                0x02, 0x01, 0, 0, 0, 0, 0, 0, // its tenant, apart from the key
+                9, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 7, 0, // global emit
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape, nothing after
+            ]
+        );
+        assert_eq!(
+            decode_record(&encode_record(&effects)).unwrap(),
+            vec![
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![9],
+                    key: None,
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: Some(0),
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![8],
+                    key: Some("r".into()),
+                    shape: Some(0x1112_1314_1516_1718),
+                    scope: Some(0x0102),
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![7],
+                    key: None,
+                    shape: Some(0x1112_1314_1516_1718),
                     scope: None,
                 },
             ]
@@ -4958,14 +5791,14 @@ mod tests {
         assert!(Refusal::of(&err).is_some(), "{err}");
     }
 
-    /// `0x0b`, the next free tag: `0x0a` is the scoped enqueue.
+    /// `0x0c`, the next free tag: `0x0b` is the scoped emit.
     #[test]
     fn decode_refuses_unknown_tags() {
         let mut out = Vec::new();
         1u32.encode(&mut out);
-        out.push(11);
+        out.push(12);
         let err = decode_record(&out).unwrap_err();
-        assert!(err.to_string().contains("unknown effect tag 11"), "{err}");
+        assert!(err.to_string().contains("unknown effect tag 12"), "{err}");
     }
 
     #[test]

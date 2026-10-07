@@ -22,12 +22,14 @@ use charpente_core::db::{
     Db, DbConfig, Refusal, Schema, Seeder, TableWriteRefusal, Tenant, Tx, TxError,
 };
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
+use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
 use charpente_core::table::{
-    Codec, Id, IndexDef, Rejection, Row, Snapshot, Store, StoreRejected, UNSCOPED, Unscoped, View,
+    Codec, Id, IndexDef, PlatformOwned, Rejection, Row, Snapshot, Store, StoreRejected, UNSCOPED,
+    Unscoped, View,
 };
 use charpente_sim::checks::{FaultReason, classify, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
@@ -459,27 +461,45 @@ fn submit_batch_advances_last_applied_to_the_last_frame_that_actually_applied() 
 /// Task 2 (tenant scoping): `Row::Scope` defaults every existing table to
 /// `Unscoped`, byte-identically. `engine.rs` has no `#[table]` type of its
 /// own to test against (`#[table]` emits `::charpente::` paths and core
-/// cannot depend on that crate), so this uses `SchemaVersion` — one of
-/// core's own hand-written `Row` impls (DESIGN §3) — as the stand-in the
-/// brief's `Widget` comment calls for ("any existing #[table] type in the
-/// test module works here"). It used `JobRow` until the job-tenancy write
-/// seal gave that table `PlatformOwned`; the next test pins what that kept.
+/// cannot depend on that crate), so this uses this file's hand-written
+/// `Widget` as the stand-in the brief's comment calls for ("any existing
+/// #[table] type in the test module works here"). It used `JobRow`, then
+/// `SchemaVersion`, until each became the platform's (`PlatformOwned`).
 #[test]
 fn an_ordinary_table_is_unscoped_by_default() {
     fn assert_unscoped<R: Row<Scope = Unscoped>>() {}
-    assert_unscoped::<SchemaVersion>();
+    assert_unscoped::<Widget>();
 }
 
-/// The job-tenancy write seal takes writes away from `JobRow` and nothing
-/// else: a transaction still reads it through `View` (`UnscopedRow`, which
-/// GUIDE §8's oracles and the dispatcher's own scan rely on), and it still
-/// stores under the bare `u64` key (`an_unscoped_table_still_writes_a_bare_u64_key`
-/// below). That `Tx::put`/`Tx::delete` refuse it is pinned by the
-/// `job_row_*` compile-fail fixtures in `charpente-macros`.
+/// The platform's three tables share the scope that seals them
+/// (tenancy-completion spec §3). A type-level pin: it stops compiling, not
+/// running, if one of them goes back to `Unscoped`. The refusal an app meets
+/// is pinned by the `job_row_*`, `event_row_*` and `schema_version_*`
+/// compile-fail fixtures in `charpente-macros`.
 #[test]
-fn a_job_row_is_still_read_through_view() {
-    fn assert_readable<R: charpente_core::table::UnscopedRow>() {}
+fn the_platform_tables_are_platform_owned() {
+    fn assert_platform<R: Row<Scope = PlatformOwned>>() {}
+    assert_platform::<JobRow>();
+    assert_platform::<EventRow>();
+    assert_platform::<SchemaVersion>();
+}
+
+/// The platform's tables are read through a `Snapshot` and nothing else
+/// (tenancy-completion spec §3). Each is still an `UnscopedRow`, keyed by
+/// bare id, and `ReadableBy<Snapshot>` holds for it, which §8's oracles and
+/// every operator read rely on. That a `Tx` read of one does not compile is
+/// pinned by the `*_read_on_bare_tx` compile-fail fixtures in
+/// `charpente-macros`, and that `Tx::put`/`delete` refuse it by the
+/// `*_written_on_bare_tx` and `job_row_*` ones.
+#[test]
+fn a_platform_row_is_read_through_a_snapshot() {
+    fn assert_readable<
+        R: charpente_core::table::UnscopedRow + charpente_core::table::ReadableBy<Snapshot>,
+    >() {
+    }
     assert_readable::<JobRow>();
+    assert_readable::<EventRow>();
+    assert_readable::<SchemaVersion>();
 }
 
 // `scoped_key`'s ordering property is pinned by `table.rs`'s own
@@ -544,6 +564,7 @@ struct TestOrg;
 /// type's `?Sized` is exercised somewhere; `Error = io::Error` so a refusal
 /// composes with the `?` the staged closures below already use.
 impl Tenant for TestOrg {
+    const NAME: &'static str = "TestOrg";
     type Who = str;
     type Error = io::Error;
 
@@ -1157,7 +1178,10 @@ fn two_tenants_rows_survive_each_other_under_the_composite_key() {
 /// from `UNSCOPED`, and the caller's mistaken belief that the row is
 /// isolated by tenant would go uncaught.
 #[test]
-#[should_panic(expected = "Writer::put: table \"charpente.jobs\" is not tenant-scoped")]
+#[should_panic(
+    expected = "Writer::put: table \"charpente.jobs\" is not tenant-scoped \
+                (Row::Scope = charpente_core::table::PlatformOwned) but was called with scope 7"
+)]
 fn an_unscoped_put_with_a_nonzero_scope_panics() {
     let sim = Sim::with_faults(0x7A2E_0009, FaultConfig::none());
     let store = Store::open(&sim.disk(), "store.redb").unwrap();
@@ -1185,7 +1209,10 @@ fn an_unscoped_put_with_a_nonzero_scope_panics() {
 /// the `expected` string names `Writer::delete` specifically so this cannot
 /// pass on `put`'s message instead.
 #[test]
-#[should_panic(expected = "Writer::delete: table \"charpente.jobs\" is not tenant-scoped")]
+#[should_panic(
+    expected = "Writer::delete: table \"charpente.jobs\" is not tenant-scoped \
+                (Row::Scope = charpente_core::table::PlatformOwned) but was called with scope 7"
+)]
 fn an_unscoped_delete_with_a_nonzero_scope_panics() {
     let sim = Sim::with_faults(0x7A2E_000B, FaultConfig::none());
     let store = Store::open(&sim.disk(), "store.redb").unwrap();
@@ -1616,7 +1643,8 @@ fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
 #[test]
 #[should_panic(
     expected = "Snapshot::get_scoped: table \"charpente.jobs\" is not tenant-scoped \
-                (Row::Scope = Unscoped) — use View::get for an unscoped table"
+                (Row::Scope = charpente_core::table::PlatformOwned) — use View::get for a \
+                table that is not tenant-scoped"
 )]
 fn get_scoped_on_an_unscoped_table_panics() {
     let sim = Sim::with_faults(0x7A2E_0012, FaultConfig::none());
@@ -1629,7 +1657,8 @@ fn get_scoped_on_an_unscoped_table_panics() {
 #[test]
 #[should_panic(
     expected = "Snapshot::scan_scoped: table \"charpente.jobs\" is not tenant-scoped \
-                (Row::Scope = Unscoped) — use View::scan for an unscoped table"
+                (Row::Scope = charpente_core::table::PlatformOwned) — use View::scan for a \
+                table that is not tenant-scoped"
 )]
 fn scan_scoped_on_an_unscoped_table_panics() {
     let sim = Sim::with_faults(0x7A2E_0013, FaultConfig::none());
@@ -1642,7 +1671,8 @@ fn scan_scoped_on_an_unscoped_table_panics() {
 #[test]
 #[should_panic(
     expected = "Snapshot::scan_from_scoped: table \"charpente.jobs\" is not tenant-scoped \
-                (Row::Scope = Unscoped) — use View::scan_from for an unscoped table"
+                (Row::Scope = charpente_core::table::PlatformOwned) — use View::scan_from for a \
+                table that is not tenant-scoped"
 )]
 fn scan_from_scoped_on_an_unscoped_table_panics() {
     let sim = Sim::with_faults(0x7A2E_0014, FaultConfig::none());
@@ -1790,7 +1820,8 @@ fn an_unscoped_index_entry_stays_byte_identical() {
 #[test]
 #[should_panic(
     expected = "Snapshot::scan_by_scoped: table \"charpente.jobs\" is not tenant-scoped \
-                (Row::Scope = Unscoped) — use View::scan_by for an unscoped table"
+                (Row::Scope = charpente_core::table::PlatformOwned) — use View::scan_by for a \
+                table that is not tenant-scoped"
 )]
 fn scan_by_scoped_on_an_unscoped_table_panics() {
     let sim = Sim::with_faults(0x7A2E_0018, FaultConfig::none());
@@ -2752,6 +2783,7 @@ static AUDITED_SCOPES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 struct AuditOrg;
 
 impl Tenant for AuditOrg {
+    const NAME: &'static str = "AuditOrg";
     type Who = str;
     type Error = io::Error;
 
@@ -3321,6 +3353,7 @@ static ADMIT_ORG_AUTHORIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 struct AdmitOrg;
 
 impl Tenant for AdmitOrg {
+    const NAME: &'static str = "AdmitOrg";
     type Who = str;
     type Error = io::Error;
 
@@ -3434,6 +3467,46 @@ fn an_opened_then_admitted_second_tenant_is_the_same_violation() {
         let _second = tx.admit_scope(Id::<TestOrg>::from_raw(2), &admission);
         Ok::<(), io::Error>(())
     });
+}
+
+/// Tenancy-completion spec §4. The one-scope contract's text names each
+/// tenant by its type's `NAME` and its id, then its full `type_name`, so two
+/// scope types spelled alike never print as one. Both scopes are admitted:
+/// `admit_scope` asks no `authorize`, so `AUDITED_SCOPES` is untouched.
+#[test]
+fn a_second_scope_names_both_tenants_by_name_and_type() {
+    let sim = Sim::with_faults(0x7F00_0008, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = group.stage(|tx| {
+            {
+                let _first = tx.admit_scope(Id::<TestOrg>::from_raw(1), &admission);
+            }
+            let _second = tx.admit_scope(Id::<AuditOrg>::from_raw(2), &admission);
+            Ok::<(), io::Error>(())
+        });
+    }))
+    .expect_err("a second tenant on one transaction is a contract violation");
+    let msg = panicked
+        .downcast_ref::<String>()
+        .map_or_else(String::new, String::clone);
+    assert_eq!(
+        msg,
+        format!(
+            "contract: a transaction opens ONE tenant scope (spec §8) — this one already \
+             opened `TestOrg` 1 ({}) and is now asked for `AuditOrg` 2 ({}); run the second \
+             tenant's work in its own transaction",
+            std::any::type_name::<TestOrg>(),
+            std::any::type_name::<AuditOrg>()
+        )
+    );
 }
 
 /// A store gracefully closed, then its file length mangled by hand into one

@@ -17,8 +17,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use charpente_core::db::{Db, DbConfig, Schema, TxError};
+use charpente_core::db::{Db, DbConfig, Job, Schema, TxError};
 use charpente_core::io::{Disk, File};
+use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::table::{Codec, Id, IndexDef, Row, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -340,4 +341,106 @@ fn sealed_segments_asserts_disk_list_is_sorted() {
 
     scramble.store(true, Ordering::SeqCst);
     let _ = db.sealed_segments();
+}
+
+/// A job with no payload, for the two tests below, which read the job queue
+/// inside a batch the way the dispatcher does.
+struct Ping;
+
+impl Codec for Ping {
+    fn encode(&self, _out: &mut Vec<u8>) {}
+    fn decode(_input: &mut &[u8]) -> io::Result<Ping> {
+        Ok(Ping)
+    }
+}
+
+impl Job for Ping {
+    const NAME: &'static str = "ping";
+    const FINGERPRINT: u64 = 0x7C00_0900;
+    type Scope = Unscoped;
+}
+
+/// DESIGN §2: the group overlay carries rows only. An enqueue is a log effect
+/// that becomes a `JobRow` at APPLY, with the id the `next_job_id` counter
+/// assigns there, so a transaction staged behind it in the same batch cannot
+/// see it — and no transaction can look, except the dispatcher's
+/// `Tx::get_job`. This was pinned from two handlers that scanned the queue
+/// and the event log (`charpente/tests/group_commit.rs`, seed `0x60C1_0007`)
+/// until no transaction could read either (tenancy-completion spec §3).
+#[test]
+fn an_enqueue_is_invisible_to_a_later_sibling_until_the_batch_commits() {
+    let mut db = fresh_db(0x7C00_0901);
+    let mut g = db.begin_group().expect("group");
+    let admission = g.tenant_admission();
+    g.stage(|tx| {
+        tx.enqueue(Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("the enqueue stages");
+    let seen = g
+        .stage(|tx| {
+            tx.get_job(Id::from_raw(0), &admission)
+                .map_err(|e| e.to_string())
+        })
+        .expect("the read stages");
+    assert!(
+        seen.is_none(),
+        "an enqueue staged earlier in this batch must be invisible to a later sibling: job rows \
+         materialize at apply, so no staged transaction can see one — got {:?}",
+        seen.map(|row| (row.id.raw(), row.name))
+    );
+    assert_eq!(
+        g.len(),
+        1,
+        "the enqueue is the batch's one record; the read stages none"
+    );
+    g.commit().expect("commit");
+    let jobs = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(
+        jobs.iter()
+            .map(|row| (row.id.raw(), row.name.as_str(), row.status))
+            .collect::<Vec<_>>(),
+        vec![(0, "ping", JobStatus::Pending)],
+        "the job DID materialize at apply, once the batch committed"
+    );
+}
+
+/// The dispatcher's failure stage reads a job row again after an earlier
+/// stage of the same batch may have settled it (dispatch.rs, the
+/// retry-policy read), so `Tx::get_job` reads what `View::get` reads: this
+/// transaction's writes, then the group's, then the snapshot.
+#[test]
+fn the_dispatchers_job_read_sees_a_settle_staged_earlier_in_its_batch() {
+    let mut db = fresh_db(0x7C00_0902);
+    db.transact(|tx| {
+        tx.enqueue(Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("the enqueue commits");
+    let mut g = db.begin_group().expect("group");
+    let admission = g.tenant_admission();
+    g.stage(|tx| {
+        let mut row = tx
+            .get_job(Id::from_raw(0), &admission)
+            .map_err(|e| e.to_string())?
+            .expect("the committed enqueue materialized job 0");
+        row.attempts = 1;
+        row.last_error = Some("the relay timed out".to_string());
+        tx.settle_job(&row, &admission);
+        Ok::<_, String>(())
+    })
+    .expect("the settle stages");
+    let seen = g
+        .stage(|tx| {
+            tx.get_job(Id::from_raw(0), &admission)
+                .map_err(|e| e.to_string())
+        })
+        .expect("the read stages")
+        .expect("job 0 exists");
+    assert_eq!(
+        (seen.attempts, seen.last_error.as_deref()),
+        (1, Some("the relay timed out")),
+        "a job read inside a batch must see the settle an earlier stage of that batch made"
+    );
+    g.commit().expect("commit");
 }
