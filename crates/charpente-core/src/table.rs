@@ -1357,7 +1357,7 @@ impl Store {
     fn mix_schedule(&self, entry: u64) {
         let _ = self
             .schedule
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hash| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |hash| {
                 let mut hash = hash;
                 for byte in entry.to_le_bytes() {
                     hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);

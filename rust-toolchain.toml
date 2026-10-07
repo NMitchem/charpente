@@ -1,0 +1,10 @@
+# Pinned, not floating: charpente-macros' trybuild pins compare rustc's diagnostics byte for
+# byte, and rustc rewords them between releases (1.99 added "conditionally implemented" and
+# "exists in another namespace" notes to eight pins), so no .stderr matches two toolchains.
+# A floating `stable` made CI red on a commit that was green the week before (run
+# 37559784616). Bump deliberately: change this line and the `toolchain:` inputs in
+# .github/workflows/, re-bless with `TRYBUILD=overwrite cargo test -p charpente-macros --test
+# trybuild`, read every rewritten .stderr, and run the full gate.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy", "rust-src"]

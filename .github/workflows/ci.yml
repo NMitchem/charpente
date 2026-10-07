@@ -13,8 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          # Must equal rust-toolchain.toml's channel; that file says why it is pinned.
+          toolchain: 1.99.0
           # rust-src is load-bearing for charpente-macros' trybuild pins: a const-eval
           # panic's diagnostic quotes std's `panic!` source line only when rust-src is
           # installed, and prints "= note: the failure occurred here" when it is not
@@ -183,7 +185,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0 # must equal rust-toolchain.toml's channel
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:

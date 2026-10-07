@@ -7633,7 +7633,42 @@ gives the decision, then its cost if wrong ("not stated" where the ruling gave n
 9. **The final review's "leave" items,** as its triage table lists them (`final-review.md`,
    "Deferred-item triage"): cosmetics and unwrapped lines, the unpinned borrowck claims, the test
    harness's n1–n4, and the follow-ups in 3–5 above.
-10. **CI on the merged tip:** one line here once Noah's push runs it.
+10. **CI on the merged tip:** red on `befcbde` (run 37559784616) from toolchain drift, not S1;
+    diagnosed and pinned in the 2026-10-06 entry below.
 
 **Next.** The merge of `s1-tenancy` into `main` (`--no-ff`, ruling 1), then Noah's push and its CI
 run. The 0.1.0 publish is Noah's call.
+
+## 2026-10-06 — S1 merged and pushed; CI went red on a compiler release, and the toolchain is now pinned
+
+S1 merged into `main` as `befcbde` (`--no-ff`, ruling 1; tree `e9a91bb`, byte-identical to
+`s1-tenancy`'s). The counted gate on the merged tip: 86 of 86 `test result: ok`, 1,816 passed,
+cb503cd's count. Pushed `57e804d..befcbde`, 209 commits. The worktree `../charpente-s1` and its
+branch are gone; the record's `.superpowers/sdd/2026-09-30-tenancy-completion/` was always in
+main's tree, and the worktree held only a symlink to it.
+
+**C1 stands.** Noah kept `Principal` without `Clone` on 2026-10-06, accepting the keep
+recommendation with the other open items, so spec A19 and the §12 amendment are final.
+
+**CI on `befcbde` was red (run 37559784616), and S1 is not why.** The check job installed a
+floating `stable`, which had moved from rustc 1.98.1 (the last green run, on 57e804d) to 1.99.0,
+released 2026-09-28. 1.99 deprecates `Atomic*::fetch_update` as a rename to `try_update`, and
+`-D warnings` failed `table.rs:1360`, a line unchanged since 2026-08-20. Reproduced on rustc
+1.99.0 (b940084d7) locally before anything changed. The rename cleared clippy across the
+workspace, and the full suite under 1.99 then failed trybuild's `macro_errors`: eight `.stderr`
+pins mismatched, and every changed line is rustc's own presentation ("is conditionally
+implemented", an "unsatisfied requirement introduced here" label, "a struct named X exists in
+another namespace"), none of it charpente's text. 1.99 prints lines 1.95 does not, so no
+`.stderr` can match both, and a floating CI toolchain beside a fixed local one can never agree
+on these pins. The drift is the defect, not the deprecation. This is its second appearance:
+57e804d (`rust-src`) was the first.
+
+**The fix.** `rust-toolchain.toml` pins 1.99.0 with rustfmt, clippy and rust-src; all three
+workflow toolchain steps name the same version; the eight pins are re-blessed under it, all 74
+changed lines read; the rename stays. A bump is now a deliberate act, and the file's comment
+gives the procedure. The cost: `try_update` is unstable on 1.92 and stable on 1.95, so the
+oldest compiler that builds `charpente-core` rises from redb 4.3.0's 1.90 to somewhere in
+1.93–1.95. The workspace declares no `rust-version`.
+
+Gate under the pin, rustc 1.99.0: fmt 0, clippy 0, 86 of 86 `test result: ok`, 1,816 passed,
+FAILED 0, and the tested diff hashed the same before and after the run.

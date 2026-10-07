@@ -10,11 +10,13 @@ error[E0277]: `JobRow` is one of the platform's tables, and a transaction does n
    = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
                db.snapshot()?.scan::<JobRow>()?
    = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
-help: the trait `ScopeReadableBy<V, R>` is implemented for `charpente::charpente_core::table::PlatformOwned`
+help: the trait `ScopeReadableBy<V, R>` is conditionally implemented for `charpente::charpente_core::table::PlatformOwned`
   --> $WORKSPACE/crates/charpente-core/src/table.rs
    |
    | impl<V: ?Sized + sealed::Operator, R> ScopeReadableBy<V, R> for PlatformOwned {}
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   | ^^^^^^^^^^^^^^^^^----------------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                  |
+   |                  unsatisfied requirement introduced here: `Tx<'_>: table::sealed::Operator`
    = note: required for `JobRow` to implement `ReadableBy<Tx<'_>>`
 note: required by a bound in `charpente::View::get`
   --> $WORKSPACE/crates/charpente-core/src/table.rs

@@ -70,7 +70,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0 # must equal rust-toolchain.toml's channel
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/edge-harness.sh
       # The rig's reproduction IS the scenario script it records (DESIGN §7:
