@@ -1,0 +1,542 @@
+59d58
+<     tx.enqueue(Echo { note: id });
+ok
+sim: 256 universe(s) per test from master seed 0x7f63491f307a3a76
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x37a242310fbecbfe
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.01, misdirected_write: 0.002, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x37a242310fbecbfe
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x55410996d9017406
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.008, object_get_error: 0.0, object_lost_ack: 0.011, object_delete_error: 0.011, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x55410996d9017406
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x09de93f49bbe7c6c
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.101, bit_flip: 0.0, misdirected_write: 0.006, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.035, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x9de93f49bbe7c6c
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x4d37c3300a5d4a88
+  config: FaultConfig { write_error: 0.016, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.3, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.073, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x4d37c3300a5d4a88
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x9404442983e17a9f
+  config: FaultConfig { write_error: 0.005, sync_error: 0.096, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.002, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.203, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x9404442983e17a9f
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xfc2d143171df20ea
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.454, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.037, object_lost_ack: 0.018, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.009, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xfc2d143171df20ea
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xd4cb2719ec075277
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.86, crash_torn: 0.13118000000000002, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.163, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xd4cb2719ec075277
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x0954753ec0c09081
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.019, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.031, disk_latency: (0ns, 50ms), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x954753ec0c09081
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xc847ee4cde4890aa
+  config: FaultConfig { write_error: 0.024, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.004, object_get_error: 0.0, object_lost_ack: 0.014, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xc847ee4cde4890aa
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x7dd4642f32d5d852
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.468, crash_torn: 0.38729600000000003, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.024, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.013, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.179, subscriber_stall: 0.244, disk_latency: (0ns, 2ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x7dd4642f32d5d852
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x00b7778e157bbd1b
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.014, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.025, net_spike: 0.027, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xb7778e157bbd1b
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x3bf8acc87146e0df
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.009, read_error: 0.0, object_put_error: 0.029, object_get_error: 0.045, object_lost_ack: 0.01, object_delete_error: 0.004, corruption_scope: "wal/", conn_drop: 0.029, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x3bf8acc87146e0df
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x730c9ad57d78217d
+  config: FaultConfig { write_error: 0.004, sync_error: 0.0, crash_apply: 0.157, crash_torn: 0.35237399999999997, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.021, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x730c9ad57d78217d
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x58ba4ded4801b3e3
+  config: FaultConfig { write_error: 0.0, sync_error: 0.011, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.005, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.107, disk_latency: (0ns, 100µs), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x58ba4ded4801b3e3
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x5b7a07fa54e99c36
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.851, crash_torn: 0.06049400000000001, dir_entry_loss: 0.413, bit_flip: 0.0, misdirected_write: 0.007, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x5b7a07fa54e99c36
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x480b41cea9cb880f
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.32, bit_flip: 0.0, misdirected_write: 0.004, read_error: 0.034, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x480b41cea9cb880f
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x436504bebdd7c32d
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.001, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.121, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x436504bebdd7c32d
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x099f0e8be954ca61
+  config: FaultConfig { write_error: 0.0, sync_error: 0.011, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.467, bit_flip: 0.0, misdirected_write: 0.004, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.014, object_lost_ack: 0.003, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.027, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x99f0e8be954ca61
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xf22012b8da683c14
+  config: FaultConfig { write_error: 0.0, sync_error: 0.101, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.006, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.017, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 0ns) }
+  fired:  fault:sync_error: 1, restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xf22012b8da683c14
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xcda7854e2fe3fa08
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.003, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.052, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xcda7854e2fe3fa08
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xe42770c39d85754b
+  config: FaultConfig { write_error: 0.0, sync_error: 0.028, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.376, bit_flip: 0.0, misdirected_write: 0.003, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.01, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xe42770c39d85754b
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x2839ce2a23ca6379
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.033, object_put_error: 0.047, object_get_error: 0.003, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.027, net_spike: 0.0, subscriber_stall: 0.164, disk_latency: (0ns, 2ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x2839ce2a23ca6379
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x992c225cec285349
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.315, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.015, object_lost_ack: 0.0, object_delete_error: 0.01, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x992c225cec285349
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xdea9efee56476339
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.226, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.018, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.022, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xdea9efee56476339
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x8cb12e98ee68ba88
+  config: FaultConfig { write_error: 0.009, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.016, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.006, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 250ms) }
+  fired:  fault:write_error: 1, restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x8cb12e98ee68ba88
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xc2c158137cc07786
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.212, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.007, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.001, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xc2c158137cc07786
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x20aaa72e8cb1404f
+  config: FaultConfig { write_error: 0.0, sync_error: 0.001, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.003, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.02, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x20aaa72e8cb1404f
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xe621aefd3290c7f3
+  config: FaultConfig { write_error: 0.0, sync_error: 0.008, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xe621aefd3290c7f3
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x405904bfc8e1ba5e
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.422, crash_torn: 0.15952800000000003, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.017, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x405904bfc8e1ba5e
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x7900db5316e275bf
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.011, object_get_error: 0.0, object_lost_ack: 0.005, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.198, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x7900db5316e275bf
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x1273074675b40c19
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.018, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x1273074675b40c19
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x6c9f682885f92074
+  config: FaultConfig { write_error: 0.031, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.016, misdirected_write: 0.003, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.01, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.062, disk_latency: (0ns, 2ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x6c9f682885f92074
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xed6c3ab2ec0e68e3
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.22, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.007, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.011, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xed6c3ab2ec0e68e3
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xbad6feea891db37f
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.005, read_error: 0.002, object_put_error: 0.002, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xbad6feea891db37f
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x7e6f33a04fd6eee6
+  config: FaultConfig { write_error: 0.004, sync_error: 0.034, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.01, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.002, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x7e6f33a04fd6eee6
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xfcb992743cdbb856
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.436, bit_flip: 0.0, misdirected_write: 0.007, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.007, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.001, net_spike: 0.043, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xfcb992743cdbb856
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x011ece3fe6da53b9
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.046, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x11ece3fe6da53b9
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xa3e4e6e4e1518fac
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.267, crash_torn: 0.730801, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.23, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xa3e4e6e4e1518fac
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x9ab7fe8803d248cb
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.487, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.084, subscriber_stall: 0.229, disk_latency: (0ns, 2ms), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x9ab7fe8803d248cb
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xc4a2b59c524b71e9
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.011, object_delete_error: 0.016, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.158, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xc4a2b59c524b71e9
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x837f7e04c381cee4
+  config: FaultConfig { write_error: 0.037, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.009, misdirected_write: 0.008, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.112, disk_latency: (0ns, 2ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x837f7e04c381cee4
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xcea263e545199ff6
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.252, bit_flip: 0.0, misdirected_write: 0.002, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.197, disk_latency: (0ns, 50ms), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xcea263e545199ff6
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x66233c89c9df9beb
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.043, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x66233c89c9df9beb
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x6440b23b1a362732
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.427, crash_torn: 0.5380469999999999, dir_entry_loss: 0.102, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.04, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x6440b23b1a362732
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x1aec532a7ca3e77b
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.351, bit_flip: 0.008, misdirected_write: 0.004, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.042, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x1aec532a7ca3e77b
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x74c2f9c40256124c
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.819, crash_torn: 0.17303600000000005, dir_entry_loss: 0.419, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.016, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.018, disk_latency: (0ns, 0ns), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x74c2f9c40256124c
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xdfd989b74a75bbf2
+  config: FaultConfig { write_error: 0.0, sync_error: 0.016, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.017, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.019, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.058, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xdfd989b74a75bbf2
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x88517681a25d809c
+  config: FaultConfig { write_error: 0.0, sync_error: 0.006, crash_apply: 0.789, crash_torn: 0.04409899999999999, dir_entry_loss: 0.373, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.015, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x88517681a25d809c
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x323ffc0d5a58d078
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.021, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.018, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x323ffc0d5a58d078
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x7c3d701e277cd01f
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.209, disk_latency: (0ns, 100µs), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x7c3d701e277cd01f
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x573a61f5765a96a4
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.576, crash_torn: 0.35616000000000003, dir_entry_loss: 0.297, bit_flip: 0.0, misdirected_write: 0.007, read_error: 0.01, object_put_error: 0.009, object_get_error: 0.034, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x573a61f5765a96a4
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x56e8e4e7b1448143
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.568, crash_torn: 0.32313600000000003, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x56e8e4e7b1448143
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x679baedb1117a1ae
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.368, bit_flip: 0.018, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.028, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x679baedb1117a1ae
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xc2b587bfc46e111c
+  config: FaultConfig { write_error: 0.0, sync_error: 0.103, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.137, subscriber_stall: 0.175, disk_latency: (0ns, 0ns), net_latency: (0ns, 0ns) }
+  fired:  fault:sync_error: 1, restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xc2b587bfc46e111c
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x251057a938327a01
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.004, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.017, net_spike: 0.156, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x251057a938327a01
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xdf5b328fc6cb31a4
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.017, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.061, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xdf5b328fc6cb31a4
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xc1d9308a434000dc
+  config: FaultConfig { write_error: 0.0, sync_error: 0.013, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.002, misdirected_write: 0.004, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.012, object_lost_ack: 0.0, object_delete_error: 0.018, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.018, disk_latency: (0ns, 0ns), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xc1d9308a434000dc
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x7bac60f366b444e9
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.013, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.018, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x7bac60f366b444e9
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x417d676c11d3d4f0
+  config: FaultConfig { write_error: 0.036, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.311, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.012, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x417d676c11d3d4f0
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x17e1bb267e368b0b
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.013, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.025, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.016, corruption_scope: "wal/", conn_drop: 0.024, net_spike: 0.097, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x17e1bb267e368b0b
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x65232f2b6aa1a2bc
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.007, read_error: 0.0, object_put_error: 0.043, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x65232f2b6aa1a2bc
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xb0f4209e43d93a2b
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.008, net_spike: 0.124, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xb0f4209e43d93a2b
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x08e98202a5c7c6c0
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.02, object_lost_ack: 0.0, object_delete_error: 0.004, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.069, subscriber_stall: 0.003, disk_latency: (0ns, 100µs), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x8e98202a5c7c6c0
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x3e977c91980ec53d
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.005, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.009, subscriber_stall: 0.075, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x3e977c91980ec53d
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x74f2b05c96d37164
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.36, crash_torn: 0.12736, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.005, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.237, disk_latency: (0ns, 100µs), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x74f2b05c96d37164
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x7345507413fa1f6e
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.016, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.009, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.178, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x7345507413fa1f6e
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x87b811004cafee6d
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.028, net_spike: 0.0, subscriber_stall: 0.156, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x87b811004cafee6d
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xeeee23b2976d2328
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xeeee23b2976d2328
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x3c75435e37daa0cf
+  config: FaultConfig { write_error: 0.04, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.042, object_lost_ack: 0.018, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.03, disk_latency: (0ns, 50ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x3c75435e37daa0cf
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xb697e6522c1dd44b
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.04, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.004, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xb697e6522c1dd44b
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x42350bbb0233c5c3
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.116, crash_torn: 0.227188, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.015, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x42350bbb0233c5c3
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xa331008511cc1277
+  config: FaultConfig { write_error: 0.012, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.009, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.159, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xa331008511cc1277
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x0c1efd5b0387c2fb
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.979, crash_torn: 0.004557000000000004, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.004, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.022, net_spike: 0.0, subscriber_stall: 0.144, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xc1efd5b0387c2fb
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x1736ef517f1c7fda
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.272, bit_flip: 0.018, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.025, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.003, subscriber_stall: 0.148, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x1736ef517f1c7fda
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x4ab60645200cfa48
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.173, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.006, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.019, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x4ab60645200cfa48
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x31b00c345625239b
+  config: FaultConfig { write_error: 0.0, sync_error: 0.003, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.003, object_delete_error: 0.01, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x31b00c345625239b
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xcc29832537b513e3
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.023, object_get_error: 0.007, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.096, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xcc29832537b513e3
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x8442630e1232da9f
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.318, crash_torn: 0.41942999999999997, dir_entry_loss: 0.0, bit_flip: 0.01, misdirected_write: 0.006, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.009, object_lost_ack: 0.01, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 50ms), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x8442630e1232da9f
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x71abf8612eb73809
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.072, disk_latency: (0ns, 50ms), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x71abf8612eb73809
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x92d887ea07f59531
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.011, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.009, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x92d887ea07f59531
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xeed538a6924d97a9
+  config: FaultConfig { write_error: 0.0, sync_error: 0.055, crash_apply: 0.788, crash_torn: 0.17511199999999996, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 20ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xeed538a6924d97a9
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xb30a7ce71e81f954
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.211, crash_torn: 0.456042, dir_entry_loss: 0.097, bit_flip: 0.012, misdirected_write: 0.0, read_error: 0.009, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.01, corruption_scope: "wal/", conn_drop: 0.017, net_spike: 0.049, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xb30a7ce71e81f954
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x483380c7a7f38d79
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.018, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 2ms), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x483380c7a7f38d79
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x972b374fcf8336b0
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 1.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.01, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 0ns) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x972b374fcf8336b0
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x030d732eca4b2413
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.736, crash_torn: 0.083688, dir_entry_loss: 0.092, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.006, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x30d732eca4b2413
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x95b14c892c83ff19
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.056, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.024, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x95b14c892c83ff19
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0x4b61129e28e32c70
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.197, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.156, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x4b61129e28e32c70
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xddbc9653faac3439
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 1.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.044, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.006, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.082, subscriber_stall: 0.192, disk_latency: (0ns, 100µs), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xddbc9653faac3439
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the enqueue did not commit with the row
+  seed:   0xca61c1dc181c05f6
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.427, crash_torn: 0.300825, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.003, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 100µs), net_latency: (0ns, 1ms) }
+  fired:  restart: 1
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xca61c1dc181c05f6
+sim: 181 of 256 universes of "acked_note_survives_a_restart" gave up — reached no verdict
+sim: 167 of 256 universes of "acked_post_implies_the_echo_after_recovery" gave up — reached no verdict
+sim: 256 universe(s) per test, 75 verdict(s), 348 gave up, 89 failure(s) (master seed: 0x7f63491f307a3a76)
+SIMEXIT=1

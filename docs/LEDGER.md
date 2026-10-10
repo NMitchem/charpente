@@ -7676,3 +7676,47 @@ FAILED 0, and the tested diff hashed the same before and after the run.
 **CI on `11e550a`: green** (run 37561067446), every step of both jobs, rustc 1.99.0 the only
 compiler in the log; the workspace step counts 86 of 86 `test result: ok` and 1,816 passed, the
 local gate's numbers exactly.
+
+## 2026-10-10 — launch run, rehearsal attempt 1: PASS (a)–(f), signed off
+
+The run's instruments landed first (plan `docs/superpowers/plans/2026-10-06-launch-run.md`):
+README's red half pinned by a test (`c4ad1d6`); the box and its selftest (`cb07935`, `6a8c3e1`);
+the registry, seal-check, block and replay tools (`b3a950a`, `e896c83`); the brief, byte-identical
+for every attempt, and the record's skeleton (`f1805a6`).
+
+**Attempt 1, rehearsal, run 2026-10-09.** Sha `f1805a6`. charpente-cli 0.1.0 from the packaged
+registry (`charpente-cli-0.1.0.crate` sha256 `43e779d4…f4d3`), network none. BRIEF sha256
+`dae25ebb…4dd9`, README `affa4644…5e96` (the repo's), image `rust@sha256:6ff07edc…a181`. One Opus
+stranger, headless, 19 turns, 0 resumes, no human input. Every number below is read from
+`attempt-1/box.jsonl`, by box call:
+
+- (a) call 19, before any edit: 256 universes per test, 181 verdicts, 331 gave up, no failures,
+  master seed `0x15a02a91b60257df`.
+- (b) call 20 deleted `tx.enqueue(Echo { note: id });`; call 23: 89 failures, every one
+  `acked_post_implies_the_echo_after_recovery`, none `acked_note_survives_a_restart`, master seed
+  `0x7f63491f307a3a76`. Call 24 re-ran that master seed and reproduced the batch.
+- (c) call 25 replayed `S = 0x37a242310fbecbfe`; its block is `cmp`-identical to the batch's.
+  Call 26 ran `S` with the line restored: no failures.
+- (d) the controller's replay in a fresh box (fresh install, network none) prints the identical
+  block, re-checked at sign-off.
+- (e) `seal-check.sh` raised 13 hits (5 box, 8 Mac), each ruled by name: the stranger read its own
+  app, its run directory and the box wrapper, and probed the offline toolchain. Nothing read
+  charpente's source. All 27 box calls are the agent's, reconciled call by call.
+- (f) frame diff 0 lines: no framework patch.
+
+**Noah signed off 2026-10-10.**
+
+**Testimony that bears on the real run.** `charpente --version` prints the usage text, because
+there is no version flag (`charpente-cli/src/main.rs:31`). README's clippy step cannot run in the official `rust`
+image, whose minimal profile has no clippy, and offline it cannot be added; that is a rehearsal
+artifact, since the real run has network, and the stranger substituted `cargo check` under
+`-D warnings` and said it was not clippy. README's doc links resolve on crates.io against
+`repository = github.com/NMitchem/charpente`, which is private, so they are dead for a stranger
+until it is public. The stranger read the gave-up counts as "only 181 of 512 runs actually tested
+anything".
+
+**The record.** `attempt-1/` is committed except `agent.session.jsonl` (sha256 `67a2783b…1427`),
+Claude Code's own session file for the stranger, whose harness context carries Noah's email
+address. Spec §8's record is `box.jsonl` and `agent.jsonl`, and neither carries it; the record's
+`.gitignore` keeps that file out of git for every attempt, and it stays beside the record on this
+machine.
