@@ -7823,3 +7823,27 @@ installed; the official image has none, and with network the stranger added it a
 passed clean. `charpente --version` prints the usage text, as in attempt 1. README's "the
 second property goes red" read as either guarantee 2 or the scaffold's second sim test, and
 both go red. The census is in the record's README.
+
+## 2026-10-10 — M3 shipped; the roadmap is complete
+
+The launch run passed on its real attempt against crates.io (the entry above; record
+`docs/experiments/2026-10-launch-run/`), signed by Noah. That is M3 exit criterion (a), and
+with (b), the third docs-only build of 2026-09-24, and (c), held by `claims_census`, M3 is
+shipped. PLAN.md marks sub-projects 1 and 5 and M3 shipped, README's status paragraph says
+so and links the record, and CLAUDE.md's "Current state" no longer calls M3 active. M0
+through M3 are the whole roadmap; PLAN.md defines no M4.
+
+The real attempt's install, `charpente new`, `cargo clippy --all-targets -- -D warnings`
+(after `rustup component add clippy`, box calls 10–11) and green `charpente test --sim` (call
+13) are the publish-path spec's §10.2 "post-publish run against the registry".
+
+**After launch** is PLAN.md's v1.x table, each item with the trigger that reopens it: the
+blob store, WebSockets, typed telemetry, the read-only Postgres-wire endpoint, the own LSM
+engine, the design C timeline epoch, the bare-metal Linux BENCH run, versioned payload
+migrations, a deep fingerprint, a commit-time shape lock, `enqueue_keyed_in`, a cross-tenant
+subscription, and a tenant's own jobs and events through `ScopedTx`. The launch run adds
+four candidates for 0.1.1, none in that table and none fixed here (the record's last
+section): the CLI never says why a universe gave up, while two strangers out of two read
+"256 universes" as more coverage than they got; `charpente --version` prints the usage
+text; README's clippy line does not say what to do when the component is missing; and
+"the second property" could name the property it means.

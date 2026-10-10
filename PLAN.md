@@ -195,7 +195,7 @@ the oracle, and the oracle is the product.
   which is a CI-checkout cost and not this item's justification. Cranelift hot reload
   stays an open question in DESIGN §9.1, unchanged and unpromoted.
 
-## M3 — Launch [in progress; defined 2026-09-13]
+## M3 — Launch [shipped 2026-10-10; defined 2026-09-13]
 
 **Goal:** a stranger reproduces the wager in one sitting, and the reviewer catches what it
 claims to. This is M0's shape again — it ends in a recorded run, not a checklist — because
@@ -209,8 +209,10 @@ gap that matters.
 
 Sub-projects, in dependency order:
 
-1. **Publish path.** Workspace to `0.1.0`; the six crates on crates.io (five names reserved
-   2026-07-01, confirmed 2026-09-13; `charpente-tsgen` publishes fresh). `charpente new
+1. **Publish path** [shipped 2026-10-10; spec
+   `docs/superpowers/specs/2026-09-13-publish-path-design.md`; `0.1.0` on crates.io].
+   Workspace to `0.1.0`; the six crates on crates.io (five names reserved 2026-07-01,
+   confirmed 2026-09-13; `charpente-tsgen` publishes fresh). `charpente new
    <name>` scaffolds GUIDE §1's layout — `Cargo.toml` with the `[[test]] name = "sim"`
    block, `src/main.rs`, `tests/sim.rs` — and the scaffold is compile-gated the way
    GUIDE's Rust code blocks are, so it cannot drift from the guide it claims to match.
@@ -251,14 +253,20 @@ Sub-projects, in dependency order:
    F1 from the helpdesk experiment — the raw panic trace that "demonstrably destroyed a
    competent agent's work" — is verified closed against the helpdesk repro, not assumed
    closed because a hook now exists.
-5. **The launch run.** DEMO.md re-executed against the published version by a docs-only
-   agent starting from `cargo install charpente-cli`: reaches a red sim with a seed, replays
-   it. That transcript is the launch post.
+5. **The launch run** [shipped 2026-10-10; spec
+   `docs/superpowers/specs/2026-10-06-launch-run-design.md`; record
+   `docs/experiments/2026-10-launch-run/`]. DEMO.md re-executed against the published
+   version by a docs-only agent starting from `cargo install charpente-cli`: reaches a red sim
+   with a seed, replays it. That transcript is the launch post. The spec ran README's "Try it" rather than DEMO.md,
+   with the stranger given the published README and one sentence. A rehearsal against the
+   packaged crates passed first, then the real attempt against crates.io passed, both signed
+   by Noah.
 
 **Exit criteria:** (a) the launch run, recorded with its seeds; (b) the third docs-only
 build passes on the bar in sub-project 3; (c) every number in README.md and MANIFESTO.md
 that is a claim about charpente is in docs/BENCH.md or absent, and every other figure
-cites its source or carries no digits (held by `claims_census`).
+cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
+the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
 ## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, each with the trigger that reopens it
 

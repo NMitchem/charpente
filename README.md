@@ -128,12 +128,14 @@ API keys, static-JWKS OIDC), schema migrations as log records, `charpente
 describe`, and a black-box edge harness that drives stock binaries over
 real TCP with `kill -9` and TCP-proxy fault injection.
 
-**M2 closed 2026-09-13; M3 — launch — is in progress.** M2 shipped six sub-projects,
+**M2 closed 2026-09-13; M3 — launch — shipped 2026-10-10.** M2 shipped six sub-projects,
 dropped one, and reclassified the rest to after launch with the trigger that reopens each
-([PLAN.md](PLAN.md)). M3 is the finish line before this is public: a stranger installs
-charpente from crates.io, scaffolds an app, and reaches a red sim with a seed in one
-sitting; a third docs-only agent build passes review with zero Criticals the platform
-should have caught; and every number in this file is measured or gone. The first two of
+([PLAN.md](PLAN.md)). M3 was the finish line before this went public. charpente `0.1.0` is
+on crates.io, and a stranger given only this README installed it, scaffolded an app, and
+reached a red sim with a seed that replays
+([docs/experiments/2026-10-launch-run](docs/experiments/2026-10-launch-run/)). A third
+docs-only agent build passed review with zero Criticals the platform should have caught.
+Every number in this file is measured or gone. The first two of
 M2's sub-projects — an honest benchmark harness and primary-side group commit — have their
 numbers in [docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`:
 one connection costs one durable fsync per transaction, ~215 durable records/sec on that

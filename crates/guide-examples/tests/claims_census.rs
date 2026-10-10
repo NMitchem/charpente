@@ -113,8 +113,13 @@ const EXEMPT: &[(&str, &str)] = &[
         "thousands of times",
         "MANIFESTO §9: the wager's restatement of that record; rhetorical",
     ),
+    (
+        "2026-10-launch-run",
+        "the launch-run record's directory name, a year and month that README's Status links; \
+         not a figure about charpente",
+    ),
 ];
-const EXEMPT_COUNT: usize = 12;
+const EXEMPT_COUNT: usize = 13;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")

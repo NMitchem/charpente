@@ -39,9 +39,10 @@ fine later), porting existing apps, and feature flags on determinism.
 
 ## What this is
 
-An agent-native, single-binary Rust backend platform. M0, M1 and M2 are complete; M3
-(launch) is in progress (see "Current state" below). The milestones and exit criteria in
-PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
+An agent-native, single-binary Rust backend platform. M0 through M3 (launch) are complete,
+and 0.1.0 is on crates.io (see "Current state" below). The milestones and exit criteria in
+PLAN.md were the roadmap, and its "After launch (v1.x)" table holds what comes next, each
+item with the trigger that reopens it.
 
 ## Commands
 
@@ -203,8 +204,9 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
 
 ## Current state
 
-**M3 (launch) is the active milestone**; M0, M1 and M2 shipped. That is deliberately all
-the status this file carries. Task-level state goes stale every time a task lands, and a
+**The roadmap is complete: M0 through M3 shipped, and M3 (launch) closed 2026-10-10 with
+0.1.0 on crates.io.** What comes next is PLAN.md's "After launch (v1.x)" table, each item
+gated on its trigger. That is deliberately all the status this file carries. Task-level state goes stale every time a task lands, and a
 stale instruction is worse than an absent one — so the chronological record is
 **[docs/LEDGER.md](docs/LEDGER.md)**, and per-plan mid-flight state lives in
 `.superpowers/sdd/<date>-<name>/progress.md` (gitignored: local working files, absent from
