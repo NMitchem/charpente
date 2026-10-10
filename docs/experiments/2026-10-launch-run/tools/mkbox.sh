@@ -12,7 +12,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
   echo "mkbox: a container named $name exists — every attempt gets a fresh one" >&2; exit 2
 fi
 net=bridge; [ -n "$reg" ] && net=none
-docker run -d --name "$name" --network "$net" "$image" sleep infinity >/dev/null
+docker run -d --init --name "$name" --network "$net" "$image" sleep infinity >/dev/null
 docker exec "$name" bash -c 'echo /root > /tmp/.box-cwd'
 if [ -n "$reg" ]; then
   docker cp "$reg" "$name:/opt/registry"

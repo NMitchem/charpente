@@ -26,13 +26,24 @@ jq -nc --argjson seq "$seq" --arg utc "$(now)" --arg cwd "$cwd" --arg command "$
   '{seq:$seq,event:"start",utc:$utc,cwd:$cwd,command:$command}' >> "$LOG"
 unlock
 
-docker exec -e BOX_CMD="$cmd" "$BOX" bash -c '
+# A killed ./box must kill its command too, and SIGKILL cannot be trapped. So
+# docker exec's stdin is a FIFO whose only writer is this shell (fd 3): however
+# this shell dies, docker closes the box side's stdin, and the watcher there
+# kills the command's process group (setsid gives it one), skipping the cwd
+# write. The command itself reads /dev/null.
+mkfifo "$tmp/in"
+docker exec -i -e BOX_CMD="$cmd" "$BOX" bash -c '
   cd "$(cat /tmp/.box-cwd 2>/dev/null || echo /root)" 2>/dev/null || cd /root
-  eval "$BOX_CMD"
-  rc=$?
-  pwd > /tmp/.box-cwd
-  exit $rc' >"$tmp/out" 2>"$tmp/err" </dev/null
+  setsid bash -c "trap \"pwd > /tmp/.box-cwd\" EXIT; eval \"\$BOX_CMD\"" </dev/null & c=$!
+  # $c as well as -$c: the watcher can run before setsid has made the group.
+  { read -r _; kill -KILL -- -$c $c; } <&0 & w=$!
+  wait $c; rc=$?
+  kill $w
+  exit $rc' <"$tmp/in" >"$tmp/out" 2>"$tmp/err" &
+exec 3>"$tmp/in"
+wait $!
 rc=$?
+exec 3>&-
 
 lock
 jq -nc --argjson seq "$seq" --arg utc "$(now)" --argjson exit "$rc" \
