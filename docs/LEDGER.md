@@ -7737,3 +7737,39 @@ Every sha cited above this entry is pre-rewrite, including the rehearsal entry j
 rehearsal's frame `f1805a6` is now `e3f7f0c`, and its record `61cd1ed` is now `9361545`.
 0.1.0 is published from the rewritten history, so the crates' `.cargo_vcs_info.json` names a
 public commit.
+
+## 2026-10-10 — 0.1.0 published to crates.io
+
+Noah ran `scripts/publish.sh --for-real` on 2026-10-10 at `a8e9ec9`, after the full gate on
+that commit (fmt 0, clippy 0, 86 of 86 `test result: ok`, 1,817 passed) and CI run
+38068872503 on it (both jobs green; the workspace step 86 of 86, 1,817 passed, rustc 1.99.0).
+All six crates went up at 0.1.0. A first attempt failed with 403 on the July token before
+uploading anything, so the registry held only the 0.0.0 reservations; a new token with
+`publish-new` (`charpente-tsgen` had never been on the registry) and `publish-update` went
+through.
+
+**Checked from the registry, not from the upload log.** Each `.crate` was downloaded from
+static.crates.io:
+
+| crate | published sha256 | rehearsed sha256 |
+|---|---|---|
+| charpente-core | `abf106dd…c624` | `a31941e0…9416` |
+| charpente-macros | `6864c95a…8459` | `e708a0fc…6090` |
+| charpente | `96099da2…eb83` | `18858eee…e02f` |
+| charpente-tsgen | `3daefaed…d9e8` | `8b9ade1c…32bd` |
+| charpente-cli | `9bbdc6fb…c19f` | `43e779d4…f4d3` |
+| charpente-sim | `5cbfa0cc…2856` | `2c49352a…043d` |
+
+Each published hash equals the `.crate` this machine packaged. Each differs from the
+rehearsed one for one stated reason: `.cargo_vcs_info.json` names `a8e9ec9` rather than the
+rehearsal's frame `e3f7f0c`, and every crate's `Cargo.lock` carries its siblings' `.crate`
+checksums, which change with that stamp. Unpacked, every other file in all six is
+byte-identical to what the rehearsal installed, and the only `Cargo.lock` lines that differ
+are `checksum =` lines. The source under `crates/`, `Cargo.toml`, `Cargo.lock` and
+`README.md` is unchanged since the rehearsal's frame.
+
+**README (§9).** The published `charpente-cli` README `cmp`s identical to the rehearsed one:
+sha256 `affa4644…5e96` on both sides.
+
+**Carried to 0.1.1:** `charpente --version` prints the usage text (rehearsal testimony 1), and
+it shipped that way.
