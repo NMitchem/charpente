@@ -7847,3 +7847,6 @@ section): the CLI never says why a universe gave up, while two strangers out of 
 "256 universes" as more coverage than they got; `charpente --version` prints the usage
 text; README's clippy line does not say what to do when the component is missing; and
 "the second property" could name the property it means.
+
+**CI on `4daeffa`: green** (run 38074959840), both jobs; the workspace step counts 86 of 86
+`test result: ok` and 1,817 passed, the local gate's numbers exactly, on rustc 1.99.0.
