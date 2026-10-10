@@ -265,6 +265,98 @@ fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_th
     );
 }
 
+/// README's "Try it", red half: delete the scaffold's `tx.enqueue` and
+/// `charpente test --sim` goes red on the second property with a seed, and
+/// the seed replays. README calls this the whole pitch; until the launch-run
+/// spec (2026-10-06, §5) nothing ran it, and the e2e test above proves only
+/// the green half. The master seed fixes the batch, and the assertions name
+/// the reason (ack-durability), so a re-keyed fault stream that still fails
+/// for this reason keeps the pin meaningful.
+#[test]
+// Rewriting the scaffold's manifest and src/lib.rs is edge tooling
+// (DESIGN.md §1): the rig making README's edit, not code the sim exercises.
+#[allow(clippy::disallowed_methods)]
+fn deleting_the_scaffolds_enqueue_turns_the_second_property_red_with_a_seed_that_replays() {
+    let dir = scratch("red");
+    let (code, _, err) = run_in(&dir, &["new", "red"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let app = dir.join("red");
+
+    let ws = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let mut manifest = read(&app.join("Cargo.toml"));
+    manifest.push_str(&format!(
+        "\n[patch.crates-io]\ncharpente = {{ path = {:?} }}\ncharpente-sim = {{ path = {:?} }}\n",
+        ws.join("crates/charpente"),
+        ws.join("crates/charpente-sim")
+    ));
+    std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+
+    // README: "delete the `tx.enqueue` line in `src/lib.rs`".
+    let lib = read(&app.join("src/lib.rs"));
+    let line = "    tx.enqueue(Echo { note: id });\n";
+    assert_eq!(
+        lib.matches("tx.enqueue").count(),
+        1,
+        "README names one `tx.enqueue` line in the scaffold's src/lib.rs:\n{lib}"
+    );
+    std::fs::write(app.join("src/lib.rs"), lib.replacen(line, "", 1)).unwrap();
+
+    let target = target_dir();
+    let batch = charpente()
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", &target)
+        .args(["test", "--sim", "--master-seed", "0x1"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&batch.stdout);
+    assert_eq!(
+        batch.status.code(),
+        Some(1),
+        "README: the second property goes red\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&batch.stderr)
+    );
+    assert!(
+        !stdout.contains("sim failure in acked_note_survives_a_restart"),
+        "the first property does not depend on the enqueue:\n{stdout}"
+    );
+    let start = stdout
+        .find("sim failure in acked_post_implies_the_echo_after_recovery: ")
+        .unwrap_or_else(|| panic!("the second property is the one that fails:\n{stdout}"));
+    let rest = &stdout[start..];
+    let repro_at = rest
+        .find("  repro:  ")
+        .expect("a failure block ends with its repro line");
+    let end = repro_at + rest[repro_at..].find('\n').expect("the repro line ends");
+    let block = &rest[..end];
+    assert!(
+        block.contains("ack-durability violated"),
+        "and it fails for the reason the deletion causes:\n{block}"
+    );
+
+    let repro = block[repro_at..]
+        .trim_start()
+        .strip_prefix("repro:  ")
+        .unwrap();
+    let args: Vec<&str> = repro.split_whitespace().collect();
+    assert_eq!(args[0], "charpente", "{repro}");
+    let replay = charpente()
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", &target)
+        .args(&args[1..])
+        .output()
+        .unwrap();
+    let replayed = String::from_utf8_lossy(&replay.stdout);
+    assert_eq!(
+        replay.status.code(),
+        Some(1),
+        "the seed replays red:\n{replayed}"
+    );
+    assert!(
+        replayed.contains(block),
+        "README: the seed replays — the same block, byte for byte\nbatch:\n{block}\nreplay:\n{replayed}"
+    );
+}
+
 /// The first ```toml block after GUIDE §1's heading, verbatim.
 fn guide_section_1_cargo_toml() -> String {
     let guide = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/GUIDE.md"));
