@@ -4,11 +4,14 @@
 set -u
 [ "$#" -ge 2 ] && [ "$#" -le 3 ] || { echo "usage: block.sh <file> <test> [<seed>]" >&2; exit 2; }
 awk -v head="sim failure in $2: " -v seed="${3:-}" '
+  index($0, "sim failure in ") == 1 { on = 0 }
   index($0, head) == 1 { on = 1; buf = "" }
   on { buf = buf $0 "\n" }
   on && index($0, "  repro:  ") == 1 {
     on = 0
     n = split($0, w, " ")
-    if (seed == "" || w[n] == seed) { printf "%s", buf; found = 1; exit }
+    # Concatenation forces a string compare: BSD awk compares two hex-looking
+    # strings as strtod doubles, so 0x…922c would match 0x…922b.
+    if (seed == "" || w[n] "" == seed "") { printf "%s", buf; found = 1; exit }
   }
   END { exit found ? 0 : 1 }' "$1"
