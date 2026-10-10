@@ -7773,3 +7773,53 @@ sha256 `affa4644…5e96` on both sides.
 
 **Carried to 0.1.1:** `charpente --version` prints the usage text (rehearsal testimony 1), and
 it shipped that way.
+
+## 2026-10-10 — launch run, real attempt against crates.io (record `attempt-2/`): PASS (a)–(f), signed off
+
+The first real attempt, and the second attempt overall. The spec names records `attempt-N`
+and puts the phase in the attempts table. The repository was public before dispatch, and
+the README's doc-link targets resolved unauthenticated.
+
+**Pins.** Version 0.1.0 from crates.io, with the repo at `0db7e7e` (source unchanged since
+the publish commit). BRIEF sha256 `dae25ebb…4dd9`, the same bytes as attempt 1. README
+`affa4644…5e96`: the published crate's, identical to the one the rehearsal read. Image
+`rust@sha256:6ff07edc…a181`, unmoved since the rehearsal. Network bridge, no cargo config in
+the box. One Opus stranger, headless and launched the same way as attempt 1: 20 turns,
+425 s, 0 resumes, no human input. Every number below is read from `attempt-2/box.jsonl`, by
+box call, and cross-checked against the container's own files:
+
+- (a) call 12 started the sim in the background, and calls 13–14 read its log: 256 universes
+  per test, 165 verdicts, 347 gave up, no failures, `EXIT=0`, master seed
+  `0x912313adf8115ad0`. That is before the edit in call 15.
+- (b) call 15 deleted `tx.enqueue(Echo { note: id });` (`59d58`). Call 16: 100 verdicts, 334
+  gave up, 78 failures, every one `acked_post_implies_the_echo_after_recovery`, none
+  `acked_note_survives_a_restart`, `EXIT=1`, master seed `0x7894bb0aadb2ce8b`. Call 19
+  re-ran that master seed and reproduced the batch byte for byte.
+- (c) call 18 replayed `S = 0xd04099cad12ff0d2` twice. Each block is `cmp`-identical to the
+  batch's (`batch.block`, 777 bytes), and so are the container's two replay logs.
+- (d) the controller's replay ran in a fresh box that installed 0.1.0 from crates.io itself.
+  The app was copied without `target/` and the stranger's call-15 edit re-applied verbatim
+  (the stranger had restored the line). The block is identical.
+- (e) `seal-check.sh` raised 12 hits (3 box, 9 Mac), each ruled. The stranger grepped its own
+  logs, read its run directory and the box wrapper, and had one Mac-side read of its own
+  offloaded tool output denied by the harness. Nothing read charpente's source. All 22 box
+  calls are the agent's, each byte-identical to the command in its transcript.
+- (f) published 0.1.0, no framework patch.
+
+The stranger's scaffold from crates.io is byte-identical to the rehearsal's (`src/lib.rs`
+sha256 `624eb197…`).
+
+**Noah signed off 2026-10-10** ("Ok let's do the original plan", after the PASS was put to
+him). This is M3 exit criterion (a).
+
+**Testimony.** Two of two strangers read the give-up counts as overstating coverage. This
+one said "'256 universes' overstates how much was actually tested": 165 of 512 runs
+decided, and in the red batch 78 of 256 for the failing property. The CLI also never says
+why a universe gave up: human and JSON output carry counts and coverage, not the
+`give_up` reason. The stranger's restored-line replay of `S` gave up with
+`fault:sync_error` fired, and its guess that the restored job's own writes took the error
+is consistent with the template but unproven. README's clippy step assumes clippy is
+installed; the official image has none, and with network the stranger added it and clippy
+passed clean. `charpente --version` prints the usage text, as in attempt 1. README's "the
+second property goes red" read as either guarantee 2 or the scaffold's second sim test, and
+both go red. The census is in the record's README.

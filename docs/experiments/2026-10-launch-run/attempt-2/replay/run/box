@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# ./box '<command>': runs <command> on the run's machine, in the working
+# directory the previous call left, and logs the call (launch-run spec §4).
+# Not a login shell: Debian's /etc/profile would reset PATH and drop cargo's
+# bin directory, which the image's own environment puts there.
+set -u
+BOX='launch-real-1-replay'
+LOG='/Users/noahmitchem/Documents/GitHub/charpente/docs/experiments/2026-10-launch-run/attempt-2/replay/replay.box.jsonl'
+if [ "$#" -ne 1 ]; then
+  echo "usage: ./box '<command>'   (exactly one argument: the whole command, quoted)" >&2
+  exit 2
+fi
+cmd=$1
+tmp=$(mktemp -d)
+locked=0
+cleanup() { [ "$locked" = 1 ] && rmdir "$LOG.lock" 2>/dev/null; rm -rf "$tmp"; }
+trap cleanup EXIT
+lock()   { until mkdir "$LOG.lock" 2>/dev/null; do sleep 0.05; done; locked=1; }
+unlock() { rmdir "$LOG.lock"; locked=0; }
+now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+cwd=$(docker exec "$BOX" cat /tmp/.box-cwd 2>/dev/null || echo '?')
+lock
+seq=$(( $(cat "$LOG.seq") + 1 )); echo "$seq" > "$LOG.seq"
+jq -nc --argjson seq "$seq" --arg utc "$(now)" --arg cwd "$cwd" --arg command "$cmd" \
+  '{seq:$seq,event:"start",utc:$utc,cwd:$cwd,command:$command}' >> "$LOG"
+unlock
+
+# A killed ./box must kill its command too, and SIGKILL cannot be trapped. So
+# docker exec's stdin is a FIFO whose only writer is this shell (fd 3): however
+# this shell dies, docker closes the box side's stdin, and the watcher there
+# kills the command's process group (setsid gives it one), skipping the cwd
+# write. The command itself reads /dev/null.
+mkfifo "$tmp/in"
+docker exec -i -e BOX_CMD="$cmd" "$BOX" bash -c '
+  cd "$(cat /tmp/.box-cwd 2>/dev/null || echo /root)" 2>/dev/null || cd /root
+  setsid bash -c "trap \"pwd > /tmp/.box-cwd\" EXIT; eval \"\$BOX_CMD\"" </dev/null & c=$!
+  # $c as well as -$c: the watcher can run before setsid has made the group.
+  { read -r _; kill -KILL -- -$c $c; } <&0 & w=$!
+  wait $c; rc=$?
+  kill $w
+  exit $rc' <"$tmp/in" >"$tmp/out" 2>"$tmp/err" &
+exec 3>"$tmp/in"
+wait $!
+rc=$?
+exec 3>&-
+
+lock
+jq -nc --argjson seq "$seq" --arg utc "$(now)" --argjson exit "$rc" \
+  --rawfile stdout "$tmp/out" --rawfile stderr "$tmp/err" \
+  '{seq:$seq,event:"end",utc:$utc,exit:$exit,stdout:$stdout,stderr:$stderr}' >> "$LOG"
+unlock
+cat "$tmp/out"; cat "$tmp/err" >&2
+exit "$rc"
