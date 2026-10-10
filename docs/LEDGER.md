@@ -7,6 +7,11 @@ instruction, and every subagent dispatched in this repo was loading all of it.
 CLAUDE.md carries the standing rules. This file carries what happened. The underlying
 detail lives in git history and `.superpowers/sdd/`.
 
+**Commit shas written before the 2026-10-10 history rewrite are pre-rewrite.** Every sha cited
+in this file above that day's "history rewritten" entry, and in any other doc written before
+it, names an old commit; `docs/commit-map-2026-10-10.txt` maps each to its current one. Commit
+messages were translated in the rewrite and already carry current shas.
+
 **How to read the pin-replay figures below (correction, 2026-08-15, M2 T9).** Entries
 report pinned-seed replays as `0x348270b38f166529` "26/26" / "29/29" / "30/30" and
 `0x8bee1752811ae873` "4/4". Those are **suite** counts, not pin evidence.
@@ -7720,3 +7725,15 @@ Claude Code's own session file for the stranger, whose harness context carries N
 address. Spec §8's record is `box.jsonl` and `agent.jsonl`, and neither carries it; the record's
 `.gitignore` keeps that file out of git for every attempt, and it stays beside the record on this
 machine.
+
+## 2026-10-10 — history rewritten; old shas map through `docs/commit-map-2026-10-10.txt`
+
+The repository's history was rewritten with `git filter-repo` before its first public push.
+Authors, committers, dates and messages are unchanged, except that every sha a message cites
+now names the rewritten commit.
+
+Every sha cited above this entry is pre-rewrite, including the rehearsal entry just above.
+`docs/commit-map-2026-10-10.txt` maps each to its current commit (`old new`, full shas): the
+rehearsal's frame `f1805a6` is now `e3f7f0c`, and its record `61cd1ed` is now `9361545`.
+0.1.0 is published from the rewritten history, so the crates' `.cargo_vcs_info.json` names a
+public commit.
