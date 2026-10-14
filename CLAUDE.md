@@ -62,8 +62,8 @@ item with the trigger that reopens it.
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
   charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-cli: cli/ctl/
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
-  charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/realtime_resume/
-  smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
+  charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/outbound/
+  realtime_resume/smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
   ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
   outbound-fixture: sim; invoicing: describe_golden/sim). Every list is exhaustive as
   written — if a name is missing, the list is stale, not selective.

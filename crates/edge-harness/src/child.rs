@@ -36,6 +36,12 @@ pub struct Bins {
     /// invoicing example target `examples/invoicing/examples/
     /// seed_foreign_job.rs`, whose doc comment explains.
     pub seed_foreign_job: PathBuf,
+    /// outbound-fixture's `charpente::launch` binary: `POST /orders` enqueues
+    /// a job that charges `pay.fixture` over TLS (`tests/outbound.rs`).
+    pub outbound_node: PathBuf,
+    /// The HTTPS remote `outbound_node` charges: it dedupes by idempotency
+    /// key and reports what arrived on its plain-HTTP `/stats` port.
+    pub fake_remote: PathBuf,
 }
 
 /// How long a freshly spawned process gets to open its port.
@@ -48,12 +54,15 @@ const RESTART_ATTEMPTS: u32 = 10;
 const RESTART_RETRY_DELAY: Duration = Duration::from_millis(300);
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// A node this rig controls: process handle, the exact `bin`/`args` it was
-/// spawned with (so `restart` can reproduce it), and its tee'd log paths.
+/// A node this rig controls: process handle, the exact `bin`/`args`/`env` it
+/// was spawned with and the address it waits on (so `restart` can reproduce
+/// it), and its tee'd log paths.
 pub struct ChildNode {
     child: Child,
     bin: PathBuf,
     args: Vec<String>,
+    env: Vec<(String, String)>,
+    addr: String,
     stdout_log: PathBuf,
     stderr_log: PathBuf,
 }
@@ -83,12 +92,31 @@ impl ChildNode {
                  knows which port to wait for",
             )
         })?;
+        ChildNode::spawn_env(bin, args, &[], &addr, scenario)
+    }
+
+    /// `spawn` for a binary whose argv names no address to wait on — a
+    /// launch-driven one reads it from the environment (`outbound_node`), and
+    /// `fake_remote` is waited on at its admin port. `env` is set on top of
+    /// the inherited environment, and `restart` sets it again beside `args`.
+    pub fn spawn_env(
+        bin: &Path,
+        args: &[String],
+        env: &[(&str, String)],
+        wait_addr: &str,
+        scenario: &mut Scenario,
+    ) -> io::Result<ChildNode> {
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        let addr = wait_addr.to_string();
 
         let tag = unique_tag();
         let stdout_log = scenario.dir().join(format!("child-{tag}-stdout.log"));
         let stderr_log = scenario.dir().join(format!("child-{tag}-stderr.log"));
 
-        let mut child = spawn_once(bin, args, &stdout_log, &stderr_log)?;
+        let mut child = spawn_once(bin, args, &env, &stdout_log, &stderr_log)?;
         if let Err(e) = wait_for_port_or_exit(&mut child, &addr, SPAWN_TIMEOUT) {
             let _ = child.kill();
             let _ = child.wait();
@@ -102,8 +130,13 @@ impl ChildNode {
             return Err(io::Error::other(format!("{e}\nstderr: {stderr}")));
         }
 
+        let env_note = if env.is_empty() {
+            String::new()
+        } else {
+            format!(" env {env:?}")
+        };
         scenario.record(format!(
-            "spawn {} {:?} (pid {})",
+            "spawn {} {:?}{env_note} (pid {})",
             bin.display(),
             args,
             child.id()
@@ -112,6 +145,8 @@ impl ChildNode {
             child,
             bin: bin.to_path_buf(),
             args: args.to_vec(),
+            env,
+            addr,
             stdout_log,
             stderr_log,
         })
@@ -189,7 +224,7 @@ impl ChildNode {
         }
     }
 
-    /// Respawns the SAME `bin`/`args` (so the same `--data-dir`) — the
+    /// Respawns the SAME `bin`/`args`/`env` (so the same data directory) — the
     /// operator's real remedy after a crash. Retries a handful of times: the
     /// previous process's listen socket can take a moment to release the
     /// address after it dies, and this crate has no dependency to set
@@ -228,14 +263,17 @@ impl ChildNode {
             ));
         }
 
-        let addr = wait_addr(&self.args)
-            .expect("ChildNode always has a waitable address (checked in spawn)");
-
         let mut last_err = None;
         for attempt in 1..=RESTART_ATTEMPTS {
-            let mut child = spawn_once(&self.bin, &self.args, &self.stdout_log, &self.stderr_log)?;
-            let outcome = wait_for_port_or_exit(&mut child, &addr, RESTART_ATTEMPT_TIMEOUT)
-                .and_then(|()| require_still_running(&mut child, &addr));
+            let mut child = spawn_once(
+                &self.bin,
+                &self.args,
+                &self.env,
+                &self.stdout_log,
+                &self.stderr_log,
+            )?;
+            let outcome = wait_for_port_or_exit(&mut child, &self.addr, RESTART_ATTEMPT_TIMEOUT)
+                .and_then(|()| require_still_running(&mut child, &self.addr));
             match outcome {
                 Ok(()) => {
                     let new_pid = child.id();
@@ -276,6 +314,7 @@ fn require_still_running(child: &mut Child, addr: &str) -> io::Result<()> {
 fn spawn_once(
     bin: &Path,
     args: &[String],
+    env: &[(String, String)],
     stdout_log: &Path,
     stderr_log: &Path,
 ) -> io::Result<Child> {
@@ -283,6 +322,7 @@ fn spawn_once(
     let stderr = std::fs::File::create(stderr_log)?;
     Command::new(bin)
         .args(args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -332,8 +372,9 @@ fn unique_tag() -> String {
 }
 
 /// Builds every binary the rig drives, once per process (release): the
-/// invoicing `node`/`tenant_node`/`main` bins, the `charpente` CLI, and the
-/// invoicing example `seed_foreign_job`. Located exactly like `charpente-cli/
+/// invoicing `node`/`tenant_node`/`main` bins, the `charpente` CLI, the
+/// invoicing example `seed_foreign_job`, and outbound-fixture's
+/// `outbound_node`/`fake_remote`. Located exactly like `charpente-cli/
 /// src/describe.rs`'s `--message-format=json` scan — reimplemented rather
 /// than shared, since this crate depends on nothing else in the workspace.
 pub fn build_bins() -> io::Result<Bins> {
@@ -347,17 +388,28 @@ pub fn build_bins() -> io::Result<Bins> {
         &root,
         &["-p", "invoicing", "--example", "seed_foreign_job"],
     )?);
+    // Its own invocation, like the example build above: resolving the fixture's
+    // TLS dependencies in the invoicing build could unify features into the
+    // bins under test.
+    bins.extend(cargo_build_release(
+        &root,
+        &["-p", "outbound-fixture", "--bins"],
+    )?);
     let node = locate(&bins, "node")?;
     let tenant_node = locate(&bins, "tenant_node")?;
     let charpente = locate(&bins, "charpente")?;
     let invoicing = locate(&bins, "invoicing")?;
     let seed_foreign_job = locate(&bins, "seed_foreign_job")?;
+    let outbound_node = locate(&bins, "outbound_node")?;
+    let fake_remote = locate(&bins, "fake_remote")?;
     Ok(Bins {
         node,
         tenant_node,
         charpente,
         invoicing,
         seed_foreign_job,
+        outbound_node,
+        fake_remote,
     })
 }
 
@@ -389,8 +441,8 @@ fn locate(bins: &[(String, String)], name: &str) -> io::Result<PathBuf> {
         .ok_or_else(|| {
             io::Error::other(format!(
                 "build_bins: no '{name}' executable in the release build output — expected it \
-                 from `-p invoicing -p charpente-cli --bins` or `-p invoicing --example \
-                 seed_foreign_job`"
+                 from `-p invoicing -p charpente-cli --bins`, `-p invoicing --example \
+                 seed_foreign_job` or `-p outbound-fixture --bins`"
             ))
         })
 }
@@ -456,6 +508,8 @@ mod tests {
                 child,
                 bin: PathBuf::from("sleep"),
                 args: vec!["60".to_string()],
+                env: Vec::new(),
+                addr: "127.0.0.1:0".to_string(),
                 stdout_log: PathBuf::from("/dev/null"),
                 stderr_log: PathBuf::from("/dev/null"),
             };
@@ -504,6 +558,8 @@ mod tests {
             child,
             bin: PathBuf::from("/nonexistent/edge-harness-no-such-binary"),
             args: vec!["--addr".to_string(), "127.0.0.1:9".to_string()],
+            env: Vec::new(),
+            addr: "127.0.0.1:9".to_string(),
             stdout_log: PathBuf::from("/dev/null"),
             stderr_log: PathBuf::from("/dev/null"),
         };
@@ -562,6 +618,8 @@ mod tests {
             child,
             bin: PathBuf::from("sleep"),
             args: vec!["60".to_string()],
+            env: Vec::new(),
+            addr: "127.0.0.1:0".to_string(),
             stdout_log: PathBuf::from("/dev/null"),
             stderr_log: PathBuf::from("/dev/null"),
         };
