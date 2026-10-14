@@ -4,9 +4,11 @@
 //! survive a restart. Each handle is one process's view (plan amendment A3): a
 //! reply goes only to the handle that started its call. Every fault axis rolls
 //! from its own keyed stream — a shared stream would let a 0.0 axis shift every
-//! later draw (`object.rs`'s lesson). Delivery and reply times are drawn at
-//! `start`, so `poll` is a pure virtual-time check. Models run under the world
-//! lock: a model must never call back into the `Sim`.
+//! later draw (`object.rs`'s lesson) — and rolls on every call, whatever the
+//! others decide, so turning one axis on or off moves no other axis's draws.
+//! Delivery and reply times are drawn at `start`, so `poll` is a pure
+//! virtual-time check. Models run under the world lock: a model must never call
+//! back into the `Sim`.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -108,7 +110,10 @@ impl<M: Remote> Idempotent<M> {
         }
     }
 
-    /// Applications per key — 1 for every key a correct app sent.
+    /// Applications per key. A repeated key replays, so every count is 1 by
+    /// construction: the map says which keys reached the inner model, and a
+    /// retry that sent a fresh key is a second entry. A test counts
+    /// applications through `inner()`'s own state.
     pub fn applied(&self) -> &BTreeMap<String, u32> {
         &self.applied
     }
@@ -193,7 +198,9 @@ struct Flight {
 
 pub(crate) struct OutboundWorld {
     // Read by `Sim::{remote, outbound, with_remote, outbound_deliveries}` in lib.rs.
-    pub(crate) models: BTreeMap<String, (Box<dyn Remote>, Rng)>,
+    /// Each host's model, its own stream, and its type's name for
+    /// `with_remote`'s wrong-type panic.
+    pub(crate) models: BTreeMap<String, (Box<dyn Remote>, Rng, &'static str)>,
     flights: BTreeMap<u64, Flight>,
     next_flight: u64,
     pub(crate) next_handle: u64,
@@ -243,10 +250,10 @@ impl OutboundWorld {
             let Fate::Delivered { deliver_at, .. } = flight.fate else {
                 unreachable!()
             };
-            let (model, rng) = self
+            let (model, rng, _) = self
                 .models
                 .get_mut(flight.call.host)
-                .expect("sim.outbound refused any host without a model");
+                .expect("start refused any host without a model");
             flight.reply = Some(model.handle(&flight.call, rng));
             flight.delivered = true;
             self.deliveries.push(Delivered {
@@ -257,6 +264,15 @@ impl OutboundWorld {
             });
         }
     }
+}
+
+/// The no-model refusal (plan amendment A21): `Sim::outbound` returns it for a
+/// declared host, and `start` panics with it for a host the list left out.
+pub(crate) fn no_model(host: &str) -> String {
+    format!(
+        "sim: a mounted job calls {host}, which has no model — add \
+         sim.remote(\"{host}\", …) before sim.outbound(…)"
+    )
 }
 
 fn draw(rng: &mut Rng, (lo, hi): (Duration, Duration)) -> u64 {
@@ -285,8 +301,43 @@ impl Outbound for SimOutbound {
                 .any(|f| f.handle == self.handle && f.token == token && !f.cancelled),
             "contract: Outbound::start({token}) while that token is in flight"
         );
-        let fate = if outbound.refused.chance(cfg.outbound_refused) {
-            *coverage.entry("fault:outbound_refused").or_insert(0) += 1;
+        assert!(
+            outbound.models.contains_key(call.host),
+            "{}",
+            no_model(call.host)
+        );
+        // Every axis rolls once per call, whatever the others decide, so
+        // turning one on or off moves no other axis's draw. A draw that only
+        // its own axis's roll gates (the throttle's status, the slow think
+        // time) stays on that axis's stream.
+        let refused = outbound.refused.chance(cfg.outbound_refused);
+        let lost_request = outbound.lost_request.chance(cfg.outbound_lost_request);
+        let throttle = if outbound.throttle.chance(cfg.outbound_throttle) {
+            Some(if outbound.throttle.chance(0.5) {
+                429
+            } else {
+                503
+            })
+        } else {
+            None
+        };
+        let up = draw(&mut outbound.latency, cfg.outbound_latency);
+        let down = draw(&mut outbound.latency, cfg.outbound_latency);
+        let think = if outbound.slow.chance(cfg.outbound_slow) {
+            let hi = cfg.outbound_latency.1;
+            let (lo, hi) = if hi.is_zero() {
+                (Duration::from_secs(1), Duration::from_secs(100))
+            } else {
+                (hi * 10, hi * 100)
+            };
+            Some(draw(&mut outbound.slow, (lo, hi)))
+        } else {
+            None
+        };
+        let reply_lost = outbound.lost_reply.chance(cfg.outbound_lost_reply);
+        let mut cover = |key| *coverage.entry(key).or_insert(0) += 1;
+        let fate = if refused {
+            cover("fault:outbound_refused");
             Fate::Short {
                 at: Some(now),
                 result: Some(Err(io::Error::new(
@@ -294,22 +345,16 @@ impl Outbound for SimOutbound {
                     "connection refused",
                 ))),
             }
-        } else if outbound.lost_request.chance(cfg.outbound_lost_request) {
-            *coverage.entry("fault:outbound_lost_request").or_insert(0) += 1;
+        } else if lost_request {
+            cover("fault:outbound_lost_request");
             Fate::Short {
                 at: None,
                 result: None,
             }
-        } else if outbound.throttle.chance(cfg.outbound_throttle) {
-            *coverage.entry("fault:outbound_throttle").or_insert(0) += 1;
-            let status = if outbound.throttle.chance(0.5) {
-                429
-            } else {
-                503
-            };
-            let at = now + draw(&mut outbound.latency, cfg.outbound_latency) * 2;
+        } else if let Some(status) = throttle {
+            cover("fault:outbound_throttle");
             Fate::Short {
-                at: Some(at),
+                at: Some(now + up * 2),
                 result: Some(Ok(OutboundReply {
                     status,
                     headers: Vec::new(),
@@ -317,27 +362,15 @@ impl Outbound for SimOutbound {
                 })),
             }
         } else {
-            let up = draw(&mut outbound.latency, cfg.outbound_latency);
-            let think = if outbound.slow.chance(cfg.outbound_slow) {
-                *coverage.entry("fault:outbound_slow").or_insert(0) += 1;
-                let hi = cfg.outbound_latency.1;
-                let (lo, hi) = if hi.is_zero() {
-                    (Duration::from_secs(1), Duration::from_secs(100))
-                } else {
-                    (hi * 10, hi * 100)
-                };
-                draw(&mut outbound.slow, (lo, hi))
-            } else {
-                0
-            };
-            let down = draw(&mut outbound.latency, cfg.outbound_latency);
-            let reply_lost = outbound.lost_reply.chance(cfg.outbound_lost_reply);
+            if think.is_some() {
+                cover("fault:outbound_slow");
+            }
             if reply_lost {
-                *coverage.entry("fault:outbound_lost_reply").or_insert(0) += 1;
+                cover("fault:outbound_lost_reply");
             }
             Fate::Delivered {
                 deliver_at: now + up,
-                reply_at: now + up + think + down,
+                reply_at: now + up + think.unwrap_or(0) + down,
                 reply_lost,
             }
         };
@@ -449,6 +482,37 @@ mod tests {
         std::iter::from_fn(|| ob.poll()).collect()
     }
 
+    /// Steps virtual time from wake to wake until nothing `ob` started can
+    /// still complete: each completed token's virtual completion time and its
+    /// status, or its error kind.
+    fn settle(sim: &Sim, ob: &SimOutbound) -> BTreeMap<u64, (u64, Result<u16, io::ErrorKind>)> {
+        let mut done = BTreeMap::new();
+        loop {
+            for (t, r) in drain(ob) {
+                let r = r.map(|r| r.status).map_err(|e| e.kind());
+                let again = done.insert(t, (sim.now().as_nanos(), r));
+                assert!(again.is_none(), "token {t} completed twice");
+            }
+            match ob.next_wake() {
+                OutboundWake::At(at) => {
+                    assert!(
+                        at > sim.now(),
+                        "a drained handle woke at {at:?}, not after now"
+                    );
+                    sim.clock().sleep(at.duration_since(sim.now()));
+                }
+                OutboundWake::Never => return done,
+                OutboundWake::Unknown => panic!("the sim always knows its next wake"),
+            }
+        }
+    }
+
+    fn panic_text(f: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("expected a contract panic");
+        crate::panic_message(&*payload)
+    }
+
     #[test]
     fn a_host_with_no_model_is_refused_by_name() {
         let sim = Sim::with_faults(1, FaultConfig::none());
@@ -514,18 +578,38 @@ mod tests {
         let ob = sim.outbound(&["pay.test"]).unwrap();
         ob.start(0, call(1)).unwrap();
         assert!(drain(&ob).is_empty());
+        assert_eq!(
+            ob.next_wake(),
+            OutboundWake::Never,
+            "a lost request is never due"
+        );
         sim.with_remote("pay.test", |r: &Recorder| assert!(r.calls().is_empty()));
+        assert_eq!(sim.coverage().get("fault:outbound_lost_request"), Some(&1));
     }
 
     #[test]
     fn a_throttle_answers_429_or_503_without_handling() {
-        let sim = Sim::with_faults(1, faults(|c| c.outbound_throttle = 1.0));
+        let sim = Sim::with_faults(
+            1,
+            faults(|c| {
+                c.outbound_throttle = 1.0;
+                c.outbound_latency = (Duration::from_millis(10), Duration::from_millis(10));
+            }),
+        );
         sim.remote("pay.test", Recorder::new());
         let ob = sim.outbound(&["pay.test"]).unwrap();
         ob.start(0, call(1)).unwrap();
+        assert!(drain(&ob).is_empty(), "a throttle takes the round trip");
+        assert_eq!(
+            ob.next_wake(),
+            OutboundWake::At(Instant::from_nanos(20_000_000)),
+            "twice the one-way latency"
+        );
+        sim.clock().sleep(Duration::from_millis(20));
         let status = drain(&ob)[0].1.as_ref().unwrap().status;
         assert!(status == 429 || status == 503, "{status}");
         sim.with_remote("pay.test", |r: &Recorder| assert!(r.calls().is_empty()));
+        assert_eq!(sim.coverage().get("fault:outbound_throttle"), Some(&1));
     }
 
     #[test]
@@ -556,6 +640,11 @@ mod tests {
         let ob = sim.outbound(&["pay.test"]).unwrap();
         ob.start(0, call(1)).unwrap();
         ob.cancel(0);
+        assert_eq!(
+            ob.next_wake(),
+            OutboundWake::Never,
+            "a cancelled call is never due"
+        );
         sim.clock().sleep(Duration::from_millis(50));
         assert!(drain(&ob).is_empty());
         sim.with_remote("pay.test", |r: &Recorder| assert_eq!(r.calls().len(), 1));
@@ -576,6 +665,11 @@ mod tests {
         sim.clock().sleep(Duration::from_millis(50));
         let got = drain(&new);
         assert_eq!(got.len(), 1);
+        assert_eq!(
+            new.next_wake(),
+            OutboundWake::Never,
+            "the old handle's call is never due on the new one"
+        );
         assert_eq!(
             sim.outbound_deliveries().len(),
             2,
@@ -674,5 +768,202 @@ mod tests {
                 "seed {seed:#x}"
             );
         }
+    }
+
+    /// Plan amendment A15: a slow call reaches the remote on time, and its
+    /// answer waits out think time from [10·hi, 100·hi], or from [1 s, 100 s]
+    /// when hi is zero.
+    #[test]
+    fn a_slow_call_arrives_on_time_and_is_answered_late() {
+        let ms = Duration::from_millis;
+        let sim = Sim::with_faults(
+            1,
+            faults(|c| {
+                c.outbound_slow = 1.0;
+                c.outbound_latency = (ms(10), ms(10));
+            }),
+        );
+        sim.remote("pay.test", Recorder::new());
+        let ob = sim.outbound(&["pay.test"]).unwrap();
+        ob.start(0, call(1)).unwrap();
+        let OutboundWake::At(due) = ob.next_wake() else {
+            panic!("a slow call is still answered")
+        };
+        let due = due.duration_since(Instant::ZERO);
+        assert!((ms(120)..=ms(1020)).contains(&due), "{due:?}");
+        sim.clock().sleep(ms(10));
+        assert!(drain(&ob).is_empty(), "delivered, not yet answered");
+        sim.with_remote("pay.test", |r: &Recorder| assert_eq!(r.calls().len(), 1));
+        assert_eq!(sim.outbound_deliveries()[0].at, 10_000_000);
+        assert_eq!(sim.coverage().get("fault:outbound_slow"), Some(&1));
+        sim.clock().sleep(due - ms(10));
+        assert_eq!(drain(&ob).len(), 1);
+
+        // Many calls: every answer lands inside the range, and both ends of
+        // the range are reached, so a narrowed range is red too.
+        let secs = Duration::from_secs;
+        for (latency, (lo, hi)) in [
+            ((ms(10), ms(10)), (ms(120), ms(1020))),
+            ((Duration::ZERO, Duration::ZERO), (secs(1), secs(100))),
+        ] {
+            let sim = Sim::with_faults(
+                1,
+                faults(|c| {
+                    c.outbound_slow = 1.0;
+                    c.outbound_latency = latency;
+                }),
+            );
+            sim.remote("pay.test", Recorder::new());
+            let ob = sim.outbound(&["pay.test"]).unwrap();
+            for t in 0..64 {
+                ob.start(t, call(t as u8)).unwrap();
+            }
+            let OutboundWake::At(first) = ob.next_wake() else {
+                panic!("slow calls are still answered")
+            };
+            assert!(
+                (lo..=hi).contains(&first.duration_since(Instant::ZERO)),
+                "{first:?}"
+            );
+            let times: Vec<Duration> = settle(&sim, &ob)
+                .values()
+                .map(|(at, _)| Duration::from_nanos(*at))
+                .collect();
+            assert_eq!(times.len(), 64);
+            assert!(times.iter().all(|t| (lo..=hi).contains(t)), "{times:?}");
+            let fifth = (hi - lo) / 5;
+            assert!(times.iter().min().unwrap() < &(lo + fifth), "{times:?}");
+            assert!(times.iter().max().unwrap() > &(hi - fifth), "{times:?}");
+        }
+    }
+
+    /// Every call rolls every axis from that axis's own stream, whatever the
+    /// others decide (GUIDE §8). Turning refusals on changes which calls are
+    /// refused, and nothing about the rest: not their lost replies, not their
+    /// times.
+    #[test]
+    fn turning_one_axis_on_moves_no_other_axis_draw() {
+        let run = |refused: f64| {
+            let sim = Sim::with_faults(
+                7,
+                faults(|c| {
+                    c.outbound_refused = refused;
+                    c.outbound_lost_reply = 0.5;
+                    c.outbound_latency = (Duration::from_millis(1), Duration::from_millis(50));
+                }),
+            );
+            sim.remote("pay.test", Recorder::new());
+            let ob = sim.outbound(&["pay.test"]).unwrap();
+            for t in 0..64 {
+                ob.start(t, call(t as u8)).unwrap();
+            }
+            let done = settle(&sim, &ob);
+            let arrived: BTreeMap<IdempotencyKey, u64> = sim
+                .outbound_deliveries()
+                .iter()
+                .map(|d| (d.key, d.at))
+                .collect();
+            (done, arrived, sim.coverage())
+        };
+        let (done_a, arrived_a, _) = run(0.0);
+        let (done_b, arrived_b, coverage_b) = run(0.5);
+        let refused: Vec<u64> = (0..64)
+            .filter(|t| {
+                matches!(
+                    done_b.get(t),
+                    Some((_, Err(io::ErrorKind::ConnectionRefused)))
+                )
+            })
+            .collect();
+        let lost_a: Vec<u64> = (0..64).filter(|t| !done_a.contains_key(t)).collect();
+        assert!(!refused.is_empty() && refused.len() < 64, "{refused:?}");
+        assert!(!lost_a.is_empty() && lost_a.len() < 64, "{lost_a:?}");
+        for t in (0..64).filter(|t| !refused.contains(t)) {
+            let key = call(t as u8).key;
+            assert_eq!(
+                done_b.get(&t),
+                done_a.get(&t),
+                "call {t}: its lost-reply fate or its reply time moved"
+            );
+            assert_eq!(
+                arrived_b.get(&key),
+                arrived_a.get(&key),
+                "call {t}: its delivery time moved"
+            );
+        }
+        // Coverage counts the fate that applies: a refused call that also
+        // rolled a lost reply counts only as refused.
+        assert!(
+            refused.iter().any(|t| lost_a.contains(t)),
+            "no refused call also rolled a lost reply"
+        );
+        let lost_b = (0..64)
+            .filter(|t| !refused.contains(t) && !done_b.contains_key(t))
+            .count() as u64;
+        assert_eq!(
+            coverage_b.get("fault:outbound_refused"),
+            Some(&(refused.len() as u64))
+        );
+        assert_eq!(coverage_b.get("fault:outbound_lost_reply"), Some(&lost_b));
+    }
+
+    #[test]
+    fn a_call_to_a_host_with_no_model_is_refused_at_start() {
+        let sim = Sim::with_faults(1, FaultConfig::none());
+        let ob = sim.outbound(&[]).unwrap();
+        assert_eq!(
+            panic_text(|| {
+                let _ = ob.start(0, call(1));
+            }),
+            "sim: a mounted job calls pay.test, which has no model — add sim.remote(\"pay.test\", …) before sim.outbound(…)"
+        );
+    }
+
+    #[test]
+    fn reading_a_host_with_no_model_names_the_fix() {
+        let sim = Sim::with_faults(1, FaultConfig::none());
+        assert_eq!(
+            panic_text(|| sim.with_remote("pay.test", |_: &Recorder| ())),
+            "contract: sim.with_remote(\"pay.test\", …) found no model for pay.test — register one with sim.remote(\"pay.test\", …) first"
+        );
+    }
+
+    #[test]
+    fn reading_a_model_as_the_wrong_type_names_both_types() {
+        let sim = Sim::with_faults(1, FaultConfig::none());
+        sim.remote(
+            "pay.test",
+            Idempotent::header("idempotency-key", Counter(0)),
+        );
+        assert_eq!(
+            panic_text(|| sim.with_remote("pay.test", |_: &Counter| ())),
+            "contract: sim.with_remote(\"pay.test\", …) asked for charpente_sim::outbound::tests::Counter, but pay.test's model is charpente_sim::outbound::Idempotent<charpente_sim::outbound::tests::Counter> — name the registered type; a wrapped model is read as its wrapper, then .inner()"
+        );
+    }
+
+    /// Models belong to the universe, not the box: a restart keeps the model
+    /// and its state, and a request on the wire at the restart still arrives.
+    #[test]
+    fn a_model_and_a_request_on_the_wire_survive_a_restart() {
+        let ms = Duration::from_millis;
+        let sim = Sim::with_faults(1, faults(|c| c.outbound_latency = (ms(10), ms(10))));
+        sim.remote("pay.test", Counter(0));
+        let old = sim.outbound(&["pay.test"]).unwrap();
+        old.start(0, call(1)).unwrap();
+        sim.clock().sleep(ms(20));
+        assert_eq!(drain(&old)[0].1.as_ref().unwrap().body, b"1");
+        old.start(1, call(2)).unwrap(); // on the wire when the box goes down
+        sim.restart();
+        let new = sim.outbound(&["pay.test"]).unwrap();
+        new.start(0, call(3)).unwrap();
+        sim.clock().sleep(ms(50));
+        let got = drain(&new);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].1.as_ref().unwrap().body,
+            b"3",
+            "the same model answered, after the pre-restart request reached it"
+        );
+        sim.with_remote("pay.test", |m: &Counter| assert_eq!(m.0, 3));
     }
 }

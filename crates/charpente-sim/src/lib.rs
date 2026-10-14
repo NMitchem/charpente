@@ -1118,10 +1118,11 @@ impl Sim {
     pub fn remote(&self, host: &str, model: impl outbound::Remote) {
         let mut guard = self.world.lock();
         let rng = keyed_stream(self.world.seed, &format!("outbound-model:{host}"));
+        let name = std::any::type_name_of_val(&model);
         let clash = guard
             .outbound
             .models
-            .insert(host.to_string(), (Box::new(model), rng));
+            .insert(host.to_string(), (Box::new(model), rng, name));
         assert!(
             clash.is_none(),
             "contract: sim.remote(\"{host}\", …) registered twice"
@@ -1135,10 +1136,7 @@ impl Sim {
         let mut guard = self.world.lock();
         for host in hosts {
             if !guard.outbound.models.contains_key(*host) {
-                return Err(io::Error::other(format!(
-                    "sim: a mounted job calls {host}, which has no model — add \
-                     sim.remote(\"{host}\", …) before sim.outbound(…)"
-                )));
+                return Err(io::Error::other(outbound::no_model(host)));
             }
         }
         let handle = guard.outbound.next_handle;
@@ -1155,12 +1153,20 @@ impl Sim {
         let mut guard = self.world.lock();
         let now = guard.now;
         guard.outbound.deliver_due(now);
-        let (model, _) = guard.outbound.models.get(host).unwrap_or_else(|| {
-            panic!("contract: sim.with_remote(\"{host}\") — no model registered")
+        let (model, _, registered) = guard.outbound.models.get(host).unwrap_or_else(|| {
+            panic!(
+                "contract: sim.with_remote(\"{host}\", …) found no model for {host} — \
+                 register one with sim.remote(\"{host}\", …) first"
+            )
         });
         let any: &dyn std::any::Any = model.as_ref();
         f(any.downcast_ref::<M>().unwrap_or_else(|| {
-            panic!("contract: sim.with_remote(\"{host}\") asked for the wrong model type")
+            panic!(
+                "contract: sim.with_remote(\"{host}\", …) asked for {}, but {host}'s model is \
+                 {registered} — name the registered type; a wrapped model is read as its \
+                 wrapper, then .inner()",
+                std::any::type_name::<M>()
+            )
         }))
     }
 

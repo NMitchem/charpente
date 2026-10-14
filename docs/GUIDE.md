@@ -3178,6 +3178,9 @@ Register one model per declared host, then build the outbound handle:
 sim: a mounted job calls <host>, which has no model — add sim.remote("<host>", …) before sim.outbound(…)
 ```
 
+The same text is a panic when a handle starts a call to a host that has no
+model, such as one the list given to `sim.outbound` left out.
+
 A model implements `charpente_sim::outbound::Remote`, whose one method is
 `fn handle(&mut self, call: &OutboundCall, rng: &mut Rng) -> OutboundReply`.
 It runs when the request reaches the remote, at its drawn delivery time, not
@@ -3214,13 +3217,18 @@ A workload reads model state with `sim.with_remote::<M, _>(host, |m| …)`. The
 closure borrows the model as its concrete type `M`, since a reference cannot
 outlive the world lock. The closure runs under that lock, as a model does, so
 it must not call the `Sim` either: return what you need and act on it after.
-Naming the wrong type, or a host with no model, is a contract panic. `sim.outbound_deliveries()` returns every request that has
-reached a remote, as `charpente_sim::outbound::Delivered { host, key, at,
-handle }`. `key` is the job's `OutboundCall::key`, which attributes a
-delivered call to its job. `at` is the virtual arrival time in nanoseconds,
-and `handle` says which `SimOutbound`, and so which process, sent it. Both
-calls first run every delivery due by now, so what they show is current
-with the clock.
+Naming a host with no model, or the wrong type, is a contract panic, and the
+wrong-type text names both the type asked for and the one registered. A
+wrapped model is read as its wrapper: `|m: &Idempotent<StripeModel>|`, then
+`m.inner()`.
+
+`sim.outbound_deliveries()` returns every request that has reached a
+remote, as `charpente_sim::outbound::Delivered { host, key, at, handle }`.
+`key` is the job's `OutboundCall::key`, which attributes a delivered call to
+its job. `at` is the virtual arrival time in nanoseconds, and `handle` says
+which `SimOutbound`, and so which process, sent it. Like `with_remote`, it
+first runs every delivery due by now, so what it shows is current with the
+clock.
 
 A request in flight at a crash still arrives; only its reply is lost. Models
 belong to the universe, not to the box, so `sim.restart()` leaves them and
@@ -3231,10 +3239,16 @@ process reuses the old token. A cancelled call (`Outbound::cancel`) behaves
 the same way: its request still reaches the remote at its delivery time, and
 its completion is never handed back.
 
-Each fault axis rolls from its own keyed stream, so turning one on moves no
-other draw. Delivery and reply times are drawn when the call starts. A call
-is refused, or else lost, or else throttled, or else delivered, in that
-order of rolls, and a delivered call may also be slow and may lose its reply:
+Every call rolls each fault axis once, from that axis's own keyed stream,
+whatever the other axes decide, and draws both of its latencies the same
+way. So turning one axis on or off moves no other axis's draw. It can still
+change what happens downstream: a call it refuses never reaches the model,
+so the model's own `rng` sees one call fewer. Delivery and reply times are
+drawn when the call starts. The call's fate is chosen from its rolls in a
+fixed precedence: refused, else lost, else throttled, else delivered. A
+delivered call may also be slow, and may lose its reply. Coverage counts
+only what applies, so a refused call that also rolled a lost reply counts as
+refused:
 
 | Axis (`FaultConfig` field) | The remote sees | The kernel sees | Coverage key |
 |---|---|---|---|
@@ -3245,9 +3259,10 @@ order of rolls, and a delivered call may also be slow and may lose its reply:
 | `outbound_latency` `(min, max)` and `outbound_slow` | the call, late | a reply late, or past the deadline (the LLM tail) | `fault:outbound_slow`; latency has none |
 
 `outbound_latency` is a one-way range, drawn once for the request and once
-for the reply, and a throttle answers after twice one such draw. `outbound_slow`
-adds think time between the request's arrival and the reply's departure,
-uniform in [10·max, 100·max], or in [1 s, 100 s] when max is zero. Every
+for the reply, and a throttle answers after twice the request's draw.
+`outbound_slow` adds think time between the request's arrival and the
+reply's departure, uniform in [10·max, 100·max], or in [1 s, 100 s] when max
+is zero. Every
 completion handed back to the kernel also marks `outbound:completed`.
 Duplicates are not an axis. In HTTP a duplicate is a retry after a lost
 reply, and the sim produces those. Whether a duplicate applies twice is the
