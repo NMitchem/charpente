@@ -217,6 +217,136 @@ pub trait ObjectStore: Send {
     fn poll(&self) -> Option<io::Result<ObjectDone>>;
 }
 
+/// The HTTP methods an outbound call may use (outbound-effects spec §3). Named
+/// `HttpMethod` because `charpente::http::Method` is the inbound one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl HttpMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+            HttpMethod::Patch => "PATCH",
+            HttpMethod::Delete => "DELETE",
+        }
+    }
+}
+
+/// An outbound job's idempotency key: 16 bytes drawn from the node's `Entropy`
+/// when the enqueue is staged, recorded in the enqueue effect, and stable across
+/// every retry, re-dispatch, failover and restore of that job (spec §6). Two
+/// diverged timelines draw different ones, which is why a key is never derived
+/// from an id. The app places it where its API wants it (spec R5).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IdempotencyKey {
+    raw: [u8; 16],
+    hex: [u8; 32],
+}
+
+impl IdempotencyKey {
+    pub fn from_bytes(raw: [u8; 16]) -> IdempotencyKey {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = [0u8; 32];
+        for (i, b) in raw.iter().enumerate() {
+            hex[2 * i] = DIGITS[usize::from(b >> 4)];
+            hex[2 * i + 1] = DIGITS[usize::from(b & 0x0f)];
+        }
+        IdempotencyKey { raw, hex }
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.raw
+    }
+
+    /// 32 lowercase hex characters.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.hex).expect("hex digits are ASCII")
+    }
+}
+
+impl std::fmt::Debug for IdempotencyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IdempotencyKey({})", self.as_str())
+    }
+}
+
+/// One outbound HTTP request, as the kernel hands it to `Outbound::start`. `host`
+/// comes from the job's declaration, never from runtime data (spec §5).
+#[derive(Clone, Debug)]
+pub struct OutboundCall {
+    pub host: &'static str,
+    pub method: HttpMethod,
+    /// Path and query only, beginning with `/`.
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// Attribution only: an impl never transmits it. The app places the key where
+    /// its API wants it (spec R5); the sim reads this field to attribute a
+    /// delivered call to its job.
+    pub key: IdempotencyKey,
+}
+
+/// A reply of any status. A transport failure is not a reply: it arrives as the
+/// `Err` of a completion.
+#[derive(Clone, Debug)]
+pub struct OutboundReply {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Outbound HTTP to declared hosts (outbound-effects spec §3): the sixth IO
+/// trait. Many calls may be in flight, at most one per token. The trait carries
+/// no timeout and no retry: both are the kernel's decisions, made on its own
+/// `Clock` (spec R10).
+///
+/// An impl reports a failure that certainly did not reach the remote with
+/// `io::ErrorKind::ConnectionRefused`. The kernel words every other error as
+/// "the remote may have applied this call".
+///
+/// `Send` because the kernel that owns it crosses into the kernel thread.
+pub trait Outbound: Send {
+    /// Begins `call` under `token`. Asserts `token` is not in flight. An `Err`
+    /// here is a completion the kernel records, not a kernel failure.
+    fn start(&self, token: u64, call: OutboundCall) -> io::Result<()>;
+
+    /// One completion or `None`. A transport failure IS a completion: the error
+    /// rides inside the `Some`, as with `ObjectStore::poll`.
+    fn poll(&self) -> Option<(u64, io::Result<OutboundReply>)>;
+
+    /// The kernel abandoned `token` (its deadline passed, or the node stopped
+    /// being writable). A completion for it may still surface; the kernel
+    /// discards it.
+    fn cancel(&self, token: u64);
+
+    /// When this handle's next completion is due, asked only while something
+    /// is in flight (plan amendment A2). The kernel parks no later than it.
+    fn next_wake(&self) -> OutboundWake {
+        OutboundWake::Unknown
+    }
+}
+
+/// `Outbound::next_wake`'s answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutboundWake {
+    /// Production's answer, since replies arrive from the network: the kernel
+    /// parks no longer than its outbound tick.
+    Unknown,
+    /// No completion will ever arrive for what is in flight (every reply is
+    /// lost): only the kernel's own deadlines wake it.
+    Never,
+    /// The next completion is due at this instant.
+    At(Instant),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +365,34 @@ mod tests {
     #[should_panic(expected = "monotonic time ran backwards")]
     fn instant_duration_since_asserts_order() {
         let _ = Instant::from_nanos(1).duration_since(Instant::from_nanos(2));
+    }
+
+    #[test]
+    fn an_idempotency_key_renders_as_32_lowercase_hex() {
+        let key = IdempotencyKey::from_bytes([
+            0x00, 0x01, 0x0a, 0x0f, 0x10, 0x7f, 0x80, 0xab, 0xcd, 0xef, 0xff, 0x12, 0x34, 0x56,
+            0x78, 0x9a,
+        ]);
+        assert_eq!(key.as_str(), "00010a0f107f80abcdefff123456789a");
+        assert_eq!(key.as_str().len(), 32);
+        assert_eq!(key.as_bytes()[2], 0x0a);
+        assert_eq!(
+            format!("{key:?}"),
+            "IdempotencyKey(00010a0f107f80abcdefff123456789a)"
+        );
+    }
+
+    #[test]
+    fn http_methods_render_upper_case() {
+        let all = [
+            (HttpMethod::Get, "GET"),
+            (HttpMethod::Post, "POST"),
+            (HttpMethod::Put, "PUT"),
+            (HttpMethod::Patch, "PATCH"),
+            (HttpMethod::Delete, "DELETE"),
+        ];
+        for (m, s) in all {
+            assert_eq!(m.as_str(), s);
+        }
     }
 }

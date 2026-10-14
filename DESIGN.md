@@ -81,6 +81,10 @@ trait Net     { fn listen(&self, addr: &str) -> Result<Box<dyn Listener>>;
 // message-oriented until the HTTP edge demands byte streams.
 trait ObjectStore { fn start(&self, op: ObjectOp) -> Result<()>;
                     fn poll(&self) -> Option<Result<ObjectDone>>; }  // PUT is atomic, never torn
+trait Outbound { fn start(&self, token: u64, call: OutboundCall) -> Result<()>;
+                 fn poll(&self) -> Option<(u64, Result<OutboundReply>)>;   // a failure IS a completion
+                 fn cancel(&self, token: u64);
+                 fn next_wake(&self) -> OutboundWake; }                    // sim: At/Never; prod: Unknown
 ```
 
 The simulator implements all of it with one seed driving: latency distributions, virtual
