@@ -6,7 +6,8 @@
 //! from its own keyed stream — a shared stream would let a 0.0 axis shift every
 //! later draw (`object.rs`'s lesson) — and rolls on every call, whatever the
 //! others decide, so turning one axis on or off moves no other axis's draws.
-//! Delivery and reply times are drawn at `start`, so `poll` is a pure
+//! `Sim::quiesce_outbound_faults` stops every roll alike for the rest of the
+//! universe. Delivery and reply times are drawn at `start`, so `poll` is a pure
 //! virtual-time check. Models run under the world lock: a model must never call
 //! back into the `Sim`.
 
@@ -205,6 +206,11 @@ pub(crate) struct OutboundWorld {
     next_flight: u64,
     pub(crate) next_handle: u64,
     pub(crate) deliveries: Vec<Delivered>,
+    /// Set by `Sim::quiesce_outbound_faults`: the fault-free tail's outbound
+    /// half. No fault axis rolls from here on, so a quiet world draws nothing
+    /// from their streams. Latency stays, since it is not a fault, and a
+    /// request already in flight keeps the fate it drew.
+    pub(crate) quiet: bool,
     refused: Rng,
     lost_request: Rng,
     lost_reply: Rng,
@@ -221,6 +227,7 @@ impl OutboundWorld {
             next_flight: 0,
             next_handle: 0,
             deliveries: Vec::new(),
+            quiet: false,
             refused: keyed_stream(seed, "outbound-rt:refused"),
             lost_request: keyed_stream(seed, "outbound-rt:lost_request"),
             lost_reply: keyed_stream(seed, "outbound-rt:lost_reply"),
@@ -309,10 +316,12 @@ impl Outbound for SimOutbound {
         // Every axis rolls once per call, whatever the others decide, so
         // turning one on or off moves no other axis's draw. A draw that only
         // its own axis's roll gates (the throttle's status, the slow think
-        // time) stays on that axis's stream.
-        let refused = outbound.refused.chance(cfg.outbound_refused);
-        let lost_request = outbound.lost_request.chance(cfg.outbound_lost_request);
-        let throttle = if outbound.throttle.chance(cfg.outbound_throttle) {
+        // time) stays on that axis's stream. A quiet world skips every roll
+        // alike, and the latency draws carry on.
+        let refused = !outbound.quiet && outbound.refused.chance(cfg.outbound_refused);
+        let lost_request =
+            !outbound.quiet && outbound.lost_request.chance(cfg.outbound_lost_request);
+        let throttle = if !outbound.quiet && outbound.throttle.chance(cfg.outbound_throttle) {
             Some(if outbound.throttle.chance(0.5) {
                 429
             } else {
@@ -323,7 +332,7 @@ impl Outbound for SimOutbound {
         };
         let up = draw(&mut outbound.latency, cfg.outbound_latency);
         let down = draw(&mut outbound.latency, cfg.outbound_latency);
-        let think = if outbound.slow.chance(cfg.outbound_slow) {
+        let think = if !outbound.quiet && outbound.slow.chance(cfg.outbound_slow) {
             let hi = cfg.outbound_latency.1;
             let (lo, hi) = if hi.is_zero() {
                 (Duration::from_secs(1), Duration::from_secs(100))
@@ -334,7 +343,7 @@ impl Outbound for SimOutbound {
         } else {
             None
         };
-        let reply_lost = outbound.lost_reply.chance(cfg.outbound_lost_reply);
+        let reply_lost = !outbound.quiet && outbound.lost_reply.chance(cfg.outbound_lost_reply);
         let mut cover = |key| *coverage.entry(key).or_insert(0) += 1;
         let fate = if refused {
             cover("fault:outbound_refused");

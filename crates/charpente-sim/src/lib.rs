@@ -1170,6 +1170,19 @@ impl Sim {
         }))
     }
 
+    /// Ends outbound fault injection for the rest of this universe: the
+    /// fault-free tail's outbound half, beside `quiesce_disk_faults`. No call
+    /// started after this is refused, lost, throttled, slowed or loses its
+    /// reply, and each skipped roll draws nothing, so a universe that never
+    /// calls this is unchanged. Latency stays, since it is not a fault, and a
+    /// request already in flight keeps the fate it drew. For an outbound
+    /// settle check (`checks::outbound_settles_by_horizon`): from here every
+    /// call reaches its remote and its reply comes back, so every outbound job
+    /// settles or retries to Dead.
+    pub fn quiesce_outbound_faults(&self) {
+        self.world.lock().outbound.quiet = true;
+    }
+
     /// Every request that reached a remote so far, after running deliveries due by now.
     pub fn outbound_deliveries(&self) -> Vec<outbound::Delivered> {
         let mut guard = self.world.lock();

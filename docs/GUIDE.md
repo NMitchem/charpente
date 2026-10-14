@@ -2930,6 +2930,16 @@ not fallout to classify. Network and object-store faults are untouched, and a
 restart still power-cycles: unsynced writes and directory entries collapse under
 the crash model as usual (`crash_apply`, `crash_torn`, `dir_entry_loss`).
 
+An outbound workload's tail needs the outbound half as well.
+`sim.quiesce_outbound_faults()` ends the five outbound fault axes for the rest of
+the universe: no call started after it is refused, lost, throttled or slowed, or
+loses its reply. Each skipped roll draws nothing, so a universe that never calls
+it replays exactly as before. Latency stays, since it is not a fault, and a
+request already in flight keeps the fate it drew. Call both, then run past the
+last backoff and deadline. From there every call reaches its remote and its
+reply comes back, so every outbound job settles or retries to Dead, which is
+what `outbound_settles_by_horizon` (below) checks.
+
 A realtime workload's settle phase has the same need for a different fault. The
 subscriber-stall rate is the one fault axis the sim does not inject itself: a
 workload reads `sim.subscriber_stall()` and drives its own sink's stall closure
@@ -2984,7 +2994,7 @@ global disk; hosts have no process restart.
 
 ### The checkers
 
-`charpente_sim::checks` ships six reusable oracles and one boot idiom — reach
+`charpente_sim::checks` ships nine reusable oracles and one boot idiom — reach
 for these before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
@@ -3109,6 +3119,23 @@ for these before hand-rolling the same logic a fourth time:
   never fired is a real regression and must fail loud. In a multi-node
   workload, ask `SimHost::dir_entry_loss_fired()` instead: it answers for one
   host's disk, so one node's gap is never excused by entry loss on another.
+- `calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String>` —
+  every call that reached a remote (`sim.outbound_deliveries()`) carries the
+  key of a job in `snap`, the recovered store, so no call fired for an enqueue
+  that never became durable. It attributes a call by `OutboundCall::key`,
+  never by where the app put the key in the request. One sim box has one loss
+  window, media corruption: a bit flip can cut an acknowledged enqueue whose
+  call was already made, and then this check fails. Route a failure through
+  `durable_corruption_fired` and give the universe up where it fired, never
+  pass it, the same rule as any acked-durability shortfall.
+- `keys_are_per_job(snap: &Snapshot) -> Result<(), String>` — no two jobs carry
+  one idempotency key. A key derived from an id, or drawn at apply instead of
+  minted at staging, repeats, and the error names both jobs and the key.
+- `outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>` — every
+  outbound job is Done or Dead. Call it only after the fault-free tail:
+  `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and a run past
+  the last backoff and deadline. A job still Pending there was lost by the
+  kernel.
 
 ```rust,ignore
 pub fn classify(text: &str) -> FaultReason   // Injected | Poisoned | RedbLatch
@@ -3140,6 +3167,12 @@ pub fn acked_implies_durable(
     drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>,
     verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>,
 ) -> Result<(), String>
+
+pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String>
+
+pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String>
+
+pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>
 ```
 
 A worked `acked_implies_durable` example — a toy that writes one byte per
@@ -3553,6 +3586,206 @@ sampled values are unchanged:
 | `outbound_throttle` | on with chance 0.25, at 0 to 0.099 |
 | `outbound_slow` | on with chance 0.25, at 0 to 0.049 |
 | `outbound_latency` | `(0, max)`, with max one of 0, 10 ms, 200 ms or 2 s, each with chance 0.25 |
+
+### Calling the outside world in a sim
+
+An app with an outbound job is driven the way "Driving the whole app in a sim"
+drives any app, with two additions: a model behind each declared host, and a
+kernel built with `Kernel::with_outbound` over the sim's handle. Build the handle
+before the kernel, since `sim.outbound(&app.outbound_hosts())` borrows the app
+that `Kernel::with_outbound` takes. The workload below takes two orders under the
+universe's faults, then runs the fault-free tail ("A fault-free tail" above) and
+calls the three outbound checkers:
+
+```rust
+use charpente::core::job::JobRow;
+use charpente::core::table::Id;
+use charpente::http::{ApiError, App, AppConfig, Method, Request};
+use charpente::kernel::{JobError, Kernel, SimSource};
+use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
+use charpente_sim::Sim;
+use charpente_sim::checks::{
+    boot_through_fallout, calls_have_durable_jobs, durable_corruption_fired, is_fault_fallout,
+    keys_are_per_job, outbound_settles_by_horizon,
+};
+use charpente_sim::outbound::{Idempotent, Recorder};
+use serde::{Deserialize, Serialize};
+
+const SEC: u64 = 1_000_000_000;
+
+#[table(global)]
+struct Receipt {
+    id: Id<Receipt>,
+    sent: bool,
+}
+
+#[job(
+    global,
+    outbound = "mail.example",
+    retry(max = 3, backoff = "1s"),
+    timeout = "5s"
+)]
+struct SendReceipt {
+    order: u64,
+}
+
+impl SendReceipt {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::post("/send")
+                .header("idempotency-key", key.as_str())
+                .form(&[("order", self.order.to_string())]),
+        ))
+    }
+
+    fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 => {
+                tx.put(&Receipt {
+                    id: Id::from_raw(self.order),
+                    sent: true,
+                });
+                Ok(())
+            }
+            s => Err(JobError::app(format!("mail.example answered {s}"))),
+        }
+    }
+}
+
+#[derive(Wire, Serialize, Deserialize)]
+struct OrderBody {
+    order: WireU64,
+}
+
+#[route(POST "/order", public)]
+fn order(tx: &mut Tx, body: OrderBody) -> Result<WireU64, ApiError> {
+    tx.put(&Receipt {
+        id: Id::from_raw(body.order.0),
+        sent: false,
+    });
+    tx.enqueue(SendReceipt {
+        order: body.order.0,
+    });
+    Ok(body.order)
+}
+
+fn build_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Receipt>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![order])
+    .mount_jobs(jobs![SendReceipt])
+    .outbound(Host::new("mail.example")))
+}
+
+fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
+    sim.remote(
+        "mail.example",
+        Idempotent::header("idempotency-key", Recorder::new()),
+    );
+    let Some(app) = boot_through_fallout(sim, 8, is_fault_fallout, || build_app(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        if sim.gave_up().is_none() {
+            sim.give_up("the app never booted");
+        }
+        return Ok(());
+    };
+    let mut source = SimSource::new(Box::new(sim.clock()), 30 * SEC);
+    for order in 0..2u64 {
+        source.push_at(
+            order * SEC,
+            Request::new(Method::Post, "/order").json(&OrderBody {
+                order: WireU64(order),
+            }),
+        );
+    }
+    let outbound = sim
+        .outbound(&app.outbound_hosts())
+        .map_err(|e| e.to_string())?;
+    match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
+        Ok(mut kernel) => {
+            if let Err(e) = kernel.run(&mut source)
+                && !is_fault_fallout(&e.to_string())
+            {
+                return Err(e.to_string());
+            }
+        }
+        Err(e) if is_fault_fallout(&e.to_string()) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+
+    // The fault-free tail. The power cycle may leave a call in flight; the
+    // job is still Pending, and its next call carries the same key.
+    sim.restart();
+    sim.quiesce_disk_faults();
+    sim.quiesce_outbound_faults();
+    let Some(app) = boot_through_fallout(sim, 8, is_fault_fallout, || build_app(sim))
+        .map_err(|e| e.to_string())?
+    else {
+        // A durable refusal gives the universe up by name; with disk faults
+        // off, nothing else should stop a boot.
+        return match sim.gave_up() {
+            Some(_) => Ok(()),
+            None => Err("the fault-free tail could not boot".to_string()),
+        };
+    };
+    let outbound = sim
+        .outbound(&app.outbound_hosts())
+        .map_err(|e| e.to_string())?;
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))
+        .map_err(|e| e.to_string())?;
+    // Past every backoff and deadline, with room to spare.
+    let horizon = sim.now().as_nanos() + 600 * SEC;
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), horizon))
+        .map_err(|e| e.to_string())?;
+
+    let app = kernel.into_app();
+    let snap = app.db().snapshot().map_err(|e| e.to_string())?;
+    keys_are_per_job(&snap)?;
+    outbound_settles_by_horizon(&snap)?;
+    if let Err(e) = calls_have_durable_jobs(sim, &snap) {
+        if durable_corruption_fired(sim) {
+            sim.give_up(format!("media corruption cut an enqueue whose call was made: {e}"));
+            return Ok(());
+        }
+        return Err(e);
+    }
+    let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
+    if jobs.iter().any(|j| j.outbound_key.is_some()) {
+        sim.cover("outbound:checked"); // no order committed, nothing checked
+    }
+    Ok(())
+}
+```
+
+Register it as `receipts_settle_under_faults require ["outbound:checked"]`. A
+universe in which neither order committed passes all three checkers having
+checked nothing, which is why the coverage key is marked only where an
+outbound job exists.
+
+**Why the key matters.** The platform mints the key and keeps it across every
+retry, but only the app puts it in the request, and only the remote can act on
+it. `crates/charpente/tests/outbound.rs` runs a workload like this one as a
+swarm property: six payment jobs against
+`Idempotent::header("idempotency-key", Recorder::new())`, three faulted rounds
+with crashes, then the fault-free tail. Beside the three checkers it asserts
+that the remote applied no charge twice, and that every recorded payment is one
+the remote applied. Two planted bugs show what those two properties are for,
+each pinned to the seed that caught it, and on both seeds the honest job passes
+with a verdict. `PayKeyless` leaves the key header out of its call. A re-call,
+whether after a lost reply, a timeout or a round that ended with the call made
+and the reply unsettled, then reaches the remote as a new request: seed
+`0xc064fe5aa31086a7` fails with `double charge: pay.test applied /pay/2 2
+times`. `PayTrusting` takes a 503 for a success, so a throttled call records a
+payment the remote never made: seed `0xce5842050b68d0cb` fails with `phantom
+charge: job 2 recorded a payment, but pay.test never applied /pay/2`.
 
 ### `charpente test --sim`
 

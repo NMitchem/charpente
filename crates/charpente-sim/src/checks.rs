@@ -1,9 +1,17 @@
 //! Reusable oracles for sim workloads (step-7 spec §Platform-checker
 //! library). v0 shipped exactly three; `durable_corruption_fired` earned
 //! its way in when the durable-corruption fault axes landed (segment-mgmt
-//! T5), and `boot_through_fallout` when `Db::open` stopped absorbing an
-//! injected fault inside the table store's open (follow-up 21) — more earn
-//! their way in the same way.
+//! T5), `boot_through_fallout` when `Db::open` stopped absorbing an
+//! injected fault inside the table store's open (follow-up 21), and
+//! `calls_have_durable_jobs`, `keys_are_per_job` and
+//! `outbound_settles_by_horizon` with outbound effects (outbound-effects
+//! spec §10) — more earn their way in the same way.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use charpente_core::io::IdempotencyKey;
+use charpente_core::job::{JobRow, JobStatus};
+use charpente_core::table::{Snapshot, View};
 
 use crate::Sim;
 
@@ -368,10 +376,87 @@ pub fn durable_refusal(sim: &Sim, text: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Every call that reached a remote carries the key of a job in `snap`, the
+/// recovered store (outbound-effects spec §10): a call never fires for an
+/// enqueue that is not durable. Single-node. One sim box's only loss window is
+/// media corruption: where [`durable_corruption_fired`], a cut enqueue whose
+/// call was already made fails this check, so a workload routes a failure
+/// through that and gives the universe up, never passes it. Attributes by
+/// `OutboundCall::key`, never by where the app put the key.
+pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String> {
+    let keys: BTreeSet<[u8; 16]> = snap
+        .scan::<JobRow>()
+        .map_err(|e| format!("calls_have_durable_jobs: scanning the jobs: {e}"))?
+        .into_iter()
+        .filter_map(|row| row.outbound_key)
+        .collect();
+    for d in sim.outbound_deliveries() {
+        if !keys.contains(d.key.as_bytes()) {
+            return Err(format!(
+                "calls_have_durable_jobs: a call to {} with key {} reached the remote at {}ns, but \
+                 no job in the recovered store carries that key — a call fired for an enqueue \
+                 that never became durable",
+                d.host,
+                d.key.as_str(),
+                d.at
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// No two jobs carry one idempotency key (spec §10).
+pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String> {
+    let mut seen: BTreeMap<[u8; 16], u64> = BTreeMap::new();
+    for row in snap
+        .scan::<JobRow>()
+        .map_err(|e| format!("keys_are_per_job: scanning the jobs: {e}"))?
+    {
+        let Some(key) = row.outbound_key else {
+            continue;
+        };
+        if let Some(first) = seen.insert(key, row.id.raw()) {
+            return Err(format!(
+                "keys_are_per_job: jobs {first} and {} carry the same idempotency key {} — keys \
+                 are minted per enqueue at staging; a key derived from an id, or drawn at apply, \
+                 repeats",
+                row.id.raw(),
+                IdempotencyKey::from_bytes(key).as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// After a fault-free tail long enough for every retry, every outbound job is
+/// Done or Dead (spec §10). Call it only after `quiesce_disk_faults`,
+/// `quiesce_outbound_faults`, and a run past the last backoff and deadline.
+pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String> {
+    for row in snap
+        .scan::<JobRow>()
+        .map_err(|e| format!("outbound_settles_by_horizon: scanning the jobs: {e}"))?
+    {
+        if row.outbound_key.is_some() && row.status == JobStatus::Pending {
+            return Err(format!(
+                "outbound_settles_by_horizon: job {} (\"{}\") is still Pending after the \
+                 fault-free tail, at attempt {} — an outbound job settles or retries to Dead; one \
+                 that does neither was lost by the kernel",
+                row.id.raw(),
+                row.name,
+                row.attempts
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use charpente_core::db::{Db, DbConfig, Job, Schema, Tx, outbound_fingerprint};
     use charpente_core::io::{Disk, Entropy};
+    use charpente_core::io::{HttpMethod, Outbound, OutboundCall};
+    use charpente_core::table::{Codec, Unscoped};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
@@ -1022,5 +1107,124 @@ mod tests {
             "{err}"
         );
         assert!(err.contains(&format!("{seed:#x}")), "{err}");
+    }
+
+    // ------------------------------------------------- the outbound checkers
+
+    struct Charge;
+    impl Codec for Charge {
+        fn encode(&self, _out: &mut Vec<u8>) {}
+        fn decode(_input: &mut &[u8]) -> std::io::Result<Charge> {
+            Ok(Charge)
+        }
+    }
+    impl Job for Charge {
+        const NAME: &'static str = "charge";
+        const FINGERPRINT: u64 = outbound_fingerprint(0x7E57_0C0C);
+        type Scope = Unscoped;
+        const OUTBOUND: bool = true;
+    }
+
+    /// Hands out `keys` in order: the only way two jobs can share a key,
+    /// which is exactly what `keys_are_per_job` must catch.
+    struct Scripted(std::cell::RefCell<Vec<[u8; 16]>>);
+    impl Entropy for Scripted {
+        fn fill(&self, buf: &mut [u8]) {
+            buf.copy_from_slice(&self.0.borrow_mut().remove(0));
+        }
+    }
+
+    /// One Pending outbound job per key, each enqueued through a minting
+    /// group over a fresh `Sim`.
+    fn jobs_with_keys(keys: &[[u8; 16]]) -> (Sim, Db) {
+        let sim = Sim::with_faults(0x0c4, crate::FaultConfig::none());
+        let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+        let mint = Scripted(std::cell::RefCell::new(keys.to_vec()));
+        let mut group = db.begin_group_minting(&mint).unwrap();
+        group
+            .stage(|tx: &mut Tx| {
+                for _ in keys {
+                    tx.enqueue(Charge);
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().map_err(|f| f.error).unwrap();
+        (sim, db)
+    }
+
+    fn orphan_call(key: [u8; 16]) -> OutboundCall {
+        OutboundCall {
+            host: "pay.test",
+            method: HttpMethod::Post,
+            path: "/x".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            key: IdempotencyKey::from_bytes(key),
+        }
+    }
+
+    #[test]
+    fn keys_are_per_job_names_both_jobs_and_the_key() {
+        let (_sim, db) = jobs_with_keys(&[[1; 16], [2; 16], [1; 16]]);
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            keys_are_per_job(&snap),
+            Err(
+                "keys_are_per_job: jobs 0 and 2 carry the same idempotency key \
+                 01010101010101010101010101010101 — keys are minted per enqueue at staging; a \
+                 key derived from an id, or drawn at apply, repeats"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn calls_have_durable_jobs_names_an_orphan_call() {
+        let (sim, db) = jobs_with_keys(&[[1; 16]]);
+        let snap = db.snapshot().unwrap();
+        sim.remote("pay.test", crate::outbound::Recorder::new());
+        let ob = sim.outbound(&["pay.test"]).unwrap();
+        ob.start(0, orphan_call([9; 16])).unwrap();
+        let err = calls_have_durable_jobs(&sim, &snap).unwrap_err();
+        assert!(
+            err.starts_with(
+                "calls_have_durable_jobs: a call to pay.test with key \
+                 09090909090909090909090909090909 reached the remote at 0ns, but no job in the \
+                 recovered store carries that key"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn outbound_settles_by_horizon_names_a_stuck_job() {
+        let (_sim, db) = jobs_with_keys(&[[1; 16]]); // Pending
+        let snap = db.snapshot().unwrap();
+        let err = outbound_settles_by_horizon(&snap).unwrap_err();
+        assert!(
+            err.starts_with("outbound_settles_by_horizon: job 0 (\"charge\") is still Pending"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn quiesced_outbound_faults_never_fire_again() {
+        let mut cfg = crate::FaultConfig::none();
+        cfg.outbound_refused = 1.0;
+        let sim = Sim::with_faults(5, cfg);
+        sim.remote("pay.test", crate::outbound::Recorder::new());
+        sim.quiesce_outbound_faults();
+        let ob = sim.outbound(&["pay.test"]).unwrap();
+        ob.start(0, orphan_call([1; 16])).unwrap();
+        assert_eq!(
+            std::iter::from_fn(|| ob.poll())
+                .next()
+                .unwrap()
+                .1
+                .unwrap()
+                .status,
+            200
+        );
     }
 }

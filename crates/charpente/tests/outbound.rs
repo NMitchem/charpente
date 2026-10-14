@@ -3,6 +3,7 @@
 //! §4's invariants, and the swarm property. Every sim failure prints its
 //! repro line (hard rule 5).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use charpente::auth::Principal;
@@ -10,7 +11,9 @@ use charpente::core::db::{
     Job, JobShapeRefusal, Refusal, Schema, TableReadRefusal, TableWriteRefusal, TxError,
     outbound_fingerprint,
 };
-use charpente::core::io::{Clock, Outbound, OutboundCall, OutboundReply, OutboundWake};
+use charpente::core::io::{
+    Clock, Entropy as _, Outbound, OutboundCall, OutboundReply, OutboundWake,
+};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, View};
 use charpente::http::{ApiError, App, AppConfig};
@@ -19,8 +22,12 @@ use charpente::kernel::{
 };
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, ScopedTx, Tenant, Tx, job, jobs};
+use charpente_sim::checks::{
+    boot_through_fallout, calls_have_durable_jobs, durable_corruption_fired, is_fault_fallout,
+    keys_are_per_job, outbound_settles_by_horizon,
+};
 use charpente_sim::outbound::{Idempotent, Recorder, from_fn};
-use charpente_sim::{FaultConfig, Sim};
+use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[job(
     global,
@@ -2553,4 +2560,410 @@ fn a_kernel_builder_wires_replication_archive_and_outbound_together() {
     let mut app = kernel.into_app();
     let (rows, paid) = jobs_and_paid(&mut app);
     assert_eq!((rows[0].status, paid), (JobStatus::Done, 1));
+}
+
+// ------------------------------------- the swarm property (spec §12, oracle 2)
+
+const POOL: u64 = 6;
+const ROUNDS: u32 = 3;
+const BOOT_TRIES: u32 = 8;
+/// The swarm property's reach floor and give-up cap. Its base is ambient. Over
+/// 10 fresh bases (0x0B1D0001..0A, 256 each) it checked 251-256 universes
+/// (mean 253.5, sample sd 1.65), so its floor is the mean less 4 sd. Every
+/// other universe gave up, 25 in all and at most 5 in one batch, each a boot
+/// refused for durable corruption (`boot:durable-refusal`). Its cap follows
+/// GUIDE §8's ambient rule, the larger of twice the largest count (10) and the
+/// Poisson cap. With x = 25 give-ups over N = 2,560 universes, U(25) =
+/// ½·χ²₀.₉₅(52) = 34.92, so a batch of n = 256 has lambda = 256 x 34.92 /
+/// 2,560 = 3.49. P(> 11) is 2.8e-4 and P(> 12) is 7.4e-5, so k = 12.
+const OUTBOUND_CHECKED_FLOOR: u64 = 246;
+const OUTBOUND_GAVE_UP_CEILING: u64 = 12;
+
+/// Which `Pay` the workload mounts: the honest one, or one of spec §12's two
+/// planted bugs.
+#[derive(Clone, Copy)]
+enum Variant {
+    Honest,
+    Keyless,
+    Trusting,
+}
+
+/// Planted bug (a): the call carries no idempotency key, so a re-call after
+/// a lost reply (or a crash, or a timeout) is applied again.
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 3, backoff = "500ms"),
+    timeout = "2s"
+)]
+struct PayKeyless {
+    n: u64,
+}
+
+impl PayKeyless {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(Call::post(format!("/pay/{}", self.n))))
+    }
+
+    fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        Pay { n: self.n }.settle(tx, reply)
+    }
+}
+
+/// Planted bug (b): `settle` takes a 503 for a success, recording a payment
+/// the remote never applied.
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 3, backoff = "500ms"),
+    timeout = "2s"
+)]
+struct PayTrusting {
+    n: u64,
+}
+
+impl PayTrusting {
+    fn call(&self, tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Pay { n: self.n }.call(tx, key)
+    }
+
+    fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 | 503 => {
+                let id = Id::from_raw(self.n);
+                let times = tx.get(id)?.map_or(0, |p: Paid| p.times);
+                tx.put(&Paid {
+                    id,
+                    times: times + 1,
+                });
+                Ok(())
+            }
+            s => Err(JobError::app(format!("pay.test answered {s}"))),
+        }
+    }
+}
+
+fn open_variant(sim: &Sim, v: Variant) -> std::io::Result<App> {
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Paid>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?;
+    let app = match v {
+        Variant::Honest => app.mount_jobs(jobs![Pay]),
+        Variant::Keyless => app.mount_jobs(jobs![PayKeyless]),
+        Variant::Trusting => app.mount_jobs(jobs![PayTrusting]),
+    };
+    Ok(app.outbound(Host::new("pay.test")))
+}
+
+/// Seeds the pool unless an earlier round's seeding is durable: a seed whose
+/// commit failed may still have landed, and seeding twice would put two jobs
+/// on one `Paid` id.
+fn seed_once(app: &mut App, v: Variant) -> Result<(), String> {
+    let seeded = app
+        .db_for_tests()
+        .snapshot()
+        .and_then(|s| s.scan::<JobRow>())
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|r| r.outbound_key.is_some());
+    if seeded {
+        return Ok(());
+    }
+    app.transact_for_tests(|tx| {
+        for n in 0..POOL {
+            match v {
+                Variant::Honest => tx.enqueue(Pay { n }),
+                Variant::Keyless => tx.enqueue(PayKeyless { n }),
+                Variant::Trusting => tx.enqueue(PayTrusting { n }),
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    // `TxError` derives only `Debug`. The injected-fault text lives in `Io`, so
+    // that arm must reach `is_fault_fallout` as the error's own text.
+    .map_err(|e| match e {
+        TxError::Io(e) => e.to_string(),
+        other => format!("{other:?}"),
+    })
+}
+
+/// Runs one kernel to `horizon`; fault fallout ends the round, anything else
+/// fails the universe.
+fn run_round(sim: &Sim, app: App, horizon: u64) -> Result<Option<App>, String> {
+    let outbound = sim
+        .outbound(&app.outbound_hosts())
+        .map_err(|e| e.to_string())?;
+    let mut kernel = match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
+        Ok(k) => k,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) => return Err(format!("kernel build failed non-injected: {e}")),
+    };
+    match kernel.run(&mut SimSource::new(Box::new(sim.clock()), horizon)) {
+        Ok(()) => Ok(Some(kernel.into_app())),
+        Err(e) if is_fault_fallout(&e.to_string()) => Ok(None),
+        Err(e) => Err(format!("kernel stopped non-injected: {e}")),
+    }
+}
+
+/// Oracle 2's swarm property (spec §12): outbound jobs under every outbound
+/// fault axis, disk faults and crashes, then a fault-free tail. Properties:
+/// the three checkers; no charge applied twice at the remote; no payment
+/// recorded for a charge the remote never applied; `settle` committed at most
+/// once per job.
+fn outbound_workload(sim: &mut Sim, v: Variant) -> Result<(), String> {
+    sim.remote(
+        "pay.test",
+        Idempotent::header("idempotency-key", Recorder::new()),
+    );
+    let entropy = sim.entropy();
+    for _round in 0..ROUNDS {
+        sim.crash_disk_after(36 + entropy.next_u64() % 438);
+        let Some(mut app) =
+            boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || open_variant(sim, v))
+                .map_err(|e| format!("open failed non-injected: {e}"))?
+        else {
+            if sim.gave_up().is_some() {
+                return Ok(());
+            }
+            sim.restart();
+            continue;
+        };
+        match seed_once(&mut app, v) {
+            Ok(()) => {}
+            Err(e) if is_fault_fallout(&e) => {
+                drop(app);
+                sim.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("seeding failed non-injected: {e}")),
+        }
+        let horizon = sim.now().as_nanos() + 20 * SEC;
+        drop(run_round(sim, app, horizon)?);
+        sim.restart();
+    }
+
+    // The fault-free tail (GUIDE §8): long enough for every backoff and deadline.
+    sim.quiesce_disk_faults();
+    sim.quiesce_outbound_faults();
+    let Some(mut app) =
+        boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || open_variant(sim, v))
+            .map_err(|e| format!("tail open failed non-injected: {e}"))?
+    else {
+        return if sim.gave_up().is_some() {
+            Ok(())
+        } else {
+            Err("the fault-free tail could not boot".into())
+        };
+    };
+    seed_once(&mut app, v)?;
+    let horizon = sim.now().as_nanos() + 600 * SEC;
+    let mut app = run_round(sim, app, horizon)?.ok_or("the fault-free tail's kernel stopped")?;
+
+    let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;
+    keys_are_per_job(&snap)?;
+    outbound_settles_by_horizon(&snap)?;
+    if let Err(e) = calls_have_durable_jobs(sim, &snap) {
+        // One sim box's only loss window is media corruption: a bit flip or
+        // misdirected write on a WAL frame above the checkpoint horizon is cut
+        // at recovery, and a call already made for the cut enqueue keeps its
+        // key while the store loses it (`checks::durable_corruption_fired`).
+        // Excused only where that fired, and as a give-up, never a pass: the
+        // re-seeded pool charges again under fresh keys, so nothing below is
+        // adjudicated.
+        if durable_corruption_fired(sim) {
+            sim.give_up(format!(
+                "durable corruption cut an enqueue whose call had already reached the remote, \
+                 so exactly-once was not adjudicated: {e}"
+            ));
+            return Ok(());
+        }
+        return Err(e);
+    }
+    let paid = snap.scan::<Paid>().map_err(|e| e.to_string())?;
+    let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
+    sim.with_remote(
+        "pay.test",
+        |m: &Idempotent<Recorder>| -> Result<(), String> {
+            let mut applied: BTreeMap<&str, u32> = BTreeMap::new();
+            for c in m.inner().calls() {
+                *applied.entry(c.path.as_str()).or_insert(0) += 1;
+            }
+            if let Some((path, n)) = applied.iter().find(|(_, n)| **n > 1) {
+                return Err(format!(
+                    "double charge: pay.test applied {path} {n} times — a re-call carried no \
+                     idempotency key the remote could dedupe on"
+                ));
+            }
+            for p in &paid {
+                if p.times != 1 {
+                    return Err(format!(
+                        "settle committed {} times for job {}",
+                        p.times,
+                        p.id.raw()
+                    ));
+                }
+                let path = format!("/pay/{}", p.id.raw());
+                if !applied.contains_key(path.as_str()) {
+                    return Err(format!(
+                        "phantom charge: job {} recorded a payment, but pay.test never applied \
+                         {path} — settle took a reply that was not a success for one",
+                        p.id.raw()
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    for row in jobs.iter().filter(|r| r.outbound_key.is_some()) {
+        let n = u64::decode(&mut &row.payload[..]).map_err(|e| e.to_string())?;
+        let has_paid = paid.iter().any(|p| p.id.raw() == n);
+        if (row.status == JobStatus::Done) != has_paid {
+            return Err(format!(
+                "job {} is {:?} but its payment row is {} — settle's effects and the Done mark \
+                 commit as one record",
+                row.id.raw(),
+                row.status,
+                if has_paid { "present" } else { "absent" }
+            ));
+        }
+        if row.status == JobStatus::Done && row.attempts > 0 {
+            sim.cover("outbound:settled-after-retry");
+        }
+    }
+    sim.cover("outbound:checked");
+    Ok(())
+}
+
+#[test]
+fn outbound_jobs_are_exactly_once_under_the_fault_matrix() {
+    run_universes_swarm!(
+        256,
+        |sim: &mut Sim| outbound_workload(sim, Variant::Honest),
+        require: [
+            "outbound:checked",
+            "outbound:settled-after-retry",
+            "fault:outbound_lost_reply",
+            "fault:outbound_lost_request",
+            "fault:outbound_refused",
+            "fault:outbound_throttle",
+            "fault:outbound_slow",
+            "fault:crash",
+            "restart",
+        ],
+        floor: [("outbound:checked", OUTBOUND_CHECKED_FLOOR)],
+        ceiling: [("universe:gave-up", OUTBOUND_GAVE_UP_CEILING)]
+    );
+}
+
+/// The universe a pinned seed names (the swarm runner's own derivation).
+fn universe(seed: u64) -> Sim {
+    let mut state = seed;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(seed, &mut cfg);
+    Sim::with_faults(seed, cfg)
+}
+
+/// One sim box's only loss window is media corruption, and the property gives
+/// it up: found by the property's first batch (2026-10-14). A bit flip at the
+/// first round's restart cut the seeded pool's enqueue after its six calls had
+/// reached the remote, and the next round re-seeded the pool under fresh keys.
+#[test]
+fn a_media_cut_enqueue_whose_calls_were_made_gives_the_universe_up() {
+    const SEED: u64 = 0x81c2_6254_2dfc_e560;
+    let mut sim = universe(SEED);
+    outbound_workload(&mut sim, Variant::Honest)
+        .unwrap_or_else(|e| panic!("seed {SEED:#x}: excused, so never a failure: {e}"));
+    assert!(
+        sim.coverage().contains_key("fault:bit_flip"),
+        "seed {SEED:#x}: the reason is a bit flip, and none fired: {:?}",
+        sim.coverage()
+    );
+    let reason = sim.gave_up().expect("excused, so never a pass");
+    assert!(
+        reason.starts_with(
+            "durable corruption cut an enqueue whose call had already reached the remote, so \
+             exactly-once was not adjudicated: calls_have_durable_jobs: a call to pay.test with \
+             key fa35dc5568cc92447a55045d8f217e5a"
+        ),
+        "seed {SEED:#x}: {reason}"
+    );
+}
+
+/// Planted bug (a), spec §12 oracle 4: without the key, a re-call is a second
+/// charge. Seed found by a 1,024-universe hunt on 2026-10-14 (progress.md).
+#[test]
+fn planted_keyless_call_is_a_double_charge_with_a_recorded_seed() {
+    const SEED: u64 = 0xc064_fe5a_a310_86a7;
+    let mut sim = universe(SEED);
+    let err =
+        outbound_workload(&mut sim, Variant::Keyless).expect_err("the planted bug must be caught");
+    assert!(
+        err.starts_with("double charge: pay.test applied /pay/"),
+        "seed {SEED:#x}: {err}"
+    );
+    // The reason is one job called again with nothing to dedupe on, not two
+    // jobs charging one path: every application carried that job's key and
+    // no key header.
+    let path = err.split(' ').nth(4).expect("the message names the path");
+    let (jobs, headed) = sim.with_remote("pay.test", |m: &Idempotent<Recorder>| {
+        let calls: Vec<&OutboundCall> = m
+            .inner()
+            .calls()
+            .iter()
+            .filter(|c| c.path == path)
+            .collect();
+        (
+            calls
+                .iter()
+                .map(|c| c.key.as_str().to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            calls.iter().filter(|c| !c.headers.is_empty()).count(),
+        )
+    });
+    assert_eq!(
+        (jobs.len(), headed),
+        (1, 0),
+        "seed {SEED:#x}: {path} must be one keyless job re-called"
+    );
+    let mut honest = universe(SEED);
+    outbound_workload(&mut honest, Variant::Honest).unwrap_or_else(|e| {
+        panic!("seed {SEED:#x}: the honest job must pass where the planted one fails: {e}")
+    });
+    assert_eq!(
+        (honest.gave_up(), honest.coverage().get("outbound:checked")),
+        (None, Some(&1)),
+        "seed {SEED:#x}: the honest twin must reach a verdict, not give up"
+    );
+}
+
+/// Planted bug (b): a 503 taken for a success records a charge that never
+/// happened. Seed found by a 1,024-universe hunt on 2026-10-14 (progress.md).
+#[test]
+fn planted_trusting_settle_is_a_phantom_charge_with_a_recorded_seed() {
+    const SEED: u64 = 0xce58_4205_0b68_d0cb;
+    let mut sim = universe(SEED);
+    let err =
+        outbound_workload(&mut sim, Variant::Trusting).expect_err("the planted bug must be caught");
+    assert!(
+        err.starts_with("phantom charge: job "),
+        "seed {SEED:#x}: {err}"
+    );
+    assert!(
+        sim.coverage().contains_key("fault:outbound_throttle"),
+        "seed {SEED:#x}: the reason is a throttled 503, and none fired: {:?}",
+        sim.coverage()
+    );
+    let mut honest = universe(SEED);
+    outbound_workload(&mut honest, Variant::Honest).unwrap_or_else(|e| {
+        panic!("seed {SEED:#x}: the honest job must pass where the planted one fails: {e}")
+    });
+    assert_eq!(
+        (honest.gave_up(), honest.coverage().get("outbound:checked")),
+        (None, Some(&1)),
+        "seed {SEED:#x}: the honest twin must reach a verdict, not give up"
+    );
 }
