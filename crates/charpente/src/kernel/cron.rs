@@ -9,6 +9,8 @@ use charpente_core::db::{Db, Group, Tx, TxError};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
 
+use super::dispatch::{not_primary_bug, verifying_bug};
+
 #[table(global)]
 pub struct CronRow {
     pub id: Id<CronRow>,
@@ -220,19 +222,8 @@ fn nanos(d: Duration, name: &'static str) -> u64 {
 fn flatten(e: TxError<io::Error>) -> io::Error {
     match e {
         TxError::App(e) | TxError::Io(e) => e,
-        TxError::NotPrimary { .. } => io::Error::other(
-            "BUG: a job/cron transaction hit NotPrimary — the kernel must not run dispatch or \
-             cron on a follower (DESIGN §5)",
-        ),
-        TxError::Verifying { .. } => io::Error::other(
-            "BUG: a job/cron transaction hit Verifying — the kernel must not run dispatch or \
-             cron on a node whose witness gate is still shut (M2 sub-project 0b). The guard \
-             that makes this unreachable is writes_allowed(): Kernel::build's cron.upsert, \
-             the Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema all check \
-             it, and after_repl_step re-runs the skipped work when the gate opens. Reaching \
-             here means one of those checks was weakened back to a role test — a verifying \
-             node is a Role::Primary, so is_primary() does not cover it",
-        ),
+        TxError::NotPrimary { .. } => not_primary_bug(),
+        TxError::Verifying { .. } => verifying_bug(),
     }
 }
 

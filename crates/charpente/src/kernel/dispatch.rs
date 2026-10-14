@@ -527,7 +527,7 @@ fn assert_row_matches_def(id: u64, row: &JobRow, def: &JobDef) {
     // checkable here, since the row records none: `Group::stage`
     // refuses an enqueue under any type but `def.scope_type`, and
     // `JobScope::open` asserts the glue opens exactly that type —
-    // inside the `catch_unwind` below, so a hand-built `JobDef` whose
+    // inside `run_due_into`'s `catch_unwind`, so a hand-built `JobDef` whose
     // glue disagrees is an attempt, not a kernel stop.
     assert_eq!(
         row.scope.is_some(),
@@ -543,14 +543,14 @@ fn assert_row_matches_def(id: u64, row: &JobRow, def: &JobDef) {
     );
 }
 
-fn not_primary_bug() -> io::Error {
+pub(super) fn not_primary_bug() -> io::Error {
     io::Error::other(
         "BUG: a job/cron transaction hit NotPrimary — the kernel must not run \
          dispatch or cron on a follower (DESIGN §5)",
     )
 }
 
-fn verifying_bug() -> io::Error {
+pub(super) fn verifying_bug() -> io::Error {
     io::Error::other(
         "BUG: a job/cron transaction hit Verifying — the kernel must not run \
          dispatch or cron on a node whose witness gate is still shut (M2 \
@@ -575,11 +575,11 @@ fn stage_failure_record(
     now: u64,
     err: String,
 ) -> io::Result<JobOutcome> {
-    // Every fallible step below (the policy read, the
-    // failure-record stage) is run through this closure so that
-    // ANY Err exit — not just the sibling Io arm's — still
-    // restores the heap entry: run_due_into's contract is that a
-    // Pending job is always in the heap on return.
+    // Every fallible step below (the job-row read, the failure-record
+    // stage) runs inside the one `group.stage` closure, so ANY Err exit
+    // comes back as this function's `Err`, and the caller restores its
+    // due-set entry on it, as `run_due_into`'s sibling Io arm does: a
+    // Pending job is always in a set on return.
     //
     // The retry-policy lookup is folded into the SAME stage as
     // the failure record (group-commit T7, C-2), rather than a
