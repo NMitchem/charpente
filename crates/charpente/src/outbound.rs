@@ -339,8 +339,10 @@ impl Host {
 }
 
 /// Why `name` is not a bare host, or `None` (spec §5). `#[job]` checks the
-/// same rule at compile time; charpente-macros cannot link this crate, so the
-/// two are pinned to agree by the compile-fail fixtures and this module's tests.
+/// same rule at compile time with a byte-for-byte copy in
+/// crates/charpente-macros/src/job.rs, since that crate cannot link this one;
+/// guide-examples' tests/hook_census.rs holds the two bodies identical, so
+/// change both or neither.
 pub(crate) fn host_name_problem(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return Some("is empty");

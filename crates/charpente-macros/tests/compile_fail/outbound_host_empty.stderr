@@ -1,0 +1,5 @@
+error: outbound = "": the host is empty — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
+ --> tests/compile_fail/outbound_host_empty.rs:4:26
+  |
+4 | #[job(global, outbound = "")]
+  |                          ^^

@@ -1,0 +1,5 @@
+error: `timeout` applies only to an outbound job — add `outbound = "<host>"`, or drop `timeout`
+ --> tests/compile_fail/outbound_timeout_without_outbound.rs:5:25
+  |
+5 | #[job(global, timeout = "5s")]
+  |                         ^^^^

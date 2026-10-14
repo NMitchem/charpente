@@ -1,0 +1,5 @@
+error: outbound = "api.stripe.com:443": the host carries a port — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
+ --> tests/compile_fail/outbound_host_has_port.rs:5:26
+  |
+5 | #[job(global, outbound = "api.stripe.com:443")]
+  |                          ^^^^^^^^^^^^^^^^^^^^

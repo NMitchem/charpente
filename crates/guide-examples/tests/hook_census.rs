@@ -22,6 +22,14 @@
 //! Scope: a call site is a non-comment line containing `set_hook(` or
 //! `take_hook(`. A string literal carrying that text would be reported too,
 //! loudly and by line — the right direction for a census.
+//!
+//! One more source pin lives here because it reads sources the same way:
+//! `host_name_problem` exists twice, in crates/charpente/src/outbound.rs
+//! (`Host::new`, at run time) and in crates/charpente-macros/src/job.rs
+//! (`#[job(outbound = "…")]`, at compile time), because the macro crate cannot
+//! link charpente. The two must be one rule, so a host the attribute accepts is
+//! one `Host::new` accepts and the reverse; the test below holds them
+//! byte-identical from the signature line through the closing brace.
 
 // Walking the repo's sources is build tooling outside the deterministic
 // boundary, the same sanctioned-edge pattern as tests/doc_inventory.rs.
@@ -126,4 +134,64 @@ fn a_call_is_a_site_by_line_whatever_its_path_prefix() {
             (4, "set_hook(prev);".to_string())
         ]
     );
+}
+
+/// `fn host_name_problem` from its signature line through the first `}` at
+/// column 0, with a leading `pub(crate) ` dropped: each copy's cross-reference
+/// comment sits above the signature, so neither is in the text compared.
+fn host_name_problem_text(src: &str, file: &str) -> String {
+    let mut lines = src
+        .lines()
+        .map(|l| l.strip_prefix("pub(crate) ").unwrap_or(l))
+        .skip_while(|l| !l.starts_with("fn host_name_problem("));
+    let mut out = String::new();
+    for line in lines.by_ref() {
+        out.push_str(line);
+        out.push('\n');
+        if line == "}" {
+            return out;
+        }
+    }
+    panic!(
+        "{file}: no `fn host_name_problem(` line followed by a closing `}}` at column 0 — the \
+         function moved or was renamed; point this test at it"
+    );
+}
+
+#[test]
+fn the_runtime_and_macro_host_name_rules_are_byte_identical() {
+    let root = repo();
+    let runtime = "crates/charpente/src/outbound.rs";
+    let macros = "crates/charpente-macros/src/job.rs";
+    let text = |rel: &str| {
+        let src = fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        host_name_problem_text(&src, rel)
+    };
+    let (a, b) = (text(runtime), text(macros));
+    assert!(
+        a.lines().count() > 20,
+        "the extracted `host_name_problem` in {runtime} is {} lines — an extraction that stops \
+         short compares too little to pin anything",
+        a.lines().count()
+    );
+    if a != b {
+        let (n, (la, lb)) = a
+            .lines()
+            .chain(std::iter::repeat("<end>"))
+            .zip(b.lines().chain(std::iter::repeat("<end>")))
+            .enumerate()
+            .find(|(_, (x, y))| x != y)
+            .expect("unequal texts differ at some line");
+        panic!(
+            "`host_name_problem` differs between {runtime} (Host::new, run time) and {macros} \
+             (#[job(outbound = \"…\")], compile time), first at line {} of the function:\n  \
+             {runtime}: {la}\n  {macros}: {lb}\n\
+             contract: the two are one rule, so a host the attribute accepts is one Host::new \
+             accepts and the reverse; charpente-macros cannot link charpente, so the rule is \
+             copied and this test holds the copies byte-identical.\n\
+             fix: make the change in one copy, then copy that function over the other, keeping \
+             each one's visibility and its cross-reference comment.",
+            n + 1
+        );
+    }
 }

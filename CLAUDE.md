@@ -57,7 +57,7 @@ item with the trigger that reopens it.
   nothing exits 1, so under `set -o pipefail` "nothing failed" and "the check itself
   broke" produce the same status.
 - One test file: `cargo test -p charpente --test kernel` — suites live in each workspace
-  member's `tests/` (charpente: archive/auth/describe/group_commit/http/kernel/realtime/
+  member's `tests/` (charpente: archive/auth/describe/group_commit/http/kernel/outbound/realtime/
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
   charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-cli: cli/ctl/

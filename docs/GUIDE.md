@@ -1432,8 +1432,9 @@ belongs to no tenant, and `#[job(scoped_by = Org)]` acts inside one (below, and
 `RetryPolicy::DEFAULT` (5 attempts, 30s base backoff), and adding `retry(max =
 <int>, backoff = "<n><unit>")` overrides either or both. `backoff` is a bare
 number plus a unit, one of `ms`, `s`, `m`, `h`. The words `global` or
-`scoped_by`, `cross_tenant` (§16) and `retry(...)` may come in any order, each
-at most once.
+`scoped_by`, `cross_tenant` (§16), `retry(...)`, and `outbound = "<host>"` with
+its optional `timeout = "<n><unit>"` ("Outbound jobs" below) may come in any
+order, each at most once.
 
 ```rust
 use charpente::core::job::RetryPolicy;
@@ -1469,7 +1470,8 @@ fn retry_policies() -> (RetryPolicy, RetryPolicy) {
 method with exactly this shape: `fn run(self, tx: &mut Tx) -> Result<(),
 JobError>`. That is a `global` job's. A `scoped_by = Org` job's `run` takes
 `tx: &mut ScopedTx<'_, '_, Org>` instead (next subsection), and `cross_tenant`
-adds `cap: &CrossTenant` after `tx` in either form. It runs as its own
+adds `cap: &CrossTenant` after `tx` in either form. An outbound job writes `call`
+and `settle` in place of `run` ("Outbound jobs" below). It runs as its own
 transaction, so it reads and writes through
 `tx` exactly like a route handler or the closure in §4's `db.transact`.
 `JobError: From<io::Error>` (mapping to `JobError::Io`), so `?` works on
@@ -1696,10 +1698,10 @@ From inside any transaction — a route handler, a job handler, a cron tick
 — `tx.enqueue(job)` writes the job into that same committing log record;
 `Db::transact`'s apply step materializes it as a row in the platform's
 `charpente.jobs` table. `tx.enqueue_keyed(key, job)` does the same, plus
-carries a key: the job's stable identity to the world **outside** the log
-(the idempotency key an at-least-once external effect needs downstream —
-M1's external-IO surface consumes it). On a bare `Tx` these take `global`
-jobs. A `scoped_by` job is enqueued the same two ways on its tenant's
+carries a key: the app's own identity for the job. It is not the idempotency
+key an outbound call sends: the platform mints that one itself, for every
+outbound job, keyed or not ("Outbound jobs" below). On a bare `Tx` these take
+`global` jobs. A `scoped_by` job is enqueued the same two ways on its tenant's
 `ScopedTx` (above). Inside the deterministic boundary
 the key means nothing in v0 — it is carried, never indexed or deduped on,
 because exactly-once state effects here are structural (below), not
@@ -1785,6 +1787,104 @@ One more failure mode: if a `JobRow`'s `name` isn't in the `jobs![...]` list
 type — it fails the same way as a handler rejection, with: `"job
 \"<name>\" is not registered — add it to the jobs![…] list passed to
 App::mount_jobs (or this log outlived a renamed job type)"`.
+
+### Outbound jobs: calling the world after commit
+
+A job that calls an outside service over HTTP declares the host it calls with
+`outbound = "<host>"`, and writes two methods in place of `run`. `call` reads what
+it needs and builds the request. The kernel sends it outside any transaction, since
+no transaction waits on the network, and hands the reply to `settle`, which commits
+the reply's consequences in the transaction that marks the job Done.
+Enqueue one the way you enqueue any job: `enqueue`, `enqueue_keyed`, `enqueue_in`
+and cron take outbound jobs unchanged.
+
+```rust
+use charpente::kernel::JobError;
+use charpente::outbound::{Call, IdempotencyKey, Reply};
+use charpente::{Tx, job};
+
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 3, backoff = "1s"),
+    timeout = "2s"
+)]
+struct Charge {
+    cents: u64,
+}
+
+impl Charge {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::post("/charges")
+                .header("idempotency-key", key.as_str())
+                .form(&[("amount", self.cents.to_string())]),
+        ))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 => Ok(()),
+            s => Err(JobError::app(format!("pay.test answered {s}"))),
+        }
+    }
+}
+```
+
+The two methods have exactly these shapes. A `global` job's:
+
+```text
+fn call(&self, tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError>
+fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError>
+```
+
+A `scoped_by = Org` job's take its tenant's `ScopedTx`, as its `run` would:
+
+```text
+fn call(&self, tx: &ScopedTx<'_, '_, Org>, key: &IdempotencyKey) -> Result<Option<Call>, JobError>
+fn settle(self, tx: &mut ScopedTx<'_, '_, Org>, reply: Reply) -> Result<(), JobError>
+```
+
+`call` takes a shared `&Tx`, so it reads and cannot write: a `tx.put` inside it is
+a compile error, and so is a scoped job's `call` or `settle` taking a bare `Tx`
+(§9 lists both). Whatever the call's outcome should change, `settle` writes. When
+there is nothing to call any more (the order was cancelled after the enqueue, say),
+`call` returns `Ok(None)`, and the job is done without a call.
+
+`key` is the job's idempotency key. The platform mints it when the job is
+enqueued, 16 bytes from the node's entropy rendered as 32 lowercase hex
+characters, and it stays the same across every retry and every re-dispatch after
+a crash or a failover. charpente sends it nowhere by itself: `call` places it
+where the remote reads one, the `idempotency-key` header above or a field of the
+body, so a remote that honours it applies a repeated request once. It is not
+`enqueue_keyed`'s app key.
+
+The request is built on the declared host, which is never runtime data:
+`Call::get`, `post`, `put`, `patch` and `delete` take a path that begins with `/`.
+`.header(name, value)` sends the name lowercase. `.json(&value)` and
+`.form(&[(name, value)])` set the body and its `content-type`, and `.body(bytes)`
+sets a raw body with none. A call carries one `content-type`, so setting another
+(through `json`, `form` or `header`) replaces the earlier one. `settle` receives
+the reply of any status, a 3xx included, since a redirect is never followed:
+`reply.status()`, `reply.header(name)` (the first of that name, case-insensitively),
+`reply.body()`, and `reply.json::<T>()`, which is a `JobError::App` when the body is
+not `T`'s JSON.
+
+The host is a bare DNS name like `api.stripe.com`. A scheme, port, path or
+userinfo in it is a compile error, because where the host resolves is the
+operator's to say. `timeout` bounds the wait for the remote's reply, with
+`backoff`'s syntax; it defaults to 30 s, and it is refused on a job without
+`outbound`. `cross_tenant` beside `outbound` is refused: an outbound call runs in
+the one tenant its job was enqueued in. An outbound job's `impl` that has `run`
+instead of `call` and `settle` fails to compile too. §9 lists each refusal's
+text.
+
+Outbound-ness is part of a job's shape: an outbound job's `FINGERPRINT` continues
+its fingerprint as a pure job (`charpente::core::db::outbound_fingerprint`), so
+adding `outbound` to a job, or removing it, is a shape change. It is refused while
+Pending jobs of the old shape exist, and the ways through are the two "Changing a
+job's fields" below describes: drain first, or a new type. The host is not part of
+the shape, so changing the host is not refused.
 
 ### Changing a job's fields
 
@@ -1968,19 +2068,23 @@ The rest are about the attribute's syntax and the struct's shape:
 // a word the attribute does not recognise
 #[job(bogus)]
 struct Foo {}
-// "a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`
-//  and `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m,
-//  h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff =
-//  \"10s\"))]` or `#[job(global, cross_tenant)]`"
+// "a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`,
+//  `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m, h),
+//  and `outbound = \"<host>\"` with an optional `timeout = \"<n><unit>\"`, in
+//  any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff =
+//  \"10s\"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org,
+//  outbound = \"api.stripe.com\", timeout = \"30s\")]`"
 
 // backoff with no unit suffix
 #[job(global, retry(max = 3, backoff = "10"))]
 struct Bar {}
 // "backoff \"10\" has no unit — a job declares `global` or `scoped_by =
-//  <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff =
-//  \"<n><unit>\")` (unit is one of ms, s, m, h), in any order — e.g.
-//  `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]` or
-//  `#[job(global, cross_tenant)]`"
+//  <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff =
+//  \"<n><unit>\")` (unit is one of ms, s, m, h), and `outbound = \"<host>\"`
+//  with an optional `timeout = \"<n><unit>\"`, in any order — e.g.
+//  `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]`,
+//  `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound =
+//  \"api.stripe.com\", timeout = \"30s\")]`"
 
 // enums and unions cannot be job payloads
 #[job(global)]
@@ -3695,7 +3799,7 @@ argument list didn't parse as `METHOD "/path"` to begin with. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
 the pattern and it's gone.
 
-### `#[job]` tenancy, retry-syntax and shape violations (`charpente-macros/src/job.rs`, compile time)
+### `#[job]` tenancy, retry-syntax, outbound and shape violations (`charpente-macros/src/job.rs`, compile time)
 
 ```text
 `NotifySubscribers` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
@@ -3704,29 +3808,68 @@ the pattern and it's gone.
 `scoped_by` given twice — write it once
 `cross_tenant` given twice — write it once
 `retry(...)` given twice — write it once
-a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
-backoff "10" has no unit — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
-unknown retry field `jitter` — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
+`outbound` given twice — write it once
+`timeout` given twice — write it once
+a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+backoff "10" has no unit — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+unknown retry field `jitter` — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
 `max` given twice — write it once
 `backoff` given twice — write it once
-backoff "12xs": "12x" is not a whole number — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
-backoff "99999999999999h" overflows u64 milliseconds — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
+backoff "12xs": "12x" is not a whole number — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+backoff "99999999999999h" overflows u64 milliseconds — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+outbound = "https://api.stripe.com": the host carries a scheme — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
+outbound = "api.stripe.com:443": the host carries a port — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
+outbound = "": the host is empty — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
+`timeout` applies only to an outbound job — add `outbound = "<host>"`, or drop `timeout`
+timeout "0s" would cancel every call before the remote could answer — give a positive duration
+`outbound` with `cross_tenant` is refused in v1 — an outbound call runs in the one tenant its job was enqueued in (outbound-effects spec §15); drop one
 #[job] applies to structs — enums and unions cannot be job payloads
 #[job] structs cannot be generic — a job is one concrete payload shape; make `Baz` non-generic
 #[job] needs named fields — `Baz` must be a braced struct
 ```
 
 The first is the one every job meets: a job declares its tenancy, and a bare `#[job]`
-names both answers. The next five refuse a word given twice or both tenancies at once.
+names both answers. The next seven refuse a word given twice or both tenancies at once.
 Anything else the attribute does not recognise hits the accepted-forms message, which
 lists every word. Four of the lines after it are that message with more specific context
 prepended: a backoff string missing its unit, an unrecognized field inside `retry(...)`,
 a backoff whose number doesn't parse, or one so large it overflows `u64` milliseconds;
 between them, `max` or `backoff` written twice inside `retry(...)` is refused like the
-words above. The last three are the struct-shape checks `#[table]` makes (§2): only
-structs, only non-generic, only named fields. A scoped job enqueued where no tenant is
-named, or scheduled by cron, is a trait-bound error rather than a macro one; §6 pins its
-note.
+words above. A `timeout` string is refused in the same three ways as a backoff, with
+`timeout` in place of `backoff`. The six lines after those refuse §6's outbound words.
+The three `outbound = …` lines are one refusal, a host that is not a bare DNS name, and
+the reason after "the host" is one of: is empty, carries a scheme, carries userinfo,
+carries a path, is an IPv6 literal, carries a port, has an uppercase letter, holds a
+character a DNS name cannot, ends with a dot, has an empty label, has a label starting
+or ending with '-', or is an IPv4 literal. `Host::new` refuses a host by the same rule.
+Then `timeout` on a job that is not outbound, a zero timeout (the message quotes the
+literal as written), and `outbound` beside `cross_tenant`. The last three are the
+struct-shape checks `#[table]` makes (§2): only structs, only non-generic, only named
+fields. A scoped job enqueued where no tenant is named, or scheduled by cron, is a
+trait-bound error rather than a macro one; §6 pins its note.
+
+An outbound job's methods are refused by rustc rather than by the macro, because the
+attribute cannot see the job's `impl`. These are the first lines, for a job named
+`Charge`:
+
+```text
+error[E0599]: expected an `Fn<_>` closure, found `Charge`
+error[E0599]: no associated function or constant named `settle` found for struct `Charge` in the current scope
+error[E0596]: cannot borrow `*tx` as mutable, as it is behind a `&` reference
+error[E0308]: mismatched types
+```
+
+The first two come together: an outbound job whose `impl` has `run`, or nothing, where
+`call` and `settle` belong. rustc reports each missing method, and words the one for
+`call` as a closure error because the prelude's `Fn` trait also has a method named
+`call`; its label reads "associated function or constant `call` not found for this
+struct". Write both methods with §6's signatures. The third is a write inside `call`,
+a `tx.put` say. rustc's help suggests making `call` take `&mut Tx`, and that signature
+is refused next, by the fourth: `call` reads, and its writes belong in `settle`. The
+fourth, with "expected fn pointer, found fn item", is a method whose signature is not
+§6's: a `call` taking `&mut Tx`, or a scoped job's `call` or `settle` taking a bare
+`Tx`, which would otherwise read or write in no tenant. Its note prints the expected
+signature above yours.
 
 Three more, at job-dispatch time rather than macro-expansion time
 (`charpente/src/kernel/dispatch.rs` — covered behaviorally in §6's "Retry,

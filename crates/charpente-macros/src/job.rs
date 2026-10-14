@@ -1,14 +1,16 @@
-//! `#[job(global | scoped_by = Org[, cross_tenant][, retry(max = N, backoff = "30s")])]`,
+//! `#[job(global | scoped_by = Org[, cross_tenant][, retry(max = N, backoff = "30s")][, outbound = "api.stripe.com"[, timeout = "30s"]])]`,
 //! the words in any order, each at most once, and exactly one of `global` /
-//! `scoped_by` (DESIGN.md §6, specs 2026-07-02-queue-cron-design.md and
-//! 2026-09-27-job-tenancy-design.md §5):
+//! `scoped_by` (DESIGN.md §6, specs 2026-07-02-queue-cron-design.md,
+//! 2026-09-27-job-tenancy-design.md §5 and 2026-10-13-outbound-effects-design.md §5):
 //! turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
 //! the id: a job payload has no primary key), `impl Job` carrying the name,
 //! the payload's structural fingerprint (`fingerprint::compute`, continued over
 //! the tenant type's `NAME` by `charpente_core::db::scoped_fingerprint` for a
-//! `scoped_by` job), the scope type and the retry policy, and the
-//! `JobEntry` glue `jobs![]` collects. Errors name the accepted forms (hard
+//! `scoped_by` job, and continued again by `charpente_core::db::outbound_fingerprint`
+//! for an outbound one), the scope type and the retry policy, and the
+//! `JobEntry` glue `jobs![]` collects; an outbound job's `JobDef` carries its
+//! `call`/`settle` glue in `outbound`. Errors name the accepted forms (hard
 //! rule 5).
 
 use proc_macro2::TokenStream;
@@ -18,9 +20,10 @@ use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Error, Fields, Ident, LitInt, LitStr, Token, parenthesized};
 
 const ACCEPTED_FORMS: &str = "a job declares `global` or `scoped_by = <Type>`, and may add \
-     `cross_tenant` and `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, \
-     m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]` \
-     or `#[job(global, cross_tenant)]`";
+     `cross_tenant`, `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m, h), \
+     and `outbound = \"<host>\"` with an optional `timeout = \"<n><unit>\"`, in any order — e.g. \
+     `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]`, `#[job(global, cross_tenant)]` \
+     or `#[job(scoped_by = Org, outbound = \"api.stripe.com\", timeout = \"30s\")]`";
 
 // ---------------------------------------------------------------- args
 
@@ -40,6 +43,12 @@ pub(crate) struct JobArgs {
     /// `global` or `scoped_by = Org`. `None` only while parsing: `expand`
     /// refuses a job that gave neither, by name, before anything else.
     pub tenancy: Option<Tenancy>,
+    /// `outbound = "<host>"` (outbound-effects spec §5): the job writes
+    /// `call`/`settle` instead of `run`. Checked by `host_name_problem`.
+    pub outbound: Option<String>,
+    /// `timeout = "<n><unit>"`, refused without `outbound`; `expand` gives an
+    /// outbound job that wrote none the 30 s default.
+    pub timeout_millis: Option<u64>,
 }
 
 impl Default for JobArgs {
@@ -49,6 +58,8 @@ impl Default for JobArgs {
             backoff_millis: 30_000,
             cross_tenant: false,
             tenancy: None,
+            outbound: None,
+            timeout_millis: None,
         }
     }
 }
@@ -86,6 +97,8 @@ enum JobArg {
     ScopedBy(proc_macro2::Span, syn::Path),
     CrossTenant(proc_macro2::Span),
     Retry(proc_macro2::Span, Vec<RetryField>),
+    Outbound(proc_macro2::Span, LitStr),
+    Timeout(proc_macro2::Span, LitStr),
 }
 
 impl Parse for JobArg {
@@ -116,6 +129,19 @@ impl Parse for JobArg {
                 let fields = content.parse_terminated(RetryField::parse, Token![,])?;
                 Ok(JobArg::Retry(ident.span(), fields.into_iter().collect()))
             }
+            word @ ("outbound" | "timeout") => {
+                input
+                    .parse::<Token![=]>()
+                    .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+                let lit: LitStr = input
+                    .parse()
+                    .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+                Ok(if word == "outbound" {
+                    JobArg::Outbound(ident.span(), lit)
+                } else {
+                    JobArg::Timeout(ident.span(), lit)
+                })
+            }
             _ => Err(Error::new(ident.span(), ACCEPTED_FORMS)),
         }
     }
@@ -127,6 +153,8 @@ impl Parse for JobArgs {
         let mut scoped_by: Option<syn::Path> = None;
         let mut cross_tenant: Option<proc_macro2::Span> = None;
         let mut retry: Option<Vec<RetryField>> = None;
+        let mut outbound_lit: Option<LitStr> = None;
+        let mut timeout_lit: Option<LitStr> = None;
         while !input.is_empty() {
             match input.parse::<JobArg>()? {
                 JobArg::Global(span) => {
@@ -162,6 +190,18 @@ impl Parse for JobArgs {
                     }
                     retry = Some(fields);
                 }
+                JobArg::Outbound(span, lit) => {
+                    if outbound_lit.is_some() {
+                        return Err(Error::new(span, "`outbound` given twice — write it once"));
+                    }
+                    outbound_lit = Some(lit);
+                }
+                JobArg::Timeout(span, lit) => {
+                    if timeout_lit.is_some() {
+                        return Err(Error::new(span, "`timeout` given twice — write it once"));
+                    }
+                    timeout_lit = Some(lit);
+                }
             }
             if input.is_empty() {
                 break;
@@ -169,6 +209,49 @@ impl Parse for JobArgs {
             input
                 .parse::<Token![,]>()
                 .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+        }
+
+        if let Some(lit) = &outbound_lit {
+            if let Some(problem) = host_name_problem(&lit.value()) {
+                return Err(Error::new(
+                    lit.span(),
+                    format!(
+                        "outbound = \"{}\": the host {problem} — a host is a bare DNS name like \
+                         \"api.stripe.com\"; where it resolves is the operator's (--outbound-base, \
+                         GUIDE §5)",
+                        lit.value()
+                    ),
+                ));
+            }
+            if let Some(span) = cross_tenant {
+                return Err(Error::new(
+                    span,
+                    "`outbound` with `cross_tenant` is refused in v1 — an outbound call runs in \
+                     the one tenant its job was enqueued in (outbound-effects spec §15); drop one",
+                ));
+            }
+        }
+        let mut timeout_millis = None;
+        if let Some(lit) = &timeout_lit {
+            if outbound_lit.is_none() {
+                return Err(Error::new(
+                    lit.span(),
+                    "`timeout` applies only to an outbound job — add `outbound = \"<host>\"`, or \
+                     drop `timeout`",
+                ));
+            }
+            let millis = parse_duration(lit, "timeout")?;
+            if millis == 0 {
+                return Err(Error::new(
+                    lit.span(),
+                    format!(
+                        "timeout \"{}\" would cancel every call before the remote could answer — \
+                         give a positive duration",
+                        lit.value()
+                    ),
+                ));
+            }
+            timeout_millis = Some(millis);
         }
 
         let mut max = None;
@@ -188,7 +271,7 @@ impl Parse for JobArgs {
                             "`backoff` given twice — write it once",
                         ));
                     }
-                    backoff_millis = Some(parse_backoff(&lit)?);
+                    backoff_millis = Some(parse_duration(&lit, "backoff")?);
                 }
             }
         }
@@ -202,13 +285,17 @@ impl Parse for JobArgs {
                 (Some(_), None) => Some(Tenancy::Global),
                 (None, None) => None,
             },
+            outbound: outbound_lit.map(|lit| lit.value()),
+            timeout_millis,
         })
     }
 }
 
 /// `"10s"` -> 10_000, `"500ms"` -> 500, `"5m"` -> 300_000, `"2h"` -> 7_200_000.
 /// Checked in order `ms, s, m, h` — `ms` first, since it also ends in `s`.
-fn parse_backoff(lit: &LitStr) -> syn::Result<u64> {
+/// `what` is the word the duration belongs to (`backoff`, `timeout`), which
+/// each refusal names.
+fn parse_duration(lit: &LitStr, what: &str) -> syn::Result<u64> {
     let raw = lit.value();
     let (digits, millis_per_unit) = if let Some(d) = raw.strip_suffix("ms") {
         (d, 1u64)
@@ -221,21 +308,71 @@ fn parse_backoff(lit: &LitStr) -> syn::Result<u64> {
     } else {
         return Err(Error::new(
             lit.span(),
-            format!("backoff \"{raw}\" has no unit — {ACCEPTED_FORMS}"),
+            format!("{what} \"{raw}\" has no unit — {ACCEPTED_FORMS}"),
         ));
     };
     let count: u64 = digits.parse().map_err(|_| {
         Error::new(
             lit.span(),
-            format!("backoff \"{raw}\": \"{digits}\" is not a whole number — {ACCEPTED_FORMS}"),
+            format!("{what} \"{raw}\": \"{digits}\" is not a whole number — {ACCEPTED_FORMS}"),
         )
     })?;
     count.checked_mul(millis_per_unit).ok_or_else(|| {
         Error::new(
             lit.span(),
-            format!("backoff \"{raw}\" overflows u64 milliseconds — {ACCEPTED_FORMS}"),
+            format!("{what} \"{raw}\" overflows u64 milliseconds — {ACCEPTED_FORMS}"),
         )
     })
+}
+
+// A byte-for-byte copy of `host_name_problem` in crates/charpente/src/outbound.rs,
+// which `Host::new` runs: this crate cannot link that one. guide-examples'
+// tests/hook_census.rs holds the two bodies identical; change both or neither.
+fn host_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("is empty");
+    }
+    if name.contains("://") {
+        return Some("carries a scheme");
+    }
+    if name.contains('@') {
+        return Some("carries userinfo");
+    }
+    if name.contains('/') {
+        return Some("carries a path");
+    }
+    if name.contains('[') {
+        return Some("is an IPv6 literal");
+    }
+    if name.contains(':') {
+        return Some("carries a port");
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Some("has an uppercase letter");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return Some("holds a character a DNS name cannot");
+    }
+    if name.ends_with('.') {
+        return Some("ends with a dot");
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.iter().any(|l| l.is_empty()) {
+        return Some("has an empty label");
+    }
+    if labels
+        .iter()
+        .any(|l| l.starts_with('-') || l.ends_with('-'))
+    {
+        return Some("has a label starting or ending with '-'");
+    }
+    if labels.len() == 4 && labels.iter().all(|l| l.bytes().all(|b| b.is_ascii_digit())) {
+        return Some("is an IPv4 literal");
+    }
+    None
 }
 
 /// `global` and `scoped_by` on one job, reported at whichever came second.
@@ -304,7 +441,10 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
     // `tenant_name`'s bound is the one `JobDef.scoped_by` already carries at
     // this span, so a scope type with no `Tenant` impl gains no error.
     // `cross_tenant` is not mixed in: it changes neither the stored bytes nor
-    // decode.
+    // decode. `outbound` is (outbound-effects spec R8): an outbound job's
+    // fingerprint continues the pure one in `outbound_fingerprint`, so adding
+    // or removing the word is a shape change; the host is not, since a minted
+    // key is host-agnostic.
     let fold = crate::fingerprint::compute(&field_idents, &field_types);
     let fingerprint = match tenancy {
         Tenancy::Global => quote! { #fold },
@@ -314,6 +454,11 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                 ::charpente::tenant::tenant_name::<#path>(),
             )
         },
+    };
+    let fingerprint = if args.outbound.is_some() {
+        quote! { ::charpente::core::db::outbound_fingerprint(#fingerprint) }
+    } else {
+        fingerprint
     };
 
     let max = args.max;
@@ -326,6 +471,13 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         cap.expect(
             "job declares cross_tenant but the dispatcher passed no CrossTenant — \
              the flag on JobDef and the token come from the same expansion"
+        )
+    };
+    let scope_expect = quote! {
+        scope.expect(
+            "job declares scoped_by but the dispatcher passed no JobScope — the \
+             dispatcher asserts a row carries a tenant exactly when JobDef.scoped_by \
+             is set"
         )
     };
     // A `global` job's glue is today's. A scoped job's opens the tenant the
@@ -366,11 +518,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     ::std::option::Option::Some(::charpente::tenant::tenant_name::<#path>())
                 },
                 quote! {
-                    let scope = scope.expect(
-                        "job declares scoped_by but the dispatcher passed no JobScope — the \
-                         dispatcher asserts a row carries a tenant exactly when JobDef.scoped_by \
-                         is set"
-                    );
+                    let scope = #scope_expect;
                     let mut tx = scope.open::<#path>(tx);
                     let run: fn(
                         #name,
@@ -395,6 +543,126 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                        damaged too, restore this node from its archive (GUIDE §15) or re-seed it \
                        from its primary (GUIDE §10)";
 
+    // An outbound job's `run` glue is never called: dispatch routes its row to
+    // `call`/`settle` by the row's minted key. Its `call` and `settle` are
+    // bound through fn pointers for the run glue's reason above
+    // (`compile_fail/outbound_scoped_call_takes_bare_tx.rs`), and for one more
+    // (spec R3): the binding holds `call` to a shared `&Tx` or `&ScopedTx`, so
+    // it cannot take `&mut` and a write inside it is a compile error
+    // (`compile_fail/outbound_call_cannot_write.rs`).
+    let (run_glue, outbound_glues, outbound_def, outbound_const) = match &args.outbound {
+        None => (
+            quote! {
+                let _ = cap; // an undeclared job is handed None and uses none of it
+                let job = __charpente_decode(payload)?;
+                #run_call
+            },
+            quote! {},
+            quote! { ::std::option::Option::None },
+            quote! {},
+        ),
+        Some(host) => {
+            let timeout_millis = args.timeout_millis.unwrap_or(30_000);
+            let (call_body, settle_body) = match tenancy {
+                Tenancy::Global => (
+                    quote! {
+                        let _ = scope; // a global job is handed no tenant
+                        let job = __charpente_decode(payload)?;
+                        let call: fn(
+                            &#name,
+                            &::charpente::Tx<'_>,
+                            &::charpente::outbound::IdempotencyKey,
+                        ) -> ::std::result::Result<
+                            ::std::option::Option<::charpente::outbound::Call>,
+                            ::charpente::kernel::JobError,
+                        > = #name::call;
+                        call(&job, tx, key)
+                    },
+                    quote! {
+                        let _ = scope;
+                        let job = __charpente_decode(payload)?;
+                        let settle: fn(
+                            #name,
+                            &mut ::charpente::Tx<'_>,
+                            ::charpente::outbound::Reply,
+                        ) -> ::std::result::Result<(), ::charpente::kernel::JobError> =
+                            #name::settle;
+                        settle(job, tx, reply)
+                    },
+                ),
+                Tenancy::ScopedBy(path) => (
+                    quote! {
+                        let job = __charpente_decode(payload)?;
+                        let scope = #scope_expect;
+                        let tx = scope.open::<#path>(tx);
+                        let call: fn(
+                            &#name,
+                            &::charpente::ScopedTx<'_, '_, #path>,
+                            &::charpente::outbound::IdempotencyKey,
+                        ) -> ::std::result::Result<
+                            ::std::option::Option<::charpente::outbound::Call>,
+                            ::charpente::kernel::JobError,
+                        > = #name::call;
+                        call(&job, &tx, key)
+                    },
+                    quote! {
+                        let job = __charpente_decode(payload)?;
+                        let scope = #scope_expect;
+                        let mut tx = scope.open::<#path>(tx);
+                        let settle: fn(
+                            #name,
+                            &mut ::charpente::ScopedTx<'_, '_, #path>,
+                            ::charpente::outbound::Reply,
+                        ) -> ::std::result::Result<(), ::charpente::kernel::JobError> =
+                            #name::settle;
+                        settle(job, &mut tx, reply)
+                    },
+                ),
+            };
+            (
+                quote! {
+                    let _ = (tx, payload, cap, scope);
+                    ::std::unreachable!(
+                        "dispatcher invariant: outbound job {} reached its run glue — dispatch \
+                         routes an outbound job to call/settle by its row's minted key",
+                        #name_str
+                    )
+                },
+                quote! {
+                    fn __charpente_call_glue(
+                        tx: &mut ::charpente::Tx,
+                        payload: &[u8],
+                        key: &::charpente::outbound::IdempotencyKey,
+                        scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
+                    ) -> ::std::result::Result<
+                        ::std::option::Option<::charpente::outbound::Call>,
+                        ::charpente::kernel::JobError,
+                    > {
+                        #call_body
+                    }
+
+                    fn __charpente_settle_glue(
+                        tx: &mut ::charpente::Tx,
+                        payload: &[u8],
+                        reply: ::charpente::outbound::Reply,
+                        scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
+                    ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
+                        #settle_body
+                    }
+                },
+                quote! {
+                    ::std::option::Option::Some(::charpente::kernel::OutboundDef {
+                        host: #host,
+                        timeout: ::std::time::Duration::from_millis(#timeout_millis),
+                        call: __charpente_call_glue,
+                        settle: __charpente_settle_glue,
+                    })
+                },
+                quote! { const OUTBOUND: bool = true; },
+            )
+        }
+    };
+
     Ok(quote! {
         #input
 
@@ -418,17 +686,14 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                 max: #max,
                 backoff: ::std::time::Duration::from_millis(#backoff_millis),
             };
+            #outbound_const
         }
 
         impl ::charpente::kernel::JobEntry for #name {
             fn def() -> ::charpente::kernel::JobDef {
-                fn __charpente_job_glue(
-                    tx: &mut ::charpente::Tx,
+                fn __charpente_decode(
                     payload: &[u8],
-                    cap: ::std::option::Option<&::charpente::CrossTenant<'_>>,
-                    scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
-                ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
-                    let _ = cap; // an undeclared job is handed None and uses none of it
+                ) -> ::std::result::Result<#name, ::charpente::kernel::JobError> {
                     let input = &mut &payload[..];
                     let job = <#name as ::charpente::core::table::Codec>::decode(input)
                         .map_err(|e| ::charpente::kernel::JobError::App(::std::format!(
@@ -442,8 +707,19 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                             ),
                         ));
                     }
-                    #run_call
+                    ::std::result::Result::Ok(job)
                 }
+
+                fn __charpente_job_glue(
+                    tx: &mut ::charpente::Tx,
+                    payload: &[u8],
+                    cap: ::std::option::Option<&::charpente::CrossTenant<'_>>,
+                    scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
+                ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
+                    #run_glue
+                }
+
+                #outbound_glues
                 ::charpente::kernel::JobDef {
                     name: <#name as ::charpente::core::db::Job>::NAME,
                     retry: <#name as ::charpente::core::db::Job>::RETRY,
@@ -457,7 +733,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     >(),
                     fingerprint: <#name as ::charpente::core::db::Job>::FINGERPRINT,
                     glue: __charpente_job_glue,
-                    outbound: None,
+                    outbound: #outbound_def,
                 }
             }
         }

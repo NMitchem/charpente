@@ -1,0 +1,5 @@
+error: timeout "0s" would cancel every call before the remote could answer — give a positive duration
+ --> tests/compile_fail/outbound_timeout_zero.rs:5:54
+  |
+5 | #[job(global, outbound = "api.stripe.com", timeout = "0s")]
+  |                                                      ^^^^

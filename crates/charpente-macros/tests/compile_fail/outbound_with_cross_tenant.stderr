@@ -1,0 +1,5 @@
+error: `outbound` with `cross_tenant` is refused in v1 — an outbound call runs in the one tenant its job was enqueued in (outbound-effects spec §15); drop one
+ --> tests/compile_fail/outbound_with_cross_tenant.rs:5:15
+  |
+5 | #[job(global, cross_tenant, outbound = "api.stripe.com")]
+  |               ^^^^^^^^^^^^

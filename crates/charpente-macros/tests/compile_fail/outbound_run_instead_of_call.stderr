@@ -1,0 +1,32 @@
+error[E0599]: expected an `Fn<_>` closure, found `Charge`
+ --> tests/compile_fail/outbound_run_instead_of_call.rs:7:1
+  |
+7 | #[job(global, outbound = "api.stripe.com")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected an `Fn<_>` closure, found `Charge`
+8 | struct Charge {}
+  | ------------- associated function or constant `call` not found for this struct because it doesn't satisfy `Charge: Fn<_>`
+  |
+  = note: the following trait bounds were not satisfied:
+          `Charge: Fn<_>`
+          which is required by `&Charge: Fn<_>`
+note: the trait `Fn` must be implemented
+ --> $RUST/core/src/ops/function.rs
+  |
+  | pub const trait Fn<Args: Tuple>: [const] FnMut<Args> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: items from traits can only be used if the trait is implemented and in scope
+  = note: the following traits define an item `call`, perhaps you need to implement one of them:
+          candidate #1: `Fn`
+          candidate #2: `hyper::service::http::HttpService`
+          candidate #3: `hyper::service::service::Service`
+  = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no associated function or constant named `settle` found for struct `Charge` in the current scope
+ --> tests/compile_fail/outbound_run_instead_of_call.rs:7:1
+  |
+7 | #[job(global, outbound = "api.stripe.com")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `Charge`
+8 | struct Charge {}
+  | ------------- associated function or constant `settle` not found for this struct
+  |
+  = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)

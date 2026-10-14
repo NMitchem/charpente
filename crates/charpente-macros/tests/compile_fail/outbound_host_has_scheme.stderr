@@ -1,0 +1,5 @@
+error: outbound = "https://api.stripe.com": the host carries a scheme — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
+ --> tests/compile_fail/outbound_host_has_scheme.rs:6:26
+  |
+6 | #[job(global, outbound = "https://api.stripe.com")]
+  |                          ^^^^^^^^^^^^^^^^^^^^^^^^
