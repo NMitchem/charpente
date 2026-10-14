@@ -160,6 +160,7 @@ fn a_scoped_outbound_job_folds_outbound_over_its_tenant_shape() {
 mod describe_hosts {
     use super::*;
     use charpente::core::db::Schema;
+    use charpente::describe::{to_human, to_json};
     use charpente::http::{App, AppConfig};
     use charpente::jobs;
     use charpente::outbound::Host;
@@ -182,54 +183,121 @@ mod describe_hosts {
         .outbound(Host::new("mail.test").header_env("X-Postmark-Server-Token", "POSTMARK_TOKEN"))
     }
 
+    const CHARGE_JOB: &str = r#"    {
+      "name": "Charge",
+      "retry": {
+        "max": 3,
+        "backoff_nanos": 1000000000
+      },
+      "scoped_by": null,
+      "cross_tenant": false,
+      "builtin": false,
+      "outbound": {
+        "host": "pay.test",
+        "timeout_ms": 2000
+      }
+    },
+"#;
+
+    const HOSTS_JSON: &str = r#"  "outbound_hosts": [
+    {
+      "host": "pay.test",
+      "env": [
+        "PAY_KEY"
+      ],
+      "injects": [
+        "authorization"
+      ],
+      "max_request_bytes": 1048576,
+      "max_reply_bytes": 1048576
+    },
+    {
+      "host": "mail.test",
+      "env": [
+        "POSTMARK_TOKEN"
+      ],
+      "injects": [
+        "x-postmark-server-token"
+      ],
+      "max_request_bytes": 1048576,
+      "max_reply_bytes": 4194304
+    }
+  ],
+"#;
+
     #[test]
     fn describe_lists_outbound_jobs_and_hosts_by_variable_name() {
         let sim = Sim::with_faults(0x0b0, FaultConfig::none());
         let app = outbound_app(&sim);
         assert_eq!(app.outbound_hosts(), vec!["mail.test", "pay.test"]);
-        let json = serde_json::to_value(app.describe()).unwrap();
-        let job = |name: &str| {
-            json["jobs"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|j| j["name"] == name)
-                .unwrap()
-                .clone()
-        };
-        assert_eq!(
-            job("Charge")["outbound"],
-            serde_json::json!({ "host": "pay.test", "timeout_ms": 2000 })
+        let c = app.describe();
+        let json = to_json(&c);
+        assert!(json.contains(CHARGE_JOB), "{json}");
+        assert!(json.contains(HOSTS_JSON), "{json}");
+        let human = to_human(&c);
+        assert!(human.contains("  Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000\n"), "{human}");
+        assert!(
+            human.contains(
+                "cron:\n  charpente.session_sweep interval_nanos=86400000000000 builtin=true\n\
+                 outbound_hosts:\n  \
+                 pay.test env=PAY_KEY injects=authorization max_request_bytes=1048576 max_reply_bytes=1048576\n  \
+                 mail.test env=POSTMARK_TOKEN injects=x-postmark-server-token max_request_bytes=1048576 max_reply_bytes=4194304\n\
+                 config:\n"
+            ),
+            "{human}"
         );
-        assert_eq!(job("SessionSweep")["outbound"], serde_json::Value::Null);
-        assert_eq!(
-            json["outbound_hosts"],
-            serde_json::json!([
-                { "host": "pay.test", "env": ["PAY_KEY"], "injects": ["authorization"],
-                  "max_request_bytes": 1048576, "max_reply_bytes": 1048576 },
-                { "host": "mail.test", "env": ["POSTMARK_TOKEN"], "injects": ["x-postmark-server-token"],
-                  "max_request_bytes": 1048576, "max_reply_bytes": 4194304 }
-            ])
-        );
-        let human = charpente::describe::to_human(&app.describe());
-        assert!(human.contains("Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000\n"), "{human}");
-        assert!(human.contains("outbound_hosts:\n  pay.test env=PAY_KEY injects=authorization max_request_bytes=1048576 max_reply_bytes=1048576\n"), "{human}");
     }
 
     #[test]
     fn outbound_hosts_is_the_hosts_jobs_call_not_every_declared_entry() {
         let sim = Sim::with_faults(0x0b2, FaultConfig::none());
-        let app = outbound_app(&sim).outbound(Host::new("unused.test"));
+        let app = outbound_app(&sim)
+            .outbound(Host::new("unused.test"))
+            .outbound(Host::new("basic.test").basic_env("B_USER", "B_PASS"));
         assert_eq!(app.outbound_hosts(), vec!["mail.test", "pay.test"]);
-        let json = serde_json::to_value(app.describe()).unwrap();
-        assert_eq!(json["outbound_hosts"].as_array().unwrap().len(), 3);
-        assert_eq!(json["outbound_hosts"][2]["host"], "unused.test");
+        let c = app.describe();
+        assert_eq!(c.outbound_hosts.len(), 4);
+        assert_eq!(c.outbound_hosts[2].host, "unused.test");
+        let human = to_human(&c);
+        assert!(
+            human.contains("  unused.test env=none injects=none max_request_bytes=1048576 max_reply_bytes=4194304\n"),
+            "{human}"
+        );
+        assert!(
+            human.contains("  basic.test env=B_USER,B_PASS injects=authorization max_request_bytes=1048576 max_reply_bytes=4194304\n"),
+            "{human}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "contract: app.outbound(Host::new(\"pay.test\")) declared twice")]
+    fn two_jobs_on_one_host_list_it_once() {
+        let sim = Sim::with_faults(0x0b3, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![Charge, ChargeInOrg, Mail]);
+        assert_eq!(app.outbound_hosts(), vec!["mail.test", "pay.test"]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "contract: app.outbound(Host::new(\"pay.test\")) declared twice — one Host entry per host"
+    )]
     fn a_host_declared_twice_is_a_contract_panic() {
         let sim = Sim::with_faults(0x0b1, FaultConfig::none());
         let _ = outbound_app(&sim).outbound(Host::new("pay.test"));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "contract: App::outbound_max_in_flight(0) would never start a call — give at least 1"
+    )]
+    fn zero_in_flight_is_a_contract_panic() {
+        let sim = Sim::with_faults(0x0b4, FaultConfig::none());
+        let _ = outbound_app(&sim).outbound_max_in_flight(0);
     }
 }

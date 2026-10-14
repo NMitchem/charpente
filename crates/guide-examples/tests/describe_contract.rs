@@ -140,3 +140,108 @@ fn guide_section_13_matches_the_real_describe_contract() {
         real_lines.len(),
     );
 }
+
+use charpente::core::db::Schema;
+use charpente::http::{App, AppConfig};
+use charpente::kernel::JobError;
+use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
+use charpente::{Tx, job, jobs};
+
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 3, backoff = "1s"),
+    timeout = "2s"
+)]
+struct Charge {}
+
+impl Charge {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(None)
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+const OUTBOUND_HEADING: &str = "### Outbound jobs and hosts in the contract";
+
+/// The fenced blocks (language, body) that follow `OUTBOUND_HEADING` up to the next heading.
+fn outbound_fences() -> Vec<(String, String)> {
+    let guide = guide();
+    let mut fences = Vec::new();
+    let mut in_section = false;
+    let mut current: Option<(String, String)> = None;
+    for line in guide.lines() {
+        if line.trim_end() == OUTBOUND_HEADING {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        match &mut current {
+            Some((_, body)) if line.trim_end() == "```" => {
+                fences.push(current.take().unwrap());
+            }
+            Some((_, body)) => {
+                body.push_str(line);
+                body.push('\n');
+            }
+            None if line.starts_with("```") => {
+                current = Some((
+                    line.trim_start_matches('`').trim_end().to_string(),
+                    String::new(),
+                ));
+            }
+            None if line.starts_with("#") => break,
+            None => {}
+        }
+    }
+    fences
+}
+
+#[test]
+fn guide_section_13_outbound_fragments_appear_in_the_real_describe_output() {
+    let sim = Sim::with_faults(0x2EC5_0002, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Charge])
+    .outbound(
+        Host::new("pay.test")
+            .bearer_env("PAY_KEY")
+            .max_reply_bytes(1 << 20),
+    );
+    let contract = app.describe();
+    let json = to_json(&contract);
+    let human = charpente::describe::to_human(&contract);
+    let fences = outbound_fences();
+    assert_eq!(
+        fences.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+        ["json", "json", "text"],
+        "docs/GUIDE.md {OUTBOUND_HEADING:?} must hold exactly a json job entry, a json \
+         outbound_hosts array and a text block, in that order"
+    );
+    for (lang, body) in &fences[..2] {
+        assert!(
+            json.contains(body.as_str()),
+            "docs/GUIDE.md {OUTBOUND_HEADING:?}'s {lang} block has drifted from describe's \
+             real JSON.\nfix: paste the matching excerpt of this output into that block:\n{json}\n\
+             not found:\n{body}"
+        );
+    }
+    for piece in fences[2].1.split("...\n") {
+        assert!(
+            human.contains(piece),
+            "docs/GUIDE.md {OUTBOUND_HEADING:?}'s text block has drifted from describe's real \
+             human output.\nfix: paste the matching excerpt of this output into that block:\n{human}\n\
+             not found:\n{piece}"
+        );
+    }
+}

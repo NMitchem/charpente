@@ -487,12 +487,22 @@ pub(crate) fn check(call: &Call, host: &Host) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn the_host_sets_must_match_both_ways() {
         let hosts = [Host::new("pay.test"), Host::new("mail.test")];
         assert_eq!(
             check_host_sets(&[("Charge", "pay.test"), ("Mail", "mail.test")], &hosts),
             Ok(())
+        );
+        assert_eq!(
+            check_host_sets(
+                &[("Charge", "pay.test"), ("Refund", "pay.test")],
+                &hosts[..1]
+            ),
+            Ok(()),
+            "two jobs on one host need one entry"
         );
         assert_eq!(
             check_host_sets(
@@ -516,8 +526,6 @@ mod tests {
                 .to_string())
         );
     }
-
-    use super::*;
 
     fn host() -> Host {
         Host::new("pay.test")

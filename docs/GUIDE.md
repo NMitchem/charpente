@@ -1829,6 +1829,34 @@ impl Charge {
         }
     }
 }
+
+#[job(global, outbound = "mail.test")]
+struct Mail {}
+
+impl Mail {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(None)
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+// One `Host` per host a mounted job calls, in any order.
+use charpente::core::db::Schema;
+use charpente::core::io::{Disk, Entropy};
+use charpente::http::{App, AppConfig};
+use charpente::jobs;
+use charpente::outbound::Host;
+
+fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Result<App> {
+    Ok(App::open(disk, Schema::new(), entropy, AppConfig::default())?
+        .mount_jobs(jobs![Charge, Mail])
+        .outbound(Host::new("pay.test").bearer_env("PAY_KEY").max_reply_bytes(1 << 20))
+        .outbound(Host::new("mail.test").header_env("X-Postmark-Server-Token", "POSTMARK_TOKEN"))
+        .outbound_max_in_flight(64))
+}
 ```
 
 The two methods have exactly these shapes. A `global` job's:
@@ -1896,12 +1924,8 @@ the shape, so changing the host is not refused.
 ### Declaring the hosts
 
 An outbound job names its host; the `App` says how to reach it. Declare one
-`Host` per host that a mounted job calls:
-
-```text
-app.outbound(Host::new("pay.test").bearer_env("PAY_KEY").max_reply_bytes(1 << 20))
-   .outbound(Host::new("mail.test").header_env("X-Postmark-Server-Token", "POSTMARK_TOKEN"))
-```
+`Host` per host that a mounted job calls, as `build_app` at the end of the `Charge`
+block above does.
 
 The builders are `bearer_env(var)`, `header_env(name, var)`, `basic_env(user_var,
 pass_var)`, `max_request_bytes(n)` and `max_reply_bytes(n)`. A credential is the
@@ -6577,6 +6601,72 @@ including field order — and `crates/charpente-cli/tests/describe.rs` cross-che
 running `charpente describe --dir examples/invoicing --format json` renders the same
 bytes. `human` format renders the same information as fixed-width lines instead of JSON,
 starting with a `tables:` header.)
+
+### Outbound jobs and hosts in the contract
+
+An outbound job (§6) carries `"outbound": {"host", "timeout_ms"}` on its `jobs[]`
+entry, `null` on a pure job. Each `Host` entry the app declares is one element of
+the top-level `outbound_hosts`, in declaration order: `env` is the environment
+variable NAMES it reads, `injects` the lowercase header names those fill, and the
+two caps are in bytes. A value never appears. For an app that mounts one `Charge`
+job on `pay.test` and declares `Host::new("pay.test").bearer_env("PAY_KEY")
+.max_reply_bytes(1 << 20)`, the job entry is
+
+```json
+    {
+      "name": "Charge",
+      "retry": {
+        "max": 3,
+        "backoff_nanos": 1000000000
+      },
+      "scoped_by": null,
+      "cross_tenant": false,
+      "builtin": false,
+      "outbound": {
+        "host": "pay.test",
+        "timeout_ms": 2000
+      }
+    }
+```
+
+and the hosts are
+
+```json
+  "outbound_hosts": [
+    {
+      "host": "pay.test",
+      "env": [
+        "PAY_KEY"
+      ],
+      "injects": [
+        "authorization"
+      ],
+      "max_request_bytes": 1048576,
+      "max_reply_bytes": 1048576
+    }
+  ],
+```
+
+The human format prints the same as these lines (`...` separates the excerpts; a
+host with no credentials prints `env=none injects=none`, and a `basic_env` host
+joins its two variables with a comma):
+
+```text
+  Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000
+...
+outbound_hosts:
+  pay.test env=PAY_KEY injects=authorization max_request_bytes=1048576 max_reply_bytes=1048576
+config:
+```
+
+`crates/guide-examples/tests/describe_contract.rs` builds that app and requires
+each of these three blocks to appear byte-for-byte in its real output.
+
+`describe` lists the declared `Host` entries and does not check the host sets: a
+mismatch between the hosts jobs call and the hosts declared is refused when the
+kernel is built, not by `describe`. So `outbound_hosts` here is the declared
+entries in declaration order, while `App::outbound_hosts()` (§6) is the hosts
+mounted jobs call, sorted. The two agree on any app that builds.
 
 ### What's not here (yet)
 

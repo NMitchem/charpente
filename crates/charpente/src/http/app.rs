@@ -477,6 +477,43 @@ impl App {
         self
     }
 
+    /// Declares one outside service its jobs call (outbound-effects spec §9):
+    /// exactly one entry per host a mounted job names, checked when the
+    /// kernel is built, so mount order is free (plan amendment A5).
+    pub fn outbound(mut self, host: Host) -> App {
+        assert!(
+            !self.hosts.iter().any(|h| h.name() == host.name()),
+            "contract: app.outbound(Host::new(\"{}\")) declared twice — one Host entry per host",
+            host.name()
+        );
+        self.hosts.push(host);
+        self
+    }
+
+    /// How many outbound calls this node keeps in flight at once (default
+    /// 64). A due outbound job waits while the table is full; a pure job
+    /// never waits behind it (spec §4).
+    pub fn outbound_max_in_flight(mut self, n: usize) -> App {
+        assert!(
+            n > 0,
+            "contract: App::outbound_max_in_flight(0) would never start a call — give at least 1"
+        );
+        self.max_in_flight = n;
+        self
+    }
+
+    /// The hosts this app's mounted jobs call, sorted and deduplicated — what
+    /// `sim.outbound(…)` takes (spec §10). Read it before building a kernel,
+    /// which takes the job defs.
+    pub fn outbound_hosts(&self) -> Vec<&'static str> {
+        self.job_defs
+            .iter()
+            .filter_map(|d| d.outbound.as_ref().map(|o| o.host))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Registers `#[job]` descriptors (mount-time duplicate-name panic — each
     /// job type is mounted once, like routes), and each one's payload shape
     /// and declared tenancy (its `scoped_by` with its `scope_type`) with the
@@ -628,54 +665,18 @@ impl App {
         &self.router
     }
 
-    /// Describe-only reach: the registered job descriptors, in registration
-    /// order. Never used by request handling itself.
-    /// Declares one outside service its jobs call (outbound-effects spec §9):
-    /// exactly one entry per host a mounted job names, checked when the
-    /// kernel is built, so mount order is free (plan amendment A5).
-    pub fn outbound(mut self, host: Host) -> App {
-        assert!(
-            !self.hosts.iter().any(|h| h.name() == host.name()),
-            "contract: app.outbound(Host::new(\"{}\")) declared twice — one Host entry per host",
-            host.name()
-        );
-        self.hosts.push(host);
-        self
-    }
-
-    /// How many outbound calls this node keeps in flight at once (default
-    /// 64). A due outbound job waits while the table is full; a pure job
-    /// never waits behind it (spec §4).
-    pub fn outbound_max_in_flight(mut self, n: usize) -> App {
-        assert!(
-            n > 0,
-            "contract: App::outbound_max_in_flight(0) would never start a call — give at least 1"
-        );
-        self.max_in_flight = n;
-        self
-    }
-
-    /// The hosts this app's mounted jobs call, sorted and deduplicated — what
-    /// `sim.outbound(…)` takes (spec §10). Read it before building a kernel,
-    /// which takes the job defs.
-    pub fn outbound_hosts(&self) -> Vec<&'static str> {
-        self.job_defs
-            .iter()
-            .filter_map(|d| d.outbound.as_ref().map(|o| o.host))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
     #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn take_outbound(&mut self) -> (Vec<Host>, usize) {
         (std::mem::take(&mut self.hosts), self.max_in_flight)
     }
 
+    /// The declared `Host` entries, for `describe`.
     pub(crate) fn outbound_config(&self) -> &[Host] {
         &self.hosts
     }
 
+    /// Describe-only reach: the registered job descriptors, in registration
+    /// order. Never used by request handling itself.
     pub(crate) fn job_defs(&self) -> &[JobDef] {
         &self.job_defs
     }
