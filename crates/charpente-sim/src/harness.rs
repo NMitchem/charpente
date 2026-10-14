@@ -546,7 +546,7 @@ fn config_json(cfg: &FaultConfig, out: &mut String) {
     json_escape(&cfg.corruption_scope, out);
     out.push_str(&format!(
         "\",\"conn_drop\":{},\"net_spike\":{},\"subscriber_stall\":{},\
-         \"disk_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"net_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}}}",
+         \"disk_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"net_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"outbound_refused\":{},\"outbound_lost_request\":{},\"outbound_lost_reply\":{},\"outbound_throttle\":{},\"outbound_slow\":{},\"outbound_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}}}",
         cfg.conn_drop,
         cfg.net_spike,
         cfg.subscriber_stall,
@@ -554,6 +554,13 @@ fn config_json(cfg: &FaultConfig, out: &mut String) {
         cfg.disk_latency.1.as_nanos(),
         cfg.net_latency.0.as_nanos(),
         cfg.net_latency.1.as_nanos(),
+        cfg.outbound_refused,
+        cfg.outbound_lost_request,
+        cfg.outbound_lost_reply,
+        cfg.outbound_throttle,
+        cfg.outbound_slow,
+        cfg.outbound_latency.0.as_nanos(),
+        cfg.outbound_latency.1.as_nanos(),
     ));
 }
 
@@ -788,6 +795,12 @@ mod tests {
             conn_drop: 0.0,
             net_spike: 0.0,
             subscriber_stall: 0.0,
+            outbound_refused: 0.0,
+            outbound_lost_request: 0.0,
+            outbound_lost_reply: 0.0,
+            outbound_throttle: 0.0,
+            outbound_slow: 0.0,
+            outbound_latency: (Duration::ZERO, Duration::ZERO),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::from_millis(250)),
         };
@@ -806,7 +819,7 @@ mod tests {
         assert!(block.contains("  seed:   0x8bee1752811ae873"), "{block}");
         assert!(
             block.contains(
-                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }"
+                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }"
             ),
             "{block}"
         );
@@ -980,6 +993,12 @@ mod tests {
             conn_drop: 0.02,
             net_spike: 0.081,
             subscriber_stall: 0.0,
+            outbound_refused: 0.0,
+            outbound_lost_request: 0.0,
+            outbound_lost_reply: 0.0,
+            outbound_throttle: 0.0,
+            outbound_slow: 0.0,
+            outbound_latency: (Duration::ZERO, Duration::ZERO),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::from_millis(20)),
         };

@@ -103,6 +103,23 @@ pub struct FaultConfig {
     /// the roll itself, and the `fault:subscriber_stall` coverage mark, are
     /// the workload's own responsibility (realtime T6).
     pub subscriber_stall: f64,
+    /// P(an outbound call is refused before it reaches the remote — the kernel
+    /// sees an immediate `ConnectionRefused`). Rolled from its own stream.
+    pub outbound_refused: f64,
+    /// P(an outbound request vanishes: the remote never sees it, the kernel
+    /// sees silence until its deadline).
+    pub outbound_lost_request: f64,
+    /// P(the remote applies a call but its reply never arrives — the ambiguous
+    /// case idempotency keys exist for; `object_lost_ack`'s outbound twin).
+    pub outbound_lost_reply: f64,
+    /// P(the remote answers 429 or 503 without handling the call).
+    pub outbound_throttle: f64,
+    /// P(a call carries extra think time from [10·hi, 100·hi], hi =
+    /// `outbound_latency.1`, or [1 s, 100 s] when hi is zero — the LLM tail
+    /// that outlives a deadline (plan amendment A15).
+    pub outbound_slow: f64,
+    /// One-way latency range for an outbound request and for its reply.
+    pub outbound_latency: (Duration, Duration),
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
 }
@@ -128,6 +145,12 @@ impl Default for FaultConfig {
             conn_drop: 0.0,
             net_spike: 0.0,
             subscriber_stall: 0.0,
+            outbound_refused: 0.0,
+            outbound_lost_request: 0.0,
+            outbound_lost_reply: 0.0,
+            outbound_throttle: 0.0,
+            outbound_slow: 0.0,
+            outbound_latency: (Duration::from_millis(1), Duration::from_millis(50)),
             disk_latency: (Duration::from_micros(20), Duration::from_millis(2)),
             net_latency: (Duration::from_micros(100), Duration::from_millis(20)),
         }
@@ -153,6 +176,12 @@ impl FaultConfig {
             conn_drop: 0.0,
             net_spike: 0.0,
             subscriber_stall: 0.0,
+            outbound_refused: 0.0,
+            outbound_lost_request: 0.0,
+            outbound_lost_reply: 0.0,
+            outbound_throttle: 0.0,
+            outbound_slow: 0.0,
+            outbound_latency: (Duration::ZERO, Duration::ZERO),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::ZERO),
         }
@@ -226,6 +255,12 @@ impl FaultConfig {
             conn_drop: 0.0,
             net_spike: 0.0,
             subscriber_stall: 0.0,
+            outbound_refused: 0.0,
+            outbound_lost_request: 0.0,
+            outbound_lost_reply: 0.0,
+            outbound_throttle: 0.0,
+            outbound_slow: 0.0,
+            outbound_latency: (Duration::ZERO, Duration::ZERO),
             // Constant, never drawn: the scope is a property of what the
             // corruption axes are FOR (the WAL fences), not a fault rate.
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
@@ -253,6 +288,11 @@ impl FaultConfig {
             ("conn_drop", self.conn_drop),
             ("net_spike", self.net_spike),
             ("subscriber_stall", self.subscriber_stall),
+            ("outbound_refused", self.outbound_refused),
+            ("outbound_lost_request", self.outbound_lost_request),
+            ("outbound_lost_reply", self.outbound_lost_reply),
+            ("outbound_throttle", self.outbound_throttle),
+            ("outbound_slow", self.outbound_slow),
         ] {
             assert!(
                 (0.0..=1.0).contains(&p),
@@ -271,6 +311,10 @@ impl FaultConfig {
             self.net_latency.0 <= self.net_latency.1,
             "net_latency range inverted"
         );
+        assert!(
+            self.outbound_latency.0 <= self.outbound_latency.1,
+            "outbound_latency range inverted"
+        );
     }
 }
 
@@ -285,6 +329,114 @@ impl FaultConfig {
 /// gets these axes sampled — this is also how Task 1's `dir_entry_loss`
 /// becomes swarm-sampled, since it draws here too.
 pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
+    let mut r = keyed_stream(seed, "bit_flip");
+    cfg.bit_flip = if r.chance(0.25) {
+        r.below(20) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "misdirected_write");
+    cfg.misdirected_write = if r.chance(0.25) {
+        r.below(10) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "read_error");
+    cfg.read_error = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "dir_entry_loss");
+    cfg.dir_entry_loss = if r.chance(0.25) {
+        r.below(500) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "conn_drop");
+    cfg.conn_drop = if r.chance(0.25) {
+        r.below(30) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "net_spike");
+    cfg.net_spike = if r.chance(0.25) {
+        r.below(200) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "subscriber_stall");
+    cfg.subscriber_stall = if r.chance(0.25) {
+        r.below(250) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "object_put_error");
+    cfg.object_put_error = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "object_get_error");
+    cfg.object_get_error = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "object_lost_ack");
+    cfg.object_lost_ack = if r.chance(0.20) {
+        r.below(20) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "object_delete_error");
+    cfg.object_delete_error = if r.chance(0.20) {
+        r.below(20) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "outbound_refused");
+    cfg.outbound_refused = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "outbound_lost_request");
+    cfg.outbound_lost_request = if r.chance(0.25) {
+        r.below(30) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "outbound_lost_reply");
+    cfg.outbound_lost_reply = if r.chance(0.25) {
+        r.below(30) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "outbound_throttle");
+    cfg.outbound_throttle = if r.chance(0.25) {
+        r.below(100) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "outbound_slow");
+    cfg.outbound_slow = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    const OUTBOUND_HI: [Duration; 4] = [
+        Duration::ZERO,
+        Duration::from_millis(10),
+        Duration::from_millis(200),
+        Duration::from_secs(2),
+    ];
+    let mut r = keyed_stream(seed, "outbound_latency");
+    cfg.outbound_latency = (Duration::ZERO, OUTBOUND_HI[r.below(4) as usize]);
+}
+
+#[cfg(test)]
+fn sample_extended_fields_without_outbound_for_tests(seed: u64, cfg: &mut FaultConfig) {
     let mut r = keyed_stream(seed, "bit_flip");
     cfg.bit_flip = if r.chance(0.25) {
         r.below(20) as f64 / 1000.0
@@ -3136,6 +3288,67 @@ mod tests {
         );
         assert_eq!(&buf[..6], b"spiked");
         assert_eq!(sim.coverage()["fault:net_spike"], 1);
+    }
+
+    #[test]
+    fn outbound_axes_are_off_in_none_and_in_a_bare_swarm() {
+        let none = FaultConfig::none();
+        assert_eq!(
+            (
+                none.outbound_refused,
+                none.outbound_lost_request,
+                none.outbound_lost_reply
+            ),
+            (0.0, 0.0, 0.0)
+        );
+        assert_eq!((none.outbound_throttle, none.outbound_slow), (0.0, 0.0));
+        assert_eq!(none.outbound_latency, (Duration::ZERO, Duration::ZERO));
+        let swarm = FaultConfig::swarm(&mut Rng::new(7));
+        assert_eq!(
+            swarm.outbound_lost_reply, 0.0,
+            "swarm alone draws no extended axis"
+        );
+    }
+
+    /// The A14 property, at the source: sampling the outbound axes perturbs no
+    /// axis that existed before them, for any seed.
+    #[test]
+    fn outbound_axes_perturb_no_existing_draw() {
+        for seed in [0u64, 1, 0x912313adf8115ad0, 0x483e230baed4922b, u64::MAX] {
+            let mut with = FaultConfig::swarm(&mut Rng::new(seed));
+            sample_extended_fields(seed, &mut with);
+            let mut without = with.clone();
+            without.outbound_refused = 0.0;
+            without.outbound_lost_request = 0.0;
+            without.outbound_lost_reply = 0.0;
+            without.outbound_throttle = 0.0;
+            without.outbound_slow = 0.0;
+            without.outbound_latency = (Duration::ZERO, Duration::ZERO);
+            let mut legacy = FaultConfig::swarm(&mut Rng::new(seed));
+            sample_extended_fields_without_outbound_for_tests(seed, &mut legacy);
+            assert_eq!(
+                format!("{without:?}"),
+                format!("{legacy:?}"),
+                "seed {seed:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn some_seed_turns_each_outbound_axis_on() {
+        let mut seen = [false; 6];
+        for seed in 0..512u64 {
+            let mut cfg = FaultConfig::swarm(&mut Rng::new(seed));
+            sample_extended_fields(seed, &mut cfg);
+            seen[0] |= cfg.outbound_refused > 0.0;
+            seen[1] |= cfg.outbound_lost_request > 0.0;
+            seen[2] |= cfg.outbound_lost_reply > 0.0;
+            seen[3] |= cfg.outbound_throttle > 0.0;
+            seen[4] |= cfg.outbound_slow > 0.0;
+            seen[5] |= cfg.outbound_latency.1 > Duration::ZERO;
+            cfg.validate();
+        }
+        assert_eq!(seen, [true; 6]);
     }
 
     #[test]
