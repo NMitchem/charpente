@@ -124,9 +124,12 @@ fn tls_config() -> io::Result<rustls::ServerConfig> {
 }
 
 /// Counts the request, then answers. A key's first authorized `POST /charge`
-/// mints `ch_<n>` and is applied, and only it waits out `hold` (the window a
-/// `kill -9` aims at); a repeat replays that body at once, and a keyless one
-/// is applied every time under a fresh charge.
+/// mints `ch_<n>` and is applied, and a repeat replays that body at once; a
+/// keyless one is applied every time under a fresh charge. The first
+/// application in each bucket waits out `hold` (the window a `kill -9` aims
+/// at) and no later one does, so a re-call answers inside the job's 2 s
+/// timeout. Holding the first keyless one too is what gives a call that lost
+/// its header the same window, so its re-call shows as a second application.
 async fn charge(
     req: Request<Incoming>,
     ledger: Shared,
@@ -158,11 +161,13 @@ async fn charge(
         } else {
             ledger.minted += 1;
             let body = format!("ch_{}", ledger.minted);
-            *ledger.applied.entry(bucket).or_insert(0) += 1;
+            let applied = ledger.applied.entry(bucket).or_insert(0);
+            *applied += 1;
+            let first = *applied == 1;
             if let Some(key) = &key {
                 ledger.charges.insert(key.clone(), body.clone());
             }
-            (200, body, key.is_some())
+            (200, body, first)
         }
     };
     if first {
