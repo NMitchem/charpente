@@ -38,7 +38,13 @@
   - **Count green.** Pipe through `tee` to the task's gate log, then `grep -c "^test result: ok"`. Never infer green from the absence of `FAILED`.
   - **The workspace suite can exceed the 600 s tool ceiling** (568–2482 s observed). A subagent partitions it per package (`cargo test -p <pkg> --no-fail-fast`, one call each). The controller runs the whole thing in the background and polls for process exit with `while kill -0 $PID`.
 - **zsh, not bash.** `${PIPESTATUS[0]}` is empty here; use `${pipestatus[1]}` or `set -o pipefail`. An unquoted `$var` does not word-split. There is no `timeout`/`gtimeout`; bound a run with `perl -e 'alarm N; exec @ARGV' -- cmd`.
-- **Oracle 3 runs after every task that touches `charpente-core`, `charpente-sim` or `charpente/src/kernel`** (Tasks 3, 4, 5, 6, 7, 8, 10, 11, 12, 18). Its procedure is the `oracle3.sh` that Task 1 Step 2 writes and Step 3 baselines. A changed verdict is a stop-and-report, never an update to the baseline.
+- **Shell state does not persist between tool calls, so every command block sets its own variables, absolute.** Every block that names `$SDD` opens with `cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects`. A command quoted in prose that names `$SDD` runs in a call that sets it the same way first, and a dispatch prompt spells the path out in full. With `SDD` empty, `$SDD/x` is `/x`: a `tee` fails while the cargo run goes on, and a later `grep -c` counts a file that does not exist. Task 20's `RUN`/`APP`/`SHA`/`MSEED` follow the same rule.
+- **Oracle 3 runs after every task that touches `charpente-core`, `charpente-sim` or `charpente/src/kernel`** (Tasks 3, 4, 5, 6, 7, 8, 10, 11, 12, 18). Its procedure is the `oracle3.sh` that Task 1 Step 2 writes and Step 3 baselines. A changed verdict is a stop-and-report, never an update to the baseline. Task 1 Step 3a times one run and records `oracle3 mode` in progress.md:
+  - `foreground` (the timed run fit in 540 s): `perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh <label>`, read its exit status directly;
+  - `background` (it did not): `( $SDD/oracle3.sh <label> > $SDD/oracle3-<label>.log 2>&1; print $? > $SDD/oracle3-<label>.exit ) &`, then poll with bounded checks, one `[[ -s $SDD/oracle3-<label>.exit ]] && cat $SDD/oracle3-<label>.exit` per call. A foreground `sleep` loop is blocked in this harness.
+
+  Every later task's oracle-3 block shows the foreground form; in background mode, run the background form with the same label instead.
+- **Dead code before its first caller.** `clippy --workspace --all-targets -- -D warnings` denies dead code, and Tasks 7, 9 and 10 land `pub(crate)` items before the task that first calls them. Each such item carries `#[expect(dead_code, reason = "first caller: Task N")]`, or `#[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task N"))]` when its own unit tests call it. Task N's text deletes the attribute. An expectation that stops being met is itself an error (`unfulfilled_lint_expectations`), so none can linger. Items reached only through an expected item (a private helper, a field it reads) need no attribute of their own.
 - **Mutation runs:** `scripts/mutants.sh` with `--test-package charpente` for any file outside core/sim. Without it, every mutant reads MISSED having measured nothing. `CARGO_TARGET_DIR` must be unset. Run `cargo clean -p charpente` before and after.
 - **Pinned seeds name universes.** A test pinning a seed asserts the *reason* (a coverage key, a message prefix), not only the outcome.
 - **Never pass `name` to an Agent dispatch.** A named dispatch routes through the teammate protocol and drops its return path. Reviewers run on `opus` for kernel and core tasks.
@@ -65,7 +71,7 @@ These are the inputs the spec implies but its sections don't test directly. Each
 - **A8 — `Db::drain_enqueued` returns `Vec<Enqueued { id, outbound }>`.** The flag comes from the record tag at apply. Looking a name up in the store would draw sim read-fault rolls and re-roll every universe (invariant 6).
 - **A9 — only App-opened groups can mint.** `App::begin_group` and the kernel's job and cron arms mint. A bare `Db::transact`/`Db::begin_group` that enqueues an outbound job is a contract panic naming the fix. Tests seed outbound jobs through `App::transact_for_tests` (`#[doc(hidden)]`).
 - **A10 — the reply-over-cap text says the remote applied the call**, since it answered: `outbound <host>: the reply exceeded the <cap>-byte reply cap — the remote answered, so it applied this call; raise the cap with Host::max_reply_bytes (the retry carries the same idempotency key)`. The text names no length: the production edge stops reading at cap + 1 bytes (Review Focus 4), so it never learns the true length, and the sim and production must print the same line.
-- **A11 — TLS identity is always the declared host.** The client keeps `https://<host>[:port]` as the request URI, so SNI and certificate verification use the declared name. `--outbound-base <host>=<url>` changes only where the name resolves (a custom resolver) and the port, as `curl --resolve` does. This adds `tower-service` (already in the tree via `hyper-util`) as a direct dependency.
+- **A11 — TLS identity is always the declared host.** The client keeps `https://<host>[:port]` as the request URI, so SNI and certificate verification use the declared name. `--outbound-base <host>=<url>` changes only where the name resolves (a custom resolver) and the port, as `curl --resolve` does. This adds `tower-service` (a dependency of `hyper-util`'s `client` feature) as a direct dependency.
 - **A12 — a path must be visible ASCII, a header name an HTTP token, and a header value free of control characters**; anything else is refused as an attempt naming the rule. This closes header injection (a CR or LF forging a header), which the spec's rules missed.
 - **A13 — a new workspace member, `crates/outbound-fixture`.** It holds the app with outbound jobs, its `launch`-driven node binary, and the TLS fake remote that the edge harness drives. Putting outbound jobs in `sim-fixture` or `invoicing` would re-roll their recorded batches (oracle 3) and their goldens.
 - **A14 — oracle 3 compares a batch's verdicts, failures (test, seed, message), outcomes and coverage, never `config`.** `config` gains the outbound axes by design. Raw JSON bytes therefore change while every universe stays the same.
@@ -75,6 +81,7 @@ These are the inputs the spec implies but its sections don't test directly. Each
 - **A18 — a refused connection carries its cause.** `ConnectionRefused` is the only "certainly not delivered" kind, and the edge also uses it for DNS and TLS failures before any request byte is sent. The attempt text is therefore `outbound <host>: <the error's own text> — the call did not reach the remote`. The sim's error text is exactly `connection refused`, so the sim reproduces spec §7's example line, and an operator still sees "invalid peer certificate: UnknownIssuer" when TLS is why.
 - **A19 — oracle 2's switchover row is pinned at the write gate, not through a two-node rig.** A switchover reaches the kernel only as `Db::forbid_writes` (`Role::HandingOff`, `repl/mod.rs:300`), and invariant 3's drop is level-triggered on writability (Task 11). So Task 11's `losing_writability_drops_in_flight_and_keeps_jobs_pending` is that row. Its mutation proof (Task 11 Step 7) deletes the drop and goes red. A real switchover under outbound load waits for the first replicated app with outbound jobs, as a v1.x row (Task 17).
 - **A20 — the docs-only build's ambiguous-call check is a controller gate, run before the review, and its result goes to the reviewer.** Spec §16(5) gave it to the reviewer. But it's a mechanical run whose output is a seed, and this repo's rule is that nothing is believed from a report (Task 20 Step 4).
+- **A21 — `sim.outbound(hosts)`'s no-model refusal names the host, not the job (spec §10 names the job).** `sim.outbound` takes the app's host list as plain data, so no job is in view there. The text is the one Task 4 pins.
 
 ## File map
 
@@ -108,11 +115,10 @@ These are the inputs the spec implies but its sections don't test directly. Each
 - [ ] **Step 1: Create the working directory and record the base**
 
 ```bash
-cd ~/Documents/GitHub/charpente
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 git status --porcelain | wc -l          # expect 0
-SDD=.superpowers/sdd/2026-10-13-outbound-effects
 mkdir -p $SDD/baseline
-printf '# Outbound effects — progress\n\nBase: %s\n\n' "$(git rev-parse HEAD)" > $SDD/progress.md
+print "\nBase: $(git rev-parse HEAD)" >> $SDD/progress.md   # append: progress.md already holds the controller's ledger
 ```
 
 - [ ] **Step 2: Write the filter and the script**
@@ -129,16 +135,18 @@ printf '# Outbound effects — progress\n\nBase: %s\n\n' "$(git rev-parse HEAD)"
 `$SDD/oracle3.sh` (a quoted heredoc, so nothing expands while writing it):
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cat > $SDD/oracle3.sh <<'EOF'
 #!/bin/zsh
 # usage: oracle3.sh <label>  — re-runs every baseline batch and diffs it, filtered.
+# `rc`, never `status`: zsh's `status` is read-only, and assigning it aborts the script.
 set -u
 SDD=${0:A:h}
 cd ${SDD:h:h:h}
 label=$1
 mkdir -p $SDD/oracle3-$label
 cargo build -q -p charpente-cli || exit 2
-status=0
+rc=0
 for spec in "crates/sim-fixture 0x912313adf8115ad0" "crates/sim-fixture 0x483e230baed4922b" \
             "examples/invoicing 0x912313adf8115ad0" "examples/invoicing 0x483e230baed4922b"; do
   dir=${spec%% *}; seed=${spec##* }
@@ -146,12 +154,15 @@ for spec in "crates/sim-fixture 0x912313adf8115ad0" "crates/sim-fixture 0x483e23
   ./target/debug/charpente test --sim --dir $dir --universes 256 --master-seed $seed \
       --format json > $SDD/oracle3-$label/$name.raw.json 2> $SDD/oracle3-$label/$name.stderr
   print "$name exit ${?}"
+  # A launch error (CLI exit 2) writes no report, and jq over an empty file prints nothing and
+  # exits 0: refuse it here, or it would read as a changed verdict.
+  [[ -s $SDD/oracle3-$label/$name.raw.json ]] || { print "$name: no report (launch error)"; exit 2 }
   jq -S -f $SDD/oracle3-filter.jq $SDD/oracle3-$label/$name.raw.json > $SDD/oracle3-$label/$name.json || exit 2
   if ! diff -u $SDD/baseline/$name.json $SDD/oracle3-$label/$name.json > $SDD/oracle3-$label/$name.diff; then
-    print "ORACLE 3 CHANGED: $name (see $SDD/oracle3-$label/$name.diff)"; status=1
+    print "ORACLE 3 CHANGED: $name (see $SDD/oracle3-$label/$name.diff)"; rc=1
   fi
 done
-exit $status
+exit $rc
 EOF
 chmod +x $SDD/oracle3.sh
 ```
@@ -159,7 +170,7 @@ chmod +x $SDD/oracle3.sh
 - [ ] **Step 3: Capture the baselines** (in the background, since four batches can pass 600 s)
 
 ```bash
-cd ~/Documents/GitHub/charpente
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 ( for spec in "crates/sim-fixture 0x912313adf8115ad0" "crates/sim-fixture 0x483e230baed4922b" \
               "examples/invoicing 0x912313adf8115ad0" "examples/invoicing 0x483e230baed4922b"; do
     dir=${spec%% *}; seed=${spec##* }; name=${dir:t}-$seed
@@ -167,17 +178,29 @@ cd ~/Documents/GitHub/charpente
       > $SDD/baseline/$name.raw.json 2> $SDD/baseline/$name.stderr
     print "$name exit $?" >> $SDD/baseline/exits.txt
     jq -S -f $SDD/oracle3-filter.jq $SDD/baseline/$name.raw.json > $SDD/baseline/$name.json
-  done ) > $SDD/baseline/run.log 2>&1 &
+  done; print done > $SDD/baseline/finished ) > $SDD/baseline/run.log 2>&1 &
 print $! > $SDD/baseline/pid
 ```
 
-Run `cargo build -q -p charpente-cli` first. Poll with `while kill -0 $(cat $SDD/baseline/pid) 2>/dev/null; do sleep 20; done`, then `cat $SDD/baseline/exits.txt`.
+Run `cargo build -q -p charpente-cli` first. Poll with bounded checks, one per call: `[[ -s $SDD/baseline/finished ]] && cat $SDD/baseline/exits.txt` (a foreground `sleep` loop is blocked in this harness).
 
-Expected: four lines. Exit 0 or 1 are both valid baselines: a batch with failures is fine as long as it's recorded. Exit 2 is a launch error, so stop and report. Each `.json` must be non-empty. Then prove the comparison works: run `$SDD/oracle3.sh selfcheck`. Expected: exit 0 and no `ORACLE 3 CHANGED`.
+Expected: four lines. Exit 0 or 1 are both valid baselines: a batch with failures is fine as long as it's recorded. Exit 2 is a launch error, so stop and report. Each `.json` must be non-empty.
+
+- [ ] **Step 3a: Prove the comparison works, and time it**
+
+The selfcheck is also the timing run that decides how every later task runs oracle 3 (Global Constraints). It runs in the background, since its length is what is being measured:
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+( t0=$(date +%s); $SDD/oracle3.sh selfcheck > $SDD/oracle3-selfcheck.log 2>&1; rc=$?
+  print "exit $rc wall $(( $(date +%s) - t0 ))s" > $SDD/oracle3-selfcheck.exit ) &
+```
+
+Poll with bounded checks of `$SDD/oracle3-selfcheck.exit`. Expected: `exit 0` and no `ORACLE 3 CHANGED` in the log. Record in progress.md `oracle3 selfcheck: exit 0, wall <N>s`, then `oracle3 mode: foreground` when N ≤ 540 or `oracle3 mode: background` otherwise.
 
 - [ ] **Step 4: Prove the comparison can fail**
 
-Copy one baseline aside, flip its `verdicts` value with `jq '.verdicts += 1'`, run `oracle3.sh negcheck` and expect exit 1 naming that file, then restore the original. Record "oracle3 negcheck: red as expected" in progress.md.
+Copy one baseline aside, flip its `verdicts` value with `jq '.verdicts += 1'`, run `oracle3.sh negcheck` in the mode Step 3a recorded, and expect exit 1 naming that file, then restore the original. Record "oracle3 negcheck: red as expected" in progress.md.
 
 - [ ] **Step 5: Record the base gate count**
 
@@ -185,11 +208,11 @@ Run the three gate commands (the workspace test in the background to `$SDD/gate-
 
 - [ ] **Step 6: Append the amendments to the spec and commit**
 
-Append the "Spec amendments" section above (A1–A20), verbatim, to the spec under `## Amendments (implementation plan)`. Then:
+Append the "Spec amendments" section above (A1–A21), verbatim, to the spec under `## Amendments (implementation plan)`. Then:
 
 ```bash
 git add docs/superpowers/specs/2026-10-13-outbound-effects-design.md
-git commit -m "docs: outbound effects spec — implementation-plan amendments A1–A20"
+git commit -m "docs: outbound effects spec — implementation-plan amendments A1–A21"
 ```
 
 ---
@@ -198,7 +221,7 @@ git commit -m "docs: outbound effects spec — implementation-plan amendments A1
 
 **Files:**
 - Modify: `crates/charpente-core/src/io.rs` (after `ObjectStore`, before `#[cfg(test)]`)
-- Modify: `CLAUDE.md` (hard rule 1's trait list), `DESIGN.md` §1's trait block (`DESIGN.md:65-80`)
+- Modify: `CLAUDE.md` (hard rule 1's trait list), `DESIGN.md` §1's trait block (`DESIGN.md:66-84`)
 
 **Interfaces:**
 - Produces (all `pub` in `charpente_core::io`):
@@ -397,7 +420,14 @@ trait Outbound { fn start(&self, token: u64, call: OutboundCall) -> Result<()>;
 
 - [ ] **Step 6: Gate and commit**
 
-Run `cargo fmt --all --check`, `cargo clippy -p charpente-core --all-targets -- -D warnings` and `cargo test -p charpente-core --no-fail-fast | tee $SDD/gate-task-2.log`, then count. Oracle 3 is not owed: no behaviour changed.
+Oracle 3 is not owed: no behaviour changed.
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+cargo fmt --all --check
+cargo clippy -p charpente-core --all-targets -- -D warnings
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee $SDD/gate-task-2.log; grep -c "^test result: ok" $SDD/gate-task-2.log
+```
 
 ```bash
 git add crates/charpente-core/src/io.rs CLAUDE.md DESIGN.md
@@ -410,8 +440,8 @@ git commit -m "core: the Outbound IO trait and its value types (outbound-effects
 
 **Files:**
 - Modify: `crates/charpente-sim/src/lib.rs` (`FaultConfig` fields, `Default`, `none`, `swarm`, `validate`, `sample_extended_fields`)
-- Modify: `crates/charpente-sim/src/harness.rs` (`config_json`; the pinned `human_failure_block` test near `:785-:812`; the JSON test near `:977`)
-- Modify: every `FaultConfig { … }` literal that lists fields without `..base`. The compiler names each one: `harness.rs` ×3, plus those `cargo build --workspace --all-targets` reports.
+- Modify: `crates/charpente-sim/src/harness.rs` (`config_json`; the two `FaultConfig` literals in its tests, `human_failure_block_matches_the_pinned_shape`'s at `:774` and `config_json_carries_every_fault_axis`'s at `:966`; the pinned Debug string at `:809`)
+- Modify: every `FaultConfig { … }` literal that lists fields without `..base`: `harness.rs`'s two above and `lib.rs`'s three (`Default` `:114`, `none` `:139`, `swarm` `:204`). Every other literal in the workspace uses `..base`.
 - Modify: `docs/GUIDE.md` §8 "Reading a failure" sample (`:3218`), refreshed to the exact pinned line
 
 **Interfaces:**
@@ -440,7 +470,7 @@ git commit -m "core: the Outbound IO trait and its value types (outbound-effects
         for seed in [0u64, 1, 0x912313adf8115ad0, 0x483e230baed4922b, u64::MAX] {
             let mut with = FaultConfig::swarm(&mut Rng::new(seed));
             sample_extended_fields(seed, &mut with);
-            let mut without = with.clone_for_tests();
+            let mut without = with.clone();
             without.outbound_refused = 0.0;
             without.outbound_lost_request = 0.0;
             without.outbound_lost_reply = 0.0;
@@ -471,11 +501,11 @@ git commit -m "core: the Outbound IO trait and its value types (outbound-effects
     }
 ```
 
-`clone_for_tests` and `sample_extended_fields_without_outbound_for_tests` are `#[cfg(test)]` helpers added in Step 3. The second one is the pre-change body of `sample_extended_fields`, kept so the property compares against what the code did before.
+`sample_extended_fields_without_outbound_for_tests` is a `#[cfg(test)]` helper added in Step 3: the pre-change body of `sample_extended_fields`, kept so the property compares against what the code did before. `with.clone()` is `FaultConfig`'s own derived `Clone` (`lib.rs:33`).
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test -p charpente-sim --lib outbound_axes`
+Run: `cargo test -p charpente-sim --lib outbound_ax`
 Expected: FAIL to compile, "no field `outbound_refused`".
 
 - [ ] **Step 3: Add the fields and their sampling**
@@ -529,20 +559,21 @@ Append to `sample_extended_fields`, after `object_delete_error`. Keep the existi
     cfg.outbound_latency = (Duration::ZERO, OUTBOUND_HI[r.below(4) as usize]);
 ```
 
-Add `#[cfg(test)] fn clone_for_tests(&self) -> FaultConfig` on `FaultConfig`: a field-by-field copy. Don't derive `Clone`, since nothing outside tests needs one.
+`FaultConfig` already derives `Clone` (`lib.rs:33`), and production code clones it (`run_universe`'s `cfg.clone()`), so the test needs no helper. Never remove that derive.
 
 - [ ] **Step 4: Carry the axes into the JSON record and re-pin the Debug line**
 
 - In `harness.rs`'s `config_json`, add `,\"outbound_refused\":{},\"outbound_lost_request\":{},\"outbound_lost_reply\":{},\"outbound_throttle\":{},\"outbound_slow\":{},\"outbound_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}` before the closing `}}` of the second `format!`, with the six values. `config_json_carries_every_fault_axis` then passes, and it must fail before you add these. Run it once first and see the failure.
-- In the `human_failure_block` test (`harness.rs:785-812`), add the six fields to its `FaultConfig` literal (rates `0.0`, latency `(Duration::ZERO, Duration::ZERO)`). Extend the expected Debug string, inserting after `subscriber_stall: 0.0, `: `outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), `. The field order is declaration order: the six sit between `subscriber_stall` and `disk_latency`.
-- Fix every other non-`..base` literal the compiler names, the same way.
+- In `human_failure_block_matches_the_pinned_shape`, add the six fields to its `FaultConfig` literal (`harness.rs:774`; rates `0.0`, latency `(Duration::ZERO, Duration::ZERO)`). Extend the expected Debug string (`:809`), inserting after `subscriber_stall: 0.0, `: `outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), `. The field order is declaration order: the six sit between `subscriber_stall` and `disk_latency`.
+- `config_json_carries_every_fault_axis`'s literal (`harness.rs:966`) takes the same six fields. No other literal outside `lib.rs`'s three needs them: the rest use `..base`.
 - GUIDE §8 (`docs/GUIDE.md:3218`): replace the abbreviated `config:` line with the exact string the pinned test now expects. It has been stale since `dir_entry_loss` landed; hard rule 6.
 
 - [ ] **Step 5: Run the sim crate and oracle 3**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo test -p charpente-sim --no-fail-fast 2>&1 | tee $SDD/gate-task-3.log; grep -c "^test result: ok" $SDD/gate-task-3.log
-$SDD/oracle3.sh task3
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh task3   # oracle3 mode foreground; background: Global Constraints
 ```
 
 Expected: every sim suite ok, and oracle 3 exit 0. A changed verdict means a draw moved, so stop and report it; don't update the baseline.
@@ -580,6 +611,8 @@ git commit -m "sim: outbound fault axes on FaultConfig, each from its own keyed 
   - `sim.outbound_deliveries() -> Vec<Delivered>`
 
 - [ ] **Step 1: Write the failing tests** (in `outbound.rs`'s own `#[cfg(test)] mod tests`)
+
+Create `crates/charpente-sim/src/outbound.rs` holding only this test module, and add `pub mod outbound;` to `lib.rs`'s module list now, so the file is compiled. Without the declaration the file is never built, and Step 2's filter would come back green on Task 3's tests.
 
 ```rust
 use super::*;
@@ -727,7 +760,6 @@ fn a_new_handle_never_receives_an_old_handles_reply() {
     assert_eq!(sim.outbound_deliveries().len(), 2, "both requests were on the wire");
 }
 
-#[test]
 /// Answers 200 with how many calls it has handled — a named type, so
 /// `with_remote` can name it to downcast.
 struct Counter(u32);
@@ -811,8 +843,8 @@ fn a_universe_replays_its_outbound_world_byte_for_byte() {
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test -p charpente-sim --lib outbound`
-Expected: FAIL to compile, "unresolved module `outbound`".
+Run: `cargo test -p charpente-sim --lib outbound::tests`
+Expected: FAIL to compile, "cannot find type `SimOutbound` in this scope" and "no method named `outbound` found for struct `Sim`".
 
 - [ ] **Step 3: Write `outbound.rs`**
 
@@ -993,11 +1025,12 @@ struct Flight {
 }
 
 pub(crate) struct OutboundWorld {
-    models: BTreeMap<String, (Box<dyn Remote>, Rng)>,
+    // Read by `Sim::{remote, outbound, with_remote, outbound_deliveries}` in lib.rs.
+    pub(crate) models: BTreeMap<String, (Box<dyn Remote>, Rng)>,
     flights: BTreeMap<u64, Flight>,
     next_flight: u64,
-    next_handle: u64,
-    deliveries: Vec<Delivered>,
+    pub(crate) next_handle: u64,
+    pub(crate) deliveries: Vec<Delivered>,
     refused: Rng,
     lost_request: Rng,
     lost_reply: Rng,
@@ -1187,7 +1220,7 @@ fn completes_at(f: &Flight) -> Option<u64> {
 A completed flight is removed in `poll`, so `!f.cancelled` is the whole "still in flight" filter. A cancelled flight stays in the map, so its request still reaches the remote at its delivery time (a cancel cannot recall a request on the wire). Its completion is never handed out.
 
 In `lib.rs`:
-- `pub mod outbound;`
+- `pub mod outbound;` (added in Step 1)
 - `State` gains `outbound: outbound::OutboundWorld`, built in `Sim::with_faults` as `outbound::OutboundWorld::new(seed)`. That's keyed streams only; no existing stream is touched.
 - `World::lock`, `State`, `World` and `keyed_stream` become `pub(crate)` where `outbound.rs` needs them. `State::cover` already exists.
 - Add the four `Sim` methods:
@@ -1250,8 +1283,8 @@ In `lib.rs`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p charpente-sim --lib outbound`
-Expected: PASS, all twelve.
+Run: `cargo test -p charpente-sim --lib outbound::tests`
+Expected: PASS, all twelve. (The bare filter `outbound` would also run Task 3's three `outbound_ax…` tests and report 15.)
 
 - [ ] **Step 5: Prove a test can fail**
 
@@ -1274,7 +1307,12 @@ Run `cargo build -p guide-examples` and `cargo test -p guide-examples --no-fail-
 
 - [ ] **Step 7: Gate, oracle 3, commit**
 
-Run the three gate commands and `$SDD/oracle3.sh task4` (expect exit 0: `OutboundWorld::new` draws nothing, and only keyed streams are built).
+Run the three gate commands, then oracle 3 (expect exit 0: `OutboundWorld::new` draws nothing, and only keyed streams are built):
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh task4   # oracle3 mode foreground; background: Global Constraints
+```
 
 ```bash
 git add crates/charpente-sim/src/outbound.rs crates/charpente-sim/src/lib.rs docs/GUIDE.md
@@ -1289,7 +1327,7 @@ git commit -m "sim: SimOutbound, Remote models (Recorder, Idempotent, from_fn), 
 - Modify: `crates/charpente-core/src/db.rs`. Covers: module doc; `Job` trait; `scoped_fingerprint` plus a new `outbound_fingerprint`; `Enqueue`; `push_enqueue`; `encode_record`/`decode_record`; `Effect::Enqueue`; the apply arm (`:2660`); `TableMachine.enqueued`; `drain_enqueued`; `Group`; `begin_group`; `Group::stage`; `enqueue_keyed`'s doc (`:1456`); `decode_refuses_unknown_tags`.
 - Modify: `crates/charpente-core/src/job.rs` (`JobRow` and its codec), `crates/charpente-core/src/table.rs:1601` (`materialize_job`).
 - Modify: `crates/charpente/src/http/app.rs` (`begin_group` mints; new `begin_job_group`, `transact_for_tests`), `crates/charpente/src/kernel/mod.rs` (job and cron arms), `crates/charpente/src/kernel/dispatch.rs` (`note_enqueued`).
-- Modify: every `JobRow { … }` and `Effect::Enqueue { … }` literal and every `drain_enqueued()` use the compiler names. Known: `charpente-core/tests/materialize.rs:103,126`, `charpente/tests/kernel.rs:3658`, `charpente/tests/transactions.rs:3886`, and the compile-fail fixtures `job_row_forged_on_bare_tx.rs:44` and `job_row_table_name_borrowed.rs:74`.
+- Modify: every `JobRow { … }` and `Effect::Enqueue { … }` literal and every `drain_enqueued()` use the compiler names. Known: `charpente-core/tests/materialize.rs:103,126`, `charpente-core/tests/engine.rs:532,1191` (two `JobRow` literals), `charpente/tests/kernel.rs:3658`, `charpente/tests/transactions.rs:3886`, `charpente/tests/typed_tables.rs:1070-1077` (`materialize_job` calls), and the compile-fail fixtures `job_row_forged_on_bare_tx.rs:44` and `job_row_table_name_borrowed.rs:74`.
 - Modify: `DESIGN.md`'s record-tag list (the `0x08`/`0x0a` paragraph near `:607-612`).
 - Test: `crates/charpente-core/tests/materialize.rs`, plus `db.rs`/`job.rs` unit tests.
 
@@ -1535,7 +1573,11 @@ Change the existing uses in this file: `drained.iter().map(|id| id.raw())` becom
 
 - [ ] **Step 3: Run them to verify they fail**
 
-Run: `cargo test -p charpente-core --no-fail-fast 2>&1 | tee $SDD/task5-red.log | grep -E "^error|test result"`
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+cargo test -p charpente-core --no-fail-fast 2>&1 | tee $SDD/task5-red.log | grep -E "^error|test result"
+```
+
 Expected: compile errors naming `outbound`, `okey`, `begin_group_minting`, `outbound_key`, `OUTBOUND`.
 
 - [ ] **Step 4: Implement the core half**
@@ -1767,6 +1809,16 @@ In `decode_row`:
         };
 ```
 
+Two `job.rs` tests pin the old text byte-exact, and take the new text in this step (hard rule 5): `a_torn_job_row_shape_is_a_named_decode_error` (`job.rs:262-266`) and `a_torn_job_row_scope_is_a_named_decode_error` (`:322-326`). Their expected strings become:
+
+```rust
+            "row decode: 3 bytes after a JobRow's last_error — the shape and the tenant scope \
+             after it are 8 bytes each and the outbound key 16, each present or absent, so the \
+             stored row is corrupt"
+```
+
+and the same with `11 bytes`. `event.rs`'s similar strings (`:90`, `:180`, `:235`) are `EventRow`'s own and stay.
+
 24 is unambiguous because a scope never comes without a shape and 16 + 8 = 24 would need a key of 8. `table.rs`: `materialize_job` gains a trailing `outbound_key: Option<[u8; 16]>` parameter, carried into the row. Its other callers (`db.rs:2667`, `typed_tables.rs:1070-1077`) pass `None` unless they are the apply arm.
 
 - [ ] **Step 5: Implement the platform half**
@@ -1810,7 +1862,7 @@ Add beside it:
 
 `kernel/mod.rs`: in `Ready::Job` and `Ready::Cron`, `let mut group = self.app.db_mut().begin_group()?;` becomes `let mut group = self.app.begin_job_group()?;`. Leave `dispatch.rs`'s `run_due` and `cron.rs`'s `tick` one-job wrappers on `Db::begin_group`: they take a `&mut Db`, and a test that enqueues an outbound job through them meets the A9 panic.
 
-`dispatch.rs`:
+`dispatch.rs` adds `Enqueued` to its `use charpente_core::db::{…}` line (`dispatch.rs:9-12`), then:
 
 ```rust
     /// Feeds jobs drained from `Db::drain_enqueued` (fresh enqueues are due
@@ -1828,7 +1880,7 @@ Fix every site the compiler names. `JobRow` literals take `outbound_key: None`, 
 
 - [ ] **Step 5a: The shape refusal names `outbound`**
 
-`outbound_fingerprint` makes outbound-ness part of a job's shape (R8). The foreign-shape refusal at `db.rs:3835` tells the operator what to restore, so it must name the new thing that can have changed. Otherwise a deploy that added `outbound = …` is told to look at fields and tenancy. Change the clause
+`outbound_fingerprint` makes outbound-ness part of a job's shape (R8). The foreign-shape refusal at `db.rs:3839` tells the operator what to restore, so it must name the new thing that can have changed. Otherwise a deploy that added `outbound = …` is told to look at fields and tenancy. Change the clause
 
 `or restore whichever of {name}'s fields, its \`global\`/\`scoped_by\` declaration or its tenant type's \`NAME\` changed`
 
@@ -1845,10 +1897,11 @@ In DESIGN.md's record paragraph listing `0x08`/`0x0a`, add: "`0x0c`/`0x0d` are t
 - [ ] **Step 7: Run the tests, then oracle 3**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo test -p charpente-core --no-fail-fast 2>&1 | tee $SDD/gate-task-5-core.log; grep -c "^test result: ok" $SDD/gate-task-5-core.log
 cargo test -p charpente --no-fail-fast 2>&1 | tee $SDD/gate-task-5-charpente.log; grep -c "^test result: ok" $SDD/gate-task-5-charpente.log
 cargo test -p charpente-macros --no-fail-fast 2>&1 | tee $SDD/gate-task-5-macros.log; grep -c "^test result: ok" $SDD/gate-task-5-macros.log
-$SDD/oracle3.sh task5
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh task5   # oracle3 mode foreground; background: Global Constraints
 ```
 
 Expected: every suite ok, and oracle 3 exit 0. Every existing record is still `0x08`/`0x0a`, and no group draws. A changed universe here means a draw moved, which is a stop-and-report.
@@ -1863,9 +1916,15 @@ The three gate commands. The workspace test is partitioned or backgrounded, then
 
 ```bash
 git add crates/charpente-core/src/db.rs crates/charpente-core/src/job.rs crates/charpente-core/src/table.rs \
-  crates/charpente-core/tests/materialize.rs crates/charpente/src/http/app.rs crates/charpente/src/kernel/mod.rs \
+  crates/charpente-core/tests/materialize.rs crates/charpente-core/tests/engine.rs \
+  crates/charpente/src/http/app.rs crates/charpente/src/kernel/mod.rs \
   crates/charpente/src/kernel/dispatch.rs crates/charpente/tests/kernel.rs crates/charpente/tests/replication.rs \
-  DESIGN.md docs/GUIDE.md <each file the compiler named>
+  crates/charpente/tests/transactions.rs crates/charpente/tests/typed_tables.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_forged_on_bare_tx.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_forged_on_bare_tx.stderr \
+  crates/charpente-macros/tests/compile_fail/job_row_table_name_borrowed.rs \
+  crates/charpente-macros/tests/compile_fail/job_row_table_name_borrowed.stderr \
+  DESIGN.md docs/GUIDE.md <each other file the compiler named>
 git commit -m "core: minted idempotency keys — tags 0x0c/0x0d, JobRow.outbound_key, App groups mint at staging (outbound-effects spec §6); oracle 3 unchanged"
 ```
 
@@ -1909,8 +1968,9 @@ Keep the arm's long comment beside the new function, with "this arm" reworded to
 - [ ] **Step 2: Prove nothing moved**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo test -p charpente --no-fail-fast 2>&1 | tee $SDD/gate-task-6.log; grep -c "^test result: ok" $SDD/gate-task-6.log
-$SDD/oracle3.sh task6
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh task6   # oracle3 mode foreground; background: Global Constraints
 ```
 
 Expected: the same ok count as Task 5's `charpente` log, and oracle 3 exit 0. `git diff --stat` touches only `dispatch.rs`.
@@ -1932,15 +1992,16 @@ git commit -m "kernel: the failure record is one function, ahead of the outbound
 - Create: `crates/charpente/src/outbound.rs`
 - Modify: `crates/charpente/src/lib.rs` (`pub mod outbound;`)
 - Modify: `crates/charpente/src/kernel/dispatch.rs` (`OutboundDef`, `CallGlue`, `SettleGlue`, `JobDef.outbound`), `crates/charpente/src/kernel/mod.rs` (re-export them)
-- Modify: every `JobDef { … }` literal. Known sites: `launch.rs:477`, `serve.rs:757`, `serve.rs:860`, `tests/kernel.rs:789,1314,1656,1703,1771`, `charpente-macros/src/job.rs:447`. Each gains `outbound: None`.
+- Modify: every `JobDef { … }` literal. Known sites: `launch.rs:477`, `serve.rs:757`, `serve.rs:860`, `charpente-macros/src/job.rs:447`. Each gains `outbound: None`. `tests/kernel.rs`'s `JobDef` sites need nothing: `:789` is a fn signature, and `:1314`, `:1656`, `:1703`, `:1771` are struct-update literals (`..<File as JobEntry>::def()`).
 
 **Interfaces:**
 - Consumes: Task 2's `HttpMethod`, `IdempotencyKey`, `OutboundCall`, `OutboundReply`.
 - Produces (`charpente::outbound`):
   - `pub use charpente_core::io::{HttpMethod, IdempotencyKey};`
-  - `pub struct Call`: `get`/`post`/`put`/`patch`/`delete(path: impl Into<String>) -> Call`, plus `header(self, name: impl Into<String>, value: impl Into<String>) -> Call`, `json<T: Serialize>(self, &T) -> Call`, `form<V: AsRef<str>>(self, &[(&str, V)]) -> Call`, `body(self, Vec<u8>) -> Call`. Crate-internal: `pub(crate) fn into_wire(self, host: &'static str, key: IdempotencyKey) -> OutboundCall` and `pub(crate) fn body_len(&self) -> usize`.
+  - `pub struct Call`: `get`/`post`/`put`/`patch`/`delete(path: impl Into<String>) -> Call`, plus `header(self, name: impl Into<String>, value: impl Into<String>) -> Call`, `json<T: Serialize>(self, &T) -> Call`, `form<V: AsRef<str>>(self, &[(&str, V)]) -> Call`, `body(self, Vec<u8>) -> Call`. Crate-internal: `pub(crate) fn into_wire(self, host: &'static str, key: IdempotencyKey) -> OutboundCall`.
   - `pub struct Reply`: `status(&self) -> u16`, `header(&self, &str) -> Option<&str>`, `body(&self) -> &[u8]`, `json<T: DeserializeOwned>(&self) -> Result<T, JobError>`. Crate-internal: `pub(crate) fn from_wire(OutboundReply) -> Reply`.
-  - `pub struct Host`: `new(&'static str)`, `bearer_env(&'static str)`, `header_env(&str, &'static str)`, `basic_env(&'static str, &'static str)`, `max_request_bytes(usize)`, `max_reply_bytes(usize)`. Crate-internal: `pub(crate) fn name(&self) -> &'static str`, `max_reply(&self) -> usize`, `env_vars(&self) -> Vec<&'static str>`, `injected_headers(&self) -> Vec<String>`, `credentials(&self) -> &[Credential]`.
+  - `pub struct Host`: `new(&'static str)`, `bearer_env(&'static str)`, `header_env(&str, &'static str)`, `basic_env(&'static str, &'static str)`, `max_request_bytes(usize)`, `max_reply_bytes(usize)`. Crate-internal: `pub(crate) fn name(&self) -> &'static str`, `max_request(&self) -> usize`, `max_reply(&self) -> usize`, `env_vars(&self) -> Vec<&'static str>`, `injected_headers(&self) -> Vec<String>`, `credentials(&self) -> &[Credential]`.
+  - Each crate-internal item above lands before its first non-test caller, so it carries the dead-code attribute (Global Constraints): `into_wire` and `check` until Task 10, `from_wire` until Task 11, `name`/`max_request`/`max_reply`/`env_vars`/`injected_headers` until Task 9, and `credentials` until Task 14.
   - `pub(crate) enum Credential { Bearer(&'static str), Header(String, &'static str), Basic(&'static str, &'static str) }`
   - `pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1 << 20;`, `DEFAULT_MAX_REPLY_BYTES: usize = 4 << 20;`, `MAX_CAP_BYTES: usize = 8 << 20;`
   - `pub(crate) fn check(call: &Call, host: &Host) -> Result<(), String>`
@@ -1952,6 +2013,8 @@ git commit -m "kernel: the failure record is one function, ahead of the outbound
   - `JobDef.outbound: Option<OutboundDef>`
 
 - [ ] **Step 1: Write the failing tests** (`outbound.rs`'s `#[cfg(test)] mod tests`)
+
+Create `crates/charpente/src/outbound.rs` holding only this test module, and add `pub mod outbound;` to `lib.rs` now, so the file is compiled.
 
 ```rust
 use super::*;
@@ -2059,7 +2122,7 @@ fn a_reply_reads_headers_case_insensitively_and_bad_json_is_an_app_error() {
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p charpente --lib outbound`
-Expected: FAIL to compile, "unresolved module `outbound`".
+Expected: FAIL to compile, "cannot find type `Host` in this scope" (and "use of undeclared type `Call`").
 
 - [ ] **Step 3: Write `outbound.rs`**
 
@@ -2152,10 +2215,7 @@ impl Call {
         self
     }
 
-    pub(crate) fn body_len(&self) -> usize {
-        self.body.len()
-    }
-
+    #[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 10"))]
     pub(crate) fn into_wire(self, host: &'static str, key: IdempotencyKey) -> OutboundCall {
         OutboundCall { host, method: self.method, path: self.path, headers: self.headers, body: self.body, key }
     }
@@ -2180,6 +2240,7 @@ pub struct Reply {
 }
 
 impl Reply {
+    #[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 11"))]
     pub(crate) fn from_wire(reply: OutboundReply) -> Reply {
         Reply { status: reply.status, headers: reply.headers, body: reply.body }
     }
@@ -2254,19 +2315,24 @@ impl Host {
         self.max_reply = n;
         self
     }
+    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn name(&self) -> &'static str {
         self.name
     }
+    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn max_request(&self) -> usize {
         self.max_request
     }
+    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn max_reply(&self) -> usize {
         self.max_reply
     }
+    #[expect(dead_code, reason = "first caller: Task 14")]
     pub(crate) fn credentials(&self) -> &[Credential] {
         &self.credentials
     }
     /// Every variable this host reads, in declaration order.
+    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn env_vars(&self) -> Vec<&'static str> {
         self.credentials
             .iter()
@@ -2287,6 +2353,7 @@ impl Host {
             })
             .collect()
     }
+    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn injected_headers(&self) -> Vec<String> {
         self.injects().into_iter().map(|(h, _)| h).collect()
     }
@@ -2325,6 +2392,7 @@ fn is_token(name: &str) -> bool {
 /// The rules a built `Call` must satisfy (spec §5, plan amendment A12),
 /// checked before a start. The edge would refuse most of these too, but only
 /// the kernel's refusal is the same in production and the sim.
+#[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 10"))]
 pub(crate) fn check(call: &Call, host: &Host) -> Result<(), String> {
     let h = host.name;
     if !call.path.starts_with('/') || call.path.starts_with("//") || call.path.contains("://") {
@@ -2379,6 +2447,8 @@ pub(crate) fn check(call: &Call, host: &Host) -> Result<(), String> {
 
 Header names reach `check` lowercased already, because `Call::header` lowercases. The token check runs on that form, which is fine: lowercasing never makes a non-token into a token.
 
+The dead-code attributes (Global Constraints) are what keep `clippy -D warnings` green until each item's first caller lands. `into_wire`, `from_wire` and `check` take the `cfg_attr(not(test), …)` form because this module's own tests call them. `injects`, `is_token`, `EDGE_HEADERS`, `Credential`'s fields and `Host`'s fields carry nothing: they are reached through the expected items. There is no `Call::body_len`: nothing would ever call it.
+
 `kernel/dispatch.rs`, beside `JobGlue`:
 
 ```rust
@@ -2400,7 +2470,7 @@ pub struct OutboundDef {
 pub type CallGlue = fn(
     &mut Tx,
     &[u8],
-    &IdempotencyKey,
+    &crate::outbound::IdempotencyKey,
     Option<JobScope<'_>>,
 ) -> Result<Option<crate::outbound::Call>, JobError>;
 
@@ -2422,7 +2492,7 @@ Run the three gate commands. Oracle 3 is not owed: nothing on any dispatch path 
 ```bash
 git add crates/charpente/src/outbound.rs crates/charpente/src/lib.rs crates/charpente/src/kernel/dispatch.rs \
   crates/charpente/src/kernel/mod.rs crates/charpente/src/launch.rs crates/charpente/src/serve.rs \
-  crates/charpente/tests/kernel.rs crates/charpente-macros/src/job.rs
+  crates/charpente-macros/src/job.rs
 git commit -m "charpente: Call, Reply, Host and the call rules; JobDef.outbound (outbound-effects spec §5, §9)"
 ```
 
@@ -2434,7 +2504,8 @@ git commit -m "charpente: Call, Reply, Host and the call rules; JobDef.outbound 
 - Modify: `crates/charpente-macros/src/job.rs`
 - Create: `crates/charpente-macros/tests/compile_fail/` seven fixtures with their `.stderr`: `outbound_host_has_scheme`, `outbound_host_has_port`, `outbound_host_empty`, `outbound_timeout_without_outbound`, `outbound_timeout_zero`, `outbound_with_cross_tenant`, `outbound_run_instead_of_call` (E0599, amendment A6), plus an eighth, `outbound_call_cannot_write` (E0596, R3).
 - Create: `crates/charpente/tests/outbound.rs` (the suite's first tests)
-- Modify: `docs/GUIDE.md` §6 (a new "Outbound jobs" subsection: the surface only; Task 11 adds the failure semantics) and §9 (the eight refusals)
+- Modify: `docs/GUIDE.md` §6 (a new "Outbound jobs" subsection: the surface only; Task 11 adds the failure semantics) and §9 (the eight refusals), plus every quote of the old `ACCEPTED_FORMS` sentence (`:1969-1972`, `:1977-1981`, `:3578-3584`)
+- Modify: `CLAUDE.md` (charpente's test list gains `outbound`: `doc_inventory` is red from the moment `tests/outbound.rs` exists)
 
 **Interfaces:**
 - Consumes: Task 5's `Job::OUTBOUND` and `outbound_fingerprint`; Task 7's `OutboundDef`, `CallGlue`, `SettleGlue`, `Call`, `Reply`, `IdempotencyKey`.
@@ -2529,35 +2600,43 @@ Add `charpente-sim` uses to this file when Task 10 needs them, not now.
 
 - [ ] **Step 2: Write the compile-fail fixtures**
 
-Each file is a complete crate root, the way the existing `job_*.rs` fixtures are; copy one's `use` lines. The bodies:
+Each file is a complete crate root, the way the existing `job_*.rs` fixtures are, with exactly the `use` lines shown. The two that name platform types need theirs in full: without them name resolution fails first (E0412/E0433), `call` never reaches borrowck, and an overwrite would bless the wrong error. The bodies:
 
 ```rust
 // outbound_host_has_scheme.rs
+use charpente::job;
 #[job(global, outbound = "https://api.stripe.com")]
 struct Charge {}
 
 // outbound_host_has_port.rs
+use charpente::job;
 #[job(global, outbound = "api.stripe.com:443")]
 struct Charge {}
 
 // outbound_host_empty.rs
+use charpente::job;
 #[job(global, outbound = "")]
 struct Charge {}
 
 // outbound_timeout_without_outbound.rs
+use charpente::job;
 #[job(global, timeout = "5s")]
 struct Charge {}
 
 // outbound_timeout_zero.rs
+use charpente::job;
 #[job(global, outbound = "api.stripe.com", timeout = "0s")]
 struct Charge {}
 
 // outbound_with_cross_tenant.rs
+use charpente::job;
 #[job(global, cross_tenant, outbound = "api.stripe.com")]
 struct Charge {}
 
 // outbound_run_instead_of_call.rs — plan amendment A6: the attribute cannot
 // see the impl, so rustc's E0599 for the missing `call` is the refusal.
+use charpente::kernel::JobError;
+use charpente::{Tx, job};
 #[job(global, outbound = "api.stripe.com")]
 struct Charge {}
 impl Charge {
@@ -2566,6 +2645,9 @@ impl Charge {
 
 // outbound_call_cannot_write.rs — spec R3: `call` takes `&Tx`, and a write
 // needs `&mut`.
+use charpente::kernel::JobError;
+use charpente::outbound::{Call, IdempotencyKey, Reply};
+use charpente::{Id, Tx, job, table};
 #[job(global, outbound = "api.stripe.com")]
 struct Charge {}
 #[table(global)]
@@ -2742,10 +2824,10 @@ The two outbound glues, `global` form:
 
 ```bash
 TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild
-git diff --stat crates/charpente-macros/tests/compile_fail/
+git status --short crates/charpente-macros/tests/compile_fail/   # `git diff` would not list the new, untracked pairs
 ```
 
-Read every new `.stderr` against the macro's strings, the house discipline (`tests/trybuild.rs`'s header). `outbound_run_instead_of_call.stderr` must show `error[E0599]: no function or associated item named \`call\` found for struct \`Charge\``. `outbound_call_cannot_write.stderr` must show `E0596` at the `tx.put` line. A changed existing `.stderr` may differ only in the `ACCEPTED_FORMS` sentence.
+Open and read each new `.stderr` the status lists (`??`), and `git diff` each modified one. Read every new `.stderr` against the macro's strings, the house discipline (`tests/trybuild.rs`'s header). `outbound_run_instead_of_call.stderr` must show `error[E0599]: no function or associated item named \`call\` found for struct \`Charge\``. `outbound_call_cannot_write.stderr` must show `E0596` at the `tx.put` line. A changed existing `.stderr` may differ only in the `ACCEPTED_FORMS` sentence.
 
 Then: `cargo test -p charpente --test outbound` → PASS. `cargo test -p charpente-macros --no-fail-fast` → every test ok.
 
@@ -2761,8 +2843,14 @@ Remove the `outbound_fingerprint(…)` wrap in the expansion and run `an_outboun
 - It says outbound-ness is part of the shape, so adding or removing `outbound` needs the drain the existing "Changing a job's fields" text describes.
 - Correct GUIDE.md:1698-1699: `enqueue_keyed`'s key is the app's own identity for the job, and the outbound idempotency key is minted by the platform.
 - §9's refusal list gains the eight with their exact first lines.
+- Replace the old `ACCEPTED_FORMS` sentence with the new one everywhere GUIDE quotes it: the two `rust,ignore` refusal comments at `docs/GUIDE.md:1969-1972` and `:1977-1981` (which escape inner quotes as `\"`), and §9's `text` block at `:3578`, `:3579`, `:3580`, `:3583` and `:3584` (unescaped). None of these is `<!-- pinned -->`, so no test would catch a stale one (hard rule 6). The new sentence, unescaped: a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+- Extend `crates/charpente-macros/src/job.rs`'s module doc. Its first line lists the accepted forms: add `[, outbound = "api.stripe.com"[, timeout = "30s"]]`. Where it lists what the expansion carries, add that an outbound job's `FINGERPRINT` is continued by `charpente_core::db::outbound_fingerprint` and that its `JobDef` carries the `call`/`settle` glue in `outbound`.
 
 Run `cargo build -p guide-examples`.
+
+- [ ] **Step 8a: CLAUDE.md's test list**
+
+`crates/charpente/tests/outbound.rs` exists from Step 1, and `doc_inventory` holds CLAUDE.md's test lists exhaustive. In the Commands section's test-file parenthetical, `(charpente: archive/auth/describe/group_commit/http/kernel/realtime/` becomes `(charpente: archive/auth/describe/group_commit/http/kernel/outbound/realtime/`. Leave the parenthetical's line breaks alone; the gate requires `). Every list` to stay on one line. Run `cargo test -p guide-examples --test doc_inventory`. Expected: PASS.
 
 - [ ] **Step 9: Gate and commit**
 
@@ -2770,7 +2858,7 @@ Run the three gate commands, counted.
 
 ```bash
 git add crates/charpente-macros/src/job.rs crates/charpente-macros/tests/compile_fail/ \
-  crates/charpente/tests/outbound.rs docs/GUIDE.md
+  crates/charpente/tests/outbound.rs docs/GUIDE.md CLAUDE.md
 git commit -m "macros: #[job(outbound = \"host\", timeout = \"30s\")] — call/settle glue, shape fold, eight compile-time refusals (outbound-effects spec §5)"
 ```
 
@@ -2783,7 +2871,10 @@ git commit -m "macros: #[job(outbound = \"host\", timeout = \"30s\")] — call/s
 - Modify: `crates/charpente/src/outbound.rs` (`check_host_sets`, `DEFAULT_MAX_IN_FLIGHT`)
 - Modify: `crates/charpente/src/describe.rs` (`JobInfo.outbound`, `OutboundInfo`, `Contract.outbound_hosts`, `HostInfo`, the human renderer near `:466`)
 - Modify: the describe goldens, `examples/invoicing/tests/describe_golden.rs`, `crates/guide-examples/tests/describe_contract.rs` (via GUIDE §13's JSON), `crates/charpente-cli/tests/describe.rs`, plus any other the run names
-- Modify: `docs/GUIDE.md` §6 (declaring a `Host`), §13 (the describe JSON and human lines)
+- Modify: `crates/charpente/tests/describe.rs` (re-bless its full-document `GOLDEN` at `:166`; the two `builtin=false\n` pins in `to_human_carries_public_scope_and_scoped_by`, `:1321-1335`, become `builtin=false outbound=none\n`)
+- Modify: `crates/charpente-cli/src/genclient.rs`, the owned mirror of `Contract` (`into_contract` builds the real types field by field, so it is E0063 without this): mirror `OutboundInfo` and `HostInfo`, `JobInfo.outbound`, `Contract.outbound_hosts`, their `into_*`, and `EVERY_SHAPE` gaining one `Some` outbound and one non-empty host
+- Modify: `crates/charpente-tsgen/tests/common/mod.rs` (`fixture_contract`, `:57`) and `crates/charpente-tsgen/tests/revive.rs` (`base()`, `:37`): `outbound_hosts: Vec::new()`
+- Modify: `docs/GUIDE.md` §6 (declaring a `Host`), §13 (the describe JSON and human lines), and the human jobs sample at `:7360`
 - Test: `crates/charpente/tests/outbound.rs`, plus `outbound.rs` unit tests
 
 **Interfaces:**
@@ -2793,6 +2884,7 @@ git commit -m "macros: #[job(outbound = \"host\", timeout = \"30s\")] — call/s
   - `pub fn outbound_max_in_flight(self, n: usize) -> App`
   - `pub fn outbound_hosts(&self) -> Vec<&'static str>`: the hosts mounted jobs call, sorted and deduplicated, which is what `sim.outbound` takes. Read it before building a kernel, which takes the job defs.
   - `pub(crate) fn take_outbound(&mut self) -> (Vec<Host>, usize)`
+  - `pub(crate) fn outbound_config(&self) -> &[Host]`
 - Produces (`charpente::outbound`):
   - `pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;`
   - `pub(crate) fn check_host_sets(callers: &[(&'static str, &'static str)], hosts: &[Host]) -> Result<(), String>`. `callers` is `(job name, host)` in mount order.
@@ -2894,6 +2986,7 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;
 
 /// R9, checked when the kernel is built (plan amendment A5): every host a
 /// mounted job calls has exactly one `Host` entry, and every entry is called.
+#[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 11"))]
 pub(crate) fn check_host_sets(
     callers: &[(&'static str, &'static str)],
     hosts: &[Host],
@@ -2956,6 +3049,7 @@ pub(crate) fn check_host_sets(
             .collect()
     }
 
+    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn take_outbound(&mut self) -> (Vec<Host>, usize) {
         (std::mem::take(&mut self.hosts), self.max_in_flight)
     }
@@ -2992,7 +3086,7 @@ pub struct HostInfo {
 }
 ```
 
-`job_info` sets `outbound: def.outbound.as_ref().map(|o| OutboundInfo { host: o.host, timeout_ms: u64::try_from(o.timeout.as_millis()).expect("a timeout fits u64 millis") })`. `Contract` gains `pub outbound_hosts: Vec<HostInfo>` after `cron`, filled from `self.outbound_config()` in declaration order. The human renderer appends ` outbound={host} timeout_ms={n}` (or ` outbound=none`) to each job line. After `cron:` it prints:
+`job_info` sets `outbound: def.outbound.as_ref().map(|o| OutboundInfo { host: o.host, timeout_ms: u64::try_from(o.timeout.as_millis()).expect("a timeout fits u64 millis") })`. `Contract` gains `pub outbound_hosts: Vec<HostInfo>` after `cron`, filled from `self.outbound_config()` in declaration order, each entry `HostInfo { host: h.name(), env: h.env_vars(), injects: h.injected_headers(), max_request_bytes: h.max_request(), max_reply_bytes: h.max_reply() }`. Those five accessors' first callers are `App::outbound` (`name`) and this, so delete the `expect(dead_code)` attributes Task 7 put on `Host::name`, `max_request`, `max_reply`, `env_vars` and `injected_headers`. `check_host_sets` and `take_outbound` carry theirs until Task 11 (Global Constraints). The human renderer appends ` outbound={host} timeout_ms={n}` (or ` outbound=none`) to each job line. After `cron:` it prints:
 
 ```text
 outbound_hosts:
@@ -3001,17 +3095,52 @@ outbound_hosts:
 
 A host with no credentials prints `env=none injects=none`.
 
+`crates/charpente-cli/src/genclient.rs`, inside `mod contract` (the owned mirror). The mirror `JobInfo` gains `outbound: Option<OutboundInfo>` after `builtin`, the mirror `Contract` gains `outbound_hosts: Vec<HostInfo>` after `cron`, and:
+
+```rust
+    #[derive(Deserialize)]
+    struct OutboundInfo {
+        host: String,
+        timeout_ms: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct HostInfo {
+        host: String,
+        env: Vec<String>,
+        injects: Vec<String>,
+        max_request_bytes: usize,
+        max_reply_bytes: usize,
+    }
+
+    fn into_host(h: HostInfo) -> real::HostInfo {
+        real::HostInfo {
+            host: leak(h.host),
+            env: leak_all(h.env),
+            injects: h.injects,
+            max_request_bytes: h.max_request_bytes,
+            max_reply_bytes: h.max_reply_bytes,
+        }
+    }
+```
+
+`into_contract` gains `outbound_hosts: c.outbound_hosts.into_iter().map(into_host).collect(),` and `into_job` gains `outbound: j.outbound.map(|o| real::OutboundInfo { host: leak(o.host), timeout_ms: o.timeout_ms }),`. In the test module's `EVERY_SHAPE`, `SendMail` gains `"outbound": { "host": "mail.test", "timeout_ms": 30000 }`, and the document gains, after `"cron"`, `"outbound_hosts": [{ "host": "mail.test", "env": ["MAIL_TOKEN"], "injects": ["x-mail-token"], "max_request_bytes": 1048576, "max_reply_bytes": 4194304 }]`. `round_trip_preserves_every_shape` then pins both new shapes' serde spelling.
+
+`crates/charpente-tsgen/tests/common/mod.rs`'s `fixture_contract` and `tests/revive.rs`'s `base()` build `Contract` without `..`: each gains `outbound_hosts: Vec::new(),`.
+
 - [ ] **Step 4: Run the tests, then re-bless the goldens by reading them**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo test -p charpente --test outbound
-cargo test -p invoicing --test describe_golden --no-fail-fast 2>&1 | tee $SDD/task9-goldens.log
+cargo test -p charpente-cli --lib --no-fail-fast 2>&1 | tee $SDD/task9-goldens.log
+cargo test -p charpente --test describe --no-fail-fast 2>&1 | tee -a $SDD/task9-goldens.log
+cargo test -p invoicing --test describe_golden --no-fail-fast 2>&1 | tee -a $SDD/task9-goldens.log
 cargo test -p guide-examples --test describe_contract --no-fail-fast 2>&1 | tee -a $SDD/task9-goldens.log
 cargo test -p charpente-cli --test describe --no-fail-fast 2>&1 | tee -a $SDD/task9-goldens.log
-grep -rn deny_unknown_fields crates/charpente-tsgen crates/charpente-cli || print "no strict decoders"
 ```
 
-Expected: `outbound` passes. The goldens fail with exactly two kinds of difference: `"outbound": null` on every job, and `"outbound_hosts": []`, plus the human lines' ` outbound=none` and an empty `outbound_hosts:` section. Update each golden and GUIDE §13's JSON by hand to that, and nothing else. A golden that differs in any other way is a stop-and-report. If a strict decoder exists, it gains the fields in this task.
+Expected: `outbound` passes, and `charpente-cli --lib` passes (`round_trip_preserves_every_shape` with `EVERY_SHAPE`'s new fields). The goldens fail with exactly two kinds of difference: `"outbound": null` on every job, and `"outbound_hosts": []`, plus the human lines' ` outbound=none` and an empty `outbound_hosts:` section. Update each golden (`crates/charpente/tests/describe.rs`'s `GOLDEN` included) and GUIDE §13's JSON by hand to that, and nothing else. In `describe.rs`'s `to_human_carries_public_scope_and_scoped_by`, the `Reconcile` and `Rollup` pins end `builtin=false outbound=none\n`. A golden that differs in any other way is a stop-and-report.
 
 - [ ] **Step 5: GUIDE**
 
@@ -3019,6 +3148,7 @@ Expected: `outbound` passes. The goldens fail with exactly two kinds of differen
 - §6 also says secrets are variable names, with values read at `serve` start and never in the log, the sim or `describe`.
 - §6 gives `outbound_max_in_flight` and its default.
 - §13 shows the new fields.
+- The human jobs sample at `docs/GUIDE.md:7360` (`Rollup max=2 … builtin=false`) gains ` outbound=none`, as the renderer now prints it.
 
 Run `cargo build -p guide-examples` and `cargo test -p guide-examples --no-fail-fast`.
 
@@ -3028,7 +3158,9 @@ Run the three gate commands, counted.
 
 ```bash
 git add crates/charpente/src/http/app.rs crates/charpente/src/outbound.rs crates/charpente/src/describe.rs \
-  crates/charpente/tests/outbound.rs crates/charpente/Cargo.toml docs/GUIDE.md <each golden updated>
+  crates/charpente/tests/outbound.rs crates/charpente/tests/describe.rs crates/charpente/Cargo.toml \
+  crates/charpente-cli/src/genclient.rs crates/charpente-tsgen/tests/common/mod.rs crates/charpente-tsgen/tests/revive.rs \
+  docs/GUIDE.md <each other golden updated>
 git commit -m "charpente: Host entries on the App, the both-ways host rule, describe lists outbound jobs and hosts (outbound-effects spec §9, §11)"
 ```
 
@@ -3040,6 +3172,8 @@ git commit -m "charpente: Host entries on the App, the both-ways host rule, desc
 - Create: `crates/charpente/src/kernel/outbound.rs` (`InFlight`, `Flight`)
 - Modify: `crates/charpente/src/kernel/dispatch.rs` (`Dispatcher` fields, `with_outbound`, `rebuild`, `note_enqueued`, `next_deadline`, `has_due`, `run_due_into`, `run_due`, new `run_call_into`, `fail_outbound`, `take_starts`, `in_flight_len`; `JobOutcome::Calling`)
 - Modify: `crates/charpente/src/kernel/mod.rs` (`mod outbound;`; the `Ready::Job` arm counts `Calling`)
+- Modify: `crates/charpente/src/outbound.rs` (delete Task 7's dead-code attributes on `Call::into_wire` and `check`)
+- Modify: `crates/charpente/tests/kernel.rs`: its two exhaustive `JobOutcome` matches (`:466-475`, `:1632-1636`) gain `JobOutcome::Calling { .. } => unreachable!("no outbound job is mounted here")`, or they are E0004 once `Calling` exists
 - Test: `crates/charpente/tests/outbound.rs`
 
 **Interfaces:**
@@ -3051,7 +3185,7 @@ git commit -m "charpente: Host entries on the App, the both-ways host rule, desc
   - `JobOutcome::Calling { id: u64, token: u64 }`
 - Produces (`kernel::outbound`, crate-private):
   - `Flight { id, due_at, deadline, host, timeout }`
-  - `InFlight` with `new(max)`, `len`, `has_room`, `holds_job`, `begin(id, due_at, now, host, timeout, call) -> u64`, `take_starts`, `abandon_starts() -> Vec<(u64, u64)>`, `finish(token) -> Option<Flight>`, `next_deadline() -> Option<u64>`, `expired(now) -> Option<u64>`, `push_completion`, `pop_completion`, `has_completions`, `drop_all() -> Vec<u64>`. Task 11 uses the completion half.
+  - `InFlight` with `new(max)`, `len`, `has_room`, `holds_job`, `begin(id, due_at, now, host, timeout, call) -> u64`, `take_starts`, `abandon_starts() -> Vec<(u64, u64)>`, `finish(token) -> Option<Flight>`, `next_deadline() -> Option<u64>`, `expired(now) -> Option<u64>`, `push_completion`, `pop_completion`, `has_completions`, `drop_all() -> Vec<u64>`. Task 11 uses the completion half, so `next_deadline`, `expired`, `push_completion`, `pop_completion`, `has_completions`, `drop_all` and the fields `Flight.host`/`Flight.timeout` carry `#[expect(dead_code, reason = "first caller: Task 11")]` (`"first reader: Task 11"` on the fields) until then.
 
 - [ ] **Step 1: Write the failing tests** (`tests/outbound.rs`)
 
@@ -3249,7 +3383,9 @@ pub(crate) struct Flight {
     /// is abandoned.
     pub due_at: u64,
     pub deadline: u64,
+    #[expect(dead_code, reason = "first reader: Task 11")]
     pub host: &'static str,
+    #[expect(dead_code, reason = "first reader: Task 11")]
     pub timeout: Duration,
 }
 
@@ -3336,22 +3472,27 @@ impl InFlight {
         Some(f)
     }
 
+    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         self.deadlines.first().map(|&(d, _)| d)
     }
 
+    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn expired(&self, now: u64) -> Option<u64> {
         self.deadlines.first().filter(|&&(d, _)| d <= now).map(|&(_, t)| t)
     }
 
+    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn push_completion(&mut self, c: (u64, io::Result<OutboundReply>)) {
         self.completions.push_back(c);
     }
 
+    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn pop_completion(&mut self) -> Option<(u64, io::Result<OutboundReply>)> {
         self.completions.pop_front()
     }
 
+    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn has_completions(&self) -> bool {
         !self.completions.is_empty()
     }
@@ -3359,6 +3500,7 @@ impl InFlight {
     /// Writable → not writable (invariant 3): every flight and buffered
     /// completion is dropped; returns the tokens to cancel. Their jobs stay
     /// Pending in the store for the next primary, with the same key (§7).
+    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn drop_all(&mut self) -> Vec<u64> {
         assert!(self.starts.is_empty(), "dispatcher invariant: starts buffered across a step boundary");
         self.jobs.clear();
@@ -3428,7 +3570,19 @@ impl InFlight {
         self.due.remove(&(due_at, id));
 ```
 
-The rest is unchanged. `run_due` (the one-job wrapper) captures `(due_at, id, outbound)` from `next_due()` the same way. It restores the original entry to the right set through a small `fn requeue(&mut self, due_at: u64, id: u64, outbound: bool)`. On a commit failure after `Calling`, it also calls `self.in_flight.abandon_starts()`. Its existing behaviour for pure jobs is unchanged.
+The rest is unchanged. `run_due` (the one-job wrapper) captures `(due_at, id, outbound)` from `next_due()` the same way. It restores the original entry to the right set through a small `fn requeue(&mut self, due_at: u64, id: u64, outbound: bool)`. A commit failure after `Calling` gets its own arm, ahead of the general `(Ok(outcome), Err(failure))` one. It calls `abandon_starts()` first and requeues from the `(due_at, id)` that returns, never the other way round: `queue_outbound` asserts the job is no longer in flight, so requeueing first would fire it.
+
+```rust
+            (Ok(JobOutcome::Calling { .. }), Err(failure)) => {
+                // R6: the group did not commit, so its call never starts.
+                for (due_at, id) in self.in_flight.abandon_starts() {
+                    self.queue_outbound(due_at, id);
+                }
+                Err(failure.error)
+            }
+```
+
+Its existing behaviour for pure jobs is unchanged.
 
 ```rust
 /// How `call`'s stage ends. A decided call leaves through `Err`, so whatever
@@ -3587,20 +3741,57 @@ impl From<io::Error> for CallStage {
 
 `JobOutcome` gains `Calling { id: u64, token: u64 }`, documented as "an outbound job's call was decided; its start waits for the batch's commit, and its outcome comes from the outbound arm". In `kernel/mod.rs`'s `Ready::Job` arm, `JobOutcome::Calling { .. } => {}` joins the match; the arm still counts it toward `drained`. Starts are not issued yet: Task 11 does that. Until then the kernel calls `self.dispatcher.take_starts()` and asserts it is empty after the job arm's commit. No test builds a kernel over an outbound job before Task 11, which adds the refusal for a kernel without an `Outbound` and replaces that assert.
 
+`run_call_into` is the first caller of `Call::into_wire` and `crate::outbound::check`, so delete the `cfg_attr(not(test), expect(dead_code, …))` Task 7 put on each. In `tests/kernel.rs`, the two exhaustive `JobOutcome` matches (`:466-475`, `:1632-1636`) each gain the arm `JobOutcome::Calling { .. } => unreachable!("no outbound job is mounted here")`.
+
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p charpente --test outbound` → PASS. Then `cargo test -p charpente --test kernel --no-fail-fast` → every test ok, since the pure path is unchanged.
 
 - [ ] **Step 6: Prove the R3 discard is load-bearing**
 
-Change `Some(call) => Err(CallStage::Decided { … })` so it first stages a write. The simplest version: `tx.settle_job(&row, &admission)` with `row.attempts += 1` before returning the `Err`. Run `a_decided_call_stages_nothing_and_buffers_its_start_with_the_row_key`. It stays GREEN, because the `Err` exit discards the write, and that is the property. Print `group.len()` in the test to show the write was staged and then dropped. Then make the arm return `Ok(())` after that write instead, and the test goes RED on `group.is_empty()`. Restore and touch the file. Record both runs. A green mutation needs its observable printed before you conclude anything.
+Two mutations, one GREEN and one RED. Restore and touch the file after each, and record both runs. A green mutation needs its observable printed before you conclude anything.
+
+1. GREEN: the discard holds. Make `call`'s stage write before it leaves through `Err`. In `run_call_into`'s closure, `Some(call) => …` becomes:
+
+   ```rust
+                   Some(call) => {
+                       // R3 mutation: a write inside call's stage.
+                       row.attempts += 1;
+                       tx.settle_job(&row, &admission);
+                       eprintln!("R3 mutation ran: staged attempts={} inside call's stage", row.attempts);
+                       Err(CallStage::Decided { call, key, host: out.host, timeout: out.timeout })
+                   }
+   ```
+
+   In the test, after `group.commit()`, temporarily add `eprintln!("attempts after commit: {}", db.snapshot().unwrap().scan::<JobRow>().unwrap()[0].attempts);`. Run `cargo test -p charpente --test outbound a_decided_call_stages_nothing_and_buffers_its_start_with_the_row_key -- --nocapture`. Expected: GREEN, with `R3 mutation ran: staged attempts=1` printed (the mutated arm ran) and `attempts after commit: 0` (the write was discarded with the `Err` exit, which is the property).
+2. RED: the assertion can fire. Restore 1. In the outer `match staged`'s `Decided` arm, immediately before `self.in_flight.begin(…)`, stage a record outside `call`'s stage, so the outcome stays `Calling` and the group is not empty:
+
+   ```rust
+                   // R3 mutation: a record staged beside a decided call.
+                   group
+                       .stage(|tx| {
+                           let mut row = tx.get_job(Id::from_raw(id), &admission)?.expect("the due row");
+                           row.attempts += 1;
+                           tx.settle_job(&row, &admission);
+                           Ok::<_, io::Error>(())
+                       })
+                       .expect("the mutation's stage");
+   ```
+
+   Run the same test. Expected: RED at `assert!(group.is_empty(), "R3: call's stage nets no record")`, not at the `let … else` that expects `Calling`.
 
 - [ ] **Step 7: Gate, oracle 3, commit**
 
-Run the three gate commands, then `$SDD/oracle3.sh task10` (expect exit 0: with no outbound job, `next_due` is the old `due.first()`).
+Run the three gate commands, then oracle 3 (expect exit 0: with no outbound job, `next_due` is the old `due.first()`):
 
 ```bash
-git add crates/charpente/src/kernel/outbound.rs crates/charpente/src/kernel/dispatch.rs crates/charpente/src/kernel/mod.rs crates/charpente/tests/outbound.rs
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh task10   # oracle3 mode foreground; background: Global Constraints
+```
+
+```bash
+git add crates/charpente/src/kernel/outbound.rs crates/charpente/src/kernel/dispatch.rs crates/charpente/src/kernel/mod.rs \
+  crates/charpente/src/outbound.rs crates/charpente/tests/outbound.rs crates/charpente/tests/kernel.rs
 git commit -m "kernel: outbound due-set, in-flight table and call path — call decides, the start waits for commit (outbound-effects spec §4, R3, R7); oracle 3 unchanged"
 ```
 
@@ -3611,7 +3802,8 @@ git commit -m "kernel: outbound due-set, in-flight table and call path — call 
 **Files:**
 - Modify: `crates/charpente/src/kernel/mod.rs`. Covers: `Ready::Outbound`; `KernelStats`; the `outbound` field; `KernelBuilder` plus `Kernel::builder`/`with_outbound`; the `build` refusals; the top-of-step drop and poll drain; the ready push; the idle deadline; the job arm's start issue; the arm itself; `outbound_in_flight_for_tests`.
 - Modify: `crates/charpente/src/kernel/dispatch.rs` (`settle_into`, `expire_into`, `push_completion`, `pop_completion`, `outbound_ready`, `next_outbound_deadline`, `abandon_starts`, `drop_in_flight`)
-- Modify: `crates/charpente/src/kernel/outbound.rs` (the three failure texts)
+- Modify: `crates/charpente/src/kernel/outbound.rs` (the three failure texts; delete Task 10's dead-code attributes)
+- Modify: `crates/charpente/src/outbound.rs` and `crates/charpente/src/http/app.rs` (delete the dead-code attributes on `Reply::from_wire`, `check_host_sets` and `App::take_outbound`)
 - Modify: `DESIGN.md` §1 (the seventh ready source, its park rule, invariant 6), `docs/GUIDE.md` §6 (failure semantics)
 - Test: `crates/charpente/tests/outbound.rs`
 
@@ -3628,7 +3820,7 @@ git commit -m "kernel: outbound due-set, in-flight table and call path — call 
 
 ```rust
 use charpente::core::db::Refusal;
-use charpente::core::io::{Outbound, OutboundCall, OutboundReply, OutboundWake};
+use charpente::core::io::{Clock, Outbound, OutboundCall, OutboundReply, OutboundWake};
 use charpente::kernel::{Kernel, KernelStats, SimSource};
 use charpente_sim::outbound::{Idempotent, Recorder, from_fn};
 
@@ -3796,19 +3988,45 @@ fn an_oversized_reply_is_a_named_attempt() {
     );
 }
 
-/// Review Focus 2 / R7. Timeline (one-way latency 1.5s, timeout 2s, backoff
-/// 500ms then 1s): token 0 starts at 0 and times out at 2s; token 1 starts at
-/// 2.5s; token 0's reply lands at 3s while token 1 is in flight — late, and it
-/// must not settle token 1's attempt. Token 1 times out at 4.5s and its reply
-/// (5.5s) is late too; token 2 starts at 5.5s, times out at 7.5s, and the job
-/// is Dead. If the count below differs, re-derive it from this timeline
-/// before changing it.
+/// Production's documented race (io.rs, `Outbound::cancel`: "A completion for
+/// it may still surface; the kernel discards it"): a cancel that loses to the
+/// reply. `SimOutbound` never hands out a cancelled flight's completion, so
+/// the kernel's late-discard path runs only behind this wrapper, which drops
+/// every cancel and forwards everything else.
+struct NoCancel<O>(O);
+
+impl<O: Outbound> Outbound for NoCancel<O> {
+    fn start(&self, token: u64, call: OutboundCall) -> std::io::Result<()> {
+        self.0.start(token, call)
+    }
+    fn poll(&self) -> Option<(u64, std::io::Result<OutboundReply>)> {
+        self.0.poll()
+    }
+    fn cancel(&self, _token: u64) {}
+    fn next_wake(&self) -> OutboundWake {
+        self.0.next_wake()
+    }
+}
+
+/// Review Focus 2 / R7, through `NoCancel`. Timeline (one-way latency 1.5s,
+/// timeout 2s, backoff 500ms then 1s): token 0 starts at 0 and times out at
+/// 2s; token 1 starts at 2.5s; token 0's reply lands at 3s while token 1 is in
+/// flight — late, and it must not settle token 1's attempt. Token 1 times out
+/// at 4.5s and its reply (5.5s) is late too, polled one step after token 2
+/// starts at 5.5s; token 2 times out at 7.5s, and the job is Dead. Token 2's
+/// own reply (8.5s) is never polled: nothing is in flight by then. If the
+/// count below differs, re-derive it from this timeline before changing it.
 #[test]
 fn a_late_reply_never_settles_the_retry() {
     let lat = Duration::from_millis(1500);
     let sim = Sim::with_faults(0x0d5, faults(|c| c.outbound_latency = (lat, lat)));
     sim.remote("pay.test", Recorder::new());
-    let (mut app, stats) = run_to(&sim, pay_app(&sim, Host::new("pay.test"), 1), 60 * SEC);
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let outbound = NoCancel(sim.outbound(&app.outbound_hosts()).unwrap());
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    kernel.run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC)).unwrap();
+    let stats = kernel.stats();
+    let mut app = kernel.into_app();
     let (rows, paid) = jobs_and_paid(&mut app);
     assert_eq!((rows[0].status, paid), (JobStatus::Dead, 0), "no late reply settled anything");
     assert_eq!(stats.outbound_settled, 0);
@@ -3896,7 +4114,9 @@ fn losing_writability_drops_in_flight_and_keeps_jobs_pending() {
     assert_eq!((rows[0].status, rows[0].attempts, paid), (JobStatus::Pending, 0, 0));
     let key = rows[0].outbound_key;
 
-    // The next writable kernel re-dispatches with the same key.
+    // The next writable kernel re-dispatches with the same key. The first
+    // kernel's build took the job defs and the Host entries, so mount them again.
+    let mut app = app.mount_jobs(jobs![Pay]).outbound(Host::new("pay.test"));
     app.db_for_tests().allow_writes();
     let (mut app, _) = run_to(&sim, app, 120 * SEC);
     let (rows, paid) = jobs_and_paid(&mut app);
@@ -4168,6 +4388,8 @@ fn a_job_gaining_outbound_is_refused_while_old_rows_are_pending() {
 
 `gated_app_reopen(&sim)` is `gated_app` without the seeding transaction: `App::open` over the same disk with the same mounts. Factor the opening half of Task 10's `gated_app` into it, so both share one body. Its `jobs![…]` becomes `jobs![Gated, ChargeAsPure, OpenGate]`, since `OpenGate` is defined here, after Task 10.
 
+A kernel's build takes the app's job defs (`take_job_defs`) and its `Host` entries (`take_outbound`), so an `App` handed back by `into_app()` mounts nothing. Any test that builds a second kernel from one re-mounts first, `app.mount_jobs(jobs![…]).outbound(Host::new(…))`, as `losing_writability_drops_in_flight_and_keeps_jobs_pending` does. `register_job_shapes` accepts the same shape again. Otherwise the second dispatcher records `job "Pay" is not registered …` as an attempt.
+
 `a_kernel_with_no_outbound_job_never_touches_its_outbound`'s `jobs_done` count assumes the built-in daily sweep runs once per day. If the first run lands at a different count, read `kernel_jobs_are_exactly_once…`'s cron facts and fix the arithmetic in the comment and the assertion together. The property under test is the absent panic.
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -4357,6 +4579,13 @@ pub(crate) fn reply_over_cap(host: &str, cap: usize) -> String {
 ```
 
 `fail_outbound` already requeues on its own `Err`, so the `?`s above leave the job in the outbound set whenever they bubble.
+
+This task is the first caller of everything still waiting under a dead-code attribute except `Host::credentials` (Task 14), so delete these attributes now:
+- `Reply::from_wire`'s `cfg_attr` (Task 7), since `settle_into` calls it;
+- `check_host_sets`'s `cfg_attr` and `App::take_outbound`'s `expect` (Task 9), since `Kernel::build` calls both (Step 5);
+- the eight in `kernel/outbound.rs` (Task 10): `Flight.host`, `Flight.timeout`, and `InFlight::{next_deadline, expired, push_completion, pop_completion, has_completions, drop_all}`.
+
+An `expect` left behind is an `unfulfilled_lint_expectations` error under the gate.
 
 - [ ] **Step 5: The kernel**
 
@@ -4588,6 +4817,7 @@ Add `#[doc(hidden)] pub fn outbound_in_flight_for_tests(&self) -> usize { self.d
 - [ ] **Step 6: Run the tests to verify they pass**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo test -p charpente --test outbound 2>&1 | tee $SDD/task11-outbound.log; grep -E "^test |test result" $SDD/task11-outbound.log
 ```
 
@@ -4595,9 +4825,18 @@ Expected: every test passes. A test with a numeric expectation (`outbound_late =
 
 - [ ] **Step 7: Prove R6 and invariant 6 can fail**
 
-1. In the job arm, call `self.start_calls()` before `group.commit()` instead of after. Run `a_call_never_starts_when_its_group_commit_fails`: expect RED, naming a `crash_after`. Restore and touch.
+1. In the job arm, issue the starts before `group.commit()` instead of after. `self.start_calls()` cannot be called there: the group holds `&mut self.app` until it commits, and `start_calls` takes `&mut self` (E0499). So the mutation inlines its loop field-wise (`dispatcher` and `outbound` are disjoint from `app`), just above `match (drain, group.commit())`:
+
+   ```rust
+                   // R6 mutation: starts issued before the commit.
+                   for (token, call) in self.dispatcher.take_starts() {
+                       let _ = self.outbound.as_ref().expect("R6 mutation").start(token, call);
+                   }
+   ```
+
+   Run `a_call_never_starts_when_its_group_commit_fails`: expect RED, naming a `crash_after`. Restore and touch.
 2. Remove the `if self.dispatcher.in_flight_len() > 0` guard around `poll`. Run `a_kernel_with_no_outbound_job_never_touches_its_outbound`: expect RED, with "invariant 6: poll". Restore and touch.
-3. Make `settle_into` look a token up without removing it, so `finish` never returns `None`. Replace its `finish` with a `get` that clones the flight. Run `a_late_reply_never_settles_the_retry`: expect RED or a panic. Restore and touch.
+3. Make `settle_into` look a token up without removing it, so `finish` never returns `None`. Replace its `finish` with a `get` that clones the flight. `Flight` derives nothing, so for the mutation only give it `#[derive(Clone)]`, or copy its fields out. Run `a_late_reply_never_settles_the_retry`: expect RED or a panic. Restore and touch, and remove the derive with it.
 4. Delete the level-triggered drop at the top of `step` (the `!writable` branch that drops the in-flight table). Run `losing_writability_drops_in_flight_and_keeps_jobs_pending`: expect RED, either at its "invariant 3" assertion or as the outbound arm's "ran on a node that is not writable" panic. Record which. This is the proof amendment A19 rests on. Restore and touch.
 
 Record each in progress.md with the failing line.
@@ -4621,10 +4860,16 @@ Dispatch an `opus` reviewer, with no `name`. Give it the spec, this task's text 
 
 - [ ] **Step 9: Gate, oracle 3, commit**
 
-Run the three gate commands, counted, then `$SDD/oracle3.sh task11`. Expect exit 0: no existing app has anything in flight, so neither the drop, the drain, the push nor the park fires.
+Run the three gate commands, counted, then oracle 3. Expect exit 0: no existing app has anything in flight, so neither the drop, the drain, the push nor the park fires.
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh task11   # oracle3 mode foreground; background: Global Constraints
+```
 
 ```bash
 git add crates/charpente/src/kernel/mod.rs crates/charpente/src/kernel/dispatch.rs crates/charpente/src/kernel/outbound.rs \
+  crates/charpente/src/outbound.rs crates/charpente/src/http/app.rs \
   crates/charpente/tests/outbound.rs DESIGN.md docs/GUIDE.md
 git commit -m "kernel: the outbound arm — starts after commit, completions, deadlines, late discards, the writability drop (outbound-effects spec §4, §7); oracle 3 unchanged"
 ```
@@ -4843,6 +5088,7 @@ pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String> {
 ```rust
 use std::collections::BTreeMap;
 
+use charpente::TxError;
 use charpente::core::io::Entropy as _;
 use charpente::core::table::Codec as _;
 use charpente_sim::checks::{
@@ -4854,6 +5100,10 @@ use charpente_sim::run_universes_swarm;
 const POOL: u64 = 6;
 const ROUNDS: u32 = 3;
 const BOOT_TRIES: u32 = 8;
+/// Provisional: Step 4 measures both bounds over ten fresh bases and replaces
+/// these values and this comment.
+const OUTBOUND_CHECKED_FLOOR: u64 = 1;
+const OUTBOUND_GAVE_UP_CEILING: u64 = 256;
 
 /// Which `Pay` the workload mounts: the honest one, or one of spec §12's two
 /// planted bugs.
@@ -4943,7 +5193,12 @@ fn seed_once(app: &mut App, v: Variant) -> Result<(), String> {
         }
         Ok::<(), std::io::Error>(())
     })
-    .map_err(|e| e.to_string())
+    // `TxError` derives only `Debug`. The injected-fault text lives in `Io`, so
+    // that arm must reach `is_fault_fallout` as the error's own text.
+    .map_err(|e| match e {
+        TxError::Io(e) => e.to_string(),
+        other => format!("{other:?}"),
+    })
 }
 
 /// Runs one kernel to `horizon`; fault fallout ends the round, anything else
@@ -5087,9 +5342,10 @@ The `Done ⇔ Paid` check depends on every variant's `settle` writing `Paid` exa
 
 - [ ] **Step 4: Measure the floor and the ceiling over ten fresh bases, then pin them (GUIDE §8's ambient rule)**
 
-`run_universes_swarm!` runs at an ambient base, so both bounds are margins over ten or more fresh batches, never exact counts (GUIDE §8, "At a pinned base both bounds are exact counts…"). Set both constants provisionally (`OUTBOUND_CHECKED_FLOOR = 1`, `OUTBOUND_GAVE_UP_CEILING = 256`). Then run ten fresh bases, in the background, since ten batches can pass 600 s:
+`run_universes_swarm!` runs at an ambient base, so both bounds are margins over ten or more fresh batches, never exact counts (GUIDE §8, "At a pinned base both bounds are exact counts…"). Step 3's block set both constants provisionally (`OUTBOUND_CHECKED_FLOOR = 1`, `OUTBOUND_GAVE_UP_CEILING = 256`). Now run ten fresh bases, in the background, since ten batches can pass 600 s:
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 ( for i in 01 02 03 04 05 06 07 08 09 0a; do
     CHARPENTE_BASE_SEED=0x0b1d00$i cargo test -p charpente --test outbound outbound_jobs_are_exactly_once -- --nocapture \
       > $SDD/task12-measure-$i.log 2>&1
@@ -5097,12 +5353,18 @@ The `Done ⇔ Paid` check depends on every variant's `settle` writing `Paid` exa
   done ) &
 ```
 
-When the loop exits, expect `grep -c " exit 0$" $SDD/task12-measure-exits.txt` to print 10. Then read each batch's counts from the runner's `coverage over 256 universes:` block: `grep -h -A40 "coverage over" $SDD/task12-measure-*.log | grep -E "outbound:checked|universe:gave-up|fault:outbound_|outbound:settled-after-retry|fault:crash|restart"`.
+When the loop exits (ten lines in the exits file), read the exits and each batch's counts from the runner's `coverage over 256 universes:` block:
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+grep -c " exit 0$" $SDD/task12-measure-exits.txt   # 10
+grep -h -A40 "coverage over" $SDD/task12-measure-*.log | grep -E "outbound:checked|universe:gave-up|fault:outbound_|outbound:settled-after-retry|fault:crash|restart"
+```
 
 `CHARPENTE_BASE_SEED` skips `require:`, `floor:` and `ceiling:`, because they are rates measured at the pinned base, so the runner checks none of them here. Check by hand that every `require` key is non-zero in every one of the ten blocks. A key that is missing is a workload too weak to judge, so strengthen the workload rather than drop the key.
 
 - `OUTBOUND_CHECKED_FLOOR` is the mean of the ten `outbound:checked` counts less four sample standard deviations, rounded down.
-- `OUTBOUND_GAVE_UP_CEILING` is the larger of twice the largest `universe:gave-up` count and the smallest k with P(Poisson(λ) > k) < 1e-4. Here λ = 256 × U(x) / 2,560, x is the total give-ups over the ten batches, and U(x) is 2.996 for x = 0, 4.744 for 1, or 6.296 for 2.
+- `OUTBOUND_GAVE_UP_CEILING` is the larger of twice the largest `universe:gave-up` count and the smallest k with P(Poisson(λ) > k) < 1e-4. Here λ = 256 × U(x) / 2,560, x is the total give-ups over the ten batches, and U(x) is 2.996 for x = 0, 4.744 for 1, or 6.296 for 2. For x > 2, U(x) = ½·χ²₀.₉₅(2x+2); twice the largest count is then normally the larger number.
 
 Give the two constants one doc comment in `crates/charpente-sim/tests/wal.rs`'s form (`FAULT_MATRIX_GAVE_UP_CEILING`). It states the ten bases, the range, mean and sample sd of `outbound:checked`, the give-up total, and the Poisson arithmetic. Record the raw counts in progress.md. Then run the property once without `CHARPENTE_BASE_SEED` and confirm it passes with the bounds enforced.
 
@@ -5156,7 +5418,7 @@ Replace both `0x0` literals and both `<date>` markers with the hunt's values bef
 
 1. Delete the `double charge` check from `outbound_workload`. Run the keyless pin: expect RED at `expect_err` (the bug escapes). Restore and touch.
 2. Delete the `phantom charge` check. Run the trusting pin: expect RED the same way. Restore and touch.
-3. In Task 5's mint (`Group::stage`), replace the drawn key with one derived from the job name (`okey = [job.len() as u8; 16]`, a key derived from data, not drawn). Run the swarm property for one base: expect RED from `keys_are_per_job`. Restore and touch.
+3. In Task 5's mint (`Group::stage`), replace the drawn key with one derived from the job name: in place of the `let mut okey …`, `mint.fill(&mut okey);` and `enqueue.okey = Some(okey);` lines, write `enqueue.okey = Some([enqueue.job.len() as u8; 16]);` (the loop binds `enqueue`; a key derived from data, not drawn). Run the swarm property for one base: expect RED from `keys_are_per_job`. Restore and touch.
 
 Record all three in progress.md with the failing line.
 
@@ -5172,7 +5434,12 @@ Then a short "Why the key matters" paragraph that names the two planted bugs, wh
 
 - [ ] **Step 8: Review gate, gate, oracle 3, commit**
 
-Dispatch an `opus` reviewer, with no `name`, writing to `$SDD/review-task12.md` first. Its brief: re-run the swarm property and both pins itself. Ask whether any property can be satisfied by a workload that checks nothing: the `outbound:checked` floor, and the honest twin passing on each pinned seed. Ask whether the `Done ⇔ Paid` and `double charge` checks hold under a crash between the remote's apply and the reply. Resolve its findings. Then run the three gate commands, counted, and `$SDD/oracle3.sh task12`.
+Dispatch an `opus` reviewer, with no `name`, writing to `$SDD/review-task12.md` first. Its brief: re-run the swarm property and both pins itself. Ask whether any property can be satisfied by a workload that checks nothing: the `outbound:checked` floor, and the honest twin passing on each pinned seed. Ask whether the `Done ⇔ Paid` and `double charge` checks hold under a crash between the remote's apply and the reply. Resolve its findings. Then run the three gate commands, counted, and oracle 3:
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh task12   # oracle3 mode foreground; background: Global Constraints
+```
 
 ```bash
 git add crates/charpente-sim/src/checks.rs crates/charpente-sim/src/lib.rs crates/charpente-sim/src/outbound.rs \
@@ -5205,7 +5472,8 @@ cargo clean -p charpente && cargo clean -p charpente-sim
 - [ ] **Step 2: Validate every `--re` against the listing, function by function**
 
 ```bash
-DISPATCH_RE='run_call_into|settle_into|expire_into|fail_outbound|queue_outbound|next_due|abandon_starts|drop_in_flight|outbound_ready|note_enqueued|rebuild'
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+DISPATCH_RE='run_call_into|settle_into|expire_into|fail_outbound|queue_outbound|next_due|abandon_starts|drop_in_flight|outbound_ready|note_enqueued|rebuild|Dispatcher::with_outbound|take_starts|in_flight_len|push_completion|pop_completion|next_outbound_deadline|requeue|run_due'
 MOD_RE='start_calls|Ready::Outbound|outbound_in_flight|KernelBuilder|with_outbound|Kernel::step'
 print -r -- "$DISPATCH_RE" > $SDD/mutants-dispatch-re.txt; print -r -- "$MOD_RE" > $SDD/mutants-mod-re.txt
 cargo mutants --list --file crates/charpente/src/kernel/dispatch.rs --re "$DISPATCH_RE" > $SDD/mutants-dispatch-list.txt
@@ -5215,9 +5483,27 @@ wc -l $SDD/mutants-*-list.txt
 
 Read both lists. Check every function name against Tasks 10 and 11's code as it actually landed (`grep -n "fn " crates/charpente/src/kernel/dispatch.rs`), and edit the two pattern files until the lists match: every outbound function must appear, and nothing must be listed only because a pattern matched by accident. `exclude_re` and `--re` are substring matches: anchor with `$` where a name is a prefix of another. A mutant's name reads `<file>:<line>:<col>: replace Kernel::step -> … with …`, so a pattern matches a path like `Kernel::step`, never `fn step`. If `Kernel::step` lists the whole of `step`, that's intended: the drop, drain, push and park all live there.
 
+- [ ] **Step 2a: Estimate each set's wall time before launching any**
+
+Every mutant runs its set's whole test package, so a set's cost is roughly its mutant count times one run of that package. List the two file-only sets, then time one test run per test set in the background (sequentially, so neither run slows the other):
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+cargo mutants --list --file crates/charpente/src/kernel/outbound.rs --file crates/charpente/src/outbound.rs > $SDD/mutants-charpente-outbound-list.txt
+cargo mutants --list --file crates/charpente-sim/src/outbound.rs > $SDD/mutants-sim-outbound-list.txt
+wc -l $SDD/mutants-*-list.txt
+( t0=$(date +%s); cargo test -p charpente --no-fail-fast > $SDD/mutants-timing-charpente.log 2>&1; rc=$?
+  print "charpente exit $rc wall $(( $(date +%s) - t0 ))s" >> $SDD/mutants-timing.txt
+  t0=$(date +%s); cargo test -p charpente-core -p charpente-sim --no-fail-fast > $SDD/mutants-timing-core-sim.log 2>&1; rc=$?
+  print "core+sim exit $rc wall $(( $(date +%s) - t0 ))s" >> $SDD/mutants-timing.txt ) &
+```
+
+When `mutants-timing.txt` has both lines (bounded checks), multiply each set's mutant count by its package's wall time. The three charpente sets use `charpente`'s time; the sim set is judged by the default core + sim test set, so it uses that one. Record the four estimates in progress.md. Split any set whose estimate exceeds 12 h into smaller `--re` sets before Step 3, validating each against the listing as Step 2 does.
+
 - [ ] **Step 3: Run the scoped sets**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 scripts/mutants.sh --file crates/charpente/src/kernel/outbound.rs --file crates/charpente/src/outbound.rs \
   --test-package charpente 2>&1 | tee $SDD/mutants-charpente-outbound.log
 scripts/mutants.sh --file crates/charpente/src/kernel/dispatch.rs --re "$(cat $SDD/mutants-dispatch-re.txt)" \
@@ -5247,12 +5533,13 @@ git commit -m "tests: close the outbound mutation survivors — oracle 6, N caug
 
 **Files:**
 - Modify: `crates/charpente/Cargo.toml` (`hyper` gains `client`; `hyper-util` gains `client-legacy`, `http1`; new `hyper-rustls`, `rustls`, `webpki-roots`, `tower-service`)
-- Modify: `crates/charpente/src/serve.rs` (`ProdOutbound`, `OutboundOptions`, `serve_with`, `serve_replicated` supplying the client, the credential read, the resolver, the TLS config)
+- Modify: `crates/charpente/src/serve.rs` (`ProdOutbound`, `OutboundOptions`, `serve_with`, `serve_replicated`, `backup` and `archive` supplying the client, the credential read, the resolver, the TLS config)
+- Modify: `crates/charpente/src/http/app.rs` (`outbound_callers`), `crates/charpente/src/outbound.rs` (delete Task 7's dead-code attribute on `Host::credentials`)
 - Modify: `docs/GUIDE.md` §5 "Starting the server" (`serve_with`, the operator flags come in Task 15) and §6 (where credentials are read), `docs/BENCH.md` (the clean-build delta)
 - Test: `serve.rs`'s `#[cfg(test)]` module (plain-HTTP loopback; real TLS is Task 16's)
 
 **Interfaces:**
-- Consumes: Task 2's trait; Task 7's `Host`, `Credential`; Task 9's `App::outbound_config`; Task 11's `Kernel::builder`.
+- Consumes: Task 2's trait; Task 7's `Host`, `Credential`; Task 9's `App::outbound_config` and `check_host_sets`; Task 11's `Kernel::builder`.
 - Produces (`charpente::serve`):
   - `pub struct OutboundOptions { pub bases: Vec<(String, String)>, pub cas: Vec<std::path::PathBuf> }` (`Default`)
   - `pub fn serve_with(addr: &str, app: App, outbound: OutboundOptions) -> io::Result<Server>`. `serve(addr, app)` becomes `serve_with(addr, app, OutboundOptions::default())`.
@@ -5263,6 +5550,7 @@ git commit -m "tests: close the outbound mutation survivors — oracle 6, N caug
 First record the baseline clean-build time. Use BENCH.md's compile instrument (`crates/bench-harness`, its `compile` suite; read docs/BENCH.md's method section for the exact command) on the commit before this one, three runs. Then:
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo add -p charpente hyper --features client
 cargo add -p charpente hyper-util --features client-legacy,http1
 cargo add -p charpente hyper-rustls --no-default-features --features http1,ring,tls12
@@ -5275,6 +5563,8 @@ cargo tree -p charpente -e normal | grep -E "rustls|webpki|hyper-rustls|ring" > 
 `aws-lc-rs` must be absent: it needs cmake, which is why spec §9 chose `ring`. Record the resolved versions, from `Cargo.lock`, for the commit message.
 
 - [ ] **Step 2: Write the failing tests** (`serve.rs`'s test module)
+
+The test module's imports gain `use crate::outbound::Host;` and `use charpente_core::io::{HttpMethod, IdempotencyKey};`. Neither `super::*` nor the existing test imports bring them in. `OutboundCall`, `OutboundReply` and the `Outbound` trait come through `super::*` from Step 4's imports.
 
 ```rust
     /// A one-shot plain-HTTP server on loopback: reads one whole request
@@ -5459,6 +5749,8 @@ Expected: FAIL to compile, naming `ProdOutbound`, `OutboundOptions`.
 
 - [ ] **Step 4: Implement**
 
+`serve.rs`'s imports gain `use std::collections::BTreeMap;`, `use std::sync::Arc;`, `use base64ct::Encoding;` (for `Base64::encode_string`, as `auth/oidc.rs` imports it), `use crate::outbound::Credential;`, and `Outbound, OutboundCall, OutboundReply` in its `use charpente_core::io::{…}` line.
+
 ```rust
 /// Operator settings for the outbound client (outbound-effects spec §9):
 /// `--outbound-base <host>=<url>` and `--outbound-ca <path>`, parsed by
@@ -5505,6 +5797,11 @@ impl ProdOutbound {
             return Ok(None);
         }
         let refuse = |m: String| io::Error::other(Refusal(m));
+        // R9 first: this client is built before the kernel, whose build runs
+        // the same check, so an unmatched host set is the kernel's own
+        // Refusal here too — and the `expect` below holds by construction.
+        let callers = app.outbound_callers();
+        crate::outbound::check_host_sets(&callers, app.outbound_config()).map_err(refuse)?;
         for (host, _) in &opts.bases {
             if !called.contains(&host.as_str()) {
                 return Err(refuse(format!(
@@ -5515,7 +5812,11 @@ impl ProdOutbound {
         }
         let mut routes = BTreeMap::new();
         for host in app.outbound_config() {
-            let job = app.first_job_calling(host.name()).expect("check_host_sets matched every Host entry");
+            let job = callers
+                .iter()
+                .find(|&&(_, h)| h == host.name())
+                .map(|&(job, _)| job)
+                .expect("check_host_sets above: every Host entry has a mounted job calling it");
             let mut headers = Vec::new();
             for cred in host.credentials() {
                 let var = |v: &str| {
@@ -5564,7 +5865,20 @@ impl Outbound for ProdOutbound {
 }
 ```
 
-`App` gains `pub(crate) fn first_job_calling(&self, host: &str) -> Option<&'static str>`. It is read before the kernel takes the defs, as `outbound_hosts` is.
+`App` gains `outbound_callers`, read before the kernel takes the defs, as `outbound_hosts` is:
+
+```rust
+    /// `(job name, host)` for each mounted outbound job, in mount order —
+    /// what `check_host_sets` takes.
+    pub(crate) fn outbound_callers(&self) -> Vec<(&'static str, &'static str)> {
+        self.job_defs
+            .iter()
+            .filter_map(|d| d.outbound.as_ref().map(|o| (d.name, o.host)))
+            .collect()
+    }
+```
+
+`ProdOutbound::new` is `Host::credentials`' first caller: delete the `expect(dead_code)` Task 7 put on it.
 
 ```rust
 /// `--outbound-base`'s value: `http(s)://<ip or localhost>[:port]`, nothing more.
@@ -5601,7 +5915,10 @@ fn parse_base(host: &str, base: &str) -> Result<(&'static str, Option<std::net::
 }
 
 /// Mozilla's roots (`webpki-roots`), so behaviour does not vary with the OS
-/// store, plus each `--outbound-ca`. HTTP/1.1 only.
+/// store, plus each `--outbound-ca`. ALPN is left to hyper-rustls:
+/// `HttpsConnectorBuilder::with_tls_config` asserts a config arrives with
+/// none set, and the HTTP/1-only connector `enable_http1` builds speaks
+/// HTTP/1.1.
 fn tls_config(cas: &[std::path::PathBuf]) -> Result<rustls::ClientConfig, String> {
     use rustls::pki_types::{CertificateDer, pem::PemObject};
     let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
@@ -5618,13 +5935,11 @@ fn tls_config(cas: &[std::path::PathBuf]) -> Result<rustls::ClientConfig, String
             roots.add(cert).map_err(|e| format!("{flag}: {e}"))?;
         }
     }
-    let mut config = rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+    Ok(rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
         .with_safe_default_protocol_versions()
         .map_err(|e| e.to_string())?
         .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
+        .with_no_client_auth())
 }
 ```
 
@@ -5682,9 +5997,55 @@ fn outbound_runtime(
 }
 ```
 
-`send` builds `{scheme}://{call.host}{:port if Some}{call.path}`. It adds the call's headers, then the route's credential headers. The kernel already refused any call that sets one of those (Task 7's `check`), so nothing collides. Map the client error: `e.is_connect()` → `io::Error::new(io::ErrorKind::ConnectionRefused, format!("could not connect: {e}"))`, so nothing was sent (A18). Anything else → `io::Error::other(format!("the connection failed after the request was sent: {e}"))`. Read the body frame by frame with `http_body_util::BodyExt::frame`, and stop once it holds more than `max_reply` bytes, truncated to `max_reply + 1`. A frame error after headers → `io::Error::other(format!("the reply broke off after {n} bytes: {e}"))`. Header values are taken with `String::from_utf8_lossy`. `Resolver` implements `tower_service::Service<hyper_util::client::legacy::connect::dns::Name>` with `Response = std::vec::IntoIter<SocketAddr>`. An override answers `SocketAddr::new(ip, 0)`; the connector applies the URI's port.
+`send` builds `{scheme}://{call.host}{:port if Some}{call.path}`. It adds the call's headers, then the route's credential headers. The kernel already refused any call that sets one of those (Task 7's `check`), so nothing collides. Map the client error: `e.is_connect()` → `io::Error::new(io::ErrorKind::ConnectionRefused, format!("could not connect: {e}"))`, so nothing was sent (A18). Anything else → `io::Error::other(format!("the connection failed after the request was sent: {e}"))`. Read the body frame by frame with `http_body_util::BodyExt::frame`, and stop once it holds more than `max_reply` bytes, truncated to `max_reply + 1`. A frame error after headers → `io::Error::other(format!("the reply broke off after {n} bytes: {e}"))`. Header values are taken with `String::from_utf8_lossy`.
+
+The resolver. `HttpConnector<R>: Service<Uri>` needs `R: Resolve + Clone + Send + Sync + 'static` and `R::Future: Send`, and `Client` needs its connector `Clone`, so `Resolver` derives `Clone` and boxes a `Send` future:
+
+```rust
+/// `--outbound-base`'s address override in front of the system resolver
+/// (plan amendment A11): only where a name resolves moves, never the name.
+#[derive(Clone)]
+struct Resolver {
+    overrides: Arc<BTreeMap<String, std::net::IpAddr>>,
+    system: hyper_util::client::legacy::connect::dns::GaiResolver,
+}
+
+impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for Resolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn std::future::Future<Output = io::Result<std::vec::IntoIter<SocketAddr>>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
+        // An override answers port 0; the connector applies the URI's port.
+        if let Some(ip) = self.overrides.get(name.as_str()) {
+            let addrs = vec![SocketAddr::new(*ip, 0)];
+            return Box::pin(async move { Ok(addrs.into_iter()) });
+        }
+        // `GaiResolver::poll_ready` is always ready, so it is not polled first.
+        let lookup = tower_service::Service::call(&mut self.system, name);
+        Box::pin(async move { Ok(lookup.await?.collect::<Vec<_>>().into_iter()) })
+    }
+}
+```
 
 `serve_with`: build `ProdOutbound::new(&app, &opts)?` before `bind_http`, so a refusal leaves nothing running. In the kernel thread, use `Kernel::builder(app, clock)`, plus `.outbound(Box::new(ob))` when `Some`, then `.build()`. `serve` delegates with defaults. `serve_replicated` does the same with `OutboundOptions::default()` and `.replication(repl)`: a replicated primary runs jobs too, and without the client its kernel would refuse to build. Update `serve`'s doc: "`Err` when the outbound setup refuses (a `Refusal`, nothing running) or the HTTP listener cannot be bound."
+
+`backup` and `archive` build kernels too, and after Task 11 an app with an outbound job refuses to start on either without a client (a backup is promoted into a primary, and an archive node runs jobs and cron). Each builds `let outbound = ProdOutbound::new(&app, &OutboundOptions::default())?;` first, then goes through the builder instead of `Kernel::with_replication`/`Kernel::with_archive`. `backup`:
+
+```rust
+    let mut builder =
+        kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new())).replication(repl);
+    if let Some(ob) = outbound {
+        builder = builder.outbound(Box::new(ob));
+    }
+    let mut kernel = builder.build()?;
+```
+
+`archive` is the same with `.archive(archive, store)` in place of `.replication(repl)`.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -5708,12 +6069,13 @@ Run `cargo build -p guide-examples`.
 Run the three gate commands, counted.
 
 ```bash
-git add crates/charpente/Cargo.toml Cargo.lock crates/charpente/src/serve.rs crates/charpente/src/http/app.rs docs/GUIDE.md docs/BENCH.md
+git add crates/charpente/Cargo.toml Cargo.lock crates/charpente/src/serve.rs crates/charpente/src/http/app.rs \
+  crates/charpente/src/outbound.rs docs/GUIDE.md docs/BENCH.md
 git commit -m "serve: the production outbound client — hyper + rustls (ring) + webpki-roots, no decisions at the edge; clean build +N.Ns (BENCH.md)
 
 Dependencies (spec §9): hyper client, hyper-util client-legacy/http1 (both already present),
 hyper-rustls <v>, rustls <v> (ring provider: no cmake), webpki-roots <v>, tower-service <v>
-(already in the tree via hyper-util; named directly for the resolver). Edge-only; the deny-list
+(a dependency of hyper-util's client feature; named directly for the resolver). Edge-only; the deny-list
 is unchanged. Rejected: reqwest (its own redirect/retry/timeout policy), native-tls (varies by OS)."
 ```
 
@@ -5726,7 +6088,7 @@ Fill in the versions and the measured delta.
 **Files:**
 - Modify: `crates/charpente/src/launch.rs` (`LAUNCH_USAGE`; the serve arm parses `--outbound-base`/`--outbound-ca`; a `Refusal` from `serve_with` prints "refused to start")
 - Create: `crates/outbound-fixture/{Cargo.toml, src/lib.rs, src/bin/outbound_node.rs, src/bin/fake_remote.rs, tests/sim.rs, tls/ca.pem, tls/ca.key, tls/server.pem, tls/server.key, tls/README.md}`
-- Modify: root `Cargo.toml` (`members`), `CLAUDE.md` (the workspace map and the test-file lists: `charpente` gains `outbound`, a new `outbound-fixture: sim` entry; `edge-harness` gains `outbound` in Task 16), `docs/GUIDE.md` §5 and §13 (the flags, `LAUNCH_USAGE` verbatim)
+- Modify: root `Cargo.toml` (`members`), `CLAUDE.md` (the workspace map and a new `outbound-fixture: sim` test-list entry; `charpente`'s `outbound` landed in Task 8, and `edge-harness` gains `outbound` in Task 16), `docs/GUIDE.md` §5 and §13 (the flags, `LAUNCH_USAGE` verbatim)
 
 **Interfaces:**
 - Consumes: Task 14's `serve_with`, `OutboundOptions`.
@@ -5810,7 +6172,8 @@ Run: `cargo test -p charpente --lib launch` → PASS, including every existing `
 - [ ] **Step 3: The test CA** (`crates/outbound-fixture/tls/`)
 
 ```bash
-cd crates/outbound-fixture/tls
+cd ~/Documents/GitHub/charpente
+mkdir -p crates/outbound-fixture/tls && cd crates/outbound-fixture/tls   # Step 4 creates the rest of the crate
 openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 36500 \
   -subj "/CN=charpente outbound-fixture test CA" \
   -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
@@ -5838,6 +6201,8 @@ publish = false
 
 [dependencies]
 charpente.workspace = true
+# The routes' `Wire` request/response types derive serde, as invoicing's do.
+serde = { version = "1", features = ["derive"] }
 # fake_remote only: a TLS server outside the deterministic boundary.
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
 hyper = { version = "1", features = ["http1", "server"] }
@@ -5851,6 +6216,11 @@ charpente-sim = { path = "../charpente-sim" }
 
 [lints]
 workspace = true
+
+# `sim_tests!` generates its own `fn main` (as sim-fixture's and invoicing's do).
+[[test]]
+name = "sim"
+harness = false
 ```
 
 Use the `rustls` version Task 14 resolved, so the tree carries one rustls. Check with `cargo tree -d | grep rustls`, which must print nothing.
@@ -5931,7 +6301,6 @@ pub fn build(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> 
 //! `charpente::launch` over the fixture app. The address and data directory
 //! come from the environment so the edge harness can run several; argv is
 //! launch's own (the serve verb's `--outbound-*` flags).
-#![allow(clippy::disallowed_methods)] // std::env at the process edge, outside the deterministic boundary
 
 fn main() -> std::io::Result<()> {
     let addr = std::env::var("OUTBOUND_NODE_ADDR").unwrap_or_else(|_| "127.0.0.1:8090".into());
@@ -5940,12 +6309,15 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-`src/bin/fake_remote.rs` is a TLS server with `tls/server.pem` + `tls/server.key`, located from `env!("CARGO_MANIFEST_DIR")`, serving HTTP/1.1. It carries the same file-level allow with the same rationale.
+`outbound_node.rs` carries no lint allow: `std::env` is not on the deny-list.
+
+`src/bin/fake_remote.rs` is a TLS server with `tls/server.pem` + `tls/server.key`, located from `env!("CARGO_MANIFEST_DIR")`, serving HTTP/1.1. It opens with `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]` and a rationale comment: a test server outside the deterministic boundary, whose `tokio::net` listeners and `std::fs` key reads are the point, as in the edge harness's files and `serve.rs`.
 - `POST /charge` requires `authorization: Bearer test-key`; anything else answers 401.
-- It dedupes by the `idempotency-key` header. The first time a key arrives it mints `ch_<n>` and counts an application. A repeat returns the same body.
-- It counts every request seen, by key.
-- With `--hold-ms MS` it applies first, then waits that long before answering. That's the "in flight" window `kill -9` aims at.
-- A plain-HTTP admin listener on `--admin-port` answers `GET /stats` with `{"requests": {key: n}, "applied": {key: n}}`.
+- It dedupes by the `idempotency-key` header. The first time a key arrives it mints `ch_<n>` and counts an application. A repeat returns the same body, at once.
+- A request with no `idempotency-key` header is applied every time (a fresh `ch_<n>` each) and counted under the bucket `<none>`.
+- It counts every request seen, by key (`<none>` for a keyless one).
+- With `--hold-ms MS`, only a key's FIRST application waits that long before answering: that's the "in flight" window `kill -9` aims at. A repeat of a key and a keyless request are never held, so a re-call after a restart answers inside the job's 2 s timeout.
+- A plain-HTTP admin listener on `--admin-port` answers `GET /stats` with plain text, one counter per line, sorted by key: `requests <key> <n>` lines, then `applied <key> <n>` lines. The edge harness has no dependencies, so it splits lines rather than parse JSON.
 - It prints `ready` once both listeners are bound.
 
 `tests/sim.rs` dogfoods `charpente test --sim --dir crates/outbound-fixture`. It holds one `sim_tests!` workload, `orders_charge_once require ["outbound:checked"]`:
@@ -5960,22 +6332,24 @@ It follows `crates/sim-fixture/tests/sim.rs`'s shape and `BOOT_TRIES` handling.
 
 Root `Cargo.toml` `members` gains `"crates/outbound-fixture"`. In CLAUDE.md:
 - the workspace map gains `` `crates/outbound-fixture` — the app outbound effects are proven against: a launch-driven node binary and a TLS fake remote the edge harness drives (its own crate so sim-fixture's and invoicing's recorded batches never move) ``;
-- the test lists gain `outbound` under charpente;
-- the test lists gain `outbound-fixture: sim`.
+- the test lists gain `outbound-fixture: sim` (charpente's `outbound` landed in Task 8).
 
 The `doc_inventory` gate enforces both lists, so run `cargo test -p guide-examples --test doc_inventory` and expect PASS.
 
 - [ ] **Step 6: Run everything this task touched**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo build -p outbound-fixture --bins
-cargo test -p outbound-fixture --no-fail-fast 2>&1 | tee $SDD/task15-fixture.log; grep -c "^test result: ok" $SDD/task15-fixture.log
-cargo run -p charpente-cli -- test --sim --dir crates/outbound-fixture --universes 64 2>&1 | tee $SDD/task15-cli-sim.log | tail -5
+cargo test -p outbound-fixture --no-fail-fast 2>&1 | tee $SDD/task15-fixture.log; print "EXIT=${pipestatus[1]}"
+grep -c "error: test failed" $SDD/task15-fixture.log    # 0
+grep -c "^test result: ok" $SDD/task15-fixture.log      # 4: the lib, the two bins, the doc-tests
+cargo run -p charpente-cli -- test --sim --dir crates/outbound-fixture --universes 64 2>&1 | tee $SDD/task15-cli-sim.log | tail -5; print "CLI_EXIT=${pipestatus[1]}"
 cargo test -p charpente --lib launch --no-fail-fast
 cargo test -p guide-examples --no-fail-fast 2>&1 | tee $SDD/task15-guide.log; grep -c "^test result: ok" $SDD/task15-guide.log
 ```
 
-Expected: the fixture builds, its sim test passes, `charpente test --sim` exits 0 over 64 universes, and `launch` and `guide-examples` stay green.
+Expected: the fixture builds; `EXIT=0` and 0 `error: test failed`; `charpente test --sim` exits 0 over 64 universes (`CLI_EXIT=0`); and `launch` and `guide-examples` stay green. The `sim` target is `harness = false`: it prints its own report and never a `test result:` line, so a red sim shows only as a non-zero exit and cargo's `error: test failed, to rerun pass --test sim`. Never judge it by the `test result:` count.
 
 - [ ] **Step 7: Gate and commit**
 
@@ -6019,6 +6393,11 @@ Read `ChildNode::spawn` and `restart`, then add `spawn_env`. It's the same body 
 //! against a local fake HTTPS remote on a local CA, over real TCP, under
 //! `kill -9` and TCP-proxy faults. The fake dedupes by idempotency key, so
 //! "applied once" is measured where the money would move.
+//!
+//! Outside DESIGN §1's determinism fence, as this whole crate is: real
+//! `TcpStream`, `Command`, `std::fs` and `thread::sleep` calls are the point,
+//! not a violation; the allow below matches `child.rs`/`scenario.rs`/`proxy.rs`'s.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use edge_harness::child::{ChildNode, build_bins};
 use edge_harness::client::Http;
@@ -6028,12 +6407,12 @@ use edge_harness::scenario::Scenario;
 const CA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../outbound-fixture/tls/ca.pem");
 ```
 
-The scenarios, each a `#[test] #[ignore]`, each opening its own `Scenario`. Each starts `fake_remote` on two free ports and waits for `ready`. Each starts `outbound_node` through `spawn_env` with `OUTBOUND_NODE_ADDR`, `OUTBOUND_NODE_DIR`, `FIXTURE_PAY_KEY=test-key` and argv `--outbound-base pay.fixture=https://127.0.0.1:<tls or proxy port> --outbound-ca <CA>`.
+The scenarios, each a `#[test] #[ignore]`, each opening its own `Scenario`. Each starts `fake_remote` on two free ports through `spawn_env`, with its admin address as `wait_addr`: `spawn_env` waits on a port, not on stdout's `ready`. Each starts `outbound_node` through `spawn_env` with `OUTBOUND_NODE_ADDR`, `OUTBOUND_NODE_DIR`, `FIXTURE_PAY_KEY=test-key` and argv `--outbound-base pay.fixture=https://127.0.0.1:<tls or proxy port> --outbound-ca <CA>`. `TcpProxy::drop_all`, `partition` and `delay_ms` each take `&mut Scenario` as their last argument (they record into it). `/stats` is Task 15's plain lines, `requests <key> <n>` and `applied <key> <n>`, read by splitting each line on whitespace.
 1. `an_order_is_charged_once_over_real_tls`: `POST /orders`, then poll `GET /orders/<id>` until `paid` (bounded at 30 s). Assert `/stats` shows that order's key applied 1 and requested 1.
 2. `kill_9_with_a_call_in_flight_re_calls_with_the_same_key`: the fake runs with `--hold-ms 3000`. Poll `/stats` until one request is seen, then `kill9` the node and `restart` it. Poll until paid. Assert applied 1 and requested ≥ 2 for one key, and exactly one key in `/stats`.
 3. `a_reset_between_node_and_remote_is_retried_with_the_same_key`: the base points through a `TcpProxy` to the fake's TLS port, and the fake holds 1000 ms. Once a request is seen, `proxy.drop_all`. Poll until paid. Assert one key, applied 1.
-4. `a_stalled_remote_times_out_and_is_retried`: the base goes through the proxy. Call `proxy.partition(true)` before the order, then `partition(false)` after 5 s (two 2 s deadlines). Poll until paid. Assert one key, applied 1.
-5. `an_unset_credential_refuses_the_start`: spawn by hand without `FIXTURE_PAY_KEY`, as `smoke.rs`'s launch-refusal test does. Expect exit 1 and stderr containing `charpente refused to start: outbound: FIXTURE_PAY_KEY is unset — host pay.fixture needs it for job ChargeOrder`.
+4. `a_stalled_remote_times_out_and_is_retried`: the base goes through the proxy, and the fake holds 1000 ms. A stall, not a partition: `partition` shuts each new connection at once, which is a connect error and so the refusal path, never a deadline. Once `/stats` shows the first request, call `proxy.delay_ms(3000, &mut scenario)`. Every chunk now crawls: the held reply misses the 2 s deadline, and a re-call's handshake stalls the same way. After 5 s, `proxy.delay_ms(0, &mut scenario)`. Poll until paid. Assert one key, with requests ≥ 2 and applied 1 for it: a deadline fired, and the re-call carried the same key.
+5. `an_unset_credential_refuses_the_start`: spawn by hand without `FIXTURE_PAY_KEY`, with `.env_remove("FIXTURE_PAY_KEY")` on the `Command` so an inherited value cannot mask the refusal, as `smoke.rs`'s launch-refusal test does. Expect exit 1 and stderr containing `charpente refused to start: outbound: FIXTURE_PAY_KEY is unset — host pay.fixture needs it for job ChargeOrder`.
 6. `without_the_test_ca_no_request_reaches_the_remote`: omit `--outbound-ca`. `POST /orders`, wait 5 s. Assert `/stats` shows zero requests and the order unpaid, so TLS verification refused the fake.
 
 Write each with the crate's helpers and its existing poll-with-deadline idiom. Every assertion message must name the scenario's artifacts directory (`Scenario`'s path), as the existing scenarios do.
@@ -6041,6 +6420,7 @@ Write each with the crate's helpers and its existing poll-with-deadline idiom. E
 - [ ] **Step 3: Run them**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo test -p edge-harness --test outbound -- --ignored --test-threads=1 2>&1 | tee $SDD/task16-edge.log; grep -E "^test |test result" $SDD/task16-edge.log
 ./scripts/edge-harness.sh 2>&1 | tee $SDD/task16-edge-all.log; grep -c "^test result: ok" $SDD/task16-edge-all.log
 ```
@@ -6049,7 +6429,7 @@ Run in the background (release builds and real timeouts), then poll. Expected: s
 
 - [ ] **Step 4: Prove the key is what makes it "applied once"**
 
-On a scratch copy (`git stash` is not used; edit, run, then `git checkout -- crates/outbound-fixture/src/lib.rs` and `touch` it), delete the `.header("idempotency-key", …)` line from `ChargeOrder::call` and rebuild the bins. Run scenario 2. Expected: RED, with applied ≥ 2 at the fake. Restore it. Record in progress.md.
+On a scratch copy (`git stash` is not used; edit, run, then `git checkout -- crates/outbound-fixture/src/lib.rs` and `touch` it), delete the `.header("idempotency-key", …)` line from `ChargeOrder::call` and rebuild the bins. Run scenario 2. Expected: RED, with the `<none>` bucket's `applied` ≥ 2 at the fake (Task 15's fake applies a keyless request every time). Restore it. Record in progress.md.
 
 - [ ] **Step 5: Inventory, gate, commit**
 
@@ -6078,7 +6458,7 @@ Tasks 2–16 landed their own docs with their code: DESIGN §1, GUIDE §5/§6/§
 
 - **README.**
   - The status section gains one paragraph after the TypeScript-client sentence, in that section's register: outbound effects have shipped. A job declared `outbound = "<host>"` decides an HTTP request after commit in a read-only `call`. The kernel makes it outside any transaction with a platform-minted idempotency key, and `settle` commits the reply's consequences with the Done mark as one record. The simulator injects the outside world's faults: refused, lost request, lost reply, throttled, slow (GUIDE §6, §8).
-  - The "not built" sentence becomes: "no blob store, no WebSockets, and on the outbound side no HTTP/2, proxies, request signing (AWS SigV4) or streaming replies."
+  - The "not built" sentence becomes: "no blob store, no WebSockets, and on the outbound side no `HTTP/2`, proxies, request signing (AWS `SigV4`) or streaming replies." The backticks are load-bearing: `claims_census` reads every unblanked digit as a figure needing provenance, and blanks only backticks and a few reference forms (`is_ref` covers `§` and `M`), so a bare `HTTP/2` or `SigV4` turns it red.
   - `:68-71` stays as written; it is now true.
 - **DESIGN §5.** The loss-window paragraph gains spec §8's first paragraph, adapted to DESIGN's voice: a dead primary can call out from a record it acked but never shipped; the minted key bounds the rest.
 - **DESIGN §6.** Replace the "M1's external-effect handlers" sentence with three sentences naming `call`/`settle`, the minted key and the `Outbound` trait, pointing at GUIDE §6.
@@ -6087,7 +6467,7 @@ Tasks 2–16 landed their own docs with their code: DESIGN §1, GUIDE §5/§6/§
 - **GUIDE §10.** Promotion and switchover gains "Calls in flight at a failover": the in-flight table is dropped, the new primary re-calls with the same key, and a call made from a record the old primary acked but never shipped is outside the surviving timeline (spec §8).
 - **GUIDE §15.** One paragraph: a restored Pending outbound job re-fires with its recorded key, so a remote that dedupes sees a repeat, not a new request.
 - **DECISIONS §14.** Spec §17's proposed text, verbatim, under `## 14. External effects are kernel-owned two-phase jobs (<date it lands>)`.
-- **PLAN.** In the after-launch section, record outbound effects as shipped (date, spec path, plan path). Add six v1.x rows, each with the trigger "the first app that needs it": outbound with `cross_tenant`, HTTP/2, outbound proxies, request signing (AWS SigV4, which SES needs), streaming replies, and a two-node switchover under outbound load (plan amendment A19; its trigger is the first replicated app with outbound jobs).
+- **PLAN.** In the after-launch section, record outbound effects as shipped (date, spec path, plan path). The section's heading (`PLAN.md:271`) lists each row's source: after "two from M3's tenancy completion" it gains ", six from outbound effects". Add six v1.x rows, each with the trigger "the first app that needs it": outbound with `cross_tenant`, HTTP/2, outbound proxies, request signing (AWS SigV4, which SES needs), streaming replies, and a two-node switchover under outbound load (plan amendment A19; its trigger is the first replicated app with outbound jobs).
 - **NEIGHBORS.** A "Durable execution" paragraph:
   - Temporal's activities are the shape `call`/`settle` takes, with the transaction as the workflow;
   - Restate journals the same idea per handler;
@@ -6097,6 +6477,7 @@ Tasks 2–16 landed their own docs with their code: DESIGN §1, GUIDE §5/§6/§
 - [ ] **Step 2: Run the doc gates**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo build -p guide-examples
 cargo test -p guide-examples --no-fail-fast 2>&1 | tee $SDD/gate-task-17.log; grep -c "^test result: ok" $SDD/gate-task-17.log; grep -c "^test result: FAILED" $SDD/gate-task-17.log
 ```
@@ -6120,9 +6501,11 @@ git commit -m "docs: outbound effects across README, DESIGN §5–§7, GUIDE §1
 - [ ] **Step 1: Draw fresh master seeds and record them before running anything**
 
 ```bash
-for i in $(seq 1 40); do od -An -N8 -tx8 /dev/urandom | tr -d ' '; done > $SDD/task18-bases.txt
-od -An -N8 -tx8 /dev/urandom | tr -d ' ' > $SDD/task18-fixture-master.txt
-wc -l $SDD/task18-bases.txt   # 40
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+# BSD `od -An` ends its output with two newlines: strip them all, then end each seed with one.
+for i in $(seq 1 40); do od -An -N8 -tx8 /dev/urandom | tr -d ' \n'; print; done > $SDD/task18-bases.txt
+{ od -An -N8 -tx8 /dev/urandom | tr -d ' \n'; print } > $SDD/task18-fixture-master.txt
+grep -c . $SDD/task18-bases.txt   # 40
 ```
 
 They are fresh, stated in the commit, and never chosen after seeing results.
@@ -6130,6 +6513,7 @@ They are fresh, stated in the commit, and never chosen after seeing results.
 - [ ] **Step 2: The platform property over 40 × 256 = 10,240 universes** (in the background)
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 ( for base in $(cat $SDD/task18-bases.txt); do
     CHARPENTE_BASE_SEED=0x$base cargo test -p charpente --test outbound outbound_jobs_are_exactly_once -- --nocapture \
       > $SDD/task18-swarm-$base.log 2>&1
@@ -6138,9 +6522,10 @@ They are fresh, stated in the commit, and never chosen after seeing results.
 print $! > $SDD/task18-swarm.pid
 ```
 
-Poll with `while kill -0 $(cat $SDD/task18-swarm.pid) 2>/dev/null; do sleep 30; done`. Then:
+Poll with bounded checks, one `kill -0 $(cat $SDD/task18-swarm.pid) 2>/dev/null || print exited` per call (a foreground `sleep` loop is blocked in this harness). Then:
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 grep -c " exit 0$" $SDD/task18-swarm-exits.txt          # expect 40
 grep -l "test result: ok. 1 passed" $SDD/task18-swarm-*.log | wc -l   # expect 40
 ```
@@ -6150,6 +6535,8 @@ A red base prints its seed and repro line. That's a finding: replay it (`CHARPEN
 - [ ] **Step 3: The fixture app over 10,000 universes from one fresh master seed** (in the background)
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+cargo build -p charpente-cli   # the binary below must exist and be this tree's
 ( ./target/debug/charpente test --sim --dir crates/outbound-fixture --universes 10000 \
     --master-seed 0x$(cat $SDD/task18-fixture-master.txt) --format json \
     > $SDD/task18-fixture.json 2> $SDD/task18-fixture.err; print "EXIT=$?" >> $SDD/task18-fixture.err ) &
@@ -6159,18 +6546,30 @@ When it exits: `jq '{universes, failures: (.failures | length), verdicts, gave_u
 
 - [ ] **Step 4: Oracle 3, final**
 
-`$SDD/oracle3.sh final` → exit 0. Every recorded batch replays with the same verdicts, failures, outcomes and coverage. Then run every existing pinned-seed test as part of the full gate below; they live in the suites it runs.
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+perl -e 'alarm 590; exec @ARGV' -- $SDD/oracle3.sh final   # oracle3 mode foreground; background: Global Constraints
+```
+
+Expected: exit 0. Every recorded batch replays with the same verdicts, failures, outcomes and coverage. Then run every existing pinned-seed test as part of the full gate below; they live in the suites it runs.
 
 - [ ] **Step 5: The full gate, counted**
 
 ```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 ( cargo test --workspace --no-fail-fast > $SDD/gate-final.log 2>&1; print "EXIT=$?" >> $SDD/gate-final.log ) &
-# poll for exit, then:
-grep -c "^test result: ok" $SDD/gate-final.log; grep -c "^test result: FAILED" $SDD/gate-final.log; tail -1 $SDD/gate-final.log
 ```
 
-Expected: the ok count is the base count from Task 1 plus every suite this plan added (`charpente`'s `outbound`, `outbound-fixture`'s `sim`, and any lib-test binary that is new). 0 FAILED, `EXIT=0`. Compare the count with `grep -c "^test result:" $SDD/gate-final.log`.
+Poll with bounded checks until the log's last line is `EXIT=…`, then:
+
+```bash
+cd ~/Documents/GitHub/charpente && SDD=/Users/noahmitchem/Documents/GitHub/charpente/.superpowers/sdd/2026-10-13-outbound-effects
+grep -c "^test result: ok" $SDD/gate-final.log; grep -c "^test result: FAILED" $SDD/gate-final.log
+grep -c "error: test failed" $SDD/gate-final.log; tail -1 $SDD/gate-final.log
+```
+
+Expected: the ok count is the base count from Task 1 plus exactly six new `test result:` lines: charpente's `tests/outbound`, edge-harness's `tests/outbound` (its six scenarios ignored), and outbound-fixture's lib, `outbound_node` bin, `fake_remote` bin and doc-tests. outbound-fixture's `sim` target is `harness = false` and prints no `test result:` line, so it is judged by the exit status alone: `EXIT=0` and 0 `error: test failed`. 0 FAILED. Compare the count with `grep -c "^test result:" $SDD/gate-final.log`.
 
 - [ ] **Step 6: The ledger**
 
@@ -6213,19 +6612,37 @@ Spec §16(5): a fresh agent builds an app that sends email and calls an LLM from
 ```bash
 cd ~/Documents/GitHub/charpente && git status --porcelain | wc -l     # 0
 SHA=$(git rev-parse HEAD); print $SHA
-cargo install --path crates/charpente-cli --locked --force 2>&1 | tail -2
+cargo install --path crates/charpente-cli --locked --force 2>&1 | tail -2; print "INSTALL_EXIT=${pipestatus[1]}"
 mkdir -p ~/Documents/GitHub/preflight-scratch && cd ~/Documents/GitHub/preflight-scratch
-charpente new preflight
+charpente new preflight; print "NEW_EXIT=$?"
 cat >> preflight/Cargo.toml <<'TOML'
 
 [patch.crates-io]
 charpente = { path = "../../charpente/crates/charpente" }
 charpente-sim = { path = "../../charpente/crates/charpente-sim" }
 TOML
-cd preflight && cargo clippy --all-targets -- -D warnings 2>&1 | tail -2 && charpente test --sim 2>&1 | tail -3
 ```
 
-0.1.0 on crates.io has no outbound surface, so the patch block is load-bearing here. Confirm that the scaffold compiled against the local crates: `cargo tree -i charpente | head -2` shows the path. If `[patch]` cannot match the registry version, use the third build's documented fallback (path dependencies via `sed`) and record which form worked. Write `preflight.md` (sha, dependency form, both exits), then `rm -rf ~/Documents/GitHub/preflight-scratch`.
+Each gate's exit is captured on its own: `a | tail && b` reads `tail`'s status, which is always 0, so a red clippy would still run the sim and record 0 for both.
+
+```bash
+cd ~/Documents/GitHub/preflight-scratch/preflight
+cargo clippy --all-targets -- -D warnings 2>&1 | tail -2; print "CLIPPY_EXIT=${pipestatus[1]}"
+charpente test --sim 2>&1 | tail -3; print "SIM_EXIT=${pipestatus[1]}"
+```
+
+Then prove the mutants verb out of tree, as the third build's preflight Step 4 did: the brief requires `--mutants`, and the local crates now pull hyper-rustls and ring into the scratch copy, so a failure here would otherwise surface only mid-attempt.
+
+```bash
+cd ~/Documents/GitHub/preflight-scratch/preflight
+unset CARGO_TARGET_DIR
+charpente test --mutants --dir . --file src/lib.rs --test-package preflight --timeout 300 2>&1 | tee mutants.log | tail -8
+print "MUTANTS_EXIT=${pipestatus[1]}"
+```
+
+Expected: `CLIPPY_EXIT=0`, `SIM_EXIT=0`, and a `mutants: N total — …` line with `MUTANTS_EXIT` 0 or 1 (both mean it ran; 2 means it could not, which is a finding to fix before dispatch).
+
+0.1.0 on crates.io has no outbound surface, so the patch block is load-bearing here. Confirm that the scaffold compiled against the local crates: `cargo tree -i charpente | head -2` shows the path. If `[patch]` cannot match the registry version, use the third build's documented fallback (path dependencies via `sed`) and record which form worked. Write `preflight.md` (sha, dependency form, every captured exit, the mutants summary line), then `rm -rf ~/Documents/GitHub/preflight-scratch`.
 
 - [ ] **Step 2: Write the brief** (`docs/experiments/2026-10-outbound/BRIEF.md`, verbatim)
 
@@ -6340,10 +6757,11 @@ The constraints carry over from the third build's plan:
 - [ ] **Step 1: Pin and lay out the run directory**
 
 ```bash
-RUN=~/Documents/GitHub/triage-run; APP=$RUN/triage
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage   # attempt N ≥ 2: triage-run-N
 cd ~/Documents/GitHub/charpente && git status --porcelain | wc -l      # 0
 SHA=$(git rev-parse HEAD); print "attempt sha $SHA"
 mkdir -p $RUN/docs
+print $SHA > $RUN/attempt-sha.txt   # later blocks re-set SHA from this file, never from HEAD
 cp docs/experiments/2026-10-outbound/BRIEF.md $RUN/BRIEF.md
 cp README.md $RUN/docs/README.md && cp docs/GUIDE.md $RUN/docs/GUIDE.md
 python3 -c "import hashlib;print(hashlib.sha256(open('$RUN/BRIEF.md','rb').read()).hexdigest())"   # equals the README's hash
@@ -6368,9 +6786,20 @@ record, and the last line of your FINDINGS.md.
 
 Record the launch result's `output_file` in progress.md. When the notification arrives, check the deliverables (`$APP/.git`, `FINDINGS.md` with a master seed and a `mutants:` line, `tests/sim.rs`). If the builder stopped short, with no live cargo process under `$APP` and no final report, resume the same agent with exactly `continue from your FINDINGS.md and git log`. Count each resume. Never answer its questions; they are testimony. While it runs, no `cargo` runs in charpente's tree and nothing under `crates/` changes. Freeze with `cp <output_file> $RUN/transcript.jsonl` and `git -C $APP bundle create ~/Documents/GitHub/triage-attempt-N.bundle --all`.
 
+- [ ] **Step 2a: Record the builder's master seed**
+
+Read the master seed from `$APP/FINDINGS.md` (`grep -n -i 'master seed' $APP/FINDINGS.md`) and check it against the builder's final reply. Write it to `$RUN/mseed.txt` (`print 0x<16 hex digits> > $RUN/mseed.txt`). Every later block re-sets `MSEED` from that file.
+
+Every block in Steps 3 and 4 opens with the same line, since shell state does not persist (Global Constraints); attempt N ≥ 2 writes `triage-run-N` in it, as Step 1 does:
+
+```bash
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage; SHA=$(cat $RUN/attempt-sha.txt); MSEED=$(cat $RUN/mseed.txt)
+```
+
 - [ ] **Step 3: The mechanical gates** (each result into `gates.md`, quoting output)
 
 ```bash
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage; SHA=$(cat $RUN/attempt-sha.txt); MSEED=$(cat $RUN/mseed.txt)
 cd ~/Documents/GitHub/charpente
 git diff $SHA --stat -- crates Cargo.toml Cargo.lock | wc -l          # 0
 python3 - "$RUN" <<'PY'
@@ -6393,15 +6822,23 @@ for line in open(os.path.join(run, "transcript.jsonl")):
 print(f"{len(hits)} suspicious call(s)")
 for n, t in hits: print(f"  {n}: {t}")
 PY
+```
+
+```bash
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage; SHA=$(cat $RUN/attempt-sha.txt); MSEED=$(cat $RUN/mseed.txt)
 cd $APP
-cargo clippy --all-targets -- -D warnings 2>&1 | tail -2
-cargo test 2>&1 | tee $RUN/app-test.log | grep -c '^test result: ok'; grep -c '^test result: FAILED' $RUN/app-test.log
+cargo clippy --all-targets -- -D warnings 2>&1 | tail -2; print "CLIPPY_EXIT=${pipestatus[1]}"
+cargo test --no-fail-fast 2>&1 | tee $RUN/app-test.log | grep -c '^test result: ok'; print "EXIT=${pipestatus[1]}"
+grep -c 'error: test failed' $RUN/app-test.log      # 0: the app's sim target is harness = false and prints no `test result:` line
+grep -c '^test result: FAILED' $RUN/app-test.log
 grep -n -i 'master seed' FINDINGS.md | head -3
 ```
 
 Then replay the agent's master seed twice, each in the background, and compare:
 
 ```bash
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage; SHA=$(cat $RUN/attempt-sha.txt); MSEED=$(cat $RUN/mseed.txt)
+cd $APP
 ( charpente test --sim --universes 10000 --master-seed $MSEED --format json > $RUN/replay-1.json 2> $RUN/replay-1.err; print "EXIT=$?" >> $RUN/replay-1.err ) &
 # poll; then the same to replay-2.json; then:
 cmp $RUN/replay-1.json $RUN/replay-2.json && print REPLAY_IDENTICAL
@@ -6411,23 +6848,28 @@ jq '{universes, failures: (.failures|length), verdicts, gave_up}' $RUN/replay-1.
 Then run the controller's own mutants over every file holding an outbound job (`grep -ln 'outbound *=' src/**/*.rs src/*.rs`):
 
 ```bash
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage; SHA=$(cat $RUN/attempt-sha.txt); MSEED=$(cat $RUN/mseed.txt)
+cd $APP
 unset CARGO_TARGET_DIR
 ( charpente test --mutants --dir . --file src/<f>.rs --test-package triage --timeout 600 > $RUN/mutants-<f>.log 2>&1; print "EXIT=$?" >> $RUN/mutants-<f>.log ) &
 # poll; then:
-grep -h '^mutants:\|^MISSED\|^TIMEOUT\|^EXIT=' $RUN/mutants-*.log; cargo clean -p triage
+grep -h '^mutants:\|MISSED\|TIMED OUT\|^EXIT=' $RUN/mutants-*.log; cargo clean -p triage
 ```
+
+The verb indents its `N MISSED:` and `N TIMED OUT:` lines, so those two patterns are unanchored; the `mutants:` line carries the counts either way.
 
 Every line must be PASS before the review starts:
 - sha unchanged;
 - 0 suspicious calls, or each one ruled;
 - clippy 0;
-- tests all ok;
+- the app's `cargo test --no-fail-fast` gives `EXIT=0` and 0 `error: test failed`;
 - `REPLAY_IDENTICAL` with `failures 0` and `universes 10000`;
 - every mutants log `EXIT=0` with 0 missed and 0 timed out.
 
 - [ ] **Step 4: The ambiguous-call check, on a copy** (spec §16(5); the controller's, before the review)
 
 ```bash
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage; SHA=$(cat $RUN/attempt-sha.txt); MSEED=$(cat $RUN/mseed.txt)
 rm -rf $RUN/keyless && cp -R $APP $RUN/keyless && cd $RUN/keyless
 grep -n -i 'idempotency' src/**/*.rs src/*.rs      # the line(s) placing the key on the mail call
 ```
@@ -6435,6 +6877,8 @@ grep -n -i 'idempotency' src/**/*.rs src/*.rs      # the line(s) placing the key
 Delete the line(s) that put the key on the mailer request, and nothing else. Record the diff in `keyless-check.md`. Then run the agent's own properties:
 
 ```bash
+RUN=/Users/noahmitchem/Documents/GitHub/triage-run; APP=$RUN/triage; SHA=$(cat $RUN/attempt-sha.txt); MSEED=$(cat $RUN/mseed.txt)
+cd $RUN/keyless
 ( charpente test --sim --universes 10000 --master-seed $MSEED --format json > $RUN/keyless.json 2> $RUN/keyless.err; print "EXIT=$?" >> $RUN/keyless.err ) &
 # poll; then:
 jq '.failures[0] | {test, seed, message, repro}' $RUN/keyless.json
