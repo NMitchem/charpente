@@ -123,9 +123,13 @@ pub type JobGlue =
 /// Dispatch runs `call`, the kernel makes the call outside any transaction,
 /// and `settle` commits the reply's consequences with the Done mark.
 pub struct OutboundDef {
+    /// The declared host, a bare DNS name; the `App` carries a `Host` entry for it.
     pub host: &'static str,
+    /// How long the edge waits for the remote before the attempt is a timeout.
     pub timeout: std::time::Duration,
+    /// Builds the call from the payload (or declines with `Ok(None)`).
     pub call: CallGlue,
+    /// Commits the reply's consequences in the transaction that marks the job Done.
     pub settle: SettleGlue,
 }
 
@@ -140,6 +144,8 @@ pub type CallGlue = fn(
     Option<JobScope<'_>>,
 ) -> Result<Option<crate::outbound::Call>, JobError>;
 
+/// Decode the payload and hand the reply to the job's `settle`, which writes
+/// in the same transaction as the Done mark.
 pub type SettleGlue =
     fn(&mut Tx, &[u8], crate::outbound::Reply, Option<JobScope<'_>>) -> Result<(), JobError>;
 
