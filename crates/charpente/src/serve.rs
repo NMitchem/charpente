@@ -757,13 +757,14 @@ impl ProdOutbound {
                 // value with no control character is a valid header value, so
                 // `send`'s request always builds; a Basic pair travels
                 // base64-encoded, so for it the rule catches a pasted newline
-                // rather than a header limit.
+                // rather than a header limit. Only a Basic password may be
+                // empty: key-as-username APIs (Stripe's `-u sk_…:`) send one.
                 let h = host.name();
-                let var = |v: &str| match std::env::var(v) {
+                let var = |v: &str, may_be_empty: bool| match std::env::var(v) {
                     Err(std::env::VarError::NotPresent) => Err(refuse(format!(
                         "outbound: {v} is unset — host {h} needs it for job {job}"
                     ))),
-                    Ok(value) if value.is_empty() => Err(refuse(format!(
+                    Ok(value) if value.is_empty() && !may_be_empty => Err(refuse(format!(
                         "outbound: {v} is set but empty — host {h} needs it for job {job}"
                     ))),
                     Ok(value) if !value.bytes().any(|b| b.is_ascii_control()) => Ok(value),
@@ -773,12 +774,13 @@ impl ProdOutbound {
                     ))),
                 };
                 headers.push(match cred {
-                    Credential::Bearer(v) => {
-                        ("authorization".to_string(), format!("Bearer {}", var(v)?))
-                    }
-                    Credential::Header(name, v) => (name.clone(), var(v)?),
+                    Credential::Bearer(v) => (
+                        "authorization".to_string(),
+                        format!("Bearer {}", var(v, false)?),
+                    ),
+                    Credential::Header(name, v) => (name.clone(), var(v, false)?),
                     Credential::Basic(u, p) => {
-                        let pair = format!("{}:{}", var(u)?, var(p)?);
+                        let pair = format!("{}:{}", var(u, false)?, var(p, true)?);
                         (
                             "authorization".to_string(),
                             format!("Basic {}", base64ct::Base64::encode_string(pair.as_bytes())),
@@ -2243,7 +2245,8 @@ mod tests {
     /// newline, or an empty one, refuses the start instead of failing every
     /// call (an empty one as `Repl::open` refuses an empty peer secret), and
     /// each refusal names the variable, never the value. Basic's pair is held
-    /// to the same rule, though base64 would carry it.
+    /// to the same rule, though base64 would carry it, except that its
+    /// password may be empty (`a_basic_host_with_an_empty_password_sends_user_colon`).
     #[test]
     fn a_credential_that_cannot_be_sent_refuses_the_start() {
         // Safety of set_var: as in
@@ -2271,10 +2274,22 @@ mod tests {
              or is not UTF-8 — host pay.test needs it for job ServeTestCharge; set it to the \
              credential alone"
         );
+        let empty = "outbound: SERVE_TEST_EMPTY_KEY is set but empty — host pay.test needs it \
+                     for job ServeTestCharge";
         assert_eq!(
             refusal(Host::new("pay.test").bearer_env("SERVE_TEST_EMPTY_KEY")),
-            "outbound: SERVE_TEST_EMPTY_KEY is set but empty — host pay.test needs it for job \
-             ServeTestCharge"
+            empty
+        );
+        assert_eq!(
+            refusal(Host::new("pay.test").header_env("x-api-key", "SERVE_TEST_EMPTY_KEY")),
+            empty
+        );
+        assert_eq!(
+            refusal(
+                Host::new("pay.test").basic_env("SERVE_TEST_EMPTY_KEY", "SERVE_TEST_BASIC_USER")
+            ),
+            empty,
+            "an empty Basic user refuses; only the password may be empty"
         );
         assert_eq!(
             refusal(
@@ -2283,6 +2298,38 @@ mod tests {
             "outbound: SERVE_TEST_BASIC_PASS holds a control character (a trailing newline, say) \
              or is not UTF-8 — host pay.test needs it for job ServeTestCharge; set it to the \
              credential alone"
+        );
+    }
+
+    /// Key-as-username APIs (Stripe's documented `-u sk_…:`) send an empty
+    /// Basic password, so an empty password variable starts, and the header
+    /// carries `user:`.
+    #[test]
+    fn a_basic_host_with_an_empty_password_sends_user_colon() {
+        // Safety of set_var: as in
+        // `prod_sends_the_call_with_its_credential_and_returns_the_reply`.
+        unsafe {
+            std::env::set_var("SERVE_TEST_KEY_AS_USER", "sk_test_basic");
+            std::env::set_var("SERVE_TEST_EMPTY_PASS", "");
+        }
+        let (port, server) = one_shot(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_vec());
+        let app = charge_app(
+            Host::new("pay.test").basic_env("SERVE_TEST_KEY_AS_USER", "SERVE_TEST_EMPTY_PASS"),
+        );
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts)
+            .unwrap()
+            .expect("the app calls out");
+        ob.start(0, plain_call("/basic")).unwrap();
+        let (_, reply) = wait_for(&ob);
+        assert_eq!(reply.unwrap().status, 200);
+        let raw = String::from_utf8(server.join().unwrap()).unwrap();
+        assert!(
+            raw.contains("authorization: Basic c2tfdGVzdF9iYXNpYzo=\r\n"),
+            "base64(\"sk_test_basic:\"): {raw}"
         );
     }
 

@@ -1969,7 +1969,9 @@ value never enters the log, the sim, an error text or `describe`, which lists
 variable and header names only. A variable that is unset, empty, holds a
 control character or is not UTF-8 refuses the start before the listener is
 bound (a `basic_env` pair included, though base64 would carry a control
-character: one there is a pasted newline, not a credential):
+character: one there is a pasted newline, not a credential). The one
+exception is a `basic_env` password, which may be empty, since APIs that take
+the key as the username (Stripe's `-u sk_…:`) send `user:`:
 
 <!-- pinned -->
 ```text
