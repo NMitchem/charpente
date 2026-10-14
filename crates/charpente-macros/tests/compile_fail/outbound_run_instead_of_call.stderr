@@ -17,8 +17,10 @@ note: the trait `Fn` must be implemented
   = help: items from traits can only be used if the trait is implemented and in scope
   = note: the following traits define an item `call`, perhaps you need to implement one of them:
           candidate #1: `Fn`
-          candidate #2: `hyper::service::http::HttpService`
-          candidate #3: `hyper::service::service::Service`
+          candidate #2: `futures_util::fns::Fn1`
+          candidate #3: `hyper::service::http::HttpService`
+          candidate #4: `hyper::service::service::Service`
+          candidate #5: `tower_service::Service`
   = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0599]: no associated function or constant named `settle` found for struct `Charge` in the current scope

@@ -295,7 +295,9 @@ pub struct OutboundCall {
 }
 
 /// A reply of any status. A transport failure is not a reply: it arrives as the
-/// `Err` of a completion.
+/// `Err` of a completion. When the remote's body exceeds the host's reply cap,
+/// an impl returns at least cap + 1 body bytes: the kernel's over-cap check
+/// depends on it.
 #[derive(Clone, Debug)]
 pub struct OutboundReply {
     pub status: u16,

@@ -514,6 +514,15 @@ impl App {
             .collect()
     }
 
+    /// `(job name, host)` for each mounted outbound job, in mount order —
+    /// what `check_host_sets` takes.
+    pub(crate) fn outbound_callers(&self) -> Vec<(&'static str, &'static str)> {
+        self.job_defs
+            .iter()
+            .filter_map(|d| d.outbound.as_ref().map(|o| (d.name, o.host)))
+            .collect()
+    }
+
     /// Registers `#[job]` descriptors (mount-time duplicate-name panic — each
     /// job type is mounted once, like routes), and each one's payload shape
     /// and declared tenancy (its `scoped_by` with its `scope_type`) with the

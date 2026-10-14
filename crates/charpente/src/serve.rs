@@ -4,13 +4,15 @@
 //! bytes. Everything behavioral stays in `crate::http`, inside the sim.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use base64ct::Encoding;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Frame, Incoming};
@@ -18,11 +20,14 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 
 use charpente_core::db::Refusal;
-use charpente_core::io::{Clock, Disk, Instant, ObjectStore};
+use charpente_core::io::{
+    Clock, Disk, Instant, ObjectStore, Outbound, OutboundCall, OutboundReply,
+};
 
 use crate::archive::{Archive, ArchiveConfig};
 use crate::http::{App, Method, Request, Response};
 use crate::kernel;
+use crate::outbound::Credential;
 use crate::repl::{self, Repl};
 
 /// A running server: the HTTP edge, and the kernel thread it feeds. v0 has no
@@ -97,10 +102,21 @@ fn kernel_stop_line(started: bool, e: &io::Error) -> String {
     }
 }
 
-/// `Err` only when the HTTP listener cannot be bound: the bind runs before
-/// the kernel thread exists, so a failed one leaves nothing running.
+/// `serve_with` and no operator outbound settings: each declared host is
+/// reached at `https://<host>:443`. `Err` when the outbound setup refuses (a
+/// `Refusal`, nothing running) or the HTTP listener cannot be bound.
 pub fn serve(addr: &str, app: App) -> io::Result<Server> {
+    serve_with(addr, app, OutboundOptions::default())
+}
+
+/// `serve`, with the operator's outbound settings (outbound-effects spec §9).
+/// The outbound client is built first, reading each credential variable
+/// once, then the HTTP listener is bound; both run before the kernel thread
+/// exists, so an `Err` (a `Refusal` from the outbound setup, or a failed
+/// bind) leaves nothing running.
+pub fn serve_with(addr: &str, app: App, outbound: OutboundOptions) -> io::Result<Server> {
     let body_cap = app.config().body_cap;
+    let outbound = ProdOutbound::new(&app, &outbound)?;
     let listener = bind_http(addr)?;
     let (kernel_tx, kernel_rx) = mpsc::channel::<(Request, kernel::Reply)>();
 
@@ -108,7 +124,8 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
     // ticks all serialize through Kernel::run's event loop (DESIGN §1).
     let kernel = std::thread::spawn(move || -> i32 {
         let clock = crate::prod::ProdClock::new();
-        let mut kernel = match kernel::Kernel::new(app, Box::new(crate::prod::ProdClock::new())) {
+        let builder = kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new()));
+        let mut kernel = match build_kernel(builder, outbound) {
             Ok(kernel) => kernel,
             Err(e) => {
                 eprintln!("{}", kernel_stop_line(false, &e));
@@ -136,13 +153,15 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
 }
 
 /// A replicated node: the same HTTP edge, but the kernel thread opens a `Repl`
-/// (over `repl_disk` for the durable role, `ProdNet` for the wire) and runs
-/// `Kernel::with_replication`. A follower serves reads and answers writes with
+/// (over `repl_disk` for the durable role, `ProdNet` for the wire) and builds
+/// a replicating kernel. A follower serves reads and answers writes with
 /// 421; a primary ships its log. `repl_cfg.listen` is the replication port
 /// (distinct from the HTTP `addr`); a startup role/config mismatch is surfaced
-/// on stderr, config never overriding the durable role (DESIGN §5). `Err`
-/// only when the HTTP listener cannot be bound, before any kernel thread
-/// exists — as for `serve`.
+/// on stderr, config never overriding the durable role (DESIGN §5). A
+/// primary runs jobs, so the outbound client is built as `serve` builds it,
+/// with no operator settings. `Err` when the outbound setup refuses or the
+/// HTTP listener cannot be bound, before any kernel thread exists — as for
+/// `serve`.
 pub fn serve_replicated(
     addr: &str,
     app: App,
@@ -150,6 +169,7 @@ pub fn serve_replicated(
     repl_cfg: repl::ReplConfig,
 ) -> io::Result<Server> {
     let body_cap = app.config().body_cap;
+    let outbound = ProdOutbound::new(&app, &OutboundOptions::default())?;
     let listener = bind_http(addr)?;
     let (kernel_tx, kernel_rx) = mpsc::channel::<(Request, kernel::Reply)>();
 
@@ -176,11 +196,9 @@ pub fn serve_replicated(
                 return 1;
             }
         };
-        let mut kernel = match kernel::Kernel::with_replication(
-            app,
-            Box::new(crate::prod::ProdClock::new()),
-            repl,
-        ) {
+        let builder =
+            kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new())).replication(repl);
+        let mut kernel = match build_kernel(builder, outbound) {
             Ok(kernel) => kernel,
             Err(e) => {
                 eprintln!("{}", kernel_stop_line(false, &e));
@@ -207,12 +225,15 @@ pub fn serve_replicated(
     Ok(http_edge(listener, body_cap, kernel_tx, kernel))
 }
 
-/// A backup node: replication only, no HTTP edge. Runs `Kernel::with_replication`
+/// A backup node: replication only, no HTTP edge. Runs a replicating kernel
 /// on the CURRENT thread against `EmptySource` (no requests ever arrive), so it
 /// follows the primary, keeps its own durable copy, and can be promoted later.
 /// Blocks until the kernel returns: `Err` on a platform IO failure or a named
-/// `Refusal` (`Refusal::of`).
+/// `Refusal` (`Refusal::of`). A backup is promoted into a primary, so it
+/// builds the outbound client first, as `serve` does with no operator
+/// settings, and a missing credential refuses before replication opens.
 pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) -> io::Result<()> {
+    let outbound = ProdOutbound::new(&app, &OutboundOptions::default())?;
     let clock = crate::prod::ProdClock::new();
     let mut app = app;
     let (repl, notice) = Repl::open(
@@ -224,8 +245,9 @@ pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) ->
     if let Some(notice) = notice {
         eprintln!("charpente replication: {notice}");
     }
-    let mut kernel =
-        kernel::Kernel::with_replication(app, Box::new(crate::prod::ProdClock::new()), repl)?;
+    let builder =
+        kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new())).replication(repl);
+    let mut kernel = build_kernel(builder, outbound)?;
     let mut source = EmptySource { clock };
     kernel.run(&mut source)
 }
@@ -264,14 +286,31 @@ pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) ->
 /// design is otherwise ready for it — the archive arm gates on
 /// `Db::verifying()` rather than `writes_allowed()`, so a follower archives
 /// normally.
+///
+/// Because it runs jobs, it builds the outbound client first, as `serve`
+/// does with no operator settings: a missing credential refuses before the
+/// archive opens.
 pub fn archive(app: App, store: Box<dyn ObjectStore>, cfg: ArchiveConfig) -> io::Result<()> {
+    let outbound = ProdOutbound::new(&app, &OutboundOptions::default())?;
     let clock = crate::prod::ProdClock::new();
     let mut app = app;
     let archive = Archive::open(cfg, app.db_mut())?;
-    let mut kernel =
-        kernel::Kernel::with_archive(app, Box::new(crate::prod::ProdClock::new()), archive, store)?;
+    let builder = kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new()))
+        .archive(archive, store);
+    let mut kernel = build_kernel(builder, outbound)?;
     let mut source = EmptySource { clock };
     kernel.run(&mut source)
+}
+
+/// `builder`'s kernel, with the outbound client when the app calls out.
+fn build_kernel(
+    builder: kernel::KernelBuilder,
+    outbound: Option<ProdOutbound>,
+) -> io::Result<kernel::Kernel> {
+    match outbound {
+        Some(ob) => builder.outbound(Box::new(ob)).build(),
+        None => builder.build(),
+    }
 }
 
 /// Binds the HTTP listener, ready for `http_edge`. `serve` and
@@ -641,17 +680,446 @@ fn from_kernel_response(
         .expect("kernel responses are valid HTTP")
 }
 
+/// Operator settings for the outbound client (outbound-effects spec §9):
+/// `--outbound-base <host>=<url>` and `--outbound-ca <path>`, parsed by
+/// `launch` (Task 15) or built by hand for `serve_with`.
+#[derive(Default, Clone)]
+pub struct OutboundOptions {
+    pub bases: Vec<(String, String)>,
+    pub cas: Vec<std::path::PathBuf>,
+}
+
+/// The production `Outbound` (spec §9): hyper + rustls on a current-thread
+/// tokio runtime of its own. It makes no decisions (R10): no timers, no
+/// retries (`retry_canceled_requests(false)`), no redirects (a 3xx is a reply),
+/// no proxy. `start` hands the call to the runtime, completions return on a
+/// std channel the kernel polls, and `cancel` aborts the task.
+///
+/// No `Debug`, here or on `Route`: the credential values it holds must never
+/// reach a log line.
+pub(crate) struct ProdOutbound {
+    cmds: tokio::sync::mpsc::UnboundedSender<Cmd>,
+    done: mpsc::Receiver<(u64, io::Result<OutboundReply>)>,
+    /// Started and neither completed nor cancelled: what `start`'s contract
+    /// assertion reads. Touched on the kernel thread only.
+    in_flight: std::cell::RefCell<BTreeSet<u64>>,
+}
+
+enum Cmd {
+    Start(u64, OutboundCall),
+    Cancel(u64),
+}
+
+/// Where one host is reached, and how it is authenticated. `scheme` is
+/// `https` except for a loopback `--outbound-base`; `addr` overrides DNS but
+/// never the TLS name (plan amendment A11).
+struct Route {
+    scheme: &'static str,
+    port: Option<u16>,
+    addr: Option<std::net::IpAddr>,
+    headers: Vec<(String, String)>,
+    max_reply: usize,
+}
+
+impl ProdOutbound {
+    /// `Ok(None)` for an app whose jobs call nothing: no runtime thread exists
+    /// (spec §4 invariant 6). Every setup failure is a `Refusal`, so `serve`
+    /// reports "refused to start".
+    pub(crate) fn new(app: &App, opts: &OutboundOptions) -> io::Result<Option<ProdOutbound>> {
+        let called = app.outbound_hosts();
+        if called.is_empty() {
+            return Ok(None);
+        }
+        let refuse = |m: String| io::Error::other(Refusal(m));
+        // R9 first: this client is built before the kernel, whose build runs
+        // the same check, so an unmatched host set is the kernel's own
+        // Refusal here too — and the `expect` below holds by construction.
+        let callers = app.outbound_callers();
+        crate::outbound::check_host_sets(&callers, app.outbound_config()).map_err(refuse)?;
+        for (host, _) in &opts.bases {
+            if !called.contains(&host.as_str()) {
+                return Err(refuse(format!(
+                    "--outbound-base names {host}, which no mounted job calls — the hosts this app calls are: {}",
+                    called.join(", ")
+                )));
+            }
+        }
+        let mut routes = BTreeMap::new();
+        for host in app.outbound_config() {
+            let job = callers
+                .iter()
+                .find(|&&(_, h)| h == host.name())
+                .map(|&(job, _)| job)
+                .expect("check_host_sets above: every Host entry has a mounted job calling it");
+            let mut headers = Vec::new();
+            for cred in host.credentials() {
+                // The refusals name the variable, never its value.
+                let var = |v: &str| match std::env::var(v) {
+                    Err(std::env::VarError::NotPresent) => Err(refuse(format!(
+                        "outbound: {v} is unset — host {} needs it for job {job}",
+                        host.name()
+                    ))),
+                    Ok(value) if hyper::header::HeaderValue::from_str(&value).is_ok() => Ok(value),
+                    _ => Err(refuse(format!(
+                        "outbound: {v} holds a byte an HTTP header cannot carry (a control \
+                         character such as a trailing newline, or text that is not UTF-8) — host \
+                         {} needs it for job {job}; set it to the credential alone",
+                        host.name()
+                    ))),
+                };
+                headers.push(match cred {
+                    Credential::Bearer(v) => {
+                        ("authorization".to_string(), format!("Bearer {}", var(v)?))
+                    }
+                    Credential::Header(name, v) => (name.clone(), var(v)?),
+                    Credential::Basic(u, p) => {
+                        let pair = format!("{}:{}", var(u)?, var(p)?);
+                        (
+                            "authorization".to_string(),
+                            format!("Basic {}", base64ct::Base64::encode_string(pair.as_bytes())),
+                        )
+                    }
+                });
+            }
+            let base = opts
+                .bases
+                .iter()
+                .find(|(h, _)| h == host.name())
+                .map(|(_, b)| b.as_str());
+            let (scheme, addr, port) = match base {
+                None => ("https", None, None),
+                Some(b) => parse_base(host.name(), b).map_err(refuse)?,
+            };
+            routes.insert(
+                host.name(),
+                Route {
+                    scheme,
+                    port,
+                    addr,
+                    headers,
+                    max_reply: host.max_reply(),
+                },
+            );
+        }
+        let tls = tls_config(&opts.cas).map_err(refuse)?;
+        let (cmds, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, done) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("charpente-outbound".into())
+            .spawn(move || outbound_runtime(rx, done_tx, routes, tls))?;
+        Ok(Some(ProdOutbound {
+            cmds,
+            done,
+            in_flight: std::cell::RefCell::new(BTreeSet::new()),
+        }))
+    }
+}
+
+impl Outbound for ProdOutbound {
+    fn start(&self, token: u64, call: OutboundCall) -> io::Result<()> {
+        assert!(
+            self.in_flight.borrow_mut().insert(token),
+            "contract: Outbound::start({token}) while that token is in flight"
+        );
+        self.cmds.send(Cmd::Start(token, call)).map_err(|_| {
+            self.in_flight.borrow_mut().remove(&token);
+            io::Error::other("the outbound runtime thread is gone")
+        })
+    }
+    fn poll(&self) -> Option<(u64, io::Result<OutboundReply>)> {
+        let (token, result) = self.done.try_recv().ok()?;
+        self.in_flight.borrow_mut().remove(&token);
+        Some((token, result))
+    }
+    fn cancel(&self, token: u64) {
+        self.in_flight.borrow_mut().remove(&token);
+        let _ = self.cmds.send(Cmd::Cancel(token));
+    }
+}
+
+/// `--outbound-base`'s value: `http(s)://<ip or localhost>[:port]`, nothing more.
+fn parse_base(
+    host: &str,
+    base: &str,
+) -> Result<(&'static str, Option<std::net::IpAddr>, Option<u16>), String> {
+    let flag = format!("--outbound-base {host}={base}");
+    let (scheme, rest) = if let Some(r) = base.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = base.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return Err(format!(
+            "{flag}: a base begins with https:// (or http:// on loopback)"
+        ));
+    };
+    if rest.contains('/') {
+        return Err(format!(
+            "{flag}: a base is a scheme, an address and an optional port — no path"
+        ));
+    }
+    let (name, port) = match rest.rsplit_once(':') {
+        Some((n, p)) if !n.ends_with(']') || n.starts_with('[') => (
+            n,
+            Some(
+                p.parse::<u16>()
+                    .map_err(|_| format!("{flag}: \"{p}\" is not a port"))?,
+            ),
+        ),
+        _ => (rest, None),
+    };
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = if name == "localhost" {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        name.parse().map_err(|_| {
+            format!(
+                "{flag}: the base must name an IP address or localhost — TLS still verifies {host}, so only the address moves (GUIDE §5)"
+            )
+        })?
+    };
+    if scheme == "http" && !ip.is_loopback() {
+        return Err(format!(
+            "{flag}: plain http is accepted only for a loopback address — use https"
+        ));
+    }
+    Ok((scheme, Some(ip), port))
+}
+
+/// Mozilla's roots (`webpki-roots`), so behaviour does not vary with the OS
+/// store, plus each `--outbound-ca`. ALPN is left to hyper-rustls:
+/// `HttpsConnectorBuilder::with_tls_config` asserts a config arrives with
+/// none set, and the HTTP/1-only connector `enable_http1` builds speaks
+/// HTTP/1.1.
+fn tls_config(cas: &[std::path::PathBuf]) -> Result<rustls::ClientConfig, String> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    for path in cas {
+        let flag = format!("--outbound-ca {}", path.display());
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+            .map_err(|e| format!("{flag}: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("{flag}: {e}"))?;
+        if certs.is_empty() {
+            return Err(format!("{flag}: the file holds no PEM certificate"));
+        }
+        for cert in certs {
+            roots.add(cert).map_err(|e| format!("{flag}: {e}"))?;
+        }
+    }
+    Ok(
+        rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
+}
+
+type OutboundClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector<Resolver>>,
+    Full<Bytes>,
+>;
+
+/// The runtime thread's body. The resolver maps a host with a base `addr` to
+/// it, and asks the system resolver otherwise. The request URI always
+/// carries the declared host, so SNI and verification use it (A11).
+fn outbound_runtime(
+    mut cmds: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    done: mpsc::Sender<(u64, io::Result<OutboundReply>)>,
+    routes: BTreeMap<&'static str, Route>,
+    tls: rustls::ClientConfig,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the outbound runtime builds");
+    let overrides: Arc<BTreeMap<String, std::net::IpAddr>> = Arc::new(
+        routes
+            .iter()
+            .filter_map(|(h, r)| r.addr.map(|a| (h.to_string(), a)))
+            .collect(),
+    );
+    let routes = Arc::new(routes);
+    rt.block_on(async move {
+        let mut http =
+            hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(Resolver {
+                overrides,
+                system: hyper_util::client::legacy::connect::dns::GaiResolver::new(),
+            });
+        http.enforce_http(false);
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http);
+        let client: OutboundClient =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .retry_canceled_requests(false)
+                .build(connector);
+        let mut tasks: BTreeMap<u64, tokio::task::AbortHandle> = BTreeMap::new();
+        while let Some(cmd) = cmds.recv().await {
+            tasks.retain(|_, h| !h.is_finished());
+            match cmd {
+                Cmd::Start(token, call) => {
+                    let (client, routes, done) = (client.clone(), routes.clone(), done.clone());
+                    let task = tokio::spawn(async move {
+                        let result = send(&client, &routes, call).await;
+                        let _ = done.send((token, result));
+                    });
+                    tasks.insert(token, task.abort_handle());
+                }
+                Cmd::Cancel(token) => {
+                    if let Some(h) = tasks.remove(&token) {
+                        h.abort();
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Sends `call` as given, then its host's credential headers (the kernel
+/// refused any call that sets one, so nothing collides), and reads the reply
+/// body until it holds more than the host's cap: an over-cap reply arrives
+/// as `max_reply + 1` bytes, which is how the kernel tells.
+async fn send(
+    client: &OutboundClient,
+    routes: &BTreeMap<&'static str, Route>,
+    call: OutboundCall,
+) -> io::Result<OutboundReply> {
+    let route = routes
+        .get(call.host)
+        .expect("the kernel starts calls only to a declared host (R9)");
+    let port = route.port.map(|p| format!(":{p}")).unwrap_or_default();
+    let mut request = hyper::Request::builder()
+        .method(call.method.as_str())
+        .uri(format!(
+            "{}://{}{port}{}",
+            route.scheme, call.host, call.path
+        ));
+    for (name, value) in call.headers.iter().chain(&route.headers) {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let request = request
+        .body(Full::new(Bytes::from(call.body)))
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("the request could not be built, so nothing was sent: {e}"),
+            )
+        })?;
+    let reply = client.request(request).await.map_err(|e| {
+        if e.is_connect() {
+            // A18: the connector failed (DNS, TCP or the TLS handshake), so
+            // no byte of the request was written.
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("could not connect: {}", with_causes(&e)),
+            )
+        } else {
+            io::Error::other(format!(
+                "the connection failed after the request was sent: {}",
+                with_causes(&e)
+            ))
+        }
+    })?;
+    let status = reply.status().as_u16();
+    let headers = reply
+        .headers()
+        .iter()
+        .map(|(n, v)| {
+            (
+                n.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let mut body = reply.into_body();
+    let mut bytes = Vec::new();
+    while bytes.len() <= route.max_reply {
+        let Some(frame) = body.frame().await else {
+            break;
+        };
+        let frame = frame.map_err(|e| {
+            io::Error::other(format!(
+                "the reply broke off after {} bytes: {}",
+                bytes.len(),
+                with_causes(&e)
+            ))
+        })?;
+        if let Ok(data) = frame.into_data() {
+            bytes.extend_from_slice(&data);
+        }
+    }
+    bytes.truncate(route.max_reply + 1);
+    Ok(OutboundReply {
+        status,
+        headers,
+        body: bytes,
+    })
+}
+
+/// hyper's errors print only their kind ("client error (Connect)"); the
+/// cause an operator needs, refused or DNS or TLS, is in the source chain.
+fn with_causes(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+/// `--outbound-base`'s address override in front of the system resolver
+/// (plan amendment A11): only where a name resolves moves, never the name.
+#[derive(Clone)]
+struct Resolver {
+    overrides: Arc<BTreeMap<String, std::net::IpAddr>>,
+    system: hyper_util::client::legacy::connect::dns::GaiResolver,
+}
+
+impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for Resolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = io::Error;
+    type Future = Pin<
+        Box<dyn std::future::Future<Output = io::Result<std::vec::IntoIter<SocketAddr>>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
+        // An override answers port 0; the connector applies the URI's port.
+        if let Some(ip) = self.overrides.get(name.as_str()) {
+            let addrs = vec![SocketAddr::new(*ip, 0)];
+            return Box::pin(async move { Ok(addrs.into_iter()) });
+        }
+        // `GaiResolver::poll_ready` is always ready, so it is not polled first.
+        let lookup = tower_service::Service::call(&mut self.system, name);
+        Box::pin(async move { Ok(lookup.await?.collect::<Vec<_>>().into_iter()) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     use super::*;
     use crate::http::{ApiError, AppConfig, Ctx, Cursor, Route, RouteGlue, Session, Subscription};
+    use crate::outbound::Host;
     use crate::prod::{ProdDisk, ProdEntropy};
     use crate::repl::role::Role;
     use crate::wire::{TypeSchema, Wire};
     use charpente_core::db::{Event, Schema, Tx};
     use charpente_core::io::Entropy;
+    use charpente_core::io::{HttpMethod, IdempotencyKey, OutboundWake};
     use charpente_core::table::{Codec, Id, Unscoped, View};
 
     /// The kernel thread's stop line — the first line of the kernel's final
@@ -1516,5 +1984,472 @@ mod tests {
         assert!(garbage_response.contains("diverged"), "{garbage_response}");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ------------------------------------------------------ outbound client
+
+    /// A one-shot plain-HTTP server on loopback: reads one whole request
+    /// (headers, then `content-length` bytes of body, however the client
+    /// split its writes), answers `reply`, and hands back the raw request.
+    fn one_shot(reply: Vec<u8>) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            // The reply-cap test's client stops reading at cap + 1 and drops
+            // the connection, so this write can fail by design.
+            let _ = conn.write_all(&reply);
+            buf
+        });
+        (port, handle)
+    }
+
+    fn wait_for(ob: &ProdOutbound) -> (u64, io::Result<OutboundReply>) {
+        for _ in 0..500 {
+            if let Some(c) = ob.poll() {
+                return c;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no completion within 5s");
+    }
+
+    #[crate::job(global, outbound = "pay.test")]
+    struct ServeTestCharge {}
+
+    impl ServeTestCharge {
+        fn call(
+            &self,
+            _tx: &Tx,
+            _key: &IdempotencyKey,
+        ) -> Result<Option<crate::outbound::Call>, crate::kernel::JobError> {
+            Ok(None)
+        }
+        fn settle(
+            self,
+            _tx: &mut Tx,
+            _reply: crate::outbound::Reply,
+        ) -> Result<(), crate::kernel::JobError> {
+            Ok(())
+        }
+    }
+
+    /// An `App` over a fresh temp `ProdDisk`, as `a_kernel_that_refuses_to_start_ends_wait_with_status_1` opens its own.
+    fn temp_app(tag: &str) -> App {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-serve-{tag}-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        App::open(
+            Box::new(ProdDisk::new(&root).unwrap()),
+            Schema::new(),
+            Box::new(ProdEntropy::new().unwrap()),
+            AppConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn charge_app(host: Host) -> App {
+        temp_app("outbound")
+            .mount_jobs(crate::jobs![ServeTestCharge])
+            .outbound(host)
+    }
+
+    fn plain_call(path: &str) -> OutboundCall {
+        OutboundCall {
+            host: "pay.test",
+            method: HttpMethod::Get,
+            path: path.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            key: IdempotencyKey::from_bytes([0; 16]),
+        }
+    }
+
+    #[test]
+    fn prod_sends_the_call_with_its_credential_and_returns_the_reply() {
+        let (port, server) =
+            one_shot(b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\nx-id: ch_1\r\n\r\nok".to_vec());
+        // Safety of set_var: this test binary's other tests read no PAY_KEY.
+        unsafe { std::env::set_var("SERVE_TEST_PAY_KEY", "sk_test_1") };
+        let app = charge_app(Host::new("pay.test").bearer_env("SERVE_TEST_PAY_KEY"));
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts)
+            .unwrap()
+            .expect("the app calls out");
+        let key = IdempotencyKey::from_bytes([5; 16]);
+        ob.start(
+            7,
+            OutboundCall {
+                host: "pay.test",
+                method: HttpMethod::Post,
+                path: "/v1/charges?x=1".into(),
+                headers: vec![("idempotency-key".into(), key.as_str().into())],
+                body: b"amount=1".to_vec(),
+                key,
+            },
+        )
+        .unwrap();
+        let (token, reply) = wait_for(&ob);
+        let reply = reply.unwrap();
+        assert_eq!(
+            (token, reply.status, reply.body.as_slice()),
+            (7, 201, &b"ok"[..])
+        );
+        assert!(
+            reply
+                .headers
+                .iter()
+                .any(|(n, v)| n == "x-id" && v == "ch_1")
+        );
+        let raw = String::from_utf8(server.join().unwrap()).unwrap();
+        assert!(
+            raw.starts_with("POST /v1/charges?x=1 HTTP/1.1\r\n"),
+            "{raw}"
+        );
+        assert!(raw.contains("authorization: Bearer sk_test_1\r\n"), "{raw}");
+        assert!(
+            raw.contains(&format!("idempotency-key: {}\r\n", key.as_str())),
+            "{raw}"
+        );
+        assert!(
+            raw.to_ascii_lowercase()
+                .contains(&format!("host: pay.test:{port}\r\n")),
+            "A11: the declared name: {raw}"
+        );
+        assert!(raw.ends_with("amount=1"), "{raw}");
+    }
+
+    /// Review Focus 4: the edge stops reading at cap + 1, so memory is bounded
+    /// whatever the remote sends. The remote promises 1 MiB, sends 64 KiB and
+    /// closes: a client that read on past the cap would hit that close and
+    /// return `Err`, so an `Ok` of cap + 1 bytes shows it stopped.
+    #[test]
+    fn prod_reply_cap_bounds_reading() {
+        let mut reply = b"HTTP/1.1 200 OK\r\ncontent-length: 1048576\r\n\r\n".to_vec();
+        reply.extend(std::iter::repeat_n(b'x', 65536));
+        let (port, _server) = one_shot(reply);
+        let app = charge_app(Host::new("pay.test").max_reply_bytes(16));
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts).unwrap().unwrap();
+        ob.start(0, plain_call("/big")).unwrap();
+        let (_, reply) = wait_for(&ob);
+        assert_eq!(
+            reply.unwrap().body.len(),
+            17,
+            "cap + 1, never the 64 KiB sent"
+        );
+    }
+
+    #[test]
+    fn a_closed_port_is_connection_refused() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port(); // bound then dropped
+        let app = charge_app(Host::new("pay.test"));
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts).unwrap().unwrap();
+        ob.start(0, plain_call("/x")).unwrap();
+        let (_, reply) = wait_for(&ob);
+        let err = reply.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        // hyper's own text is only "client error (Connect)": the cause rides in its sources.
+        let text = err.to_string();
+        assert!(
+            text.starts_with("could not connect: ")
+                && text.to_ascii_lowercase().contains("connection refused"),
+            "{text}"
+        );
+    }
+
+    /// A credential is checked as a header value when it is read, so a value
+    /// with a trailing newline refuses the start instead of failing every
+    /// call, and the refusal names the variable, never the value.
+    #[test]
+    fn a_credential_no_header_can_carry_refuses_the_start() {
+        // Safety of set_var: no other test reads this variable.
+        unsafe { std::env::set_var("SERVE_TEST_NEWLINE_KEY", "sk_newline_1\n") };
+        let app =
+            charge_app(Host::new("pay.test").header_env("x-api-key", "SERVE_TEST_NEWLINE_KEY"));
+        let err = ProdOutbound::new(&app, &OutboundOptions::default())
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "outbound: SERVE_TEST_NEWLINE_KEY holds a byte an HTTP header cannot carry (a control \
+             character such as a trailing newline, or text that is not UTF-8) — host pay.test \
+             needs it for job ServeTestCharge; set it to the credential alone"
+        );
+        assert!(Refusal::of(&err).is_some());
+        assert!(!format!("{err} {err:?}").contains("sk_newline_1"));
+    }
+
+    #[test]
+    fn outbound_setup_refusals_name_the_fix() {
+        let app = charge_app(Host::new("pay.test").bearer_env("SERVE_TEST_UNSET_VAR"));
+        let err = ProdOutbound::new(&app, &OutboundOptions::default())
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "outbound: SERVE_TEST_UNSET_VAR is unset — host pay.test needs it for job ServeTestCharge"
+        );
+        assert!(Refusal::of(&err).is_some());
+
+        let app = charge_app(Host::new("pay.test"));
+        let bad = |base: &str| {
+            let opts = OutboundOptions {
+                bases: vec![("pay.test".into(), base.into())],
+                cas: vec![],
+            };
+            ProdOutbound::new(&app, &opts).err().unwrap().to_string()
+        };
+        assert_eq!(
+            bad("http://10.0.0.5:80"),
+            "--outbound-base pay.test=http://10.0.0.5:80: plain http is accepted only for a loopback address — use https"
+        );
+        assert_eq!(
+            bad("https://fake.internal:8443"),
+            "--outbound-base pay.test=https://fake.internal:8443: the base must name an IP address or localhost — TLS still verifies pay.test, so only the address moves (GUIDE §5)"
+        );
+        assert_eq!(
+            bad("https://127.0.0.1:8443/v1"),
+            "--outbound-base pay.test=https://127.0.0.1:8443/v1: a base is a scheme, an address and an optional port — no path"
+        );
+        let opts = OutboundOptions {
+            bases: vec![("other.test".into(), "https://127.0.0.1:1".into())],
+            cas: vec![],
+        };
+        assert_eq!(
+            ProdOutbound::new(&app, &opts).err().unwrap().to_string(),
+            "--outbound-base names other.test, which no mounted job calls — the hosts this app calls are: pay.test"
+        );
+        let opts = OutboundOptions {
+            bases: vec![],
+            cas: vec!["/nonexistent/ca.pem".into()],
+        };
+        assert!(
+            ProdOutbound::new(&app, &opts)
+                .err()
+                .unwrap()
+                .to_string()
+                .starts_with("--outbound-ca /nonexistent/ca.pem: ")
+        );
+    }
+
+    #[test]
+    fn an_app_with_no_outbound_job_gets_no_client() {
+        let app = temp_app("plain");
+        assert!(
+            ProdOutbound::new(&app, &OutboundOptions::default())
+                .unwrap()
+                .is_none(),
+            "invariant 6: no runtime thread"
+        );
+    }
+
+    /// Plan amendment A2: replies arrive from the network, so production
+    /// never knows when the next one is due, and the kernel parks no longer
+    /// than its outbound tick.
+    #[test]
+    fn the_production_client_never_names_its_next_wake() {
+        let app = charge_app(Host::new("pay.test"));
+        let ob = ProdOutbound::new(&app, &OutboundOptions::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ob.next_wake(), OutboundWake::Unknown);
+    }
+
+    #[crate::job(global, outbound = "pay.test")]
+    struct ServeTestPing {}
+
+    impl ServeTestPing {
+        fn call(
+            &self,
+            _tx: &Tx,
+            _key: &IdempotencyKey,
+        ) -> Result<Option<crate::outbound::Call>, crate::kernel::JobError> {
+            Ok(Some(crate::outbound::Call::get("/served")))
+        }
+        fn settle(
+            self,
+            _tx: &mut Tx,
+            _reply: crate::outbound::Reply,
+        ) -> Result<(), crate::kernel::JobError> {
+            Ok(())
+        }
+    }
+
+    /// The serve path supplies the production client (the kernel's
+    /// no-`Outbound` refusal says it does): an app holding a Pending
+    /// outbound job, served, sends that job's call to the remote. Without
+    /// the client its kernel refuses to build and nothing is ever sent.
+    #[test]
+    fn serve_with_supplies_the_production_client() {
+        let (port, remote) = one_shot(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_vec());
+        let mut app = temp_app("served")
+            .mount_jobs(crate::jobs![ServeTestPing])
+            .outbound(Host::new("pay.test"));
+        app.transact_for_tests(|tx| {
+            tx.enqueue(ServeTestPing {});
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let server = serve_with("127.0.0.1:0", app, opts).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !remote.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no call reached the remote within 10 s (kernel thread finished: {}) — serve_with \
+                 must hand the kernel the production client",
+                server.kernel.is_finished()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let raw = String::from_utf8(remote.join().unwrap()).unwrap();
+        assert!(raw.starts_with("GET /served HTTP/1.1\r\n"), "{raw}");
+        assert!(
+            !server.kernel.is_finished(),
+            "the kernel serves on after the call"
+        );
+    }
+
+    /// `serve_replicated` builds the client too: a primary over an app that
+    /// mounts an outbound job starts and answers, where a kernel without one
+    /// refuses to build (and the edge would answer 500, the kernel gone).
+    #[test]
+    fn serve_replicated_starts_an_app_that_calls_out() {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-repl-ob-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        let app = App::open(
+            Box::new(ProdDisk::new(&root).unwrap()),
+            Schema::new(),
+            Box::new(ProdEntropy::new().unwrap()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(crate::jobs![ServeTestCharge])
+        .outbound(Host::new("pay.test"));
+        let server = serve_replicated(
+            "127.0.0.1:0",
+            app,
+            Box::new(ProdDisk::new(&root).unwrap()),
+            repl::ReplConfig {
+                listen: Some(format!("127.0.0.1:{}", free_port())),
+                initial_role: Role::Primary,
+                peer_secret: None,
+                strict_witnesses: false,
+            },
+        )
+        .unwrap();
+        let response = http1(&server.local_addr(), "GET", "/nope");
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(!server.kernel.is_finished());
+    }
+
+    /// Every entry point that builds a kernel builds the client first, from
+    /// the app's `Host` entries, so a missing credential refuses before a
+    /// listener, a replication session or an archive opens. Each is handed a
+    /// second fault in what it would open next (an address no listener binds,
+    /// an empty peer secret `Repl::open` refuses, a `pin_segments` of 0 that
+    /// `Archive::open` panics on), so built any later, the refusal changes.
+    #[test]
+    fn every_entry_point_reads_credentials_before_it_opens_anything() {
+        let refusal = "outbound: SERVE_TEST_UNSET_VAR is unset — host pay.test needs it for job \
+                       ServeTestCharge";
+        let unbindable = "no-such-address";
+        let app = || charge_app(Host::new("pay.test").bearer_env("SERVE_TEST_UNSET_VAR"));
+        let repl_cfg = || repl::ReplConfig {
+            listen: Some(format!("127.0.0.1:{}", free_port())),
+            initial_role: Role::Primary,
+            peer_secret: Some(String::new()),
+            strict_witnesses: false,
+        };
+        let repl_disk = || -> Box<dyn Disk> {
+            let mut suffix = [0u8; 8];
+            ProdEntropy::new().unwrap().fill(&mut suffix);
+            let root = std::env::temp_dir().join(format!(
+                "charpente-serve-refuse-repl-{:016x}",
+                u64::from_le_bytes(suffix)
+            ));
+            Box::new(ProdDisk::new(root).unwrap())
+        };
+
+        assert!(bind_http(unbindable).is_err());
+        let err = serve_with(unbindable, app(), OutboundOptions::default())
+            .err()
+            .unwrap();
+        assert_eq!(
+            (err.to_string().as_str(), Refusal::of(&err).is_some()),
+            (refusal, true)
+        );
+        let err = serve(unbindable, app()).err().unwrap();
+        assert_eq!(err.to_string(), refusal);
+        let err = serve_replicated(unbindable, app(), repl_disk(), repl_cfg())
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), refusal);
+        let err = backup(app(), repl_disk(), repl_cfg()).unwrap_err();
+        assert_eq!(err.to_string(), refusal);
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let bucket = std::env::temp_dir().join(format!(
+            "charpente-serve-refuse-bucket-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        let err = archive(
+            app(),
+            Box::new(crate::prod::FsObjectStore::new(&bucket).unwrap()),
+            ArchiveConfig {
+                prefix: "refuse".into(),
+                writer: "serve-test".into(),
+                snapshot_every: 0,
+                pin_segments: 0,
+                read_budget_bytes: 1 << 20,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), refusal);
     }
 }

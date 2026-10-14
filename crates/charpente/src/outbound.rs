@@ -305,7 +305,6 @@ impl Host {
     pub(crate) fn max_reply(&self) -> usize {
         self.max_reply
     }
-    #[expect(dead_code, reason = "first caller: Task 14")]
     pub(crate) fn credentials(&self) -> &[Credential] {
         &self.credentials
     }

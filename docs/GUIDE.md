@@ -1365,6 +1365,39 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+An app whose jobs call outside services (§6) gets its HTTP client from the
+server. `serve(addr, app)` is `serve_with(addr, app,
+OutboundOptions::default())`, and `serve_with(addr: &str, app: App, outbound:
+OutboundOptions) -> io::Result<Server>` takes the operator's settings:
+`OutboundOptions { bases, cas }` (both `Vec`s, `Default` empty). `bases`
+holds `(host, base)` pairs that move where a declared host is reached
+(`--outbound-base`), and `cas` holds paths of PEM CA certificates to trust
+beside the built-in roots (`--outbound-ca`). `launch` (§13) fills both from
+its flags.
+
+```rust
+use charpente::http::App;
+use charpente::serve::{OutboundOptions, Server, serve_with};
+
+fn serve_against_a_local_fake(app: App) -> std::io::Result<Server> {
+    serve_with(
+        "127.0.0.1:8080",
+        app,
+        OutboundOptions {
+            bases: vec![("pay.test".into(), "https://127.0.0.1:8443".into())],
+            cas: vec!["./tls/ca.pem".into()],
+        },
+    )
+}
+```
+
+The client is built before the listener is bound, reading each credential
+variable once, so a setup refusal (an unset credential, a bad base or CA
+file) returns an `Err` holding a `Refusal`, with nothing running. An app
+whose jobs call nothing gets no client and no thread for one.
+`serve_replicated`, `backup` and `archive` build the client the same way,
+with no operator settings.
+
 ### What `#[route]` rejects
 
 Every rejection is a compile error naming the contract and the fix. The
@@ -1929,10 +1962,28 @@ block above does.
 
 The builders are `bearer_env(var)`, `header_env(name, var)`, `basic_env(user_var,
 pass_var)`, `max_request_bytes(n)` and `max_reply_bytes(n)`. A credential is the
-NAME of an environment variable: the value is read when `serve` starts and
-never enters the log, the sim or `describe`, which lists variable and header
-names only. The caps default to 1 MiB and 4 MiB, and neither passes
-`MAX_CAP_BYTES` (8 MiB).
+NAME of an environment variable. `serve` reads each value once, when it starts
+(as `serve_with`, `serve_replicated`, `backup` and `archive` do, §5), and the
+value never enters the log, the sim, an error text or `describe`, which lists
+variable and header names only. A variable that is unset, or that holds what
+a header cannot carry, refuses the start before the listener is bound:
+
+<!-- pinned -->
+```text
+outbound: <var> is unset — host <host> needs it for job <job>
+outbound: <var> holds a byte an HTTP header cannot carry (a control character such as a trailing newline, or text that is not UTF-8) — host <host> needs it for job <job>; set it to the credential alone
+```
+
+`<job>` is the first mounted job that calls `<host>`. The caps default to
+1 MiB and 4 MiB, and neither passes `MAX_CAP_BYTES` (8 MiB).
+
+Each host is reached at `https://<host>:443` over HTTP/1.1, its certificate
+verified against Mozilla's root store (`webpki-roots`, so the answer does not
+vary with the machine's OS). An operator moves the address with
+`--outbound-base` and adds a CA with `--outbound-ca` (§5); neither changes the
+name that TLS verifies. No redirect is followed, so a 3xx is a reply that
+`settle` reads. The client neither retries nor times out on its own: both are
+the kernel's, through `retry` and `timeout`.
 
 The two sets must match both ways, checked when the kernel is built, so mount
 order is free. A called host with no entry is refused with
@@ -1986,8 +2037,12 @@ outbound <host>: timed out after <timeout> — the remote may have applied this 
 outbound <host>: the reply exceeded the <cap>-byte reply cap — the remote answered, so it applied this call; raise the cap with Host::max_reply_bytes (the retry carries the same idempotency key)
 ```
 
-The first line is a refused connection's, and its `<error>` reads `connection
-refused`. The second is every other transport failure's. `<timeout>` is the
+The first line is a call whose connection never opened, so no byte of it was
+sent: a refused connection, a failed DNS lookup or a failed TLS handshake. Its
+`<error>` names which: `connection refused` in the sim, and in production
+`could not connect: ` and the client's cause chain (`client error (Connect):
+tcp connect error: Connection refused (os error 61)`, say). The second is
+every other transport failure's. `<timeout>` is the
 job's `timeout` as Rust prints a `Duration` (`2s`, `1.5s`), and `<cap>` is the
 host's reply cap in bytes.
 
