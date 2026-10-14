@@ -153,8 +153,17 @@ snapshot shipper. A TypeScript client generator has since shipped too
 tenant scoping, where a tenant is a typed key prefix enforced by the compiler rather than
 a `where` clause anyone can forget ([docs/GUIDE.md](docs/GUIDE.md) §16), and since
 2026-09-16 the platform asks: a route says `auth`, `public` or `public(Org)`, a table, a
-job and an event say `scoped_by` or `global`, and none is a default. What is *not* built, so you don't have to go looking:
-no blob store and no WebSockets.
+job and an event say `scoped_by` or `global`, and none is a default.
+
+Outbound effects have shipped. A job declared `outbound = "<host>"` decides an HTTP
+request after commit, in a read-only `call`. The kernel makes the request outside any
+transaction with a platform-minted idempotency key, and `settle` commits the reply's
+consequences together with the Done mark as one record. The simulator injects the outside
+world's faults: refused, lost request, lost reply, throttled, slow
+([docs/GUIDE.md](docs/GUIDE.md) §6, §8).
+
+What is *not* built, so you don't have to go looking: no blob store, no WebSockets, and on
+the outbound side no `HTTP/2`, proxies, request signing (AWS `SigV4`) or streaming replies.
 
 ## Try it
 

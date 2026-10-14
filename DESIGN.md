@@ -1547,7 +1547,7 @@ drains its inbox before any reconnect, and the primary drains the target session
 before the dead-session reap. **Promote** (`charpente promote`) is the bounded-loss
 failover: a follower/backup drops its upstream client, flips durably to `Primary`, allows
 writes, and the `CtrlOk` names `last_applied` — records the dead primary acked but had not
-shipped are the DECISIONS §6 window, lost honestly and named. A node that restarts in a
+shipped are the DECISIONS §6 window, lost honestly and named. The window now covers external effects: a dead primary can call out from a record it acked but never shipped, so the world saw an effect the surviving timeline has no record of. Nothing short of synchronous replication closes that, and DECISIONS §6 chose asynchronous replication. The minted key bounds the rest: an enqueue that shipped without its Done mark is re-called with the same key, and one that never shipped cannot collide with anything the new timeline mints. A node that restarts in a
 durable `HandingOff(to)` stays write-stopped and resolves against `to`: a probe `Hello`
 answered as a primary demotes it to `Follower(to)` (a diverged refusal is the operator's
 re-seed signal, surfaced as the step error); `to` unreachable or not-yet-primary keeps it
@@ -1714,8 +1714,12 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   aborts that transaction and a second commits the failure record — attempts, doubling
   backoff, Dead at the policy's `max`, last_error carried (typed `RetryPolicy` on the
   `#[job]` item; handler panics are absorbed into the same path). At-least-once execution
-  plus idempotency-key observability is the framing M1's external-effect handlers need; v0
-  handlers are pure state and don't need it yet. Every enqueue records the payload type's
+  plus idempotency-key observability is the framing external effects need, and they now
+  have it: a job declared `outbound = "<host>"` implements `call` (read-only, by type) and
+  `settle` instead of `run`. The kernel makes the request between them, outside any
+  transaction, through the `Outbound` IO trait. The idempotency key is minted from
+  `Entropy` at staging and recorded in the enqueue effect, so a retry, a restart and a
+  follower's replay all carry the same one. GUIDE §6 is the app-facing account. Every enqueue records the payload type's
   structural fingerprint (§3). A scoped job's fingerprint also carries its tenant
   type's `NAME`, so moving a job between `global` and `scoped_by`, or to a tenant type of
   another `NAME`, is refused like a change of fields; respelling its path to a type of the
@@ -1888,9 +1892,10 @@ Charpente treats the coding agent as the primary developer persona:
   registered with `mount_events(events![…])` as `EventInfo { name, payload, scoped_by }`,
   sorted by event name (`scoped_by` is the tenant type's `Tenant::NAME` for a
   `#[event(scoped_by = Org)]` event and `null` for a global one; an app key is a call-site
-  filter, so the contract lists no keys)**, jobs (name, retry policy, **`scoped_by`, the `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`), cron
+  filter, so the contract lists no keys)**, jobs (name, retry policy, **`scoped_by`, the `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`, **`outbound`: `null`, or `{ host, timeout_ms }` for a job declared `outbound = "<host>"`**), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
+  **`outbound_hosts`, one entry per declared `Host` with the names of its credential variables (never their values), the headers it injects and its request and reply caps, so "which outside services does this app talk to, and what must an operator set" is an inventory;**
   field order is
   part of the pinned shape. `Contract` also carries **`types: Vec<TypeDef>`** — the
   transitive closure of every NAMED wire type a route's params/request/response/error
@@ -1985,7 +1990,12 @@ Charpente treats the coding agent as the primary developer persona:
   accepts some families and fails on others (sub-project 6 T7 — first-match arm order is
   load-bearing and pinned); `replays_identically` (determinism oracle);
   `acked_implies_durable` (the request-level ack-durability property, generalized for app
-  workloads); and the two fire-time-marked axis companions `durable_corruption_fired` and
+  workloads); the three outbound checkers: `calls_have_durable_jobs` (every call that
+  reached a remote carries the key of a job in the recovered store, so a call never fires
+  for an enqueue that is not durable), `keys_are_per_job` (no two jobs carry one
+  idempotency key, which a constant or data-derived key would produce) and
+  `outbound_settles_by_horizon` (after a fault-free tail, every outbound job is Done or
+  Dead); and the two fire-time-marked axis companions `durable_corruption_fired` and
   `dir_entry_loss_fired`, which excuse a shortfall only in universes where that fault
   actually fired. `SimHost::durable_corruption_fired` and `SimHost::dir_entry_loss_fired`
   are the same two scoped to a host, for a multi-node workload whose excuse must name the
@@ -2091,8 +2101,9 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   row, nothing to revoke but a short `exp`. Each failed check is its own named 401 (below).
   Verification is ~100µs of pure computation on the kernel thread; the test suite checks in a
   fixed RSA keypair and mints tokens in-test with the same crate, so the claim matrix replays
-  byte-identically — proof the crypto path added no nondeterminism. Dynamic JWKS fetch (any
-  outbound IO) waits for the external-IO surface; ES256 joins when someone needs it.
+  byte-identically — proof the crypto path added no nondeterminism. A JWKS refresh is now
+  expressible as a global outbound cron job; the platform still ships none. ES256 joins
+  when someone needs it.
 - **Expiry: lazy resolution is correctness, the sweep is hygiene.** A `Session` row with
   `expires_at <= now` is treated as absent at resolution — invisible the instant `now` passes
   it, restart or not (the same restart-stable `Clock` shape cron's catch-up already relies

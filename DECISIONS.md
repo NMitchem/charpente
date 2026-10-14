@@ -416,3 +416,18 @@ config key, a builder default, or a "sensible" fallback in the macro is the thin
 refuses. **Reopen if:** a surface appears whose only honest default is "always on" with no
 second choice worth naming — then there is nothing to declare, and this entry does not
 apply to it.
+
+## 14. External effects are kernel-owned two-phase jobs (2026-10-14)
+
+An external effect is a job declared `outbound = "<host>"` whose `call` (read-only, by
+type) decides a request and whose `settle` commits the reply's consequences with the
+Done-mark as one record; the kernel makes the call between them, outside any
+transaction, through the `Outbound` IO trait. Rejected: **edge workers** (a worker SDK
+running async handlers on the tokio edge), because the handler leaves the deterministic
+boundary and every injected fault stops at its door; and **a call effect recorded inside
+the transaction** (`tx.call`), because the request freezes at commit, its body rides the
+WAL, and storing a reply rebuilds `settle` anyway. **Keys are platform-minted** from
+`Entropy` at staging and recorded in the enqueue effect, because keys derived from ids
+collide across the DECISIONS §6 loss window's diverged timelines. Reopen if: an app needs
+an effect whose request cannot be decided from committed state plus its payload, or a
+protocol that is not request/response.

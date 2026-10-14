@@ -71,6 +71,15 @@ on why); for charpente to add their features is milestone work.
   runs through it for a reason.
 - Litestream's WAL-shipping design doc — the M1 replication/backup blueprint.
 
+**Durable execution**
+- Temporal's activities are the shape `call`/`settle` takes, with the transaction as the
+  workflow: a side effect runs outside the deterministic part, and its result re-enters it.
+  Restate journals the same idea per handler. DBOS keeps workflow state in Postgres beside
+  the app's own. What charpente does differently: there is one log, not a workflow history
+  beside the data; the simulator drives the remote itself, so the outside world's faults
+  are injected and replayed from a seed; and the idempotency keys are minted at staging
+  rather than derived from ids or app data (DECISIONS §14).
+
 **Deployment/scale stance**
 - "Use One Big Server" (specbranch.com, 2022) — the capacity math behind MANIFESTO §7.
 - SQLite "when to use" doc — the original single-node honesty argument.

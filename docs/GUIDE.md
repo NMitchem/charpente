@@ -4783,6 +4783,15 @@ role file:
   by the position its `Hello` carries. If the target cannot catch up before the
   deadline, the switchover aborts and the primary resumes.
 
+**Calls in flight at a failover.** The kernel's in-flight table of outbound calls lives in
+memory and is dropped when the primary stops. The new primary finds each unfinished
+outbound job Pending in the replicated log and re-calls it with the same idempotency key,
+so a remote that dedupes sees a repeat. A call the old primary made from a record it
+acked but never shipped is outside the surviving timeline: the remote saw it, and no
+record on the new primary says so. That is `promote`'s loss window extended to external
+effects, named and not closed. The key bounds it, since a job the new timeline never saw
+cannot collide with a key it mints.
+
 **Once the hand-off is sent, there is no abort.** The deadline aborts a
 switchover only while the target is still catching up. After the hand-off is
 sent, the target may already be the primary, so the old primary never resumes
@@ -7515,6 +7524,11 @@ them. That means restore can re-fire emails and third-party calls that already r
 the loss. This is correct — they are durable transactional state — and idempotency keys
 (`enqueue_keyed`, §6) are exactly what make the re-fire exactly-once-*observable*. But it
 is a consequence of running the command, which is why the command prints the count.
+
+**A restored outbound job re-fires with its recorded key.** The idempotency key of an
+`outbound` job rides in its row, so a Pending one that is restored is called again under
+the key it had before the loss. A remote that dedupes sees a repeat, not a new request;
+one that ignores keys applies it twice (§6).
 
 **A restore that fails part-way leaves a partial rebuild, not the old directory.** Reading
 the bucket, verifying every segment's frames, and judging the destination all happen

@@ -268,7 +268,7 @@ that is a claim about charpente is in docs/BENCH.md or absent, and every other f
 cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
 the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
@@ -278,6 +278,14 @@ shipped detection and refusal (its §1 and §8): a foreign shape is already refu
 so each waits for its trigger. The job-tenancy one was deferred on 2026-09-27 by the
 job-tenancy spec's §12. The tenancy-completion two were deferred on 2026-09-30
 by that spec's §12.
+
+Outbound effects shipped on 2026-10-14 (spec
+[docs/superpowers/specs/2026-10-13-outbound-effects-design.md](docs/superpowers/specs/2026-10-13-outbound-effects-design.md),
+plan [docs/superpowers/plans/2026-10-13-outbound-effects.md](docs/superpowers/plans/2026-10-13-outbound-effects.md);
+DECISIONS §14). What it refused or left unproven became the seven rows at the end of
+this table: spec §15 refused the first five, plan amendment A19 pinned oracle 2's
+switchover row at the write gate rather than through a two-node rig (the sixth), and the
+seventh is a node-wiring gap. Each reopens on the first app that needs it.
 
 | Item | Trigger |
 |---|---|
@@ -294,6 +302,13 @@ by that spec's §12.
 | **`enqueue_keyed_in`** — a keyed declared fan-out (job-tenancy spec §12) | The first fan-out whose job needs an external idempotency key. `enqueue_in` and `ScopedTx::enqueue_keyed` both exist; the keyed fan-out is the one combination deferred. |
 | **A cross-tenant subscription** — one feed over every tenant's events (tenancy-completion spec §12) | The first app that needs a feed across tenants. It arrives as a declared capability `describe` lists (DECISIONS §11), the shape `cross_tenant` already gives reads. |
 | **A tenant's own jobs and events, read through `ScopedTx`** — for a job-status or activity view (tenancy-completion spec §12) | The first app with a job-status or activity view. Until then an app keeps its own table of what it enqueued and emitted, and the platform's tables stay the operator's. |
+| **Outbound with `cross_tenant`** (outbound-effects spec §15) | The first app that needs it. |
+| **HTTP/2 for outbound calls** (spec §15) | The first app that needs it. |
+| **Outbound proxies** (spec §15) | The first app that needs it. |
+| **Request signing** — AWS SigV4, which SES needs (spec §15) | The first app that needs it. |
+| **Streaming replies** (spec §15) | The first app that needs it. |
+| **A two-node switchover under outbound load** (plan amendment A19) | The first replicated app with outbound jobs. Oracle 2's switchover row is pinned at the write gate (`Db::forbid_writes`), not through a two-node rig. |
+| **`OutboundOptions` on `serve_replicated`, `backup` and `archive`** — they take none, so a replicated node can reach only public-CA hosts at their real addresses | An app that calls an internal API behind a private CA and must run replicated. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,
