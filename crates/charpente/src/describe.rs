@@ -49,6 +49,8 @@ pub struct Contract {
     pub types: Vec<TypeDef>,
     pub jobs: Vec<JobInfo>,
     pub cron: Vec<CronInfo>,
+    /// Every `Host` entry in declaration order: names only, never a value (spec §9).
+    pub outbound_hosts: Vec<HostInfo>,
     pub config: ConfigInfo,
     pub telemetry: TelemetryInfo,
 }
@@ -192,6 +194,26 @@ pub struct JobInfo {
     /// covers both surfaces that receive a `Tx`, or it covers neither.
     pub cross_tenant: bool,
     pub builtin: bool,
+    /// `#[job(…, outbound = "<host>")]`: the host and the kernel's deadline
+    /// (outbound-effects spec §11); `None` for a pure job.
+    pub outbound: Option<OutboundInfo>,
+}
+
+#[derive(Serialize)]
+pub struct OutboundInfo {
+    pub host: &'static str,
+    pub timeout_ms: u64,
+}
+
+/// One `Host` entry: which variables an operator must set, and which headers
+/// they fill — names only; a value never reaches `describe` (spec §9).
+#[derive(Serialize)]
+pub struct HostInfo {
+    pub host: &'static str,
+    pub env: Vec<&'static str>,
+    pub injects: Vec<String>,
+    pub max_request_bytes: usize,
+    pub max_reply_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -259,6 +281,17 @@ impl App {
             types: reg.into_sorted(),
             jobs: self.job_defs().iter().map(job_info).collect(),
             cron: self.cron_entries().iter().map(cron_info).collect(),
+            outbound_hosts: self
+                .outbound_config()
+                .iter()
+                .map(|h| HostInfo {
+                    host: h.name(),
+                    env: h.env_vars(),
+                    injects: h.injected_headers(),
+                    max_request_bytes: h.max_request(),
+                    max_reply_bytes: h.max_reply(),
+                })
+                .collect(),
             config: config_info(self),
             telemetry: TelemetryInfo {},
         }
@@ -338,6 +371,10 @@ fn job_info(def: &JobDef) -> JobInfo {
         // (`SESSION_SWEEP_NAME`, "charpente.session_sweep") used below.
         // Two different registrations, two different consts.
         builtin: def.name == <SessionSweep as Job>::NAME,
+        outbound: def.outbound.as_ref().map(|o| OutboundInfo {
+            host: o.host,
+            timeout_ms: u64::try_from(o.timeout.as_millis()).expect("a timeout fits u64 millis"),
+        }),
     }
 }
 
@@ -461,9 +498,13 @@ pub fn to_human(c: &Contract) -> String {
     }
     writeln!(out, "jobs:").unwrap();
     for j in &c.jobs {
+        let outbound = match &j.outbound {
+            Some(o) => format!("outbound={} timeout_ms={}", o.host, o.timeout_ms),
+            None => "outbound=none".to_string(),
+        };
         writeln!(
             out,
-            "  {} max={} backoff_nanos={} scoped_by={} cross_tenant={} builtin={}",
+            "  {} max={} backoff_nanos={} scoped_by={} cross_tenant={} builtin={} {outbound}",
             j.name,
             j.retry.max,
             j.retry.backoff_nanos,
@@ -479,6 +520,26 @@ pub fn to_human(c: &Contract) -> String {
             out,
             "  {} interval_nanos={} builtin={}",
             e.name, e.interval_nanos, e.builtin
+        )
+        .unwrap();
+    }
+    writeln!(out, "outbound_hosts:").unwrap();
+    for h in &c.outbound_hosts {
+        let list = |v: Vec<String>| {
+            if v.is_empty() {
+                "none".to_string()
+            } else {
+                v.join(",")
+            }
+        };
+        writeln!(
+            out,
+            "  {} env={} injects={} max_request_bytes={} max_reply_bytes={}",
+            h.host,
+            list(h.env.iter().map(|s| s.to_string()).collect()),
+            list(h.injects.clone()),
+            h.max_request_bytes,
+            h.max_reply_bytes
         )
         .unwrap();
     }

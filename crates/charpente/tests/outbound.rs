@@ -156,3 +156,80 @@ fn a_scoped_outbound_job_folds_outbound_over_its_tenant_shape() {
         "tenancy stays part of an outbound job's shape"
     );
 }
+
+mod describe_hosts {
+    use super::*;
+    use charpente::core::db::Schema;
+    use charpente::http::{App, AppConfig};
+    use charpente::jobs;
+    use charpente::outbound::Host;
+    use charpente_sim::{FaultConfig, Sim};
+
+    fn outbound_app(sim: &Sim) -> App {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![Charge, Mail])
+        .outbound(
+            Host::new("pay.test")
+                .bearer_env("PAY_KEY")
+                .max_reply_bytes(1 << 20),
+        )
+        .outbound(Host::new("mail.test").header_env("X-Postmark-Server-Token", "POSTMARK_TOKEN"))
+    }
+
+    #[test]
+    fn describe_lists_outbound_jobs_and_hosts_by_variable_name() {
+        let sim = Sim::with_faults(0x0b0, FaultConfig::none());
+        let app = outbound_app(&sim);
+        assert_eq!(app.outbound_hosts(), vec!["mail.test", "pay.test"]);
+        let json = serde_json::to_value(app.describe()).unwrap();
+        let job = |name: &str| {
+            json["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|j| j["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            job("Charge")["outbound"],
+            serde_json::json!({ "host": "pay.test", "timeout_ms": 2000 })
+        );
+        assert_eq!(job("SessionSweep")["outbound"], serde_json::Value::Null);
+        assert_eq!(
+            json["outbound_hosts"],
+            serde_json::json!([
+                { "host": "pay.test", "env": ["PAY_KEY"], "injects": ["authorization"],
+                  "max_request_bytes": 1048576, "max_reply_bytes": 1048576 },
+                { "host": "mail.test", "env": ["POSTMARK_TOKEN"], "injects": ["x-postmark-server-token"],
+                  "max_request_bytes": 1048576, "max_reply_bytes": 4194304 }
+            ])
+        );
+        let human = charpente::describe::to_human(&app.describe());
+        assert!(human.contains("Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000\n"), "{human}");
+        assert!(human.contains("outbound_hosts:\n  pay.test env=PAY_KEY injects=authorization max_request_bytes=1048576 max_reply_bytes=1048576\n"), "{human}");
+    }
+
+    #[test]
+    fn outbound_hosts_is_the_hosts_jobs_call_not_every_declared_entry() {
+        let sim = Sim::with_faults(0x0b2, FaultConfig::none());
+        let app = outbound_app(&sim).outbound(Host::new("unused.test"));
+        assert_eq!(app.outbound_hosts(), vec!["mail.test", "pay.test"]);
+        let json = serde_json::to_value(app.describe()).unwrap();
+        assert_eq!(json["outbound_hosts"].as_array().unwrap().len(), 3);
+        assert_eq!(json["outbound_hosts"][2]["host"], "unused.test");
+    }
+
+    #[test]
+    #[should_panic(expected = "contract: app.outbound(Host::new(\"pay.test\")) declared twice")]
+    fn a_host_declared_twice_is_a_contract_panic() {
+        let sim = Sim::with_faults(0x0b1, FaultConfig::none());
+        let _ = outbound_app(&sim).outbound(Host::new("pay.test"));
+    }
+}

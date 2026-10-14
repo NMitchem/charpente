@@ -448,7 +448,8 @@ const GOLDEN: &str = r#"{
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": true
+      "builtin": true,
+      "outbound": null
     },
     {
       "name": "Ping",
@@ -458,7 +459,8 @@ const GOLDEN: &str = r#"{
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": false
+      "builtin": false,
+      "outbound": null
     }
   ],
   "cron": [
@@ -473,6 +475,7 @@ const GOLDEN: &str = r#"{
       "builtin": false
     }
   ],
+  "outbound_hosts": [],
   "config": {
     "body_cap": 1048576,
     "session_ttl": 2592000000000000,
@@ -1327,9 +1330,9 @@ fn to_human_carries_public_scope_and_scoped_by() {
         "  GET /admin/plain name=admin_plain auth=false public_scope=none cross_tenant=false \
          stream=false\n",
         "  Reconcile max=5 backoff_nanos=30000000000 scoped_by=Org cross_tenant=false \
-         builtin=false\n",
+         builtin=false outbound=none\n",
         "  Rollup max=5 backoff_nanos=30000000000 scoped_by=none cross_tenant=true \
-         builtin=false\n",
+         builtin=false outbound=none\n",
     ] {
         assert!(out.contains(line), "missing {line:?} in:\n{out}");
     }

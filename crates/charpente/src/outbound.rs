@@ -20,6 +20,10 @@ pub const DEFAULT_MAX_REPLY_BYTES: usize = 4 << 20;
 /// leaves room for the rest of its record (spec §9).
 pub const MAX_CAP_BYTES: usize = 8 << 20;
 
+/// How many calls a node keeps in flight at once (spec §4); set per app with
+/// `App::outbound_max_in_flight`.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;
+
 /// The headers the edge sets itself (spec §5).
 const EDGE_HEADERS: [&str; 4] = ["host", "content-length", "transfer-encoding", "connection"];
 
@@ -294,15 +298,12 @@ impl Host {
             );
         }
     }
-    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn name(&self) -> &'static str {
         self.name
     }
-    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn max_request(&self) -> usize {
         self.max_request
     }
-    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn max_reply(&self) -> usize {
         self.max_reply
     }
@@ -311,7 +312,6 @@ impl Host {
         &self.credentials
     }
     /// Every variable this host reads, in declaration order.
-    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn env_vars(&self) -> Vec<&'static str> {
         self.credentials
             .iter()
@@ -332,10 +332,36 @@ impl Host {
             })
             .collect()
     }
-    #[expect(dead_code, reason = "first caller: Task 9")]
     pub(crate) fn injected_headers(&self) -> Vec<String> {
         self.injects().into_iter().map(|(h, _)| h).collect()
     }
+}
+
+/// R9, checked when the kernel is built (plan amendment A5): every host a
+/// mounted job calls has exactly one `Host` entry, and every entry is called.
+#[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 11"))]
+pub(crate) fn check_host_sets(
+    callers: &[(&'static str, &'static str)],
+    hosts: &[Host],
+) -> Result<(), String> {
+    for &(job, host) in callers {
+        if !hosts.iter().any(|h| h.name == host) {
+            return Err(format!(
+                "kernel: job {job} calls {host}, which has no Host entry — add \
+                 app.outbound(Host::new(\"{host}\")) with the credentials it needs (GUIDE §6)"
+            ));
+        }
+    }
+    for h in hosts {
+        if !callers.iter().any(|&(_, host)| host == h.name) {
+            return Err(format!(
+                "kernel: app.outbound(Host::new(\"{}\")) declares a host no mounted job calls — \
+                 remove it, or mount the job that calls it",
+                h.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Why `name` is not a bare host, or `None` (spec §5). `#[job]` checks the
@@ -461,6 +487,36 @@ pub(crate) fn check(call: &Call, host: &Host) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_host_sets_must_match_both_ways() {
+        let hosts = [Host::new("pay.test"), Host::new("mail.test")];
+        assert_eq!(
+            check_host_sets(&[("Charge", "pay.test"), ("Mail", "mail.test")], &hosts),
+            Ok(())
+        );
+        assert_eq!(
+            check_host_sets(
+                &[
+                    ("Charge", "pay.test"),
+                    ("Mail", "mail.test"),
+                    ("Ask", "llm.test")
+                ],
+                &hosts
+            ),
+            Err(
+                "kernel: job Ask calls llm.test, which has no Host entry — add \
+                 app.outbound(Host::new(\"llm.test\")) with the credentials it needs (GUIDE §6)"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            check_host_sets(&[("Charge", "pay.test")], &hosts),
+            Err("kernel: app.outbound(Host::new(\"mail.test\")) declares a host no mounted job calls — \
+                 remove it, or mount the job that calls it"
+                .to_string())
+        );
+    }
+
     use super::*;
 
     fn host() -> Host {

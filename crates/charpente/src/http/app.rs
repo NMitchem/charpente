@@ -3,7 +3,7 @@
 
 use std::any::TypeId;
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,7 @@ use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex}
 use crate::kernel::JobDef;
 use crate::kernel::JobEntry;
 use crate::kernel::cron::{CronEntry, CronRow};
+use crate::outbound::{DEFAULT_MAX_IN_FLIGHT, Host};
 
 /// Shared by `db_mut` and `begin_group`, which cannot share the *call* — the
 /// ruling behind `begin_group`'s field projection forbids it reaching for
@@ -355,6 +356,8 @@ pub struct App {
     /// <Ev>()` captured statically at the subscribe site, registered or not.
     event_defs: Vec<EventDef>,
     cron_entries: Vec<CronEntry>,
+    hosts: Vec<Host>,
+    max_in_flight: usize,
     /// `None` until `App::with_oidc` mounts a verifier. The `Arc` is now
     /// incidental, not load-bearing: it existed so `handle_or_subscribe`
     /// could clone an owned handle before `db_mut()` took `&mut self`, and
@@ -410,6 +413,8 @@ impl App {
             // No platform events to seed: the built-in surface emits none.
             event_defs: Vec::new(),
             cron_entries: vec![sweep::platform_cron_entry()],
+            hosts: Vec::new(),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             oidc: None,
             tenants: BTreeMap::new(),
         };
@@ -625,6 +630,52 @@ impl App {
 
     /// Describe-only reach: the registered job descriptors, in registration
     /// order. Never used by request handling itself.
+    /// Declares one outside service its jobs call (outbound-effects spec §9):
+    /// exactly one entry per host a mounted job names, checked when the
+    /// kernel is built, so mount order is free (plan amendment A5).
+    pub fn outbound(mut self, host: Host) -> App {
+        assert!(
+            !self.hosts.iter().any(|h| h.name() == host.name()),
+            "contract: app.outbound(Host::new(\"{}\")) declared twice — one Host entry per host",
+            host.name()
+        );
+        self.hosts.push(host);
+        self
+    }
+
+    /// How many outbound calls this node keeps in flight at once (default
+    /// 64). A due outbound job waits while the table is full; a pure job
+    /// never waits behind it (spec §4).
+    pub fn outbound_max_in_flight(mut self, n: usize) -> App {
+        assert!(
+            n > 0,
+            "contract: App::outbound_max_in_flight(0) would never start a call — give at least 1"
+        );
+        self.max_in_flight = n;
+        self
+    }
+
+    /// The hosts this app's mounted jobs call, sorted and deduplicated — what
+    /// `sim.outbound(…)` takes (spec §10). Read it before building a kernel,
+    /// which takes the job defs.
+    pub fn outbound_hosts(&self) -> Vec<&'static str> {
+        self.job_defs
+            .iter()
+            .filter_map(|d| d.outbound.as_ref().map(|o| o.host))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[expect(dead_code, reason = "first caller: Task 11")]
+    pub(crate) fn take_outbound(&mut self) -> (Vec<Host>, usize) {
+        (std::mem::take(&mut self.hosts), self.max_in_flight)
+    }
+
+    pub(crate) fn outbound_config(&self) -> &[Host] {
+        &self.hosts
+    }
+
     pub(crate) fn job_defs(&self) -> &[JobDef] {
         &self.job_defs
     }

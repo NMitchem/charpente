@@ -392,6 +392,7 @@ pub fn fixture_contract() -> Contract {
         ],
         jobs: Vec::new(),
         cron: Vec::new(),
+        outbound_hosts: Vec::new(),
         config: ConfigInfo {
             body_cap: 1_048_576,
             session_ttl: 3600,

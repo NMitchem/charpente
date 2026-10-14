@@ -733,7 +733,8 @@ const GOLDEN: &str = r#"{
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": true
+      "builtin": true,
+      "outbound": null
     },
     {
       "name": "SendReceipt",
@@ -743,7 +744,8 @@ const GOLDEN: &str = r#"{
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": false
+      "builtin": false,
+      "outbound": null
     },
     {
       "name": "SendOverdueReminder",
@@ -753,7 +755,8 @@ const GOLDEN: &str = r#"{
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": false
+      "builtin": false,
+      "outbound": null
     },
     {
       "name": "AdvanceDay",
@@ -763,7 +766,8 @@ const GOLDEN: &str = r#"{
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": false
+      "builtin": false,
+      "outbound": null
     }
   ],
   "cron": [
@@ -778,6 +782,7 @@ const GOLDEN: &str = r#"{
       "builtin": false
     }
   ],
+  "outbound_hosts": [],
   "config": {
     "body_cap": 1048576,
     "session_ttl": 2592000000000000,

@@ -257,6 +257,7 @@ mod contract {
         types: Vec<TypeDef>,
         jobs: Vec<JobInfo>,
         cron: Vec<CronInfo>,
+        outbound_hosts: Vec<HostInfo>,
         config: ConfigInfo,
         telemetry: TelemetryInfo,
     }
@@ -375,6 +376,32 @@ mod contract {
         scoped_by: Option<String>,
         cross_tenant: bool,
         builtin: bool,
+        outbound: Option<OutboundInfo>,
+    }
+
+    #[derive(Deserialize)]
+    struct OutboundInfo {
+        host: String,
+        timeout_ms: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct HostInfo {
+        host: String,
+        env: Vec<String>,
+        injects: Vec<String>,
+        max_request_bytes: usize,
+        max_reply_bytes: usize,
+    }
+
+    fn into_host(h: HostInfo) -> real::HostInfo {
+        real::HostInfo {
+            host: leak(h.host),
+            env: leak_all(h.env),
+            injects: h.injects,
+            max_request_bytes: h.max_request_bytes,
+            max_reply_bytes: h.max_reply_bytes,
+        }
     }
 
     #[derive(Deserialize)]
@@ -414,6 +441,7 @@ mod contract {
             types: c.types.into_iter().map(into_type_def).collect(),
             jobs: c.jobs.into_iter().map(into_job).collect(),
             cron: c.cron.into_iter().map(into_cron).collect(),
+            outbound_hosts: c.outbound_hosts.into_iter().map(into_host).collect(),
             config: into_config(c.config),
             telemetry: into_telemetry(c.telemetry),
         }
@@ -503,6 +531,10 @@ mod contract {
             scoped_by: j.scoped_by.map(leak),
             cross_tenant: j.cross_tenant,
             builtin: j.builtin,
+            outbound: j.outbound.map(|o| real::OutboundInfo {
+                host: leak(o.host),
+                timeout_ms: o.timeout_ms,
+            }),
         }
     }
 
@@ -659,9 +691,12 @@ mod tests {
         { "name": "WidgetView", "schema": { "Struct": { "fields": [] } } }
       ],
       "jobs": [{ "name": "SendMail", "retry": { "max": 3, "backoff_nanos": 1000 },
-                 "scoped_by": "Org", "cross_tenant": true, "builtin": false }],
+                 "scoped_by": "Org", "cross_tenant": true, "builtin": false,
+                 "outbound": { "host": "mail.test", "timeout_ms": 30000 } }],
       "cron": [{ "name": "charpente.session_sweep", "interval_nanos": 60000000000,
                  "builtin": true }],
+      "outbound_hosts": [{ "host": "mail.test", "env": ["MAIL_TOKEN"], "injects": ["x-mail-token"],
+                           "max_request_bytes": 1048576, "max_reply_bytes": 4194304 }],
       "config": { "body_cap": 1024, "session_ttl": 3600, "store_path": "/tmp/x",
                   "retain_segments": 4, "checkpoint_every": 100, "event_retention": 1000,
                   "migration_batch_size": 500, "oidc": false },

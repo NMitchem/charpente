@@ -1893,6 +1893,38 @@ Pending jobs of the old shape exist, and the ways through are the two "Changing 
 job's fields" below describes: drain first, or a new type. The host is not part of
 the shape, so changing the host is not refused.
 
+### Declaring the hosts
+
+An outbound job names its host; the `App` says how to reach it. Declare one
+`Host` per host that a mounted job calls:
+
+```text
+app.outbound(Host::new("pay.test").bearer_env("PAY_KEY").max_reply_bytes(1 << 20))
+   .outbound(Host::new("mail.test").header_env("X-Postmark-Server-Token", "POSTMARK_TOKEN"))
+```
+
+The builders are `bearer_env(var)`, `header_env(name, var)`, `basic_env(user_var,
+pass_var)`, `max_request_bytes(n)` and `max_reply_bytes(n)`. A credential is the
+NAME of an environment variable: the value is read when `serve` starts and
+never enters the log, the sim or `describe`, which lists variable and header
+names only. The caps default to 1 MiB and 4 MiB, and neither passes
+`MAX_CAP_BYTES` (8 MiB).
+
+The two sets must match both ways, checked when the kernel is built, so mount
+order is free. A called host with no entry is refused with
+`kernel: job <job> calls <host>, which has no Host entry — add
+app.outbound(Host::new("<host>")) with the credentials it needs (GUIDE §6)`,
+and an entry no mounted job calls with `kernel:
+app.outbound(Host::new("<host>")) declares a host no mounted job calls —
+remove it, or mount the job that calls it`. Declaring one host twice panics
+at `app.outbound`. `app.outbound_hosts()` returns the hosts the mounted jobs
+call, sorted: the list `sim.outbound` takes.
+
+`app.outbound_max_in_flight(n)` sets how many calls a node keeps in flight at
+once (default 64, `charpente::outbound::DEFAULT_MAX_IN_FLIGHT`). A due
+outbound job waits while the table is full, and a pure job never waits behind
+it.
+
 ### Changing a job's fields
 
 Every enqueue records the payload's shape — `Job::FINGERPRINT`, the structural
@@ -5649,8 +5681,8 @@ a global event (§11, "An event's tenancy").
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, migration chain, and whether it's tenant-scoped),
 every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, by that tenant type's `NAME`, whether it declared `cross_tenant`, whether it's an SSE stream),
-every registered event (name, payload type, and the tenant it belongs to if it is `scoped_by` — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`), every cron entry
-(name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
+every registered event (name, payload type, and the tenant it belongs to if it is `scoped_by` — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`, and its `outbound` host and `timeout_ms`, or `null` for a pure job), every cron entry
+(name, interval), every declared `Host` as `outbound_hosts` (the host, the variable NAMES it reads, the header names those fill, and its two caps; never a value — §6), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
 every `#[table]`/`#[route]`/`#[job]` item across the crate by hand.
@@ -6476,7 +6508,8 @@ memorizing a list:
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": true
+      "builtin": true,
+      "outbound": null
     },
     {
       "name": "SendReceipt",
@@ -6486,7 +6519,8 @@ memorizing a list:
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": false
+      "builtin": false,
+      "outbound": null
     },
     {
       "name": "SendOverdueReminder",
@@ -6496,7 +6530,8 @@ memorizing a list:
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": false
+      "builtin": false,
+      "outbound": null
     },
     {
       "name": "AdvanceDay",
@@ -6506,7 +6541,8 @@ memorizing a list:
       },
       "scoped_by": null,
       "cross_tenant": false,
-      "builtin": false
+      "builtin": false,
+      "outbound": null
     }
   ],
   "cron": [
@@ -6521,6 +6557,7 @@ memorizing a list:
       "builtin": false
     }
   ],
+  "outbound_hosts": [],
   "config": {
     "body_cap": 1048576,
     "session_ttl": 2592000000000000,
@@ -7644,7 +7681,7 @@ Five properties make this a capability rather than an escape hatch:
       params=[...] request=... response=... error=... emits=[]
   ...
   jobs:
-    Rollup max=2 backoff_nanos=5000000000 scoped_by=none cross_tenant=true builtin=false
+    Rollup max=2 backoff_nanos=5000000000 scoped_by=none cross_tenant=true builtin=false outbound=none
   ```
 
   (Each route prints a second, indented line of type info, and the dump also
