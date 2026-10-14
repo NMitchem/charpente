@@ -1399,6 +1399,28 @@ whose jobs call nothing gets no client and no thread for one.
 with no operator settings, so they reach only hosts whose certificates chain
 to a public CA, at their real addresses.
 
+On the command line of an app built on `charpente::launch` (§13), the two
+settings are the serve form's flags, each repeatable:
+
+- `--outbound-base HOST=URL` reaches the declared host `HOST` at `URL`
+  instead of `https://HOST:443`. `URL` is a scheme, an IP address or
+  `localhost`, and an optional port (`https://127.0.0.1:8443`,
+  `https://[::1]:8443`), with no path. Only the address moves: TLS still
+  verifies `HOST`, and the request's `host` header still names it, so a
+  stand-in remote must present a certificate for `HOST` that a trusted CA
+  issued. That is why a DNS name is refused as a base: it would read as
+  moving the name, which never moves. Plain `http://` is accepted only for a
+  loopback address. A `HOST` no mounted job calls is refused, naming the
+  hosts the app does call.
+- `--outbound-ca PATH` trusts the PEM CA certificates in `PATH`, for every
+  host, beside Mozilla's roots. A file that cannot be read or holds no
+  certificate refuses the start.
+
+A flag that is unknown, has no value, or (for `--outbound-base`) is not
+`HOST=URL` exits 2 with `launch`'s usage before the data directory is
+touched; anything `serve_with` refuses prints `charpente refused to start:
+<the refusal>` and exits 1 (§13).
+
 ### What `#[route]` rejects
 
 Every rejection is a compile error naming the contract and the fix. The
@@ -6175,20 +6197,25 @@ fn main() -> std::io::Result<()> {
 
 That's the whole migration: no verb still serves on `"0.0.0.0:8080"` against `./data`
 exactly as a hand-rolled `main` would; `myapp describe` and `myapp describe --format json`
-are new, for free — and so is `restore` (§15). An unrecognized verb or a bad `--format`
-value exits 2 with a pinned usage message:
+are new, for free — and so is `restore` (§15). The serve form takes the operator's outbound
+flags (§5), each repeatable, which `launch` hands to `serve_with`: `myapp --outbound-base
+pay.example=https://127.0.0.1:8443 --outbound-ca ./ca.pem`. An unrecognized verb, a bad
+`--format` value, or a serve flag that is unknown, missing its value, or (for
+`--outbound-base`) not `HOST=URL` exits 2 with a pinned usage message, before the data
+directory is touched:
 
 <!-- pinned -->
 ```text
 usage: <app> [describe [--format json|human]]
-       <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  — no verb serves the app
+       <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]
+       <app> [--outbound-base HOST=URL]... [--outbound-ca PATH]...  — no verb serves the app
 ```
 
 (`launch.rs`'s `the_guide_quotes_the_usage_text_the_binary_actually_prints` `include_str!`s
 this file and asserts the block above is the constant verbatim, so the two cannot drift
 apart silently again — they did once, when §15 was added.)
 
-A status-1 exit under `launch` (non-replicated — `launch` only ever calls `serve::serve`,
+A status-1 exit under `launch` (non-replicated — `launch` only ever calls `serve::serve_with`,
 never `serve_replicated`, so neither a witness conflict nor a strict-witness deadline can
 happen here; those are `charpente::serve_replicated`-only stops) comes from one of three
 distinct moments, each with its own line on stderr:
@@ -6200,9 +6227,12 @@ distinct moments, each with its own line on stderr:
   `/dev/urandom` (`ProdEntropy::new`) or `build` (`App::open`) fails — a table-gate barrier
   from a schema this binary cannot open, or an ordinary platform IO failure (the store, the
   log): `charpente refused to start: ...`/`charpente failed to start — fix the store/log and
-  restart: ...`. Or the HTTP bind fails, which `serve` attempts
-  before it spawns the kernel thread: `charpente failed to start — could not bind <addr>:
-  <the OS error> — free that address, or change the one the app passes to launch`.
+  restart: ...`. Or the outbound client's setup refuses (§5, §6) — an unset or malformed
+  credential variable, a bad `--outbound-base`, an unreadable `--outbound-ca`:
+  `charpente refused to start: ...`, the refusal's own text naming the fix. Or the HTTP bind
+  fails, which `serve_with` attempts after the client is built and before it spawns the
+  kernel thread: `charpente failed to start — could not bind <addr>: <the OS error> — free
+  that address, or change the one the app passes to launch`.
 - **The kernel stops on its own account** — a Pending job of a foreign shape (§6), a
   migration step this binary has no registration for, or a platform IO failure — and its
   stop line names which: `charpente kernel refused to start`/`stopped on a

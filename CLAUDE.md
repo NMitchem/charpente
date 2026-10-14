@@ -65,7 +65,7 @@ item with the trigger that reopens it.
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/realtime_resume/
   smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
   ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
-  invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
+  outbound-fixture: sim; invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
   missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
   with tests cannot sit outside this list either.
@@ -138,6 +138,9 @@ item with the trigger that reopens it.
   `client.ts`, behind the CLI's `gen-client`/`check-client` verbs.
 - `crates/sim-fixture` — minimal app the CLI dogfoods against; single-dep on `charpente`,
   so it also pins macro-path expansion.
+- `crates/outbound-fixture` — the app outbound effects are proven against: a launch-driven
+  node binary and a TLS fake remote the edge harness drives (its own crate so
+  sim-fixture's and invoicing's recorded batches never move).
 - `crates/ts-fixture-app` — the app the TS client is generated from; its `tests/` are the
   codegen's oracles (staleness diff, wire-shape drift).
 - `crates/guide-examples` — compile gate for docs/GUIDE.md, the CLAUDE.md inventory gate

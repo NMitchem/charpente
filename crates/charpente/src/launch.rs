@@ -4,8 +4,9 @@
 //! every app that adopts it. `dispatch` is the testable core (the
 //! `harness::run` convention: argv in, output through an injected writer,
 //! exit code out) — unit tests drive it with synthetic argv and a `Vec<u8>`
-//! sink, never spawning a real server; the `[]` arm is the only one that
-//! calls `serve::serve`, and the loopback smoke test in serve.rs covers it.
+//! sink, never spawning a real server; the serve arm (no verb) is the only
+//! one that calls `serve::serve_with`, and the loopback smoke test in
+//! serve.rs covers it.
 
 use std::io;
 
@@ -16,6 +17,7 @@ use crate::archive::restore::{RestoreOpts, restore};
 use crate::describe::{to_human, to_json};
 use crate::http::App;
 use crate::prod::{FsObjectStore, ProdDisk, ProdEntropy};
+use crate::serve::OutboundOptions;
 
 /// The permission-pin helper `tests/archive.rs` shares (D2 re-review R4).
 #[cfg(test)]
@@ -23,7 +25,8 @@ use crate::prod::{FsObjectStore, ProdDisk, ProdEntropy};
 mod support;
 
 pub const LAUNCH_USAGE: &str = "usage: <app> [describe [--format json|human]]\n       \
-       <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  — no verb serves the app";
+       <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]\n       \
+       <app> [--outbound-base HOST=URL]... [--outbound-ca PATH]...  — no verb serves the app";
 
 /// The standard app entry (spec §1.1): argv dispatch owned by charpente so
 /// `describe` is free for every app. `build` runs against the disk THIS
@@ -35,8 +38,8 @@ pub fn launch(
     data_dir: &str,
     build: impl Fn(Box<dyn Disk>, Box<dyn Entropy>) -> io::Result<App>,
 ) -> io::Result<()> {
-    // Unlocked: the `[]` arm's `match serve(..) { Ok(server) => server.wait(),
-    // .. }` below blocks this thread on the kernel thread's own `JoinHandle`,
+    // Unlocked: the `[]` arm's `match serve_with(..) { Ok(server) =>
+    // server.wait(), .. }` below blocks this thread on the kernel thread's own `JoinHandle`,
     // and the kernel thread's own stop line prints through a bare
     // `eprintln!` (serve.rs) — a lock held here across that wait would never
     // release for it, so the kernel thread's print blocks forever and
@@ -85,7 +88,17 @@ pub(crate) fn dispatch(
     out: &mut dyn io::Write,
     err: &mut dyn io::Write,
 ) -> io::Result<i32> {
-    let Some(verb) = args.first() else {
+    // No verb serves, and the serve form's only arguments are its
+    // `--outbound-*` flags.
+    let Some(verb) = args.first().filter(|a| !a.starts_with("--outbound-")) else {
+        // Parsed before `ProdDisk::new`, so a refused flag touches no disk.
+        let opts = match outbound_flags(args) {
+            Ok(opts) => opts,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}\n\n{LAUNCH_USAGE}");
+                return Ok(2);
+            }
+        };
         // Same leak `build`'s own match below exists to close (GUIDE §13):
         // left to bubble through this function's `?`, either failure would
         // reach `main`'s default `Termination` impl and print the raw
@@ -137,10 +150,16 @@ pub(crate) fn dispatch(
         };
         // A stopped kernel ends the process with its code (spec §5), rather
         // than parking forever behind an edge that can only answer 500.
-        // `serve` binds before any kernel exists, so its only `Err` is the
-        // bind's, with nothing left running behind it.
-        return match crate::serve::serve(addr, app) {
+        // `serve_with` builds the outbound client, then binds, both before
+        // any kernel exists, so its `Err` — the outbound setup's `Refusal`
+        // (a credential, a base or a CA file) or the bind's failure — leaves
+        // nothing running behind it.
+        return match crate::serve::serve_with(addr, app, opts) {
             Ok(server) => Ok(server.wait()),
+            Err(e) if Refusal::of(&e).is_some() => {
+                let _ = writeln!(err, "charpente refused to start: {e}");
+                Ok(1)
+            }
             Err(e) => {
                 let _ = writeln!(
                     err,
@@ -191,6 +210,35 @@ pub(crate) fn dispatch(
     };
 
     describe(build, format, out)
+}
+
+/// The serve form's flags (outbound-effects spec §9), each repeatable. Only
+/// their shape is checked here; what a base or a CA file says is
+/// `serve_with`'s to refuse.
+fn outbound_flags(args: &[String]) -> Result<OutboundOptions, String> {
+    let mut opts = OutboundOptions::default();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--outbound-base" => {
+                let value = args
+                    .next()
+                    .ok_or("--outbound-base needs a value, HOST=URL")?;
+                match value.split_once('=') {
+                    Some((host, base)) if !host.is_empty() && !base.is_empty() => {
+                        opts.bases.push((host.to_string(), base.to_string()));
+                    }
+                    _ => return Err(format!("--outbound-base takes HOST=URL — got '{value}'")),
+                }
+            }
+            "--outbound-ca" => {
+                let value = args.next().ok_or("--outbound-ca needs a value, PATH")?;
+                opts.cas.push(value.into());
+            }
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+    Ok(opts)
 }
 
 /// `restore`'s own help. Long on purpose: an operator meets `--force` here
@@ -424,14 +472,44 @@ mod tests {
         App::open(disk, Schema::new(), entropy, AppConfig::default())
     }
 
+    #[crate::job(global, outbound = "pay.test")]
+    struct LaunchTestCharge {}
+
+    impl LaunchTestCharge {
+        fn call(
+            &self,
+            _tx: &Tx,
+            _key: &charpente_core::io::IdempotencyKey,
+        ) -> Result<Option<crate::outbound::Call>, crate::kernel::JobError> {
+            Ok(None)
+        }
+        fn settle(
+            self,
+            _tx: &mut Tx,
+            _reply: crate::outbound::Reply,
+        ) -> Result<(), crate::kernel::JobError> {
+            Ok(())
+        }
+    }
+
+    /// `tiny_app` with one job that calls `pay.test`, so the serve arm builds
+    /// an outbound client and its flags reach `serve_with`.
+    fn outbound_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> {
+        Ok(
+            App::open(disk, Schema::new(), entropy, AppConfig::default())?
+                .mount_jobs(crate::jobs![LaunchTestCharge])
+                .outbound(crate::outbound::Host::new("pay.test")),
+        )
+    }
+
     /// Builds successfully (unlike
     /// `refusing_build`/`io_failing_build` below, which fail before `serve`
     /// is ever called) but seeds a Pending job under one shape while
     /// mounting a different one for the same name — the same fixture
     /// `serve.rs`'s `a_kernel_that_refuses_to_start_ends_wait_with_status_1`
     /// uses, reused here to drive it through `dispatch`'s `[]` arm instead
-    /// of `serve` directly, so its `match crate::serve::serve(addr, app) {
-    /// Ok(server) => server.wait(), .. }` (launch.rs) is exercised for real:
+    /// of `serve` directly, so its `match crate::serve::serve_with(addr, app,
+    /// opts) { Ok(server) => server.wait(), .. }` (launch.rs) is exercised for real:
     /// a real bind, a real spawned kernel thread that refuses at
     /// `Kernel::new`, and a real `.wait()` join.
     fn build_with_foreign_pending_job(
@@ -748,7 +826,7 @@ mod tests {
         assert!(!exists, "the refusal created {}", missing.display());
     }
 
-    /// The `[]` arm's `match serve::serve(addr, app) { Ok(server) =>
+    /// The `[]` arm's `match serve::serve_with(addr, app, opts) { Ok(server) =>
     /// server.wait(), .. }` (spec §5) is otherwise driven by no test. A
     /// `dispatch` that never returns (a reversion to the old `serve(addr,
     /// app)?; loop { thread::park() }`, or a kernel that does not refuse)
@@ -861,10 +939,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(err).unwrap(),
-            "error: --format must be json or human — got 'yaml'\n\n\
-             usage: <app> [describe [--format json|human]]\n       \
-             <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  \
-             — no verb serves the app\n"
+            format!("error: --format must be json or human — got 'yaml'\n\n{LAUNCH_USAGE}\n")
         );
     }
 
@@ -888,10 +963,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(err).unwrap(),
-            "error: unknown verb 'frobnicate'\n\n\
-             usage: <app> [describe [--format json|human]]\n       \
-             <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  \
-             — no verb serves the app\n"
+            format!("error: unknown verb 'frobnicate'\n\n{LAUNCH_USAGE}\n")
         );
     }
 
@@ -920,11 +992,135 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(err).unwrap(),
-            "error: unknown verb 'describe --format'\n\n\
-             usage: <app> [describe [--format json|human]]\n       \
-             <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  \
-             — no verb serves the app\n"
+            format!("error: unknown verb 'describe --format'\n\n{LAUNCH_USAGE}\n")
         );
+    }
+
+    /// The serve arm's flags refuse before any disk is opened: every call
+    /// here passes `MISSING_DATA_DIR`, so a parse that ran after
+    /// `ProdDisk::new` would exit 1 with "charpente failed to start", not 2.
+    #[test]
+    fn serve_flags_must_come_in_pairs_and_be_known() {
+        let run = |args: &[&str]| {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let code = dispatch(
+                &args,
+                "127.0.0.1:0",
+                MISSING_DATA_DIR,
+                tiny_app,
+                &mut out,
+                &mut err,
+            )
+            .unwrap();
+            assert!(out.is_empty(), "a refused flag prints nothing to stdout");
+            (code, String::from_utf8(err).unwrap())
+        };
+        assert_eq!(
+            run(&["--outbound-base"]),
+            (
+                2,
+                format!("error: --outbound-base needs a value, HOST=URL\n\n{LAUNCH_USAGE}\n")
+            )
+        );
+        assert_eq!(
+            run(&["--outbound-base", "pay.test"]),
+            (
+                2,
+                format!(
+                    "error: --outbound-base takes HOST=URL — got 'pay.test'\n\n{LAUNCH_USAGE}\n"
+                )
+            )
+        );
+        // Either side of the first `=` empty is the same refusal.
+        for value in ["=https://127.0.0.1:1", "pay.test="] {
+            assert_eq!(
+                run(&["--outbound-base", value]),
+                (
+                    2,
+                    format!(
+                        "error: --outbound-base takes HOST=URL — got '{value}'\n\n{LAUNCH_USAGE}\n"
+                    )
+                )
+            );
+        }
+        assert_eq!(
+            run(&["--outbound-ca"]),
+            (
+                2,
+                format!("error: --outbound-ca needs a value, PATH\n\n{LAUNCH_USAGE}\n")
+            )
+        );
+        assert_eq!(
+            run(&["--outbound-proxy", "x"]),
+            (
+                2,
+                format!("error: unknown flag '--outbound-proxy'\n\n{LAUNCH_USAGE}\n")
+            )
+        );
+    }
+
+    /// The parsed flags reach `serve_with`: a base naming a host no job
+    /// calls is `ProdOutbound::new`'s refusal (Task 14), printed as one. Each
+    /// dispatch runs on its own thread under a deadline: a flag that never
+    /// reached `serve_with` leaves nothing to refuse, so the node serves and
+    /// `wait` never returns — a hang a mutation run can only read as a
+    /// timeout, where this test names it.
+    #[test]
+    fn a_refused_outbound_setup_is_a_refused_start() {
+        let dir =
+            std::env::temp_dir().join(format!("charpente-launch-outbound-{}", std::process::id()));
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let data_dir = dir.to_str().unwrap().to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let code = dispatch(
+                    &args,
+                    "127.0.0.1:0",
+                    &data_dir,
+                    outbound_app,
+                    &mut out,
+                    &mut err,
+                );
+                let _ = tx.send((code.map_err(|e| e.to_string()), out, err));
+            });
+            let (code, out, err) = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("dispatch did not return within 10 s: a flag never reached serve_with, so it served");
+            assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+            (code, String::from_utf8(err).unwrap())
+        };
+
+        assert_eq!(
+            run(&["--outbound-base", "nobody.test=https://127.0.0.1:1"]),
+            (
+                Ok(1),
+                "charpente refused to start: --outbound-base names nobody.test, which no mounted job calls — \
+                 the hosts this app calls are: pay.test\n"
+                    .to_string()
+            )
+        );
+
+        // `--outbound-ca` reaches it too, beside a base it accepts.
+        let ca = dir.join("no-such-ca.pem");
+        let (code, err) = run(&[
+            "--outbound-base",
+            "pay.test=https://127.0.0.1:1",
+            "--outbound-ca",
+            ca.to_str().unwrap(),
+        ]);
+        assert_eq!(code, Ok(1), "{err}");
+        assert!(
+            err.starts_with(&format!(
+                "charpente refused to start: --outbound-ca {}: ",
+                ca.display()
+            )),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // Negative space (load-bearing): describe must never touch `data_dir`,

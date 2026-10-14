@@ -1,0 +1,30 @@
+[package]
+name = "outbound-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+charpente.workspace = true
+# The routes' `Wire` request/response types derive serde, as invoicing's do.
+serde = { version = "1", features = ["derive"] }
+# fake_remote only: a TLS server outside the deterministic boundary. `time` is
+# `--hold-ms`'s sleep.
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+[dev-dependencies]
+charpente-sim = { path = "../charpente-sim" }
+
+[lints]
+workspace = true
+
+# `sim_tests!` generates its own `fn main` (as sim-fixture's and invoicing's do).
+[[test]]
+name = "sim"
+harness = false
