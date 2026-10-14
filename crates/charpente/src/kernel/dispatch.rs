@@ -325,53 +325,7 @@ impl Dispatcher {
                     row.name
                 )));
             };
-            // Dispatch runs only while writable (the `Ready::Job` push is
-            // gated on it), and every way to become writable passes a
-            // refusal over a Pending row of a foreign shape first:
-            // `Kernel::build` on a node writable at start, `after_repl_step`
-            // at every write-gate opening. While writable, new rows come only
-            // from this binary's own enqueues, and `Group::stage` refuses one
-            // under another shape of a mounted name; shipped frames apply only
-            // on a follower. So a foreign-shape payload never reaches decode
-            // — asserted, not handled (hard rule 4).
-            assert_eq!(
-                row.shape,
-                Some(def.fingerprint),
-                "dispatcher invariant: job {id} (\"{}\") has recorded shape {} but this binary \
-                 compiled {:#x} — a foreign-shape payload never reaches decode",
-                row.name,
-                row.shape
-                    .map_or_else(|| "none".to_string(), |shape| format!("{shape:#x}")),
-                def.fingerprint
-            );
-            // Unreachable, by three refusals that run before a row can get
-            // here (hard rule 4 — asserted, not handled; the backstop, since
-            // this panics outside the glue's `catch_unwind` and stops the
-            // kernel): app code cannot write a job row (`Tx::put`/`delete`
-            // refuse `JobRow` and any row borrowing its table name, so only
-            // the enqueue family and `Tx::settle_job` write one);
-            // `Group::stage` refuses an enqueue whose tenant presence
-            // disagrees with the mounted declaration, which a hand-written
-            // `impl Job` or `JobDef` could otherwise produce; and the startup
-            // refusal (`Db::pending_job_shape_refusal`) names a Pending row
-            // that disagrees before dispatch starts. The scope TYPE is not
-            // checkable here, since the row records none: `Group::stage`
-            // refuses an enqueue under any type but `def.scope_type`, and
-            // `JobScope::open` asserts the glue opens exactly that type —
-            // inside the `catch_unwind` below, so a hand-built `JobDef` whose
-            // glue disagrees is an attempt, not a kernel stop.
-            assert_eq!(
-                row.scope.is_some(),
-                def.scoped_by.is_some(),
-                "dispatcher invariant: job {id} (\"{}\") carries tenant {:?} but this binary \
-                 declares it {} — app code cannot write a job row, Group::stage refuses an \
-                 enqueue that disagrees with the mounted declaration, and startup refuses a \
-                 Pending row that does, so a row reaching dispatch cannot disagree with it",
-                row.name,
-                row.scope,
-                def.scoped_by
-                    .map_or_else(|| "global".to_string(), |s| format!("scoped_by = {s}"))
-            );
+            assert_row_matches_def(id, &row, def);
             let scope = row.scope.map(|id| JobScope {
                 id,
                 admission: &admission,
@@ -446,90 +400,17 @@ impl Dispatcher {
                 // never runs on a follower. If it ever fires, that gate
                 // broke: fail loudly, don't silently retry.
                 self.due.insert((due_at, id));
-                Err(io::Error::other(
-                    "BUG: a job/cron transaction hit NotPrimary — the kernel must not run \
-                     dispatch or cron on a follower (DESIGN §5)",
-                ))
+                Err(not_primary_bug())
             }
             Err(TxError::Verifying { .. }) => {
                 // Same shape as the NotPrimary arm above: unreachable because
                 // the Ready::Job push is gated on writes_allowed(), which a
                 // verifying node fails.
                 self.due.insert((due_at, id));
-                Err(io::Error::other(
-                    "BUG: a job/cron transaction hit Verifying — the kernel must not run \
-                     dispatch or cron on a node whose witness gate is still shut (M2 \
-                     sub-project 0b). The guard that makes this unreachable is \
-                     writes_allowed(): Kernel::build's cron.upsert, the \
-                     Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema all \
-                     check it, and after_repl_step re-runs the skipped work when the gate \
-                     opens. Reaching here means one of those checks was weakened back to a \
-                     role test — a verifying node is a Role::Primary, so is_primary() does \
-                     not cover it",
-                ))
+                Err(verifying_bug())
             }
             Err(TxError::App(JobError::App(err))) => {
-                // Every fallible step below (the policy read, the
-                // failure-record stage) is run through this closure so that
-                // ANY Err exit — not just the sibling Io arm's — still
-                // restores the heap entry: run_due_into's contract is that a
-                // Pending job is always in the heap on return.
-                //
-                // The retry-policy lookup is folded into the SAME stage as
-                // the failure record (group-commit T7, C-2), rather than a
-                // separate `db.snapshot()` re-read the way this used to
-                // work: `Group` deliberately exposes no snapshot accessor
-                // (spec §1 has no group-snapshot escape hatch), and reading
-                // `row.name` through `tx.get_job` here is strictly MORE correct
-                // anyway — it sees this batch's own earlier writes through
-                // the group overlay, where a bare snapshot would not. This
-                // also deletes one of the two `expect("row existed a moment
-                // ago")` sites the old shape needed.
-                let defs = &self.defs;
-                let staged = group.stage(|tx| {
-                    let mut row = tx
-                        .get_job(Id::from_raw(id), &admission)?
-                        .expect("row existed a moment ago");
-                    let retry = defs
-                        .get(row.name.as_str())
-                        .map_or(RetryPolicy::DEFAULT, |d| d.retry);
-                    row.attempts += 1;
-                    row.last_error = Some(err.clone());
-                    let outcome = if row.attempts >= retry.max {
-                        row.status = JobStatus::Dead;
-                        JobOutcome::Dead {
-                            id,
-                            attempts: row.attempts,
-                        }
-                    } else {
-                        row.due_at = now.saturating_add(retry.backoff_nanos(row.attempts));
-                        JobOutcome::Retried {
-                            id,
-                            attempts: row.attempts,
-                            due_at: row.due_at,
-                        }
-                    };
-                    tx.settle_job(&row, &admission);
-                    Ok::<_, io::Error>(outcome)
-                });
-                match staged.map_err(|e| match e {
-                    TxError::Io(e) | TxError::App(e) => e,
-                    TxError::NotPrimary { .. } => io::Error::other(
-                        "BUG: a job/cron transaction hit NotPrimary — the kernel must not \
-                         run dispatch or cron on a follower (DESIGN §5)",
-                    ),
-                    TxError::Verifying { .. } => io::Error::other(
-                        "BUG: a job/cron transaction hit Verifying — the kernel must not \
-                         run dispatch or cron on a node whose witness gate is still shut \
-                         (M2 sub-project 0b). The guard that makes this unreachable is \
-                         writes_allowed(): Kernel::build's cron.upsert, the \
-                         Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema \
-                         all check it, and after_repl_step re-runs the skipped work when \
-                         the gate opens. Reaching here means one of those checks was \
-                         weakened back to a role test — a verifying node is a \
-                         Role::Primary, so is_primary() does not cover it",
-                    ),
-                }) {
+                match stage_failure_record(&self.defs, group, &admission, id, now, err) {
                     Ok(outcome) => {
                         if let JobOutcome::Retried { due_at, .. } = outcome {
                             self.due.insert((due_at, id));
@@ -610,6 +491,137 @@ impl Dispatcher {
             (Err(_), Err(failure)) => Err(failure.error),
         }
     }
+}
+
+fn assert_row_matches_def(id: u64, row: &JobRow, def: &JobDef) {
+    // Dispatch runs only while writable (the `Ready::Job` push is
+    // gated on it), and every way to become writable passes a
+    // refusal over a Pending row of a foreign shape first:
+    // `Kernel::build` on a node writable at start, `after_repl_step`
+    // at every write-gate opening. While writable, new rows come only
+    // from this binary's own enqueues, and `Group::stage` refuses one
+    // under another shape of a mounted name; shipped frames apply only
+    // on a follower. So a foreign-shape payload never reaches decode
+    // — asserted, not handled (hard rule 4).
+    assert_eq!(
+        row.shape,
+        Some(def.fingerprint),
+        "dispatcher invariant: job {id} (\"{}\") has recorded shape {} but this binary \
+         compiled {:#x} — a foreign-shape payload never reaches decode",
+        row.name,
+        row.shape
+            .map_or_else(|| "none".to_string(), |shape| format!("{shape:#x}")),
+        def.fingerprint
+    );
+    // Unreachable, by three refusals that run before a row can get
+    // here (hard rule 4 — asserted, not handled; the backstop, since
+    // this panics outside the glue's `catch_unwind` and stops the
+    // kernel): app code cannot write a job row (`Tx::put`/`delete`
+    // refuse `JobRow` and any row borrowing its table name, so only
+    // the enqueue family and `Tx::settle_job` write one);
+    // `Group::stage` refuses an enqueue whose tenant presence
+    // disagrees with the mounted declaration, which a hand-written
+    // `impl Job` or `JobDef` could otherwise produce; and the startup
+    // refusal (`Db::pending_job_shape_refusal`) names a Pending row
+    // that disagrees before dispatch starts. The scope TYPE is not
+    // checkable here, since the row records none: `Group::stage`
+    // refuses an enqueue under any type but `def.scope_type`, and
+    // `JobScope::open` asserts the glue opens exactly that type —
+    // inside the `catch_unwind` below, so a hand-built `JobDef` whose
+    // glue disagrees is an attempt, not a kernel stop.
+    assert_eq!(
+        row.scope.is_some(),
+        def.scoped_by.is_some(),
+        "dispatcher invariant: job {id} (\"{}\") carries tenant {:?} but this binary \
+         declares it {} — app code cannot write a job row, Group::stage refuses an \
+         enqueue that disagrees with the mounted declaration, and startup refuses a \
+         Pending row that does, so a row reaching dispatch cannot disagree with it",
+        row.name,
+        row.scope,
+        def.scoped_by
+            .map_or_else(|| "global".to_string(), |s| format!("scoped_by = {s}"))
+    );
+}
+
+fn not_primary_bug() -> io::Error {
+    io::Error::other(
+        "BUG: a job/cron transaction hit NotPrimary — the kernel must not run \
+         dispatch or cron on a follower (DESIGN §5)",
+    )
+}
+
+fn verifying_bug() -> io::Error {
+    io::Error::other(
+        "BUG: a job/cron transaction hit Verifying — the kernel must not run \
+         dispatch or cron on a node whose witness gate is still shut (M2 \
+         sub-project 0b). The guard that makes this unreachable is \
+         writes_allowed(): Kernel::build's cron.upsert, the \
+         Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema all \
+         check it, and after_repl_step re-runs the skipped work when the gate \
+         opens. Reaching here means one of those checks was weakened back to a \
+         role test — a verifying node is a Role::Primary, so is_primary() does \
+         not cover it",
+    )
+}
+
+/// Stages the failure record for one failed attempt: `attempts += 1`,
+/// `last_error`, then a backoff or `Dead`. It touches no due-set; the caller
+/// owns that bookkeeping, since an outbound job returns to a different set.
+fn stage_failure_record(
+    defs: &BTreeMap<&'static str, JobDef>,
+    group: &mut Group,
+    admission: &TenantAdmission<'_>,
+    id: u64,
+    now: u64,
+    err: String,
+) -> io::Result<JobOutcome> {
+    // Every fallible step below (the policy read, the
+    // failure-record stage) is run through this closure so that
+    // ANY Err exit — not just the sibling Io arm's — still
+    // restores the heap entry: run_due_into's contract is that a
+    // Pending job is always in the heap on return.
+    //
+    // The retry-policy lookup is folded into the SAME stage as
+    // the failure record (group-commit T7, C-2), rather than a
+    // separate `db.snapshot()` re-read the way this used to
+    // work: `Group` deliberately exposes no snapshot accessor
+    // (spec §1 has no group-snapshot escape hatch), and reading
+    // `row.name` through `tx.get_job` here is strictly MORE correct
+    // anyway — it sees this batch's own earlier writes through
+    // the group overlay, where a bare snapshot would not. This
+    // also deletes one of the two `expect("row existed a moment
+    // ago")` sites the old shape needed.
+    let staged = group.stage(|tx| {
+        let mut row = tx
+            .get_job(Id::from_raw(id), admission)?
+            .expect("row existed a moment ago");
+        let retry = defs
+            .get(row.name.as_str())
+            .map_or(RetryPolicy::DEFAULT, |d| d.retry);
+        row.attempts += 1;
+        row.last_error = Some(err.clone());
+        let outcome = if row.attempts >= retry.max {
+            row.status = JobStatus::Dead;
+            JobOutcome::Dead {
+                id,
+                attempts: row.attempts,
+            }
+        } else {
+            row.due_at = now.saturating_add(retry.backoff_nanos(row.attempts));
+            JobOutcome::Retried {
+                id,
+                attempts: row.attempts,
+                due_at: row.due_at,
+            }
+        };
+        tx.settle_job(&row, admission);
+        Ok::<_, io::Error>(outcome)
+    });
+    staged.map_err(|e| match e {
+        TxError::Io(e) | TxError::App(e) => e,
+        TxError::NotPrimary { .. } => not_primary_bug(),
+        TxError::Verifying { .. } => verifying_bug(),
+    })
 }
 
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
