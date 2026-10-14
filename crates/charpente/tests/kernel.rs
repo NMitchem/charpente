@@ -472,6 +472,7 @@ mod scoped_jobs {
                 }
                 JobOutcome::Dead { attempts, .. } => assert_eq!((attempts, attempt), (3, 3)),
                 JobOutcome::Done { .. } => panic!("Jam never succeeds"),
+                JobOutcome::Calling { .. } => unreachable!("no outbound job is mounted here"),
             }
         }
         let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
@@ -1635,6 +1636,7 @@ mod scoped_jobs {
                 JobOutcome::Done { .. } => ("done", 0),
                 JobOutcome::Retried { attempts, .. } => ("retried", attempts),
                 JobOutcome::Dead { attempts, .. } => ("dead", attempts),
+                JobOutcome::Calling { .. } => unreachable!("no outbound job is mounted here"),
             });
         }
     }

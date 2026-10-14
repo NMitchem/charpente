@@ -4,6 +4,7 @@
 
 pub(crate) mod cron;
 mod dispatch;
+mod outbound;
 mod tail;
 
 pub use cron::{CronRow, CronScheduler};
@@ -685,6 +686,7 @@ impl Kernel {
                             JobOutcome::Done { .. } => self.stats.jobs_done += 1,
                             JobOutcome::Retried { .. } => self.stats.jobs_retried += 1,
                             JobOutcome::Dead { .. } => self.stats.jobs_dead += 1,
+                            JobOutcome::Calling { .. } => {}
                         }
                         drained += 1;
                     }
@@ -709,6 +711,14 @@ impl Kernel {
                     (Err(e), Ok(())) => return Err(e),
                     (Err(_), Err(failure)) => return Err(failure.error),
                 }
+                // No start can be buffered yet: `build` hands the dispatcher no
+                // `Host` entries, so a decided call stops at its host lookup.
+                // The outbound arm (Task 11) issues these after the commit.
+                assert!(
+                    self.dispatcher.take_starts().is_empty(),
+                    "kernel invariant: a job batch decided an outbound call, but this kernel has \
+                     no Outbound to start it"
+                );
             }
             Ready::Cron => {
                 // Identical shape to the Job arm above, for the identical

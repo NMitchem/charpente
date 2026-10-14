@@ -2,17 +2,22 @@
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::Duration;
 
 use charpente_core::db::{
     CrossTenant, Db, Enqueued, Group, JobShapeRefusal, ScopedTx, TableReadRefusal,
     TableWriteRefusal, Tenant, TenantAdmission, Tx, TxError,
 };
+use charpente_core::io::OutboundCall;
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
+use super::outbound::InFlight;
+use crate::outbound::{Call, DEFAULT_MAX_IN_FLIGHT, Host, IdempotencyKey};
 use crate::tenant::TenantScope;
 
 /// Why a job run did not complete. The App/Io split mirrors `TxError` and is
@@ -134,9 +139,13 @@ pub struct OutboundDef {
 }
 
 /// Decode the payload and call the job's `call`, which receives `&Tx` (or
-/// `&ScopedTx`), so it cannot write (spec R3). Whatever a hand-written glue
-/// writes anyway is discarded: the dispatcher leaves `call`'s stage through
-/// its `Err` path whenever a call is to be made.
+/// `&ScopedTx`), so it cannot write (spec R3). A hand-written glue holds the
+/// `&mut Tx` and can write anyway; whatever it writes is discarded on every
+/// path, since the dispatcher leaves `call`'s stage through its `Err` path
+/// whatever the glue answers. A decided call (`Ok(Some)`) stages nothing; a
+/// declined one (`Ok(None)`) stages only the Done mark, in a stage of its own
+/// after `call`'s; a failure (`Err`, or a panic) stages only the failure
+/// record.
 pub type CallGlue = fn(
     &mut Tx,
     &[u8],
@@ -224,9 +233,24 @@ macro_rules! jobs {
 /// *platform* faults (see `Dispatcher::run_due`).
 #[derive(Debug)]
 pub enum JobOutcome {
-    Done { id: u64 },
-    Retried { id: u64, attempts: u32, due_at: u64 },
-    Dead { id: u64, attempts: u32 },
+    Done {
+        id: u64,
+    },
+    Retried {
+        id: u64,
+        attempts: u32,
+        due_at: u64,
+    },
+    Dead {
+        id: u64,
+        attempts: u32,
+    },
+    /// An outbound job's call was decided; its start waits for the batch's
+    /// commit, and its outcome comes from the outbound arm.
+    Calling {
+        id: u64,
+        token: u64,
+    },
 }
 
 /// The due-heap: which jobs to run and when. The store (`charpente.jobs`) is
@@ -236,6 +260,13 @@ pub struct Dispatcher {
     defs: BTreeMap<&'static str, JobDef>,
     /// (due_at, id) — BTreeSet keeps the earliest-due first; ids break ties.
     due: BTreeSet<(u64, u64)>,
+    /// The outbound jobs' `(due_at, id)`, kept apart from `due` so a
+    /// capacity-blocked outbound job never blocks a pure job due after it
+    /// (outbound-effects spec §4).
+    outbound_due: BTreeSet<(u64, u64)>,
+    /// The `Host` entries by name: what a decided `Call` is checked against.
+    hosts: BTreeMap<&'static str, Host>,
+    in_flight: InFlight,
 }
 
 impl Dispatcher {
@@ -251,16 +282,39 @@ impl Dispatcher {
         Dispatcher {
             defs: map,
             due: BTreeSet::new(),
+            outbound_due: BTreeSet::new(),
+            hosts: BTreeMap::new(),
+            in_flight: InFlight::new(DEFAULT_MAX_IN_FLIGHT),
         }
     }
 
+    /// The kernel's outbound configuration (built from the `App`'s `Host`
+    /// entries, after the host-set check).
+    pub fn with_outbound(mut self, hosts: Vec<Host>, max_in_flight: usize) -> Dispatcher {
+        self.hosts = hosts.into_iter().map(|h| (h.name(), h)).collect();
+        self.in_flight = InFlight::new(max_in_flight);
+        self
+    }
+
     /// Rebuilds the due-heap from Pending rows (called at kernel start — the
-    /// store is the only truth; the heap is a cache of it).
+    /// store is the only truth; the heap is a cache of it). A row with a
+    /// minted key is an outbound job's and goes to the outbound set.
     pub fn rebuild(&mut self, snap: &Snapshot) -> io::Result<()> {
+        assert_eq!(
+            self.in_flight.len(),
+            0,
+            "dispatcher invariant: rebuild with calls in flight — a rebuild follows kernel start \
+             or a write-gate opening, and losing the gate drops the table (spec §4 invariant 3)"
+        );
         self.due.clear();
+        self.outbound_due.clear();
         for job in snap.scan::<JobRow>()? {
             if job.status == JobStatus::Pending {
-                self.due.insert((job.due_at, job.id.raw()));
+                if job.outbound_key.is_some() {
+                    self.queue_outbound(job.due_at, job.id.raw());
+                } else {
+                    self.due.insert((job.due_at, job.id.raw()));
+                }
             }
         }
         Ok(())
@@ -270,12 +324,48 @@ impl Dispatcher {
     /// immediately: due_at 0).
     pub fn note_enqueued(&mut self, enqueued: Vec<Enqueued>) {
         for e in enqueued {
-            self.due.insert((0, e.id.raw()));
+            if e.outbound {
+                self.queue_outbound(0, e.id.raw());
+            } else {
+                self.due.insert((0, e.id.raw()));
+            }
+        }
+    }
+
+    /// The earliest dispatchable job: the pure heap's head, or the outbound
+    /// set's head while the in-flight table has room. Ids are unique across
+    /// both, so the tuple order never consults the flag.
+    fn next_due(&self) -> Option<(u64, u64, bool)> {
+        let pure = self.due.first().map(|&(d, id)| (d, id, false));
+        let outbound = self
+            .in_flight
+            .has_room()
+            .then(|| self.outbound_due.first().map(|&(d, id)| (d, id, true)))
+            .flatten();
+        match (pure, outbound) {
+            (Some(p), Some(o)) => Some(p.min(o)),
+            (p, o) => p.or(o),
         }
     }
 
     pub fn next_deadline(&self) -> Option<u64> {
-        self.due.first().map(|&(due_at, _)| due_at)
+        self.next_due().map(|(d, _, _)| d)
+    }
+
+    fn queue_outbound(&mut self, due_at: u64, id: u64) {
+        assert!(
+            !self.in_flight.holds_job(id),
+            "dispatcher invariant: job {id} queued while in flight (spec §4 invariant 2)"
+        );
+        self.outbound_due.insert((due_at, id));
+    }
+
+    fn requeue(&mut self, due_at: u64, id: u64, outbound: bool) {
+        if outbound {
+            self.queue_outbound(due_at, id);
+        } else {
+            self.due.insert((due_at, id));
+        }
     }
 
     pub fn has_due(&self, now: u64) -> bool {
@@ -302,6 +392,13 @@ impl Dispatcher {
     /// Pending in the store either way, since nothing this call staged has
     /// been committed.
     ///
+    /// An outbound job (its row carries a minted key, so it sits in the
+    /// outbound set) runs its `call` instead of its run glue, under the same
+    /// outcomes and the same `Err` causes, plus `Calling`: the call was
+    /// decided, nothing was staged, and its start waits in `take_starts`
+    /// until the group commits (outbound-effects spec §4, R6). Every entry
+    /// restored on an `Err` goes back to the set it came from.
+    ///
     /// **Contract for a caller sharing `group` across several jobs** (the
     /// kernel's batched drain): an `Err` return here does NOT mean `group`
     /// is empty — an earlier job in the same batch may already have staged
@@ -322,11 +419,15 @@ impl Dispatcher {
     /// most `MAX_BATCH - 1` when a job's second stage runs, so a batch of
     /// `MAX_BATCH` jobs can never push `group.len()` past `MAX_BATCH`.
     pub fn run_due_into(&mut self, group: &mut Group, now: u64) -> io::Result<JobOutcome> {
-        let &(due_at, id) = self.due.first().expect("run_due called with an empty heap");
+        let (due_at, id, outbound) = self.next_due().expect("run_due called with an empty heap");
         assert!(
             due_at <= now,
             "dispatcher bug: run_due at {now} but the earliest job is due at {due_at}"
         );
+        if outbound {
+            self.outbound_due.remove(&(due_at, id));
+            return self.run_call_into(group, now, due_at, id);
+        }
         self.due.remove(&(due_at, id));
 
         let defs = &self.defs;
@@ -359,6 +460,23 @@ impl Dispatcher {
                 )));
             };
             assert_row_matches_def(id, &row, def);
+            // Outside the glue's `catch_unwind`, so a misroute stops the
+            // kernel rather than retrying through the outbound glue's
+            // `unreachable!` until the job is Dead.
+            if let Some(out) = &def.outbound {
+                panic!(
+                    "contract: job {id} (\"{name}\") has no minted key, so dispatch routed it to \
+                     its run glue, but the mounted `JobDef` declares it outbound (it calls \
+                     {host}), and an outbound job's run glue is never called — the `JobDef` is \
+                     hand-built, with `outbound` set beside a pure job's fingerprint, or a \
+                     hand-written `impl Job` enqueued its shape with `OUTBOUND = false`; nothing \
+                     ran, and dispatch stops here rather than spend the job's retries on a glue \
+                     that cannot run — mount {name} through `jobs![…]` and enqueue its #[job] \
+                     type, which mints the key (R8)",
+                    name = row.name,
+                    host = out.host,
+                );
+            }
             let scope = row.scope.map(|id| JobScope {
                 id,
                 admission: &admission,
@@ -485,7 +603,7 @@ impl Dispatcher {
     /// removed first — and the heap is restored to the ORIGINAL `(due_at,
     /// id)`, mirroring the `Io` arm above, one level up.
     pub fn run_due(&mut self, db: &mut Db, now: u64) -> io::Result<JobOutcome> {
-        let &(due_at, id) = self.due.first().expect("run_due called with an empty heap");
+        let (due_at, id, outbound) = self.next_due().expect("run_due called with an empty heap");
         let mut group = db.begin_group()?;
         let result = self.run_due_into(&mut group, now);
         // Sampled BEFORE commit (which `mem::take`s the group's records):
@@ -501,6 +619,13 @@ impl Dispatcher {
         // THIS job (a fresh group, used by no one else).
         match (result, group.commit()) {
             (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(JobOutcome::Calling { .. }), Err(failure)) => {
+                // R6: the group did not commit, so its call never starts.
+                for (due_at, id) in self.in_flight.abandon_starts() {
+                    self.queue_outbound(due_at, id);
+                }
+                Err(failure.error)
+            }
             (Ok(outcome), Err(failure)) => {
                 let reported_elsewhere = db.poisoned() || db.store_failed();
                 if failure.invalidates(0, staged) || !reported_elsewhere {
@@ -508,9 +633,13 @@ impl Dispatcher {
                         due_at: new_due_at, ..
                     } = outcome
                     {
-                        self.due.remove(&(new_due_at, id));
+                        if outbound {
+                            self.outbound_due.remove(&(new_due_at, id));
+                        } else {
+                            self.due.remove(&(new_due_at, id));
+                        }
                     }
-                    self.due.insert((due_at, id));
+                    self.requeue(due_at, id, outbound);
                     Err(failure.error)
                 } else {
                     Ok(outcome)
@@ -523,6 +652,206 @@ impl Dispatcher {
             // undo on this path.
             (Err(_), Err(failure)) => Err(failure.error),
         }
+    }
+
+    fn run_call_into(
+        &mut self,
+        group: &mut Group,
+        now: u64,
+        due_at: u64,
+        id: u64,
+    ) -> io::Result<JobOutcome> {
+        let defs = &self.defs;
+        let admission = group.tenant_admission();
+        let staged = group.stage(|tx| -> Result<Infallible, CallStage> {
+            let row = tx
+                .get_job(Id::from_raw(id), &admission)?
+                .unwrap_or_else(|| panic!("dispatcher invariant: due job {id} has no row"));
+            assert_eq!(
+                row.status,
+                JobStatus::Pending,
+                "dispatcher invariant: job {id} in the outbound set is not Pending"
+            );
+            let Some(def) = defs.get(row.name.as_str()) else {
+                return Err(CallStage::Failed(JobError::App(format!(
+                    "job \"{}\" is not registered — add it to the jobs![…] list passed to \
+                     App::mount_jobs (or this log outlived a renamed job type)",
+                    row.name
+                ))));
+            };
+            assert_row_matches_def(id, &row, def);
+            let out = def.outbound.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "dispatcher invariant: job {id} (\"{}\") carries a minted key but this binary \
+                     declares it a pure job — outbound-ness is part of the shape (R8), and the \
+                     shape was asserted equal above",
+                    row.name
+                )
+            });
+            let key = IdempotencyKey::from_bytes(row.outbound_key.unwrap_or_else(|| {
+                panic!(
+                    "dispatcher invariant: job {id} is in the outbound set without a minted key — \
+                     only 0x0c/0x0d write one, and only a row with one is routed there"
+                )
+            }));
+            let scope = row.scope.map(|sid| JobScope {
+                id: sid,
+                admission: &admission,
+                job: def.name,
+                scope_type: def.scope_type,
+                scope_name: def.scoped_by,
+            });
+            let decided = match catch_unwind(AssertUnwindSafe(|| {
+                (out.call)(tx, &row.payload, &key, scope)
+            })) {
+                Ok(Ok(decided)) => decided,
+                Ok(Err(e)) => return Err(CallStage::Failed(e)),
+                Err(payload) => {
+                    return Err(CallStage::Failed(JobError::App(format!(
+                        "call panicked: {}",
+                        panic_text(&*payload)
+                    ))));
+                }
+            };
+            Err(match decided {
+                None => CallStage::Declined,
+                Some(call) => CallStage::Decided {
+                    call: Box::new(call),
+                    key,
+                    host: out.host,
+                    timeout: out.timeout,
+                },
+            })
+        });
+        let Err(ended) = staged;
+        match ended {
+            TxError::App(CallStage::Declined) => {
+                // Nothing to send is a success (spec §4). The Done mark is the
+                // job's one record, staged after `call`'s stage was discarded.
+                let staged = group.stage(|tx| {
+                    let mut row = tx
+                        .get_job(Id::from_raw(id), &admission)?
+                        .expect("row existed a moment ago");
+                    row.status = JobStatus::Done;
+                    row.last_error = None;
+                    tx.settle_job(&row, &admission);
+                    Ok::<_, io::Error>(())
+                });
+                match staged {
+                    Ok(()) => Ok(JobOutcome::Done { id }),
+                    Err(e) => {
+                        self.queue_outbound(due_at, id);
+                        Err(match e {
+                            TxError::Io(e) | TxError::App(e) => e,
+                            TxError::NotPrimary { .. } => not_primary_bug(),
+                            TxError::Verifying { .. } => verifying_bug(),
+                        })
+                    }
+                }
+            }
+            TxError::App(CallStage::Decided {
+                call,
+                key,
+                host,
+                timeout,
+            }) => {
+                let rules = self.hosts.get(host).unwrap_or_else(|| {
+                    panic!(
+                        "dispatcher invariant: job {id} calls {host}, which has no Host entry — \
+                         the kernel refuses to build with an unmatched host set (R9)"
+                    )
+                });
+                if let Err(rule) = crate::outbound::check(&call, rules) {
+                    return self.fail_outbound(group, &admission, id, due_at, now, rule);
+                }
+                let token =
+                    self.in_flight
+                        .begin(id, due_at, now, host, timeout, call.into_wire(host, key));
+                Ok(JobOutcome::Calling { id, token })
+            }
+            TxError::App(CallStage::Failed(JobError::App(err))) => {
+                self.fail_outbound(group, &admission, id, due_at, now, err)
+            }
+            // A read the `Schema` refuses is the glue's own deterministic bug,
+            // an attempt, as on the run path.
+            TxError::App(CallStage::Failed(JobError::Io(e)))
+                if TableReadRefusal::of(&e).is_some() =>
+            {
+                self.fail_outbound(group, &admission, id, due_at, now, e.to_string())
+            }
+            TxError::App(CallStage::Failed(JobError::Io(e))) => {
+                self.queue_outbound(due_at, id);
+                Err(e)
+            }
+            // `Group::stage` returns `f`'s `Err` before its write gate and its
+            // two refusals, so a stage that always fails reaches none of them.
+            TxError::Io(_) | TxError::NotPrimary { .. } | TxError::Verifying { .. } => {
+                unreachable!(
+                    "dispatcher invariant: call's stage for job {id} ended in a TxError other \
+                     than its own — Group::stage returns f's Err before its write gate and its \
+                     refusals, and call's stage always returns Err"
+                )
+            }
+        }
+    }
+
+    /// An outbound attempt failed (spec §7): the failure record, and the job
+    /// back in the outbound set at its backoff — or at its old place if the
+    /// record could not be staged.
+    fn fail_outbound(
+        &mut self,
+        group: &mut Group,
+        admission: &TenantAdmission<'_>,
+        id: u64,
+        due_at: u64,
+        now: u64,
+        err: String,
+    ) -> io::Result<JobOutcome> {
+        match stage_failure_record(&self.defs, group, admission, id, now, err) {
+            Ok(outcome) => {
+                if let JobOutcome::Retried { due_at, .. } = outcome {
+                    self.queue_outbound(due_at, id);
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                self.queue_outbound(due_at, id);
+                Err(e)
+            }
+        }
+    }
+
+    /// The starts the last job batch decided; the kernel issues them only
+    /// after that batch's group commits (R6).
+    pub fn take_starts(&mut self) -> Vec<(u64, OutboundCall)> {
+        self.in_flight.take_starts()
+    }
+
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+}
+
+/// How `call`'s stage ends. It always ends through `Err`, so whatever the
+/// stage wrote — nothing, for generated glue (R3) — is discarded on every
+/// path; a declined call's Done mark is staged afterwards, on its own.
+enum CallStage {
+    Decided {
+        /// Boxed: `call`'s stage returns this through its `Err`, which
+        /// clippy keeps small (`result_large_err`).
+        call: Box<Call>,
+        key: IdempotencyKey,
+        host: &'static str,
+        timeout: Duration,
+    },
+    /// `call` answered `Ok(None)`: the job is Done with nothing to send.
+    Declined,
+    Failed(JobError),
+}
+
+impl From<io::Error> for CallStage {
+    fn from(e: io::Error) -> CallStage {
+        CallStage::Failed(JobError::Io(e))
     }
 }
 

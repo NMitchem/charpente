@@ -6,11 +6,14 @@
 use std::time::Duration;
 
 use charpente::auth::Principal;
-use charpente::core::db::{Job, outbound_fingerprint};
-use charpente::http::ApiError;
-use charpente::kernel::{JobEntry, JobError};
-use charpente::outbound::{Call, IdempotencyKey, Reply};
-use charpente::{Id, ScopedTx, Tenant, Tx, job};
+use charpente::core::db::{Job, Schema, outbound_fingerprint};
+use charpente::core::job::{JobRow, JobStatus};
+use charpente::core::table::{Codec, View};
+use charpente::http::{ApiError, App, AppConfig};
+use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope};
+use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
+use charpente::{Id, ScopedTx, Tenant, Tx, job, jobs};
+use charpente_sim::{FaultConfig, Sim};
 
 #[job(
     global,
@@ -159,12 +162,7 @@ fn a_scoped_outbound_job_folds_outbound_over_its_tenant_shape() {
 
 mod describe_hosts {
     use super::*;
-    use charpente::core::db::Schema;
     use charpente::describe::{to_human, to_json};
-    use charpente::http::{App, AppConfig};
-    use charpente::jobs;
-    use charpente::outbound::Host;
-    use charpente_sim::{FaultConfig, Sim};
 
     fn outbound_app(sim: &Sim) -> App {
         App::open(
@@ -299,5 +297,609 @@ mod describe_hosts {
     fn zero_in_flight_is_a_contract_panic() {
         let sim = Sim::with_faults(0x0b4, FaultConfig::none());
         let _ = outbound_app(&sim).outbound_max_in_flight(0);
+    }
+}
+
+/// A global outbound job whose `call` reads a counter row so a test can see
+/// what it saw, and builds the call only while `go` is set.
+#[charpente::table(global)]
+struct Gate {
+    id: charpente::Id<Gate>,
+    go: bool,
+}
+
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 3, backoff = "1s"),
+    timeout = "2s"
+)]
+struct Gated {
+    n: u64,
+}
+
+impl Gated {
+    fn call(&self, tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        let gate = tx.get(charpente::Id::<Gate>::from_raw(0))?;
+        if !gate.is_some_and(|g| g.go) {
+            return Ok(None);
+        }
+        Ok(Some(
+            Call::post(format!("/charge/{}", self.n)).header("idempotency-key", key.as_str()),
+        ))
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+fn gated_app(sim: &Sim, go: bool, jobs: u64) -> App {
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Gate>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Gated, ChargeAsPure])
+    .outbound(Host::new("pay.test"));
+    app.transact_for_tests(|tx| {
+        tx.put(&Gate {
+            id: charpente::Id::from_raw(0),
+            go,
+        });
+        for n in 0..jobs {
+            tx.enqueue(Gated { n });
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    app
+}
+
+fn dispatcher_for(app: &mut App, max_in_flight: usize) -> Dispatcher {
+    let mut d = Dispatcher::new(app.take_job_defs_for_tests())
+        .with_outbound(vec![Host::new("pay.test")], max_in_flight);
+    d.rebuild(&app.db_for_tests().snapshot().unwrap()).unwrap();
+    d
+}
+
+#[test]
+fn a_call_that_answers_none_is_done_with_no_start() {
+    let sim = Sim::with_faults(0x0c0, FaultConfig::none());
+    let mut app = gated_app(&sim, false, 1);
+    let mut d = dispatcher_for(&mut app, 64);
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    assert!(matches!(
+        d.run_due_into(&mut group, 0).unwrap(),
+        JobOutcome::Done { id: 0 }
+    ));
+    group.commit().map_err(|f| f.error).unwrap();
+    assert!(d.take_starts().is_empty());
+    assert_eq!(d.in_flight_len(), 0);
+    let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+    assert_eq!(row.status, JobStatus::Done);
+}
+
+#[test]
+fn a_decided_call_stages_nothing_and_buffers_its_start_with_the_row_key() {
+    let sim = Sim::with_faults(0x0c1, FaultConfig::none());
+    let mut app = gated_app(&sim, true, 1);
+    let mut d = dispatcher_for(&mut app, 64);
+    let db = app.db_for_tests();
+    let key = db.snapshot().unwrap().scan::<JobRow>().unwrap()[0]
+        .outbound_key
+        .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let JobOutcome::Calling { id: 0, token } = d.run_due_into(&mut group, 0).unwrap() else {
+        panic!("a decided call is Calling");
+    };
+    assert!(group.is_empty(), "R3: call's stage nets no record");
+    group.commit().map_err(|f| f.error).unwrap();
+    let starts = d.take_starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].0, token);
+    assert_eq!(starts[0].1.path, "/charge/0");
+    assert_eq!(
+        starts[0].1.key.as_bytes(),
+        &key,
+        "the row's minted key, never a fresh draw"
+    );
+    assert_eq!(d.in_flight_len(), 1);
+    assert!(
+        !d.has_due(u64::MAX),
+        "invariant 2: an in-flight job is in no due-set"
+    );
+}
+
+#[test]
+fn a_full_in_flight_table_never_blocks_a_pure_job() {
+    let sim = Sim::with_faults(0x0c2, FaultConfig::none());
+    let mut app = gated_app(&sim, true, 3);
+    app.transact_for_tests(|tx| {
+        tx.enqueue(ChargeAsPure { cents: 1 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let mut d = dispatcher_for(&mut app, 1);
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    assert!(matches!(
+        d.run_due_into(&mut group, 0).unwrap(),
+        JobOutcome::Calling { id: 0, .. }
+    ));
+    assert!(
+        d.has_due(0),
+        "the pure job (id 3) is still due with the table full"
+    );
+    assert!(matches!(
+        d.run_due_into(&mut group, 0).unwrap(),
+        JobOutcome::Done { id: 3 }
+    ));
+    assert!(!d.has_due(u64::MAX), "outbound ids 1 and 2 wait for room");
+    group.commit().map_err(|f| f.error).unwrap();
+}
+
+#[test]
+fn a_refused_call_is_an_attempt_naming_the_rule() {
+    // `Gated` with a forbidden header: built by `Leaky`, below.
+    let sim = Sim::with_faults(0x0c3, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Leaky])
+    .outbound(Host::new("pay.test").bearer_env("PAY_KEY"));
+    app.transact_for_tests(|tx| {
+        tx.enqueue(Leaky {});
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let mut d = Dispatcher::new(app.take_job_defs_for_tests())
+        .with_outbound(vec![Host::new("pay.test").bearer_env("PAY_KEY")], 64);
+    d.rebuild(&app.db_for_tests().snapshot().unwrap()).unwrap();
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    assert!(matches!(
+        d.run_due_into(&mut group, 0).unwrap(),
+        JobOutcome::Retried {
+            id: 0,
+            attempts: 1,
+            ..
+        }
+    ));
+    group.commit().map_err(|f| f.error).unwrap();
+    assert!(d.take_starts().is_empty(), "a refused call never starts");
+    let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some(
+            "outbound pay.test: the call sets \"authorization\", which this host's Host entry \
+              injects from PAY_KEY — remove it from call; a credential never enters app code"
+        )
+    );
+}
+
+#[job(global, outbound = "pay.test")]
+struct Leaky {}
+
+impl Leaky {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::get("/x").header("Authorization", "Bearer sk_live_leaked"),
+        ))
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// An app over `schema` with `defs` mounted and `Host::new("pay.test")`
+/// declared, and a dispatcher over the same defs and host, rebuilt from the
+/// store once `seed` has run in one minting transaction.
+fn seeded(
+    sim: &Sim,
+    schema: Schema,
+    defs: Vec<JobDef>,
+    seed: impl FnOnce(&mut Tx),
+) -> (App, Dispatcher) {
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        schema,
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(defs)
+    .outbound(Host::new("pay.test"));
+    app.transact_for_tests(|tx| {
+        seed(tx);
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let mut d = Dispatcher::new(app.take_job_defs_for_tests())
+        .with_outbound(vec![Host::new("pay.test")], 64);
+    d.rebuild(&app.db_for_tests().snapshot().unwrap()).unwrap();
+    (app, d)
+}
+
+#[job(global, outbound = "pay.test")]
+struct Boom {}
+
+impl Boom {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        panic!("boom")
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// Plan amendment A16: a panic inside `call` is an attempt, named as `call`'s.
+#[test]
+fn a_call_panic_is_an_attempt_with_the_call_panicked_prefix() {
+    let sim = Sim::with_faults(0x0c4, FaultConfig::none());
+    let (mut app, mut d) = seeded(&sim, Schema::new(), jobs![Boom], |tx| tx.enqueue(Boom {}));
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let outcome = d.run_due_into(&mut group, 0).unwrap();
+    group.commit().map_err(|f| f.error).unwrap();
+    let JobOutcome::Retried {
+        id: 0,
+        attempts: 1,
+        due_at,
+    } = outcome
+    else {
+        panic!("a panicking call is an attempt: {outcome:?}");
+    };
+    assert!(d.take_starts().is_empty(), "a panicking call never starts");
+    let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+    assert_eq!(row.last_error.as_deref(), Some("call panicked: boom"));
+    assert!(
+        d.has_due(due_at) && !d.has_due(due_at - 1),
+        "the attempt returns to the outbound set at its backoff"
+    );
+}
+
+#[job(global, outbound = "pay.test")]
+struct Probe {
+    answer: u64,
+}
+
+impl Probe {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(None)
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// A hand-written `CallGlue` holds `&mut Tx`, so nothing stops it writing: a
+/// `Gate` row whose id names the answer it then gives.
+fn writing_call(
+    tx: &mut Tx,
+    payload: &[u8],
+    _key: &IdempotencyKey,
+    _scope: Option<JobScope<'_>>,
+) -> Result<Option<Call>, JobError> {
+    let probe = <Probe as Codec>::decode(&mut &payload[..])?;
+    tx.put(&Gate {
+        id: charpente::Id::from_raw(10 + probe.answer),
+        go: true,
+    });
+    match probe.answer {
+        0 => Ok(None),
+        1 => Ok(Some(Call::get("/probe"))),
+        _ => Err(JobError::app("probe refused")),
+    }
+}
+
+/// R3 on every path: whatever a hand-written `call` glue writes is discarded
+/// whether it declines (`Ok(None)`, the job Done), decides a call, or fails.
+#[test]
+fn a_hand_written_call_glue_writes_nothing_whatever_it_answers() {
+    let sim = Sim::with_faults(0x0c5, FaultConfig::none());
+    let mut def = <Probe as JobEntry>::def();
+    def.outbound.as_mut().expect("declared outbound").call = writing_call;
+    let (mut app, mut d) = seeded(&sim, Schema::new().table::<Gate>(), vec![def], |tx| {
+        for answer in 0..3 {
+            tx.enqueue(Probe { answer });
+        }
+    });
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let outcomes: Vec<JobOutcome> = (0..3)
+        .map(|_| d.run_due_into(&mut group, 0).unwrap())
+        .collect();
+    group.commit().map_err(|f| f.error).unwrap();
+    assert!(
+        matches!(
+            outcomes[..],
+            [
+                JobOutcome::Done { id: 0 },
+                JobOutcome::Calling { id: 1, .. },
+                JobOutcome::Retried { id: 2, .. }
+            ]
+        ),
+        "{outcomes:?}"
+    );
+    let snap = db.snapshot().unwrap();
+    let written: Vec<u64> = snap
+        .scan::<Gate>()
+        .unwrap()
+        .iter()
+        .map(|g| g.id.raw())
+        .collect();
+    assert_eq!(
+        written,
+        Vec::<u64>::new(),
+        "R3: call's writes never commit (10 = declined, 11 = decided, 12 = failed)"
+    );
+    let rows = snap.scan::<JobRow>().unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.status).collect::<Vec<_>>(),
+        vec![JobStatus::Done, JobStatus::Pending, JobStatus::Pending],
+        "the declined job is Done all the same"
+    );
+}
+
+/// The misroute guard: a row with no minted key reaching a `JobDef` that
+/// declares `outbound`. Here a hand-built def is `Charge`'s (its run glue is
+/// the `unreachable!` stub) under `ChargeAsPure`'s name and fingerprint, so
+/// a pure `ChargeAsPure` enqueue reaches it.
+#[test]
+#[should_panic(
+    expected = "contract: job 0 (\"ChargeAsPure\") has no minted key, so dispatch routed it to its \
+                run glue, but the mounted `JobDef` declares it outbound (it calls pay.test), and an \
+                outbound job's run glue is never called — the `JobDef` is hand-built, with \
+                `outbound` set beside a pure job's fingerprint, or a hand-written `impl Job` \
+                enqueued its shape with `OUTBOUND = false`; nothing ran, and dispatch stops here \
+                rather than spend the job's retries on a glue that cannot run — mount ChargeAsPure \
+                through `jobs![…]` and enqueue its #[job] type, which mints the key (R8)"
+)]
+fn a_row_without_a_key_never_reaches_an_outbound_def_s_run_glue() {
+    let sim = Sim::with_faults(0x0c6, FaultConfig::none());
+    let mut misrouted = <Charge as JobEntry>::def();
+    misrouted.name = <ChargeAsPure as Job>::NAME;
+    misrouted.fingerprint = <ChargeAsPure as Job>::FINGERPRINT;
+    let (mut app, mut d) = seeded(&sim, Schema::new(), vec![misrouted], |tx| {
+        tx.enqueue(ChargeAsPure { cents: 1 })
+    });
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let outcome = d.run_due_into(&mut group, 0);
+    group.commit().map_err(|f| f.error).unwrap();
+    eprintln!("the misroute did not stop dispatch: {outcome:?}");
+}
+
+/// The scoped form end to end: `call` reads a tenant-scoped row through its
+/// `&ScopedTx`, and the queued start carries what it read.
+mod scoped_call {
+    use super::*;
+
+    #[charpente::table(scoped_by = Org)]
+    struct Invoice {
+        id: charpente::Id<Invoice>,
+        cents: u64,
+    }
+
+    #[job(scoped_by = Org, outbound = "pay.test")]
+    struct ChargeInvoice {
+        invoice: charpente::Id<Invoice>,
+    }
+
+    impl ChargeInvoice {
+        fn call(
+            &self,
+            tx: &ScopedTx<'_, '_, Org>,
+            key: &IdempotencyKey,
+        ) -> Result<Option<Call>, JobError> {
+            let Some(invoice) = tx.get(self.invoice)? else {
+                return Err(JobError::app("invoice gone"));
+            };
+            Ok(Some(
+                Call::post(format!("/orgs/{}/charges", tx.scope().raw()))
+                    .header("idempotency-key", key.as_str())
+                    .form(&[("amount", invoice.cents.to_string())]),
+            ))
+        }
+
+        fn settle(self, _tx: &mut ScopedTx<'_, '_, Org>, _reply: Reply) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_scoped_call_reads_its_own_tenant_and_the_start_carries_it() {
+        let sim = Sim::with_faults(0x0c7, FaultConfig::none());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Invoice>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![ChargeInvoice])
+        .outbound(Host::new("pay.test"));
+        // Invoice 1 exists in both orgs, at different amounts; the job is
+        // enqueued in org 7 only, so only org 7's amount may reach the call.
+        let mint = sim.entropy();
+        let mut group = app.db_for_tests().begin_group_minting(&mint).unwrap();
+        let admission = group.tenant_admission();
+        for (org, cents) in [(8u64, 999u64), (7, 250)] {
+            group
+                .stage(|tx| {
+                    let mut scoped = tx.admit_scope(Id::<Org>::from_raw(org), &admission);
+                    scoped.put(&Invoice {
+                        id: Id::from_raw(1),
+                        cents,
+                    });
+                    if org == 7 {
+                        scoped.enqueue(ChargeInvoice {
+                            invoice: Id::from_raw(1),
+                        });
+                    }
+                    Ok::<(), std::io::Error>(())
+                })
+                .unwrap();
+        }
+        group.commit().map_err(|f| f.error).unwrap();
+        let mut d = Dispatcher::new(app.take_job_defs_for_tests())
+            .with_outbound(vec![Host::new("pay.test")], 64);
+        d.rebuild(&app.db_for_tests().snapshot().unwrap()).unwrap();
+        let db = app.db_for_tests();
+        let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+        assert_eq!(row.scope, Some(7));
+        let mut group = db.begin_group().unwrap();
+        let outcome = d.run_due_into(&mut group, 0).unwrap();
+        assert!(
+            matches!(outcome, JobOutcome::Calling { id: 0, .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            group.is_empty(),
+            "R3: the scoped call's stage nets no record"
+        );
+        group.commit().map_err(|f| f.error).unwrap();
+        let starts = d.take_starts();
+        assert_eq!(starts.len(), 1);
+        let call = &starts[0].1;
+        assert_eq!(
+            (call.host, call.path.as_str()),
+            ("pay.test", "/orgs/7/charges")
+        );
+        assert_eq!(call.body, b"amount=250", "org 7's invoice, not org 8's");
+        let key = IdempotencyKey::from_bytes(row.outbound_key.expect("minted"));
+        assert_eq!(call.key, key);
+        assert!(
+            call.headers
+                .contains(&("idempotency-key".to_string(), key.as_str().to_string())),
+            "{:?}",
+            call.headers
+        );
+    }
+}
+
+/// Every group the platform opens mints an outbound enqueue's key (plan
+/// amendment A9): a route's (`App::begin_group`), the kernel's job arm (a
+/// job's `run` enqueues) and its cron arm (a tick enqueues). `Minted` is
+/// deliberately not mounted: a kernel over a mounted outbound job needs an
+/// `Outbound` to start its calls, and `Group::stage` mints by `Job::OUTBOUND`
+/// at the enqueue, not by the mount. Unmounted, each `Minted` row dispatches
+/// as a "not registered" attempt, which keeps its row and its key.
+mod mint_paths {
+    use super::*;
+    use charpente::http::{Method, Request};
+    use charpente::kernel::{Kernel, SimSource};
+    use charpente::{route, routes};
+
+    const SEC: u64 = 1_000_000_000;
+    const ROUTE: u64 = 0;
+    const JOB: u64 = 1;
+    const CRON: u64 = 2;
+
+    #[job(global, outbound = "pay.test")]
+    pub struct Minted {
+        pub via: u64,
+    }
+
+    impl Minted {
+        fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+            Ok(None)
+        }
+
+        fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+
+    #[job(global)]
+    pub struct Relay {}
+
+    impl Relay {
+        fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+            tx.enqueue(Minted { via: JOB });
+            Ok(())
+        }
+    }
+
+    #[route(POST "/relay", public)]
+    fn relay(tx: &mut Tx) -> Result<(), ApiError> {
+        tx.enqueue(Minted { via: ROUTE });
+        Ok(())
+    }
+
+    #[test]
+    fn a_route_a_job_and_a_cron_tick_each_mint_their_own_key() {
+        let sim = Sim::with_faults(0x0c8, FaultConfig::none());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(routes![relay])
+        .mount_jobs(jobs![Relay])
+        .schedule("mint", Duration::from_secs(60), || Minted { via: CRON });
+        app.transact_for_tests(|tx| {
+            tx.enqueue(Relay {});
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        let mut source = SimSource::new(Box::new(sim.clock()), 90 * SEC);
+        source.push_at(0, Request::new(Method::Post, "/relay"));
+        let responses = source.responses();
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        kernel.run(&mut source).unwrap();
+        assert_eq!(
+            responses
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            vec![200],
+            "the route ran"
+        );
+        let rows = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap();
+        let mut keys = std::collections::BTreeMap::new();
+        for row in rows.iter().filter(|r| r.name == "Minted") {
+            let via = <Minted as Codec>::decode(&mut &row.payload[..])
+                .unwrap()
+                .via;
+            let key = row
+                .outbound_key
+                .unwrap_or_else(|| panic!("the enqueue via {via} drew no key"));
+            assert!(keys.insert(via, key).is_none(), "one enqueue via {via}");
+        }
+        assert_eq!(
+            keys.keys().copied().collect::<Vec<_>>(),
+            vec![ROUTE, JOB, CRON],
+            "a route, a job and a cron tick each enqueued once"
+        );
+        let distinct: std::collections::BTreeSet<_> = keys.values().collect();
+        assert_eq!(distinct.len(), 3, "each enqueue drew its own key");
+        assert!(
+            rows.iter()
+                .filter(|r| r.name == "Relay")
+                .all(|r| r.outbound_key.is_none()),
+            "a pure enqueue draws none"
+        );
     }
 }

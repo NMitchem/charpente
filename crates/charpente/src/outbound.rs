@@ -111,7 +111,6 @@ impl Call {
         self
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 10"))]
     pub(crate) fn into_wire(self, host: &'static str, key: IdempotencyKey) -> OutboundCall {
         OutboundCall {
             host,
@@ -426,7 +425,6 @@ fn is_token(name: &str) -> bool {
 /// The rules a built `Call` must satisfy (spec §5, plan amendment A12),
 /// checked before a start. The edge would refuse most of these too, but only
 /// the kernel's refusal is the same in production and the sim.
-#[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 10"))]
 pub(crate) fn check(call: &Call, host: &Host) -> Result<(), String> {
     let h = host.name;
     let before_query = call.path.split('?').next().unwrap_or_default();
