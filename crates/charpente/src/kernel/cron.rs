@@ -5,11 +5,11 @@
 use std::io;
 use std::time::Duration;
 
-use charpente_core::db::{Db, Group, Tx, TxError};
+use charpente_core::db::{Db, Group, Tx};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
 
-use super::dispatch::{not_primary_bug, verifying_bug};
+use super::dispatch::flatten;
 
 #[table(global)]
 pub struct CronRow {
@@ -217,14 +217,6 @@ fn nanos(d: Duration, name: &'static str) -> u64 {
              pick a smaller interval"
         )
     })
-}
-
-fn flatten(e: TxError<io::Error>) -> io::Error {
-    match e {
-        TxError::App(e) | TxError::Io(e) => e,
-        TxError::NotPrimary { .. } => not_primary_bug(),
-        TxError::Verifying { .. } => verifying_bug(),
-    }
 }
 
 #[cfg(test)]

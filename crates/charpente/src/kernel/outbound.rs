@@ -108,7 +108,12 @@ impl InFlight {
         tokens
             .into_iter()
             .map(|t| {
-                let f = self.finish(t).expect("a buffered start is in flight");
+                let f = self.finish(t).unwrap_or_else(|| {
+                    panic!(
+                        "dispatcher invariant: buffered start {t} has no flight — begin records \
+                         both, and finish never runs while a start is buffered"
+                    )
+                });
                 (f.due_at, f.id)
             })
             .collect()
@@ -117,6 +122,12 @@ impl InFlight {
     /// Removes `token`'s flight. `None` for a token not in flight — a late
     /// completion, which the caller discards (invariant 4).
     pub(crate) fn finish(&mut self, token: u64) -> Option<Flight> {
+        assert!(
+            !self.starts.iter().any(|&(t, _)| t == token),
+            "dispatcher invariant: token {token} finished while its start is still buffered — a \
+             buffered start is issued after its batch commits or abandoned with it (R6), never \
+             finished in between, or the remote would still get the call"
+        );
         let f = self.flights.remove(&token)?;
         self.jobs.remove(&f.id);
         self.deadlines.remove(&(f.deadline, token));

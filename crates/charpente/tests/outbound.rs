@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use charpente::auth::Principal;
-use charpente::core::db::{Job, Schema, outbound_fingerprint};
+use charpente::core::db::{Job, Schema, TableReadRefusal, TxError, outbound_fingerprint};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, View};
 use charpente::http::{ApiError, App, AppConfig};
@@ -440,6 +440,20 @@ fn a_full_in_flight_table_never_blocks_a_pure_job() {
     ));
     assert!(!d.has_due(u64::MAX), "outbound ids 1 and 2 wait for room");
     group.commit().map_err(|f| f.error).unwrap();
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    for id in [1, 2] {
+        let row = &rows[id];
+        assert_eq!(
+            (
+                row.id.raw(),
+                row.status,
+                row.attempts,
+                row.last_error.as_deref()
+            ),
+            (id as u64, JobStatus::Pending, 0, None),
+            "waiting for room charges no attempt"
+        );
+    }
 }
 
 #[test]
@@ -681,6 +695,149 @@ fn a_row_without_a_key_never_reaches_an_outbound_def_s_run_glue() {
     eprintln!("the misroute did not stop dispatch: {outcome:?}");
 }
 
+/// The guard's mirror: a row with a minted key reaching a `JobDef` that
+/// declares no `outbound`. Here a hand-built def is `Charge`'s with its
+/// `outbound` cleared, so a `Charge` enqueue (minted, by `Job::OUTBOUND`)
+/// reaches it under the same fingerprint.
+#[test]
+#[should_panic(
+    expected = "contract: job 0 (\"Charge\") carries a minted key, so dispatch routed it to its \
+                call glue, but the mounted `JobDef` declares it a pure job (its `outbound` is \
+                `None`), and a pure job has no call glue — the `JobDef` is hand-built, with \
+                `outbound` cleared beside an outbound job's fingerprint, or a hand-written `impl \
+                Job` enqueued a pure job's shape with `OUTBOUND = true`; nothing ran, and dispatch \
+                stops here rather than spend the job's retries on a call it cannot build — mount \
+                Charge through `jobs![…]` and enqueue its #[job] type (R8)"
+)]
+fn a_row_with_a_key_never_reaches_a_pure_def() {
+    let sim = Sim::with_faults(0x0c9, FaultConfig::none());
+    let mut cleared = <Charge as JobEntry>::def();
+    cleared.outbound = None;
+    let (mut app, mut d) = seeded(&sim, Schema::new(), vec![cleared], |tx| {
+        tx.enqueue(Charge { cents: 1 })
+    });
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let outcome = d.run_due_into(&mut group, 0);
+    group.commit().map_err(|f| f.error).unwrap();
+    eprintln!("the misroute did not stop dispatch: {outcome:?}");
+}
+
+#[job(global, outbound = "pay.test")]
+struct ReadFaults {}
+
+impl ReadFaults {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        // Stands in for a platform read fault inside `call`.
+        Err(JobError::Io(std::io::Error::other(
+            "simulated read fault (injected)",
+        )))
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// Spec §7: `call` returning `Err(Io)` is not an attempt. It bubbles, the row
+/// stays Pending with nothing recorded, the job is due again at once, and
+/// nothing starts.
+#[test]
+fn platform_io_inside_call_is_not_an_attempt() {
+    let sim = Sim::with_faults(0x0ca, FaultConfig::none());
+    let (mut app, mut d) = seeded(&sim, Schema::new(), jobs![ReadFaults], |tx| {
+        tx.enqueue(ReadFaults {})
+    });
+    let db = app.db_for_tests();
+    let err = d.run_due(db, 0).unwrap_err();
+    assert!(err.to_string().contains("simulated read fault"), "{err}");
+    let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
+    assert_eq!(
+        row.status,
+        JobStatus::Pending,
+        "an IO fault is not an attempt"
+    );
+    assert_eq!(row.attempts, 0, "retry budget untouched by platform faults");
+    assert!(row.last_error.is_none(), "nothing was recorded");
+    assert!(
+        d.has_due(0),
+        "the job goes straight back in the outbound set"
+    );
+    assert!(d.take_starts().is_empty(), "and nothing starts");
+    assert_eq!(d.in_flight_len(), 0);
+}
+
+/// A second Row type over `Gate`'s table name: a read through it is refused.
+mod gate_alias {
+    #[charpente::table(global)]
+    pub struct Gate {
+        pub id: charpente::Id<Gate>,
+        pub go: bool,
+    }
+}
+
+#[job(global, outbound = "pay.test")]
+struct ReadsAlias {}
+
+impl ReadsAlias {
+    fn call(&self, tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        tx.get(charpente::Id::<gate_alias::Gate>::from_raw(0))?;
+        Ok(Some(Call::get("/never")))
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// A read the `Schema` refuses inside `call` comes back through `?` as
+/// `JobError::Io`, the variant a platform fault takes, but it is the job's
+/// own deterministic bug: an attempt whose `last_error` is the refusal, and
+/// no start (amendment A18, as on the run path; §7 has no row of its own).
+#[test]
+fn a_refused_read_inside_call_is_an_attempt_naming_the_refusal() {
+    let sim = Sim::with_faults(0x0cb, FaultConfig::none());
+    let (mut app, mut d) = seeded(
+        &sim,
+        Schema::new().table::<Gate>(),
+        jobs![ReadsAlias],
+        |tx| tx.enqueue(ReadsAlias {}),
+    );
+    let db = app.db_for_tests();
+    let refusal = match db.transact(|tx| {
+        tx.get(charpente::Id::<gate_alias::Gate>::from_raw(0))
+            .map(|_| ())
+    }) {
+        Err(TxError::App(e)) if TableReadRefusal::of(&e).is_some() => e.to_string(),
+        other => panic!("the alias read is a TableReadRefusal: {other:?}"),
+    };
+    let outcome = d.run_due(db, 0).unwrap();
+    assert!(
+        matches!(
+            outcome,
+            JobOutcome::Retried {
+                id: 0,
+                attempts: 1,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(d.take_starts().is_empty(), "a refused read never starts");
+    let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+    assert_eq!(row.last_error.as_deref(), Some(refusal.as_str()));
+    assert!(!db.poisoned());
+}
+
+#[test]
+#[should_panic(
+    expected = "contract: Dispatcher::with_outbound(_, 0) would never start a call — give \
+                max_in_flight at least 1"
+)]
+fn a_dispatcher_with_no_room_is_a_contract_panic() {
+    let _ = Dispatcher::new(vec![]).with_outbound(vec![], 0);
+}
+
 /// The scoped form end to end: `call` reads a tenant-scoped row through its
 /// `&ScopedTx`, and the queued start carries what it read.
 mod scoped_call {
@@ -887,6 +1044,14 @@ mod mint_paths {
                 .outbound_key
                 .unwrap_or_else(|| panic!("the enqueue via {via} drew no key"));
             assert!(keys.insert(via, key).is_none(), "one enqueue via {via}");
+            assert_eq!(
+                row.last_error.as_deref(),
+                Some(
+                    "job \"Minted\" is not registered — add it to the jobs![…] list passed to \
+                     App::mount_jobs (or this log outlived a renamed job type)"
+                ),
+                "the call path names an unmounted job as the run path does"
+            );
         }
         assert_eq!(
             keys.keys().copied().collect::<Vec<_>>(),

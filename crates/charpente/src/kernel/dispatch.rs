@@ -144,8 +144,9 @@ pub struct OutboundDef {
 /// path, since the dispatcher leaves `call`'s stage through its `Err` path
 /// whatever the glue answers. A decided call (`Ok(Some)`) stages nothing; a
 /// declined one (`Ok(None)`) stages only the Done mark, in a stage of its own
-/// after `call`'s; a failure (`Err`, or a panic) stages only the failure
-/// record.
+/// after `call`'s; an attempt (`Err(JobError::App)`, a panic, or a read the
+/// `Schema` refuses) stages only the failure record; and a platform fault
+/// (any other `Err(JobError::Io)`) stages nothing and bubbles.
 pub type CallGlue = fn(
     &mut Tx,
     &[u8],
@@ -228,9 +229,11 @@ macro_rules! jobs {
     };
 }
 
-/// The result of running the earliest-due job. `Done`/`Retried`/`Dead` are
-/// all committed records — a run only fails to produce one of these when the
-/// *platform* faults (see `Dispatcher::run_due`).
+/// The result of running the earliest-due job. `Done`/`Retried`/`Dead` each
+/// stand for one record (committed by `run_due`, staged by `run_due_into`);
+/// `Calling` stands for none — an outbound job's call was decided, and its
+/// start waits for the commit. A run only fails to produce one of these when
+/// the *platform* faults (see `Dispatcher::run_due`).
 #[derive(Debug)]
 pub enum JobOutcome {
     Done {
@@ -291,6 +294,11 @@ impl Dispatcher {
     /// The kernel's outbound configuration (built from the `App`'s `Host`
     /// entries, after the host-set check).
     pub fn with_outbound(mut self, hosts: Vec<Host>, max_in_flight: usize) -> Dispatcher {
+        assert!(
+            max_in_flight > 0,
+            "contract: Dispatcher::with_outbound(_, 0) would never start a call — give \
+             max_in_flight at least 1"
+        );
         self.hosts = hosts.into_iter().map(|h| (h.name(), h)).collect();
         self.in_flight = InFlight::new(max_in_flight);
         self
@@ -414,7 +422,9 @@ impl Dispatcher {
     /// stage (the handler attempt) nets ZERO records — `f`'s `Err` propagates
     /// out of `Group::stage` via `?` before it ever touches `self.records` —
     /// and only the SECOND stage (the failure-record write below) nets one.
-    /// On success there is only the one stage. Either way `stage`'s own
+    /// On success there is only the one stage, except for a declined outbound
+    /// call: its first stage (`call`'s) nets zero records and its second (the
+    /// Done mark) nets one; a decided call nets zero. Either way `stage`'s own
     /// assert (`records.len() < MAX_BATCH`, checked BEFORE `f` runs) sees at
     /// most `MAX_BATCH - 1` when a job's second stage runs, so a batch of
     /// `MAX_BATCH` jobs can never push `group.len()` past `MAX_BATCH`.
@@ -453,11 +463,7 @@ impl Dispatcher {
                 "dispatcher invariant: job {id} in the heap is not Pending"
             );
             let Some(def) = defs.get(row.name.as_str()) else {
-                return Err(JobError::App(format!(
-                    "job \"{}\" is not registered — add it to the jobs![…] list passed to \
-                     App::mount_jobs (or this log outlived a renamed job type)",
-                    row.name
-                )));
+                return Err(JobError::App(not_registered(&row.name)));
             };
             assert_row_matches_def(id, &row, def);
             // Outside the glue's `catch_unwind`, so a misroute stops the
@@ -607,10 +613,9 @@ impl Dispatcher {
         let mut group = db.begin_group()?;
         let result = self.run_due_into(&mut group, now);
         // Sampled BEFORE commit (which `mem::take`s the group's records):
-        // `run_due_into`'s Ok arm always stages exactly one record (the
-        // Done/Retried/Dead write), so `staged` is true whenever `result` is
-        // `Ok` — but read from the group itself rather than from `result`,
-        // so this stays correct if that ever changes.
+        // `run_due_into`'s `Ok` stages exactly one record for
+        // `Done`/`Retried`/`Dead` and none for `Calling`, so `staged` is read
+        // from the group itself rather than derived from `result`.
         let staged = !group.is_empty();
         // Nothing is durable until commit runs — and it runs regardless of
         // `result` (C-1's commit-then-bubble rule): `Group`'s only
@@ -620,7 +625,10 @@ impl Dispatcher {
         match (result, group.commit()) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Ok(JobOutcome::Calling { .. }), Err(failure)) => {
-                // R6: the group did not commit, so its call never starts.
+                // Defensive, unreachable today: this group holds only this
+                // job, `Calling` stages nothing, and `Group::commit` returns
+                // `Ok` for an empty group before any IO. Kept so R6 holds if
+                // that ever changes: a group that did not commit starts no call.
                 for (due_at, id) in self.in_flight.abandon_starts() {
                     self.queue_outbound(due_at, id);
                 }
@@ -673,19 +681,22 @@ impl Dispatcher {
                 "dispatcher invariant: job {id} in the outbound set is not Pending"
             );
             let Some(def) = defs.get(row.name.as_str()) else {
-                return Err(CallStage::Failed(JobError::App(format!(
-                    "job \"{}\" is not registered — add it to the jobs![…] list passed to \
-                     App::mount_jobs (or this log outlived a renamed job type)",
-                    row.name
-                ))));
+                return Err(CallStage::Failed(JobError::App(not_registered(&row.name))));
             };
             assert_row_matches_def(id, &row, def);
+            // The run path's misroute guard, mirrored: outside the glue's
+            // `catch_unwind`, so it stops the kernel.
             let out = def.outbound.as_ref().unwrap_or_else(|| {
                 panic!(
-                    "dispatcher invariant: job {id} (\"{}\") carries a minted key but this binary \
-                     declares it a pure job — outbound-ness is part of the shape (R8), and the \
-                     shape was asserted equal above",
-                    row.name
+                    "contract: job {id} (\"{name}\") carries a minted key, so dispatch routed it \
+                     to its call glue, but the mounted `JobDef` declares it a pure job (its \
+                     `outbound` is `None`), and a pure job has no call glue — the `JobDef` is \
+                     hand-built, with `outbound` cleared beside an outbound job's fingerprint, or \
+                     a hand-written `impl Job` enqueued a pure job's shape with `OUTBOUND = \
+                     true`; nothing ran, and dispatch stops here rather than spend the job's \
+                     retries on a call it cannot build — mount {name} through `jobs![…]` and \
+                     enqueue its #[job] type (R8)",
+                    name = row.name,
                 )
             });
             let key = IdempotencyKey::from_bytes(row.outbound_key.unwrap_or_else(|| {
@@ -741,11 +752,7 @@ impl Dispatcher {
                     Ok(()) => Ok(JobOutcome::Done { id }),
                     Err(e) => {
                         self.queue_outbound(due_at, id);
-                        Err(match e {
-                            TxError::Io(e) | TxError::App(e) => e,
-                            TxError::NotPrimary { .. } => not_primary_bug(),
-                            TxError::Verifying { .. } => verifying_bug(),
-                        })
+                        Err(flatten(e))
                     }
                 }
             }
@@ -905,14 +912,34 @@ fn assert_row_matches_def(id: u64, row: &JobRow, def: &JobDef) {
     );
 }
 
-pub(super) fn not_primary_bug() -> io::Error {
+/// The run path's and the call path's refusal for a row whose job name this
+/// binary does not mount: an attempt, so it dead-letters by name.
+fn not_registered(name: &str) -> String {
+    format!(
+        "job \"{name}\" is not registered — add it to the jobs![…] list passed to \
+         App::mount_jobs (or this log outlived a renamed job type)"
+    )
+}
+
+/// A job or cron stage's `TxError` as the `io::Error` its caller returns: the
+/// stage's own error, or the BUG text for a write gate the kernel never runs
+/// dispatch or cron behind.
+pub(super) fn flatten(e: TxError<io::Error>) -> io::Error {
+    match e {
+        TxError::App(e) | TxError::Io(e) => e,
+        TxError::NotPrimary { .. } => not_primary_bug(),
+        TxError::Verifying { .. } => verifying_bug(),
+    }
+}
+
+fn not_primary_bug() -> io::Error {
     io::Error::other(
         "BUG: a job/cron transaction hit NotPrimary — the kernel must not run \
          dispatch or cron on a follower (DESIGN §5)",
     )
 }
 
-pub(super) fn verifying_bug() -> io::Error {
+fn verifying_bug() -> io::Error {
     io::Error::other(
         "BUG: a job/cron transaction hit Verifying — the kernel must not run \
          dispatch or cron on a node whose witness gate is still shut (M2 \
@@ -979,11 +1006,7 @@ fn stage_failure_record(
         tx.settle_job(&row, admission);
         Ok::<_, io::Error>(outcome)
     });
-    staged.map_err(|e| match e {
-        TxError::Io(e) | TxError::App(e) => e,
-        TxError::NotPrimary { .. } => not_primary_bug(),
-        TxError::Verifying { .. } => verifying_bug(),
-    })
+    staged.map_err(flatten)
 }
 
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
