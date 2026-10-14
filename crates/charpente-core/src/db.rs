@@ -18,13 +18,13 @@
 //! `0x0b [event][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
 //! scoped emit, an event emitted on a `ScopedTx` (tenancy-completion spec §6),
 //! `0x0c [job][payload][key: Option<String>][shape: u64 le][okey: 16 bytes]`
-//! outbound enqueue, and `0x0d` the same with `[scope: u64 le]` before `okey`
-//! — a job declared `outbound`, its idempotency key minted at staging
-//! (outbound-effects spec §6),
-//! — strings and byte fields length-prefixed per the `Codec` layout; `0x0e` is
-//! the next free tag. `0x02`/`0x03` (the same without the shape) still
-//! decode, with the shape unknown, and are never written — `TxEffects` holds
-//! a bare shape, so a shapeless enqueue or emit cannot be represented.
+//! outbound enqueue, and `0x0d` the same with `[scope: u64 le]` before `okey`,
+//! for a job declared `outbound`, its idempotency key minted at staging
+//! (outbound-effects spec §6) — strings and byte fields length-prefixed per
+//! the `Codec` layout; `0x0e` is the next free tag. `0x02`/`0x03` (the same
+//! without the shape) still decode, with the shape unknown, and are never
+//! written — `TxEffects` holds a bare shape, so a shapeless enqueue or emit
+//! cannot be represented.
 //! `0x05`/`0x06`/`0x07`, `0x0a`, `0x0b` and `0x0d` are the ONLY tags that
 //! carry a scope. A table effect's is chosen by the table's own
 //! `Row::Scope`, not by the scope value (tenant 0 is a legal tenant, so a
@@ -34,8 +34,8 @@
 //! `Job::Scope` through the enqueue family; a scoped emit is `0x0b` rather
 //! than a widened `0x09`, chosen by the `ScopedTx` it was emitted on. The
 //! same presence-not-value rule applies to both: an enqueue or emit carrying
-//! `Some(0)` is `0x0a` or `0x0b`. An emit's
-//! tenant is never folded into its key, which stays the app's own filter.
+//! `Some(0)` is `0x0a`, `0x0b` or `0x0d`. An emit's tenant is never folded
+//! into its key, which stays the app's own filter.
 //! A binary that does not know a tag refuses it by name (`decode_record`'s
 //! unknown-tag error) rather than misreading a wider record. `0x07` is a
 //! NEW tag rather than a widened `0x04`, the same choice `0x05`/`0x06` made
@@ -1101,7 +1101,10 @@ fn decode_outbound_key(input: &mut &[u8]) -> io::Result<[u8; 16]> {
     let Some((key, rest)) = input.split_first_chunk::<16>() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "record decode: an outbound enqueue (0x0c/0x0d) ends before its 16-byte idempotency key",
+            format!(
+                "record decode: an outbound enqueue (0x0c/0x0d) ends before its 16-byte \
+                 idempotency key; restore from a replica or backup. {RESTORE_IS_A_RESEED}"
+            ),
         ));
     };
     *input = rest;
@@ -1490,8 +1493,8 @@ impl<'a> Tx<'a> {
         if let Some(key) = &key {
             assert!(
                 !key.is_empty(),
-                "contract: an idempotency key names the job's external identity — it cannot be \
-                 empty"
+                "contract: an `enqueue_keyed` app key names the job's external identity — it \
+                 cannot be empty"
             );
         }
         let mut payload = Vec::new();
@@ -2341,7 +2344,8 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         self.tx.push_enqueue(Some(scope), None, job);
     }
 
-    /// `enqueue`, with `Tx::enqueue_keyed`'s idempotency key.
+    /// `enqueue`, with `Tx::enqueue_keyed`'s app key: carried on the job's
+    /// row, never deduped on, and not the outbound idempotency key.
     pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J)
     where
         S: Tenant,
@@ -3560,6 +3564,10 @@ impl Db {
     /// run the identical instruction sequence — batch-of-one byte identity
     /// (spec §7) is a property of the code, not something tests must keep
     /// true by hand.
+    ///
+    /// It cannot mint, so `f` enqueueing an outbound job (`Job::OUTBOUND`)
+    /// panics by name. Stage one through `Db::begin_group_minting`, or in a
+    /// test through `App::transact_for_tests`.
     pub fn transact<T, E>(
         &mut self,
         f: impl FnOnce(&mut Tx) -> Result<T, E>,
@@ -3600,6 +3608,10 @@ impl Db {
     /// record, syncs ONCE for however many staged, then applies each in seq
     /// order — the append→sync→apply discipline of a lone transaction,
     /// N-wide, and apply stays strictly after sync either way.
+    ///
+    /// The group cannot mint: staging an outbound enqueue (`Job::OUTBOUND`)
+    /// into it panics by name. `Db::begin_group_minting` opens one that can,
+    /// and a test can use `App::transact_for_tests`.
     pub fn begin_group(&mut self) -> io::Result<Group<'_>> {
         let snapshot = self.engine.machine().store.snapshot()?;
         Ok(Group {
@@ -6037,19 +6049,29 @@ mod tests {
 
     #[test]
     fn a_truncated_outbound_key_is_refused_by_name() {
-        let mut out = Vec::new();
-        1u32.encode(&mut out);
-        out.push(0x0c);
-        encode_bytes(b"Charge", &mut out);
-        encode_bytes(&[], &mut out);
-        Option::<String>::None.encode(&mut out);
-        1u64.encode(&mut out);
-        out.extend_from_slice(&[1; 15]);
-        let err = decode_record(&out).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "record decode: an outbound enqueue (0x0c/0x0d) ends before its 16-byte idempotency key"
-        );
+        for (tag, scope) in [(0x0c, None), (0x0d, Some(9u64))] {
+            let mut out = Vec::new();
+            1u32.encode(&mut out);
+            out.push(tag);
+            encode_bytes(b"Charge", &mut out);
+            encode_bytes(&[], &mut out);
+            Option::<String>::None.encode(&mut out);
+            1u64.encode(&mut out);
+            if let Some(scope) = scope {
+                scope.encode(&mut out);
+            }
+            out.extend_from_slice(&[1; 15]);
+            let err = decode_record(&out).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "record decode: an outbound enqueue (0x0c/0x0d) ends before its 16-byte \
+                     idempotency key; restore from a replica or backup. {RESTORE_IS_A_RESEED}"
+                ),
+                "tag {tag:#04x}"
+            );
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "tag {tag:#04x}");
+        }
     }
 
     #[test]

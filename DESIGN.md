@@ -615,7 +615,11 @@ emit `0x09 [event][payload][key: Option<String>][shape: u64]`, scoped enqueue
 `#[job(scoped_by = …)]` job's tenant, spec 2026-09-27-job-tenancy §6), scoped emit
 `0x0b [event][payload][key: Option<String>][shape: u64][scope: u64]` (an event emitted
 on a `ScopedTx`, its tenant beside the app's key, spec 2026-09-30-tenancy-completion §6),
-migrate-put
+outbound enqueue `0x0c [job][payload][key: Option<String>][shape: u64][okey: [u8; 16]]`,
+scoped outbound enqueue
+`0x0d [job][payload][key: Option<String>][shape: u64][scope: u64][okey: [u8; 16]]` (a job
+declared `outbound`, its idempotency key minted at staging, spec
+2026-10-13-outbound-effects §6), migrate-put
 `0x04 [table][id: u64][row]` (§3's `MigratePut`, below), strings and byte
 fields length-prefixed per the row codec. The shape is the payload type's
 structural fingerprint (§3). The pre-shape `0x02`/`0x03` (the same without the
@@ -1411,10 +1415,11 @@ Vec<(u64, Vec<u8>)> }` (tag 5, unchanged since before tenant scoping), a scoped 
 rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
 older binary already expects); the receiving side checks the message against its own
 schema's word for that table and refuses a mismatch by name rather than importing a row
-under the wrong scope. `PROTO_VERSION` is 5 — a message body's shape changing is what
+under the wrong scope. `PROTO_VERSION` is 6 — a message body's shape changing is what
 bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
-made it 3, job tenancy's `0x0a` made it 4, event tenancy's `0x0b` made it 5, and a
-`Hello` declaring an older version is refused by name. The follower
+made it 3, job tenancy's `0x0a` made it 4, event tenancy's `0x0b` made it 5, outbound
+effects' `0x0c`/`0x0d` (and `JobRow`'s outbound key tail) made it 6, and a `Hello`
+declaring an older version is refused by name. The follower
 buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot
 replace a `Db` it only borrows, so the CALLER (the kernel arm, T8) runs
 `Repl::run_seed(db, clock)`, which consumes the `Db` through `into_seeder`, replays the

@@ -2943,8 +2943,8 @@ fn hello_declaring_protocol_version_1_is_refused_by_name() {
 
 /// PROTO_VERSION 3 (payload shapes): a version-2 binary writes `0x02`/`0x03`
 /// and cannot read `0x08`/`0x09`, so it is refused at Hello, by name, before a
-/// single frame ships (spec amendment A3). (Protocol 5 since event tenancy; the
-/// version-3 and version-4 tests follow.)
+/// single frame ships (spec amendment A3). (Protocol 6 since outbound effects;
+/// the version-3, version-4 and version-5 tests follow.)
 #[test]
 fn hello_declaring_protocol_version_2_is_refused_by_name() {
     let sim = Sim::with_faults(0x2EB1_0006 ^ 2, FaultConfig::none());
@@ -2965,9 +2965,9 @@ fn hello_declaring_protocol_version_2_is_refused_by_name() {
     match reply {
         Msg::Refuse { message } => assert_eq!(
             message,
-            "replication protocol version mismatch: this node speaks protocol version 5, but \
+            "replication protocol version mismatch: this node speaks protocol version 6, but \
              the peer's Hello declared version 2 — upgrade the older binary so both speak the \
-             expected version 5"
+             expected version 6"
         ),
         other => panic!("expected Refuse, got {other:?}"),
     }
@@ -2975,8 +2975,8 @@ fn hello_declaring_protocol_version_2_is_refused_by_name() {
 
 /// PROTO_VERSION 4 (job tenancy, spec §6): a version-3 binary cannot read the
 /// scoped enqueue tag `0x0a`, so it is refused at Hello, by name, before a
-/// single frame ships — not at its first scoped job. (Protocol 5 since event
-/// tenancy; the version-4 test follows.)
+/// single frame ships — not at its first scoped job. (Protocol 6 since
+/// outbound effects; the version-4 and version-5 tests follow.)
 #[test]
 fn hello_declaring_protocol_version_3_is_refused_by_name() {
     let sim = Sim::with_faults(0x2EB1_0006 ^ 3, FaultConfig::none());
@@ -2997,9 +2997,9 @@ fn hello_declaring_protocol_version_3_is_refused_by_name() {
     match reply {
         Msg::Refuse { message } => assert_eq!(
             message,
-            "replication protocol version mismatch: this node speaks protocol version 5, but \
+            "replication protocol version mismatch: this node speaks protocol version 6, but \
              the peer's Hello declared version 3 — upgrade the older binary so both speak the \
-             expected version 5"
+             expected version 6"
         ),
         other => panic!("expected Refuse, got {other:?}"),
     }
@@ -3008,7 +3008,8 @@ fn hello_declaring_protocol_version_3_is_refused_by_name() {
 /// PROTO_VERSION 5 (tenancy completion, spec §6): a version-4 binary cannot
 /// read the scoped emit tag `0x0b`, nor an `EventRow`'s trailing tenant, so
 /// it is refused at Hello, by name, before a single frame ships — not at its
-/// first scoped emit.
+/// first scoped emit. (Protocol 6 since outbound effects; the version-5 test
+/// follows.)
 #[test]
 fn hello_declaring_protocol_version_4_is_refused_by_name() {
     let sim = Sim::with_faults(0x2EB1_0006 ^ 4, FaultConfig::none());
@@ -3029,9 +3030,42 @@ fn hello_declaring_protocol_version_4_is_refused_by_name() {
     match reply {
         Msg::Refuse { message } => assert_eq!(
             message,
-            "replication protocol version mismatch: this node speaks protocol version 5, but \
+            "replication protocol version mismatch: this node speaks protocol version 6, but \
              the peer's Hello declared version 4 — upgrade the older binary so both speak the \
-             expected version 5"
+             expected version 6"
+        ),
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+
+/// PROTO_VERSION 6 (outbound effects, spec §6): a version-5 binary cannot read
+/// the outbound enqueue tags `0x0c`/`0x0d`, nor a `JobRow`'s trailing outbound
+/// key (its decoder would call a seeded outbound row corrupt), so it is refused
+/// at Hello, by name, before a single frame ships — not at its first outbound
+/// enqueue.
+#[test]
+fn hello_declaring_protocol_version_5_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_0006 ^ 5, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: 5,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest: 0,
+        },
+    )
+    .unwrap();
+    match reply {
+        Msg::Refuse { message } => assert_eq!(
+            message,
+            "replication protocol version mismatch: this node speaks protocol version 6, but \
+             the peer's Hello declared version 5 — upgrade the older binary so both speak the \
+             expected version 6"
         ),
         other => panic!("expected Refuse, got {other:?}"),
     }

@@ -611,10 +611,12 @@ return `io::Result` because they read through the snapshot. A transaction
 that never calls `put`/`delete`/`enqueue`/`emit` writes nothing and consumes
 no log position — read-only queries are free.
 
-Enqueuing also takes an idempotency key, for effects the outside world must
-observe at most once: `tx.enqueue_keyed(key, job)`. An empty key is a
-contract panic ("contract: an idempotency key names the job's external
-identity — it cannot be empty"). One more hard limit: all of a
+Enqueuing also takes the app's own key for the job: `tx.enqueue_keyed(key,
+job)` carries it on the job's row, and the platform never dedupes on it. It is
+not the idempotency key an outbound job's call carries — the platform mints
+that one (see Outbound jobs below). An empty key is a contract panic
+("contract: an `enqueue_keyed` app key names the job's external identity — it
+cannot be empty"). One more hard limit: all of a
 transaction's buffered effects together must fit in one 16 MiB log record —
 a transaction that doesn't panics with "transaction effects are N bytes but
 one log record holds at most 16777216 — split the work into smaller
@@ -1299,7 +1301,7 @@ confirmation.** What that means in practice:
 Operationally this is the same epistemic class as any `TxError::Io`, so
 handle it the same way: a blind retry is safe only where the operation is
 idempotent in your own schema — the platform does not dedupe for you, and
-§6 is explicit that an idempotency key is carried, not indexed. After the
+§6 is explicit that an `enqueue_keyed` key is carried, not indexed. After the
 restart, the honest way to learn what happened is to read the state back
 rather than infer it from the status code.
 
@@ -1701,8 +1703,8 @@ jobs. A `scoped_by` job is enqueued the same two ways on its tenant's
 `ScopedTx` (above). Inside the deterministic boundary
 the key means nothing in v0 — it is carried, never indexed or deduped on,
 because exactly-once state effects here are structural (below), not
-key-based. An empty key is a contract panic: `"contract: an idempotency
-key names the job's external identity — it cannot be empty"`.
+key-based. An empty key is a contract panic: ``"contract: an `enqueue_keyed`
+app key names the job's external identity — it cannot be empty"``.
 
 ```rust
 use charpente::core::table::Id;
@@ -3824,7 +3826,7 @@ request.
 
 <!-- pinned -->
 ```text
-contract: an idempotency key names the job's external identity — it cannot be empty
+contract: an `enqueue_keyed` app key names the job's external identity — it cannot be empty
 Disk paths are relative flat names like "wal/000001.log" — got "<path>"
 cron schedule "<name>": interval <duration> exceeds u64 nanos (~584 years) — pick a smaller interval
 ```
