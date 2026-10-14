@@ -864,11 +864,18 @@ impl Dispatcher {
         }
     }
 
-    /// Invariant 3: the node is not writable. Returns the tokens to cancel;
-    /// the jobs stay Pending in the store and come back through `rebuild`
-    /// when this node is writable again, or on the new primary.
-    pub(crate) fn drop_in_flight(&mut self) -> Vec<u64> {
+    /// Invariant 3: the node is not writable. Returns the tokens to cancel
+    /// and the number of buffered completions discarded with them; the jobs
+    /// stay Pending in the store and come back through `rebuild` when this
+    /// node is writable again, or on the new primary.
+    pub(crate) fn drop_in_flight(&mut self) -> (Vec<u64>, u64) {
         self.in_flight.drop_all()
+    }
+
+    /// Whether the job `run_due_into` would run next is an outbound one: its
+    /// failure record is then an outbound failure (`KernelStats`).
+    pub(crate) fn next_due_is_outbound(&self) -> bool {
+        self.next_due().is_some_and(|(_, _, outbound)| outbound)
     }
 
     /// The earliest passed deadline: the flight is finished and its failure

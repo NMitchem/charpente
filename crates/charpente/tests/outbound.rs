@@ -6,7 +6,10 @@
 use std::time::Duration;
 
 use charpente::auth::Principal;
-use charpente::core::db::{Job, Refusal, Schema, TableReadRefusal, TxError, outbound_fingerprint};
+use charpente::core::db::{
+    Job, JobShapeRefusal, Refusal, Schema, TableReadRefusal, TableWriteRefusal, TxError,
+    outbound_fingerprint,
+};
 use charpente::core::io::{Clock, Outbound, OutboundCall, OutboundReply, OutboundWake};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, View};
@@ -1092,8 +1095,9 @@ struct Paid {
     times: u32,
 }
 
-/// Charges once per job; `settle` records the payment on a 200 and treats
-/// anything else as an attempt. Used by every §7 row below.
+/// Charges once per job; `settle` records the payment, then keeps it on a
+/// 200 and treats anything else as an attempt, so a failed settle's write
+/// must be discarded. Used by every §7 row below.
 #[job(
     global,
     outbound = "pay.test",
@@ -1112,16 +1116,14 @@ impl Pay {
     }
 
     fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        let id = charpente::Id::from_raw(self.n);
+        let times = tx.get(id)?.map_or(0, |p: Paid| p.times);
+        tx.put(&Paid {
+            id,
+            times: times + 1,
+        });
         match reply.status() {
-            200 => {
-                let id = charpente::Id::from_raw(self.n);
-                let times = tx.get(id)?.map_or(0, |p: Paid| p.times);
-                tx.put(&Paid {
-                    id,
-                    times: times + 1,
-                });
-                Ok(())
-            }
+            200 => Ok(()),
             s => Err(JobError::app(format!("pay.test answered {s}"))),
         }
     }
@@ -1187,6 +1189,11 @@ fn a_settled_reply_commits_its_effects_with_the_done_mark() {
             stats.outbound_failed
         ),
         (1, 1, 0)
+    );
+    assert_eq!(
+        (stats.jobs_done, stats.jobs_retried, stats.jobs_dead),
+        (1, 0, 0),
+        "the outbound arm counts its Done as a job's"
     );
     let key = IdempotencyKey::from_bytes(rows[0].outbound_key.unwrap());
     sim.with_remote("pay.test", |r: &Recorder| {
@@ -1268,9 +1275,18 @@ fn a_settle_error_discards_its_effects_and_is_an_attempt() {
     );
     let (mut app, stats) = run_to(&sim, pay_app(&sim, Host::new("pay.test"), 1), 60 * SEC);
     let (rows, paid) = jobs_and_paid(&mut app);
-    assert_eq!((rows[0].status, paid), (JobStatus::Dead, 0));
+    assert_eq!(
+        (rows[0].status, paid),
+        (JobStatus::Dead, 0),
+        "settle wrote its payment before it failed, and the write was discarded each time"
+    );
     assert_eq!(rows[0].last_error.as_deref(), Some("pay.test answered 503"));
     assert_eq!((stats.outbound_started, stats.outbound_failed), (3, 3));
+    assert_eq!(
+        (stats.jobs_done, stats.jobs_retried, stats.jobs_dead),
+        (0, 2, 1),
+        "the outbound arm counts its failure records as a job's"
+    );
 }
 
 /// Review Focus 4: a reply over the host's cap is an attempt whose text says
@@ -1988,11 +2004,553 @@ fn a_completion_left_behind_the_last_flight_goes_with_the_gate() {
         .db_for_tests()
         .forbid_writes("elsewhere:1".into());
     kernel.step(&mut source).unwrap();
+    assert_eq!(
+        kernel.stats().outbound_late,
+        1,
+        "the buffered completion was dropped with the gate, and counted as discarded"
+    );
     kernel.app_mut_for_tests().db_for_tests().allow_writes();
     kernel.step(&mut source).unwrap();
     assert_eq!(
         kernel.stats().outbound_late,
-        0,
-        "the buffered completion was dropped with the gate, never handed to the arm"
+        1,
+        "and never handed to the arm afterwards"
     );
+}
+
+// ------------------------------------------------ §7's settle-side rows
+
+/// A settle whose platform read faults on a 500 and records the payment on
+/// anything else: §7's "settle returns `Err(Io)`" row.
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 3, backoff = "500ms"),
+    timeout = "2s"
+)]
+struct SettleFaults {
+    n: u64,
+}
+
+impl SettleFaults {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::post(format!("/faults/{}", self.n)).header("idempotency-key", key.as_str()),
+        ))
+    }
+
+    fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        tx.put(&Paid {
+            id: charpente::Id::from_raw(self.n),
+            times: 1,
+        });
+        if reply.status() == 500 {
+            return Err(JobError::Io(std::io::Error::other(
+                "simulated settle fault (injected)",
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn settle_faults_app(sim: &Sim) -> App {
+    App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Paid>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![SettleFaults])
+    .outbound(Host::new("pay.test"))
+}
+
+/// §7: a settle's platform fault is not an attempt. It bubbles out of `run`,
+/// the row stays Pending and untouched, and the restarted process calls
+/// again with the same key.
+#[test]
+fn a_settle_platform_fault_is_not_an_attempt_and_re_calls_after_restart() {
+    let sim = Sim::with_faults(0x0e1, FaultConfig::none());
+    let mut replies = 0u32;
+    sim.remote(
+        "pay.test",
+        from_fn(move |_c: &OutboundCall| {
+            replies += 1;
+            OutboundReply {
+                status: if replies == 1 { 500 } else { 200 },
+                headers: vec![],
+                body: vec![],
+            }
+        }),
+    );
+    let mut app = settle_faults_app(&sim);
+    app.transact_for_tests(|tx| {
+        tx.enqueue(SettleFaults { n: 0 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    let err = kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC))
+        .unwrap_err();
+    assert_eq!(err.to_string(), "simulated settle fault (injected)");
+    let stats = kernel.stats();
+    assert_eq!(
+        (
+            stats.outbound_started,
+            stats.outbound_settled,
+            stats.outbound_failed
+        ),
+        (1, 0, 0)
+    );
+    let mut app = kernel.into_app();
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (
+            rows[0].status,
+            rows[0].attempts,
+            rows[0].last_error.as_deref(),
+            paid
+        ),
+        (JobStatus::Pending, 0, None, 0),
+        "not an attempt, and settle's write was discarded"
+    );
+    let k = IdempotencyKey::from_bytes(rows[0].outbound_key.unwrap());
+    drop(app);
+    sim.restart();
+    let (mut app, _) = run_to(&sim, settle_faults_app(&sim), 120 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, rows[0].attempts, paid),
+        (JobStatus::Done, 0, 1)
+    );
+    let delivered = sim.outbound_deliveries();
+    assert_eq!(
+        delivered.len(),
+        2,
+        "called once before the restart, once after"
+    );
+    assert!(
+        delivered.iter().all(|d| d.key == k),
+        "the re-call carries the recorded key"
+    );
+}
+
+/// A table no `Schema` in this file registers: a write to it is refused.
+#[charpente::table(global)]
+struct Unlisted {
+    id: charpente::Id<Unlisted>,
+    n: u64,
+}
+
+/// What a `SettleProbe` wrote before it failed.
+#[charpente::table(global)]
+struct Effect {
+    id: charpente::Id<Effect>,
+    mode: u64,
+}
+
+const PANICS: u64 = 0;
+const READS_ALIAS: u64 = 1;
+const WRITES_UNLISTED: u64 = 2;
+const ENQUEUES_FOREIGN_SHAPE: u64 = 3;
+
+/// Writes an `Effect`, then fails the way its `mode` names.
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 1, backoff = "1s"),
+    timeout = "2s"
+)]
+struct SettleProbe {
+    mode: u64,
+}
+
+impl SettleProbe {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(Call::post(format!("/probe/{}", self.mode))))
+    }
+
+    fn settle(self, tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        tx.put(&Effect {
+            id: charpente::Id::from_raw(self.mode),
+            mode: self.mode,
+        });
+        match self.mode {
+            PANICS => panic!("settle exploded"),
+            READS_ALIAS => {
+                tx.get(charpente::Id::<gate_alias::Gate>::from_raw(0))?;
+            }
+            WRITES_UNLISTED => tx.put(&Unlisted {
+                id: charpente::Id::from_raw(0),
+                n: 1,
+            }),
+            _ => tx.enqueue(shape_v1::Settle { n: 1 }),
+        }
+        Ok(())
+    }
+}
+
+/// §7's "settle panics" row (plan amendment A16's `settle panicked:` prefix),
+/// and the three refusals a settle's own transaction can meet: each is an
+/// attempt whose `last_error` is the refusal, and none of settle's writes
+/// commits.
+#[test]
+fn a_failed_settle_is_an_attempt_naming_its_cause_and_writes_nothing() {
+    let sim = Sim::with_faults(0x0e2, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Gate>().table::<Effect>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![SettleProbe, shape_v2::Settle])
+    .outbound(Host::new("pay.test"));
+    // The refusal texts, read off the same refusals outside any job.
+    let db = app.db_for_tests();
+    let read_refusal = match db.transact(|tx| {
+        tx.get(charpente::Id::<gate_alias::Gate>::from_raw(0))
+            .map(|_| ())
+    }) {
+        Err(TxError::App(e)) if TableReadRefusal::of(&e).is_some() => e.to_string(),
+        other => panic!("the alias read is a TableReadRefusal: {other:?}"),
+    };
+    let write_refusal = match db.transact(|tx| {
+        tx.put(&Unlisted {
+            id: charpente::Id::from_raw(0),
+            n: 1,
+        });
+        Ok::<(), std::io::Error>(())
+    }) {
+        Err(TxError::Io(e)) if TableWriteRefusal::of(&e).is_some() => e.to_string(),
+        other => panic!("the unlisted write is a TableWriteRefusal: {other:?}"),
+    };
+    let shape_refusal = match db.transact(|tx| {
+        tx.enqueue(shape_v1::Settle { n: 1 });
+        Ok::<(), std::io::Error>(())
+    }) {
+        Err(TxError::Io(e)) if JobShapeRefusal::of(&e).is_some() => e.to_string(),
+        other => panic!("the foreign-shape enqueue is a JobShapeRefusal: {other:?}"),
+    };
+    app.transact_for_tests(|tx| {
+        for mode in [PANICS, READS_ALIAS, WRITES_UNLISTED, ENQUEUES_FOREIGN_SHAPE] {
+            tx.enqueue(SettleProbe { mode });
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let (mut app, stats) = run_to(&sim, app, 60 * SEC);
+    let snap = app.db_for_tests().snapshot().unwrap();
+    let rows = snap.scan::<JobRow>().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.status, r.attempts, r.last_error.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (JobStatus::Dead, 1, Some("settle panicked: settle exploded")),
+            (JobStatus::Dead, 1, Some(read_refusal.as_str())),
+            (JobStatus::Dead, 1, Some(write_refusal.as_str())),
+            (JobStatus::Dead, 1, Some(shape_refusal.as_str())),
+        ]
+    );
+    assert!(
+        snap.scan::<Effect>().unwrap().is_empty(),
+        "no failed settle's write committed"
+    );
+    assert_eq!(
+        (
+            stats.outbound_started,
+            stats.outbound_settled,
+            stats.outbound_failed,
+            stats.jobs_dead
+        ),
+        (4, 0, 4, 4)
+    );
+}
+
+/// Every completion becomes a reset after the request was sent: the
+/// transport failure that is not a refusal, which `SimOutbound` never
+/// produces.
+struct ResetOnPoll<O>(O);
+
+impl<O: Outbound> Outbound for ResetOnPoll<O> {
+    fn start(&self, token: u64, call: OutboundCall) -> std::io::Result<()> {
+        self.0.start(token, call)
+    }
+    fn poll(&self) -> Option<(u64, std::io::Result<OutboundReply>)> {
+        self.0.poll().map(|(token, _)| {
+            (
+                token,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset after the request was sent",
+                )),
+            )
+        })
+    }
+    fn cancel(&self, token: u64) {
+        self.0.cancel(token)
+    }
+    fn next_wake(&self) -> OutboundWake {
+        self.0.next_wake()
+    }
+}
+
+/// Spec §7's second text: any transport failure but a refusal may have
+/// reached the remote, and says so.
+#[test]
+fn a_reset_after_sending_is_an_attempt_that_may_have_applied() {
+    let sim = Sim::with_faults(0x0e4, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let outbound = ResetOnPoll(sim.outbound(&app.outbound_hosts()).unwrap());
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC))
+        .unwrap();
+    let mut app = kernel.into_app();
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, rows[0].attempts, paid),
+        (JobStatus::Dead, 3, 0)
+    );
+    assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some(
+            "outbound pay.test: connection reset after the request was sent — the remote may have \
+             applied this call; the retry carries the same idempotency key"
+        )
+    );
+    sim.with_remote("pay.test", |r: &Recorder| {
+        assert_eq!(r.calls().len(), 3, "the remote did get every call")
+    });
+}
+
+/// `start` fails without forwarding: no flight exists at the edge, so only
+/// the kernel's own bookkeeping can turn the error into an attempt.
+struct FailsToStart<O>(O);
+
+impl<O: Outbound> Outbound for FailsToStart<O> {
+    fn start(&self, _token: u64, _call: OutboundCall) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ))
+    }
+    fn poll(&self) -> Option<(u64, std::io::Result<OutboundReply>)> {
+        self.0.poll()
+    }
+    fn cancel(&self, token: u64) {
+        self.0.cancel(token)
+    }
+    fn next_wake(&self) -> OutboundWake {
+        self.0.next_wake()
+    }
+}
+
+/// io.rs: an `Err` from `start` is a completion. Its attempt carries the
+/// start's own error at once, never a timeout: all three attempts (at 0,
+/// 0.5s and 1.5s) are recorded before the first 2s deadline could pass.
+#[test]
+fn a_start_error_is_an_immediate_attempt_not_a_timeout() {
+    let sim = Sim::with_faults(0x0e5, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let outbound = FailsToStart(sim.outbound(&app.outbound_hosts()).unwrap());
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 19 * SEC / 10))
+        .unwrap();
+    let stats = kernel.stats();
+    let mut app = kernel.into_app();
+    let (rows, _) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, rows[0].attempts),
+        (JobStatus::Dead, 3),
+        "every attempt was recorded by 1.9s, before any deadline"
+    );
+    assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some(
+            "outbound pay.test: connection reset by peer — the remote may have applied this call; \
+             the retry carries the same idempotency key"
+        )
+    );
+    assert_eq!(
+        (
+            stats.outbound_started,
+            stats.outbound_failed,
+            stats.outbound_timed_out
+        ),
+        (3, 3, 0)
+    );
+}
+
+/// A plain job that always fails: its failure records are a job's, never
+/// an outbound one's.
+#[job(global, retry(max = 2, backoff = "1s"))]
+struct PlainFails {}
+
+impl PlainFails {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Err(JobError::app("plain failure"))
+    }
+}
+
+/// `KernelStats::outbound_failed` counts every outbound failure record, the
+/// ones `call` causes in the job arm included: a refused call (`Leaky`), a
+/// panicking `call` (`Boom`) and a refused read inside `call` (`ReadsAlias`),
+/// each Dead at the default policy's 5 attempts. None starts. A plain job
+/// failing beside them (`PlainFails`, 2 attempts) is not counted.
+#[test]
+fn call_side_failure_records_count_as_outbound_failures() {
+    let sim = Sim::with_faults(0x0e6, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Gate>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Leaky, Boom, ReadsAlias, PlainFails])
+    .outbound(Host::new("pay.test").bearer_env("PAY_KEY"));
+    app.transact_for_tests(|tx| {
+        tx.enqueue(Leaky {});
+        tx.enqueue(Boom {});
+        tx.enqueue(ReadsAlias {});
+        tx.enqueue(PlainFails {});
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let (mut app, stats) = run_to(&sim, app, 3600 * SEC);
+    let (rows, _) = jobs_and_paid(&mut app);
+    assert!(
+        rows.iter().all(|r| (r.status, r.attempts)
+            == (JobStatus::Dead, if r.name == "PlainFails" { 2 } else { 5 })),
+        "{:?}",
+        rows.iter()
+            .map(|r| (&r.name, r.status, r.attempts))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (
+            stats.outbound_failed,
+            stats.outbound_started,
+            stats.jobs_retried,
+            stats.jobs_dead
+        ),
+        (15, 0, 13, 4)
+    );
+}
+
+/// Spec §9's cap is inclusive: a reply of exactly `max_reply_bytes` settles.
+#[test]
+fn a_reply_of_exactly_the_cap_settles() {
+    let sim = Sim::with_faults(0x0e7, FaultConfig::none());
+    sim.remote(
+        "pay.test",
+        from_fn(|_c: &OutboundCall| OutboundReply {
+            status: 200,
+            headers: vec![],
+            body: vec![b'x'; 16],
+        }),
+    );
+    let host = Host::new("pay.test").max_reply_bytes(16);
+    let (mut app, _) = run_to(&sim, pay_app(&sim, host, 1), 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, rows[0].attempts, paid),
+        (JobStatus::Done, 0, 1)
+    );
+}
+
+/// `Kernel::builder` combines parts. Each part leaves its own mark, so a
+/// builder that dropped any one of them turns one assertion red: the
+/// outbound job settles (`.outbound`), the archive arm stepped
+/// (`.archive`), and an idle step parks no longer than the replication tick
+/// (`.replication`; a kernel without `Repl` parks to its next deadline, the
+/// daily session sweep).
+#[test]
+fn a_kernel_builder_wires_replication_archive_and_outbound_together() {
+    use charpente::archive::{Archive, ArchiveConfig};
+    use charpente::kernel::Step;
+    use charpente::repl::role::Role;
+    use charpente::repl::{REPL_TICK_NANOS, Repl, ReplConfig};
+    use charpente_sim::object::SimObjectStore;
+
+    let sim = Sim::with_faults(0x0e8, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let node = sim.host("p");
+    let mut app = App::open(
+        Box::new(node.disk()),
+        Schema::new().table::<Paid>(),
+        Box::new(node.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Pay])
+    .outbound(Host::new("pay.test"));
+    app.transact_for_tests(|tx| {
+        tx.enqueue(Pay { n: 0 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let (repl, _) = Repl::open(
+        Box::new(node.net()),
+        Box::new(node.disk()),
+        ReplConfig {
+            listen: Some("p:1".to_string()),
+            initial_role: Role::Primary,
+            peer_secret: None,
+            strict_witnesses: false,
+        },
+        app.db_for_tests(),
+    )
+    .unwrap();
+    let archive = Archive::open(
+        ArchiveConfig {
+            prefix: "archive/".to_string(),
+            writer: "p".to_string(),
+            snapshot_every: 0,
+            pin_segments: 4,
+            read_budget_bytes: 8 << 20,
+        },
+        app.db_for_tests(),
+    )
+    .unwrap();
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let mut kernel = Kernel::builder(app, Box::new(sim.clock()))
+        .replication(repl)
+        .archive(archive, Box::new(SimObjectStore::new()))
+        .outbound(Box::new(outbound))
+        .build()
+        .unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
+    kernel.run(&mut source).unwrap();
+    let stats = kernel.stats();
+    assert_eq!(stats.outbound_settled, 1, "the outbound part");
+    assert!(stats.archive_steps > 0, "the archive part");
+    let step = (0..1000)
+        .map(|_| kernel.step(&mut source).unwrap())
+        .find(|s| matches!(s, Step::Idle { .. }))
+        .expect("the kernel idles");
+    let now = sim.clock().now().as_nanos();
+    let Step::Idle {
+        deadline: Some(deadline),
+    } = step
+    else {
+        panic!("a replicated kernel always names a park deadline");
+    };
+    assert!(
+        deadline.as_nanos() <= now + REPL_TICK_NANOS,
+        "the replication part: parks at most one tick, not until {}",
+        deadline.as_nanos()
+    );
+    let mut app = kernel.into_app();
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!((rows[0].status, paid), (JobStatus::Done, 1));
 }

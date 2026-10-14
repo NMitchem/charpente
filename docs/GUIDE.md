@@ -2044,8 +2044,10 @@ A node that also replicates or archives is built with `Kernel::builder(app,
 clock)`, then any of `.replication(repl)`, `.archive(archive, store)` and
 `.outbound(outbound)`, then `.build()`. `kernel.stats()` counts the arm's work
 in `outbound_started` (calls started), `outbound_settled` (replies whose
-`settle` committed), `outbound_failed` (failure records, timeouts included),
-`outbound_timed_out` and `outbound_late`.
+`settle` committed), `outbound_failed` (every failure record: a failed or
+refused `call`, a transport failure, a timeout, a failed `settle`),
+`outbound_timed_out` and `outbound_late` (replies discarded, including any
+still buffered when the node stopped being writable).
 
 ### Changing a job's fields
 

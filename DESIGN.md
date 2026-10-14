@@ -371,35 +371,6 @@ or read one `read_budget_bytes` bite — never a loop to completion. An archive 
 absorbed, never bubbled: an archive failure is not a database failure (spec §8), and a `?`
 there would let a transient PUT kill a serving node.
 
-Outbound effects (spec `2026-10-13-outbound-effects-design.md` §4) add a **seventh** ready
-source, `Outbound`, over the sixth IO trait. An outbound job's `call` runs in the job arm's
-group and decides a request without sending it: the start is buffered and issued only after
-that group commits, and a failed commit abandons it, so the job returns to its due-set with no
-call on the wire. `Outbound::poll` consumes, as `ObjectStore::poll` does, so the kernel drains
-it into its own completion buffer once per step before building the ready set, and only while
-the in-flight table is non-empty. The source is ready when that buffer holds a completion or
-the earliest in-flight deadline has passed; one win settles, fails or expires a batch of
-flights in one group, committed once, with the job arm's commit-then-bubble shape. Its park:
-the idle deadline gains the earliest in-flight deadline, and while anything is in flight the
-kernel parks no longer than the next completion `Outbound::next_wake` names (`At`), or than
-the replication park tick when it answers `Unknown` — production's answer, since replies
-arrive from the network. `Never` (every reply lost) leaves only the deadlines. The table is
-volatile: every step that finds the node not writable drops it, completion buffer included,
-and cancels its tokens — keyed on the write gate, never the role, so every way the gate shuts
-is covered — and the jobs stay Pending in the store for whichever node is writable next, with
-the same key. `Kernel::with_outbound(app, clock, outbound)` wires it beside `with_archive`, and
-`Kernel::builder(app, clock)` combines `.replication`, `.archive` and `.outbound` for a node
-that needs more than one. Its invariants hold in release (hard rule 4):
-
-1. A token is never started while in flight; a token is never reused within a process.
-2. A job in the in-flight table is never in a due-set.
-3. The in-flight table is empty whenever the node is not writable.
-4. `settle` never runs for a token that was not in flight.
-5. No `start` precedes the commit of the group that staged its `call`.
-6. With no outbound job mounted and nothing in flight, the kernel calls no `Outbound` method
-   and draws no entropy for outbound: every existing app replays byte-for-byte, and every
-   existing pinned seed names the same universe (the `Tail` arm's precedent, DESIGN §1).
-
 That round-robin is fairness *among* tails; it is not protection *from* the request arm.
 `Ready::Tail` sits in the same ready set as every other source and is picked by the same
 single uniform draw, so a request arm draining up to `MAX_BATCH` per win (§2) competes with
@@ -434,6 +405,35 @@ the **interleaving** invariant, that the job arm is serviced at least once while
 still has outstanding work. The second is deliberately not a bound on degree: a bound pinned
 by a test is a contract whatever this document says, and greedy drain cannot honour a fixed
 ratio on a fast device anyway (docs/BENCH.md — shallower queues mean smaller batches).
+
+Outbound effects (spec `2026-10-13-outbound-effects-design.md` §4) add a **seventh** ready
+source, `Outbound`, over the sixth IO trait. An outbound job's `call` runs in the job arm's
+group and decides a request without sending it: the start is buffered and issued only after
+that group commits, and a failed commit abandons it, so the job returns to its due-set with no
+call on the wire. `Outbound::poll` consumes, as `ObjectStore::poll` does, so the kernel drains
+it into its own completion buffer once per step before building the ready set, and only while
+the in-flight table is non-empty. The source is ready when that buffer holds a completion or
+the earliest in-flight deadline has passed; one win settles, fails or expires a batch of
+flights in one group, committed once, with the job arm's commit-then-bubble shape. Its park:
+the idle deadline gains the earliest in-flight deadline, and while anything is in flight the
+kernel parks no longer than the next completion `Outbound::next_wake` names (`At`), or than
+the replication park tick when it answers `Unknown` — production's answer, since replies
+arrive from the network. `Never` (every reply lost) leaves only the deadlines. The table is
+volatile: every step that finds the node not writable drops it, completion buffer included,
+and cancels its tokens — keyed on the write gate, never the role, so every way the gate shuts
+is covered — and the jobs stay Pending in the store for whichever node is writable next, with
+the same key. `Kernel::with_outbound(app, clock, outbound)` wires it beside `with_archive`, and
+`Kernel::builder(app, clock)` combines `.replication`, `.archive` and `.outbound` for a node
+that needs more than one. Its invariants hold in release (hard rule 4):
+
+1. A token is never started while in flight; a token is never reused within a process.
+2. A job in the in-flight table is never in a due-set.
+3. The in-flight table is empty whenever the node is not writable.
+4. `settle` never runs for a token that was not in flight.
+5. No `start` precedes the commit of the group that staged its `call`.
+6. With no outbound job mounted and nothing in flight, the kernel calls no `Outbound` method
+   and draws no entropy for outbound: every existing app replays byte-for-byte, and every
+   existing pinned seed names the same universe (the `Tail` arm's precedent above).
 
 The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
 `App::handle` directly; hyper only translates wire↔struct at the edge

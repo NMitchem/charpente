@@ -98,11 +98,13 @@ pub struct KernelStats {
     pub outbound_started: u64,
     /// Outbound replies whose `settle` committed with the Done mark.
     pub outbound_settled: u64,
-    /// Outbound failure records staged, timeouts included.
+    /// Outbound failure records staged: a failed or refused `call`, a
+    /// transport failure, a timeout, a failed `settle`.
     pub outbound_failed: u64,
     /// Outbound calls whose deadline passed before a completion arrived.
     pub outbound_timed_out: u64,
-    /// Completions for a token not in flight, discarded (spec §4 invariant 4).
+    /// Completions discarded: for a token not in flight (spec §4 invariant
+    /// 4), or buffered when the node stopped being writable.
     pub outbound_late: u64,
 }
 
@@ -430,7 +432,8 @@ impl Kernel {
         // can outlive the table's last flight (a drain stopped at
         // `MAX_BATCH`), so the outbound arm never runs behind a shut gate.
         if !writable {
-            let dropped = self.dispatcher.drop_in_flight();
+            let (dropped, discarded) = self.dispatcher.drop_in_flight();
+            self.stats.outbound_late += discarded;
             if !dropped.is_empty() {
                 let outbound = self
                     .outbound
@@ -807,6 +810,7 @@ impl Kernel {
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {
                     while self.dispatcher.has_due(now) && drained < MAX_BATCH {
+                        let outbound = self.dispatcher.next_due_is_outbound();
                         match self.dispatcher.run_due_into(&mut group, now)? {
                             // Stats increment as jobs are STAGED, before the
                             // batch commits (accepted, T7 pre-flight §3): if
@@ -833,8 +837,16 @@ impl Kernel {
                             // it before a restart resets it", which is what
                             // stopping the kernel guarantees.
                             JobOutcome::Done { .. } => self.stats.jobs_done += 1,
-                            JobOutcome::Retried { .. } => self.stats.jobs_retried += 1,
-                            JobOutcome::Dead { .. } => self.stats.jobs_dead += 1,
+                            // An outbound job's failure here is its `call`'s:
+                            // `Err`, a panic, a refused read or a refused call.
+                            JobOutcome::Retried { .. } => {
+                                self.stats.jobs_retried += 1;
+                                self.stats.outbound_failed += u64::from(outbound);
+                            }
+                            JobOutcome::Dead { .. } => {
+                                self.stats.jobs_dead += 1;
+                                self.stats.outbound_failed += u64::from(outbound);
+                            }
                             // Counted when `start_calls` issues it, after the
                             // commit; its outcome comes from the outbound arm.
                             JobOutcome::Calling { .. } => {}
@@ -862,6 +874,10 @@ impl Kernel {
                     // identical reason. Every failure abandons the batch's
                     // starts, so none is issued for a group that did not
                     // commit (R6): its jobs go back to the outbound set.
+                    // `(Err, Ok)` abandons the starts of a group that DID
+                    // commit, which is conservative: the kernel stops here,
+                    // and those Pending jobs are called after the restart
+                    // with the same key.
                     (Ok(()), Err(failure)) => {
                         self.dispatcher.abandon_starts();
                         return Err(failure.error);

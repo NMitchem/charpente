@@ -156,17 +156,21 @@ impl InFlight {
     }
 
     /// The node is not writable (invariant 3): every flight and buffered
-    /// completion is dropped; returns the tokens to cancel. Their jobs stay
-    /// Pending in the store for the next primary, with the same key (§7).
-    pub(crate) fn drop_all(&mut self) -> Vec<u64> {
+    /// completion is dropped. Returns the tokens to cancel and how many
+    /// buffered completions were discarded. Their jobs stay Pending in the
+    /// store for the next primary, with the same key (§7).
+    pub(crate) fn drop_all(&mut self) -> (Vec<u64>, u64) {
         assert!(
             self.starts.is_empty(),
             "dispatcher invariant: starts buffered across a step boundary"
         );
         self.jobs.clear();
         self.deadlines.clear();
-        self.completions.clear();
-        std::mem::take(&mut self.flights).into_keys().collect()
+        let discarded = self.completions.drain(..).count() as u64;
+        (
+            std::mem::take(&mut self.flights).into_keys().collect(),
+            discarded,
+        )
     }
 }
 
