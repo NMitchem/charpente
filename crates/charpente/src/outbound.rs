@@ -144,7 +144,6 @@ pub struct Reply {
 }
 
 impl Reply {
-    #[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 11"))]
     pub(crate) fn from_wire(reply: OutboundReply) -> Reply {
         Reply {
             status: reply.status,
@@ -338,7 +337,6 @@ impl Host {
 
 /// R9, checked when the kernel is built (plan amendment A5): every host a
 /// mounted job calls has exactly one `Host` entry, and every entry is called.
-#[cfg_attr(not(test), expect(dead_code, reason = "first caller: Task 11"))]
 pub(crate) fn check_host_sets(
     callers: &[(&'static str, &'static str)],
     hosts: &[Host],

@@ -11664,3 +11664,119 @@ fn a_torn_role_file_restarted_as_its_text_says_keeps_its_data_and_one_writable_p
         }
     }
 }
+
+// ------------------------------------------ outbound enqueues ship their key
+
+/// A global outbound job, hand-written so the test mounts nothing: its
+/// enqueue mints a key and records tag `0x0c`.
+struct ShipCharge {
+    n: u64,
+}
+
+impl Codec for ShipCharge {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.n.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<ShipCharge> {
+        Ok(ShipCharge {
+            n: u64::decode(input)?,
+        })
+    }
+}
+
+impl Job for ShipCharge {
+    const NAME: &'static str = "ShipCharge";
+    const FINGERPRINT: u64 = 0x7E57_0C00;
+    type Scope = Unscoped;
+    const OUTBOUND: bool = true;
+}
+
+/// Its scoped twin: tag `0x0d`.
+struct ShipScopedCharge {
+    n: u64,
+}
+
+impl Codec for ShipScopedCharge {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.n.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<ShipScopedCharge> {
+        Ok(ShipScopedCharge {
+            n: u64::decode(input)?,
+        })
+    }
+}
+
+impl Job for ShipScopedCharge {
+    const NAME: &'static str = "ShipScopedCharge";
+    const FINGERPRINT: u64 = 0x7E57_0D00;
+    type Scope = SeedOrg;
+    const OUTBOUND: bool = true;
+}
+
+/// Outbound-effects spec §6: the key is drawn once, on the staging node, and
+/// rides in the record. A follower applying a shipped `0x0c` and `0x0d`
+/// holds the primary's keys byte for byte, so a failover re-dispatches each
+/// job with the key its remote already saw.
+#[test]
+fn a_follower_applies_shipped_outbound_enqueues_with_the_primary_s_keys() {
+    let sim = Sim::with_faults(0x5A9E_0C0D, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    let mint = p.host.entropy();
+    let db = p.db.as_mut().unwrap();
+    let mut group = db.begin_group_minting(&mint).unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            tx.enqueue(ShipCharge { n: 1 });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<SeedOrg>::from_raw(4), &admission)
+                .enqueue(ShipScopedCharge { n: 2 });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    group.commit().map_err(|f| f.error).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+
+    let rows = |n: &Node| {
+        n.db.as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap()
+    };
+    let (pj, fj) = (rows(&p), rows(&f));
+    assert_eq!(
+        pj.iter()
+            .map(|r| (r.name.as_str(), r.scope))
+            .collect::<Vec<_>>(),
+        vec![("ShipCharge", None), ("ShipScopedCharge", Some(4))],
+        "the primary holds one global and one scoped outbound enqueue"
+    );
+    let keys = |rows: &[JobRow]| {
+        rows.iter()
+            .map(|r| r.outbound_key.expect("an outbound enqueue carries its key"))
+            .collect::<Vec<_>>()
+    };
+    let (pk, fk) = (keys(&pj), keys(&fj));
+    assert_ne!(pk[0], pk[1], "each enqueue drew its own key");
+    assert_eq!(
+        fk, pk,
+        "the follower holds the primary's keys byte for byte"
+    );
+    let raw = |n: &Node| {
+        n.db.as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .scan_raw(JobRow::TABLE, false)
+            .unwrap()
+    };
+    assert_eq!(raw(&f), raw(&p), "and the whole job rows, as stored");
+}

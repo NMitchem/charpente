@@ -257,14 +257,13 @@ pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) ->
 /// default here would convert an availability event into that, and the
 /// failure would appear only on the second deployment.
 ///
-/// NOT CONSTRUCTIBLE: an archive that also replicates. Spec §4 calls
-/// archiving from a standby the deployment most operators should choose, and
-/// `Kernel::build` does take both — but `build` is PRIVATE, and all three
-/// public constructors pass one of them `None`. So this is not merely
-/// un-wired at the `serve` layer: reaching that deployment needs a new
-/// public constructor, not just a new function here. The design is otherwise
-/// ready for it — the archive arm gates on `Db::verifying()` rather than
-/// `writes_allowed()`, so a follower archives normally.
+/// NOT WIRED HERE: an archive that also replicates. Spec §4 calls archiving
+/// from a standby the deployment most operators should choose, and
+/// `Kernel::builder` takes both (`.replication(repl).archive(archive,
+/// store)`), so what is missing is a `serve` entry point that opens both. The
+/// design is otherwise ready for it — the archive arm gates on
+/// `Db::verifying()` rather than `writes_allowed()`, so a follower archives
+/// normally.
 pub fn archive(app: App, store: Box<dyn ObjectStore>, cfg: ArchiveConfig) -> io::Result<()> {
     let clock = crate::prod::ProdClock::new();
     let mut app = app;

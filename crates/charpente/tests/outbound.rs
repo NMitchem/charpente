@@ -6,13 +6,17 @@
 use std::time::Duration;
 
 use charpente::auth::Principal;
-use charpente::core::db::{Job, Schema, TableReadRefusal, TxError, outbound_fingerprint};
+use charpente::core::db::{Job, Refusal, Schema, TableReadRefusal, TxError, outbound_fingerprint};
+use charpente::core::io::{Clock, Outbound, OutboundCall, OutboundReply, OutboundWake};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, View};
 use charpente::http::{ApiError, App, AppConfig};
-use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope};
+use charpente::kernel::{
+    Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope, Kernel, KernelStats, SimSource,
+};
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, ScopedTx, Tenant, Tx, job, jobs};
+use charpente_sim::outbound::{Idempotent, Recorder, from_fn};
 use charpente_sim::{FaultConfig, Sim};
 
 #[job(
@@ -334,16 +338,22 @@ impl Gated {
     }
 }
 
-fn gated_app(sim: &Sim, go: bool, jobs: u64) -> App {
-    let mut app = App::open(
+/// `gated_app` without its seeding transaction: the same mounts over the same
+/// disk, for a test that reopens after a restart.
+fn gated_app_reopen(sim: &Sim) -> App {
+    App::open(
         Box::new(sim.disk()),
         Schema::new().table::<Gate>(),
         Box::new(sim.entropy()),
         AppConfig::default(),
     )
     .unwrap()
-    .mount_jobs(jobs![Gated, ChargeAsPure])
-    .outbound(Host::new("pay.test"));
+    .mount_jobs(jobs![Gated, ChargeAsPure, OpenGate])
+    .outbound(Host::new("pay.test"))
+}
+
+fn gated_app(sim: &Sim, go: bool, jobs: u64) -> App {
+    let mut app = gated_app_reopen(sim);
     app.transact_for_tests(|tx| {
         tx.put(&Gate {
             id: charpente::Id::from_raw(0),
@@ -793,7 +803,8 @@ impl ReadsAlias {
 /// A read the `Schema` refuses inside `call` comes back through `?` as
 /// `JobError::Io`, the variant a platform fault takes, but it is the job's
 /// own deterministic bug: an attempt whose `last_error` is the refusal, and
-/// no start (amendment A18, as on the run path; §7 has no row of its own).
+/// no start (the tenancy-completion plan's amendment A18, docs/LEDGER.md,
+/// which the run path in dispatch.rs cites too; §7 has no row of its own).
 #[test]
 fn a_refused_read_inside_call_is_an_attempt_naming_the_refusal() {
     let sim = Sim::with_faults(0x0cb, FaultConfig::none());
@@ -1067,4 +1078,921 @@ mod mint_paths {
             "a pure enqueue draws none"
         );
     }
+}
+
+// ------------------------------------------------- the kernel's outbound arm
+
+const SEC: u64 = 1_000_000_000;
+
+#[charpente::table(global)]
+struct Paid {
+    id: charpente::Id<Paid>,
+    /// How many times `settle` recorded this payment: 1 for every Done job,
+    /// or `settle` committed twice (Task 12's exactly-once oracle).
+    times: u32,
+}
+
+/// Charges once per job; `settle` records the payment on a 200 and treats
+/// anything else as an attempt. Used by every §7 row below.
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 3, backoff = "500ms"),
+    timeout = "2s"
+)]
+struct Pay {
+    n: u64,
+}
+
+impl Pay {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::post(format!("/pay/{}", self.n)).header("idempotency-key", key.as_str()),
+        ))
+    }
+
+    fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 => {
+                let id = charpente::Id::from_raw(self.n);
+                let times = tx.get(id)?.map_or(0, |p: Paid| p.times);
+                tx.put(&Paid {
+                    id,
+                    times: times + 1,
+                });
+                Ok(())
+            }
+            s => Err(JobError::app(format!("pay.test answered {s}"))),
+        }
+    }
+}
+
+fn pay_app(sim: &Sim, host: Host, jobs: u64) -> App {
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Paid>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Pay])
+    .outbound(host);
+    app.transact_for_tests(|tx| {
+        for n in 0..jobs {
+            tx.enqueue(Pay { n });
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    app
+}
+
+/// Runs to `horizon` virtual nanos and hands back the App and the stats.
+fn run_to(sim: &Sim, app: App, horizon: u64) -> (App, KernelStats) {
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), horizon))
+        .unwrap();
+    let stats = kernel.stats();
+    (kernel.into_app(), stats)
+}
+
+fn jobs_and_paid(app: &mut App) -> (Vec<JobRow>, usize) {
+    let snap = app.db_for_tests().snapshot().unwrap();
+    (
+        snap.scan::<JobRow>().unwrap(),
+        snap.scan::<Paid>().unwrap().len(),
+    )
+}
+
+fn faults(f: impl FnOnce(&mut FaultConfig)) -> FaultConfig {
+    let mut cfg = FaultConfig::none();
+    f(&mut cfg);
+    cfg
+}
+
+#[test]
+fn a_settled_reply_commits_its_effects_with_the_done_mark() {
+    let sim = Sim::with_faults(0x0d0, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let (mut app, stats) = run_to(&sim, app, 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!((rows[0].status, paid), (JobStatus::Done, 1));
+    assert_eq!(
+        (
+            stats.outbound_started,
+            stats.outbound_settled,
+            stats.outbound_failed
+        ),
+        (1, 1, 0)
+    );
+    let key = IdempotencyKey::from_bytes(rows[0].outbound_key.unwrap());
+    sim.with_remote("pay.test", |r: &Recorder| {
+        assert_eq!(r.calls().len(), 1);
+        assert_eq!(
+            r.calls()[0].headers,
+            vec![("idempotency-key".to_string(), key.as_str().to_string())]
+        );
+    });
+}
+
+#[test]
+fn a_refused_connection_is_an_attempt_that_says_it_never_arrived() {
+    let sim = Sim::with_faults(0x0d1, faults(|c| c.outbound_refused = 1.0));
+    sim.remote("pay.test", Recorder::new());
+    let (mut app, _) = run_to(&sim, pay_app(&sim, Host::new("pay.test"), 1), 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, rows[0].attempts, paid),
+        (JobStatus::Dead, 3, 0)
+    );
+    assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some("outbound pay.test: connection refused — the call did not reach the remote")
+    );
+    sim.with_remote("pay.test", |r: &Recorder| assert!(r.calls().is_empty()));
+}
+
+#[test]
+fn a_lost_reply_times_out_and_every_retry_carries_the_same_key() {
+    let sim = Sim::with_faults(0x0d2, faults(|c| c.outbound_lost_reply = 1.0));
+    sim.remote(
+        "pay.test",
+        Idempotent::header("idempotency-key", Recorder::new()),
+    );
+    let (mut app, stats) = run_to(&sim, pay_app(&sim, Host::new("pay.test"), 1), 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, paid),
+        (JobStatus::Dead, 0),
+        "Dead means no reply was settled"
+    );
+    assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some(
+            "outbound pay.test: timed out after 2s — the remote may have applied this call; the \
+              retry carries the same idempotency key"
+        )
+    );
+    assert_eq!(stats.outbound_timed_out, 3);
+    let key = IdempotencyKey::from_bytes(rows[0].outbound_key.unwrap());
+    let delivered = sim.outbound_deliveries();
+    assert_eq!(delivered.len(), 3);
+    assert!(delivered.iter().all(|d| d.key == key));
+    sim.with_remote("pay.test", |m: &Idempotent<Recorder>| {
+        assert_eq!(
+            m.applied().get(key.as_str()),
+            Some(&1),
+            "applied once, replayed twice"
+        );
+        assert_eq!(
+            m.inner().calls().len(),
+            1,
+            "the remote applied the effect once"
+        );
+    });
+}
+
+#[test]
+fn a_settle_error_discards_its_effects_and_is_an_attempt() {
+    let sim = Sim::with_faults(0x0d3, FaultConfig::none());
+    sim.remote(
+        "pay.test",
+        from_fn(|_c: &OutboundCall| OutboundReply {
+            status: 503,
+            headers: vec![],
+            body: vec![],
+        }),
+    );
+    let (mut app, stats) = run_to(&sim, pay_app(&sim, Host::new("pay.test"), 1), 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!((rows[0].status, paid), (JobStatus::Dead, 0));
+    assert_eq!(rows[0].last_error.as_deref(), Some("pay.test answered 503"));
+    assert_eq!((stats.outbound_started, stats.outbound_failed), (3, 3));
+}
+
+/// Review Focus 4: a reply over the host's cap is an attempt whose text says
+/// the remote applied the call (plan amendment A10).
+#[test]
+fn an_oversized_reply_is_a_named_attempt() {
+    let sim = Sim::with_faults(0x0d4, FaultConfig::none());
+    sim.remote(
+        "pay.test",
+        from_fn(|_c: &OutboundCall| OutboundReply {
+            status: 200,
+            headers: vec![],
+            body: vec![b'x'; 17],
+        }),
+    );
+    let host = Host::new("pay.test").max_reply_bytes(16);
+    let (mut app, _) = run_to(&sim, pay_app(&sim, host, 1), 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!((rows[0].status, paid), (JobStatus::Dead, 0));
+    assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some(
+            "outbound pay.test: the reply exceeded the 16-byte reply cap — the remote \
+              answered, so it applied this call; raise the cap with Host::max_reply_bytes (the \
+              retry carries the same idempotency key)"
+        )
+    );
+}
+
+/// Production's documented race (io.rs, `Outbound::cancel`: "A completion for
+/// it may still surface; the kernel discards it"): a cancel that loses to the
+/// reply. `SimOutbound` never hands out a cancelled flight's completion, so
+/// the kernel's late-discard path runs only behind this wrapper, which drops
+/// every cancel and forwards everything else.
+struct NoCancel<O>(O);
+
+impl<O: Outbound> Outbound for NoCancel<O> {
+    fn start(&self, token: u64, call: OutboundCall) -> std::io::Result<()> {
+        self.0.start(token, call)
+    }
+    fn poll(&self) -> Option<(u64, std::io::Result<OutboundReply>)> {
+        self.0.poll()
+    }
+    fn cancel(&self, _token: u64) {}
+    fn next_wake(&self) -> OutboundWake {
+        self.0.next_wake()
+    }
+}
+
+/// Review Focus 2 / R7, through `NoCancel`. Timeline (one-way latency 1.5s,
+/// timeout 2s, backoff 500ms then 1s): token 0 starts at 0 and times out at
+/// 2s; token 1 starts at 2.5s; token 0's reply lands at 3s while token 1 is in
+/// flight — late, and it must not settle token 1's attempt. Token 1 times out
+/// at 4.5s and its reply (5.5s) is late too, polled one step after token 2
+/// starts at 5.5s; token 2 times out at 7.5s, and the job is Dead. Token 2's
+/// own reply (8.5s) is never polled: nothing is in flight by then. If the
+/// count below differs, re-derive it from this timeline before changing it.
+#[test]
+fn a_late_reply_never_settles_the_retry() {
+    let lat = Duration::from_millis(1500);
+    let sim = Sim::with_faults(0x0d5, faults(|c| c.outbound_latency = (lat, lat)));
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let outbound = NoCancel(sim.outbound(&app.outbound_hosts()).unwrap());
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC))
+        .unwrap();
+    let stats = kernel.stats();
+    let mut app = kernel.into_app();
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, paid),
+        (JobStatus::Dead, 0),
+        "no late reply settled anything"
+    );
+    assert_eq!(stats.outbound_settled, 0);
+    assert_eq!(stats.outbound_late, 2);
+    assert_eq!(stats.outbound_timed_out, 3);
+}
+
+/// Review Focus 1 / R6: a call that read a sibling's uncommitted write never
+/// starts when the batch's commit fails. Swept over every crash point the run
+/// reaches; the property is "a delivery implies the write it read is durable".
+/// Beside it, the other side of R6: a batch that fails to commit abandons its
+/// starts, so no flight is left in the table without its start on the wire.
+#[test]
+fn a_call_never_starts_when_its_group_commit_fails() {
+    let mut failed_commits = 0;
+    let mut abandoned = 0;
+    for crash_after in 0..400u64 {
+        let sim = Sim::with_faults(0x0d6, FaultConfig::none());
+        sim.remote("pay.test", Recorder::new());
+        let mut app = gated_app(&sim, false, 0);
+        app.transact_for_tests(|tx| {
+            tx.enqueue(OpenGate {});
+            tx.enqueue(Gated { n: 0 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+        sim.crash_disk_after(crash_after);
+        let Ok(mut kernel) = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))
+        else {
+            continue; // the crash landed in kernel build: nothing ran
+        };
+        let ran = kernel.run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC));
+        let stats = kernel.stats();
+        let in_flight = kernel.outbound_in_flight_for_tests() as u64;
+        if ran.is_err() {
+            failed_commits += 1;
+            // The job batch staged its jobs (`OpenGate`'s Done counts as it
+            // is staged) and no start went out: its commit, or a read inside
+            // it, failed with the call decided or about to be.
+            if stats.jobs_done > 0 && stats.outbound_started == 0 {
+                abandoned += 1;
+            }
+        }
+        drop(kernel);
+        let delivered = !sim.outbound_deliveries().is_empty();
+        sim.restart();
+        let mut reopened = gated_app_reopen(&sim);
+        let gate_durable = reopened
+            .db_for_tests()
+            .snapshot()
+            .unwrap()
+            .get::<Gate>(charpente::Id::from_raw(0))
+            .unwrap()
+            .is_some_and(|g| g.go);
+        assert!(
+            !delivered || gate_durable,
+            "crash_after {crash_after}: a call that read the gate was delivered, but the write it \
+             read never became durable (R6)"
+        );
+        assert!(
+            in_flight <= stats.outbound_started,
+            "crash_after {crash_after}: {in_flight} flight(s) in the table but {} start(s) \
+             issued — a batch that failed to commit kept a flight whose start never went out, \
+             so its job is in no due-set and its call is not on the wire (abandon_starts, R6)",
+            stats.outbound_started
+        );
+    }
+    assert!(
+        failed_commits > 0,
+        "the sweep never failed a commit, so it proved nothing"
+    );
+    assert!(
+        abandoned > 0,
+        "the sweep never failed a job batch before its start, so R6's abandoned side went \
+         unexercised"
+    );
+}
+
+#[job(global)]
+struct OpenGate {}
+
+impl OpenGate {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        tx.put(&Gate {
+            id: charpente::Id::from_raw(0),
+            go: true,
+        });
+        Ok(())
+    }
+}
+
+/// Review Focus 5 / invariant 3, and oracle 2's switchover row (plan
+/// amendment A19): a switchover reaches the kernel only as this write gate
+/// (`Role::HandingOff` calls `forbid_writes`, `repl/mod.rs:300`), and the
+/// kernel's drop is level-triggered on the gate, never on the role.
+#[test]
+fn losing_writability_drops_in_flight_and_keeps_jobs_pending() {
+    let lat = Duration::from_millis(500);
+    let sim = Sim::with_faults(0x0d7, faults(|c| c.outbound_latency = (lat, lat)));
+    sim.remote(
+        "pay.test",
+        Idempotent::header("idempotency-key", Recorder::new()),
+    );
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    while kernel.outbound_in_flight_for_tests() == 0 {
+        kernel.step(&mut source).unwrap();
+    }
+    kernel
+        .app_mut_for_tests()
+        .db_for_tests()
+        .forbid_writes("elsewhere:1".into());
+    kernel.step(&mut source).unwrap();
+    assert_eq!(kernel.outbound_in_flight_for_tests(), 0, "invariant 3");
+    sim.clock().sleep(Duration::from_secs(5));
+    kernel.step(&mut source).unwrap();
+    let mut app = kernel.into_app();
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, rows[0].attempts, paid),
+        (JobStatus::Pending, 0, 0)
+    );
+    let key = rows[0].outbound_key;
+
+    // The next writable kernel re-dispatches with the same key. The first
+    // kernel's build took the job defs and the Host entries, so mount them again.
+    let mut app = app.mount_jobs(jobs![Pay]).outbound(Host::new("pay.test"));
+    app.db_for_tests().allow_writes();
+    let (mut app, _) = run_to(&sim, app, 120 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        (rows[0].status, rows[0].outbound_key, paid),
+        (JobStatus::Done, key, 1)
+    );
+    let k = IdempotencyKey::from_bytes(key.unwrap());
+    sim.with_remote("pay.test", |m: &Idempotent<Recorder>| {
+        assert_eq!(
+            m.applied().get(k.as_str()),
+            Some(&1),
+            "two deliveries, one application"
+        );
+        assert_eq!(
+            m.inner().calls().len(),
+            1,
+            "the remote applied the effect once"
+        );
+    });
+    let delivered = sim.outbound_deliveries();
+    assert_eq!(delivered.len(), 2);
+    assert!(
+        delivered.iter().all(|d| d.key == k),
+        "the re-dispatch sent the recorded key, not a fresh one"
+    );
+}
+
+#[test]
+fn a_crash_mid_flight_re_dispatches_with_the_same_key() {
+    let lat = Duration::from_secs(1);
+    let sim = Sim::with_faults(0x0d8, faults(|c| c.outbound_latency = (lat, lat)));
+    sim.remote(
+        "pay.test",
+        Idempotent::header("idempotency-key", Recorder::new()),
+    );
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let (app, _) = run_to(&sim, app, SEC / 2); // started, not answered
+    drop(app);
+    sim.restart();
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Paid>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Pay])
+    .outbound(Host::new("pay.test"));
+    let (mut app, _) = run_to(&sim, app, 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!((rows[0].status, paid), (JobStatus::Done, 1));
+    let delivered = sim.outbound_deliveries();
+    assert_eq!(delivered.len(), 2, "the pre-crash request still arrived");
+    let k = IdempotencyKey::from_bytes(rows[0].outbound_key.unwrap());
+    assert!(
+        delivered.iter().all(|d| d.key == k),
+        "the re-dispatch sent the recorded key, not a fresh one"
+    );
+    sim.with_remote("pay.test", |m: &Idempotent<Recorder>| {
+        assert_eq!(m.applied().get(k.as_str()), Some(&1));
+        assert_eq!(
+            m.inner().calls().len(),
+            1,
+            "the remote applied the effect once"
+        );
+    });
+}
+
+/// Task 10 could not free a slot: with the table full, a due outbound job
+/// waits, Pending and charged nothing, and dispatches the moment a reply
+/// frees the slot.
+#[test]
+fn a_capacity_blocked_outbound_job_dispatches_once_a_slot_frees() {
+    let lat = Duration::from_millis(500);
+    let sim = Sim::with_faults(0x0df, faults(|c| c.outbound_latency = (lat, lat)));
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 2).outbound_max_in_flight(1);
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    // Job 0's reply lands at 1s; stop at 0.75s, with its call in flight.
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 3 * SEC / 4))
+        .unwrap();
+    assert_eq!(kernel.outbound_in_flight_for_tests(), 1);
+    assert_eq!(
+        kernel.stats().outbound_started,
+        1,
+        "job 1 waits for the slot"
+    );
+    let rows = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan::<JobRow>()
+        .unwrap();
+    assert_eq!(
+        (
+            rows[1].status,
+            rows[1].attempts,
+            rows[1].last_error.as_deref()
+        ),
+        (JobStatus::Pending, 0, None),
+        "waiting for a slot charges no attempt"
+    );
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 60 * SEC))
+        .unwrap();
+    let stats = kernel.stats();
+    let mut app = kernel.into_app();
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.status, r.attempts))
+            .collect::<Vec<_>>(),
+        vec![(JobStatus::Done, 0); 2]
+    );
+    assert_eq!(paid, 2);
+    assert_eq!((stats.outbound_started, stats.outbound_settled), (2, 2));
+    let at: Vec<u64> = sim.outbound_deliveries().iter().map(|d| d.at).collect();
+    assert_eq!(
+        at,
+        vec![SEC / 2, 3 * SEC / 2],
+        "job 1's call started only when job 0's reply (1s) freed the slot"
+    );
+}
+
+#[test]
+fn a_kernel_without_an_outbound_refuses_by_name() {
+    let sim = Sim::with_faults(0x0d9, FaultConfig::none());
+    let app = pay_app(&sim, Host::new("pay.test"), 0);
+    let err = Kernel::new(app, Box::new(sim.clock()))
+        .err()
+        .expect("refused");
+    assert_eq!(
+        err.to_string(),
+        "kernel: job Pay calls pay.test, but this kernel has no Outbound — serve() supplies the \
+         production client; a sim test passes one: let outbound = \
+         sim.outbound(&app.outbound_hosts())?; Kernel::with_outbound(app, clock, Box::new(outbound))"
+    );
+    assert!(Refusal::of(&err).is_some());
+}
+
+#[test]
+fn an_unmatched_host_set_refuses_the_kernel() {
+    let sim = Sim::with_faults(0x0da, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 0).outbound(Host::new("extra.test"));
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let err = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))
+        .err()
+        .expect("refused");
+    assert_eq!(
+        err.to_string(),
+        "kernel: app.outbound(Host::new(\"extra.test\")) declares a host no mounted job calls — \
+         remove it, or mount the job that calls it"
+    );
+    assert!(Refusal::of(&err).is_some());
+}
+
+/// Invariant 6: a kernel that mounts no outbound job calls no `Outbound`
+/// method, however long it runs.
+struct Tripwire;
+
+impl Outbound for Tripwire {
+    fn start(&self, _: u64, _: OutboundCall) -> std::io::Result<()> {
+        panic!("invariant 6: start on a kernel with no outbound job")
+    }
+    fn poll(&self) -> Option<(u64, std::io::Result<OutboundReply>)> {
+        panic!("invariant 6: poll on a kernel with no outbound job")
+    }
+    fn cancel(&self, _: u64) {
+        panic!("invariant 6: cancel on a kernel with no outbound job")
+    }
+    fn next_wake(&self) -> OutboundWake {
+        panic!("invariant 6: next_wake on a kernel with no outbound job")
+    }
+}
+
+#[test]
+fn a_kernel_with_no_outbound_job_never_touches_its_outbound() {
+    let sim = Sim::with_faults(0x0db, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![ChargeAsPure]);
+    app.transact_for_tests(|tx| {
+        tx.enqueue(ChargeAsPure { cents: 1 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(Tripwire)).unwrap();
+    kernel
+        .run(&mut SimSource::new(
+            Box::new(sim.clock()),
+            3 * 24 * 3600 * SEC,
+        ))
+        .unwrap();
+    assert_eq!(
+        kernel.stats().jobs_done,
+        1 + 3,
+        "the job plus three daily session sweeps"
+    );
+}
+
+mod scoped_outbound {
+    use super::*;
+
+    #[charpente::table(global)]
+    pub struct Shop {
+        pub id: charpente::Id<Shop>,
+        pub name: String,
+    }
+
+    impl Tenant for Shop {
+        const NAME: &'static str = "Shop";
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(
+            _tx: &Tx,
+            _who: &Principal,
+            _scope: charpente::Id<Shop>,
+        ) -> Result<(), ApiError> {
+            panic!("a job has no principal — Shop::authorize is never asked")
+        }
+    }
+
+    #[charpente::table(scoped_by = Shop)]
+    pub struct Sale {
+        pub id: charpente::Id<Sale>,
+        pub charged: bool,
+    }
+
+    #[job(
+        scoped_by = Shop,
+        outbound = "pay.test",
+        retry(max = 3, backoff = "500ms"),
+        timeout = "2s"
+    )]
+    pub struct ChargeSale {
+        pub sale: charpente::Id<Sale>,
+    }
+
+    impl ChargeSale {
+        fn call(
+            &self,
+            tx: &ScopedTx<'_, '_, Shop>,
+            key: &IdempotencyKey,
+        ) -> Result<Option<Call>, JobError> {
+            let Some(sale) = tx.get(self.sale)? else {
+                return Err(JobError::app("sale gone"));
+            };
+            if sale.charged {
+                return Ok(None);
+            }
+            Ok(Some(
+                Call::post(format!(
+                    "/shops/{}/sales/{}",
+                    tx.scope().raw(),
+                    self.sale.raw()
+                ))
+                .header("idempotency-key", key.as_str()),
+            ))
+        }
+
+        fn settle(self, tx: &mut ScopedTx<'_, '_, Shop>, reply: Reply) -> Result<(), JobError> {
+            if reply.status() != 200 {
+                return Err(JobError::app(format!(
+                    "pay.test answered {}",
+                    reply.status()
+                )));
+            }
+            tx.put(&Sale {
+                id: self.sale,
+                charged: true,
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_scoped_outbound_job_calls_and_settles_inside_its_tenant() {
+        let sim = Sim::with_faults(0x0dc, FaultConfig::none());
+        sim.remote("pay.test", Recorder::new());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Sale>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![ChargeSale])
+        .outbound(Host::new("pay.test"));
+        // The operator path (kernel.rs's `enqueue_in_desk`), through a minting group.
+        let mint = sim.entropy();
+        for shop in [3u64, 4] {
+            let mut group = app.db_for_tests().begin_group_minting(&mint).unwrap();
+            let admission = group.tenant_admission();
+            group
+                .stage(|tx| {
+                    let mut scoped =
+                        tx.admit_scope(charpente::Id::<Shop>::from_raw(shop), &admission);
+                    scoped.put(&Sale {
+                        id: charpente::Id::from_raw(1),
+                        charged: false,
+                    });
+                    scoped.enqueue(ChargeSale {
+                        sale: charpente::Id::from_raw(1),
+                    });
+                    Ok::<(), std::io::Error>(())
+                })
+                .unwrap();
+            group.commit().map_err(|f| f.error).unwrap();
+        }
+        let (mut app, stats) = run_to(&sim, app, 60 * SEC);
+        sim.with_remote("pay.test", |r: &Recorder| {
+            let mut paths: Vec<&str> = r.calls().iter().map(|c| c.path.as_str()).collect();
+            paths.sort_unstable();
+            assert_eq!(
+                paths,
+                vec!["/shops/3/sales/1", "/shops/4/sales/1"],
+                "call ran in each job's own tenant"
+            );
+        });
+        let snap = app.db_for_tests().snapshot().unwrap();
+        for shop in [3u64, 4] {
+            let sale = snap
+                .get_scoped::<Sale>(shop, charpente::Id::from_raw(1))
+                .unwrap()
+                .unwrap();
+            assert!(sale.charged, "settle wrote in shop {shop}, its own tenant");
+        }
+        let jobs = snap.scan::<JobRow>().unwrap();
+        assert_eq!(
+            jobs.iter()
+                .map(|r| (r.scope, r.status, r.attempts))
+                .collect::<Vec<_>>(),
+            vec![(Some(3), JobStatus::Done, 0), (Some(4), JobStatus::Done, 0)],
+            "each settle committed with its job's Done mark, first time"
+        );
+        assert_eq!((stats.outbound_started, stats.outbound_settled), (2, 2));
+    }
+}
+
+#[test]
+fn cron_enqueues_an_outbound_job_with_a_minted_key() {
+    let sim = Sim::with_faults(0x0dd, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 0).schedule(
+        "hourly",
+        Duration::from_secs(3600),
+        || Pay { n: 9 },
+    );
+    let (mut app, _) = run_to(&sim, app, 2 * 3600 * SEC + 60 * SEC);
+    let (rows, _) = jobs_and_paid(&mut app);
+    let pay: Vec<_> = rows.iter().filter(|r| r.name == "Pay").collect();
+    assert!(pay.len() >= 2, "a tick per hour: {}", pay.len());
+    let keys: std::collections::BTreeSet<_> = pay
+        .iter()
+        .map(|r| {
+            r.outbound_key
+                .expect("the cron arm's group minted it (plan amendment A9)")
+        })
+        .collect();
+    assert_eq!(keys.len(), pay.len(), "one key per tick, never shared");
+    assert!(pay.iter().all(|r| r.status == JobStatus::Done));
+}
+
+mod shape_v1 {
+    use super::*;
+    #[job(global)]
+    pub struct Settle {
+        pub n: u64,
+    }
+    impl Settle {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+}
+
+mod shape_v2 {
+    use super::*;
+    #[job(global, outbound = "pay.test")]
+    pub struct Settle {
+        pub n: u64,
+    }
+    impl Settle {
+        fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+            Ok(None)
+        }
+        fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+}
+
+/// R8 / spec §14: declaring `outbound` is a shape change, refused by the
+/// existing refusal while rows of the old shape are Pending.
+#[test]
+fn a_job_gaining_outbound_is_refused_while_old_rows_are_pending() {
+    let sim = Sim::with_faults(0x0de, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap();
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(shape_v1::Settle { n: 1 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    let app = app
+        .mount_jobs(jobs![shape_v2::Settle])
+        .outbound(Host::new("pay.test"));
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let err = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))
+        .err()
+        .expect("refused");
+    assert!(
+        err.to_string().starts_with(
+            "1 Pending \"Settle\" job(s) (ids 0) were enqueued under a different shape"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("its `outbound` declaration"),
+        "Task 5 Step 5a: the fix names outbound: {err}"
+    );
+    assert!(Refusal::of(&err).is_some());
+}
+
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 1, backoff = "1s"),
+    timeout = "1s"
+)]
+struct Expiring {}
+
+impl Expiring {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(Call::post("/expiring")))
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// The completion buffer can outlive the table's last flight: a drain stops
+/// at `MAX_BATCH` (64) settled completions, and a late one queued behind them
+/// stays buffered with nothing in flight. Losing writability then must drop
+/// it with the table, or the outbound arm runs behind a shut gate. Timeline
+/// (one-way latency 0.75s): 64 `Pay` calls and one `Expiring` start at 0;
+/// `Expiring` times out at 1s (Dead, its cancel dropped by `NoCancel`); all 65
+/// replies land at 1.5s, `Expiring`'s last; the arm settles the 64 and stops.
+#[test]
+fn a_completion_left_behind_the_last_flight_goes_with_the_gate() {
+    use charpente::kernel::{RequestSource, Step};
+    let lat = Duration::from_millis(750);
+    let sim = Sim::with_faults(0x0e0, faults(|c| c.outbound_latency = (lat, lat)));
+    sim.remote("pay.test", Recorder::new());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Paid>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Pay, Expiring])
+    .outbound(Host::new("pay.test"))
+    .outbound_max_in_flight(65);
+    app.transact_for_tests(|tx| {
+        for n in 0..64 {
+            tx.enqueue(Pay { n });
+        }
+        tx.enqueue(Expiring {});
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let outbound = NoCancel(sim.outbound(&app.outbound_hosts()).unwrap());
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    while kernel.stats().outbound_settled < 64 {
+        if let Step::Idle { deadline } = kernel.step(&mut source).unwrap() {
+            source.wait_until(deadline);
+        }
+    }
+    let stats = kernel.stats();
+    assert_eq!(
+        (
+            stats.outbound_timed_out,
+            stats.outbound_late,
+            kernel.outbound_in_flight_for_tests()
+        ),
+        (1, 0, 0),
+        "nothing in flight, and Expiring's late reply still buffered"
+    );
+    kernel
+        .app_mut_for_tests()
+        .db_for_tests()
+        .forbid_writes("elsewhere:1".into());
+    kernel.step(&mut source).unwrap();
+    kernel.app_mut_for_tests().db_for_tests().allow_writes();
+    kernel.step(&mut source).unwrap();
+    assert_eq!(
+        kernel.stats().outbound_late,
+        0,
+        "the buffered completion was dropped with the gate, never handed to the arm"
+    );
 }

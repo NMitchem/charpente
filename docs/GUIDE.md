@@ -1949,6 +1949,104 @@ once (default 64, `charpente::outbound::DEFAULT_MAX_IN_FLIGHT`). A due
 outbound job waits while the table is full, and a pure job never waits behind
 it.
 
+### When a call fails
+
+The kernel starts a call only after the transaction that ran `call` has
+committed, so a call never goes out on state that did not become durable,
+including a write by another job in the same batch that `call` read. It waits
+for the reply outside any transaction, for at most `timeout`, and hands the
+reply to `settle`. An attempt below counts against `retry` the way a failed
+`run` does: `attempts` increments, `last_error` names the failure, and the job
+waits out its backoff or goes Dead. Every retry carries the job's key unchanged.
+
+| What happens | An attempt? | Result |
+|---|---|---|
+| `call` returns `Ok(None)` | — | Done; no call |
+| `call` returns `Err(JobError::App)` or panics (`call panicked: …`) | yes | failure record; no call |
+| `call` builds a request its `Host` entry refuses | yes | failure record naming the rule; no call |
+| `call` returns `Err(JobError::Io)` | no | bubbles: restart-and-recover |
+| a transport failure: refused, TLS, DNS, a reset, a reply over the cap | yes | failure record |
+| `timeout` passes with no reply | yes | the call is cancelled; failure record |
+| a reply for a call that already timed out or was dropped | — | discarded, counted in `outbound_late` |
+| `settle` returns `Ok` | — | its writes and the Done mark commit as one record |
+| `settle` returns `Err(JobError::App)` or panics (`settle panicked: …`) | yes | its writes discarded; failure record |
+| `settle` returns `Err(JobError::Io)` | no | bubbles; still Pending, called again after the restart |
+| the process crashes with calls in flight | no | the Pending jobs are called again on restart |
+| the node stops being writable (a switchover, a demotion) | no | its calls in flight are dropped; the next writable node calls again |
+| the node is restored from its archive | no | Pending rows keep their key, so a re-call is the same request |
+
+An attempt that may have reached the remote says so. Only a refused connection
+certainly did not, so it is the one text that says the call never arrived:
+
+<!-- pinned -->
+```text
+outbound <host>: <error> — the call did not reach the remote
+outbound <host>: <error> — the remote may have applied this call; the retry carries the same idempotency key
+outbound <host>: timed out after <timeout> — the remote may have applied this call; the retry carries the same idempotency key
+outbound <host>: the reply exceeded the <cap>-byte reply cap — the remote answered, so it applied this call; raise the cap with Host::max_reply_bytes (the retry carries the same idempotency key)
+```
+
+The first line is a refused connection's, and its `<error>` reads `connection
+refused`. The second is every other transport failure's. `<timeout>` is the
+job's `timeout` as Rust prints a `Duration` (`2s`, `1.5s`), and `<cap>` is the
+host's reply cap in bytes.
+
+**Dead means no reply was settled.** It does not mean nothing happened at the
+remote: a call whose reply was lost, or that timed out, may have been applied
+there. The Dead job's `last_error` says which of the texts above ended it.
+
+**A remote that ignores the key is called again, and may bill again.** A retry
+after a lost reply or a timeout sends the same request with the same key. A
+remote with Stripe's semantics applies it once. Many remotes do not dedupe at
+all, LLM APIs among them, so a lost reply there means a second completion is
+requested and paid for. `settle` still commits at most once, so the app's state
+stays exactly-once, but the remote's bill does not.
+
+**A crash-looping process calls again on every restart.** A crash is not an
+attempt, as `JobError::Io` is not, so it spends nothing from `retry`. A job
+whose dispatch keeps killing the process is called again each time it comes
+back, without end.
+
+**Deploying a changed `call` under a key in flight.** A call in flight when the
+process stops is called again by whichever binary comes up next. If that
+binary's `call` builds different parameters, the remote receives the old key
+with new parameters. Stripe-style APIs refuse that (the sim's `Idempotent`
+model answers 409, §8), and `settle` receives the refusal as an ordinary reply.
+Change what `call` sends the way "Changing a job's fields" below changes a
+job's shape: drain the type's Pending jobs on the old binary first, or send the
+new request from a new job type.
+
+**In a sim test.** A kernel over an app that mounts an outbound job needs an
+`Outbound`, and every constructor refuses to build without one:
+
+<!-- pinned -->
+```text
+kernel: job <job> calls <host>, but this kernel has no Outbound — serve() supplies the production client; a sim test passes one: let outbound = sim.outbound(&app.outbound_hosts())?; Kernel::with_outbound(app, clock, Box::new(outbound))
+```
+
+Register a model for each host with `sim.remote` (§8), then build the handle
+from the app before the kernel takes it:
+
+```rust
+use charpente::http::App;
+use charpente::kernel::{Kernel, SimSource};
+use charpente_sim::Sim;
+
+fn run_with_outbound(sim: &Sim, app: App, horizon_nanos: u64) -> std::io::Result<Kernel> {
+    let outbound = sim.outbound(&app.outbound_hosts())?;
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))?;
+    kernel.run(&mut SimSource::new(Box::new(sim.clock()), horizon_nanos))?;
+    Ok(kernel)
+}
+```
+
+A node that also replicates or archives is built with `Kernel::builder(app,
+clock)`, then any of `.replication(repl)`, `.archive(archive, store)` and
+`.outbound(outbound)`, then `.build()`. `kernel.stats()` counts the arm's work
+in `outbound_started` (calls started), `outbound_settled` (replies whose
+`settle` committed), `outbound_failed` (failure records, timeouts included),
+`outbound_timed_out` and `outbound_late`.
+
 ### Changing a job's fields
 
 Every enqueue records the payload's shape — `Job::FINGERPRINT`, the structural
@@ -3127,8 +3225,10 @@ pieces:
   `Ok(())` once nothing is left inside the horizon, `Err` if the engine
   poisoned mid-run (§9). Afterwards, `kernel.stats()` snapshots the loop's
   counters (`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`,
-  `cron_ticks`, `cron_catchups`) and `kernel.into_app()` hands the `App`
-  back — `app.db().snapshot()` reads the durable end-state.
+  `cron_ticks`, `cron_catchups`, and §6's outbound counters) and
+  `kernel.into_app()` hands the `App` back — `app.db().snapshot()` reads the
+  durable end-state. An app that mounts an outbound job builds its kernel with
+  `Kernel::with_outbound` instead (§6, "When a call fails").
 
 One mindset note before the example: under `charpente test --sim`, every
 universe gets its own swarm-sampled fault matrix, so exact-trace assertions

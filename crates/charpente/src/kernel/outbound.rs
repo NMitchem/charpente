@@ -18,9 +18,7 @@ pub(crate) struct Flight {
     /// is abandoned.
     pub due_at: u64,
     pub deadline: u64,
-    #[expect(dead_code, reason = "first reader: Task 11")]
     pub host: &'static str,
-    #[expect(dead_code, reason = "first reader: Task 11")]
     pub timeout: Duration,
 }
 
@@ -134,12 +132,10 @@ impl InFlight {
         Some(f)
     }
 
-    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         self.deadlines.first().map(|&(d, _)| d)
     }
 
-    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn expired(&self, now: u64) -> Option<u64> {
         self.deadlines
             .first()
@@ -147,25 +143,21 @@ impl InFlight {
             .map(|&(_, t)| t)
     }
 
-    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn push_completion(&mut self, c: (u64, io::Result<OutboundReply>)) {
         self.completions.push_back(c);
     }
 
-    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn pop_completion(&mut self) -> Option<(u64, io::Result<OutboundReply>)> {
         self.completions.pop_front()
     }
 
-    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn has_completions(&self) -> bool {
         !self.completions.is_empty()
     }
 
-    /// Writable → not writable (invariant 3): every flight and buffered
+    /// The node is not writable (invariant 3): every flight and buffered
     /// completion is dropped; returns the tokens to cancel. Their jobs stay
     /// Pending in the store for the next primary, with the same key (§7).
-    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn drop_all(&mut self) -> Vec<u64> {
         assert!(
             self.starts.is_empty(),
@@ -176,4 +168,33 @@ impl InFlight {
         self.completions.clear();
         std::mem::take(&mut self.flights).into_keys().collect()
     }
+}
+
+/// Spec §7: an attempt that may have reached the remote says so. Only
+/// `ConnectionRefused` is "certainly not delivered" (io.rs's contract).
+pub(crate) fn transport_failure(host: &str, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::ConnectionRefused {
+        format!("outbound {host}: {e} — the call did not reach the remote")
+    } else {
+        format!(
+            "outbound {host}: {e} — the remote may have applied this call; the retry carries the \
+             same idempotency key"
+        )
+    }
+}
+
+pub(crate) fn timed_out(host: &str, timeout: Duration) -> String {
+    format!(
+        "outbound {host}: timed out after {timeout:?} — the remote may have applied this call; \
+         the retry carries the same idempotency key"
+    )
+}
+
+/// Plan amendment A10.
+pub(crate) fn reply_over_cap(host: &str, cap: usize) -> String {
+    format!(
+        "outbound {host}: the reply exceeded the {cap}-byte reply cap — the remote \
+         answered, so it applied this call; raise the cap with Host::max_reply_bytes (the retry \
+         carries the same idempotency key)"
+    )
 }

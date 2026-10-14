@@ -12,12 +12,12 @@ use charpente_core::db::{
     CrossTenant, Db, Enqueued, Group, JobShapeRefusal, ScopedTx, TableReadRefusal,
     TableWriteRefusal, Tenant, TenantAdmission, Tx, TxError,
 };
-use charpente_core::io::OutboundCall;
+use charpente_core::io::{OutboundCall, OutboundReply};
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
-use super::outbound::InFlight;
-use crate::outbound::{Call, DEFAULT_MAX_IN_FLIGHT, Host, IdempotencyKey};
+use super::outbound::{Flight, InFlight, reply_over_cap, timed_out, transport_failure};
+use crate::outbound::{Call, DEFAULT_MAX_IN_FLIGHT, Host, IdempotencyKey, Reply};
 use crate::tenant::TenantScope;
 
 /// Why a job run did not complete. The App/Io split mirrors `TxError` and is
@@ -836,6 +836,174 @@ impl Dispatcher {
 
     pub fn in_flight_len(&self) -> usize {
         self.in_flight.len()
+    }
+
+    pub(crate) fn push_completion(&mut self, c: (u64, io::Result<OutboundReply>)) {
+        self.in_flight.push_completion(c);
+    }
+
+    pub(crate) fn pop_completion(&mut self) -> Option<(u64, io::Result<OutboundReply>)> {
+        self.in_flight.pop_completion()
+    }
+
+    /// The outbound arm's ready predicate: a completion to settle, or a
+    /// deadline passed.
+    pub(crate) fn outbound_ready(&self, now: u64) -> bool {
+        self.in_flight.has_completions() || self.in_flight.expired(now).is_some()
+    }
+
+    pub(crate) fn next_outbound_deadline(&self) -> Option<u64> {
+        self.in_flight.next_deadline()
+    }
+
+    /// The job batch's commit failed: no start is issued (R6), and each
+    /// abandoned job returns to the outbound set at its old place.
+    pub(crate) fn abandon_starts(&mut self) {
+        for (due_at, id) in self.in_flight.abandon_starts() {
+            self.queue_outbound(due_at, id);
+        }
+    }
+
+    /// Invariant 3: the node is not writable. Returns the tokens to cancel;
+    /// the jobs stay Pending in the store and come back through `rebuild`
+    /// when this node is writable again, or on the new primary.
+    pub(crate) fn drop_in_flight(&mut self) -> Vec<u64> {
+        self.in_flight.drop_all()
+    }
+
+    /// The earliest passed deadline: the flight is finished and its failure
+    /// record staged. Returns the token, which the caller cancels.
+    pub(crate) fn expire_into(
+        &mut self,
+        group: &mut Group,
+        now: u64,
+    ) -> io::Result<Option<(u64, JobOutcome)>> {
+        let Some(token) = self.in_flight.expired(now) else {
+            return Ok(None);
+        };
+        let flight = self.in_flight.finish(token).expect("listed by expired");
+        let admission = group.tenant_admission();
+        let text = timed_out(flight.host, flight.timeout);
+        let outcome = self.fail_outbound(group, &admission, flight.id, flight.due_at, now, text)?;
+        Ok(Some((token, outcome)))
+    }
+
+    /// One completion. `None` for a token not in flight — a late completion,
+    /// discarded by rule (invariant 4). A transport error and an oversized
+    /// reply are attempts; a reply runs `settle`, whose `Ok` commits its
+    /// effects with the Done mark as one record.
+    pub(crate) fn settle_into(
+        &mut self,
+        group: &mut Group,
+        now: u64,
+        token: u64,
+        result: io::Result<OutboundReply>,
+    ) -> io::Result<Option<JobOutcome>> {
+        let Some(Flight {
+            id, due_at, host, ..
+        }) = self.in_flight.finish(token)
+        else {
+            return Ok(None);
+        };
+        let admission = group.tenant_admission();
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(e) => {
+                let text = transport_failure(host, &e);
+                return self
+                    .fail_outbound(group, &admission, id, due_at, now, text)
+                    .map(Some);
+            }
+        };
+        let cap = self
+            .hosts
+            .get(host)
+            .expect("a flight's host has a Host entry (R9)")
+            .max_reply();
+        if reply.body.len() > cap {
+            let text = reply_over_cap(host, cap);
+            return self
+                .fail_outbound(group, &admission, id, due_at, now, text)
+                .map(Some);
+        }
+        let defs = &self.defs;
+        let staged = group.stage(|tx| {
+            let mut row = tx
+                .get_job(Id::from_raw(id), &admission)?
+                .unwrap_or_else(|| panic!("dispatcher invariant: in-flight job {id} has no row"));
+            assert_eq!(
+                row.status,
+                JobStatus::Pending,
+                "dispatcher invariant: in-flight job {id} is not Pending"
+            );
+            let Some(def) = defs.get(row.name.as_str()) else {
+                return Err(JobError::App(not_registered(&row.name)));
+            };
+            assert_row_matches_def(id, &row, def);
+            let out = def.outbound.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "dispatcher invariant: in-flight job {id} (\"{}\") is not outbound in this \
+                     binary",
+                    row.name
+                )
+            });
+            let scope = row.scope.map(|sid| JobScope {
+                id: sid,
+                admission: &admission,
+                job: def.name,
+                scope_type: def.scope_type,
+                scope_name: def.scoped_by,
+            });
+            let reply = Reply::from_wire(reply);
+            match catch_unwind(AssertUnwindSafe(|| {
+                (out.settle)(tx, &row.payload, reply, scope)
+            })) {
+                Ok(result) => result?,
+                Err(payload) => {
+                    return Err(JobError::App(format!(
+                        "settle panicked: {}",
+                        panic_text(&*payload)
+                    )));
+                }
+            }
+            row.status = JobStatus::Done;
+            row.last_error = None;
+            tx.settle_job(&row, &admission);
+            Ok(())
+        });
+        let outcome = match staged {
+            Ok(()) => JobOutcome::Done { id },
+            Err(TxError::Io(e)) => {
+                assert!(
+                    JobShapeRefusal::of(&e).is_some() || TableWriteRefusal::of(&e).is_some(),
+                    "dispatcher invariant: Group::stage returned an io error that is neither its \
+                     job-shape nor its table-write refusal — classify it in dispatch before it \
+                     can reach a job: {e}"
+                );
+                self.fail_outbound(group, &admission, id, due_at, now, e.to_string())?
+            }
+            Err(TxError::App(JobError::Io(e))) if TableReadRefusal::of(&e).is_some() => {
+                self.fail_outbound(group, &admission, id, due_at, now, e.to_string())?
+            }
+            Err(TxError::App(JobError::App(err))) => {
+                self.fail_outbound(group, &admission, id, due_at, now, err)?
+            }
+            Err(TxError::App(JobError::Io(e))) => {
+                // §7: settle's platform fault is not an attempt. Still Pending; called
+                // again after the restart this error causes, with the same key.
+                self.queue_outbound(due_at, id);
+                return Err(e);
+            }
+            Err(TxError::NotPrimary { .. }) => {
+                self.queue_outbound(due_at, id);
+                return Err(not_primary_bug());
+            }
+            Err(TxError::Verifying { .. }) => {
+                self.queue_outbound(due_at, id);
+                return Err(verifying_bug());
+            }
+        };
+        Ok(Some(outcome))
     }
 }
 

@@ -665,7 +665,6 @@ impl App {
         &self.router
     }
 
-    #[expect(dead_code, reason = "first caller: Task 11")]
     pub(crate) fn take_outbound(&mut self) -> (Vec<Host>, usize) {
         (std::mem::take(&mut self.hosts), self.max_in_flight)
     }

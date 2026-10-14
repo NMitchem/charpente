@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use charpente_core::db::{Db, MAX_BATCH, Refusal};
 use charpente_core::event::EventRow;
-use charpente_core::io::{Clock, Instant, ObjectStore};
+use charpente_core::io::{Clock, Instant, ObjectStore, Outbound, OutboundWake};
 use charpente_core::table::View;
 
 use crate::archive::Archive;
@@ -94,6 +94,16 @@ pub struct KernelStats {
     /// `Archive::step` calls the arm has made — including the ones that
     /// returned `Err`, since a retry is still a step the loop spent.
     pub archive_steps: u64,
+    /// Outbound calls started: an `Outbound::start` the kernel issued.
+    pub outbound_started: u64,
+    /// Outbound replies whose `settle` committed with the Done mark.
+    pub outbound_settled: u64,
+    /// Outbound failure records staged, timeouts included.
+    pub outbound_failed: u64,
+    /// Outbound calls whose deadline passed before a completion arrived.
+    pub outbound_timed_out: u64,
+    /// Completions for a token not in flight, discarded (spec §4 invariant 4).
+    pub outbound_late: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +114,7 @@ enum Ready {
     Repl,
     Tail,
     Archive,
+    Outbound,
 }
 
 /// The deterministic kernel: one `App`, one due-heap, one cron schedule, one
@@ -183,17 +194,79 @@ pub struct Kernel {
     /// rather route it than read stderr (`Repl::take_witness_notice`'s
     /// precedent).
     archive_notice: Option<String>,
+    /// The outbound HTTP handle (outbound-effects spec §3, §4): `None` for a
+    /// kernel built without one, which `build` refuses whenever the app mounts
+    /// an outbound job. Touched only while something is in flight, or to
+    /// start a call a committed batch decided (invariant 6).
+    outbound: Option<Box<dyn Outbound>>,
+}
+
+/// Builds a `Kernel` from its parts (outbound-effects spec §4): a node that
+/// replicates, archives and calls out at once would otherwise need a
+/// five-argument constructor.
+pub struct KernelBuilder {
+    app: App,
+    clock: Box<dyn Clock>,
+    repl: Option<Repl>,
+    archive: Option<(Archive, Box<dyn ObjectStore>)>,
+    outbound: Option<Box<dyn Outbound>>,
+}
+
+impl KernelBuilder {
+    /// Runs the `Repl` engine as a ready source (`Kernel::with_replication`).
+    pub fn replication(mut self, repl: Repl) -> KernelBuilder {
+        self.repl = Some(repl);
+        self
+    }
+    /// Ships to `store` through `archive` (`Kernel::with_archive`).
+    pub fn archive(mut self, archive: Archive, store: Box<dyn ObjectStore>) -> KernelBuilder {
+        self.archive = Some((archive, store));
+        self
+    }
+    /// Starts the app's outbound calls through `outbound` (`Kernel::with_outbound`).
+    pub fn outbound(mut self, outbound: Box<dyn Outbound>) -> KernelBuilder {
+        self.outbound = Some(outbound);
+        self
+    }
+    /// The kernel, or the refusals `Kernel::new` documents.
+    pub fn build(self) -> io::Result<Kernel> {
+        Kernel::build(self.app, self.clock, self.repl, self.archive, self.outbound)
+    }
 }
 
 impl Kernel {
+    /// A kernel built from parts: `.replication`, `.archive`, `.outbound`,
+    /// then `.build()`.
+    pub fn builder(app: App, clock: Box<dyn Clock>) -> KernelBuilder {
+        KernelBuilder {
+            app,
+            clock,
+            repl: None,
+            archive: None,
+            outbound: None,
+        }
+    }
+
+    /// A kernel whose app mounts outbound jobs (spec §4). Build the handle
+    /// first — `sim.outbound(&app.outbound_hosts())` borrows the app this moves.
+    pub fn with_outbound(
+        app: App,
+        clock: Box<dyn Clock>,
+        outbound: Box<dyn Outbound>,
+    ) -> io::Result<Kernel> {
+        Kernel::builder(app, clock).outbound(outbound).build()
+    }
+
     /// Consumes the mounted App: upserts cron rows, rebuilds the due-heap
     /// from Pending rows. `now` for the cron phase comes from `clock`. The
     /// single-node constructor — no replication. On a writable node it first
     /// refuses — an `io::Error` carrying a `Refusal` — while any Pending job
     /// of a mounted type was enqueued under another shape
-    /// (`Db::pending_job_shape_refusal`).
+    /// (`Db::pending_job_shape_refusal`). Every constructor also refuses, by
+    /// name, an app that mounts an outbound job when no `Outbound` was given,
+    /// and a `Host` set that does not match the hosts its jobs call (R9).
     pub fn new(app: App, clock: Box<dyn Clock>) -> io::Result<Kernel> {
-        Kernel::build(app, clock, None, None)
+        Kernel::builder(app, clock).build()
     }
 
     /// The replicated constructor: same setup, plus a `Repl` whose role gates
@@ -201,7 +274,7 @@ impl Kernel {
     /// and whose park tick (`REPL_TICK_NANOS`) bounds every idle wait so
     /// in-flight replication IO is polled promptly.
     pub fn with_replication(app: App, clock: Box<dyn Clock>, repl: Repl) -> io::Result<Kernel> {
-        Kernel::build(app, clock, Some(repl), None)
+        Kernel::builder(app, clock).replication(repl).build()
     }
 
     /// The archiving constructor (archive spec §4): same setup, plus the
@@ -217,7 +290,7 @@ impl Kernel {
         archive: Archive,
         store: Box<dyn ObjectStore>,
     ) -> io::Result<Kernel> {
-        Kernel::build(app, clock, None, Some((archive, store)))
+        Kernel::builder(app, clock).archive(archive, store).build()
     }
 
     fn build(
@@ -225,8 +298,27 @@ impl Kernel {
         clock: Box<dyn Clock>,
         repl: Option<Repl>,
         archive: Option<(Archive, Box<dyn ObjectStore>)>,
+        outbound: Option<Box<dyn Outbound>>,
     ) -> io::Result<Kernel> {
-        let mut dispatcher = Dispatcher::new(app.take_job_defs());
+        let defs = app.take_job_defs();
+        let (hosts, max_in_flight) = app.take_outbound();
+        let callers: Vec<(&'static str, &'static str)> = defs
+            .iter()
+            .filter_map(|d| d.outbound.as_ref().map(|o| (d.name, o.host)))
+            .collect();
+        if let Some(&(job, host)) = callers.first()
+            && outbound.is_none()
+        {
+            return Err(io::Error::other(Refusal(format!(
+                "kernel: job {job} calls {host}, but this kernel has no Outbound — serve() \
+                 supplies the production client; a sim test passes one: let outbound = \
+                 sim.outbound(&app.outbound_hosts())?; Kernel::with_outbound(app, clock, \
+                 Box::new(outbound))"
+            ))));
+        }
+        crate::outbound::check_host_sets(&callers, &hosts)
+            .map_err(|m| io::Error::other(Refusal(m)))?;
+        let mut dispatcher = Dispatcher::new(defs).with_outbound(hosts, max_in_flight);
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let now = clock.now().as_nanos();
         let was_writable = app.db_mut().writes_allowed();
@@ -273,6 +365,7 @@ impl Kernel {
             archive_gapped: false,
             archive_stopped: false,
             archive_notice: None,
+            outbound,
         })
     }
 
@@ -330,7 +423,38 @@ impl Kernel {
         // (DESIGN §5). The guard is the write gate, not the role — see
         // `was_writable`.
         let writable = self.app.db().writes_allowed();
-        let mut ready = Vec::with_capacity(6);
+        // Spec §4 invariant 3, level-triggered so every way a gate closes is
+        // covered: a node that is not writable holds nothing in flight. The
+        // jobs stay Pending in the store; their late completions are
+        // discarded by rule. The drop takes the completion buffer too, which
+        // can outlive the table's last flight (a drain stopped at
+        // `MAX_BATCH`), so the outbound arm never runs behind a shut gate.
+        if !writable {
+            let dropped = self.dispatcher.drop_in_flight();
+            if !dropped.is_empty() {
+                let outbound = self
+                    .outbound
+                    .as_ref()
+                    .expect("calls in flight imply an Outbound");
+                for token in dropped {
+                    outbound.cancel(token);
+                }
+            }
+        }
+        // `poll` consumes (the archive arm's constraint), so completions are
+        // drained into the dispatcher before the ready set is built — and
+        // only while something is in flight, so a kernel with nothing in
+        // flight calls no `Outbound` method (invariant 6).
+        if self.dispatcher.in_flight_len() > 0 {
+            let outbound = self
+                .outbound
+                .as_ref()
+                .expect("calls in flight imply an Outbound");
+            while let Some(completion) = outbound.poll() {
+                self.dispatcher.push_completion(completion);
+            }
+        }
+        let mut ready = Vec::with_capacity(7);
         if self.pending.is_some() {
             ready.push(Ready::Request);
         }
@@ -440,6 +564,12 @@ impl Kernel {
                 ready.push(Ready::Tail);
             }
         }
+        // The seventh source (spec §4), appended last so every existing
+        // source keeps its index: never ready for an app with nothing in
+        // flight, so it moves no existing universe's draw.
+        if self.dispatcher.outbound_ready(now) {
+            ready.push(Ready::Outbound);
+        }
         if ready.is_empty() {
             // An iteration that services nothing is still an iteration
             // the archive arm did not consume, so it releases the retry hold
@@ -455,11 +585,30 @@ impl Kernel {
                 writable.then(|| self.dispatcher.next_deadline()).flatten(),
                 writable.then(|| self.cron.next_deadline()).flatten(),
                 self.repl.as_ref().and_then(|r| r.next_deadline(now)),
+                self.dispatcher.next_outbound_deadline(),
             ]
             .into_iter()
             .flatten()
             .min()
             .map(Instant::from_nanos);
+            // The outbound park (plan amendment A2): replies arrive from
+            // outside the kernel, so while anything is in flight it parks no
+            // longer than the next completion the impl can name — or than the
+            // replication tick (DESIGN.md:326-328) when it cannot.
+            if self.dispatcher.in_flight_len() > 0 {
+                let outbound = self
+                    .outbound
+                    .as_ref()
+                    .expect("calls in flight imply an Outbound");
+                let wake = match outbound.next_wake() {
+                    OutboundWake::At(at) => Some(at),
+                    OutboundWake::Never => None,
+                    OutboundWake::Unknown => Some(Instant::from_nanos(now + REPL_TICK_NANOS)),
+                };
+                if let Some(w) = wake {
+                    deadline = Some(deadline.map_or(w, |d| d.min(w)));
+                }
+            }
             // The replication park tick (spec §3's accepted wart): a
             // repl-configured node never parks past one tick, so in-flight sim
             // messages and prod TCP are both polled within `REPL_TICK_NANOS`.
@@ -686,6 +835,8 @@ impl Kernel {
                             JobOutcome::Done { .. } => self.stats.jobs_done += 1,
                             JobOutcome::Retried { .. } => self.stats.jobs_retried += 1,
                             JobOutcome::Dead { .. } => self.stats.jobs_dead += 1,
+                            // Counted when `start_calls` issues it, after the
+                            // commit; its outcome comes from the outbound arm.
                             JobOutcome::Calling { .. } => {}
                         }
                         drained += 1;
@@ -693,7 +844,9 @@ impl Kernel {
                     Ok(())
                 })();
                 match (drain, group.commit()) {
-                    (Ok(()), Ok(())) => {}
+                    // R6 (invariant 5): a call starts only after the group
+                    // whose overlay its `call` read has committed.
+                    (Ok(()), Ok(())) => self.start_calls(),
                     // Deliberately does NOT apply
                     // `CommitFailure::invalidates` the way `Db::transact` and
                     // the one-job/one-schedule wrappers now do (dispatch.rs's
@@ -706,19 +859,22 @@ impl Kernel {
                     // the comment above, until the very next commit failed
                     // anyway). Reviewed and accepted, not an oversight; the
                     // Cron arm below answers the identical way for the
-                    // identical reason.
-                    (Ok(()), Err(failure)) => return Err(failure.error),
-                    (Err(e), Ok(())) => return Err(e),
-                    (Err(_), Err(failure)) => return Err(failure.error),
+                    // identical reason. Every failure abandons the batch's
+                    // starts, so none is issued for a group that did not
+                    // commit (R6): its jobs go back to the outbound set.
+                    (Ok(()), Err(failure)) => {
+                        self.dispatcher.abandon_starts();
+                        return Err(failure.error);
+                    }
+                    (Err(e), Ok(())) => {
+                        self.dispatcher.abandon_starts();
+                        return Err(e);
+                    }
+                    (Err(_), Err(failure)) => {
+                        self.dispatcher.abandon_starts();
+                        return Err(failure.error);
+                    }
                 }
-                // No start can be buffered yet: `build` hands the dispatcher no
-                // `Host` entries, so a decided call stops at its host lookup.
-                // The outbound arm (Task 11) issues these after the commit.
-                assert!(
-                    self.dispatcher.take_starts().is_empty(),
-                    "kernel invariant: a job batch decided an outbound call, but this kernel has \
-                     no Outbound to start it"
-                );
             }
             Ready::Cron => {
                 // Identical shape to the Job arm above, for the identical
@@ -860,6 +1016,84 @@ impl Kernel {
                 self.archive_gapped = gapped;
                 self.archive_stopped = stopped;
             }
+            Ready::Outbound => {
+                assert!(
+                    writable,
+                    "kernel invariant: the outbound arm ran on a node that is not writable — the \
+                     top of step drops the in-flight table whenever the gate is shut (spec §4 \
+                     invariant 3)"
+                );
+                // One group, commit once, commit-then-bubble: the job arm's
+                // shape, for the job arm's reason (C-1).
+                let mut group = self.app.begin_job_group()?;
+                let mut drained = 0usize;
+                let mut cancels = Vec::new();
+                let drain = (|| -> io::Result<()> {
+                    while drained < MAX_BATCH {
+                        let outcome =
+                            if let Some((token, result)) = self.dispatcher.pop_completion() {
+                                match self
+                                    .dispatcher
+                                    .settle_into(&mut group, now, token, result)?
+                                {
+                                    Some(outcome) => outcome,
+                                    None => {
+                                        self.stats.outbound_late += 1;
+                                        continue;
+                                    }
+                                }
+                            } else if let Some((token, outcome)) =
+                                self.dispatcher.expire_into(&mut group, now)?
+                            {
+                                cancels.push(token);
+                                self.stats.outbound_timed_out += 1;
+                                outcome
+                            } else {
+                                break;
+                            };
+                        // Counted as staged, like the job arm's: a failed
+                        // commit below stops the kernel before anything
+                        // reads them.
+                        match outcome {
+                            JobOutcome::Done { .. } => {
+                                self.stats.outbound_settled += 1;
+                                self.stats.jobs_done += 1;
+                            }
+                            JobOutcome::Retried { .. } => {
+                                self.stats.outbound_failed += 1;
+                                self.stats.jobs_retried += 1;
+                            }
+                            JobOutcome::Dead { .. } => {
+                                self.stats.outbound_failed += 1;
+                                self.stats.jobs_dead += 1;
+                            }
+                            JobOutcome::Calling { .. } => {
+                                unreachable!("the outbound arm settles; it never decides a call")
+                            }
+                        }
+                        drained += 1;
+                    }
+                    Ok(())
+                })();
+                let commit = group.commit();
+                // A cancel is not an effect: it only tells the edge to stop
+                // waiting, so it is issued whatever the commit did.
+                if !cancels.is_empty() {
+                    let outbound = self
+                        .outbound
+                        .as_ref()
+                        .expect("in flight implies an Outbound");
+                    for token in cancels {
+                        outbound.cancel(token);
+                    }
+                }
+                match (drain, commit) {
+                    (Ok(()), Ok(())) => {}
+                    (Ok(()), Err(failure)) => return Err(failure.error),
+                    (Err(e), Ok(())) => return Err(e),
+                    (Err(_), Err(failure)) => return Err(failure.error),
+                }
+            }
         }
         // Any serviced source may have enqueued (handlers can enqueue too), so
         // this runs after every branch above. A follower's shipped applies also
@@ -916,8 +1150,33 @@ impl Kernel {
         Ok(())
     }
 
+    /// Issues the starts the job batch that just committed decided (R6).
+    fn start_calls(&mut self) {
+        let starts = self.dispatcher.take_starts();
+        if starts.is_empty() {
+            return;
+        }
+        let outbound = self
+            .outbound
+            .as_ref()
+            .expect("Kernel::build refuses an outbound job without an Outbound");
+        for (token, call) in starts {
+            self.stats.outbound_started += 1;
+            // An `Err` from `start` is a completion, not a kernel failure (io.rs).
+            if let Err(e) = outbound.start(token, call) {
+                self.dispatcher.push_completion((token, Err(e)));
+            }
+        }
+    }
+
     pub fn stats(&self) -> KernelStats {
         self.stats
+    }
+
+    /// How many outbound calls are in flight.
+    #[doc(hidden)]
+    pub fn outbound_in_flight_for_tests(&self) -> usize {
+        self.dispatcher.in_flight_len()
     }
 
     /// The last notice the archive arm raised (a gap, or a permanent
