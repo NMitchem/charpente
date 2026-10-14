@@ -46,6 +46,9 @@ struct Ledger {
     /// The body each key's first application answered, replayed to a repeat.
     charges: BTreeMap<String, String>,
     minted: u64,
+    /// TLS handshakes the TLS port saw fail: a client that refused the
+    /// certificate, or one that closed mid-handshake.
+    refused: u64,
 }
 
 type Shared = Arc<Mutex<Ledger>>;
@@ -75,8 +78,13 @@ async fn main() -> io::Result<()> {
         let (acceptor, ledger) = (acceptor.clone(), ledger.clone());
         tokio::spawn(async move {
             // A client that refuses the certificate ends the connection here,
-            // before any request exists to count.
+            // before any request exists to count, so the handshake is what
+            // shows it dialed.
             let Ok(stream) = acceptor.accept(stream).await else {
+                ledger
+                    .lock()
+                    .expect("no handler panics holding the ledger")
+                    .refused += 1;
                 return;
             };
             let service = service_fn(move |req| charge(req, ledger.clone(), hold));
@@ -195,7 +203,7 @@ async fn serve_admin(listener: TcpListener, ledger: Shared) {
 }
 
 /// `requests <key> <n>` lines, then `applied <key> <n>` lines, each set
-/// sorted by key.
+/// sorted by key, then one `refused <n>` line.
 fn stats(req: &Request<Incoming>, ledger: &Shared) -> Response<Full<Bytes>> {
     if req.method() != Method::GET || req.uri().path() != "/stats" {
         return text(404, "no such route".to_string());
@@ -208,6 +216,7 @@ fn stats(req: &Request<Incoming>, ledger: &Shared) -> Response<Full<Bytes>> {
     for (key, n) in &ledger.applied {
         out.push_str(&format!("applied {key} {n}\n"));
     }
+    out.push_str(&format!("refused {}\n", ledger.refused));
     text(200, out)
 }
 

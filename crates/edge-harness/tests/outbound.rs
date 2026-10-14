@@ -24,7 +24,7 @@ const CA: &str = concat!(
 );
 
 const PAID_TIMEOUT: Duration = Duration::from_secs(30);
-const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SEEN_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// The bucket `fake_remote` counts a request with no `idempotency-key` under.
 const KEYLESS: &str = "<none>";
@@ -50,11 +50,13 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// `fake_remote`'s `/stats`, by key.
+/// `fake_remote`'s `/stats`: requests and applications by key, and TLS
+/// handshakes that failed.
 #[derive(Debug, Default)]
 struct Stats {
     requests: BTreeMap<String, u64>,
     applied: BTreeMap<String, u64>,
+    refused: u64,
 }
 
 /// One scenario: its script and directory, and a running `fake_remote`.
@@ -71,8 +73,9 @@ struct Rig {
 }
 
 impl Rig {
-    /// A fresh scenario and a `fake_remote` that holds each key's first
-    /// charge `hold_ms` before answering.
+    /// A fresh scenario and a `fake_remote` that holds the first charge in
+    /// each bucket (a key's only application, or the first keyless one)
+    /// `hold_ms` before answering.
     fn open(name: &str, hold_ms: u64) -> Rig {
         let bins = build_bins().expect("build_bins");
         let root = temp_dir("outbound");
@@ -136,40 +139,54 @@ impl Rig {
         assert_eq!(resp.status, 200, "GET /stats: {body:?} (artifacts: {dir})");
         let mut stats = Stats::default();
         for line in body.lines() {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let (counts, key, n) = match words[..] {
-                ["requests", key, n] => (&mut stats.requests, key, n),
-                ["applied", key, n] => (&mut stats.applied, key, n),
-                _ => panic!(
-                    "a /stats line is `requests|applied <key> <n>`, got {line:?} (artifacts: {dir})"
-                ),
+            let count = |n: &str| -> u64 {
+                n.parse()
+                    .unwrap_or_else(|_| panic!("a /stats count, got {line:?} (artifacts: {dir})"))
             };
-            let n = n
-                .parse()
-                .unwrap_or_else(|_| panic!("a /stats count, got {line:?} (artifacts: {dir})"));
-            counts.insert(key.to_string(), n);
+            match line.split_whitespace().collect::<Vec<_>>()[..] {
+                ["requests", key, n] => {
+                    stats.requests.insert(key.to_string(), count(n));
+                }
+                ["applied", key, n] => {
+                    stats.applied.insert(key.to_string(), count(n));
+                }
+                ["refused", n] => stats.refused = count(n),
+                _ => panic!(
+                    "a /stats line is `requests|applied <key> <n>` or `refused <n>`, got \
+                     {line:?} (artifacts: {dir})"
+                ),
+            }
         }
         stats
     }
 
-    /// Polls `/stats` until the fake has seen a charge request.
-    fn await_first_request(&mut self) {
-        let deadline = Instant::now() + FIRST_REQUEST_TIMEOUT;
+    /// Polls `/stats` until `until` holds, records the reading as `what`, and
+    /// returns it.
+    fn await_stats(&mut self, what: &str, until: impl Fn(&Stats) -> bool) -> Stats {
+        let deadline = Instant::now() + SEEN_TIMEOUT;
         loop {
             let stats = self.stats();
-            if stats.requests.values().sum::<u64>() > 0 {
-                self.scenario
-                    .record(format!("the fake saw the first charge: {stats:?}"));
-                return;
+            if until(&stats) {
+                self.scenario.record(format!("{what}: {stats:?}"));
+                return stats;
             }
             assert!(
                 Instant::now() < deadline,
-                "no charge request reached the fake within {FIRST_REQUEST_TIMEOUT:?} \
+                "the fake never showed {what} within {SEEN_TIMEOUT:?}: last read {stats:?} \
                  (artifacts: {})",
                 self.dir
             );
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    /// Polls until the fake has applied a charge. Its reply is held from
+    /// then on, so a fault injected now lands after the money moved and
+    /// before the node heard.
+    fn await_first_application(&mut self) {
+        self.await_stats("the first charge applied", |s| {
+            s.applied.values().sum::<u64>() > 0
+        });
     }
 
     /// `POST /orders`, which enqueues the order's charge; the order's id.
@@ -268,7 +285,9 @@ impl Rig {
     /// points.
     fn finish(mut self) {
         self.scenario.record("passed");
-        self.scenario.dump().expect("scenario dump");
+        self.scenario
+            .dump()
+            .unwrap_or_else(|e| panic!("scenario dump: {e} (artifacts: {})", self.dir));
         drop(self._fake);
         let _ = std::fs::remove_dir_all(&self.root);
     }
@@ -304,7 +323,7 @@ fn kill_9_with_a_call_in_flight_re_calls_with_the_same_key() {
     let target = rig.fake_tls.clone();
     let (mut node, mut http) = rig.node(&target, true);
     let id = rig.place_order(&mut http);
-    rig.await_first_request();
+    rig.await_first_application();
     node.kill9(&mut rig.scenario);
     node.restart(&mut rig.scenario)
         .unwrap_or_else(|e| panic!("restart outbound_node: {e} (artifacts: {})", rig.dir));
@@ -327,10 +346,11 @@ fn a_reset_between_node_and_remote_is_retried_with_the_same_key() {
         "a_reset_between_node_and_remote_is_retried_with_the_same_key",
         1000,
     );
-    let proxy = TcpProxy::start(&rig.fake_tls).expect("start proxy");
+    let proxy = TcpProxy::start(&rig.fake_tls)
+        .unwrap_or_else(|e| panic!("start proxy: {e} (artifacts: {})", rig.dir));
     let (node, mut http) = rig.node(&proxy.addr(), true);
     let id = rig.place_order(&mut http);
-    rig.await_first_request();
+    rig.await_first_application();
     proxy.drop_all(&mut rig.scenario);
     rig.await_paid(&mut http, &id);
     let requests = rig.assert_charged_once();
@@ -349,10 +369,11 @@ fn a_reset_between_node_and_remote_is_retried_with_the_same_key() {
 #[ignore]
 fn a_stalled_remote_times_out_and_is_retried() {
     let mut rig = Rig::open("a_stalled_remote_times_out_and_is_retried", 1000);
-    let proxy = TcpProxy::start(&rig.fake_tls).expect("start proxy");
+    let proxy = TcpProxy::start(&rig.fake_tls)
+        .unwrap_or_else(|e| panic!("start proxy: {e} (artifacts: {})", rig.dir));
     let (node, mut http) = rig.node(&proxy.addr(), true);
     let id = rig.place_order(&mut http);
-    rig.await_first_request();
+    rig.await_first_application();
     // A stall, not a partition: `partition` shuts each new connection at
     // once, which is a connect error and so the refusal path, never a
     // deadline. Every chunk now crawls, so the held reply misses ChargeOrder's
@@ -399,10 +420,11 @@ fn an_unset_credential_refuses_the_start() {
         .env_remove("FIXTURE_PAY_KEY")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
-            std::fs::File::create(&stderr_path).expect("stderr file"),
+            std::fs::File::create(&stderr_path)
+                .unwrap_or_else(|e| panic!("stderr file: {e} (artifacts: {dir})")),
         ))
         .spawn()
-        .expect("spawn outbound_node");
+        .unwrap_or_else(|e| panic!("spawn outbound_node: {e} (artifacts: {dir})"));
     scenario.record(format!(
         "spawn {} without FIXTURE_PAY_KEY (pid {})",
         bins.outbound_node.display(),
@@ -410,7 +432,10 @@ fn an_unset_credential_refuses_the_start() {
     ));
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|e| panic!("try_wait: {e} (artifacts: {dir})"))
+        {
             break status;
         }
         if Instant::now() >= deadline {
@@ -420,7 +445,8 @@ fn an_unset_credential_refuses_the_start() {
         }
         std::thread::sleep(POLL_INTERVAL);
     };
-    let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
+    let stderr = std::fs::read_to_string(&stderr_path)
+        .unwrap_or_else(|e| panic!("read the node's stderr: {e} (artifacts: {dir})"));
     scenario.record(format!("exited {status}: {stderr:?}"));
     assert_eq!(
         status.code(),
@@ -435,7 +461,9 @@ fn an_unset_credential_refuses_the_start() {
         "{stderr:?} (artifacts: {dir})"
     );
     scenario.record("passed");
-    scenario.dump().expect("scenario dump");
+    scenario
+        .dump()
+        .unwrap_or_else(|e| panic!("scenario dump: {e} (artifacts: {dir})"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -446,11 +474,10 @@ fn without_the_test_ca_no_request_reaches_the_remote() {
     let target = rig.fake_tls.clone();
     let (node, mut http) = rig.node(&target, false);
     let id = rig.place_order(&mut http);
-    std::thread::sleep(Duration::from_secs(5));
-    rig.scenario.record("waited 5 s");
-    // `an_order_is_charged_once_over_real_tls` is the same rig with the CA,
-    // and is paid: an empty ledger here is TLS verification refusing the fake.
-    let stats = rig.stats();
+    // The witness that the node dialed: a handshake the fake saw fail. With
+    // the CA (`an_order_is_charged_once_over_real_tls`'s rig) none fails, so
+    // a failed handshake and no request is TLS verification refusing the fake.
+    let stats = rig.await_stats("a failed handshake", |s| s.refused > 0);
     assert!(
         stats.requests.is_empty() && stats.applied.is_empty(),
         "the fake's certificate chains to a CA the node was not given, so no request may \
