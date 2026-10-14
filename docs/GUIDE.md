@@ -1400,7 +1400,8 @@ with no operator settings, so they reach only hosts whose certificates chain
 to a public CA, at their real addresses.
 
 On the command line of an app built on `charpente::launch` (§13), the two
-settings are the serve form's flags, each repeatable:
+settings are the serve form's flags, each repeatable for a different `HOST` or
+`PATH`:
 
 - `--outbound-base HOST=URL` reaches the declared host `HOST` at `URL`
   instead of `https://HOST:443`. `URL` is a scheme, an IP address or
@@ -1416,10 +1417,10 @@ settings are the serve form's flags, each repeatable:
   host, beside Mozilla's roots. A file that cannot be read or holds no
   certificate refuses the start.
 
-A flag that is unknown, has no value, or (for `--outbound-base`) is not
-`HOST=URL` exits 2 with `launch`'s usage before the data directory is
-touched; anything `serve_with` refuses prints `charpente refused to start:
-<the refusal>` and exits 1 (§13).
+A flag that is unknown, has no value, names a `HOST` or a `PATH` a second
+time, or (for `--outbound-base`) is not `HOST=URL` exits 2 with `launch`'s
+usage before the data directory is touched; anything `serve_with` refuses
+prints `charpente refused to start: <the refusal>` and exits 1 (§13).
 
 ### What `#[route]` rejects
 
@@ -6198,11 +6199,11 @@ fn main() -> std::io::Result<()> {
 That's the whole migration: no verb still serves on `"0.0.0.0:8080"` against `./data`
 exactly as a hand-rolled `main` would; `myapp describe` and `myapp describe --format json`
 are new, for free — and so is `restore` (§15). The serve form takes the operator's outbound
-flags (§5), each repeatable, which `launch` hands to `serve_with`: `myapp --outbound-base
-pay.example=https://127.0.0.1:8443 --outbound-ca ./ca.pem`. An unrecognized verb, a bad
-`--format` value, or a serve flag that is unknown, missing its value, or (for
-`--outbound-base`) not `HOST=URL` exits 2 with a pinned usage message, before the data
-directory is touched:
+flags (§5), each repeatable for a different host or CA file, which `launch` hands to
+`serve_with`: `myapp --outbound-base pay.example=https://127.0.0.1:8443 --outbound-ca
+./ca.pem`. An unrecognized verb, a bad `--format` value, or a serve flag that is unknown,
+missing its value, naming a host or CA file a second time, or (for `--outbound-base`) not
+`HOST=URL` exits 2 with a pinned usage message, before the data directory is touched:
 
 <!-- pinned -->
 ```text
@@ -6229,10 +6230,14 @@ distinct moments, each with its own line on stderr:
   log): `charpente refused to start: ...`/`charpente failed to start — fix the store/log and
   restart: ...`. Or the outbound client's setup refuses (§5, §6) — an unset or malformed
   credential variable, a bad `--outbound-base`, an unreadable `--outbound-ca`:
-  `charpente refused to start: ...`, the refusal's own text naming the fix. Or the HTTP bind
-  fails, which `serve_with` attempts after the client is built and before it spawns the
-  kernel thread: `charpente failed to start — could not bind <addr>: <the OS error> — free
-  that address, or change the one the app passes to launch`.
+  `charpente refused to start: ...`, the refusal's own text naming the fix. Or the outbound
+  client cannot be built for want of resources, its runtime or its thread: `charpente failed
+  to start: outbound: the client's runtime could not be built: ...` or `... the client's
+  thread could not be spawned: ...`, each ending `— raise the process's thread and file
+  limits, then restart`. Or the HTTP bind fails, which `serve_with` attempts after the client
+  is built and before it spawns the kernel thread: `charpente failed to start — could not
+  bind <addr>: <the OS error> — free that address, or change the one the app passes to
+  launch`.
 - **The kernel stops on its own account** — a Pending job of a foreign shape (§6), a
   migration step this binary has no registration for, or a platform IO failure — and its
   stop line names which: `charpente kernel refused to start`/`stopped on a

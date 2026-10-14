@@ -17,7 +17,7 @@ use crate::archive::restore::{RestoreOpts, restore};
 use crate::describe::{to_human, to_json};
 use crate::http::App;
 use crate::prod::{FsObjectStore, ProdDisk, ProdEntropy};
-use crate::serve::OutboundOptions;
+use crate::serve::{BindFailed, OutboundOptions};
 
 /// The permission-pin helper `tests/archive.rs` shares (D2 re-review R4).
 #[cfg(test)]
@@ -151,21 +151,12 @@ pub(crate) fn dispatch(
         // A stopped kernel ends the process with its code (spec §5), rather
         // than parking forever behind an edge that can only answer 500.
         // `serve_with` builds the outbound client, then binds, both before
-        // any kernel exists, so its `Err` — the outbound setup's `Refusal`
-        // (a credential, a base or a CA file) or the bind's failure — leaves
-        // nothing running behind it.
+        // any kernel exists, so its `Err` leaves nothing running behind it;
+        // `serve_failure_line` names which of its three failures it was.
         return match crate::serve::serve_with(addr, app, opts) {
             Ok(server) => Ok(server.wait()),
-            Err(e) if Refusal::of(&e).is_some() => {
-                let _ = writeln!(err, "charpente refused to start: {e}");
-                Ok(1)
-            }
             Err(e) => {
-                let _ = writeln!(
-                    err,
-                    "charpente failed to start — could not bind {addr}: {e} — free that \
-                     address, or change the one the app passes to launch"
-                );
+                let _ = writeln!(err, "{}", serve_failure_line(addr, &e));
                 Ok(1)
             }
         };
@@ -212,9 +203,26 @@ pub(crate) fn dispatch(
     describe(build, format, out)
 }
 
-/// The serve form's flags (outbound-effects spec §9), each repeatable. Only
-/// their shape is checked here; what a base or a CA file says is
-/// `serve_with`'s to refuse.
+/// What `serve_with`'s `Err` prints, by its class, each naming its own fix:
+/// the outbound setup's `Refusal`, the bind's failure (`BindFailed`), or a
+/// platform failure building the outbound client, whose text names the site
+/// and the fix itself.
+fn serve_failure_line(addr: &str, e: &io::Error) -> String {
+    if Refusal::of(e).is_some() {
+        format!("charpente refused to start: {e}")
+    } else if BindFailed::of(e) {
+        format!(
+            "charpente failed to start — could not bind {addr}: {e} — free that address, or \
+             change the one the app passes to launch"
+        )
+    } else {
+        format!("charpente failed to start: {e}")
+    }
+}
+
+/// The serve form's flags (outbound-effects spec §9), each repeatable for a
+/// different HOST or PATH. Only their shape is checked here; what a base or
+/// a CA file says is `serve_with`'s to refuse.
 fn outbound_flags(args: &[String]) -> Result<OutboundOptions, String> {
     let mut opts = OutboundOptions::default();
     let mut args = args.iter();
@@ -224,16 +232,29 @@ fn outbound_flags(args: &[String]) -> Result<OutboundOptions, String> {
                 let value = args
                     .next()
                     .ok_or("--outbound-base needs a value, HOST=URL")?;
-                match value.split_once('=') {
-                    Some((host, base)) if !host.is_empty() && !base.is_empty() => {
-                        opts.bases.push((host.to_string(), base.to_string()));
-                    }
-                    _ => return Err(format!("--outbound-base takes HOST=URL — got '{value}'")),
+                let Some((host, base)) = value
+                    .split_once('=')
+                    .filter(|(host, base)| !host.is_empty() && !base.is_empty())
+                else {
+                    return Err(format!("--outbound-base takes HOST=URL — got '{value}'"));
+                };
+                // `serve_with` would take the first and drop the rest unsaid.
+                if opts.bases.iter().any(|(h, _)| h == host) {
+                    return Err(format!(
+                        "--outbound-base names {host} twice — give each host one base"
+                    ));
                 }
+                opts.bases.push((host.to_string(), base.to_string()));
             }
             "--outbound-ca" => {
                 let value = args.next().ok_or("--outbound-ca needs a value, PATH")?;
-                opts.cas.push(value.into());
+                let path = std::path::PathBuf::from(value);
+                if opts.cas.contains(&path) {
+                    return Err(format!(
+                        "--outbound-ca names {value} twice — name each CA file once"
+                    ));
+                }
+                opts.cas.push(path);
             }
             other => return Err(format!("unknown flag '{other}'")),
         }
@@ -1059,6 +1080,46 @@ mod tests {
                 format!("error: unknown flag '--outbound-proxy'\n\n{LAUNCH_USAGE}\n")
             )
         );
+        // One host, or one CA file, named twice is refused by name ...
+        assert_eq!(
+            run(&[
+                "--outbound-base",
+                "pay.test=https://127.0.0.1:1",
+                "--outbound-base",
+                "pay.test=https://127.0.0.1:2",
+            ]),
+            (
+                2,
+                format!(
+                    "error: --outbound-base names pay.test twice — give each host one base\n\n\
+                     {LAUNCH_USAGE}\n"
+                )
+            )
+        );
+        assert_eq!(
+            run(&["--outbound-ca", "./ca.pem", "--outbound-ca", "./ca.pem"]),
+            (
+                2,
+                format!(
+                    "error: --outbound-ca names ./ca.pem twice — name each CA file once\n\n\
+                     {LAUNCH_USAGE}\n"
+                )
+            )
+        );
+        // ... and distinct ones pass the parse: the missing data dir stops
+        // them, at exit 1.
+        let (code, err) = run(&[
+            "--outbound-base",
+            "pay.test=https://127.0.0.1:1",
+            "--outbound-base",
+            "fx.test=https://127.0.0.1:2",
+            "--outbound-ca",
+            "./a.pem",
+            "--outbound-ca",
+            "./b.pem",
+        ]);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.starts_with("charpente failed to start: "), "{err}");
     }
 
     /// The parsed flags reach `serve_with`: a base naming a host no job
@@ -1069,8 +1130,7 @@ mod tests {
     /// timeout, where this test names it.
     #[test]
     fn a_refused_outbound_setup_is_a_refused_start() {
-        let dir =
-            std::env::temp_dir().join(format!("charpente-launch-outbound-{}", std::process::id()));
+        let dir = fresh_data_dir("outbound-refusal");
         let run = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             let data_dir = dir.to_str().unwrap().to_string();
@@ -1087,9 +1147,10 @@ mod tests {
                 );
                 let _ = tx.send((code.map_err(|e| e.to_string()), out, err));
             });
-            let (code, out, err) = rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("dispatch did not return within 10 s: a flag never reached serve_with, so it served");
+            let (code, out, err) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+                "dispatch did not return within 10 s — most likely a flag never reached \
+                     serve_with, so it served",
+            );
             assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
             (code, String::from_utf8(err).unwrap())
         };
@@ -1121,6 +1182,60 @@ mod tests {
             "{err}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `serve_with` fails before any kernel exists in three ways, and each
+    /// prints its own fix. Only the bind's failure says "free that
+    /// address": the outbound client's runtime or thread failing for want of
+    /// resources used to print it too. The real platform failures cannot be
+    /// triggered here, so the routing is pinned on errors built like theirs;
+    /// `an_occupied_port_exits_one_with_a_named_bind_line` drives a real
+    /// bind through `BindFailed`.
+    #[test]
+    fn a_serve_failure_prints_the_line_for_its_class() {
+        let addr = "127.0.0.1:8080";
+        let refusal = io::Error::other(Refusal("outbound: PAY_KEY is unset".to_string()));
+        let bind = BindFailed::wrap(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "Address already in use (os error 48)",
+        ));
+        let platform = io::Error::other(
+            "outbound: the client's thread could not be spawned: Resource temporarily \
+             unavailable (os error 35) — raise the process's thread and file limits, then \
+             restart",
+        );
+        assert_eq!(
+            (
+                bind.to_string().as_str(),
+                bind.kind(),
+                BindFailed::of(&bind),
+                BindFailed::of(&platform),
+                BindFailed::of(&refusal),
+            ),
+            (
+                "Address already in use (os error 48)",
+                io::ErrorKind::AddrInUse,
+                true,
+                false,
+                false
+            ),
+            "the marker prints as the bind's own error and marks nothing else"
+        );
+        assert_eq!(
+            serve_failure_line(addr, &refusal),
+            "charpente refused to start: outbound: PAY_KEY is unset"
+        );
+        assert_eq!(
+            serve_failure_line(addr, &bind),
+            "charpente failed to start — could not bind 127.0.0.1:8080: Address already in use \
+             (os error 48) — free that address, or change the one the app passes to launch"
+        );
+        assert_eq!(
+            serve_failure_line(addr, &platform),
+            "charpente failed to start: outbound: the client's thread could not be spawned: \
+             Resource temporarily unavailable (os error 35) — raise the process's thread and \
+             file limits, then restart"
+        );
     }
 
     // Negative space (load-bearing): describe must never touch `data_dir`,

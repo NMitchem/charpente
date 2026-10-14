@@ -1,10 +1,13 @@
 //! `charpente test --sim --dir crates/outbound-fixture` dogfoods this file:
 //! the fixture's `ChargeOrder` under each universe's faults, against a model
 //! of `pay.fixture` that dedupes by the `idempotency-key` header, as
-//! `fake_remote` does over real TLS (oracle 7's sim half).
+//! `fake_remote` does, and records every call it applies, so a second charge
+//! for one order is seen where the money would move.
+
+use std::collections::BTreeMap;
 
 use charpente::View;
-use charpente::core::io::{Entropy as _, OutboundReply};
+use charpente::core::io::{Entropy as _, IdempotencyKey};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::Codec as _;
 use charpente::http::{App, Method, Request};
@@ -14,11 +17,14 @@ use charpente_sim::checks::{
     boot_through_fallout, calls_have_durable_jobs, durable_corruption_fired, is_fault_fallout,
     keys_are_per_job, outbound_settles_by_horizon,
 };
-use charpente_sim::outbound::{Idempotent, from_fn};
+use charpente_sim::outbound::{Idempotent, Recorder};
 use outbound_fixture::{ChargeOrder, Order};
 
+// `re-called` is what makes "once" a claim: measured in 355 of 1024 universes
+// (master seed 0x222517d092c8c3b7), so 64 universes miss it all with
+// probability about 1e-12 (1e-9 at a one-sided 1e-6 lower bound on the rate).
 charpente_sim::sim_tests! {
-    orders_charge_once require ["outbound:checked"],
+    orders_charge_once require ["outbound:checked", "outbound-fixture:re-called"],
 }
 
 const SEC: u64 = 1_000_000_000;
@@ -26,6 +32,9 @@ const SEC: u64 = 1_000_000_000;
 /// How many boots one `App::open` here gets, each failed boot followed by a
 /// restart, as a supervised process restarts (`checks::boot_through_fallout`).
 const BOOT_TRIES: u32 = 8;
+
+/// Faulted rounds before the tail, each ending in a power cycle.
+const ROUNDS: u32 = 3;
 
 /// Ends a universe that adjudicated nothing, marking `key`, the arm's name:
 /// the harness reports how many universes gave up, not why.
@@ -60,38 +69,53 @@ fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Option<App>, Strin
     }
 }
 
-/// Three orders under the universe's faults, the box power-cycled at a drawn
-/// moment (a call may be in flight), then a fault-free tail past the last
-/// backoff. Properties: the three outbound checkers, and every order paid
-/// exactly when its charge is Done.
+/// Up to `ROUNDS` faulted rounds, each booting, posting three orders when the
+/// store holds none (a client retries orders that never became durable), and
+/// power-cycling at a drawn moment, a call possibly in flight. Then a
+/// fault-free tail past the last backoff. Properties: the three outbound
+/// checkers; the remote applied no order twice, and every Done charge's order
+/// exactly once; every order paid exactly when its charge is Done.
 fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
     sim.remote(
         "pay.fixture",
-        Idempotent::header(
-            "idempotency-key",
-            from_fn(|_| OutboundReply {
-                status: 200,
-                headers: vec![],
-                body: b"ch_1".to_vec(),
-            }),
-        ),
+        Idempotent::header("idempotency-key", Recorder::new()),
     );
 
-    let Some(app) = boot(sim)? else {
-        return gave_up(
-            sim,
-            "outbound-fixture:gave-up:boot",
-            format!("the app never booted in {BOOT_TRIES} boots"),
-        );
-    };
-    let start = sim.now().as_nanos();
-    let cut = start + SEC + sim.entropy().next_u64() % (8 * SEC);
-    let mut source = SimSource::new(Box::new(sim.clock()), cut);
-    for i in 0..3 {
-        source.push_at(start + i * SEC / 10, Request::new(Method::Post, "/orders"));
+    for _round in 0..ROUNDS {
+        let Some(mut app) = boot(sim)? else {
+            // A durable refusal gave the universe up; boots that ran out end
+            // this round, and the next one boots again.
+            if sim.gave_up().is_some() {
+                return Ok(());
+            }
+            sim.restart();
+            continue;
+        };
+        let start = sim.now().as_nanos();
+        let cut = start + SEC + sim.entropy().next_u64() % (8 * SEC);
+        let mut source = SimSource::new(Box::new(sim.clock()), cut);
+        let orders = app
+            .db_for_tests()
+            .snapshot()
+            .and_then(|s| s.scan::<Order>())
+            .map_err(|e| e.to_string());
+        match orders {
+            Ok(orders) if orders.is_empty() => {
+                for i in 0..3 {
+                    source.push_at(start + i * SEC / 10, Request::new(Method::Post, "/orders"));
+                }
+            }
+            Ok(_) => {}
+            Err(e) if is_fault_fallout(&e) => {
+                drop(app);
+                sim.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("reading the orders failed non-injected: {e}")),
+        }
+        drop(run(sim, app, &mut source)?);
+        sim.restart();
     }
-    drop(run(sim, app, &mut source)?);
-    sim.restart();
 
     // The fault-free tail (GUIDE §8): 8 attempts back off 0.5 s doubling to
     // 32 s (63.5 s in all), each with a 2 s deadline, well inside 600 s.
@@ -133,6 +157,35 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         return Err(e);
     }
 
+    // What the remote applied, per order. `Idempotent` hands its inner model
+    // only a key's first call, or every keyless one.
+    let applied = sim.with_remote(
+        "pay.fixture",
+        |m: &Idempotent<Recorder>| -> Result<BTreeMap<u64, u32>, String> {
+            let mut applied = BTreeMap::new();
+            for call in m.inner().calls() {
+                let order = std::str::from_utf8(&call.body)
+                    .ok()
+                    .and_then(|body| body.strip_prefix("order="))
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "pay.fixture applied a call whose body is not order=<id>: {:?}",
+                            String::from_utf8_lossy(&call.body)
+                        )
+                    })?;
+                *applied.entry(order).or_insert(0) += 1;
+            }
+            Ok(applied)
+        },
+    )?;
+    if let Some((order, n)) = applied.iter().find(|(_, n)| **n > 1) {
+        return Err(format!(
+            "double charge: pay.fixture applied order {order} {n} times — a re-call carried no \
+             idempotency key the remote could dedupe on"
+        ));
+    }
+
     let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
     let mut charges = 0;
     for row in jobs.iter().filter(|r| r.outbound_key.is_some()) {
@@ -155,6 +208,15 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
                 order.paid
             ));
         }
+        let n = applied.get(&job.order.raw()).copied().unwrap_or(0);
+        if row.status == JobStatus::Done && n != 1 {
+            return Err(format!(
+                "job {} is Done, but pay.fixture applied order {} {n} times — settle took a reply \
+                 for a charge that was never applied",
+                row.id.raw(),
+                job.order.raw()
+            ));
+        }
         charges += 1;
     }
     if charges == 0 {
@@ -163,6 +225,16 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
             "outbound-fixture:gave-up:no-order",
             "no POST /orders became durable, so no charge was adjudicated".into(),
         );
+    }
+
+    // The "once" above judged something only where one key reached the
+    // remote twice: a re-call after a lost reply, a deadline, or a restart.
+    let mut delivered: BTreeMap<IdempotencyKey, u32> = BTreeMap::new();
+    for d in sim.outbound_deliveries() {
+        *delivered.entry(d.key).or_insert(0) += 1;
+    }
+    if delivered.values().any(|n| *n > 1) {
+        sim.cover("outbound-fixture:re-called");
     }
     sim.cover("outbound:checked");
     Ok(())

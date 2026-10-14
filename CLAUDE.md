@@ -65,8 +65,8 @@ item with the trigger that reopens it.
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/realtime_resume/
   smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
   ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
-  outbound-fixture: sim; invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
-  missing, the list is stale, not selective.
+  outbound-fixture: sim; invoicing: describe_golden/sim). Every list is exhaustive as
+  written — if a name is missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
   with tests cannot sit outside this list either.
 - Replay one universe: `CHARPENTE_SEED=0x… cargo test -p <crate> --test <file> --

@@ -112,8 +112,9 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
 /// `serve`, with the operator's outbound settings (outbound-effects spec §9).
 /// The outbound client is built first, reading each credential variable
 /// once, then the HTTP listener is bound; both run before the kernel thread
-/// exists, so an `Err` (a `Refusal` from the outbound setup, or a failed
-/// bind) leaves nothing running.
+/// exists, so an `Err` leaves nothing running. It is one of three: a
+/// `Refusal` from the outbound setup, a platform failure building the
+/// client's runtime or thread, or a failed bind, marked `BindFailed`.
 pub fn serve_with(addr: &str, app: App, outbound: OutboundOptions) -> io::Result<Server> {
     let body_cap = app.config().body_cap;
     let outbound = ProdOutbound::new(&app, &outbound)?;
@@ -318,11 +319,44 @@ fn build_kernel(
 /// failure returns before any kernel exists: nothing is left running
 /// detached, and the caller names the failure (`launch` does).
 fn bind_http(addr: &str) -> io::Result<(std::net::TcpListener, SocketAddr)> {
-    let listener = std::net::TcpListener::bind(addr)?;
+    let listener = std::net::TcpListener::bind(addr).map_err(BindFailed::wrap)?;
     let local = listener.local_addr()?;
     listener.set_nonblocking(true)?;
     Ok((listener, local))
 }
+
+/// Marks the HTTP bind's failure, the way `Refusal` marks a refusal:
+/// `serve_with` builds the outbound client and then binds, both before any
+/// kernel exists, and only the bind's failure is fixed by freeing the
+/// address, so `launch` must tell it apart. It prints as the bind's own
+/// error, and keeps its kind.
+pub(crate) struct BindFailed(io::Error);
+
+impl BindFailed {
+    pub(crate) fn wrap(e: io::Error) -> io::Error {
+        io::Error::new(e.kind(), BindFailed(e))
+    }
+
+    pub(crate) fn of(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<BindFailed>())
+    }
+}
+
+impl std::fmt::Display for BindFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// The bind error's own `Debug`, as `Refusal`'s is its text's: the marker is
+/// for `BindFailed::of`, not for whoever prints it.
+impl std::fmt::Debug for BindFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for BindFailed {}
 
 /// Spawns the hyper accept loop over the already-bound listener, feeding
 /// `kernel_tx`. Shared by `serve` and `serve_replicated` — the edge is
@@ -817,14 +851,26 @@ impl ProdOutbound {
             .map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!("outbound: the client's runtime could not be built: {e}"),
+                    format!(
+                        "outbound: the client's runtime could not be built: {e} — raise the \
+                         process's thread and file limits, then restart"
+                    ),
                 )
             })?;
         let (cmds, rx) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done) = mpsc::channel();
         std::thread::Builder::new()
             .name("charpente-outbound".into())
-            .spawn(move || outbound_runtime(rt, rx, done_tx, routes, tls))?;
+            .spawn(move || outbound_runtime(rt, rx, done_tx, routes, tls))
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "outbound: the client's thread could not be spawned: {e} — raise the \
+                         process's thread and file limits, then restart"
+                    ),
+                )
+            })?;
         Ok(Some(ProdOutbound {
             cmds,
             done,
