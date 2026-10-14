@@ -483,6 +483,7 @@ mod tests {
             scope_type_name: std::any::type_name::<charpente_core::table::Unscoped>(),
             fingerprint: 0x7E57_0702, // the shape MOUNTED — different
             glue: noop_glue,
+            outbound: None,
         }]))
     }
 

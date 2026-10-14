@@ -24,6 +24,7 @@ pub mod describe;
 pub mod http;
 pub mod kernel;
 pub mod launch;
+pub mod outbound;
 pub mod prod;
 pub mod repl;
 pub mod serve;

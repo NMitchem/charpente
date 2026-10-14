@@ -7,7 +7,9 @@ mod dispatch;
 mod tail;
 
 pub use cron::{CronRow, CronScheduler};
-pub use dispatch::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope};
+pub use dispatch::{
+    CallGlue, Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope, OutboundDef, SettleGlue,
+};
 pub use tail::{
     ERROR_FRAME, EventFrame, EventSink, RESHAPED_FRAME, SimSink, SimSinkHandle, SinkStatus,
     TAIL_BATCH_EVENTS,

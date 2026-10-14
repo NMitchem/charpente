@@ -106,6 +106,8 @@ pub struct JobDef {
     /// declared job, and a job that never declared it is handed `None` it
     /// has no way to use.
     pub glue: JobGlue,
+    /// `Some` for an outbound job (spec §5); `glue` is then never called, since dispatch routes by the row's minted key.
+    pub outbound: Option<OutboundDef>,
 }
 
 /// The glue signature `#[job]` generates: decode the payload, call the
@@ -115,6 +117,31 @@ pub struct JobDef {
 /// which only the dispatcher can construct.
 pub type JobGlue =
     fn(&mut Tx, &[u8], Option<&CrossTenant<'_>>, Option<JobScope<'_>>) -> Result<(), JobError>;
+
+/// An outbound job's declaration and glue (outbound-effects spec §5), `Some`
+/// on its `JobDef` exactly when its `#[job]` says `outbound = "<host>"`.
+/// Dispatch runs `call`, the kernel makes the call outside any transaction,
+/// and `settle` commits the reply's consequences with the Done mark.
+pub struct OutboundDef {
+    pub host: &'static str,
+    pub timeout: std::time::Duration,
+    pub call: CallGlue,
+    pub settle: SettleGlue,
+}
+
+/// Decode the payload and call the job's `call`, which receives `&Tx` (or
+/// `&ScopedTx`), so it cannot write (spec R3). Whatever a hand-written glue
+/// writes anyway is discarded: the dispatcher leaves `call`'s stage through
+/// its `Err` path whenever a call is to be made.
+pub type CallGlue = fn(
+    &mut Tx,
+    &[u8],
+    &crate::outbound::IdempotencyKey,
+    Option<JobScope<'_>>,
+) -> Result<Option<crate::outbound::Call>, JobError>;
+
+pub type SettleGlue =
+    fn(&mut Tx, &[u8], crate::outbound::Reply, Option<JobScope<'_>>) -> Result<(), JobError>;
 
 /// The tenant a scoped job was enqueued in, handed to its glue by the
 /// dispatcher and by nothing else (job-tenancy spec §5). Its fields are

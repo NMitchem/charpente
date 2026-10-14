@@ -763,6 +763,7 @@ mod tests {
             scope_type_name: std::any::type_name::<charpente_core::table::Unscoped>(),
             fingerprint: 0x7E57_0702,
             glue: noop_glue,
+            outbound: None,
         }]);
         let server = serve("127.0.0.1:0", app).unwrap();
         // A deadline before `wait`, whose join would otherwise block forever
@@ -866,6 +867,7 @@ mod tests {
             scope_type_name: std::any::type_name::<charpente_core::table::Unscoped>(),
             fingerprint: 0x7E57_0704,
             glue: cron_foreign_shape_glue,
+            outbound: None,
         }])
         .schedule("drift", std::time::Duration::from_millis(1), || {
             DriftedCronReceipt
