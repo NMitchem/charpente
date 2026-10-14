@@ -753,18 +753,23 @@ impl ProdOutbound {
                 .expect("check_host_sets above: every Host entry has a mounted job calling it");
             let mut headers = Vec::new();
             for cred in host.credentials() {
-                // The refusals name the variable, never its value.
+                // The refusals name the variable, never its value. A UTF-8
+                // value with no control character is a valid header value, so
+                // `send`'s request always builds; a Basic pair travels
+                // base64-encoded, so for it the rule catches a pasted newline
+                // rather than a header limit.
+                let h = host.name();
                 let var = |v: &str| match std::env::var(v) {
                     Err(std::env::VarError::NotPresent) => Err(refuse(format!(
-                        "outbound: {v} is unset — host {} needs it for job {job}",
-                        host.name()
+                        "outbound: {v} is unset — host {h} needs it for job {job}"
                     ))),
-                    Ok(value) if hyper::header::HeaderValue::from_str(&value).is_ok() => Ok(value),
+                    Ok(value) if value.is_empty() => Err(refuse(format!(
+                        "outbound: {v} is set but empty — host {h} needs it for job {job}"
+                    ))),
+                    Ok(value) if !value.bytes().any(|b| b.is_ascii_control()) => Ok(value),
                     _ => Err(refuse(format!(
-                        "outbound: {v} holds a byte an HTTP header cannot carry (a control \
-                         character such as a trailing newline, or text that is not UTF-8) — host \
-                         {} needs it for job {job}; set it to the credential alone",
-                        host.name()
+                        "outbound: {v} holds a control character (a trailing newline, say) or is \
+                         not UTF-8 — host {h} needs it for job {job}; set it to the credential alone"
                     ))),
                 };
                 headers.push(match cred {
@@ -802,11 +807,22 @@ impl ProdOutbound {
             );
         }
         let tls = tls_config(&opts.cas).map_err(refuse)?;
+        // Built here, not in the thread, so a runtime that cannot be built is
+        // a failed start rather than a server whose every call fails.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("outbound: the client's runtime could not be built: {e}"),
+                )
+            })?;
         let (cmds, rx) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done) = mpsc::channel();
         std::thread::Builder::new()
             .name("charpente-outbound".into())
-            .spawn(move || outbound_runtime(rx, done_tx, routes, tls))?;
+            .spawn(move || outbound_runtime(rt, rx, done_tx, routes, tls))?;
         Ok(Some(ProdOutbound {
             cmds,
             done,
@@ -857,8 +873,9 @@ fn parse_base(
             "{flag}: a base is a scheme, an address and an optional port — no path"
         ));
     }
+    // A bracketed IPv6 literal with no port ends in `]`; its colons are not a port's.
     let (name, port) = match rest.rsplit_once(':') {
-        Some((n, p)) if !n.ends_with(']') || n.starts_with('[') => (
+        Some((n, p)) if !rest.ends_with(']') => (
             n,
             Some(
                 p.parse::<u16>()
@@ -928,15 +945,12 @@ type OutboundClient = hyper_util::client::legacy::Client<
 /// it, and asks the system resolver otherwise. The request URI always
 /// carries the declared host, so SNI and verification use it (A11).
 fn outbound_runtime(
+    rt: tokio::runtime::Runtime,
     mut cmds: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
     done: mpsc::Sender<(u64, io::Result<OutboundReply>)>,
     routes: BTreeMap<&'static str, Route>,
     tls: rustls::ClientConfig,
 ) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("the outbound runtime builds");
     let overrides: Arc<BTreeMap<String, std::net::IpAddr>> = Arc::new(
         routes
             .iter()
@@ -1021,10 +1035,7 @@ async fn send(
                 format!("could not connect: {}", with_causes(&e)),
             )
         } else {
-            io::Error::other(format!(
-                "the connection failed after the request was sent: {}",
-                with_causes(&e)
-            ))
+            io::Error::other(format!("the connection failed: {}", with_causes(&e)))
         }
     })?;
     let status = reply.status().as_u16();
@@ -2092,7 +2103,11 @@ mod tests {
     fn prod_sends_the_call_with_its_credential_and_returns_the_reply() {
         let (port, server) =
             one_shot(b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\nx-id: ch_1\r\n\r\nok".to_vec());
-        // Safety of set_var: this test binary's other tests read no PAY_KEY.
+        // Safety of set_var: the hazard is foreign (libc) code reading the
+        // environment concurrently; std's own reads take its lock. None runs
+        // in this binary's tests: every outbound call resolves through a
+        // base's address override, and every socket address is an IP literal,
+        // so nothing reaches getaddrinfo.
         unsafe { std::env::set_var("SERVE_TEST_PAY_KEY", "sk_test_1") };
         let app = charge_app(Host::new("pay.test").bearer_env("SERVE_TEST_PAY_KEY"));
         let opts = OutboundOptions {
@@ -2169,6 +2184,35 @@ mod tests {
         );
     }
 
+    /// The bound's `<=`: a reply whose first frame ends exactly at the cap
+    /// must still read one byte past it, or the kernel takes a cut reply as
+    /// whole. hyper yields chunked data at most one chunk per frame, so the
+    /// first frame here ends at byte 16, the cap.
+    #[test]
+    fn a_reply_whose_frame_ends_at_the_cap_still_reads_past_it() {
+        let mut reply = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n10\r\n".to_vec();
+        reply.extend([b'a'; 16]);
+        reply.extend(b"\r\n10\r\n");
+        reply.extend([b'b'; 16]);
+        reply.extend(b"\r\n0\r\n\r\n");
+        let (port, _server) = one_shot(reply);
+        let app = charge_app(Host::new("pay.test").max_reply_bytes(16));
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts).unwrap().unwrap();
+        ob.start(0, plain_call("/edge")).unwrap();
+        let (_, reply) = wait_for(&ob);
+        let mut want = vec![b'a'; 16];
+        want.push(b'b');
+        assert_eq!(
+            reply.unwrap().body,
+            want,
+            "cap + 1: one byte of the second chunk"
+        );
+    }
+
     #[test]
     fn a_closed_port_is_connection_refused() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -2195,26 +2239,75 @@ mod tests {
         );
     }
 
-    /// A credential is checked as a header value when it is read, so a value
-    /// with a trailing newline refuses the start instead of failing every
-    /// call, and the refusal names the variable, never the value.
+    /// A credential is checked when it is read, so a value with a trailing
+    /// newline, or an empty one, refuses the start instead of failing every
+    /// call (an empty one as `Repl::open` refuses an empty peer secret), and
+    /// each refusal names the variable, never the value. Basic's pair is held
+    /// to the same rule, though base64 would carry it.
     #[test]
-    fn a_credential_no_header_can_carry_refuses_the_start() {
-        // Safety of set_var: no other test reads this variable.
-        unsafe { std::env::set_var("SERVE_TEST_NEWLINE_KEY", "sk_newline_1\n") };
-        let app =
-            charge_app(Host::new("pay.test").header_env("x-api-key", "SERVE_TEST_NEWLINE_KEY"));
-        let err = ProdOutbound::new(&app, &OutboundOptions::default())
-            .err()
-            .unwrap();
+    fn a_credential_that_cannot_be_sent_refuses_the_start() {
+        // Safety of set_var: as in
+        // `prod_sends_the_call_with_its_credential_and_returns_the_reply`.
+        unsafe {
+            std::env::set_var("SERVE_TEST_NEWLINE_KEY", "sk_newline_1\n");
+            std::env::set_var("SERVE_TEST_EMPTY_KEY", "");
+            std::env::set_var("SERVE_TEST_BASIC_USER", "basic_user_1");
+            std::env::set_var("SERVE_TEST_BASIC_PASS", "basic_pass_1\r\n");
+        }
+        let refusal = |host: Host| {
+            let err = ProdOutbound::new(&charge_app(host), &OutboundOptions::default())
+                .err()
+                .unwrap();
+            assert!(Refusal::of(&err).is_some());
+            let shown = format!("{err} {err:?}");
+            for value in ["sk_newline_1", "basic_user_1", "basic_pass_1"] {
+                assert!(!shown.contains(value), "{shown}");
+            }
+            err.to_string()
+        };
         assert_eq!(
-            err.to_string(),
-            "outbound: SERVE_TEST_NEWLINE_KEY holds a byte an HTTP header cannot carry (a control \
-             character such as a trailing newline, or text that is not UTF-8) — host pay.test \
-             needs it for job ServeTestCharge; set it to the credential alone"
+            refusal(Host::new("pay.test").header_env("x-api-key", "SERVE_TEST_NEWLINE_KEY")),
+            "outbound: SERVE_TEST_NEWLINE_KEY holds a control character (a trailing newline, say) \
+             or is not UTF-8 — host pay.test needs it for job ServeTestCharge; set it to the \
+             credential alone"
         );
-        assert!(Refusal::of(&err).is_some());
-        assert!(!format!("{err} {err:?}").contains("sk_newline_1"));
+        assert_eq!(
+            refusal(Host::new("pay.test").bearer_env("SERVE_TEST_EMPTY_KEY")),
+            "outbound: SERVE_TEST_EMPTY_KEY is set but empty — host pay.test needs it for job \
+             ServeTestCharge"
+        );
+        assert_eq!(
+            refusal(
+                Host::new("pay.test").basic_env("SERVE_TEST_BASIC_USER", "SERVE_TEST_BASIC_PASS")
+            ),
+            "outbound: SERVE_TEST_BASIC_PASS holds a control character (a trailing newline, say) \
+             or is not UTF-8 — host pay.test needs it for job ServeTestCharge; set it to the \
+             credential alone"
+        );
+    }
+
+    /// A reply cut off with no answer is a transport failure that does not
+    /// claim the request went out or stayed home: hyper can hand back a
+    /// request unsent when a pooled connection died, so only the kernel's
+    /// "may have applied" suffix speaks to delivery.
+    #[test]
+    fn a_remote_that_closes_without_answering_is_a_neutral_failure() {
+        let (port, _server) = one_shot(Vec::new());
+        let app = charge_app(Host::new("pay.test"));
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts).unwrap().unwrap();
+        ob.start(0, plain_call("/x")).unwrap();
+        let (_, reply) = wait_for(&ob);
+        let err = reply.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.to_string()
+                .starts_with("the connection failed: client error"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2248,6 +2341,20 @@ mod tests {
         assert_eq!(
             bad("https://127.0.0.1:8443/v1"),
             "--outbound-base pay.test=https://127.0.0.1:8443/v1: a base is a scheme, an address and an optional port — no path"
+        );
+        // A bracketed IPv6 literal ends in `]` when it has no port.
+        let v6 = Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            parse_base("pay.test", "https://[::1]"),
+            Ok(("https", v6, None))
+        );
+        assert_eq!(
+            parse_base("pay.test", "https://[::1]:8443"),
+            Ok(("https", v6, Some(8443)))
+        );
+        assert_eq!(
+            parse_base("pay.test", "http://[::1]"),
+            Ok(("http", v6, None))
         );
         let opts = OutboundOptions {
             bases: vec![("other.test".into(), "https://127.0.0.1:1".into())],

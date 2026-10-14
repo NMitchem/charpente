@@ -1396,7 +1396,8 @@ variable once, so a setup refusal (an unset credential, a bad base or CA
 file) returns an `Err` holding a `Refusal`, with nothing running. An app
 whose jobs call nothing gets no client and no thread for one.
 `serve_replicated`, `backup` and `archive` build the client the same way,
-with no operator settings.
+with no operator settings, so they reach only hosts whose certificates chain
+to a public CA, at their real addresses.
 
 ### What `#[route]` rejects
 
@@ -1965,13 +1966,16 @@ pass_var)`, `max_request_bytes(n)` and `max_reply_bytes(n)`. A credential is the
 NAME of an environment variable. `serve` reads each value once, when it starts
 (as `serve_with`, `serve_replicated`, `backup` and `archive` do, §5), and the
 value never enters the log, the sim, an error text or `describe`, which lists
-variable and header names only. A variable that is unset, or that holds what
-a header cannot carry, refuses the start before the listener is bound:
+variable and header names only. A variable that is unset, empty, holds a
+control character or is not UTF-8 refuses the start before the listener is
+bound (a `basic_env` pair included, though base64 would carry a control
+character: one there is a pasted newline, not a credential):
 
 <!-- pinned -->
 ```text
 outbound: <var> is unset — host <host> needs it for job <job>
-outbound: <var> holds a byte an HTTP header cannot carry (a control character such as a trailing newline, or text that is not UTF-8) — host <host> needs it for job <job>; set it to the credential alone
+outbound: <var> is set but empty — host <host> needs it for job <job>
+outbound: <var> holds a control character (a trailing newline, say) or is not UTF-8 — host <host> needs it for job <job>; set it to the credential alone
 ```
 
 `<job>` is the first mounted job that calls `<host>`. The caps default to
