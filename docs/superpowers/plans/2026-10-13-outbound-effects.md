@@ -4836,7 +4836,50 @@ Expected: every test passes. A test with a numeric expectation (`outbound_late =
 
    Run `a_call_never_starts_when_its_group_commit_fails`: expect RED, naming a `crash_after`. Restore and touch.
 2. Remove the `if self.dispatcher.in_flight_len() > 0` guard around `poll`. Run `a_kernel_with_no_outbound_job_never_touches_its_outbound`: expect RED, with "invariant 6: poll". Restore and touch.
-3. Make `settle_into` look a token up without removing it, so `finish` never returns `None`. Replace its `finish` with a `get` that clones the flight. `Flight` derives nothing, so for the mutation only give it `#[derive(Clone)]`, or copy its fields out. Run `a_late_reply_never_settles_the_retry`: expect RED or a panic. Restore and touch, and remove the derive with it.
+3. Make a late completion settle its job's CURRENT attempt, which is the bug R7 guards against. By the time a late reply arrives, `expire_into`'s `finish` has already removed its token, so `settle_into` no longer knows the token's job. The mutation therefore needs scaffolding in `kernel/outbound.rs`, used only by the mutation and deleted with the restore:
+   - `InFlight` gains `retired: BTreeMap<u64, u64>` (token → job id), set to `BTreeMap::new()` in `new`;
+   - `finish` records `self.retired.insert(token, f.id);` before `Some(f)`;
+   - and:
+
+   ```rust
+       // R7 mutation scaffolding: the in-flight token of the job a retired token belonged to.
+       pub(crate) fn current_flight_of_retired(&self, late: u64) -> Option<u64> {
+           let id = *self.retired.get(&late)?;
+           self.flights.iter().find(|(_, f)| f.id == id).map(|(&t, _)| t)
+       }
+   ```
+
+   In `settle_into`, `let Some(Flight { id, due_at, host, .. }) = self.in_flight.finish(token) else { return Ok(None); };` becomes:
+
+   ```rust
+           // R7 mutation: a late completion falls back to its job's current flight.
+           let flight = match self.in_flight.finish(token) {
+               Some(f) => f,
+               None => {
+                   let Some(current) = self.in_flight.current_flight_of_retired(token) else {
+                       return Ok(None);
+                   };
+                   self.in_flight.finish(current).expect("R7 mutation: the current flight is in flight")
+               }
+           };
+           let Flight { id, due_at, host, .. } = flight;
+   ```
+
+   Timeline under the mutation, with the test's numbers (one-way latency 1.5 s, timeout 2 s, first backoff 500 ms):
+   - Token 0 starts at 0 and times out at 2 s. `expire_into`'s `finish` retires it as job 0's, and the job is Retried for 2.5 s.
+   - Token 1 starts at 2.5 s.
+   - At 3 s, token 0's 200 lands while token 1 is in flight. `finish(0)` is `None`, so the fallback finishes token 1 and runs `Pay::settle` with token 0's reply. That writes `Paid { times: 1 }`, and the job is Done.
+   - From then on nothing is in flight, so token 1's own reply (due at 5.5 s) is never polled.
+
+   Run `a_late_reply_never_settles_the_retry`. Expected: RED at its first assertion, before the counters, which would read `outbound_settled` 1, `outbound_late` 0 and `outbound_timed_out` 1:
+
+   ```text
+   assertion `left == right` failed: no late reply settled anything
+     left: (Done, 1)
+    right: (Dead, 0)
+   ```
+
+   Restore and touch both files, the scaffolding included. Before going on, check that `kernel/outbound.rs` has no `retired` and no `current_flight_of_retired`.
 4. Delete the level-triggered drop at the top of `step` (the `!writable` branch that drops the in-flight table). Run `losing_writability_drops_in_flight_and_keeps_jobs_pending`: expect RED, either at its "invariant 3" assertion or as the outbound arm's "ran on a node that is not writable" panic. Record which. This is the proof amendment A19 rests on. Restore and touch.
 
 Record each in progress.md with the failing line.
@@ -5081,7 +5124,7 @@ pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String> {
 }
 ```
 
-`OutboundWorld` gains `quiet: bool`. `Sim::quiesce_outbound_faults` sets it. Its doc: the fault-free tail's outbound half; latency stays, since it is not a fault; requests already in flight keep the fate they drew. In `SimOutbound::start`, each fault test becomes `!outbound.quiet && outbound.<axis>.chance(…)`. The short circuit means a quiet world draws nothing from those streams. Update the module docs of `checks.rs` ("v0 shipped exactly three…") to say these three earned their way in with outbound effects.
+`OutboundWorld` gains `pub(crate) quiet: bool`, initialised `quiet: false` in `OutboundWorld::new`. It is `pub(crate)` for the reason Task 4 made `models`, `next_handle` and `deliveries` so: `Sim::quiesce_outbound_faults`, in `lib.rs`, sets it. Its doc: the fault-free tail's outbound half; latency stays, since it is not a fault; requests already in flight keep the fate they drew. In `SimOutbound::start`, each fault test becomes `!outbound.quiet && outbound.<axis>.chance(…)`. The short circuit means a quiet world draws nothing from those streams. Update the module docs of `checks.rs` ("v0 shipped exactly three…") to say these three earned their way in with outbound effects.
 
 - [ ] **Step 3: The workload and the property** (`tests/outbound.rs`)
 
