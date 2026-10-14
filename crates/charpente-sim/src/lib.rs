@@ -15,6 +15,7 @@ mod disk;
 pub mod harness;
 mod net;
 pub mod object;
+pub mod outbound;
 pub mod rng;
 
 use std::collections::BTreeMap;
@@ -597,6 +598,10 @@ struct State {
     /// 0.0 from then on. False for the whole of every universe that never
     /// calls it.
     stalls_off: bool,
+    /// The outside world behind `Sim::outbound` handles. Keyed streams only,
+    /// and nothing is drawn until a handle starts a call, so a universe that
+    /// never builds one replays exactly as before.
+    outbound: outbound::OutboundWorld,
 }
 
 impl State {
@@ -766,6 +771,7 @@ impl Sim {
                     hosts: BTreeMap::new(),
                     disk_faults_off: false,
                     stalls_off: false,
+                    outbound: outbound::OutboundWorld::new(seed),
                 }),
             }),
         }
@@ -1105,6 +1111,65 @@ impl Sim {
             }
         }
         next
+    }
+
+    /// Registers the model for `host` (spec §10). One model per host; a second
+    /// registration is a contract panic.
+    pub fn remote(&self, host: &str, model: impl outbound::Remote) {
+        let mut guard = self.world.lock();
+        let rng = keyed_stream(self.world.seed, &format!("outbound-model:{host}"));
+        let clash = guard
+            .outbound
+            .models
+            .insert(host.to_string(), (Box::new(model), rng));
+        assert!(
+            clash.is_none(),
+            "contract: sim.remote(\"{host}\", …) registered twice"
+        );
+    }
+
+    /// A new process's outbound handle. `hosts` is the app's declared host list
+    /// (`App::outbound_hosts`) — plain data, since this crate cannot take an
+    /// `App`. Refuses a host with no model, by name.
+    pub fn outbound(&self, hosts: &[&'static str]) -> io::Result<outbound::SimOutbound> {
+        let mut guard = self.world.lock();
+        for host in hosts {
+            if !guard.outbound.models.contains_key(*host) {
+                return Err(io::Error::other(format!(
+                    "sim: a mounted job calls {host}, which has no model — add \
+                     sim.remote(\"{host}\", …) before sim.outbound(…)"
+                )));
+            }
+        }
+        let handle = guard.outbound.next_handle;
+        guard.outbound.next_handle += 1;
+        Ok(outbound::SimOutbound {
+            world: self.world.clone(),
+            handle,
+        })
+    }
+
+    /// Reads `host`'s model after every delivery due by now has run (amendment
+    /// A1: a reference cannot escape the world lock).
+    pub fn with_remote<M: outbound::Remote, T>(&self, host: &str, f: impl FnOnce(&M) -> T) -> T {
+        let mut guard = self.world.lock();
+        let now = guard.now;
+        guard.outbound.deliver_due(now);
+        let (model, _) = guard.outbound.models.get(host).unwrap_or_else(|| {
+            panic!("contract: sim.with_remote(\"{host}\") — no model registered")
+        });
+        let any: &dyn std::any::Any = model.as_ref();
+        f(any.downcast_ref::<M>().unwrap_or_else(|| {
+            panic!("contract: sim.with_remote(\"{host}\") asked for the wrong model type")
+        }))
+    }
+
+    /// Every request that reached a remote so far, after running deliveries due by now.
+    pub fn outbound_deliveries(&self) -> Vec<outbound::Delivered> {
+        let mut guard = self.world.lock();
+        let now = guard.now;
+        guard.outbound.deliver_due(now);
+        guard.outbound.deliveries.clone()
     }
 }
 

@@ -3156,6 +3156,118 @@ be `run` again against a second `SimSource` — script a login phase, read
 the token out of its recorded responses, then script the authenticated
 phase with `.header("authorization", format!("Bearer {token}"))`.
 
+### The outside world: remote models
+
+Outbound HTTP goes through the `Outbound` IO trait, to hosts the app
+declares. In a sim, each declared host is a model you register: a `Remote`
+that lives inside the universe, runs on its seed, and answers each request
+when the request reaches it. The wire between the kernel and the model
+belongs to the sim, and the outbound fault axes act on that wire.
+
+Register one model per declared host, then build the outbound handle:
+
+- `sim.remote(host, model)` makes `model` the outside world behind `host`.
+  One model per host: registering a host twice is a contract panic,
+  `contract: sim.remote("<host>", …) registered twice`.
+- `sim.outbound(hosts)` builds one process's handle, a
+  `charpente_sim::outbound::SimOutbound`. `hosts` is the app's declared host
+  list, passed as plain data. A host with no model is refused by name before
+  anything runs:
+
+```text
+sim: a mounted job calls <host>, which has no model — add sim.remote("<host>", …) before sim.outbound(…)
+```
+
+A model implements `charpente_sim::outbound::Remote`, whose one method is
+`fn handle(&mut self, call: &OutboundCall, rng: &mut Rng) -> OutboundReply`.
+It runs when the request reaches the remote, at its drawn delivery time, not
+when the kernel starts the call. `rng` is the model's own seeded stream,
+keyed by the host's name, so a model's variance (a payment that is sometimes
+declined, an LLM that sometimes answers ambiguously) replays with the seed
+and moves no other draw. A model is `Send + 'static`. It runs under the sim's
+world lock, so it must never call back into the `Sim`.
+
+There are three ways to get a model. Each is a named choice, and none is a
+default:
+
+- `charpente_sim::outbound::from_fn(f)` wraps a closure,
+  `FnMut(&OutboundCall) -> OutboundReply`. The closure gets no `rng`, so
+  write a `Remote` impl when the model needs variance.
+- `Recorder::new()` answers 200 with an empty body and keeps every call it
+  was handed, in delivery order. `calls()` reads them. It models
+  fire-and-forget email.
+- `Idempotent::header(name, model)` wraps an inner model in Stripe's
+  idempotency semantics, keyed by the value of the header `name` (matched
+  case-insensitively). `Idempotent::by(extract, model)` takes the key from
+  any part of the request, through `extract: fn(&OutboundCall) ->
+  Option<String>`. A repeated key with the same method, path and body gets
+  the first reply again, and the inner model does not run. A repeated key
+  with a different method, path or body gets a 409. A request with no key is
+  applied every time, as Stripe does. `applied()` counts applications per
+  key. A repeated key replays, so every count is 1, and the map says which
+  keys reached the inner model: a retry that sent a fresh key shows up as a
+  second entry, never as a 2. `inner()` reads the wrapped model. The key is
+  what the app put in the request, never `OutboundCall::key`: a real remote
+  never sees that field.
+
+A workload reads model state with `sim.with_remote::<M, _>(host, |m| …)`. The
+closure borrows the model as its concrete type `M`, since a reference cannot
+outlive the world lock. The closure runs under that lock, as a model does, so
+it must not call the `Sim` either: return what you need and act on it after.
+Naming the wrong type, or a host with no model, is a contract panic. `sim.outbound_deliveries()` returns every request that has
+reached a remote, as `charpente_sim::outbound::Delivered { host, key, at,
+handle }`. `key` is the job's `OutboundCall::key`, which attributes a
+delivered call to its job. `at` is the virtual arrival time in nanoseconds,
+and `handle` says which `SimOutbound`, and so which process, sent it. Both
+calls first run every delivery due by now, so what they show is current
+with the clock.
+
+A request in flight at a crash still arrives; only its reply is lost. Models
+belong to the universe, not to the box, so `sim.restart()` leaves them and
+every request already on the wire alone. The restarted process builds a new
+handle with `sim.outbound(…)`. A reply goes only to the handle that started
+its call, so a pre-restart reply has nowhere to land, even when the new
+process reuses the old token. A cancelled call (`Outbound::cancel`) behaves
+the same way: its request still reaches the remote at its delivery time, and
+its completion is never handed back.
+
+Each fault axis rolls from its own keyed stream, so turning one on moves no
+other draw. Delivery and reply times are drawn when the call starts. A call
+is refused, or else lost, or else throttled, or else delivered, in that
+order of rolls, and a delivered call may also be slow and may lose its reply:
+
+| Axis (`FaultConfig` field) | The remote sees | The kernel sees | Coverage key |
+|---|---|---|---|
+| `outbound_refused` | nothing | an immediate transport error, `ConnectionRefused` | `fault:outbound_refused` |
+| `outbound_lost_request` | nothing | silence, then its deadline | `fault:outbound_lost_request` |
+| `outbound_lost_reply` | the call, applied | silence, then its deadline: the ambiguous case | `fault:outbound_lost_reply` |
+| `outbound_throttle` | nothing (overloaded) | a 429 or 503 | `fault:outbound_throttle` |
+| `outbound_latency` `(min, max)` and `outbound_slow` | the call, late | a reply late, or past the deadline (the LLM tail) | `fault:outbound_slow`; latency has none |
+
+`outbound_latency` is a one-way range, drawn once for the request and once
+for the reply, and a throttle answers after twice one such draw. `outbound_slow`
+adds think time between the request's arrival and the reply's departure,
+uniform in [10·max, 100·max], or in [1 s, 100 s] when max is zero. Every
+completion handed back to the kernel also marks `outbound:completed`.
+Duplicates are not an axis. In HTTP a duplicate is a retry after a lost
+reply, and the sim produces those. Whether a duplicate applies twice is the
+model's semantics, which is what `Idempotent` is for.
+
+`FaultConfig::default()`, which `Sim::new` uses, turns the five outbound
+faults off and sets latency to 1–50 ms. `FaultConfig::none()` makes every
+call instantaneous. A swarm universe samples all six fields in
+`sample_extended_fields`, each from its own stream, so the existing axes'
+sampled values are unchanged:
+
+| Field | Swarm sample |
+|---|---|
+| `outbound_refused` | on with chance 0.25, at a rate from 0 to 0.049 in steps of 0.001 |
+| `outbound_lost_request` | on with chance 0.25, at 0 to 0.029 |
+| `outbound_lost_reply` | on with chance 0.25, at 0 to 0.029 |
+| `outbound_throttle` | on with chance 0.25, at 0 to 0.099 |
+| `outbound_slow` | on with chance 0.25, at 0 to 0.049 |
+| `outbound_latency` | `(0, max)`, with max one of 0, 10 ms, 200 ms or 2 s, each with chance 0.25 |
+
 ### `charpente test --sim`
 
 Run it from the app crate's own directory (or pass `--dir`):
