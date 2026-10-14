@@ -144,7 +144,9 @@ item with the trigger that reopens it.
   (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest,
   `tests/describe_contract.rs`, which diffs §13's `describe` JSON against a freshly built
   `examples/invoicing` fixture, and `tests/hook_census.rs`, which holds "no panic-hook
-  installer" by walking the sources — the deny-list is inert under a file-level allow.
+  installer" by walking the sources — the deny-list is inert under a file-level allow —
+  and also holds `host_name_problem`'s two copies (charpente's `outbound.rs`,
+  charpente-macros' `job.rs`) byte-identical.
   `tests/mutants_exclusions.rs` pins the known-equivalent mutant list's size and demands a
   rationale per entry.
 - `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock

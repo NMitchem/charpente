@@ -1,0 +1,5 @@
+error: timeout "30" has no unit — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+ --> tests/compile_fail/outbound_timeout_without_unit.rs:5:54
+  |
+5 | #[job(global, outbound = "api.stripe.com", timeout = "30")]
+  |                                                      ^^^^

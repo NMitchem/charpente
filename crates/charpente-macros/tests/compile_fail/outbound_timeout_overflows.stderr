@@ -1,0 +1,5 @@
+error: timeout "99999999999h" is longer than u64::MAX nanoseconds (about 584 years), the longest duration the kernel's clock can count — give a shorter timeout
+ --> tests/compile_fail/outbound_timeout_overflows.rs:6:54
+  |
+6 | #[job(global, outbound = "api.stripe.com", timeout = "99999999999h")]
+  |                                                      ^^^^^^^^^^^^^^

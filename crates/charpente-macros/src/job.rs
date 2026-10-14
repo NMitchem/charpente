@@ -317,12 +317,21 @@ fn parse_duration(lit: &LitStr, what: &str) -> syn::Result<u64> {
             format!("{what} \"{raw}\": \"{digits}\" is not a whole number — {ACCEPTED_FORMS}"),
         )
     })?;
-    count.checked_mul(millis_per_unit).ok_or_else(|| {
-        Error::new(
-            lit.span(),
-            format!("{what} \"{raw}\" overflows u64 milliseconds — {ACCEPTED_FORMS}"),
-        )
-    })
+    // The kernel's clock counts u64 nanoseconds, so a longer duration is
+    // refused here: as a timeout it would saturate into "never", and as a
+    // backoff it would panic at dispatch (`RetryPolicy::backoff_nanos`).
+    count
+        .checked_mul(millis_per_unit)
+        .filter(|millis| millis.checked_mul(1_000_000).is_some())
+        .ok_or_else(|| {
+            Error::new(
+                lit.span(),
+                format!(
+                    "{what} \"{raw}\" is longer than u64::MAX nanoseconds (about 584 years), the \
+                     longest duration the kernel's clock can count — give a shorter {what}"
+                ),
+            )
+        })
 }
 
 // A byte-for-byte copy of `host_name_problem` in crates/charpente/src/outbound.rs,
@@ -547,8 +556,12 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
     // `call`/`settle` by the row's minted key. Its `call` and `settle` are
     // bound through fn pointers for the run glue's reason above
     // (`compile_fail/outbound_scoped_call_takes_bare_tx.rs`), and for one more
-    // (spec R3): the binding holds `call` to a shared `&Tx` or `&ScopedTx`, so
-    // it cannot take `&mut` and a write inside it is a compile error
+    // (spec R3): the binding holds `call` to a shared `&Tx` or `&ScopedTx`.
+    // A direct call, `#name::call(&job, tx, key)`, would accept a `call` taking
+    // `&mut`, since the glue holds one; the binding makes that a compile error,
+    // pinned by `compile_fail/outbound_call_takes_mut_tx.rs` and
+    // `compile_fail/outbound_scoped_call_takes_mut_scoped_tx.rs`. With the
+    // signature held shared, a write inside `call` cannot compile either
     // (`compile_fail/outbound_call_cannot_write.rs`).
     let (run_glue, outbound_glues, outbound_def, outbound_const) = match &args.outbound {
         None => (

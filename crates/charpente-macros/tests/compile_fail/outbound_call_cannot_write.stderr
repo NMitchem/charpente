@@ -1,10 +1,10 @@
 error[E0596]: cannot borrow `*tx` as mutable, as it is behind a `&` reference
-  --> tests/compile_fail/outbound_call_cannot_write.rs:19:9
+  --> tests/compile_fail/outbound_call_cannot_write.rs:21:9
    |
-19 |         tx.put(&Note {
+21 |         tx.put(&Note {
    |         ^^ `tx` is a `&` reference, so it cannot be borrowed as mutable
    |
 help: consider changing this to be a mutable reference
    |
-18 |     fn call(&self, tx: &mut Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+20 |     fn call(&self, tx: &mut Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
    |                         +++

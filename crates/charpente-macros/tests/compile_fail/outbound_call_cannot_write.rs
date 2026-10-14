@@ -1,6 +1,8 @@
 // Spec R3: `call` takes `&Tx`, and a write needs `&mut`, so `call` reads and
 // cannot write — its effects belong in `settle`, which commits with the Done
-// mark.
+// mark. This pins the app's own shared signature. That the glue holds `call`
+// to it, so a `call` taking `&mut Tx` is refused, is pinned by
+// `outbound_call_takes_mut_tx.rs`.
 use charpente::kernel::JobError;
 use charpente::outbound::{Call, IdempotencyKey, Reply};
 use charpente::{Id, Tx, job, table};

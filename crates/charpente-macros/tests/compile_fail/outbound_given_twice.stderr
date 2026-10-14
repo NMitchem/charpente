@@ -1,0 +1,5 @@
+error: `outbound` given twice — write it once
+ --> tests/compile_fail/outbound_given_twice.rs:4:44
+  |
+4 | #[job(global, outbound = "api.stripe.com", outbound = "api.example.com")]
+  |                                            ^^^^^^^^

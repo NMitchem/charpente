@@ -1795,8 +1795,8 @@ A job that calls an outside service over HTTP declares the host it calls with
 it needs and builds the request. The kernel sends it outside any transaction, since
 no transaction waits on the network, and hands the reply to `settle`, which commits
 the reply's consequences in the transaction that marks the job Done.
-Enqueue one the way you enqueue any job: `enqueue`, `enqueue_keyed`, `enqueue_in`
-and cron take outbound jobs unchanged.
+Enqueue one the way you enqueue any job, from a route, a job or a cron tick:
+`enqueue`, `enqueue_keyed`, `enqueue_in` and cron take outbound jobs unchanged.
 
 ```rust
 use charpente::kernel::JobError;
@@ -1858,6 +1858,13 @@ a crash or a failover. charpente sends it nowhere by itself: `call` places it
 where the remote reads one, the `idempotency-key` header above or a field of the
 body, so a remote that honours it applies a repeated request once. It is not
 `enqueue_keyed`'s app key.
+
+Because the key is drawn as the enqueue is staged, an outbound job is enqueued
+only in a transaction the platform opens: a route's, a job's or a cron tick's.
+`Db::transact` and `Db::begin_group` (§4) cannot mint, and an outbound enqueue
+inside either panics with a contract message (§9). Code that opens its own group
+stages through `Db::begin_group_minting` instead, and a test seeds an outbound job
+through `App::transact_for_tests`, which the message names.
 
 The request is built on the declared host, which is never runtime data:
 `Call::get`, `post`, `put`, `patch` and `delete` take a path that begins with `/`.
@@ -3816,7 +3823,7 @@ unknown retry field `jitter` — a job declares `global` or `scoped_by = <Type>`
 `max` given twice — write it once
 `backoff` given twice — write it once
 backoff "12xs": "12x" is not a whole number — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
-backoff "99999999999999h" overflows u64 milliseconds — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+backoff "99999999999999h" is longer than u64::MAX nanoseconds (about 584 years), the longest duration the kernel's clock can count — give a shorter backoff
 outbound = "https://api.stripe.com": the host carries a scheme — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
 outbound = "api.stripe.com:443": the host carries a port — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
 outbound = "": the host is empty — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
@@ -3831,12 +3838,15 @@ timeout "0s" would cancel every call before the remote could answer — give a p
 The first is the one every job meets: a job declares its tenancy, and a bare `#[job]`
 names both answers. The next seven refuse a word given twice or both tenancies at once.
 Anything else the attribute does not recognise hits the accepted-forms message, which
-lists every word. Four of the lines after it are that message with more specific context
-prepended: a backoff string missing its unit, an unrecognized field inside `retry(...)`,
-a backoff whose number doesn't parse, or one so large it overflows `u64` milliseconds;
-between them, `max` or `backoff` written twice inside `retry(...)` is refused like the
-words above. A `timeout` string is refused in the same three ways as a backoff, with
-`timeout` in place of `backoff`. The six lines after those refuse §6's outbound words.
+lists every word; so does `outbound` written without its `= "<host>"`. Three of the lines
+after it are that message with more specific context prepended: a backoff string missing
+its unit, an unrecognized field inside `retry(...)`, or a backoff whose number doesn't
+parse; between them, `max` or `backoff` written twice inside `retry(...)` is refused like
+the words above. The line after those refuses a backoff longer than the kernel's clock
+can count, which is `u64` nanoseconds: as a backoff it would panic at dispatch, and as
+a timeout it would mean "never". A `timeout` string is refused in the same three ways as a
+backoff, with `timeout` in place of `backoff`. The six lines after those refuse §6's
+outbound words.
 The three `outbound = …` lines are one refusal, a host that is not a bare DNS name, and
 the reason after "the host" is one of: is empty, carries a scheme, carries userinfo,
 carries a path, is an IPv6 literal, carries a port, has an uppercase letter, holds a
@@ -3972,6 +3982,7 @@ request.
 contract: an `enqueue_keyed` app key names the job's external identity — it cannot be empty
 Disk paths are relative flat names like "wal/000001.log" — got "<path>"
 cron schedule "<name>": interval <duration> exceeds u64 nanos (~584 years) — pick a smaller interval
+contract: job "<job>" is outbound, so its enqueue needs an idempotency key drawn from the node's Entropy, and this group has none — Db::transact and Db::begin_group cannot mint; enqueue it from a route, a job or cron (the App's groups mint), or in a test through App::transact_for_tests
 ```
 
 The first (§4, §6) is `tx.enqueue_keyed(key, job)` handed an empty `key` —
@@ -3984,7 +3995,11 @@ empty, or contains a `.`/`..` segment — usually a hand-built `DbConfig`
 (§7) is a cron interval that overflows `u64` nanoseconds; note §7's timing
 caveat — it fires at kernel startup, not at the `.schedule(...)` call, so
 under `serve()` it takes the kernel thread down after `serve` has already
-returned `Ok`.
+returned `Ok`. The fourth (§6) is an outbound job enqueued inside `Db::transact`
+or `Db::begin_group`, which have no entropy to draw its idempotency key from:
+enqueue it from a route, a job or a cron tick, stage it through
+`Db::begin_group_minting` in code that opens its own group, or seed it in a
+test through `App::transact_for_tests`.
 
 ### Record and body size limits (`charpente-core/src/db.rs`, `charpente-core/src/log.rs`, `charpente/src/http/app.rs`)
 

@@ -1,0 +1,5 @@
+error: `timeout` given twice — write it once
+ --> tests/compile_fail/timeout_given_twice.rs:4:60
+  |
+4 | #[job(global, outbound = "api.stripe.com", timeout = "5s", timeout = "10s")]
+  |                                                            ^^^^^^^
