@@ -2902,6 +2902,266 @@ fn tick_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint() 
     );
 }
 
+/// Which WAL operation `OneShotWalFaultDisk` fails once while armed.
+#[derive(Clone, Copy, PartialEq)]
+enum WalFault {
+    /// A WAL segment's `sync`: the append/sync arm, nothing in the batch applied.
+    Sync,
+    /// The WAL directory's `list`, the first thing a checkpoint's segment GC
+    /// does: the batch already applied, and only the WAL is poisoned.
+    GcList,
+}
+
+/// Delegates to the sim's disk, failing ONE WAL operation while `armed` and
+/// then disarming, so a commit failure lands on exactly the arm a test names.
+/// The store file is never faulted.
+struct OneShotWalFaultDisk {
+    inner: charpente_sim::SimDisk,
+    fault: WalFault,
+    armed: Arc<AtomicBool>,
+    fired: Arc<AtomicU64>,
+}
+
+struct WalSyncFaultFile {
+    inner: Box<dyn charpente_core::io::File>,
+    /// `None` for every file but a WAL segment under a `Sync` fault.
+    fault: Option<(Arc<AtomicBool>, Arc<AtomicU64>)>,
+}
+
+impl charpente_core::io::Disk for OneShotWalFaultDisk {
+    fn open(&self, path: &str) -> std::io::Result<Box<dyn charpente_core::io::File>> {
+        let inner = self.inner.open(path)?;
+        let fault = (self.fault == WalFault::Sync && path.starts_with("wal/"))
+            .then(|| (self.armed.clone(), self.fired.clone()));
+        Ok(Box::new(WalSyncFaultFile { inner, fault }))
+    }
+
+    fn remove(&self, path: &str) -> std::io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        if self.fault == WalFault::GcList
+            && prefix == "wal/"
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            return Err(std::io::Error::other(
+                "simulated WAL directory list failure",
+            ));
+        }
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> std::io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+impl charpente_core::io::File for WalSyncFaultFile {
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        if let Some((armed, fired)) = &self.fault
+            && armed.swap(false, Ordering::SeqCst)
+        {
+            fired.fetch_add(1, Ordering::SeqCst);
+            return Err(std::io::Error::other(
+                "simulated fsync failure — durability of writes since the last successful sync \
+                 is unknown",
+            ));
+        }
+        self.inner.sync()
+    }
+}
+
+/// One `CountUp` enqueued and noted, over `fault`, with the fault armed only
+/// afterwards: the next WAL operation of that kind is `run_due`'s own commit.
+fn run_due_over_a_wal_fault(
+    seed: u64,
+    fault: WalFault,
+    cfg: AppConfig,
+) -> (App, Dispatcher, Arc<AtomicU64>, std::io::Result<JobOutcome>) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let mut app = App::open(
+        Box::new(OneShotWalFaultDisk {
+            inner: sim.disk(),
+            fault,
+            armed: armed.clone(),
+            fired: fired.clone(),
+        }),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        cfg,
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp]);
+    let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+    let db = app.db_for_tests();
+    db.transact(|tx| {
+        tx.enqueue(CountUp { slot: 1 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    dispatcher.note_enqueued(db.drain_enqueued());
+    armed.store(true, Ordering::SeqCst);
+    let outcome = dispatcher.run_due(db, 0);
+    (app, dispatcher, fired, outcome)
+}
+
+/// I-2's ruled policy, append/sync arm: a WAL sync failure in `run_due`'s own
+/// commit leaves `applied == 0`, so the job's Done mark never reached the
+/// store. The poisoned engine REPORTS that failure; it does not make the
+/// record durable. So `run_due` answers `Err`, and the job is due again at
+/// its original place rather than lost from the heap while Pending in the
+/// store, or reported Done when nothing durable says it ran.
+#[test]
+fn run_due_restores_a_job_whose_done_mark_never_reached_the_store() {
+    let (mut app, dispatcher, fired, outcome) =
+        run_due_over_a_wal_fault(0x7A13_0001, WalFault::Sync, crash_config());
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the WAL sync must fail exactly once, on run_due's own commit"
+    );
+    let db = app.db_for_tests();
+    assert!(
+        db.poisoned() && !db.store_failed(),
+        "an append/sync failure poisons the engine and leaves the store alone, or this is not \
+         the arm under test"
+    );
+    let err = outcome.expect_err(
+        "the job's Done mark never reached the store (applied == 0), so run_due must not \
+         answer Ok: a poisoned engine reports the failure, it does not make the record durable",
+    );
+    assert!(err.to_string().contains("simulated fsync failure"), "{err}");
+    assert_eq!(
+        dispatcher.next_deadline(),
+        Some(0),
+        "the job must be due again at its original place (due_at 0): nothing durable says it \
+         ran, and a heap that dropped it leaves a Pending job no dispatch reaches until a restart"
+    );
+    let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
+    assert_eq!((row.status, row.attempts), (JobStatus::Pending, 0));
+}
+
+/// I-2's ruled policy, checkpoint arm, reached through the WAL rather than the
+/// store: the cadence checkpoint after `run_due`'s batch applied fails in the
+/// WAL's segment GC, which poisons the engine and latches nothing.
+/// `applied == n`, so the Done mark IS durable, and `Db::poisoned()` already
+/// reports the failure; `run_due` answers `Ok(Done)` and never puts a Done job
+/// back in the heap. `run_due_answers_ok_when_the_commit_failure_is_a_reported_
+/// elsewhere_checkpoint` covers the store-latch side of the same arm.
+#[test]
+fn run_due_answers_ok_when_only_the_wal_is_poisoned_after_the_batch_applied() {
+    let (mut app, dispatcher, fired, outcome) =
+        run_due_over_a_wal_fault(0x7A13_0002, WalFault::GcList, latch_config());
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the WAL list must fail exactly once, in run_due's own cadence checkpoint"
+    );
+    let db = app.db_for_tests();
+    assert!(
+        db.poisoned() && !db.store_failed(),
+        "a WAL GC failure poisons the engine and leaves the store unlatched, or this is not the \
+         arm under test"
+    );
+    let outcome = outcome.unwrap_or_else(|e| {
+        panic!(
+            "run_due must answer Ok for a job whose Done mark reached the store: the checkpoint \
+             failure ({e}) is already reported through Db::poisoned() — the engine's WAL poison, \
+             not a store latch"
+        )
+    });
+    assert!(
+        matches!(outcome, JobOutcome::Done { id: 0 }),
+        "got {outcome:?}"
+    );
+    assert!(
+        !dispatcher.has_due(u64::MAX),
+        "a Done job is back in the heap: the next run_due_into would find a row the heap calls \
+         Pending and the store calls Done"
+    );
+    let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
+    assert_eq!(row.status, JobStatus::Done, "durable in the store");
+}
+
+/// The cron arm's batch is bounded at `MAX_BATCH` ticks, as the job arm's
+/// is: with 65 schedules due at one instant, the first cron step commits
+/// exactly 64 and the 65th waits for a later step. A 65th staged into the
+/// same group would trip `Group::stage`'s own `MAX_BATCH` contract.
+#[test]
+fn a_cron_step_ticks_at_most_max_batch_schedules() {
+    use charpente_core::io::Clock;
+    let sim = Sim::with_faults(0x7A13_0004, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp]);
+    let due = charpente_core::db::MAX_BATCH as u64 + 1;
+    for i in 0..due {
+        let name: &'static str = Box::leak(format!("hourly-{i}").into_boxed_str());
+        app = app.schedule(name, Duration::from_secs(3600), || CountUp { slot: 0 });
+    }
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    sim.clock().sleep(Duration::from_nanos(HOUR));
+    let mut source = SimSource::new(Box::new(sim.clock()), 2 * HOUR);
+    assert!(matches!(kernel.step(&mut source).unwrap(), Step::Worked));
+    assert_eq!(
+        kernel.stats().cron_ticks,
+        due - 1,
+        "the first cron step commits exactly MAX_BATCH ticks of the {due} due"
+    );
+    for _ in 0..16 {
+        kernel.step(&mut source).unwrap();
+    }
+    assert_eq!(
+        kernel.stats().cron_ticks,
+        due,
+        "the 65th schedule ticks on a later step"
+    );
+}
+
+/// A catch-up tick counts one catch-up in the kernel's stats beside the tick
+/// itself: after downtime an operator reads that missed intervals were
+/// coalesced into one tick, never backfilled.
+#[test]
+fn a_catch_up_tick_counts_one_catch_up() {
+    use charpente_core::io::Clock;
+    let (sim, app) = cron_app(0x7A13_0005);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    sim.clock().sleep(Duration::from_nanos(5 * HOUR + 7));
+    let mut source = SimSource::new(Box::new(sim.clock()), 6 * HOUR);
+    assert!(matches!(kernel.step(&mut source).unwrap(), Step::Worked));
+    let stats = kernel.stats();
+    assert_eq!(
+        (stats.cron_ticks, stats.cron_catchups),
+        (1, 1),
+        "three missed intervals: one tick, counted as one catch-up"
+    );
+}
+
 #[test]
 fn loop_serves_requests_runs_jobs_and_ticks_cron() {
     let sim = Sim::with_faults(0x640, FaultConfig::none());

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use charpente::auth::Principal;
 use charpente::core::db::{
-    Job, JobShapeRefusal, Refusal, Schema, TableReadRefusal, TableWriteRefusal, TxError,
+    Enqueued, Job, JobShapeRefusal, Refusal, Schema, TableReadRefusal, TableWriteRefusal, TxError,
     outbound_fingerprint,
 };
 use charpente::core::io::{
@@ -1408,6 +1408,170 @@ fn a_late_reply_never_settles_the_retry() {
     assert_eq!(stats.outbound_settled, 0);
     assert_eq!(stats.outbound_late, 2);
     assert_eq!(stats.outbound_timed_out, 3);
+}
+
+/// The same timeline with the cancel left in: each timed-out call is
+/// cancelled at the edge, so its reply never comes back as a completion and
+/// nothing is discarded late. The kernel cancels what it timed out; it does
+/// not wait for the stale reply and throw it away.
+#[test]
+fn a_timed_out_call_is_cancelled_so_its_reply_never_comes_back() {
+    let lat = Duration::from_millis(1500);
+    let sim = Sim::with_faults(0x7A13_0011, faults(|c| c.outbound_latency = (lat, lat)));
+    sim.remote("pay.test", Recorder::new());
+    let (mut app, stats) = run_to(&sim, pay_app(&sim, Host::new("pay.test"), 1), 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!((rows[0].status, paid), (JobStatus::Dead, 0));
+    assert_eq!(stats.outbound_timed_out, 3);
+    assert_eq!(
+        stats.outbound_late, 0,
+        "a timed-out call's reply came back as a completion: the kernel never cancelled it"
+    );
+}
+
+/// Forwards everything but `next_wake`, which answers `Unknown`, as the
+/// production client always does.
+struct UnknownWake<O>(O);
+
+impl<O: Outbound> Outbound for UnknownWake<O> {
+    fn start(&self, token: u64, call: OutboundCall) -> std::io::Result<()> {
+        self.0.start(token, call)
+    }
+    fn poll(&self) -> Option<(u64, std::io::Result<OutboundReply>)> {
+        self.0.poll()
+    }
+    fn cancel(&self, token: u64) {
+        self.0.cancel(token)
+    }
+    fn next_wake(&self) -> OutboundWake {
+        OutboundWake::Unknown
+    }
+}
+
+/// Plan amendment A2's park: an `Outbound` that cannot name its next
+/// completion is polled one replication tick after now while a call is in
+/// flight, never parked until the call's 2s deadline.
+#[test]
+fn an_outbound_that_cannot_name_its_wake_is_polled_one_tick_later() {
+    let lat = Duration::from_millis(500);
+    let sim = Sim::with_faults(0x7A13_0012, faults(|c| c.outbound_latency = (lat, lat)));
+    sim.remote("pay.test", Recorder::new());
+    sim.clock().sleep(Duration::from_secs(1));
+    let app = pay_app(&sim, Host::new("pay.test"), 1);
+    let outbound = UnknownWake(sim.outbound(&app.outbound_hosts()).unwrap());
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    // Steps never park here, so virtual time stands still until the first Idle.
+    let deadline = (0..100)
+        .find_map(|_| match kernel.step(&mut source).unwrap() {
+            charpente::kernel::Step::Idle { deadline } => Some(deadline),
+            charpente::kernel::Step::Worked => None,
+        })
+        .expect("the kernel never went idle in 100 steps with one call out");
+    assert_eq!(kernel.outbound_in_flight_for_tests(), 1, "the call is out");
+    let now = sim.clock().now().as_nanos();
+    assert_eq!(
+        deadline.map(|d| d.as_nanos()),
+        Some(now + charpente::repl::REPL_TICK_NANOS),
+        "an in-flight call whose completion the Outbound cannot name is polled one replication \
+         tick after now"
+    );
+}
+
+/// Invariant 2, by name: a second enqueue notice for a job whose call is in
+/// flight never queues it again, since the next dispatch would call it a
+/// second time while the first call is still out.
+#[test]
+#[should_panic(
+    expected = "dispatcher invariant: job 0 queued while in flight (spec §4 invariant 2)"
+)]
+fn a_job_in_flight_is_never_queued_again() {
+    let sim = Sim::with_faults(0x7A13_0013, FaultConfig::none());
+    let mut app = gated_app(&sim, true, 1);
+    let mut d = dispatcher_for(&mut app, 64);
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let outcome = d.run_due_into(&mut group, 0).unwrap();
+    group.commit().map_err(|f| f.error).unwrap();
+    assert!(matches!(outcome, JobOutcome::Calling { id: 0, .. }));
+    assert_eq!(d.in_flight_len(), 1);
+    d.note_enqueued(vec![Enqueued {
+        id: charpente::Id::from_raw(0),
+        outbound: true,
+    }]);
+}
+
+#[charpente::table(global)]
+struct Receipt {
+    id: charpente::Id<Receipt>,
+    body: Vec<u8>,
+}
+
+/// Keeps the reply's body, as a `settle` that records the remote's receipt.
+#[job(
+    global,
+    outbound = "pay.test",
+    retry(max = 1, backoff = "1s"),
+    timeout = "2s"
+)]
+struct KeepReceipt {}
+
+impl KeepReceipt {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(Call::post("/receipt")))
+    }
+
+    fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        tx.put(&Receipt {
+            id: charpente::Id::from_raw(0),
+            body: reply.body().to_vec(),
+        });
+        Ok(())
+    }
+}
+
+/// `settle` reads the remote's reply body byte for byte through
+/// `Reply::body`: what the remote answered is what the job records.
+#[test]
+fn settle_reads_the_reply_body_the_remote_sent() {
+    let sim = Sim::with_faults(0x7A13_0014, FaultConfig::none());
+    let body = b"receipt 42: paid in full".to_vec();
+    let sent = body.clone();
+    sim.remote(
+        "pay.test",
+        from_fn(move |_c: &OutboundCall| OutboundReply {
+            status: 200,
+            headers: vec![],
+            body: sent.clone(),
+        }),
+    );
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Receipt>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![KeepReceipt])
+    .outbound(Host::new("pay.test"));
+    app.transact_for_tests(|tx| {
+        tx.enqueue(KeepReceipt {});
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let (mut app, stats) = run_to(&sim, app, 60 * SEC);
+    assert_eq!(stats.outbound_settled, 1);
+    let kept = app
+        .db_for_tests()
+        .snapshot()
+        .unwrap()
+        .scan::<Receipt>()
+        .unwrap();
+    assert_eq!(
+        kept.iter().map(|r| r.body.clone()).collect::<Vec<_>>(),
+        vec![body],
+        "settle must read exactly the bytes the remote answered"
+    );
 }
 
 /// Review Focus 1 / R6: a call that read a sibling's uncommitted write never

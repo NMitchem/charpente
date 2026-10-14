@@ -804,6 +804,14 @@ mod tests {
         );
     }
 
+    /// Only four labels that are ALL digits make an IPv4 literal: a DNS name
+    /// that happens to have four labels is a host like any other.
+    #[test]
+    fn a_four_label_dns_name_is_a_host() {
+        assert_eq!(host_name_problem("api.eu.pay.example"), None);
+        assert_eq!(Host::new("api.eu.pay.example").name(), "api.eu.pay.example");
+    }
+
     #[test]
     #[should_panic(
         expected = "contract: Host::max_reply_bytes(9437184) exceeds the 8388608-byte bound"
