@@ -9,8 +9,8 @@ error[E0277]: `JobRow` rows are the platform's, and app code cannot write them
 46 | |         name: "CloseIncident".into(),
 47 | |         payload,
 ...  |
-54 | |         scope: Some(13),
-55 | |     });
+55 | |         outbound_key: None,
+56 | |     });
    | |_____^ `JobRow` is written only by the platform
    |
    = help: the trait `AppWritable<JobRow>` is not implemented for `charpente::charpente_core::table::PlatformOwned`

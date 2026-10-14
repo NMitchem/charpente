@@ -651,7 +651,7 @@ impl Kernel {
                 // gives by a different argument — this is NOT a repeat of
                 // that reasoning and is written down so the next reader
                 // does not assume it is.
-                let mut group = self.app.db_mut().begin_group()?;
+                let mut group = self.app.begin_job_group()?;
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {
                     while self.dispatcher.has_due(now) && drained < MAX_BATCH {
@@ -723,7 +723,7 @@ impl Kernel {
                 // asymmetry someone "cleans up" later not knowing it was
                 // deliberate — do not measure this arm and report a
                 // disappointing number as a regression.
-                let mut group = self.app.db_mut().begin_group()?;
+                let mut group = self.app.begin_job_group()?;
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {
                     while self.cron.has_due(now) && drained < MAX_BATCH {

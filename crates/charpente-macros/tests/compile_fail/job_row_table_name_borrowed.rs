@@ -82,6 +82,7 @@ fn forged(id: u64) -> JobRow {
         last_error: None,
         shape: None,
         scope: Some(13),
+        outbound_key: None,
     }
 }
 

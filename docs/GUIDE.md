@@ -1795,7 +1795,7 @@ opening, a completed switchover), and `promote` checks before it changes anythin
 
 <!-- pinned -->
 ```text
-<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore whichever of <job>'s fields, its `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give the new shape its own #[job] type under a new name (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore whichever of <job>'s fields, its `global`/`scoped_by` declaration, its `outbound` declaration or its tenant type's `NAME` changed, and give the new shape its own #[job] type under a new name (GUIDE §6)
 ```
 
 A job's tenancy is part of its shape. A `scoped_by` job's fingerprint continues its

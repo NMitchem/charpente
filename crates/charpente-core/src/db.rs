@@ -16,20 +16,25 @@
 //! `0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
 //! scoped enqueue, for a `#[job(scoped_by = …)]` job (job-tenancy spec §6),
 //! `0x0b [event][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
-//! scoped emit, an event emitted on a `ScopedTx` (tenancy-completion spec §6)
-//! — strings and byte fields length-prefixed per the `Codec` layout; `0x0c` is
+//! scoped emit, an event emitted on a `ScopedTx` (tenancy-completion spec §6),
+//! `0x0c [job][payload][key: Option<String>][shape: u64 le][okey: 16 bytes]`
+//! outbound enqueue, and `0x0d` the same with `[scope: u64 le]` before `okey`
+//! — a job declared `outbound`, its idempotency key minted at staging
+//! (outbound-effects spec §6),
+//! — strings and byte fields length-prefixed per the `Codec` layout; `0x0e` is
 //! the next free tag. `0x02`/`0x03` (the same without the shape) still
 //! decode, with the shape unknown, and are never written — `TxEffects` holds
 //! a bare shape, so a shapeless enqueue or emit cannot be represented.
-//! `0x05`/`0x06`/`0x07`, `0x0a` and `0x0b` are the ONLY tags that carry a
-//! scope. A table effect's is chosen by the table's own `Row::Scope`, not by
-//! the scope value (tenant 0 is a legal tenant, so a scoped table's records
-//! always use `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at
-//! scope 0). A scoped enqueue is `0x0a` rather than a widened `0x08` for the
-//! same reason, chosen by the job's own `Job::Scope` through the enqueue
-//! family; a scoped emit is `0x0b` rather than a widened `0x09`, chosen by the
-//! `ScopedTx` it was emitted on. The same presence-not-value rule applies to
-//! both: an enqueue or emit carrying `Some(0)` is `0x0a` or `0x0b`. An emit's
+//! `0x05`/`0x06`/`0x07`, `0x0a`, `0x0b` and `0x0d` are the ONLY tags that
+//! carry a scope. A table effect's is chosen by the table's own
+//! `Row::Scope`, not by the scope value (tenant 0 is a legal tenant, so a
+//! scoped table's records always use `0x05`/`0x06`/`0x07`, never
+//! `0x00`/`0x01`/`0x04`, even at scope 0). A scoped enqueue is `0x0a`
+//! rather than a widened `0x08` for the same reason, chosen by the job's own
+//! `Job::Scope` through the enqueue family; a scoped emit is `0x0b` rather
+//! than a widened `0x09`, chosen by the `ScopedTx` it was emitted on. The
+//! same presence-not-value rule applies to both: an enqueue or emit carrying
+//! `Some(0)` is `0x0a` or `0x0b`. An emit's
 //! tenant is never folded into its key, which stays the app's own filter.
 //! A binary that does not know a tag refuses it by name (`decode_record`'s
 //! unknown-tag error) rather than misreading a wider record. `0x07` is a
@@ -40,8 +45,9 @@
 //! Table effects are the transaction's collapsed overlay in (table, scope,
 //! id) order: intermediate overwrites inside a transaction are invisible to
 //! every observer and are not logged. Enqueues and emits keep call order.
-//! The enqueue key is the job's idempotency identity to the world outside
-//! the log — carried, never interpreted inside the deterministic boundary.
+//! The enqueue key is the app's own identity for the job — carried, never
+//! interpreted inside the deterministic boundary. An outbound job's
+//! idempotency key is the minted `okey`, not this.
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,7 +56,7 @@ use std::io;
 
 use crate::engine::{Engine, StateMachine, SubmitFailure};
 use crate::event::EventRow;
-use crate::io::{Disk, File};
+use crate::io::{Disk, Entropy, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
@@ -120,6 +126,11 @@ pub trait Job: Codec {
     /// because `push_enqueue` compares it by `TypeId`.
     type Scope: 'static;
     const RETRY: crate::job::RetryPolicy = crate::job::RetryPolicy::DEFAULT;
+    /// `#[job(…, outbound = "<host>")]` (outbound-effects spec §5): its
+    /// enqueue mints an idempotency key from the staging node's `Entropy` and
+    /// records tag `0x0c`/`0x0d`, and dispatch runs `call`/`settle` rather
+    /// than `run`. `#[job]` folds it into `FINGERPRINT` (`outbound_fingerprint`).
+    const OUTBOUND: bool = false;
 }
 
 /// A realtime event (DESIGN.md §6). Emits materialize into `charpente.events`
@@ -701,16 +712,18 @@ enum Effect {
         id: u64,
     },
     // `shape`: `None` for the pre-shape tags `0x02`/`0x03`, `Some` for
-    // `0x08`/`0x09`/`0x0a`/`0x0b` — the wire presence, like `scope` above.
-    // `None` is foreign to every check downstream (payload-shapes spec §2).
-    // `scope`: `Some` exactly for `0x0a`, the scoped enqueue (job-tenancy
-    // spec §6).
+    // `0x08`/`0x09`/`0x0a`/`0x0b`/`0x0c`/`0x0d` — the wire presence, like
+    // `scope` above. `None` is foreign to every check downstream
+    // (payload-shapes spec §2). `scope`: `Some` exactly for `0x0a` and
+    // `0x0d`, the scoped enqueues (job-tenancy spec §6).
     Enqueue {
         job: String,
         payload: Vec<u8>,
         key: Option<String>,
         shape: Option<u64>,
         scope: Option<u64>,
+        // `Some` exactly for `0x0c`/`0x0d`.
+        outbound_key: Option<[u8; 16]>,
     },
     // `scope`: `Some` exactly for `0x0b`, the scoped emit (tenancy-completion
     // spec §6) — presence, not value, as for `Enqueue` above.
@@ -763,6 +776,11 @@ struct Enqueue {
     key: Option<String>,
     shape: u64,
     scope: Option<EnqueuedTenant>,
+    /// `J::OUTBOUND`, set by `push_enqueue`.
+    outbound: bool,
+    /// The idempotency key, drawn by `Group::stage` just before the record is
+    /// encoded. `Some` exactly when `outbound`; `encode_record` asserts it.
+    okey: Option<[u8; 16]>,
 }
 
 /// The tenant a scoped job was enqueued in: the id the record carries, and
@@ -892,15 +910,32 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         key,
         shape,
         scope,
+        outbound,
+        okey,
     } in &effects.enqueues
     {
-        out.push(if scope.is_some() { 10 } else { 8 });
+        assert_eq!(
+            okey.is_some(),
+            *outbound,
+            "record encode: job \"{job}\" reached encode with outbound={outbound} and a key \
+             {} — Group::stage mints every outbound enqueue's key before encoding",
+            if okey.is_some() { "present" } else { "absent" }
+        );
+        out.push(match (scope.is_some(), okey.is_some()) {
+            (false, false) => 8,
+            (true, false) => 10,
+            (false, true) => 12,
+            (true, true) => 13,
+        });
         encode_bytes(job.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
         shape.encode(&mut out);
         if let Some(tenant) = scope {
             tenant.id.encode(&mut out);
+        }
+        if let Some(okey) = okey {
+            out.extend_from_slice(okey);
         }
     }
     for Emit {
@@ -961,6 +996,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 key: Option::<String>::decode(input)?,
                 shape: None,
                 scope: None,
+                outbound_key: None,
             },
             3 => Effect::Emit {
                 event: String::decode(input)?,
@@ -997,6 +1033,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
                 scope: None,
+                outbound_key: None,
             },
             9 => Effect::Emit {
                 event: String::decode(input)?,
@@ -1011,6 +1048,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
                 scope: Some(u64::decode(input)?),
+                outbound_key: None,
             },
             11 => Effect::Emit {
                 event: String::decode(input)?,
@@ -1018,6 +1056,22 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
                 scope: Some(u64::decode(input)?),
+            },
+            12 => Effect::Enqueue {
+                job: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
+                scope: None,
+                outbound_key: Some(decode_outbound_key(input)?),
+            },
+            13 => Effect::Enqueue {
+                job: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
+                scope: Some(u64::decode(input)?),
+                outbound_key: Some(decode_outbound_key(input)?),
             },
             other => {
                 return Err(io::Error::new(
@@ -1041,6 +1095,17 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
         ));
     }
     Ok(effects)
+}
+
+fn decode_outbound_key(input: &mut &[u8]) -> io::Result<[u8; 16]> {
+    let Some((key, rest)) = input.split_first_chunk::<16>() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record decode: an outbound enqueue (0x0c/0x0d) ends before its 16-byte idempotency key",
+        ));
+    };
+    *input = rest;
+    Ok(*key)
 }
 
 // ---------------------------------------------------------------- tx
@@ -1441,6 +1506,8 @@ impl<'a> Tx<'a> {
                 scope_type: TypeId::of::<J::Scope>(),
                 scope_name: name,
             }),
+            outbound: J::OUTBOUND,
+            okey: None,
         });
     }
 
@@ -1452,8 +1519,9 @@ impl<'a> Tx<'a> {
         self.push_enqueue(None, None, job);
     }
 
-    /// Enqueues with an idempotency key: the job's stable identity to the world
-    /// OUTSIDE the log (consumed by M1's external-IO surface). Inside the
+    /// Enqueues with a key: the app's own identity for the job, carried on
+    /// its row and never deduped on. Not the outbound idempotency key: that
+    /// one the platform mints (outbound-effects spec §6). Inside the
     /// deterministic boundary the key means nothing — exactly-once state effects
     /// are structural, so the platform neither indexes nor dedupes on it.
     pub fn enqueue_keyed<J: UnscopedJob>(&mut self, key: impl Into<String>, job: J) {
@@ -1964,16 +2032,31 @@ pub trait Tenant: Sized + 'static {
 /// over `Tenant::NAME`, which macro expansion cannot read. No identifier begins
 /// with `#`, so no field list can produce the suffix.
 pub const fn scoped_fingerprint(fold: u64, tenant: &str) -> u64 {
-    const fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
-        let mut i = 0;
-        while i < bytes.len() {
-            hash ^= bytes[i] as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-            i += 1;
-        }
-        hash
+    fnv_continue(
+        fnv_continue(fnv_continue(fold, b"#scoped_by\0"), tenant.as_bytes()),
+        b"\0",
+    )
+}
+
+/// FNV-1a continued over `bytes` — the one mixer both fingerprint folds use.
+const fn fnv_continue(mut hash: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        i += 1;
     }
-    mix(mix(mix(fold, b"#scoped_by\0"), tenant.as_bytes()), b"\0")
+    hash
+}
+
+/// An outbound job's fingerprint (outbound-effects spec R8): its fingerprint
+/// as a pure job, continued over `#outbound\0`. Declaring or removing
+/// `outbound` is therefore a shape change, refused while Pending jobs of the
+/// old shape exist, by the existing refusal and with its existing fix. The
+/// host is not folded in: a minted key is host-agnostic. No identifier begins
+/// with `#`, so no field list can produce the suffix.
+pub const fn outbound_fingerprint(fingerprint: u64) -> u64 {
+    fnv_continue(fingerprint, b"#outbound\0")
 }
 
 /// The scoped emit and subscribe sites' check (tenancy-completion spec §6):
@@ -2469,6 +2552,16 @@ fn merge_overlay_all_scopes<R: Row>(
 
 // ---------------------------------------------------------------- machine
 
+/// One job materialized since the last `Db::drain_enqueued`. `outbound` is
+/// read from the record's tag at apply, so the kernel routes the job without
+/// a store read (plan amendment A8: a read would draw sim fault rolls and
+/// re-roll every universe).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Enqueued {
+    pub id: Id<JobRow>,
+    pub outbound: bool,
+}
+
 /// The state machine the engine drives: decodes effect records and applies
 /// them to the store through the schema's vtables. Records at or below the
 /// store's `applied_seq`-at-open are skipped during recovery replay.
@@ -2476,9 +2569,9 @@ struct TableMachine {
     store: Store,
     schema: Schema,
     skip_through: Option<u64>,
-    /// Ids of jobs materialized since the last `Db::drain_enqueued` — the
+    /// Jobs materialized since the last `Db::drain_enqueued` — the
     /// kernel's incremental feed for its due-heap.
-    enqueued: Vec<u64>,
+    enqueued: Vec<Enqueued>,
     /// Per-table persisted schema state as of replay progress: seeded
     /// from the checkpointed store at open, updated whenever a
     /// `charpente.schema_versions` put applies. Consulted before any row
@@ -2663,14 +2756,20 @@ impl StateMachine for TableMachine {
                         key,
                         shape,
                         scope,
+                        outbound_key,
                     } => {
-                        new_ids.push(w.materialize_job(
+                        let id = w.materialize_job(
                             job,
                             payload,
                             key.as_deref(),
                             *shape,
                             *scope,
-                        )?);
+                            *outbound_key,
+                        )?;
+                        new_ids.push(Enqueued {
+                            id: Id::from_raw(id),
+                            outbound: outbound_key.is_some(),
+                        });
                     }
                     Effect::Emit {
                         event,
@@ -3508,8 +3607,19 @@ impl Db {
             overlay: GroupOverlay::new(),
             records: Vec::new(),
             staged_adoptions: BTreeSet::new(),
+            mint: None,
             db: self,
         })
+    }
+
+    /// `begin_group` for the App's staging paths (plan amendment A9): what
+    /// they stage can enqueue an outbound job, whose idempotency key is drawn
+    /// from `mint` when it is staged — never at apply, which must stay a pure
+    /// function of the record (outbound-effects spec §6).
+    pub fn begin_group_minting<'g>(&'g mut self, mint: &'g dyn Entropy) -> io::Result<Group<'g>> {
+        let mut group = self.begin_group()?;
+        group.mint = Some(mint);
+        Ok(group)
     }
 
     /// A consistent read-only view for queries outside transactions.
@@ -3553,16 +3663,11 @@ impl Db {
         self.snapshot()?.seed_frontier()
     }
 
-    /// Ids of jobs materialized by transactions since the last drain — the
+    /// Jobs materialized by transactions since the last drain — the
     /// kernel's incremental feed for its due-heap. Recovery replay does not
     /// appear here; the dispatcher rebuilds from a Pending scan at open.
-    pub fn drain_enqueued(&mut self) -> Vec<Id<JobRow>> {
-        self.engine
-            .machine_mut()
-            .enqueued
-            .drain(..)
-            .map(Id::from_raw)
-            .collect()
+    pub fn drain_enqueued(&mut self) -> Vec<Enqueued> {
+        std::mem::take(&mut self.engine.machine_mut().enqueued)
     }
 
     /// Durably persists the store, bounding recovery replay at this seq,
@@ -3836,8 +3941,9 @@ impl Db {
                      of {name} (recorded {}; this binary {:#x}) — this binary will not decode \
                      them; run the binary that enqueued them until they are Done or Dead, then \
                      deploy this one, or restore whichever of {name}'s fields, its \
-                     `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and \
-                     give the new shape its own #[job] type under a new name (GUIDE §6)",
+                     `global`/`scoped_by` declaration, its `outbound` declaration or its tenant \
+                     type's `NAME` changed, and give the new shape its own #[job] type under a \
+                     new name (GUIDE §6)",
                     ids.len(),
                     listed(&ids),
                     recorded.join(", "),
@@ -4362,6 +4468,10 @@ pub struct Group<'a> {
     overlay: GroupOverlay,
     records: Vec<Vec<u8>>,
     staged_adoptions: BTreeSet<String>,
+    /// Where `stage` draws an outbound enqueue's idempotency key; `None` for
+    /// `Db::begin_group`, whose `stage` panics on one by name (a contract
+    /// violation: the caller must use a minting group).
+    mint: Option<&'a dyn Entropy>,
     db: &'a mut Db,
 }
 
@@ -4410,6 +4520,10 @@ impl<'a> Group<'a> {
     /// `Schema` disagrees with about its table (`TableWriteRefusal`): a name
     /// it does not register, the other scope shape, or a put or delete
     /// through a Rust type that is not the registered one.
+    ///
+    /// An outbound enqueue (`Job::OUTBOUND`) draws its 16-byte idempotency
+    /// key from the group's `Entropy` here, after those refusals; a group
+    /// from `Db::begin_group`, which has none, panics on one by name.
     pub fn stage<T, E>(
         &mut self,
         f: impl FnOnce(&mut Tx) -> Result<T, E>,
@@ -4674,6 +4788,23 @@ impl<'a> Group<'a> {
                 .entry(crate::migration::SchemaVersion::TABLE)
                 .or_default()
                 .insert((UNSCOPED, vid.raw()), Some(bytes));
+        }
+        // Outbound-effects spec §6: minted at staging, and only for an
+        // outbound enqueue, so a group that stages none draws nothing (§4
+        // invariant 6) and every existing universe keeps its entropy stream.
+        for enqueue in effects.enqueues.iter_mut().filter(|e| e.outbound) {
+            let mint = self.mint.unwrap_or_else(|| {
+                panic!(
+                    "contract: job \"{}\" is outbound, so its enqueue needs an idempotency key \
+                     drawn from the node's Entropy, and this group has none — Db::transact and \
+                     Db::begin_group cannot mint; enqueue it from a route, a job or cron (the \
+                     App's groups mint), or in a test through App::transact_for_tests",
+                    enqueue.job
+                )
+            });
+            let mut okey = [0u8; 16];
+            mint.fill(&mut okey);
+            enqueue.okey = Some(okey);
         }
         let record = encode_record(&effects);
         assert!(
@@ -4977,6 +5108,27 @@ mod tests {
         assert_eq!(IN_A_CONST, 0xaac8_d6b2_01d1_f744);
     }
 
+    /// Outbound-effects Task 5 hoisted `scoped_fingerprint`'s FNV mixer into
+    /// `fnv_continue`. The literal was computed by the pre-hoist code, so a
+    /// hoist that changed one byte of the fold is a red test.
+    #[test]
+    fn scoped_fingerprint_is_unchanged_by_the_fnv_hoist() {
+        assert_eq!(scoped_fingerprint(0x1234, "Org"), 0xc329_3676_be67_d773);
+    }
+
+    /// R8: an outbound job's fingerprint is its pure fold continued over
+    /// `#outbound\0` — one FNV-1a pass over the concatenation, as for
+    /// `scoped_fingerprint`.
+    #[test]
+    fn an_outbound_fingerprint_continues_the_fold_over_its_suffix() {
+        let fold = crate::migration::fnv1a_hash(b"n\0u64\0");
+        assert_eq!(
+            outbound_fingerprint(fold),
+            crate::migration::fnv1a_hash(b"n\0u64\0#outbound\0")
+        );
+        assert_ne!(outbound_fingerprint(fold), fold);
+    }
+
     /// An `io::Error` carrying a refusal prints, under `Debug`, exactly what
     /// one carrying the bare text does — `main`'s `Error: …` line for a
     /// binary that returns one (GUIDE §10's `run_backup`) shows the text, not
@@ -5246,6 +5398,8 @@ mod tests {
             key: None,
             shape: 0x5E4D,
             scope: None,
+            outbound: false,
+            okey: None,
         });
         effects.emits.push(Emit {
             event: "invoice_finalized",
@@ -5283,7 +5437,8 @@ mod tests {
                     payload: vec![10, 0],
                     key: None,
                     shape: Some(0x5E4D),
-                    scope: None
+                    scope: None,
+                    outbound_key: None,
                 },
                 Effect::Emit {
                     event: "invoice_finalized".into(),
@@ -5383,6 +5538,8 @@ mod tests {
             key: Some("receipt:10".to_string()),
             shape: 0x5E4D,
             scope: None,
+            outbound: false,
+            okey: None,
         });
         effects.enqueues.push(Enqueue {
             job: "ping",
@@ -5390,6 +5547,8 @@ mod tests {
             key: None,
             shape: 0x9196,
             scope: None,
+            outbound: false,
+            okey: None,
         });
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
@@ -5400,14 +5559,16 @@ mod tests {
                     payload: vec![1],
                     key: Some("receipt:10".into()),
                     shape: Some(0x5E4D),
-                    scope: None
+                    scope: None,
+                    outbound_key: None,
                 },
                 Effect::Enqueue {
                     job: "ping".into(),
                     payload: vec![2],
                     key: None,
                     shape: Some(0x9196),
-                    scope: None
+                    scope: None,
+                    outbound_key: None,
                 },
             ]
         );
@@ -5434,7 +5595,8 @@ mod tests {
                     payload: vec![7],
                     key: None,
                     shape: None,
-                    scope: None
+                    scope: None,
+                    outbound_key: None,
                 },
                 Effect::Emit {
                     event: "pong".into(),
@@ -5458,6 +5620,8 @@ mod tests {
             key: None,
             shape: 0x0102_0304_0506_0708,
             scope: None,
+            outbound: false,
+            okey: None,
         });
         effects.emits.push(Emit {
             event: "pong",
@@ -5484,7 +5648,8 @@ mod tests {
                     payload: vec![7],
                     key: None,
                     shape: Some(0x0102_0304_0506_0708),
-                    scope: None
+                    scope: None,
+                    outbound_key: None,
                 },
                 Effect::Emit {
                     event: "pong".into(),
@@ -5517,6 +5682,8 @@ mod tests {
                 scope_type: TypeId::of::<u8>(),
                 scope_name: "u8",
             }),
+            outbound: false,
+            okey: None,
         });
         effects.enqueues.push(Enqueue {
             job: "ping",
@@ -5524,6 +5691,8 @@ mod tests {
             key: None,
             shape: 0x0102_0304_0506_0708,
             scope: None,
+            outbound: false,
+            okey: None,
         });
         assert_eq!(
             encode_record(&effects),
@@ -5545,6 +5714,7 @@ mod tests {
                     key: None,
                     shape: Some(0x0102_0304_0506_0708),
                     scope: Some(0),
+                    outbound_key: None,
                 },
                 Effect::Enqueue {
                     job: "ping".into(),
@@ -5552,6 +5722,7 @@ mod tests {
                     key: None,
                     shape: Some(0x0102_0304_0506_0708),
                     scope: None,
+                    outbound_key: None,
                 },
             ]
         );
@@ -5791,14 +5962,94 @@ mod tests {
         assert!(Refusal::of(&err).is_some(), "{err}");
     }
 
-    /// `0x0c`, the next free tag: `0x0b` is the scoped emit.
+    /// `0x0e`, the next free tag: `0x0d` is the scoped outbound enqueue.
     #[test]
     fn decode_refuses_unknown_tags() {
         let mut out = Vec::new();
         1u32.encode(&mut out);
-        out.push(12);
+        out.push(14);
         let err = decode_record(&out).unwrap_err();
-        assert!(err.to_string().contains("unknown effect tag 12"), "{err}");
+        assert!(err.to_string().contains("unknown effect tag 14"), "{err}");
+    }
+
+    /// Outbound-effects spec §6: `0x0c` is `0x08` plus the 16 key bytes, and
+    /// `0x0d` is `0x0a` plus them. Byte-pinned, so a reordered field is a red test.
+    #[test]
+    fn outbound_enqueues_record_tags_0x0c_and_0x0d_with_their_key() {
+        let mut effects = TxEffects::default();
+        effects.enqueues.push(Enqueue {
+            job: "Charge",
+            payload: vec![0xAB],
+            key: None,
+            shape: 0x1122_3344_5566_7788,
+            scope: None,
+            outbound: true,
+            okey: Some([7; 16]),
+        });
+        effects.enqueues.push(Enqueue {
+            job: "Charge",
+            payload: vec![],
+            key: Some("k".into()),
+            shape: 1,
+            scope: Some(EnqueuedTenant {
+                id: 9,
+                scope_type: TypeId::of::<()>(),
+                scope_name: "Org",
+            }),
+            outbound: true,
+            okey: Some([0xEE; 16]),
+        });
+        let bytes = encode_record(&effects);
+        let mut expected = Vec::new();
+        2u32.encode(&mut expected);
+        expected.push(0x0c);
+        encode_bytes(b"Charge", &mut expected);
+        encode_bytes(&[0xAB], &mut expected);
+        Option::<String>::None.encode(&mut expected);
+        0x1122_3344_5566_7788u64.encode(&mut expected);
+        expected.extend_from_slice(&[7; 16]);
+        expected.push(0x0d);
+        encode_bytes(b"Charge", &mut expected);
+        encode_bytes(&[], &mut expected);
+        Some("k".to_string()).encode(&mut expected);
+        1u64.encode(&mut expected);
+        9u64.encode(&mut expected);
+        expected.extend_from_slice(&[0xEE; 16]);
+        assert_eq!(bytes, expected);
+
+        let decoded = decode_record(&bytes).unwrap();
+        let keys: Vec<_> = decoded
+            .iter()
+            .map(|e| match e {
+                Effect::Enqueue {
+                    scope,
+                    outbound_key,
+                    ..
+                } => (*scope, *outbound_key),
+                _ => panic!("only enqueues were encoded"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(None, Some([7; 16])), (Some(9), Some([0xEE; 16]))]
+        );
+    }
+
+    #[test]
+    fn a_truncated_outbound_key_is_refused_by_name() {
+        let mut out = Vec::new();
+        1u32.encode(&mut out);
+        out.push(0x0c);
+        encode_bytes(b"Charge", &mut out);
+        encode_bytes(&[], &mut out);
+        Option::<String>::None.encode(&mut out);
+        1u64.encode(&mut out);
+        out.extend_from_slice(&[1; 15]);
+        let err = decode_record(&out).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "record decode: an outbound enqueue (0x0c/0x0d) ends before its 16-byte idempotency key"
+        );
     }
 
     #[test]

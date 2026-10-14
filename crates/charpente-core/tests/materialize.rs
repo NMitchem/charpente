@@ -33,6 +33,32 @@ impl Job for Ping {
     type Scope = Unscoped;
 }
 
+/// Counts draws and hands out 0x01, 0x02, … so a test can name the bytes.
+struct CountingEntropy(std::cell::Cell<u8>);
+// `Entropy: Send`; a Cell is Send, and this test never crosses threads.
+impl charpente_core::io::Entropy for CountingEntropy {
+    fn fill(&self, buf: &mut [u8]) {
+        for b in buf {
+            self.0.set(self.0.get() + 1);
+            *b = self.0.get();
+        }
+    }
+}
+
+struct Charge;
+impl Codec for Charge {
+    fn encode(&self, _out: &mut Vec<u8>) {}
+    fn decode(_input: &mut &[u8]) -> io::Result<Charge> {
+        Ok(Charge)
+    }
+}
+impl Job for Charge {
+    const NAME: &'static str = "charge";
+    const FINGERPRINT: u64 = charpente_core::db::outbound_fingerprint(0x7E57_000C);
+    type Scope = Unscoped;
+    const OUTBOUND: bool = true;
+}
+
 struct TestEvent {
     n: u32,
 }
@@ -102,7 +128,7 @@ fn enqueues_materialize_job_rows_with_counter_ids() {
     .unwrap();
     let drained = db.drain_enqueued();
     assert_eq!(
-        drained.iter().map(|id| id.raw()).collect::<Vec<_>>(),
+        drained.iter().map(|e| e.id.raw()).collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert!(db.drain_enqueued().is_empty(), "drain drains");
@@ -123,7 +149,87 @@ fn enqueues_materialize_job_rows_with_counter_ids() {
         Ok::<(), io::Error>(())
     })
     .unwrap();
-    assert_eq!(db.drain_enqueued()[0].raw(), 2);
+    assert_eq!(db.drain_enqueued()[0].id.raw(), 2);
+}
+
+#[test]
+fn a_minting_group_draws_16_bytes_per_outbound_enqueue_and_none_otherwise() {
+    let sim = Sim::with_faults(0x601, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mint = CountingEntropy(std::cell::Cell::new(0));
+    let mut group = db.begin_group_minting(&mint).unwrap();
+    group
+        .stage(|tx: &mut Tx| {
+            tx.enqueue(Ping);
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    assert_eq!(
+        mint.0.get(),
+        0,
+        "a pure enqueue draws nothing (spec §4 invariant 6)"
+    );
+    group
+        .stage(|tx: &mut Tx| {
+            tx.enqueue(Charge);
+            tx.enqueue(Charge);
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    group.commit().map_err(|f| f.error).unwrap();
+    assert_eq!(mint.0.get(), 32, "16 bytes per outbound enqueue");
+
+    let drained = db.drain_enqueued();
+    assert_eq!(
+        drained
+            .iter()
+            .map(|e| (e.id.raw(), e.outbound))
+            .collect::<Vec<_>>(),
+        vec![(0, false), (1, true), (2, true)]
+    );
+    let jobs = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    let first: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
+    let second: [u8; 16] = std::array::from_fn(|i| i as u8 + 17);
+    assert_eq!(jobs[0].outbound_key, None);
+    assert_eq!(jobs[1].outbound_key, Some(first));
+    assert_eq!(jobs[2].outbound_key, Some(second));
+}
+
+#[test]
+#[should_panic(expected = "Db::transact and Db::begin_group cannot mint")]
+fn a_non_minting_transaction_refuses_an_outbound_enqueue() {
+    let sim = Sim::with_faults(0x602, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let _ = db.transact(|tx: &mut Tx| {
+        tx.enqueue(Charge);
+        Ok::<(), io::Error>(())
+    });
+}
+
+#[test]
+fn an_outbound_key_survives_reopen() {
+    let sim = Sim::with_faults(0x603, FaultConfig::none());
+    let mint = CountingEntropy(std::cell::Cell::new(0x40));
+    {
+        let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+        let mut group = db.begin_group_minting(&mint).unwrap();
+        group
+            .stage(|tx: &mut Tx| {
+                tx.enqueue(Charge);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        group.commit().map_err(|f| f.error).unwrap();
+    }
+    sim.restart();
+    let db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let jobs = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    let expected: [u8; 16] = std::array::from_fn(|i| 0x41 + i as u8);
+    assert_eq!(
+        jobs[0].outbound_key,
+        Some(expected),
+        "replay is a pure function of the record"
+    );
 }
 
 #[test]

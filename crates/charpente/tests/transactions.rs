@@ -3887,7 +3887,7 @@ fn seed_rebuilds_a_byte_identical_store() {
         .pop()
         .expect("the fresh commit enqueued exactly one job");
     assert_eq!(
-        new_job.raw(),
+        new_job.id.raw(),
         next_job_id,
         "job ids must continue from the exported counter, not collide with a seeded job's"
     );

@@ -636,7 +636,10 @@ carries the tenant as a trailing `scope`, absent for every other row. The
 scoped emit is a new tag rather than a widened `0x09` for the same reason,
 chosen by presence and never by the tenant's value, so tenant 0 is `0x0b` too
 and a global emit stays `0x09` byte for byte; its `EventRow` carries the
-tenant as a trailing `scope`, absent for every other row. `0x0c` is the next
+tenant as a trailing `scope`, absent for every other row. `0x0c`/`0x0d` are the
+outbound enqueues: `0x08`/`0x0a` plus a 16-byte idempotency key the staging node drew
+from its `Entropy` (outbound-effects spec §6). An older binary refuses them by name as
+unknown tags, so downgrading after an outbound enqueue is unsupported. `0x0e` is the next
 free tag. A binary that does not know a tag (older, or a later
 one it hasn't caught up to) refuses it by name rather than misreading a
 wider record.
@@ -644,9 +647,9 @@ Table effects are the transaction's collapsed write set in (table, scope,
 id) order — intermediate overwrites inside a transaction are observable by
 no one and are not logged; enqueues and emits keep call order. Replay
 resolves table names through the `Schema` registry passed to `Db::open`. The
-enqueue key is the job's stable external identity — carried, never
-interpreted inside the deterministic boundary in v0; M1's external-IO
-surface is what consumes it.
+enqueue key is the app's own identity for the job — carried on its row, never
+interpreted or deduped on inside the deterministic boundary. It is not the outbound
+idempotency key, which the platform mints (`0x0c`/`0x0d` above).
 
 **Group commit (M2 sub-project 2, 2026-08-15).** The commit point is a *group*, not a
 transaction. `Db::begin_group` opens one store snapshot and an empty group overlay;

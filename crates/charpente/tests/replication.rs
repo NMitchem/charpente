@@ -3417,18 +3417,19 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
 /// Task 1's dangling World-A obligation, discharged (tenant-scoping Task 6b,
 /// Step 4): "a follower on an older binary refuses [a wider record] by
 /// name." No genuinely older binary runs in-process, so the oracle is a
-/// follower fed a tag THIS binary does not know either — tag 12 (`0x0c`),
-/// one past event tenancy's `0x0b` (scoped emit). This test's own doc
-/// comment predicted exactly this collision when it was written against tag
-/// 7 (Task 6b): "so this stays true whichever tag a later task (6c or
-/// beyond) claims next" — tag 12 is simply one past the highest tag any
+/// follower fed a tag THIS binary does not know either — tag 14 (`0x0e`),
+/// one past outbound effects' `0x0d` (scoped outbound enqueue). This test's
+/// own doc comment predicted exactly this collision when it was written
+/// against tag 7 (Task 6b): "so this stays true whichever tag a later task (6c or
+/// beyond) claims next" — tag 14 is simply one past the highest tag any
 /// mounted feature claims today (job tenancy's `0x0a` moved the fixture from
-/// 10 to 11, and event tenancy's `0x0b` from 11 to 12, DESIGN §4). Proves the
+/// 10 to 11, event tenancy's `0x0b` from 11 to 12, and outbound effects'
+/// `0x0c`/`0x0d` from 12 to 14, DESIGN §4). Proves the
 /// unknown-tag refusal is wired through the REAL `apply_shipped` path, not
 /// just `decode_record`'s own unit test (`db::tests::decode_refuses_unknown_
 /// tags`) — and, like the sibling test above, that it refuses the WHOLE
 /// batch: two good records ship in the same `Frames` batch ahead of the
-/// tag-12 one, and neither must land.
+/// tag-14 one, and neither must land.
 #[test]
 fn a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name() {
     let sim = Sim::with_faults(0x6B00_0004, FaultConfig::none());
@@ -3449,11 +3450,11 @@ fn a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by
     }
     let mut frames = db_a.read_log(0, usize::MAX).unwrap();
     assert_eq!(frames.len(), 2);
-    frames.push((2, vec![1u8, 0, 0, 0, 12]));
+    frames.push((2, vec![1u8, 0, 0, 0, 14]));
 
     let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), make_schema()).unwrap();
     let err = db_b.apply_shipped(&frames).unwrap_err();
-    assert!(err.to_string().contains("unknown effect tag 12"), "{err}");
+    assert!(err.to_string().contains("unknown effect tag 14"), "{err}");
     assert_eq!(
         db_b.last_applied(),
         None,
@@ -10637,9 +10638,9 @@ fn ping_refusal(ids: &str, compiled: u64) -> String {
         "1 Pending \"ping\" job(s) (ids {ids}) were enqueued under a different shape of ping \
          (recorded {:#x}; this binary {compiled:#x}) — this binary will not decode them; run \
          the binary that enqueued them until they are Done or Dead, then deploy this one, or \
-         restore whichever of ping's fields, its `global`/`scoped_by` declaration or its \
-         tenant type's `NAME` changed, and give the new shape its own #[job] type under a new \
-         name (GUIDE §6)",
+         restore whichever of ping's fields, its `global`/`scoped_by` declaration, its \
+         `outbound` declaration or its tenant type's `NAME` changed, and give the new shape its \
+         own #[job] type under a new name (GUIDE §6)",
         <Ping as Job>::FINGERPRINT
     )
 }

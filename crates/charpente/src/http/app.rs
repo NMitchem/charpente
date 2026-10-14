@@ -657,6 +657,8 @@ impl App {
     /// shared half of the dispatch path — everything `stage_or_subscribe`
     /// needs besides the `Db` itself. Returns both as disjoint sub-borrows so
     /// a caller can stage many requests into one `Group` before committing.
+    /// The group mints (plan amendment A9): an outbound job a route enqueues
+    /// draws its idempotency key from this app's entropy when it is staged.
     ///
     /// The returned `Group` MUST be committed: dropping a non-empty one
     /// panics by contract (`Group`'s `Drop`). `Err` here means the store
@@ -674,8 +676,40 @@ impl App {
             oidc: self.oidc.as_deref(),
         };
         // Not `self.db_mut()` — see the doc above.
-        let group = self.db.as_mut().expect(DB_TAKEN).begin_group()?;
+        let group = self
+            .db
+            .as_mut()
+            .expect(DB_TAKEN)
+            .begin_group_minting(&*self.entropy)?;
         Ok((group, staged))
+    }
+
+    /// A minting group for the kernel's job, cron and outbound arms (plan
+    /// amendment A9): a job, a cron tick or a `settle` can enqueue an
+    /// outbound job, whose key is drawn from this app's entropy. Field
+    /// projections, as in `begin_group`, so the borrows split.
+    pub(crate) fn begin_job_group(&mut self) -> io::Result<Group<'_>> {
+        let entropy = &*self.entropy;
+        self.db
+            .as_mut()
+            .expect(DB_TAKEN)
+            .begin_group_minting(entropy)
+    }
+
+    /// Test-only: one minting transaction — `Db::transact` refuses an
+    /// outbound enqueue, so a test seeds one through here. Every commit
+    /// failure is `Err` (a test has no request to answer).
+    #[doc(hidden)]
+    pub fn transact_for_tests<T, E>(
+        &mut self,
+        f: impl FnOnce(&mut Tx) -> Result<T, E>,
+    ) -> Result<T, TxError<E>> {
+        let mut group = self.begin_job_group().map_err(TxError::Io)?;
+        let out = group.stage(f)?;
+        group
+            .commit()
+            .map_err(|failure| TxError::Io(failure.error))?;
+        Ok(out)
     }
 
     /// Lifts the `Db` out for the replication reseed swap (the kernel's

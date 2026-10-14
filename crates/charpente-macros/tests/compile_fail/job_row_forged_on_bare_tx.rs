@@ -52,6 +52,7 @@ fn forge(tx: &mut Tx) -> Result<(), ApiError> {
         last_error: None,
         shape: Some(<CloseIncident as Job>::FINGERPRINT),
         scope: Some(13),
+        outbound_key: None,
     });
     Ok(())
 }

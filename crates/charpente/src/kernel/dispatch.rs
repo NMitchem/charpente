@@ -7,8 +7,8 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use charpente_core::db::{
-    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TableReadRefusal, TableWriteRefusal, Tenant,
-    TenantAdmission, Tx, TxError,
+    CrossTenant, Db, Enqueued, Group, JobShapeRefusal, ScopedTx, TableReadRefusal,
+    TableWriteRefusal, Tenant, TenantAdmission, Tx, TxError,
 };
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
@@ -233,11 +233,11 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Feeds ids drained from `Db::drain_enqueued` (fresh enqueues are due
+    /// Feeds jobs drained from `Db::drain_enqueued` (fresh enqueues are due
     /// immediately: due_at 0).
-    pub fn note_enqueued(&mut self, ids: Vec<Id<JobRow>>) {
-        for id in ids {
-            self.due.insert((0, id.raw()));
+    pub fn note_enqueued(&mut self, enqueued: Vec<Enqueued>) {
+        for e in enqueued {
+            self.due.insert((0, e.id.raw()));
         }
     }
 

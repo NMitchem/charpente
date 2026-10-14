@@ -1596,8 +1596,9 @@ impl Writer<'_> {
     /// Materializes one enqueue effect as a `JobRow`, id from the monotonic
     /// `next_job_id` meta counter — bumped in this same store transaction, so
     /// ids are deterministic across replay. Platform apply-path surface.
-    /// `scope` is the record's tenant for a scoped job (`0x0a`), carried into
-    /// the row unchanged.
+    /// `scope` is the record's tenant for a scoped job (`0x0a`/`0x0d`), and
+    /// `outbound_key` its minted idempotency key for an outbound one
+    /// (`0x0c`/`0x0d`), each carried into the row unchanged.
     pub fn materialize_job(
         &mut self,
         name: &str,
@@ -1605,6 +1606,7 @@ impl Writer<'_> {
         key: Option<&str>,
         shape: Option<u64>,
         scope: Option<u64>,
+        outbound_key: Option<[u8; 16]>,
     ) -> io::Result<u64> {
         let mut meta = self.txn.open_table(META).map_err(redb_err)?;
         let id = meta
@@ -1627,6 +1629,7 @@ impl Writer<'_> {
                 last_error: None,
                 shape,
                 scope,
+                outbound_key,
             },
         )?;
         Ok(id)

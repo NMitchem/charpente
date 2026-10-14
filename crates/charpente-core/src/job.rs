@@ -81,21 +81,26 @@ pub struct JobRow {
     /// The last failure's message (handler error or absorbed panic) — the
     /// dead-letter record's substance (hard rule 5).
     pub last_error: Option<String>,
-    /// The enqueuing type's `Job::FINGERPRINT`, from the record's `0x08` or
-    /// `0x0a` tag; `None` for a row applied from a pre-shape `0x02` record.
-    /// Encoded after `last_error` and only when `Some`, so a row written
-    /// before this field existed decodes unchanged: `last_error` before it is
-    /// tagged, and only `scope` below can follow it (payload-shapes spec §2,
-    /// job-tenancy spec §6).
+    /// The enqueuing type's `Job::FINGERPRINT`, from the record's `0x08`,
+    /// `0x0a`, `0x0c` or `0x0d` tag; `None` for a row applied from a pre-shape
+    /// `0x02` record. Encoded after `last_error` and only when `Some`, so a
+    /// row written before this field existed decodes unchanged: `last_error`
+    /// before it is tagged, and only `scope` and `outbound_key` below can
+    /// follow it (payload-shapes spec §2, job-tenancy spec §6).
     pub shape: Option<u64>,
     /// The tenant a `#[job(scoped_by = …)]` job was enqueued in, from the
-    /// record's `0x0a` tag. `None` for a `global` job (`0x08`) and for a row
-    /// applied from a pre-shape record. Encoded after `shape`, and only when
-    /// `Some`. A scoped row always has a shape, because only `0x0a` writes a
-    /// scope, so every row written before this field existed decodes
-    /// unchanged. `Some(0)` is tenant 0: presence, not value (job-tenancy
-    /// spec §6).
+    /// record's `0x0a` or `0x0d` tag. `None` for a `global` job (`0x08`,
+    /// `0x0c`) and for a row applied from a pre-shape record. Encoded after
+    /// `shape`, and only when `Some`. A scoped row always has a shape, because
+    /// only `0x0a`/`0x0d` write a scope, so every row written before this field
+    /// existed decodes unchanged. `Some(0)` is tenant 0: presence, not value
+    /// (job-tenancy spec §6).
     pub scope: Option<u64>,
+    /// An outbound job's idempotency key, from the record's `0x0c`/`0x0d` tag
+    /// (outbound-effects spec §6). Encoded after `scope`, only when `Some`, so
+    /// every row written before it decodes unchanged. Requires a shape: only
+    /// `0x0c`/`0x0d` write one, and both carry the shape.
+    pub outbound_key: Option<[u8; 16]>,
 }
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
@@ -129,10 +134,19 @@ impl Row for JobRow {
             assert!(
                 self.shape.is_some(),
                 "JobRow {}: a tenant scope is encoded after the shape, so a scoped row must \
-                 carry one — only tag 0x0a writes a scope, and 0x0a always carries the shape",
+                 carry one — only tags 0x0a/0x0d write a scope, and both carry the shape",
                 self.id.raw()
             );
             scope.encode(out);
+        }
+        if let Some(okey) = self.outbound_key {
+            assert!(
+                self.shape.is_some(),
+                "JobRow {}: an outbound key is encoded after the shape, so an outbound row must \
+                 carry one — only tags 0x0c/0x0d write a key, and both carry the shape",
+                self.id.raw()
+            );
+            out.extend_from_slice(&okey);
         }
     }
 
@@ -146,17 +160,30 @@ impl Row for JobRow {
         let attempts = u32::decode(input)?;
         let due_at = u64::decode(input)?;
         let last_error = Option::<String>::decode(input)?;
-        let (shape, scope) = match input.len() {
-            0 => (None, None),
-            8 => (Some(u64::decode(input)?), None),
-            16 => (Some(u64::decode(input)?), Some(u64::decode(input)?)),
+        let key16 = |input: &mut &[u8]| -> io::Result<[u8; 16]> {
+            let (k, rest) = input
+                .split_first_chunk::<16>()
+                .expect("length checked by the match");
+            *input = rest;
+            Ok(*k)
+        };
+        let (shape, scope, outbound_key) = match input.len() {
+            0 => (None, None, None),
+            8 => (Some(u64::decode(input)?), None, None),
+            16 => (Some(u64::decode(input)?), Some(u64::decode(input)?), None),
+            24 => (Some(u64::decode(input)?), None, Some(key16(input)?)),
+            32 => (
+                Some(u64::decode(input)?),
+                Some(u64::decode(input)?),
+                Some(key16(input)?),
+            ),
             n => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "row decode: {n} bytes after a JobRow's last_error — the shape and the \
-                         tenant scope after it are 8 bytes each, present or absent, so the \
-                         stored row is corrupt"
+                         tenant scope after it are 8 bytes each and the outbound key 16, each \
+                         present or absent, so the stored row is corrupt"
                     ),
                 ));
             }
@@ -172,6 +199,7 @@ impl Row for JobRow {
             last_error,
             shape,
             scope,
+            outbound_key,
         })
     }
 }
@@ -193,6 +221,7 @@ mod tests {
             last_error: Some("boom".into()),
             shape: Some(0xFEED),
             scope: None,
+            outbound_key: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -223,6 +252,7 @@ mod tests {
             last_error: None,
             shape: None,
             scope: None,
+            outbound_key: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -252,6 +282,7 @@ mod tests {
             last_error: None,
             shape: Some(0xFEED),
             scope: None,
+            outbound_key: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -262,7 +293,8 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "row decode: 3 bytes after a JobRow's last_error — the shape and the tenant scope \
-             after it are 8 bytes each, present or absent, so the stored row is corrupt"
+             after it are 8 bytes each and the outbound key 16, each present or absent, so the \
+             stored row is corrupt"
         );
     }
 
@@ -282,6 +314,7 @@ mod tests {
             last_error: None,
             shape: Some(0xFEED),
             scope,
+            outbound_key: None,
         };
         let mut unscoped = Vec::new();
         row(None).encode_row(&mut unscoped);
@@ -312,6 +345,7 @@ mod tests {
             last_error: None,
             shape: Some(0xFEED),
             scope: Some(3),
+            outbound_key: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -322,7 +356,8 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "row decode: 11 bytes after a JobRow's last_error — the shape and the tenant scope \
-             after it are 8 bytes each, present or absent, so the stored row is corrupt"
+             after it are 8 bytes each and the outbound key 16, each present or absent, so the \
+             stored row is corrupt"
         );
     }
 
@@ -343,6 +378,52 @@ mod tests {
             last_error: None,
             shape: None,
             scope: Some(3),
+            outbound_key: None,
+        };
+        row.encode_row(&mut Vec::new());
+    }
+
+    #[test]
+    fn an_outbound_job_row_roundtrips_with_and_without_a_scope() {
+        for scope in [None, Some(4u64)] {
+            let row = JobRow {
+                id: Id::from_raw(1),
+                name: "Charge".into(),
+                payload: vec![9],
+                key: None,
+                status: JobStatus::Pending,
+                attempts: 0,
+                due_at: 0,
+                last_error: None,
+                shape: Some(0xFEED),
+                scope,
+                outbound_key: Some([3; 16]),
+            };
+            let mut bytes = Vec::new();
+            row.encode_row(&mut bytes);
+            let back = JobRow::decode_row(&bytes).unwrap();
+            assert_eq!(
+                (back.shape, back.scope, back.outbound_key),
+                (Some(0xFEED), scope, Some([3; 16]))
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "an outbound key is encoded after the shape")]
+    fn an_outbound_key_without_a_shape_is_a_contract_panic() {
+        let row = JobRow {
+            id: Id::from_raw(1),
+            name: "Charge".into(),
+            payload: vec![],
+            key: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+            shape: None,
+            scope: None,
+            outbound_key: Some([3; 16]),
         };
         row.encode_row(&mut Vec::new());
     }

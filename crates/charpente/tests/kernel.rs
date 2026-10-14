@@ -739,8 +739,9 @@ mod scoped_jobs {
                  of Reconcile (recorded {v1:#x}; this binary {v2:#x}) — this binary will not \
                  decode them; run the binary that enqueued them until they are Done or Dead, \
                  then deploy this one, or restore whichever of Reconcile's fields, its \
-                 `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give \
-                 the new shape its own #[job] type under a new name (GUIDE §6)"
+                 `global`/`scoped_by` declaration, its `outbound` declaration or its tenant \
+                 type's `NAME` changed, and give the new shape its own #[job] type under a new \
+                 name (GUIDE §6)"
             )
         );
         assert!(
@@ -1405,8 +1406,9 @@ mod scoped_jobs {
              {name} (recorded {recorded:#x}; this binary {compiled:#x}) — this binary will not \
              decode them; run the binary that enqueued them until they are Done or Dead, then \
              deploy this one, or restore whichever of {name}'s fields, its \
-             `global`/`scoped_by` declaration or its tenant type's `NAME` changed, and give the \
-             new shape its own #[job] type under a new name (GUIDE §6)"
+             `global`/`scoped_by` declaration, its `outbound` declaration or its tenant type's \
+             `NAME` changed, and give the new shape its own #[job] type under a new name \
+             (GUIDE §6)"
         )
     }
 
@@ -3655,7 +3657,7 @@ fn harness_catches_a_split_done_mark() {
         Ok::<(), std::io::Error>(())
     })
     .unwrap();
-    let id = db.drain_enqueued()[0];
+    let id = db.drain_enqueued()[0].id;
 
     // Wrong executor, transaction 1: handler effects WITHOUT the done-mark.
     db.transact(|tx| {
@@ -4472,8 +4474,8 @@ fn receipt_refusal(ids: &[u64], recorded: &str) -> String {
          SendReceipt (recorded {recorded}; this binary {:#x}) — this binary will not decode \
          them; run the binary that enqueued them until they are Done or Dead, then deploy this \
          one, or restore whichever of SendReceipt's fields, its `global`/`scoped_by` \
-         declaration or its tenant type's `NAME` changed, and give the new shape its own \
-         #[job] type under a new name (GUIDE §6)",
+         declaration, its `outbound` declaration or its tenant type's `NAME` changed, and give \
+         the new shape its own #[job] type under a new name (GUIDE §6)",
         ids.len(),
         listed.join(", "),
         <receipt_v2::SendReceipt as Job>::FINGERPRINT
@@ -5505,9 +5507,9 @@ fn a_refusal_over_two_job_types_and_mixed_shapes_is_one_line_per_type() {
         "1 Pending \"CountUp\" job(s) (ids 3) were enqueued under a different shape of CountUp \
          (recorded 0xbad; this binary {:#x}) — this binary will not decode them; run the \
          binary that enqueued them until they are Done or Dead, then deploy this one, or \
-         restore whichever of CountUp's fields, its `global`/`scoped_by` declaration or its \
-         tenant type's `NAME` changed, and give the new shape its own #[job] type under a new \
-         name (GUIDE §6)",
+         restore whichever of CountUp's fields, its `global`/`scoped_by` declaration, its \
+         `outbound` declaration or its tenant type's `NAME` changed, and give the new shape its \
+         own #[job] type under a new name (GUIDE §6)",
         <CountUp as Job>::FINGERPRINT
     );
     let receipt_line = receipt_refusal(
