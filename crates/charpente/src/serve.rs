@@ -1426,10 +1426,18 @@ mod tests {
         )
         .expect("nothing Pending at open — the drifted shape is only staged by the tick");
         let (_tx, rx) = mpsc::channel::<(Request, kernel::Reply)>();
-        let mut source = ProdSource {
-            rx,
-            stash: None,
-            clock: crate::prod::ProdClock::new(),
+        // The refusal stops it on step 1 of the green run, and the served kernel
+        // in about 25 ms; both bounds are far above, so a tick that never runs
+        // fails by name instead of spinning the suite.
+        let mut source = Bounded {
+            inner: ProdSource {
+                rx,
+                stash: None,
+                clock: crate::prod::ProdClock::new(),
+            },
+            steps: 0,
+            max: 1_000,
+            stops_when: "the 1ms cron tick stages a foreign shape and is refused",
         };
         let err = kernel
             .run(&mut source)
@@ -1443,8 +1451,46 @@ mod tests {
 
         let served_root = cron_foreign_shape_root("served");
         let server = serve("127.0.0.1:0", cron_foreign_shape_app(&served_root)).unwrap();
-        assert_eq!(server.wait(), 1);
+        let (done, status) = mpsc::channel();
+        std::thread::spawn(move || done.send(server.wait()));
+        let status = status
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "serve's kernel never stopped within 30s: the 1ms cron tick over a foreign \
+                 shape must end it with status 1"
+                )
+            });
+        assert_eq!(status, 1);
         std::fs::remove_dir_all(&served_root).unwrap();
+    }
+
+    /// A `RequestSource` that fails by name after `max` kernel steps (`step` polls
+    /// its source once per iteration), so a kernel that never stops (a tick that
+    /// never runs, a deadline already past) fails the test instead of spinning it
+    /// forever.
+    struct Bounded<S> {
+        inner: S,
+        steps: u32,
+        max: u32,
+        stops_when: &'static str,
+    }
+
+    impl<S: kernel::RequestSource> kernel::RequestSource for Bounded<S> {
+        fn poll(&mut self) -> Option<(Request, kernel::Reply)> {
+            self.steps += 1;
+            assert!(
+                self.steps <= self.max,
+                "the kernel never stopped: {} steps, and it should stop when {}",
+                self.max,
+                self.stops_when
+            );
+            self.inner.poll()
+        }
+
+        fn wait_until(&mut self, deadline: Option<Instant>) -> kernel::Wake {
+            self.inner.wait_until(deadline)
+        }
     }
 
     // #[route] can't be used inside the charpente crate itself (it emits

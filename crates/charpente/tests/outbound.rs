@@ -1511,8 +1511,19 @@ fn losing_writability_drops_in_flight_and_keeps_jobs_pending() {
     let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
     let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
     let mut source = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    // The call goes in flight after 1 step on the green run; the bound turns a
+    // call that never goes in flight into a named failure, not a hang.
+    let mut steps = 0u32;
     while kernel.outbound_in_flight_for_tests() == 0 {
+        assert!(
+            steps < 100,
+            "the Pay call never went in flight: {steps} kernel steps, outbound started {}, \
+             in flight {}",
+            kernel.stats().outbound_started,
+            kernel.outbound_in_flight_for_tests()
+        );
         kernel.step(&mut source).unwrap();
+        steps += 1;
     }
     kernel
         .app_mut_for_tests()
@@ -2001,7 +2012,7 @@ impl Expiring {
 /// replies land at 1.5s, `Expiring`'s last; the arm settles the 64 and stops.
 #[test]
 fn a_completion_left_behind_the_last_flight_goes_with_the_gate() {
-    use charpente::kernel::{RequestSource, Step};
+    use charpente::kernel::{RequestSource, Step, Wake};
     let lat = Duration::from_millis(750);
     let sim = Sim::with_faults(0x0e0, faults(|c| c.outbound_latency = (lat, lat)));
     sim.remote("pay.test", Recorder::new());
@@ -2026,10 +2037,38 @@ fn a_completion_left_behind_the_last_flight_goes_with_the_gate() {
     let outbound = NoCancel(sim.outbound(&app.outbound_hosts()).unwrap());
     let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
     let mut source = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    // The 64 settle after 6 steps on the green run. Two ways they never do, each
+    // named rather than hung: nothing left to wake for inside the horizon, or
+    // steps that never advance time.
+    let mut steps = 0u32;
     while kernel.stats().outbound_settled < 64 {
-        if let Step::Idle { deadline } = kernel.step(&mut source).unwrap() {
-            source.wait_until(deadline);
+        let s = kernel.stats();
+        assert!(
+            steps < 1_000,
+            "64 Pay replies never settled: {} settled after {steps} kernel steps at virtual \
+             {}ns; outbound started {}, in flight {}, timed out {}, late {}",
+            s.outbound_settled,
+            sim.clock().now().as_nanos(),
+            s.outbound_started,
+            kernel.outbound_in_flight_for_tests(),
+            s.outbound_timed_out,
+            s.outbound_late
+        );
+        if let Step::Idle { deadline } = kernel.step(&mut source).unwrap()
+            && let Wake::Shutdown = source.wait_until(deadline)
+        {
+            let s = kernel.stats();
+            panic!(
+                "64 Pay replies never settled: nothing left to wake for before the 60s horizon \
+                 with {} settled; outbound started {}, in flight {}, timed out {}, late {}",
+                s.outbound_settled,
+                s.outbound_started,
+                kernel.outbound_in_flight_for_tests(),
+                s.outbound_timed_out,
+                s.outbound_late
+            );
         }
+        steps += 1;
     }
     let stats = kernel.stats();
     assert_eq!(
