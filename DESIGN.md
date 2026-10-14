@@ -1547,7 +1547,13 @@ drains its inbox before any reconnect, and the primary drains the target session
 before the dead-session reap. **Promote** (`charpente promote`) is the bounded-loss
 failover: a follower/backup drops its upstream client, flips durably to `Primary`, allows
 writes, and the `CtrlOk` names `last_applied` — records the dead primary acked but had not
-shipped are the DECISIONS §6 window, lost honestly and named. The window now covers external effects: a dead primary can call out from a record it acked but never shipped, so the world saw an effect the surviving timeline has no record of. Nothing short of synchronous replication closes that, and DECISIONS §6 chose asynchronous replication. The minted key bounds the rest: an enqueue that shipped without its Done mark is re-called with the same key, and one that never shipped cannot collide with anything the new timeline mints. A node that restarts in a
+shipped are the DECISIONS §6 window, lost honestly and named. The window now covers
+external effects: a dead primary can call out from a record it acked but never shipped, so
+the world saw an effect the surviving timeline has no record of. Nothing short of
+synchronous replication closes that, and DECISIONS §6 chose asynchronous replication. The
+minted key bounds the rest: an enqueue that shipped without its Done mark is re-called
+with the same key, and one that never shipped cannot collide with anything the new
+timeline mints. A node that restarts in a
 durable `HandingOff(to)` stays write-stopped and resolves against `to`: a probe `Hello`
 answered as a primary demotes it to `Follower(to)` (a diverged refusal is the operator's
 re-seed signal, surfaced as the step error); `to` unreachable or not-yet-primary keeps it
@@ -1892,10 +1898,15 @@ Charpente treats the coding agent as the primary developer persona:
   registered with `mount_events(events![…])` as `EventInfo { name, payload, scoped_by }`,
   sorted by event name (`scoped_by` is the tenant type's `Tenant::NAME` for a
   `#[event(scoped_by = Org)]` event and `null` for a global one; an app key is a call-site
-  filter, so the contract lists no keys)**, jobs (name, retry policy, **`scoped_by`, the `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`, **`outbound`: `null`, or `{ host, timeout_ms }` for a job declared `outbound = "<host>"`**), cron
+  filter, so the contract lists no keys)**, jobs (name, retry policy, **`scoped_by`, the
+  `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`, **`outbound`:
+  `null`, or `{ host, timeout_ms }` for a job declared `outbound = "<host>"`**), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
-  **`outbound_hosts`, one entry per declared `Host` with the names of its credential variables (never their values), the headers it injects and its request and reply caps, so "which outside services does this app talk to, and what must an operator set" is an inventory;**
+  **`outbound_hosts`, one entry per declared `Host` with the names of its credential
+  variables (never their values), the headers it injects and its request and reply caps,
+  so "which outside services does this app talk to, and what must an operator set" is an
+  inventory;**
   field order is
   part of the pinned shape. `Contract` also carries **`types: Vec<TypeDef>`** — the
   transitive closure of every NAMED wire type a route's params/request/response/error
