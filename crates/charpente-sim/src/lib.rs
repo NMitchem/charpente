@@ -235,7 +235,7 @@ impl FaultConfig {
             sync_error,
             crash_apply,
             crash_torn,
-            // These ten axes draw from field-keyed sub-streams
+            // These axes (`dir_entry_loss` … `subscriber_stall`, and the six `outbound_*`) draw from field-keyed sub-streams
             // (`sample_extended_fields`, applied in `run_universe`/
             // `run_universe_with_adjust` right after this function returns)
             // rather than this sequential stream, so they cannot perturb the
