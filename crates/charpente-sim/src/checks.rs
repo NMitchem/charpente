@@ -405,7 +405,8 @@ pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String>
     Ok(())
 }
 
-/// No two jobs carry one idempotency key (spec §10).
+/// No two jobs carry one idempotency key (spec §10): it catches two jobs
+/// sharing a key, which a constant or data-derived key produces.
 pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String> {
     let mut seen: BTreeMap<[u8; 16], u64> = BTreeMap::new();
     for row in snap
@@ -418,7 +419,7 @@ pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String> {
         if let Some(first) = seen.insert(key, row.id.raw()) {
             return Err(format!(
                 "keys_are_per_job: jobs {first} and {} carry the same idempotency key {} — keys \
-                 are minted per enqueue at staging; a key derived from an id, or drawn at apply, \
+                 are minted per enqueue at staging; a key computed from job data or a constant \
                  repeats",
                 row.id.raw(),
                 IdempotencyKey::from_bytes(key).as_str()
@@ -1125,8 +1126,8 @@ mod tests {
         const OUTBOUND: bool = true;
     }
 
-    /// Hands out `keys` in order: the only way two jobs can share a key,
-    /// which is exactly what `keys_are_per_job` must catch.
+    /// Hands out `keys` in order, so a test can give two jobs one key, as a
+    /// constant or data-derived key would: what `keys_are_per_job` catches.
     struct Scripted(std::cell::RefCell<Vec<[u8; 16]>>);
     impl Entropy for Scripted {
         fn fill(&self, buf: &mut [u8]) {
@@ -1173,7 +1174,7 @@ mod tests {
             Err(
                 "keys_are_per_job: jobs 0 and 2 carry the same idempotency key \
                  01010101010101010101010101010101 — keys are minted per enqueue at staging; a \
-                 key derived from an id, or drawn at apply, repeats"
+                 key computed from job data or a constant repeats"
                     .to_string()
             )
         );
@@ -1208,23 +1209,39 @@ mod tests {
         );
     }
 
+    /// Each of the five axes at 1.0, quiesced: the call is answered at once
+    /// with the model's 200, and no outbound fault marks coverage. Each
+    /// axis's own failure differs (an error, no completion, a 429/503, a
+    /// reply seconds late), so every one of the five gates is held.
     #[test]
     fn quiesced_outbound_faults_never_fire_again() {
-        let mut cfg = crate::FaultConfig::none();
-        cfg.outbound_refused = 1.0;
-        let sim = Sim::with_faults(5, cfg);
-        sim.remote("pay.test", crate::outbound::Recorder::new());
-        sim.quiesce_outbound_faults();
-        let ob = sim.outbound(&["pay.test"]).unwrap();
-        ob.start(0, orphan_call([1; 16])).unwrap();
-        assert_eq!(
-            std::iter::from_fn(|| ob.poll())
-                .next()
-                .unwrap()
-                .1
-                .unwrap()
-                .status,
-            200
-        );
+        let on = |set: fn(&mut crate::FaultConfig)| {
+            let mut cfg = crate::FaultConfig::none();
+            set(&mut cfg);
+            cfg
+        };
+        for (axis, cfg) in [
+            ("refused", on(|c| c.outbound_refused = 1.0)),
+            ("lost_request", on(|c| c.outbound_lost_request = 1.0)),
+            ("lost_reply", on(|c| c.outbound_lost_reply = 1.0)),
+            ("throttle", on(|c| c.outbound_throttle = 1.0)),
+            ("slow", on(|c| c.outbound_slow = 1.0)),
+        ] {
+            let sim = Sim::with_faults(5, cfg);
+            sim.remote("pay.test", crate::outbound::Recorder::new());
+            sim.quiesce_outbound_faults();
+            let ob = sim.outbound(&["pay.test"]).unwrap();
+            ob.start(0, orphan_call([1; 16])).unwrap();
+            let done = ob
+                .poll()
+                .map(|(t, r)| (t, r.map(|r| r.status).map_err(|e| e.kind())));
+            assert_eq!(done, Some((0, Ok(200))), "{axis}");
+            let fired: Vec<&str> = sim
+                .coverage()
+                .into_keys()
+                .filter(|k| k.starts_with("fault:outbound_"))
+                .collect();
+            assert!(fired.is_empty(), "{axis}: {fired:?}");
+        }
     }
 }

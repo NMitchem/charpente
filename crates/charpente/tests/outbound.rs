@@ -1269,6 +1269,41 @@ fn a_lost_reply_times_out_and_every_retry_carries_the_same_key() {
     });
 }
 
+/// Planted bug (a)'s mechanism without a swarm seed: the test above with the
+/// key left out of the request. The kernel's side is unchanged (three
+/// attempts under one minted key), but the remote has nothing to dedupe on,
+/// so it applies every retry where the keyed job is applied once.
+#[test]
+fn a_keyless_call_whose_replies_are_lost_is_applied_on_every_retry() {
+    let sim = Sim::with_faults(0x0e9, faults(|c| c.outbound_lost_reply = 1.0));
+    sim.remote(
+        "pay.test",
+        Idempotent::header("idempotency-key", Recorder::new()),
+    );
+    let mut app = open_variant(&sim, Variant::Keyless).unwrap();
+    app.transact_for_tests(|tx| {
+        tx.enqueue(PayKeyless { n: 0 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let (mut app, stats) = run_to(&sim, app, 60 * SEC);
+    let (rows, paid) = jobs_and_paid(&mut app);
+    assert_eq!((rows[0].status, paid), (JobStatus::Dead, 0));
+    assert_eq!(stats.outbound_timed_out, 3);
+    let key = IdempotencyKey::from_bytes(rows[0].outbound_key.unwrap());
+    let delivered = sim.outbound_deliveries();
+    assert_eq!(delivered.len(), 3);
+    assert!(delivered.iter().all(|d| d.key == key));
+    sim.with_remote("pay.test", |m: &Idempotent<Recorder>| {
+        assert_eq!(
+            m.inner().calls().len(),
+            3,
+            "the remote applied the effect on every retry"
+        );
+        assert!(m.applied().is_empty(), "no call carried a key");
+    });
+}
+
 #[test]
 fn a_settle_error_discards_its_effects_and_is_an_attempt() {
     let sim = Sim::with_faults(0x0d3, FaultConfig::none());
@@ -2567,17 +2602,26 @@ fn a_kernel_builder_wires_replication_archive_and_outbound_together() {
 const POOL: u64 = 6;
 const ROUNDS: u32 = 3;
 const BOOT_TRIES: u32 = 8;
-/// The swarm property's reach floor and give-up cap. Its base is ambient. Over
-/// 10 fresh bases (0x0B1D0001..0A, 256 each) it checked 251-256 universes
-/// (mean 253.5, sample sd 1.65), so its floor is the mean less 4 sd. Every
-/// other universe gave up, 25 in all and at most 5 in one batch, each a boot
-/// refused for durable corruption (`boot:durable-refusal`). Its cap follows
-/// GUIDE §8's ambient rule, the larger of twice the largest count (10) and the
-/// Poisson cap. With x = 25 give-ups over N = 2,560 universes, U(25) =
-/// ½·χ²₀.₉₅(52) = 34.92, so a batch of n = 256 has lambda = 256 x 34.92 /
-/// 2,560 = 3.49. P(> 11) is 2.8e-4 and P(> 12) is 7.4e-5, so k = 12.
-const OUTBOUND_CHECKED_FLOOR: u64 = 246;
-const OUTBOUND_GAVE_UP_CEILING: u64 = 12;
+/// The swarm property's reach floors and give-up cap. Its base is ambient, so
+/// all three are margins over 10 fresh bases (0x0B1D1001..0A, 768 universes
+/// each). The floors count what the exactly-once checks had to judge, not
+/// universes that merely ran: `outbound:re-called` (a key reached the remote
+/// twice) was 333-376 (mean 358.1, sample sd 13.1), and
+/// `outbound:re-called-across-restart` (one key's deliveries from two
+/// processes) 222-246 (mean 233.6, sample sd 8.7), so each floor is the mean
+/// less 4 sd. The batch is 768 because at 256 a required axis missed about once
+/// in 200 runs; here the rarest, `fault:outbound_lost_request` and
+/// `fault:outbound_lost_reply`, fired at least 13 and 17 times in every batch.
+/// It gave up 104 times in all, at most 16 in one batch: 96 boots refused for
+/// durable corruption and 8 corruption-cut enqueues. The cap follows GUIDE §8's
+/// ambient rule, the larger of twice the largest count (32) and the Poisson
+/// cap. With x = 104 give-ups over N = 7,680 universes, U(104) =
+/// ½·χ²₀.₉₅(210) = 122.40, so a batch of n = 768 has lambda = 768 x 122.40 /
+/// 7,680 = 12.24. P(> 26) is 1.8e-4 and P(> 27) is 7.8e-5, so k = 27, and the
+/// cap is 32.
+const OUTBOUND_RE_CALLED_FLOOR: u64 = 305;
+const OUTBOUND_RE_CALLED_ACROSS_RESTART_FLOOR: u64 = 198;
+const OUTBOUND_GAVE_UP_CEILING: u64 = 32;
 
 /// Which `Pay` the workload mounts: the honest one, or one of spec §12's two
 /// planted bugs.
@@ -2833,6 +2877,18 @@ fn outbound_workload(sim: &mut Sim, v: Variant) -> Result<(), String> {
             sim.cover("outbound:settled-after-retry");
         }
     }
+    // What the exactly-once checks above had to judge: a key that reached the
+    // remote twice, and one whose deliveries came from two processes.
+    let mut handles: BTreeMap<IdempotencyKey, Vec<u64>> = BTreeMap::new();
+    for d in sim.outbound_deliveries() {
+        handles.entry(d.key).or_default().push(d.handle);
+    }
+    if handles.values().any(|h| h.len() > 1) {
+        sim.cover("outbound:re-called");
+    }
+    if handles.values().any(|h| h.iter().any(|&x| x != h[0])) {
+        sim.cover("outbound:re-called-across-restart");
+    }
     sim.cover("outbound:checked");
     Ok(())
 }
@@ -2840,7 +2896,7 @@ fn outbound_workload(sim: &mut Sim, v: Variant) -> Result<(), String> {
 #[test]
 fn outbound_jobs_are_exactly_once_under_the_fault_matrix() {
     run_universes_swarm!(
-        256,
+        768,
         |sim: &mut Sim| outbound_workload(sim, Variant::Honest),
         require: [
             "outbound:checked",
@@ -2853,7 +2909,13 @@ fn outbound_jobs_are_exactly_once_under_the_fault_matrix() {
             "fault:crash",
             "restart",
         ],
-        floor: [("outbound:checked", OUTBOUND_CHECKED_FLOOR)],
+        floor: [
+            ("outbound:re-called", OUTBOUND_RE_CALLED_FLOOR),
+            (
+                "outbound:re-called-across-restart",
+                OUTBOUND_RE_CALLED_ACROSS_RESTART_FLOOR
+            ),
+        ],
         ceiling: [("universe:gave-up", OUTBOUND_GAVE_UP_CEILING)]
     );
 }
@@ -2895,39 +2957,59 @@ fn a_media_cut_enqueue_whose_calls_were_made_gives_the_universe_up() {
 
 /// Planted bug (a), spec §12 oracle 4: without the key, a re-call is a second
 /// charge. Seed found by a 1,024-universe hunt on 2026-10-14 (progress.md).
+/// The universe is the crash between the remote's apply and the reply's
+/// settle: process 0 delivered `/pay/2`, its round ended on an injected write
+/// fault with the job unsettled, and process 1, which exists only after that
+/// round's power cycle, called again.
 #[test]
 fn planted_keyless_call_is_a_double_charge_with_a_recorded_seed() {
     const SEED: u64 = 0xc064_fe5a_a310_86a7;
     let mut sim = universe(SEED);
     let err =
         outbound_workload(&mut sim, Variant::Keyless).expect_err("the planted bug must be caught");
-    assert!(
-        err.starts_with("double charge: pay.test applied /pay/"),
-        "seed {SEED:#x}: {err}"
+    assert_eq!(
+        err,
+        "double charge: pay.test applied /pay/2 2 times — a re-call carried no idempotency key \
+         the remote could dedupe on",
+        "seed {SEED:#x}"
     );
-    // The reason is one job called again with nothing to dedupe on, not two
-    // jobs charging one path: every application carried that job's key and
-    // no key header.
-    let path = err.split(' ').nth(4).expect("the message names the path");
-    let (jobs, headed) = sim.with_remote("pay.test", |m: &Idempotent<Recorder>| {
+    // One job called again with nothing to dedupe on, not two jobs charging
+    // one path: every application carried that job's key and no key header.
+    let (keys, headed) = sim.with_remote("pay.test", |m: &Idempotent<Recorder>| {
         let calls: Vec<&OutboundCall> = m
             .inner()
             .calls()
             .iter()
-            .filter(|c| c.path == path)
+            .filter(|c| c.path == "/pay/2")
             .collect();
         (
             calls
                 .iter()
                 .map(|c| c.key.as_str().to_string())
-                .collect::<std::collections::BTreeSet<_>>(),
+                .collect::<Vec<_>>(),
             calls.iter().filter(|c| !c.headers.is_empty()).count(),
         )
     });
     assert_eq!(
-        (jobs.len(), headed),
-        (1, 0),
-        "seed {SEED:#x}: {path} must be one keyless job re-called"
+        (keys.len(), headed),
+        (2, 0),
+        "seed {SEED:#x}: /pay/2 must be applied twice, with no key header"
+    );
+    assert_eq!(keys[0], keys[1], "seed {SEED:#x}: one job, re-called");
+    let key = keys[0].clone();
+    // (virtual nanos, handle) of each delivery of that job's call. A new
+    // handle is a new process, built only after a power cycle.
+    let delivered = |sim: &Sim| -> Vec<(u64, u64)> {
+        sim.outbound_deliveries()
+            .iter()
+            .filter(|d| d.key.as_str() == key)
+            .map(|d| (d.at, d.handle))
+            .collect()
+    };
+    assert_eq!(
+        delivered(&sim),
+        [(3_449_721, 0), (8_332_991, 1)],
+        "seed {SEED:#x}: applied by process 0, re-called by process 1 after the power cycle"
     );
     let mut honest = universe(SEED);
     outbound_workload(&mut honest, Variant::Honest).unwrap_or_else(|e| {
@@ -2937,6 +3019,21 @@ fn planted_keyless_call_is_a_double_charge_with_a_recorded_seed() {
         (honest.gave_up(), honest.coverage().get("outbound:checked")),
         (None, Some(&1)),
         "seed {SEED:#x}: the honest twin must reach a verdict, not give up"
+    );
+    // The twin goes through the same crash, and its key is what saves it:
+    // delivered twice, applied once.
+    assert_eq!(
+        delivered(&honest),
+        [(3_449_721, 0), (8_332_991, 1)],
+        "seed {SEED:#x}: the twin runs the same scenario"
+    );
+    assert_eq!(
+        honest.with_remote("pay.test", |m: &Idempotent<Recorder>| m
+            .applied()
+            .get(&key)
+            .copied()),
+        Some(1),
+        "seed {SEED:#x}: the twin's re-call is deduped"
     );
 }
 
@@ -2948,9 +3045,11 @@ fn planted_trusting_settle_is_a_phantom_charge_with_a_recorded_seed() {
     let mut sim = universe(SEED);
     let err =
         outbound_workload(&mut sim, Variant::Trusting).expect_err("the planted bug must be caught");
-    assert!(
-        err.starts_with("phantom charge: job "),
-        "seed {SEED:#x}: {err}"
+    assert_eq!(
+        err,
+        "phantom charge: job 2 recorded a payment, but pay.test never applied /pay/2 — settle \
+         took a reply that was not a success for one",
+        "seed {SEED:#x}"
     );
     assert!(
         sim.coverage().contains_key("fault:outbound_throttle"),
@@ -2965,5 +3064,10 @@ fn planted_trusting_settle_is_a_phantom_charge_with_a_recorded_seed() {
         (honest.gave_up(), honest.coverage().get("outbound:checked")),
         (None, Some(&1)),
         "seed {SEED:#x}: the honest twin must reach a verdict, not give up"
+    );
+    assert!(
+        honest.coverage().contains_key("fault:outbound_throttle"),
+        "seed {SEED:#x}: the twin must meet the same throttle: {:?}",
+        honest.coverage()
     );
 }

@@ -3129,8 +3129,8 @@ for these before hand-rolling the same logic a fourth time:
   `durable_corruption_fired` and give the universe up where it fired, never
   pass it, the same rule as any acked-durability shortfall.
 - `keys_are_per_job(snap: &Snapshot) -> Result<(), String>` — no two jobs carry
-  one idempotency key. A key derived from an id, or drawn at apply instead of
-  minted at staging, repeats, and the error names both jobs and the key.
+  one idempotency key. It catches two jobs sharing a key, which a constant or
+  data-derived key produces, and the error names both jobs and the key.
 - `outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>` — every
   outbound job is Done or Dead. Call it only after the fault-free tail:
   `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and a run past
@@ -3777,15 +3777,21 @@ swarm property: six payment jobs against
 `Idempotent::header("idempotency-key", Recorder::new())`, three faulted rounds
 with crashes, then the fault-free tail. Beside the three checkers it asserts
 that the remote applied no charge twice, and that every recorded payment is one
-the remote applied. Two planted bugs show what those two properties are for,
-each pinned to the seed that caught it, and on both seeds the honest job passes
-with a verdict. `PayKeyless` leaves the key header out of its call. A re-call,
-whether after a lost reply, a timeout or a round that ended with the call made
-and the reply unsettled, then reaches the remote as a new request: seed
-`0xc064fe5aa31086a7` fails with `double charge: pay.test applied /pay/2 2
-times`. `PayTrusting` takes a 503 for a success, so a throttled call records a
-payment the remote never made: seed `0xce5842050b68d0cb` fails with `phantom
-charge: job 2 recorded a payment, but pay.test never applied /pay/2`.
+the remote applied. Those two checks judge something only where a charge was
+called again, so the property floors how many universes re-called a key, and how
+many re-called it from a second process, rather than how many merely ran. Two
+planted bugs show what the checks are for, each pinned to the seed that caught
+it, and on both seeds the honest job passes with a verdict. `PayKeyless` leaves
+the key header out of its call, so any re-call reaches the remote as a new
+request. At seed `0xc064fe5aa31086a7` the first process's call to `/pay/2` was
+applied, an injected fault ended the process before the reply settled, and the
+next process called again: `double charge: pay.test applied /pay/2 2 times`. The
+honest job goes through the same crash, and its second delivery is deduped. A
+lost reply does the same thing inside one process: with every reply lost, the
+keyless job's three attempts are three charges, where the keyed job's are one.
+`PayTrusting` takes a 503 for a success, so a throttled call records a payment
+the remote never made: seed `0xce5842050b68d0cb` fails with `phantom charge: job
+2 recorded a payment, but pay.test never applied /pay/2`.
 
 ### `charpente test --sim`
 
