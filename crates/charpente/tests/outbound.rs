@@ -3234,6 +3234,56 @@ fn universe(seed: u64) -> Sim {
     Sim::with_faults(seed, cfg)
 }
 
+/// Final review M3 (carry 6): kernel-level replay under the outbound fault
+/// axes. `checks::replays_identically` builds `Sim::new`, which carries no
+/// fault config, and charpente-sim's world-level replay runs no kernel. So
+/// the swarm property's workload runs one faulted universe twice, and both
+/// runs must leave the same durable bytes, the same coverage and the same
+/// deliveries (host, key, virtual time, process). Seed found by a 400-seed
+/// scan from 0x0E5E_ED00_0000_0000 on 2026-10-15: a reply is lost and its job
+/// called again, and a crash makes a later process call one key too, so the
+/// replay crosses the outbound arm, a restart and recovery.
+#[test]
+fn an_outbound_faulted_universe_replays_identically_through_the_kernel() {
+    const SEED: u64 = 0x0E5E_ED00_0000_00A5;
+    let run = || {
+        let mut sim = universe(SEED);
+        outbound_workload(&mut sim, Variant::Honest)
+            .unwrap_or_else(|e| panic!("seed {SEED:#x}: the honest workload must pass: {e}"));
+        assert_eq!(
+            sim.gave_up(),
+            None,
+            "seed {SEED:#x}: a verdict, not a give-up"
+        );
+        let deliveries: Vec<(String, String, u64, u64)> = sim
+            .outbound_deliveries()
+            .iter()
+            .map(|d| (d.host.clone(), d.key.as_str().to_string(), d.at, d.handle))
+            .collect();
+        (sim.durable_fingerprint(), sim.coverage(), deliveries)
+    };
+    let first = run();
+    for reason in [
+        "fault:outbound_lost_reply",
+        "outbound:re-called",
+        "fault:crash",
+        "outbound:re-called-across-restart",
+        "outbound:checked",
+    ] {
+        assert!(
+            first.1.contains_key(reason),
+            "seed {SEED:#x}: the pin's reason includes {reason}, and it did not fire: {:?}",
+            first.1
+        );
+    }
+    let second = run();
+    assert_eq!(
+        first, second,
+        "seed {SEED:#x}: one faulted universe, run twice through the kernel, diverged \
+         (durable fingerprint, coverage, deliveries)"
+    );
+}
+
 /// One sim box's only loss window is media corruption, and the property gives
 /// it up: found by the property's first batch (2026-10-14). A bit flip at the
 /// first round's restart cut the seeded pool's enqueue after its six calls had
