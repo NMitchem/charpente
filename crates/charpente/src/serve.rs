@@ -2593,6 +2593,86 @@ mod tests {
         );
     }
 
+    /// R9 at the production client: the client is built before the kernel,
+    /// so a host set that does not match its jobs is refused here, by name,
+    /// as the kernel would refuse it. Both directions: a called host with no
+    /// `Host` entry, and an entry no job calls.
+    #[test]
+    fn a_host_set_mismatch_refuses_the_client_by_name() {
+        let refusal = |app: &App| {
+            let err = ProdOutbound::new(app, &OutboundOptions::default())
+                .err()
+                .expect("a host set that does not match its jobs builds no client");
+            assert!(Refusal::of(&err).is_some(), "{err}");
+            err.to_string()
+        };
+        let unentered = temp_app("unentered").mount_jobs(crate::jobs![ServeTestCharge]);
+        assert_eq!(
+            refusal(&unentered),
+            "kernel: job ServeTestCharge calls pay.test, which has no Host entry — add \
+             app.outbound(Host::new(\"pay.test\")) with the credentials it needs (GUIDE §6)"
+        );
+        let uncalled = charge_app(Host::new("pay.test")).outbound(Host::new("extra.test"));
+        assert_eq!(
+            refusal(&uncalled),
+            "kernel: app.outbound(Host::new(\"extra.test\")) declares a host no mounted job calls \
+             — remove it, or mount the job that calls it"
+        );
+    }
+
+    /// A base that cannot be parsed is a Refusal like every other setup
+    /// failure, so `launch` reports "refused to start" with exit code 2, not
+    /// a failed start.
+    #[test]
+    fn a_malformed_base_is_a_refusal() {
+        let app = charge_app(Host::new("pay.test"));
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), "http://10.0.0.5:80".into())],
+            cas: vec![],
+        };
+        let err = ProdOutbound::new(&app, &opts).err().unwrap();
+        assert!(Refusal::of(&err).is_some(), "not a Refusal: {err}");
+    }
+
+    #[crate::job(global, outbound = "ledger.test")]
+    struct ServeTestLedger {}
+
+    impl ServeTestLedger {
+        fn call(
+            &self,
+            _tx: &Tx,
+            _key: &IdempotencyKey,
+        ) -> Result<Option<crate::outbound::Call>, crate::kernel::JobError> {
+            Ok(None)
+        }
+        fn settle(
+            self,
+            _tx: &mut Tx,
+            _reply: crate::outbound::Reply,
+        ) -> Result<(), crate::kernel::JobError> {
+            Ok(())
+        }
+    }
+
+    /// A credential refusal names the job that calls THAT host: with two
+    /// jobs on two hosts, the unset variable of the second host's credential
+    /// is the second job's.
+    #[test]
+    fn a_credential_refusal_names_the_job_that_calls_its_host() {
+        let app = temp_app("two-hosts")
+            .mount_jobs(crate::jobs![ServeTestCharge, ServeTestLedger])
+            .outbound(Host::new("pay.test"))
+            .outbound(Host::new("ledger.test").bearer_env("SERVE_TEST_UNSET_LEDGER_KEY"));
+        let err = ProdOutbound::new(&app, &OutboundOptions::default())
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "outbound: SERVE_TEST_UNSET_LEDGER_KEY is unset — host ledger.test needs it for job \
+             ServeTestLedger"
+        );
+    }
+
     /// Plan amendment A2: replies arrive from the network, so production
     /// never knows when the next one is due, and the kernel parks no longer
     /// than its outbound tick.
