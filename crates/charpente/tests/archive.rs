@@ -4897,7 +4897,9 @@ fn a_stopped_archive_raises_one_notice() {
     assert_eq!(
         notices.len(),
         1,
-        "a stopped archive must raise exactly one notice: {notices:?}"
+        "a stopped archive must raise exactly one notice, got {}: {:?}",
+        notices.len(),
+        notices.first()
     );
     assert!(notices[0].contains(FOREIGN_WRITER), "{}", notices[0]);
 }
@@ -4928,7 +4930,9 @@ fn a_within_bound_archive_failure_raises_no_notice() {
     );
     assert!(
         notices.is_empty(),
-        "a within-bound retry raised operator notices: {notices:?}"
+        "a within-bound retry raised {} operator notices, the first: {:?}",
+        notices.len(),
+        notices.first()
     );
 }
 
@@ -4989,7 +4993,9 @@ fn a_gapped_archive_raises_one_notice() {
     assert_eq!(
         notices.len(),
         1,
-        "a gap must raise exactly one notice: {notices:?}"
+        "a gap must raise exactly one notice, got {}: {:?}",
+        notices.len(),
+        notices.first()
     );
     assert!(notices[0].contains("pin_segments"), "{}", notices[0]);
 }
