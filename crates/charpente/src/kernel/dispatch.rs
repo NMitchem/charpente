@@ -112,6 +112,10 @@ pub struct JobDef {
     /// has no way to use.
     pub glue: JobGlue,
     /// `Some` for an outbound job (spec §5); `glue` is then never called, since dispatch routes by the row's minted key.
+    /// `App::mount_jobs` registers its host beside `fingerprint` and
+    /// `scoped_by`, so `Group::stage` refuses an enqueue whose `Job::OUTBOUND`
+    /// disagrees with it; dispatch's misroute guards stop the kernel on a row
+    /// already on disk that does.
     pub outbound: Option<OutboundDef>,
 }
 

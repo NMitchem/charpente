@@ -660,8 +660,9 @@ after the next recovery even though the caller was told the commit failed —
 so treat `TxError::Io` as "unknown," never as "definitely didn't happen."
 The exceptions are an `Io` carrying one of `Group::stage`'s two refusals,
 each read with its own `of`. A `JobShapeRefusal`
-(`charpente::core::db::JobShapeRefusal::of`) is an enqueue under another shape
-of a job name this binary mounts (§6, "Changing a job's fields"). A
+(`charpente::core::db::JobShapeRefusal::of`) is an enqueue that disagrees with a
+job name this binary mounts on its shape, its tenancy or whether it is outbound
+(§6, "Changing a job's fields" and "Outbound jobs"). A
 `TableWriteRefusal` (`charpente::core::db::TableWriteRefusal::of`) is a write
 the `Schema` disagrees with about its table: a table it does not register
 (add `.table::<T>()`), a scoped `Row` whose `TABLE` is an unscoped table's or
@@ -2014,6 +2015,24 @@ adding `outbound` to a job, or removing it, is a shape change. It is refused whi
 Pending jobs of the old shape exist, and the ways through are the two "Changing a
 job's fields" below describes: drain first, or a new type. The host is not part of
 the shape, so changing the host is not refused.
+
+`#[job]` writes a job's `OUTBOUND` constant and its mounted `JobDef.outbound` from
+the one declaration, so the two agree. A hand-written `impl Job` or a hand-built
+`JobDef` can make them disagree under the same shape, and dispatch routes a row by
+whether its enqueue minted a key, so that row would reach a glue the mounted job does
+not have. From `App::mount_jobs` on, such an enqueue refuses its whole transaction
+before any key is drawn, and is answered the way the shape refusal in "Changing a
+job's fields" below is. `<value>` is `true` or `false`, and `<declaration>` is
+`a pure job` or `` `outbound = "<host>"` ``:
+
+<!-- pinned -->
+```text
+job "<job>" was enqueued with `OUTBOUND = <value>`, but this binary mounts <job> as <declaration> under the same shape (<shape>) — dispatch routes a row by whether its enqueue minted an idempotency key, which only an `OUTBOUND = true` enqueue does, so this row would reach a glue the mounted <job> does not have; a hand-written `impl Job` or `JobDef` contradicts <job>'s #[job]; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted type, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
+```
+
+A row that already disagrees, enqueued by a binary that did not mount the name,
+stops the kernel at dispatch with a `contract:` panic that names the job and the
+fix, rather than spending its retries on a glue that cannot run.
 
 ### Declaring the hosts
 

@@ -530,13 +530,14 @@ pub type DeclaredTenancy = Option<(&'static str, TypeId)>;
 pub struct Schema {
     tables: BTreeMap<&'static str, TableOps>,
     migrations: BTreeMap<&'static str, Vec<crate::migration::MigrationStep>>,
-    /// `Job::NAME` → (`Job::FINGERPRINT`, its `DeclaredTenancy`) for every
+    /// `Job::NAME` → (`Job::FINGERPRINT`, its `DeclaredTenancy`, the host its
+    /// `JobDef.outbound` calls) for every
     /// job type this binary mounts (`Db::register_job_shapes`). Here rather than
     /// on `Db` because a snapshot re-seed rebuilds the `Db` from its schema,
     /// and a registry kept anywhere else would come back empty (spec
     /// amendment A4). Not part of `schema_digest_of`: job shapes are refused
     /// at promote, never compared in Hello (spec §8).
-    job_shapes: BTreeMap<&'static str, (u64, DeclaredTenancy)>,
+    job_shapes: BTreeMap<&'static str, (u64, DeclaredTenancy, Option<&'static str>)>,
 }
 
 impl Schema {
@@ -3192,6 +3193,14 @@ fn declared_tenancy(scoped_by: Option<&str>) -> String {
     scoped_by.map_or_else(|| "`global`".to_string(), |s| format!("`scoped_by = {s}`"))
 }
 
+/// A mounted job's outbound declaration as the refusals render it.
+fn declared_outbound(host: Option<&str>) -> String {
+    host.map_or_else(
+        || "a pure job".to_string(),
+        |h| format!("`outbound = \"{h}\"`"),
+    )
+}
+
 /// The composed deterministic core: WAL + store + schema. One `Db` is the
 /// single writer; `transact` takes `&mut self`, so transactions are
 /// serializable because two cannot exist at once.
@@ -3851,32 +3860,41 @@ impl Db {
         matches!(self.gate, WriteGate::Verifying(_))
     }
 
-    /// Registers each mounted job type's payload shape and declared tenancy
-    /// (`(name, fingerprint, scoped_by)`, where `scoped_by` is `JobDef`'s
-    /// scope name paired with its `scope_type`, `None` for a `global` job)
-    /// so `pending_job_shape_refusal` can name a Pending row this binary
-    /// would decode under a foreign shape or dispatch into the wrong tenancy,
-    /// and `Group::stage` can refuse an enqueue that disagrees with a mounted
-    /// name on shape, on tenant presence, or on scope type. `App::mount_jobs`
-    /// calls it with the `JobDef`s it mounts. Re-registering the same
-    /// declaration is a no-op.
-    pub fn register_job_shapes(&mut self, shapes: &[(&'static str, u64, DeclaredTenancy)]) {
+    /// Registers each mounted job type's payload shape, declared tenancy and
+    /// outbound host (`(name, fingerprint, scoped_by, outbound)`, where
+    /// `scoped_by` is `JobDef`'s scope name paired with its `scope_type`,
+    /// `None` for a `global` job, and `outbound` is the host its
+    /// `JobDef.outbound` calls, `None` for a pure job) so
+    /// `pending_job_shape_refusal` can name a Pending row this binary would
+    /// decode under a foreign shape or dispatch into the wrong tenancy, and
+    /// `Group::stage` can refuse an enqueue that disagrees with a mounted name
+    /// on shape, on tenant presence, on scope type, or on whether it is
+    /// outbound. `App::mount_jobs` calls it with the `JobDef`s it mounts.
+    /// Re-registering the same declaration is a no-op.
+    pub fn register_job_shapes(
+        &mut self,
+        shapes: &[(&'static str, u64, DeclaredTenancy, Option<&'static str>)],
+    ) {
         let registry = &mut self.engine.machine_mut().schema.job_shapes;
-        for &(name, fingerprint, scoped_by) in shapes {
-            let Some((prev_fingerprint, prev_scoped_by)) =
-                registry.insert(name, (fingerprint, scoped_by))
+        for &(name, fingerprint, scoped_by, outbound) in shapes {
+            let Some((prev_fingerprint, prev_scoped_by, prev_outbound)) =
+                registry.insert(name, (fingerprint, scoped_by, outbound))
             else {
                 continue;
             };
             assert!(
-                (prev_fingerprint, prev_scoped_by) == (fingerprint, scoped_by),
+                (prev_fingerprint, prev_scoped_by, prev_outbound)
+                    == (fingerprint, scoped_by, outbound),
                 "job \"{name}\" registered with two declarations (shape {prev_fingerprint:#x}, \
-                 {}; then shape {fingerprint:#x}, {}{}) — a job name has one shape and one \
-                 tenancy, and `App::mount_jobs` refuses a duplicate name, so a second \
-                 `register_job_shapes` call named it again; register each job name once",
+                 {}, {}; then shape {fingerprint:#x}, {}, {}{}) — a job name has one shape, one \
+                 tenancy and one outbound declaration, and `App::mount_jobs` refuses a \
+                 duplicate name, so a second `register_job_shapes` call named it again; \
+                 register each job name once",
                 declared_tenancy(prev_scoped_by.map(|(scope, _)| scope)),
+                declared_outbound(prev_outbound),
                 declared_tenancy(scoped_by.map(|(scope, _)| scope)),
-                if prev_fingerprint == fingerprint
+                declared_outbound(outbound),
+                if prev_scoped_by != scoped_by
                     && prev_scoped_by.map(|(scope, _)| scope) == scoped_by.map(|(scope, _)| scope)
                 {
                     ", a different scope type of the same name"
@@ -3920,7 +3938,8 @@ impl Db {
             if job.status != crate::job::JobStatus::Pending {
                 continue;
             }
-            let Some((&name, &(compiled, scoped_by))) = registry.get_key_value(job.name.as_str())
+            let Some((&name, &(compiled, scoped_by, _))) =
+                registry.get_key_value(job.name.as_str())
             else {
                 continue;
             };
@@ -4528,7 +4547,8 @@ impl<'a> Group<'a> {
     ///
     /// Before the record exists it also refuses, as `TxError::Io`, what apply
     /// would refuse only after the WAL sync: an enqueue of a mounted job name
-    /// under another shape or tenancy (`JobShapeRefusal`), and a write the
+    /// under another shape or tenancy, or whose `Job::OUTBOUND` contradicts the
+    /// mounted declaration (`JobShapeRefusal`), and a write the
     /// `Schema` disagrees with about its table (`TableWriteRefusal`): a name
     /// it does not register, the other scope shape, or a put or delete
     /// through a Rust type that is not the registered one.
@@ -4653,7 +4673,8 @@ impl<'a> Group<'a> {
              above never saw it — every overlay writer but Tx::settle_job records its Row type \
              there, and Tx::settle_job's JobRow is one Db::open registers on every path"
         );
-        // A mounted job name has one shape and one tenancy. `NAME` is the
+        // A mounted job name has one shape, one tenancy and one outbound
+        // declaration (the last checked at the end of this loop). `NAME` is the
         // bare type identifier, so a second `#[job]` type of the same name
         // enqueues under a shape no dispatch of this binary can decode;
         // refusing it here, before a record exists, is what makes dispatch's
@@ -4678,10 +4699,11 @@ impl<'a> Group<'a> {
             job: name,
             shape,
             scope,
+            outbound,
             ..
         } in &effects.enqueues
         {
-            let Some(&(mounted, scoped_by)) = job_shapes.get(*name) else {
+            let Some(&(mounted, scoped_by, mounted_host)) = job_shapes.get(*name) else {
                 continue;
             };
             if mounted != *shape {
@@ -4739,6 +4761,29 @@ impl<'a> Group<'a> {
                          other type its own name, or mount {name} as its #[job] declares it \
                          (GUIDE §6)",
                         tenant.id
+                    ),
+                )))));
+            }
+            // `#[job]` emits `OUTBOUND` and `JobDef.outbound` from one
+            // declaration, and the outbound fold puts outbound-ness in the
+            // fingerprint, so only a hand-written `impl Job` or `JobDef` gets
+            // here. Refused before the key is minted below: dispatch routes a
+            // row by its minted key, and a row of the other kind would stop the
+            // kernel at every restart (dispatch's misroute guards, which stay
+            // as the backstop for rows already on disk; final review M1).
+            if *outbound != mounted_host.is_some() {
+                return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
+                    format!(
+                        "job \"{name}\" was enqueued with `OUTBOUND = {outbound}`, but this binary \
+                         mounts {name} as {} under the same shape ({shape:#x}) — dispatch routes \
+                         a row by whether its enqueue minted an idempotency key, which only an \
+                         `OUTBOUND = true` enqueue does, so this row would reach a glue the \
+                         mounted {name} does not have; a hand-written `impl Job` or `JobDef` \
+                         contradicts {name}'s #[job]; the transaction was refused and nothing \
+                         was written, so a retry cannot succeed — enqueue the mounted type, give \
+                         the other type its own name, or mount {name} as its #[job] declares it \
+                         (GUIDE §6)",
+                        declared_outbound(mounted_host)
                     ),
                 )))));
             }

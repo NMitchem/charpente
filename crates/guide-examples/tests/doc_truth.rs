@@ -63,8 +63,9 @@ use std::path::{Path, PathBuf};
 /// event-shape refusals and the hand-built `EventDef` tenancy refusal
 /// (2026-10-03); 41 with outbound effects' four attempt texts and the
 /// kernel's no-`Outbound` refusal (2026-10-14); 42 with the production
-/// client's credential refusals (2026-10-14).
-const PINNED_FLOOR: usize = 42;
+/// client's credential refusals (2026-10-14); 43 with the enqueue refusal of
+/// an `OUTBOUND` that contradicts the mounted `JobDef` (2026-10-15).
+const PINNED_FLOOR: usize = 43;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

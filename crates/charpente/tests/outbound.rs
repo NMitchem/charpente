@@ -686,10 +686,113 @@ fn a_hand_written_call_glue_writes_nothing_whatever_it_answers() {
     );
 }
 
+/// `seeded`, but the rows are enqueued while nothing is mounted, so no stage
+/// check sees them: rows already on disk when a binary that mounts `defs`
+/// starts. An enqueue that contradicts a mounted `JobDef` on outbound-ness is
+/// refused (final review M1), so this is how such a row reaches dispatch's
+/// misroute guards, the backstop for rows on disk.
+fn seeded_unmounted(sim: &Sim, defs: Vec<JobDef>, seed: impl FnOnce(&mut Tx)) -> (App, Dispatcher) {
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap();
+    app.transact_for_tests(|tx| {
+        seed(tx);
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let mut d = Dispatcher::new(defs).with_outbound(vec![Host::new("pay.test")], 64);
+    d.rebuild(&app.db_for_tests().snapshot().unwrap()).unwrap();
+    (app, d)
+}
+
+/// The enqueue-time refusal (final review M1), in its two directions: the
+/// enqueued type's `OUTBOUND` disagrees with the mounted `JobDef.outbound`
+/// under the same shape. Nothing is written and nothing is queued, so no row
+/// ever reaches dispatch's misroute guards from this binary.
+fn refused_enqueue(def: JobDef, enqueue: impl FnOnce(&mut Tx)) -> std::io::Error {
+    let sim = Sim::with_faults(0x0d1, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(vec![def]);
+    let err = match app.transact_for_tests(|tx| {
+        enqueue(tx);
+        Ok::<(), std::io::Error>(())
+    }) {
+        Err(TxError::Io(e)) => e,
+        Err(other) => panic!("expected the stage refusal, got {other:?}"),
+        Ok(()) => panic!("a row contradicting its mounted JobDef reached the store"),
+    };
+    assert!(
+        JobShapeRefusal::of(&err).is_some(),
+        "the stage refusal, which a route answers with its own text: {err}"
+    );
+    let db = app.db_for_tests();
+    assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+    assert!(db.drain_enqueued().is_empty());
+    err
+}
+
+/// `Charge`'s def with its `outbound` cleared: `Charge`'s own enqueue
+/// (`OUTBOUND = true`, so it would mint a key) is refused by name.
+#[test]
+fn an_outbound_enqueue_of_a_job_mounted_pure_is_refused_by_name() {
+    let mut cleared = <Charge as JobEntry>::def();
+    cleared.outbound = None;
+    let err = refused_enqueue(cleared, |tx| tx.enqueue(Charge { cents: 1 }));
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "job \"Charge\" was enqueued with `OUTBOUND = true`, but this binary mounts Charge \
+             as a pure job under the same shape ({:#x}) — dispatch routes a row by whether its \
+             enqueue minted an idempotency key, which only an `OUTBOUND = true` enqueue does, \
+             so this row would reach a glue the mounted Charge does not have; a hand-written \
+             `impl Job` or `JobDef` contradicts Charge's #[job]; the transaction was refused \
+             and nothing was written, so a retry cannot succeed — enqueue the mounted type, \
+             give the other type its own name, or mount Charge as its #[job] declares it \
+             (GUIDE §6)",
+            <Charge as Job>::FINGERPRINT
+        )
+    );
+}
+
+/// The mirror: `Charge`'s def under `ChargeAsPure`'s name and fingerprint, so
+/// a pure `ChargeAsPure` enqueue (no key) is refused, naming the host the
+/// mounted def calls.
+#[test]
+fn a_pure_enqueue_of_a_job_mounted_outbound_is_refused_by_name() {
+    let mut misrouted = <Charge as JobEntry>::def();
+    misrouted.name = <ChargeAsPure as Job>::NAME;
+    misrouted.fingerprint = <ChargeAsPure as Job>::FINGERPRINT;
+    let err = refused_enqueue(misrouted, |tx| tx.enqueue(ChargeAsPure { cents: 1 }));
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "job \"ChargeAsPure\" was enqueued with `OUTBOUND = false`, but this binary mounts \
+             ChargeAsPure as `outbound = \"pay.test\"` under the same shape ({:#x}) — dispatch \
+             routes a row by whether its enqueue minted an idempotency key, which only an \
+             `OUTBOUND = true` enqueue does, so this row would reach a glue the mounted \
+             ChargeAsPure does not have; a hand-written `impl Job` or `JobDef` contradicts \
+             ChargeAsPure's #[job]; the transaction was refused and nothing was written, so a \
+             retry cannot succeed — enqueue the mounted type, give the other type its own \
+             name, or mount ChargeAsPure as its #[job] declares it (GUIDE §6)",
+            <ChargeAsPure as Job>::FINGERPRINT
+        )
+    );
+}
+
 /// The misroute guard: a row with no minted key reaching a `JobDef` that
 /// declares `outbound`. Here a hand-built def is `Charge`'s (its run glue is
 /// the `unreachable!` stub) under `ChargeAsPure`'s name and fingerprint, so
-/// a pure `ChargeAsPure` enqueue reaches it.
+/// a pure `ChargeAsPure` row enqueued while nothing was mounted reaches it.
 #[test]
 #[should_panic(
     expected = "contract: job 0 (\"ChargeAsPure\") has no minted key, so dispatch routed it to its \
@@ -705,7 +808,7 @@ fn a_row_without_a_key_never_reaches_an_outbound_def_s_run_glue() {
     let mut misrouted = <Charge as JobEntry>::def();
     misrouted.name = <ChargeAsPure as Job>::NAME;
     misrouted.fingerprint = <ChargeAsPure as Job>::FINGERPRINT;
-    let (mut app, mut d) = seeded(&sim, Schema::new(), vec![misrouted], |tx| {
+    let (mut app, mut d) = seeded_unmounted(&sim, vec![misrouted], |tx| {
         tx.enqueue(ChargeAsPure { cents: 1 })
     });
     let db = app.db_for_tests();
@@ -717,8 +820,8 @@ fn a_row_without_a_key_never_reaches_an_outbound_def_s_run_glue() {
 
 /// The guard's mirror: a row with a minted key reaching a `JobDef` that
 /// declares no `outbound`. Here a hand-built def is `Charge`'s with its
-/// `outbound` cleared, so a `Charge` enqueue (minted, by `Job::OUTBOUND`)
-/// reaches it under the same fingerprint.
+/// `outbound` cleared, so a `Charge` row (minted, by `Job::OUTBOUND`)
+/// enqueued while nothing was mounted reaches it under the same fingerprint.
 #[test]
 #[should_panic(
     expected = "contract: job 0 (\"Charge\") carries a minted key, so dispatch routed it to its \
@@ -733,9 +836,8 @@ fn a_row_with_a_key_never_reaches_a_pure_def() {
     let sim = Sim::with_faults(0x0c9, FaultConfig::none());
     let mut cleared = <Charge as JobEntry>::def();
     cleared.outbound = None;
-    let (mut app, mut d) = seeded(&sim, Schema::new(), vec![cleared], |tx| {
-        tx.enqueue(Charge { cents: 1 })
-    });
+    let (mut app, mut d) =
+        seeded_unmounted(&sim, vec![cleared], |tx| tx.enqueue(Charge { cents: 1 }));
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
     let outcome = d.run_due_into(&mut group, 0);

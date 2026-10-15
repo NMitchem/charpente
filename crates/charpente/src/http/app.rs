@@ -403,6 +403,7 @@ impl App {
             sweep.name,
             sweep.fingerprint,
             sweep.scoped_by.map(|scope| (scope, sweep.scope_type)),
+            sweep.outbound.as_ref().map(|o| o.host),
         )]);
         let mut app = App {
             db: Some(db),
@@ -524,11 +525,11 @@ impl App {
     }
 
     /// Registers `#[job]` descriptors (mount-time duplicate-name panic — each
-    /// job type is mounted once, like routes), and each one's payload shape
-    /// and declared tenancy (its `scoped_by` with its `scope_type`) with the
-    /// `Db` (`Db::register_job_shapes`) in the same step, so the enqueue
-    /// refusal holds for every transaction through this App — before any
-    /// kernel exists, too — and the startup refusal knows both.
+    /// job type is mounted once, like routes), and each one's payload shape,
+    /// declared tenancy (its `scoped_by` with its `scope_type`) and outbound
+    /// host with the `Db` (`Db::register_job_shapes`) in the same step, so the
+    /// enqueue refusals hold for every transaction through this App — before
+    /// any kernel exists, too — and the startup refusal knows the first two.
     pub fn mount_jobs(mut self, defs: Vec<JobDef>) -> App {
         let shapes: Vec<_> = defs
             .iter()
@@ -537,6 +538,7 @@ impl App {
                     d.name,
                     d.fingerprint,
                     d.scoped_by.map(|scope| (scope, d.scope_type)),
+                    d.outbound.as_ref().map(|o| o.host),
                 )
             })
             .collect();

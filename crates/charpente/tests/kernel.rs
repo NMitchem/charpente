@@ -1094,18 +1094,19 @@ mod scoped_jobs {
     #[test]
     #[should_panic(
         expected = "job \"Twice\" registered with two declarations (shape 0x1, \
-                               `scoped_by = Desk`; then shape 0x1, `scoped_by = Desk`, a \
-                               different scope type of the same name) — a job name has one \
-                               shape and one tenancy, and `App::mount_jobs` refuses a \
-                               duplicate name, so a second `register_job_shapes` call named \
-                               it again; register each job name once"
+                               `scoped_by = Desk`, a pure job; then shape 0x1, `scoped_by = \
+                               Desk`, a pure job, a different scope type of the same name) — \
+                               a job name has one shape, one tenancy and one outbound \
+                               declaration, and `App::mount_jobs` refuses a duplicate name, so \
+                               a second `register_job_shapes` call named it again; register \
+                               each job name once"
     )]
     fn a_job_name_registered_under_two_declarations_panics_naming_both() {
         let sim = Sim::with_faults(0x5C0B_00F7, FaultConfig::none());
         let mut app = only_jobs_app(&sim, vec![]);
         let db = app.db_for_tests();
-        db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Desk>())))]);
-        db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Board>())))]);
+        db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Desk>())), None)]);
+        db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Board>())), None)]);
     }
 
     // ------------------------------- a scope type renders as its NAME

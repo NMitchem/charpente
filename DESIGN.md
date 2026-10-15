@@ -424,7 +424,11 @@ and cancels its tokens — keyed on the write gate, never the role, so every way
 is covered — and the jobs stay Pending in the store for whichever node is writable next, with
 the same key. `Kernel::with_outbound(app, clock, outbound)` wires it beside `with_archive`, and
 `Kernel::builder(app, clock)` combines `.replication`, `.archive` and `.outbound` for a node
-that needs more than one. Its invariants hold in release (hard rule 4):
+that needs more than one. Dispatch routes a row by its minted key, so an enqueue whose
+`Job::OUTBOUND` contradicts the mounted `JobDef.outbound` (a hand-written `impl Job` or
+`JobDef`) is refused by name at staging, before a key is drawn, as a tenancy contradiction
+is; dispatch's `contract:` panics stay the backstop for such a row already on disk. Its
+invariants hold in release (hard rule 4):
 
 1. A token is never started while in flight; a token is never reused within a process.
 2. A job in the in-flight table is never in a due-set.
