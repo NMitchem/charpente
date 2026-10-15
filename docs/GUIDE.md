@@ -1039,20 +1039,28 @@ or not — a built-in daily cron sweeps the dead rows for hygiene, but
 resolution never waits on it.
 
 ```rust
-use charpente::auth::ApiKey;
+use charpente::auth::{ApiKey, Via};
 use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Id, Schema, Tx, View, route, routes};
 
-// A login trades a credential the ladder has already verified (an API key, or
-// an OIDC token, below) for a session in the same subject. charpente has no
-// password check, so never mint for a subject a request body names: that
-// lets anyone log in as anyone. The first credential comes from something the
-// app trusts, such as an IdP or a signup route that mints a key for a subject
-// it has just created.
+// A login trades a credential the ladder has already verified, an API key or
+// an OIDC token (below), for a session in the same subject. It refuses a
+// session: a session that could buy a session would renew itself past its TTL
+// and outlive its holder's logout. A session bought with a key still outlives a
+// revoke of that key (above). charpente has no password check, so never mint
+// for a subject a request body names: that lets anyone log in as anyone. The
+// first credential comes from something the app trusts, such as an IdP or a
+// signup route that mints a key for a subject it has just created.
 #[route(POST "/login", auth)]
 fn login(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
-    let subject = ctx.principal().expect("auth route").subject().to_string();
+    let principal = ctx.principal().expect("auth route");
+    if matches!(principal.via(), Via::Session(_)) {
+        return Err(ApiError::BadRequest(
+            "log in with an API key or an OIDC token, not a session".to_string(),
+        ));
+    }
+    let subject = principal.subject().to_string();
     Ok(ctx.create_session(tx, subject))
 }
 
@@ -4235,14 +4243,17 @@ mutants: 1 total — 0 caught, 1 missed, 0 unviable, 0 timed out
   diff is in the run directory.
 ```
 
-To cargo-mutants' own lines, which pass through (the `MISSED` line above is
-one), the verb adds only the summary and a MISSED or TIMED OUT paragraph; it
-names no caught mutant. The run directory is cargo-mutants' own per-mutant
-record, at `target/charpente-mutants/mutants.out/`
-under the directory the verb ran in (`--dir`, default `.`): `outcomes.json`, and
-`caught.txt`, `missed.txt`, `timeout.txt` and `unviable.txt`, one mutant per
-line. The previous run's record moves to `mutants.out.old`. Both sit under
-`target/`, which the scaffold's `.gitignore` leaves out of the repository.
+cargo-mutants' own lines pass through (the `MISSED` line above is one). To
+them the verb adds the summary, a MISSED or TIMED OUT paragraph and, when it
+derives `--timeout`, its timing line (below); it names no caught mutant. The
+run directory is cargo-mutants' own per-mutant record, at
+`target/charpente-mutants/mutants.out/` under the directory the verb ran in
+(`--dir`, default `.`): `outcomes.json`; `caught.txt`, `missed.txt`,
+`timeout.txt` and `unviable.txt`, one mutant per line; and `diff/`, one patch
+per mutant named by its file, line and column, where a MISSED mutant's
+surviving diff is. The previous run's record moves to `mutants.out.old`. Both
+sit under `target/`, which the scaffold's `.gitignore` leaves out of the
+repository.
 
 The same mutant, judged by the honest sibling, is **CAUGHT**:
 

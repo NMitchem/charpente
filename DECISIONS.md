@@ -50,11 +50,11 @@ query patterns by mid-M1.
 **Trigger read 2026-09-02; it does not fire, and the deferral stands.** (Recorded at Noah's
 direction; a status-quo reading, not Noah's own hand — revisable.) `examples/invoicing` is
 still the only app in the tree. `examples/invoicing/src` has three `scan::<T>()` call sites:
-`list_customers` and `list_invoices` in `routes.rs` (lines 89, 222) are legitimate list-all
+`list_customers` and `list_invoices` in `routes.rs` (lines 91, 224) are legitimate list-all
 routes; the overdue sweep in `jobs.rs` (line 121) is a filtered full scan standing in for a
 missing range index. Typed indexes ARE used where they fit: `LineItem::by_invoice` (twice —
-`routes.rs:134`, `jobs.rs:28`) and `ApiKey::by_key_hash` (used by the platform's own auth
-ladder, `crates/charpente/src/auth/ladder.rs:111`, which `examples/invoicing`'s `auth` routes
+`routes.rs:136`, `jobs.rs:28`) and `ApiKey::by_key_hash` (used by the platform's own auth
+ladder, `crates/charpente/src/auth/ladder.rs:137`, which `examples/invoicing`'s `auth` routes
 exercise). The chain that normalized the one gap:
 `examples/invoicing/FINDINGS.md` (79-87, "`#[index]` is only demonstrated on `Id<T>` and
 `String` fields") → `docs/GUIDE.md` (188-191, under the "`#[index]` works on any `Codec`
