@@ -2673,6 +2673,84 @@ mod tests {
         );
     }
 
+    /// Each host's calls go to that host's own `--outbound-base`, carrying
+    /// that host's own credential. A route built from the wrong base sends
+    /// one host's calls, credential included, to another host.
+    #[test]
+    fn each_host_is_routed_to_its_own_base_with_its_own_credential() {
+        let (pay_port, pay_remote) =
+            one_shot(b"HTTP/1.1 201 Created\r\ncontent-length: 3\r\n\r\npay".to_vec());
+        let (ledger_port, ledger_remote) =
+            one_shot(b"HTTP/1.1 202 Accepted\r\ncontent-length: 6\r\n\r\nledger".to_vec());
+        // Safety of set_var: see
+        // `prod_sends_the_call_with_its_credential_and_returns_the_reply`.
+        unsafe {
+            std::env::set_var("SERVE_TEST_ROUTE_PAY_KEY", "sk_pay");
+            std::env::set_var("SERVE_TEST_ROUTE_LEDGER_KEY", "sk_ledger");
+        }
+        let app = temp_app("two-bases")
+            .mount_jobs(crate::jobs![ServeTestCharge, ServeTestLedger])
+            .outbound(Host::new("pay.test").bearer_env("SERVE_TEST_ROUTE_PAY_KEY"))
+            .outbound(Host::new("ledger.test").bearer_env("SERVE_TEST_ROUTE_LEDGER_KEY"));
+        let opts = OutboundOptions {
+            bases: vec![
+                ("pay.test".into(), format!("http://127.0.0.1:{pay_port}")),
+                (
+                    "ledger.test".into(),
+                    format!("http://127.0.0.1:{ledger_port}"),
+                ),
+            ],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts)
+            .unwrap()
+            .expect("the app calls out");
+        // One call at a time: each remote answers one connection, so a call
+        // routed to the other host's remote is refused rather than queued.
+        for (token, host, status, body) in [
+            (1, "pay.test", 201, &b"pay"[..]),
+            (2, "ledger.test", 202, &b"ledger"[..]),
+        ] {
+            ob.start(
+                token,
+                OutboundCall {
+                    host,
+                    ..plain_call("/route")
+                },
+            )
+            .unwrap();
+            let (got, reply) = wait_for(&ob);
+            let reply = reply
+                .unwrap_or_else(|e| panic!("the call to {host} never reached its own base: {e}"));
+            assert_eq!(
+                (got, reply.status, reply.body.as_slice()),
+                (token, status, body),
+                "the call to {host} was answered by another host's remote"
+            );
+        }
+        for (remote, host, port, key, other) in [
+            (pay_remote, "pay.test", pay_port, "sk_pay", "sk_ledger"),
+            (
+                ledger_remote,
+                "ledger.test",
+                ledger_port,
+                "sk_ledger",
+                "sk_pay",
+            ),
+        ] {
+            let raw = String::from_utf8(remote.join().unwrap()).unwrap();
+            assert!(
+                raw.to_ascii_lowercase()
+                    .contains(&format!("host: {host}:{port}\r\n")),
+                "{host}'s base received another host's call: {raw}"
+            );
+            assert!(
+                raw.contains(&format!("authorization: Bearer {key}\r\n")) && !raw.contains(other),
+                "{host}'s call must carry {host}'s credential and no other: {raw}"
+            );
+        }
+    }
+
     /// Plan amendment A2: replies arrive from the network, so production
     /// never knows when the next one is due, and the kernel parks no longer
     /// than its outbound tick.
