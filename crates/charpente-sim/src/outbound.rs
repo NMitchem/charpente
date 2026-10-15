@@ -902,6 +902,23 @@ mod tests {
         }
     }
 
+    /// A fixed range (`lo == hi`) is not a draw: it answers `lo` and takes
+    /// nothing from the stream. A stream that mixes fixed and ranged draws
+    /// then maps each seed to the same universe whichever ranges are fixed,
+    /// and seeds are product surface (hard rule 3).
+    #[test]
+    fn a_fixed_range_draws_nothing_from_the_stream() {
+        let fixed = Duration::from_millis(250);
+        let mut used = Rng::new(0x7A13_0050);
+        let mut fresh = Rng::new(0x7A13_0050);
+        assert_eq!(draw(&mut used, (fixed, fixed)), 250_000_000);
+        assert_eq!(
+            used.next_u64(),
+            fresh.next_u64(),
+            "a fixed-range draw advanced the stream, so every later draw on it moved"
+        );
+    }
+
     /// Every call rolls every axis from that axis's own stream, whatever the
     /// others decide (GUIDE §8). Turning refusals on changes which calls are
     /// refused, and nothing about the rest: not their lost replies, not their
