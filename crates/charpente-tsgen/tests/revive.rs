@@ -105,7 +105,7 @@ fn reviver_body(ts: &str, name: &str) -> String {
 
 // ---------------------------------------------------------------------
 // A2: a bare `Int64` sits directly in a route position, no `TypeDef` to
-// hang a function on (docs/GUIDE.md:2040's `Result<WireU64, ApiError>`).
+// hang a function on (the shape of the GUIDE's `Result<WireU64, ApiError>` routes).
 // ---------------------------------------------------------------------
 
 #[test]

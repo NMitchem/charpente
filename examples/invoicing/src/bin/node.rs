@@ -3,8 +3,8 @@
 //! repo artifact `crates/edge-harness::ChildNode` spawns and controls
 //! (kill9/pause/resume/restart) against real TCP. Plain `std::env::args`
 //! parsing, no new dependency; maps 1:1 onto `serve::serve`/
-//! `serve::serve_replicated`/`serve::backup` — the exact GUIDE §10
-//! worked-example shapes (docs/GUIDE.md:2407-2448). `main.rs` (the GUIDE
+//! `serve::serve_replicated`/`serve::backup` — the exact shapes of GUIDE §10's
+//! worked example. `main.rs` (the GUIDE
 //! demo binary, driven by `charpente::launch`) is untouched: `launch`'s argv
 //! convention has no replication-role dispatch, which this harness vehicle
 //! needs, so it is a second, independent bin rather than a mode of the first.
