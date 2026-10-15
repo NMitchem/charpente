@@ -2333,6 +2333,72 @@ mod tests {
         );
     }
 
+    /// A cancelled call never completes: `cancel` aborts its task, so the
+    /// reply the remote sends afterwards never reaches `poll`. The remote holds
+    /// each reply 300 ms; an uncancelled call to it afterwards completes, so the
+    /// silence is the cancel's and not a remote that never answers.
+    #[test]
+    fn a_cancelled_call_never_completes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..2 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = conn.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+            }
+        });
+        let app = charge_app(Host::new("pay.test"));
+        let opts = OutboundOptions {
+            bases: vec![("pay.test".into(), format!("http://127.0.0.1:{port}"))],
+            cas: vec![],
+        };
+        let ob = ProdOutbound::new(&app, &opts).unwrap().unwrap();
+        ob.start(0, plain_call("/cancelled")).unwrap();
+        ob.cancel(0);
+        for _ in 0..150 {
+            if let Some((token, _)) = ob.poll() {
+                panic!("token {token} completed after its cancel: the call was never aborted");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ob.start(1, plain_call("/control")).unwrap();
+        let (token, reply) = wait_for(&ob);
+        assert_eq!(
+            (token, reply.unwrap().status),
+            (1, 200),
+            "the remote answers"
+        );
+    }
+
+    /// `BindFailed` marks a bind failure for `launch` and is otherwise
+    /// invisible: it prints as the bind's own error, `{:?}` included, so an
+    /// operator who meets it through `unwrap` or a debug log reads the OS cause.
+    #[test]
+    fn a_bind_failure_prints_as_the_bind_error_in_debug_too() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        let bare = std::net::TcpListener::bind(&addr).unwrap_err();
+        let err = bind_http(&addr).unwrap_err();
+        assert!(BindFailed::of(&err));
+        assert_eq!(err.kind(), bare.kind());
+        assert_eq!(err.to_string(), bare.to_string());
+        assert!(
+            format!("{err:?}").contains(&format!("{bare:?}")),
+            "the marked error's Debug hides the bind's cause: {err:?}"
+        );
+    }
+
     /// A credential is checked when it is read, so a value with a trailing
     /// newline, or an empty one, refuses the start instead of failing every
     /// call (an empty one as `Repl::open` refuses an empty peer secret), and

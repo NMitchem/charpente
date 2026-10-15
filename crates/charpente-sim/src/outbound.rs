@@ -659,6 +659,62 @@ mod tests {
         sim.with_remote("pay.test", |r: &Recorder| assert_eq!(r.calls().len(), 1));
     }
 
+    /// Cancelling one call leaves every other call alone: the same handle's
+    /// other token, and another handle's call under the same token number.
+    #[test]
+    fn cancelling_one_call_leaves_every_other_call_alone() {
+        let sim = Sim::with_faults(
+            0x7A13_0020,
+            faults(|c| c.outbound_latency = (Duration::from_millis(10), Duration::from_millis(10))),
+        );
+        sim.remote("pay.test", Recorder::new());
+        let a = sim.outbound(&["pay.test"]).unwrap();
+        let b = sim.outbound(&["pay.test"]).unwrap();
+        a.start(0, call(1)).unwrap();
+        a.start(1, call(2)).unwrap();
+        b.start(0, call(3)).unwrap();
+        a.cancel(0);
+        sim.clock().sleep(Duration::from_millis(50));
+        let tokens = |ob: &SimOutbound| drain(ob).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(
+            tokens(&a),
+            vec![1],
+            "only the cancelled token stops completing"
+        );
+        assert_eq!(
+            tokens(&b),
+            vec![0],
+            "another handle's token 0 is another call, untouched by this cancel"
+        );
+    }
+
+    /// A request reaches the remote at its delivery time, one latency after
+    /// its start, never earlier: until then the remote has not applied it.
+    #[test]
+    fn a_request_reaches_the_remote_only_at_its_delivery_time() {
+        let sim = Sim::with_faults(
+            0x7A13_0021,
+            faults(|c| c.outbound_latency = (Duration::from_secs(1), Duration::from_secs(1))),
+        );
+        sim.remote("pay.test", Recorder::new());
+        let ob = sim.outbound(&["pay.test"]).unwrap();
+        ob.start(0, call(1)).unwrap();
+        assert!(drain(&ob).is_empty());
+        sim.with_remote("pay.test", |r: &Recorder| {
+            assert_eq!(
+                r.calls().len(),
+                0,
+                "the remote applied a request still on the wire"
+            )
+        });
+        assert!(sim.outbound_deliveries().is_empty());
+        sim.clock().sleep(Duration::from_secs(1));
+        assert!(drain(&ob).is_empty(), "the reply is still on its way back");
+        sim.with_remote("pay.test", |r: &Recorder| assert_eq!(r.calls().len(), 1));
+        let at: Vec<u64> = sim.outbound_deliveries().iter().map(|d| d.at).collect();
+        assert_eq!(at, vec![1_000_000_000]);
+    }
+
     /// Amendment A3: a reply goes only to the handle that started the call.
     #[test]
     fn a_new_handle_never_receives_an_old_handles_reply() {

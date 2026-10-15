@@ -4868,6 +4868,132 @@ fn the_kernel_stops_stepping_a_stopped_archive() {
     );
 }
 
+/// Steps once and hands back the archive notice that step left, if any.
+fn step_for_notice(k: &mut Kernel, source: &mut dyn RequestSource) -> Option<String> {
+    k.step(source).expect("the kernel must not stop");
+    k.take_archive_notice()
+}
+
+/// Spec §7's operator surface at the kernel: a permanent ownership refusal
+/// raises exactly ONE notice, on the step that stops the archive, and it
+/// names the writer that owns the bucket.
+#[test]
+fn a_stopped_archive_raises_one_notice() {
+    let (_sim, mut k, _store) = kernel_with_archive_over(0x7A13_0030, FOREIGN_WRITER);
+    let mut source = SilentSource;
+    let mut notices = Vec::new();
+    for i in 0..2_000u64 {
+        notices.extend(step_for_notice(&mut k, &mut source));
+        if i % 10 == 0 {
+            write_records_at(k.app_mut_for_tests().db_for_tests(), 10_000 + i, 1);
+        }
+    }
+    assert!(
+        k.archive_for_tests()
+            .expect("built with an archive")
+            .stopped(),
+        "the planted foreign manifest never stopped the archive, so the count below says nothing"
+    );
+    assert_eq!(
+        notices.len(),
+        1,
+        "a stopped archive must raise exactly one notice: {notices:?}"
+    );
+    assert!(notices[0].contains(FOREIGN_WRITER), "{}", notices[0]);
+}
+
+/// Spec §7's first row: a failure the archive retries within its bound is
+/// not an operator notice. With every PUT failing and the log well inside
+/// `pin_segments`, the archive fails attempt after attempt and the kernel
+/// raises nothing.
+#[test]
+fn a_within_bound_archive_failure_raises_no_notice() {
+    let (_sim, mut k, store) = kernel_with_archive(0x7A13_0031, 3 * RECORDS_PER_SEGMENT);
+    store.set_puts_fail(true);
+    let mut source = EndlessSource { next: 0 };
+    let mut notices = Vec::new();
+    for _ in 0..300 {
+        notices.extend(step_for_notice(&mut k, &mut source));
+    }
+    let archive = k.archive_for_tests().expect("built with an archive");
+    assert!(
+        store.keys().is_empty() && k.stats().archive_steps > 0,
+        "the outage did not hold or the archive never ran ({} steps, bucket {:?})",
+        k.stats().archive_steps,
+        store.keys()
+    );
+    assert!(
+        !archive.gapped() && !archive.stopped(),
+        "the log left the bound, so this is no longer the within-bound case"
+    );
+    assert!(
+        notices.is_empty(),
+        "a within-bound retry raised operator notices: {notices:?}"
+    );
+}
+
+/// Spec §7: a gap raises exactly ONE notice, on the step that gaps, and it
+/// names the bound. Every PUT fails while the log seals past
+/// `GAP_PIN_SEGMENTS`; the archive keeps failing afterwards and raises
+/// nothing more.
+#[test]
+fn a_gapped_archive_raises_one_notice() {
+    let (sim, mut app) = kernel_app(0x7A13_0032);
+    let arc = Archive::open(
+        archive_config_bounded(0, 8 << 20, GAP_PIN_SEGMENTS),
+        app.db_for_tests(),
+    )
+    .unwrap();
+    let store = SharedStore::new();
+    store.set_puts_fail(true);
+    let mut k = Kernel::with_archive(
+        app,
+        Box::new(sim.clock()),
+        arc,
+        Box::new(store.clone()) as Box<dyn ObjectStore>,
+    )
+    .unwrap();
+    let mut source = SilentSource;
+    let mut notices = Vec::new();
+    let chunk = RECORDS_PER_SEGMENT / 2;
+    let gapped = |k: &Kernel| {
+        k.archive_for_tests()
+            .expect("built with an archive")
+            .gapped()
+    };
+    // Natural count: the first gap lands in round 18 (9 sealed segments
+    // against a bound of 8).
+    let mut round = 0;
+    while !gapped(&k) {
+        assert!(
+            round < 40,
+            "{round} rounds sealed ~{} segments against a bound of {GAP_PIN_SEGMENTS} with every \
+             PUT failing, and the archive never gapped, so the count below says nothing",
+            round / 2
+        );
+        write_records_at(k.app_mut_for_tests().db_for_tests(), round * chunk, chunk);
+        for _ in 0..4 {
+            notices.extend(step_for_notice(&mut k, &mut source));
+        }
+        round += 1;
+    }
+    // The archive keeps failing while gapped. A few single-record commits
+    // keep its arm ready without sealing toward a second gap: each gap is
+    // its own episode, and this test asks about one.
+    for i in 0..200u64 {
+        if i % 10 == 0 {
+            write_records_at(k.app_mut_for_tests().db_for_tests(), 1_000_000 + i, 1);
+        }
+        notices.extend(step_for_notice(&mut k, &mut source));
+    }
+    assert_eq!(
+        notices.len(),
+        1,
+        "a gap must raise exactly one notice: {notices:?}"
+    );
+    assert!(notices[0].contains("pin_segments"), "{}", notices[0]);
+}
+
 /// `kernel_with_archive`, but over a bucket a DIFFERENT writer already owns
 /// — so `adopt` refuses and latches `State::Stopped` (spec §4 rule 2).
 fn kernel_with_archive_over(seed: u64, writer: &str) -> (Sim, Kernel, SharedStore) {

@@ -3086,6 +3086,180 @@ fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
     );
 }
 
+/// Commits `n` pongs straight to the store, so they arrive without a request
+/// step for the tail arm to race against.
+fn emit_pongs_directly(kernel: &mut Kernel, n: u64) {
+    let db = kernel.app_mut_for_tests().db_for_tests();
+    for i in 0..n {
+        db.transact(|tx| {
+            tx.emit(Pong { n: WireU64(i) });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    }
+}
+
+/// Subscribes one `/pongs` tail per entry of `requests` (each with its own
+/// stall), in order, and steps until every subscribe is served. Each step's
+/// arm is the kernel's own choice, so a tail that is already behind may be
+/// served in between; the caller states what it needs of that.
+fn subscribe_tails(
+    sim: &Sim,
+    kernel: &mut Kernel,
+    requests: Vec<(String, Box<dyn FnMut() -> bool + Send>)>,
+) -> (SimSource, Vec<SimSinkHandle>) {
+    let want = requests.len();
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    for (path, stall) in requests {
+        source.push_stall(stall);
+        source.push_at(t, Request::new(Method::Get, path));
+    }
+    let sinks = source.sinks();
+    // Natural count: one step per subscribe, plus whatever tail steps the
+    // kernel interleaves.
+    for _ in 0..1_000 {
+        if sinks.lock().unwrap().len() == want {
+            let handles = sinks.lock().unwrap().clone();
+            return (source, handles);
+        }
+        kernel.step(&mut source).expect("no step may fail");
+    }
+    panic!(
+        "{} of {want} subscribes were served in 1,000 steps",
+        sinks.lock().unwrap().len()
+    );
+}
+
+fn never_stall() -> Box<dyn FnMut() -> bool + Send> {
+    Box::new(|| false)
+}
+
+/// The tail arm serves a tail that is BEHIND: with one tail caught up at the
+/// round-robin cursor and another far behind, every step of the arm delivers
+/// to the one behind. A step spent on the caught-up tail delivers nothing,
+/// and the tail with a backlog waits a whole extra step per tail ahead of it.
+#[test]
+fn every_tail_step_serves_a_tail_that_is_behind() {
+    let sim = Sim::with_faults(0x7A13_0040, FaultConfig::none());
+    let mut kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    let total = 10 * TAIL_BATCH_EVENTS as u64;
+    emit_pongs_directly(&mut kernel, total);
+    let first: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 1)
+        .unwrap();
+    // A resumes after the first pong, 639 behind; B subscribes bare, caught up.
+    let (mut source, handles) = subscribe_tails(
+        &sim,
+        &mut kernel,
+        vec![
+            (
+                format!("/pongs?cursor={}", cursor_of(&first[0])),
+                never_stall(),
+            ),
+            ("/pongs".to_string(), never_stall()),
+        ],
+    );
+    let (a, b) = (&handles[0], &handles[1]);
+    let want = total as usize - 1;
+    assert!(
+        a.frames().len() < want - TAIL_BATCH_EVENTS,
+        "A was served {} of {want} before B subscribed, leaving too little backlog to measure",
+        a.frames().len()
+    );
+    // Natural count: at most 10 steps, one per unit of A's backlog.
+    for _ in 0..20 {
+        let before = a.frames().len();
+        if before == want {
+            break;
+        }
+        kernel.step(&mut source).expect("no step may fail");
+        assert!(
+            a.frames().len() > before,
+            "a tail-arm step delivered nothing to A, {} of {want} behind: it served the \
+             caught-up tail B instead",
+            want - before
+        );
+    }
+    assert_eq!(a.frames().len(), want, "A never caught up in 20 steps");
+    assert!(b.frames().is_empty(), "B subscribed after the last pong");
+}
+
+/// Round-robin (`tail_cursor`'s doc: one slow tail must not starve the
+/// others): while two tails are both behind, the arm alternates between them,
+/// and neither is served twice in a row.
+#[test]
+fn two_tails_behind_are_served_in_turn() {
+    let sim = Sim::with_faults(0x7A13_0041, FaultConfig::none());
+    let mut kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    let (mut source, handles) = subscribe_tails(
+        &sim,
+        &mut kernel,
+        vec![
+            ("/pongs".to_string(), never_stall()),
+            ("/pongs".to_string(), never_stall()),
+        ],
+    );
+    let total = 4 * TAIL_BATCH_EVENTS;
+    emit_pongs_directly(&mut kernel, total as u64);
+    let counts = || handles.iter().map(|h| h.frames().len()).collect::<Vec<_>>();
+    let mut served = Vec::new();
+    // Natural count: 8 steps, four units for each tail.
+    for _ in 0..8 {
+        let before = counts();
+        kernel.step(&mut source).expect("no step may fail");
+        let after = counts();
+        let who: Vec<usize> = (0..2).filter(|&i| after[i] > before[i]).collect();
+        assert_eq!(
+            who.len(),
+            1,
+            "one tail-arm step serves one tail: {before:?} -> {after:?}"
+        );
+        served.push(who[0]);
+    }
+    assert_eq!(counts(), vec![total, total], "both tails caught up");
+    assert!(
+        served.windows(2).all(|w| w[0] != w[1]),
+        "a tail was served twice in a row while the other was behind: {served:?}"
+    );
+}
+
+/// When a tail ends mid-rotation, the rotation goes on from the tail that
+/// came after it, so no tail is passed over. A's sink is full from its first
+/// frame, so A ends on its first unit; B came after A, so B is served next,
+/// ahead of C.
+#[test]
+fn a_tail_ending_mid_rotation_passes_no_tail_over() {
+    let sim = Sim::with_faults(0x7A13_0042, FaultConfig::none());
+    let mut kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    let (mut source, handles) = subscribe_tails(
+        &sim,
+        &mut kernel,
+        vec![
+            ("/pongs".to_string(), Box::new(|| true)),
+            ("/pongs".to_string(), never_stall()),
+            ("/pongs".to_string(), never_stall()),
+        ],
+    );
+    emit_pongs_directly(&mut kernel, 4 * TAIL_BATCH_EVENTS as u64);
+    let (a, b, c) = (&handles[0], &handles[1], &handles[2]);
+    kernel.step(&mut source).expect("no step may fail");
+    assert!(
+        a.closed() && b.frames().is_empty() && c.frames().is_empty(),
+        "the first step serves A, the tail at the cursor, and ends it"
+    );
+    kernel.step(&mut source).expect("no step may fail");
+    assert_eq!(
+        (b.frames().len(), c.frames().len()),
+        (TAIL_BATCH_EVENTS, 0),
+        "B came after A in the rotation, so B is served next; serving C first passes B over"
+    );
+}
+
 /// The literal bytes a subscriber receives, pinned as bytes (review round 1,
 /// finding 4). Task 6 moved `Ping.n` from a bare `u64` to `WireU64`, which
 /// changed this document: the frame body is now `{"n":"7"}`, a decimal STRING,
