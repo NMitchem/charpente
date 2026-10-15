@@ -53,6 +53,8 @@ impl From<Customer> for CustomerView {
     }
 }
 
+// Demo only: this login mints a session for whatever subject the body names.
+// A real app trades a verified credential for a session (GUIDE §5's `login`).
 #[route(POST "/login", public)]
 pub fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_session(tx, subject))

@@ -268,7 +268,7 @@ that is a claim about charpente is in docs/BENCH.md or absent, and every other f
 cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
 the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, four from the outbound docs-only build, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
@@ -289,11 +289,11 @@ signed by Noah 2026-10-14 (record
 refused or left unproven became the seven outbound rows near the end of
 this table: spec §15 refused the first five, plan amendment A19 pinned oracle 2's
 switchover row at the write gate rather than through a two-node rig (the sixth), and the
-seventh is a node-wiring gap. Each reopens on the first app that needs it. The four rows
+seventh is a node-wiring gap. Each reopens on the first app that needs it. The five rows
 after them came from that build's own record
 ([docs/experiments/2026-10-outbound/](docs/experiments/2026-10-outbound/)): three are
-gaps its review found in the outbound oracles (I3, I4, I1), and one is a credential fact
-its testimony surfaced.
+gaps its review found in the outbound oracles (I3, I4, I1), and two are credential facts
+its testimony and review surfaced (the id, I5's revocation).
 
 | Item | Trigger |
 |---|---|
@@ -321,6 +321,7 @@ its testimony surfaced.
 | **Dead reachable in the sim, and a hook or documented path for an outbound job that goes Dead** (review I4) | The first app that must act on an outbound effect it gave up on. `outbound_settles_by_horizon` rightly counts Dead as settled (spec §10), but no universe reaches Dead, and an app has no documented way to notice one. |
 | **Mechanical enforcement of GUIDE §8's rule that `durable_corruption_fired` may excuse a give-up, never wrong data** (review I1) | The first app whose corruption excuse hides a consistency or isolation failure. Today the rule is stated in prose and enforced by nothing. |
 | **Credential row ids drawn independently of the secret** (testimony row 12) | The first app that must show a key's or session's id to someone other than its holder. Today a `Session`'s or `ApiKey`'s id is the first 64 bits of its secret's draw (GUIDE §5). |
+| **Revocation that ends what a credential minted** (review I5) | The first app whose revoke must also end the sessions and keys minted by a request that presented the revoked credential. Today revoking a key ends that key alone (GUIDE §5), so a session traded for it stays live until it expires. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,
