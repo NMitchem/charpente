@@ -5,8 +5,9 @@
 remote for `pay.fixture` on loopback, and so `outbound_node` can verify it.
 
 - `ca.pem` / `ca.key`: a self-signed CA, "charpente outbound-fixture test CA",
-  with a critical name constraint that permits `pay.fixture` and nothing else
-  (`nameConstraints=critical,permitted;DNS:pay.fixture`).
+  with a critical name constraint that permits `pay.fixture` and names under it
+  (`nameConstraints=critical,permitted;DNS:pay.fixture`; a DNS constraint
+  admits subdomains too), so it cannot vouch for any real host.
 - `server.pem` / `server.key`: a certificate for `pay.fixture` (its only
   subject alternative name), issued by that CA. `fake_remote` serves it.
 
