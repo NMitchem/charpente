@@ -44,9 +44,8 @@ this plan. There is no attempt 2.
 | App repository | final code commit `fe71ad6`, 10 commits, head `bbecb23` (FINDINGS commits after the code), outside charpente (`triage-run/triage/`); bundle `triage-attempt-1.bundle` beside the run directory, full history, head `bbecb23` |
 
 `$RUN` in `attempt-1/keyless-check.md` is the run directory, `triage-run/`; the keyless
-copy was removed after the check. `attempt-1/gates.md` quotes every line of the
-controller's raw gate log (`gates-raw.txt`), which stayed in the plan's working directory
-and is not part of this record.
+copy was removed after the check. `attempt-1/gates.md` summarizes the controller's raw
+gate log, `attempt-1/gates-raw.txt`, which sits beside it.
 
 **The scan note.** The builder ran under the same harness session as the controller, so
 its scratchpad directory was the controller's, and that directory held plan material. The
