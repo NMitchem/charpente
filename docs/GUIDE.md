@@ -2128,7 +2128,8 @@ The first line is a call whose connection never opened, so no byte of it was
 sent: a refused connection, a failed DNS lookup or a failed TLS handshake. Its
 `<error>` names which: `connection refused` in the sim, and in production
 `could not connect: ` and the client's cause chain (`client error (Connect):
-tcp connect error: Connection refused (os error 61)`, say). The second is
+tcp connect error: Connection refused (os error 61)`, say), or `the outbound
+runtime thread is gone` for a call the client's dead thread never took. The second is
 every other transport failure's. `<timeout>` is the
 job's `timeout` as Rust prints a `Duration` (`2s`, `1.5s`), and `<cap>` is the
 host's reply cap in bytes.

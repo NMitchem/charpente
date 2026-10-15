@@ -897,7 +897,12 @@ impl Outbound for ProdOutbound {
         );
         self.cmds.send(Cmd::Start(token, call)).map_err(|_| {
             self.in_flight.borrow_mut().remove(&token);
-            io::Error::other("the outbound runtime thread is gone")
+            // Nothing was sent, so this is io.rs's "certainly did not reach
+            // the remote" kind (final review M4).
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the outbound runtime thread is gone",
+            )
         })
     }
     fn poll(&self) -> Option<(u64, io::Result<OutboundReply>)> {
@@ -2771,6 +2776,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ob.next_wake(), OutboundWake::Unknown);
+    }
+
+    /// Final review M4: a `start` the runtime thread is no longer there to
+    /// take sent nothing, so it fails with `ConnectionRefused`, the kind io.rs
+    /// reserves for a call that certainly did not reach the remote (the
+    /// kernel words any other as "may have applied"), and the token leaves
+    /// flight. Only a panicked runtime thread drops the receiver, so the test
+    /// builds the client with its receiver already dropped.
+    #[test]
+    fn a_start_after_the_runtime_thread_is_gone_never_reached_the_remote() {
+        let (cmds, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let (_done_tx, done) = mpsc::channel();
+        let ob = ProdOutbound {
+            cmds,
+            done,
+            in_flight: std::cell::RefCell::new(BTreeSet::new()),
+        };
+        let err = ob.start(7, plain_call("/gone")).unwrap_err();
+        assert_eq!(
+            (err.kind(), err.to_string().as_str()),
+            (
+                io::ErrorKind::ConnectionRefused,
+                "the outbound runtime thread is gone"
+            )
+        );
+        assert!(
+            ob.in_flight.borrow().is_empty(),
+            "a failed start leaves nothing in flight"
+        );
     }
 
     #[crate::job(global, outbound = "pay.test")]
