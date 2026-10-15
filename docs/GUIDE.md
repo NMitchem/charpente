@@ -3637,6 +3637,7 @@ Register one model per declared host, then build the outbound handle:
   list, passed as plain data. A host with no model is refused by name before
   anything runs:
 
+<!-- pinned -->
 ```text
 sim: a mounted job calls <host>, which has no model — add sim.remote("<host>", …) before sim.outbound(…)
 ```
