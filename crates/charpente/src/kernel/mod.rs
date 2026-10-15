@@ -630,9 +630,13 @@ impl Kernel {
                  now ({now}), so Kernel::run would spin without advancing time. The component \
                  that named it holds a deadline at or before now: job {:?} (writable \
                  {writable}), cron {:?}, repl {:?}, outbound timeout {:?}, outbound wake {:?} \
-                 with {} in flight. Fix that component's ready predicate in Kernel::step \
-                 (kernel/mod.rs) so it is ready whenever its own deadline has passed, or its \
-                 deadline so it names only the future",
+                 with {} in flight. Fix the pair that disagrees so a component is ready \
+                 whenever its own deadline has passed, or names only the future: job \
+                 Dispatcher::has_due/next_deadline (kernel/dispatch.rs), cron \
+                 CronScheduler::has_due/next_deadline (kernel/cron.rs), repl Repl::has_work/next_deadline \
+                 (repl/mod.rs), outbound timeout Dispatcher::outbound_ready/\
+                 next_outbound_deadline (kernel/dispatch.rs), outbound wake the Outbound \
+                 impl's poll/next_wake",
                 self.dispatcher.next_deadline(),
                 self.cron.next_deadline(),
                 self.repl.as_ref().and_then(|r| r.next_deadline(now)),

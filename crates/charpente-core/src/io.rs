@@ -345,7 +345,9 @@ pub enum OutboundWake {
     /// No completion will ever arrive for what is in flight (every reply is
     /// lost): only the kernel's own deadlines wake it.
     Never,
-    /// The next completion is due at this instant.
+    /// The next completion is due at this instant: `poll` returns it once the
+    /// clock reaches the instant. An `At` already passed with nothing to poll
+    /// stops the kernel by name, since parking on it would never advance time.
     At(Instant),
 }
 
