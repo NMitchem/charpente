@@ -619,6 +619,28 @@ impl Kernel {
                 let tick = Instant::from_nanos(now + REPL_TICK_NANOS);
                 deadline = Some(deadline.map_or(tick, |d| d.min(tick)));
             }
+            // Negative space (hard rule 4). A wake at or before `now` parks
+            // for nothing: `SimSource::wait_until` returns without moving
+            // virtual time and `ProdSource`'s returns at once, so `run` would
+            // spin here forever. Whatever names a passed deadline must
+            // already have been in the ready set above.
+            assert!(
+                deadline.is_none_or(|d| d.as_nanos() > now),
+                "kernel invariant: Kernel::step went Idle with a wake at {deadline:?}, not after \
+                 now ({now}), so Kernel::run would spin without advancing time. The component \
+                 that named it holds a deadline at or before now: job {:?} (writable \
+                 {writable}), cron {:?}, repl {:?}, outbound timeout {:?}, outbound wake {:?} \
+                 with {} in flight. Fix that component's ready predicate in Kernel::step \
+                 (kernel/mod.rs) so it is ready whenever its own deadline has passed, or its \
+                 deadline so it names only the future",
+                self.dispatcher.next_deadline(),
+                self.cron.next_deadline(),
+                self.repl.as_ref().and_then(|r| r.next_deadline(now)),
+                self.dispatcher.next_outbound_deadline(),
+                (self.dispatcher.in_flight_len() > 0)
+                    .then(|| self.outbound.as_ref().map(|o| o.next_wake())),
+                self.dispatcher.in_flight_len(),
+            );
             return Ok(Step::Idle { deadline });
         }
         // The same-shape decision site (DESIGN §1): one entropy draw
@@ -1043,6 +1065,7 @@ impl Kernel {
                 // shape, for the job arm's reason (C-1).
                 let mut group = self.app.begin_job_group()?;
                 let mut drained = 0usize;
+                let late_at_start = self.stats.outbound_late;
                 let mut cancels = Vec::new();
                 let drain = (|| -> io::Result<()> {
                     while drained < MAX_BATCH {
@@ -1109,6 +1132,23 @@ impl Kernel {
                     (Err(e), Ok(())) => return Err(e),
                     (Err(_), Err(failure)) => return Err(failure.error),
                 }
+                // Negative space (hard rule 4). The arm ran because
+                // `outbound_ready` said a completion or a passed deadline was
+                // waiting. A drain that takes neither returns `Worked` and
+                // leaves the arm exactly as ready, so `run` would never park.
+                assert!(
+                    drained > 0 || self.stats.outbound_late > late_at_start,
+                    "kernel invariant: the outbound arm was ready but serviced nothing (no \
+                     completion settled or discarded late, no call expired), so Kernel::step \
+                     would return Worked forever and Kernel::run would never park. After the \
+                     drain: ready {}, {} in flight, earliest timeout {:?}, now {now}. Fix \
+                     Dispatcher::outbound_ready (kernel/dispatch.rs) and the arm's drain \
+                     (pop_completion, expire_into) so whatever makes the arm ready is what the \
+                     drain takes",
+                    self.dispatcher.outbound_ready(now),
+                    self.dispatcher.in_flight_len(),
+                    self.dispatcher.next_outbound_deadline(),
+                );
             }
         }
         // Any serviced source may have enqueued (handlers can enqueue too), so
