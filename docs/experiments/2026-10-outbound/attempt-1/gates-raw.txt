@@ -1,0 +1,11 @@
+start 2026-10-14T14:26:10 sha 706fed550fdcf3ac84885816458b309fc9ea8721 mseed 0x9363215d418bc339 app-head bbecb23
+CLIPPY_EXIT=0
+TEST_EXIT=0 ok=3 failed_lines=0 error_test_failed=0
+REPLAY_1_EXIT=0 end 2026-10-14T14:54:39
+REPLAY_2_EXIT=0 end 2026-10-14T15:14:04
+REPLAY_IDENTICAL
+{"universes":10000,"failures":0,"verdicts":45312,"gave_up":4688}
+MUTANTS_classify: mutants: 5 total — 4 caught, 0 missed, 1 unviable, 0 timed out EXIT=0
+MUTANTS_page: mutants: 3 total — 2 caught, 0 missed, 1 unviable, 0 timed out EXIT=0
+app tree clean after
+done 2026-10-14T15:19:23
