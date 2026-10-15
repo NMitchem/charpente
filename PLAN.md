@@ -268,7 +268,7 @@ that is a claim about charpente is in docs/BENCH.md or absent, and every other f
 cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
 the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, four from the outbound docs-only build, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
@@ -286,10 +286,14 @@ DECISIONS §14). Its exit criterion 5 (spec §16), the docs-only build, was met 
 signed by Noah 2026-10-14 (record
 [docs/experiments/2026-10-outbound/](docs/experiments/2026-10-outbound/);
 [docs/LEDGER.md](docs/LEDGER.md), 2026-10-14, "the outbound docs-only build"). What it
-refused or left unproven became the seven rows at the end of
+refused or left unproven became the seven outbound rows near the end of
 this table: spec §15 refused the first five, plan amendment A19 pinned oracle 2's
 switchover row at the write gate rather than through a two-node rig (the sixth), and the
-seventh is a node-wiring gap. Each reopens on the first app that needs it.
+seventh is a node-wiring gap. Each reopens on the first app that needs it. The four rows
+after them came from that build's own record
+([docs/experiments/2026-10-outbound/](docs/experiments/2026-10-outbound/)): three are
+gaps its review found in the outbound oracles (I3, I4, I1), and one is a credential fact
+its testimony surfaced.
 
 | Item | Trigger |
 |---|---|
@@ -313,6 +317,10 @@ seventh is a node-wiring gap. Each reopens on the first app that needs it.
 | **Streaming replies** (spec §15) | The first app that needs it. |
 | **A two-node switchover under outbound load** (plan amendment A19) | The first replicated app with outbound jobs. Oracle 2's switchover row is pinned at the write gate (`Db::forbid_writes`), not through a two-node rig. |
 | **`OutboundOptions` on `serve_replicated`, `backup` and `archive`** — they take none, so a replicated node can reach only public-CA hosts at their real addresses | An app that calls an internal API behind a private CA and must run replicated. |
+| **A per-host coverage key for an outbound timeout that fired** (outbound docs-only build, review I3) | The first app that must `require` that its own timeout path ran. The outbound coverage keys are per fault axis, so a host's timeout path can be dead in every universe with no oracle saying so. |
+| **Dead reachable in the sim, and a hook or documented path for an outbound job that goes Dead** (review I4) | The first app that must act on an outbound effect it gave up on. `outbound_settles_by_horizon` rightly counts Dead as settled (spec §10), but no universe reaches Dead, and an app has no documented way to notice one. |
+| **Mechanical enforcement of GUIDE §8's rule that `durable_corruption_fired` may excuse a give-up, never wrong data** (review I1) | The first app whose corruption excuse hides a consistency or isolation failure. Today the rule is stated in prose and enforced by nothing. |
+| **Credential row ids drawn independently of the secret** (testimony row 12) | The first app that must show a key's or session's id to someone other than its holder. Today a `Session`'s or `ApiKey`'s id is the first 64 bits of its secret's draw (GUIDE §5). |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,

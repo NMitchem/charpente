@@ -961,7 +961,8 @@ handler, carrying:
 - `ctx.principal() -> Option<&Principal>` — the authenticated identity, if
   any. `principal.subject()` is the subject the credential was minted for,
   and `principal.via()` names which rung authenticated it
-  (`Via::Session(id)`, `Via::ApiKey(id)`, or `Via::Oidc`). Read the subject
+  (`Via::Session(id)`, `Via::ApiKey(id)`, or `Via::Oidc`; `charpente::auth::Via`, whose
+  `id` is the matched row's `Id<Session>` or `Id<ApiKey>`). Read the subject
   from here on any `auth` route, whatever the credential kind. A `Principal`
   is read-only to your code: its fields are private, so the only principals
   are the ones the ladder produced. It is not `Clone` either, so the only one
@@ -978,7 +979,10 @@ handler, carrying:
 - `ctx.create_api_key(tx, subject) -> String` — inserts an `ApiKey` row and
   returns the raw key: `"ck_"` + 64 hex chars (the prefix makes a leaked key
   grep-able for scanners). Revoke a key by deleting its row —
-  `tx.delete::<ApiKey>(id)`, an ordinary write.
+  `tx.delete::<ApiKey>(id)`, an ordinary write — after checking that the row's
+  `subject` is the caller's: an id names a key, it does not show the caller holds
+  it (`revoke_key` below). Revoking a key ends that key alone: a session or key
+  minted by a request that presented it stays live.
 - `ctx.revoke(tx)` — deletes the current session (logout); a no-op without
   one.
 
@@ -987,6 +991,12 @@ entropy bytes drawn once *before* the transaction starts, so
 `create_session` and `create_api_key` share a single mint budget — calling
 either a second time in one request panics: "Ctx::create_session/create_api_key
 called twice in one request — one credential mint per request".
+
+A `Session`'s or `ApiKey`'s `id` is the first 64 bits of that same draw: the
+raw token's first 16 hex characters (after `ck_` for a key). The ladder finds a
+row by the hash of the whole raw token, and the other 192 bits stay secret, so
+showing a holder the id of their own credential (to revoke it, say) is fine.
+Show it to no one else: each id is a quarter of a credential.
 
 **The resolution ladder.** Before your handler runs, the platform turns the
 request's credential into a `Principal`, in this order:
@@ -1032,10 +1042,17 @@ resolution never waits on it.
 use charpente::auth::ApiKey;
 use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Id, Schema, Tx, route, routes};
+use charpente::{Id, Schema, Tx, View, route, routes};
 
-#[route(POST "/login", public)]
-fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
+// A login trades a credential the ladder has already verified (an API key, or
+// an OIDC token, below) for a session in the same subject. charpente has no
+// password check, so never mint for a subject a request body names: that
+// lets anyone log in as anyone. The first credential comes from something the
+// app trusts, such as an IdP or a signup route that mints a key for a subject
+// it has just created.
+#[route(POST "/login", auth)]
+fn login(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let subject = ctx.principal().expect("auth route").subject().to_string();
     Ok(ctx.create_session(tx, subject))
 }
 
@@ -1062,11 +1079,18 @@ fn mint_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_api_key(tx, subject))
 }
 
+// `ApiKey` is a global table, so any id reaches any subject's key. Revoke only
+// the caller's own, and answer another subject's key as absent.
 #[route(DELETE "/keys/:id", auth)]
 fn revoke_key(tx: &mut Tx, id: Id<ApiKey>, ctx: &Ctx) -> Result<&'static str, ApiError> {
-    let _ = ctx;
-    tx.delete::<ApiKey>(id);
-    Ok("revoked")
+    let caller = ctx.principal().expect("auth route").subject();
+    match tx.get(id)? {
+        Some(key) if key.subject == caller => {
+            tx.delete::<ApiKey>(id);
+            Ok("revoked")
+        }
+        _ => Err(ApiError::NotFound),
+    }
 }
 
 fn build_app(data_dir: &str) -> std::io::Result<App> {
@@ -1200,6 +1224,11 @@ value:
   unmatched path gets from the router directly.
 - `Internal(String)` → 500. Carries `e.to_string()` when it arrived via
   `?`, or your own message.
+
+There is no 403. To refuse a caller the ladder did authenticate (an `authorize`
+that says no, a row the caller does not own), pick one of the variants above:
+this guide's membership checks answer `BadRequest` naming the tenant, and
+`revoke_key` above answers `NotFound`, which does not say whether the row exists.
 
 Two more statuses never go through `ApiError` at all: an unmatched path is
 404 ("not found") and a matched path with the wrong method is 405 ("method
@@ -2741,7 +2770,8 @@ your property could be adjudicated at all. Say so with `sim.give_up(reason)`;
 it is neither a pass nor a failure, and the report counts it separately.
 `sim_tests!` lists
 the workloads to run by name, each optionally followed by `require [...]` —
-sometimes-coverage keys (`Sim::cover`, plus the sim's own auto-covered
+sometimes-coverage keys (`Sim::cover(&self, what: &'static str)`, so a key is a
+literal or a `const`, not a `format!`ed `String`; plus the sim's own auto-covered
 `fault:*`/`crash:*`/`restart` keys) that must be hit at least once across
 that test's universes in a batch run, or the batch fails even if every
 universe individually passed. A `require`d key that never fires is telling
@@ -3333,8 +3363,14 @@ pieces:
   `SimSource::new(Box::new(sim.clock()), horizon_nanos)` bounds the
   universe at a virtual-time horizon; `push_at(at_nanos, request)`
   schedules arrivals (in arrival order — pushing out of order is an
-  assert); `responses()` hands back a shared handle to the recorded
-  `(status, body)` pairs, filled in as the kernel replies.
+  assert). Both times are absolute virtual nanoseconds on the universe's
+  clock, not offsets: a source built mid-universe adds
+  `sim.now().as_nanos()`. `responses()` hands back a shared handle to the recorded
+  `(status, body)` pairs, filled in as the kernel replies: one entry per
+  request the kernel served (an SSE upgrade's opening response included), in
+  arrival order. A request it never served, past the horizon or after `run`
+  stopped on a poisoned engine, records nothing, so the entries are a prefix
+  of the script and entry `i` answers the `i`-th push.
 - **`Kernel::new(app, Box::new(sim.clock()))`** consumes the mounted `App`
   (upserting cron rows and rebuilding the job due-heap — §6, §7);
   `kernel.run(&mut source)` then serves scripted requests at their virtual
@@ -3346,7 +3382,16 @@ pieces:
   counters (`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`,
   `cron_ticks`, `cron_catchups`, and §6's outbound counters) and
   `kernel.into_app()` hands the `App` back — `app.db().snapshot()` reads the
-  durable end-state. An app that mounts an outbound job builds its kernel with
+  durable end-state. A tenant's rows read through `snap.scan_scoped::<R>(tenant)`
+  and `snap.get_scoped(tenant, id)`, where `tenant` is its raw id (§16). The job
+  queue reads through `snap.scan::<JobRow>()`; `charpente::core::job::JobRow`'s
+  fields are all `pub`: `id: Id<JobRow>`, `name: String`, `payload: Vec<u8>`,
+  `key: Option<String>`, `status: JobStatus` (`Pending`, `Done` or `Dead`),
+  `attempts: u32`, `due_at: u64`, `last_error: Option<String>`, `shape:
+  Option<u64>`, `scope: Option<u64>` (the tenant's raw id; `None` for a global
+  job) and `outbound_key: Option<[u8; 16]>` (`Some` on an outbound job: the
+  bytes of the key its calls carry, as a `Delivered`'s `key.as_bytes()`
+  returns them, below). An app that mounts an outbound job builds its kernel with
   `Kernel::with_outbound` instead (§6, "When a call fails").
 
 One mindset note before the example: under `charpente test --sim`, every
@@ -3570,13 +3615,22 @@ The same text is a panic when a handle starts a call to a host that has no
 model, such as one the list given to `sim.outbound` left out.
 
 A model implements `charpente_sim::outbound::Remote`, whose one method is
-`fn handle(&mut self, call: &OutboundCall, rng: &mut Rng) -> OutboundReply`.
-It runs when the request reaches the remote, at its drawn delivery time, not
-when the kernel starts the call. `rng` is the model's own seeded stream,
-keyed by the host's name, so a model's variance (a payment that is sometimes
-declined, an LLM that sometimes answers ambiguously) replays with the seed
-and moves no other draw. A model is `Send + 'static`. It runs under the sim's
-world lock, so it must never call back into the `Sim`.
+`fn handle(&mut self, call: &OutboundCall, rng: &mut Rng) -> OutboundReply`,
+with `OutboundCall` and `OutboundReply` from `charpente::core::io` and `Rng`
+from `charpente_sim::rng`. `call` is the request as the kernel built it:
+`host: &'static str`, `method: HttpMethod`, `path: String` (path and query),
+`headers: Vec<(String, String)>`, `body: Vec<u8>` and `key: IdempotencyKey`.
+`OutboundReply` has no constructor: build it as a struct literal of its three
+`pub` fields, `status: u16`, `headers: Vec<(String, String)>` and `body:
+Vec<u8>` (the example below). `handle` runs when the request reaches the
+remote, at its drawn delivery time, not when the kernel starts the call.
+`rng` is the model's own seeded stream, keyed by the host's name, so a
+model's variance (a payment that is sometimes declined, an LLM that sometimes
+answers ambiguously) replays with the seed and moves no other draw. It offers `next_u64()`, `fill(&mut [u8])`,
+`chance(p)` (true with probability `p`, which must lie in [0, 1]), `below(n)`
+(uniform in `0..n`) and `between(lo, hi)` (uniform in `lo..=hi`). A model is
+`Send + 'static`. It runs under the sim's world lock, so it must never call
+back into the `Sim`.
 
 There are three ways to get a model. Each is a named choice, and none is a
 default:
@@ -3610,8 +3664,57 @@ wrong-type text names both the type asked for and the one registered. A
 wrapped model is read as its wrapper: `|m: &Idempotent<StripeModel>|`, then
 `m.inner()`.
 
+The closure gets `&M`, never `&mut M`, so nothing reaches a model through
+`with_remote`. A model the workload must change mid-universe, such as one
+calmed for the fault-free tail, shares state with it from registration: the
+workload keeps a clone of an `Arc<AtomicBool>` and flips it between kernel
+runs. The model reads it when a request reaches it, so a request already on
+the wire meets the new state. This model does that, and draws its variance
+from `rng`:
+
+```rust
+use charpente::core::io::{OutboundCall, OutboundReply};
+use charpente_sim::Sim;
+use charpente_sim::outbound::Remote;
+use charpente_sim::rng::Rng;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// An LLM that labels a message, and answers "unsure" one call in ten until
+/// the workload calms it.
+struct Classifier {
+    calm: Arc<AtomicBool>,
+}
+
+impl Remote for Classifier {
+    fn handle(&mut self, call: &OutboundCall, rng: &mut Rng) -> OutboundReply {
+        let label = if !self.calm.load(Ordering::Relaxed) && rng.chance(0.1) {
+            "unsure"
+        } else if call.body.windows(6).any(|w| w == b"urgent") {
+            "urgent"
+        } else {
+            "routine"
+        };
+        OutboundReply {
+            status: 200,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: format!(r#"{{"label":"{label}"}}"#).into_bytes(),
+        }
+    }
+}
+
+/// Registers the model and hands back its switch. Before the fault-free tail
+/// the workload calls `calm.store(true, Ordering::Relaxed)`.
+fn register(sim: &Sim) -> Arc<AtomicBool> {
+    let calm = Arc::new(AtomicBool::new(false));
+    sim.remote("llm.example", Classifier { calm: Arc::clone(&calm) });
+    calm
+}
+```
+
 `sim.outbound_deliveries()` returns every request that has reached a
-remote, as `charpente_sim::outbound::Delivered { host, key, at, handle }`.
+remote, as `charpente_sim::outbound::Delivered { host: String, key:
+IdempotencyKey, at: u64, handle: u64 }`.
 `key` is the job's `OutboundCall::key`, which attributes a delivered call to
 its job. `at` is the virtual arrival time in nanoseconds, and `handle` says
 which `SimOutbound`, and so which process, sent it. Like `with_remote`, it
@@ -3852,7 +3955,14 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
 Register it as `receipts_settle_under_faults require ["outbound:checked"]`. A
 universe in which neither order committed passes all three checkers having
 checked nothing, which is why the coverage key is marked only where an
-outbound job exists.
+outbound job exists. One kernel per faulted phase, as here, leaves room for
+that: under a swarm's `sync_error`, a kernel can poison early in a round and
+`run` stops, leaving the rest of the script unanswered (`responses()` above).
+A workload that wants verdicts runs the phase as a supervisor loop: restart
+the process (`sim.restart_process()`, or `sim.restart()` once
+`sim.disk_crashed()`), boot through `boot_through_fallout`, build a fresh
+handle and kernel, and re-send in a new `SimSource` every request past the end
+of the last one's `responses()`, until the phase's time is up.
 
 **Why the key matters.** The platform mints the key and keeps it across every
 retry, but only the app puts it in the request, and only the remote can act on
@@ -4121,8 +4231,18 @@ mutants: 1 total — 0 caught, 1 missed, 0 unviable, 0 timed out
   runs, reaches a verdict, and does not notice this change — it is ONE-SIDED with
   respect to the mutated code, and would pass just the same if the code were deleted.
   Fix: assert the EFFECT the mutated code produces (a value that differs when it does
-  not run), not merely that the surrounding state is still readable.
+  not run), not merely that the surrounding state is still readable. The surviving
+  diff is in the run directory.
 ```
+
+To cargo-mutants' own lines, which pass through (the `MISSED` line above is
+one), the verb adds only the summary and a MISSED or TIMED OUT paragraph; it
+names no caught mutant. The run directory is cargo-mutants' own per-mutant
+record, at `target/charpente-mutants/mutants.out/`
+under the directory the verb ran in (`--dir`, default `.`): `outcomes.json`, and
+`caught.txt`, `missed.txt`, `timeout.txt` and `unviable.txt`, one mutant per
+line. The previous run's record moves to `mutants.out.old`. Both sit under
+`target/`, which the scaffold's `.gitignore` leaves out of the repository.
 
 The same mutant, judged by the honest sibling, is **CAUGHT**:
 
@@ -8288,7 +8408,10 @@ It is **not** a sandbox around the process. Your own `main` builds the `App` it
 hands to `launch`, so it holds `App::db()` — and a `Db` reaches every tenant:
 `Db::snapshot()` exposes scoped and raw reads that take a scope on the caller's
 word with no `authorize` on the path (replication seeding, the archive and
-`restore` are built on them), and `Db::begin_group` can mint the `CrossTenant`
+`restore` are built on them; operator code and a sim oracle read one tenant's
+rows with `get_scoped(scope, id)`, `scan_scoped(scope)`, `scan_from_scoped(scope,
+from_id, limit)` and `scan_by_scoped(scope, index, key)`, `scope` being the
+tenant's raw id), and `Db::begin_group` can mint the `CrossTenant`
 token, for the length of that group's borrow. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
 
@@ -8330,7 +8453,9 @@ this Row's TABLE is "charpente.schema_versions", the platform's migration record
 **Sessions and API keys are the app's own.** `Session` and `ApiKey` (§5) are ordinary
 `#[table(global)]` tables that `App::open` registers for you, and a handler reads and
 writes them like any other global table. They carry no tenant data, and revoking a key is
-`tx.delete::<ApiKey>(id)`, an ordinary write, by design.
+`tx.delete::<ApiKey>(id)`, an ordinary write, by design. Being global, any id reaches any
+subject's key, so a revoke checks the row's `subject` against the caller's first (§5's
+`revoke_key`).
 
 **Code outside a handler never takes a scope on its own word.** A job declares
 `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened or its fan-out
