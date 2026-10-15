@@ -83,9 +83,11 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
 
     for _round in 0..ROUNDS {
         let Some(mut app) = boot(sim)? else {
-            // A durable refusal gave the universe up; boots that ran out end
-            // this round, and the next one boots again.
+            // A durable refusal gave the universe up (`boot_through_fallout`
+            // recorded the reason, so only the arm is marked here); boots that
+            // ran out end this round, and the next one boots again.
             if sim.gave_up().is_some() {
+                sim.cover("outbound-fixture:gave-up:boot");
                 return Ok(());
             }
             sim.restart();
@@ -123,6 +125,7 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
     sim.quiesce_outbound_faults();
     let Some(app) = boot(sim)? else {
         return if sim.gave_up().is_some() {
+            sim.cover("outbound-fixture:gave-up:boot");
             Ok(())
         } else {
             Err("the fault-free tail could not boot".into())
