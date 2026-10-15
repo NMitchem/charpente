@@ -411,12 +411,25 @@ fn run_mutants_with_cargo_shim(
 /// `run_mutants_with_cargo_shim` with the install probe answering
 /// `version_exit`: anything but 0 is a machine without cargo-mutants.
 #[cfg(unix)]
-#[allow(clippy::disallowed_methods)]
 fn run_mutants_with_cargo_shim_probed(
     version_exit: &str,
     shim_exit: &str,
     test_exit: &str,
     extra: &[&str],
+) -> (std::process::Output, Vec<String>) {
+    run_mutants_with_cargo_shim_in(version_exit, shim_exit, test_exit, extra, false)
+}
+
+/// The shim run, with `--dir` given as the absolute scratch workspace or, when
+/// `relative_dir`, as `ws` from the scratch directory the verb then runs in.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn run_mutants_with_cargo_shim_in(
+    version_exit: &str,
+    shim_exit: &str,
+    test_exit: &str,
+    extra: &[&str],
+    relative_dir: bool,
 ) -> (std::process::Output, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     // Tests run in parallel threads of one process, so pid alone is not a
@@ -472,7 +485,12 @@ fn run_mutants_with_cargo_shim_probed(
     );
     let out = charpente()
         .args(["test", "--mutants", "--dir"])
-        .arg(&ws)
+        .arg(if relative_dir {
+            std::path::PathBuf::from("ws")
+        } else {
+            ws.clone()
+        })
+        .current_dir(&scratch)
         .args(["--re", "no-such-mutant-anywhere"])
         .args(extra)
         .env("PATH", path)
@@ -538,6 +556,24 @@ fn mutants_creates_the_output_dir_before_spawning_the_tool() {
         recorded.last().map(String::as_str),
         Some("output existed"),
         "the verb chose the --output path, so the verb makes it exist; the shim saw {recorded:?}"
+    );
+}
+
+/// Carry 16 of the outbound-effects final review: the verb runs cargo-mutants
+/// from `--dir`, so an `--output` path built by joining a relative `--dir`
+/// onto it named `<dir>/<dir>/target/charpente-mutants` from the tool's
+/// working directory — a directory nobody created, so the real tool died
+/// before measuring anything. The path the tool is handed must exist from
+/// where the tool runs.
+#[cfg(unix)]
+#[test]
+fn mutants_with_a_relative_dir_hands_the_tool_an_output_dir_that_exists() {
+    let (_, recorded) = run_mutants_with_cargo_shim_in("0", "0", "0", &["--timeout", "60"], true);
+    assert_eq!(
+        recorded.last().map(String::as_str),
+        Some("output existed"),
+        "with --dir ws, the --output the tool receives must exist from inside ws; the shim \
+         saw {recorded:?}"
     );
 }
 

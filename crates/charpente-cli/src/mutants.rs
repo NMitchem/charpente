@@ -205,7 +205,22 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
 
-    let out_dir = PathBuf::from(&opts.dir).join("target/charpente-mutants");
+    // Absolute, because the verb and the tool resolve it from different
+    // places: the verb creates and reads it from its own working directory,
+    // and cargo-mutants runs from `--dir`, where a relative `<dir>/target/…`
+    // would name `<dir>/<dir>/target/…` (outbound-effects final review,
+    // carry 16).
+    let out_dir =
+        match std::path::absolute(PathBuf::from(&opts.dir).join("target/charpente-mutants")) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "error: could not resolve --dir {} to an absolute path: {e}",
+                    opts.dir
+                );
+                return 2;
+            }
+        };
     let mut argv: Vec<String> = vec!["mutants".into(), "--output".into(), display(&out_dir)];
     for file in &opts.files {
         argv.push("--file".into());
