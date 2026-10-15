@@ -4071,8 +4071,9 @@ tests, or the sim binary failing to launch or exiting by signal. Exit code
 
 ### Reading a failure, replaying its seed
 
-A human-format failure looks like this (the exact shape a pinned test in
-`charpente-sim`'s harness checks byte-for-byte):
+A human-format failure looks like this (a pinned test in `charpente-sim`'s
+harness holds its shape: the same five lines, with this `config` line
+verbatim):
 
 ```text
 sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
