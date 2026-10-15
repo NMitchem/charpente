@@ -1,9 +1,9 @@
 # The mechanical fence around the deterministic core (CLAUDE.md hard rule 1,
 # DESIGN.md §1): no ambient time, randomness, filesystem, network, or thread
 # spawning anywhere in the workspace. All IO goes through the Clock/Entropy/
-# Disk/Net traits. Production trait impls are the one sanctioned boundary and
-# opt out site-locally with #[allow(clippy::disallowed_methods)] plus a
-# rationale comment.
+# Disk/Net/ObjectStore/Outbound traits. Production trait impls are the one
+# sanctioned boundary and opt out site-locally with
+# #[allow(clippy::disallowed_methods)] plus a rationale comment.
 #
 # Entries for tokio/rand/etc. are added in the same commit that adds the
 # dependency.
@@ -39,6 +39,32 @@ disallowed-methods = [
     { path = "tokio::time::sleep", reason = "ambient time — use Clock::sleep (DESIGN.md §1)" },
     { path = "tokio::net::TcpListener::bind", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
     { path = "tokio::net::TcpStream::connect", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    # The outbound HTTP client stack (outbound effects, DECISIONS §14): hyper's
+    # client, hyper-util's client-legacy and its connector and resolver,
+    # hyper-rustls, and the tokio surfaces they connect and run through. Every
+    # constructor that reaches the network, resolves a name or starts a runtime
+    # is fenced, so a kernel/dispatch/http module cannot build a client and call
+    # out directly — that is the edge-worker escape §14 rejects. serve.rs's
+    # ProdOutbound is the one production client, under its file-level allow.
+    { path = "hyper_util::client::legacy::Client::builder", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper_util::client::legacy::Builder::new", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper_util::client::legacy::connect::HttpConnector::new", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper_util::client::legacy::connect::HttpConnector::new_with_resolver", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper_util::client::legacy::connect::dns::GaiResolver::new", reason = "ambient name resolution — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper_rustls::HttpsConnectorBuilder::new", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper_rustls::HttpsConnector::builder", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper_rustls::HttpsConnector::new", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper::client::conn::http1::handshake", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "hyper::client::conn::http1::Builder::new", reason = "ambient outbound network — the Outbound trait, or edge modules only (serve.rs's ProdOutbound) (DESIGN.md §1, DECISIONS.md §14)" },
+    { path = "tokio::net::TcpSocket::connect", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
+    { path = "tokio::net::lookup_host", reason = "ambient name resolution — Net/Outbound trait, or edge modules only (DESIGN.md §1)" },
+    { path = "tokio::runtime::Builder::new_current_thread", reason = "ambient task spawning and IO driver — edge modules only; core scheduling goes through the deterministic executor (DESIGN.md §1)" },
+    # Fence-of-intent: these two exist only under tokio's `rt-multi-thread`
+    # feature, which no crate enables today, so they resolve to nothing
+    # (`allow-invalid` keeps clippy from warning that they do). They are here so
+    # the fence fires the moment that feature is turned on.
+    { path = "tokio::runtime::Runtime::new", reason = "ambient task spawning and IO driver — edge modules only; core scheduling goes through the deterministic executor (DESIGN.md §1)", allow-invalid = true },
+    { path = "tokio::runtime::Builder::new_multi_thread", reason = "ambient task spawning and IO driver — edge modules only; core scheduling goes through the deterministic executor (DESIGN.md §1)", allow-invalid = true },
     { path = "std::process::Command::new", reason = "ambient process spawning — edge tooling only (charpente-cli); nothing inside the deterministic boundary spawns processes (DESIGN.md §1)" },
     { path = "std::process::Command::spawn", reason = "ambient process spawning — edge tooling only (charpente-cli); nothing inside the deterministic boundary spawns processes (DESIGN.md §1)" },
     # The process-global panic hook has NO installer. The one there was — a filter that
@@ -77,6 +103,7 @@ disallowed-types = [
     { path = "std::thread::Builder", reason = "ambient task spawning — scheduling goes through the deterministic executor (DESIGN.md §1)" },
     { path = "tokio::net::TcpListener", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
     { path = "tokio::net::TcpStream", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
+    { path = "tokio::net::TcpSocket", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
     { path = "tokio::time::Instant", reason = "ambient monotonic clock — use the Clock trait (DESIGN.md §1)" },
     # Recorded as fence-of-intent (auth T5 review fix): rand_core is only
     # transitively reachable via rsa (see the disallowed-methods comment
