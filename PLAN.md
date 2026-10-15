@@ -282,7 +282,11 @@ by that spec's §12.
 Outbound effects shipped on 2026-10-14 (spec
 [docs/superpowers/specs/2026-10-13-outbound-effects-design.md](docs/superpowers/specs/2026-10-13-outbound-effects-design.md),
 plan [docs/superpowers/plans/2026-10-13-outbound-effects.md](docs/superpowers/plans/2026-10-13-outbound-effects.md);
-DECISIONS §14). What it refused or left unproven became the seven rows at the end of
+DECISIONS §14). Its exit criterion 5 (spec §16), the docs-only build, was met on attempt 1,
+signed by Noah 2026-10-14 (record
+[docs/experiments/2026-10-outbound/](docs/experiments/2026-10-outbound/);
+[docs/LEDGER.md](docs/LEDGER.md), 2026-10-14, "the outbound docs-only build"). What it
+refused or left unproven became the seven rows at the end of
 this table: spec §15 refused the first five, plan amendment A19 pinned oracle 2's
 switchover row at the write gate rather than through a two-node rig (the sixth), and the
 seventh is a node-wiring gap. Each reopens on the first app that needs it.

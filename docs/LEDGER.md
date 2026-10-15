@@ -7850,3 +7850,87 @@ text; README's clippy line does not say what to do when the component is missing
 
 **CI on `4daeffa`: green** (run 38074959840), both jobs; the workspace step counts 86 of 86
 `test result: ok` and 1,817 passed, the local gate's numbers exactly, on rustc 1.99.0.
+
+## 2026-10-14 — the outbound docs-only build: a triage service, 1 attempt, PASS
+
+Spec `docs/superpowers/specs/2026-10-13-outbound-effects-design.md` (exit criterion 5,
+§16), plan `docs/superpowers/plans/2026-10-13-outbound-effects.md`, Tasks 19 and 20.
+Workspace `.superpowers/sdd/2026-10-13-outbound-effects/`; record
+`docs/experiments/2026-10-outbound/`.
+
+**What was asked.** A sealed Opus agent, given `BRIEF.md` (sha256
+`73692af03241326ac9f903b113d9142d90d712eaae4a85011f3493f7fc0340b9`), README and GUIDE and
+nothing else, built `triage` in its own repository scaffolded by `charpente new`. Anyone
+submits a feedback item to an org; operators log in and hold API keys; an outside
+classifier, which does not deduplicate and bills every call, labels each item; an urgent
+label pages the on-call address, as it was when the item was labelled, through a mailer
+that honours an `Idempotency-Key`; a 422 is a failed page, never retried. The brief names
+the services' behaviour and never the platform's surface. Pinned at `706fed55`, the brief
+commit; the preflight installed the CLI from `0506e22c`, and `crates/`, `Cargo.toml` and
+`Cargo.lock` are identical between the two. Dependency form `[patch.crates-io]`. One
+attempt, no resumes. The app's final code commit is `fe71ad6`, head `bbecb23`, 10 commits,
+kept as `triage-attempt-1.bundle` beside the run directory.
+
+**Verdict: PASS, signed by Noah 2026-10-14.** Every mechanical gate passed (below). The
+blind review found 0 Critical, 5 Important and 11 Minor, so spec §16(5)'s "zero Criticals
+the platform should have caught" holds with nothing to rule on. The review confirmed the
+four points it was told to watch: the key goes on the deduplicating mailer only; the label
+is exactly-once state while classifier calls are at-least-once and billed; the label, the
+on-call capture and the page enqueue are one `settle`; and the sim models are the outside
+world the brief describes. The reviewer ran eleven hand mutations at 512 universes against
+green controls. Ten went red, and the eleventh stays green only under the isolation
+property judged alone (I2).
+
+**The ambiguous-call check.** On a copy, deleting the one line that puts the platform key
+on the mailer request (`src/page.rs:45`) turned the agent's own 10,000-universe batch red:
+2,672 failures, the first `urgent_items_page_exactly_once` ("the mailer sent 2 emails"),
+seed `0xb2fcbfc15b29ef9f`, config `outbound_lost_reply` 0.026. Its repro line replays it
+red with the same text.
+
+**Platform findings, none fixed here.** Attempt 1 passed, so the fail loop never ran and no
+platform commit belongs to this build. What it hit that no claim covers: there is no
+per-host timeout-fired coverage key, so `Classify`'s 30 s timeout path is dead in the sim
+(I3: changing it to 1 h leaves the coverage map identical over 512 universes); Dead is
+unreachable in the sim, and an app cannot see its own Dead job, with no hook, no backoff
+cap and job rows unreadable from a transaction (I4; `outbound_settles_by_horizon` counting
+Dead as settled is its documented contract); GUIDE §8's rule against excusing wrong data
+under `durable_corruption_fired` is enforced by nothing (I1's platform half: the app's arm
+recorded 18 of 512 deliberate cross-tenant leaks as give-ups); and cargo-mutants cannot
+mutate a key's placement, so the keyless check stays a hand step. They are candidates for
+PLAN's v1.x table, and this entry does not add them. The review's other Importants are app
+defects: I1's arm itself, I2 (the isolation property never reads `page_detail`) and I5
+(revoking a key leaves what it minted alive).
+
+**Testimony.** FINDINGS.md made 41 claims about charpente: 36 right, 3 wrong, 1 right about
+a symptom for the wrong reason, 1 unverified. Wrong: T8, a non-member refused with 400 "as
+every §16 example does", where the `admit_scope` example refuses with a 401
+(`docs/GUIDE.md:8358-8361`); T38, `attempts` undocumented, where §6 names it
+(`docs/GUIDE.md:1821-1823`, `:2039`); T40, whether `Idempotent` stores a 5xx undocumented,
+where GUIDE says "the first reply again" without qualification (`docs/GUIDE.md:3594-3596`).
+Wrong reason: T35, the `--mutants` record does exist, at
+`target/charpente-mutants/mutants.out/outcomes.json`, gitignored, and no doc names the path.
+Unverified: T33, a cargo-mutants internal. The costliest right gaps: `OutboundCall` and
+`OutboundReply`'s path and fields, with no `impl Remote` example; `SimSource::responses()`'s
+order; `Snapshot`'s unnamed scoped reads; `with_remote`'s read-only borrow; the model
+`Rng`'s path and methods. Found while checking: an API key's or session's row id is the
+first 64 bits of the minted secret, which GUIDE does not say. The census is
+`attempt-1/testimony.md` in the record.
+
+**Replay and mutants.** Master seed `0x9363215d418bc339` (10,000 universes per test). Two
+controller replays are byte-identical: 0 failures, 45,312 verdicts, 4,688 gave up, the
+builder's recorded totals. The controller's `--mutants`, one run per job file:
+`src/classify.rs` 5 — 4 caught, 1 unviable; `src/page.rs` 3 — 2 caught, 1 unviable; 0
+missed, 0 timed out. The builder's 8 — 6 caught, 2 unviable equals the sum. App gates:
+clippy EXIT 0; `cargo test --no-fail-fast` EXIT 0, 3 `test result: ok`, 0 FAILED. Zero
+framework patches: `git diff 706fed5 -- crates Cargo.toml Cargo.lock` is empty, and the
+transcript scan's one hit is the brief-mandated `cat >> Cargo.toml` of the brief's own
+`[patch]` lines. The builder's harness scratchpad was the controller's, which held plan
+material; the builder used it only for its own logs and never listed or read it. An
+attempt N ≥ 2 should be checked the same way.
+
+**Gate** on `706fed55` plus this record (docs only; no crate changed):
+`cargo test -p guide-examples --no-fail-fast` 8 of 8 `test result: ok`, 0 FAILED, EXIT=0.
+The workspace gate is the controller's.
+
+**Open, deliberately.** The four platform findings above, as candidates. The app
+repository stays outside charpente, its bundle beside the run directory.
