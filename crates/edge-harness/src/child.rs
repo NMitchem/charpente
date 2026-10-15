@@ -415,8 +415,31 @@ pub fn build_bins() -> io::Result<Bins> {
 
 /// `cargo build --release <selection> --message-format=json` from `root`,
 /// returning every executable artifact it reports as `(target name, path)`.
+///
+/// The test process carries the variables cargo sets for edge-harness's own
+/// test binary (`CARGO_MANIFEST_DIR`, `CARGO_PKG_*`, …). Left in place, the
+/// nested build passes them on, and a build script that tracks them (ring's
+/// tracks `CARGO_PKG_NAME` and `CARGO_MANIFEST_DIR`) sees them change between
+/// this build and a plain `cargo build --release`, so each rebuilds it for the
+/// other. Removing them gives this build the environment a plain one has.
 fn cargo_build_release(root: &Path, selection: &[&str]) -> io::Result<Vec<(String, String)>> {
-    let output = Command::new("cargo")
+    let mut cargo = Command::new("cargo");
+    for (key, _) in std::env::vars_os() {
+        let leaked = key.to_str().is_some_and(|k| {
+            k.starts_with("CARGO_PKG_")
+                || matches!(
+                    k,
+                    "CARGO_MANIFEST_DIR"
+                        | "CARGO_MANIFEST_PATH"
+                        | "CARGO_CRATE_NAME"
+                        | "CARGO_PRIMARY_PACKAGE"
+                )
+        });
+        if leaked {
+            cargo.env_remove(key);
+        }
+    }
+    let output = cargo
         .args(["build", "--release"])
         .args(selection)
         .arg("--message-format=json")
