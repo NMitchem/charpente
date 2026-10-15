@@ -1184,6 +1184,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Final review M2: an app whose jobs call nothing builds no client, but
+    /// its operator flags are not dropped unsaid. A base is refused by name,
+    /// and a CA file is read all the same, so a missing one refuses the start.
+    /// Under the same deadline as the test above: a flag ignored here serves.
+    #[test]
+    fn an_app_that_calls_nothing_still_refuses_bad_outbound_flags() {
+        let dir = fresh_data_dir("outbound-pure");
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let data_dir = dir.to_str().unwrap().to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let code = dispatch(
+                    &args,
+                    "127.0.0.1:0",
+                    &data_dir,
+                    tiny_app,
+                    &mut out,
+                    &mut err,
+                );
+                let _ = tx.send((code.map_err(|e| e.to_string()), out, err));
+            });
+            let (code, out, err) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+                "dispatch did not return within 10 s — most likely the flag was ignored, so it \
+                 served",
+            );
+            assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+            (code, String::from_utf8(err).unwrap())
+        };
+
+        assert_eq!(
+            run(&["--outbound-base", "x.test=https://127.0.0.1:1"]),
+            (
+                Ok(1),
+                "charpente refused to start: --outbound-base names x.test, which no mounted job \
+                 calls — this app's jobs call no host, so remove the flag\n"
+                    .to_string()
+            )
+        );
+
+        let ca = dir.join("no-such-ca.pem");
+        let (code, err) = run(&["--outbound-ca", ca.to_str().unwrap()]);
+        assert_eq!(code, Ok(1), "{err}");
+        assert!(
+            err.starts_with(&format!(
+                "charpente refused to start: --outbound-ca {}: ",
+                ca.display()
+            )),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// `serve_with` fails before any kernel exists in three ways, and each
     /// prints its own fix. Only the bind's failure says "free that
     /// address": the outbound client's runtime or thread failing for want of

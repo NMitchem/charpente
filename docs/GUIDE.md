@@ -1432,7 +1432,9 @@ fn serve_against_a_local_fake(app: App) -> std::io::Result<Server> {
 The client is built before the listener is bound, reading each credential
 variable once, so a setup refusal (an unset credential, a bad base or CA
 file) returns an `Err` holding a `Refusal`, with nothing running. An app
-whose jobs call nothing gets no client and no thread for one.
+whose jobs call nothing gets no client and no thread for one, but its
+settings are still checked: any base is refused, since it names a host no job
+calls, and each CA file is read, so a bad one refuses the start.
 `serve_replicated`, `backup` and `archive` build the client the same way,
 with no operator settings, so they reach only hosts whose certificates chain
 to a public CA, at their real addresses.
@@ -1450,10 +1452,10 @@ settings are the serve form's flags, each repeatable for a different `HOST` or
   issued. That is why a DNS name is refused as a base: it would read as
   moving the name, which never moves. Plain `http://` is accepted only for a
   loopback address. A `HOST` no mounted job calls is refused, naming the
-  hosts the app does call.
+  hosts the app does call, or saying it calls none.
 - `--outbound-ca PATH` trusts the PEM CA certificates in `PATH`, for every
   host, beside Mozilla's roots. A file that cannot be read or holds no
-  certificate refuses the start.
+  certificate refuses the start, even for an app that calls no host.
 
 A flag that is unknown, has no value, names a `HOST` or a `PATH` a second
 time, or (for `--outbound-base`) is not `HOST=URL` exits 2 with `launch`'s

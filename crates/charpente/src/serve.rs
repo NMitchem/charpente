@@ -761,10 +761,20 @@ impl ProdOutbound {
     /// reports "refused to start".
     pub(crate) fn new(app: &App, opts: &OutboundOptions) -> io::Result<Option<ProdOutbound>> {
         let called = app.outbound_hosts();
+        let refuse = |m: String| io::Error::other(Refusal(m));
         if called.is_empty() {
+            // No client, but the operator's flags are still checked, so none is
+            // dropped unsaid (final review M2): any base names a host nothing
+            // calls, and each CA file is read as it would be for a client.
+            if let Some((host, _)) = opts.bases.first() {
+                return Err(refuse(format!(
+                    "--outbound-base names {host}, which no mounted job calls — this app's jobs \
+                     call no host, so remove the flag"
+                )));
+            }
+            tls_config(&opts.cas).map_err(refuse)?;
             return Ok(None);
         }
-        let refuse = |m: String| io::Error::other(Refusal(m));
         // R9 first: this client is built before the kernel, whose build runs
         // the same check, so an unmatched host set is the kernel's own
         // Refusal here too — and the `expect` below holds by construction.
