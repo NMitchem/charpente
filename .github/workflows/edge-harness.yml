@@ -5,13 +5,15 @@ name: edge-harness
 # edge harness)", PLAN.md), and the one that until 2026-09-05 never ran automatically
 # anywhere.
 #
-# COUNTED, not estimated (2026-09-05), and confirmed against the first runner execution:
-# this job runs **34** `#[ignore]`d tests. 15 are the wire scenarios in `tests/` —
-# acked_durable (2), failover (3), hunts (5), realtime_resume (1), smoke (1),
-# tenant_wire (3) — and the other 19 are the harness's own real-disk/real-process unit
-# tests under `src/`, which `--ignored` picks up too and which are just as absent from
-# `cargo test --workspace`. The 15 is the figure this ledger and PLAN.md quote for the
-# WIRE ORACLE specifically; 34 is what this job executes. `ci.yml:34`'s
+# COUNTED, not estimated: recounted 2026-10-15 with `cargo test -p edge-harness --
+# --ignored --list`. This job runs **42** `#[ignore]`d tests. 23 are the wire scenarios in
+# `tests/` — acked_durable (2), failover (3), hunts (5), outbound (6), realtime_resume (1),
+# smoke (3), tenant_wire (3) — and the other 19 are the harness's own real-disk/real-process
+# unit tests under `src/`, which `--ignored` picks up too and which are just as absent from
+# `cargo test --workspace`. `tests/unopenable_store.rs` is not `#[ignore]`d, so it runs in
+# `ci.yml`'s workspace test and not here. The first count (2026-09-05, confirmed against the
+# first runner execution) was 34: 15 wire scenarios and the same 19. That 15 is the figure
+# the ledger and PLAN.md quote for M1's WIRE ORACLE. `ci.yml:34`'s
 # `cargo test --workspace` skips every one of them, because it passes no `--ignored`, and
 # that workflow's ONLY `--ignored` invocation is `:75`, the bench-harness passthrough
 # guard, named `--exact`. So the wire oracle has been a local gate all along: guarded by a
@@ -32,8 +34,8 @@ name: edge-harness
 #
 # ONE DEFINITION. This job shells out to `scripts/edge-harness.sh` instead of repeating its
 # command line, so the runner cannot drift from what a local sweep runs. That script passes
-# `--ignored` (only the 15 — the crate's zero-IO parse/scan unit tests are NOT ignored and
-# already run in `ci.yml`) and `--test-threads=1` (the tests bind real loopback ports and
+# `--ignored` (only the 42 above — the crate's zero-IO parse/scan unit tests and
+# `tests/unopenable_store.rs` are NOT ignored and already run in `ci.yml`) and `--test-threads=1` (the tests bind real loopback ports and
 # spawn real processes; serializing avoids port collisions).
 #
 # FIRST RUNNER EXECUTION: 2026-09-05, run 33974865000, dispatched manually against `main`

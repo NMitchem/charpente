@@ -236,7 +236,8 @@ impl FaultConfig {
             sync_error,
             crash_apply,
             crash_torn,
-            // These axes (`dir_entry_loss` … `subscriber_stall`, and the six `outbound_*`) draw from field-keyed sub-streams
+            // These axes (`dir_entry_loss` … `subscriber_stall`, and the six
+            // `outbound_*`) draw from field-keyed sub-streams
             // (`sample_extended_fields`, applied in `run_universe`/
             // `run_universe_with_adjust` right after this function returns)
             // rather than this sequential stream, so they cannot perturb the
@@ -436,6 +437,10 @@ pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
     cfg.outbound_latency = (Duration::ZERO, OUTBOUND_HI[r.below(4) as usize]);
 }
 
+// A frozen copy of `sample_extended_fields` as of f21b491e, before the
+// outbound axes: the "without" arm of `outbound_axes_perturb_no_existing_draw`.
+// The next extended axis turns that test red by design, so add that axis to
+// this copy when it lands.
 #[cfg(test)]
 fn sample_extended_fields_without_outbound_for_tests(seed: u64, cfg: &mut FaultConfig) {
     let mut r = keyed_stream(seed, "bit_flip");

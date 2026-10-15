@@ -182,7 +182,7 @@ fn outbound_fences() -> Vec<(String, String)> {
             continue;
         }
         match &mut current {
-            Some((_, body)) if line.trim_end() == "```" => {
+            Some(_) if line.trim_end() == "```" => {
                 fences.push(current.take().unwrap());
             }
             Some((_, body)) => {

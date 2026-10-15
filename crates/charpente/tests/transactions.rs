@@ -344,8 +344,11 @@ impl Job for Ping {
 }
 
 #[test]
-#[should_panic(expected = "cannot be empty")]
-fn empty_idempotency_key_is_a_contract_violation() {
+#[should_panic(
+    expected = "contract: an `enqueue_keyed` app key names the job's external identity — it \
+                cannot be empty"
+)]
+fn an_empty_enqueue_keyed_app_key_is_a_contract_violation() {
     let sim = Sim::with_faults(0x601, FaultConfig::none());
     let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
     let _ = db.transact(|tx| {

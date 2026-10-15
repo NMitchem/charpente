@@ -146,10 +146,11 @@ item with the trigger that reopens it.
 - `crates/guide-examples` — compile gate for docs/GUIDE.md, the CLAUDE.md inventory gate
   (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest,
   `tests/describe_contract.rs`, which diffs §13's `describe` JSON against a freshly built
-  `examples/invoicing` fixture, and `tests/hook_census.rs`, which holds "no panic-hook
-  installer" by walking the sources — the deny-list is inert under a file-level allow —
-  and also holds `host_name_problem`'s two copies (charpente's `outbound.rs`,
-  charpente-macros' `job.rs`) byte-identical.
+  `examples/invoicing` fixture and its outbound blocks against an outbound app the test
+  builds, and `tests/hook_census.rs`, which holds "no panic-hook installer" by walking the
+  sources — the deny-list is inert under a file-level allow — and also holds
+  `host_name_problem`'s two copies (charpente's `outbound.rs`, charpente-macros' `job.rs`)
+  byte-identical.
   `tests/mutants_exclusions.rs` pins the known-equivalent mutant list's size and demands a
   rationale per entry.
 - `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock
@@ -165,10 +166,10 @@ item with the trigger that reopens it.
 
 1. **No ambient nondeterminism inside the core.** Zero direct calls to wall clocks, OS
    randomness, raw filesystem/network APIs, or thread/task spawning from core code — all IO
-   goes through the `Clock`/`Entropy`/`Disk`/`Net`/`ObjectStore`/`Outbound` traits (DESIGN §1) — every
-   top-level trait in `io.rs`, since `File`/`Listener`/`Conn` are handed out by `Disk`/`Net`.
-   Enforce mechanically (clippy `disallowed_methods`/`disallowed_types` deny-list in CI from
-   the first commit), not by review.
+   goes through the `Clock`/`Entropy`/`Disk`/`Net`/`ObjectStore`/`Outbound` traits
+   (DESIGN §1) — every top-level trait in `io.rs`, since `File`/`Listener`/`Conn` are handed
+   out by `Disk`/`Net`. Enforce mechanically (clippy `disallowed_methods`/`disallowed_types`
+   deny-list in CI from the first commit), not by review.
 2. **No escape hatches on guarantees.** No "fast mode" bypassing the log, no network awaits
    inside transactions, no optional determinism, no feature flags on correctness
    (MANIFESTO §8). If a feature seems to need one, the design is wrong — stop and redesign.
