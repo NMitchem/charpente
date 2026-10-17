@@ -1690,3 +1690,136 @@ published as accepted.
 This reading's artifact, committed as its provenance:
 `bench-runs/compile-bench/20260909T000045-25002/attempt-1/` (`run.log`, and
 `status` holding 0).
+
+---
+
+## Compile latency of the outbound client (2026-10-15) — refused, no delta published
+
+The outbound-effects spec (§13) asked this file for one number: the clean-build
+compile-time delta of its §9 dependencies, the production outbound client that
+landed in `0d7aacf5` — `hyper`'s client, `hyper-util`'s `client-legacy`,
+`rustls` with the `ring` provider, `hyper-rustls` and `webpki-roots`. The
+workload would have been this instrument's own, `examples/invoicing`, which
+depends on `charpente` and so compiles whatever `charpente` links. The plan was
+three runs of the compile instrument at `3b9529cb`, the commit before the client,
+and three at `0d7aacf5`, with the delta read off the `Clean` phase.
+
+**There is no delta here, and nothing in this section may be quoted.** The run at
+the before-sha ended in a final refusal, spec §4 forbids retrying one, and a delta
+needs an accepted reading at both ends.
+
+### The run
+
+- **Commit:** `3b9529cb`, the before-sha, checked out in a dedicated worktree.
+- **Run:** `20261015T075737-58350`, started 2026-10-15 at 07:57:37 EDT, **attempt
+  1 of a maximum 4**.
+- **Exit:** 3, a final refusal. The runner stopped on it, as §4 requires, so the
+  driver never reached `0d7aacf5`.
+- **Conditions:** the 12-core laptop, `dev` profile, workload and dedicated target
+  directory of the 2026-09-09 reading above.
+
+| night | attempt | outcome |
+|---|---|---|
+| 2026-10-15 00:41 | none | the runner refused to start (exit 2): a `cargo` or `rustc` was already running. Nothing was measured, so nothing was recorded under `bench-runs/` |
+| 2026-10-15 07:57 | 1 of a maximum 4 | **handler body `Unstable`, spread 40%: a final refusal, exit 3, not retried** |
+
+`verdict()` accepted every observation one at a time (each `OBS` line in the log is
+followed by `accepted`). The refusal is the handler-body phase's, over its three
+observations taken together:
+
+| observation | wall | child CPU | `load_before` | parallelism |
+|---|---|---|---|---|
+| clean[0] | 6.843 s | 42.81 s | 3.14 | 6.26 |
+| handler[0] | 454.1 ms | 1.771 s | 3.50 | 3.90 |
+| schema[0] | 531.8 ms | 2.084 s | 3.50 | 3.92 |
+| clean[1] | 6.938 s | 42.98 s | 3.50 | 6.20 |
+| handler[1] | 578.0 ms | 1.660 s | 3.86 | 2.87 |
+| schema[1] | 654.6 ms | 1.971 s | 4.35 | 3.01 |
+| clean[2] | 7.755 s | 47.07 s | 4.35 | 6.07 |
+| handler[2] | 636.5 ms | 1.746 s | 4.32 | 2.74 |
+| schema[2] | 641.1 ms | 1.957 s | 4.38 | 3.05 |
+
+These are the log's `OBS` lines rounded, in the order they ran. The verdicts, verbatim:
+
+```text
+SUMMARY clean: n=3 median_wall=6.937767708s fastest=6.843220917s slowest=7.755049417s median_cpu=42.984317s spread=13%
+VERDICT clean: Accepted
+SUMMARY handler-body: REFUSED — the observations spread 40%, over the 30% limit — they are not samples of one quantity, and a median over them would have no defensible meaning
+VERDICT handler-body: Final
+SUMMARY schema: n=3 median_wall=641.1235ms fastest=531.803791ms slowest=654.561ms median_cpu=1.970987s spread=23%
+VERDICT schema: Accepted
+VERDICT exit=3 (0 accepted, 1 refused-retryable, 2 usage, 3 refused-final)
+```
+
+### The refusal
+
+The handler-body edit took **454 / 578 / 636 ms** of wall clock. Slowest over
+fastest is 1.40, a 40% spread against `MAX_SPREAD_PERCENT = 30`. That is
+`Unstable`, which `Invalid::is_environmental` classifies as describing the
+measurement rather than the machine, so the phase is `Final` and the run exits 3.
+
+**The compiler did the same work each time; the wall clock is what spread.** Child
+CPU held at **1.77 / 1.66 / 1.75 s**, within 7% of each other. What fell was
+build parallelism (compiler CPU over wall): 3.90, 2.87, 2.74 across the three
+handler builds, while `load_before` rose 3.50, 3.86, 4.32, and 3.14 to 4.38 across
+the whole run. Every load sample sat under the quiesce target of 4.80
+(`QUIESCE_TARGET_PER_CORE = 0.4` on 12 cores; the quiesce loop never had to wait)
+and so under the contention gate's 6.00 (`CONTENTION_CEILING_PER_CORE = 0.5`), at
+0.26–0.36 runnable threads per core. **The gate that exists to catch a busy machine
+passed all nine observations, so by the instrument's rules the spread belongs to
+the measurement.**
+
+### No retry, and no run at the after-sha
+
+Spec §4 is explicit: "Never retry `Unstable`", because "rerolling it is precisely
+p-hacking". The runner's override, `COMPILE_BENCH_IGNORE_PRIOR_FINAL`, exists for
+one case, "a genuine instrument fix has landed since", and none has. Measuring
+`0d7aacf5` alone would produce an after with nothing to subtract it from, since a
+delta needs an accepted before. The only way to get one is to measure `3b9529cb`
+again, and a second attempt accepted *because* the first was refused is that
+reroll. 2026-09-09's accepted clean reading cannot stand in either: it was taken
+five weeks earlier, so a subtraction against it would charge every change to
+`charpente` since then, outbound effects' own included, to §9's dependencies.
+
+### Two phases were accepted, and are still not quotable
+
+`summarize()` accepted the clean phase (spread 13%) and the schema phase (23%).
+Both come from a run that ended in a final refusal, and keeping the phases that
+passed from a run that failed is choosing results after seeing them. They have
+the standing of 2026-09-07's refused observations: a consistency check against the
+2026-09-09 reading, never a figure to cite.
+
+**As a consistency check only:** on compiler CPU, the two incremental phases did
+2026-09-09's work. Handler-body CPU was 1.66–1.77 s against 1.80–1.85 s, and schema
+CPU 1.96–2.08 s against a 1.964 s median. The wall clock and parallelism moved
+instead: handler body ran 454–636 ms at 2.74–3.90 against 430–436 ms at 4.19–4.23.
+The load average does not explain that by itself: 2026-09-09 ran two of its three
+handler builds at a `load_before` of 4.22–4.27, as high as this run's, and held its
+parallelism. The clean phase's median, 6.938 s wall and 42.98 s compiler CPU against
+5.969 s and 37.63 s, is about 16% and 14% higher. `3b9529cb` predates the outbound
+client, and its clean build compiles the same 67 crates as 2026-09-09's apart from
+`redb` 4.1.0 becoming 4.3.0, so that rise belongs to what changed in those five
+weeks, `charpente`'s own code and `redb`, not to §9's dependencies.
+
+### What was on the box
+
+The contention gate passed, so the instrument attributes the spread to the
+measurement, and this section does the same. One thing was seen **shortly after
+the run, and is not proven to have been running during it**: a
+Virtualization.framework `VirtualMachine` process at about 180% CPU, running an
+unrelated repository's VM-backed tests. If it ran during the measurement, it would
+fit the shape above, with cores taken from `rustc` and the compiler's work
+unchanged. No sample taken during the run shows it, and a reading cannot rest on
+an explanation found after its refusal.
+
+### What this leaves
+
+- **The runner is blocked in every clone.** This run's artifact is committed as its
+  provenance: `bench-runs/compile-bench/20261015T075737-58350/attempt-1/`
+  (`run.log`, and `status` holding 3). Under the script header's "§4 across nights"
+  rule, `scripts/compile-bench.sh` refuses to start while any recorded attempt's
+  status file holds 3, so every compile-bench run, in every clone, stops there until
+  an instrument fix lands.
+- **The clean-build cost of the outbound dependencies is unmeasured.** The
+  2026-09-09 reading above predates them, and the rest of outbound effects, and
+  describes only the commit it was taken at.

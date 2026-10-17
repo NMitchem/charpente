@@ -1,0 +1,271 @@
+compile-bench: app = /Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing
+compile-bench: CARGO_TARGET_DIR = "/var/folders/sv/qhscv_qn0yz__5bbk46tlfy00000gn/T//charpente-compile-bench-target"
+compile-bench: cores = 12
+     Removed 0 files
+  quiesce: load 3.14 <= 4.80 after 2.5µs
+   Compiling libc v0.2.186
+   Compiling version_check v0.9.5
+   Compiling cfg-if v1.0.4
+   Compiling proc-macro2 v1.0.106
+   Compiling const-oid v0.9.6
+   Compiling unicode-ident v1.0.24
+   Compiling zerocopy v0.8.54
+   Compiling quote v1.0.46
+   Compiling autocfg v1.5.1
+   Compiling typenum v1.20.1
+   Compiling libm v0.2.16
+   Compiling itoa v1.0.18
+   Compiling zeroize v1.9.0
+   Compiling base64ct v1.8.3
+   Compiling bytes v1.12.0
+   Compiling serde_core v1.0.228
+   Compiling futures-core v0.3.32
+   Compiling generic-array v0.14.7
+   Compiling pem-rfc7468 v0.7.0
+   Compiling num-traits v0.2.19
+   Compiling smallvec v1.15.2
+   Compiling der v0.7.10
+   Compiling http v1.4.2
+   Compiling httparse v1.10.1
+   Compiling pin-project-lite v0.2.17
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.228
+   Compiling redb v4.3.0
+   Compiling num-bigint-dig v0.8.6
+   Compiling spin v0.9.9
+   Compiling lazy_static v1.5.0
+   Compiling http-body v1.0.1
+   Compiling spki v0.7.3
+   Compiling pkcs8 v0.10.2
+   Compiling syn v2.0.118
+   Compiling futures-channel v0.3.32
+   Compiling getrandom v0.2.17
+   Compiling socket2 v0.6.4
+   Compiling rand_core v0.6.4
+   Compiling mio v1.2.1
+   Compiling serde_json v1.0.150
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling tokio v1.52.3
+   Compiling digest v0.10.7
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling signature v2.2.0
+   Compiling cpufeatures v0.2.17
+   Compiling pkcs1 v0.7.5
+   Compiling memchr v2.8.2
+   Compiling num-integer v0.1.46
+   Compiling subtle v2.6.1
+   Compiling sha2 v0.10.9
+   Compiling num-iter v0.1.46
+   Compiling http-body-util v0.1.3
+   Compiling serde_derive v1.0.228
+   Compiling charpente-macros v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente-macros)
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.7
+   Compiling hyper v1.10.1
+   Compiling rsa v0.9.10
+   Compiling hyper-util v0.1.20
+   Compiling charpente-core v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente-core)
+   Compiling charpente v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente)
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.81s
+OBS clean[0] wall=6.843220917s child_cpu=42.810987s parent_cpu=7.443ms load_before=Some(3.14111328125) load_after=Some(3.5) cores=12
+    accepted, parallelism=6.26
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+NOOP handler[0] wall=58.0395ms child_cpu=50.102ms   (calibrates the compiler-CPU floor)
+  quiesce: load 3.50 <= 4.80 after 667ns
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.42s
+OBS handler[0] wall=454.075083ms child_cpu=1.770555s parent_cpu=1.173ms load_before=Some(3.5) load_after=Some(3.5) cores=12
+    accepted, parallelism=3.90
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.42s
+SETTLE schema[0] wall=447.030292ms child_cpu=1.690946s   (rebuilds the reverted edit — NOT a no-op, NOT floor evidence)
+  quiesce: load 3.50 <= 4.80 after 708ns
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s
+OBS schema[0] wall=531.803791ms child_cpu=2.083763s parent_cpu=1.257ms load_before=Some(3.5) load_after=Some(3.5) cores=12
+    accepted, parallelism=3.92
+     Removed 3052 files, 678.7MiB total
+  quiesce: load 3.50 <= 4.80 after 3.125µs
+   Compiling libc v0.2.186
+   Compiling version_check v0.9.5
+   Compiling const-oid v0.9.6
+   Compiling cfg-if v1.0.4
+   Compiling proc-macro2 v1.0.106
+   Compiling autocfg v1.5.1
+   Compiling typenum v1.20.1
+   Compiling libm v0.2.16
+   Compiling unicode-ident v1.0.24
+   Compiling zerocopy v0.8.54
+   Compiling quote v1.0.46
+   Compiling base64ct v1.8.3
+   Compiling itoa v1.0.18
+   Compiling zeroize v1.9.0
+   Compiling bytes v1.12.0
+   Compiling pem-rfc7468 v0.7.0
+   Compiling serde_core v1.0.228
+   Compiling smallvec v1.15.2
+   Compiling generic-array v0.14.7
+   Compiling num-traits v0.2.19
+   Compiling der v0.7.10
+   Compiling httparse v1.10.1
+   Compiling http v1.4.2
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.32
+   Compiling redb v4.3.0
+   Compiling num-bigint-dig v0.8.6
+   Compiling spin v0.9.9
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.228
+   Compiling spki v0.7.3
+   Compiling syn v2.0.118
+   Compiling http-body v1.0.1
+   Compiling pkcs8 v0.10.2
+   Compiling lazy_static v1.5.0
+   Compiling getrandom v0.2.17
+   Compiling rand_core v0.6.4
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling futures-channel v0.3.32
+   Compiling digest v0.10.7
+   Compiling tokio v1.52.3
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling serde_json v1.0.150
+   Compiling signature v2.2.0
+   Compiling cpufeatures v0.2.17
+   Compiling pkcs1 v0.7.5
+   Compiling memchr v2.8.2
+   Compiling num-integer v0.1.46
+   Compiling subtle v2.6.1
+   Compiling sha2 v0.10.9
+   Compiling num-iter v0.1.46
+   Compiling http-body-util v0.1.3
+   Compiling serde_derive v1.0.228
+   Compiling charpente-macros v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente-macros)
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.3.1
+   Compiling hyper v1.10.1
+   Compiling rand v0.8.7
+   Compiling hyper-util v0.1.20
+   Compiling rsa v0.9.10
+   Compiling charpente-core v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente-core)
+   Compiling charpente v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente)
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.91s
+OBS clean[1] wall=6.937767708s child_cpu=42.984317s parent_cpu=7.665ms load_before=Some(3.5) load_after=Some(3.8603515625) cores=12
+    accepted, parallelism=6.20
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+NOOP handler[1] wall=103.61525ms child_cpu=62.576ms   (calibrates the compiler-CPU floor)
+  quiesce: load 3.86 <= 4.80 after 917ns
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.54s
+OBS handler[1] wall=578.006125ms child_cpu=1.660332s parent_cpu=1.573ms load_before=Some(3.8603515625) load_after=Some(4.3515625) cores=12
+    accepted, parallelism=2.87
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.47s
+SETTLE schema[1] wall=498.245708ms child_cpu=1.642415s   (rebuilds the reverted edit — NOT a no-op, NOT floor evidence)
+  quiesce: load 4.35 <= 4.80 after 875ns
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.62s
+OBS schema[1] wall=654.561ms child_cpu=1.970987s parent_cpu=1.689ms load_before=Some(4.3515625) load_after=Some(4.3515625) cores=12
+    accepted, parallelism=3.01
+     Removed 3052 files, 678.7MiB total
+  quiesce: load 4.35 <= 4.80 after 5.583µs
+   Compiling libc v0.2.186
+   Compiling version_check v0.9.5
+   Compiling const-oid v0.9.6
+   Compiling proc-macro2 v1.0.106
+   Compiling cfg-if v1.0.4
+   Compiling quote v1.0.46
+   Compiling autocfg v1.5.1
+   Compiling typenum v1.20.1
+   Compiling libm v0.2.16
+   Compiling unicode-ident v1.0.24
+   Compiling zerocopy v0.8.54
+   Compiling itoa v1.0.18
+   Compiling zeroize v1.9.0
+   Compiling base64ct v1.8.3
+   Compiling serde_core v1.0.228
+   Compiling bytes v1.12.0
+   Compiling smallvec v1.15.2
+   Compiling generic-array v0.14.7
+   Compiling pem-rfc7468 v0.7.0
+   Compiling num-traits v0.2.19
+   Compiling httparse v1.10.1
+   Compiling der v0.7.10
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.32
+   Compiling http v1.4.2
+   Compiling zmij v1.0.21
+   Compiling num-bigint-dig v0.8.6
+   Compiling spin v0.9.9
+   Compiling serde v1.0.228
+   Compiling syn v2.0.118
+   Compiling spki v0.7.3
+   Compiling redb v4.3.0
+   Compiling http-body v1.0.1
+   Compiling pkcs8 v0.10.2
+   Compiling lazy_static v1.5.0
+   Compiling getrandom v0.2.17
+   Compiling socket2 v0.6.4
+   Compiling rand_core v0.6.4
+   Compiling mio v1.2.1
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling futures-channel v0.3.32
+   Compiling digest v0.10.7
+   Compiling tokio v1.52.3
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling serde_json v1.0.150
+   Compiling signature v2.2.0
+   Compiling num-integer v0.1.46
+   Compiling cpufeatures v0.2.17
+   Compiling pkcs1 v0.7.5
+   Compiling memchr v2.8.2
+   Compiling subtle v2.6.1
+   Compiling sha2 v0.10.9
+   Compiling num-iter v0.1.46
+   Compiling http-body-util v0.1.3
+   Compiling ppv-lite86 v0.2.21
+   Compiling serde_derive v1.0.228
+   Compiling charpente-macros v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente-macros)
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.7
+   Compiling hyper v1.10.1
+   Compiling rsa v0.9.10
+   Compiling hyper-util v0.1.20
+   Compiling charpente-core v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente-core)
+   Compiling charpente v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/crates/charpente)
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.72s
+OBS clean[2] wall=7.755049417s child_cpu=47.065155s parent_cpu=8.922ms load_before=Some(4.3515625) load_after=Some(4.3232421875) cores=12
+    accepted, parallelism=6.07
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+NOOP handler[2] wall=118.749542ms child_cpu=57.622ms   (calibrates the compiler-CPU floor)
+  quiesce: load 4.32 <= 4.80 after 792ns
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+OBS handler[2] wall=636.466125ms child_cpu=1.746102s parent_cpu=1.502ms load_before=Some(4.3232421875) load_after=Some(4.376953125) cores=12
+    accepted, parallelism=2.74
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.46s
+SETTLE schema[2] wall=492.025ms child_cpu=1.712526s   (rebuilds the reverted edit — NOT a no-op, NOT floor evidence)
+  quiesce: load 4.38 <= 4.80 after 958ns
+   Compiling invoicing v0.1.0 (/Users/noahmitchem/Documents/GitHub/charpente-gate/examples/invoicing)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+OBS schema[2] wall=641.1235ms child_cpu=1.957329s parent_cpu=1.481ms load_before=Some(4.376953125) load_after=Some(4.376953125) cores=12
+    accepted, parallelism=3.05
+SUMMARY clean: n=3 median_wall=6.937767708s fastest=6.843220917s slowest=7.755049417s median_cpu=42.984317s spread=13%
+VERDICT clean: Accepted
+SUMMARY handler-body: REFUSED — the observations spread 40%, over the 30% limit — they are not samples of one quantity, and a median over them would have no defensible meaning
+VERDICT handler-body: Final
+SUMMARY schema: n=3 median_wall=641.1235ms fastest=531.803791ms slowest=654.561ms median_cpu=1.970987s spread=23%
+VERDICT schema: Accepted
+VERDICT exit=3 (0 accepted, 1 refused-retryable, 2 usage, 3 refused-final)
