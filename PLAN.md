@@ -269,7 +269,7 @@ that is a claim about charpente is in docs/BENCH.md or absent, and every other f
 cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
 the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
@@ -294,7 +294,9 @@ seventh is a node-wiring gap. Each reopens on the first app that needs it. The f
 after them came from that build's own record
 ([docs/experiments/2026-10-outbound/](docs/experiments/2026-10-outbound/)): three are
 gaps its review found in the outbound oracles (I3, I4, I1), and two are credential facts
-its testimony and review surfaced (the id, I5's revocation).
+its testimony and review surfaced (the id, I5's revocation). The last row is the
+outbound client's compile reading, which spec §16 exit criterion 7 asked BENCH.md to carry
+and the one attempt did not deliver (2026-10-15), so it is owed.
 
 | Item | Trigger |
 |---|---|
@@ -323,6 +325,7 @@ its testimony and review surfaced (the id, I5's revocation).
 | **Mechanical enforcement of GUIDE §8's rule that `durable_corruption_fired` may excuse a give-up, never wrong data** (review I1) | The second app found routing a consistency or isolation oracle's failure through `durable_corruption_fired` (the outbound build's triage app was the first, found by its review's mutation run). Today the rule is stated in prose and enforced by nothing, so only a review or a mutation proof finds one. |
 | **Credential row ids drawn independently of the secret** (testimony row 12) | The first app that must show a key's or session's id to someone other than its holder. Today a `Session`'s or `ApiKey`'s id is the first 64 bits of its secret's draw (GUIDE §5). |
 | **Revocation that ends what a credential minted** (review I5) | The first app whose revoke must also end the sessions and keys minted by a request that presented the revoked credential. Today revoking a key ends that key alone (GUIDE §5), so a session traded for it stays live until it expires. |
+| **The outbound client's clean-build compile delta** (owed since 2026-10-15; spec §16 exit 7; docs/BENCH.md, "Compile latency of the outbound client (2026-10-15) — refused, no delta published") | Either an instrument change that lands for its own stated reason, which is what lets `scripts/compile-bench.sh` start again, or a clean build reported as an adoption cost. The refused run (sha 3b9529cb, handler-body `Unstable`) stays attempt 1 and is never re-rolled; no gate moves to unblock it. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,

@@ -1,6 +1,6 @@
 # Charpente — Architecture & Design
 
-Status: M0 and M1 shipped, M2 in progress. This document records the load-bearing decisions
+Status: M0 through M3 shipped (launch, 0.1.0 on crates.io, 2026-10-10); PLAN.md's "After launch (v1.x)" table holds what comes next. This document records the load-bearing decisions
 and their rationale. Decisions marked **[IRREVERSIBLE]** cannot be retrofitted and are argued
 in detail; everything else is chosen for speed with a clear upgrade path. Sections marked
 "(v0/v1, implemented)" describe the tree as it stands; the rest is design intent, not yet
