@@ -216,8 +216,9 @@ Sub-projects, in dependency order:
    <name>` scaffolds GUIDE §1's layout — `Cargo.toml` with the `[[test]] name = "sim"`
    block, `src/main.rs`, `tests/sim.rs` — and the scaffold is compile-gated the way
    GUIDE's Rust code blocks are, so it cannot drift from the guide it claims to match.
-   GUIDE §1's dependency line is `charpente = "0.1"`, and a test holds the guide's
-   `Cargo.toml` block byte-identical to the verb's output.
+   GUIDE §1's dependency line is the workspace's `major.minor` (`charpente = "0.1"` at
+   that publish), and a test holds the guide's `Cargo.toml` block byte-identical to the
+   verb's output.
 2. **Default-secure surfaces** [shipped 2026-09-16; spec
    `docs/superpowers/specs/2026-09-16-default-secure-surfaces-design.md`]. A
    `#[route]` that declares neither `auth` nor an explicit `public` is a compile error

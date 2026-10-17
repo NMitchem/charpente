@@ -70,11 +70,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-charpente = "0.1"
+charpente = "0.2"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-charpente-sim = "0.1"
+charpente-sim = "0.2"
 
 [[test]]
 name = "sim"
@@ -6451,7 +6451,7 @@ memorizing a list:
 
 ```json
 {
-  "charpente_version": "0.1.0",
+  "charpente_version": "0.2.0",
   "tables": [
     {
       "name": "ApiKey",

@@ -51,7 +51,7 @@ fn the_invoicing_events_fingerprints_do_not_move() {
 // count reviewed field-by-field against invoicing's actual surface (T5
 // report).
 const GOLDEN: &str = r#"{
-  "charpente_version": "0.1.0",
+  "charpente_version": "0.2.0",
   "tables": [
     {
       "name": "ApiKey",

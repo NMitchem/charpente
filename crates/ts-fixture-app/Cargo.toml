@@ -29,4 +29,4 @@ charpente-sim = { path = "../charpente-sim" }
 # could quietly drift from the emitter's and report a floor as covered when it
 # is not. A workspace-internal, test-only edge; `charpente-tsgen` depends on
 # `charpente` alone, so there is no cycle back to this crate.
-charpente-tsgen = { path = "../charpente-tsgen", version = "0.1.0" }
+charpente-tsgen = { path = "../charpente-tsgen", version = "0.2.0" }

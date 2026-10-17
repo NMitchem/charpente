@@ -46,7 +46,7 @@ const RESERVED: &[&str] = &[
 ];
 
 /// `major.minor` of this binary's own version: a new app's requirement is
-/// `^0.1`, and the number lives in one place, the workspace manifest.
+/// `^0.2`, and the number lives in one place, the workspace manifest.
 fn dependency_version() -> String {
     let mut parts = env!("CARGO_PKG_VERSION").splitn(3, '.');
     format!(
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn dependency_version_is_major_minor_of_this_binary() {
-        assert_eq!(dependency_version(), "0.1");
+        assert_eq!(dependency_version(), "0.2");
     }
 
     #[test]
