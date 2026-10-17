@@ -296,7 +296,7 @@ after them came from that build's own record
 gaps its review found in the outbound oracles (I3, I4, I1), and two are credential facts
 its testimony and review surfaced (the id, I5's revocation). The last row is the
 outbound client's compile reading, which spec §16 exit criterion 7 asked BENCH.md to carry
-and the one attempt did not deliver (2026-10-15), so it is owed.
+and the one attempt was refused (2026-10-15), so it is owed.
 
 | Item | Trigger |
 |---|---|
