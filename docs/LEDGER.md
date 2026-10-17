@@ -7934,3 +7934,317 @@ The workspace gate is the controller's.
 
 **Open, deliberately.** The four platform findings above, as candidates. The app
 repository stays outside charpente, its bundle beside the run directory.
+
+## 2026-10-17 — outbound effects shipped: call/settle jobs, minted keys, the Outbound trait, the production HTTPS edge
+
+**Why.** MANIFESTO §5 promises that "External effects (emails, third-party API calls) execute
+*after* commit, driven by the durable queue, with idempotency keys making them
+exactly-once-observable", and nothing built it: every job handler is itself a transaction, a
+transaction cannot await the network (hard rule 2), the workspace had no outbound HTTP client,
+and the M0 step-6 spec's deferral of external IO to M1 was never scheduled (the spec's
+"Predecessor" line). Outbound effects makes that sentence true as written: a job declared
+`#[job(outbound = "<host>")]` decides its request in a read-only `call`, the kernel makes the
+call after commit and outside any transaction, through a sixth IO trait, `Outbound`, carrying
+an idempotency key minted from `Entropy` when the enqueue was staged, and `settle` commits the
+reply's consequences with the Done-mark as one record, inside the simulator, which injects the
+outside world's faults, and in production through a hyper + rustls client at the edge.
+
+Spec `docs/superpowers/specs/2026-10-13-outbound-effects-design.md` (`46923a71`; amendments
+A1–A22), plan `docs/superpowers/plans/2026-10-13-outbound-effects.md` (`f8c634b8`, pre-flight
+fixes from three scans in `c12eaba2` and `7391884f`), twenty tasks, executed subagent-driven;
+DECISIONS §14 is new (`dd7eede6`). Tasks 14–16 ran on the branch `outbound-chain-b` and Task
+13's survivor work on `outbound-task13`, both in the worktree `../charpente-chainb`, and each
+was cherry-picked onto `main` without a conflict. Workspace
+`.superpowers/sdd/2026-10-13-outbound-effects/` (gitignored, so absent from a fresh clone):
+`progress.md` there is the full record of every ruling the sub-project took, each with its
+reason and its cost if wrong, and every report and log named below is in that directory.
+
+**Shipped.** Seventy-one commits, `f21b491e..7f0fedfe` (`f21b491e` is `origin/main`, the
+launch's last pushed commit), all on `main` and none pushed; this entry is the seventy-second.
+Every other task closed on an approving review, many after one fix round (progress.md's
+`Task N: complete` lines).
+- **Spec, plan and T1** `46923a71`, `f8c634b8`, `c12eaba2`, `7391884f`, `3fc122c0`: the
+  design, the plan, its pre-flight fixes (amendment A21), and the spec's amendments A1–A21.
+- **T2** `81fde6eb`: the `Outbound` IO trait and its value types (spec §3).
+- **T3** `e13902b1`, `be97fbde`: the outbound fault axes on `FaultConfig`, each from its own
+  keyed stream.
+- **T4** `7069b170`, `b9d0a447`: `SimOutbound`, the `Remote` models (`Recorder`, `Idempotent`,
+  `from_fn`) and the outbound world.
+- **T5** `ae3fe077`, `85e8213b`: minted idempotency keys (record tags `0x0c`/`0x0d`,
+  `JobRow.outbound_key`, groups mint at staging) and `PROTO_VERSION` 5 → 6 (Rulings, below).
+- **T6** `d0f2fe6b`, `8c854cf0`: the failure record becomes one function, a pure refactor ahead
+  of the outbound arms.
+- **T7** `75fd3c50`, `69ea3c18`: `charpente::outbound`'s `Call`, `Reply`, `Host` and call
+  rules, and `JobDef.outbound`.
+- **T8** `8a6edc20`, `d67017f2`: `#[job(outbound = "host", timeout = "30s")]`, its call/settle
+  glue and shape fold, and nine compile-fail pins.
+- **T9** `187b3560`, `60c435b8`: `Host` entries on the `App`, the both-ways host rule, and
+  `describe`'s outbound jobs and hosts.
+- **T10** `b715d9f9`, `b03015df`: the dispatcher's outbound due-set, in-flight table and call
+  path: `call` decides, and the start waits for commit.
+- **T11** `ceb47556`, `f47815d0`: the kernel's outbound arm (starts after commit, completions,
+  deadlines, late discards, the writability drop) and settle's failure arms.
+- **T12** `e351bf56`, `5af37a4d`: the swarm property, the three checkers
+  (`calls_have_durable_jobs`, `keys_are_per_job`, `outbound_settles_by_horizon`) and the two
+  planted bugs.
+- **T17** `dd7eede6`, `3b9529cb`: the docs sweep across README, DESIGN §5–§7, GUIDE §10/§15,
+  DECISIONS §14, PLAN's v1.x rows, NEIGHBORS and spec A22.
+- **T14** `0d7aacf5`, `160e2428`, `c07d85f3`: the production client, hyper + rustls (`ring`) +
+  webpki-roots, with no decisions at the edge; bracketed IPv6 bases, the reply cap pinned at a
+  chunk boundary, empty credentials refused (an empty Basic password starts).
+- **T15** `d483abdf`, `74729cdd`: the `--outbound-base`/`--outbound-ca` flags, and
+  `crates/outbound-fixture`, the launch-driven node and TLS fake remote that oracle 7 drives,
+  whose sim counts applications at the remote.
+- **T16** `35fbee94`, `0e5e806f`, `0506e22c`: oracle 7's scenarios,
+  `crates/edge-harness/tests/outbound.rs`.
+- **T19, T20** `706fed55`, `b0568385`, `f469a742`, `f0d613ef`: the docs-only build and its
+  record (the entry above).
+- **T20a** `b2276241`, `479f6b39`, `bbb28217`, `1453100a`: GUIDE closes the gaps that build
+  found, and PLAN's v1.x table gains its five rows.
+- **T13** `7902a6b2`, `a1cd621e`, `fed2ef26`, `2495d2da`, `160e64f2`, `be85c802`, `c46d70ce`,
+  `c5f356ee`, `8b939ad5`: the mutation run's survivors closed by behaviour tests, and two kernel
+  assertions (exit criterion 3, below).
+- **Final-review fix wave** `57332378` (I1), `6a044240` (M1), `577814cc` (M2), `4fe574ea` (M3),
+  `8da2eac8` (M4), `a82b2e60` (M5), `b660d9fd` (M6), `d8fe1165` (M7), `08d263fb` (M8), and
+  carries 13, 15 and 16 in `a6dcdef7`, `be82a6a1` and `a6618e97`; then `41d04681`, the
+  re-review's one fixed Minor.
+- **Close-out** `864423d7` (BENCH's refusal record and the run's artifact), `70564d88`
+  (CHANGELOG.md), `37616d8f` (the workspace to 0.2.0, unreleased); **docs follow-up**
+  `8f4affcf`, `7f0fedfe` (DESIGN's status line, and PLAN's row for the owed compile reading).
+
+**What the final whole-branch review found.** `final-review.md` (opus, over
+`f21b491e..8b939ad5`, 53 commits): "Ready to merge: With fixes", 0 Critical, 1 Important, 8
+Minor, and all 16 parked carries answered. I1: the deny-list did not fence the new HTTP
+client's ambient-network surface. The Minors: a mirror class refused at dispatch rather than
+at enqueue (M1), operator flags silently ignored for an app that calls nothing (M2), no
+committed test replaying an outbound-faulted universe through the kernel (M3), a dead runtime
+thread worded as "may have applied" (M4), a test CA with no name constraints (M5), the
+fixture's unmarked boot give-up (M6), an unpinned GUIDE refusal block (M7), and drift (M8).
+The wave fixed every one, and the re-review (`final-fix-rereview.md`) approved it with two
+Minors: one fixed in `41d04681`, the other (M1's and M2's behaviour changes) carried into
+CHANGELOG's break list.
+
+**Exit criteria (spec §16), each with its evidence.** The final evidence chain ran at
+`41d04681` (`final-chain.txt`), the last commit before the close-out; the commits after it
+change no code but version strings.
+
+1. **Sim: met.** Oracles 1, 2, 4 and 5 are suites in the gate below: `SimOutbound`'s unit
+   tests, `crates/charpente/tests/outbound.rs` (56 passed), the planted-bug pins, and the
+   compile-fail and exact-text pins. The fresh seeds were drawn from `/dev/urandom` at
+   `8b939ad5` before anything ran (`task18-bases.txt`, `task18-fixture-master.txt`), run there,
+   and run again at `41d04681` (`final-chain.txt`).
+   - **The platform property,** `outbound_jobs_are_exactly_once_under_the_fault_matrix`, 768
+     universes per base (Rulings) over 40 fresh bases: 40 of 40 `exit 0` and
+     `test result: ok. 1 passed`; **30,720 universes, 30,305 verdicts, 415 gave up, 0
+     failures**. Each base's coverage block and verdict line is byte-identical between the two
+     runs, so the fix wave moved no universe. The bases, in draw order: `0x1628e24040468611`,
+     `0x549978a23c3bdcfc`, `0x451f1aaab6eb75dd`, `0x9989bce5fe362b21`, `0x8012f930696e4285`,
+     `0x9f7ab2138db1299f`, `0x57cd576d8961026b`, `0xa6310e5732c87795`, `0x35f1cb03fb9d3ef9`,
+     `0xb3cd2a8feab8627f`, `0xf6b31a69dee9f557`, `0x3d40579b6af93cd2`, `0x471a748a79e6731d`,
+     `0x0a79aa73d6d6d493`, `0xfca2ce8bc43ef0ed`, `0x5eee6c38e70b6a6d`, `0xe28bb8418e48ddcd`,
+     `0xb16ed654422ef61d`, `0x243c3597f48136c3`, `0x07ced32e205f97a5`, `0x90a6577d99a6668c`,
+     `0x024b73070cad8d6c`, `0x80d5d5c7a1025752`, `0x1095bfcf848a9a66`, `0x8a4fdd676856e3c4`,
+     `0x9223ec0f28deffff`, `0x231537c7a0e346e0`, `0xa255519285b4bc57`, `0x515cfd7acfad2e11`,
+     `0xcb8048c806c4b104`, `0xc5fbbc5f8a0212c4`, `0x826e768119ad9d1d`, `0xf7ed7e1f95461337`,
+     `0xf5b291f3cb074d42`, `0x3aa510326d28f92d`, `0xd0fef939bebd5963`, `0xd210acb4cacef66e`,
+     `0x503e4a0be1e86ea8`, `0x9d92285419917eec`, `0xefbfe030d54e0240`. Under
+     `CHARPENTE_BASE_SEED` the runner skips `require:`, `floor:` and `ceiling:` (each log's
+     re-basing line says so), so these batches are evidence about failures only. The floors
+     (`outbound:re-called` 305, `outbound:re-called-across-restart` 198) and the give-up cap
+     (32), measured over the ten bases `0x0b1d1001`…`0a` in Task 12's fix round, bind wherever
+     the property runs without the override, every gate included.
+   - **The fixture app,** `charpente test --sim --dir crates/outbound-fixture --universes 10000
+     --master-seed 0xf207f4dcbfade216`: EXIT 0 twice, the two JSON reports byte-identical
+     (`cmp`), `{"universes":10000,"failures":0,"verdicts":9708,"gave_up":292}` for its one
+     property, `orders_charge_once`, with `missing_coverage` empty. The same totals as at
+     `8b939ad5`; the report differs from that run's only by the coverage key
+     `outbound-fixture:gave-up:boot` (108), which `b660d9fd` added (M6).
+   - **The planted bugs (oracle 4),** each found by a 1,024-universe hunt and pinned in
+     `tests/outbound.rs`: (a) the keyless call, seed `0xc064fe5aa31086a7` (base
+     `0xf6ef50d55e7093df`), "double charge: pay.test applied /pay/2 2 times — a re-call carried
+     no idempotency key the remote could dedupe on"; (b) the trusting settle, seed
+     `0xce5842050b68d0cb` (base `0x37143e5ae70609ed`), "phantom charge: job 2 recorded a
+     payment, but pay.test never applied /pay/2 — settle took a reply that was not a success
+     for one". Each is mutation-proven: deleting the double-charge check turns pin (a) red, and
+     deleting the phantom check turns pin (b) red. One accepted deviation: (a)'s universe
+     re-calls after a round that ended on a disk fault with the call made and unsettled (apply,
+     power cycle, re-call), not under `outbound_lost_reply` as spec §12 words it. The
+     lost-reply mechanism is pinned by a deterministic test instead,
+     `a_keyless_call_whose_replies_are_lost_is_applied_on_every_retry` (three timeouts, three
+     deliveries under one key), because a seed names a universe and breaks on re-keying.
+   - **One more pinned seed,** `0x81c262542dfce560`: the property's first batch found spec
+     §10's "no loss window inside one sim box" false under media corruption, where a bit flip
+     cut an enqueue after its calls had reached the remote. The pin asserts the bit flip and the
+     give-up text (Rulings: the corruption excuse).
+2. **Determinism: met.** Oracle 3 replays the four recorded batches, `crates/sim-fixture` and
+   `examples/invoicing`, each from master seeds `0x912313adf8115ad0` and `0x483e230baed4922b`
+   at 256 universes per test, and diffs master seed, universes, verdicts, gave-up, outcomes,
+   coverage, missing coverage and each failure's test, seed and message (`oracle3-filter.jq`)
+   against baselines Task 1 recorded before any code changed. It ran after each task the plan
+   names for it (3–8 and 10–12, fix rounds included), at the integrated head, after Task 13
+   reached `main`, and at `41d04681`, where all four exit 0 and all four diffs are 0 bytes
+   (`oracle3-final/`). Task 1 showed it able to fail: its negative check read 1427 verdicts
+   against 1426. Every pinned seed already in the suites passes in the gate below, and
+   `4fe574ea` adds the replay the final review found missing (M3): one outbound-faulted
+   universe, seed `0x0E5E_ED00_0000_00A5`, run twice through the kernel, must leave the same
+   durable fingerprint, coverage and deliveries, and the pin asserts that a lost reply, a
+   re-call, a crash and a re-call across the restart all fired.
+3. **Mutation: met as argued, with three survivors and no exclusion added.** Oracle 6's scope,
+   ruled before the run: spec §12's kernel arm, outbound due-set and `SimOutbound`, the plan's
+   two outbound files, and the production client in `serve.rs`. A function is in a set iff the
+   plan introduced it or changed its body since `f21b491e`. The other files outbound touched
+   (core io/db/job, the macros' job.rs, sim lib/checks, http/app, launch, describe) are outside
+   it, pinned by exact-text tests, trybuild and the swarm property. Five sets, each validated
+   against `cargo mutants --list`, judged with `--test-package charpente` (and
+   charpente-sim for the sim set), `--jobs 2`. Run 1 at `0506e22c`: 499 mutants, 329 caught,
+   32 missed, 99 unviable, 39 timed out. A timeout is not a catch: 19 were test-side wait loops
+   with no bound, now bounded so that they fail by name (`7902a6b2`); the other 20 spun in
+   `Kernel::run`, on an Idle wake at or before now or on an outbound arm that serviced nothing,
+   and two kernel assertions now stop both by name (`be85c802`, `8b939ad5`). Every MISSED but
+   the three below was closed by a behaviour test proved red by hand. cargo-mutants 27.1.0
+   never mutates an impl `fn new` body, so `ProdOutbound::new`'s arms got a hand pass: three
+   were green under a hand mutation and are now tested, and its runtime-build and thread-spawn
+   arms cannot be triggered. Final counts, from a full rerun of all five sets at Task 13's head
+   `0f6d6185` (branch `outbound-task13`; its crates equal `8b939ad5`'s bar one tsgen test
+   comment), with dispatch and serve rerun at `41d04681` because the fix wave changed only
+   those two sets' files:
+
+   | Set | Files | At | Total | Caught | Missed | Unviable | Timed out |
+   |---|---|---|---|---|---|---|---|
+   | sim-outbound | charpente-sim `outbound.rs` | `0f6d6185` | 98 | 76 | 0 | 22 | 0 |
+   | dispatch | `kernel/dispatch.rs`, `--re` | `41d04681` | 75 | 58 | 0 | 17 | 0 |
+   | serve | `serve.rs`, `--re` | `41d04681` | 50 | 29 | 1 | 20 | 0 |
+   | charpente-outbound | `kernel/outbound.rs`, `outbound.rs` | `0f6d6185` | 147 | 124 | 0 | 23 | 0 |
+   | mod | `kernel/mod.rs`, `--re` | `0f6d6185` | 129 | 110 | 2 | 17 | 0 |
+   | **Total** | | | **499** | **397** | **3** | **99** | **0** |
+
+   397 of the 400 viable mutants are caught. The three survivors, as progress.md argues them:
+   - `serve.rs:1169`, `Resolver::poll_ready` → `Poll::from(Ok(()))` (`:1154` at `0f6d6185`):
+     **ruled equivalent**. The body is `Poll::Ready(Ok(()))`, and `Poll::from(x)` is
+     `Poll::Ready(x)`. It is left visible rather than excluded: spec §16 says no exclusion is
+     added, and `tests/mutants_exclusions.rs` pins the list at two.
+   - `kernel/mod.rs:699`, `+=` → `-=` and `+=` → `*=` on `self.stats.requests += 1` in
+     `begin_group`'s `Err` arm (`:673` before the assertions): **pre-existing, out of oracle
+     6's scope**. `git blame` dates the line to `48a7ea50` (2026-08-12), before the base;
+     `Kernel::step` is in the set whole only because the plan changed its body, and the branch
+     runs only when redb's `begin_read` fails, which no sim fault produces. Closing it needs a
+     failure seam in `Store::snapshot`, a src change outside this plan.
+
+   `.cargo/mutants.toml` is untouched.
+4. **Wire: met locally; the nightly half is pending the push.** `scripts/edge-harness.sh` at
+   `41d04681`, first and alone in the final chain, on production binaries: EXIT 0, 10 of 10
+   `test result: ok`, 0 FAILED, 0 `kernel invariant` lines. The outbound file's six scenarios
+   passed: `an_order_is_charged_once_over_real_tls`,
+   `kill_9_with_a_call_in_flight_re_calls_with_the_same_key`,
+   `a_reset_between_node_and_remote_is_retried_with_the_same_key`,
+   `a_stalled_remote_times_out_and_is_retried`, `an_unset_credential_refuses_the_start` and
+   `without_the_test_ca_no_request_reaches_the_remote`. The fake remote dedupes by key and
+   holds each key's first application, so `kill -9` lands mid-call, and each of the four
+   scenarios that places an order asserts that the fake applied exactly one charge in all,
+   summed across every key. With the key header dropped from `ChargeOrder::call` the file went
+   red on that total ("one order was placed, so the fake must have applied exactly one charge
+   in all: Stats { requests: {"<none>": 2}, applied: {"<none>": 2} }"); `0e5e806f`, which holds
+   a keyless request's first application too, is what made that reachable. `edge-harness.yml`
+   runs the six nightly with the rest.
+5. **Docs-only build: met,** signed PASS by Noah 2026-10-14; the entry above holds the verdict,
+   the ambiguous-call check and the build's platform findings. Task 20a then closed the GUIDE
+   gaps its testimony ranked, and gave PLAN's v1.x table five rows: three gaps its review found
+   in the outbound oracles (I3, I4, I1) and two credential facts (the id, I5's revocation). Its
+   fourth finding, that cargo-mutants cannot mutate a key's placement, stays in the record as
+   an instrument limit, so the keyless check remains a hand step.
+6. **Gate: met locally; CI is pending the push.** At `37616d8f`, the last commit to touch code,
+   run in the worktree `../charpente-chainb` by `gate-chainb.sh` (`gate-closeout.exit`,
+   `gate-closeout.log`): `cargo fmt --all --check` exit 0, `cargo clippy --workspace
+   --all-targets -- -D warnings` exit 0, `cargo test --workspace --no-fail-fast` exit 0 with
+   **92 of 92** `test result: ok`, 0 FAILED, 0 `error: test failed`, 1,967 passed, 0 failed, 60
+   ignored, and 0 `kernel invariant` lines. That is the base's 86 at `3fc122c0` (1,817 passed)
+   plus the six `test result:` lines plan Task 18 Step 5 names: charpente's `tests/outbound`,
+   edge-harness's `tests/outbound` (its six scenarios ignored there), and outbound-fixture's
+   lib, its `outbound_node` and `fake_remote` bins, and its doc-tests. outbound-fixture's `sim`
+   target is `harness = false` and is judged by the exit status. The same counts held at
+   `a6618e97`. The two commits since are docs only, and each ran `cargo test -p guide-examples
+   --no-fail-fast` at 8 of 8 `test result: ok`, 0 FAILED; so did this entry, before its commit.
+7. **Docs: the §13 half met; the BENCH half UNMET.** §13's rows landed with their code and in
+   Task 17's sweep, and the final review named only the BENCH reading among them as open.
+   BENCH.md does not carry the compile-time reading, and nothing from the attempt may be
+   quoted. The only attempt, run `20261015T075737-58350` on 2026-10-15 at the before-sha
+   `3b9529cb`, ended in a final refusal: the handler-body phase was `Unstable`. Bench spec
+   2026-09-08 §4 forbids retrying `Unstable`, so the after-sha `0d7aacf5` was never measured
+   and no delta exists. docs/BENCH.md, "Compile latency of the outbound client (2026-10-15) —
+   refused, no delta published" (`864423d7`), records the run and why it was not retried; the
+   run's artifact is committed under `bench-runs/compile-bench/20261015T075737-58350/attempt-1/`,
+   and its `status` of 3 makes `scripts/compile-bench.sh` refuse to start in every clone until
+   an instrument fix lands. PLAN's v1.x table carries the reading as owed, with its trigger
+   (`8f4affcf`, `7f0fedfe`).
+
+**Rulings.** `progress.md` holds every one; these are the ones a later reader needs.
+- **`PROTO_VERSION` 5 → 6** (`85e8213b`, Task 5's review): the constant's own rule is that it
+  bumps whenever a message body's shape changes, as both earlier tag additions did, and
+  without the bump a v5 follower seeded from a new primary would report an outbound `JobRow`
+  as a corrupt store. A 0.1 node and a 0.2 node now refuse each other at Hello (CHANGELOG).
+- **768 universes per swarm batch** (Task 12's review): the noise in the `require:` list is
+  removed, not loosened. At 768 the chance a batch never fires `fault:outbound_lost_request`
+  is about 1.5e-7, against about 5e-3 at 256. Reach is floored on what the oracle judged
+  (`outbound:re-called`, `outbound:re-called-across-restart`), not on universes that ran.
+  Hence 40 × 768 = 30,720 above, where the plan said 10,240.
+- **The corruption excuse** (spec A22): `calls_have_durable_jobs` is excused only where
+  `durable_corruption_fired`, and the universe counts as a give-up, as the acked-write checks
+  already do. A22 records that §10's "no loss window inside one sim box" is false under
+  durable corruption.
+- **Oracle 6's scope, the `fn new` hand pass, and the two kernel assertions** (criterion 3):
+  the assertions are written as `assert!`, so they add no mutants, and each message names the
+  contract, the site and the fix (hard rules 4 and 5). Neither has fired in any run recorded
+  since.
+- **The deny-list fences the outbound client's constructors** (`57332378`, final review I1):
+  hard rule 1 says to enforce mechanically, and clippy.toml's own rule is that its entries land
+  with the dependency. Spec §9's "the deny-list is unchanged" is read as nothing loosened, so
+  the tightening contradicts no DECISIONS entry.
+- **No `#[non_exhaustive]` on `JobOutcome` or `KernelStats`,** decided under Noah's 2026-10-14
+  delegation ("As long as everything is aligned with our MANIFESTO and design docs I am OK"):
+  "the framework is the reviewer" makes an exhaustive match an oracle, so a new outcome is a
+  compile error the app must handle, never a silent wildcard arm. The price is that each new
+  variant is a minor-version break.
+- **Credential ids,** under the same delegation: an API key's or session's row id is the first
+  64 bits of its minted secret. No code changes here: lookup hashes the whole token, so the id
+  plays no part in finding a credential and 192 secret bits remain, and a new derivation would
+  move every recorded batch that prints or orders by a credential id. GUIDE states the fact,
+  PLAN carries the row, and the build's `testimony.md` is published as it stands.
+- **BENCH: no retry** (criterion 7): neither a rerun nor `COMPILE_BENCH_IGNORE_PRIOR_FINAL`,
+  whose stated use is "a genuine instrument fix has landed since". The refused run's accepted
+  phases are not quotable either. Criterion 7's BENCH half is recorded as unmet rather than met
+  by the reroll §4 forbids.
+- **0.2.0, unreleased** (`37616d8f`): `JobOutcome::Calling` is a source break against 0.1.0,
+  and Noah chose the version on 2026-10-14. CHANGELOG.md is new (`70564d88`) and lists the
+  break list, each line checked against the code. 0.1.0 stays the release on crates.io, and
+  nothing is pushed or published.
+
+**Record corrections.**
+- progress.md's Task 18 Step 1 line names the fixture master `0x549978a23c3bdcfc`, which is
+  base 2; the master is `0xf207f4dcbfade216` (`task18-fixture-master.txt`, and the fixture's
+  stderr), as its CORRECTION line says.
+- Three of the 40 bases are written with 15 hex digits in `task18-bases.txt`, a leading zero
+  dropped. The harness ran and printed them as the 16-digit values listed above.
+- progress.md's 2026-10-15 07:58 line calls 4.80 a ceiling. It is the quiesce target (0.4 per
+  core); the contention gate is 6.00 (0.5 per core), as BENCH says.
+- task-13-report.md's "29 are closed … 3 are not closed" counts the `mod.rs:673` pair as one.
+  Its table closes 28 of the 32 MISSED. The 29th, `sim outbound.rs:287` (`>` → `>=`), was
+  ruled not equivalent, since it moves the seed-to-universe map, and was closed in round 2
+  (`c46d70ce`). Its row 23 calls `mod.rs:919` "cron ticks"; that line is the cron arm's
+  `drained += 1` (Task 13 review M3).
+
+**Open, deliberately.** PLAN's v1.x table holds seven rows from outbound effects (spec §15's
+`cross_tenant`, HTTP/2, proxies, request signing and streaming replies; amendment A19's
+two-node switchover under outbound load; `OutboundOptions` on `serve_replicated`, `backup` and
+`archive`), five from its docs-only build, and one for the outbound client's compile reading,
+each with its trigger. Outside oracle 6's scope: the outbound-touched files named in criterion
+3, and the two `mod.rs:699` mutants.
+
+**Next.** Noah's push, then `ci.yml` on the pushed tip (criterion 6's CI half) and the next
+nightly `edge-harness.yml` run (criterion 4's), each recorded here in a one-line follow-up with
+its run id. Push and the 0.2.0 publish go to Noah together: GUIDE §1 already reads
+`charpente = "0.2"`, which crates.io cannot resolve until 0.2.0 is published, and publishing is
+his hand. The repository is public, and `crates/outbound-fixture/tls` commits two test-only
+PEM private keys; secret scanning and push protection are disabled on it (checked
+2026-10-14), so expect at most a third-party scanner's email, and since `a82b2e60` the test
+CA's name constraint admits only `pay.fixture` and its subdomains. Then PLAN's v1.x rows,
+each on its trigger.
