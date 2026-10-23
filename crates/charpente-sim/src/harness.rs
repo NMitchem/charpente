@@ -1,11 +1,11 @@
 //! `charpente test --sim` harness core (step-7 spec: docs/superpowers/specs/
 //! 2026-07-05-sim-cli-design.md). Registers app-authored sim workloads
 //! (`SimTest`), parses runner flags (`HarnessArgs`), and runs them as a
-//! sequential batch reusing the frozen single-universe executor
-//! (`crate::run_universe`) — the same seed→behavior mapping the internal
-//! swarm macro uses. Runs a batch in parallel over a `--jobs`-sized thread
-//! pool and can render the report as JSON (`Report::to_json`) for downstream
-//! tooling.
+//! sequential batch, each run through `crate::run_app_universe`: the
+//! internal swarm macro's seed→behavior mapping plus the clock axes, which
+//! only this harness samples. Runs a batch in parallel over a `--jobs`-sized
+//! thread pool and can render the report as JSON (`Report::to_json`) for
+//! downstream tooling.
 //!
 //! Batch model: one splitmix64 chain, seeded from the master seed, consumed
 //! in registry order — each selected test draws `args.universes` seeds in
@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::rng::splitmix64;
-use crate::{FaultConfig, Sim, UniverseEnd, ambient_base_seed, run_universe};
+use crate::{FaultConfig, Sim, UniverseEnd, UniverseFailure, ambient_base_seed, run_app_universe};
 
 /// One registered sim workload. `require` lists sometimes-coverage keys that
 /// must be hit at least once across the test's universes in a batch run
@@ -270,12 +270,17 @@ fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
             verdicts: 0,
             gave_up: 0,
         };
-        match run_universe(seed, &test.run) {
+        match run_app_universe(seed, None, &[], &test.run) {
             Ok(end) => {
                 tally(&mut outcomes, &end);
                 merge(&mut report.coverage, &end.coverage);
             }
-            Err((config, coverage, message)) => report.failures.push(Failure {
+            Err(UniverseFailure {
+                config,
+                coverage,
+                message,
+                ..
+            }) => report.failures.push(Failure {
                 test: test.name,
                 seed,
                 config,
@@ -301,7 +306,7 @@ fn tally(outcomes: &mut TestOutcomes, end: &UniverseEnd) {
 /// One (test, universe) unit of work: the seed is pre-derived on the main
 /// thread before any worker starts, so `jobs` only changes scheduling, never
 /// the seed each universe runs with.
-type UniverseOutcome = Result<UniverseEnd, (FaultConfig, BTreeMap<&'static str, u64>, String)>;
+type UniverseOutcome = Result<UniverseEnd, UniverseFailure>;
 
 fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) -> Report {
     // DESIGN §7: the master seed is printed at startup, before any universe
@@ -349,7 +354,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
                         return;
                     }
                     let (test_index, seed) = work[index];
-                    let outcome = run_universe(seed, &tests[test_index].run);
+                    let outcome = run_app_universe(seed, None, &[], &tests[test_index].run);
                     slots.lock().unwrap()[index] = Some(outcome);
                 }
             });
@@ -375,7 +380,12 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
                     tally(&mut outcomes, &end);
                     merge(&mut covered, &end.coverage);
                 }
-                Err((config, coverage, message)) => report.failures.push(Failure {
+                Err(UniverseFailure {
+                    config,
+                    coverage,
+                    message,
+                    ..
+                }) => report.failures.push(Failure {
                     test: test.name,
                     seed,
                     config,
@@ -546,7 +556,7 @@ fn config_json(cfg: &FaultConfig, out: &mut String) {
     json_escape(&cfg.corruption_scope, out);
     out.push_str(&format!(
         "\",\"conn_drop\":{},\"net_spike\":{},\"subscriber_stall\":{},\
-         \"disk_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"net_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"outbound_refused\":{},\"outbound_lost_request\":{},\"outbound_lost_reply\":{},\"outbound_throttle\":{},\"outbound_slow\":{},\"outbound_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}}}",
+         \"disk_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"net_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"outbound_refused\":{},\"outbound_lost_request\":{},\"outbound_lost_reply\":{},\"outbound_throttle\":{},\"outbound_slow\":{},\"outbound_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}",
         cfg.conn_drop,
         cfg.net_spike,
         cfg.subscriber_stall,
@@ -561,6 +571,15 @@ fn config_json(cfg: &FaultConfig, out: &mut String) {
         cfg.outbound_slow,
         cfg.outbound_latency.0.as_nanos(),
         cfg.outbound_latency.1.as_nanos(),
+    ));
+    out.push_str(&format!(
+        ",\"clock_skew\":{},\"clock_step_back\":{{\"chance\":{},\"max_ns\":{}}},\
+         \"clock_downtime\":{{\"chance\":{},\"max_ns\":{}}}}}",
+        cfg.clock_skew,
+        cfg.clock_step_back.0,
+        cfg.clock_step_back.1.as_nanos(),
+        cfg.clock_downtime.0,
+        cfg.clock_downtime.1.as_nanos(),
     ));
 }
 
@@ -803,6 +822,9 @@ mod tests {
             outbound_latency: (Duration::ZERO, Duration::ZERO),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::from_millis(250)),
+            clock_skew: -41_207_118_532,
+            clock_step_back: (0.0, Duration::ZERO),
+            clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
         };
         let failure = Failure {
             test: "receipts_exactly_once",
@@ -819,7 +841,7 @@ mod tests {
         assert!(block.contains("  seed:   0x8bee1752811ae873"), "{block}");
         assert!(
             block.contains(
-                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }"
+                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: -41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }"
             ),
             "{block}"
         );
@@ -922,7 +944,9 @@ mod tests {
     /// 2026-09-07 — `run_universe`'s `Err` payload was `(FaultConfig, String)`,
     /// with nowhere to put coverage — so on the one run where a reader most
     /// needs to know which axis explains the failure, the report carried none
-    /// at all, while a GREEN run of the same workload reported it fine.
+    /// at all, while a GREEN run of the same workload reported it fine. The
+    /// harness's runs now fail with a named `UniverseFailure`, whose
+    /// `coverage` carries it.
     ///
     /// Asserts through the public `Report`, not the renderer, so it fails if
     /// the payload is ever narrowed again regardless of how the text is
@@ -1001,6 +1025,9 @@ mod tests {
             outbound_latency: (Duration::ZERO, Duration::ZERO),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::from_millis(20)),
+            clock_skew: -73_000_000_000,
+            clock_step_back: (0.012, Duration::from_secs(120)),
+            clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
         };
         let mut json = String::new();
         config_json(&cfg, &mut json);

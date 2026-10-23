@@ -14,8 +14,8 @@ use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, calls_have_durable_jobs, durable_corruption_fired, is_fault_fallout,
-    keys_are_per_job, outbound_settles_by_horizon,
+    boot_through_fallout, calls_have_durable_jobs, clock_refused, durable_corruption_fired,
+    is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon,
 };
 use charpente_sim::outbound::{Idempotent, Recorder};
 use outbound_fixture::{ChargeOrder, Order};
@@ -51,20 +51,20 @@ fn boot(sim: &Sim) -> Result<Option<App>, String> {
     .map_err(|e| format!("the app failed to open non-injected: {e}"))
 }
 
-/// One kernel over `source`. Fault fallout stops it (`None`); anything else
-/// fails the universe.
-fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Option<App>, String> {
+/// One kernel over `source`. Fault fallout stops it (`Ok(Err(text))`, the
+/// fallout's text); anything else fails the universe.
+fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String>, String> {
     let outbound = sim
         .outbound(&app.outbound_hosts())
         .map_err(|e| e.to_string())?;
     let mut kernel = match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
         Ok(kernel) => kernel,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(Err(e.to_string())),
         Err(e) => return Err(format!("the kernel build failed non-injected: {e}")),
     };
     match kernel.run(source) {
-        Ok(()) => Ok(Some(kernel.into_app())),
-        Err(e) if is_fault_fallout(&e.to_string()) => Ok(None),
+        Ok(()) => Ok(Ok(kernel.into_app())),
+        Err(e) if is_fault_fallout(&e.to_string()) => Ok(Err(e.to_string())),
         Err(e) => Err(format!("the kernel stopped non-injected: {e}")),
     }
 }
@@ -132,12 +132,25 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         };
     };
     let horizon = sim.now().as_nanos() + 600 * SEC;
-    let mut app = run(
+    let mut app = match run(
         sim,
         app,
         &mut SimSource::new(Box::new(sim.clock()), horizon),
-    )?
-    .ok_or("the fault-free tail's kernel stopped")?;
+    )? {
+        Ok(app) => app,
+        // The tail quiesces the disk and outbound faults, not the clock's: a
+        // step back past CLOCK_TOLERANCE stops the kernel, or one in an
+        // earlier round left the clock behind what the store recorded and the
+        // open is refused. Nothing settled either way, so nothing is judged.
+        Err(e) if clock_refused(&e) => {
+            return gave_up(
+                sim,
+                "outbound-fixture:gave-up:clock",
+                format!("the fault-free tail's kernel met the clock axes: {e}"),
+            );
+        }
+        Err(e) => return Err(format!("the fault-free tail's kernel stopped: {e}")),
+    };
 
     let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;
     keys_are_per_job(&snap)?;

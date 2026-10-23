@@ -3204,16 +3204,49 @@ change everything your workload does afterwards, as any restart would. It marks
 `restart_process()` refuses it by name: call `restart()` there. It covers the
 global disk; hosts have no process restart.
 
+### Wall time and its faults
+
+A workload reads two times. `sim.now()` is virtual time, the one dimension every
+host shares; `SimSource` horizons and `push_at` times are on it. A clock's
+`wall()` (`sim.clock()`, or a host's `host.clock()`) is the wall time a node
+sees: `sim.true_wall()` (virtual time plus 2026-01-01T00:00:00Z) plus that
+clock's offset. `charpente test --sim` puts three faults on the offset, each on
+in a quarter of runs, from its own stream:
+
+| Axis (`FaultConfig` field) | What it does | Coverage key |
+|---|---|---|
+| `clock_skew` | every clock reads this many nanoseconds ahead (+) or behind (-) of true time, within ±120 s | `clock:skewed`, once per clock, at its first read |
+| `clock_step_back` | per wall read, the chance the clock steps back by up to 120 s, and stays there | `clock:stepped-back`, per step |
+| `clock_downtime` | per power cycle (`sim.restart()`, `host.restart()`), the chance the clock jumps forward by up to three days, as if the machine had been off; virtual time stays put, and `restart_process()` is not downtime | `clock:downtime`, per jump |
+
+Each clock's step-backs and jumps are its own, so two hosts' clocks drift apart.
+The sizes span both sides of `CLOCK_TOLERANCE` (60 s), so a run sees what a node
+does with a bad clock (§5, §7): it holds its wall reading at the latest time it
+used for a step back within the tolerance, stops by name for one beyond it
+(`clock went backwards: …`), and refuses to open while its clock is more than
+the tolerance behind the latest time its data directory recorded (`refusing to
+open: this node's wall clock …`). The stop and the refusal are fallout:
+`is_fault_fallout` accepts them, and `clock_refused` names them (below). The
+fault-free tail above does not quiesce the clock, so give up a run whose tail a
+clock stop or refusal ends; do not fail it.
+
+Judge expiry and lateness against `sim.true_wall()`, never against a node's
+reading: a skewed clock is the thing under test. The platform's own suites
+(`run_universes_swarm!`, `Sim::new`, `FaultConfig::default()` and `none()`) leave
+the three axes off; a platform property turns them on in
+`run_universes_swarm_with!`'s `adjust`.
+
 ### The checkers
 
-`charpente_sim::checks` ships nine reusable oracles and one boot idiom — reach
+`charpente_sim::checks` ships ten reusable oracles and one boot idiom — reach
 for these before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
   is this the harness's own injected fault (or its consequences) rather
   than a bug your workload should fail on? It recognizes the sim's
   injected-fault wording (including the `read_error` axis), the WAL/engine
-  poison wording, and redb's "close and re-open the database" latch. Used
+  poison wording, redb's "close and re-open the database" latch, and the
+  kernel's clock stop and open/promote refusal (`clock_refused`, below). Used
   inside a workload to turn "the disk broke, as instructed" into "no answer
   this round" rather than a hard failure — never to swallow anything else.
   (`misdirected_write` is not in that list and cannot be: it returns `Ok`, so
@@ -3228,8 +3261,9 @@ for these before hand-rolling the same logic a fourth time:
   `SimHost::durable_corruption_fired()`. `boot_through_fallout` does that for
   you.
 - `classify(text: &str) -> FaultReason` — the families, typed:
-  `Injected`, `Poisoned`, `RedbLatch`, `DurableHorizon`, or `Unrelated`
-  (`is_fault_fallout` is `Injected | Poisoned | RedbLatch`). Use it when your
+  `Injected`, `Poisoned`, `RedbLatch`, `DurableHorizon`, `ClockRefused`, or
+  `Unrelated` (`is_fault_fallout` is `Injected | Poisoned | RedbLatch |
+  ClockRefused`). Use it when your
   workload wants to accept some families and fail on others — e.g. "an
   injected fault is fallout this round, but a poisoned engine is a finding" —
   or to name the family in a coverage key. `DurableHorizon` is a name, never
@@ -3238,6 +3272,16 @@ for these before hand-rolling the same logic a fourth time:
   reworded, `classify` is the single site that must change, and it fails by
   name instead of leaking a wrong classification into whichever oracle saw
   the text first.
+- `clock_refused(text: &str) -> bool` — true for the kernel's clock stop
+  (`clock went backwards: …`) and for its refusal to open or promote a node
+  whose wall clock is more than `CLOCK_TOLERANCE` behind the latest time its
+  data directory recorded (`refusing to open: this node's wall clock …`,
+  `refusing to promote: this node's wall clock …`). Both are what the clock
+  axes produce ("Wall time and its faults", above), so `is_fault_fallout`
+  accepts them. Ask this one where a workload must tell them from other
+  fallout: a fault-free tail quiesces the disk and outbound faults, not the
+  clock's, so there a clock refusal gives the run up and any other fallout is
+  a failure.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
@@ -4146,7 +4190,7 @@ verbatim):
 ```text
 sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
   seed:   0x8bee1752811ae873
-  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: -41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }
   fired:  crash:torn: 7, fault:sync_error: 4, restart: 2
   repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873
 ```
@@ -4162,7 +4206,10 @@ Five lines, each load-bearing:
   under the checkers above). It is a set of probabilities, so it tells you
   what kind of trouble was *possible*: `crash_torn: 0.664668` means torn
   writes were likely in this universe, not that any occurred. Do not read a
-  diagnosis off this line — that is the next one's job.
+  diagnosis off this line — that is the next one's job. The last three fields
+  are the clock axes ("Wall time and its faults"): here every clock read
+  41.2 s behind true time, and each power cycle had an even chance of a jump
+  of up to three days.
 - `fired` is what ACTUALLY happened: the universe's coverage map, every
   fault and event that really occurred, with counts. This is the line to
   reason from. A high probability whose key is absent here never fired, and
@@ -4179,10 +4226,12 @@ Five lines, each load-bearing:
 
 The same discipline extends outward: `run_universes!`/`run_universes_swarm!`
 (the frozen internal-suite macros the platform's own tests use) and
-`charpente test --sim` share the same seed→behavior mapping, so
-`CHARPENTE_SEED=0x… cargo test -p <pkg> --test <file>` and `charpente test
---sim --seed 0x…` are the same idea at two different layers: a failure's
-seed is always enough, on its own, to see the exact same universe again.
+`charpente test --sim` share one seed→behavior mapping, except that only
+`charpente test --sim` samples the clock axes. So `CHARPENTE_SEED=0x… cargo
+test -p <pkg> --test <file>` and `charpente test --sim --seed 0x…` are the
+same idea at two different layers, each replaying its own layer's universe: a
+failure's seed is always enough, on its own, to see the exact same universe
+again.
 
 ### Re-basing a pinned property: `CHARPENTE_BASE_SEED`
 

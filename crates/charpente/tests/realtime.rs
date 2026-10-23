@@ -4203,6 +4203,7 @@ fn rt_recover_exhausted_key(last: &str) -> &'static str {
         FaultReason::Poisoned => "rt:inconclusive:recover-exhausted:poisoned",
         FaultReason::RedbLatch => "rt:inconclusive:recover-exhausted:redb-latch",
         FaultReason::DurableHorizon => "rt:inconclusive:recover-exhausted:durable-horizon",
+        FaultReason::ClockRefused => "rt:inconclusive:recover-exhausted:clock-refused",
         FaultReason::Unrelated => "rt:inconclusive:recover-exhausted:unrelated",
     }
 }

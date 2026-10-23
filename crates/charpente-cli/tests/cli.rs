@@ -16,6 +16,10 @@ fn invoicing_dir() -> String {
     format!("{}/../../examples/invoicing", env!("CARGO_MANIFEST_DIR"))
 }
 
+fn outbound_fixture_dir() -> String {
+    format!("{}/../outbound-fixture", env!("CARGO_MANIFEST_DIR"))
+}
+
 #[test]
 fn sim_green_run_exits_zero_and_prints_master_seed() {
     let out = charpente()
@@ -261,6 +265,39 @@ fn a_universe_that_checked_nothing_gives_up_by_its_arm() {
             "seed {seed} must give up at {arm}, not pass:\n{stdout}"
         );
     }
+}
+
+/// A clock the sim stepped back past `CLOCK_TOLERANCE` is fallout, so a run it
+/// stops gives up by name; it never fails. Found when the app harness turned
+/// the clock axes on (0.3.0, named step S3): the outbound fixture's fault-free
+/// tail quiesces the disk and outbound faults, not the clock's, and failed 7
+/// of 256 runs (master seed 0xe5ad6290df3f222c) as "the fault-free tail's
+/// kernel stopped". In this seed a step back of about 80 s in a faulted round
+/// left the clock behind the time the store recorded, so the tail's open was
+/// refused ("refusing to open: this node's wall clock …").
+#[test]
+fn a_clock_refusal_in_the_outbound_fixtures_tail_gives_up_by_name() {
+    let seed = "0x4af3b8a4fb1dc3d0";
+    let out = charpente()
+        .args([
+            "test",
+            "--sim",
+            "--seed",
+            seed,
+            "--filter",
+            "orders_charge_once",
+        ])
+        .args(["--format", "json", "--dir", &outbound_fixture_dir()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
+    assert!(
+        stdout.contains(r#""outcomes":[{"test":"orders_charge_once","verdicts":0,"gave_up":1}]"#)
+            && stdout.contains(r#""outbound-fixture:gave-up:clock":1"#)
+            && stdout.contains(r#""clock:stepped-back":1"#),
+        "seed {seed} must give up at the clock arm after a step back, not fail:\n{stdout}"
+    );
 }
 
 /// The sentence this whole change exists to make true (MANIFESTO §9): a batch

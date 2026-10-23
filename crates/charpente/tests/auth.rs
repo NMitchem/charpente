@@ -480,6 +480,7 @@ fn auth_recover_exhausted_key(last: &str) -> &'static str {
         FaultReason::Poisoned => "auth:inconclusive:recover-exhausted:poisoned",
         FaultReason::RedbLatch => "auth:inconclusive:recover-exhausted:redb-latch",
         FaultReason::DurableHorizon => "auth:inconclusive:recover-exhausted:durable-horizon",
+        FaultReason::ClockRefused => "auth:inconclusive:recover-exhausted:clock-refused",
         FaultReason::Unrelated => "auth:inconclusive:recover-exhausted:unrelated",
     }
 }

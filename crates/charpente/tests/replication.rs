@@ -463,6 +463,7 @@ fn recover_exhausted_key(last: &str) -> &'static str {
         FaultReason::Poisoned => "repl:inconclusive:recover-exhausted:poisoned",
         FaultReason::RedbLatch => "repl:inconclusive:recover-exhausted:redb-latch",
         FaultReason::DurableHorizon => "repl:inconclusive:recover-exhausted:durable-horizon",
+        FaultReason::ClockRefused => "repl:inconclusive:recover-exhausted:clock-refused",
         // `recover_node` only ever stores a fallout error in `last`, so this is
         // unreachable through that path — but `last` also starts EMPTY, and a
         // loop that exhausts without one failed open (RECOVER_ATTEMPTS == 0, or

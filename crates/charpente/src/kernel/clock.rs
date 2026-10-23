@@ -213,6 +213,11 @@ mod tests {
              restart; if the clock is right, the earlier reading came from a clock that ran \
              ahead, and the node runs again after 2026-01-01T00:00:40.000Z."
         );
+        assert!(
+            charpente_sim::checks::is_fault_fallout(&err.to_string()),
+            "the sim's app workloads skip a run this stop ends: reword it and \
+             charpente_sim::checks::clock_refused must follow"
+        );
     }
 
     #[test]
@@ -220,6 +225,14 @@ mod tests {
         assert_eq!(behind_floor(secs(40), secs(100), "open"), None);
         assert_eq!(behind_floor(secs(100), secs(40), "open"), None);
         assert!(behind_floor(secs(39), secs(100), "open").is_some());
+        for verb in ["open", "promote"] {
+            let refusal = behind_floor(secs(39), secs(100), verb).unwrap();
+            assert!(
+                charpente_sim::checks::is_fault_fallout(&refusal),
+                "the sim's app workloads skip a run this refusal ends: reword it and \
+                 charpente_sim::checks::clock_refused must follow: {refusal}"
+            );
+        }
     }
 
     /// Review focus 1: the floor is a time the store saw. A cron row's

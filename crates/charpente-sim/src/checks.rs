@@ -40,13 +40,15 @@ pub enum FaultReason {
     /// fallout only where durable corruption fired on that node's disk,
     /// which its text cannot say, so [`is_fault_fallout`] never excuses it.
     DurableHorizon,
+    /// The kernel's clock stop or its open/promote refusal ([`clock_refused`]).
+    ClockRefused,
     /// Everything else: NOT fallout; fails the universe for adjudication.
     Unrelated,
 }
 
-/// Classifies `text` (an error's Display/to_string output) into one of four
-/// recognized families or `Unrelated`. Families 1-3 are fault fallout by their
-/// text alone ([`is_fault_fallout`]); family 4 is only named here:
+/// Classifies `text` (an error's Display/to_string output) into one of five
+/// recognized families or `Unrelated`. Families 1-3 and 5 are fault fallout by
+/// their text alone ([`is_fault_fallout`]); family 4 is only named here:
 ///  1. the sim's own injected-fault wordings — including the `read_error`
 ///     axis (segment-mgmt T5), whose error text is "injected" too.
 ///     `misdirected_write` is NOT in this family and cannot be: it returns
@@ -67,10 +69,14 @@ pub enum FaultReason {
 ///     is a NAME, not an excuse. Only a check that durable corruption fired
 ///     excuses it: [`durable_refusal`] in a single-node workload, and
 ///     [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired)
-///     for the refusing node in a multi-node one (S3b item 0).
+///     for the refusing node in a multi-node one (S3b item 0),
+///  5. the kernel's clock stop and its open/promote refusal
+///     ([`clock_refused`]), which the sim's clock axes produce. Whether one
+///     fired exactly when the clock was beyond `CLOCK_TOLERANCE` is a clock
+///     property's to judge, not this classifier's.
 ///
 /// Anything else is `Unrelated`: NOT fallout, must fail the universe for
-/// adjudication. Recognizing families 1-3 cannot mask a real bug so long as
+/// adjudication. Recognizing families 1-3 and 5 cannot mask a real bug so long as
 /// the workload's end-state oracle (e.g. exactly-once on reopen) still runs
 /// either way.
 ///
@@ -91,13 +97,16 @@ pub fn classify(text: &str) -> FaultReason {
         FaultReason::RedbLatch
     } else if text.contains("durable horizon") {
         FaultReason::DurableHorizon
+    } else if clock_refused(text) {
+        FaultReason::ClockRefused
     } else {
         FaultReason::Unrelated
     }
 }
 
 /// `true` for the families an error's text alone excuses: injected,
-/// poisoned and the redb latch (`classify`'s families 1-3). Never for the
+/// poisoned, the redb latch and the clock stop or refusal (`classify`'s
+/// families 1-3 and 5). Never for the
 /// durable-horizon refusal: whether that is fallout depends on whether durable
 /// corruption fired, which text cannot say, so it is `false` here and a
 /// caller that retries or gives up on fallout fails it unless it asks
@@ -108,8 +117,24 @@ pub fn classify(text: &str) -> FaultReason {
 pub fn is_fault_fallout(text: &str) -> bool {
     matches!(
         classify(text),
-        FaultReason::Injected | FaultReason::Poisoned | FaultReason::RedbLatch
+        FaultReason::Injected
+            | FaultReason::Poisoned
+            | FaultReason::RedbLatch
+            | FaultReason::ClockRefused
     )
+}
+
+/// `true` for the kernel's clock stop ("clock went backwards: …") and for its
+/// refusal to open or promote a node whose wall clock is more than
+/// `CLOCK_TOLERANCE` behind the latest time its data directory recorded
+/// (charpente's `kernel/clock.rs`). The sim's clock axes produce both: a step
+/// back past the tolerance stops the node, and it then cannot open again
+/// until true time catches up. So in an app workload they are fault fallout
+/// ([`is_fault_fallout`]), and a clock property marks one when it sees it.
+pub fn clock_refused(text: &str) -> bool {
+    text.contains("clock went backwards:")
+        || text.contains("refusing to open: this node's wall clock")
+        || text.contains("refusing to promote: this node's wall clock")
 }
 
 /// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
@@ -569,6 +594,49 @@ mod tests {
         );
     }
 
+    /// The kernel's clock stop and its open and promote refusals (charpente's
+    /// `kernel/clock.rs`) are fallout of the sim's clock axes: a step back past
+    /// `CLOCK_TOLERANCE` stops a node, and it then cannot open until true time
+    /// catches up. One exemplar of each, verbatim, and no other family's
+    /// exemplar reads as one.
+    #[test]
+    fn the_clock_stop_and_refusal_are_fault_fallout() {
+        for text in [
+            "clock went backwards: this node's wall clock reads 2026-01-01T00:00:39.000Z, 61s \
+             behind 2026-01-01T00:01:40.000Z, the latest time it already used — more than the \
+             60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather than extend \
+             sessions or delay schedules by that much. Fix the system clock (check NTP) and \
+             restart; if the clock is right, the earlier reading came from a clock that ran \
+             ahead, and the node runs again after 2026-01-01T00:00:40.000Z.",
+            "refusing to open: this node's wall clock reads 2026-01-01T00:00:39.000Z, 61s behind \
+             2026-01-01T00:01:40.000Z, the latest time this data directory recorded — more than \
+             the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if \
+             the clock is right, the recorded time came from a clock that ran ahead, and the \
+             node will open after 2026-01-01T00:00:40.000Z.",
+            "refusing to promote: this node's wall clock reads 2026-01-01T00:00:39.000Z, 61s \
+             behind 2026-01-01T00:01:40.000Z, the latest time this data directory recorded — \
+             more than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock \
+             (check NTP); if the clock is right, the recorded time came from a clock that ran \
+             ahead, and the node will promote after 2026-01-01T00:00:40.000Z.",
+        ] {
+            assert_eq!(classify(text), FaultReason::ClockRefused, "{text}");
+            assert!(clock_refused(text), "{text}");
+            assert!(is_fault_fallout(text), "{text}");
+        }
+        for other in [
+            "simulated disk write error (injected fault)",
+            "WAL poisoned by an earlier IO failure",
+            "Storage error: close and re-open the database",
+            "log frame 3 is invalid but at-or-below the store's durable horizon 7",
+            "exactly-once violated: hits 3, done 2 for key 7",
+            // A refusal to open for another reason is not a clock refusal.
+            "refusing to open: the data directory was written by charpente 0.2",
+        ] {
+            assert!(!clock_refused(other), "{other}");
+            assert_ne!(classify(other), FaultReason::ClockRefused, "{other}");
+        }
+    }
+
     // ------------------------------------------- durable_corruption_fired
 
     #[test]
@@ -800,7 +868,7 @@ mod tests {
     }
 
     /// The checker must restart the CALLER'S world, because that is the world
-    /// the harness reads coverage from — `run_universe` hands the workload a
+    /// the harness reads coverage from — `run_app_universe` hands the workload a
     /// `Sim` and reports that sim's keys. A checker that restarts a private
     /// world of its own credits `restart` where nothing can see it, so a
     /// workload writing `require: ["restart"]` over this checker gets a key

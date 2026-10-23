@@ -123,6 +123,19 @@ pub struct FaultConfig {
     pub outbound_latency: (Duration, Duration),
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
+    /// Nanoseconds every host's wall clock reads ahead (+) or behind (-) of
+    /// true time (`Sim::true_wall`). Hosts still diverge from one another:
+    /// each one's step-backs and downtime roll on its own streams.
+    pub clock_skew: i64,
+    /// Per wall read: the chance the host's clock steps back, and the largest
+    /// step. A step's size is uniform in (0, max], and the clock stays where
+    /// the step left it.
+    pub clock_step_back: (f64, Duration),
+    /// Per power cycle (`Sim::restart`, `SimHost::restart`): the chance the
+    /// host's wall clock jumps forward, as if the machine had been down, and
+    /// the largest jump. Virtual time does not move; only that host's wall
+    /// reading does.
+    pub clock_downtime: (f64, Duration),
 }
 
 const CORRUPTION_SCOPE_DEFAULT: &str = "wal/";
@@ -154,6 +167,9 @@ impl Default for FaultConfig {
             outbound_latency: (Duration::from_millis(1), Duration::from_millis(50)),
             disk_latency: (Duration::from_micros(20), Duration::from_millis(2)),
             net_latency: (Duration::from_micros(100), Duration::from_millis(20)),
+            clock_skew: 0,
+            clock_step_back: (0.0, Duration::ZERO),
+            clock_downtime: (0.0, Duration::ZERO),
         }
     }
 }
@@ -185,6 +201,9 @@ impl FaultConfig {
             outbound_latency: (Duration::ZERO, Duration::ZERO),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::ZERO),
+            clock_skew: 0,
+            clock_step_back: (0.0, Duration::ZERO),
+            clock_downtime: (0.0, Duration::ZERO),
         }
     }
 
@@ -238,7 +257,7 @@ impl FaultConfig {
             crash_torn,
             // These axes (`dir_entry_loss` … `subscriber_stall`, and the six
             // `outbound_*`) draw from field-keyed sub-streams
-            // (`sample_extended_fields`, applied in `run_universe`/
+            // (`sample_extended_fields`, applied in `run_app_universe`/
             // `run_universe_with_adjust` right after this function returns)
             // rather than this sequential stream, so they cannot perturb the
             // draws above — each composes order-independently and adding
@@ -268,6 +287,12 @@ impl FaultConfig {
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             disk_latency: (Duration::ZERO, disk_hi),
             net_latency: (Duration::ZERO, net_hi),
+            // Off, and drawn by `sample_clock_fields` on the app harness's
+            // path only (`run_app_universe`), so no platform suite's
+            // universes move.
+            clock_skew: 0,
+            clock_step_back: (0.0, Duration::ZERO),
+            clock_downtime: (0.0, Duration::ZERO),
         };
         cfg.validate(); // a sampler that produces an invalid config is a harness bug
         cfg
@@ -295,10 +320,26 @@ impl FaultConfig {
             ("outbound_lost_reply", self.outbound_lost_reply),
             ("outbound_throttle", self.outbound_throttle),
             ("outbound_slow", self.outbound_slow),
+            ("clock_step_back", self.clock_step_back.0),
+            ("clock_downtime", self.clock_downtime.0),
         ] {
             assert!(
                 (0.0..=1.0).contains(&p),
                 "FaultConfig.{name} = {p} — must be in [0, 1]"
+            );
+        }
+        for (name, (p, max)) in [
+            ("clock_step_back", self.clock_step_back),
+            ("clock_downtime", self.clock_downtime),
+        ] {
+            assert!(
+                p == 0.0 || !max.is_zero(),
+                "FaultConfig.{name} = ({p}, 0ns) — a chance above zero needs a largest size above \
+                 zero"
+            );
+            assert!(
+                i64::try_from(max.as_nanos()).is_ok(),
+                "FaultConfig.{name}'s largest size {max:?} exceeds i64 nanoseconds"
             );
         }
         assert!(
@@ -325,7 +366,7 @@ impl FaultConfig {
 /// stream above (this file's frozen replay contract). Adding a field here
 /// changes no existing universe's legacy draws and no other extended
 /// field's draws: each stream is independent of the seed's position in any
-/// other stream. Called from `run_universe`/`run_universe_with_adjust`
+/// other stream. Called from `run_app_universe`/`run_universe_with_adjust`
 /// immediately after `FaultConfig::swarm`, so every swarm-sampled universe
 /// (the production CLI harness and every workspace swarm test alike) also
 /// gets these axes sampled — this is also how Task 1's `dir_entry_loss`
@@ -435,6 +476,34 @@ pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
     ];
     let mut r = keyed_stream(seed, "outbound_latency");
     cfg.outbound_latency = (Duration::ZERO, OUTBOUND_HI[r.below(4) as usize]);
+}
+
+/// The clock axes, each on in a quarter of runs and drawn from its own keyed
+/// stream, so no existing field moves (`clock_axes_move_no_existing_draw`).
+/// Called by `run_app_universe` only: a platform suite that wants them turns
+/// them on in its `run_universes_swarm_with!` `adjust`, so no pinned platform
+/// seed moves either. The skew and step sizes span both sides of
+/// `CLOCK_TOLERANCE` (60 s), so a run sees both the kernel's hold and its stop.
+fn sample_clock_fields(seed: u64, cfg: &mut FaultConfig) {
+    const SKEW: u64 = 120_000_000_000;
+    let mut r = keyed_stream(seed, "clock_skew");
+    cfg.clock_skew = if r.chance(0.25) {
+        r.between(0, 2 * SKEW) as i64 - SKEW as i64
+    } else {
+        0
+    };
+    let mut r = keyed_stream(seed, "clock_step_back");
+    cfg.clock_step_back = if r.chance(0.25) {
+        (r.below(20) as f64 / 1000.0, Duration::from_secs(120))
+    } else {
+        (0.0, Duration::ZERO)
+    };
+    let mut r = keyed_stream(seed, "clock_downtime");
+    cfg.clock_downtime = if r.chance(0.25) {
+        (0.5, Duration::from_secs(3 * 86_400))
+    } else {
+        (0.0, Duration::ZERO)
+    };
 }
 
 // A frozen copy of `sample_extended_fields` as of f21b491e, before the
@@ -549,6 +618,8 @@ struct HostWorld {
     /// universe-wide `fault:dir-entry` key around this host's collapse; it
     /// draws nothing.
     entry_loss: u64,
+    /// This host's wall clock (`SimHost::clock`).
+    wall: WallClock,
 }
 
 impl HostWorld {
@@ -560,7 +631,112 @@ impl HostWorld {
             dir_faults: keyed_stream(seed, &format!("host-dir-faults:{host}")),
             durable_corruption: 0,
             entry_loss: 0,
+            wall: WallClock::new(seed, &format!("host-wall:{host}")),
         }
+    }
+}
+
+/// One clock's wall-time faults. Its reading is true time plus
+/// `FaultConfig::clock_skew` plus `drift`, the sum of its step-backs
+/// (negative) and downtime jumps (positive). Each axis rolls on a keyed
+/// stream of its own, so a clock's faults never depend on another clock's
+/// reads or on the frozen global streams, and with both axes off nothing is
+/// drawn.
+struct WallClock {
+    drift: i64,
+    /// Whether `clock:skewed` was marked: once per clock, at its first read.
+    skew_marked: bool,
+    step_back: Rng,
+    downtime: Rng,
+}
+
+impl WallClock {
+    fn new(seed: u64, name: &str) -> WallClock {
+        WallClock {
+            drift: 0,
+            skew_marked: false,
+            step_back: keyed_stream(seed, &format!("{name}:step-back")),
+            downtime: keyed_stream(seed, &format!("{name}:downtime")),
+        }
+    }
+
+    /// One wall read at virtual time `now` on `host`'s clock (`None`: the one
+    /// `Sim::clock` reads): rolls a step back first, so the step lands in
+    /// this reading.
+    fn read(
+        &mut self,
+        now: u64,
+        cfg: &FaultConfig,
+        coverage: &mut BTreeMap<&'static str, u64>,
+        host: Option<&str>,
+    ) -> WallTime {
+        let (p, max) = cfg.clock_step_back;
+        if p > 0.0 && self.step_back.chance(p) {
+            // `validate` holds the largest size within i64 nanoseconds.
+            let size = self.step_back.between(1, max.as_nanos() as u64) as i64;
+            self.drift = self.drift.checked_sub(size).unwrap_or_else(|| {
+                panic!(
+                    "{}'s step-backs overflowed i64 nanoseconds of drift",
+                    clock_name(host)
+                )
+            });
+            *coverage.entry("clock:stepped-back").or_insert(0) += 1;
+        }
+        if cfg.clock_skew != 0 && !self.skew_marked {
+            self.skew_marked = true;
+            *coverage.entry("clock:skewed").or_insert(0) += 1;
+        }
+        let offset = cfg.clock_skew.checked_add(self.drift).unwrap_or_else(|| {
+            panic!(
+                "{}'s offset overflowed i64 nanoseconds: skew {} ns plus drift {} ns",
+                clock_name(host),
+                cfg.clock_skew,
+                self.drift
+            )
+        });
+        let nanos = now
+            .checked_add(SIM_WALL_BASE_NANOS)
+            .and_then(|t| t.checked_add_signed(offset))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}'s wall reading left u64 nanoseconds: virtual time {now} ns + \
+                     SIM_WALL_BASE_NANOS {SIM_WALL_BASE_NANOS} ns + offset {offset} ns (skew {} \
+                     ns, step-backs and downtime {} ns)",
+                    clock_name(host),
+                    cfg.clock_skew,
+                    self.drift
+                )
+            });
+        WallTime::from_nanos(nanos)
+    }
+
+    /// A power cycle of `host` (`None`: the global disk's): rolls the
+    /// downtime jump.
+    fn power_cycle(
+        &mut self,
+        cfg: &FaultConfig,
+        coverage: &mut BTreeMap<&'static str, u64>,
+        host: Option<&str>,
+    ) {
+        let (p, max) = cfg.clock_downtime;
+        if p > 0.0 && self.downtime.chance(p) {
+            let jump = self.downtime.between(1, max.as_nanos() as u64) as i64;
+            self.drift = self.drift.checked_add(jump).unwrap_or_else(|| {
+                panic!(
+                    "{}'s downtime overflowed i64 nanoseconds of drift",
+                    clock_name(host)
+                )
+            });
+            *coverage.entry("clock:downtime").or_insert(0) += 1;
+        }
+    }
+}
+
+/// How a clock names itself in its panics.
+fn clock_name(host: Option<&str>) -> String {
+    match host {
+        None => "the sim's clock (Sim::clock)".to_string(),
+        Some(name) => format!("host \"{name}\"'s clock (SimHost::clock)"),
     }
 }
 
@@ -607,6 +783,9 @@ struct State {
     /// and nothing is drawn until a handle starts a call, so a universe that
     /// never builds one replays exactly as before.
     outbound: outbound::OutboundWorld,
+    /// The wall clock `Sim::clock` reads: keyed streams only, drawn from only
+    /// while a clock axis is on.
+    wall: WallClock,
 }
 
 impl State {
@@ -777,6 +956,7 @@ impl Sim {
                     disk_faults_off: false,
                     stalls_off: false,
                     outbound: outbound::OutboundWorld::new(seed),
+                    wall: WallClock::new(seed, "wall"),
                 }),
             }),
         }
@@ -877,7 +1057,20 @@ impl Sim {
     pub fn clock(&self) -> SimClock {
         SimClock {
             world: self.world.clone(),
+            host: None,
         }
+    }
+
+    /// True wall time: virtual time plus `SIM_WALL_BASE_NANOS`, with no host's
+    /// skew, step-backs or downtime in it. A property judges expiry and lateness
+    /// against this, never against a reading some host's clock gave.
+    pub fn true_wall(&self) -> WallTime {
+        let now = self.world.lock().now;
+        WallTime::from_nanos(now.checked_add(SIM_WALL_BASE_NANOS).unwrap_or_else(|| {
+            panic!(
+                "true wall time left u64 nanoseconds: virtual time {now} ns + SIM_WALL_BASE_NANOS"
+            )
+        }))
     }
 
     pub fn entropy(&self) -> SimEntropy {
@@ -978,6 +1171,7 @@ impl Sim {
             faults,
             coverage,
             disk_faults_off,
+            wall,
             ..
         } = &mut *guard;
         // Bit-level corruption of already-durable bytes (the bitrot model),
@@ -1029,6 +1223,7 @@ impl Sim {
         disk.epoch += 1;
         disk.crashed = false;
         disk.crash_countdown = None;
+        wall.power_cycle(&self.world.cfg, coverage, None);
     }
 
     /// Restarts the PROCESS, not the machine: every open file handle dies (it
@@ -1226,6 +1421,16 @@ impl SimHost {
         }
     }
 
+    /// This host's clock: virtual time for `now`, and a wall reading carrying
+    /// this host's offset from true time (`FaultConfig::clock_skew` plus its
+    /// own step-backs and downtime).
+    pub fn clock(&self) -> SimClock {
+        SimClock {
+            world: self.world.clone(),
+            host: Some(self.name.clone()),
+        }
+    }
+
     /// Same as `sim.net(host.name())` — `NetWorld` is not split per host
     /// (listeners/conns are already keyed by address/id), only the disk and
     /// fault/entropy streams are.
@@ -1318,6 +1523,7 @@ impl SimHost {
                 faults,
                 durable_corruption,
                 entry_loss,
+                wall,
                 ..
             } = host;
             // Bit-level corruption of already-durable bytes, before per-file
@@ -1360,6 +1566,7 @@ impl SimHost {
             disk.epoch += 1;
             disk.crashed = false;
             disk.crash_countdown = None;
+            wall.power_cycle(&cfg, coverage, Some(&self.name));
         }
         guard.net.teardown_host(&self.name);
     }
@@ -1379,6 +1586,7 @@ pub const SIM_WALL_BASE_NANOS: u64 = 1_767_225_600_000_000_000;
 
 pub struct SimClock {
     world: Arc<World>,
+    host: Option<String>,
 }
 
 impl Clock for SimClock {
@@ -1387,7 +1595,23 @@ impl Clock for SimClock {
     }
 
     fn wall(&self) -> WallTime {
-        WallTime::from_nanos(self.world.lock().now + SIM_WALL_BASE_NANOS)
+        let cfg = &self.world.cfg;
+        let mut guard = self.world.lock();
+        let State {
+            now,
+            wall,
+            hosts,
+            coverage,
+            ..
+        } = &mut *guard;
+        match &self.host {
+            None => wall.read(*now, cfg, coverage, None),
+            Some(name) => hosts
+                .get_mut(name)
+                .expect("a SimClock for a host is made by SimHost::clock, after Sim::host")
+                .wall
+                .read(*now, cfg, coverage, Some(name)),
+        }
     }
 
     fn sleep(&self, duration: Duration) {
@@ -2176,8 +2400,8 @@ pub fn run_universes_swarm_in(
     // Ambient base, no config override — delegates to the `_with` runner
     // added alongside `run_universes_swarm_with!`; a no-op adjust makes this
     // byte-for-byte the same seed→behavior mapping as before that macro
-    // existed (`run_universe`, below, is untouched and still the shared
-    // contract with the CLI harness).
+    // existed (`run_universe`, below, is untouched). The CLI harness shared
+    // it until the clock axes; it now runs `run_app_universe`.
     run_universes_swarm_with_in(
         package,
         file,
@@ -2435,8 +2659,8 @@ impl Outcome {
 }
 
 /// One universe's end: how it ended, and the coverage it marked. The Ok
-/// payload of `run_universe` — a give-up and a verdict are distinct values
-/// here, where they used to be the same `Ok(coverage_map)`.
+/// payload of every single-universe runner — a give-up and a verdict are
+/// distinct values here, where they used to be the same `Ok(coverage_map)`.
 #[derive(Debug, Clone)]
 pub struct UniverseEnd {
     pub outcome: Outcome,
@@ -2455,11 +2679,14 @@ fn end_of(sim: &Sim) -> UniverseEnd {
     }
 }
 
-/// One universe, shared by the frozen swarm macro and the CLI harness
-/// (harness.rs). The seed→behavior mapping here is the frozen replay
+/// One universe, as the CLI harness ran it before the clock axes (0.3.0's
+/// named step S3). The seed→behavior mapping here is the frozen replay
 /// contract: config derives from `splitmix64(seed)`, the workload runs
 /// under catch_unwind, Ok returns the universe's end. Do not reorder
-/// anything.
+/// anything. The swarm runners keep this mapping (`run_universe_with_adjust`
+/// with a no-op adjust) and the app harness now runs `run_app_universe`, so
+/// this stays only as the reference `app_runs_with_the_clock_axes_off_decide_
+/// as_before` holds `run_app_universe` to.
 /// `sample_extended_fields` runs right after `FaultConfig::swarm` — its own
 /// sub-streams (keyed off `seed`, not `cfg_seed`) never touch the legacy
 /// draw above, so this addition changes no existing universe's replay
@@ -2468,6 +2695,7 @@ fn end_of(sim: &Sim) -> UniverseEnd {
 // `dir_entry_loss` landed; boxing the Err would touch this frozen function's
 // signature (and every caller) for a lint, not a behavior change.
 #[allow(clippy::result_large_err)]
+#[cfg(test)]
 pub(crate) fn run_universe(
     seed: u64,
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
@@ -2481,6 +2709,93 @@ pub(crate) fn run_universe(
         Ok(Ok(())) => Ok(end_of(&sim)),
         Ok(Err(msg)) => Err((cfg, sim.coverage(), msg)),
         Err(payload) => Err((cfg, sim.coverage(), panic_message(&*payload))),
+    }
+}
+
+/// One app-harness run's failure (`run_app_universe`): what to file it with
+/// and what to replay it from. `choices` and `drawn` stay empty until a
+/// workload can draw inputs.
+#[derive(Debug)]
+pub struct UniverseFailure {
+    pub config: FaultConfig,
+    pub coverage: BTreeMap<&'static str, u64>,
+    pub message: String,
+    pub choices: Vec<u64>,
+    pub drawn: Vec<(&'static str, String)>,
+}
+
+/// One run of `charpente test --sim` (harness.rs): `run_universe`'s mapping
+/// plus the clock axes (`sample_clock_fields`), then every `FaultConfig`
+/// field named in `faults_off` turned off. The clock axes sample last, from
+/// their own streams, so with them off a run decides exactly as before them.
+/// `choices` is the input sequence a replay feeds the workload; nothing draws
+/// inputs yet, so it is unread.
+// The same large-Err trade as `run_universe`.
+#[allow(clippy::result_large_err)]
+pub(crate) fn run_app_universe(
+    seed: u64,
+    choices: Option<&[u64]>,
+    faults_off: &[&'static str],
+    f: &dyn Fn(&mut Sim) -> Result<(), String>,
+) -> Result<UniverseEnd, UniverseFailure> {
+    let _ = choices;
+    let mut s = seed;
+    let cfg_seed = splitmix64(&mut s);
+    let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    sample_extended_fields(seed, &mut cfg);
+    sample_clock_fields(seed, &mut cfg);
+    for field in faults_off {
+        turn_off(&mut cfg, field);
+    }
+    cfg.validate();
+    let mut sim = Sim::with_faults(seed, cfg.clone());
+    let failure = |sim: &Sim, message: String| UniverseFailure {
+        config: cfg.clone(),
+        coverage: sim.coverage(),
+        message,
+        choices: Vec::new(),
+        drawn: Vec::new(),
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
+        Ok(Ok(())) => Ok(end_of(&sim)),
+        Ok(Err(msg)) => Err(failure(&sim, msg)),
+        Err(payload) => Err(failure(&sim, panic_message(&*payload))),
+    }
+}
+
+/// Turns off the `FaultConfig` field named `field`: a probability or a skew
+/// to zero, a range or a clock axis to its off pair. The harness checks names
+/// before a run, so an unknown one here is a harness bug.
+fn turn_off(cfg: &mut FaultConfig, field: &str) {
+    const NONE: (Duration, Duration) = (Duration::ZERO, Duration::ZERO);
+    match field {
+        "write_error" => cfg.write_error = 0.0,
+        "sync_error" => cfg.sync_error = 0.0,
+        "crash_apply" => cfg.crash_apply = 0.0,
+        "crash_torn" => cfg.crash_torn = 0.0,
+        "dir_entry_loss" => cfg.dir_entry_loss = 0.0,
+        "bit_flip" => cfg.bit_flip = 0.0,
+        "misdirected_write" => cfg.misdirected_write = 0.0,
+        "read_error" => cfg.read_error = 0.0,
+        "object_put_error" => cfg.object_put_error = 0.0,
+        "object_get_error" => cfg.object_get_error = 0.0,
+        "object_lost_ack" => cfg.object_lost_ack = 0.0,
+        "object_delete_error" => cfg.object_delete_error = 0.0,
+        "conn_drop" => cfg.conn_drop = 0.0,
+        "net_spike" => cfg.net_spike = 0.0,
+        "subscriber_stall" => cfg.subscriber_stall = 0.0,
+        "outbound_refused" => cfg.outbound_refused = 0.0,
+        "outbound_lost_request" => cfg.outbound_lost_request = 0.0,
+        "outbound_lost_reply" => cfg.outbound_lost_reply = 0.0,
+        "outbound_throttle" => cfg.outbound_throttle = 0.0,
+        "outbound_slow" => cfg.outbound_slow = 0.0,
+        "outbound_latency" => cfg.outbound_latency = NONE,
+        "disk_latency" => cfg.disk_latency = NONE,
+        "net_latency" => cfg.net_latency = NONE,
+        "clock_skew" => cfg.clock_skew = 0,
+        "clock_step_back" => cfg.clock_step_back = (0.0, Duration::ZERO),
+        "clock_downtime" => cfg.clock_downtime = (0.0, Duration::ZERO),
+        _ => panic!("faults_off names \"{field}\", which is no FaultConfig fault axis"),
     }
 }
 
@@ -2618,6 +2933,104 @@ mod tests {
         assert_eq!(clock.wall().as_nanos(), SIM_WALL_BASE_NANOS);
         clock.sleep(Duration::from_secs(3));
         assert_eq!(clock.wall().as_nanos(), SIM_WALL_BASE_NANOS + 3_000_000_000);
+    }
+
+    /// A host's wall reading is true time plus that host's offset: the
+    /// universe's skew, then whatever the host's own step-backs and downtime
+    /// added. Each axis marks its key when it acts.
+    #[test]
+    fn a_host_wall_reading_is_true_time_plus_its_offset() {
+        const SEC: i128 = 1_000_000_000;
+        let offset = |clock: &SimClock, sim: &Sim| {
+            clock.wall().as_nanos() as i128 - sim.true_wall().as_nanos() as i128
+        };
+        let fired = |sim: &Sim, key: &str| sim.coverage().get(key).copied().unwrap_or(0);
+
+        // Skew: every host's clock reads the same distance from true time,
+        // and each marks `clock:skewed` once, at its first read.
+        let sim = Sim::with_faults(
+            0xC10C_8001,
+            FaultConfig {
+                clock_skew: -90_000_000_000,
+                ..FaultConfig::none()
+            },
+        );
+        sim.clock().sleep(Duration::from_secs(5));
+        assert_eq!(
+            sim.true_wall().as_nanos(),
+            SIM_WALL_BASE_NANOS + 5_000_000_000
+        );
+        assert_eq!(offset(&sim.clock(), &sim), -90 * SEC);
+        assert_eq!(offset(&sim.clock(), &sim), -90 * SEC);
+        assert_eq!(offset(&sim.host("a").clock(), &sim), -90 * SEC);
+        assert_eq!(fired(&sim, "clock:skewed"), 2, "once per clock that read");
+
+        // A step back: at chance 1 every read steps, by (0, 120 s], and the
+        // clock stays where the step left it. Host a's steps are its own.
+        let sim = Sim::with_faults(
+            0xC10C_8002,
+            FaultConfig {
+                clock_step_back: (1.0, Duration::from_secs(120)),
+                ..FaultConfig::none()
+            },
+        );
+        let clock = sim.clock();
+        let mut last = 0;
+        for read in 1..=10 {
+            let now = offset(&clock, &sim);
+            assert!(
+                (1..=120 * SEC).contains(&(last - now)),
+                "read {read} moved the clock from {last} ns to {now} ns"
+            );
+            last = now;
+        }
+        assert_eq!(fired(&sim, "clock:stepped-back"), 10);
+        assert!(last < -120 * SEC, "ten steps on this seed: {last} ns");
+        let a = offset(&sim.host("a").clock(), &sim);
+        assert!(
+            (-120 * SEC..0).contains(&a),
+            "host a's first read steps from its own offset, 0, not the global clock's {last} ns: {a} ns"
+        );
+        assert_eq!(fired(&sim, "clock:stepped-back"), 11);
+        assert_eq!(fired(&sim, "clock:skewed"), 0, "no skew, no mark");
+
+        // Downtime: a power cycle jumps that host's clock forward by
+        // (0, 3 days], and no other host's. A process restart is not one.
+        let sim = Sim::with_faults(
+            0xC10C_8003,
+            FaultConfig {
+                clock_downtime: (1.0, Duration::from_secs(3 * 86_400)),
+                ..FaultConfig::none()
+            },
+        );
+        assert_eq!(offset(&sim.clock(), &sim), 0);
+        sim.restart_process();
+        assert_eq!(
+            offset(&sim.clock(), &sim),
+            0,
+            "a process restart is not downtime"
+        );
+        sim.restart();
+        let jumped = offset(&sim.clock(), &sim);
+        assert!((1..=3 * 86_400 * SEC).contains(&jumped), "{jumped} ns");
+        let host = sim.host("a");
+        assert_eq!(
+            offset(&host.clock(), &sim),
+            0,
+            "the global power cycle left host a alone"
+        );
+        host.restart();
+        let host_jumped = offset(&host.clock(), &sim);
+        assert!(
+            (1..=3 * 86_400 * SEC).contains(&host_jumped),
+            "{host_jumped} ns"
+        );
+        assert_eq!(
+            offset(&sim.clock(), &sim),
+            jumped,
+            "host a's power cycle left the global clock alone"
+        );
+        assert_eq!(fired(&sim, "clock:downtime"), 2);
     }
 
     #[test]
@@ -3437,6 +3850,118 @@ mod tests {
                 "seed {seed:#x}"
             );
         }
+    }
+
+    /// Spec §4: adding the clock axes moves none of the swarm config's
+    /// existing draws. They sample from their own keyed streams, after
+    /// everything else, so every field that existed before them is the same
+    /// with and without them. The counts keep it from passing vacuously.
+    #[test]
+    fn clock_axes_move_no_existing_draw() {
+        let mut on = [0u32; 3];
+        for seed in 0..1_000u64 {
+            let mut s = seed;
+            let cfg_seed = splitmix64(&mut s);
+            let mut without = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+            sample_extended_fields(seed, &mut without);
+            let mut with = without.clone();
+            sample_clock_fields(seed, &mut with);
+            with.validate();
+            on[0] += u32::from(with.clock_skew != 0);
+            on[1] += u32::from(with.clock_step_back != (0.0, Duration::ZERO));
+            on[2] += u32::from(with.clock_downtime != (0.0, Duration::ZERO));
+            assert!(
+                with.clock_skew.unsigned_abs() <= 120_000_000_000,
+                "seed {seed}: skew {} ns",
+                with.clock_skew
+            );
+            with.clock_skew = 0;
+            with.clock_step_back = (0.0, Duration::ZERO);
+            with.clock_downtime = (0.0, Duration::ZERO);
+            assert_eq!(format!("{with:?}"), format!("{without:?}"), "seed {seed}");
+        }
+        // Each axis is on in a quarter of runs.
+        for (axis, count) in ["clock_skew", "clock_step_back", "clock_downtime"]
+            .iter()
+            .zip(on)
+        {
+            assert!(
+                (200..=300).contains(&count),
+                "{axis} was on in {count} of 1000 seeds"
+            );
+        }
+    }
+
+    /// Spec §4, at the universe: with the clock axes turned off, an app run
+    /// decides exactly as the harness did before them (`run_universe`) —
+    /// same outcome, coverage, message and every other config field. With
+    /// them on, some runs differ, so the comparison is not vacuous.
+    #[test]
+    fn app_runs_with_the_clock_axes_off_decide_as_before() {
+        fn workload(sim: &mut Sim) -> Result<(), String> {
+            let file = sim.disk().open("wal/f").map_err(|e| e.to_string())?;
+            let mut payload = [0u8; 64];
+            sim.entropy().fill(&mut payload);
+            let wrote = file.write_at(0, &payload).is_ok() && file.sync().is_ok();
+            sim.cover(if wrote {
+                "toy:wrote"
+            } else {
+                "toy:write-failed"
+            });
+            let before = sim.clock().wall();
+            sim.restart();
+            let after = sim.clock().wall();
+            if payload[0] % 5 == 0 {
+                return Err(format!("toy failure from {before} to {after}"));
+            }
+            if payload[1] % 3 == 0 {
+                sim.give_up("toy give-up");
+            }
+            Ok(())
+        }
+        type Seen = (String, BTreeMap<&'static str, u64>, String);
+        let off = |cfg: &FaultConfig| {
+            let mut cfg = cfg.clone();
+            cfg.clock_skew = 0;
+            cfg.clock_step_back = (0.0, Duration::ZERO);
+            cfg.clock_downtime = (0.0, Duration::ZERO);
+            format!("{cfg:?}")
+        };
+        let app = |seed: u64, faults_off: &[&'static str]| -> Seen {
+            match run_app_universe(seed, None, faults_off, &workload) {
+                Ok(end) => (format!("{:?}", end.outcome), end.coverage, String::new()),
+                Err(f) => (off(&f.config), f.coverage, f.message),
+            }
+        };
+        let mut differed = 0;
+        for seed in 0..300u64 {
+            let before: Seen = match run_universe(seed, &workload) {
+                Ok(end) => (format!("{:?}", end.outcome), end.coverage, String::new()),
+                Err((config, coverage, message)) => (off(&config), coverage, message),
+            };
+            assert_eq!(
+                app(seed, &["clock_skew", "clock_step_back", "clock_downtime"]),
+                before,
+                "seed {seed:#x}"
+            );
+            differed += u32::from(app(seed, &[]) != before);
+        }
+        assert!(differed > 0, "the clock axes changed no run of 300");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "host \"a\"'s clock (SimHost::clock)'s wall reading left u64 nanoseconds"
+    )]
+    fn a_wall_reading_before_the_epoch_panics_naming_the_host() {
+        let sim = Sim::with_faults(
+            0xC10C_8004,
+            FaultConfig {
+                clock_skew: -(SIM_WALL_BASE_NANOS as i64) - 1,
+                ..FaultConfig::none()
+            },
+        );
+        sim.host("a").clock().wall();
     }
 
     #[test]
