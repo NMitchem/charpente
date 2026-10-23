@@ -495,4 +495,72 @@ mod tests {
             "beta's enqueue closure ran"
         );
     }
+
+    /// A 0.2 data directory meets the stale-directory refusal at `CronRow`, the
+    /// platform table every directory records (the session-sweep cron). The stored
+    /// fingerprint is the real 0.2 one, so this fails if the arm that treats the
+    /// un-prefixed `CronRow` as a platform table goes.
+    #[test]
+    fn a_0_2_data_directory_is_refused_at_cron_row_by_name() {
+        use charpente_core::table::{Codec, IndexDef, Row, Unscoped};
+
+        struct CronRow02 {
+            id: Id<CronRow02>,
+        }
+        impl Row for CronRow02 {
+            type Scope = Unscoped;
+            const TABLE: &'static str = "CronRow";
+            const INDEXES: &'static [IndexDef<CronRow02>] = &[];
+            const VERSION: u32 = 1;
+            const FINGERPRINT: Option<u64> = Some(0xbed2ea12c6f56d9a);
+            fn id(&self) -> Id<CronRow02> {
+                self.id
+            }
+            fn encode_row(&self, out: &mut Vec<u8>) {
+                self.id.encode(out);
+            }
+            fn decode_row(bytes: &[u8]) -> std::io::Result<CronRow02> {
+                Ok(CronRow02 {
+                    id: Id::decode(&mut &bytes[..])?,
+                })
+            }
+        }
+        let sim = Sim::with_faults(0x2EB1_0007, FaultConfig::none());
+        let cfg = || DbConfig {
+            store_path: "t.redb".into(),
+            ..DbConfig::default()
+        };
+        let mut db = Db::open(
+            Box::new(sim.disk()),
+            cfg(),
+            Schema::new().table::<CronRow02>(),
+        )
+        .unwrap();
+        db.transact(|tx| -> Result<(), ()> {
+            tx.put(&CronRow02 {
+                id: Id::from_raw(1),
+            });
+            Ok(())
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+        let err = Db::open(
+            Box::new(sim.disk()),
+            cfg(),
+            Schema::new().table::<CronRow>(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "this data directory was written by another charpente release: the platform table \
+                 \"CronRow\" has a different shape (0xbed2ea12c6f56d9a stored, {:#x} compiled). \
+                 charpente does not migrate its own formats between releases (DECISIONS §15). Start \
+                 this node from an empty data directory, or restore an archive written by this \
+                 release.",
+                CronRow::FINGERPRINT.unwrap()
+            )
+        );
+    }
 }

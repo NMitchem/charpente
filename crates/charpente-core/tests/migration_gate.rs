@@ -961,6 +961,10 @@ platform_row!(CronStored, "charpente.cron", 0xaaaa);
 platform_row!(CronCompiled, "charpente.cron", 0xbbbb);
 platform_row!(SessionStored, "Session", 0xaaaa);
 platform_row!(SessionCompiled, "Session", 0xbbbb);
+platform_row!(ApiKeyStored, "ApiKey", 0xaaaa);
+platform_row!(ApiKeyCompiled, "ApiKey", 0xbbbb);
+platform_row!(CronRowStored, "CronRow", 0xaaaa);
+platform_row!(CronRowCompiled, "CronRow", 0xbbbb);
 
 #[test]
 fn a_platform_table_with_a_foreign_shape_is_refused_as_another_release() {
@@ -1000,27 +1004,39 @@ fn a_platform_table_with_a_foreign_shape_is_refused_as_another_release() {
 
     // The app-built platform tables (`Session`, `ApiKey`, `CronRow`) carry no
     // `charpente.` prefix; they are platform tables all the same.
-    let sim = Sim::with_faults(0x2EB7_0F16, FaultConfig::none());
-    let mut db = Db::open(
-        Box::new(sim.disk()),
-        cfg(),
-        Schema::new().table::<SessionStored>(),
-    )
-    .unwrap();
-    db.transact(|tx| -> Result<(), ()> {
-        tx.put(&SessionStored {
-            id: Id::from_raw(1),
-        });
-        Ok(())
-    })
-    .unwrap();
-    db.checkpoint().unwrap();
-    drop(db);
-    let err = Db::open(
-        Box::new(sim.disk()),
-        cfg(),
-        Schema::new().table::<SessionCompiled>(),
-    )
-    .unwrap_err();
-    assert_eq!(err.to_string(), stale("Session", "0xaaaa", "0xbbbb"));
+    fn refused<S: Row<Scope = Unscoped> + 'static, C: Row + 'static>(
+        seed: u64,
+        mk: impl Fn(u64) -> S,
+    ) -> String {
+        let sim = Sim::with_faults(seed, FaultConfig::none());
+        let mut db = Db::open(Box::new(sim.disk()), cfg(), Schema::new().table::<S>()).unwrap();
+        db.transact(|tx| -> Result<(), ()> {
+            tx.put(&mk(1));
+            Ok(())
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+        Db::open(Box::new(sim.disk()), cfg(), Schema::new().table::<C>())
+            .unwrap_err()
+            .to_string()
+    }
+    assert_eq!(
+        refused::<SessionStored, SessionCompiled>(0x2EB7_0F16, |i| SessionStored {
+            id: Id::from_raw(i)
+        }),
+        stale("Session", "0xaaaa", "0xbbbb")
+    );
+    assert_eq!(
+        refused::<ApiKeyStored, ApiKeyCompiled>(0x2EB7_0F17, |i| ApiKeyStored {
+            id: Id::from_raw(i)
+        }),
+        stale("ApiKey", "0xaaaa", "0xbbbb")
+    );
+    assert_eq!(
+        refused::<CronRowStored, CronRowCompiled>(0x2EB7_0F18, |i| CronRowStored {
+            id: Id::from_raw(i)
+        }),
+        stale("CronRow", "0xaaaa", "0xbbbb")
+    );
 }

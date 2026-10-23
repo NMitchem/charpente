@@ -6369,9 +6369,11 @@ or restore an archive written by this release.
 The fix is the text's: start from an empty data directory and re-create the state from your
 own source of truth, or restore an archive this release wrote. The platform's `charpente.jobs`,
 `charpente.events` and `charpente.schema_versions` tables are not fingerprinted (they are
-hand-written `Row`s), so a release that changes only those is told apart by the replication
-protocol version and the archive's manifest format, not by this refusal. The two other
-refusals are in §10 and §15.
+hand-written `Row`s), so they have no data-directory detector: a 0.2 directory is refused
+because `CronRow` (always recorded: the session-sweep cron) changed shape in the same
+release. A release that changes one of them must bump `PROTO_VERSION` and `MANIFEST_FORMAT`
+and give the directory a detector, by gating the table or changing it with a fingerprinted
+platform table. The two other refusals are in §10 and §15.
 
 ### The upgrade barrier
 
@@ -7803,7 +7805,7 @@ the prefix and the generation.
 
 The manifest carries a `format` (`MANIFEST_FORMAT`, 3 in 0.3) that tracks the charpente
 minor. `restore` and an archiving node that adopts a prefix both refuse a manifest with another
-format, or with none (a 0.2 bucket), and an archiving node stops rather than write over it:
+format, or with none (a 0.2 bucket), and the archive stops rather than write over it (the node keeps serving):
 
 <!-- pinned -->
 ```text
@@ -7812,7 +7814,7 @@ reads <expected>); charpente does not migrate its own formats between releases (
 — archive to a fresh bucket prefix from a node running this release
 ```
 
-`<found>` is `none` when the field is absent. Nothing is converted: point the archive at a
+New manifest fields go after `format`, so an older binary still reaches this refusal. `<found>` is `none` when the field is absent. Nothing is converted: point the archive at a
 fresh prefix and take a new snapshot.
 
 ### Restoring from an archive

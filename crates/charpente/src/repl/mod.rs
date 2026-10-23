@@ -39,7 +39,9 @@ pub mod witnesses;
 
 /// The wire protocol version this binary speaks; carried in every `Hello`
 /// and checked against the peer's (spec §5's version-mismatch surface).
-/// Bumps whenever a message body's shape changes — tenant-scoping's
+/// Bumps whenever a release changes the shape or the meaning of anything a
+/// peer ships (0.3 changed no wire bytes; stored times moved to wall scale).
+/// History: a message body's shape changing — tenant-scoping's
 /// `ScopedSnapshotRows` (tag 14) made it 2; payload shapes' `0x08`/`0x09`
 /// record tags made it 3; job tenancy's `0x0a` scoped enqueue made it 4;
 /// event tenancy's `0x0b` scoped emit made it 5; outbound effects' `0x0c`/

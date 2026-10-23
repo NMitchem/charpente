@@ -1356,10 +1356,13 @@ after every table has landed.
   Across charpente minors there is no migration: a node refuses, by name, a data directory
   whose platform tables (`Session`, `ApiKey`, `CronRow`, fingerprinted like an app's) have
   another shape, a peer whose `Hello` declares another `PROTO_VERSION`, and an archive
-  bucket whose manifest `format` is not `MANIFEST_FORMAT` (or is absent). The refusals are
-  as precise as those constants: a release that changes a hand-written platform table
-  (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`, which carry no
-  fingerprint) must bump `PROTO_VERSION` and `MANIFEST_FORMAT` with it (DECISIONS §15).
+  bucket whose manifest `format` is not `MANIFEST_FORMAT` (or is absent). The hand-written
+  platform tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`) have
+  no data-directory detector: a 0.2 directory is refused because `CronRow` (always
+  recorded: the session-sweep cron) changed shape in the same release. A release that
+  changes one of them must bump both constants AND give the directory a detector, by
+  gating the table (a named step) or changing it with a fingerprinted platform table.
+  New manifest fields go after `format`, so an older binary still reaches the refusal.
 - **Backup (M2, built):** log segments + periodic snapshot to object storage,
   Litestream-style, built in — not an add-on. Two distinct things exist and stay distinct.
   `serve::backup` (`crates/charpente/src/serve.rs`) is a replication-only node with no HTTP
@@ -1482,8 +1485,8 @@ Vec<(u64, Vec<u8>)> }` (tag 5, unchanged since before tenant scoping), a scoped 
 rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
 older binary already expects); the receiving side checks the message against its own
 schema's word for that table and refuses a mismatch by name rather than importing a row
-under the wrong scope. `PROTO_VERSION` is 7 — a message body's shape changing is what
-bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
+under the wrong scope. `PROTO_VERSION` is 7 — it bumps when a release changes the shape or the meaning of
+anything a peer ships (0.3 changed no wire bytes; stored times moved to wall scale): tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
 made it 3, job tenancy's `0x0a` made it 4, event tenancy's `0x0b` made it 5, outbound
 effects' `0x0c`/`0x0d` (and `JobRow`'s outbound key tail) made it 6, 0.3's wall-time
 platform columns made it 7, and a `Hello` declaring any other version is refused by name,

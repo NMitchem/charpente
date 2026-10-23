@@ -12125,3 +12125,119 @@ fn a_follower_far_behind_its_store_refuses_to_open_by_name() {
         panic!("a follower 30s behind its store was refused: {e}");
     }
 }
+
+/// No fingerprint guards `charpente.jobs`, `charpente.events` or
+/// `charpente.schema_versions` (hand-written `Row`s), so a data directory
+/// written under another shape of one of them is NOT refused at open. This
+/// pins their shape beside `PROTO_VERSION`: a change here must bump both
+/// constants and give the directory a detector (DECISIONS §15).
+#[test]
+fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move() {
+    use charpente_core::event::EventRow;
+    use charpente_core::io::WallTime;
+    use charpente_core::job::{JobRow, JobStatus};
+    use charpente_core::table::Row;
+
+    // Exhaustive and typed, no `..`: adding, removing or retyping a field of
+    // any of the three rows is a compile error HERE, which names this test and
+    // the rule above.
+    let job = JobRow {
+        id: Id::from_raw(1),
+        name: "j".to_string(),
+        payload: vec![7],
+        key: Some("k".to_string()),
+        status: JobStatus::Pending,
+        attempts: 2,
+        due_at: WallTime::UNIX_EPOCH,
+        last_error: None,
+        shape: Some(9),
+        scope: Some(3),
+        outbound_key: Some([5; 16]),
+    };
+    let JobRow {
+        id: _id1,
+        name: _name1,
+        payload: _payload1,
+        key: _key1,
+        status: _status,
+        attempts: _attempts,
+        due_at: _due_at,
+        last_error: _last_error,
+        shape: _shape1,
+        scope: _scope1,
+        outbound_key: _outbound_key,
+    }: JobRow = job_clone(&job);
+    let event = EventRow {
+        id: Id::from_raw(1),
+        seq: 4,
+        name: "e".to_string(),
+        key: None,
+        payload: vec![8],
+        shape: Some(9),
+        scope: Some(3),
+    };
+    let EventRow {
+        id: _id2,
+        seq: _seq,
+        name: _name2,
+        key: _key2,
+        payload: _payload2,
+        shape: _shape2,
+        scope: _scope2,
+    }: EventRow = event_clone(&event);
+    let sv = SchemaVersion {
+        id: Id::from_raw(1),
+        table: "t".to_string(),
+        version: 2,
+        fingerprint: 0xabcd,
+        migrating_through: Some((1, 2)),
+        migrating_to: Some(3),
+    };
+    let SchemaVersion {
+        id: _id3,
+        table: _table,
+        version: _version,
+        fingerprint: _fingerprint,
+        migrating_through: _through,
+        migrating_to: _to,
+    }: SchemaVersion = sv.clone();
+
+    let hex = |row: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = Vec::new();
+        row(&mut b);
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    };
+    let got = (
+        PROTO_VERSION,
+        charpente::archive::manifest::MANIFEST_FORMAT,
+        hex(&|b| job.encode_row(b)),
+        hex(&|b| event.encode_row(b)),
+        hex(&|b| sv.encode_row(b)),
+    );
+    assert_eq!(
+        got,
+        (
+            7,
+            3,
+            "0100000000000000010000006a010000000701010000006b00020000000000000000000000000900000000000000030000000000000005050505050505050505050505050505".to_string(),
+            "01000000000000000400000000000000010000006500010000000809000000000000000300000000000000".to_string(),
+            "0100000000000000010000007402000000cdab00000000000001010000000000000002000000000000000103000000".to_string()
+        ),
+        "no fingerprint guards charpente.jobs, charpente.events or charpente.schema_versions, \
+         so a stale data directory is NOT refused at open when one of them changes; the fix is \
+         to bump PROTO_VERSION and MANIFEST_FORMAT and give the directory a detector, by gating \
+         the table or changing it with a fingerprinted platform table (DECISIONS §15)"
+    );
+}
+
+fn job_clone(j: &charpente_core::job::JobRow) -> charpente_core::job::JobRow {
+    let mut b = Vec::new();
+    charpente_core::table::Row::encode_row(j, &mut b);
+    <charpente_core::job::JobRow as charpente_core::table::Row>::decode_row(&b).unwrap()
+}
+
+fn event_clone(e: &charpente_core::event::EventRow) -> charpente_core::event::EventRow {
+    let mut b = Vec::new();
+    charpente_core::table::Row::encode_row(e, &mut b);
+    <charpente_core::event::EventRow as charpente_core::table::Row>::decode_row(&b).unwrap()
+}
