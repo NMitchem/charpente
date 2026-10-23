@@ -5867,7 +5867,7 @@ fn a_tenant_feed_widened_after_into_is_refused_by_name() {
     .mount(routes![widened_feed]);
     let _ = app.handle_or_subscribe(
         Request::new(Method::Get, "/widened-feed/1"),
-        sim.now().as_nanos(),
+        sim.clock().wall(),
     );
 }
 

@@ -10,6 +10,7 @@ use charpente::http::{
 };
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, Wire as WireDerive, event, route, routes, table};
+use charpente_core::io::WallTime;
 use charpente_core::table::{Id, Unscoped};
 use charpente_sim::{FaultConfig, Sim};
 use rsa::traits::PublicKeyParts;
@@ -493,7 +494,10 @@ fn session_token_is_hashed_at_rest_and_expires() {
     .mount(note_routes());
 
     // 1. Login at now=0 mints a raw token.
-    let login = app.handle_at(Request::new(Method::Post, "/login").json(&"alice"), 0);
+    let login = app.handle_at(
+        Request::new(Method::Post, "/login").json(&"alice"),
+        WallTime::UNIX_EPOCH,
+    );
     assert_eq!(login.status, 200, "{}", body_text(&login));
     let token: String = serde_json::from_slice(&login.body).unwrap();
 
@@ -511,7 +515,7 @@ fn session_token_is_hashed_at_rest_and_expires() {
     // 3. Still valid well inside the 1µs TTL.
     let me = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token}")),
-        500,
+        WallTime::from_nanos(500),
     );
     assert_eq!(me.status, 200, "{}", body_text(&me));
     assert_eq!(body_text(&me), "\"alice\"");
@@ -519,7 +523,7 @@ fn session_token_is_hashed_at_rest_and_expires() {
     // 4. Past expiry: a distinct 401, not the generic unrecognized-credential one.
     let expired = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token}")),
-        2_000,
+        WallTime::from_nanos(2_000),
     );
     assert_eq!(expired.status, 401, "{}", body_text(&expired));
     assert_eq!(error_text(&expired), "session expired — log in again");
@@ -596,16 +600,19 @@ fn resolution_ladder_matrix() {
     const EXPIRED: &str = "session expired — log in again";
 
     // 1. No header at all.
-    let denied = app.handle_at(Request::new(Method::Get, "/me"), 0);
+    let denied = app.handle_at(Request::new(Method::Get, "/me"), WallTime::UNIX_EPOCH);
     assert_eq!(denied.status, 401, "{}", body_text(&denied));
     assert_eq!(error_text(&denied), NO_CREDENTIAL);
 
     // 2. Bearer, valid session.
-    let login_alice = app.handle_at(Request::new(Method::Post, "/login").json(&"alice"), 0);
+    let login_alice = app.handle_at(
+        Request::new(Method::Post, "/login").json(&"alice"),
+        WallTime::UNIX_EPOCH,
+    );
     let token_alice: String = serde_json::from_slice(&login_alice.body).unwrap();
     let ok = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token_alice}")),
-        500,
+        WallTime::from_nanos(500),
     );
     assert_eq!(ok.status, 200, "{}", body_text(&ok));
     assert_eq!(body_text(&ok), "\"alice\"");
@@ -613,23 +620,26 @@ fn resolution_ladder_matrix() {
     // 3. Bearer, expired session (now past the 1_000ns TTL).
     let expired = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token_alice}")),
-        2_000,
+        WallTime::from_nanos(2_000),
     );
     assert_eq!(expired.status, 401, "{}", body_text(&expired));
     assert_eq!(error_text(&expired), EXPIRED);
 
     // 4. Bearer, valid API key.
-    let login_bob = app.handle_at(Request::new(Method::Post, "/login").json(&"bob"), 2_000);
+    let login_bob = app.handle_at(
+        Request::new(Method::Post, "/login").json(&"bob"),
+        WallTime::from_nanos(2_000),
+    );
     let token_bob: String = serde_json::from_slice(&login_bob.body).unwrap();
     let minted = app.handle_at(
         Request::new(Method::Post, "/keys").header("Authorization", format!("Bearer {token_bob}")),
-        2_000,
+        WallTime::from_nanos(2_000),
     );
     assert_eq!(minted.status, 200, "{}", body_text(&minted));
     let raw_key_bob: String = serde_json::from_slice(&minted.body).unwrap();
     let key_ok = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {raw_key_bob}")),
-        2_500,
+        WallTime::from_nanos(2_500),
     );
     assert_eq!(key_ok.status, 200, "{}", body_text(&key_ok));
     assert_eq!(body_text(&key_ok), "\"bob\"");
@@ -645,12 +655,12 @@ fn resolution_ladder_matrix() {
     let revoked = app.handle_at(
         Request::new(Method::Delete, format!("/keys/{}", key_id.raw()))
             .header("Authorization", format!("Bearer {token_bob}")),
-        2_500,
+        WallTime::from_nanos(2_500),
     );
     assert_eq!(revoked.status, 200, "{}", body_text(&revoked));
     let after_revoke = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {raw_key_bob}")),
-        2_600,
+        WallTime::from_nanos(2_600),
     );
     assert_eq!(after_revoke.status, 401, "{}", body_text(&after_revoke));
     assert_eq!(error_text(&after_revoke), UNRECOGNIZED);
@@ -658,18 +668,21 @@ fn resolution_ladder_matrix() {
     // 6. Bearer, garbage.
     let garbage = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", "Bearer nope"),
-        2_600,
+        WallTime::from_nanos(2_600),
     );
     assert_eq!(garbage.status, 401, "{}", body_text(&garbage));
     assert_eq!(error_text(&garbage), UNRECOGNIZED);
 
     // 7. Cookie, valid session.
-    let login_carol = app.handle_at(Request::new(Method::Post, "/login").json(&"carol"), 2_600);
+    let login_carol = app.handle_at(
+        Request::new(Method::Post, "/login").json(&"carol"),
+        WallTime::from_nanos(2_600),
+    );
     let token_carol: String = serde_json::from_slice(&login_carol.body).unwrap();
     let cookie_ok = app.handle_at(
         Request::new(Method::Get, "/me")
             .header("Cookie", format!("charpente_session={token_carol}")),
-        2_700,
+        WallTime::from_nanos(2_700),
     );
     assert_eq!(cookie_ok.status, 200, "{}", body_text(&cookie_ok));
     assert_eq!(body_text(&cookie_ok), "\"carol\"");
@@ -678,7 +691,7 @@ fn resolution_ladder_matrix() {
     //    JWT, never falls through to hash lookup.
     let jwt_shaped = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", "Bearer a.b.c"),
-        2_700,
+        WallTime::from_nanos(2_700),
     );
     assert_eq!(jwt_shaped.status, 401, "{}", body_text(&jwt_shaped));
     assert_eq!(error_text(&jwt_shaped), UNRECOGNIZED);
@@ -692,7 +705,7 @@ fn resolution_ladder_matrix() {
         Request::new(Method::Post, "/login")
             .header("Authorization", "Bearer garbage-not-two-dots")
             .json(&"eve"),
-        2_700,
+        WallTime::from_nanos(2_700),
     );
     assert_eq!(
         garbage_open_route.status,
@@ -827,7 +840,12 @@ fn oidc_claim_matrix() {
         jwks_json: test_jwks_json(&public),
     })
     .unwrap();
-    assert_eq!(verifier.verify(&valid_jwt, OIDC_NOW).unwrap(), "bob");
+    assert_eq!(
+        verifier
+            .verify(&valid_jwt, WallTime::from_nanos(OIDC_NOW))
+            .unwrap(),
+        "bob"
+    );
 
     // 2. Bad signature: flip the first byte of the decoded signature.
     let mut segments = valid_jwt.split('.');
@@ -841,7 +859,7 @@ fn oidc_claim_matrix() {
     let tampered_jwt = format!("{h}.{p}.{}", Base64UrlUnpadded::encode_string(&sig_bytes));
     assert_eq!(
         verifier
-            .verify(&tampered_jwt, OIDC_NOW)
+            .verify(&tampered_jwt, WallTime::from_nanos(OIDC_NOW))
             .unwrap_err()
             .to_string(),
         BAD_SIGNATURE
@@ -854,7 +872,7 @@ fn oidc_claim_matrix() {
     let expired_jwt = mint_jwt(&private, &rs256_header(), &expired_claims);
     assert_eq!(
         verifier
-            .verify(&expired_jwt, OIDC_NOW)
+            .verify(&expired_jwt, WallTime::from_nanos(OIDC_NOW))
             .unwrap_err()
             .to_string(),
         EXPIRED
@@ -867,7 +885,7 @@ fn oidc_claim_matrix() {
     let not_yet_jwt = mint_jwt(&private, &rs256_header(), &not_yet_claims);
     assert_eq!(
         verifier
-            .verify(&not_yet_jwt, OIDC_NOW)
+            .verify(&not_yet_jwt, WallTime::from_nanos(OIDC_NOW))
             .unwrap_err()
             .to_string(),
         NOT_YET_VALID
@@ -879,7 +897,7 @@ fn oidc_claim_matrix() {
     let wrong_iss_jwt = mint_jwt(&private, &rs256_header(), &wrong_iss_claims);
     assert_eq!(
         verifier
-            .verify(&wrong_iss_jwt, OIDC_NOW)
+            .verify(&wrong_iss_jwt, WallTime::from_nanos(OIDC_NOW))
             .unwrap_err()
             .to_string(),
         format!(
@@ -895,7 +913,7 @@ fn oidc_claim_matrix() {
     let wrong_aud_jwt = mint_jwt(&private, &rs256_header(), &wrong_aud_claims);
     assert_eq!(
         verifier
-            .verify(&wrong_aud_jwt, OIDC_NOW)
+            .verify(&wrong_aud_jwt, WallTime::from_nanos(OIDC_NOW))
             .unwrap_err()
             .to_string(),
         format!(
@@ -911,7 +929,7 @@ fn oidc_claim_matrix() {
     let hs256_jwt = mint_jwt(&private, &hs256_header, &valid_claims());
     assert_eq!(
         verifier
-            .verify(&hs256_jwt, OIDC_NOW)
+            .verify(&hs256_jwt, WallTime::from_nanos(OIDC_NOW))
             .unwrap_err()
             .to_string(),
         "unsupported OIDC token alg \"HS256\" — only \"RS256\" is verified; mint the token \
@@ -921,7 +939,7 @@ fn oidc_claim_matrix() {
     // 8. Not three segments.
     assert_eq!(
         verifier
-            .verify("not.enough", OIDC_NOW)
+            .verify("not.enough", WallTime::from_nanos(OIDC_NOW))
             .unwrap_err()
             .to_string(),
         "malformed OIDC token — expected \"header.payload.signature\" (three dot-separated \
@@ -933,7 +951,7 @@ fn oidc_claim_matrix() {
     let (_sim, mut app) = oidc_app(0x0D1C_0001, &public);
     let ok = app.handle_at(
         Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {valid_jwt}")),
-        OIDC_NOW,
+        WallTime::from_nanos(OIDC_NOW),
     );
     assert_eq!(ok.status, 200, "{}", body_text(&ok));
     assert_eq!(body_text(&ok), "\"bob\"");
@@ -944,7 +962,7 @@ fn oidc_claim_matrix() {
     //     OIDC-verified — so it lands on the unrecognized-credential 401.
     let cookie_two_dots = app.handle_at(
         Request::new(Method::Get, "/me").header("Cookie", "charpente_session=a.b.c"),
-        OIDC_NOW,
+        WallTime::from_nanos(OIDC_NOW),
     );
     assert_eq!(
         cookie_two_dots.status,
@@ -1108,7 +1126,7 @@ fn sse_route_reaches_handler_with_extracted_cursor() {
     // The `Last-Event-ID` header wins.
     let handled = app.handle_or_subscribe(
         Request::new(Method::Get, "/feed").header("last-event-id", "5.9"),
-        0,
+        WallTime::UNIX_EPOCH,
     );
     let Handled::Subscribe(sub) = handled else {
         panic!("expected Subscribe from an SSE route")
@@ -1116,7 +1134,10 @@ fn sse_route_reaches_handler_with_extracted_cursor() {
     assert_eq!(sub.cursor, Some(Cursor { id: 5, seq: 9 }));
 
     // Same result from the `cursor` query parameter with no header.
-    let handled = app.handle_or_subscribe(Request::new(Method::Get, "/feed?cursor=5.9"), 0);
+    let handled = app.handle_or_subscribe(
+        Request::new(Method::Get, "/feed?cursor=5.9"),
+        WallTime::UNIX_EPOCH,
+    );
     let Handled::Subscribe(sub) = handled else {
         panic!("expected Subscribe from an SSE route")
     };
@@ -1125,7 +1146,7 @@ fn sse_route_reaches_handler_with_extracted_cursor() {
     // An unparseable cursor is a 400 naming the contract — the handler never runs.
     let handled = app.handle_or_subscribe(
         Request::new(Method::Get, "/feed").header("last-event-id", "garbage"),
-        0,
+        WallTime::UNIX_EPOCH,
     );
     let Handled::Response(resp) = handled else {
         panic!("expected Response for an unparseable cursor")

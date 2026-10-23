@@ -36,7 +36,7 @@ const GOLDEN: &str = r#"{
     {
       "name": "ApiKey",
       "version": 1,
-      "fingerprint": 11308777448940268015,
+      "fingerprint": 13155888733427888359,
       "indexes": [
         "key_hash"
       ],
@@ -56,7 +56,7 @@ const GOLDEN: &str = r#"{
     {
       "name": "CronRow",
       "version": 1,
-      "fingerprint": 13750309978683829658,
+      "fingerprint": 6876731707294550864,
       "indexes": [
         "name"
       ],
@@ -134,7 +134,7 @@ const GOLDEN: &str = r#"{
     {
       "name": "Session",
       "version": 1,
-      "fingerprint": 11676348087434866846,
+      "fingerprint": 50804230146766996,
       "indexes": [
         "token_hash"
       ],

@@ -32,7 +32,7 @@ use charpente::kernel::{
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, job, jobs, route, routes, table};
 use charpente_core::db::Db;
-use charpente_core::io::{Disk, File, Instant};
+use charpente_core::io::{Disk, File, Instant, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
 use charpente_core::table::{Id, View};
@@ -183,7 +183,11 @@ fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
     let (mut app, counts) = app_with_op_counter(0x60C0_0007);
     let before = counts.appends() + counts.syncs();
     let (mut g, staged) = app.begin_group().expect("group");
-    let handled = staged.stage_or_subscribe(&mut g, Request::new(Method::Post, "/hit/1"), 0);
+    let handled = staged.stage_or_subscribe(
+        &mut g,
+        Request::new(Method::Post, "/hit/1"),
+        WallTime::UNIX_EPOCH,
+    );
     assert!(
         matches!(handled, Handled::Response(_)),
         "a write route responds"
@@ -208,7 +212,11 @@ fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
 fn a_staged_group_dropped_without_commit_panics() {
     let (mut app, _counts) = app_with_op_counter(0x60C0_000A);
     let (mut g, staged) = app.begin_group().expect("group");
-    let _ = staged.stage_or_subscribe(&mut g, Request::new(Method::Post, "/hit/1"), 0);
+    let _ = staged.stage_or_subscribe(
+        &mut g,
+        Request::new(Method::Post, "/hit/1"),
+        WallTime::UNIX_EPOCH,
+    );
     // `g` drops here, non-empty and never committed.
 }
 
@@ -222,7 +230,7 @@ fn a_staged_group_dropped_without_commit_panics() {
 fn handle_or_subscribe_still_commits_exactly_one_request() {
     let (mut app, counts) = app_with_op_counter(0x60C0_000B);
     let before_syncs = counts.syncs();
-    let response = app.handle_at(Request::new(Method::Post, "/hit/1"), 0);
+    let response = app.handle_at(Request::new(Method::Post, "/hit/1"), WallTime::UNIX_EPOCH);
     assert_eq!(response.status, 200, "the write route still responds 200");
     assert_eq!(
         counts.syncs() - before_syncs,

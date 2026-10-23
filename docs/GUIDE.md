@@ -948,8 +948,8 @@ conflicting — `/notes/all` and `/notes/:id` can coexist, and a request for
 
 `App::open` registers two platform tables of its own alongside yours —
 `Session` (`id: Id<Session>`, `#[index] token_hash: String`, `subject:
-String`, `expires_at: u64`) and `ApiKey` (`id: Id<ApiKey>`, `#[index]
-key_hash: String`, `subject: String`, `created_at: u64`) — both inside the
+String`, `expires_at: WallTime`) and `ApiKey` (`id: Id<ApiKey>`, `#[index]
+key_hash: String`, `subject: String`, `created_at: WallTime`) — both inside the
 commit point, so a login or a minted key is a durable, replicated
 transaction like any other. **Only the hash is ever stored:**
 `token_hash`/`key_hash` are lowercase-hex SHA-256 of the raw credential; the
@@ -975,8 +975,8 @@ handler, carrying:
   `Session` row, but only when the principal authenticated `via` a session
   (bearer or cookie); `None` for an API-key or OIDC principal.
 - `ctx.create_session(tx, subject) -> String` — inserts a `Session` row and
-  returns its raw token (a login). `expires_at` is this request's `now` plus
-  `AppConfig::session_ttl` (default 30 days).
+  returns its raw token (a login). `expires_at` is this request's wall-clock
+  `now` plus `AppConfig::session_ttl` (default 30 days).
 - `ctx.create_api_key(tx, subject) -> String` — inserts an `ApiKey` row and
   returns the raw key: `"ck_"` + 64 hex chars (the prefix makes a leaked key
   grep-able for scanners). Revoke a key by deleting its row —
@@ -1035,9 +1035,12 @@ session expired — log in again
 The first fires when an `auth` route saw no credential; the second for a
 bearer/cookie that matched no live row (garbage, revoked, or a JWT-shaped
 bearer with no OIDC configured); the third for a session past its TTL. Expiry
-is *lazy*: a row is invisible the moment `now` passes `expires_at`, restart
-or not — a built-in daily cron sweeps the dead rows for hygiene, but
-resolution never waits on it.
+is judged on wall time: `expires_at` is a `WallTime` (UTC nanoseconds since the
+Unix epoch, `charpente::core::io::WallTime`), and each request's `now` is the
+node's `Clock::wall` reading, so a TTL means the same thing after a restart or
+a failover as before it. Expiry is *lazy*: a row is invisible the moment `now`
+passes `expires_at` — a built-in daily cron sweeps the dead rows for hygiene,
+but resolution never waits on it.
 
 ```rust
 use charpente::auth::{ApiKey, Via};
@@ -1148,8 +1151,9 @@ OIDC JWKS key <kid> is invalid: modulus "n" is not valid base64url: <detail>
 
 A verified token yields a `Principal` whose `via()` is `Via::Oidc` and whose
 `subject()` is the token's `sub` claim — ephemeral, no row, nothing to revoke
-but a short `exp`. `exp`/`nbf` are checked against the request clock with a
-60-second skew tolerance. Each failed check is its own named 401 (the
+but a short `exp`. `exp`/`nbf` (Unix seconds) are checked against the node's
+wall clock with a 60-second skew tolerance (`CLOCK_TOLERANCE`). Each failed
+check is its own named 401 (the
 `iss`/`aud` ones name presented-vs-configured; `<presented>`/`<configured>`
 are the actual values):
 
@@ -1862,10 +1866,11 @@ see "Changing a job's fields") — that attempt's own effects never committed, a
 transaction records the failure: `attempts` increments, `last_error` gets
 the message, and:
 
-- if `attempts < retry.max`: stays Pending, `due_at` moves to
-  `now + backoff * 2^(attempts - 1)` (nanoseconds; doubles every attempt,
-  saturating rather than overflowing at absurd attempt counts) — the
-  policy's configured base `backoff` is attempt 1's wait.
+- if `attempts < retry.max`: stays Pending, `due_at` (a `WallTime`, so a
+  restart keeps the wait) moves to the wall-clock `now + backoff *
+  2^(attempts - 1)` (nanoseconds; doubles every attempt, saturating rather
+  than overflowing at absurd attempt counts) — the policy's configured base
+  `backoff` is attempt 1's wait.
 - if `attempts >= retry.max`: status becomes Dead. Dead rows are retained,
   with `last_error` as the record of what killed them.
 
@@ -2585,12 +2590,13 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 ### Ticks are transactions
 
 Nothing about a tick is special: `CronRow` (`id`, `#[index] name`,
-`interval_nanos`, `next_due`) is a platform-registered row like `Session`,
-and a due tick opens a transaction that reads that row, advances
+`interval_nanos`, `next_due: WallTime`) is a platform-registered row like
+`Session`, and a due tick opens a transaction that reads that row, advances
 `next_due` by one interval, and calls your `make()` job's `tx.enqueue` —
-all committed together. A schedule's phase survives process restarts: its
-row is upserted (not reset) at startup — `App::open` only registers the
-table; the upsert itself happens when the kernel starts.
+all committed together. A schedule's phase survives process restarts and
+failovers: `next_due` is wall time, judged against the node's `Clock::wall`,
+and the row is upserted (not reset) at startup — `App::open` only registers
+the table; the upsert itself happens when the kernel starts.
 
 ### Catch-up fires once, never backfills
 
@@ -6456,7 +6462,7 @@ memorizing a list:
     {
       "name": "ApiKey",
       "version": 1,
-      "fingerprint": 11308777448940268015,
+      "fingerprint": 13155888733427888359,
       "indexes": [
         "key_hash"
       ],
@@ -6476,7 +6482,7 @@ memorizing a list:
     {
       "name": "CronRow",
       "version": 1,
-      "fingerprint": 13750309978683829658,
+      "fingerprint": 6876731707294550864,
       "indexes": [
         "name"
       ],
@@ -6554,7 +6560,7 @@ memorizing a list:
     {
       "name": "Session",
       "version": 1,
-      "fingerprint": 11676348087434866846,
+      "fingerprint": 50804230146766996,
       "indexes": [
         "token_hash"
       ],

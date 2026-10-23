@@ -1432,9 +1432,10 @@ mod tests {
     #[test]
     fn a_cron_tick_over_a_foreign_shape_stops_the_kernel_on_the_run_path() {
         let direct_root = cron_foreign_shape_root("direct");
+        let clock = crate::prod::ProdClock::new();
         let mut kernel = kernel::Kernel::new(
             cron_foreign_shape_app(&direct_root),
-            Box::new(crate::prod::ProdClock::new()),
+            Box::new(clock.clone()),
         )
         .expect("nothing Pending at open — the drifted shape is only staged by the tick");
         let (_tx, rx) = mpsc::channel::<(Request, kernel::Reply)>();
@@ -1445,7 +1446,7 @@ mod tests {
             inner: ProdSource {
                 rx,
                 stash: None,
-                clock: crate::prod::ProdClock::new(),
+                clock,
             },
             steps: 0,
             max: 1_000,
@@ -1624,7 +1625,7 @@ mod tests {
             id: Id::from_raw(id),
             token_hash: format!("smoke-{id}"),
             subject: "replicated".to_string(),
-            expires_at: u64::MAX,
+            expires_at: charpente_core::io::WallTime::from_nanos(u64::MAX),
         });
         Ok(Response::json(200, &id))
     }

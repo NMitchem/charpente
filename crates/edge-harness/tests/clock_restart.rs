@@ -132,8 +132,10 @@ fn an_oidc_token_is_judged_on_unix_time() {
     http.set_bearer(clock_fixture::mint_jwt(now + 3600, Some(now - 60)));
     let ok = http.get("/me").expect("GET /me, valid token");
     let ok_body = String::from_utf8_lossy(&ok.body).into_owned();
+    // The body is the `{"error": …}` JSON envelope, so the claim's quotes
+    // arrive escaped.
     let expired_msg = expired_body
-        .contains("OIDC token expired — its \"exp\" claim is in the past; obtain a new one");
+        .contains(r#"OIDC token expired — its \"exp\" claim is in the past; obtain a new one"#);
     assert_eq!(
         ((expired.status, expired_msg), ok.status),
         ((401, true), 200),

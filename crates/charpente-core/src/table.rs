@@ -1634,7 +1634,7 @@ impl Writer<'_> {
                 key: key.map(str::to_string),
                 status: crate::job::JobStatus::Pending,
                 attempts: 0,
-                due_at: 0,
+                due_at: crate::io::WallTime::UNIX_EPOCH,
                 last_error: None,
                 shape,
                 scope,

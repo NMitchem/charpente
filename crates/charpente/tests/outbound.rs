@@ -12,13 +12,14 @@ use charpente::core::db::{
     outbound_fingerprint,
 };
 use charpente::core::io::{
-    Clock, Entropy as _, Outbound, OutboundCall, OutboundReply, OutboundWake,
+    Clock, Entropy as _, Instant, Outbound, OutboundCall, OutboundReply, OutboundWake, WallTime,
 };
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, View};
 use charpente::http::{ApiError, App, AppConfig};
 use charpente::kernel::{
-    Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope, Kernel, KernelStats, SimSource,
+    Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope, Kernel, KernelStats, Now,
+    SimSource,
 };
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, ScopedTx, Tenant, Tx, job, jobs};
@@ -378,6 +379,12 @@ fn gated_app(sim: &Sim, go: bool, jobs: u64) -> App {
     app
 }
 
+/// Both clocks at zero, for driving a `Dispatcher` directly.
+const T0: Now = Now {
+    mono: Instant::ZERO,
+    wall: WallTime::UNIX_EPOCH,
+};
+
 fn dispatcher_for(app: &mut App, max_in_flight: usize) -> Dispatcher {
     let mut d = Dispatcher::new(app.take_job_defs_for_tests())
         .with_outbound(vec![Host::new("pay.test")], max_in_flight);
@@ -393,7 +400,7 @@ fn a_call_that_answers_none_is_done_with_no_start() {
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
     assert!(matches!(
-        d.run_due_into(&mut group, 0).unwrap(),
+        d.run_due_into(&mut group, T0).unwrap(),
         JobOutcome::Done { id: 0 }
     ));
     group.commit().map_err(|f| f.error).unwrap();
@@ -413,7 +420,7 @@ fn a_decided_call_stages_nothing_and_buffers_its_start_with_the_row_key() {
         .outbound_key
         .unwrap();
     let mut group = db.begin_group().unwrap();
-    let JobOutcome::Calling { id: 0, token } = d.run_due_into(&mut group, 0).unwrap() else {
+    let JobOutcome::Calling { id: 0, token } = d.run_due_into(&mut group, T0).unwrap() else {
         panic!("a decided call is Calling");
     };
     assert!(group.is_empty(), "R3: call's stage nets no record");
@@ -429,7 +436,7 @@ fn a_decided_call_stages_nothing_and_buffers_its_start_with_the_row_key() {
     );
     assert_eq!(d.in_flight_len(), 1);
     assert!(
-        !d.has_due(u64::MAX),
+        !d.has_due(WallTime::from_nanos(u64::MAX)),
         "invariant 2: an in-flight job is in no due-set"
     );
 }
@@ -447,18 +454,21 @@ fn a_full_in_flight_table_never_blocks_a_pure_job() {
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
     assert!(matches!(
-        d.run_due_into(&mut group, 0).unwrap(),
+        d.run_due_into(&mut group, T0).unwrap(),
         JobOutcome::Calling { id: 0, .. }
     ));
     assert!(
-        d.has_due(0),
+        d.has_due(WallTime::UNIX_EPOCH),
         "the pure job (id 3) is still due with the table full"
     );
     assert!(matches!(
-        d.run_due_into(&mut group, 0).unwrap(),
+        d.run_due_into(&mut group, T0).unwrap(),
         JobOutcome::Done { id: 3 }
     ));
-    assert!(!d.has_due(u64::MAX), "outbound ids 1 and 2 wait for room");
+    assert!(
+        !d.has_due(WallTime::from_nanos(u64::MAX)),
+        "outbound ids 1 and 2 wait for room"
+    );
     group.commit().map_err(|f| f.error).unwrap();
     let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
     for id in [1, 2] {
@@ -500,7 +510,7 @@ fn a_refused_call_is_an_attempt_naming_the_rule() {
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
     assert!(matches!(
-        d.run_due_into(&mut group, 0).unwrap(),
+        d.run_due_into(&mut group, T0).unwrap(),
         JobOutcome::Retried {
             id: 0,
             attempts: 1,
@@ -583,7 +593,7 @@ fn a_call_panic_is_an_attempt_with_the_call_panicked_prefix() {
     let (mut app, mut d) = seeded(&sim, Schema::new(), jobs![Boom], |tx| tx.enqueue(Boom {}));
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
-    let outcome = d.run_due_into(&mut group, 0).unwrap();
+    let outcome = d.run_due_into(&mut group, T0).unwrap();
     group.commit().map_err(|f| f.error).unwrap();
     let JobOutcome::Retried {
         id: 0,
@@ -597,7 +607,7 @@ fn a_call_panic_is_an_attempt_with_the_call_panicked_prefix() {
     let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
     assert_eq!(row.last_error.as_deref(), Some("call panicked: boom"));
     assert!(
-        d.has_due(due_at) && !d.has_due(due_at - 1),
+        d.has_due(due_at) && !d.has_due(due_at.saturating_sub(Duration::from_nanos(1))),
         "the attempt returns to the outbound set at its backoff"
     );
 }
@@ -652,7 +662,7 @@ fn a_hand_written_call_glue_writes_nothing_whatever_it_answers() {
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
     let outcomes: Vec<JobOutcome> = (0..3)
-        .map(|_| d.run_due_into(&mut group, 0).unwrap())
+        .map(|_| d.run_due_into(&mut group, T0).unwrap())
         .collect();
     group.commit().map_err(|f| f.error).unwrap();
     assert!(
@@ -813,7 +823,7 @@ fn a_row_without_a_key_never_reaches_an_outbound_def_s_run_glue() {
     });
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
-    let outcome = d.run_due_into(&mut group, 0);
+    let outcome = d.run_due_into(&mut group, T0);
     group.commit().map_err(|f| f.error).unwrap();
     eprintln!("the misroute did not stop dispatch: {outcome:?}");
 }
@@ -840,7 +850,7 @@ fn a_row_with_a_key_never_reaches_a_pure_def() {
         seeded_unmounted(&sim, vec![cleared], |tx| tx.enqueue(Charge { cents: 1 }));
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
-    let outcome = d.run_due_into(&mut group, 0);
+    let outcome = d.run_due_into(&mut group, T0);
     group.commit().map_err(|f| f.error).unwrap();
     eprintln!("the misroute did not stop dispatch: {outcome:?}");
 }
@@ -871,7 +881,7 @@ fn platform_io_inside_call_is_not_an_attempt() {
         tx.enqueue(ReadFaults {})
     });
     let db = app.db_for_tests();
-    let err = d.run_due(db, 0).unwrap_err();
+    let err = d.run_due(db, T0).unwrap_err();
     assert!(err.to_string().contains("simulated read fault"), "{err}");
     let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
     assert_eq!(
@@ -882,7 +892,7 @@ fn platform_io_inside_call_is_not_an_attempt() {
     assert_eq!(row.attempts, 0, "retry budget untouched by platform faults");
     assert!(row.last_error.is_none(), "nothing was recorded");
     assert!(
-        d.has_due(0),
+        d.has_due(WallTime::UNIX_EPOCH),
         "the job goes straight back in the outbound set"
     );
     assert!(d.take_starts().is_empty(), "and nothing starts");
@@ -934,7 +944,7 @@ fn a_refused_read_inside_call_is_an_attempt_naming_the_refusal() {
         Err(TxError::App(e)) if TableReadRefusal::of(&e).is_some() => e.to_string(),
         other => panic!("the alias read is a TableReadRefusal: {other:?}"),
     };
-    let outcome = d.run_due(db, 0).unwrap();
+    let outcome = d.run_due(db, T0).unwrap();
     assert!(
         matches!(
             outcome,
@@ -1040,7 +1050,7 @@ mod scoped_call {
         let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
         assert_eq!(row.scope, Some(7));
         let mut group = db.begin_group().unwrap();
-        let outcome = d.run_due_into(&mut group, 0).unwrap();
+        let outcome = d.run_due_into(&mut group, T0).unwrap();
         assert!(
             matches!(outcome, JobOutcome::Calling { id: 0, .. }),
             "{outcome:?}"
@@ -1593,7 +1603,7 @@ fn a_job_in_flight_is_never_queued_again() {
     let mut d = dispatcher_for(&mut app, 64);
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
-    let outcome = d.run_due_into(&mut group, 0).unwrap();
+    let outcome = d.run_due_into(&mut group, T0).unwrap();
     group.commit().map_err(|f| f.error).unwrap();
     assert!(matches!(outcome, JobOutcome::Calling { id: 0, .. }));
     assert_eq!(d.in_flight_len(), 1);

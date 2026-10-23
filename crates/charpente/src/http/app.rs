@@ -12,7 +12,7 @@ use charpente_core::db::{
     CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableWriteRefusal, Tenant,
     TenantAdmission, Tx, TxError,
 };
-use charpente_core::io::{Disk, Entropy};
+use charpente_core::io::{Disk, Entropy, WallTime};
 use charpente_core::table::{Id, Unscoped, UnscopedJob, View};
 use charpente_macros::table;
 
@@ -55,29 +55,28 @@ const _: () = assert!(PROBE_TOKEN.len() >= 16);
 
 // ---------------------------------------------------------------- session
 
-/// Default session lifetime: 30 days, in nanoseconds — the clock's unit
-/// throughout the kernel (`Clock::now().as_nanos()`).
+/// Default session lifetime: 30 days, in nanoseconds.
 pub const SESSION_TTL: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
 /// A session row inside the commit point (DESIGN §8). The token is stored
 /// hashed (M1 "auth, properly") — only `token_hash` ever reaches disk; the
 /// raw token lives only in the response that mints it. `expires_at` is a
-/// clock reading (nanos); a row past it is treated as absent, never valid.
+/// wall time; a row past it is treated as absent, never valid.
 #[table(global)]
 pub struct Session {
     pub id: Id<Session>,
     #[index]
     pub token_hash: String,
     pub subject: String,
-    pub expires_at: u64,
+    pub expires_at: WallTime,
 }
 
 // ---------------------------------------------------------------- ctx
 
 /// Per-request context handed to handlers: the authenticated principal (if
 /// any) and one fresh entropy-derived token for session/key creation. `now`
-/// and `session_ttl` are the clock reading `handle_or_subscribe` took for
-/// this request and the app's configured TTL — both needed to mint
+/// and `session_ttl` are the wall-clock reading `handle_or_subscribe` took
+/// for this request and the app's configured TTL — both needed to mint
 /// `expires_at`.
 ///
 /// `'g` is the request's group: `Ctx` holds the tokens minted from it (the
@@ -92,7 +91,7 @@ pub struct Ctx<'g> {
     /// for an `ApiKey`/`Oidc` principal or no principal at all.
     session: Option<Session>,
     fresh_token: String,
-    now: u64,
+    now: WallTime,
     session_ttl: u64,
     created: Cell<bool>,
     /// `Some` exactly when the matched route declared `cross_tenant` (spec
@@ -221,7 +220,7 @@ impl<'g> Ctx<'g> {
             id: Id::from_raw(id),
             token_hash: hash_token(&self.fresh_token),
             subject: subject.into(),
-            expires_at: self.now + self.session_ttl,
+            expires_at: self.now + Duration::from_nanos(self.session_ttl),
         });
         self.fresh_token.clone()
     }
@@ -912,7 +911,7 @@ impl App {
                 &Presented::None,
                 false,
                 PROBE_TOKEN.to_string(),
-                0,
+                WallTime::UNIX_EPOCH,
                 session_ttl,
                 None,
                 cap,
@@ -969,18 +968,18 @@ impl App {
     /// `Response` outcome), and turns a `Subscribe` outcome into a 500 — an
     /// SSE route matched, but a bare caller has no sink to hand the tail.
     /// Only the kernel (`Kernel::step`, T5) has one, so only it should ever
-    /// see a `Handled::Subscribe`. Defaults `now` to 0 — every current
-    /// caller relies on this implicitly for sessions that outlive a single
-    /// scenario; a test that must observe the expiry boundary calls
+    /// see a `Handled::Subscribe`. Defaults `now` to the Unix epoch — every
+    /// current caller relies on this implicitly for sessions that outlive a
+    /// single scenario; a test that must observe the expiry boundary calls
     /// `handle_at` directly instead.
     pub fn handle(&mut self, request: Request) -> Response {
-        self.handle_at(request, 0)
+        self.handle_at(request, WallTime::UNIX_EPOCH)
     }
 
     /// `handle`, with the clock reading `handle_or_subscribe` needs made
     /// explicit — the seam a caller that tracks its own `now` (tests driving
-    /// session expiry) uses instead of the 0-default.
-    pub fn handle_at(&mut self, request: Request, now: u64) -> Response {
+    /// session expiry) uses instead of the epoch default.
+    pub fn handle_at(&mut self, request: Request, now: WallTime) -> Response {
         match self.handle_or_subscribe(request, now) {
             Handled::Response(response) => response,
             Handled::Subscribe(_) => Response::error(
@@ -1007,7 +1006,7 @@ impl App {
     /// incidental — under T6 the group opens once at the top of a batch, so
     /// every batched request's snapshot necessarily precedes its own routing
     /// — so it is named here rather than worked around.
-    pub fn handle_or_subscribe(&mut self, request: Request, now: u64) -> Handled {
+    pub fn handle_or_subscribe(&mut self, request: Request, now: WallTime) -> Handled {
         let (mut group, staged) = match self.begin_group() {
             Ok(pair) => pair,
             Err(e) => return Handled::Response(tx_error_response(TxError::Io(e))),
@@ -1058,16 +1057,20 @@ impl<'a> StagedDispatch<'a> {
     /// returns `Response`; a `#[route(SSE …)]` extracts the resume cursor
     /// (before the handler runs — an unparseable one is a 400, never a
     /// silent from-now), stages its handler, and returns the validated
-    /// `Subscription`. `now` is the caller's clock reading (the kernel's own
-    /// `Clock`, in production) — threaded into `Ctx` for session expiry and
-    /// minting.
+    /// `Subscription`. `now` is the caller's wall-clock reading (the kernel's
+    /// `Clock::wall`) — threaded into `Ctx` for session expiry and minting.
     ///
     /// Both `RouteGlue` arms route through `group.stage(...)` identically
     /// (T5 pre-flight finding F): an SSE glue closure may legitimately write
     /// (`ctx.create_session` is the obvious case), and `Group::stage`'s
     /// empty-effects check — not a special case here — is what makes a
     /// typical read-only subscribe cost no record.
-    pub fn stage_or_subscribe(&self, group: &mut Group, request: Request, now: u64) -> Handled {
+    pub fn stage_or_subscribe(
+        &self,
+        group: &mut Group,
+        request: Request,
+        now: WallTime,
+    ) -> Handled {
         let (route, captures) = match self.router.find(request.method, &request.path) {
             RouteMatch::Found(route, captures) => (route, captures),
             RouteMatch::PathNotFound => {
@@ -1185,7 +1188,7 @@ fn build_ctx<'g>(
     presented: &Presented,
     auth_required: bool,
     fresh_token: String,
-    now: u64,
+    now: WallTime,
     session_ttl: u64,
     oidc: Option<&OidcVerifier>,
     cap: Option<CrossTenant<'g>>,

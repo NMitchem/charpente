@@ -1180,7 +1180,7 @@ fn the_harness_catches_a_raw_token_written_to_disk() {
                 id: Id::from_raw(0x0123_4567_89ab_cdef),
                 token_hash: raw.clone(),
                 subject: "victim".to_string(),
-                expires_at: u64::MAX,
+                expires_at: charpente_core::io::WallTime::from_nanos(u64::MAX),
             });
             Ok::<(), io::Error>(())
         })
@@ -1229,7 +1229,7 @@ fn the_harness_catches_a_raw_token_written_to_disk() {
                 id: Id::from_raw(0x0123_4567_89ab_cdef),
                 token_hash: hash_token(&raw),
                 subject: "ok".to_string(),
-                expires_at: u64::MAX,
+                expires_at: charpente_core::io::WallTime::from_nanos(u64::MAX),
             });
             Ok::<(), io::Error>(())
         })

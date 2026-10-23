@@ -138,10 +138,9 @@ fn enqueues_materialize_job_rows_with_counter_ids() {
     assert_eq!(jobs[0].name, "ping");
     assert_eq!(jobs[0].key, None);
     assert_eq!(jobs[1].key.as_deref(), Some("k:1"));
-    assert!(
-        jobs.iter()
-            .all(|j| j.status == JobStatus::Pending && j.attempts == 0 && j.due_at == 0)
-    );
+    assert!(jobs.iter().all(|j| j.status == JobStatus::Pending
+        && j.attempts == 0
+        && j.due_at == charpente_core::io::WallTime::UNIX_EPOCH));
 
     // Ids keep counting across transactions.
     db.transact(|tx: &mut Tx| {

@@ -5,12 +5,13 @@
 //! like the `Session`/`ApiKey`/`CronRow` tables themselves — no app opts in)
 //! enqueues this as a normal `#[job]`, carrying the tick's own `now` as
 //! `before` (a job handler runs as a transaction with no clock of its own —
-//! `CronEntry.enqueue`'s widened `(&mut Tx, u64)` seam is how `now` gets
+//! `CronEntry.enqueue`'s widened `(&mut Tx, WallTime)` seam is how `now` gets
 //! here). Being a normal job means retry/observability come for free.
 
 use std::time::Duration;
 
 use charpente_core::db::Tx;
+use charpente_core::io::WallTime;
 use charpente_core::table::View;
 use charpente_macros::job;
 
@@ -21,16 +22,14 @@ use crate::kernel::cron::CronEntry;
 pub const SESSION_SWEEP_NAME: &str = "charpente.session_sweep";
 pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(86_400);
 
-/// A charpente release never changes these fields, or this job's `global`
-/// declaration, without renaming the type: a node refuses to start over a
-/// Pending job of another shape, and of that refusal's two fixes — run the
-/// binary that enqueued them until they are Done or Dead, then deploy this
-/// one; or restore the old fields and the `global`/`scoped_by` declaration
-/// and give the new shape its own `#[job]` type under a new name — an app
-/// author could apply only the first to the platform's own job.
+/// These fields, and this job's `global` declaration, change only between
+/// charpente minors and in place (DECISIONS §15): a node refuses a data
+/// directory another minor wrote, so a Pending sweep of another shape never
+/// meets the job-shape refusal, whose fixes an app author could not apply to
+/// the platform's own job. Within a minor they never change.
 #[job(global)]
 pub struct SessionSweep {
-    pub before: u64,
+    pub before: WallTime,
 }
 
 impl SessionSweep {

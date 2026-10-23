@@ -78,7 +78,7 @@ fn forged(id: u64) -> JobRow {
         key: None,
         status: JobStatus::Pending,
         attempts: 0,
-        due_at: 0,
+        due_at: charpente::core::io::WallTime::UNIX_EPOCH,
         last_error: None,
         shape: None,
         scope: Some(13),

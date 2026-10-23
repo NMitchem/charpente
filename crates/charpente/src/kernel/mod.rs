@@ -2,11 +2,13 @@
 //! the event loop multiplexing HTTP requests, due jobs, and cron ticks — all
 //! inside the simulation boundary.
 
+mod clock;
 pub(crate) mod cron;
 mod dispatch;
 mod outbound;
 mod tail;
 
+pub use clock::Now;
 pub use cron::{CronRow, CronScheduler};
 pub use dispatch::{
     CallGlue, Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope, OutboundDef, SettleGlue,
@@ -322,7 +324,6 @@ impl Kernel {
             .map_err(|m| io::Error::other(Refusal(m)))?;
         let mut dispatcher = Dispatcher::new(defs).with_outbound(hosts, max_in_flight);
         let mut cron = CronScheduler::new(app.take_cron_entries());
-        let now = clock.now().as_nanos();
         let was_writable = app.db_mut().writes_allowed();
         // `cron.upsert` writes the schedule rows — skip it whenever the write
         // gate is shut (its transaction would be refused, and on a follower
@@ -338,7 +339,7 @@ impl Kernel {
         // ruled "serve reads, withhold writes".
         if was_writable {
             refuse_foreign_pending_jobs(app.db())?;
-            cron.upsert(app.db_mut(), now)?;
+            cron.upsert(app.db_mut(), clock.wall())?;
         }
         dispatcher.rebuild(&app.db_mut().snapshot()?)?;
         // The rebuild scan above is the authoritative snapshot of everything
@@ -413,11 +414,15 @@ impl Kernel {
         if self.pending.is_none() {
             self.pending = source.poll();
         }
-        let now = self.clock.now().as_nanos();
+        let now = Now {
+            mono: self.clock.now(),
+            wall: self.clock.wall(),
+        };
+        let mono = now.mono.as_nanos();
         // Non-destructive IO movement, the peer of `source.poll()` (DESIGN §1):
         // accept conns, drain readable messages, note timers — no `Db` access.
         if let Some(repl) = &mut self.repl {
-            repl.pump_io(now);
+            repl.pump_io(mono);
         }
         // A follower (or a draining primary, or a primary still verifying its
         // witnesses) serves reads and ships, but never runs jobs or cron:
@@ -461,16 +466,16 @@ impl Kernel {
         if self.pending.is_some() {
             ready.push(Ready::Request);
         }
-        if writable && self.dispatcher.has_due(now) {
+        if writable && self.dispatcher.has_due(now.wall) {
             ready.push(Ready::Job);
         }
-        if writable && self.cron.has_due(now) {
+        if writable && self.cron.has_due(now.wall) {
             ready.push(Ready::Cron);
         }
         if self
             .repl
             .as_ref()
-            .is_some_and(|r| r.has_work(self.app.db(), now))
+            .is_some_and(|r| r.has_work(self.app.db(), mono))
         {
             ready.push(Ready::Repl);
         }
@@ -570,7 +575,7 @@ impl Kernel {
         // The seventh source (spec §4), appended last so every existing
         // source keeps its index: never ready for an app with nothing in
         // flight, so it moves no existing universe's draw.
-        if self.dispatcher.outbound_ready(now) {
+        if self.dispatcher.outbound_ready(mono) {
             ready.push(Ready::Outbound);
         }
         if ready.is_empty() {
@@ -584,16 +589,28 @@ impl Kernel {
             // Gate the job/cron deadlines on `writable` too: a node with a
             // due-but-gated job must not busy-spin on a deadline already in the
             // past — the park tick (below) is what wakes it to re-check.
+            // Job and cron due times are wall times; each becomes a monotonic
+            // deadline afresh every step (`Now::deadline`).
             let mut deadline = [
-                writable.then(|| self.dispatcher.next_deadline()).flatten(),
-                writable.then(|| self.cron.next_deadline()).flatten(),
-                self.repl.as_ref().and_then(|r| r.next_deadline(now)),
-                self.dispatcher.next_outbound_deadline(),
+                writable
+                    .then(|| self.dispatcher.next_deadline())
+                    .flatten()
+                    .map(|due| now.deadline(due)),
+                writable
+                    .then(|| self.cron.next_deadline())
+                    .flatten()
+                    .map(|due| now.deadline(due)),
+                self.repl
+                    .as_ref()
+                    .and_then(|r| r.next_deadline(mono))
+                    .map(Instant::from_nanos),
+                self.dispatcher
+                    .next_outbound_deadline()
+                    .map(Instant::from_nanos),
             ]
             .into_iter()
             .flatten()
-            .min()
-            .map(Instant::from_nanos);
+            .min();
             // The outbound park (plan amendment A2): replies arrive from
             // outside the kernel, so while anything is in flight it parks no
             // longer than the next completion the impl can name — or than the
@@ -606,7 +623,7 @@ impl Kernel {
                 let wake = match outbound.next_wake() {
                     OutboundWake::At(at) => Some(at),
                     OutboundWake::Never => None,
-                    OutboundWake::Unknown => Some(Instant::from_nanos(now + REPL_TICK_NANOS)),
+                    OutboundWake::Unknown => Some(Instant::from_nanos(mono + REPL_TICK_NANOS)),
                 };
                 if let Some(w) = wake {
                     deadline = Some(deadline.map_or(w, |d| d.min(w)));
@@ -616,7 +633,7 @@ impl Kernel {
             // repl-configured node never parks past one tick, so in-flight sim
             // messages and prod TCP are both polled within `REPL_TICK_NANOS`.
             if self.repl.is_some() {
-                let tick = Instant::from_nanos(now + REPL_TICK_NANOS);
+                let tick = Instant::from_nanos(mono + REPL_TICK_NANOS);
                 deadline = Some(deadline.map_or(tick, |d| d.min(tick)));
             }
             // Negative space (hard rule 4). A wake at or before `now` parks
@@ -625,9 +642,9 @@ impl Kernel {
             // spin here forever. Whatever names a passed deadline must
             // already have been in the ready set above.
             assert!(
-                deadline.is_none_or(|d| d.as_nanos() > now),
+                deadline.is_none_or(|d| d.as_nanos() > mono),
                 "kernel invariant: Kernel::step went Idle with a wake at {deadline:?}, not after \
-                 now ({now}), so Kernel::run would spin without advancing time. The component \
+                 now ({mono}), so Kernel::run would spin without advancing time. The component \
                  that named it holds a deadline at or before now: job {:?} (writable \
                  {writable}), cron {:?}, repl {:?}, outbound timeout {:?}, outbound wake {:?} \
                  with {} in flight. Fix the pair that disagrees so a component is ready \
@@ -639,7 +656,7 @@ impl Kernel {
                  impl's poll/next_wake",
                 self.dispatcher.next_deadline(),
                 self.cron.next_deadline(),
-                self.repl.as_ref().and_then(|r| r.next_deadline(now)),
+                self.repl.as_ref().and_then(|r| r.next_deadline(mono)),
                 self.dispatcher.next_outbound_deadline(),
                 (self.dispatcher.in_flight_len() > 0)
                     .then(|| self.outbound.as_ref().map(|o| o.next_wake())),
@@ -718,7 +735,7 @@ impl Kernel {
                 let mut next = Some(self.pending.take().expect("checked above"));
                 while let Some((request, reply)) = next.take() {
                     let before = group.len();
-                    let outcome = staged.stage_or_subscribe(&mut group, request, now);
+                    let outcome = staged.stage_or_subscribe(&mut group, request, now.wall);
                     // A subscribe ENDS the batch. Its cursor is resolved
                     // after the commit (`validate_subscribe` needs `&Db`,
                     // which the open group holds), so any sibling staged
@@ -835,7 +852,7 @@ impl Kernel {
                 let mut group = self.app.begin_job_group()?;
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {
-                    while self.dispatcher.has_due(now) && drained < MAX_BATCH {
+                    while self.dispatcher.has_due(now.wall) && drained < MAX_BATCH {
                         let outbound = self.dispatcher.next_due_is_outbound();
                         match self.dispatcher.run_due_into(&mut group, now)? {
                             // Stats increment as jobs are STAGED, before the
@@ -936,8 +953,8 @@ impl Kernel {
                 let mut group = self.app.begin_job_group()?;
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {
-                    while self.cron.has_due(now) && drained < MAX_BATCH {
-                        let (_, catchup) = self.cron.tick_into(&mut group, now)?;
+                    while self.cron.has_due(now.wall) && drained < MAX_BATCH {
+                        let (_, catchup) = self.cron.tick_into(&mut group, now.wall)?;
                         self.stats.cron_ticks += 1;
                         if catchup {
                             self.stats.cron_catchups += 1;
@@ -1077,7 +1094,7 @@ impl Kernel {
                             if let Some((token, result)) = self.dispatcher.pop_completion() {
                                 match self
                                     .dispatcher
-                                    .settle_into(&mut group, now, token, result)?
+                                    .settle_into(&mut group, now.wall, token, result)?
                                 {
                                     Some(outcome) => outcome,
                                     None => {
@@ -1145,11 +1162,11 @@ impl Kernel {
                     "kernel invariant: the outbound arm was ready but serviced nothing (no \
                      completion settled or discarded late, no call expired), so Kernel::step \
                      would return Worked forever and Kernel::run would never park. After the \
-                     drain: ready {}, {} in flight, earliest timeout {:?}, now {now}. Fix \
+                     drain: ready {}, {} in flight, earliest timeout {:?}, now {mono}. Fix \
                      Dispatcher::outbound_ready (kernel/dispatch.rs) and the arm's drain \
                      (pop_completion, expire_into) so whatever makes the arm ready is what the \
                      drain takes",
-                    self.dispatcher.outbound_ready(now),
+                    self.dispatcher.outbound_ready(mono),
                     self.dispatcher.in_flight_len(),
                     self.dispatcher.next_outbound_deadline(),
                 );
@@ -1201,8 +1218,7 @@ impl Kernel {
             // (payload-shapes amendment A1).
             refuse_foreign_pending_jobs(self.app.db())?;
             self.app.db_mut().migrate_schema()?;
-            let now = self.clock.now().as_nanos();
-            self.cron.upsert(self.app.db_mut(), now)?;
+            self.cron.upsert(self.app.db_mut(), self.clock.wall())?;
             let snap = self.app.db_mut().snapshot()?;
             self.dispatcher.rebuild(&snap)?;
         }

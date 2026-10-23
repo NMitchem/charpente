@@ -4,6 +4,16 @@
 
 ### Breaking changes
 - **`Clock` gains `wall()`; an implementor adds it.** `WallTime` is new.
+- **Every stored or compared time is a `WallTime`; durations stay on `Instant`.**
+  - Fields: `Session.expires_at`, `ApiKey.created_at`, `CronRow.next_due`, `JobRow.due_at` (`WallTime::UNIX_EPOCH` still means due now), `SessionSweep.before`, and `JobOutcome::Retried`'s `due_at`.
+  - `App::handle_at`, `App::handle_or_subscribe` and `StagedDispatch::stage_or_subscribe` take `now: WallTime`. `App::handle` passes `WallTime::UNIX_EPOCH`.
+  - `OidcVerifier::verify` takes `now: WallTime`.
+  - `CronEnqueue` is `Box<dyn Fn(&mut Tx, WallTime) + Send>`. `CronScheduler::upsert`, `tick`, `tick_into` and `has_due` take a `WallTime`, and `next_deadline` returns one.
+  - `Dispatcher::run_due` and `run_due_into` take the new `kernel::Now`, one reading of both clocks: `mono` times an outbound call's deadline and `wall` judges due times. `Dispatcher::has_due` takes a `WallTime`, and `next_deadline` returns one.
+  - The fingerprints of the platform tables `Session`, `ApiKey` and `CronRow`, and of the platform job `SessionSweep`, change with their field types.
+
+### Fixed
+- Production time was process uptime, so after a restart or failover cron stalled until uptime caught up, sessions outlived their TTL, an expired OIDC token was accepted and any token with nbf was refused. Every stored or compared time is now wall-clock time (WallTime).
 
 ## 0.2.0 (2026-10-17)
 

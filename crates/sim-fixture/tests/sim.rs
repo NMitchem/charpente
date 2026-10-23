@@ -2,9 +2,9 @@
 //! convention). Also the meta-test's target: `sometimes_fails` is gated
 //! behind CHARPENTE_FIXTURE_FAIL so the workspace suite stays green.
 
-use charpente::core::io::Entropy;
+use charpente::core::io::{Entropy, Instant, WallTime};
 use charpente::http::{App, AppConfig};
-use charpente::kernel::Dispatcher;
+use charpente::kernel::{Dispatcher, Now};
 use charpente::{Db, DbConfig, Id, Schema, TxError, View, jobs};
 use charpente_sim::Sim;
 use sim_fixture::{BumpCounter, FixtureCounter, NoteAdded};
@@ -347,7 +347,11 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
     }
 
     dispatcher.note_enqueued(db.drain_enqueued());
-    fallible!("dispatching the job", dispatcher.run_due(db, 0));
+    let now = Now {
+        mono: Instant::ZERO,
+        wall: WallTime::UNIX_EPOCH,
+    };
+    fallible!("dispatching the job", dispatcher.run_due(db, now));
 
     let snap = fallible!("the snapshot after dispatch", db.snapshot());
     match fallible!("reading the row back", snap.get::<FixtureCounter>(id)) {

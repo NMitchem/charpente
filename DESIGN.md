@@ -92,7 +92,10 @@ trait Outbound { fn start(&self, token: u64, call: OutboundCall) -> Result<()>;
 deadlines inside the process; it is never stored (no table codec exists for it) and means
 nothing after a restart. `wall` is `WallTime`, UTC nanoseconds since the Unix epoch, for every
 time that is stored or compared with anything outside the process. Each node builds one
-`ProdClock` and clones it (same origin) to everything that reads time.
+`ProdClock` and clones it (same origin) to everything that reads time. The kernel reads both
+once per step (`kernel::Now`); a stored wall due time (a job's `due_at`, a schedule's
+`next_due`) becomes the loop's monotonic wake-up as `now.mono + (due - now.wall)`, recomputed
+every step, so a wall-clock step moves a wake-up at the next step rather than freezing it.
 
 The simulator implements all of it with one seed driving: latency distributions, virtual
 time (a simulated year of heartbeats runs in seconds), and the fault matrix — injected
@@ -1751,9 +1754,10 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   writes such a row itself: the job-shape registry is filled at `App::mount_jobs`, and an
   enqueue under another shape of a mounted job name (two `#[job]` types sharing one)
   refuses its whole transaction by name, before any record exists. Dispatch asserts the
-  invariant. A charpente release never changes the platform's own `SessionSweep` job's
-  fields without renaming it: of the refusal's two fixes, an app author could apply only
-  the drain to it, never the restore of its old fields.
+  invariant. The platform's own `SessionSweep` job's fields change only between charpente
+  minors, in place (DECISIONS §15): a node refuses a data directory another minor wrote, so
+  a Pending sweep of another shape never meets this refusal, whose restore-the-old-fields
+  fix an app author could not apply to it.
 - **Cron.** Schedules are rows; a due tick is one transaction that advances `next_due` and
   enqueues through the normal path — on a bare `Tx`, so a schedule takes `global` jobs
   only; a sweep that acts per tenant is a `global, cross_tenant` job that fans out with
@@ -2083,7 +2087,8 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   matrix, assert no raw credential byte-string appears in any store, WAL segment, or role
   file) is what mechanically forbids a regression; its naive-victim meta-test (a resolver
   that stores the raw token) fails that oracle by name. `create_session(tx, subject)` sets
-  `expires_at = now + session_ttl` (`AppConfig`, default 30 days in `Clock` nanos);
+  `expires_at = now + session_ttl` (`now` the kernel's `Clock::wall` reading, `expires_at` a
+  `WallTime`; `AppConfig`, default 30 days in nanos);
   `create_api_key(tx, subject)` returns `"ck_"` + 64 hex (the prefix makes a leaked key
   grep-able for secret scanners); revocation is `tx.delete::<ApiKey>(id)` — an ordinary
   write, durable and replicated like any other.
@@ -2120,9 +2125,10 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   (v1 is RS256-only; `kid` selects the JWK when present, else all configured keys are tried),
   check RSA-PKCS1-v1.5-SHA256 over the `header.payload` signing input, then `iss`
   string-equals issuer, `aud` (string or array) contains audience, `exp > now - skew`,
-  `nbf <= now + skew` (`JWT_CLOCK_SKEW_NANOS` = 60s; JWT `exp`/`nbf` seconds converted to the
-  clock's nanos). Success yields an ephemeral `Principal { subject: sub, via: Oidc }` — no
-  row, nothing to revoke but a short `exp`. Each failed check is its own named 401 (below).
+  `nbf <= now + skew` (`JWT_CLOCK_SKEW_NANOS` = `CLOCK_TOLERANCE`'s 60s; JWT `exp`/`nbf` Unix
+  seconds converted to nanos and judged against `now`, the kernel's `Clock::wall` reading).
+  Success yields an ephemeral `Principal { subject: sub, via: Oidc }` — no row, nothing to
+  revoke but a short `exp`. Each failed check is its own named 401 (below).
   Verification is ~100µs of pure computation on the kernel thread; the test suite checks in a
   fixed RSA keypair and mints tokens in-test with the same crate, so the claim matrix replays
   byte-identically — proof the crypto path added no nondeterminism. A JWKS refresh is now
@@ -2130,10 +2136,11 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   when someone needs it.
 - **Expiry: lazy resolution is correctness, the sweep is hygiene.** A `Session` row with
   `expires_at <= now` is treated as absent at resolution — invisible the instant `now` passes
-  it, restart or not (the same restart-stable `Clock` shape cron's catch-up already relies
-  on). A built-in daily cron (`charpente.session_sweep`, registered platform-side with no
-  opt-in, running through the ordinary cron/job machinery — retry and observability for free)
-  deletes expired rows in one transaction per tick so the table doesn't grow unbounded.
+  it, restart or not: both are wall time (`WallTime`, `Clock::wall`), the same scale cron's
+  `next_due` is stored on. A built-in daily cron (`charpente.session_sweep`, registered
+  platform-side with no opt-in, running through the ordinary cron/job machinery — retry and
+  observability for free) deletes expired rows in one transaction per tick so the table
+  doesn't grow unbounded.
   Because lazy resolution is authoritative, the sweep's cadence is not load-bearing; the tick
   threads its `now` into an enqueued `SessionSweep { before }` job (the cron enqueue closure
   was widened to see the scheduler's `now`), which deletes rows with `expires_at <= before`.

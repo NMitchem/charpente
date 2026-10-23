@@ -3,6 +3,7 @@
 //! never reaching disk. Revocation is `tx.delete::<ApiKey>(id)`; there is no
 //! separate revoked flag (revoke-as-delete).
 
+use charpente_core::io::WallTime;
 use charpente_core::table::Id;
 use charpente_macros::table;
 
@@ -12,5 +13,5 @@ pub struct ApiKey {
     #[index]
     pub key_hash: String,
     pub subject: String,
-    pub created_at: u64,
+    pub created_at: WallTime,
 }

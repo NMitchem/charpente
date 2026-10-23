@@ -3,10 +3,10 @@
 
 use charpente::auth::Principal;
 use charpente::http::{App, AppConfig, Session};
-use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
+use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome, Now};
 use charpente::{Db, DbConfig, Schema, Scoped, Tenant, Tx, job, jobs, table};
 use charpente_core::db::{Job, TxError};
-use charpente_core::io::Entropy;
+use charpente_core::io::{Entropy, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::migration::{MigrationError, TableMigration};
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
@@ -20,6 +20,19 @@ use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 // `durable_refusal` at every open site (S3b item 0).
 use charpente_sim::checks::{boot_through_fallout, durable_refusal, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
+
+/// One reading of both clocks, `nanos` on each scale, for driving a
+/// `Dispatcher` directly.
+fn at(nanos: u64) -> Now {
+    Now {
+        mono: charpente_core::io::Instant::from_nanos(nanos),
+        wall: wall(nanos),
+    }
+}
+
+fn wall(nanos: u64) -> WallTime {
+    WallTime::from_nanos(nanos)
+}
 
 /// The re-seed clause every "restore … from a replica or backup" text carries
 /// (DESIGN §5's re-seed rule; S3b R3-M1), typed out so a pin goes red if it
@@ -227,15 +240,15 @@ fn a_jobs_fingerprint_follows_its_fields_not_its_name() {
 /// Job-tenancy spec §6 and §9 item 7: a `global` job's fingerprint is exactly
 /// the fold a bare `#[job]` computed, so no Pending job of an existing type
 /// changes shape when its declaration gains `global`. `SessionSweep` is the
-/// platform's own job, whose shape a release must never move (its doc comment
-/// says why). The literals are FNV-1a over charpente's own rendering —
-/// `"before\0u64\0"` and `"slot\0u64\0"` — and were run green at `d363baf`,
-/// before any job said `global`.
+/// platform's own job, whose shape moves only between charpente minors (its
+/// doc comment says why). The literals are FNV-1a over charpente's own
+/// rendering — `"before\0WallTime\0"` (0.3.0, where `before` became wall time)
+/// and `"slot\0u64\0"`, run green at `d363baf` before any job said `global`.
 #[test]
 fn a_global_jobs_fingerprint_is_the_bare_jobs_fingerprint() {
     assert_eq!(
         <charpente::auth::SessionSweep as Job>::FINGERPRINT,
-        0x7e72_9c20_6b79_cbad
+        0xeb16_df6c_8733_f149
     );
     assert_eq!(<CountUp as Job>::FINGERPRINT, 0x766b_8ba4_18db_4d08);
 }
@@ -393,10 +406,10 @@ mod scoped_jobs {
         let mut ran = 0;
         loop {
             dispatcher.note_enqueued(db.drain_enqueued());
-            if !dispatcher.has_due(now) {
+            if !dispatcher.has_due(wall(now)) {
                 return ran;
             }
-            dispatcher.run_due(db, now).unwrap();
+            dispatcher.run_due(db, at(now)).unwrap();
             ran += 1;
         }
     }
@@ -451,7 +464,7 @@ mod scoped_jobs {
         dispatcher.note_enqueued(db.drain_enqueued());
         let mut now = 1_000;
         for attempt in 1..=3u32 {
-            let outcome = dispatcher.run_due(db, now).unwrap();
+            let outcome = dispatcher.run_due(db, at(now)).unwrap();
             let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
             assert_eq!(
                 row.scope,
@@ -468,7 +481,7 @@ mod scoped_jobs {
                     attempts, due_at, ..
                 } => {
                     assert_eq!(attempts, attempt);
-                    now = due_at;
+                    now = due_at.as_nanos();
                 }
                 JobOutcome::Dead { attempts, .. } => assert_eq!((attempts, attempt), (3, 3)),
                 JobOutcome::Done { .. } => panic!("Jam never succeeds"),
@@ -524,7 +537,7 @@ mod scoped_jobs {
         let db = app.db_for_tests();
         enqueue_in_desk(db, 7, PeeksFiled {});
         dispatcher.note_enqueued(db.drain_enqueued());
-        let outcome = dispatcher.run_due(db, 1_000).map_err(|e| e.to_string());
+        let outcome = dispatcher.run_due(db, at(1_000)).map_err(|e| e.to_string());
         assert!(
             matches!(outcome, Ok(JobOutcome::Dead { attempts: 1, .. })),
             "the refused read is an attempt, dead at its first: {outcome:?}"
@@ -1633,7 +1646,7 @@ mod scoped_jobs {
             let Some(now) = dispatcher.next_deadline() else {
                 return seen;
             };
-            seen.push(match dispatcher.run_due(db, now).unwrap() {
+            seen.push(match dispatcher.run_due(db, at(now.as_nanos())).unwrap() {
                 JobOutcome::Done { .. } => ("done", 0),
                 JobOutcome::Retried { attempts, .. } => ("retried", attempts),
                 JobOutcome::Dead { attempts, .. } => ("dead", attempts),
@@ -1805,14 +1818,17 @@ fn dispatcher_runs_due_job_with_atomic_done_mark() {
     })
     .unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
-    assert!(dispatcher.has_due(0));
+    assert!(dispatcher.has_due(wall(0)));
 
-    let outcome = dispatcher.run_due(db, 0).unwrap();
+    let outcome = dispatcher.run_due(db, at(0)).unwrap();
     assert!(matches!(outcome, JobOutcome::Done { id: 0 }));
     let snap = db.snapshot().unwrap();
     assert_eq!(snap.scan::<Counter>().unwrap()[0].hits, 1);
     assert_eq!(snap.scan::<JobRow>().unwrap()[0].status, JobStatus::Done);
-    assert!(!dispatcher.has_due(u64::MAX), "done jobs leave the heap");
+    assert!(
+        !dispatcher.has_due(wall(u64::MAX)),
+        "done jobs leave the heap"
+    );
 }
 
 #[test]
@@ -1830,19 +1846,20 @@ fn failing_job_follows_backoff_then_dies_with_the_story() {
     let now0 = 1_000;
     let JobOutcome::Retried {
         attempts, due_at, ..
-    } = dispatcher.run_due(db, now0).unwrap()
+    } = dispatcher.run_due(db, at(now0)).unwrap()
     else {
         panic!("first failure retries");
     };
     assert_eq!(attempts, 1);
-    assert_eq!(due_at, now0 + 10_000_000_000); // backoff 10s * 2^0
+    assert_eq!(due_at, wall(now0 + 10_000_000_000)); // backoff 10s * 2^0
     assert!(
-        !dispatcher.has_due(now0),
+        !dispatcher.has_due(wall(now0)),
         "not due again until backoff passes"
     );
     assert!(dispatcher.has_due(due_at));
 
-    let JobOutcome::Dead { attempts, .. } = dispatcher.run_due(db, due_at).unwrap() else {
+    let JobOutcome::Dead { attempts, .. } = dispatcher.run_due(db, at(due_at.as_nanos())).unwrap()
+    else {
         panic!("attempts == max means dead");
     };
     assert_eq!(attempts, 2);
@@ -1937,7 +1954,7 @@ fn panicking_handler_is_absorbed_into_the_retry_path() {
     })
     .unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
-    let JobOutcome::Retried { .. } = dispatcher.run_due(db, 0).unwrap() else {
+    let JobOutcome::Retried { .. } = dispatcher.run_due(db, at(0)).unwrap() else {
         panic!("a panic is a failure, not a crash");
     };
     let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
@@ -1976,7 +1993,7 @@ fn platform_io_during_a_handler_is_not_an_attempt() {
     .unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
 
-    let err = dispatcher.run_due(db, 0).unwrap_err();
+    let err = dispatcher.run_due(db, at(0)).unwrap_err();
     assert!(err.to_string().contains("simulated read fault"), "{err}");
     let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
     assert_eq!(
@@ -1987,7 +2004,7 @@ fn platform_io_during_a_handler_is_not_an_attempt() {
     assert_eq!(row.attempts, 0, "retry budget untouched by platform faults");
     assert!(row.last_error.is_none(), "nothing was recorded");
     assert!(
-        dispatcher.has_due(0),
+        dispatcher.has_due(wall(0)),
         "the job goes straight back on the heap"
     );
 }
@@ -2003,7 +2020,7 @@ fn unregistered_job_name_fails_with_the_fix() {
     })
     .unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
-    dispatcher.run_due(db, 0).unwrap();
+    dispatcher.run_due(db, at(0)).unwrap();
     let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
     let msg = row.last_error.as_deref().unwrap();
     assert!(
@@ -2040,28 +2057,28 @@ fn cron_upsert_ticks_and_catches_up_once() {
     let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
     let db = app.db_for_tests();
 
-    cron.upsert(db, 0).unwrap();
-    assert_eq!(cron.next_deadline(), Some(HOUR));
-    assert!(!cron.has_due(HOUR - 1) && cron.has_due(HOUR));
+    cron.upsert(db, wall(0)).unwrap();
+    assert_eq!(cron.next_deadline(), Some(wall(HOUR)));
+    assert!(!cron.has_due(wall(HOUR - 1)) && cron.has_due(wall(HOUR)));
 
     // A tick advances the schedule and enqueues through the normal path.
-    let (name, catchup) = cron.tick(db, HOUR).unwrap();
+    let (name, catchup) = cron.tick(db, wall(HOUR)).unwrap();
     assert_eq!((name, catchup), ("hourly-count", false));
     assert_eq!(db.drain_enqueued().len(), 1);
-    assert_eq!(cron.next_deadline(), Some(2 * HOUR));
+    assert_eq!(cron.next_deadline(), Some(wall(2 * HOUR)));
 
     // Downtime: three intervals pass unserved. Catch-up fires ONCE and the
     // schedule jumps past now — no backfill.
     let much_later = 5 * HOUR + 7;
-    assert!(cron.has_due(much_later));
-    let (_, catchup) = cron.tick(db, much_later).unwrap();
+    assert!(cron.has_due(wall(much_later)));
+    let (_, catchup) = cron.tick(db, wall(much_later)).unwrap();
     assert!(
         catchup,
         "a tick past a whole missed interval reports catch-up"
     );
     assert_eq!(db.drain_enqueued().len(), 1, "one catch-up tick, not three");
-    assert_eq!(cron.next_deadline(), Some(much_later + HOUR));
-    assert!(!cron.has_due(much_later));
+    assert_eq!(cron.next_deadline(), Some(wall(much_later + HOUR)));
+    assert!(!cron.has_due(wall(much_later)));
 }
 
 #[test]
@@ -2082,18 +2099,18 @@ fn cron_schedule_survives_reopen_without_resetting_phase() {
     };
     let mut app = open(&sim);
     let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
-    cron.upsert(app.db_for_tests(), 0).unwrap();
+    cron.upsert(app.db_for_tests(), wall(0)).unwrap();
 
     sim.restart();
     drop(app);
     let mut app = open(&sim);
     let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
     // Re-upsert at a later now: the existing row keeps its phase.
-    cron.upsert(app.db_for_tests(), 30 * 60 * 1_000_000_000)
+    cron.upsert(app.db_for_tests(), wall(30 * 60 * 1_000_000_000))
         .unwrap();
     assert_eq!(
         cron.next_deadline(),
-        Some(HOUR),
+        Some(wall(HOUR)),
         "an existing schedule keeps next_due across restarts"
     );
 }
@@ -2141,10 +2158,10 @@ fn rebuild_restores_pending_jobs_after_reopen() {
         .rebuild(&app.db_for_tests().snapshot().unwrap())
         .unwrap();
     assert!(
-        dispatcher.has_due(0),
+        dispatcher.has_due(wall(0)),
         "pending jobs survive recovery into the heap"
     );
-    let outcome = dispatcher.run_due(app.db_for_tests(), 0).unwrap();
+    let outcome = dispatcher.run_due(app.db_for_tests(), at(0)).unwrap();
     assert!(matches!(outcome, JobOutcome::Done { .. }));
 }
 
@@ -2784,10 +2801,10 @@ fn run_due_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint
     })
     .unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
-    assert!(dispatcher.has_due(0));
+    assert!(dispatcher.has_due(wall(0)));
 
     armed.store(true, Ordering::SeqCst);
-    let outcome = dispatcher.run_due(db, 0);
+    let outcome = dispatcher.run_due(db, at(0));
 
     assert_eq!(
         fired.load(Ordering::SeqCst),
@@ -2813,7 +2830,7 @@ fn run_due_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint
         "the fault must have actually latched the store, or this test proves nothing"
     );
     assert!(
-        !dispatcher.has_due(0),
+        !dispatcher.has_due(wall(0)),
         "the job's Done-mark IS durable (checkpoint arm, applied == n) — leaving (due_at, id) \
          in the heap here is exactly the state Dispatcher::run_due_into's own invariant assert \
          exists to catch (a Done row the heap still calls Pending)"
@@ -2863,11 +2880,11 @@ fn tick_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint() 
     // upsert while UNARMED, same reasoning as the job-wrapper test above: its
     // own checkpoint_every: 1 cadence checkpoint must fire and succeed
     // before the fault is armed.
-    cron.upsert(db, 0).unwrap();
-    assert!(cron.has_due(HOUR));
+    cron.upsert(db, wall(0)).unwrap();
+    assert!(cron.has_due(wall(HOUR)));
 
     armed.store(true, Ordering::SeqCst);
-    let outcome = cron.tick(db, HOUR);
+    let outcome = cron.tick(db, wall(HOUR));
 
     assert_eq!(
         fired.load(Ordering::SeqCst),
@@ -2891,7 +2908,7 @@ fn tick_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint() 
     );
     assert_eq!(
         cron.next_deadline(),
-        Some(2 * HOUR),
+        Some(wall(2 * HOUR)),
         "the schedule's next_due IS durable (checkpoint arm, applied == n) — rolling *cached \
          back to `previous` here would re-tick and re-enqueue the SAME interval the next time \
          has_due is checked"
@@ -3022,7 +3039,7 @@ fn run_due_over_a_wal_fault(
     .unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
     armed.store(true, Ordering::SeqCst);
-    let outcome = dispatcher.run_due(db, 0);
+    let outcome = dispatcher.run_due(db, at(0));
     (app, dispatcher, fired, outcome)
 }
 
@@ -3054,7 +3071,7 @@ fn run_due_restores_a_job_whose_done_mark_never_reached_the_store() {
     assert!(err.to_string().contains("simulated fsync failure"), "{err}");
     assert_eq!(
         dispatcher.next_deadline(),
-        Some(0),
+        Some(WallTime::UNIX_EPOCH),
         "the job must be due again at its original place (due_at 0): nothing durable says it \
          ran, and a heap that dropped it leaves a Pending job no dispatch reaches until a restart"
     );
@@ -3096,7 +3113,7 @@ fn run_due_answers_ok_when_only_the_wal_is_poisoned_after_the_batch_applied() {
         "got {outcome:?}"
     );
     assert!(
-        !dispatcher.has_due(u64::MAX),
+        !dispatcher.has_due(wall(u64::MAX)),
         "a Done job is back in the heap: the next run_due_into would find a row the heap calls \
          Pending and the store calls Done"
     );
@@ -3950,10 +3967,10 @@ fn harness_catches_a_split_done_mark() {
         .rebuild(&app.db_for_tests().snapshot().unwrap())
         .unwrap();
     assert!(
-        dispatcher.has_due(0),
+        dispatcher.has_due(wall(0)),
         "the split executor left the job Pending"
     );
-    dispatcher.run_due(app.db_for_tests(), 0).unwrap();
+    dispatcher.run_due(app.db_for_tests(), at(0)).unwrap();
 
     let err = exactly_once_holds(&mut app).unwrap_err();
     assert!(
@@ -4141,7 +4158,8 @@ fn sweep_whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
 /// `session_ttl: 0` lets each login's own `now` argument set `expires_at`
 /// directly, so the two sessions land squarely on either side of the
 /// platform's real `Duration::from_secs(86_400)` cadence (`DAY`, in nanos)
-/// without needing a test-only knob on the interval.
+/// without needing a test-only knob on the interval. The logins are on the
+/// sim's wall scale (`base`, virtual time zero), which the kernel's sweep reads.
 #[test]
 fn session_sweep_deletes_expired_rows_on_tick() {
     let sim = Sim::with_faults(0x6B0, FaultConfig::none());
@@ -4157,17 +4175,18 @@ fn session_sweep_deletes_expired_rows_on_tick() {
     .unwrap()
     .mount(routes![sweep_login, sweep_whoami]);
 
+    let base = WallTime::from_nanos(charpente_sim::SIM_WALL_BASE_NANOS);
     let login_a = app.handle_at(
         Request::new(Method::Post, "/sweep-login").json(&"alice"),
-        100,
-    ); // expires_at = 100 — long before the first tick at DAY
+        base + Duration::from_nanos(100),
+    ); // expires_at = base + 100 — long before the first tick at base + DAY
     assert_eq!(login_a.status, 200);
     let token_a: String = serde_json::from_slice(&login_a.body).unwrap();
 
     let login_b = app.handle_at(
         Request::new(Method::Post, "/sweep-login").json(&"bob"),
-        2 * DAY,
-    ); // expires_at = 2*DAY — long after the first tick
+        base + Duration::from_nanos(2 * DAY),
+    ); // expires_at = base + 2*DAY — long after the first tick
     assert_eq!(login_b.status, 200);
 
     assert_eq!(
@@ -4187,7 +4206,7 @@ fn session_sweep_deletes_expired_rows_on_tick() {
     let denied = app.handle_at(
         Request::new(Method::Get, "/sweep-whoami")
             .header("Authorization", format!("Bearer {token_a}")),
-        DAY / 2,
+        base + Duration::from_nanos(DAY / 2),
     );
     assert_eq!(
         denied.status, 401,
@@ -4195,8 +4214,8 @@ fn session_sweep_deletes_expired_rows_on_tick() {
     );
 
     // Run the kernel forward past the platform's first daily tick: now=DAY
-    // sits strictly between the two expiries (100 <= DAY < 2*DAY), so the
-    // sweep's enqueued `before` deletes exactly alice's row.
+    // (wall base + DAY) sits strictly between the two expiries, so the sweep's
+    // enqueued `before` deletes exactly alice's row.
     let mut source = SimSource::new(Box::new(sim.clock()), DAY + SEC);
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
     kernel.run(&mut source).unwrap();
@@ -4851,7 +4870,7 @@ fn a_drained_queue_lets_the_new_shape_start() {
     .unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
     assert!(matches!(
-        dispatcher.run_due(db, 0).unwrap(),
+        dispatcher.run_due(db, at(0)).unwrap(),
         JobOutcome::Done { .. }
     ));
     sim.restart();
@@ -4891,7 +4910,7 @@ fn a_retried_pending_job_still_refuses_and_a_dead_one_does_not() {
                 .get_job(Id::from_raw(1), &admission)?
                 .expect("the second receipt");
             retried.attempts = 2;
-            retried.due_at = 60 * SEC;
+            retried.due_at = wall(60 * SEC);
             retried.last_error = Some("the mail relay timed out".to_string());
             tx.settle_job(&retried, &admission);
             Ok::<(), std::io::Error>(())
@@ -5675,7 +5694,7 @@ fn dispatch_asserts_it_never_decodes_a_foreign_shape() {
     let seq = db.last_applied().map_or(0, |s| s + 1);
     db.apply_shipped(&[(seq, record)]).unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
-    let _ = dispatcher.run_due(db, 0);
+    let _ = dispatcher.run_due(db, at(0));
 }
 
 /// Spec §4 (amendment A14): a payload whose recorded shape IS this binary's
@@ -5702,7 +5721,7 @@ fn a_corrupt_payload_under_its_own_shape_retries_naming_corruption() {
     db.apply_shipped(&[(seq, record)]).unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
     assert!(matches!(
-        dispatcher.run_due(db, 0).unwrap(),
+        dispatcher.run_due(db, at(0)).unwrap(),
         JobOutcome::Retried { attempts: 1, .. }
     ));
     let job = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
@@ -5810,7 +5829,7 @@ fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption()
     db.apply_shipped(&[(seq, record)]).unwrap();
     dispatcher.note_enqueued(db.drain_enqueued());
     assert!(matches!(
-        dispatcher.run_due(db, 0).unwrap(),
+        dispatcher.run_due(db, at(0)).unwrap(),
         JobOutcome::Retried { attempts: 1, .. }
     ));
     let job = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
@@ -6375,7 +6394,7 @@ mod job_tenancy {
                     id: Id::from_raw(shop),
                     key_hash: hash_token(&key_of(shop)),
                     subject: subject_of(shop),
-                    created_at: 0,
+                    created_at: WallTime::UNIX_EPOCH,
                 });
             }
             Ok::<(), std::io::Error>(())
@@ -6982,7 +7001,7 @@ mod job_tenancy {
             });
             dispatcher.note_enqueued(db.drain_enqueued());
             assert!(matches!(
-                dispatcher.run_due(db, 0).unwrap(),
+                dispatcher.run_due(db, at(0)).unwrap(),
                 JobOutcome::Done { .. }
             ));
             let verdict = jobs_stay_in_their_tenant(db);

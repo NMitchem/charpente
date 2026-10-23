@@ -234,12 +234,13 @@ pub fn run_with_trace_mode(
         syncs: sync_count.clone(),
     };
     let app = build(Box::new(disk), Box::new(ProdEntropy::new()?))?;
-    let mut source = SimSource::new(Box::new(ProdClock::new()), 0);
+    let clock = ProdClock::new();
+    let mut source = SimSource::new(Box::new(clock.clone()), 0);
     for i in 0..requests {
         source.push_at(0, Request::new(Method::Post, format!("/hit/{}", i % SLOTS)));
     }
     let responses = source.responses();
-    let mut kernel = Kernel::new(app, Box::new(ProdClock::new()))?;
+    let mut kernel = Kernel::new(app, Box::new(clock))?;
 
     let mut obs = KernelObs {
         requests_planned: requests,

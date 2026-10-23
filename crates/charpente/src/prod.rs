@@ -1952,7 +1952,7 @@ mod tests {
                 id: Id::from_raw(id),
                 name: name.to_string(),
                 interval_nanos: 1,
-                next_due: 1,
+                next_due: WallTime::from_nanos(1),
             });
             Ok::<(), io::Error>(())
         })

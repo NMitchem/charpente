@@ -7,6 +7,7 @@
 use std::io;
 use std::time::Duration;
 
+use crate::io::WallTime;
 use crate::table::{Codec, Id, IndexDef, Row};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,7 +78,9 @@ pub struct JobRow {
     pub key: Option<String>,
     pub status: JobStatus,
     pub attempts: u32,
-    pub due_at: u64,
+    /// When the job is next due. `WallTime::UNIX_EPOCH` means due now: every
+    /// enqueue writes it, and only a retry moves it.
+    pub due_at: WallTime,
     /// The last failure's message (handler error or absorbed panic) — the
     /// dead-letter record's substance (hard rule 5).
     pub last_error: Option<String>,
@@ -158,7 +161,7 @@ impl Row for JobRow {
         let key = Option::<String>::decode(input)?;
         let status = JobStatus::decode(input)?;
         let attempts = u32::decode(input)?;
-        let due_at = u64::decode(input)?;
+        let due_at = WallTime::decode(input)?;
         let last_error = Option::<String>::decode(input)?;
         let key16 = |input: &mut &[u8]| -> io::Result<[u8; 16]> {
             let (k, rest) = input
@@ -217,7 +220,7 @@ mod tests {
             key: Some("receipt:10".into()),
             status: JobStatus::Pending,
             attempts: 3,
-            due_at: 99,
+            due_at: WallTime::from_nanos(99),
             last_error: Some("boom".into()),
             shape: Some(0xFEED),
             scope: None,
@@ -230,7 +233,7 @@ mod tests {
         assert_eq!(back.name, row.name);
         assert_eq!(back.key, row.key);
         assert_eq!(back.status, JobStatus::Pending);
-        assert_eq!((back.attempts, back.due_at), (3, 99));
+        assert_eq!((back.attempts, back.due_at), (3, WallTime::from_nanos(99)));
         assert_eq!(back.last_error.as_deref(), Some("boom"));
         assert_eq!(back.shape, row.shape);
         assert_eq!(back.scope, row.scope);
@@ -248,7 +251,7 @@ mod tests {
             key: None,
             status: JobStatus::Pending,
             attempts: 0,
-            due_at: 0,
+            due_at: WallTime::UNIX_EPOCH,
             last_error: None,
             shape: None,
             scope: None,
@@ -278,7 +281,7 @@ mod tests {
             key: None,
             status: JobStatus::Pending,
             attempts: 0,
-            due_at: 0,
+            due_at: WallTime::UNIX_EPOCH,
             last_error: None,
             shape: Some(0xFEED),
             scope: None,
@@ -310,7 +313,7 @@ mod tests {
             key: None,
             status: JobStatus::Pending,
             attempts: 0,
-            due_at: 0,
+            due_at: WallTime::UNIX_EPOCH,
             last_error: None,
             shape: Some(0xFEED),
             scope,
@@ -341,7 +344,7 @@ mod tests {
             key: None,
             status: JobStatus::Pending,
             attempts: 0,
-            due_at: 0,
+            due_at: WallTime::UNIX_EPOCH,
             last_error: None,
             shape: Some(0xFEED),
             scope: Some(3),
@@ -374,7 +377,7 @@ mod tests {
             key: None,
             status: JobStatus::Pending,
             attempts: 0,
-            due_at: 0,
+            due_at: WallTime::UNIX_EPOCH,
             last_error: None,
             shape: None,
             scope: Some(3),
@@ -393,7 +396,7 @@ mod tests {
                 key: None,
                 status: JobStatus::Pending,
                 attempts: 0,
-                due_at: 0,
+                due_at: WallTime::UNIX_EPOCH,
                 last_error: None,
                 shape: Some(0xFEED),
                 scope,
@@ -419,7 +422,7 @@ mod tests {
             key: None,
             status: JobStatus::Pending,
             attempts: 0,
-            due_at: 0,
+            due_at: WallTime::UNIX_EPOCH,
             last_error: None,
             shape: None,
             scope: None,

@@ -24,7 +24,7 @@ fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
         tx,
         &charpente::auth::Presented::Bearer("x".to_string()),
         None,
-        0,
+        charpente::core::io::WallTime::UNIX_EPOCH,
     );
     Ok(format!("{held:?}"))
 }

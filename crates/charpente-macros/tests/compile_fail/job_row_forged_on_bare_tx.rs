@@ -48,7 +48,7 @@ fn forge(tx: &mut Tx) -> Result<(), ApiError> {
         key: None,
         status: JobStatus::Pending,
         attempts: 0,
-        due_at: 0,
+        due_at: charpente::core::io::WallTime::UNIX_EPOCH,
         last_error: None,
         shape: Some(<CloseIncident as Job>::FINGERPRINT),
         scope: Some(13),

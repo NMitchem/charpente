@@ -13,6 +13,7 @@
 use std::io;
 
 use charpente_core::db::Tx;
+use charpente_core::io::WallTime;
 use charpente_core::table::Id;
 
 use crate::auth::oidc::{OidcReject, OidcVerifier};
@@ -110,7 +111,7 @@ pub(crate) fn resolve(
     tx: &mut Tx,
     presented: &Presented,
     oidc: Option<&OidcVerifier>,
-    now: u64,
+    now: WallTime,
 ) -> Result<Option<Principal>, AuthReject> {
     let token = match presented {
         Presented::None => return Ok(None),

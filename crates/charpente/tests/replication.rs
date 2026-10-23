@@ -11005,7 +11005,7 @@ fn a_kernel_switchover_onto_foreign_pending_jobs_stops_the_target_by_name() {
                 let mut job = tx
                     .get_job(Id::from_raw(0), &admission)?
                     .expect("the enqueued ping");
-                job.due_at = u64::MAX / 2;
+                job.due_at = charpente_core::io::WallTime::from_nanos(u64::MAX / 2);
                 tx.settle_job(&job, &admission);
                 Ok::<(), io::Error>(())
             })

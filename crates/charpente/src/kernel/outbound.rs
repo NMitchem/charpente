@@ -10,13 +10,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::time::Duration;
 
-use charpente_core::io::{OutboundCall, OutboundReply};
+use charpente_core::io::{OutboundCall, OutboundReply, WallTime};
 
 pub(crate) struct Flight {
     pub id: u64,
     /// The `due_at` it was dispatched at — where it goes back if its start
     /// is abandoned.
-    pub due_at: u64,
+    pub due_at: WallTime,
     pub deadline: u64,
     pub host: &'static str,
     pub timeout: Duration,
@@ -62,7 +62,7 @@ impl InFlight {
     pub(crate) fn begin(
         &mut self,
         id: u64,
-        due_at: u64,
+        due_at: WallTime,
         now: u64,
         host: &'static str,
         timeout: Duration,
@@ -101,7 +101,7 @@ impl InFlight {
 
     /// The batch's commit failed: its calls never start (R6, invariant 5).
     /// Returns each abandoned `(due_at, id)` for the caller to requeue.
-    pub(crate) fn abandon_starts(&mut self) -> Vec<(u64, u64)> {
+    pub(crate) fn abandon_starts(&mut self) -> Vec<(WallTime, u64)> {
         let tokens: Vec<u64> = self.starts.drain(..).map(|(t, _)| t).collect();
         tokens
             .into_iter()

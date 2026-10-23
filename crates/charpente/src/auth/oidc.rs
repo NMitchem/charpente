@@ -8,6 +8,7 @@
 use std::fmt;
 
 use base64ct::{Base64UrlUnpadded, Encoding};
+use charpente_core::io::WallTime;
 use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -253,9 +254,10 @@ impl OidcVerifier {
     }
 
     /// Verifies a compact JWT (spec §3), returning the `sub` claim on
-    /// success. Pure over `(jwt, now)` — `now` is the caller's single clock
-    /// reading (nanos); no clock read, no entropy draw happens in here.
-    pub fn verify(&self, jwt: &str, now: u64) -> Result<String, OidcReject> {
+    /// success. Pure over `(jwt, now)` — `now` is the caller's single wall-clock
+    /// reading, the scale of `exp`/`nbf`; no clock read, no entropy draw happens
+    /// in here.
+    pub fn verify(&self, jwt: &str, now: WallTime) -> Result<String, OidcReject> {
         let mut segments = jwt.split('.');
         let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) = (
             segments.next(),
@@ -317,6 +319,7 @@ impl OidcVerifier {
                 configured: self.audience.clone(),
             });
         }
+        let now = now.as_nanos();
         let exp_nanos = claims.exp.saturating_mul(1_000_000_000);
         if exp_nanos <= now.saturating_sub(JWT_CLOCK_SKEW_NANOS) {
             return Err(OidcReject::Expired);

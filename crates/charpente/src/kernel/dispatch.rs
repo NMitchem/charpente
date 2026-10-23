@@ -12,10 +12,11 @@ use charpente_core::db::{
     CrossTenant, Db, Enqueued, Group, JobShapeRefusal, ScopedTx, TableReadRefusal,
     TableWriteRefusal, Tenant, TenantAdmission, Tx, TxError,
 };
-use charpente_core::io::{OutboundCall, OutboundReply};
+use charpente_core::io::{OutboundCall, OutboundReply, WallTime};
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
+use super::clock::Now;
 use super::outbound::{Flight, InFlight, reply_over_cap, timed_out, transport_failure};
 use crate::outbound::{Call, DEFAULT_MAX_IN_FLIGHT, Host, IdempotencyKey, Reply};
 use crate::tenant::TenantScope;
@@ -246,7 +247,7 @@ pub enum JobOutcome {
     Retried {
         id: u64,
         attempts: u32,
-        due_at: u64,
+        due_at: WallTime,
     },
     Dead {
         id: u64,
@@ -266,11 +267,11 @@ pub enum JobOutcome {
 pub struct Dispatcher {
     defs: BTreeMap<&'static str, JobDef>,
     /// (due_at, id) — BTreeSet keeps the earliest-due first; ids break ties.
-    due: BTreeSet<(u64, u64)>,
+    due: BTreeSet<(WallTime, u64)>,
     /// The outbound jobs' `(due_at, id)`, kept apart from `due` so a
     /// capacity-blocked outbound job never blocks a pure job due after it
     /// (outbound-effects spec §4).
-    outbound_due: BTreeSet<(u64, u64)>,
+    outbound_due: BTreeSet<(WallTime, u64)>,
     /// The `Host` entries by name: what a decided `Call` is checked against.
     hosts: BTreeMap<&'static str, Host>,
     in_flight: InFlight,
@@ -333,13 +334,13 @@ impl Dispatcher {
     }
 
     /// Feeds jobs drained from `Db::drain_enqueued` (fresh enqueues are due
-    /// immediately: due_at 0).
+    /// immediately: due_at `WallTime::UNIX_EPOCH`).
     pub fn note_enqueued(&mut self, enqueued: Vec<Enqueued>) {
         for e in enqueued {
             if e.outbound {
-                self.queue_outbound(0, e.id.raw());
+                self.queue_outbound(WallTime::UNIX_EPOCH, e.id.raw());
             } else {
-                self.due.insert((0, e.id.raw()));
+                self.due.insert((WallTime::UNIX_EPOCH, e.id.raw()));
             }
         }
     }
@@ -347,7 +348,7 @@ impl Dispatcher {
     /// The earliest dispatchable job: the pure heap's head, or the outbound
     /// set's head while the in-flight table has room. Ids are unique across
     /// both, so the tuple order never consults the flag.
-    fn next_due(&self) -> Option<(u64, u64, bool)> {
+    fn next_due(&self) -> Option<(WallTime, u64, bool)> {
         let pure = self.due.first().map(|&(d, id)| (d, id, false));
         let outbound = self
             .in_flight
@@ -360,11 +361,11 @@ impl Dispatcher {
         }
     }
 
-    pub fn next_deadline(&self) -> Option<u64> {
+    pub fn next_deadline(&self) -> Option<WallTime> {
         self.next_due().map(|(d, _, _)| d)
     }
 
-    fn queue_outbound(&mut self, due_at: u64, id: u64) {
+    fn queue_outbound(&mut self, due_at: WallTime, id: u64) {
         assert!(
             !self.in_flight.holds_job(id),
             "dispatcher invariant: job {id} queued while in flight (spec §4 invariant 2)"
@@ -372,7 +373,7 @@ impl Dispatcher {
         self.outbound_due.insert((due_at, id));
     }
 
-    fn requeue(&mut self, due_at: u64, id: u64, outbound: bool) {
+    fn requeue(&mut self, due_at: WallTime, id: u64, outbound: bool) {
         if outbound {
             self.queue_outbound(due_at, id);
         } else {
@@ -380,7 +381,7 @@ impl Dispatcher {
         }
     }
 
-    pub fn has_due(&self, now: u64) -> bool {
+    pub fn has_due(&self, now: WallTime) -> bool {
         self.next_deadline().is_some_and(|d| d <= now)
     }
 
@@ -432,11 +433,13 @@ impl Dispatcher {
     /// assert (`records.len() < MAX_BATCH`, checked BEFORE `f` runs) sees at
     /// most `MAX_BATCH - 1` when a job's second stage runs, so a batch of
     /// `MAX_BATCH` jobs can never push `group.len()` past `MAX_BATCH`.
-    pub fn run_due_into(&mut self, group: &mut Group, now: u64) -> io::Result<JobOutcome> {
+    pub fn run_due_into(&mut self, group: &mut Group, now: Now) -> io::Result<JobOutcome> {
         let (due_at, id, outbound) = self.next_due().expect("run_due called with an empty heap");
         assert!(
-            due_at <= now,
-            "dispatcher bug: run_due at {now} but the earliest job is due at {due_at}"
+            due_at <= now.wall,
+            "dispatcher bug: run_due at wall {} but the earliest job is due at {}",
+            now.wall.as_nanos(),
+            due_at.as_nanos()
         );
         if outbound {
             self.outbound_due.remove(&(due_at, id));
@@ -571,7 +574,7 @@ impl Dispatcher {
                 Err(verifying_bug())
             }
             Err(TxError::App(JobError::App(err))) => {
-                match stage_failure_record(&self.defs, group, &admission, id, now, err) {
+                match stage_failure_record(&self.defs, group, &admission, id, now.wall, err) {
                     Ok(outcome) => {
                         if let JobOutcome::Retried { due_at, .. } = outcome {
                             self.due.insert((due_at, id));
@@ -612,7 +615,7 @@ impl Dispatcher {
     /// undone — a `Retried` outcome's speculative NEW `due_at` entry is
     /// removed first — and the heap is restored to the ORIGINAL `(due_at,
     /// id)`, mirroring the `Io` arm above, one level up.
-    pub fn run_due(&mut self, db: &mut Db, now: u64) -> io::Result<JobOutcome> {
+    pub fn run_due(&mut self, db: &mut Db, now: Now) -> io::Result<JobOutcome> {
         let (due_at, id, outbound) = self.next_due().expect("run_due called with an empty heap");
         let mut group = db.begin_group()?;
         let result = self.run_due_into(&mut group, now);
@@ -669,8 +672,8 @@ impl Dispatcher {
     fn run_call_into(
         &mut self,
         group: &mut Group,
-        now: u64,
-        due_at: u64,
+        now: Now,
+        due_at: WallTime,
         id: u64,
     ) -> io::Result<JobOutcome> {
         let defs = &self.defs;
@@ -773,22 +776,27 @@ impl Dispatcher {
                     )
                 });
                 if let Err(rule) = crate::outbound::check(&call, rules) {
-                    return self.fail_outbound(group, &admission, id, due_at, now, rule);
+                    return self.fail_outbound(group, &admission, id, due_at, now.wall, rule);
                 }
-                let token =
-                    self.in_flight
-                        .begin(id, due_at, now, host, timeout, call.into_wire(host, key));
+                let token = self.in_flight.begin(
+                    id,
+                    due_at,
+                    now.mono.as_nanos(),
+                    host,
+                    timeout,
+                    call.into_wire(host, key),
+                );
                 Ok(JobOutcome::Calling { id, token })
             }
             TxError::App(CallStage::Failed(JobError::App(err))) => {
-                self.fail_outbound(group, &admission, id, due_at, now, err)
+                self.fail_outbound(group, &admission, id, due_at, now.wall, err)
             }
             // A read the `Schema` refuses is the glue's own deterministic bug,
             // an attempt, as on the run path.
             TxError::App(CallStage::Failed(JobError::Io(e)))
                 if TableReadRefusal::of(&e).is_some() =>
             {
-                self.fail_outbound(group, &admission, id, due_at, now, e.to_string())
+                self.fail_outbound(group, &admission, id, due_at, now.wall, e.to_string())
             }
             TxError::App(CallStage::Failed(JobError::Io(e))) => {
                 self.queue_outbound(due_at, id);
@@ -814,8 +822,8 @@ impl Dispatcher {
         group: &mut Group,
         admission: &TenantAdmission<'_>,
         id: u64,
-        due_at: u64,
-        now: u64,
+        due_at: WallTime,
+        now: WallTime,
         err: String,
     ) -> io::Result<JobOutcome> {
         match stage_failure_record(&self.defs, group, admission, id, now, err) {
@@ -887,15 +895,16 @@ impl Dispatcher {
     pub(crate) fn expire_into(
         &mut self,
         group: &mut Group,
-        now: u64,
+        now: Now,
     ) -> io::Result<Option<(u64, JobOutcome)>> {
-        let Some(token) = self.in_flight.expired(now) else {
+        let Some(token) = self.in_flight.expired(now.mono.as_nanos()) else {
             return Ok(None);
         };
         let flight = self.in_flight.finish(token).expect("listed by expired");
         let admission = group.tenant_admission();
         let text = timed_out(flight.host, flight.timeout);
-        let outcome = self.fail_outbound(group, &admission, flight.id, flight.due_at, now, text)?;
+        let outcome =
+            self.fail_outbound(group, &admission, flight.id, flight.due_at, now.wall, text)?;
         Ok(Some((token, outcome)))
     }
 
@@ -906,7 +915,7 @@ impl Dispatcher {
     pub(crate) fn settle_into(
         &mut self,
         group: &mut Group,
-        now: u64,
+        now: WallTime,
         token: u64,
         result: io::Result<OutboundReply>,
     ) -> io::Result<Option<JobOutcome>> {
@@ -1140,7 +1149,7 @@ fn stage_failure_record(
     group: &mut Group,
     admission: &TenantAdmission<'_>,
     id: u64,
-    now: u64,
+    now: WallTime,
     err: String,
 ) -> io::Result<JobOutcome> {
     // Every fallible step below (the job-row read, the failure-record
@@ -1175,7 +1184,10 @@ fn stage_failure_record(
                 attempts: row.attempts,
             }
         } else {
-            row.due_at = now.saturating_add(retry.backoff_nanos(row.attempts));
+            row.due_at = WallTime::from_nanos(
+                now.as_nanos()
+                    .saturating_add(retry.backoff_nanos(row.attempts)),
+            );
             JobOutcome::Retried {
                 id,
                 attempts: row.attempts,

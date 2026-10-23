@@ -6,6 +6,7 @@ use std::io;
 use std::time::Duration;
 
 use charpente_core::db::{Db, Group, Tx};
+use charpente_core::io::WallTime;
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
 
@@ -17,7 +18,7 @@ pub struct CronRow {
     #[index]
     pub name: String,
     pub interval_nanos: u64,
-    pub next_due: u64,
+    pub next_due: WallTime,
 }
 
 /// Named (like `kernel::RecordedResponses`/`SinkHandles`) so the closure type
@@ -27,7 +28,7 @@ pub struct CronRow {
 /// job handler runs as a transaction with no clock of its own (DESIGN §1) —
 /// the cron tick is the only place `now` is available, so it rides along
 /// into the enqueue closure instead.
-pub type CronEnqueue = Box<dyn Fn(&mut Tx, u64) + Send>;
+pub type CronEnqueue = Box<dyn Fn(&mut Tx, WallTime) + Send>;
 
 pub struct CronEntry {
     pub name: &'static str,
@@ -38,17 +39,20 @@ pub struct CronEntry {
 pub struct CronScheduler {
     /// (entry, cached next_due) — the cache mirrors the row; the store is
     /// the truth and upsert/tick keep them identical.
-    entries: Vec<(CronEntry, u64)>,
+    entries: Vec<(CronEntry, WallTime)>,
 }
 
 impl CronScheduler {
     pub fn new(entries: Vec<CronEntry>) -> CronScheduler {
         CronScheduler {
-            entries: entries.into_iter().map(|e| (e, 0)).collect(),
+            entries: entries
+                .into_iter()
+                .map(|e| (e, WallTime::UNIX_EPOCH))
+                .collect(),
         }
     }
 
-    pub fn upsert(&mut self, db: &mut Db, now: u64) -> io::Result<()> {
+    pub fn upsert(&mut self, db: &mut Db, now: WallTime) -> io::Result<()> {
         for (entry, cached) in &mut self.entries {
             let interval = nanos(entry.interval, entry.name);
             let existing = {
@@ -67,7 +71,7 @@ impl CronScheduler {
                         id: Id::from_raw(next_id),
                         name: entry.name.to_string(),
                         interval_nanos: interval,
-                        next_due: now + interval,
+                        next_due: now + entry.interval,
                     }
                 }
             };
@@ -84,11 +88,11 @@ impl CronScheduler {
         Ok(())
     }
 
-    pub fn next_deadline(&self) -> Option<u64> {
+    pub fn next_deadline(&self) -> Option<WallTime> {
         self.entries.iter().map(|&(_, due)| due).min()
     }
 
-    pub fn has_due(&self, now: u64) -> bool {
+    pub fn has_due(&self, now: WallTime) -> bool {
         self.next_deadline().is_some_and(|d| d <= now)
     }
 
@@ -108,16 +112,20 @@ impl CronScheduler {
     /// either way (see the comment at that call site for why): a stale
     /// cache does not survive to be read again before a restart rebuilds it
     /// from the store.
-    pub fn tick_into(&mut self, group: &mut Group, now: u64) -> io::Result<(&'static str, bool)> {
+    pub fn tick_into(
+        &mut self,
+        group: &mut Group,
+        now: WallTime,
+    ) -> io::Result<(&'static str, bool)> {
         let (entry, cached) = self
             .entries
             .iter_mut()
             .filter(|(_, due)| *due <= now)
             .min_by_key(|(_, due)| *due)
             .expect("tick called with nothing due");
-        let interval = nanos(entry.interval, entry.name);
-        let catchup = now >= (*cached).saturating_add(interval); // a whole interval missed
-        let next = now + interval; // catch-up fires once: jump past now
+        // A whole interval missed.
+        let catchup = now.saturating_duration_since(*cached) >= entry.interval;
+        let next = now + entry.interval; // catch-up fires once: jump past now
         let name = entry.name;
         let enqueue = &entry.enqueue;
         group
@@ -161,7 +169,7 @@ impl CronScheduler {
     /// same `self.entries`/`now`, and nothing mutates `self.entries` in
     /// between), so it names the entry `tick_into` actually picked without
     /// `tick_into` itself having to hand it back.
-    pub fn tick(&mut self, db: &mut Db, now: u64) -> io::Result<(&'static str, bool)> {
+    pub fn tick(&mut self, db: &mut Db, now: WallTime) -> io::Result<(&'static str, bool)> {
         let (name, previous) = self
             .entries
             .iter()
@@ -313,7 +321,7 @@ mod tests {
         )
         .expect("Db::open on a fresh sim disk");
 
-        let now = 1_000_000_000u64;
+        let now = WallTime::from_nanos(1_000_000_000);
         let alpha_interval = Duration::from_secs(5);
         let beta_interval = Duration::from_secs(9);
         let alpha_enqueued = Arc::new(AtomicBool::new(false));
@@ -414,12 +422,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             alpha.next_due,
-            now + alpha_interval.as_nanos() as u64,
+            now + alpha_interval,
             "alpha's row must advance by alpha's OWN interval, not beta's"
         );
         assert_eq!(
             beta.next_due,
-            now + beta_interval.as_nanos() as u64,
+            now + beta_interval,
             "beta's row must advance by beta's OWN interval, not alpha's"
         );
         // (c) both enqueues landed.
