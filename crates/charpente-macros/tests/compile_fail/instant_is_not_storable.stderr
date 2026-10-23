@@ -1,0 +1,34 @@
+error[E0277]: the trait bound `charpente::charpente_core::io::Instant: Codec` is not satisfied
+ --> tests/compile_fail/instant_is_not_storable.rs:7:1
+  |
+7 | #[table(global)]
+  | ^^^^^^^^^^^^^^^^ the trait `Codec` is not implemented for `charpente::charpente_core::io::Instant`
+  |
+  = help: the following other types implement trait `Codec`:
+            JobStatus
+            SessionSweep
+            Vec<u8>
+            WallTime
+            WireI64
+            WireU64
+            bool
+            charpente::Id<T>
+          and $N others
+  = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `charpente::charpente_core::io::Instant: Codec` is not satisfied
+  --> tests/compile_fail/instant_is_not_storable.rs:10:15
+   |
+10 |     taken_at: Instant,
+   |               ^^^^^^^ the trait `Codec` is not implemented for `charpente::charpente_core::io::Instant`
+   |
+   = help: the following other types implement trait `Codec`:
+             JobStatus
+             SessionSweep
+             Vec<u8>
+             WallTime
+             WireI64
+             WireU64
+             bool
+             charpente::Id<T>
+           and $N others

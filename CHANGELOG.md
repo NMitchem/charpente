@@ -2,6 +2,9 @@
 
 ## 0.3.0 (unreleased)
 
+### Breaking changes
+- **`Clock` gains `wall()`; an implementor adds it.** `WallTime` is new.
+
 ## 0.2.0 (2026-10-17)
 
 ### Added: outbound effects

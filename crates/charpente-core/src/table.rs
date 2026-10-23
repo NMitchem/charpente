@@ -26,7 +26,7 @@ use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
 };
 
-use crate::io::{Disk, File};
+use crate::io::{Disk, File, WallTime};
 
 // ---------------------------------------------------------------- Id
 
@@ -161,6 +161,15 @@ macro_rules! int_codec {
     )*};
 }
 int_codec!(u8, u16, u32, u64, i8, i16, i32, i64);
+
+impl Codec for WallTime {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.as_nanos().encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<Self> {
+        Ok(WallTime::from_nanos(u64::decode(input)?))
+    }
+}
 
 impl Codec for bool {
     fn encode(&self, out: &mut Vec<u8>) {

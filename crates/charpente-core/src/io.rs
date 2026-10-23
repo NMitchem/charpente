@@ -11,10 +11,12 @@
 use std::io;
 use std::time::Duration;
 
-/// Monotonic time as nanoseconds since an arbitrary origin — process start in
-/// production, universe start in simulation. This is charpente's own type
-/// because `std::time::Instant` is opaque and cannot be constructed from
-/// virtual time. Not wall-clock time; wall-clock never enters the core.
+/// Monotonic time as nanoseconds since an arbitrary process-local origin —
+/// process start in production, universe start in simulation. Never stored
+/// (no table codec exists for it) and never compared with anything outside the
+/// process: it means nothing after a restart. Wall time arrives as `WallTime`
+/// through `Clock::wall`. This is charpente's own type because
+/// `std::time::Instant` is opaque and cannot be constructed from virtual time.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Instant {
     nanos: u64,
@@ -54,10 +56,88 @@ impl std::ops::Add<Duration> for Instant {
     }
 }
 
-/// Monotonic time. In production, anchored at process start; in simulation,
-/// virtual — a sleep advances the universe instead of the wall clock.
+/// Wall time as nanoseconds since 1970-01-01T00:00:00Z. Unlike `Instant` it
+/// survives a restart, so it is the type of every stored time.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct WallTime {
+    nanos: u64,
+}
+
+/// How far two nodes' wall clocks, or a token's and ours, may disagree.
+pub const CLOCK_TOLERANCE: Duration = Duration::from_secs(60);
+
+impl WallTime {
+    pub const UNIX_EPOCH: WallTime = WallTime { nanos: 0 };
+
+    pub fn from_nanos(nanos: u64) -> WallTime {
+        WallTime { nanos }
+    }
+
+    pub fn as_nanos(self) -> u64 {
+        self.nanos
+    }
+
+    pub fn saturating_sub(self, d: Duration) -> WallTime {
+        let d = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        WallTime {
+            nanos: self.nanos.saturating_sub(d),
+        }
+    }
+
+    /// Zero when `earlier` is later than `self`.
+    pub fn saturating_duration_since(self, earlier: WallTime) -> Duration {
+        Duration::from_nanos(self.nanos.saturating_sub(earlier.nanos))
+    }
+}
+
+impl std::ops::Add<Duration> for WallTime {
+    type Output = WallTime;
+
+    fn add(self, d: Duration) -> WallTime {
+        let d =
+            u64::try_from(d.as_nanos()).expect("WallTime + Duration: duration exceeds u64 nanos");
+        let nanos = self
+            .nanos
+            .checked_add(d)
+            .expect("WallTime + Duration overflowed u64 nanos (year 2554)");
+        WallTime { nanos }
+    }
+}
+
+/// RFC 3339 UTC, millisecond precision.
+impl std::fmt::Display for WallTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = self.nanos / 1_000_000_000;
+        let millis = self.nanos / 1_000_000 % 1_000;
+        let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+            rem / 3_600,
+            rem % 3_600 / 60,
+            rem % 60
+        )
+    }
+}
+
+/// Two readings. `now` is monotonic and process-local, for durations and
+/// deadlines inside the process. `wall` is UTC time since the Unix epoch, for
+/// every time that is stored or compared with anything outside the process.
+/// In simulation both are virtual — a sleep advances the universe.
 pub trait Clock {
     fn now(&self) -> Instant;
+
+    fn wall(&self) -> WallTime;
 
     /// Blocks the calling thread in production; advances virtual time in sim.
     fn sleep(&self, duration: Duration);
@@ -354,6 +434,35 @@ pub enum OutboundWake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_time_displays_rfc3339_utc_with_millis() {
+        for (nanos, want) in [
+            (0, "1970-01-01T00:00:00.000Z"),
+            (1_767_225_600_000_000_000, "2026-01-01T00:00:00.000Z"),
+            (951_782_400_123_000_000, "2000-02-29T00:00:00.123Z"),
+        ] {
+            assert_eq!(WallTime::from_nanos(nanos).to_string(), want);
+        }
+    }
+
+    #[test]
+    fn wall_time_saturates_instead_of_underflowing() {
+        let t = WallTime::from_nanos(5);
+        assert_eq!(
+            t.saturating_sub(Duration::from_nanos(9)),
+            WallTime::UNIX_EPOCH
+        );
+        assert_eq!(
+            t.saturating_duration_since(WallTime::from_nanos(9)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            WallTime::from_nanos(9).saturating_duration_since(t),
+            Duration::from_nanos(4)
+        );
+        assert_eq!((t + Duration::from_nanos(2)).as_nanos(), 7);
+    }
 
     #[test]
     fn instant_arithmetic() {

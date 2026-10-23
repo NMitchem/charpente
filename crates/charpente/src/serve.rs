@@ -125,7 +125,7 @@ pub fn serve_with(addr: &str, app: App, outbound: OutboundOptions) -> io::Result
     // ticks all serialize through Kernel::run's event loop (DESIGN §1).
     let kernel = std::thread::spawn(move || -> i32 {
         let clock = crate::prod::ProdClock::new();
-        let builder = kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new()));
+        let builder = kernel::Kernel::builder(app, Box::new(clock.clone()));
         let mut kernel = match build_kernel(builder, outbound) {
             Ok(kernel) => kernel,
             Err(e) => {
@@ -197,8 +197,7 @@ pub fn serve_replicated(
                 return 1;
             }
         };
-        let builder =
-            kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new())).replication(repl);
+        let builder = kernel::Kernel::builder(app, Box::new(clock.clone())).replication(repl);
         let mut kernel = match build_kernel(builder, outbound) {
             Ok(kernel) => kernel,
             Err(e) => {
@@ -246,8 +245,7 @@ pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) ->
     if let Some(notice) = notice {
         eprintln!("charpente replication: {notice}");
     }
-    let builder =
-        kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new())).replication(repl);
+    let builder = kernel::Kernel::builder(app, Box::new(clock.clone())).replication(repl);
     let mut kernel = build_kernel(builder, outbound)?;
     let mut source = EmptySource { clock };
     kernel.run(&mut source)
@@ -296,8 +294,7 @@ pub fn archive(app: App, store: Box<dyn ObjectStore>, cfg: ArchiveConfig) -> io:
     let clock = crate::prod::ProdClock::new();
     let mut app = app;
     let archive = Archive::open(cfg, app.db_mut())?;
-    let builder = kernel::Kernel::builder(app, Box::new(crate::prod::ProdClock::new()))
-        .archive(archive, store);
+    let builder = kernel::Kernel::builder(app, Box::new(clock.clone())).archive(archive, store);
     let mut kernel = build_kernel(builder, outbound)?;
     let mut source = EmptySource { clock };
     kernel.run(&mut source)

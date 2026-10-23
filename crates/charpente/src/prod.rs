@@ -11,11 +11,14 @@ use std::time::Duration;
 
 use charpente_core::io::{
     Clock, Conn, Disk, Entropy, File, Instant, Listener, Net, ObjectDone, ObjectOp, ObjectStore,
+    WallTime,
 };
 
 // ---------------------------------------------------------------- Clock
 
-/// Monotonic time anchored at construction (normally: process start).
+/// Monotonic time anchored at construction (normally: process start), and the
+/// system's UTC time. A clone shares the origin.
+#[derive(Clone)]
 pub struct ProdClock {
     origin: std::time::Instant,
 }
@@ -34,6 +37,13 @@ impl Clock for ProdClock {
         let nanos = u64::try_from(self.origin.elapsed().as_nanos())
             .expect("process uptime exceeds u64 nanos");
         Instant::from_nanos(nanos)
+    }
+
+    fn wall(&self) -> WallTime {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock is before 1970-01-01 — set it before starting charpente");
+        WallTime::from_nanos(u64::try_from(since.as_nanos()).expect("wall time exceeds u64 nanos"))
     }
 
     fn sleep(&self, duration: Duration) {
@@ -1004,6 +1014,16 @@ fn named(e: &io::Error, op: &str, key: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prod_clock_wall_reads_unix_epoch_nanos() {
+        let want = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let got = ProdClock::new().wall().as_nanos();
+        assert!(got.abs_diff(want) < 5_000_000_000, "{got} vs {want}");
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let mut suffix = [0u8; 8];

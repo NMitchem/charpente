@@ -65,7 +65,7 @@ charpente's own nanosecond type — std's is opaque and cannot be fabricated fro
 time.
 
 ```rust
-trait Clock   { fn now(&self) -> Instant; fn sleep(&self, d: Duration); }
+trait Clock   { fn now(&self) -> Instant; fn wall(&self) -> WallTime; fn sleep(&self, d: Duration); }
 trait Entropy { fn fill(&self, buf: &mut [u8]); }
 trait Disk    { fn open(&self, path: &str) -> Result<Box<dyn File>>;
                 fn remove(&self, path: &str) -> Result<()>;
@@ -87,6 +87,12 @@ trait Outbound { fn start(&self, token: u64, call: OutboundCall) -> Result<()>;
                  fn cancel(&self, token: u64);
                  fn next_wake(&self) -> OutboundWake; }                    // sim: At/Never; prod: Unknown
 ```
+
+`Clock` has two readings. `now` is the monotonic `Instant`, process-local, for durations and
+deadlines inside the process; it is never stored (no table codec exists for it) and means
+nothing after a restart. `wall` is `WallTime`, UTC nanoseconds since the Unix epoch, for every
+time that is stored or compared with anything outside the process. Each node builds one
+`ProdClock` and clones it (same origin) to everything that reads time.
 
 The simulator implements all of it with one seed driving: latency distributions, virtual
 time (a simulated year of heartbeats runs in seconds), and the fault matrix — injected

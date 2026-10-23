@@ -13,7 +13,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Clock skew tolerance for `exp`/`nbf`, in nanoseconds (spec §3/§8: 60s).
-pub const JWT_CLOCK_SKEW_NANOS: u64 = 60_000_000_000;
+pub const JWT_CLOCK_SKEW_NANOS: u64 = charpente_core::io::CLOCK_TOLERANCE.as_nanos() as u64;
 
 /// App-mount config (spec §3): the IdP's issuer/audience and its JWKS
 /// document verbatim (`{"keys": [...]}`), parsed once at `from_config`.

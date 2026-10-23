@@ -23,7 +23,7 @@ use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net};
+use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net, WallTime};
 
 use crate::disk::{DiskWorld, FileState, PendingOp, SECTOR};
 use crate::net::{ConnState, ListenerState, NetWorld, host_of, normalize};
@@ -1374,6 +1374,9 @@ impl SimHost {
 
 // ---------------------------------------------------------------- Clock
 
+/// 2026-01-01T00:00:00Z: virtual time zero reads as this wall time.
+pub const SIM_WALL_BASE_NANOS: u64 = 1_767_225_600_000_000_000;
+
 pub struct SimClock {
     world: Arc<World>,
 }
@@ -1381,6 +1384,10 @@ pub struct SimClock {
 impl Clock for SimClock {
     fn now(&self) -> Instant {
         Instant::from_nanos(self.world.lock().now)
+    }
+
+    fn wall(&self) -> WallTime {
+        WallTime::from_nanos(self.world.lock().now + SIM_WALL_BASE_NANOS)
     }
 
     fn sleep(&self, duration: Duration) {
@@ -2602,6 +2609,15 @@ mod tests {
         assert_eq!(sim.now(), Instant::ZERO);
         sim.clock().sleep(Duration::from_secs(3600));
         assert_eq!(sim.now(), Instant::from_nanos(3_600_000_000_000));
+    }
+
+    #[test]
+    fn sim_clock_wall_is_virtual_time_plus_the_base() {
+        let sim = Sim::with_faults(1, FaultConfig::none());
+        let clock = sim.clock();
+        assert_eq!(clock.wall().as_nanos(), SIM_WALL_BASE_NANOS);
+        clock.sleep(Duration::from_secs(3));
+        assert_eq!(clock.wall().as_nanos(), SIM_WALL_BASE_NANOS + 3_000_000_000);
     }
 
     #[test]
