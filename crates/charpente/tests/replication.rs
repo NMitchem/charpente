@@ -7069,7 +7069,7 @@ fn route_promise_scan(
 ///   that node, from any of the three byte-level faults in the property's
 ///   fault model: a `bit_flip` or `misdirected_write`
 ///   (`KNode::corruption_since_wipe`), or the rig's forced CRC flip this
-///   round (`KNode::corrupted_by_rig`). Seed `0x78f5713c6b6cd7cd` pins a
+///   round (`KNode::corrupted_by_rig`). Seed `0x6916df3d6c5c3ac1` pins a
 ///   refusal that only the rig's flip explains: it landed on a sacrificial
 ///   frame the checkpoint had already covered.
 /// - **"log directory gapped by entry loss"** is explained by entry loss on
@@ -7435,7 +7435,7 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
         // recorded on `p`: it is a fault injected on p's disk, and when the
         // sacrificial frame sits at or below the horizon (the checkpoint
         // covered it) recovery refuses p below the horizon because of it
-        // (D3 round 5, seed 0x78f5713c6b6cd7cd at the pinned base).
+        // (D3 round 5, seed 0x6916df3d6c5c3ac1 at the pinned base).
         p.corrupted_by_rig |= forced_cut;
         let forced_cut = forced_cut && corrupt_last_wal_frame(&p.host).is_ok();
         p.host.crash_now();
@@ -7985,8 +7985,9 @@ fn a_spawn_refused_below_the_horizon_gives_up_only_for_corruption_on_its_own_dis
     );
 }
 
-/// D3 round 4 (review I2), seed `0x9827a4c2014d41d4`, found by the review
-/// over its own fresh bases. A restore re-seeds `p` from `f`, and before the
+/// D3 round 4 (review I2), seed `0xc881457d826c1d2c` (re-pinned from
+/// `0x9827a4c2014d41d4` when cron kept its grid, step S2), found by a scan of
+/// the pinned base. A restore re-seeds `p` from `f`, and before the
 /// re-seed converges `p` is refused as diverged behind again. That is the
 /// laggard refusal itself, raised inside the re-seed's own convergence. It
 /// gives up under its own key, `repl:inconclusive:reseed-refused-behind`.
@@ -7994,7 +7995,7 @@ fn a_spawn_refused_below_the_horizon_gives_up_only_for_corruption_on_its_own_dis
 /// would have hidden a refusal no fault explains.
 #[test]
 fn a_reseed_refused_behind_before_it_converges_gives_up_under_its_own_key() {
-    let (sim, r) = replay_above_horizon(0x9827_a4c2_014d_41d4);
+    let (sim, r) = replay_above_horizon(0xc881_457d_826c_1d2c);
     assert_eq!(r, Ok(()), "the universe gives up, it does not fail");
     let reason = sim.gave_up().expect("the universe gives up");
     assert!(
@@ -8064,16 +8065,17 @@ fn fault_a_bystander(sim: &Sim) {
     );
 }
 
-/// D3 round 5, seed `0x78f5713c6b6cd7cd`, a universe of the pinned base. The
+/// D3 round 5, seed `0x6916df3d6c5c3ac1`, a universe of the pinned base (re-pinned
+/// from `0x78f5713c6b6cd7cd` when cron kept its grid, step S2: the old seed's
+/// universe no longer reached this scenario). The
 /// rig's forced CRC flip (`corrupt_last_wal_frame`), one of the property's
 /// three byte-level faults, lands on a sacrificial frame the checkpoint has
-/// already covered, so recovery refuses `p` below the horizon (frame 15 at
-/// horizon 15). No sim fault fires anywhere in this universe, so the rig's
+/// already covered, so recovery refuses `p` below the horizon. No sim fault fires anywhere in this universe, so the rig's
 /// flip is the only explanation in the fault model. It is one, and `p` is
 /// restored.
 #[test]
 fn a_below_horizon_refusal_the_rigs_own_corruption_explains_is_restored() {
-    let (sim, r) = replay_above_horizon(0x78f5_713c_6b6c_d7cd);
+    let (sim, r) = replay_above_horizon(0x6916_df3d_6c5c_3ac1);
     let coverage = sim.coverage();
     assert_eq!(r, Ok(()), "the universe does not fail: {coverage:?}");
     assert_eq!(

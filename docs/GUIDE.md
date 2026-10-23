@@ -2602,7 +2602,7 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 Nothing about a tick is special: `CronRow` (`id`, `#[index] name`,
 `interval_nanos`, `next_due: WallTime`) is a platform-registered row like
 `Session`, and a due tick opens a transaction that reads that row, advances
-`next_due` by one interval, and calls your `make()` job's `tx.enqueue` —
+`next_due` to the schedule's next grid slot, and calls your `make()` job's `tx.enqueue` —
 all committed together. A schedule's phase survives process restarts and
 failovers: `next_due` is wall time, judged against the node's `Clock::wall`,
 and the row is upserted (not reset) at startup — `App::open` only registers
@@ -2614,9 +2614,14 @@ schedule's interval leaves the row as it is, and the next tick writes both.
 
 If the process is down across more than one whole interval — say an
 hourly schedule misses five hours of ticks — the next tick still only
-enqueues **one** job, and `next_due` jumps to `now + interval`: a single
+enqueues **one** job, and `next_due` jumps to the next grid slot after `now`: a single
 step past the present, not five queued catch-up runs for the five missed
 hours. Backfill is a deliberate non-goal.
+
+One rule covers on-time, late and caught-up ticks: `next_due` becomes the next
+slot on the schedule's grid, `next_due + interval * ((now - next_due) /
+interval + 1)`. A tick at 125 s on a 10 s schedule due at 100 s lands on 130 s,
+not 135 s, so lateness never drifts the phase.
 
 ### Clock errors
 

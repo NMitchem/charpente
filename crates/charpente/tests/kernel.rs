@@ -2080,8 +2080,54 @@ fn cron_upsert_ticks_and_catches_up_once() {
         "a tick past a whole missed interval reports catch-up"
     );
     assert_eq!(db.drain_enqueued().len(), 1, "one catch-up tick, not three");
-    assert_eq!(cron.next_deadline(), Some(wall(much_later + HOUR)));
+    assert_eq!(cron.next_deadline(), Some(wall(6 * HOUR)));
     assert!(!cron.has_due(wall(much_later)));
+}
+
+fn tick_at(interval_s: u64, next_due_s: u64, now_s: u64) -> (WallTime, bool) {
+    const S: u64 = 1_000_000_000;
+    let sim = Sim::with_faults(0x632, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp])
+    .schedule("grid", Duration::from_secs(interval_s), || CountUp {
+        slot: 0,
+    });
+    let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
+    let db = app.db_for_tests();
+    // First upsert sets next_due = interval; walk the grid to next_due_s.
+    cron.upsert(db, wall(0)).unwrap();
+    let mut t = interval_s;
+    while t < next_due_s {
+        cron.tick(db, wall(t * S)).unwrap();
+        t += interval_s;
+    }
+    assert_eq!(cron.next_deadline(), Some(wall(next_due_s * S)));
+    let (_, catchup) = cron.tick(db, wall(now_s * S)).unwrap();
+    (cron.next_deadline().unwrap(), catchup)
+}
+
+#[test]
+fn a_late_tick_lands_on_the_next_grid_slot() {
+    let (next, _) = tick_at(10, 100, 125);
+    assert_eq!(next, wall(130_000_000_000));
+}
+
+#[test]
+fn an_on_time_tick_advances_by_exactly_one_interval() {
+    let (next, catchup) = tick_at(10, 100, 100);
+    assert_eq!((next, catchup), (wall(110_000_000_000), false));
+}
+
+#[test]
+fn catch_up_after_many_missed_slots_fires_once_and_stays_on_grid() {
+    let (next, catchup) = tick_at(10, 100, 1000);
+    assert_eq!((next, catchup), (wall(1_010_000_000_000), true));
 }
 
 #[test]

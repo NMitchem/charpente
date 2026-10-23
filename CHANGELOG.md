@@ -13,6 +13,9 @@
   - The fingerprints of the platform tables `Session`, `ApiKey` and `CronRow`, and of the platform job `SessionSweep`, change with their field types.
 - **`CronRow.interval_nanos` is the interval the row's `next_due` was set with.** `CronScheduler::upsert` no longer rewrites it on an existing row; the next tick writes it with `next_due`.
 
+### Changed
+- **Cron keeps its grid.** A tick advances `next_due` to the schedule's next grid slot, `next_due + interval * ((now - next_due) / interval + 1)`, not to `now + interval`, so a late tick no longer drifts the phase. Catch-up still fires once.
+
 ### Added
 - **Wall time never runs backwards within a node.** The kernel holds its wall reading at the latest value it used when the clock steps back by up to `CLOCK_TOLERANCE` (60 s), and stops by name, with both fixes in the text, beyond that. A node opening, whatever its role, or being promoted, is refused by name while its clock is more than the tolerance behind the latest time its data directory recorded (an API key's `created_at`, a schedule's last tick or its creation); a switchover's target completes the hand-off and its kernel stops with the same refusal. See GUIDE §7 "Clock errors".
 

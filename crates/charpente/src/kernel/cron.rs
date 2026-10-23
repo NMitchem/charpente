@@ -127,8 +127,9 @@ impl CronScheduler {
             .expect("tick called with nothing due");
         // A whole interval missed.
         let catchup = now.saturating_duration_since(*cached) >= entry.interval;
-        let next = now + entry.interval; // catch-up fires once: jump past now
         let interval = nanos(entry.interval, entry.name);
+        // Catch-up fires once, then the next slot on the grid, never now + interval.
+        let next = next_slot(*cached, now, interval, entry.name);
         let name = entry.name;
         let enqueue = &entry.enqueue;
         group
@@ -222,6 +223,29 @@ impl CronScheduler {
     }
 }
 
+/// `interval` must be the value the same put writes to `interval_nanos`: the
+/// open-time floor is `next_due - interval_nanos`, which must stay <= `now`.
+fn next_slot(next_due: WallTime, now: WallTime, interval: u64, name: &'static str) -> WallTime {
+    let (due, now) = (next_due.as_nanos(), now.as_nanos());
+    assert!(
+        interval > 0 && now >= due,
+        "cron schedule \"{name}\": tick before due"
+    );
+    let next = (now - due)
+        .div_euclid(interval)
+        .checked_add(1)
+        .and_then(|k| k.checked_mul(interval))
+        .and_then(|d| d.checked_add(due))
+        .unwrap_or_else(|| {
+            panic!("cron schedule \"{name}\": next slot after {due}ns overflows u64 nanos")
+        });
+    assert!(
+        next > now && next - interval <= now,
+        "cron schedule \"{name}\": slot off grid"
+    );
+    WallTime::from_nanos(next)
+}
+
 fn nanos(d: Duration, name: &'static str) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or_else(|_| {
         panic!(
@@ -234,6 +258,21 @@ fn nanos(d: Duration, name: &'static str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_slot_stays_on_grid_and_floor_holds_after_an_interval_change() {
+        const S: u64 = 1_000_000_000;
+        let w = |s: u64| WallTime::from_nanos(s * S);
+        assert_eq!(next_slot(w(100), w(125), 10 * S, "t"), w(130));
+        assert_eq!(next_slot(w(100), w(100), 10 * S, "t"), w(110));
+        assert_eq!(next_slot(w(100), w(1000), 10 * S, "t"), w(1010));
+        // Row stored 10s, entry now 2s: the put writes 2s, so the floor
+        // next - 2s is <= the tick's now.
+        let next = next_slot(w(100), w(125), 2 * S, "t");
+        assert_eq!(next, w(126));
+        assert!(next.as_nanos() - 2 * S <= w(125).as_nanos());
+    }
+
     use crate::{DbConfig, Schema};
     use charpente_core::io::{Disk, File};
     use charpente_sim::{FaultConfig, Sim};
@@ -426,13 +465,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             alpha.next_due,
-            now + alpha_interval,
-            "alpha's row must advance by alpha's OWN interval, not beta's"
+            WallTime::from_nanos(5_000_000_000),
+            "alpha's row must advance to its OWN next grid slot (cache 0, 5s grid), not beta's"
         );
         assert_eq!(
             beta.next_due,
-            now + beta_interval,
-            "beta's row must advance by beta's OWN interval, not alpha's"
+            WallTime::from_nanos(9_000_000_000),
+            "beta's row must advance to its OWN next grid slot (cache 0, 9s grid), not alpha's"
         );
         // (c) both enqueues landed.
         assert!(

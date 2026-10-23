@@ -1779,7 +1779,7 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   enqueues through the normal path — on a bare `Tx`, so a schedule takes `global` jobs
   only; a sweep that acts per tenant is a `global, cross_tenant` job that fans out with
   `enqueue_in` — a recurring enqueuer, inheriting retry and
-  observability for free. Catch-up fires once per wake, never backfills. In simulation,
+  observability for free. A tick advances `next_due` to the schedule's next grid slot (`next_due + interval * ((now - next_due) / interval + 1)`), so lateness never drifts its phase; catch-up fires once per wake, never backfills. In simulation,
   virtual time makes "run this monthly job 120 times" a subsecond test.
 - **Realtime.** `tx.emit(event)`/`tx.emit_keyed(key, event)` writes a typed event into the
   committing log record alongside the transaction's other effects — `key` is an opaque
