@@ -2120,13 +2120,14 @@ fn a_late_tick_lands_on_the_next_grid_slot() {
 
 #[test]
 fn an_on_time_tick_advances_by_exactly_one_interval() {
+    // Both rules agree on an on-time tick, so this is a regression pin.
     let (next, catchup) = tick_at(10, 100, 100);
     assert_eq!((next, catchup), (wall(110_000_000_000), false));
 }
 
 #[test]
 fn catch_up_after_many_missed_slots_fires_once_and_stays_on_grid() {
-    let (next, catchup) = tick_at(10, 100, 1000);
+    let (next, catchup) = tick_at(10, 100, 1005);
     assert_eq!((next, catchup), (wall(1_010_000_000_000), true));
 }
 

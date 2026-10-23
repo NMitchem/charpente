@@ -247,6 +247,10 @@ fn next_slot(next_due: WallTime, now: WallTime, interval: u64, name: &'static st
 }
 
 fn nanos(d: Duration, name: &'static str) -> u64 {
+    assert!(
+        !d.is_zero(),
+        "cron schedule \"{name}\": interval is zero — a schedule needs an interval of at least 1ns; pick the period it should run at"
+    );
     u64::try_from(d.as_nanos()).unwrap_or_else(|_| {
         panic!(
             "cron schedule \"{name}\": interval {d:?} exceeds u64 nanos (~584 years) — \
@@ -258,6 +262,14 @@ fn nanos(d: Duration, name: &'static str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(
+        expected = "cron schedule \"z\": interval is zero — a schedule needs an interval of at least 1ns; pick the period it should run at"
+    )]
+    fn a_zero_interval_is_refused_by_name() {
+        nanos(Duration::ZERO, "z");
+    }
 
     #[test]
     fn next_slot_stays_on_grid_and_floor_holds_after_an_interval_change() {

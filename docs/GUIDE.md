@@ -2508,6 +2508,10 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 }
 ```
 
+A zero interval panics the same way, at kernel startup, with `"cron schedule
+\"<name>\": interval is zero — a schedule needs an interval of at least 1ns; pick
+the period it should run at"`.
+
 An interval that overflows u64 nanoseconds (~584 years — not a realistic
 schedule, but checked) panics too, with `"cron schedule \"<name>\":
 interval <duration> exceeds u64 nanos (~584 years) — pick a smaller
