@@ -83,11 +83,12 @@ fn a_schedule_ticks_within_an_interval_after_a_restart() {
     );
     node.kill9(&mut scenario);
     node.restart(&mut scenario).expect("restart");
+    let base = ticks(&mut http, &dir);
     sleep(Duration::from_millis(2500));
     let after = ticks(&mut http, &dir);
     assert!(
-        after > before,
-        "the 1 s schedule did not tick within 2.5 s of a restart: {before} before, {after} after (artifacts: {dir})"
+        after > base,
+        "the 1 s schedule did not tick within 2.5 s of a restart: {base} at restart, {after} after (artifacts: {dir})"
     );
 }
 
@@ -127,24 +128,17 @@ fn an_oidc_token_is_judged_on_unix_time() {
 
     http.set_bearer(clock_fixture::mint_jwt(now - 3600, None));
     let expired = http.get("/me").expect("GET /me, expired token");
-    let body = String::from_utf8_lossy(&expired.body).into_owned();
-    assert_eq!(
-        (
-            expired.status,
-            body.contains(
-                "OIDC token expired — its \"exp\" claim is in the past; obtain a new one"
-            )
-        ),
-        (401, true),
-        "a token whose exp is an hour ago: {} {body:?} (artifacts: {dir})",
-        expired.status
-    );
-
+    let expired_body = String::from_utf8_lossy(&expired.body).into_owned();
     http.set_bearer(clock_fixture::mint_jwt(now + 3600, Some(now - 60)));
     let ok = http.get("/me").expect("GET /me, valid token");
-    let body = String::from_utf8_lossy(&ok.body).into_owned();
+    let ok_body = String::from_utf8_lossy(&ok.body).into_owned();
+    let expired_msg = expired_body
+        .contains("OIDC token expired — its \"exp\" claim is in the past; obtain a new one");
     assert_eq!(
-        ok.status, 200,
-        "a token valid from a minute ago for an hour: {body:?} (artifacts: {dir})"
+        ((expired.status, expired_msg), ok.status),
+        ((401, true), 200),
+        "exp an hour ago: {} {expired_body:?}; exp in an hour, nbf a minute ago: {} {ok_body:?} (artifacts: {dir})",
+        expired.status,
+        ok.status
     );
 }
