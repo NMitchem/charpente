@@ -14,7 +14,7 @@
 - **`CronRow.interval_nanos` is the interval the row's `next_due` was set with.** `CronScheduler::upsert` no longer rewrites it on an existing row; the next tick writes it with `next_due`.
 
 ### Added
-- **Wall time never runs backwards within a node.** The kernel holds its wall reading at the latest value it used when the clock steps back by up to `CLOCK_TOLERANCE` (60 s), and stops by name, with both fixes in the text, beyond that. A node opening as a single node or a primary, or being promoted, is refused by name while its clock is more than the tolerance behind the latest time its data directory recorded (an API key's `created_at`, a schedule's last tick); a switchover's target completes the hand-off and its kernel stops with the same refusal. See GUIDE §7 "Clock errors".
+- **Wall time never runs backwards within a node.** The kernel holds its wall reading at the latest value it used when the clock steps back by up to `CLOCK_TOLERANCE` (60 s), and stops by name, with both fixes in the text, beyond that. A node opening, whatever its role, or being promoted, is refused by name while its clock is more than the tolerance behind the latest time its data directory recorded (an API key's `created_at`, a schedule's last tick or its creation); a switchover's target completes the hand-off and its kernel stops with the same refusal. See GUIDE §7 "Clock errors".
 
 ### Fixed
 - Production time was process uptime, so after a restart or failover cron stalled until uptime caught up, sessions outlived their TTL, an expired OIDC token was accepted and any token with nbf was refused. Every stored or compared time is now wall-clock time (WallTime).

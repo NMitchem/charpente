@@ -12069,3 +12069,59 @@ fn a_witness_gated_primary_far_behind_its_store_refuses_to_open() {
          will open after 2026-10-22T03:03:05.123Z."
     );
 }
+
+/// Spec §5 B (controller ruling R4): opening is checked for every role. A
+/// follower judges session expiry on reads with its own wall clock, so one far
+/// behind the data it holds is refused at open with `open` in the text, as a
+/// primary is; within the tolerance it opens.
+#[test]
+fn a_follower_far_behind_its_store_refuses_to_open_by_name() {
+    let sim = Sim::with_faults(0x5C10_0205, FaultConfig::none());
+    let primary = WallTime::from_nanos(PRIMARY_WALL);
+    let mut p = clocked_knode(&sim, "p", primary_cfg("p:1"), primary);
+    let mut f = clocked_knode(&sim, "f", follower_cfg("f:1", "p:1"), primary);
+    let (status, _) = drive_request(
+        &sim,
+        &mut [&mut p, &mut f],
+        0,
+        Request::new(Method::Post, "/clock-key"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200, "the primary mints a key at its wall time");
+    krun_until(&sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
+    let app = f.kernel.take().unwrap().into_app();
+    f.host.restart();
+    drop(app);
+    let cfg = follower_cfg("f:1", "p:1");
+    let err = match clocked_kernel(
+        &sim,
+        &f.host,
+        &cfg,
+        primary.saturating_sub(Duration::from_secs(120)),
+    ) {
+        Ok(_) => panic!("a follower 120s behind its store opened"),
+        Err(e) => e,
+    };
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "a named refusal: {err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "refusing to open: this node's wall clock reads 2026-10-22T03:02:05.123Z, 120s behind \
+         2026-10-22T03:04:05.123Z, the latest time this data directory recorded — more than \
+         the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if \
+         the clock is right, the recorded time came from a clock that ran ahead, and the node \
+         will open after 2026-10-22T03:03:05.123Z."
+    );
+    f.host.restart();
+    if let Err(e) = clocked_kernel(
+        &sim,
+        &f.host,
+        &cfg,
+        primary.saturating_sub(Duration::from_secs(30)),
+    ) {
+        panic!("a follower 30s behind its store was refused: {e}");
+    }
+}

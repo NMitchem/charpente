@@ -2633,13 +2633,14 @@ a tick by at most the tolerance, never silently by a year:
 clock went backwards: this node's wall clock reads <wall>, <gap> behind <held>, the latest time it already used — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather than extend sessions or delay schedules by that much. Fix the system clock (check NTP) and restart; if the clock is right, the earlier reading came from a clock that ran ahead, and the node runs again after <held minus 60s>.
 ```
 
-A restart starts the hold over, so the same check runs whenever a node becomes
-writable: when it opens as a single node or a primary (a primary held write-gated
-by its witnesses included), and at a promote. The node recovers the latest wall
-time its data directory recorded from times it already stores: the newest API
-key's `created_at`, and each schedule's last tick, `next_due - interval_nanos`.
-It refuses while its clock is more than the tolerance behind that time, and
-otherwise starts its hold there:
+A restart starts the hold over, so the same check runs whenever a node opens,
+whatever its role (a follower judges session expiry on reads with its own clock,
+and a primary held write-gated by its witnesses is opening too), and at a
+promote. The node recovers the latest wall time its data directory recorded from
+times it already stores: the newest API key's `created_at`, and each schedule's
+`next_due - interval_nanos`, which is the time of its last tick or, before any,
+of the open that created it. It refuses while its clock is more than the
+tolerance behind that time, and otherwise starts its hold there:
 
 <!-- pinned -->
 ```text
@@ -2652,8 +2653,8 @@ node stays a follower. A switchover's target cannot refuse the hand-off (§10:
 once sent, there is no abort), so the switchover completes and the target's
 kernel stops with `promote` in the text. No flag skips either check.
 
-The recorded time is a lower bound, as recent as the last key minted or the
-last tick (the built-in session sweep ticks daily). A clock behind true time by
+The recorded time is a lower bound, as recent as the last key minted or a
+schedule's last tick or creation (the built-in session sweep ticks daily). A clock behind true time by
 less than the time since then, plus the tolerance, opens unnoticed, and that is
 also how long a session that expired just before a restart or a failover can
 resolve again.

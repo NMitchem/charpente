@@ -181,6 +181,21 @@ mod tests {
     }
 
     #[test]
+    fn a_seed_below_the_hold_never_lowers_it() {
+        let sim = Sim::with_faults(0x5C10_0004, FaultConfig::none());
+        let (clock, steer) = SteeredClock::new(sim.clock(), secs(100));
+        let mut hold = WallHold::new();
+        hold.read(&clock).unwrap();
+        hold.seed(secs(50));
+        steer.set(secs(45));
+        assert_eq!(
+            hold.read(&clock).unwrap(),
+            secs(100),
+            "a floor below the held time leaves the hold where it was"
+        );
+    }
+
+    #[test]
     fn a_step_back_beyond_tolerance_stops_by_name() {
         let sim = Sim::with_faults(0x5C10_0002, FaultConfig::none());
         let (clock, steer) = SteeredClock::new(sim.clock(), secs(100));

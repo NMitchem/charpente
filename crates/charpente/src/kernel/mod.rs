@@ -270,10 +270,10 @@ impl Kernel {
     /// single-node constructor — no replication. On a writable node it first
     /// refuses — an `io::Error` carrying a `Refusal` — while any Pending job
     /// of a mounted type was enqueued under another shape
-    /// (`Db::pending_job_shape_refusal`). A node opening as a single node or
-    /// a primary also refuses while its wall clock is more than
-    /// `CLOCK_TOLERANCE` behind the latest time its data directory recorded
-    /// (GUIDE §7 "Clock errors"). Every constructor also refuses, by
+    /// (`Db::pending_job_shape_refusal`). Every node, follower included,
+    /// also refuses while its wall clock is more than `CLOCK_TOLERANCE`
+    /// behind the latest time its data directory recorded (GUIDE §7 "Clock
+    /// errors"). Every constructor also refuses, by
     /// name, an app that mounts an outbound job when no `Outbound` was given,
     /// and a `Host` set that does not match the hosts its jobs call (R9).
     pub fn new(app: App, clock: Box<dyn Clock>) -> io::Result<Kernel> {
@@ -332,17 +332,13 @@ impl Kernel {
         let mut dispatcher = Dispatcher::new(defs).with_outbound(hosts, max_in_flight);
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let was_writable = app.db_mut().writes_allowed();
-        // A node opening as a single node or a primary (a witness-gated one
-        // too: it is opening, not being promoted) checks its wall clock
-        // against the latest time its data directory recorded. A follower's
-        // check is at promote.
+        // Every node checks its wall clock at open against the latest time
+        // its data directory recorded: a follower judges session expiry on
+        // reads with its own clock, and a witness-gated primary is opening,
+        // not being promoted.
         let mut hold = WallHold::new();
-        let wall = if repl.as_ref().is_none_or(Repl::is_primary) {
-            let floor = recorded_wall_floor(&app.db().snapshot()?)?;
-            hold.start(&*clock, floor, "open")?
-        } else {
-            hold.read(&*clock)?
-        };
+        let floor = recorded_wall_floor(&app.db().snapshot()?)?;
+        let wall = hold.start(&*clock, floor, "open")?;
         // `cron.upsert` writes the schedule rows — skip it whenever the write
         // gate is shut (its transaction would be refused, and on a follower
         // the rows arrive by replication anyway); `after_repl_step` re-runs it
@@ -1245,9 +1241,10 @@ impl Kernel {
             // Only a hand-off's target can be refused here: a promote was
             // checked in `do_promote` before its durable flip, and a node that
             // opened as a primary was checked at open and has held at or above
-            // its floor since. The hand-off is the primary's point of no
-            // return, so its target stops here by name instead. Read before
-            // `upsert` writes this node's schedules.
+            // its floor since, while a follower's floor rose with every record
+            // it applied. The hand-off is the primary's point of no return, so
+            // its target stops here by name instead. Read before `upsert`
+            // writes this node's schedules.
             let floor = recorded_wall_floor(&self.app.db().snapshot()?)?;
             let wall = self.hold.start(&*self.clock, floor, "promote")?;
             self.cron.upsert(self.app.db_mut(), wall)?;
