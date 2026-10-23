@@ -130,6 +130,10 @@ is not a limitation. It is the moat.
 - **Feature flags for determinism.** There is no "fast mode" that bypasses the log, no
   escape hatch that awaits the network mid-transaction. The guarantees are the product;
   optional guarantees are no guarantees.
+- **A compatibility layer.** When charpente's own API or formats change, they change in
+  place: the break arrives as a compile error or a named refusal that says what to do, which
+  an agent acts on in seconds. Parallel old and new APIs, and migrations of charpente's own
+  stored formats between releases, are what that would cost instead.
 
 ## 9. The wager
 

@@ -1325,8 +1325,10 @@ after every table has landed.
   primary failure (external arbiter or manual, v1 — consensus-elected promotion can come
   later *without* changing the data plane, because the log format is the contract).
 - **Stance (fixed):** one primary, no sharding, no multi-master. See MANIFESTO §7.
-- **Deploy:** one binary + one data directory. Upgrades: new binary replays/attaches to the
-  same log (schema versions in-log make this well-defined).
+- **Deploy:** one binary + one data directory. An app's new binary replays and attaches to
+  the same log across the app's own deploys (schema versions in-log make this well-defined).
+  Across charpente minors there is no migration: a node refuses a data directory, peer or
+  archive bucket written by another minor, by name (DECISIONS §15).
 - **Backup (M2, built):** log segments + periodic snapshot to object storage,
   Litestream-style, built in — not an add-on. Two distinct things exist and stay distinct.
   `serve::backup` (`crates/charpente/src/serve.rs`) is a replication-only node with no HTTP

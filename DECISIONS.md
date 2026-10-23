@@ -431,3 +431,21 @@ WAL, and storing a reply rebuilds `settle` anyway. **Keys are platform-minted** 
 collide across the DECISIONS §6 loss window's diverged timelines. Reopen if: an app needs
 an effect whose request cannot be decided from committed state plus its payload, or a
 protocol that is not request/response.
+
+## 15. charpente's own APIs and formats change in place (2026-10-22)
+
+Noah, 2026-10-22: "Nothing needs to be backwards compatible. The goal for charpente is the
+manifesto, not backwards compatibility." So when charpente's own API, output, JSON, on-disk
+format or wire protocol changes, it changes in place and the minor version bumps. The break
+arrives as a compile error that names the fix, or as a named refusal (hard rule 5): a node
+refuses a data directory, a replication peer or an archive bucket written by another
+charpente minor, saying what to do, and never converts it. The scope is charpente's own
+formats across charpente releases. An app's own data across the app's own deploys stays
+guaranteed (`migrate_schema`, payload shapes, the upgrade barrier, §5's "log-replay
+upgrades"), because it is the user's data. Rejected: **semver-compatible parallel APIs** (an
+additive method beside the one it replaces, private types so a public struct never gains a
+field), because an agent fixes a compile error that names its fix in seconds and every
+parallel API is a second surface to keep true; and **migrations of platform state between
+releases**, because each one is a code path that runs once per adopter, under no oracle the
+sim exercises daily. Reopen if: an adopter's data cannot be re-created from its own source of
+truth and must cross a charpente minor.
