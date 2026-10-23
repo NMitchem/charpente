@@ -31,6 +31,12 @@ pub mod serve;
 pub mod tenant;
 pub mod wire;
 
+/// What the unit tests share with `tests/`: included once, here, for every
+/// module's tests.
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
 pub use launch::launch;
 // Re-exported at the root as public API, the same flat-path convention
 // `Wire` (from `charpente-macros`) already gets. The macros' output names

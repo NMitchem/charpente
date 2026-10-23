@@ -1036,11 +1036,21 @@ The first fires when an `auth` route saw no credential; the second for a
 bearer/cookie that matched no live row (garbage, revoked, or a JWT-shaped
 bearer with no OIDC configured); the third for a session past its TTL. Expiry
 is judged on wall time: `expires_at` is a `WallTime` (UTC nanoseconds since the
-Unix epoch, `charpente::core::io::WallTime`), and each request's `now` is the
-node's `Clock::wall` reading, so a TTL means the same thing after a restart or
-a failover as before it. Expiry is *lazy*: a row is invisible the moment `now`
-passes `expires_at` — a built-in daily cron sweeps the dead rows for hygiene,
-but resolution never waits on it.
+Unix epoch, `charpente::core::io::WallTime`), and under the kernel each
+request's `now` is the node's `Clock::wall` reading, held so that it never runs
+backwards (§7, "Clock errors"). So a TTL means the same thing after a restart or
+a failover as before it, within one bound: a session that expired just before a
+restart or a failover can resolve again for at most `CLOCK_TOLERANCE` (60 s)
+plus the time since the data directory last recorded a time, and never when the
+clocks are right. Expiry is *lazy*: a row is invisible the moment `now` passes
+`expires_at` — a built-in daily cron sweeps the dead rows for hygiene, but
+resolution never waits on it.
+
+`App::handle` is the one seam outside the kernel's clock: it judges at
+`WallTime::UNIX_EPOCH`, so a session it mints expires `session_ttl` after 1970
+and reads as expired the moment a kernel presents it. When a kernel will present
+the credential, mint it through the kernel, or call `app.handle_at(request,
+clock.wall())` with the node's clock.
 
 ```rust
 use charpente::auth::{ApiKey, Via};
@@ -2596,7 +2606,9 @@ Nothing about a tick is special: `CronRow` (`id`, `#[index] name`,
 all committed together. A schedule's phase survives process restarts and
 failovers: `next_due` is wall time, judged against the node's `Clock::wall`,
 and the row is upserted (not reset) at startup — `App::open` only registers
-the table; the upsert itself happens when the kernel starts.
+the table; the upsert itself happens when the kernel starts. `interval_nanos`
+is the interval the row's `next_due` was set with: a deploy that changes a
+schedule's interval leaves the row as it is, and the next tick writes both.
 
 ### Catch-up fires once, never backfills
 
@@ -2605,6 +2617,46 @@ hourly schedule misses five hours of ticks — the next tick still only
 enqueues **one** job, and `next_due` jumps to `now + interval`: a single
 step past the present, not five queued catch-up runs for the five missed
 hours. Backfill is a deliberate non-goal.
+
+### Clock errors
+
+The wall time the kernel hands out (each request's `now`, a tick's, a retry's
+`due_at`) never runs backwards within a node. When the system clock steps back,
+the reading holds at the latest value already used, for as far back as
+`CLOCK_TOLERANCE` (60 s, `charpente::core::io::CLOCK_TOLERANCE`, the skew OIDC
+already allows). A clock that falls further behind stops the node by name, and a
+stopped kernel ends the process. So a clock error can extend a session or delay
+a tick by at most the tolerance, never silently by a year:
+
+<!-- pinned -->
+```text
+clock went backwards: this node's wall clock reads <wall>, <gap> behind <held>, the latest time it already used — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather than extend sessions or delay schedules by that much. Fix the system clock (check NTP) and restart; if the clock is right, the earlier reading came from a clock that ran ahead, and the node runs again after <held minus 60s>.
+```
+
+A restart starts the hold over, so the same check runs whenever a node becomes
+writable: when it opens as a single node or a primary (a primary held write-gated
+by its witnesses included), and at a promote. The node recovers the latest wall
+time its data directory recorded from times it already stores: the newest API
+key's `created_at`, and each schedule's last tick, `next_due - interval_nanos`.
+It refuses while its clock is more than the tolerance behind that time, and
+otherwise starts its hold there:
+
+<!-- pinned -->
+```text
+refusing to <verb>: this node's wall clock reads <wall>, <gap> behind <floor>, the latest time this data directory recorded — more than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if the clock is right, the recorded time came from a clock that ran ahead, and the node will <verb> after <floor minus 60s>.
+```
+
+`<verb>` is `open` or `promote`. At open the refusal stops the kernel. A refused
+promote answers `CtrlErr` with the text before the durable role flip, so the
+node stays a follower. A switchover's target cannot refuse the hand-off (§10:
+once sent, there is no abort), so the switchover completes and the target's
+kernel stops with `promote` in the text. No flag skips either check.
+
+The recorded time is a lower bound, as recent as the last key minted or the
+last tick (the built-in session sweep ticks daily). A clock behind true time by
+less than the time since then, plus the tolerance, opens unnoticed, and that is
+also how long a session that expired just before a restart or a failover can
+resolve again.
 
 ### Virtual time in tests
 
@@ -5027,6 +5079,14 @@ role file:
   shows it holds them by acking them, or, when it reconnects already caught up,
   by the position its `Hello` carries. If the target cannot catch up before the
   deadline, the switchover aborts and the primary resumes.
+
+**A clock behind the data.** The node that becomes primary checks its wall clock
+against the latest time its data directory recorded (§7, "Clock errors"). More
+than 60 s behind, a `promote` answers `CtrlErr` with `refusing to promote: …` and
+the node stays a follower; a switchover's target completes the hand-off, and its
+kernel then stops with the same text. A follower within 60 s of that time
+promotes, and the wall time it hands out starts at the recorded time rather than
+at its own clock's.
 
 **Calls in flight at a failover.** The kernel's in-flight table of outbound calls lives in
 memory and is dropped when the primary stops. The new primary finds each unfinished

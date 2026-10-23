@@ -60,10 +60,12 @@ impl CronScheduler {
                 CronRow::by_name(&snap, &entry.name.to_string())?.pop()
             };
             let row = match existing {
-                Some(mut row) => {
-                    row.interval_nanos = interval;
-                    row
-                }
+                // The row keeps the interval its `next_due` was set with until
+                // the next tick sets both, so `next_due - interval_nanos` stays
+                // a time this store saw (the wall floor, kernel/clock.rs) when
+                // a deploy shortens the interval. It is still written: every
+                // open has always logged this put.
+                Some(row) => row,
                 None => {
                     let snap = db.snapshot()?;
                     let next_id = snap.scan::<CronRow>()?.last().map_or(0, |r| r.id.raw() + 1);
@@ -126,6 +128,7 @@ impl CronScheduler {
         // A whole interval missed.
         let catchup = now.saturating_duration_since(*cached) >= entry.interval;
         let next = now + entry.interval; // catch-up fires once: jump past now
+        let interval = nanos(entry.interval, entry.name);
         let name = entry.name;
         let enqueue = &entry.enqueue;
         group
@@ -134,6 +137,7 @@ impl CronScheduler {
                     .pop()
                     .unwrap_or_else(|| panic!("cron invariant: schedule \"{name}\" has no row"));
                 row.next_due = next;
+                row.interval_nanos = interval;
                 tx.put(&row);
                 enqueue(tx, now);
                 Ok::<(), io::Error>(())

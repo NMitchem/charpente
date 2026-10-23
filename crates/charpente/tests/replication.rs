@@ -11780,3 +11780,292 @@ fn a_follower_applies_shipped_outbound_enqueues_with_the_primary_s_keys() {
     };
     assert_eq!(raw(&f), raw(&p), "and the whole job rows, as stored");
 }
+
+// ============================================================ clock floor
+//
+// 0.3.0 spec §5 B at promote: a node never hands out a wall time more than
+// `CLOCK_TOLERANCE` behind one its data directory already recorded. A promote
+// is refused before the durable role flip (amendment A1's reason: a refused
+// promote leaves a follower); a hand-off, the primary's point of no return,
+// completes, and the target's kernel stops by name instead.
+
+mod support;
+use charpente::http::Ctx;
+use charpente_core::io::WallTime;
+use support::SteeredClock;
+
+#[route(POST "/clock-key", public)]
+fn clock_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_api_key(tx, "alice"))
+}
+
+#[route(POST "/clock-login", public)]
+fn clock_login(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_session(tx, "bob"))
+}
+
+/// Where the primary's wall clock stands: 2026-10-22T03:04:05.123Z.
+const PRIMARY_WALL: u64 = 1_792_638_245_123_000_000;
+
+const CLOCK_TTL: u64 = 3_600_000_000_000;
+
+/// A replicated kernel on `h` whose wall clock stands at `wall`; virtual
+/// time still drives its deadlines.
+fn clocked_kernel(sim: &Sim, h: &SimHost, cfg: &ReplConfig, wall: WallTime) -> io::Result<Kernel> {
+    let mut app = App::open(
+        Box::new(h.disk()),
+        Schema::new(),
+        Box::new(h.entropy()),
+        AppConfig {
+            session_ttl: CLOCK_TTL,
+            ..AppConfig::default()
+        },
+    )?
+    .mount(routes![clock_key, clock_login]);
+    let (repl, _) = Repl::open(
+        Box::new(h.net()),
+        Box::new(h.disk()),
+        cfg.clone(),
+        app.db_for_tests(),
+    )?;
+    let (clock, _) = SteeredClock::new(sim.clock(), wall);
+    Kernel::with_replication(app, Box::new(clock), repl)
+}
+
+fn clocked_knode(sim: &Sim, host: &str, cfg: ReplConfig, wall: WallTime) -> KNode {
+    let h = sim.host(host);
+    let kernel = clocked_kernel(sim, &h, &cfg, wall).unwrap();
+    let source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    let responses = source.responses();
+    KNode {
+        host: h,
+        kernel: Some(kernel),
+        source,
+        responses,
+        name: host.to_string(),
+        repl_cfg: cfg,
+        db_cfg: DbConfig::default(),
+        schema: Schema::new(),
+        recoveries: 0,
+        flipped: false,
+        recoverable: false,
+        corrupted_by_rig: false,
+        corruption_at_wipe: 0,
+        entry_loss_at_wipe: 0,
+    }
+}
+
+/// A primary at `PRIMARY_WALL` that minted a key, a follower at `follower`
+/// that holds it, and the primary crashed.
+fn a_follower_behind(seed: u64, follower: WallTime) -> (Sim, KNode) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let primary = WallTime::from_nanos(PRIMARY_WALL);
+    let mut p = clocked_knode(&sim, "p", primary_cfg("p:1"), primary);
+    let mut f = clocked_knode(&sim, "f", follower_cfg("f:1", "p:1"), follower);
+    let (status, _) = drive_request(
+        &sim,
+        &mut [&mut p, &mut f],
+        0,
+        Request::new(Method::Post, "/clock-key"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200, "the primary mints a key at its wall time");
+    krun_until(&sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
+    p.host.crash_now();
+    (sim, f)
+}
+
+fn kpromote(sim: &Sim, f: &mut KNode) -> Msg {
+    f.flipped = true;
+    let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    drive_ctrl_kernel(sim, &mut [f], &mut cli, CONVERGE_BUDGET).unwrap()
+}
+
+/// Review focus 2: a follower 30s behind the primary is within the
+/// tolerance, so it promotes, and the wall time it hands out holds at the
+/// latest time the primary recorded rather than at its own clock's.
+#[test]
+fn a_follower_within_tolerance_promotes() {
+    let primary = WallTime::from_nanos(PRIMARY_WALL);
+    let (sim, mut f) =
+        a_follower_behind(0x5C10_0201, primary.saturating_sub(Duration::from_secs(30)));
+    let reply = kpromote(&sim, &mut f);
+    assert!(matches!(reply, Msg::CtrlOk { .. }), "promotes: {reply:?}");
+    let (status, _) = drive_request(
+        &sim,
+        &mut [&mut f],
+        0,
+        Request::new(Method::Post, "/clock-login"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200, "the new primary serves a write");
+    let sessions = f
+        .kernel
+        .as_ref()
+        .unwrap()
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan::<Session>()
+        .unwrap();
+    assert!(
+        sessions[0].expires_at >= primary + Duration::from_nanos(CLOCK_TTL),
+        "the session expires at {}, before {primary} plus its one-hour TTL: the promoted node \
+         handed out its own clock's reading, 30s behind a time the store already recorded",
+        sessions[0].expires_at
+    );
+}
+
+/// 120s behind is beyond the tolerance: the promote is refused by name before
+/// the durable role flip, and the node stays a follower.
+#[test]
+fn a_follower_far_behind_refuses_to_promote_by_name() {
+    let primary = WallTime::from_nanos(PRIMARY_WALL);
+    let (sim, mut f) = a_follower_behind(
+        0x5C10_0202,
+        primary.saturating_sub(Duration::from_secs(120)),
+    );
+    match kpromote(&sim, &mut f) {
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            "refusing to promote: this node's wall clock reads 2026-10-22T03:02:05.123Z, 120s \
+             behind 2026-10-22T03:04:05.123Z, the latest time this data directory recorded — \
+             more than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock \
+             (check NTP); if the clock is right, the recorded time came from a clock that ran \
+             ahead, and the node will promote after 2026-10-22T03:03:05.123Z."
+        ),
+        other => panic!("expected CtrlErr, got {other:?}"),
+    }
+    let kernel = f.kernel.as_ref().unwrap();
+    assert!(!kernel.is_primary(), "still a follower in memory");
+    assert!(!kernel.app().db().writes_allowed(), "and not writable");
+    let (durable, _) = charpente::repl::role::load_role(&f.host.disk(), &Role::Primary).unwrap();
+    assert!(
+        matches!(durable, Role::Follower { .. }),
+        "and still a follower on disk"
+    );
+}
+
+/// The hand-off is the primary's point of no return (DESIGN §5), so a target
+/// far behind is not refused there: the switchover completes, and the
+/// target's kernel stops by name the moment its write gate opens.
+#[test]
+fn a_switchover_onto_a_follower_far_behind_completes_and_the_target_stops_by_name() {
+    let sim = Sim::with_faults(0x5C10_0203, FaultConfig::none());
+    let primary = WallTime::from_nanos(PRIMARY_WALL);
+    let mut p = clocked_knode(&sim, "p", primary_cfg("p:1"), primary);
+    let mut f = clocked_knode(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        primary.saturating_sub(Duration::from_secs(120)),
+    );
+    let (status, _) = drive_request(
+        &sim,
+        &mut [&mut p, &mut f],
+        0,
+        Request::new(Method::Post, "/clock-key"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    krun_until(&sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let mut refused: Option<io::Error> = None;
+    let mut reply = None;
+    for _ in 0..CONVERGE_BUDGET {
+        let mut worked = false;
+        let mut deadlines = Vec::new();
+        for (node, is_target) in [(&mut p, false), (&mut f, true)] {
+            if is_target && refused.is_some() {
+                continue;
+            }
+            match node.kernel.as_mut().unwrap().step(&mut node.source) {
+                Ok(Step::Worked) => worked = true,
+                Ok(Step::Idle { deadline }) => deadlines.extend(deadline.map(|d| d.as_nanos())),
+                Err(e) if is_target => refused = Some(e),
+                Err(e) => panic!("the old primary's kernel stopped: {e}"),
+            }
+        }
+        if let Some(msg) = cli.poll().unwrap() {
+            reply = Some(msg);
+            break;
+        }
+        if !worked {
+            let now = sim.now().as_nanos();
+            let next = deadlines
+                .into_iter()
+                .chain(sim.next_wakeup())
+                .filter(|&d| d > now)
+                .min()
+                .expect("quiescent before the switchover's reply");
+            sim.clock().sleep(Duration::from_nanos(next - now));
+        }
+    }
+    assert!(
+        matches!(reply, Some(Msg::CtrlOk { .. })),
+        "the switchover completes — it is never stranded mid-hand-off: {reply:?}"
+    );
+    let err = refused.expect("the target's kernel stopped when its write gate opened");
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "a named refusal: {err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "refusing to promote: this node's wall clock reads 2026-10-22T03:02:05.123Z, 120s \
+         behind 2026-10-22T03:04:05.123Z, the latest time this data directory recorded — more \
+         than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); \
+         if the clock is right, the recorded time came from a clock that ran ahead, and the \
+         node will promote after 2026-10-22T03:03:05.123Z."
+    );
+}
+
+/// A primary restarted with a witness opens write-gated, but it is opening,
+/// not being promoted: the check runs at open, with `open` in the text.
+#[test]
+fn a_witness_gated_primary_far_behind_its_store_refuses_to_open() {
+    let sim = Sim::with_faults(0x5C10_0204, FaultConfig::none());
+    let primary = WallTime::from_nanos(PRIMARY_WALL);
+    let h = sim.host("p");
+    let cfg = primary_cfg("p:1");
+    let mut kernel = clocked_kernel(&sim, &h, &cfg, primary).unwrap();
+    let now = sim.now().as_nanos();
+    let mut source = SimSource::new(Box::new(sim.clock()), now + 1_000_000_000);
+    let responses = source.responses();
+    source.push_at(now, Request::new(Method::Post, "/clock-key"));
+    kernel.run(&mut source).unwrap();
+    assert_eq!(responses.lock().unwrap()[0].0, 200, "the key is minted");
+    let app = kernel.into_app();
+    h.restart();
+    drop(app);
+    store_witnesses(&h.disk(), &["w:1".to_string()]).unwrap();
+    let err = match clocked_kernel(
+        &sim,
+        &h,
+        &cfg,
+        primary.saturating_sub(Duration::from_secs(120)),
+    ) {
+        Ok(_) => panic!("a primary 120s behind its store opened"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        "refusing to open: this node's wall clock reads 2026-10-22T03:02:05.123Z, 120s behind \
+         2026-10-22T03:04:05.123Z, the latest time this data directory recorded — more than \
+         the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if \
+         the clock is right, the recorded time came from a clock that ran ahead, and the node \
+         will open after 2026-10-22T03:03:05.123Z."
+    );
+}

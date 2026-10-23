@@ -1,11 +1,16 @@
-//! What every real-filesystem pin that leans on a permission bit shares.
-//! One file, compiled into two targets: `tests/archive.rs` declares it as a
-//! module, and `src/launch.rs`'s unit tests include it by path.
+//! What charpente's own tests share. One file, compiled into several
+//! targets: the integration tests declare it as a module, and `src/lib.rs`
+//! includes it by path for the unit tests. Each target uses only part of it.
 
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types, dead_code)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use charpente_core::io::{Clock, Instant, WallTime};
 
 /// Sets `dir`'s mode and proves the kernel enforces it. A pin that needs a
 /// refused open or a refused create gets neither under root (or
@@ -35,5 +40,51 @@ pub fn chmod_that_bites(dir: &Path, mode: u32) {
             dir.display(),
             ignored.join(" or ")
         );
+    }
+}
+
+/// A `Clock` whose wall reading a test sets. `now` and `sleep` are the
+/// wrapped clock's, so virtual time still drives every deadline; `wall`
+/// stands still at the last value set, so a test can put a node's clock an
+/// exact distance from a time its store recorded.
+pub struct SteeredClock<C: Clock> {
+    inner: C,
+    wall: WallSteer,
+}
+
+/// The test's half of a `SteeredClock`: moves its wall reading.
+#[derive(Clone)]
+pub struct WallSteer(Arc<AtomicU64>);
+
+impl WallSteer {
+    pub fn set(&self, wall: WallTime) {
+        self.0.store(wall.as_nanos(), Ordering::SeqCst);
+    }
+}
+
+impl<C: Clock> SteeredClock<C> {
+    pub fn new(inner: C, wall: WallTime) -> (SteeredClock<C>, WallSteer) {
+        let steer = WallSteer(Arc::new(AtomicU64::new(wall.as_nanos())));
+        (
+            SteeredClock {
+                inner,
+                wall: steer.clone(),
+            },
+            steer,
+        )
+    }
+}
+
+impl<C: Clock> Clock for SteeredClock<C> {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+
+    fn wall(&self) -> WallTime {
+        WallTime::from_nanos(self.wall.0.load(Ordering::SeqCst))
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
     }
 }

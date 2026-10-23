@@ -2,7 +2,7 @@
 //! the event loop multiplexing HTTP requests, due jobs, and cron ticks — all
 //! inside the simulation boundary.
 
-mod clock;
+pub(crate) mod clock;
 pub(crate) mod cron;
 mod dispatch;
 mod outbound;
@@ -29,6 +29,7 @@ use charpente_core::table::View;
 
 use crate::archive::Archive;
 use crate::http::{App, Handled, Request, Response, Subscription, io_failure_response};
+use crate::kernel::clock::{WallHold, recorded_wall_floor};
 use crate::kernel::tail::Tail;
 use crate::repl::{REPL_TICK_NANOS, Repl};
 
@@ -129,6 +130,9 @@ pub struct Kernel {
     dispatcher: Dispatcher,
     cron: CronScheduler,
     clock: Box<dyn Clock>,
+    /// Every wall time the kernel hands out passes through this hold, so it
+    /// never decreases within the process (0.3.0 spec §5 B).
+    hold: WallHold,
     pending: Option<(Request, Reply)>,
     stats: KernelStats,
     /// The replication engine when this kernel runs replicated (`None` for a
@@ -266,7 +270,10 @@ impl Kernel {
     /// single-node constructor — no replication. On a writable node it first
     /// refuses — an `io::Error` carrying a `Refusal` — while any Pending job
     /// of a mounted type was enqueued under another shape
-    /// (`Db::pending_job_shape_refusal`). Every constructor also refuses, by
+    /// (`Db::pending_job_shape_refusal`). A node opening as a single node or
+    /// a primary also refuses while its wall clock is more than
+    /// `CLOCK_TOLERANCE` behind the latest time its data directory recorded
+    /// (GUIDE §7 "Clock errors"). Every constructor also refuses, by
     /// name, an app that mounts an outbound job when no `Outbound` was given,
     /// and a `Host` set that does not match the hosts its jobs call (R9).
     pub fn new(app: App, clock: Box<dyn Clock>) -> io::Result<Kernel> {
@@ -325,6 +332,17 @@ impl Kernel {
         let mut dispatcher = Dispatcher::new(defs).with_outbound(hosts, max_in_flight);
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let was_writable = app.db_mut().writes_allowed();
+        // A node opening as a single node or a primary (a witness-gated one
+        // too: it is opening, not being promoted) checks its wall clock
+        // against the latest time its data directory recorded. A follower's
+        // check is at promote.
+        let mut hold = WallHold::new();
+        let wall = if repl.as_ref().is_none_or(Repl::is_primary) {
+            let floor = recorded_wall_floor(&app.db().snapshot()?)?;
+            hold.start(&*clock, floor, "open")?
+        } else {
+            hold.read(&*clock)?
+        };
         // `cron.upsert` writes the schedule rows — skip it whenever the write
         // gate is shut (its transaction would be refused, and on a follower
         // the rows arrive by replication anyway); `after_repl_step` re-runs it
@@ -339,7 +357,7 @@ impl Kernel {
         // ruled "serve reads, withhold writes".
         if was_writable {
             refuse_foreign_pending_jobs(app.db())?;
-            cron.upsert(app.db_mut(), clock.wall())?;
+            cron.upsert(app.db_mut(), wall)?;
         }
         dispatcher.rebuild(&app.db_mut().snapshot()?)?;
         // The rebuild scan above is the authoritative snapshot of everything
@@ -353,6 +371,7 @@ impl Kernel {
             dispatcher,
             cron,
             clock,
+            hold,
             pending: None,
             stats: KernelStats::default(),
             repl,
@@ -377,8 +396,9 @@ impl Kernel {
     /// Returns `Ok(())` on source `Shutdown`; `Err` on a platform IO failure
     /// or a named `Refusal` (`Refusal::of`) — the jobs refusal at a write-gate
     /// opening, a witness or migration refusal, a cron enqueue refused by
-    /// name. Thin wrapper over `step`: it owns the park, `step` owns the
-    /// decision.
+    /// name, a wall clock that went backwards past `CLOCK_TOLERANCE`, or a
+    /// hand-off's target too far behind its data. Thin wrapper over `step`:
+    /// it owns the park, `step` owns the decision.
     pub fn run(&mut self, source: &mut dyn RequestSource) -> io::Result<()> {
         // The role-aware schema gate (spec §2): single-node and primary
         // kernels migrate before serving anything; followers skip (their
@@ -416,7 +436,7 @@ impl Kernel {
         }
         let now = Now {
             mono: self.clock.now(),
-            wall: self.clock.wall(),
+            wall: self.hold.read(&*self.clock)?,
         };
         let mono = now.mono.as_nanos();
         // Non-destructive IO movement, the peer of `source.poll()` (DESIGN §1):
@@ -644,16 +664,18 @@ impl Kernel {
             assert!(
                 deadline.is_none_or(|d| d.as_nanos() > mono),
                 "kernel invariant: Kernel::step went Idle with a wake at {deadline:?}, not after \
-                 now ({mono}), so Kernel::run would spin without advancing time. The component \
-                 that named it holds a deadline at or before now: job {:?} (writable \
-                 {writable}), cron {:?}, repl {:?}, outbound timeout {:?}, outbound wake {:?} \
-                 with {} in flight. Fix the pair that disagrees so a component is ready \
-                 whenever its own deadline has passed, or names only the future: job \
+                 now ({mono}; wall {:?}), so Kernel::run would spin without advancing time. The \
+                 component that named it holds a deadline at or before now: job {:?} (writable \
+                 {writable}; a wall time), cron {:?} (a wall time), repl {:?}, outbound timeout \
+                 {:?}, outbound wake {:?} with {} in flight. Fix the pair that disagrees so a \
+                 component is ready whenever its own deadline has passed, or names only the \
+                 future: job \
                  Dispatcher::has_due/next_deadline (kernel/dispatch.rs), cron \
                  CronScheduler::has_due/next_deadline (kernel/cron.rs), repl Repl::has_work/next_deadline \
                  (repl/mod.rs), outbound timeout Dispatcher::outbound_ready/\
                  next_outbound_deadline (kernel/dispatch.rs), outbound wake the Outbound \
                  impl's poll/next_wake",
+                now.wall,
                 self.dispatcher.next_deadline(),
                 self.cron.next_deadline(),
                 self.repl.as_ref().and_then(|r| r.next_deadline(mono)),
@@ -1187,8 +1209,10 @@ impl Kernel {
     /// After a `Repl::step`, catch this node BECOMING WRITABLE — a promote, a
     /// switchover hand-off, or the witness boot gate resolving — refuse by
     /// name while a Pending job of a mounted type carries a foreign shape
-    /// (`Kernel::build` checks that only on a writable node), and otherwise
-    /// run the three pieces of startup a non-writable node had to skip:
+    /// (`Kernel::build` checks that only on a writable node) or while this
+    /// node's wall clock is more than `CLOCK_TOLERANCE` behind the latest time
+    /// its data directory recorded, and otherwise run the three pieces of
+    /// startup a non-writable node had to skip:
     ///
     /// - the schema gate (`Kernel::run` guards it on `writes_allowed()` and
     ///   never retries it),
@@ -1218,7 +1242,15 @@ impl Kernel {
             // (payload-shapes amendment A1).
             refuse_foreign_pending_jobs(self.app.db())?;
             self.app.db_mut().migrate_schema()?;
-            self.cron.upsert(self.app.db_mut(), self.clock.wall())?;
+            // Only a hand-off's target can be refused here: a promote was
+            // checked in `do_promote` before its durable flip, and a node that
+            // opened as a primary was checked at open and has held at or above
+            // its floor since. The hand-off is the primary's point of no
+            // return, so its target stops here by name instead. Read before
+            // `upsert` writes this node's schedules.
+            let floor = recorded_wall_floor(&self.app.db().snapshot()?)?;
+            let wall = self.hold.start(&*self.clock, floor, "promote")?;
+            self.cron.upsert(self.app.db_mut(), wall)?;
             let snap = self.app.db_mut().snapshot()?;
             self.dispatcher.rebuild(&snap)?;
         }

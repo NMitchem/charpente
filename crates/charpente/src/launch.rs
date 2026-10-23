@@ -21,8 +21,7 @@ use crate::serve::{BindFailed, OutboundOptions};
 
 /// The permission-pin helper `tests/archive.rs` shares (D2 re-review R4).
 #[cfg(test)]
-#[path = "../tests/support/mod.rs"]
-mod support;
+use crate::support;
 
 pub const LAUNCH_USAGE: &str = "usage: <app> [describe [--format json|human]]\n       \
        <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]\n       \

@@ -11,6 +11,10 @@
   - `CronEnqueue` is `Box<dyn Fn(&mut Tx, WallTime) + Send>`. `CronScheduler::upsert`, `tick`, `tick_into` and `has_due` take a `WallTime`, and `next_deadline` returns one.
   - `Dispatcher::run_due` and `run_due_into` take the new `kernel::Now`, one reading of both clocks: `mono` times an outbound call's deadline and `wall` judges due times. `Dispatcher::has_due` takes a `WallTime`, and `next_deadline` returns one.
   - The fingerprints of the platform tables `Session`, `ApiKey` and `CronRow`, and of the platform job `SessionSweep`, change with their field types.
+- **`CronRow.interval_nanos` is the interval the row's `next_due` was set with.** `CronScheduler::upsert` no longer rewrites it on an existing row; the next tick writes it with `next_due`.
+
+### Added
+- **Wall time never runs backwards within a node.** The kernel holds its wall reading at the latest value it used when the clock steps back by up to `CLOCK_TOLERANCE` (60 s), and stops by name, with both fixes in the text, beyond that. A node opening as a single node or a primary, or being promoted, is refused by name while its clock is more than the tolerance behind the latest time its data directory recorded (an API key's `created_at`, a schedule's last tick); a switchover's target completes the hand-off and its kernel stops with the same refusal. See GUIDE §7 "Clock errors".
 
 ### Fixed
 - Production time was process uptime, so after a restart or failover cron stalled until uptime caught up, sessions outlived their TTL, an expired OIDC token was accepted and any token with nbf was refused. Every stored or compared time is now wall-clock time (WallTime).

@@ -97,6 +97,21 @@ once per step (`kernel::Now`); a stored wall due time (a job's `due_at`, a sched
 `next_due`) becomes the loop's monotonic wake-up as `now.mono + (due - now.wall)`, recomputed
 every step, so a wall-clock step moves a wake-up at the next step rather than freezing it.
 
+The wall half never runs backwards within a node. Every step's reading passes through a hold
+(`kernel::clock::WallHold`): a reading behind the latest one is held at the latest, and one
+more than `CLOCK_TOLERANCE` (60 s) behind stops the kernel by name, so a clock error extends a
+session or delays a tick by at most the tolerance. A restart loses the hold, so the same check
+runs wherever a node becomes writable: at open as a single node or a primary, at a promote
+(before its durable flip, so a refused promote leaves a follower), and at a hand-off's target,
+which stops at its write-gate flip because the hand-off is the primary's point of no return
+(§5). The bound it checks against is recovered from times the store already holds: the newest
+`ApiKey.created_at`, and each `CronRow`'s `next_due - interval_nanos`, the row keeping the
+interval its `next_due` was set with so that a shortened interval cannot raise the bound above
+a time the store saw. A stored "latest wall time" would be tighter, but it is a new field or
+record in the log, which changes the log format and every pinned seed's byte counts; the
+recovered bound costs neither. Its price: the bound is only as recent as the last key or tick,
+and a clock behind by less than the time since then opens unnoticed.
+
 The simulator implements all of it with one seed driving: latency distributions, virtual
 time (a simulated year of heartbeats runs in seconds), and the fault matrix — injected
 write/sync errors, crash-restart between any two disk operations, partitions, and

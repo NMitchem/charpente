@@ -20,6 +20,7 @@ use charpente_core::db::Refusal;
 use charpente_core::io::{Clock, Disk, Listener, Net};
 
 use crate::Db;
+use crate::kernel::clock::{behind_floor, recorded_wall_floor};
 use crate::repl::follower::Follower;
 use crate::repl::probe::{WitnessProbe, WitnessVerdict};
 use crate::repl::protocol::Msg;
@@ -585,7 +586,7 @@ impl Repl {
         // a switchover). Handled before the round-robin, which skips it.
         for idx in 0..self.sessions.len() {
             if self.sessions[idx].pending_ctrl.is_some() {
-                return self.begin_control(db, idx, now);
+                return self.begin_control(db, idx, now, clock);
             }
         }
 
@@ -871,21 +872,33 @@ impl Repl {
     }
 
     /// Executes a control verb parked on session `idx`.
-    fn begin_control(&mut self, db: &mut Db, idx: usize, now: u64) -> io::Result<()> {
+    fn begin_control(
+        &mut self,
+        db: &mut Db,
+        idx: usize,
+        now: u64,
+        clock: &dyn Clock,
+    ) -> io::Result<()> {
         let verb = self.sessions[idx]
             .pending_ctrl
             .take()
             .expect("begin_control on a session with a pending verb");
         let ctrl_id = self.sessions[idx].id;
         match verb {
-            PendingCtrl::Promote => self.do_promote(db, ctrl_id, now),
+            PendingCtrl::Promote => self.do_promote(db, ctrl_id, now, clock),
             PendingCtrl::Switchover(to) => self.begin_switchover(db, ctrl_id, to, now),
         }
     }
 
     /// `promote` — failover, bounded loss (spec §2). A follower/backup flips
     /// durably to primary, drops its upstream client, and starts serving.
-    fn do_promote(&mut self, db: &mut Db, ctrl_id: u64, now: u64) -> io::Result<()> {
+    fn do_promote(
+        &mut self,
+        db: &mut Db,
+        ctrl_id: u64,
+        now: u64,
+        clock: &dyn Clock,
+    ) -> io::Result<()> {
         match self.role.clone() {
             Role::Primary => {
                 self.reply_ctrl(
@@ -935,6 +948,15 @@ impl Repl {
                 },
                 now,
             );
+            return Ok(());
+        }
+        // The same moment, for the same reason: a node whose wall clock is
+        // more than CLOCK_TOLERANCE behind the latest time this data directory
+        // recorded stays a follower (0.3.0 spec §5 B).
+        if let Some(floor) = recorded_wall_floor(&db.snapshot()?)?
+            && let Some(refusal) = behind_floor(clock.wall(), floor, "promote")
+        {
+            self.reply_ctrl(ctrl_id, &Msg::CtrlErr { message: refusal }, now);
             return Ok(());
         }
         self.clear_stale_witnesses()?;

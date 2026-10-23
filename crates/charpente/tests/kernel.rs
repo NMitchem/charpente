@@ -21,6 +21,9 @@ use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::checks::{boot_through_fallout, durable_refusal, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim};
 
+mod support;
+use support::{SteeredClock, WallSteer};
+
 /// One reading of both clocks, `nanos` on each scale, for driving a
 /// `Dispatcher` directly.
 fn at(nanos: u64) -> Now {
@@ -4228,6 +4231,158 @@ fn session_sweep_deletes_expired_rows_on_tick() {
         "the expired row is swept; the live one survives"
     );
     assert_eq!(sessions[0].subject, "bob");
+}
+
+// ------------------------------------------------------------- clock floor
+
+/// Mints an API key, so the store records the time it was minted at.
+#[route(POST "/hold-key", public)]
+fn hold_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_api_key(tx, "alice"))
+}
+
+/// The wall time the first node records its key at: 2026-10-22T03:04:05.123Z.
+const RECORDED: u64 = 1_792_638_245_123_000_000;
+
+/// A node over `sim`'s disk whose wall clock stands at `wall` until the
+/// returned handle moves it.
+fn hold_kernel(sim: &Sim, wall: WallTime) -> std::io::Result<(Kernel, WallSteer)> {
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            session_ttl: HOUR,
+            ..AppConfig::default()
+        },
+    )?
+    .mount(routes![hold_key, sweep_login]);
+    let (clock, steer) = SteeredClock::new(sim.clock(), wall);
+    Ok((Kernel::new(app, Box::new(clock))?, steer))
+}
+
+/// Serves `request` to the end of a one-second source.
+fn hold_serve(sim: &Sim, kernel: &mut Kernel, request: Request) -> (u16, Vec<u8>) {
+    let now = sim.now().as_nanos();
+    let mut source = SimSource::new(Box::new(sim.clock()), now + SEC);
+    let responses = source.responses();
+    source.push_at(now, request);
+    kernel.run(&mut source).unwrap();
+    responses.lock().unwrap()[0].clone()
+}
+
+/// A first life that records `RECORDED` (its key), then a restart.
+fn a_store_that_recorded(sim: &Sim) {
+    let (mut kernel, _) = hold_kernel(sim, WallTime::from_nanos(RECORDED)).unwrap();
+    let (status, _) = hold_serve(sim, &mut kernel, Request::new(Method::Post, "/hold-key"));
+    assert_eq!(status, 200, "the key is minted");
+    let app = kernel.into_app();
+    sim.restart();
+    drop(app);
+}
+
+/// 0.3.0 spec §5 B: a node whose wall clock is more than `CLOCK_TOLERANCE`
+/// behind the latest time its data directory recorded does not open, and the
+/// refusal names both fixes.
+#[test]
+fn a_node_whose_clock_is_far_behind_its_store_refuses_to_open() {
+    let sim = Sim::with_faults(0x5C10_0101, FaultConfig::none());
+    a_store_that_recorded(&sim);
+    let behind = WallTime::from_nanos(RECORDED).saturating_sub(Duration::from_secs(120));
+    let err = match hold_kernel(&sim, behind) {
+        Ok(_) => panic!("a node 120s behind its store opened"),
+        Err(e) => e,
+    };
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "a named refusal: {err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "refusing to open: this node's wall clock reads 2026-10-22T03:02:05.123Z, 120s behind \
+         2026-10-22T03:04:05.123Z, the latest time this data directory recorded — more than \
+         the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if \
+         the clock is right, the recorded time came from a clock that ran ahead, and the node \
+         will open after 2026-10-22T03:03:05.123Z."
+    );
+}
+
+/// Within the tolerance the node opens, and the wall time it hands out holds
+/// at the recorded time rather than going back to its own clock's.
+#[test]
+fn a_node_within_tolerance_of_its_store_opens_and_holds() {
+    let sim = Sim::with_faults(0x5C10_0102, FaultConfig::none());
+    a_store_that_recorded(&sim);
+    let recorded = WallTime::from_nanos(RECORDED);
+    let (mut kernel, _) =
+        hold_kernel(&sim, recorded.saturating_sub(Duration::from_secs(30))).unwrap();
+    let (status, _) = hold_serve(
+        &sim,
+        &mut kernel,
+        Request::new(Method::Post, "/sweep-login").json(&"bob"),
+    );
+    assert_eq!(status, 200, "the login is served");
+    let sessions = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan::<Session>()
+        .unwrap();
+    assert!(
+        sessions[0].expires_at >= recorded + Duration::from_nanos(HOUR),
+        "the session expires at {}, before {} plus its one-hour TTL: the node handed out its \
+         own clock's reading, 30s behind a time the store already recorded",
+        sessions[0].expires_at,
+        recorded
+    );
+}
+
+/// The step's wall reading goes through the hold: a clock that steps back by
+/// the tolerance or less holds at the latest time used, and one that steps
+/// back further stops the kernel by name.
+#[test]
+fn a_kernel_whose_clock_steps_back_holds_then_stops_by_name() {
+    let sim = Sim::with_faults(0x5C10_0103, FaultConfig::none());
+    let t = WallTime::from_nanos(RECORDED);
+    let (mut kernel, steer) = hold_kernel(&sim, t).unwrap();
+    let login = || Request::new(Method::Post, "/sweep-login").json(&"bob");
+    assert_eq!(hold_serve(&sim, &mut kernel, login()).0, 200);
+    steer.set(t.saturating_sub(Duration::from_secs(60)));
+    assert_eq!(hold_serve(&sim, &mut kernel, login()).0, 200);
+    let expiries: Vec<WallTime> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan::<Session>()
+        .unwrap()
+        .iter()
+        .map(|s| s.expires_at)
+        .collect();
+    assert_eq!(
+        expiries,
+        vec![t + Duration::from_nanos(HOUR); 2],
+        "60s back, the second login's TTL starts from the held time, not the clock's"
+    );
+    steer.set(t.saturating_sub(Duration::from_secs(61)));
+    let now = sim.now().as_nanos();
+    let mut source = SimSource::new(Box::new(sim.clock()), now + SEC);
+    source.push_at(now, login());
+    let err = kernel.run(&mut source).unwrap_err();
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "a named stop: {err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "clock went backwards: this node's wall clock reads 2026-10-22T03:03:04.123Z, 61s \
+         behind 2026-10-22T03:04:05.123Z, the latest time it already used — more than the 60s \
+         charpente tolerates (CLOCK_TOLERANCE). The node stopped rather than extend sessions \
+         or delay schedules by that much. Fix the system clock (check NTP) and restart; if the \
+         clock is right, the earlier reading came from a clock that ran ahead, and the node \
+         runs again after 2026-10-22T03:03:05.123Z."
+    );
 }
 
 // ------------------------------------------------------------------- tail
