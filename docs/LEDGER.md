@@ -8248,3 +8248,5 @@ PEM private keys; secret scanning and push protection are disabled on it (checke
 2026-10-14), so expect at most a third-party scanner's email, and since `a82b2e60` the test
 CA's name constraint admits only `pay.fixture` and its subdomains. Then PLAN's v1.x rows,
 each on its trigger.
+
+**Follow-up (2026-10-22): 0.2.0's close-out.** Published 2026-10-17 (Noah, `scripts/publish.sh --for-real` from f6eb65b6; each crate's index cksum equals its packaged `.crate` sha256), with a registry smoke from crates.io (install, new, clippy, 256-universe sim) green. Criterion 6's CI half: run 39048921595 on f6eb65b6, green, workspace step 92/92. Criterion 4's nightly half: edge-harness run 39125650197 at f6eb65b6 (2026-10-18), green, and green on every night since through 39782557724 (2026-10-22). CHANGELOG's 0.2.0 heading now carries its date.
