@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 /// an `OUTBOUND` that contradicts the mounted `JobDef` (2026-10-15); 44 with
 /// the sim's no-model refusal for an outbound host (2026-10-15); 46 with the
 /// kernel's clock stop and its open/promote refusal (2026-10-23).
-const PINNED_FLOOR: usize = 46;
+const PINNED_FLOOR: usize = 49;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

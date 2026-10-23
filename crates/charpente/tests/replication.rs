@@ -2865,6 +2865,17 @@ fn exchange_hello(sim: &Sim, node: &mut Node, addr: &str, hello: Msg) -> Result<
     Err("no reply from the node within the budget".to_string())
 }
 
+/// The stale-peer refusal, byte-exact (DECISIONS §15).
+fn stale_peer_refusal(proto: u8) -> String {
+    format!(
+        "replication protocol version mismatch: this node speaks protocol version {}, but the \
+         peer's Hello declared version {proto} — charpente does not migrate between releases \
+         (DECISIONS §15), so an older node's data directory is refused too; replace it with a \
+         fresh follower running this release",
+        charpente::repl::PROTO_VERSION
+    )
+}
+
 #[test]
 fn hello_with_a_future_protocol_version_is_refused_naming_both_versions() {
     let sim = Sim::with_faults(0x2EB1_0006, FaultConfig::none());
@@ -2884,19 +2895,10 @@ fn hello_with_a_future_protocol_version_is_refused_naming_both_versions() {
     .unwrap();
     match reply {
         Msg::Refuse { message } => {
-            // Byte-exact (error-suite T8): reconstructed from decide_hello's
-            // own format args — both sides of the mismatch are the test's own
-            // scenario values (PROTO_VERSION and PROTO_VERSION + 1).
-            let proto = charpente::repl::PROTO_VERSION + 1;
+            // Byte-exact (error-suite T8).
             assert_eq!(
                 message,
-                format!(
-                    "replication protocol version mismatch: this node speaks protocol version \
-                     {}, but the peer's Hello declared version {proto} — upgrade the older \
-                     binary so both speak the expected version {}",
-                    charpente::repl::PROTO_VERSION,
-                    charpente::repl::PROTO_VERSION
-                )
+                stale_peer_refusal(charpente::repl::PROTO_VERSION + 1)
             );
         }
         other => panic!("expected Refuse, got {other:?}"),
@@ -2926,24 +2928,14 @@ fn hello_declaring_protocol_version_1_is_refused_by_name() {
     )
     .unwrap();
     match reply {
-        Msg::Refuse { message } => {
-            assert_eq!(
-                message,
-                format!(
-                    "replication protocol version mismatch: this node speaks protocol version \
-                     {0}, but the peer's Hello declared version 1 — upgrade the older binary so \
-                     both speak the expected version {0}",
-                    charpente::repl::PROTO_VERSION
-                )
-            );
-        }
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(1)),
         other => panic!("expected Refuse, got {other:?}"),
     }
 }
 
 /// PROTO_VERSION 3 (payload shapes): a version-2 binary writes `0x02`/`0x03`
 /// and cannot read `0x08`/`0x09`, so it is refused at Hello, by name, before a
-/// single frame ships (spec amendment A3). (Protocol 6 since outbound effects;
+/// single frame ships (spec amendment A3). (Protocol 7 since 0.3;
 /// the version-3, version-4 and version-5 tests follow.)
 #[test]
 fn hello_declaring_protocol_version_2_is_refused_by_name() {
@@ -2963,12 +2955,7 @@ fn hello_declaring_protocol_version_2_is_refused_by_name() {
     )
     .unwrap();
     match reply {
-        Msg::Refuse { message } => assert_eq!(
-            message,
-            "replication protocol version mismatch: this node speaks protocol version 6, but \
-             the peer's Hello declared version 2 — upgrade the older binary so both speak the \
-             expected version 6"
-        ),
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(2)),
         other => panic!("expected Refuse, got {other:?}"),
     }
 }
@@ -2995,12 +2982,7 @@ fn hello_declaring_protocol_version_3_is_refused_by_name() {
     )
     .unwrap();
     match reply {
-        Msg::Refuse { message } => assert_eq!(
-            message,
-            "replication protocol version mismatch: this node speaks protocol version 6, but \
-             the peer's Hello declared version 3 — upgrade the older binary so both speak the \
-             expected version 6"
-        ),
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(3)),
         other => panic!("expected Refuse, got {other:?}"),
     }
 }
@@ -3008,7 +2990,7 @@ fn hello_declaring_protocol_version_3_is_refused_by_name() {
 /// PROTO_VERSION 5 (tenancy completion, spec §6): a version-4 binary cannot
 /// read the scoped emit tag `0x0b`, nor an `EventRow`'s trailing tenant, so
 /// it is refused at Hello, by name, before a single frame ships — not at its
-/// first scoped emit. (Protocol 6 since outbound effects; the version-5 test
+/// first scoped emit. (Protocol 7 since 0.3; the version-5 test
 /// follows.)
 #[test]
 fn hello_declaring_protocol_version_4_is_refused_by_name() {
@@ -3028,12 +3010,7 @@ fn hello_declaring_protocol_version_4_is_refused_by_name() {
     )
     .unwrap();
     match reply {
-        Msg::Refuse { message } => assert_eq!(
-            message,
-            "replication protocol version mismatch: this node speaks protocol version 6, but \
-             the peer's Hello declared version 4 — upgrade the older binary so both speak the \
-             expected version 6"
-        ),
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(4)),
         other => panic!("expected Refuse, got {other:?}"),
     }
 }
@@ -3061,12 +3038,33 @@ fn hello_declaring_protocol_version_5_is_refused_by_name() {
     )
     .unwrap();
     match reply {
-        Msg::Refuse { message } => assert_eq!(
-            message,
-            "replication protocol version mismatch: this node speaks protocol version 6, but \
-             the peer's Hello declared version 5 — upgrade the older binary so both speak the \
-             expected version 6"
-        ),
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(5)),
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+
+/// PROTO_VERSION 7 (0.3): a 0.2 binary speaks 6 and carries `u64` times in the
+/// platform tables, so it is refused at Hello by name, with the fix in the text
+/// (DECISIONS §15).
+#[test]
+fn hello_declaring_protocol_version_6_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_0006 ^ 6, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: 6,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest: 0,
+        },
+    )
+    .unwrap();
+    match reply {
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(6)),
         other => panic!("expected Refuse, got {other:?}"),
     }
 }

@@ -183,6 +183,9 @@ fn prepare(
         )
     })?;
     let m = Manifest::decode(&manifest_bytes).map_err(|e| {
+        if e.kind() == io::ErrorKind::Unsupported {
+            return e;
+        }
         io::Error::new(
             e.kind(),
             format!(

@@ -48,8 +48,10 @@ pub mod witnesses;
 /// a follower a second way: `JobRow`'s row codec gained a trailing `scope` at
 /// 4, `EventRow`'s at 5, and `JobRow`'s 16-byte outbound key tail at 6, and
 /// seeding ships platform table rows, so an older follower would also meet a
-/// row's longer tail, which its decoder calls corrupt.
-pub const PROTO_VERSION: u8 = 6;
+/// row's longer tail, which its decoder calls corrupt. 0.3's wall-time columns
+/// (`WallTime` in the platform tables) make it 7: a 0.2 peer is refused at
+/// Hello by name, never migrated (DECISIONS §15).
+pub const PROTO_VERSION: u8 = 7;
 
 /// The hard ceiling on one encoded `Msg` on the wire: one `MAX_RECORD_BYTES`
 /// frame (16 MiB) plus envelope overhead (spec Global Constraints).

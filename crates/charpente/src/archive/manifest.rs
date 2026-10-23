@@ -87,9 +87,17 @@ pub struct SegmentRef {
     pub end_seq: u64,
 }
 
+/// The manifest layout this release reads and writes. It tracks the charpente
+/// minor (0.3 writes 3): a bucket written by another release is refused by
+/// name, never migrated (DECISIONS §15).
+pub const MANIFEST_FORMAT: u32 = 3;
+
 /// The archive's generation pointer (spec §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
+    /// Always `MANIFEST_FORMAT` for a manifest this release wrote; `decode`
+    /// refuses any other value, and an absent field (a 0.2 manifest) as `none`.
+    pub format: u32,
     pub generation: u64,
     /// Node identity of the writer that produced this generation (spec
     /// §4's ownership rule): a writer that finds the manifest advanced by
@@ -133,6 +141,7 @@ fn write_body(m: &Manifest) -> Vec<u8> {
         buf.extend_from_slice(&s.end_seq.to_le_bytes());
     }
     buf.push(m.closed as u8);
+    buf.extend_from_slice(&m.format.to_le_bytes());
     buf
 }
 
@@ -236,6 +245,22 @@ fn check_crc<'a>(kind: &str, bytes: &'a [u8]) -> io::Result<&'a [u8]> {
         return Err(crc_error(kind, stored, computed));
     }
     Ok(body)
+}
+
+/// The stale-bucket refusal (DECISIONS §15). `ErrorKind::Unsupported` is its
+/// marker: restore and the archive's adoption pass it through unwrapped, so
+/// the operator reads exactly this text.
+pub(crate) fn stale_format_error(found: Option<u32>) -> io::Error {
+    let found = found.map_or_else(|| "none".to_string(), |f| f.to_string());
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "this archive was written by another charpente release (manifest format {found}, \
+             this release reads {MANIFEST_FORMAT}); charpente does not migrate its own formats \
+             between releases (DECISIONS §15) — archive to a fresh bucket prefix from a node \
+             running this release"
+        ),
+    )
 }
 
 /// m1: the `closed` field decodes exactly two bytes, never guesses at a third. `encode`
@@ -510,11 +535,20 @@ impl Manifest {
             1 => true,
             other => return Err(manifest_closed_byte_error(other)),
         };
+        let format = if r.remaining() == 0 {
+            return Err(stale_format_error(None));
+        } else {
+            r.u32()?
+        };
+        if format != MANIFEST_FORMAT {
+            return Err(stale_format_error(Some(format)));
+        }
         r.finish()?;
 
         check_contiguous(&segments, generation)?;
 
         Ok(Manifest {
+            format,
             generation,
             writer,
             applied_seq,
@@ -941,6 +975,7 @@ mod tests {
 
     fn one_segment_manifest(segments: Vec<SegmentRef>) -> Manifest {
         Manifest {
+            format: MANIFEST_FORMAT,
             generation: 1,
             writer: "n".into(),
             applied_seq: 0,
@@ -985,6 +1020,7 @@ mod tests {
     #[test]
     fn manifest_roundtrips() {
         let m = Manifest {
+            format: MANIFEST_FORMAT,
             generation: 3,
             writer: "node-a:9000".into(),
             applied_seq: 4096,
@@ -1013,6 +1049,7 @@ mod tests {
     #[test]
     fn a_closed_manifest_roundtrips_too() {
         let m = Manifest {
+            format: MANIFEST_FORMAT,
             generation: 3,
             writer: "node-a:9000".into(),
             applied_seq: 4096,
@@ -1030,6 +1067,7 @@ mod tests {
     #[test]
     fn a_corrupt_manifest_is_refused_by_name_never_guessed() {
         let m = Manifest {
+            format: MANIFEST_FORMAT,
             generation: 1,
             writer: "n".into(),
             applied_seq: 0,
@@ -1052,6 +1090,7 @@ mod tests {
     fn a_discontiguous_segment_chain_is_refused_at_decode() {
         // A generation's chain is never allowed to have a hole (spec §2, §8).
         let m = Manifest {
+            format: MANIFEST_FORMAT,
             generation: 1,
             writer: "n".into(),
             applied_seq: 0,
@@ -1195,7 +1234,7 @@ mod tests {
     fn a_closed_byte_that_is_neither_0_nor_1_is_refused_not_guessed() {
         let m = one_segment_manifest(vec![]);
         let mut buf = write_body(&m);
-        let last = buf.len() - 1; // write_body's last push is always the closed byte
+        let last = buf.len() - 5; // the closed byte, just before the 4-byte format
         buf[last] = 7;
         buf.extend_from_slice(&crc32(&buf).to_le_bytes());
         let e = Manifest::decode(&buf).unwrap_err();

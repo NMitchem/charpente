@@ -13,8 +13,8 @@ use std::io;
 mod support;
 
 use charpente::archive::manifest::{
-    Manifest, SnapshotMeta, TableBatches, decode_snapshot_batch, manifest_key, segment_key,
-    snapshot_batch_key, snapshot_meta_key,
+    MANIFEST_FORMAT, Manifest, SnapshotMeta, TableBatches, decode_snapshot_batch, manifest_key,
+    segment_key, snapshot_batch_key, snapshot_meta_key,
 };
 use charpente::archive::restore::{RestoreOpts, RestoreReport, restore};
 use charpente::archive::{Archive, ArchiveConfig};
@@ -1030,6 +1030,7 @@ fn assert_snapshot_objects_unchanged(
 
 fn write_foreign_manifest(store: &dyn ObjectStore, writer: &str, generation: u64) {
     let m = Manifest {
+        format: MANIFEST_FORMAT,
         generation,
         writer: writer.to_string(),
         applied_seq: 0,
@@ -2978,6 +2979,7 @@ fn fixture_with_a_long_unarchived_log() -> (Db, SimObjectStore, Archive) {
 /// hand makes the arm testable from either side of the change.
 fn write_own_manifest(store: &SimObjectStore, db: &Db, generation: u64, applied_seq: u64) {
     let m = Manifest {
+        format: MANIFEST_FORMAT,
         generation,
         writer: WRITER.to_string(),
         applied_seq,
@@ -3814,6 +3816,7 @@ fn a_gap_crossing_while_the_ownership_get_is_in_flight_never_abandons_it() {
 /// otherwise be indistinguishable.
 fn corrupt_manifest_bytes() -> Vec<u8> {
     let mut bytes = Manifest {
+        format: MANIFEST_FORMAT,
         generation: 0,
         writer: WRITER.to_string(),
         applied_seq: 0,
@@ -8159,6 +8162,7 @@ fn conv_plant_diverged(
 /// `false` means the plant never landed and the probe cannot run.
 fn conv_plant_foreign_manifest(store: &FlakyStore, generation: u64) -> bool {
     let bytes = Manifest {
+        format: MANIFEST_FORMAT,
         generation,
         writer: FOREIGN_WRITER.to_string(),
         applied_seq: 0,
@@ -9699,5 +9703,65 @@ mod fs_object_store {
             );
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Another release's bucket is refused by name at restore and at adoption
+/// (DECISIONS §15): a 0.2 manifest has no `format` field (found = none), and a
+/// future one declares another number.
+#[test]
+fn a_manifest_without_a_format_is_refused_at_restore_and_adopt() {
+    let expect = |found: &str| {
+        format!(
+            "this archive was written by another charpente release (manifest format {found}, \
+             this release reads {MANIFEST_FORMAT}); charpente does not migrate its own formats \
+             between releases (DECISIONS §15) — archive to a fresh bucket prefix from a node \
+             running this release"
+        )
+    };
+    let manifest = |format: u32| Manifest {
+        format,
+        generation: 1,
+        writer: WRITER.to_string(),
+        applied_seq: 0,
+        next_job_id: 1,
+        tables: vec![],
+        segments: vec![],
+        closed: false,
+    };
+    // A 0.2 manifest: the same bytes minus the trailing format, re-CRC'd.
+    let mut legacy = manifest(MANIFEST_FORMAT).encode();
+    legacy.truncate(legacy.len() - 8);
+    legacy.extend_from_slice(&crc32(&legacy).to_le_bytes());
+    for (bytes, found) in [(legacy, "none"), (manifest(2).encode(), "2")] {
+        // restore
+        let (_db, store, _arc) = archive_fixture();
+        plant(&store, &[(manifest_key(PREFIX), bytes.clone())]);
+        let sim = fresh_sim();
+        let e = restore(
+            &store,
+            Box::new(sim.disk()),
+            restore_cfg(),
+            restore_schema(),
+            restore_opts(),
+            &mut |m| panic!("a refusal must emit no operator notice, got: {m}"),
+        )
+        .unwrap_err();
+        // restore's read phase appends its own true sentence to any refusal.
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "{}. Nothing in the destination has been touched",
+                expect(found)
+            ),
+            "restore"
+        );
+        // adoption
+        let (mut db, store, mut arc) = archive_fixture();
+        write_records(&mut db, 500);
+        plant(&store, &[(manifest_key(PREFIX), bytes)]);
+        let e = step_until_error(&mut arc, &db, &store);
+        assert_eq!(e.to_string(), expect(found), "adopt");
+        assert!(arc.stopped());
     }
 }

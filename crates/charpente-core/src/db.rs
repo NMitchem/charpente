@@ -2903,7 +2903,24 @@ fn upgrade_barrier_msg(table: &str, persisted: u32, compiled: u32) -> String {
     )
 }
 
+/// The tables the platform itself registers: the `charpente.*` names, and the
+/// three `#[table]`-built ones (`App::open`) whose names carry no prefix. A
+/// foreign shape here means the data directory came from another release, not
+/// that an app's struct changed.
+fn is_platform_table(table: &str) -> bool {
+    table.starts_with("charpente.") || matches!(table, "Session" | "ApiKey" | "CronRow")
+}
+
 fn drift_msg(table: &str, persisted_fp: u64, compiled_fp: u64, version: u32) -> String {
+    if is_platform_table(table) {
+        return format!(
+            "this data directory was written by another charpente release: the platform table \
+             \"{table}\" has a different shape ({persisted_fp:#x} stored, {compiled_fp:#x} \
+             compiled). charpente does not migrate its own formats between releases (DECISIONS \
+             §15). Start this node from an empty data directory, or restore an archive written \
+             by this release."
+        );
+    }
     format!(
         "table \"{table}\"'s shape changed but its #[table(version = ...)] did not — \
          persisted fingerprint {persisted_fp:#x} != compiled fingerprint {compiled_fp:#x} at \

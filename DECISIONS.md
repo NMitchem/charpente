@@ -439,7 +439,9 @@ manifesto, not backwards compatibility." So when charpente's own API, output, JS
 format or wire protocol changes, it changes in place and the minor version bumps. The break
 arrives as a compile error that names the fix, or as a named refusal (hard rule 5): a node
 refuses a data directory, a replication peer or an archive bucket written by another
-charpente minor, saying what to do, and never converts it. The scope is charpente's own
+charpente minor, saying what to do, and never converts it. The detectors are a changed
+platform-table fingerprint (`Session`, `ApiKey`, `CronRow`), `PROTO_VERSION` and the
+manifest's `MANIFEST_FORMAT`; a minor that changes a state none of them sees must bump one. The scope is charpente's own
 formats across charpente releases. An app's own data across the app's own deploys stays
 guaranteed (`migrate_schema`, payload shapes, the upgrade barrier, §5's "log-replay
 upgrades"), because it is the user's data. Rejected: **semver-compatible parallel APIs** (an

@@ -328,8 +328,8 @@ pub mod manifest;
 pub mod restore;
 
 use manifest::{
-    MANIFEST_MAX_BYTES, Manifest, SegmentRef, SnapshotMeta, TableBatches, encode_snapshot_batch,
-    manifest_key, segment_key, snapshot_batch_key, snapshot_meta_key,
+    MANIFEST_FORMAT, MANIFEST_MAX_BYTES, Manifest, SegmentRef, SnapshotMeta, TableBatches,
+    encode_snapshot_batch, manifest_key, segment_key, snapshot_batch_key, snapshot_meta_key,
 };
 
 /// Rows per `<gen>/snapshot/<table>/<n>` object, and with it the archive's
@@ -1360,6 +1360,7 @@ impl Archive {
     /// each segment.
     fn manifest_bytes(&self, frontier: &Frontier) -> Vec<u8> {
         Manifest {
+            format: MANIFEST_FORMAT,
             generation: self.generation,
             writer: self.cfg.writer.clone(),
             applied_seq: frontier.applied_seq,
@@ -1772,6 +1773,10 @@ impl Archive {
             }
             Some(Ok(ObjectDone::Get(bytes))) => match Manifest::decode(&bytes) {
                 Ok(m) => self.adopt(db, Some(m)),
+                // A bucket from another release: its own named refusal, not
+                // the "unreadable" one (that text tells the operator to
+                // re-fetch or delete the manifest, which is wrong here).
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => Err(self.stop(e)),
                 Err(e) => {
                     // F5. Untrusted bytes that will not decode: refuse, do
                     // not retry. See `unreadable_manifest_notice` for why
@@ -2485,6 +2490,7 @@ impl Archive {
                 // `Opening` is: it cannot tell whether the prefix is still
                 // its own, and must not resolve that by overwriting the
                 // evidence.
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => Err(self.stop(e)),
                 Err(e) => {
                     let notice = self.unreadable_manifest_notice(&e, commits.is_some());
                     Err(self.stop(notice))

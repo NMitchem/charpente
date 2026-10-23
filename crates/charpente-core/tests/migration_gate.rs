@@ -929,3 +929,98 @@ fn finding2_cross_fingerprint_resume_refuses_by_name() {
          it, or restore"
     );
 }
+
+/// A platform table at one fingerprint (`FP`), hand-built so a test can record
+/// it under one shape and reopen it under another.
+macro_rules! platform_row {
+    ($name:ident, $table:expr, $fp:expr) => {
+        struct $name {
+            id: Id<$name>,
+        }
+        impl Row for $name {
+            type Scope = Unscoped;
+            const TABLE: &'static str = $table;
+            const INDEXES: &'static [IndexDef<$name>] = &[];
+            const VERSION: u32 = 1;
+            const FINGERPRINT: Option<u64> = Some($fp);
+            fn id(&self) -> Id<$name> {
+                self.id
+            }
+            fn encode_row(&self, out: &mut Vec<u8>) {
+                self.id.encode(out);
+            }
+            fn decode_row(bytes: &[u8]) -> io::Result<$name> {
+                Ok($name {
+                    id: Id::decode(&mut &bytes[..])?,
+                })
+            }
+        }
+    };
+}
+platform_row!(CronStored, "charpente.cron", 0xaaaa);
+platform_row!(CronCompiled, "charpente.cron", 0xbbbb);
+platform_row!(SessionStored, "Session", 0xaaaa);
+platform_row!(SessionCompiled, "Session", 0xbbbb);
+
+#[test]
+fn a_platform_table_with_a_foreign_shape_is_refused_as_another_release() {
+    let stale = |table: &str, stored: &str, compiled: &str| {
+        format!(
+            "this data directory was written by another charpente release: the platform table \
+             \"{table}\" has a different shape ({stored} stored, {compiled} compiled). \
+             charpente does not migrate its own formats between releases (DECISIONS §15). Start \
+             this node from an empty data directory, or restore an archive written by this \
+             release."
+        )
+    };
+    let sim = Sim::with_faults(0x2EB7_0F15, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<CronStored>(),
+    )
+    .unwrap();
+    db.transact(|tx| -> Result<(), ()> {
+        tx.put(&CronStored {
+            id: Id::from_raw(1),
+        });
+        Ok(())
+    })
+    .unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+    let err = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<CronCompiled>(),
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), stale("charpente.cron", "0xaaaa", "0xbbbb"));
+    assert!(Refusal::of(&err).is_some(), "{err}");
+
+    // The app-built platform tables (`Session`, `ApiKey`, `CronRow`) carry no
+    // `charpente.` prefix; they are platform tables all the same.
+    let sim = Sim::with_faults(0x2EB7_0F16, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<SessionStored>(),
+    )
+    .unwrap();
+    db.transact(|tx| -> Result<(), ()> {
+        tx.put(&SessionStored {
+            id: Id::from_raw(1),
+        });
+        Ok(())
+    })
+    .unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+    let err = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<SessionCompiled>(),
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), stale("Session", "0xaaaa", "0xbbbb"));
+}

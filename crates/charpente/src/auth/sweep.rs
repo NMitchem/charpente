@@ -23,10 +23,11 @@ pub const SESSION_SWEEP_NAME: &str = "charpente.session_sweep";
 pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(86_400);
 
 /// These fields, and this job's `global` declaration, change only between
-/// charpente minors and in place (DECISIONS §15): a node refuses a data
-/// directory another minor wrote, so a Pending sweep of another shape never
-/// meets the job-shape refusal, whose fixes an app author could not apply to
-/// the platform's own job. Within a minor they never change.
+/// charpente minors and in place (DECISIONS §15), together with a platform
+/// table (`Session`, `ApiKey` or `CronRow`): a node refuses a data directory
+/// whose platform tables have another shape, so a Pending sweep of another
+/// shape never meets the job-shape refusal, whose fixes an app author could
+/// not apply to the platform's own job. Within a minor they never change.
 #[job(global)]
 pub struct SessionSweep {
     pub before: WallTime,

@@ -741,8 +741,9 @@ fn decide_hello(
     if proto != PROTO_VERSION {
         return Ok(Decision::Refuse(format!(
             "replication protocol version mismatch: this node speaks protocol version \
-             {PROTO_VERSION}, but the peer's Hello declared version {proto} — upgrade the older \
-             binary so both speak the expected version {PROTO_VERSION}"
+             {PROTO_VERSION}, but the peer's Hello declared version {proto} — charpente does not \
+             migrate between releases (DECISIONS §15), so an older node's data directory is \
+             refused too; replace it with a fresh follower running this release"
         )));
     }
     if schema_digest != db.schema_digest() {

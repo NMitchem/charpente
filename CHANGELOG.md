@@ -11,6 +11,10 @@
   - `CronEnqueue` is `Box<dyn Fn(&mut Tx, WallTime) + Send>`. `CronScheduler::upsert`, `tick`, `tick_into` and `has_due` take a `WallTime`, and `next_deadline` returns one.
   - `Dispatcher::run_due` and `run_due_into` take the new `kernel::Now`, one reading of both clocks: `mono` times an outbound call's deadline and `wall` judges due times. `Dispatcher::has_due` takes a `WallTime`, and `next_deadline` returns one.
   - The fingerprints of the platform tables `Session`, `ApiKey` and `CronRow`, and of the platform job `SessionSweep`, change with their field types.
+- **A 0.2 data directory, replication peer or archive bucket is refused by name, with the fix in the text.** Nothing is migrated (DECISIONS §15).
+  - A data directory whose platform table (`Session`, `ApiKey`, `CronRow`) has another shape: start from an empty directory or restore a 0.3 archive.
+  - `PROTO_VERSION` goes from 6 to 7: a 0.2 peer is refused at Hello; replace it with a fresh follower.
+  - `Manifest` gains `format`, and `MANIFEST_FORMAT` is 3: `restore` and archive adoption refuse a manifest with another format, or none; archive to a fresh bucket prefix.
 - **`CronRow.interval_nanos` is the interval the row's `next_due` was set with.** `CronScheduler::upsert` no longer rewrites it on an existing row; the next tick writes it with `next_due`.
 
 ### Changed

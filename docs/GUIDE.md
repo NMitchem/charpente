@@ -4836,6 +4836,23 @@ follower, so a failover can lose the records the primary acked but had not yet
 shipped (the bounded-loss window, named in the `promote` reply). There is no
 sharding and no multi-master — that stance is fixed.
 
+
+### A peer from another release is refused
+
+Every `Hello` carries the wire protocol version (`PROTO_VERSION`, 7 in 0.3). A peer
+declaring another one is refused at `Hello`, by name, before a frame ships:
+
+<!-- pinned -->
+```text
+replication protocol version mismatch: this node speaks protocol version <ours>, but the
+peer's Hello declared version <theirs> — charpente does not migrate between releases
+(DECISIONS §15), so an older node's data directory is refused too; replace it with a fresh
+follower running this release
+```
+
+Delete the older node's data directory and start it as a follower of the current primary; it
+snapshot-seeds from it.
+
 ### Configuring a node
 
 A node's *effective* role lives in a durable role file on its data disk; the
@@ -6333,6 +6350,29 @@ same log position the primary did. No re-seed is ever required by a migration �
 only re-seed rule is the pre-existing retention-window one (§10, "Promotion and
 switchover").
 
+### Across charpente releases: nothing is migrated
+
+`#[table(version = N)]` and `migrate_schema` carry **your** tables across **your** deploys.
+charpente's own state is different: it changes in place between minors and is never
+converted (DECISIONS §15). The platform tables `Session`, `ApiKey` and `CronRow` are
+fingerprinted like yours, so a data directory written by another release lands on this
+refusal instead of a misread row:
+
+<!-- pinned -->
+```text
+this data directory was written by another charpente release: the platform table "<table>"
+has a different shape (<stored> stored, <compiled> compiled). charpente does not migrate its
+own formats between releases (DECISIONS §15). Start this node from an empty data directory,
+or restore an archive written by this release.
+```
+
+The fix is the text's: start from an empty data directory and re-create the state from your
+own source of truth, or restore an archive this release wrote. The platform's `charpente.jobs`,
+`charpente.events` and `charpente.schema_versions` tables are not fingerprinted (they are
+hand-written `Row`s), so a release that changes only those is told apart by the replication
+protocol version and the archive's manifest format, not by this refusal. The two other
+refusals are in §10 and §15.
+
 ### The upgrade barrier
 
 A crash *before* a clean shutdown leaves an old binary's writes sitting in the WAL
@@ -7758,6 +7798,22 @@ generation. Nothing is lost and nothing stops — the retired chain is still rec
 generation's snapshot objects stay in the bucket, and the archive advances — but the claim is
 evidence about who is writing the prefix, so the notice names the bound, the claim, the key,
 the prefix and the generation.
+
+### A bucket from another release is refused
+
+The manifest carries a `format` (`MANIFEST_FORMAT`, 3 in 0.3) that tracks the charpente
+minor. `restore` and an archiving node that adopts a prefix both refuse a manifest with another
+format, or with none (a 0.2 bucket), and an archiving node stops rather than write over it:
+
+<!-- pinned -->
+```text
+this archive was written by another charpente release (manifest format <found>, this release
+reads <expected>); charpente does not migrate its own formats between releases (DECISIONS §15)
+— archive to a fresh bucket prefix from a node running this release
+```
+
+`<found>` is `none` when the field is absent. Nothing is converted: point the archive at a
+fresh prefix and take a new snapshot.
 
 ### Restoring from an archive
 
