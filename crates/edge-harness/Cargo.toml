@@ -8,3 +8,7 @@ publish = false
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# `mint_jwt` for tests/clock_restart.rs; the rig itself depends on nothing here.
+clock-fixture = { path = "../clock-fixture" }

@@ -127,6 +127,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clock-fixture"
+version = "0.2.0"
+dependencies = [
+ "base64ct",
+ "charpente",
+ "rsa",
+ "sha2",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -176,6 +186,9 @@ dependencies = [
 [[package]]
 name = "edge-harness"
 version = "0.2.0"
+dependencies = [
+ "clock-fixture",
+]
 
 [[package]]
 name = "equivalent"

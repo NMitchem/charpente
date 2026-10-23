@@ -305,6 +305,7 @@ fn read_one_chunk(reader: &mut BufReader<TcpStream>) -> Result<ChunkRead, ChunkE
 pub struct Http {
     addr: String,
     session: Option<String>,
+    bearer: Option<String>,
 }
 
 impl Http {
@@ -312,6 +313,7 @@ impl Http {
         Http {
             addr: addr.into(),
             session: None,
+            bearer: None,
         }
     }
 
@@ -320,6 +322,12 @@ impl Http {
     /// Every subsequent request attaches it as `Cookie: charpente_session=…`.
     pub fn set_session(&mut self, token: impl Into<String>) {
         self.session = Some(token.into());
+    }
+
+    /// Sends `Authorization: Bearer <token>` on every request from now on
+    /// (an OIDC JWT or an API key).
+    pub fn set_bearer(&mut self, token: impl Into<String>) {
+        self.bearer = Some(token.into());
     }
 
     pub fn post(&mut self, path: &str, body: &str) -> io::Result<HttpResponse> {
@@ -343,6 +351,9 @@ impl Http {
             format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
         if let Some(session) = &self.session {
             head.push_str(&format!("Cookie: charpente_session={session}\r\n"));
+        }
+        if let Some(bearer) = &self.bearer {
+            head.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
         }
         if let Some(body) = body {
             head.push_str("Content-Type: application/json\r\n");

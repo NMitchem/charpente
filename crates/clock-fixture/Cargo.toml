@@ -1,0 +1,16 @@
+[package]
+name = "clock-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+charpente.workspace = true
+# Token minting, the same versions as charpente's own.
+sha2 = { version = "0.10", features = ["oid"] }
+base64ct = { version = "1", features = ["alloc"] }
+rsa = "0.9"
+
+[lints]
+workspace = true

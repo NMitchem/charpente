@@ -9,6 +9,7 @@ members = [
     "crates/charpente-tsgen",
     "crates/sim-fixture",
     "crates/outbound-fixture",
+    "crates/clock-fixture",
     "crates/ts-fixture-app",
     "crates/guide-examples",
     "crates/edge-harness",

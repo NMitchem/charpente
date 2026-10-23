@@ -6,8 +6,8 @@ name: edge-harness
 # anywhere.
 #
 # COUNTED, not estimated: recounted 2026-10-15 with `cargo test -p edge-harness --
-# --ignored --list`. This job runs **42** `#[ignore]`d tests. 23 are the wire scenarios in
-# `tests/` — acked_durable (2), failover (3), hunts (5), outbound (6), realtime_resume (1),
+# --ignored --list`. This job runs **45** `#[ignore]`d tests. 26 are the wire scenarios in
+# `tests/` — acked_durable (2), clock_restart (3), failover (3), hunts (5), outbound (6), realtime_resume (1),
 # smoke (3), tenant_wire (3) — and the other 19 are the harness's own real-disk/real-process
 # unit tests under `src/`, which `--ignored` picks up too and which are just as absent from
 # `cargo test --workspace`. `tests/unopenable_store.rs` is not `#[ignore]`d, so it runs in
@@ -34,7 +34,7 @@ name: edge-harness
 #
 # ONE DEFINITION. This job shells out to `scripts/edge-harness.sh` instead of repeating its
 # command line, so the runner cannot drift from what a local sweep runs. That script passes
-# `--ignored` (only the 42 above — the crate's zero-IO parse/scan unit tests and
+# `--ignored` (only the 45 above — the crate's zero-IO parse/scan unit tests and
 # `tests/unopenable_store.rs` are NOT ignored and already run in `ci.yml`) and `--test-threads=1` (the tests bind real loopback ports and
 # spawn real processes; serializing avoids port collisions).
 #

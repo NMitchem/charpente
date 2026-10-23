@@ -42,6 +42,9 @@ pub struct Bins {
     /// The HTTPS remote `outbound_node` charges: it dedupes by idempotency
     /// key and reports what arrived on its plain-HTTP `/stats` port.
     pub fake_remote: PathBuf,
+    /// clock-fixture's `charpente::launch` binary: a one-second schedule, a
+    /// session route and an OIDC verifier (`tests/clock_restart.rs`).
+    pub clock_node: PathBuf,
 }
 
 /// How long a freshly spawned process gets to open its port.
@@ -395,6 +398,10 @@ pub fn build_bins() -> io::Result<Bins> {
         &root,
         &["-p", "outbound-fixture", "--bins"],
     )?);
+    bins.extend(cargo_build_release(
+        &root,
+        &["-p", "clock-fixture", "--bins"],
+    )?);
     let node = locate(&bins, "node")?;
     let tenant_node = locate(&bins, "tenant_node")?;
     let charpente = locate(&bins, "charpente")?;
@@ -402,6 +409,7 @@ pub fn build_bins() -> io::Result<Bins> {
     let seed_foreign_job = locate(&bins, "seed_foreign_job")?;
     let outbound_node = locate(&bins, "outbound_node")?;
     let fake_remote = locate(&bins, "fake_remote")?;
+    let clock_node = locate(&bins, "clock_node")?;
     Ok(Bins {
         node,
         tenant_node,
@@ -410,6 +418,7 @@ pub fn build_bins() -> io::Result<Bins> {
         seed_foreign_job,
         outbound_node,
         fake_remote,
+        clock_node,
     })
 }
 
