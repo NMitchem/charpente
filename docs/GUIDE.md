@@ -3236,6 +3236,33 @@ reading: a skewed clock is the thing under test. The platform's own suites
 the three axes off; a platform property turns them on in
 `run_universes_swarm_with!`'s `adjust`.
 
+`crates/charpente/tests/clock.rs` is the worked example. It runs four platform
+properties with all three axes on (sessions, a one-second schedule, retries, and
+the stop and refusal themselves) and a victim clock that fails two of them by
+name. It shows how to write the bounds.
+
+Write a bound through each clock's offset, the reading minus `sim.true_wall()`
+at that instant, never through `clock_skew`. A step back within the tolerance
+is held and then caught up, so step-backs add up, and a clock can run any
+distance behind true time without a check firing. A bound on `expires_at` that
+allows only the skew fails on correct code.
+
+What a node does guarantee is relative to its own clock. The time it hands out
+is never behind its clock's reading, and never more than `CLOCK_TOLERANCE`
+ahead of it: the hold takes the larger, the stop fires past the tolerance, and
+the open refuses past it. That gives these bounds:
+- A session resolves only while the clock judging it reads before its
+  `expires_at`. In true time, it resolves no later than its TTL plus the
+  tolerance after it was minted, plus however far the judging clock has fallen
+  behind the minting one.
+- A schedule never sits idle once its slot has come on the node's clock.
+- Two ticks are never further apart in true time than one interval plus the
+  tolerance, plus the clock's own loss and the time the node was busy.
+
+The file records every wall read the kernel makes (a `Clock` wrapper around
+`sim.clock()`) and steps the kernel by hand. That ties each response, tick and
+retry to the reading it was decided at.
+
 ### The checkers
 
 `charpente_sim::checks` ships ten reusable oracles and one boot idiom — reach
@@ -3529,7 +3556,8 @@ pieces:
   queue reads through `snap.scan::<JobRow>()`; `charpente::core::job::JobRow`'s
   fields are all `pub`: `id: Id<JobRow>`, `name: String`, `payload: Vec<u8>`,
   `key: Option<String>`, `status: JobStatus` (`Pending`, `Done` or `Dead`),
-  `attempts: u32`, `due_at: u64`, `last_error: Option<String>`, `shape:
+  `attempts: u32`, `due_at: WallTime` (`charpente::core::io::WallTime`;
+  `WallTime::UNIX_EPOCH` means due now), `last_error: Option<String>`, `shape:
   Option<u64>`, `scope: Option<u64>` (the tenant's raw id; `None` for a global
   job) and `outbound_key: Option<[u8; 16]>` (`Some` on an outbound job: the
   bytes of the key its calls carry, as a `Delivered`'s `key.as_bytes()`
