@@ -2655,7 +2655,7 @@ clock stalled: this node's wall clock has not advanced past <held>, the latest t
 
 So each hold episode, a step back or a freeze, extends sessions and delays ticks
 by at most the tolerance before the node stops by name, and a clock that stops
-advancing stops the node at the first read more than 60 s after it last moved.
+advancing stops the node at the first read more than 60 s after it first read the value it is stuck at.
 Two clock errors pass every check. A
 clock that runs slow never reads behind the hold. Steps within the tolerance add
 up: a clock that steps back 50 s, catches up to the time it held, and steps back
@@ -2990,6 +2990,26 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     }
 }
 ```
+
+### Drawing inputs
+
+`sim.input()` is for the inputs a property must hold for: a name, an amount, an
+order of operations. Each draw comes from a stream of its own, so drawing moves
+no fault, and the harness records every draw as a raw choice sequence it can
+replay and shrink.
+
+```text
+let i = sim.input();
+let qty = i.between("qty", 1, 500);        // inclusive; shrinks toward 1
+let kind = i.pick("kind", &["a", "b"]);    // shrinks toward the first item
+i.shuffle("order", &mut ops);              // shrinks toward the given order
+let note = i.text("note", &["x", "y"], 1, 4);
+```
+
+It is the workload's own script only: a modelled remote keeps its own `Rng`. A
+drawn input tests how the app handles what its model stand-in returns, never
+the real model's behaviour. `between` panics when `lo > hi`, and `pick` on an
+empty slice; each message names the call and the draw.
 
 ### Giving up: a universe that reached no verdict
 

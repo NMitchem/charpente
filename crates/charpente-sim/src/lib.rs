@@ -801,6 +801,8 @@ struct State {
     /// the returned `Result` is exactly what a `finish_universe`-style wrapper
     /// launders into `Ok(())` before the runner ever sees it.
     gave_up: Option<(&'static str, Option<String>)>,
+    /// The workload's drawn inputs (`Sim::input`): own stream, own record.
+    inputs: InputLog,
     /// Per-host worlds, created lazily by `Sim::host`. NEW state: no existing
     /// single-node universe ever populates this map, so the frozen global
     /// world above is untouched by this task (the replay contract).
@@ -958,6 +960,118 @@ fn fingerprint_files(files: &BTreeMap<String, FileState>) -> u64 {
     hash
 }
 
+/// What `Sim::input` has drawn: from `rng` on a normal run, from `replay`
+/// (then 0s) when the harness replays a recorded sequence.
+struct InputLog {
+    rng: Rng,
+    replay: Option<(Vec<u64>, usize)>,
+    choices: Vec<u64>,
+    drawn: Vec<(&'static str, String)>,
+}
+
+impl InputLog {
+    fn raw(&mut self) -> u64 {
+        let raw = match &mut self.replay {
+            Some((c, at)) => {
+                let v = c.get(*at).copied().unwrap_or(0);
+                *at += 1;
+                v
+            }
+            None => self.rng.next_u64(),
+        };
+        self.choices.push(raw);
+        raw
+    }
+
+    fn between(&mut self, lo: u64, hi: u64) -> u64 {
+        let raw = self.raw();
+        match (hi - lo).checked_add(1) {
+            Some(span) => lo + raw % span,
+            None => lo.saturating_add(raw),
+        }
+    }
+}
+
+/// A workload's input draws; see `Sim::input`.
+pub struct Input<'a> {
+    sim: &'a Sim,
+}
+
+impl Input<'_> {
+    fn log(&self) -> MutexGuard<'_, State> {
+        self.sim.world.lock()
+    }
+
+    /// A number in `lo..=hi`; shrinks toward `lo`. Panics if `lo > hi`.
+    pub fn between(&self, name: &'static str, lo: u64, hi: u64) -> u64 {
+        assert!(
+            lo <= hi,
+            "sim.input().between(\"{name}\", {lo}, {hi}): lo is above hi, so no value fits; \
+             pass the smaller bound first"
+        );
+        let mut g = self.log();
+        let v = g.inputs.between(lo, hi);
+        g.inputs.drawn.push((name, format!("{v:?}")));
+        v
+    }
+
+    /// One of `items`; shrinks toward the first. Panics on an empty slice.
+    pub fn pick<'t, T: std::fmt::Debug>(&self, name: &'static str, items: &'t [T]) -> &'t T {
+        assert!(
+            !items.is_empty(),
+            "sim.input().pick(\"{name}\", ..): the slice is empty, so there is nothing to pick; \
+             pass at least one item"
+        );
+        let mut g = self.log();
+        let raw = g.inputs.raw();
+        let item = &items[(raw % items.len() as u64) as usize];
+        g.inputs.drawn.push((name, format!("{item:?}")));
+        item
+    }
+
+    /// Reorders `items` in place; shrinks toward the order given.
+    pub fn shuffle<T: std::fmt::Debug>(&self, name: &'static str, items: &mut [T]) {
+        let mut g = self.log();
+        for i in 0..items.len() {
+            let j = i + (g.inputs.raw() % (items.len() - i) as u64) as usize;
+            items.swap(i, j);
+        }
+        g.inputs.drawn.push((name, format!("{items:?}")));
+    }
+
+    /// Between `min_words` and `max_words` words from `words`, space-joined;
+    /// shrinks toward `min_words` copies of the first word. Panics if
+    /// `min_words > max_words`, or on an empty `words` when any are wanted.
+    pub fn text(
+        &self,
+        name: &'static str,
+        words: &[&str],
+        min_words: usize,
+        max_words: usize,
+    ) -> String {
+        assert!(
+            min_words <= max_words,
+            "sim.input().text(\"{name}\", .., {min_words}, {max_words}): min_words is above max_words; \
+             pass the smaller count first"
+        );
+        assert!(
+            !words.is_empty() || max_words == 0,
+            "sim.input().text(\"{name}\", ..): `words` is empty but up to {max_words} words are wanted; \
+             pass at least one word or a max_words of 0"
+        );
+        let mut g = self.log();
+        let n = g.inputs.between(min_words as u64, max_words as u64) as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let raw = g.inputs.raw();
+            out.push(words[(raw % words.len() as u64) as usize]);
+        }
+        let text = out.join(" ");
+        g.inputs.drawn.push((name, format!("{text:?}")));
+        text
+    }
+}
+
 pub struct Sim {
     world: Arc<World>,
 }
@@ -991,6 +1105,12 @@ impl Sim {
                     net: NetWorld::default(),
                     coverage: BTreeMap::new(),
                     gave_up: None,
+                    inputs: InputLog {
+                        rng: keyed_stream(seed, "inputs"),
+                        replay: None,
+                        choices: Vec::new(),
+                        drawn: Vec::new(),
+                    },
                     hosts: BTreeMap::new(),
                     disk_faults_off: false,
                     stalls_off: false,
@@ -1004,6 +1124,29 @@ impl Sim {
 
     pub fn seed(&self) -> u64 {
         self.world.seed
+    }
+
+    /// The workload's inputs: the values the property must hold for, drawn
+    /// from their own stream (`keyed_stream(seed, "inputs")`), so drawing
+    /// moves no fault draw. Every draw is recorded as raw choices, which the
+    /// harness replays and shrinks.
+    ///
+    /// This is the workload's own script only. A modelled remote (an outbound
+    /// stand-in) keeps its own `Rng`. Values shrink toward `lo`, the first
+    /// item and the identity order. A drawn input tests how the app handles
+    /// what its model stand-in returns, never the real model's behaviour.
+    pub fn input(&self) -> Input<'_> {
+        Input { sim: self }
+    }
+
+    /// Feeds `choices` to later `input()` draws in order, then 0s.
+    pub(crate) fn replay_choices(&self, choices: &[u64]) {
+        self.world.lock().inputs.replay = Some((choices.to_vec(), 0));
+    }
+
+    fn input_record(&self) -> (Vec<u64>, Vec<(&'static str, String)>) {
+        let g = self.world.lock();
+        (g.inputs.choices.clone(), g.inputs.drawn.clone())
     }
 
     /// This universe's sampled `subscriber_stall` rate — the one extended
@@ -2769,12 +2912,18 @@ impl Outcome {
 pub struct UniverseEnd {
     pub outcome: Outcome,
     pub coverage: BTreeMap<&'static str, u64>,
+    /// The raw input choices the run consumed, and each input by name.
+    pub choices: Vec<u64>,
+    pub drawn: Vec<(&'static str, String)>,
 }
 
 /// Reads the outcome off the world the workload just ran in. Called only on
 /// the success path: a workload that gave up AND then failed is a failure.
 fn end_of(sim: &Sim) -> UniverseEnd {
+    let (choices, drawn) = sim.input_record();
     UniverseEnd {
+        choices,
+        drawn,
         outcome: match sim.gave_up() {
             Some(reason) => Outcome::GaveUp {
                 reason,
@@ -2822,16 +2971,15 @@ pub(crate) fn run_universe(
 /// One app-harness run's failure (`run_app_universe`): what the harness
 /// files it with (`config`, the `coverage` that fired, the workload's
 /// `message`) and what a replay starts from (`choices`, the run's input
-/// sequence, and `drawn`, each input by name). The last two stay empty until a
-/// workload can draw inputs. Crate-private: only the harness obtains one.
+/// sequence, and `drawn`, each input by name). Crate-private: only the harness obtains one.
 #[derive(Debug)]
 pub(crate) struct UniverseFailure {
     pub config: FaultConfig,
     pub coverage: BTreeMap<&'static str, u64>,
     pub message: String,
-    #[expect(dead_code, reason = "the harness reads it once workloads draw inputs")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 12's shrinker reads it"))]
     pub choices: Vec<u64>,
-    #[expect(dead_code, reason = "the harness reads it once workloads draw inputs")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 12's shrinker reads it"))]
     pub drawn: Vec<(&'static str, String)>,
 }
 
@@ -2839,8 +2987,7 @@ pub(crate) struct UniverseFailure {
 /// plus the clock axes (`sample_clock_fields`), then every `FaultConfig`
 /// field named in `faults_off` turned off. The clock axes sample last, from
 /// their own streams, so with them off a run decides exactly as before them.
-/// `choices` is the input sequence a replay feeds the workload; nothing draws
-/// inputs yet, so it is unread.
+/// `choices` is the input sequence a replay feeds the workload (then 0s).
 // The same large-Err trade as `run_universe`.
 #[allow(clippy::result_large_err)]
 pub(crate) fn run_app_universe(
@@ -2849,7 +2996,6 @@ pub(crate) fn run_app_universe(
     faults_off: &[&'static str],
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
 ) -> Result<UniverseEnd, UniverseFailure> {
-    let _ = choices;
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
@@ -2860,12 +3006,18 @@ pub(crate) fn run_app_universe(
     }
     cfg.validate();
     let mut sim = Sim::with_faults(seed, cfg.clone());
-    let failure = |sim: &Sim, message: String| UniverseFailure {
-        config: cfg.clone(),
-        coverage: sim.coverage(),
-        message,
-        choices: Vec::new(),
-        drawn: Vec::new(),
+    if let Some(c) = choices {
+        sim.replay_choices(c);
+    }
+    let failure = |sim: &Sim, message: String| {
+        let (choices, drawn) = sim.input_record();
+        UniverseFailure {
+            config: cfg.clone(),
+            coverage: sim.coverage(),
+            message,
+            choices,
+            drawn,
+        }
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
         Ok(Ok(())) => Ok(end_of(&sim)),
@@ -3028,6 +3180,119 @@ macro_rules! sim_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draw_some(sim: &Sim) -> (u64, &'static str, String) {
+        let i = sim.input();
+        (
+            i.between("n", 3, 900),
+            i.pick("p", &["a", "b", "c"]),
+            i.text("t", &["x", "y", "z"], 1, 4),
+        )
+    }
+
+    #[test]
+    fn drawn_inputs_replay_from_their_own_stream() {
+        let (a, b) = (Sim::new(7), Sim::new(7));
+        assert_eq!(draw_some(&a), draw_some(&b));
+        assert_ne!(draw_some(&Sim::new(8)), draw_some(&Sim::new(7)));
+    }
+
+    #[test]
+    fn drawing_moves_no_fault_draw() {
+        let cfg = FaultConfig::swarm(&mut Rng::new(5));
+        let run = |draw: bool| {
+            let sim = Sim::with_faults(11, cfg.clone());
+            if draw {
+                draw_some(&sim);
+            }
+            let mut rolls = Vec::new();
+            for _ in 0..40 {
+                rolls.push(sim.world.lock().faults.next_u64());
+                rolls.push(sim.world.lock().entropy.next_u64());
+            }
+            (rolls, sim.coverage())
+        };
+        assert_eq!(run(true), run(false));
+        let a = run_app_universe(3, None, &[], &|s| {
+            draw_some(s);
+            Ok(())
+        });
+        let b = run_app_universe(3, None, &[], &|_| Ok(()));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.coverage, b.coverage);
+    }
+
+    #[test]
+    fn a_replayed_choice_sequence_reproduces_the_values() {
+        let first = Sim::new(21);
+        let want = draw_some(&first);
+        let (choices, drawn) = first.input_record();
+        let again = Sim::new(99);
+        again.replay_choices(&choices);
+        assert_eq!(draw_some(&again), want);
+        assert_eq!(again.input_record(), (choices, drawn));
+    }
+
+    #[test]
+    fn exhausted_choices_read_as_zero_and_give_the_simplest_values() {
+        let sim = Sim::new(21);
+        sim.replay_choices(&[]);
+        assert_eq!(draw_some(&sim), (3, "a", "x".to_string()));
+        assert!(sim.input_record().0.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn shuffle_with_zero_choices_is_identity() {
+        let sim = Sim::new(1);
+        sim.replay_choices(&[]);
+        let mut v = [1, 2, 3, 4, 5];
+        sim.input().shuffle("order", &mut v);
+        assert_eq!(v, [1, 2, 3, 4, 5]);
+        let live = Sim::new(1);
+        let mut w: Vec<u32> = (0..20).collect();
+        live.input().shuffle("order", &mut w);
+        assert_ne!(w, (0..20).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn drawn_values_are_recorded_by_name_in_draw_order() {
+        let sim = Sim::new(4);
+        let i = sim.input();
+        let n = i.between("count", 0, u64::MAX);
+        let p = *i.pick("kind", &["a", "b"]);
+        let (choices, drawn) = sim.input_record();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(n, choices[0]);
+        assert_eq!(drawn[0], ("count", format!("{n:?}")));
+        assert_eq!(drawn[1], ("kind", format!("{p:?}")));
+    }
+
+    #[test]
+    fn a_failing_app_universe_carries_its_choices_and_replays_them() {
+        let body = |s: &mut Sim| {
+            let n = s.input().between("n", 0, 1_000_000);
+            Err(format!("n={n}"))
+        };
+        let f = run_app_universe(9, None, &[], &body).unwrap_err();
+        assert_eq!(f.choices.len(), 1);
+        assert_eq!(f.drawn[0].0, "n");
+        let g = run_app_universe(1234, Some(&f.choices), &[], &body).unwrap_err();
+        assert_eq!(g.message, f.message);
+        let z = run_app_universe(9, Some(&[]), &[], &body).unwrap_err();
+        assert_eq!(z.message, "n=0");
+    }
+
+    #[test]
+    #[should_panic(expected = "between(\"n\", 5, 2): lo is above hi")]
+    fn between_with_lo_above_hi_names_the_call() {
+        Sim::new(1).input().between("n", 5, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "pick(\"p\", ..): the slice is empty")]
+    fn pick_on_empty_names_the_call() {
+        Sim::new(1).input().pick::<u8>("p", &[]);
+    }
 
     #[test]
     fn virtual_time_advances_only_by_simulation() {

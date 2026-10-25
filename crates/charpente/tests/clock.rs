@@ -70,6 +70,8 @@ const STALL_PROPERTY: &str = "a_schedule_never_stalls_past_one_interval_plus_tol
 const RETRY_PROPERTY: &str = "no_retry_runs_before_its_due_at";
 const BOUNDARY_PROPERTY: &str =
     "the_stop_and_the_refusal_fire_exactly_when_the_clock_is_beyond_tolerance";
+const PROMOTE_PROPERTY: &str =
+    "a_promote_is_refused_exactly_when_the_followers_clock_is_beyond_tolerance";
 
 // ------------------------------------------------------------------- app
 
@@ -1244,7 +1246,7 @@ fn check_retry(sim: &Sim, t: &Trace) -> Result<(), String> {
 /// Wherever a workload excuses a clock stop or refusal as a fault's fallout,
 /// this property is the oracle that none fires without a clock beyond the
 /// tolerance behind it.
-fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
+fn check_boundary(sim: &Sim, t: &Trace, property: &str) -> Result<(), String> {
     let hold = replay_hold(t)?;
     let gave = |site: &str, read: usize, w: u64| -> Result<(), String> {
         let replayed = handed(&hold, read)?;
@@ -1252,7 +1254,7 @@ fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
             Ok(())
         } else {
             Err(format!(
-                "{BOUNDARY_PROPERTY}: the node handed out {} for {site}, and the hold replayed \
+                "{property}: the node handed out {} for {site}, and the hold replayed \
                  from its readings says {}",
                 wall(w),
                 wall(replayed)
@@ -1300,15 +1302,15 @@ fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
         match (due, fired) {
             (Some(named), Some(text)) if text.starts_with(&named) => Ok(()),
             (Some(named), Some(text)) => Err(format!(
-                "{BOUNDARY_PROPERTY}: the {site} at {at} does not name its reading, held time \
+                "{property}: the {site} at {at} does not name its reading, held time \
                  or floor (expected it to start {named:?}): {text}"
             )),
             (Some(named), None) => Err(format!(
-                "{BOUNDARY_PROPERTY}: the {site} at {at} went on, and the rule stops or \
+                "{property}: the {site} at {at} went on, and the rule stops or \
                  refuses it there with {named:?}"
             )),
             (None, Some(text)) => Err(format!(
-                "{BOUNDARY_PROPERTY}: the {site} at {at} stopped or was refused within the \
+                "{property}: the {site} at {at} stopped or was refused within the \
                  tolerance: {text}"
             )),
             (None, None) => Ok(()),
@@ -1378,7 +1380,7 @@ fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
                 // write gate is the node's own answer.
                 if due.is_some() == *accepted {
                     return Err(format!(
-                        "{BOUNDARY_PROPERTY}: a promote at {} {} the write gate",
+                        "{property}: a promote at {} {} the write gate",
                         over(*read, *floor),
                         if *accepted {
                             "opened, more than the tolerance behind,"
@@ -2018,7 +2020,7 @@ fn the_stop_and_the_refusal_fire_exactly_when_the_clock_is_beyond_tolerance() {
         clock_axes,
         |sim: &mut Sim| {
             let trace = time_universe(sim, false)?;
-            check_boundary(sim, &trace)
+            check_boundary(sim, &trace, BOUNDARY_PROPERTY)
         },
         require: [
             "clock:refused",
@@ -2045,8 +2047,8 @@ fn a_promote_is_refused_exactly_when_the_followers_clock_is_beyond_tolerance() {
         clock_axes,
         |sim: &mut Sim| {
             let [p, f] = promote_universe(sim)?;
-            check_boundary(sim, &p)?;
-            check_boundary(sim, &f)
+            check_boundary(sim, &p, PROMOTE_PROPERTY)?;
+            check_boundary(sim, &f, PROMOTE_PROPERTY)
         },
         require: [
             "clock:skewed",
@@ -2080,11 +2082,11 @@ fn an_uptime_clock_fails_the_ttl_and_stall_properties_by_name() {
         check_ttl(&honest, &trace).unwrap();
         check_stall(&honest, &trace).unwrap();
         check_retry(&honest, &trace).unwrap();
-        check_boundary(&honest, &trace).unwrap();
+        check_boundary(&honest, &trace, BOUNDARY_PROPERTY).unwrap();
         let mut sim = Sim::with_faults(seed, FaultConfig::none());
         let trace = time_universe(&mut sim, true).unwrap();
         check_retry(&sim, &trace).unwrap();
-        check_boundary(&sim, &trace).unwrap();
+        check_boundary(&sim, &trace, BOUNDARY_PROPERTY).unwrap();
         ttl = ttl.or_else(|| check_ttl(&sim, &trace).err());
         stall = stall.or_else(|| check_stall(&sim, &trace).err());
         if ttl.is_some() && stall.is_some() {
