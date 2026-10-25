@@ -1343,11 +1343,11 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             // in every universe where corruption did not fire. Excused is a
             // give-up, never a pass: nothing past the loss is adjudicated.
             if charpente_sim::checks::durable_corruption_fired(sim) {
-                sim.give_up(format!(
-                    "durable corruption cut acknowledged requests at a round's recovery \
-                     ({acked} acked over HTTP, {recovered} recovered), so durability was not \
-                     adjudicated and the rounds after it never ran"
-                ));
+                sim.give_up(
+                    "durable corruption cut acknowledged requests at a round's recovery, so \
+                     durability was not adjudicated and the rounds after it never ran",
+                    format!("{acked} acked over HTTP, {recovered} recovered"),
+                );
                 return Ok(responses);
             }
             return Err(format!(
@@ -1439,11 +1439,11 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             // Same excuse-only-if-injected routing, and give-up, as the round
             // loop above.
             if charpente_sim::checks::durable_corruption_fired(sim) {
-                sim.give_up(format!(
-                    "durable corruption cut acknowledged requests at the final recovery \
-                     ({acked} acked over HTTP, {recovered} recovered), so the final state was \
-                     never checked"
-                ));
+                sim.give_up(
+                    "durable corruption cut acknowledged requests at the final recovery, so the \
+                     final state was never checked",
+                    format!("{acked} acked over HTTP, {recovered} recovered"),
+                );
                 return Ok(responses);
             }
             return Err(format!(
@@ -1459,10 +1459,11 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
             Err(msg) => return Err(msg),
         }
     }
-    sim.give_up(format!(
-        "the final verification never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, \
-         so the last round's acked requests were never checked"
-    ));
+    sim.give_up(
+        "the final verification never ran: every attempt hit injected faults, so the last \
+         round's acked requests were never checked",
+        format!("{FINAL_ATTEMPTS} attempts"),
+    );
     Ok(responses)
 }
 
@@ -1617,11 +1618,12 @@ fn a_durable_refusal_at_a_round_boot_gives_up_at_once_by_name() {
     let reason = sim
         .gave_up()
         .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
+    let detail = sim.gave_up_detail().unwrap_or_default();
     assert!(
         reason.contains(
             "the boot was refused for durable corruption at or below the store's horizon"
-        ) && reason.contains("at-or-below the store's durable horizon"),
-        "seed {SEED:#x} must give up for the refusal, carrying its text: {reason}"
+        ) && detail.contains("at-or-below the store's durable horizon"),
+        "seed {SEED:#x} must give up for the refusal, carrying its text: {reason}: {detail}"
     );
 }
 

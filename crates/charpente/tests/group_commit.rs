@@ -2365,16 +2365,18 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
         Verify::Checked if watermark == 0 => sim.give_up(
             "no request was ever acknowledged, so the final check compared the durable count \
              with 0 and could not have failed",
+            "",
         ),
         Verify::Checked => {}
         // The durable-corruption excuse stays a pass: the fault it excuses
         // fired and is on record under its own fire-time key
         // (`durable_corruption_fired`), unlike a check that never ran.
         Verify::Excused => {}
-        Verify::Unreachable => sim.give_up(format!(
-            "the final coda never verified the watermark: all {CODA_REOPENS} reopens hit \
-             injected faults, so the last round's acked requests were never checked"
-        )),
+        Verify::Unreachable => sim.give_up(
+            "the final coda never verified the watermark: every reopen hit injected faults, so \
+             the last round's acked requests were never checked",
+            format!("{CODA_REOPENS} reopens"),
+        ),
         Verify::Refused => {}
     }
     Ok(())

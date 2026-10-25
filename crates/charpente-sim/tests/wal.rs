@@ -180,6 +180,7 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
         sim.give_up(
             "every final recovery died to injected faults, so the last round's records were \
              never checked",
+            "",
         );
         return Ok(());
     };
@@ -319,7 +320,7 @@ fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
         Err(e) => {
             let msg = e.to_string();
             return if is_fault_fallout(&msg) {
-                sim.give_up(format!("the initial open died to an injected fault: {msg}"));
+                sim.give_up("the initial open died to an injected fault", msg);
                 Ok(())
             } else {
                 Err(format!(
@@ -371,7 +372,7 @@ fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
             if horizon_fence_held(sim, &msg)? {
                 Ok(())
             } else if is_fault_fallout(&msg) {
-                sim.give_up(format!("the recovery died to an injected fault: {msg}"));
+                sim.give_up("the recovery died to an injected fault", msg);
                 Ok(())
             } else {
                 Err(format!(
@@ -1453,7 +1454,10 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
         }
     }
     let Some(records) = recovered else {
-        sim.give_up("every final reopen died to injected faults, so gap-freedom was never checked");
+        sim.give_up(
+            "every final reopen died to injected faults, so gap-freedom was never checked",
+            "",
+        );
         return Ok(());
     };
 

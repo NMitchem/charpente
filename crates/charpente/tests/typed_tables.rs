@@ -529,12 +529,11 @@ fn recover_and_check(
         // in every universe where corruption did not fire. Excused is a
         // give-up, never a pass: nothing past the loss is adjudicated.
         if charpente_sim::checks::durable_corruption_fired(sim) {
-            sim.give_up(format!(
-                "durable corruption cut acknowledged records at a round's recovery (acked \
-                 {acked}, recovered {}), so durability was not adjudicated and the rounds \
-                 after it never ran",
-                recovered.len()
-            ));
+            sim.give_up(
+                "durable corruption cut acknowledged records at a round's recovery, so \
+                 durability was not adjudicated and the rounds after it never ran",
+                format!("acked {acked}, recovered {}", recovered.len()),
+            );
             return Ok(Recovered::GaveUp);
         }
         return Err(format!(
@@ -722,6 +721,7 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
                     sim.give_up(
                         "no record was ever logged, so the final check compared the store with an \
                          empty model and could not have failed",
+                        "",
                     );
                 }
                 return Ok(rejected);
@@ -730,10 +730,11 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
             Recovered::GaveUp => return Ok(rejected),
         }
     }
-    sim.give_up(format!(
-        "the final check never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, so the \
-         last round's records were never checked"
-    ));
+    sim.give_up(
+        "the final check never ran: every attempt hit injected faults, so the last round's \
+         records were never checked",
+        format!("{FINAL_ATTEMPTS} attempts"),
+    );
     Ok(rejected)
 }
 

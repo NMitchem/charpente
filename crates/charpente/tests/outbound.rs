@@ -3133,10 +3133,11 @@ fn outbound_workload(sim: &mut Sim, v: Variant) -> Result<(), String> {
         // re-seeded pool charges again under fresh keys, so nothing below is
         // adjudicated.
         if durable_corruption_fired(sim) {
-            sim.give_up(format!(
+            sim.give_up(
                 "durable corruption cut an enqueue whose call had already reached the remote, \
-                 so exactly-once was not adjudicated: {e}"
-            ));
+                 so exactly-once was not adjudicated",
+                e,
+            );
             return Ok(());
         }
         return Err(e);
@@ -3310,13 +3311,17 @@ fn a_media_cut_enqueue_whose_calls_were_made_gives_the_universe_up() {
         sim.coverage()
     );
     let reason = sim.gave_up().expect("excused, so never a pass");
+    assert_eq!(
+        reason,
+        "durable corruption cut an enqueue whose call had already reached the remote, so \
+         exactly-once was not adjudicated"
+    );
+    let detail = sim.gave_up_detail().unwrap_or_default();
     assert!(
-        reason.starts_with(
-            "durable corruption cut an enqueue whose call had already reached the remote, so \
-             exactly-once was not adjudicated: calls_have_durable_jobs: a call to pay.test with \
-             key fa35dc5568cc92447a55045d8f217e5a"
+        detail.starts_with(
+            "calls_have_durable_jobs: a call to pay.test with key fa35dc5568cc92447a55045d8f217e5a"
         ),
-        "seed {SEED:#x}: {reason}"
+        "seed {SEED:#x}: {detail}"
     );
 }
 

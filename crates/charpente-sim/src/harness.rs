@@ -683,7 +683,7 @@ mod tests {
     }
 
     fn always_gives_up(sim: &mut Sim) -> Result<(), String> {
-        sim.give_up("toy give-up");
+        sim.give_up("toy give-up", "");
         Ok(())
     }
 
@@ -1265,7 +1265,7 @@ mod tests {
     #[test]
     fn a_failure_after_a_give_up_is_still_a_failure() {
         fn gives_up_then_fails(sim: &mut Sim) -> Result<(), String> {
-            sim.give_up("toy give-up");
+            sim.give_up("toy give-up", "");
             Err("toy failure".into())
         }
         let test = SimTest {
@@ -1311,7 +1311,7 @@ mod tests {
             let mut b = [0u8; 1];
             sim.entropy().fill(&mut b);
             if b[0] % 2 == 0 {
-                sim.give_up("toy give-up");
+                sim.give_up("toy give-up", "");
                 Ok(())
             } else {
                 Err("toy failure".into())

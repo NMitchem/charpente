@@ -34,7 +34,7 @@ fn open_app(sim: &mut Sim) -> Result<Option<App>, String> {
                 return Ok(None);
             }
             if is_fault_fallout(&e.to_string()) {
-                sim.give_up(format!("App::open hit fault fallout: {e}"));
+                sim.give_up("App::open hit fault fallout", e);
                 return Ok(None);
             }
             Err(e.to_string())
@@ -51,14 +51,14 @@ fn run_kernel(sim: &mut Sim, app: App, source: &mut SimSource) -> Result<Option<
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(kernel) => kernel,
         Err(e) if fallout(&e.to_string()) => {
-            sim.give_up(format!("Kernel::new hit fault fallout: {e}"));
+            sim.give_up("Kernel::new hit fault fallout", e);
             return Ok(None);
         }
         Err(e) => return Err(e.to_string()),
     };
     if let Err(e) = kernel.run(source) {
         if fallout(&e.to_string()) {
-            sim.give_up(format!("the kernel loop hit fault fallout: {e}"));
+            sim.give_up("the kernel loop hit fault fallout", e);
             return Ok(None);
         }
         return Err(e.to_string());
@@ -102,13 +102,16 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
         return Ok(());
     };
     if !acked {
-        sim.give_up("the POST was never acked, so durability has nothing to prove");
+        sim.give_up(
+            "the POST was never acked, so durability has nothing to prove",
+            "",
+        );
         return Ok(());
     }
     let snap = match app.db().snapshot() {
         Ok(snap) => snap,
         Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("the snapshot hit fault fallout: {e}"));
+            sim.give_up("the snapshot hit fault fallout", e);
             return Ok(());
         }
         Err(e) => return Err(e.to_string()),
@@ -118,12 +121,12 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
         // Acked-but-lost is excused ONLY where the harness injected durable
         // corruption into this universe (GUIDE §8, "Giving up").
         Ok(None) if durable_corruption_fired(sim) => {
-            sim.give_up("durable corruption fired, so the acked row is excused");
+            sim.give_up("durable corruption fired, so the acked row is excused", "");
             Ok(())
         }
         Ok(None) => Err("acked note 1 lost across a crash".to_string()),
         Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("the read-back hit fault fallout: {e}"));
+            sim.give_up("the read-back hit fault fallout", e);
             Ok(())
         }
         Err(e) => Err(e.to_string()),
@@ -183,7 +186,7 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
         Ok(()) => Ok(()),
         // The oracle's own reads go through the same faulted disk.
         Err(msg) if is_fault_fallout(&msg) => {
-            sim.give_up(format!("the end-state read hit fault fallout: {msg}"));
+            sim.give_up("the end-state read hit fault fallout", msg);
             Ok(())
         }
         Err(msg) => Err(msg),

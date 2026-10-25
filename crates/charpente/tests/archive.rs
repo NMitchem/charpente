@@ -8418,6 +8418,7 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
             sim.give_up(
                 "the source never opened: every attempt hit injected faults, so nothing was \
                  archived or restored",
+                "",
             );
             return Ok(());
         }
@@ -8778,6 +8779,7 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
         sim.give_up(
             "no manifest was ever read back from the archive, so there was no frontier to \
              restore to",
+            "",
         );
         return Ok(());
     };
@@ -8809,6 +8811,7 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
         sim.cover("archive:restore_never_completed");
         sim.give_up(
             "the restore never completed past injected faults, so nothing restored was checked",
+            "",
         );
         return Ok(());
     };
@@ -8852,10 +8855,10 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
     }
     if !verified {
         sim.cover("archive:verify_never_read_cleanly");
-        sim.give_up(format!(
-            "the restored destination never read cleanly in {CONV_VERIFY_ATTEMPTS} attempts, so \
-             the restore was never verified"
-        ));
+        sim.give_up(
+            "the restored destination never read cleanly, so the restore was never verified",
+            format!("{CONV_VERIFY_ATTEMPTS} attempts"),
+        );
         return Ok(());
     }
     sim.cover("archive:restored");

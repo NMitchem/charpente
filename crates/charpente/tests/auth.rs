@@ -1074,7 +1074,7 @@ fn finish_auth_universe(
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("auth:inconclusive");
-            sim.give_up(e);
+            sim.give_up(INCONCLUSIVE, e);
             Ok(())
         }
         Ok(_) => Ok(()),

@@ -1602,12 +1602,15 @@ impl Client {
     /// shape and stay as they were.
     fn give_up_if_nothing_adjudicated(&self, sim: &Sim) {
         if self.adjudicated_nothing() {
-            sim.give_up(format!(
-                "the settled client was owed nothing and delivered nothing: no ledgered row \
-                 lay in its subscription's window [{}, {}), so nothing was adjudicated",
-                self.floor.min(self.next_scan_id),
-                self.next_scan_id
-            ));
+            sim.give_up(
+                "the settled client was owed nothing and delivered nothing: no ledgered row lay \
+                 in its subscription's window, so nothing was adjudicated",
+                format!(
+                    "window [{}, {})",
+                    self.floor.min(self.next_scan_id),
+                    self.next_scan_id
+                ),
+            );
         }
     }
 
@@ -2465,11 +2468,11 @@ fn realtime_workload_judged(
         // one nothing explains, which fails below. That give-up reached 0 of
         // 3,328 universes over 26 bases once the flagship re-synced (S3b item 3).
         if clean_attempts == 0 {
-            sim.give_up(format!(
-                "no settle attempt completed without fault fallout over \
-                 {SETTLE_ATTEMPTS} attempts — there was no node to catch up from ({})",
-                client.unsettled_report()
-            ));
+            sim.give_up(
+                "no settle attempt completed without fault fallout, so there was no node to \
+                 catch up from",
+                format!("{SETTLE_ATTEMPTS} attempts ({})", client.unsettled_report()),
+            );
             return Ok(client.trace);
         }
         return Err(client.unsettled_report());
@@ -2635,10 +2638,13 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
     );
     assert!(
         reason.contains("there was no node to catch up from")
-            && reason.contains("first unaccounted matching id Some("),
+            && sim
+                .gave_up_detail()
+                .is_some_and(|d| d.contains("first unaccounted matching id Some(")),
         "and it must be THIS give-up — no settle attempt ever ran cleanly while the client \
          was owed an event — rather than some unrelated cause that happens to keep the test \
-         green: {reason}"
+         green: {reason}: {:?}",
+        sim.gave_up_detail()
     );
     assert!(!sim.coverage().contains_key("realtime:settle-clean"));
 }
@@ -3519,7 +3525,10 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
             Err(e) => return Err(format!("event scan failed non-injected: {e}")),
         };
         if rows.is_empty() {
-            sim.give_up("no event survived the two eras — nothing to resume across");
+            sim.give_up(
+                "no event survived the two eras — nothing to resume across",
+                "",
+            );
             return Ok(());
         }
         // `EventRow` is not `Clone`: the anchor is an index into `rows`.
@@ -3564,9 +3573,10 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
             Err(e) => return Err(format!("resume kernel.run failed non-injected: {e}")),
         }
     }
-    sim.give_up(format!(
-        "no resume completed without fault fallout in {SHAPES_SETTLE_ATTEMPTS} attempts"
-    ));
+    sim.give_up(
+        "no resume completed without fault fallout",
+        format!("{SHAPES_SETTLE_ATTEMPTS} attempts"),
+    );
     Ok(())
 }
 
@@ -5023,7 +5033,7 @@ fn finish_rt_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("realtime:multi-node-inconclusive");
-            sim.give_up(e);
+            sim.give_up(INCONCLUSIVE, e);
             Ok(())
         }
         other => other,
@@ -6278,11 +6288,11 @@ fn scoped_realtime_workload_judged(
         // give-up reached 0 of 3,200 universes over 25 bases (S3b item 1), as the
         // S3 re-review measured (0 of 16,384), so it went.
         if clean_attempts == 0 {
-            sim.give_up(format!(
-                "no settle attempt completed without fault fallout over \
-                 {SETTLE_ATTEMPTS} attempts — there was no node to catch up from ({})",
-                client.unsettled_report()
-            ));
+            sim.give_up(
+                "no settle attempt completed without fault fallout, so there was no node to \
+                 catch up from",
+                format!("{SETTLE_ATTEMPTS} attempts ({})", client.unsettled_report()),
+            );
             return Ok(client.trace);
         }
         return Err(client.unsettled_report());
@@ -9283,16 +9293,17 @@ mod tenancy_feeds {
             // subscribe read a head, and this give-up names it.
             if clean_attempts == 0 {
                 let why = if u.head_read {
-                    "there was no node to catch up from"
+                    "no settle attempt completed without fault fallout, so there was no node to \
+                     catch up from"
                 } else {
-                    "no subscribe read a head after the last recovery, so a cut it made could \
-                     not be re-synced, and there was no node to catch up from"
+                    "no settle attempt completed without fault fallout, and no subscribe read a \
+                     head after the last recovery, so a cut it made could not be re-synced and \
+                     there was no node to catch up from"
                 };
-                sim.give_up(format!(
-                    "no settle attempt completed without fault fallout over {SETTLE_ATTEMPTS} \
-                     attempts — {why} ({})",
-                    u.unsettled_report()
-                ));
+                sim.give_up(
+                    why,
+                    format!("{SETTLE_ATTEMPTS} attempts ({})", u.unsettled_report()),
+                );
                 return Ok(u.trace());
             }
             return Err(u.unsettled_report());
@@ -9301,6 +9312,7 @@ mod tenancy_feeds {
             sim.give_up(
                 "every feed settled owed nothing, delivered nothing and refused no probe, so \
                  nothing was adjudicated",
+                "",
             );
             return Ok(u.trace());
         }

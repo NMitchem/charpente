@@ -396,12 +396,15 @@ fn judge_divergence<T: PartialEq + std::fmt::Debug>(
         charpente_sim::checks::durable_corruption_fired(sim),
     ) {
         sim.cover(excused);
-        sim.give_up(format!(
-            "durable corruption cut rows from the {what}: it kept {} of the uninterrupted \
-             twin's {} rows, every one of them intact, so the migration was not adjudicated",
-            got.len(),
-            twin.len()
-        ));
+        sim.give_up(
+            "durable corruption cut rows from the store, every one left intact, so the migration \
+             was not adjudicated",
+            format!(
+                "the {what}: it kept {} of the uninterrupted twin's {} rows",
+                got.len(),
+                twin.len()
+            ),
+        );
         return Ok(());
     }
     Err(format!(
@@ -433,9 +436,15 @@ fn a_loss_durable_corruption_explains_gives_up_rather_than_passing() {
         .gave_up()
         .expect("an excused loss must give up, not pass: nothing was adjudicated");
     assert!(
-        reason.contains("durable corruption cut rows from the migrated store")
-            && reason.contains("kept 1 of the uninterrupted twin's 2 rows"),
+        reason.contains("durable corruption cut rows from the store"),
         "and it must be THIS give-up: {reason}"
+    );
+    let detail = sim
+        .gave_up_detail()
+        .expect("the per-run text rides the detail");
+    assert!(
+        detail.contains("the migrated store: it kept 1 of the uninterrupted twin's 2 rows"),
+        "{detail}"
     );
 
     let clean = Sim::with_faults(0x2EB7_0902, FaultConfig::none());
@@ -543,25 +552,25 @@ fn a_migration_universe_whose_budget_runs_out_gives_up_by_name() {
         (
             0xafac_f795_99dc_b367_u64,
             false,
-            seed_never_completed(),
+            SEED_NEVER_COMPLETED,
             "migrations:inconclusive",
         ),
         (
             0x94bc_dae8_8fea_9141,
             false,
-            migrate_never_completed(),
+            MIGRATE_NEVER_COMPLETED,
             "migrations:inconclusive",
         ),
         (
             0x1ee4_034f_da27_b296,
             true,
-            seed_never_completed(),
+            SEED_NEVER_COMPLETED,
             "migrations:scoped-inconclusive",
         ),
         (
             0x063a_7755_a85b_e5b3,
             true,
-            migrate_never_completed(),
+            MIGRATE_NEVER_COMPLETED,
             "migrations:scoped-inconclusive",
         ),
     ] {
@@ -577,8 +586,8 @@ fn a_migration_universe_whose_budget_runs_out_gives_up_by_name() {
         };
         result.unwrap_or_else(|e| panic!("seed {seed:#x}: an exhausted budget is no failure: {e}"));
         assert_eq!(
-            sim.gave_up().as_deref(),
-            Some(reason.as_str()),
+            sim.gave_up(),
+            Some(reason),
             "seed {seed:#x}: a universe that compared nothing gives up, by this name"
         );
         assert_eq!(sim.coverage().get(key), Some(&1), "seed {seed:#x}");
@@ -629,25 +638,17 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
 /// The give-ups of a migration universe that never reached its comparison
 /// (S3b item 4). Every seeding or open-and-migrate round met fault fallout
 /// (the barrier remedy counts as a round), so no store was compared.
-fn seed_never_completed() -> String {
-    format!(
-        "seeding the v1 store never completed: every one of its {SEED_ROUNDS} rounds met fault \
-         fallout, so there was no store to migrate"
-    )
-}
-fn migrate_never_completed() -> String {
-    format!(
-        "open-and-migrate never completed: every one of its {MIGRATE_ROUNDS} rounds met fault \
-         fallout or the upgrade barrier, so there was no migrated store to compare"
-    )
-}
+const SEED_NEVER_COMPLETED: &str = "seeding the v1 store never completed: every round met fault fallout, so there was no store \
+     to migrate";
+const MIGRATE_NEVER_COMPLETED: &str = "open-and-migrate never completed: every round met fault fallout or the upgrade barrier, so \
+     there was no migrated store to compare";
 
 /// One universe of the property above: seed the v1 store, open and migrate it
 /// under the fault matrix, and compare the migrated store with `twin`.
 fn migration_universe(sim: &mut Sim, twin: &[(u64, u32, String)]) -> Result<(), String> {
     if !seed_v1_result(sim, 20)? {
         sim.cover("migrations:inconclusive");
-        sim.give_up(seed_never_completed());
+        sim.give_up(SEED_NEVER_COMPLETED, format!("{SEED_ROUNDS} rounds"));
         return Ok(());
     }
     let db_cfg = DbConfig {
@@ -659,7 +660,7 @@ fn migration_universe(sim: &mut Sim, twin: &[(u64, u32, String)]) -> Result<(), 
         // legitimately-remedied barrier, and the budget ran out before a
         // clean open+migrate. Nothing was compared, so nothing passes.
         sim.cover("migrations:inconclusive");
-        sim.give_up(migrate_never_completed());
+        sim.give_up(MIGRATE_NEVER_COMPLETED, format!("{MIGRATE_ROUNDS} rounds"));
         return Ok(());
     };
     sim.cover("migrations:resumed-to-completion");
@@ -1593,7 +1594,7 @@ fn scoped_migration_universe(
 ) -> Result<(), String> {
     if !seed_scoped_v1_result(sim, rows_per_scope, scopes)? {
         sim.cover("migrations:scoped-inconclusive");
-        sim.give_up(seed_never_completed());
+        sim.give_up(SEED_NEVER_COMPLETED, format!("{SEED_ROUNDS} rounds"));
         return Ok(());
     }
     let db_cfg = DbConfig {
@@ -1602,7 +1603,7 @@ fn scoped_migration_universe(
     };
     let Some(db) = open_and_migrate_scoped_with_remedy(sim, db_cfg)? else {
         sim.cover("migrations:scoped-inconclusive");
-        sim.give_up(migrate_never_completed());
+        sim.give_up(MIGRATE_NEVER_COMPLETED, format!("{MIGRATE_ROUNDS} rounds"));
         return Ok(());
     };
     sim.cover("migrations:scoped-resumed-to-completion");

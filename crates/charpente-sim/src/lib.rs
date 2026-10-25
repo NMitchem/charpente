@@ -800,7 +800,7 @@ struct State {
     /// It lives on the world, not in the workload's returned `Result`, because
     /// the returned `Result` is exactly what a `finish_universe`-style wrapper
     /// launders into `Ok(())` before the runner ever sees it.
-    gave_up: Option<String>,
+    gave_up: Option<(&'static str, Option<String>)>,
     /// Per-host worlds, created lazily by `Sim::host`. NEW state: no existing
     /// single-node universe ever populates this map, so the frozen global
     /// world above is untouched by this task (the replay contract).
@@ -1073,7 +1073,11 @@ impl Sim {
     /// Also marks `universe:gave-up` coverage, so a give-up *rate* can be
     /// capped with the swarm runners' `ceiling:` (a `floor:` on it would bound
     /// give-ups from below, which guards nothing).
-    pub fn give_up(&self, reason: impl Into<String>) {
+    ///
+    /// `reason` is fixed text: the CLI groups give-ups by it, so it must not
+    /// embed anything that varies per run. `detail` is that run's own text (an
+    /// error, a count, a seq), which `--seed` shows; an empty detail is none.
+    pub fn give_up(&self, reason: &'static str, detail: impl std::fmt::Display) {
         let mut guard = self.world.lock();
         if guard.gave_up.is_none() {
             // Inside the first-call guard on purpose: the key counts
@@ -1081,13 +1085,27 @@ impl Sim {
             // it reads as a rate and cross-checks the runner's reported count
             // exactly.
             guard.cover("universe:gave-up");
-            guard.gave_up = Some(reason.into());
+            let detail = detail.to_string();
+            guard.gave_up = Some((reason, (!detail.is_empty()).then_some(detail)));
         }
     }
 
-    /// The reason this universe gave up, if it did.
-    pub fn gave_up(&self) -> Option<String> {
-        self.world.lock().gave_up.clone()
+    /// The fixed reason this universe gave up, if it did.
+    pub fn gave_up(&self) -> Option<&'static str> {
+        self.world
+            .lock()
+            .gave_up
+            .as_ref()
+            .map(|(reason, _)| *reason)
+    }
+
+    /// This universe's own text for its give-up, if it gave one.
+    pub fn gave_up_detail(&self) -> Option<String> {
+        self.world
+            .lock()
+            .gave_up
+            .as_ref()
+            .and_then(|(_, d)| d.clone())
     }
 
     pub fn now(&self) -> Instant {
@@ -2331,7 +2349,14 @@ fn report_outcomes(test_file: &str, universes: u64, gave_up: u64) {
 fn describe_outcome(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Verdict => "reached a verdict".to_string(),
-        Outcome::GaveUp { reason } => format!("gave up: {reason}"),
+        Outcome::GaveUp {
+            reason,
+            detail: None,
+        } => format!("gave up: {reason}"),
+        Outcome::GaveUp {
+            reason,
+            detail: Some(detail),
+        } => format!("gave up: {reason}: {detail}"),
     }
 }
 
@@ -2352,7 +2377,10 @@ fn run_one(
         panic!("{}", failure_report(package, test_file, seed, &msg));
     }
     match sim.gave_up() {
-        Some(reason) => Outcome::GaveUp { reason },
+        Some(reason) => Outcome::GaveUp {
+            reason,
+            detail: sim.gave_up_detail(),
+        },
         None => Outcome::Verdict,
     }
 }
@@ -2722,7 +2750,10 @@ pub enum Outcome {
     /// The workload adjudicated its property.
     Verdict,
     /// The workload could not adjudicate: see `Sim::give_up`.
-    GaveUp { reason: String },
+    GaveUp {
+        reason: &'static str,
+        detail: Option<String>,
+    },
 }
 
 impl Outcome {
@@ -2745,7 +2776,10 @@ pub struct UniverseEnd {
 fn end_of(sim: &Sim) -> UniverseEnd {
     UniverseEnd {
         outcome: match sim.gave_up() {
-            Some(reason) => Outcome::GaveUp { reason },
+            Some(reason) => Outcome::GaveUp {
+                reason,
+                detail: sim.gave_up_detail(),
+            },
             None => Outcome::Verdict,
         },
         coverage: sim.coverage(),
@@ -4075,7 +4109,7 @@ mod tests {
                 return Err(format!("toy failure from {before} to {after}"));
             }
             if payload[1] % 3 == 0 {
-                sim.give_up("toy give-up");
+                sim.give_up("toy give-up", "");
             }
             Ok(())
         }
@@ -4146,7 +4180,7 @@ mod tests {
                 return Err(format!("toy failure on byte {}", payload[0]));
             }
             if payload[1] % 3 == 0 {
-                sim.give_up("toy give-up");
+                sim.give_up("toy give-up", "");
             }
             Ok(())
         }
@@ -4388,6 +4422,46 @@ mod tests {
     }
 
     #[test]
+    fn give_up_keeps_the_reason_and_the_detail_apart() {
+        let sim = Sim::new(0x10_0001);
+        sim.give_up("fixed reason", format!("seq {}", 7));
+        assert_eq!(sim.gave_up(), Some("fixed reason"));
+        assert_eq!(sim.gave_up_detail().as_deref(), Some("seq 7"));
+        assert_eq!(
+            end_of(&sim).outcome,
+            Outcome::GaveUp {
+                reason: "fixed reason",
+                detail: Some("seq 7".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn the_first_give_up_wins() {
+        let sim = Sim::new(0x10_0002);
+        sim.give_up("first", "one");
+        sim.give_up("second", "two");
+        assert_eq!(sim.gave_up(), Some("first"));
+        assert_eq!(sim.gave_up_detail().as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn an_empty_detail_is_none() {
+        let sim = Sim::new(0x10_0003);
+        sim.give_up("fixed reason", "");
+        assert_eq!(sim.gave_up(), Some("fixed reason"));
+        assert_eq!(sim.gave_up_detail(), None);
+    }
+
+    #[test]
+    fn give_up_marks_the_skipped_key_once_per_run() {
+        let sim = Sim::new(0x10_0004);
+        sim.give_up("a", "x");
+        sim.give_up("b", "y");
+        assert_eq!(sim.coverage().get("universe:gave-up"), Some(&1));
+    }
+
+    #[test]
     fn a_give_up_rate_above_its_ceiling_fails_the_batch_naming_key_count_and_cap() {
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_universes_swarm_with_in(
@@ -4400,7 +4474,7 @@ mod tests {
                 &[("universe:gave-up", 0)],
                 |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
-                    sim.give_up("this workload adjudicates nothing");
+                    sim.give_up("this workload adjudicates nothing", "");
                     Ok(())
                 },
             );
@@ -4428,7 +4502,7 @@ mod tests {
                 |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
                     if give_up {
-                        sim.give_up("this workload adjudicates nothing");
+                        sim.give_up("this workload adjudicates nothing", "");
                     }
                     Ok(())
                 },

@@ -2889,7 +2889,7 @@ A workload is a plain function, `fn(&mut Sim) -> Result<(), String>`: `Ok(())`
 means the universe passed; `Err(message)` means it didn't, and so does a
 panic (both turn into the same kind of failure record). There is a third
 ending — see "Giving up" below: a universe the injected faults stopped before
-your property could be adjudicated at all. Say so with `sim.give_up(reason)`;
+your property could be adjudicated at all. Say so with `sim.give_up(reason, detail)`;
 it is neither a pass nor a failure, and the report counts it separately.
 `sim_tests!` lists
 the workloads to run by name, each optionally followed by `require [...]` —
@@ -2927,7 +2927,7 @@ charpente_sim::sim_tests! {
 /// up" below).
 fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
     if counter_roundtrip_result(sim)?.is_none() {
-        sim.give_up("nothing to assert: the write never acked, or a boot never came up");
+        sim.give_up("nothing to assert: the write never acked, or a boot never came up", "");
     }
     Ok(())
 }
@@ -3022,7 +3022,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         .map_err(|e| e.to_string())?
     else {
         // Nothing to adjudicate: the disk never let the claim become testable.
-        sim.give_up("Db::open never booted in 8 tries");
+        sim.give_up("Db::open never booted", "in 8 tries");
         return Ok(());
     };
     let put = db.transact(|tx| {
@@ -3037,7 +3037,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         // An injected fault kept the write from its ack: no claim to check.
         // Any other error is the platform's, and fails, as the opens do.
         Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up("the write was never acknowledged, so there is no claim to check");
+            sim.give_up("the write was never acknowledged, so there is no claim to check", "");
             return Ok(());
         }
         Err(e) => return Err(format!("{e:?}")),
@@ -3049,7 +3049,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
     let Some(db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up("the reopen never booted in 8 tries");
+        sim.give_up("the reopen never booted", "in 8 tries");
         return Ok(());
     };
     match db.snapshot().and_then(|snap| snap.get::<Counter>(Id::from_raw(1))) {
@@ -3058,12 +3058,12 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         // universe GIVES UP: the row's durability was not adjudicated, and a
         // pass needs a verdict.
         Ok(None) if durable_corruption_fired(sim) => {
-            sim.give_up("durable corruption cut the acked row, so durability was not adjudicated");
+            sim.give_up("durable corruption cut the acked row, so durability was not adjudicated", "");
             Ok(())
         }
         Ok(None) => Err("acked Counter row lost across a crash".to_string()),
         Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("the read-back hit fault fallout: {e}"));
+            sim.give_up("the read-back hit fault fallout", e);
             Ok(())
         }
         Err(e) => Err(e.to_string()),
@@ -3071,12 +3071,22 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
 }
 ```
 
-- `sim.give_up(reason)` records the give-up **on the universe**, not in the
-  value you return. That is deliberate: a `Result` can be mapped back to
+- `sim.give_up(reason, detail)` records the give-up **on the universe**, not in
+  the value you return. That is deliberate: a `Result` can be mapped back to
   `Ok(())` by a wrapper before the runner ever sees it, and for a long time
   that is exactly what happened — a property could report green having
   concluded nothing over most of its universes.
-- First call wins; later ones are consequences of the first.
+- **The reason is fixed text; the detail is this run's own.** `reason` is a
+  `&'static str` that names the *kind* of give-up and embeds nothing that
+  varies between runs: no error text, count or seq. `charpente test --sim`
+  groups give-ups by reason, so a reason with a seq in it makes every universe
+  its own group and the grouping says nothing. What varies goes in `detail`
+  (anything `Display`: `e`, `format!("in {BOOT_TRIES} boots")`), which
+  `--seed` prints for the one universe it replays. A give-up with nothing to
+  add passes `""`, and an empty detail is none. `sim.gave_up()` reads the
+  reason and `sim.gave_up_detail()` the detail; `Outcome::GaveUp` carries both.
+- First call wins, reason and detail together; later ones are consequences of
+  the first.
 - **Give up and stop.** The record is sticky and nothing enforces terminality,
   so if you give up inside a retry arm and the loop then goes on to adjudicate,
   the universe is still reported as a give-up and that verdict is thrown away.
@@ -3116,7 +3126,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   fresh batches less four standard deviations (§8).
 - If your workload already funnels give-ups through a wrapper (the
   `Err("universe-inconclusive: …")` idiom the platform's own suites use), put
-  the `sim.give_up(e)` call there, beside the `sim.cover(...)` mark. Keep
+  the `sim.give_up(INCONCLUSIVE, e)` call there, beside the `sim.cover(...)` mark. Keep
   both: the coverage keys are a floorable distribution over *causes*, and the
   outcome is the scalar the runner reports. Neither replaces the other.
 
@@ -3618,7 +3628,7 @@ pieces:
   and since sleeping through an empty stretch just advances the virtual
   clock, a two-hour universe finishes in milliseconds. `run` returns
   `Ok(())` once nothing is left inside the horizon, `Err` if the engine
-  poisoned mid-run (§9). Afterwards, `kernel.stats()` snapshots the loop's
+  poisoned mid-run (§9), or on a clock stop ("Wall time and its faults"). Afterwards, `kernel.stats()` snapshots the loop's
   counters (`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`,
   `cron_ticks`, `cron_catchups`, and §6's outbound counters) and
   `kernel.into_app()` hands the `App` back — `app.db().snapshot()` reads the
@@ -3639,8 +3649,10 @@ One mindset note before the example: under `charpente test --sim`, every
 universe gets its own swarm-sampled fault matrix, so exact-trace assertions
 ("exactly 3 requests, exactly 5 jobs done") will fail whenever a fault
 fires. Assert *invariants* — claims that hold under any fault schedule —
-and classify operational failures with `is_fault_fallout`, exactly like the
-`Db`-level workload above. (For an exact-trace test, build your own
+and classify operational failures with `is_fault_fallout`, like the
+`Db`-level workload above, plus `clock_fallout(sim, text)` for a clock stop or
+refusal, which `is_fault_fallout` alone never excuses (the example below
+and "Wall time and its faults" show the filter). (For an exact-trace test, build your own
 fault-free world inside the workload: `Sim::with_faults(seed,
 FaultConfig::none())`.)
 
@@ -3764,7 +3776,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
     let app = match build_app(sim) {
         Ok(app) => app,
         Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("the app never booted: {e}"));
+            sim.give_up("the app never booted", e);
             return Ok(());
         }
         Err(e) => return Err(e.to_string()),
@@ -3786,7 +3798,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(kernel) => kernel,
         Err(e) if fallout(&e.to_string()) => {
-            sim.give_up(format!("Kernel::new hit fault fallout: {e}"));
+            sim.give_up("Kernel::new hit fault fallout", e);
             return Ok(());
         }
         Err(e) => return Err(e.to_string()),
@@ -3819,7 +3831,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
         // ends the universe with nothing asserted, a give-up; anything else is
         // real.
         Err(msg) if is_fault_fallout(&msg) => {
-            sim.give_up(format!("the invariant check hit fault fallout: {msg}"));
+            sim.give_up("the invariant check hit fault fallout", msg);
             Ok(())
         }
         Err(msg) => Err(msg),
@@ -4127,7 +4139,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         .map_err(|e| e.to_string())?
     else {
         if sim.gave_up().is_none() {
-            sim.give_up("the app never booted");
+            sim.give_up("the app never booted", "");
         }
         return Ok(());
     };
@@ -4187,7 +4199,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
             return Err(e);
         };
         if waits == 2 {
-            sim.give_up(format!("the tail was refused after two waits: {e}"));
+            sim.give_up("the tail was refused after two waits", e);
             return Ok(());
         }
         waits += 1;
@@ -4207,7 +4219,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         if durable_corruption_fired(sim) {
-            sim.give_up(format!("media corruption cut an enqueue whose call was made: {e}"));
+            sim.give_up("media corruption cut an enqueue whose call was made", e);
             return Ok(());
         }
         return Err(e);

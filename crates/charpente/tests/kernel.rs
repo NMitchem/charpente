@@ -3817,10 +3817,11 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         }
     }
     // A universe that adjudicated nothing gives up; it does not pass.
-    sim.give_up(format!(
-        "the final check never ran: {FINAL_REOPENS} reopens in a row hit injected faults, so \
-         the last round's jobs were never adjudicated"
-    ));
+    sim.give_up(
+        "the final check never ran: every reopen in a row hit injected faults, so the last \
+         round's jobs were never adjudicated",
+        format!("{FINAL_REOPENS} reopens"),
+    );
     Ok(())
 }
 
@@ -6096,10 +6097,10 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     })
     .map_err(|e| format!("v1 boot failed non-injected: {e}"))?
     else {
-        sim.give_up(format!(
-            "the v1 binary never booted in {BOOT_TRIES} boots, so it enqueued nothing for v2 \
-             to refuse or drain"
-        ));
+        sim.give_up(
+            "the v1 binary never booted, so it enqueued nothing for v2 to refuse or drain",
+            format!("in {BOOT_TRIES} boots"),
+        );
         return Ok(());
     };
     let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
@@ -6209,7 +6210,10 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
             Err(e) => Err(format!("v2 Kernel::new failed non-injected: {e}")),
         };
     }
-    sim.give_up("the v2 binary never booted cleanly — nothing adjudicated");
+    sim.give_up(
+        "the v2 binary never booted cleanly — nothing adjudicated",
+        "",
+    );
     Ok(())
 }
 
@@ -7002,10 +7006,11 @@ mod job_tenancy {
             }
         }
         // A universe that adjudicated nothing gives up; it does not pass.
-        sim.give_up(format!(
-            "the final check never ran: {FINAL_REOPENS} reopens in a row hit injected faults, \
-             so the last round's jobs were never adjudicated"
-        ));
+        sim.give_up(
+            "the final check never ran: every reopen in a row hit injected faults, so the last \
+             round's jobs were never adjudicated",
+            format!("{FINAL_REOPENS} reopens"),
+        );
         Ok(())
     }
 

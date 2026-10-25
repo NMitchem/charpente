@@ -266,7 +266,7 @@ fn finish_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("repl:inconclusive");
-            sim.give_up(e);
+            sim.give_up(INCONCLUSIVE, e);
             Ok(())
         }
         other => other,
@@ -1297,10 +1297,10 @@ fn follower_kept_its_tenants(sim: &Sim, f: &Node) -> Result<(), String> {
             match $e {
                 Ok(v) => v,
                 Err(e) if is_fault_fallout(&e.to_string()) => {
-                    sim.give_up(format!(
-                        "follower tenant oracle: {} hit fault fallout: {e}",
-                        $what
-                    ));
+                    sim.give_up(
+                        concat!("follower tenant oracle: ", $what, " hit fault fallout"),
+                        e,
+                    );
                     return Ok(());
                 }
                 Err(e) => return Err(format!("f: {e}")),
@@ -7928,7 +7928,9 @@ fn replay_above_horizon(seed: u64) -> (Sim, Result<(), String>) {
 fn a_spawn_refused_below_the_horizon_gives_up_only_for_corruption_on_its_own_disk() {
     let (sim, r) = replay_above_horizon(0x14c3_8063_db53_5c63);
     assert_eq!(r, Ok(()), "the universe gives up, it does not fail");
-    let reason = sim.gave_up().expect("the universe gives up");
+    let reason = sim
+        .gave_up_detail()
+        .expect("the universe gives up, with the inconclusive text as its detail");
     assert!(
         reason.contains("p kernel spawn refused for durable corruption that fired on p's disk")
             && reason.contains("durable horizon"),
@@ -7996,7 +7998,9 @@ fn a_spawn_refused_below_the_horizon_gives_up_only_for_corruption_on_its_own_dis
 fn a_reseed_refused_behind_before_it_converges_gives_up_under_its_own_key() {
     let (sim, r) = replay_above_horizon(0xc881_457d_826c_1d2c);
     assert_eq!(r, Ok(()), "the universe gives up, it does not fail");
-    let reason = sim.gave_up().expect("the universe gives up");
+    let reason = sim
+        .gave_up_detail()
+        .expect("the universe gives up, with the inconclusive text as its detail");
     assert!(
         reason.contains("GC'd every record below its retained base"),
         "and for this reason, or the seed no longer names the scenario: {reason}"

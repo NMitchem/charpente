@@ -356,10 +356,10 @@ pub fn acked_implies_durable(
     }
     // Every `verify` above ran over an empty list, so none could have failed.
     if acked.is_empty() {
-        sim.give_up(format!(
-            "acked-implies-durable: no round acked anything in {rounds} rounds, so there was \
-             no claim to check"
-        ));
+        sim.give_up(
+            "acked-implies-durable: no round acked anything, so there was no claim to check",
+            format!("in {rounds} rounds"),
+        );
     }
     Ok(())
 }
@@ -474,10 +474,11 @@ pub fn durable_refusal(sim: &Sim, text: &str) -> Result<bool, String> {
         ));
     }
     sim.cover("boot:durable-refusal");
-    sim.give_up(format!(
+    sim.give_up(
         "the boot was refused for durable corruption at or below the store's horizon, which no \
-         restart clears, so nothing past it was adjudicated: {text}"
-    ));
+         restart clears, so nothing past it was adjudicated",
+        text,
+    );
     Ok(true)
 }
 
@@ -1030,11 +1031,10 @@ mod tests {
         let mut sim = Sim::new(0xACE0);
         acked_implies_durable(&mut sim, 3, |_sim: &mut Sim| Ok(vec![]), toy_verify).unwrap();
         assert_eq!(
-            sim.gave_up().as_deref(),
-            Some(
-                "acked-implies-durable: no round acked anything in 3 rounds, so there was no claim to check"
-            )
+            sim.gave_up(),
+            Some("acked-implies-durable: no round acked anything, so there was no claim to check")
         );
+        assert_eq!(sim.gave_up_detail().as_deref(), Some("in 3 rounds"));
     }
 
     /// One ack in any round is a claim, and the run reaches a verdict on it.
@@ -1203,9 +1203,14 @@ mod tests {
             .gave_up()
             .expect("a durable refusal gives the universe up at once");
         assert!(
-            reason.contains("refused for durable corruption")
-                && reason.contains("durable horizon 9"),
-            "under its own name, carrying the refusal: {reason}"
+            reason.contains("refused for durable corruption"),
+            "under its own name: {reason}"
+        );
+        assert!(
+            sim.gave_up_detail()
+                .is_some_and(|d| d.contains("durable horizon 9")),
+            "carrying the refusal as its detail: {:?}",
+            sim.gave_up_detail()
         );
 
         // The same refusal where no durable corruption fired is a finding:
@@ -1286,9 +1291,10 @@ mod tests {
             reason.starts_with(
                 "the boot was refused for durable corruption at or below the store's horizon, \
                  which no restart clears"
-            ) && reason.ends_with(REFUSAL),
+            ),
             "{reason}"
         );
+        assert_eq!(sim.gave_up_detail().as_deref(), Some(REFUSAL));
     }
 
     /// GUIDE §8's promise that no classifier of the caller's can excuse a
@@ -1344,9 +1350,9 @@ mod tests {
         assert_eq!(booted, Ok(None), "corruption fired: the refusal gives up");
         assert_eq!(calls, 1, "at once, not after the classifier's retries");
         assert!(
-            sim.gave_up().is_some_and(|r| r.ends_with(REFUSAL)),
+            sim.gave_up_detail().as_deref() == Some(REFUSAL),
             "{:?}",
-            sim.gave_up()
+            sim.gave_up_detail()
         );
     }
 

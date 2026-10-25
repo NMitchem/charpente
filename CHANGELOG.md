@@ -18,6 +18,7 @@
 - **`CronRow.interval_nanos` is the interval the row's `next_due` was set with.** `CronScheduler::upsert` no longer rewrites it on an existing row; the next tick writes it with `next_due`.
 - **The simulator's clock axes.** `FaultConfig` gains `clock_skew`, `clock_step_back` and `clock_downtime`: an exhaustive literal breaks, and `..FaultConfig::none()` still works. `checks::FaultReason` gains `ClockRefused`, so an exhaustive `match` over it must handle it.
 - **`run_universes_swarm_with!`'s `adjust` takes the universe's seed: `|seed, cfg| …`, not `|cfg| …`.** A value an adjust draws comes from a stream keyed by the seed, so a change to `FaultConfig` no longer moves it. An adjust that ignores the seed draws nothing new, and no platform suite's pinned seed moved.
+- **`Sim::give_up` takes a fixed reason and a per-run detail: `give_up(reason: &'static str, detail: impl Display)`.** The CLI groups give-ups by reason and `--seed` shows the detail. Split a text that embeds an error, count or seq into its fixed part and the detail; a fixed reason passes `""`, and an empty detail is none. `Sim::gave_up()` returns `Option<&'static str>`, `Sim::gave_up_detail()` returns `Option<String>`, and `Outcome::GaveUp` is `{ reason: &'static str, detail: Option<String> }`.
 
 ### Changed
 - **Cron keeps its grid.** A tick advances `next_due` to the schedule's next grid slot, `next_due + interval * ((now - next_due) / interval + 1)`, not to `now + interval`, so a late tick no longer drifts the phase. Catch-up still fires once.

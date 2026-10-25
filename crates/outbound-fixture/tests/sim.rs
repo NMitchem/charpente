@@ -38,8 +38,8 @@ const BOOT_TRIES: u32 = 8;
 const ROUNDS: u32 = 3;
 
 /// How many refused opens the fault-free tail waits out. With the clock's
-/// faults ended, one wait reaches the instant the refusal names; the bound
-/// only makes a second refusal, a bug, end the universe by name.
+/// faults ended, one wait reaches the instant the refusal names; the refusal
+/// after the last of these waits, a bug, ends the universe by name.
 const CLOCK_WAITS: u32 = 2;
 
 /// Fault fallout here: the families an error's text alone excuses, and the
@@ -49,10 +49,16 @@ fn fallout(sim: &Sim, text: &str) -> bool {
 }
 
 /// Ends a universe that adjudicated nothing, marking `key`, the arm's name:
-/// the harness reports how many universes gave up, not why.
-fn gave_up(sim: &Sim, key: &'static str, reason: String) -> Result<(), String> {
+/// the harness reports how many universes gave up, and the CLI groups them by
+/// `reason`, whose `detail` is this run's own text.
+fn gave_up(
+    sim: &Sim,
+    key: &'static str,
+    reason: &'static str,
+    detail: impl std::fmt::Display,
+) -> Result<(), String> {
     sim.cover(key);
-    sim.give_up(reason);
+    sim.give_up(reason, detail);
     Ok(())
 }
 
@@ -161,15 +167,19 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         // A step back in an earlier round left the clock behind the time the
         // store recorded, and the open is refused. With the clock's faults
         // ended its offset is frozen, so it reaches the instant the refusal
-        // names as virtual time passes: wait, and restart the process.
-        let Some(at) = clock_reopens_after(&e) else {
-            return Err(format!("the fault-free tail's kernel stopped: {e}"));
+        // names as virtual time passes: wait, and restart the process. Only
+        // that refusal: a quiesced clock cannot produce a mid-run stop, so
+        // one is a platform bug and fails the run.
+        let at = match clock_reopens_after(&e) {
+            Some(at) if e.contains("refusing to open") => at,
+            _ => return Err(format!("the fault-free tail's kernel stopped: {e}")),
         };
         if waits == CLOCK_WAITS {
             return gave_up(
                 sim,
                 "outbound-fixture:gave-up:clock",
-                format!("the fault-free tail was refused {waits} times after waiting: {e}"),
+                "the fault-free tail was still refused after waiting out every refusal it allows",
+                format!("refused {} times, the last after waiting: {e}", waits + 1),
             );
         }
         waits += 1;
@@ -191,10 +201,9 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
             return gave_up(
                 sim,
                 "outbound-fixture:gave-up:media-cut",
-                format!(
-                    "durable corruption cut an enqueue whose call had already reached the \
-                     remote, so exactly-once was not adjudicated: {e}"
-                ),
+                "durable corruption cut an enqueue whose call had already reached the \
+                 remote, so exactly-once was not adjudicated",
+                e,
             );
         }
         return Err(e);
@@ -266,7 +275,8 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         return gave_up(
             sim,
             "outbound-fixture:gave-up:no-order",
-            "no POST /orders became durable, so no charge was adjudicated".into(),
+            "no POST /orders became durable, so no charge was adjudicated",
+            "",
         );
     }
 

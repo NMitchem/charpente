@@ -622,11 +622,11 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             // not fire. Ending it is a give-up, never a pass: nothing past
             // the loss is adjudicated.
             if charpente_sim::checks::durable_corruption_fired(sim) {
-                sim.give_up(format!(
-                    "durable corruption cut acknowledged transactions at a round's recovery \
-                     ({committed} acknowledged, {recovered} recovered), so durability was not \
-                     adjudicated and the rounds after it never ran"
-                ));
+                sim.give_up(
+                    "durable corruption cut acknowledged transactions at a round's recovery, so \
+                     durability was not adjudicated and the rounds after it never ran",
+                    format!("{committed} acknowledged, {recovered} recovered"),
+                );
                 return Ok(());
             }
             return Err(format!(
@@ -825,11 +825,11 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             // Same excuse-only-if-injected routing, and give-up, as the round
             // loop above.
             if charpente_sim::checks::durable_corruption_fired(sim) {
-                sim.give_up(format!(
-                    "durable corruption cut acknowledged transactions at the final recovery \
-                     ({committed} acknowledged, {recovered} recovered), so the final state was \
-                     never checked"
-                ));
+                sim.give_up(
+                    "durable corruption cut acknowledged transactions at the final recovery, so \
+                     the final state was never checked",
+                    format!("{committed} acknowledged, {recovered} recovered"),
+                );
                 return Ok(());
             }
             return Err(format!(
@@ -898,10 +898,11 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
             Err(msg) => Err(msg),
         };
     }
-    sim.give_up(format!(
-        "the final verification never ran: all {FINAL_ATTEMPTS} attempts hit injected faults, \
-         so the last round's commits were never checked"
-    ));
+    sim.give_up(
+        "the final verification never ran: every attempt hit injected faults, so the last \
+         round's commits were never checked",
+        format!("{FINAL_ATTEMPTS} attempts"),
+    );
     Ok(())
 }
 

@@ -56,9 +56,14 @@ const BOOT_TRIES: u32 = 8;
 /// marks `key`, the arm's name, because the harness reports a give-up's count
 /// but not its text (charpente-cli's tests read the key). Every fault-fallout
 /// exit of a property below comes through here: a pass needs a verdict.
-fn gave_up(sim: &Sim, key: &'static str, reason: String) -> Result<(), String> {
+fn gave_up(
+    sim: &Sim,
+    key: &'static str,
+    reason: &'static str,
+    detail: impl std::fmt::Display,
+) -> Result<(), String> {
     sim.cover(key);
-    sim.give_up(reason);
+    sim.give_up(reason, detail);
     Ok(())
 }
 
@@ -107,7 +112,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
@@ -116,7 +121,8 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
-                format!("Kernel::new hit fault fallout: {e}"),
+                "Kernel::new hit fault fallout",
+                e,
             );
         }
         Err(e) => return Err(e.to_string()),
@@ -168,7 +174,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
         return Ok(());
     };
     let snap = match app.db().snapshot() {
@@ -177,7 +183,8 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
             return gave_up(
                 sim,
                 "invoicing:gave-up:reopen-snapshot",
-                format!("the snapshot after the restart hit fault fallout: {e}"),
+                "the snapshot after the restart hit fault fallout",
+                e,
             );
         }
         Err(e) => return Err(e.to_string()),
@@ -186,7 +193,8 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
         return gave_up(
             sim,
             "invoicing:gave-up:nothing-acked",
-            "no write was acknowledged, so there was no durability claim to check".to_string(),
+            "no write was acknowledged, so there was no durability claim to check",
+            "",
         );
     }
 
@@ -206,6 +214,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 sim.cover("invoicing:acked-customer-cut");
                 sim.give_up(
                     "durable corruption cut acked customer 1, so durability was not adjudicated",
+                    "",
                 );
                 return Ok(());
             }
@@ -214,7 +223,8 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 return gave_up(
                     sim,
                     "invoicing:gave-up:customer-read",
-                    format!("reading customer 1 back hit fault fallout: {e}"),
+                    "reading customer 1 back hit fault fallout",
+                    e,
                 );
             }
             Err(e) => return Err(e.to_string()),
@@ -227,6 +237,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 sim.cover("invoicing:acked-invoice-cut");
                 sim.give_up(
                     "durable corruption cut acked invoice 1, so durability was not adjudicated",
+                    "",
                 );
                 return Ok(());
             }
@@ -235,7 +246,8 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 return gave_up(
                     sim,
                     "invoicing:gave-up:invoice-read",
-                    format!("reading invoice 1 back hit fault fallout: {e}"),
+                    "reading invoice 1 back hit fault fallout",
+                    e,
                 );
             }
             Err(e) => return Err(e.to_string()),
@@ -253,6 +265,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 sim.give_up(
                     "durable corruption cut invoice 1's acked finalize, so durability was not \
                      adjudicated",
+                    "",
                 );
                 return Ok(());
             }
@@ -269,7 +282,8 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 return gave_up(
                     sim,
                     "invoicing:gave-up:finalize-read",
-                    format!("reading invoice 1's state back hit fault fallout: {e}"),
+                    "reading invoice 1's state back hit fault fallout",
+                    e,
                 );
             }
             Err(e) => return Err(e.to_string()),
@@ -346,7 +360,7 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
@@ -355,7 +369,8 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
-                format!("Kernel::new hit fault fallout: {e}"),
+                "Kernel::new hit fault fallout",
+                e,
             );
         }
         Err(e) => return Err(e.to_string()),
@@ -424,13 +439,14 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
         Ok(false) => gave_up(
             sim,
             "invoicing:gave-up:nothing-to-count",
-            "no finalize acked and no receipt job or row exists, so exactly-once counted nothing"
-                .to_string(),
+            "no finalize acked and no receipt job or row exists, so exactly-once counted nothing",
+            "",
         ),
         Err(msg) if fallout(sim, &msg) => gave_up(
             sim,
             "invoicing:gave-up:receipts-read",
-            format!("reading the receipts back hit fault fallout: {msg}"),
+            "reading the receipts back hit fault fallout",
+            msg,
         ),
         Err(msg) => Err(msg),
     }
@@ -498,7 +514,7 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
@@ -507,7 +523,8 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
-                format!("Kernel::new hit fault fallout: {e}"),
+                "Kernel::new hit fault fallout",
+                e,
             );
         }
         Err(e) => return Err(e.to_string()),
@@ -566,12 +583,14 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
         Ok(false) => gave_up(
             sim,
             "invoicing:gave-up:no-reminder",
-            "no reminder fired, so no reminder was checked".to_string(),
+            "no reminder fired, so no reminder was checked",
+            "",
         ),
         Err(msg) if fallout(sim, &msg) => gave_up(
             sim,
             "invoicing:gave-up:reminders-read",
-            format!("reading the reminders back hit fault fallout: {msg}"),
+            "reading the reminders back hit fault fallout",
+            msg,
         ),
         Err(msg) => Err(msg),
     }
@@ -877,7 +896,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
@@ -886,7 +905,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
-                format!("Kernel::new hit fault fallout: {e}"),
+                "Kernel::new hit fault fallout",
+                e,
             );
         }
         Err(e) => return Err(e.to_string()),
@@ -909,7 +929,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         return gave_up(
             sim,
             "invoicing:gave-up:mint-unacked",
-            "the key mint never acked, so there was no key to check".to_string(),
+            "the key mint never acked, so there was no key to check",
+            "",
         );
     };
     let raw_key: String = {
@@ -947,8 +968,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             return gave_up(
                 sim,
                 "invoicing:gave-up:authorize-unacked",
-                "the read under the fresh key got no answer, so revocation had nothing to undo"
-                    .to_string(),
+                "the read under the fresh key got no answer, so revocation had nothing to undo",
+                "",
             );
         }
         Some((status, body))
@@ -957,10 +978,9 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             return gave_up(
                 sim,
                 "invoicing:gave-up:authorize-unacked",
-                format!(
-                    "the read under the fresh key answered {status} on fault fallout, so \
-                     revocation had nothing to undo"
-                ),
+                "the read under the fresh key answered on fault fallout, so revocation had nothing to \
+                 undo",
+                status,
             );
         }
         // Any other answer comes from no fault: the key was minted on this same
@@ -984,7 +1004,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             return gave_up(
                 sim,
                 "invoicing:gave-up:key-snapshot",
-                format!("the snapshot to find the key's row hit fault fallout: {e}"),
+                "the snapshot to find the key's row hit fault fallout",
+                e,
             );
         }
         Err(e) => return Err(e.to_string()),
@@ -1005,7 +1026,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             return gave_up(
                 sim,
                 "invoicing:gave-up:key-lookup",
-                format!("looking the key's row up hit fault fallout: {e}"),
+                "looking the key's row up hit fault fallout",
+                e,
             );
         }
         Err(e) => return Err(e.to_string()),
@@ -1028,7 +1050,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         return gave_up(
             sim,
             "invoicing:gave-up:revoke-unacked",
-            "the revoke never acked, so there was no revocation to check".to_string(),
+            "the revoke never acked, so there was no revocation to check",
+            "",
         );
     };
 
@@ -1055,8 +1078,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
                 return gave_up(
                     sim,
                     "invoicing:gave-up:no-final-response",
-                    "the read under the revoked key got no response, so nothing was checked"
-                        .to_string(),
+                    "the read under the revoked key got no response, so nothing was checked",
+                    "",
                 );
             }
         }
@@ -1091,10 +1114,8 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             gave_up(
                 sim,
                 "invoicing:gave-up:final-status",
-                format!(
-                    "the read under the revoked key answered {other} on fault fallout, so \
-                     nothing was checked"
-                ),
+                "the read under the revoked key answered on fault fallout, so nothing was checked",
+                other,
             )
         }
         other => Err(format!(

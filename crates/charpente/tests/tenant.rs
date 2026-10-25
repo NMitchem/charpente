@@ -1081,10 +1081,11 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
             Err(msg) => Err(msg),
         };
     }
-    sim.give_up(format!(
-        "the final recovery never ran the oracle: all {FINAL_ATTEMPTS} attempts hit injected \
-             faults, so the last round's writes were never checked"
-    ));
+    sim.give_up(
+        "the final recovery never ran the oracle: every attempt hit injected faults, so the \
+         last round's writes were never checked",
+        format!("{FINAL_ATTEMPTS} attempts"),
+    );
     Ok(())
 }
 

@@ -58,9 +58,10 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let Some(mut db) =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!(
-            "Db::open before the crash never booted in {BOOT_TRIES} boots"
-        ));
+        sim.give_up(
+            "Db::open before the crash never booted",
+            format!("in {BOOT_TRIES} boots"),
+        );
         return Ok(None);
     };
     // Only an injected fault excuses a write that never acked; any other
@@ -81,19 +82,23 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let Some(db) =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!(
-            "Db::open after the crash never booted in {BOOT_TRIES} boots"
-        ));
+        sim.give_up(
+            "Db::open after the crash never booted",
+            format!("in {BOOT_TRIES} boots"),
+        );
         return Ok(None);
     };
     if !acked {
-        sim.give_up("the write was never acked, so durability has nothing to prove");
+        sim.give_up(
+            "the write was never acked, so durability has nothing to prove",
+            "",
+        );
         return Ok(None);
     }
     let snap = match db.snapshot() {
         Ok(snap) => snap,
         Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("snapshot hit fault fallout: {e}"));
+            sim.give_up("snapshot hit fault fallout", e);
             return Ok(None);
         }
         Err(e) => return Err(e.to_string()),
@@ -101,7 +106,7 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let row = match snap.get::<FixtureCounter>(Id::from_raw(7)) {
         Ok(row) => row,
         Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up(format!("the read-back hit fault fallout: {e}"));
+            sim.give_up("the read-back hit fault fallout", e);
             return Ok(None);
         }
         Err(e) => return Err(e.to_string()),
@@ -115,7 +120,7 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
         // `durable_corruption_fired`'s docs. In every universe where no
         // corruption fired, this stays the hard check it always was.
         None if charpente_sim::checks::durable_corruption_fired(sim) => {
-            sim.give_up("durable corruption fired, so the acked row is excused");
+            sim.give_up("durable corruption fired, so the acked row is excused", "");
             Ok(None)
         }
         None => Err("acked FixtureCounter row lost across a crash".into()),
@@ -194,9 +199,10 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
         let skip = |sim: &mut Sim, what: String| {
             if verified_rounds == ROUNDS && !checked_any {
                 sim.cover("fixture:last-verify-fallout");
-                sim.give_up(format!(
-                    "the last round's check {what}, and no earlier round checked an acked row"
-                ));
+                sim.give_up(
+                    "the last round's check was skipped, and no earlier round checked an acked row",
+                    what,
+                );
             }
             Ok(())
         };
@@ -232,10 +238,10 @@ fn acked_counter_survives_rounds(sim: &mut Sim) -> Result<(), String> {
                 // injected.
                 Ok(None) if durable_corruption_fired(sim) => {
                     sim.cover("fixture:acked-round-cut");
-                    sim.give_up(format!(
-                        "durable corruption cut acked round {raw}, so durability was not \
-                         adjudicated"
-                    ));
+                    sim.give_up(
+                        "durable corruption cut an acked round, so durability was not adjudicated",
+                        format!("round {raw}"),
+                    );
                     return Ok(());
                 }
                 Ok(None) => return Err(format!("acked round {raw} lost across a restart")),
@@ -301,7 +307,7 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
             match $e {
                 Ok(v) => v,
                 Err(e) if is_fault_fallout(&e.to_string()) => {
-                    sim.give_up(format!("{} hit fault fallout: {e}", $what));
+                    sim.give_up(concat!($what, " hit fault fallout"), e);
                     return Ok(None);
                 }
                 Err(e) => return Err(e.to_string()),
@@ -321,7 +327,7 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
     let Some(app) =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
     else {
-        sim.give_up(format!("App::open never booted in {BOOT_TRIES} boots"));
+        sim.give_up("App::open never booted", format!("in {BOOT_TRIES} boots"));
         return Ok(None);
     };
     let mut app = app.mount_jobs(jobs![BumpCounter]);
@@ -339,7 +345,8 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
         Ok(()) => {}
         Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
             sim.give_up(
-                "the seeding transaction never committed, so no job was ever enqueued".to_string(),
+                "the seeding transaction never committed, so no job was ever enqueued",
+                "",
             );
             return Ok(None);
         }
