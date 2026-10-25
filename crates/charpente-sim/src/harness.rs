@@ -15,7 +15,13 @@
 //! explicit universe seed rather than relying on the batch's master seed.
 //! `--seed 0x…` bypasses the chain entirely: each selected test runs once on
 //! that literal seed, and coverage requirements are skipped (a single
-//! universe can't be expected to hit everything a batch would).
+//! universe can't be expected to hit everything a batch would). `--inputs`
+//! and `--faults-off` replay that run with given input choices and with fault
+//! axes off, which is how a shrunk failure's repro line replays it.
+//!
+//! Shrinking: after a batch, each check's first failure in seed order is
+//! shrunk (`shrink`) by replaying smaller candidates under a budget counted in
+//! replays, and its block reports the smallest run that still fails the check.
 //!
 //! Parallelism: all seeds for a batch are pre-derived on the main thread, in
 //! the exact registry order above, before any work is distributed — a pool
@@ -24,12 +30,15 @@
 //! `Report`s (worker scheduling is unobservable; only universe index orders
 //! the output).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::rng::splitmix64;
-use crate::{FaultConfig, Sim, UniverseEnd, UniverseFailure, ambient_base_seed, run_app_universe};
+use crate::{
+    FAULT_AXES, FaultConfig, Sim, UniverseEnd, UniverseFailure, ambient_base_seed, axis_on,
+    run_app_universe,
+};
 
 /// One registered sim workload. `require` lists sometimes-coverage keys that
 /// must be hit at least once across the test's universes in a batch run
@@ -54,9 +63,15 @@ pub struct HarnessArgs {
     pub filter: Option<String>,
     pub jobs: usize,
     pub format: Format,
+    /// `--inputs`: the choice sequence a `--seed` run replays (then 0s).
+    pub inputs: Option<Vec<u64>>,
+    /// `--faults-off`: the `FaultConfig` axes a `--seed` run turns off, in
+    /// field order.
+    pub faults_off: Vec<&'static str>,
 }
 
-const VALID_FLAGS: &str = "--universes, --seed, --master-seed, --filter, --jobs, --format";
+const VALID_FLAGS: &str =
+    "--universes, --seed, --master-seed, --filter, --jobs, --format, --inputs, --faults-off";
 
 impl HarnessArgs {
     pub fn parse(mut args: impl Iterator<Item = String>) -> Result<HarnessArgs, String> {
@@ -66,6 +81,8 @@ impl HarnessArgs {
         let mut filter = None;
         let mut jobs = default_jobs();
         let mut format = Format::Human;
+        let mut inputs = None;
+        let mut faults_off: Vec<&'static str> = Vec::new();
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
@@ -85,6 +102,35 @@ impl HarnessArgs {
                             ));
                         }
                     };
+                }
+                "--inputs" => {
+                    let value = next_value(&mut args, &flag)?;
+                    inputs = Some(decode_inputs(&value).ok_or_else(|| {
+                        format!(
+                            "--inputs: \"{value}\" is not a choice sequence (lowercase hex of \
+                             LEB128 numbers, as a failure's repro line prints it)"
+                        )
+                    })?);
+                }
+                "--faults-off" => {
+                    for name in next_value(&mut args, &flag)?.split(',') {
+                        let Some(&axis) = FAULT_AXES.iter().find(|a| **a == name) else {
+                            // A field, but a scope rather than an axis, so the
+                            // binding refusal's "not a FaultConfig field" would
+                            // be false for it.
+                            return Err(if name == "corruption_scope" {
+                                "--faults-off: \"corruption_scope\" is not a fault axis: it \
+                                 scopes bit_flip and misdirected_write, so turn those off instead"
+                                    .to_string()
+                            } else {
+                                format!("--faults-off: \"{name}\" is not a FaultConfig field")
+                            });
+                        };
+                        if !faults_off.contains(&axis) {
+                            faults_off.push(axis);
+                        }
+                    }
+                    faults_off.sort_by_key(|a| FAULT_AXES.iter().position(|f| f == a));
                 }
                 other => {
                     return Err(format!(
@@ -108,6 +154,14 @@ impl HarnessArgs {
                     .to_string(),
             );
         }
+        if inputs.is_some() && seed.is_none() {
+            return Err("--inputs needs --seed: it replays one run's inputs".to_string());
+        }
+        if !faults_off.is_empty() && seed.is_none() {
+            return Err(
+                "--faults-off needs --seed: it replays one run with those faults off".to_string(),
+            );
+        }
 
         Ok(HarnessArgs {
             universes,
@@ -116,6 +170,8 @@ impl HarnessArgs {
             filter,
             jobs,
             format,
+            inputs,
+            faults_off,
         })
     }
 }
@@ -170,6 +226,289 @@ pub struct Failure {
     /// aggregate cannot answer it.
     pub coverage: BTreeMap<&'static str, u64>,
     pub message: String,
+    /// The inputs this run drew, by name, in draw order.
+    pub drawn: Vec<(&'static str, String)>,
+    /// What a `--seed` run was replayed with, so its repro passes them back.
+    pub(crate) inputs: Option<Vec<u64>>,
+    pub(crate) faults_off: Vec<&'static str>,
+    /// A check's first failure in a batch, shrunk.
+    pub(crate) shrunk: Option<Shrunk>,
+}
+
+/// The smallest run `shrink` found that still fails the check: the shortest
+/// and smallest input choices, then the fewest fault axes on. Every field but
+/// the last three describes that run, which `--seed`, `--inputs` and
+/// `--faults-off` replay exactly.
+#[derive(Debug)]
+pub(crate) struct Shrunk {
+    /// The run's input choices, trimmed of trailing zeros: a replay reads 0s
+    /// past the end, so they are implied.
+    pub choices: Vec<u64>,
+    /// The axes turned off, in `FaultConfig` field order.
+    pub faults_off: Vec<&'static str>,
+    pub drawn: Vec<(&'static str, String)>,
+    pub message: String,
+    pub coverage: BTreeMap<&'static str, u64>,
+    /// The seed's config with `faults_off` turned off.
+    pub config: FaultConfig,
+    /// Candidate runs replayed, kept or not; at most `SHRINK_BUDGET`.
+    pub replays: u32,
+    /// Whether the repro must pass `--inputs`: false when the seed's own
+    /// stream draws these choices, because they begin the first failure's.
+    pub replay_inputs: bool,
+    /// False when nothing smaller failed, so this is the first failure itself.
+    pub smaller: bool,
+}
+
+/// The shrinker's budget, counted in replayed runs: nothing in the harness
+/// reads a clock, so the result is the same on any machine.
+const SHRINK_BUDGET: u32 = 500;
+
+/// Shrinks the first failure of `test` on `seed` (a batch shrinks only each
+/// check's first failure, in seed order) by replaying candidates, each run by
+/// `run_app_universe` exactly as `--seed --inputs --faults-off` would run it.
+/// A candidate is kept when it fails the same check, with any message; a run
+/// that passes or gives up has not. Candidates come from four passes, repeated
+/// until a round keeps nothing or the budget is spent:
+/// 1. delete chunks of the choices (8, 4, 2, then 1 long, from the end);
+/// 2. set each choice to 0;
+/// 3. binary-search each choice toward 0;
+/// 4. turn off each fault axis that is on, in `FaultConfig` field order.
+///
+/// Every candidate is strictly smaller than the best so far (shorter or
+/// lexicographically smaller choices, or one more axis off), so each round
+/// shrinks or ends the loop. It depends only on its arguments, so the result
+/// is identical for any `--jobs`.
+fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
+    let mut s = Shrinker {
+        test,
+        seed,
+        first_choices: &first.choices,
+        tried: BTreeSet::new(),
+        best: Shrunk {
+            choices: trimmed(&first.choices),
+            faults_off: Vec::new(),
+            drawn: first.drawn.clone(),
+            message: first.message.clone(),
+            coverage: first.coverage.clone(),
+            config: first.config.clone(),
+            replays: 0,
+            replay_inputs: false,
+            smaller: false,
+        },
+    };
+    loop {
+        let round = (s.best.choices.clone(), s.best.faults_off.clone());
+        s.delete_chunks();
+        s.zero_each();
+        s.search_each_toward_zero();
+        s.turn_off_axes();
+        if s.spent() || (&s.best.choices, &s.best.faults_off) == (&round.0, &round.1) {
+            return s.best;
+        }
+    }
+}
+
+struct Shrinker<'a> {
+    test: &'a SimTest,
+    seed: u64,
+    first_choices: &'a [u64],
+    tried: BTreeSet<(Vec<u64>, Vec<&'static str>)>,
+    best: Shrunk,
+}
+
+impl Shrinker<'_> {
+    fn spent(&self) -> bool {
+        self.best.replays >= SHRINK_BUDGET
+    }
+
+    /// Replays a candidate and keeps it if it fails the check. A candidate
+    /// already replayed, or past the budget, is not run again.
+    fn try_keep(&mut self, choices: &[u64], faults_off: Vec<&'static str>) -> bool {
+        let choices = trimmed(choices);
+        assert!(
+            faults_off.len() > self.best.faults_off.len()
+                || (choices.len(), &choices) < (self.best.choices.len(), &self.best.choices),
+            "a shrink candidate must be smaller than the best so far"
+        );
+        if self.spent() || !self.tried.insert((choices.clone(), faults_off.clone())) {
+            return false;
+        }
+        self.best.replays += 1;
+        let Err(failed) = run_app_universe(self.seed, Some(&choices), &faults_off, &self.test.run)
+        else {
+            return false;
+        };
+        // The run read at most `choices` and then 0s, so what it consumed,
+        // trimmed, is no larger than the candidate.
+        let kept = trimmed(&failed.choices);
+        assert!(
+            (kept.len(), &kept) <= (choices.len(), &choices),
+            "a replay consumed choices it was not given"
+        );
+        self.best = Shrunk {
+            replay_inputs: !self.first_choices.starts_with(&failed.choices),
+            choices: kept,
+            faults_off,
+            drawn: failed.drawn,
+            message: failed.message,
+            coverage: failed.coverage,
+            config: failed.config,
+            replays: self.best.replays,
+            smaller: true,
+        };
+        true
+    }
+
+    fn delete_chunks(&mut self) {
+        for size in [8, 4, 2, 1] {
+            let mut at = self.best.choices.len().checked_sub(size);
+            while let Some(i) = at {
+                let mut c = self.best.choices.clone();
+                c.drain(i..i + size);
+                at = if self.try_keep(&c, self.best.faults_off.clone()) {
+                    // What now sits at `i` is new, so try `i` again.
+                    self.best
+                        .choices
+                        .len()
+                        .checked_sub(size)
+                        .map(|last| last.min(i))
+                } else {
+                    i.checked_sub(1)
+                };
+            }
+        }
+    }
+
+    fn zero_each(&mut self) {
+        let mut i = 0;
+        while i < self.best.choices.len() {
+            if self.best.choices[i] != 0 {
+                self.keep_choice(i, 0);
+            }
+            i += 1;
+        }
+    }
+
+    /// Binary search from 0, taken as passing (pass 2 tried it), toward the
+    /// choice, which fails. It gallops up first (1, 2, 4, …) and bisects the
+    /// step where a value first fails, so a small failing value is found
+    /// whatever the choice's size: a draw maps its choice by a remainder
+    /// (`lo + raw % span`), so a choice billions of spans up fails exactly as
+    /// one inside the first span does, and a plain bisection of
+    /// `0..choice` would settle on one far up.
+    fn search_each_toward_zero(&mut self) {
+        let mut i = 0;
+        'choices: while i < self.best.choices.len() {
+            let (mut lo, mut hi) = (0, self.best.choices[i]);
+            let mut probe = Some(1u64);
+            while let Some(p) = probe.filter(|&p| p < hi) {
+                if self.spent() {
+                    return;
+                }
+                if self.keep_choice(i, p) {
+                    match self.best.choices.get(i) {
+                        Some(&v) => hi = v,
+                        None => continue 'choices,
+                    }
+                    break;
+                }
+                lo = p;
+                probe = p.checked_mul(2);
+            }
+            while lo + 1 < hi {
+                if self.spent() {
+                    return;
+                }
+                let mid = lo + (hi - lo) / 2;
+                if self.keep_choice(i, mid) {
+                    match self.best.choices.get(i) {
+                        Some(&v) => hi = v,
+                        None => continue 'choices,
+                    }
+                } else {
+                    lo = mid;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// The best choices with choice `i` set to `value`, kept if that fails.
+    fn keep_choice(&mut self, i: usize, value: u64) -> bool {
+        let mut c = self.best.choices.clone();
+        c[i] = value;
+        self.try_keep(&c, self.best.faults_off.clone())
+    }
+
+    fn turn_off_axes(&mut self) {
+        for axis in FAULT_AXES {
+            if self.best.faults_off.contains(&axis) || !axis_on(&self.best.config, axis) {
+                continue;
+            }
+            let mut off = self.best.faults_off.clone();
+            off.push(axis);
+            off.sort_by_key(|a| FAULT_AXES.iter().position(|f| f == a));
+            self.try_keep(&self.best.choices.clone(), off);
+        }
+    }
+}
+
+/// `choices` without its trailing zeros, which a replay implies.
+fn trimmed(choices: &[u64]) -> Vec<u64> {
+    let len = choices.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+    choices[..len].to_vec()
+}
+
+/// `--inputs`' encoding: each choice as unsigned LEB128, the bytes in
+/// lowercase hex. No choices encode as one zero choice, which replays the same
+/// (a replay reads 0s past the end), so the flag always has a value.
+fn encode_inputs(choices: &[u64]) -> String {
+    let mut hex = String::new();
+    for &choice in choices {
+        let mut v = choice;
+        loop {
+            let low = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                hex.push_str(&format!("{low:02x}"));
+                break;
+            }
+            hex.push_str(&format!("{:02x}", low | 0x80));
+        }
+    }
+    if hex.is_empty() {
+        "00".to_string()
+    } else {
+        hex
+    }
+}
+
+/// `encode_inputs` read back: `None` for a character that is not lowercase
+/// hex, an odd length, a number cut off mid-way, or one past 64 bits.
+fn decode_inputs(hex: &str) -> Option<Vec<u64>> {
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut choices = Vec::new();
+    let (mut value, mut shift, mut open) = (0u64, 0u32, false);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+        let low = u64::from(byte & 0x7f);
+        if shift > 63 || (shift == 63 && low > 1) {
+            return None;
+        }
+        value |= low << shift;
+        open = byte & 0x80 != 0;
+        if open {
+            shift += 7;
+        } else {
+            choices.push(value);
+            (value, shift) = (0, 0);
+        }
+    }
+    (!open).then_some(choices)
 }
 
 /// How one test's universes ended in this batch. A give-up is a universe the
@@ -233,7 +572,7 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
     }
 
     let report = match args.seed {
-        Some(seed) => run_single_seed(&selected, seed),
+        Some(seed) => run_single_seed(&selected, seed, args.inputs.as_deref(), &args.faults_off),
         None => run_batch(
             &selected,
             args.master_seed.unwrap_or_else(ambient_base_seed),
@@ -255,7 +594,16 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
     }
 }
 
-fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
+/// One run per test on `seed`, replaying `inputs` and with `faults_off`
+/// turned off when given: what a failure's repro line runs. It shrinks
+/// nothing, since it replays one run, and its repro passes back what it was
+/// given.
+fn run_single_seed(
+    tests: &[&SimTest],
+    seed: u64,
+    inputs: Option<&[u64]>,
+    faults_off: &[&'static str],
+) -> Report {
     let mut report = Report {
         master_seed: seed,
         universes: 1,
@@ -270,27 +618,37 @@ fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
             verdicts: 0,
             gave_up: 0,
         };
-        match run_app_universe(seed, None, &[], &test.run) {
+        match run_app_universe(seed, inputs, faults_off, &test.run) {
             Ok(end) => {
                 tally(&mut outcomes, &end);
                 merge(&mut report.coverage, &end.coverage);
             }
-            Err(UniverseFailure {
-                config,
-                coverage,
-                message,
-                ..
-            }) => report.failures.push(Failure {
-                test: test.name,
-                seed,
-                config,
-                coverage,
-                message,
-            }),
+            Err(failed) => {
+                let mut failure = Failure::of(test.name, seed, &failed);
+                failure.inputs = inputs.map(<[u64]>::to_vec);
+                failure.faults_off = faults_off.to_vec();
+                report.failures.push(failure);
+            }
         }
         report.outcomes.push(outcomes);
     }
     report
+}
+
+impl Failure {
+    fn of(test: &'static str, seed: u64, failed: &UniverseFailure) -> Failure {
+        Failure {
+            test,
+            seed,
+            config: failed.config.clone(),
+            coverage: failed.coverage.clone(),
+            message: failed.message.clone(),
+            drawn: failed.drawn.clone(),
+            inputs: None,
+            faults_off: Vec::new(),
+            shrunk: None,
+        }
+    }
 }
 
 /// A universe that failed is neither: it never lands here (the failure branch
@@ -334,66 +692,39 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
         }
     }
 
-    let next = AtomicUsize::new(0);
-    let slots: Mutex<Vec<Option<UniverseOutcome>>> =
-        Mutex::new((0..work.len()).map(|_| None).collect());
-    let jobs = jobs.max(1);
-
-    // The one sanctioned thread-spawning site in the workspace besides prod
-    // impls: the harness orchestrates universes from OUTSIDE the deterministic
-    // boundary — each universe inside a worker is a sealed, single-threaded,
-    // seed-determined world, and reports are ordered by universe index so the
-    // pool's scheduling is unobservable.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::scope(|scope| {
-        for _ in 0..jobs {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= work.len() {
-                        return;
-                    }
-                    let (test_index, seed) = work[index];
-                    let outcome = run_app_universe(seed, None, &[], &tests[test_index].run);
-                    slots.lock().unwrap()[index] = Some(outcome);
-                }
-            });
-        }
+    // The same large-Err trade as `run_app_universe`.
+    #[allow(clippy::result_large_err)]
+    let results: Vec<UniverseOutcome> = in_parallel(&work, jobs, |&(test, seed)| {
+        run_app_universe(seed, None, &[], &tests[test].run)
     });
-    let mut slots = slots.into_inner().unwrap();
+    let mut results = results.into_iter().zip(&work);
 
-    let mut index = 0;
-    for test in tests {
+    // Each test's first failure in seed order (universe index, never
+    // completion order), with where its `Failure` sits in the report.
+    let mut firsts: Vec<(usize, usize, u64, UniverseFailure)> = Vec::new();
+    for (test_index, test) in tests.iter().enumerate() {
         let mut covered: BTreeMap<&'static str, u64> = BTreeMap::new();
         let mut outcomes = TestOutcomes {
             test: test.name,
             verdicts: 0,
             gave_up: 0,
         };
+        let mut first = true;
         for _ in 0..universes {
-            let (_, seed) = work[index];
-            let outcome = slots[index]
-                .take()
-                .expect("every work item is filled before the pool returns");
+            let (outcome, &(_, seed)) = results.next().expect("one result per work item");
             match outcome {
                 Ok(end) => {
                     tally(&mut outcomes, &end);
                     merge(&mut covered, &end.coverage);
                 }
-                Err(UniverseFailure {
-                    config,
-                    coverage,
-                    message,
-                    ..
-                }) => report.failures.push(Failure {
-                    test: test.name,
-                    seed,
-                    config,
-                    coverage,
-                    message,
-                }),
+                Err(failed) => {
+                    report.failures.push(Failure::of(test.name, seed, &failed));
+                    if first {
+                        firsts.push((report.failures.len() - 1, test_index, seed, failed));
+                        first = false;
+                    }
+                }
             }
-            index += 1;
         }
         report.outcomes.push(outcomes);
         merge(&mut report.coverage, &covered);
@@ -405,7 +736,53 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
             }
         }
     }
+
+    // Each shrink is a function of its check, seed and failure alone, so
+    // running them in parallel changes nothing but the wall time.
+    let shrunk = in_parallel(&firsts, jobs, |(_, test, seed, failed)| {
+        shrink(tests[*test], *seed, failed)
+    });
+    for ((at, ..), shrunk) in firsts.iter().zip(shrunk) {
+        report.failures[*at].shrunk = Some(shrunk);
+    }
     report
+}
+
+/// `work` over every item on a pool of `jobs` threads, returned in item
+/// order, so the pool's scheduling is unobservable.
+fn in_parallel<T: Sync, R: Send>(
+    items: &[T],
+    jobs: usize,
+    work: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+    // The one sanctioned thread-spawning site in the workspace besides prod
+    // impls: the harness orchestrates universes from OUTSIDE the deterministic
+    // boundary — each universe inside a worker is a sealed, single-threaded,
+    // seed-determined world, and results are ordered by item index so the
+    // pool's scheduling is unobservable.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        return;
+                    }
+                    let result = work(&items[index]);
+                    slots.lock().unwrap()[index] = Some(result);
+                }
+            });
+        }
+    });
+    slots
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.expect("every item is filled before the pool returns"))
+        .collect()
 }
 
 fn merge(into: &mut BTreeMap<&'static str, u64>, from: &BTreeMap<&'static str, u64>) {
@@ -451,11 +828,10 @@ impl Report {
             out.push_str(",\"message\":\"");
             json_escape(&f.message, &mut out);
             out.push_str("\",\"repro\":\"");
+            // The run this record describes: a batch's records are the runs
+            // the batch decided, unshrunk; the human block shows the shrink.
             json_escape(
-                &format!(
-                    "charpente test --sim --filter {} --seed {:#x}",
-                    f.test, f.seed
-                ),
+                &repro(f.test, f.seed, f.inputs.as_deref(), &f.faults_off),
                 &mut out,
             );
             out.push_str("\"}");
@@ -655,17 +1031,80 @@ fn write_human(report: &Report, out: &mut dyn std::io::Write) {
     );
 }
 
+/// The failure block (GUIDE §8 "Reading a failure"). A check's first failure
+/// in a batch prints its shrunk run, with a `shrunk:` line saying how it
+/// shrank and a `first:` line when the shrunk run failed with another
+/// message; its repro replays the shrunk run. Any other failure, and a
+/// `--seed` replay, prints its own run.
 fn human_failure_block(f: &Failure) -> String {
-    format!(
-        "\nsim failure in {}: {}\n  seed:   {:#018x}\n  config: {:?}\n  fired:  {}\n  repro:  charpente test --sim --filter {} --seed {:#x}\n",
+    let (message, config, coverage, drawn, inputs, faults_off) = match &f.shrunk {
+        Some(s) => (
+            &s.message,
+            &s.config,
+            &s.coverage,
+            &s.drawn,
+            s.replay_inputs.then_some(&s.choices[..]),
+            &s.faults_off[..],
+        ),
+        None => (
+            &f.message,
+            &f.config,
+            &f.coverage,
+            &f.drawn,
+            f.inputs.as_deref(),
+            &f.faults_off[..],
+        ),
+    };
+    let mut block = format!(
+        "\nsim failure in {}: {message}\n  seed:   {:#018x}\n  config: {config:?}\n  fired:  {}\n",
         f.test,
-        f.message,
         f.seed,
-        f.config,
-        crate::render_fired(&f.coverage),
-        f.test,
-        f.seed
-    )
+        crate::render_fired(coverage),
+    );
+    if !drawn.is_empty() {
+        let inputs: Vec<String> = drawn.iter().map(|(n, v)| format!("{n}={v}")).collect();
+        block.push_str(&format!("  inputs: {}\n", inputs.join(", ")));
+    }
+    if let Some(s) = &f.shrunk {
+        if s.smaller {
+            let off = match s.faults_off.is_empty() {
+                true => "none".to_string(),
+                false => s.faults_off.join(", "),
+            };
+            block.push_str(&format!(
+                "  shrunk: {} draws to {}, faults off: {off}, in {} replays\n",
+                f.drawn.len(),
+                s.drawn.len(),
+                s.replays
+            ));
+        } else {
+            block.push_str(&format!(
+                "  shrunk: nothing smaller fails, in {} replays\n",
+                s.replays
+            ));
+        }
+        if s.message != f.message {
+            block.push_str(&format!("  first:  {}\n", f.message));
+        }
+    }
+    block.push_str(&format!(
+        "  repro:  {}\n",
+        repro(f.test, f.seed, inputs, faults_off)
+    ));
+    block
+}
+
+/// The command that replays one run: its check, its seed, and the inputs and
+/// fault axes the seed alone would not reproduce.
+fn repro(test: &str, seed: u64, inputs: Option<&[u64]>, faults_off: &[&str]) -> String {
+    let mut line = format!("charpente test --sim --filter {test} --seed {seed:#x}");
+    if let Some(choices) = inputs {
+        line.push_str(&format!(" --inputs {}", encode_inputs(choices)));
+    }
+    if !faults_off.is_empty() {
+        line.push_str(&format!(" --faults-off {}", faults_off.join(",")));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -826,43 +1265,80 @@ mod tests {
             clock_step_back: (0.0, Duration::ZERO),
             clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
         };
-        let failure = Failure {
+        let config_line = "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: 41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }\n";
+        let mut failure = Failure {
             test: "receipts_exactly_once",
             seed: 0x8bee_1752_811a_e873,
-            config,
-            coverage: BTreeMap::from([("fault:dir-entry", 3), ("restart", 7)]),
-            message: "exactly-once violated: hits 2, done 1 for key 3".to_string(),
+            config: config.clone(),
+            coverage: BTreeMap::from([("fault:crash", 2)]),
+            message: "exactly-once violated: hits 3, done 1 for key 812".to_string(),
+            drawn: vec![
+                ("key", "812".into()),
+                ("key", "77".into()),
+                ("order", "[1, 0]".into()),
+            ],
+            inputs: None,
+            faults_off: Vec::new(),
+            shrunk: Some(Shrunk {
+                choices: vec![3, 200],
+                faults_off: vec!["bit_flip", "read_error"],
+                drawn: vec![("key", "3".into()), ("order", "[1, 0]".into())],
+                message: "exactly-once violated: hits 2, done 1 for key 3".to_string(),
+                coverage: BTreeMap::from([("fault:dir-entry", 3), ("restart", 7)]),
+                config,
+                replays: 87,
+                replay_inputs: true,
+                smaller: true,
+            }),
         };
-        let block = human_failure_block(&failure);
-        assert!(
-            block.contains("sim failure in receipts_exactly_once"),
-            "{block}"
-        );
-        assert!(block.contains("  seed:   0x8bee1752811ae873"), "{block}");
-        assert!(
-            block.contains(
-                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: 41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }"
-            ),
-            "{block}"
-        );
-        assert!(
-            block.contains("  fired:  fault:dir-entry: 3, restart: 7"),
-            "{block}"
-        );
-        assert!(
-            block.contains(
-                "  repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873"
-            ),
-            "{block}"
-        );
-        // The GUIDE calls this five load-bearing lines; if that stops being
-        // true the doc is wrong (hard rule 6, docs/GUIDE.md "Reading a
-        // failure, replaying its seed").
+        // The binding copy, line for line: each label padded so the values
+        // align, `inputs:` because the run drew, `first:` because the shrink
+        // slipped to another message, and a repro that replays the shrunk run.
         assert_eq!(
-            block.trim_matches('\n').lines().count(),
-            5,
-            "the GUIDE documents five lines: {block}"
+            human_failure_block(&failure),
+            format!(
+                "\nsim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3\n\
+                 \x20 seed:   0x8bee1752811ae873\n\
+                 {config_line}\
+                 \x20 fired:  fault:dir-entry: 3, restart: 7\n\
+                 \x20 inputs: key=3, order=[1, 0]\n\
+                 \x20 shrunk: 3 draws to 2, faults off: bit_flip, read_error, in 87 replays\n\
+                 \x20 first:  exactly-once violated: hits 3, done 1 for key 812\n\
+                 \x20 repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873 --inputs 03c801 --faults-off bit_flip,read_error\n"
+            )
         );
+
+        // Nothing smaller failed: the block is the first failure's own, the
+        // `shrunk:` line says so, and the repro is the seed alone.
+        let first = failure.shrunk.take().unwrap();
+        failure.shrunk = Some(Shrunk {
+            choices: vec![812, 77, 1],
+            faults_off: Vec::new(),
+            drawn: failure.drawn.clone(),
+            message: failure.message.clone(),
+            coverage: failure.coverage.clone(),
+            config: first.config,
+            replays: 41,
+            replay_inputs: false,
+            smaller: false,
+        });
+        assert_eq!(
+            human_failure_block(&failure),
+            format!(
+                "\nsim failure in receipts_exactly_once: exactly-once violated: hits 3, done 1 for key 812\n\
+                 \x20 seed:   0x8bee1752811ae873\n\
+                 {config_line}\
+                 \x20 fired:  fault:crash: 2\n\
+                 \x20 inputs: key=812, key=77, order=[1, 0]\n\
+                 \x20 shrunk: nothing smaller fails, in 41 replays\n\
+                 \x20 repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873\n"
+            )
+        );
+
+        // A run that drew nothing has no `inputs:` line.
+        failure.drawn.clear();
+        failure.shrunk.as_mut().unwrap().drawn.clear();
+        assert!(!human_failure_block(&failure).contains("inputs:"));
     }
 
     // -------------------------------------------------------------- run()
@@ -963,7 +1439,7 @@ mod tests {
             require: &[],
         }];
         let refs: Vec<&SimTest> = tests.iter().collect();
-        let report = run_single_seed(&refs, 0x1234);
+        let report = run_single_seed(&refs, 0x1234, None, &[]);
         assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
         assert_eq!(
             report.failures[0].coverage.get("restart").copied(),
@@ -985,7 +1461,7 @@ mod tests {
             require: &[],
         }];
         let refs: Vec<&SimTest> = tests.iter().collect();
-        let report = run_single_seed(&refs, 0x1234);
+        let report = run_single_seed(&refs, 0x1234, None, &[]);
         let block = human_failure_block(&report.failures[0]);
         assert!(
             block.contains("fired:  nothing (no faults or events marked coverage"),
@@ -1057,7 +1533,7 @@ mod tests {
             require: &[],
         }];
         let refs: Vec<&SimTest> = tests.iter().collect();
-        let json = run_single_seed(&refs, 0x1234).to_json();
+        let json = run_single_seed(&refs, 0x1234, None, &[]).to_json();
         assert!(json.contains("\"coverage\":{\"restart\":1}"), "{json}");
     }
 
@@ -1499,6 +1975,394 @@ mod tests {
                 "\"summary\":{\"master_seed\":\"0xabc123\",\"universes\":1,\"failures\":1,\"coverage\":{}}}"
             ),
             "{trimmed}"
+        );
+    }
+
+    // ------------------------------------------------------------ shrinking
+
+    fn sim_test(name: &'static str, run: fn(&mut Sim) -> Result<(), String>) -> SimTest {
+        SimTest {
+            name,
+            run,
+            require: &[],
+        }
+    }
+
+    fn run_to_string(tests: &[SimTest], flags: &[&str]) -> (i32, String) {
+        let mut out = Vec::new();
+        let code = run(tests, &parse(flags).unwrap(), &mut out);
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    /// The first failure block for `check` in `out`: its headline through its
+    /// repro line.
+    fn first_block<'a>(out: &'a str, check: &str) -> &'a str {
+        let start = out
+            .find(&format!("sim failure in {check}: "))
+            .unwrap_or_else(|| panic!("no failure block for {check}:\n{out}"));
+        let rest = &out[start..];
+        let repro = rest
+            .find("  repro:  ")
+            .expect("a block ends with its repro line");
+        &rest[..repro + rest[repro..].find('\n').unwrap() + 1]
+    }
+
+    fn line<'a>(block: &'a str, label: &str) -> Option<&'a str> {
+        block.lines().find_map(|l| l.strip_prefix(label))
+    }
+
+    /// Runs a block's repro line as `charpente test --sim` would, and returns
+    /// the replay's block for `check`.
+    fn replay(tests: &[SimTest], block: &str, check: &str) -> String {
+        let repro = line(block, "  repro:  ").unwrap();
+        let args: Vec<&str> = repro.split_whitespace().collect();
+        assert_eq!(args[..3], ["charpente", "test", "--sim"], "{repro}");
+        let (code, out) = run_to_string(tests, &args[3..]);
+        assert_eq!(code, 1, "the repro replays a failure:\n{out}");
+        first_block(&out, check).to_string()
+    }
+
+    /// The block a replay prints: the batch's, less the lines only shrinking
+    /// prints. A replay is one run, so it shrinks nothing.
+    fn unshrunk(block: &str) -> String {
+        block
+            .lines()
+            .filter(|l| !l.starts_with("  shrunk: ") && !l.starts_with("  first:  "))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// Draws up to six numbers in 0..=1000 and returns how many it had drawn
+    /// when one landed 500 or more from an earlier one.
+    fn far_apart(sim: &Sim) -> Option<usize> {
+        let mut seen: Vec<u64> = Vec::new();
+        while seen.len() < 6 {
+            let n = sim.input().between("n", 0, 1000);
+            let apart = seen.iter().any(|m| m.abs_diff(n) >= 500);
+            seen.push(n);
+            if apart {
+                return Some(seen.len());
+            }
+        }
+        None
+    }
+
+    fn two_far_apart(sim: &mut Sim) -> Result<(), String> {
+        match far_apart(sim) {
+            Some(_) => Err("two numbers are 500 or more apart".into()),
+            None => Ok(()),
+        }
+    }
+
+    /// `two_far_apart` with its draw count in the message, so a shrink that
+    /// draws fewer slips to another message (Review Focus 5).
+    fn two_far_apart_after_n(sim: &mut Sim) -> Result<(), String> {
+        match far_apart(sim) {
+            Some(n) => Err(format!("after {n} draws, two are 500 or more apart")),
+            None => Ok(()),
+        }
+    }
+
+    #[test]
+    fn a_failure_shrinks_to_the_smallest_inputs_that_still_fail() {
+        let tests = [sim_test("two_far_apart", two_far_apart)];
+        let flags = ["--universes", "4", "--master-seed", "0x5400", "--jobs", "2"];
+        let (code, out) = run_to_string(&tests, &flags);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, "two_far_apart");
+        // The smallest failing draws: one number 500 from the 0 a replay
+        // reads past the end of its choices.
+        assert_eq!(line(block, "  inputs: "), Some("n=500, n=0"), "{block}");
+        let shrunk = line(block, "  shrunk: ").unwrap_or_else(|| panic!("{block}"));
+        let (from, rest) = shrunk.split_once(" draws to ").unwrap();
+        assert!(
+            from.parse::<usize>().unwrap() > 2,
+            "non-vacuous: the first failure drew more than it needed: {block}"
+        );
+        // `{to}` counts the draws the `inputs:` line lists.
+        assert!(rest.starts_with("2, faults off: "), "{block}");
+        assert!(rest.ends_with(" replays"), "{block}");
+        assert_eq!(
+            line(block, "  first:  "),
+            None,
+            "a fixed message cannot slip: {block}"
+        );
+        // A replay reads 0s past the end, so `--inputs` carries one choice for
+        // the two draws: the trailing zero is trimmed.
+        let repro = line(block, "  repro:  ").unwrap();
+        let hex = repro
+            .split(" --inputs ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert_eq!(decode_inputs(hex).map(|c| c.len()), Some(1), "{repro}");
+        assert_eq!(replay(&tests, block, "two_far_apart"), unshrunk(block));
+    }
+
+    #[test]
+    fn shrinking_turns_off_faults_the_failure_does_not_need() {
+        let on = |seed: u64| -> Vec<&'static str> {
+            let cfg = crate::app_config(seed, &[]);
+            FAULT_AXES
+                .into_iter()
+                .filter(|a| axis_on(&cfg, a))
+                .collect()
+        };
+        // A fault-heavy run: the first master seed whose run has 15 axes on.
+        let (master, seed) = (0u64..)
+            .map(|m| {
+                let mut s = m;
+                (m, splitmix64(&mut s))
+            })
+            .find(|&(_, s)| on(s).len() >= 15)
+            .unwrap();
+        let axes = on(seed);
+        let tests = [sim_test("always_fails", always_fails)];
+        let master = format!("{master:#x}");
+        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", &master]);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, "always_fails");
+        // Every axis that was on, in field order, one replay each.
+        let want = format!(
+            "0 draws to 0, faults off: {}, in {} replays",
+            axes.join(", "),
+            axes.len()
+        );
+        assert_eq!(line(block, "  shrunk: "), Some(want.as_str()), "{block}");
+        let config = format!("{:?}", crate::app_config(seed, &axes));
+        assert_eq!(line(block, "  config: "), Some(config.as_str()), "{block}");
+        let repro = line(block, "  repro:  ").unwrap();
+        assert!(
+            repro.ends_with(&format!(" --faults-off {}", axes.join(","))),
+            "{block}"
+        );
+        assert!(!repro.contains("--inputs"), "it drew nothing: {block}");
+        assert_eq!(replay(&tests, block, "always_fails"), unshrunk(block));
+    }
+
+    /// Draws one number per disk write until the disk crashes or a write hits
+    /// an injected error, so how many it draws depends on the faults that
+    /// fired (Review Focus 4).
+    fn draws_until_the_disk_gives_out(sim: &mut Sim) -> Result<(), String> {
+        use charpente_core::io::{Disk, Entropy};
+        let mut b = [0u8; 1];
+        sim.entropy().fill(&mut b);
+        sim.crash_disk_after(u64::from(b[0] % 24));
+        let Ok(file) = sim.disk().open("draws") else {
+            sim.give_up("the disk crashed before the first draw", "");
+            return Ok(());
+        };
+        let mut seen: Vec<u64> = Vec::new();
+        while !sim.disk_crashed() && seen.len() < 24 {
+            seen.push(sim.input().between("n", 0, 1000));
+            if file.write_at(0, b"x").is_err() && !sim.disk_crashed() {
+                break;
+            }
+        }
+        match (seen.iter().min(), seen.iter().max()) {
+            (Some(lo), Some(hi)) if hi - lo >= 500 => Err("two draws are 500 or more apart".into()),
+            _ => Ok(()),
+        }
+    }
+
+    #[test]
+    fn a_fault_dependent_draw_count_shrinks_deterministically_and_its_repro_replays() {
+        let check = "draws_until_the_disk_gives_out";
+        let tests = [sim_test(check, draws_until_the_disk_gives_out)];
+        let flags = |jobs| {
+            [
+                "--universes",
+                "24",
+                "--master-seed",
+                "0xd2aa",
+                "--jobs",
+                jobs,
+            ]
+        };
+        let (code, out) = run_to_string(&tests, &flags("1"));
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(run_to_string(&tests, &flags("1")).1, out, "two runs differ");
+        assert_eq!(
+            run_to_string(&tests, &flags("4")).1,
+            out,
+            "--jobs 4 differs"
+        );
+        let block = first_block(&out, check);
+        // Non-vacuous: the faults the shrink turned off changed how many
+        // draws the loop made, so the replay ran past the first run's choices.
+        let shrunk = line(block, "  shrunk: ").unwrap_or_else(|| panic!("{block}"));
+        let (from, rest) = shrunk.split_once(" draws to ").unwrap();
+        assert_ne!(from, rest.split_once(',').unwrap().0, "{block}");
+        assert_eq!(replay(&tests, block, check), unshrunk(block));
+    }
+
+    #[test]
+    fn a_slipped_shrink_prints_the_first_message_and_replays_the_shrunk_one() {
+        let check = "two_far_apart_after_n";
+        let tests = [sim_test(check, two_far_apart_after_n)];
+        let (code, out) = run_to_string(&tests, &["--universes", "4", "--master-seed", "0x5400"]);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, check);
+        let shrunk = "after 2 draws, two are 500 or more apart";
+        assert!(
+            block.starts_with(&format!("sim failure in {check}: {shrunk}\n")),
+            "the headline is the shrunk run's own message: {block}"
+        );
+        let first = line(block, "  first:  ")
+            .unwrap_or_else(|| panic!("a slipped shrink prints the first message: {block}"));
+        assert_ne!(first, shrunk, "{block}");
+        assert!(
+            first.ends_with(" draws, two are 500 or more apart"),
+            "{block}"
+        );
+        let replayed = replay(&tests, block, check);
+        assert!(
+            replayed.starts_with(&format!("sim failure in {check}: {shrunk}\n")),
+            "{replayed}"
+        );
+        assert_eq!(replayed, unshrunk(block));
+    }
+
+    /// Fails only on its seed's own draw under its seed's own config, so no
+    /// smaller input and no axis turned off still fails it.
+    fn fails_only_as_sampled(sim: &mut Sim) -> Result<(), String> {
+        let n = sim.input().between("n", 0, u64::MAX);
+        let drawn_as_sampled = n == crate::keyed_stream(sim.seed(), "inputs").next_u64();
+        let config_as_sampled =
+            format!("{:?}", sim.world.cfg) == format!("{:?}", crate::app_config(sim.seed(), &[]));
+        if drawn_as_sampled && config_as_sampled {
+            Err(format!("only {n} fails"))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn nothing_smaller_fails_prints_so() {
+        let check = "fails_only_as_sampled";
+        let tests = [sim_test(check, fails_only_as_sampled)];
+        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", "0x77"]);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, check);
+        let replays: u32 = line(block, "  shrunk: ")
+            .and_then(|l| l.strip_prefix("nothing smaller fails, in "))
+            .and_then(|l| l.strip_suffix(" replays"))
+            .unwrap_or_else(|| panic!("{block}"))
+            .parse()
+            .unwrap();
+        assert!(replays > 0 && replays <= SHRINK_BUDGET, "it tried: {block}");
+        assert_eq!(line(block, "  first:  "), None, "{block}");
+        assert_eq!(
+            line(block, "  repro:  "),
+            Some(
+                format!("charpente test --sim --filter {check} --seed {:#x}", {
+                    let mut s = 0x77;
+                    splitmix64(&mut s)
+                })
+                .as_str()
+            ),
+            "the seed alone replays it: {block}"
+        );
+        assert_eq!(replay(&tests, block, check), unshrunk(block));
+    }
+
+    /// Fails while each of its sixty draws is at least 2^32, so every draw
+    /// has a long way to shrink.
+    fn sixty_large_draws(sim: &mut Sim) -> Result<(), String> {
+        let mut all_large = true;
+        for _ in 0..60 {
+            all_large &= sim.input().between("n", 0, u64::MAX) >= 1 << 32;
+        }
+        if all_large {
+            Err("every draw is at least 2^32".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_shrink_budget_is_a_replay_count() {
+        let test = sim_test("sixty_large_draws", sixty_large_draws);
+        let first = run_app_universe(0x5eed, None, &[], &test.run).unwrap_err();
+        let shrunk = shrink(&test, 0x5eed, &first);
+        assert!(shrunk.replays <= SHRINK_BUDGET, "{}", shrunk.replays);
+        assert_eq!(
+            shrunk.replays, SHRINK_BUDGET,
+            "the budget, not a fixed point, ended it"
+        );
+        assert!(shrunk.smaller);
+        let failure = Failure {
+            test: test.name,
+            seed: 0x5eed,
+            config: first.config.clone(),
+            coverage: first.coverage.clone(),
+            message: first.message.clone(),
+            drawn: first.drawn.clone(),
+            inputs: None,
+            faults_off: Vec::new(),
+            shrunk: Some(shrunk),
+        };
+        let block = human_failure_block(&failure);
+        assert!(block.contains(", in 500 replays\n"), "{block}");
+    }
+
+    #[test]
+    fn the_repro_flags_parse_what_a_repro_line_prints() {
+        let choices = vec![0, 1, 127, 128, 300, u64::MAX];
+        let hex = encode_inputs(&choices);
+        assert_eq!(hex, "00017f8001ac02ffffffffffffffffff01");
+        assert_eq!(decode_inputs(&hex), Some(choices.clone()));
+        let args = parse(&[
+            "--seed",
+            "0x1",
+            "--inputs",
+            &hex,
+            "--faults-off",
+            "clock_skew,write_error",
+        ])
+        .unwrap();
+        assert_eq!(args.inputs, Some(choices));
+        assert_eq!(
+            args.faults_off,
+            ["write_error", "clock_skew"],
+            "field order"
+        );
+        // An all-zero sequence still prints a value: one zero choice replays
+        // the same as none, since a replay reads 0s past the end.
+        assert_eq!(encode_inputs(&[]), "00");
+    }
+
+    #[test]
+    fn the_repro_flags_refuse_by_name() {
+        assert_eq!(
+            parse(&["--inputs", "05"]).unwrap_err(),
+            "--inputs needs --seed: it replays one run's inputs"
+        );
+        assert_eq!(
+            parse(&["--faults-off", "write_error"]).unwrap_err(),
+            "--faults-off needs --seed: it replays one run with those faults off"
+        );
+        // Not hex, odd length, upper case, a truncated number, one past 64
+        // bits, and stray whitespace.
+        for bad in ["zz", "0", "0A", "80", "ffffffffffffffffffff01", " 05"] {
+            assert_eq!(
+                parse(&["--seed", "0x1", "--inputs", bad]).unwrap_err(),
+                format!(
+                    "--inputs: \"{bad}\" is not a choice sequence (lowercase hex of LEB128 \
+                     numbers, as a failure's repro line prints it)"
+                )
+            );
+        }
+        assert_eq!(
+            parse(&["--seed", "0x1", "--faults-off", "write_error,disk_crash"]).unwrap_err(),
+            "--faults-off: \"disk_crash\" is not a FaultConfig field"
+        );
+        assert_eq!(
+            parse(&["--seed", "0x1", "--faults-off", "corruption_scope"]).unwrap_err(),
+            "--faults-off: \"corruption_scope\" is not a fault axis: it scopes bit_flip and \
+             misdirected_write, so turn those off instead"
         );
     }
 }

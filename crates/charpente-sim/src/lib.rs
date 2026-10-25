@@ -2977,25 +2977,17 @@ pub(crate) struct UniverseFailure {
     pub config: FaultConfig,
     pub coverage: BTreeMap<&'static str, u64>,
     pub message: String,
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 12's shrinker reads it"))]
     pub choices: Vec<u64>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 12's shrinker reads it"))]
     pub drawn: Vec<(&'static str, String)>,
 }
 
-/// One run of `charpente test --sim` (harness.rs): `run_universe`'s mapping
-/// plus the clock axes (`sample_clock_fields`), then every `FaultConfig`
-/// field named in `faults_off` turned off. The clock axes sample last, from
-/// their own streams, so with them off a run decides exactly as before them.
-/// `choices` is the input sequence a replay feeds the workload (then 0s).
-// The same large-Err trade as `run_universe`.
-#[allow(clippy::result_large_err)]
-pub(crate) fn run_app_universe(
-    seed: u64,
-    choices: Option<&[u64]>,
-    faults_off: &[&'static str],
-    f: &dyn Fn(&mut Sim) -> Result<(), String>,
-) -> Result<UniverseEnd, UniverseFailure> {
+/// The config one run of `charpente test --sim` runs under: `run_universe`'s
+/// mapping plus the clock axes (`sample_clock_fields`), then every
+/// `FaultConfig` field named in `faults_off` turned off. The clock axes sample
+/// last, from their own streams, so with them off a run decides exactly as
+/// before them. `faults_off` applies after every draw, so turning an axis off
+/// moves no other field (`turning_an_axis_off_moves_no_other_field`).
+fn app_config(seed: u64, faults_off: &[&'static str]) -> FaultConfig {
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
@@ -3005,6 +2997,20 @@ pub(crate) fn run_app_universe(
         turn_off(&mut cfg, field);
     }
     cfg.validate();
+    cfg
+}
+
+/// One run of `charpente test --sim` (harness.rs), under `app_config`.
+/// `choices` is the input sequence a replay feeds the workload (then 0s).
+// The same large-Err trade as `run_universe`.
+#[allow(clippy::result_large_err)]
+pub(crate) fn run_app_universe(
+    seed: u64,
+    choices: Option<&[u64]>,
+    faults_off: &[&'static str],
+    f: &dyn Fn(&mut Sim) -> Result<(), String>,
+) -> Result<UniverseEnd, UniverseFailure> {
+    let cfg = app_config(seed, faults_off);
     let mut sim = Sim::with_faults(seed, cfg.clone());
     if let Some(c) = choices {
         sim.replay_choices(c);
@@ -3026,9 +3032,50 @@ pub(crate) fn run_app_universe(
     }
 }
 
+/// Every `FaultConfig` field `turn_off` takes, in field order: all of them but
+/// `corruption_scope`, which scopes two axes rather than being one. The
+/// harness's `--faults-off` names these, and its shrinker turns them off in
+/// this order (`fault_axes_are_every_field_but_the_scope`).
+pub(crate) const FAULT_AXES: [&str; 26] = [
+    "write_error",
+    "sync_error",
+    "crash_apply",
+    "crash_torn",
+    "dir_entry_loss",
+    "bit_flip",
+    "misdirected_write",
+    "read_error",
+    "object_put_error",
+    "object_get_error",
+    "object_lost_ack",
+    "object_delete_error",
+    "conn_drop",
+    "net_spike",
+    "subscriber_stall",
+    "outbound_refused",
+    "outbound_lost_request",
+    "outbound_lost_reply",
+    "outbound_throttle",
+    "outbound_slow",
+    "outbound_latency",
+    "disk_latency",
+    "net_latency",
+    "clock_skew",
+    "clock_step_back",
+    "clock_downtime",
+];
+
+/// Whether the axis `field` is on in `cfg`: turning it off would change the
+/// config. Judged by `turn_off` itself, so the two cannot disagree.
+pub(crate) fn axis_on(cfg: &FaultConfig, field: &str) -> bool {
+    let mut off = cfg.clone();
+    turn_off(&mut off, field);
+    format!("{off:?}") != format!("{cfg:?}")
+}
+
 /// Turns off the `FaultConfig` field named `field`: a probability or a skew
 /// to zero, a range or a clock axis to its off pair. The harness checks names
-/// before a run, so an unknown one here is a harness bug.
+/// against `FAULT_AXES` before a run, so an unknown one here is a harness bug.
 fn turn_off(cfg: &mut FaultConfig, field: &str) {
     const NONE: (Duration, Duration) = (Duration::ZERO, Duration::ZERO);
     match field {
@@ -4708,6 +4755,83 @@ mod tests {
         sim.give_up("second", "two");
         assert_eq!(sim.gave_up(), Some("first"));
         assert_eq!(sim.gave_up_detail().as_deref(), Some("one"));
+        // The other half: a first call with no detail keeps none, even when a
+        // later call brings one.
+        let sim = Sim::new(0x10_0005);
+        sim.give_up("first", "");
+        sim.give_up("second", "two");
+        assert_eq!(sim.gave_up(), Some("first"));
+        assert_eq!(sim.gave_up_detail(), None);
+    }
+
+    #[test]
+    fn fault_axes_are_every_field_but_the_scope() {
+        let fields: Vec<String> = format!("{:?}", FaultConfig::default())
+            .split(&['{', '}', ',', ' '][..])
+            .filter(|t| t.ends_with(':'))
+            .map(|t| t.trim_end_matches(':').to_string())
+            .filter(|f| f != "corruption_scope")
+            .collect();
+        assert_eq!(fields, FAULT_AXES, "FAULT_AXES lists the fields in order");
+        let ms = Duration::from_millis(1);
+        let every_axis_on = FaultConfig {
+            write_error: 0.1,
+            sync_error: 0.1,
+            crash_apply: 0.1,
+            crash_torn: 0.1,
+            dir_entry_loss: 0.1,
+            bit_flip: 0.1,
+            misdirected_write: 0.1,
+            read_error: 0.1,
+            object_put_error: 0.1,
+            object_get_error: 0.1,
+            object_lost_ack: 0.1,
+            object_delete_error: 0.1,
+            corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
+            conn_drop: 0.1,
+            net_spike: 0.1,
+            subscriber_stall: 0.1,
+            outbound_refused: 0.1,
+            outbound_lost_request: 0.1,
+            outbound_lost_reply: 0.1,
+            outbound_throttle: 0.1,
+            outbound_slow: 0.1,
+            outbound_latency: (ms, ms),
+            disk_latency: (ms, ms),
+            net_latency: (ms, ms),
+            clock_skew: 1,
+            clock_step_back: (0.1, ms),
+            clock_downtime: (0.1, ms),
+        };
+        for axis in FAULT_AXES {
+            assert!(
+                !axis_on(&FaultConfig::none(), axis),
+                "{axis} is off in none()"
+            );
+            assert!(axis_on(&every_axis_on, axis), "{axis} is on");
+            // `turn_off` turns off the axis it names and no other.
+            let mut cfg = every_axis_on.clone();
+            turn_off(&mut cfg, axis);
+            for other in FAULT_AXES {
+                assert_eq!(axis_on(&cfg, other), other != axis, "{axis} off, {other}");
+            }
+        }
+    }
+
+    #[test]
+    fn turning_an_axis_off_moves_no_other_field() {
+        for seed in 0..300u64 {
+            let sampled = app_config(seed, &[]);
+            for axis in FAULT_AXES {
+                let mut want = sampled.clone();
+                turn_off(&mut want, axis);
+                assert_eq!(
+                    format!("{:?}", app_config(seed, &[axis])),
+                    format!("{want:?}"),
+                    "seed {seed:#x}, {axis} off"
+                );
+            }
+        }
     }
 
     #[test]

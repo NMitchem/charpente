@@ -3011,6 +3011,10 @@ drawn input tests how the app handles what its model stand-in returns, never
 the real model's behaviour. `between` panics when `lo > hi`, and `pick` on an
 empty slice; each message names the call and the draw.
 
+When a check fails, its first failure is shrunk to the smallest draws that still
+fail it, and the failure block lists them by name on its `inputs:` line
+("Shrinking a failure" below).
+
 ### Giving up: a universe that reached no verdict
 
 Sooner or later a workload hits a universe where the faults are severe enough
@@ -4293,7 +4297,8 @@ Run it from the app crate's own directory (or pass `--dir`):
 
 ```bash
 charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
-    [--filter S] [--jobs N] [--format human|json] [--dir PATH]
+    [--filter S] [--jobs N] [--format human|json] [--inputs HEX] \
+    [--faults-off AXIS,…] [--dir PATH]
 ```
 
 - `--universes N` — how many fresh seeds to run **per selected test**
@@ -4302,7 +4307,19 @@ charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
 - `--seed 0x…` — bypass the batch entirely and run every selected test
   once, on this exact literal seed. Coverage `require`ments are skipped (one
   universe can't be expected to hit everything a batch would). This is the
-  replay flag: it is exactly what a failure's own `repro:` line uses.
+  replay flag: it is exactly what a failure's own `repro:` line uses. A
+  replay is one run, so it shrinks nothing.
+- `--inputs HEX` — with `--seed`, replay these input choices instead of the
+  ones the seed draws: each `sim.input()` draw reads the next, and every draw
+  past the end reads 0. `HEX` is each choice as an unsigned LEB128 number, the
+  bytes in lowercase hex, which is what a shrunk failure's `repro:` line
+  prints. Anything else (a character that is not lowercase hex, an odd
+  length, a number cut off or past 64 bits) is a usage error naming the flag.
+- `--faults-off AXIS,…` — with `--seed`, turn these `FaultConfig` axes off
+  (any field but `corruption_scope`, which scopes two axes rather than being
+  one). The seed's config is sampled first and these are turned off after, so
+  every other field is the seed's own. A name that is not a field is a usage
+  error.
 - `--master-seed 0x…` — pick where the batch's seed chain starts, instead
   of fresh OS entropy, for a byte-identical repeat of an entire batch
   (every test's every universe). Cannot be combined with `--seed`.
@@ -4317,7 +4334,8 @@ charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
   and `--jobs 8` run the identical seed sequence and produce byte-identical
   reports — worker scheduling is unobservable.
 - `--format human|json` — human is the default; `json` emits one object
-  with `master_seed`, `universes`, `failures` (each carrying its own `test`,
+  with `master_seed`, `universes`, `failures` (each the run as the batch ran
+  it, unshrunk, carrying its own `test`,
   `seed`, `master_seed`, `config` — every fault axis, not a subset — its own
   `coverage` of what actually fired in that universe, `message`, and a
   copy-pasteable `repro` command), `verdicts` and `gave_up` (batch totals), `outcomes` (the same
@@ -4334,39 +4352,48 @@ failed — see "Giving up" above; a green run tells you how many reached a
 verdict, and reading that number is on you); **1** at least one universe failed, or a
 coverage requirement went unmet — the run itself completed, but something
 in it was red; **2** the run never got that far — a build failure, no
-`tests/sim.rs` target found, an unrecognized flag, a filter matching no
-tests, or the sim binary failing to launch or exiting by signal. Exit code
+`tests/sim.rs` target found, an unrecognized flag, `--inputs` or
+`--faults-off` without `--seed` or with a value they cannot read, a filter
+matching no tests, or the sim binary failing to launch or exiting by signal. Exit code
 2 means "rerun once this is fixed," not "here is a reproducible bug."
 
 ### Reading a failure, replaying its seed
 
 A human-format failure looks like this (a pinned test in `charpente-sim`'s
-harness holds its shape: the same five lines, with this `config` line
+harness holds its shape, these lines in this order, with this `config` line
 verbatim):
 
 ```text
 sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
   seed:   0x8bee1752811ae873
   config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: 41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }
-  fired:  crash:torn: 7, fault:sync_error: 4, restart: 2
-  repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873
+  fired:  fault:dir-entry: 3, restart: 7
+  inputs: key=3, order=[1, 0]
+  shrunk: 3 draws to 2, faults off: bit_flip, read_error, in 87 replays
+  first:  exactly-once violated: hits 3, done 1 for key 812
+  repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873 --inputs 03c801 --faults-off bit_flip,read_error
 ```
 
-Five lines, each load-bearing:
+This is a check's first failure in the batch, shrunk ("Shrinking a failure"
+below): every line but `first:` describes the smallest run the harness found
+that still fails the check, and `repro:` replays exactly that run. Each line,
+in order:
 
-- The first line is the workload's own `Err` message (or an absorbed panic
+- The first line is that run's own `Err` message (or an absorbed panic
   payload) — the actual claim that failed.
 - `seed` is the one `u64` that determined this entire universe: virtual
-  time, every entropy draw, and the fault matrix's decisions.
-- `config` is that universe's sampled `FaultConfig` — the fault rates and
-  latency ranges that were ENABLED (per-universe swarm sampling, glossed
-  under the checkers above). It is a set of probabilities, so it tells you
-  what kind of trouble was *possible*: `crash_torn: 0.664668` means torn
-  writes were likely in this universe, not that any occurred. Do not read a
-  diagnosis off this line — that is the next one's job. The last three fields
-  are the clock axes ("Wall time and its faults"): here each clock drew its
-  own skew within ±41.2 s of true time, no reading stepped back, and each
-  power cycle had an even chance of a jump of up to three days.
+  time, every entropy draw, the fault matrix's decisions and, unless the
+  repro passes `--inputs`, every `sim.input()` draw.
+- `config` is the run's `FaultConfig` — the fault rates and latency ranges
+  that were ENABLED (per-universe swarm sampling, glossed under the checkers
+  above): the seed's sampled config with the axes on the `shrunk:` line
+  turned off. It is a set of probabilities, so it tells you what kind of
+  trouble was *possible*: `crash_torn: 0.664668` means torn writes were
+  likely in this universe, not that any occurred. Do not read a diagnosis
+  off this line — that is the next one's job. The last three fields are the
+  clock axes ("Wall time and its faults"): here each clock drew its own skew
+  within ±41.2 s of true time, no reading stepped back, and each power cycle
+  had an even chance of a jump of up to three days.
 - `fired` is what ACTUALLY happened: the universe's coverage map, every
   fault and event that really occurred, with counts. This is the line to
   reason from. A high probability whose key is absent here never fired, and
@@ -4376,10 +4403,28 @@ Five lines, each load-bearing:
   finding was attributed to `dir_entry_loss: 0.477` by three separate
   readers, none of whom could have known whether that axis fired, because
   the failure path discarded coverage entirely — docs/LEDGER.md 2026-09-07.)
+- `inputs` is every `sim.input()` draw the run made, by name, in draw order
+  ("Drawing inputs" above). A run that drew nothing has no `inputs:` line.
+- `shrunk` says how far shrinking got: how many inputs the first failure
+  drew and how many the shrunk run drew, counted as the `inputs:` line lists
+  them; the fault axes it turned off (`none` when it needed them all); and
+  how many runs it replayed. The shrunk run can draw more than the first: a
+  fault turned off can let a loop run longer. `shrunk: nothing smaller fails, in N replays`
+  means no smaller run failed the check, so the block is the first failure's
+  own and its repro is the seed alone.
+- `first` is the first failure's message, printed only when the shrunk run
+  failed the check with another one (a slipped shrink, below).
 - `repro` is not advice, it **is** the reproduction: paste that exact line
-  and the same universe runs again, because `--seed` (above) replays a
-  literal seed byte-identically. There is no separate "figure out how to
-  reproduce this" step — the failure message already did that work.
+  and the same run happens again, byte for byte. `--seed` replays a literal
+  seed; `--inputs` appears only when the shrunk run's choices are not the
+  ones the seed draws, and `--faults-off` only when it turned axes off (both
+  above). There is no separate "figure out how to reproduce this" step —
+  the failure message already did that work. Replaying it prints the same
+  block without `shrunk:` and `first:`, since a replay is one run and shrinks
+  nothing.
+
+The check's other failures in the batch print their own runs, unshrunk: no
+`shrunk:` line, and a repro that is the seed alone.
 
 The same discipline extends outward: `run_universes!`/`run_universes_swarm!`
 (the frozen internal-suite macros the platform's own tests use) and
@@ -4389,6 +4434,48 @@ test -p <pkg> --test <file>` and `charpente test --sim --seed 0x…` are the
 same idea at two different layers, each replaying its own layer's universe: a
 failure's seed is always enough, on its own, to see the exact same universe
 again.
+
+### Shrinking a failure
+
+A failing run usually carries more than its bug: inputs that play no part, and
+fault axes that were on but did nothing to it. So the harness replays the first
+failure of each check with smaller choices and fewer faults, and keeps the
+smallest run that still fails the same check. That is the run the block shows.
+The rule is the same for every check: the smallest inputs, then the fewest fault
+axes, that still fail it.
+
+It shrinks the recorded choice sequence, not the values (Hypothesis's approach):
+a smaller choice is a simpler value (`lo`, the first item, the identity order),
+and a draw past the end of the choices reads 0. Four passes repeat until a whole
+round keeps nothing:
+
+1. delete chunks of the choices, 8, 4, 2 and then 1 long, from the end toward
+   the start;
+2. set each choice to 0;
+3. search each choice down toward 0 (galloping up from 0, then bisecting), so a
+   small value that fails is found even when the recorded choice is huge;
+4. turn off each fault axis that is on, one at a time, in `FaultConfig` field
+   order.
+
+A candidate is kept when the same check fails, with any message. One that
+passes or gives up is not kept, so a clock axis whose removal turns the failure
+into a clock-excused skip stays on. A smaller input can move where faults land,
+and a fault turned off can change how many inputs a run draws (a retry loop that
+no longer retries). Neither breaks anything, because the harness judges a
+candidate only by replaying it, exactly as the printed repro does.
+
+Shrinking runs on the first failure of each check in seed order, never in
+completion order, and each shrink depends only on its check, seed and first
+failure. Its budget is 500 replays, counted rather than timed, so the block is
+identical for any `--jobs` and on any machine. A shrink that spends the budget
+stops with the smallest run found so far.
+
+**A slipped shrink.** Any failure of the same check counts, so the smallest run
+can fail it for another reason than the first did. The headline is then the
+shrunk run's own message, `first:` keeps the original, and `repro:` replays the
+shrunk run. The original is the seed alone: drop `--inputs` and `--faults-off`
+from the repro. When the two messages name different bugs, fix the one the
+repro shows, then rerun the batch.
 
 ### Re-basing a pinned property: `CHARPENTE_BASE_SEED`
 

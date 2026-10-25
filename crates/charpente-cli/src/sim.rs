@@ -23,11 +23,14 @@ const KNOWN_FLAGS: &[&str] = &[
     "--filter",
     "--jobs",
     "--format",
+    "--inputs",
+    "--faults-off",
     "--dir",
 ];
 
 pub const USAGE: &str = "usage: charpente test --sim [--universes N] [--seed 0x…] \
-[--master-seed 0x…] [--filter S] [--jobs N] [--format human|json] [--dir PATH]\n\
+[--master-seed 0x…] [--filter S] [--jobs N] [--format human|json] [--inputs HEX] \
+[--faults-off AXIS,…] [--dir PATH]\n\
        --dir PATH   the app crate directory to build and run sim tests from (default: .)";
 
 /// Runs `test --sim`'s runner-flag args (everything after `--sim`). Returns

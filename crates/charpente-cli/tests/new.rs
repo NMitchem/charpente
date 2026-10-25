@@ -351,8 +351,19 @@ fn deleting_the_scaffolds_enqueue_turns_the_second_property_red_with_a_seed_that
         Some(1),
         "the seed replays red:\n{replayed}"
     );
+    // A replay is one run, so it shrinks nothing: its block is the batch's,
+    // less the lines only shrinking prints, byte for byte.
+    let unshrunk = block
+        .lines()
+        .filter(|l| !l.starts_with("  shrunk: ") && !l.starts_with("  first:  "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        replayed.contains(block),
+        block.contains("\n  shrunk: "),
+        "the batch shrinks the check's first failure:\n{block}"
+    );
+    assert!(
+        replayed.contains(&unshrunk),
         "README: the seed replays — the same block, byte for byte\nbatch:\n{block}\nreplay:\n{replayed}"
     );
 }

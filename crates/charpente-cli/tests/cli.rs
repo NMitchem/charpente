@@ -66,6 +66,47 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("seed:   0x"), "failure block:\n{stdout}");
     assert!(stdout.contains("repro:  charpente test --sim --filter sometimes_fails --seed 0x"));
+    // The check's first failure is shrunk. `sometimes_fails` draws nothing and
+    // fails on an entropy byte alone, so every fault axis that was on turns
+    // off, and the repro replays the run with them off.
+    let start = stdout
+        .find("sim failure in sometimes_fails: ")
+        .expect("a failure block");
+    let rest = &stdout[start..];
+    let repro_at = rest
+        .find("  repro:  ")
+        .expect("a block ends with its repro line");
+    let block = &rest[..repro_at + rest[repro_at..].find('\n').unwrap() + 1];
+    assert!(
+        block.contains("\n  shrunk: 0 draws to 0, faults off: "),
+        "{block}"
+    );
+    assert!(!block.contains("inputs"), "it drew nothing: {block}");
+    let repro: Vec<&str> = block[repro_at..]
+        .trim_start()
+        .strip_prefix("repro:  ")
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert!(repro.contains(&"--faults-off"), "{block}");
+    let replay = charpente()
+        .args(&repro[1..])
+        .args(["--dir", &fixture_dir()])
+        .env("CHARPENTE_FIXTURE_FAIL", "1")
+        .output()
+        .unwrap();
+    assert_eq!(replay.status.code(), Some(1));
+    // A replay is one run: its block is the batch's, less the `shrunk:` line.
+    let unshrunk: String = block
+        .lines()
+        .filter(|l| !l.starts_with("  shrunk: "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let replayed = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        replayed.contains(&unshrunk),
+        "the repro replays the shrunk run\nbatch:\n{block}\nreplay:\n{replayed}"
+    );
     // The gap this closes: a failing run must still reveal its master seed
     // (previously only an all-green run printed it, in the stdout summary
     // line) — the startup line goes to stderr, before any universe runs.
@@ -74,6 +115,45 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
         stderr.contains("master seed") && stderr.contains("0x0000000000005eed"),
         "startup line must announce the master seed even on a failing run:\n{stderr}"
     );
+}
+
+/// The repro flags' refusals (Review Focus 3): each names its flag, exits 2,
+/// and runs nothing — never a panic, and never a default run in its place.
+#[test]
+fn the_repro_flags_refuse_by_name_and_run_nothing() {
+    for (args, want) in [
+        (
+            &["--inputs", "05"][..],
+            "--inputs needs --seed: it replays one run's inputs",
+        ),
+        (
+            &["--faults-off", "write_error"][..],
+            "--faults-off needs --seed: it replays one run with those faults off",
+        ),
+        (
+            &["--seed", "0x1", "--inputs", "8"][..],
+            "--inputs: \"8\" is not a choice sequence (lowercase hex of LEB128 numbers, as a \
+             failure's repro line prints it)",
+        ),
+        (
+            &["--seed", "0x1", "--faults-off", "disk_crash"][..],
+            "--faults-off: \"disk_crash\" is not a FaultConfig field",
+        ),
+    ] {
+        let out = charpente()
+            .args(["test", "--sim"])
+            .args(args)
+            .args(["--dir", &fixture_dir()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}\n{stderr}");
+        assert!(
+            stderr.lines().any(|l| l == want),
+            "{args:?}: want {want}\n{stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{args:?} ran something");
+    }
 }
 
 /// The end-to-end proof that a give-up is a REPORTED number, not a coverage
