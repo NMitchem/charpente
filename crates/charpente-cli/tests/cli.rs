@@ -213,11 +213,13 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(r#""outcomes":[{"test":"counter_roundtrip","verdicts":52,"gave_up":12}]"#),
-        "the per-test outcome split is the machine-readable field:\n{stdout}"
+        stdout.contains(
+            r#""checks":[{"check":"counter_roundtrip","status":"ok","passed":52,"failed":0,"skipped":12,"#
+        ),
+        "the per-check split is the machine-readable field:\n{stdout}"
     );
     assert!(
-        stdout.contains(r#""verdicts":52,"gave_up":12,"outcomes""#),
+        stdout.contains(r#""passed":52,"failed":0,"skipped":12,"coverage""#),
         "the batch totals sit alongside the per-test split:\n{stdout}"
     );
     // Cross-checked a second way: `Sim::give_up` also marks coverage, so the
@@ -263,8 +265,8 @@ rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --
 /// A universe whose acknowledged write was cut by durable corruption gives up;
 /// it does not pass, because nothing about durability was adjudicated (S3's
 /// sweep, 2026-10-01). One seed per excuse arm, each found by scanning harness
-/// universes. The JSON report these pins read carries no give-up reason, so
-/// each arm marks its own coverage key beside the give-up and the pin reads
+/// universes. The JSON report these pins read lists the give-up reason, but
+/// each arm also marks its own coverage key beside the give-up and the pin reads
 /// that key, along with the corruption axis that fired.
 #[test]
 fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
@@ -303,7 +305,7 @@ fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
         assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
         assert!(
             stdout.contains(&format!(
-                r#""outcomes":[{{"test":"{test}","verdicts":0,"gave_up":1}}]"#
+                r#""checks":[{{"check":"{test}","status":"untested","passed":0,"failed":0,"skipped":1,"#
             )),
             "seed {seed} must give up, not pass:\n{stdout}"
         );
@@ -394,7 +396,7 @@ fn a_universe_that_checked_nothing_gives_up_by_its_arm() {
         assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
         assert!(
             stdout.contains(&format!(
-                r#""outcomes":[{{"test":"{test}","verdicts":0,"gave_up":1}}]"#
+                r#""checks":[{{"check":"{test}","status":"untested","passed":0,"failed":0,"skipped":1,"#
             )) && stdout.contains(&format!(r#""{arm}":1"#)),
             "seed {seed} must give up at {arm}, not pass:\n{stdout}"
         );
@@ -422,7 +424,7 @@ fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
     for (seed, outcome, keys) in [
         (
             "0x37c729667e04270c",
-            r#""outcomes":[{"test":"orders_charge_once","verdicts":1,"gave_up":0}]"#,
+            r#""checks":[{"check":"orders_charge_once","status":"ok","passed":1,"failed":0,"skipped":0,"#,
             &[
                 r#""outbound-fixture:waited-out-clock":1"#,
                 r#""outbound:checked":1"#,
@@ -432,7 +434,7 @@ fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
         ),
         (
             "0x4af3b8a4fb1dc3d0",
-            r#""outcomes":[{"test":"orders_charge_once","verdicts":0,"gave_up":1}]"#,
+            r#""checks":[{"check":"orders_charge_once","status":"untested","passed":0,"failed":0,"skipped":1,"#,
             &[
                 r#""outbound-fixture:waited-out-clock":1"#,
                 r#""outbound-fixture:gave-up:no-order":1"#,

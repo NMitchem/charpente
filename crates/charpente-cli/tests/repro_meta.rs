@@ -48,24 +48,15 @@ fn a_failure_report_is_a_reproduction() {
     let json = String::from_utf8_lossy(&out.stdout);
     // Hand-extract the first failure's fields (stable JSON field order, Task 5):
     let seed = extract(&json, r#""seed":""#);
-    let test = extract(&json, r#""test":""#);
+    let test = extract(&json, r#""failures":[{"check":""#);
     let message = extract(&json, r#""message":""#);
+    let repro_line = extract(&json, r#""repro":""#);
     assert_eq!(test, "sometimes_fails");
 
     // Execute the repro exactly as the report tells a human to:
     let repro = charpente()
-        .args([
-            "test",
-            "--sim",
-            "--filter",
-            &test,
-            "--seed",
-            &seed,
-            "--format",
-            "json",
-            "--dir",
-            &fixture_dir(),
-        ])
+        .args(repro_line.split_whitespace().skip(1))
+        .args(["--format", "json", "--dir", &fixture_dir()])
         .env("CHARPENTE_FIXTURE_FAIL", "1")
         .output()
         .unwrap();

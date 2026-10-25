@@ -4380,15 +4380,24 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   thread, in registry order, before any work is handed out, so `--jobs 1`
   and `--jobs 8` run the identical seed sequence and produce byte-identical
   reports — worker scheduling is unobservable.
-- `--format human|json` — human is the default; `json` emits one object
-  with `master_seed`, `universes`, `failures` (each the run as the batch ran
-  it, unshrunk, carrying its own `test`,
-  `seed`, `master_seed`, `config` — every fault axis, not a subset — its own
-  `coverage` of what actually fired in that run, `message`, and a
-  copy-pasteable `repro` command), `verdicts` and `gave_up` (batch totals), `outcomes` (the same
-  split per test: `{test, verdicts, gave_up}`), `coverage`,
-  `missing_coverage` (`{test, key}` pairs), and a trailing `summary`, for
-  downstream tooling.
+- `--format human|json` — human is the default; `json` emits one object with
+  every fact the human report prints, keys in this order: `master_seed`,
+  `runs`, `passed`, `failed` and `skipped` (run totals over every check),
+  `coverage`, `missing_coverage` (`{check, key}` pairs), `checks` and
+  `failures`. Each of `checks`, in registry order, is `{check, status, passed,
+  failed, skipped, distinct_inputs, drew_inputs, skipped_reasons}`: `status` is
+  `ok`, `FAILED` or `untested` (under `--seed` too, where the human line says
+  `skipped`), and `skipped_reasons` lists every reason, uncapped, as `{reason,
+  count}` by count descending then reason, plus `detail` under `--seed`, the one
+  run's own text. Each of `failures` lists every failing run, in seed order, as
+  `{check, seed, config, fired, message, inputs, faults_off, first_message,
+  replays, repro}`, with `config` carrying every fault axis. A check's first
+  failure is the one a batch shrinks: its `inputs` are `{name, value}` pairs of
+  the shrunk run, `message` is the shrunk run's, `first_message` appears only
+  when the shrink slipped to another message, `replays` counts the candidates
+  tried and `repro` replays the shrunk run. Every other failure is its own
+  unshrunk run: its own drawn `inputs`, `faults_off` `[]`, `replays` 0, no
+  `first_message`, and a `repro` that is its seed alone. Seeds are hex strings.
 - `--dir PATH` — the app crate directory to build and run sim tests from
   (default: `.`). This flag is consumed by the CLI itself; every other flag
   passes straight through to the sim binary the CLI builds and execs.

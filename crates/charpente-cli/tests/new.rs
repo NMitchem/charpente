@@ -615,15 +615,15 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
     );
     assert!(report.contains("\"failures\":[]"), "{report}");
     assert!(
-        report.contains("\"verdicts\":0,\"gave_up\":1"),
+        report.contains("\"passed\":0,\"failed\":0,\"skipped\":1,"),
         "the seed gives up, reaching no verdict:\n{report}"
     );
     assert!(
         report.contains("\"fault:misdirected_write\":1"),
         "and the corruption that excuses it fired:\n{report}"
     );
-    // The JSON report carries no skipped reason; the human replay does, and
-    // this give-up has a fixed reason and no detail.
+    // The human replay prints the skipped reason, and this give-up has a
+    // fixed reason and no detail.
     let human = charpente()
         .current_dir(&app)
         .env("CARGO_TARGET_DIR", target_dir())

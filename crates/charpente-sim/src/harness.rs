@@ -4,7 +4,7 @@
 //! sequential batch, each run through `crate::run_app_universe`: the
 //! internal swarm macro's seed→behavior mapping plus the clock axes, which
 //! only this harness samples. Runs a batch in parallel over a `--jobs`-sized
-//! thread pool and can render the report as JSON (`Report::to_json`) for
+//! thread pool and can render the report as JSON (`render_json`) for
 //! downstream tooling.
 //!
 //! Batch model: one splitmix64 chain, seeded from the master seed, consumed
@@ -659,7 +659,7 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
     match args.format {
         Format::Human => write_human(&batch, out),
         Format::Json => {
-            let _ = writeln!(out, "{}", batch.report.to_json());
+            let _ = writeln!(out, "{}", render_json(&batch));
         }
     }
     let report = &batch.report;
@@ -924,99 +924,141 @@ fn merge(into: &mut BTreeMap<&'static str, u64>, from: &BTreeMap<&'static str, u
     }
 }
 
-impl Report {
-    /// Hand-assembled JSON (no dependency): field order is a pinned contract
-    /// downstream tooling parses (spec: docs/superpowers/specs/
-    /// 2026-07-05-sim-cli-design.md, "Failure output"). Seeds are always hex
-    /// strings, never JSON numbers — a `u64` seed routinely exceeds 2^53,
-    /// the largest integer a JSON-consuming float type can represent
-    /// exactly. Each failure record carries its own `master_seed` (the spec
-    /// requires a record to be self-contained once extracted from the
-    /// document); `summary` is the trailing field, exactly `{master_seed,
-    /// universes, failures, coverage}` per spec.
-    pub fn to_json(&self) -> String {
-        let mut out = String::new();
-        out.push('{');
+/// The batch as JSON, with every fact the human output prints (GUIDE §8
+/// "Reading the JSON"). Hand-assembled, no dependency: the key order is a
+/// pinned contract downstream tooling parses. Seeds are hex strings, never
+/// JSON numbers: a `u64` routinely exceeds 2^53, the largest integer a
+/// JSON-consuming float type holds exactly. Every failure is listed; only a
+/// check's first carries the shrink.
+fn render_json(batch: &Batch) -> String {
+    let report = &batch.report;
+    let mut out = String::new();
+    let (mut passed, mut failed, mut skipped) = (0, 0, 0);
+    for c in &batch.checks {
+        passed += c.passed;
+        failed += c.failed;
+        skipped += c.skipped.iter().map(|(_, n)| n).sum::<u64>();
+    }
+    out.push_str(&format!(
+        "{{\"master_seed\":\"{:#x}\",\"runs\":{},\"passed\":{passed},\"failed\":{failed},\
+         \"skipped\":{skipped},\"coverage\":",
+        report.master_seed, report.universes,
+    ));
+    coverage_json(&report.coverage, &mut out);
 
-        out.push_str("\"master_seed\":\"");
-        out.push_str(&format!("{:#x}", self.master_seed));
-        out.push_str("\",\"universes\":");
-        out.push_str(&self.universes.to_string());
-
-        out.push_str(",\"failures\":[");
-        for (i, f) in self.failures.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"test\":\"");
-            json_escape(f.test, &mut out);
-            out.push_str("\",\"seed\":\"");
-            out.push_str(&format!("{:#x}", f.seed));
-            out.push_str("\",\"master_seed\":\"");
-            out.push_str(&format!("{:#x}", self.master_seed));
-            out.push_str("\",\"config\":");
-            config_json(&f.config, &mut out);
-            out.push_str(",\"coverage\":");
-            coverage_json(&f.coverage, &mut out);
-            out.push_str(",\"message\":\"");
-            json_escape(&f.message, &mut out);
-            out.push_str("\",\"repro\":\"");
-            // The run this record describes: a batch's records are the runs
-            // the batch decided, unshrunk; the human block shows the shrink.
-            json_escape(
-                &repro(f.test, f.seed, f.inputs.as_deref(), &f.faults_off),
-                &mut out,
-            );
-            out.push_str("\"}");
+    out.push_str(",\"missing_coverage\":[");
+    for (i, (test, key)) in report.missing_coverage.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
         }
-        out.push(']');
+        out.push_str("{\"check\":\"");
+        json_escape(test, &mut out);
+        out.push_str("\",\"key\":\"");
+        json_escape(key, &mut out);
+        out.push_str("\"}");
+    }
 
-        out.push_str(",\"verdicts\":");
-        out.push_str(&self.verdicts().to_string());
-        out.push_str(",\"gave_up\":");
-        out.push_str(&self.gave_up().to_string());
-
-        out.push_str(",\"outcomes\":[");
-        for (i, o) in self.outcomes.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"test\":\"");
-            json_escape(o.test, &mut out);
-            out.push_str(&format!(
-                "\",\"verdicts\":{},\"gave_up\":{}}}",
-                o.verdicts, o.gave_up
-            ));
+    out.push_str("],\"checks\":[");
+    for (i, (o, c)) in report.outcomes.iter().zip(&batch.checks).enumerate() {
+        if i > 0 {
+            out.push(',');
         }
-        out.push(']');
-
-        out.push_str(",\"coverage\":");
-        coverage_json(&self.coverage, &mut out);
-
-        out.push_str(",\"missing_coverage\":[");
-        for (i, (test, key)) in self.missing_coverage.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"test\":\"");
-            json_escape(test, &mut out);
-            out.push_str("\",\"key\":\"");
-            json_escape(key, &mut out);
-            out.push_str("\"}");
-        }
-        out.push(']');
-
+        let unmet = report
+            .missing_coverage
+            .iter()
+            .any(|(test, _)| test == o.test);
+        out.push_str("{\"check\":\"");
+        json_escape(o.test, &mut out);
         out.push_str(&format!(
-            ",\"summary\":{{\"master_seed\":\"{:#x}\",\"universes\":{},\"failures\":{},\"coverage\":",
-            self.master_seed,
-            self.universes,
-            self.failures.len(),
+            "\",\"status\":\"{}\",\"passed\":{},\"failed\":{},\"skipped\":{},\
+             \"distinct_inputs\":{},\"drew_inputs\":{},\"skipped_reasons\":[",
+            check_status(c, unmet),
+            c.passed,
+            c.failed,
+            c.skipped.iter().map(|(_, n)| n).sum::<u64>(),
+            c.distinct_inputs,
+            c.drew,
         ));
-        coverage_json(&self.coverage, &mut out);
-        out.push('}');
+        for (j, (reason, n)) in c.skipped.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"reason\":\"");
+            json_escape(reason, &mut out);
+            out.push_str(&format!("\",\"count\":{n}"));
+            // Only a `--seed` replay keeps details, one per skipped run, and
+            // it has one run per check.
+            if let Some(detail) = c.details.get(j) {
+                out.push_str(",\"detail\":\"");
+                json_escape(detail, &mut out);
+                out.push('"');
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+    }
 
-        out.push('}');
-        out
+    out.push_str("],\"failures\":[");
+    for (i, f) in report.failures.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let (message, config, coverage, drawn, inputs, faults_off) = failure_run(f);
+        out.push_str("{\"check\":\"");
+        json_escape(f.test, &mut out);
+        out.push_str(&format!("\",\"seed\":\"{:#x}\",\"config\":", f.seed));
+        config_json(config, &mut out);
+        out.push_str(",\"fired\":");
+        coverage_json(coverage, &mut out);
+        out.push_str(",\"message\":\"");
+        json_escape(message, &mut out);
+        out.push_str("\",\"inputs\":[");
+        for (j, (name, value)) in drawn.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":\"");
+            json_escape(name, &mut out);
+            out.push_str("\",\"value\":\"");
+            json_escape(value, &mut out);
+            out.push_str("\"}");
+        }
+        out.push_str("],\"faults_off\":[");
+        for (j, axis) in faults_off.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("\"{axis}\""));
+        }
+        out.push(']');
+        let mut replays = 0;
+        if let Some(s) = &f.shrunk {
+            replays = s.replays;
+            if s.message != f.message {
+                out.push_str(",\"first_message\":\"");
+                json_escape(&f.message, &mut out);
+                out.push('"');
+            }
+        }
+        out.push_str(&format!(",\"replays\":{replays},\"repro\":\""));
+        json_escape(&repro(f.test, f.seed, inputs, faults_off), &mut out);
+        out.push_str("\"}");
+    }
+    out.push_str("]}");
+    out
+}
+
+/// A check's status in both formats: FAILED when a run failed or a required
+/// coverage key never occurred, untested when no run reached the check, else
+/// ok. A check that tested nothing is never ok, and a `--seed` replay's
+/// skipped check is `untested` here (its human line says `skipped`).
+fn check_status(c: &CheckExtras, unmet: bool) -> &'static str {
+    if c.failed > 0 || unmet {
+        "FAILED"
+    } else if c.passed + c.failed == 0 {
+        "untested"
+    } else {
+        "ok"
     }
 }
 
@@ -1171,16 +1213,12 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
         // every check is untested never reads `ok` either: a batch that
         // adjudicated nothing must never read as an unqualified success
         // (MANIFESTO §9).
-        let status = if c.failed > 0 || !unmet.is_empty() {
-            failed += 1;
-            "FAILED"
-        } else if tested == 0 {
-            untested += 1;
-            "untested"
-        } else {
-            passed += 1;
-            "ok"
-        };
+        let status = check_status(c, !unmet.is_empty());
+        match status {
+            "FAILED" => failed += 1,
+            "untested" => untested += 1,
+            _ => passed += 1,
+        }
         let mut counts = match c.drew {
             true => format!("{tested} tested over {} distinct inputs", c.distinct_inputs),
             false => format!("{tested} tested"),
@@ -1351,13 +1389,20 @@ fn write_replay(
     );
 }
 
-/// The failure block (GUIDE §8 "Reading a failure"). A batch prints one per
-/// failing check: its first failure, shrunk, with a `shrunk:` line saying how
-/// it shrank and a `first:` line when the shrunk run failed with another
-/// message; its repro replays the shrunk run. The check's other failures get
-/// no block, only the count on its line. A `--seed` replay prints its own run.
-fn human_failure_block(f: &Failure) -> String {
-    let (message, config, coverage, drawn, inputs, faults_off) = match &f.shrunk {
+/// The run a failure's record describes: the shrunk run when there is one,
+/// else the failure itself, with the inputs and fault axes its repro passes.
+#[allow(clippy::type_complexity)]
+fn failure_run(
+    f: &Failure,
+) -> (
+    &String,
+    &FaultConfig,
+    &BTreeMap<&'static str, u64>,
+    &Vec<(&'static str, String)>,
+    Option<&[u64]>,
+    &[&'static str],
+) {
+    match &f.shrunk {
         Some(s) => (
             &s.message,
             &s.config,
@@ -1374,7 +1419,16 @@ fn human_failure_block(f: &Failure) -> String {
             f.inputs.as_deref(),
             &f.faults_off[..],
         ),
-    };
+    }
+}
+
+/// The failure block (GUIDE §8 "Reading a failure"). A batch prints one per
+/// failing check: its first failure, shrunk, with a `shrunk:` line saying how
+/// it shrank and a `first:` line when the shrunk run failed with another
+/// message; its repro replays the shrunk run. The check's other failures get
+/// no block, only the count on its line. A `--seed` replay prints its own run.
+fn human_failure_block(f: &Failure) -> String {
+    let (message, config, coverage, drawn, inputs, faults_off) = failure_run(f);
     let mut block = format!(
         "\nsim failure in {}: {message}\n  seed:   {:#018x}\n  config: {config:?}\n  fired:  {}\n",
         f.test,
@@ -1856,8 +1910,8 @@ mod tests {
             require: &[],
         }];
         let refs: Vec<&SimTest> = tests.iter().collect();
-        let json = run_single_seed(&refs, 0x1234, None, &[]).report.to_json();
-        assert!(json.contains("\"coverage\":{\"restart\":1}"), "{json}");
+        let json = render_json(&run_single_seed(&refs, 0x1234, None, &[]));
+        assert!(json.contains("\"fired\":{\"restart\":1}"), "{json}");
     }
 
     #[test]
@@ -2231,107 +2285,25 @@ mod tests {
 
     #[test]
     fn json_master_seed_and_failure_seed_are_hex_strings_not_numbers() {
-        let tests = [SimTest {
-            name: "always_fails",
-            run: always_fails,
-            require: &[],
-        }];
-        let args = parse(&[
-            "--runs",
-            "1",
-            "--master-seed",
-            "0xabc123",
-            "--format",
-            "json",
-        ])
-        .unwrap();
-        let mut out = Vec::new();
-        let code = run(&tests, &args, &mut out);
+        let tests = [sim_test("always_fails", always_fails)];
+        let (code, text) = run_to_string(
+            &tests,
+            &[
+                "--runs",
+                "1",
+                "--master-seed",
+                "0xabc123",
+                "--format",
+                "json",
+            ],
+        );
         assert_eq!(code, 1);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("\"master_seed\":\"0x"), "{text}");
+        assert!(text.starts_with("{\"master_seed\":\"0xabc123\","), "{text}");
         assert!(
-            text.contains("\"test\":\"always_fails\",\"seed\":\"0x"),
+            text.contains("\"failures\":[{\"check\":\"always_fails\",\"seed\":\"0x"),
             "{text}"
         );
-        // Every failure record is self-contained: it carries its own
-        // master_seed (spec field order test, seed, master_seed, config), on
-        // top of the document's top-level and summary master_seed fields —
-        // three occurrences total for this one-failure batch.
-        let occurrences = text.matches("\"master_seed\":\"0xabc123\"").count();
-        assert_eq!(
-            occurrences, 3,
-            "expected the top-level, per-failure, and summary master_seed: {text}"
-        );
-        let obj_start = text.find("\"test\":\"always_fails\"").unwrap();
-        let seed_pos = text[obj_start..]
-            .find("\"seed\":\"0x")
-            .map(|p| p + obj_start)
-            .unwrap();
-        let master_seed_pos = text[seed_pos..]
-            .find("\"master_seed\":\"0xabc123\"")
-            .map(|p| p + seed_pos)
-            .unwrap();
-        let config_pos = text[master_seed_pos..]
-            .find("\"config\":{")
-            .map(|p| p + master_seed_pos)
-            .unwrap();
-        assert!(
-            obj_start < seed_pos && seed_pos < master_seed_pos && master_seed_pos < config_pos,
-            "failure record field order must be test, seed, master_seed, config: {text}"
-        );
-    }
-
-    #[test]
-    fn json_failure_object_has_config_message_and_repro_fields() {
-        let tests = [SimTest {
-            name: "always_fails",
-            run: always_fails,
-            require: &[],
-        }];
-        let args = parse(&["--runs", "1", "--format", "json"]).unwrap();
-        let mut out = Vec::new();
-        let code = run(&tests, &args, &mut out);
-        assert_eq!(code, 1);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("\"config\":{"), "{text}");
         assert!(text.contains("\"message\":\"toy failure\""), "{text}");
-        assert!(
-            text.contains("\"repro\":\"charpente test --sim --filter always_fails --seed 0x"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn json_summary_matches_the_spec_shape() {
-        let tests = [SimTest {
-            name: "always_fails",
-            run: always_fails,
-            require: &[],
-        }];
-        let args = parse(&[
-            "--runs",
-            "1",
-            "--master-seed",
-            "0xabc123",
-            "--format",
-            "json",
-        ])
-        .unwrap();
-        let mut out = Vec::new();
-        let code = run(&tests, &args, &mut out);
-        assert_eq!(code, 1);
-        let text = String::from_utf8(out).unwrap();
-        let trimmed = text.trim_end();
-        // The spec pins the trailing summary object's field set exactly:
-        // {master_seed, universes, failures, coverage} (docs/superpowers/
-        // specs/2026-07-05-sim-cli-design.md, "Failure output").
-        assert!(
-            trimmed.ends_with(
-                "\"summary\":{\"master_seed\":\"0xabc123\",\"universes\":1,\"failures\":1,\"coverage\":{}}}"
-            ),
-            "{trimmed}"
-        );
     }
 
     // ------------------------------------------------------------ shrinking
@@ -3142,7 +3114,8 @@ mod tests {
         );
         let (_, json) = run_to_string(&tests, &[&flags[..], &["--format", "json"]].concat());
         assert_eq!(
-            json.matches("{\"test\":\"always_fails\",\"seed\":").count(),
+            json.matches("{\"check\":\"always_fails\",\"seed\":")
+                .count(),
             6,
             "{json}"
         );
@@ -3235,6 +3208,189 @@ mod tests {
         }
         let (_, out) = replay_seed(sim_test("newline_detail", newline_detail), &[]);
         assert!(out.contains("\n    detail:  a\\nb\n"), "{out}");
+    }
+
+    // ------------------------------------------------- Task 17: JSON facts
+
+    /// The text after `"key":` up to the next occurrence of `next`.
+    fn between_keys<'a>(json: &'a str, key: &str, next: &str) -> &'a str {
+        let start = json
+            .find(key)
+            .unwrap_or_else(|| panic!("no {key} in {json}"))
+            + key.len();
+        let end = json[start..].find(next).map_or(json.len(), |e| start + e);
+        &json[start..end]
+    }
+
+    #[test]
+    fn the_json_has_every_fact_in_order() {
+        let tests = [
+            sim_test("draws_a_digit", draws_a_digit),
+            sim_test("draws_nothing", always_ok),
+        ];
+        let flags = [
+            "--runs",
+            "64",
+            "--master-seed",
+            "0x1234",
+            "--format",
+            "json",
+        ];
+        let (code, json) = run_to_string(&tests, &flags);
+        assert_eq!(code, 1, "{json}");
+        let digits: Vec<u64> = batch_seeds(0x1234, 64)
+            .into_iter()
+            .map(|seed| Sim::new(seed).input().between("n", 0, 9))
+            .collect();
+        let tested: Vec<u64> = digits.iter().copied().filter(|&n| n < 7).collect();
+        let failed = tested.iter().filter(|&&n| n == 0).count();
+        let skipped = digits.len() - tested.len();
+        let distinct = tested.iter().collect::<BTreeSet<_>>().len();
+        // Non-vacuous: failures, skips and several distinct inputs all occur.
+        assert!(failed > 0 && skipped > 0 && distinct > 1, "{digits:?}");
+        let passed = tested.len() - failed;
+        assert!(
+            json.starts_with(&format!(
+                "{{\"master_seed\":\"0x1234\",\"runs\":64,\"passed\":{},\"failed\":{failed},\
+                 \"skipped\":{skipped},\"coverage\":{{",
+                passed + 64
+            )),
+            "{json}"
+        );
+        let at = |key: &str| json.find(key).unwrap_or_else(|| panic!("no {key}: {json}"));
+        assert!(
+            at("\"coverage\":") < at("\"missing_coverage\":[]")
+                && at("\"missing_coverage\":[]") < at("\"checks\":[")
+                && at("\"checks\":[") < at("\"failures\":["),
+            "{json}"
+        );
+        let checks = between_keys(&json, "\"checks\":", ",\"failures\":");
+        assert_eq!(
+            checks,
+            format!(
+                "[{{\"check\":\"draws_a_digit\",\"status\":\"FAILED\",\"passed\":{passed},\
+                 \"failed\":{failed},\"skipped\":{skipped},\"distinct_inputs\":{distinct},\
+                 \"drew_inputs\":true,\"skipped_reasons\":[{{\"reason\":\"drew 7 or more\",\
+                 \"count\":{skipped}}}]}},{{\"check\":\"draws_nothing\",\"status\":\"ok\",\
+                 \"passed\":64,\"failed\":0,\"skipped\":0,\"distinct_inputs\":1,\
+                 \"drew_inputs\":false,\"skipped_reasons\":[]}}]"
+            )
+        );
+        assert!(
+            !json.contains("\"detail\""),
+            "a batch keeps no detail: {json}"
+        );
+        assert!(
+            !json.contains("universe") && !json.contains("verdicts"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn the_json_lists_every_reason_uncapped() {
+        let tests = [sim_test("gives_up_twelve_ways", gives_up_twelve_ways)];
+        let flags = [
+            "--runs",
+            "256",
+            "--master-seed",
+            "0x1234",
+            "--format",
+            "json",
+        ];
+        let (code, json) = run_to_string(&tests, &flags);
+        assert_eq!(code, 0, "{json}");
+        let mut counts = [0u64; 12];
+        for seed in batch_seeds(0x1234, 256) {
+            counts[twelfth(seed)] += 1;
+        }
+        let mut reasons: Vec<(&str, u64)> = TWELVE.into_iter().zip(counts).collect();
+        reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
+        let want: Vec<String> = reasons
+            .iter()
+            .map(|(r, n)| format!("{{\"reason\":\"{r}\",\"count\":{n}}}"))
+            .collect();
+        assert!(
+            json.contains(&format!("\"skipped_reasons\":[{}]", want.join(","))),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"status\":\"untested\""),
+            "every run skipped: {json}"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_failure_carries_its_inputs_and_repro() {
+        let check = "two_far_apart_after_n";
+        let tests = [sim_test(check, two_far_apart_after_n)];
+        let flags = ["--runs", "4", "--master-seed", "0x5400"];
+        let (_, human) = run_to_string(&tests, &flags);
+        let block = first_block(&human, check);
+        let (_, json) = run_to_string(&tests, &[&flags[..], &["--format", "json"]].concat());
+        let records: Vec<&str> = json
+            .split("{\"check\":\"two_far_apart_after_n\",\"seed\":")
+            .skip(1)
+            .collect();
+        assert!(records.len() >= 2, "one batch, both kinds: {json}");
+        // The first failure carries the shrink.
+        let first = records[0];
+        let repro = line(block, "  repro:  ").unwrap();
+        assert!(
+            first.contains(
+                "\"message\":\"after 2 draws, two are 500 or more apart\",\"inputs\":[\
+                 {\"name\":\"n\",\"value\":\"500\"},{\"name\":\"n\",\"value\":\"0\"}],\
+                 \"faults_off\":["
+            ),
+            "{first}"
+        );
+        let slipped = between_keys(first, "\"first_message\":\"", "\"");
+        assert!(
+            slipped.ends_with(" draws, two are 500 or more apart"),
+            "{first}"
+        );
+        assert!(
+            slipped != "after 2 draws, two are 500 or more apart",
+            "{first}"
+        );
+        assert!(first.contains(&format!("\"repro\":\"{repro}\"")), "{first}");
+        assert!(!first.contains("\"replays\":0,"), "{first}");
+        assert!(first.contains(",\"replays\":"), "{first}");
+        // Every other failure is its own unshrunk run.
+        for other in &records[1..] {
+            let seed = between_keys(other, "\"", "\"");
+            assert!(
+                other.contains("\"faults_off\":[],\"replays\":0,\"repro\":\"charpente test --sim --filter two_far_apart_after_n --seed "),
+                "{other}"
+            );
+            assert!(!other.contains("first_message"), "{other}");
+            assert!(!other.contains("--inputs"), "{other}");
+            assert!(other.contains(&format!("--seed {seed}\"")), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_replayed_seed_carries_its_detail() {
+        fn gives_up_with_detail(sim: &mut Sim) -> Result<(), String> {
+            sim.give_up("the store hit fault fallout", "seq \"14\"");
+            Ok(())
+        }
+        let tests = [sim_test("gives_up_with_detail", gives_up_with_detail)];
+        let (code, json) = run_to_string(&tests, &["--seed", "0x1234", "--format", "json"]);
+        assert_eq!(code, 0, "{json}");
+        assert!(
+            json.contains(
+                "{\"check\":\"gives_up_with_detail\",\"status\":\"untested\",\"passed\":0,\
+                 \"failed\":0,\"skipped\":1,\"distinct_inputs\":0,\"drew_inputs\":false,\
+                 \"skipped_reasons\":[{\"reason\":\"the store hit fault fallout\",\"count\":1,\
+                 \"detail\":\"seq \\\"14\\\"\"}]}"
+            ),
+            "{json}"
+        );
+        assert!(
+            json.starts_with("{\"master_seed\":\"0x1234\",\"runs\":1,"),
+            "{json}"
+        );
     }
 
     #[test]
