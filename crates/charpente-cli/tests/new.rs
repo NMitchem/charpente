@@ -489,7 +489,9 @@ fn failure_block(stdout: &str, check: &str) -> String {
 
 /// The scaffold's `tx.emit` line is the one an outside agent found nothing
 /// noticing the loss of: the event commits with the note and the job, and the
-/// third check reads the durable event log to prove it.
+/// third check reads the durable event log to prove it. Its failure block also
+/// pins that the notes, their order and their bodies are drawn, not written:
+/// the shrunk run's `inputs:` line names each draw.
 #[test]
 fn deleting_the_emit_line_turns_the_event_check_red() {
     let (_, out) = sim_with_line_deleted("noemit", "    tx.emit(NoteAdded { note: id });\n");
@@ -505,6 +507,16 @@ fn deleting_the_emit_line_turns_the_event_check_red() {
         block.contains("event-durability violated"),
         "and it fails for the reason the deletion causes:\n{block}"
     );
+    let inputs = block
+        .lines()
+        .find(|l| l.starts_with("  inputs: "))
+        .unwrap_or_else(|| panic!("a failure block names the inputs it drew:\n{block}"));
+    for name in ["notes", "order", "body"] {
+        assert!(
+            inputs.contains(&format!(" {name}=")),
+            "`{name}` is drawn:\n{block}"
+        );
+    }
     for other in [
         "acked_note_survives_a_restart",
         "acked_post_implies_the_echo_after_recovery",
@@ -531,9 +543,10 @@ fn deleting_the_enqueue_line_turns_the_echo_check_red() {
     );
 }
 
-/// The scaffold's notes, bodies and order are drawn, not written: over the
-/// green batch at master seed 0x1, each check's line counts more than one
-/// distinct input among its tested runs.
+/// The scaffold's inputs vary: over the green batch at master seed 0x1, each
+/// check's line counts more than one distinct input among its tested runs.
+/// The count alone would hold with only the note count drawn, so which draws
+/// there are is pinned by name in `deleting_the_emit_line_turns_the_event_check_red`.
 #[test]
 fn the_scaffold_draws_its_inputs() {
     let app = patched_scaffold("drawn");

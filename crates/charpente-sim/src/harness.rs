@@ -671,14 +671,16 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
 }
 
 /// The command that reruns a batch exactly: its master seed, its run count
-/// unless that is the default, and its filter. `--jobs` changes nothing the
-/// batch prints, so it is left out.
+/// unless that is the default, and its filter unless it is empty. `--jobs`
+/// changes nothing the batch prints, so it is left out. An empty filter
+/// selects every check, as none does, and printed it would end the line in a
+/// bare `--filter`, which is refused for want of a value.
 fn rerun(master_seed: u64, runs: u64, filter: Option<&str>) -> String {
     let mut line = format!("charpente test --sim --master-seed {master_seed:#x}");
     if runs != DEFAULT_RUNS {
         line.push_str(&format!(" --runs {runs}"));
     }
-    if let Some(filter) = filter {
+    if let Some(filter) = filter.filter(|f| !f.is_empty()) {
         line.push_str(&format!(" --filter {filter}"));
     }
     line
@@ -1349,11 +1351,11 @@ fn write_replay(
     );
 }
 
-/// The failure block (GUIDE §8 "Reading a failure"). A check's first failure
-/// in a batch prints its shrunk run, with a `shrunk:` line saying how it
-/// shrank and a `first:` line when the shrunk run failed with another
-/// message; its repro replays the shrunk run. Any other failure, and a
-/// `--seed` replay, prints its own run.
+/// The failure block (GUIDE §8 "Reading a failure"). A batch prints one per
+/// failing check: its first failure, shrunk, with a `shrunk:` line saying how
+/// it shrank and a `first:` line when the shrunk run failed with another
+/// message; its repro replays the shrunk run. The check's other failures get
+/// no block, only the count on its line. A `--seed` replay prints its own run.
 fn human_failure_block(f: &Failure) -> String {
     let (message, config, coverage, drawn, inputs, faults_off) = match &f.shrunk {
         Some(s) => (
@@ -2906,11 +2908,14 @@ mod tests {
         assert_eq!(run_to_string(&tests, &args).1, out);
         // The default count and no filter add nothing after the master seed.
         let (_, out) = run_to_string(&tests, &["--master-seed", "0x1234"]);
-        assert_eq!(
-            out.lines().last(),
-            Some("rerun exactly this batch: charpente test --sim --master-seed 0x1234"),
-            "{out}"
-        );
+        let bare = "rerun exactly this batch: charpente test --sim --master-seed 0x1234";
+        assert_eq!(out.lines().last(), Some(bare), "{out}");
+        // Nor does an empty filter (an unset `--filter "$CHECK"`): it selects
+        // every check, as no filter does, and `--filter` with no value after
+        // it is refused.
+        let (_, empty) = run_to_string(&tests, &["--filter", "", "--master-seed", "0x1234"]);
+        assert_eq!(empty, out, "an empty filter is the unfiltered batch");
+        assert_eq!(empty.lines().last(), Some(bare), "{empty}");
     }
 
     const TWELVE: [&str; 12] = [

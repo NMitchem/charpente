@@ -3162,10 +3162,11 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   both: the coverage keys are a floorable distribution over *causes*, and the
   outcome is the scalar the runner reports. Neither replaces the other.
 
-Every batch states, check by check, how many runs tested the check and how many
-were skipped, and why each skipped run was skipped, whether or not anything was
-skipped. This is a pinned batch of `crates/sim-fixture`, `charpente test --sim
---runs 64 --master-seed 0x5eed --filter counter_roundtrip`:
+Every batch states, check by check, how many runs tested the check and, when any
+were skipped, how many and why. A check with nothing skipped shows no skipped
+count and is left out of the reasons block, and a batch that skipped nothing
+prints no reasons block at all. This is a pinned batch of `crates/sim-fixture`,
+`charpente test --sim --runs 64 --master-seed 0x5eed --filter counter_roundtrip`:
 
 <!-- pinned -->
 ```text
@@ -4426,9 +4427,10 @@ shows two). In order:
   key never occurred, `untested` when no run tested the check, and `ok`
   otherwise. The counts are how many runs tested it (`52 tested`), how many
   distinct inputs those runs drew when it draws any (`203 tested over 181
-  distinct inputs`, "Drawing inputs" above), how many failed (`64 tested: 16
-  failed`), how many were skipped, and the keys that never occurred
-  (`required "restart" never occurred`).
+  distinct inputs`, "Drawing inputs" above), how many failed when any did
+  (`64 tested: 16 failed`), how many were skipped when any were (`52 tested,
+  12 skipped`), and the keys that never occurred (`required "restart" never
+  occurred`).
 - **The skipped runs' reasons**, under each check that skipped any, most
   frequent first and then in byte order, each with its count. A check that
   tested nothing is headed `— never tested: every run was skipped`. A check
