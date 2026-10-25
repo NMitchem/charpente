@@ -26,6 +26,7 @@ fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
 /// followed by a restart, as a supervised process restarts
 /// (`checks::boot_through_fallout`).
 const BOOT_TRIES: u32 = 8;
+const _: () = assert!(BOOT_TRIES == 8);
 
 /// Wires `replays_identically` to a real app roundtrip: two fresh worlds on
 /// the same seed must retrace `counter_roundtrip_result` byte-for-byte. Uses
@@ -58,7 +59,7 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let Some(mut db) =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
     else {
-        sim.give_up("Db::open before the crash never booted", "");
+        sim.give_up("Db::open before the crash never booted in 8 boots", "");
         return Ok(None);
     };
     // Only an injected fault excuses a write that never acked; any other
@@ -79,7 +80,7 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let Some(db) =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
     else {
-        sim.give_up("Db::open after the crash never booted", "");
+        sim.give_up("Db::open after the crash never booted in 8 boots", "");
         return Ok(None);
     };
     if !acked {
@@ -321,7 +322,7 @@ fn dispatch_one_bump(sim: &mut Sim) -> Result<Option<u64>, String> {
     let Some(app) =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?
     else {
-        sim.give_up("App::open never booted", "");
+        sim.give_up("App::open never booted in 8 boots", "");
         return Ok(None);
     };
     let mut app = app.mount_jobs(jobs![BumpCounter]);

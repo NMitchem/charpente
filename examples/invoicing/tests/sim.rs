@@ -51,6 +51,7 @@ fn fallout(sim: &Sim, text: &str) -> bool {
 /// How many boots the app gets, each failed boot followed by a restart, as a
 /// supervised process restarts (`checks::boot_through_fallout`).
 const BOOT_TRIES: u32 = 8;
+const _: () = assert!(BOOT_TRIES == 8);
 
 /// Ends a universe that adjudicated nothing: gives it up under `reason`, and
 /// marks `key`, the arm's name, because the harness reports a give-up's count
@@ -112,7 +113,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted in 8 boots", "");
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
@@ -174,7 +175,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted in 8 boots", "");
         return Ok(());
     };
     let snap = match app.db().snapshot() {
@@ -360,7 +361,7 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted in 8 boots", "");
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
@@ -514,7 +515,7 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted in 8 boots", "");
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
@@ -896,7 +897,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up("the app never booted", format!("in {BOOT_TRIES} boots"));
+        sim.give_up("the app never booted in 8 boots", "");
         return Ok(());
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {

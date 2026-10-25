@@ -887,6 +887,7 @@ fn oracle(sim: &Sim, db: &mut Db) -> Result<(), String> {
 /// fresh bases from 234 to 65 for +2.8% CPU (2026-10-01, S5 review I1). Before
 /// S5 a failed reopen rebuilt the table store, and 32 cost +34%.
 const FINAL_ATTEMPTS: u32 = 64;
+const _: () = assert!(FINAL_ATTEMPTS == 64);
 
 /// How many boots each round gets before it restarts and moves on
 /// (`checks::boot_through_fallout`). A round whose boot fails skips its oracle
@@ -1082,7 +1083,7 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
         };
     }
     sim.give_up(
-        "the final recovery never ran the oracle: every attempt hit injected faults, so the \
+        "the final recovery never ran the oracle: every one of 64 attempts hit injected faults, so the \
          last round's writes were never checked",
         "",
     );

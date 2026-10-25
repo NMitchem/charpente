@@ -181,8 +181,10 @@ impl TableMigration for Widget3 {
 /// Rounds a seeding helper gets before it stops: each round is one boot and
 /// one write, and a round that meets fault fallout restarts and goes again.
 const SEED_ROUNDS: u32 = 64;
+const _: () = assert!(SEED_ROUNDS == 64);
 /// Rounds an open-and-migrate helper gets, the barrier remedy's included.
 const MIGRATE_ROUNDS: u32 = 128;
+const _: () = assert!(MIGRATE_ROUNDS == 128);
 
 fn cfg() -> DbConfig {
     DbConfig {
@@ -638,9 +640,9 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
 /// The give-ups of a migration universe that never reached its comparison
 /// (S3b item 4). Every seeding or open-and-migrate round met fault fallout
 /// (the barrier remedy counts as a round), so no store was compared.
-const SEED_NEVER_COMPLETED: &str = "seeding the v1 store never completed: every round met fault fallout, so there was no store \
+const SEED_NEVER_COMPLETED: &str = "seeding the v1 store never completed: every one of 64 rounds met fault fallout, so there was no store \
      to migrate";
-const MIGRATE_NEVER_COMPLETED: &str = "open-and-migrate never completed: every round met fault fallout or the upgrade barrier, so \
+const MIGRATE_NEVER_COMPLETED: &str = "open-and-migrate never completed: every one of 128 rounds met fault fallout or the upgrade barrier, so \
      there was no migrated store to compare";
 
 /// One universe of the property above: seed the v1 store, open and migrate it

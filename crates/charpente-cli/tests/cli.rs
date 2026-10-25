@@ -248,7 +248,7 @@ check counter_roundtrip ... ok  (52 tested, 12 skipped)
 
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
-    10  Db::open after the crash never booted
+    10  Db::open after the crash never booted in 8 boots
      2  the write was never acked, so durability has nothing to prove
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):

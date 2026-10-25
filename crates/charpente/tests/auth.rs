@@ -1076,7 +1076,7 @@ fn finish_auth_universe(
             sim.cover("auth:inconclusive");
             sim.give_up(
                 INCONCLUSIVE,
-                e.replacen(&format!("{INCONCLUSIVE}: "), "", 1),
+                e.strip_prefix(&format!("{INCONCLUSIVE}: ")).unwrap_or(&e),
             );
             Ok(())
         }

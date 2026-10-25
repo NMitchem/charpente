@@ -7205,6 +7205,7 @@ const CONV_RESTORE_ATTEMPTS: u32 = 64;
 /// own doc calls transient. 32 until 2026-10-01; 64 verifies 2 and 4 more
 /// universes at the two bases for no measurable CPU (`CONV_RESTORED_FLOOR`).
 const CONV_VERIFY_ATTEMPTS: u32 = 64;
+const _: () = assert!(CONV_VERIFY_ATTEMPTS == 64);
 
 /// The base seed `archive_converges` runs from. Explicit, like
 /// `replication.rs`'s `0x2EB1_*` family.
@@ -8856,7 +8857,7 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
     if !verified {
         sim.cover("archive:verify_never_read_cleanly");
         sim.give_up(
-            "the restored destination never read cleanly, so the restore was never verified",
+            "the restored destination never read cleanly in 64 attempts, so the restore was never verified",
             "",
         );
         return Ok(());

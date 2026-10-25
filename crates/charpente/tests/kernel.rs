@@ -2267,6 +2267,7 @@ fn loop_app(sim: &Sim) -> std::io::Result<App> {
 /// need none: their next round is the retry, after a restart, and their final
 /// reopen loops have budgets of their own.
 const BOOT_TRIES: u32 = 64;
+const _: () = assert!(BOOT_TRIES == 64);
 
 /// Scripted request source for tests that need the reply itself (`SimSource`
 /// above only records `(status, body)`): drains a fixed list of requests in
@@ -3326,6 +3327,7 @@ use charpente_sim::run_universes_swarm;
 /// universes, and every rescued one passed). Shared by `kernel_workload` and
 /// `job_tenancy_universe`, whose give-up rates are capped by `ceiling:`.
 const FINAL_REOPENS: u32 = 64;
+const _: () = assert!(FINAL_REOPENS == 64);
 
 fn crash_config() -> AppConfig {
     AppConfig {
@@ -3818,7 +3820,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     }
     // A universe that adjudicated nothing gives up; it does not pass.
     sim.give_up(
-        "the final check never ran: every reopen in a row hit injected faults, so the last \
+        "the final check never ran: every one of 64 reopens in a row hit injected faults, so the last \
          round's jobs were never adjudicated",
         "",
     );
@@ -6098,7 +6100,7 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     .map_err(|e| format!("v1 boot failed non-injected: {e}"))?
     else {
         sim.give_up(
-            "the v1 binary never booted, so it enqueued nothing for v2 to refuse or drain",
+            "the v1 binary never booted in 64 boots, so it enqueued nothing for v2 to refuse or drain",
             "",
         );
         return Ok(());
@@ -7007,7 +7009,7 @@ mod job_tenancy {
         }
         // A universe that adjudicated nothing gives up; it does not pass.
         sim.give_up(
-            "the final check never ran: every reopen in a row hit injected faults, so the last \
+            "the final check never ran: every one of 64 reopens in a row hit injected faults, so the last \
              round's jobs were never adjudicated",
             "",
         );

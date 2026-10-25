@@ -1297,6 +1297,7 @@ fn is_injected(text: &str) -> bool {
 /// fresh bases from 258 to 94 for +2.2% CPU (2026-10-01, S5 review I1). Before
 /// S5 a failed reopen rebuilt the table store, and 32 cost +24.5%.
 const FINAL_ATTEMPTS: u32 = 64;
+const _: () = assert!(FINAL_ATTEMPTS == 64);
 
 /// How many boots each round gets before it restarts and moves on
 /// (`checks::boot_through_fallout`). A round whose boot fails skips its check
@@ -1460,7 +1461,7 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
         }
     }
     sim.give_up(
-        "the final verification never ran: every attempt hit injected faults, so the last \
+        "the final verification never ran: every one of 64 attempts hit injected faults, so the last \
          round's acked requests were never checked",
         "",
     );

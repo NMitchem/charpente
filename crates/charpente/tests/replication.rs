@@ -268,7 +268,7 @@ fn finish_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
             sim.cover("repl:inconclusive");
             sim.give_up(
                 INCONCLUSIVE,
-                e.replacen(&format!("{INCONCLUSIVE}: "), "", 1),
+                e.strip_prefix(&format!("{INCONCLUSIVE}: ")).unwrap_or(&e),
             );
             Ok(())
         }

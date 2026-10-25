@@ -624,6 +624,7 @@ fn recover_and_check(
 /// Over four bases 16 left 157 give-ups, 32 left 155 and 64 rescued none more,
 /// for 4.62 s of CPU against 4.37 s without a final check, +5.7% (2026-10-01).
 const FINAL_ATTEMPTS: u32 = 32;
+const _: () = assert!(FINAL_ATTEMPTS == 32);
 
 fn tables_workload(sim: &mut Sim) -> Result<(), String> {
     tables_workload_traced(sim).map(|_| ())
@@ -731,7 +732,7 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
         }
     }
     sim.give_up(
-        "the final check never ran: every attempt hit injected faults, so the last round's \
+        "the final check never ran: every one of 32 attempts hit injected faults, so the last round's \
          records were never checked",
         "",
     );

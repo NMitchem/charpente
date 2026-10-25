@@ -3053,7 +3053,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         .map_err(|e| e.to_string())?
     else {
         // Nothing to adjudicate: the disk never let the claim become testable.
-        sim.give_up("Db::open never booted", "in 8 tries");
+        sim.give_up("Db::open never booted in 8 boots", "");
         return Ok(());
     };
     let put = db.transact(|tx| {
@@ -3068,7 +3068,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
         // An injected fault kept the write from its ack: no claim to check.
         // Any other error is the platform's, and fails, as the opens do.
         Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up("the write was never acknowledged, so there is no claim to check", "");
+            sim.give_up("the write was never acknowledged, so there is no claim to check", e);
             return Ok(());
         }
         Err(e) => return Err(format!("{e:?}")),
@@ -3080,7 +3080,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
     let Some(db) = boot_through_fallout(sim, 8, is_fault_fallout, open)
         .map_err(|e| e.to_string())?
     else {
-        sim.give_up("the reopen never booted", "in 8 tries");
+        sim.give_up("the reopen never booted in 8 boots", "");
         return Ok(());
     };
     match db.snapshot().and_then(|snap| snap.get::<Counter>(Id::from_raw(1))) {
@@ -3112,9 +3112,11 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   varies between runs: no error text, count or seq. A batch groups each
   check's skipped runs by reason and counts each group, so a reason with a seq
   in it makes every run its own group and the counts say nothing. What varies
-  goes in `detail` (anything `Display`: `e`, `format!("in {BOOT_TRIES}
-  boots")`): that one run's own text, which a batch does not print and `--seed` prints under the skipped check as `detail:`. A
-  give-up with nothing to add passes `""`, and an empty detail is none.
+  goes in `detail` (anything `Display`, such as the fallout error `e`): that one
+  run's own text, which a batch does not print and `--seed` prints under the skipped check as `detail:`. A
+  constant such as a retry count is fixed text, so it belongs in the reason
+  (`"Db::open never booted in 8 boots"`), not the detail. A give-up with
+  nothing to add passes `""`, and an empty detail is none.
   `sim.gave_up()` reads the reason and `sim.gave_up_detail()` the detail;
   `Outcome::GaveUp` carries both.
 - First call wins, reason and detail together; later ones are consequences of
@@ -3174,7 +3176,7 @@ check counter_roundtrip ... ok  (52 tested, 12 skipped)
 
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
-    10  Db::open after the crash never booted
+    10  Db::open after the crash never booted in 8 boots
      2  the write was never acked, so durability has nothing to prove
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):

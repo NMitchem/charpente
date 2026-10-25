@@ -23,6 +23,7 @@ fn run_tests(tests: &[SimTest]) -> (i32, String) {
 }
 
 const BOOT_TRIES: u32 = 8;
+const _: () = assert!(BOOT_TRIES == 8);
 
 /// Opens the app, retrying through transient disk fallout; gives up only if
 /// every boot is refused.
@@ -31,7 +32,7 @@ fn boot(sim: &mut Sim, merge: Merge) -> Result<Option<App>, String> {
     let app =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?;
     if app.is_none() {
-        sim.give_up("App::open never booted", "");
+        sim.give_up("App::open never booted in 8 boots", "");
     }
     Ok(app)
 }

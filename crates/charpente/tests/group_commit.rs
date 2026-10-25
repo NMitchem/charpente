@@ -2132,6 +2132,7 @@ enum Verify {
 /// otherwise have concluded nothing: 8 -> 64 took this property's give-ups at
 /// its base from 27 to 0 for +11% CPU (2026-10-01; 16 left 12, 32 left 3).
 const CODA_REOPENS: u32 = 64;
+const _: () = assert!(CODA_REOPENS == 64);
 /// How many reopens a round boundary's check gets. Its `Unreachable` is not a
 /// give-up, which is sticky and would throw away the coda's verdict, but the
 /// coda does not cover that boundary either: as `verify_watermark`'s doc says,
@@ -2373,7 +2374,7 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
         // (`durable_corruption_fired`), unlike a check that never ran.
         Verify::Excused => {}
         Verify::Unreachable => sim.give_up(
-            "the final coda never verified the watermark: every reopen hit injected faults, so \
+            "the final coda never verified the watermark: every one of 64 reopens hit injected faults, so \
              the last round's acked requests were never checked",
             "",
         ),

@@ -2103,6 +2103,7 @@ const ROUNDS_PER_EPOCH: u32 = 4;
 /// Settle attempts: how many times the client is handed a live node to
 /// reconnect to and catch up from.
 const SETTLE_ATTEMPTS: u32 = 12;
+const _: () = assert!(SETTLE_ATTEMPTS == 12);
 /// Tries `settle_boot` spends getting one of those nodes up, and how many of
 /// them share a power cycle — see `settle_boot`.
 const SETTLE_BOOT_TRIES: u32 = 64;
@@ -2469,7 +2470,7 @@ fn realtime_workload_judged(
         // 3,328 universes over 26 bases once the flagship re-synced (S3b item 3).
         if clean_attempts == 0 {
             sim.give_up(
-                "no settle attempt completed without fault fallout, so there was no node to \
+                "no settle attempt completed without fault fallout over 12 attempts, so there was no node to \
                  catch up from",
                 client.unsettled_report(),
             );
@@ -3423,6 +3424,7 @@ fn a_real_events_serialize_failure_fails_its_tail_not_the_node() {
 /// gives up. Only an attempt whose `kernel.run` returns without fault fallout
 /// is adjudicated.
 const SHAPES_SETTLE_ATTEMPTS: u32 = 12;
+const _: () = assert!(SHAPES_SETTLE_ATTEMPTS == 12);
 
 #[derive(Clone, Copy, Debug)]
 enum Era {
@@ -3573,7 +3575,10 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
             Err(e) => return Err(format!("resume kernel.run failed non-injected: {e}")),
         }
     }
-    sim.give_up("no resume completed without fault fallout", "");
+    sim.give_up(
+        "no resume completed without fault fallout in 12 attempts",
+        "",
+    );
     Ok(())
 }
 
@@ -5032,7 +5037,7 @@ fn finish_rt_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
             sim.cover("realtime:multi-node-inconclusive");
             sim.give_up(
                 INCONCLUSIVE,
-                e.replacen(&format!("{INCONCLUSIVE}: "), "", 1),
+                e.strip_prefix(&format!("{INCONCLUSIVE}: ")).unwrap_or(&e),
             );
             Ok(())
         }
@@ -6289,7 +6294,7 @@ fn scoped_realtime_workload_judged(
         // S3 re-review measured (0 of 16,384), so it went.
         if clean_attempts == 0 {
             sim.give_up(
-                "no settle attempt completed without fault fallout, so there was no node to \
+                "no settle attempt completed without fault fallout over 12 attempts, so there was no node to \
                  catch up from",
                 client.unsettled_report(),
             );
@@ -9293,10 +9298,10 @@ mod tenancy_feeds {
             // subscribe read a head, and this give-up names it.
             if clean_attempts == 0 {
                 let why = if u.head_read {
-                    "no settle attempt completed without fault fallout, so there was no node to \
+                    "no settle attempt completed without fault fallout over 12 attempts, so there was no node to \
                      catch up from"
                 } else {
-                    "no settle attempt completed without fault fallout, and no subscribe read a \
+                    "no settle attempt completed without fault fallout over 12 attempts, and no subscribe read a \
                      head after the last recovery, so a cut it made could not be re-synced and \
                      there was no node to catch up from"
                 };
