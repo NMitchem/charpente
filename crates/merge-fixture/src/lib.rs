@@ -24,6 +24,7 @@ pub struct Bid {
 }
 
 /// How a bid merges into its lab's `Best`.
+#[derive(Clone, Copy)]
 pub enum Merge {
     /// The correct merge: the largest amount ever acked for the lab.
     Max,

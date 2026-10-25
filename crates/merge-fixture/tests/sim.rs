@@ -7,7 +7,7 @@ use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, View};
 use charpente_sim::Sim;
-use charpente_sim::checks::{clock_fallout, durable_refusal, is_fault_fallout};
+use charpente_sim::checks::{boot_through_fallout, clock_fallout, is_fault_fallout};
 use charpente_sim::harness::{self, HarnessArgs, SimTest};
 use merge_fixture::{Best, Bid, Merge, build_app};
 
@@ -25,100 +25,114 @@ fn run_tests(tests: &[SimTest], format: Option<&str>) -> (i32, String) {
     (code, String::from_utf8(out).unwrap())
 }
 
-fn open_app(sim: &mut Sim, merge: Merge) -> Result<Option<App>, String> {
-    match build_app(Box::new(sim.disk()), Box::new(sim.entropy()), merge) {
-        Ok(app) => Ok(Some(app)),
-        Err(e) => {
-            if durable_refusal(sim, &e.to_string())? {
-                return Ok(None);
-            }
-            if is_fault_fallout(&e.to_string()) {
-                sim.give_up("App::open hit fault fallout", e);
-                return Ok(None);
-            }
-            Err(e.to_string())
-        }
+const BOOT_TRIES: u32 = 8;
+
+/// Opens the app, retrying through transient disk fallout; gives up only if
+/// every boot is refused.
+fn boot(sim: &mut Sim, merge: Merge) -> Result<Option<App>, String> {
+    let open = || build_app(Box::new(sim.disk()), Box::new(sim.entropy()), merge);
+    let app =
+        boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?;
+    if app.is_none() {
+        sim.give_up("App::open never booted", format!("in {BOOT_TRIES} boots"));
     }
+    Ok(app)
 }
 
-/// Posts `bids` (lab, amount) in arrival order through the production kernel
-/// loop, then checks each lab's `Best.amount` against the maximum acked
-/// amount for that lab.
+/// Posts `bids` (lab, amount) one at a time, each through the production
+/// kernel loop, and after every acked bid checks each lab's `Best.amount`
+/// against the maximum amount acked for that lab so far. A bid that was not
+/// acked makes its lab unjudgeable from then on (it may or may not have
+/// landed); the other lab is still checked.
 fn bids_hold_the_max(sim: &mut Sim, merge: Merge, bids: &[(u64, u32)]) -> Result<(), String> {
-    let Some(app) = open_app(sim, merge)? else {
+    let Some(mut app) = boot(sim, merge)? else {
         return Ok(());
     };
-    let mut source = SimSource::new(Box::new(sim.clock()), (bids.len() as u64 + 2) * 10 * MS);
+    let mut max_acked = [0u64; 2];
+    let mut tainted = [false; 2];
+    let mut judged = false;
     for (i, (lab, amount)) in bids.iter().enumerate() {
+        let slot = *lab as usize - 1;
+        let mut source = SimSource::new(Box::new(sim.clock()), 10 * MS);
         source.push_at(
-            i as u64 * 10 * MS,
+            0,
             Request::new(Method::Post, "/bids").json(&Bid {
                 lab: Id::from_raw(*lab),
                 amount: *amount,
             }),
         );
-    }
-    let responses = source.responses();
-    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
-        Ok(kernel) => kernel,
-        Err(e) if fallout(&e.to_string()) => {
-            sim.give_up("Kernel::new hit fault fallout", e);
-            return Ok(());
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    if let Err(e) = kernel.run(&mut source) {
-        if fallout(&e.to_string()) {
-            sim.give_up("the kernel loop hit fault fallout", e);
-            return Ok(());
-        }
-        return Err(e.to_string());
-    }
-    let app = kernel.into_app();
-    let statuses: Vec<u16> = responses
-        .lock()
-        .map_err(|_| "responses lock poisoned".to_string())?
-        .iter()
-        .map(|(status, _)| *status)
-        .collect();
-    if statuses.len() != bids.len() || statuses.iter().any(|s| *s != 200) {
-        sim.give_up("a bid was not acked, so the merge has nothing to prove", "");
-        return Ok(());
-    }
-    let snap = match app.db().snapshot() {
-        Ok(snap) => snap,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up("the snapshot hit fault fallout", e);
-            return Ok(());
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    for lab in [1u64, 2] {
-        let Some(want) = bids
-            .iter()
-            .filter(|b| b.0 == lab)
-            .map(|b| u64::from(b.1))
-            .max()
-        else {
-            continue;
+        let responses = source.responses();
+        let stopped = match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(mut kernel) => match kernel.run(&mut source) {
+                Ok(()) => Ok(kernel.into_app()),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
         };
-        match snap.get::<Best>(Id::from_raw(lab)) {
-            Ok(Some(best)) if best.amount == want => {}
-            Ok(Some(best)) => {
-                return Err(format!(
-                    "lab {lab}: Best.amount is {} but the maximum acked amount is {want} — \
-                     the merge must keep the max, whatever order bids arrive in",
-                    best.amount
-                ));
+        // A node that stops on fault fallout is rebooted, as a supervisor
+        // would; the bid it was serving and its lab are then unjudgeable.
+        app = match stopped {
+            Ok(running) => running,
+            Err(text) => {
+                if !(is_fault_fallout(&text) || clock_fallout(sim, &text)) {
+                    return Err(text);
+                }
+                tainted[slot] = true;
+                if sim.disk_crashed() {
+                    sim.restart();
+                } else {
+                    sim.restart_process();
+                }
+                let Some(rebooted) = boot(sim, merge)? else {
+                    return Ok(());
+                };
+                app = rebooted;
+                continue;
             }
-            Ok(None) => return Err(format!("lab {lab}: acked bids but no Best row")),
+        };
+        let acked = responses
+            .lock()
+            .map_err(|_| "responses lock poisoned".to_string())?
+            .iter()
+            .any(|(status, _)| *status == 200);
+        if !acked {
+            tainted[slot] = true;
+            continue;
+        }
+        max_acked[slot] = max_acked[slot].max(u64::from(*amount));
+        let snap = match app.db().snapshot() {
+            Ok(snap) => snap,
             Err(e) if is_fault_fallout(&e.to_string()) => {
-                sim.give_up("the read-back hit fault fallout", e);
+                sim.give_up("the snapshot hit fault fallout", e);
                 return Ok(());
             }
             Err(e) => return Err(e.to_string()),
+        };
+        for check in 0..2 {
+            if tainted[check] || max_acked[check] == 0 {
+                continue;
+            }
+            let lab = check as u64 + 1;
+            match snap.get::<Best>(Id::from_raw(lab)) {
+                Ok(Some(best)) if best.amount == max_acked[check] => judged = true,
+                Ok(Some(best)) => {
+                    return Err(format!(
+                        "after acked bid {i}: lab {lab}'s Best.amount is {} but the maximum acked \
+                         amount is {} — the merge must keep the max, whatever order bids arrive in",
+                        best.amount, max_acked[check]
+                    ));
+                }
+                Ok(None) => return Err(format!("after acked bid {i}: lab {lab} has no Best row")),
+                Err(e) if is_fault_fallout(&e.to_string()) => {
+                    sim.give_up("the read-back hit fault fallout", e);
+                    return Ok(());
+                }
+                Err(e) => return Err(e.to_string()),
+            }
         }
+    }
+    if !judged {
+        sim.give_up("no bid was acked, so the merge has nothing to prove", "");
     }
     Ok(())
 }
@@ -177,7 +191,7 @@ fn generated_inputs_catch_latest_wins_and_shrink_it() {
         inputs, "  inputs: arrivals=2, lab=1, amount=2, lab=1, amount=1",
         "{out}"
     );
-    assert!(out.contains("  shrunk: 13 draws to 5, "), "{out}");
+    assert!(out.contains("  shrunk: 11 draws to 5, "), "{out}");
 }
 
 #[test]
