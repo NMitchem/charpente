@@ -23,7 +23,9 @@ use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net, WallTime};
+use charpente_core::io::{
+    CLOCK_TOLERANCE, Clock, Conn, Disk, Entropy, File, Instant, Listener, Net, WallTime,
+};
 
 use crate::disk::{DiskWorld, FileState, PendingOp, SECTOR};
 use crate::net::{ConnState, ListenerState, NetWorld, host_of, normalize};
@@ -123,9 +125,11 @@ pub struct FaultConfig {
     pub outbound_latency: (Duration, Duration),
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
-    /// Nanoseconds every host's wall clock reads ahead (+) or behind (-) of
-    /// true time (`Sim::true_wall`). Hosts still diverge from one another:
-    /// each one's step-backs and downtime roll on its own streams.
+    /// The largest skew, in nanoseconds, of any clock's wall reading from true
+    /// time (`Sim::true_wall`). Each clock (`Sim::clock`, and each host's
+    /// `SimHost::clock`) draws its own skew once, uniform in ±|clock_skew|,
+    /// from a stream of its own, so two hosts' clocks disagree; the sign is
+    /// ignored.
     pub clock_skew: i64,
     /// Per wall read: the chance the host's clock steps back, and the largest
     /// step. A step's size is uniform in (0, max], and the clock stays where
@@ -328,6 +332,10 @@ impl FaultConfig {
                 "FaultConfig.{name} = {p} — must be in [0, 1]"
             );
         }
+        assert!(
+            self.clock_skew != i64::MIN,
+            "FaultConfig.clock_skew = i64::MIN — its magnitude must fit in i64 nanoseconds"
+        );
         for (name, (p, max)) in [
             ("clock_step_back", self.clock_step_back),
             ("clock_downtime", self.clock_downtime),
@@ -485,10 +493,9 @@ pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
 /// seed moves either. The skew and step sizes span both sides of
 /// `CLOCK_TOLERANCE` (60 s), so a run sees both the kernel's hold and its stop.
 fn sample_clock_fields(seed: u64, cfg: &mut FaultConfig) {
-    const SKEW: u64 = 120_000_000_000;
     let mut r = keyed_stream(seed, "clock_skew");
     cfg.clock_skew = if r.chance(0.25) {
-        r.between(0, 2 * SKEW) as i64 - SKEW as i64
+        r.between(0, 120_000_000_000) as i64
     } else {
         0
     };
@@ -623,7 +630,7 @@ struct HostWorld {
 }
 
 impl HostWorld {
-    fn new(seed: u64, host: &str) -> HostWorld {
+    fn new(seed: u64, host: &str, skew: i64) -> HostWorld {
         HostWorld {
             disk: DiskWorld::default(),
             faults: keyed_stream(seed, &format!("host-faults:{host}")),
@@ -631,47 +638,76 @@ impl HostWorld {
             dir_faults: keyed_stream(seed, &format!("host-dir-faults:{host}")),
             durable_corruption: 0,
             entry_loss: 0,
-            wall: WallClock::new(seed, &format!("host-wall:{host}")),
+            wall: WallClock::new(seed, &format!("host-wall:{host}"), skew),
         }
     }
 }
 
-/// One clock's wall-time faults. Its reading is true time plus
-/// `FaultConfig::clock_skew` plus `drift`, the sum of its step-backs
-/// (negative) and downtime jumps (positive). Each axis rolls on a keyed
-/// stream of its own, so a clock's faults never depend on another clock's
-/// reads or on the frozen global streams, and with both axes off nothing is
-/// drawn.
+/// One clock's wall-time faults. Its reading is true time plus its offset:
+/// its own `skew`, drawn once, plus `drift`, the sum of its step-backs
+/// (negative) and downtime jumps (positive). Each axis draws from a keyed
+/// stream of this clock's own, so a clock's faults never depend on another
+/// clock's reads or on the frozen global streams, and with an axis off
+/// nothing is drawn for it.
 struct WallClock {
+    skew: i64,
     drift: i64,
     /// Whether `clock:skewed` was marked: once per clock, at its first read.
     skew_marked: bool,
+    /// Downtime jumps since the last read: `clock:downtime` is marked when a
+    /// reading first carries them.
+    jumps_unread: u64,
     step_back: Rng,
     downtime: Rng,
 }
 
 impl WallClock {
-    fn new(seed: u64, name: &str) -> WallClock {
+    /// `skew` is `FaultConfig::clock_skew`: this clock's own skew is uniform
+    /// in ±|skew|, from the `"{name}:skew"` stream.
+    fn new(seed: u64, name: &str, skew: i64) -> WallClock {
+        let magnitude = skew.unsigned_abs();
+        let skew = if magnitude == 0 {
+            0
+        } else {
+            let mut r = keyed_stream(seed, &format!("{name}:skew"));
+            // `validate` holds the magnitude within i64, so both ends fit.
+            (i128::from(r.between(0, 2 * magnitude)) - i128::from(magnitude)) as i64
+        };
         WallClock {
+            skew,
             drift: 0,
             skew_marked: false,
+            jumps_unread: 0,
             step_back: keyed_stream(seed, &format!("{name}:step-back")),
             downtime: keyed_stream(seed, &format!("{name}:downtime")),
         }
     }
 
+    /// This clock's offset from true time: its skew plus its drift.
+    fn offset(&self, host: Option<&str>) -> i64 {
+        self.skew.checked_add(self.drift).unwrap_or_else(|| {
+            panic!(
+                "{}'s offset overflowed i64 nanoseconds: skew {} ns plus drift {} ns",
+                clock_name(host),
+                self.skew,
+                self.drift
+            )
+        })
+    }
+
     /// One wall read at virtual time `now` on `host`'s clock (`None`: the one
-    /// `Sim::clock` reads): rolls a step back first, so the step lands in
-    /// this reading.
+    /// `Sim::clock` reads): rolls a step back first, unless `faults_off`, so
+    /// the step lands in this reading.
     fn read(
         &mut self,
         now: u64,
         cfg: &FaultConfig,
+        faults_off: bool,
         coverage: &mut BTreeMap<&'static str, u64>,
         host: Option<&str>,
     ) -> WallTime {
         let (p, max) = cfg.clock_step_back;
-        if p > 0.0 && self.step_back.chance(p) {
+        if !faults_off && p > 0.0 && self.step_back.chance(p) {
             // `validate` holds the largest size within i64 nanoseconds.
             let size = self.step_back.between(1, max.as_nanos() as u64) as i64;
             self.drift = self.drift.checked_sub(size).unwrap_or_else(|| {
@@ -681,19 +717,22 @@ impl WallClock {
                 )
             });
             *coverage.entry("clock:stepped-back").or_insert(0) += 1;
+            let class = if size as u128 > CLOCK_TOLERANCE.as_nanos() {
+                "clock:stepped-back:beyond-tolerance"
+            } else {
+                "clock:stepped-back:within-tolerance"
+            };
+            *coverage.entry(class).or_insert(0) += 1;
         }
-        if cfg.clock_skew != 0 && !self.skew_marked {
+        if self.skew != 0 && !self.skew_marked {
             self.skew_marked = true;
             *coverage.entry("clock:skewed").or_insert(0) += 1;
         }
-        let offset = cfg.clock_skew.checked_add(self.drift).unwrap_or_else(|| {
-            panic!(
-                "{}'s offset overflowed i64 nanoseconds: skew {} ns plus drift {} ns",
-                clock_name(host),
-                cfg.clock_skew,
-                self.drift
-            )
-        });
+        if self.jumps_unread > 0 {
+            *coverage.entry("clock:downtime").or_insert(0) += self.jumps_unread;
+            self.jumps_unread = 0;
+        }
+        let offset = self.offset(host);
         let nanos = now
             .checked_add(SIM_WALL_BASE_NANOS)
             .and_then(|t| t.checked_add_signed(offset))
@@ -703,7 +742,7 @@ impl WallClock {
                      SIM_WALL_BASE_NANOS {SIM_WALL_BASE_NANOS} ns + offset {offset} ns (skew {} \
                      ns, step-backs and downtime {} ns)",
                     clock_name(host),
-                    cfg.clock_skew,
+                    self.skew,
                     self.drift
                 )
             });
@@ -711,15 +750,10 @@ impl WallClock {
     }
 
     /// A power cycle of `host` (`None`: the global disk's): rolls the
-    /// downtime jump.
-    fn power_cycle(
-        &mut self,
-        cfg: &FaultConfig,
-        coverage: &mut BTreeMap<&'static str, u64>,
-        host: Option<&str>,
-    ) {
+    /// downtime jump, unless `faults_off`.
+    fn power_cycle(&mut self, cfg: &FaultConfig, faults_off: bool, host: Option<&str>) {
         let (p, max) = cfg.clock_downtime;
-        if p > 0.0 && self.downtime.chance(p) {
+        if !faults_off && p > 0.0 && self.downtime.chance(p) {
             let jump = self.downtime.between(1, max.as_nanos() as u64) as i64;
             self.drift = self.drift.checked_add(jump).unwrap_or_else(|| {
                 panic!(
@@ -727,7 +761,7 @@ impl WallClock {
                     clock_name(host)
                 )
             });
-            *coverage.entry("clock:downtime").or_insert(0) += 1;
+            self.jumps_unread += 1;
         }
     }
 }
@@ -786,6 +820,10 @@ struct State {
     /// The wall clock `Sim::clock` reads: keyed streams only, drawn from only
     /// while a clock axis is on.
     wall: WallClock,
+    /// Set by `Sim::quiesce_clock_faults`: no clock steps back or jumps from
+    /// then on, and each skipped roll draws nothing. False for the whole of
+    /// every universe that never calls it.
+    clock_faults_off: bool,
 }
 
 impl State {
@@ -931,6 +969,7 @@ impl Sim {
 
     pub fn with_faults(seed: u64, cfg: FaultConfig) -> Sim {
         cfg.validate();
+        let skew = cfg.clock_skew;
         let mut sm = seed;
         let faults = Rng::new(splitmix64(&mut sm));
         let entropy = Rng::new(splitmix64(&mut sm));
@@ -956,7 +995,8 @@ impl Sim {
                     disk_faults_off: false,
                     stalls_off: false,
                     outbound: outbound::OutboundWorld::new(seed),
-                    wall: WallClock::new(seed, "wall"),
+                    wall: WallClock::new(seed, "wall", skew),
+                    clock_faults_off: false,
                 }),
             }),
         }
@@ -1105,7 +1145,7 @@ impl Sim {
         guard
             .hosts
             .entry(name.to_string())
-            .or_insert_with(|| HostWorld::new(seed, name));
+            .or_insert_with(|| HostWorld::new(seed, name, self.world.cfg.clock_skew));
         SimHost {
             world: self.world.clone(),
             name: name.to_string(),
@@ -1137,6 +1177,18 @@ impl Sim {
         for host in guard.hosts.values_mut() {
             host.disk.crash_countdown = None;
         }
+    }
+
+    /// Ends clock fault injection for the rest of this universe, on every
+    /// clock: no reading steps back and no power cycle jumps a clock forward
+    /// from here on, so each clock's offset stays where its faults left it,
+    /// skew included. Each skipped roll draws nothing, and a universe that
+    /// never calls this is unchanged. For a fault-free tail: a node whose
+    /// clock an earlier step left behind its store's recorded time is refused
+    /// at open, and with the offset frozen, the clock reaches the instant the
+    /// refusal names as virtual time passes (`checks::clock_reopens_after`).
+    pub fn quiesce_clock_faults(&self) {
+        self.world.lock().clock_faults_off = true;
     }
 
     /// Whether the disk has crashed and stays gone until `restart()`: every op
@@ -1172,6 +1224,7 @@ impl Sim {
             coverage,
             disk_faults_off,
             wall,
+            clock_faults_off,
             ..
         } = &mut *guard;
         // Bit-level corruption of already-durable bytes (the bitrot model),
@@ -1223,7 +1276,7 @@ impl Sim {
         disk.epoch += 1;
         disk.crashed = false;
         disk.crash_countdown = None;
-        wall.power_cycle(&self.world.cfg, coverage, None);
+        wall.power_cycle(&self.world.cfg, *clock_faults_off, None);
     }
 
     /// Restarts the PROCESS, not the machine: every open file handle dies (it
@@ -1422,8 +1475,8 @@ impl SimHost {
     }
 
     /// This host's clock: virtual time for `now`, and a wall reading carrying
-    /// this host's offset from true time (`FaultConfig::clock_skew` plus its
-    /// own step-backs and downtime).
+    /// this host's offset from true time (its own skew, within
+    /// ±`FaultConfig::clock_skew`, plus its own step-backs and downtime).
     pub fn clock(&self) -> SimClock {
         SimClock {
             world: self.world.clone(),
@@ -1515,6 +1568,7 @@ impl SimHost {
                 hosts,
                 coverage,
                 disk_faults_off,
+                clock_faults_off,
                 ..
             } = &mut *guard;
             let host = hosts.get_mut(&self.name).expect("checked above");
@@ -1566,7 +1620,7 @@ impl SimHost {
             disk.epoch += 1;
             disk.crashed = false;
             disk.crash_countdown = None;
-            wall.power_cycle(&cfg, coverage, Some(&self.name));
+            wall.power_cycle(&cfg, *clock_faults_off, Some(&self.name));
         }
         guard.net.teardown_host(&self.name);
     }
@@ -1589,6 +1643,20 @@ pub struct SimClock {
     host: Option<String>,
 }
 
+impl SimClock {
+    /// This clock's offset from true time now, in nanoseconds: its skew plus
+    /// the step-backs and downtime it has taken so far, so `wall()` reads
+    /// `sim.true_wall()` plus this, unless that read steps back. Draws
+    /// nothing and marks nothing: a property reads it to judge a reading.
+    pub fn offset(&self) -> i64 {
+        let mut guard = self.world.lock();
+        match &self.host {
+            None => guard.wall.offset(None),
+            Some(name) => guard.host_mut(name).wall.offset(Some(name)),
+        }
+    }
+}
+
 impl Clock for SimClock {
     fn now(&self) -> Instant {
         Instant::from_nanos(self.world.lock().now)
@@ -1602,15 +1670,16 @@ impl Clock for SimClock {
             wall,
             hosts,
             coverage,
+            clock_faults_off,
             ..
         } = &mut *guard;
         match &self.host {
-            None => wall.read(*now, cfg, coverage, None),
+            None => wall.read(*now, cfg, *clock_faults_off, coverage, None),
             Some(name) => hosts
                 .get_mut(name)
                 .expect("a SimClock for a host is made by SimHost::clock, after Sim::host")
                 .wall
-                .read(*now, cfg, coverage, Some(name)),
+                .read(*now, cfg, *clock_faults_off, coverage, Some(name)),
         }
     }
 
@@ -2712,15 +2781,19 @@ pub(crate) fn run_universe(
     }
 }
 
-/// One app-harness run's failure (`run_app_universe`): what to file it with
-/// and what to replay it from. `choices` and `drawn` stay empty until a
-/// workload can draw inputs.
+/// One app-harness run's failure (`run_app_universe`): what the harness
+/// files it with (`config`, the `coverage` that fired, the workload's
+/// `message`) and what a replay starts from (`choices`, the run's input
+/// sequence, and `drawn`, each input by name). The last two stay empty until a
+/// workload can draw inputs. Crate-private: only the harness obtains one.
 #[derive(Debug)]
-pub struct UniverseFailure {
+pub(crate) struct UniverseFailure {
     pub config: FaultConfig,
     pub coverage: BTreeMap<&'static str, u64>,
     pub message: String,
+    #[expect(dead_code, reason = "the harness reads it once workloads draw inputs")]
     pub choices: Vec<u64>,
+    #[expect(dead_code, reason = "the harness reads it once workloads draw inputs")]
     pub drawn: Vec<(&'static str, String)>,
 }
 
@@ -2935,9 +3008,10 @@ mod tests {
         assert_eq!(clock.wall().as_nanos(), SIM_WALL_BASE_NANOS + 3_000_000_000);
     }
 
-    /// A host's wall reading is true time plus that host's offset: the
-    /// universe's skew, then whatever the host's own step-backs and downtime
-    /// added. Each axis marks its key when it acts.
+    /// A host's wall reading is true time plus that host's offset: its own
+    /// skew, drawn once, then whatever its own step-backs and downtime added.
+    /// `SimClock::offset` reports it without drawing. Each axis marks its key
+    /// when a reading first shows it.
     #[test]
     fn a_host_wall_reading_is_true_time_plus_its_offset() {
         const SEC: i128 = 1_000_000_000;
@@ -2946,12 +3020,12 @@ mod tests {
         };
         let fired = |sim: &Sim, key: &str| sim.coverage().get(key).copied().unwrap_or(0);
 
-        // Skew: every host's clock reads the same distance from true time,
-        // and each marks `clock:skewed` once, at its first read.
+        // Skew: each clock draws its own, within ±|clock_skew|, keeps it, and
+        // marks `clock:skewed` once, at its first read.
         let sim = Sim::with_faults(
             0xC10C_8001,
             FaultConfig {
-                clock_skew: -90_000_000_000,
+                clock_skew: 90_000_000_000,
                 ..FaultConfig::none()
             },
         );
@@ -2960,13 +3034,32 @@ mod tests {
             sim.true_wall().as_nanos(),
             SIM_WALL_BASE_NANOS + 5_000_000_000
         );
-        assert_eq!(offset(&sim.clock(), &sim), -90 * SEC);
-        assert_eq!(offset(&sim.clock(), &sim), -90 * SEC);
-        assert_eq!(offset(&sim.host("a").clock(), &sim), -90 * SEC);
+        let (global, a) = (sim.clock(), sim.host("a").clock());
+        let (skew, skew_a) = (i128::from(global.offset()), i128::from(a.offset()));
+        assert_eq!(fired(&sim, "clock:skewed"), 0, "offset() marks nothing");
+        assert!((-90 * SEC..=90 * SEC).contains(&skew), "{skew} ns");
+        assert!((-90 * SEC..=90 * SEC).contains(&skew_a), "{skew_a} ns");
+        assert_ne!(skew, skew_a, "two clocks drew one skew");
+        assert_eq!(offset(&global, &sim), skew);
+        assert_eq!(offset(&global, &sim), skew);
+        assert_eq!(offset(&a, &sim), skew_a);
         assert_eq!(fired(&sim, "clock:skewed"), 2, "once per clock that read");
+        let again = Sim::with_faults(
+            0xC10C_8001,
+            FaultConfig {
+                clock_skew: 90_000_000_000,
+                ..FaultConfig::none()
+            },
+        );
+        assert_eq!(
+            (again.clock().offset(), again.host("a").clock().offset()),
+            (skew as i64, skew_a as i64),
+            "a seed names each clock's skew"
+        );
 
         // A step back: at chance 1 every read steps, by (0, 120 s], and the
-        // clock stays where the step left it. Host a's steps are its own.
+        // clock stays where the step left it. Host a's steps are its own. Each
+        // step also marks its size against CLOCK_TOLERANCE.
         let sim = Sim::with_faults(
             0xC10C_8002,
             FaultConfig {
@@ -2976,15 +3069,31 @@ mod tests {
         );
         let clock = sim.clock();
         let mut last = 0;
+        let mut beyond = 0;
         for read in 1..=10 {
             let now = offset(&clock, &sim);
             assert!(
                 (1..=120 * SEC).contains(&(last - now)),
                 "read {read} moved the clock from {last} ns to {now} ns"
             );
+            beyond += u64::from(last - now > 60 * SEC);
+            assert_eq!(
+                i128::from(clock.offset()),
+                now,
+                "offset() is the last reading's"
+            );
             last = now;
         }
         assert_eq!(fired(&sim, "clock:stepped-back"), 10);
+        assert_eq!(fired(&sim, "clock:stepped-back:beyond-tolerance"), beyond);
+        assert_eq!(
+            fired(&sim, "clock:stepped-back:within-tolerance"),
+            10 - beyond
+        );
+        assert!(
+            0 < beyond && beyond < 10,
+            "this seed steps on both sides of the tolerance: {beyond} of 10 beyond"
+        );
         assert!(last < -120 * SEC, "ten steps on this seed: {last} ns");
         let a = offset(&sim.host("a").clock(), &sim);
         assert!(
@@ -2995,7 +3104,8 @@ mod tests {
         assert_eq!(fired(&sim, "clock:skewed"), 0, "no skew, no mark");
 
         // Downtime: a power cycle jumps that host's clock forward by
-        // (0, 3 days], and no other host's. A process restart is not one.
+        // (0, 3 days], and no other host's. A process restart is not one. The
+        // jump is marked at the first reading that shows it.
         let sim = Sim::with_faults(
             0xC10C_8003,
             FaultConfig {
@@ -3011,8 +3121,10 @@ mod tests {
             "a process restart is not downtime"
         );
         sim.restart();
+        assert_eq!(fired(&sim, "clock:downtime"), 0, "no reading shows it yet");
         let jumped = offset(&sim.clock(), &sim);
         assert!((1..=3 * 86_400 * SEC).contains(&jumped), "{jumped} ns");
+        assert_eq!(fired(&sim, "clock:downtime"), 1);
         let host = sim.host("a");
         assert_eq!(
             offset(&host.clock(), &sim),
@@ -3020,6 +3132,7 @@ mod tests {
             "the global power cycle left host a alone"
         );
         host.restart();
+        assert_eq!(fired(&sim, "clock:downtime"), 1, "host a's clock is unread");
         let host_jumped = offset(&host.clock(), &sim);
         assert!(
             (1..=3 * 86_400 * SEC).contains(&host_jumped),
@@ -3031,6 +3144,49 @@ mod tests {
             "host a's power cycle left the global clock alone"
         );
         assert_eq!(fired(&sim, "clock:downtime"), 2);
+    }
+
+    /// `quiesce_clock_faults` freezes every clock's offset where its faults
+    /// left it, skew included, and draws nothing from then on.
+    #[test]
+    fn quiesce_clock_faults_freezes_every_offset_and_draws_nothing() {
+        let cfg = FaultConfig {
+            clock_skew: 90_000_000_000,
+            clock_step_back: (1.0, Duration::from_secs(120)),
+            clock_downtime: (1.0, Duration::from_secs(3 * 86_400)),
+            ..FaultConfig::none()
+        };
+        let sim = Sim::with_faults(0xC10C_8005, cfg.clone());
+        let (global, host) = (sim.clock(), sim.host("a"));
+        global.wall();
+        host.clock().wall();
+        sim.restart();
+        host.restart();
+        sim.quiesce_clock_faults();
+        let frozen = (global.offset(), host.clock().offset());
+        let coverage = sim.coverage();
+        for _ in 0..10 {
+            global.wall();
+            host.clock().wall();
+        }
+        sim.restart();
+        host.restart();
+        global.sleep(Duration::from_secs(30));
+        let true_wall = sim.true_wall().as_nanos() as i128;
+        assert_eq!((global.offset(), host.clock().offset()), frozen);
+        assert_eq!(
+            global.wall().as_nanos() as i128 - true_wall,
+            i128::from(frozen.0)
+        );
+        let mut after = sim.coverage();
+        // The jumps before the quiesce are marked at the first read after it.
+        let jumps = after.remove("clock:downtime");
+        assert_eq!(jumps, Some(2), "the two pre-quiesce jumps, and no more");
+        let mut before = coverage;
+        before.remove("clock:downtime");
+        after.remove("restart");
+        before.remove("restart");
+        assert_eq!(after, before, "a quiesced clock still stepped back");
     }
 
     #[test]
@@ -3949,15 +4105,99 @@ mod tests {
         assert!(differed > 0, "the clock axes changed no run of 300");
     }
 
+    /// With the clock axes on, a clock draws from no stream but its own: on a
+    /// workload whose decisions read only the disk and entropy, on the sim and
+    /// on a host, each run decides exactly as with the axes off. Same outcome,
+    /// message and coverage, once the `clock:*` keys are set aside, and those
+    /// keys fire, so the axes acted. A step back or a jump drawn from a disk's
+    /// fault stream would move that disk's later faults, and this goes red.
+    #[test]
+    fn the_clock_axes_draw_from_no_stream_but_their_own() {
+        fn workload(sim: &mut Sim) -> Result<(), String> {
+            let host = sim.host("a");
+            let mut payload = [0u8; 16];
+            for round in 0..4u64 {
+                sim.clock().wall();
+                host.clock().wall();
+                for (disk, key) in [(sim.disk(), "toy:sim"), (host.disk(), "toy:host")] {
+                    let file = disk.open("wal/f").map_err(|e| e.to_string())?;
+                    sim.entropy().fill(&mut payload);
+                    let wrote = file.write_at(round * 16, &payload).is_ok() && file.sync().is_ok();
+                    sim.cover(key);
+                    sim.cover(if wrote {
+                        "toy:wrote"
+                    } else {
+                        "toy:write-failed"
+                    });
+                }
+                sim.clock().wall();
+                host.clock().wall();
+                if round % 2 == 0 {
+                    sim.restart();
+                } else {
+                    host.restart();
+                }
+            }
+            if payload[0] % 5 == 0 {
+                return Err(format!("toy failure on byte {}", payload[0]));
+            }
+            if payload[1] % 3 == 0 {
+                sim.give_up("toy give-up");
+            }
+            Ok(())
+        }
+        type Seen = (String, BTreeMap<&'static str, u64>, String);
+        let clock_off = |cfg: &FaultConfig| {
+            let mut cfg = cfg.clone();
+            cfg.clock_skew = 0;
+            cfg.clock_step_back = (0.0, Duration::ZERO);
+            cfg.clock_downtime = (0.0, Duration::ZERO);
+            format!("{cfg:?}")
+        };
+        let mut fired: BTreeMap<&'static str, u64> = BTreeMap::new();
+        let mut run = |seed: u64, faults_off: &[&'static str]| -> Seen {
+            let (seen, mut coverage) = match run_app_universe(seed, None, faults_off, &workload) {
+                Ok(end) => ((format!("{:?}", end.outcome), String::new()), end.coverage),
+                Err(f) => ((clock_off(&f.config), f.message), f.coverage),
+            };
+            coverage.retain(|key, n| {
+                if key.starts_with("clock:") {
+                    *fired.entry(key).or_insert(0) += *n;
+                }
+                !key.starts_with("clock:")
+            });
+            (seen.0, coverage, seen.1)
+        };
+        for seed in 0..300u64 {
+            let on = run(seed, &[]);
+            let off = run(seed, &["clock_skew", "clock_step_back", "clock_downtime"]);
+            assert_eq!(on, off, "seed {seed:#x}");
+        }
+        for key in [
+            "clock:skewed",
+            "clock:stepped-back",
+            "clock:stepped-back:within-tolerance",
+            "clock:stepped-back:beyond-tolerance",
+            "clock:downtime",
+        ] {
+            assert!(
+                fired.get(key).copied().unwrap_or(0) > 0,
+                "{key} never fired in 300 runs: {fired:?}"
+            );
+        }
+    }
+
     #[test]
     #[should_panic(
         expected = "host \"a\"'s clock (SimHost::clock)'s wall reading left u64 nanoseconds"
     )]
     fn a_wall_reading_before_the_epoch_panics_naming_the_host() {
+        // A step back of up to i64::MAX ns; on this seed host a's first one
+        // is past the 2026 base, so the reading would precede the epoch.
         let sim = Sim::with_faults(
             0xC10C_8004,
             FaultConfig {
-                clock_skew: -(SIM_WALL_BASE_NANOS as i64) - 1,
+                clock_step_back: (1.0, Duration::from_nanos(i64::MAX as u64)),
                 ..FaultConfig::none()
             },
         );

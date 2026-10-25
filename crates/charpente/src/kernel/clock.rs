@@ -31,8 +31,9 @@ impl Now {
 
 /// Keeps the wall time this node hands out from ever decreasing. A reading
 /// behind the latest one is held at the latest; a reading more than
-/// `CLOCK_TOLERANCE` behind it stops the node by name, so a clock error can
-/// extend a session or delay a tick by at most the tolerance.
+/// `CLOCK_TOLERANCE` behind it stops the node by name. So each backward step
+/// extends sessions and delays ticks by at most the tolerance, and repeated
+/// steps within it add up.
 pub(crate) struct WallHold {
     held: Option<WallTime>,
 }
@@ -214,9 +215,15 @@ mod tests {
              ahead, and the node runs again after 2026-01-01T00:00:40.000Z."
         );
         assert!(
-            charpente_sim::checks::is_fault_fallout(&err.to_string()),
-            "the sim's app workloads skip a run this stop ends: reword it and \
-             charpente_sim::checks::clock_refused must follow"
+            charpente_sim::checks::clock_refused(&err.to_string()),
+            "the sim's app workloads excuse this stop where a clock fault fired \
+             (checks::clock_fallout): reword it and checks::clock_refused must follow"
+        );
+        assert_eq!(
+            charpente_sim::checks::clock_reopens_after(&err.to_string()),
+            Some(secs(40)),
+            "a fault-free tail waits out the instant this names: reword it and \
+             checks::clock_reopens_after must follow"
         );
     }
 
@@ -228,9 +235,16 @@ mod tests {
         for verb in ["open", "promote"] {
             let refusal = behind_floor(secs(39), secs(100), verb).unwrap();
             assert!(
-                charpente_sim::checks::is_fault_fallout(&refusal),
-                "the sim's app workloads skip a run this refusal ends: reword it and \
-                 charpente_sim::checks::clock_refused must follow: {refusal}"
+                charpente_sim::checks::clock_refused(&refusal),
+                "the sim's app workloads excuse this refusal where a clock fault fired \
+                 (checks::clock_fallout): reword it and checks::clock_refused must follow: \
+                 {refusal}"
+            );
+            assert_eq!(
+                charpente_sim::checks::clock_reopens_after(&refusal),
+                Some(secs(40)),
+                "a fault-free tail waits out the instant this names: reword it and \
+                 checks::clock_reopens_after must follow: {refusal}"
             );
         }
     }

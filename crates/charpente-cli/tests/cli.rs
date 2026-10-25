@@ -267,37 +267,68 @@ fn a_universe_that_checked_nothing_gives_up_by_its_arm() {
     }
 }
 
-/// A clock the sim stepped back past `CLOCK_TOLERANCE` is fallout, so a run it
-/// stops gives up by name; it never fails. Found when the app harness turned
-/// the clock axes on (0.3.0, named step S3): the outbound fixture's fault-free
-/// tail quiesces the disk and outbound faults, not the clock's, and failed 7
-/// of 256 runs (master seed 0xe5ad6290df3f222c) as "the fault-free tail's
-/// kernel stopped". In this seed a step back of about 80 s in a faulted round
-/// left the clock behind the time the store recorded, so the tail's open was
-/// refused ("refusing to open: this node's wall clock …").
+/// A clock the sim stepped back past `CLOCK_TOLERANCE` leaves the node refused
+/// at open until true time catches up, and the fault-free tail waits that out.
+/// Found when the app harness turned the clock axes on (0.3.0, named step S3):
+/// the outbound fixture's tail quiesced the disk and outbound faults, not the
+/// clock's, and failed 7 of 256 runs (master seed 0xe5ad6290df3f222c) as "the
+/// fault-free tail's kernel stopped". Since the task 8 review the tail calls
+/// `Sim::quiesce_clock_faults`, sleeps past the instant the refusal names
+/// (`checks::clock_reopens_after`), restarts the process and boots again.
+/// Both seeds are from that batch, and each waits once:
+/// - 0x37c729667e04270c is then adjudicated: exactly-once is checked, with a
+///   re-call, so the wait turns a lost run into a verdict.
+/// - 0x4af3b8a4fb1dc3d0, the first one replayed, still has nothing to judge. A
+///   step back of about 80 s at round 0's first reads stopped the kernel
+///   before it served a request. Rounds 1 and 2 were refused at open, with no
+///   virtual time passing, so no order ever became durable. It gives up at
+///   `no-order`, not at the clock.
 #[test]
-fn a_clock_refusal_in_the_outbound_fixtures_tail_gives_up_by_name() {
-    let seed = "0x4af3b8a4fb1dc3d0";
-    let out = charpente()
-        .args([
-            "test",
-            "--sim",
-            "--seed",
-            seed,
-            "--filter",
-            "orders_charge_once",
-        ])
-        .args(["--format", "json", "--dir", &outbound_fixture_dir()])
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
-    assert!(
-        stdout.contains(r#""outcomes":[{"test":"orders_charge_once","verdicts":0,"gave_up":1}]"#)
-            && stdout.contains(r#""outbound-fixture:gave-up:clock":1"#)
-            && stdout.contains(r#""clock:stepped-back":1"#),
-        "seed {seed} must give up at the clock arm after a step back, not fail:\n{stdout}"
-    );
+fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
+    for (seed, outcome, keys) in [
+        (
+            "0x37c729667e04270c",
+            r#""outcomes":[{"test":"orders_charge_once","verdicts":1,"gave_up":0}]"#,
+            &[
+                r#""outbound-fixture:waited-out-clock":1"#,
+                r#""outbound:checked":1"#,
+                r#""outbound-fixture:re-called":1"#,
+                r#""clock:stepped-back:beyond-tolerance":1"#,
+            ][..],
+        ),
+        (
+            "0x4af3b8a4fb1dc3d0",
+            r#""outcomes":[{"test":"orders_charge_once","verdicts":0,"gave_up":1}]"#,
+            &[
+                r#""outbound-fixture:waited-out-clock":1"#,
+                r#""outbound-fixture:gave-up:no-order":1"#,
+                r#""clock:stepped-back:beyond-tolerance":1"#,
+            ][..],
+        ),
+    ] {
+        let out = charpente()
+            .args([
+                "test",
+                "--sim",
+                "--seed",
+                seed,
+                "--filter",
+                "orders_charge_once",
+            ])
+            .args(["--format", "json", "--dir", &outbound_fixture_dir()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "seed {seed}:\n{stdout}");
+        assert!(stdout.contains(outcome), "seed {seed}: {outcome}\n{stdout}");
+        for key in keys {
+            assert!(stdout.contains(key), "seed {seed}: {key}\n{stdout}");
+        }
+        assert!(
+            !stdout.contains("outbound-fixture:gave-up:clock"),
+            "seed {seed}: the tail's wait did not open the node:\n{stdout}"
+        );
+    }
 }
 
 /// The sentence this whole change exists to make true (MANIFESTO §9): a batch

@@ -822,7 +822,7 @@ mod tests {
             outbound_latency: (Duration::ZERO, Duration::ZERO),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::from_millis(250)),
-            clock_skew: -41_207_118_532,
+            clock_skew: 41_207_118_532,
             clock_step_back: (0.0, Duration::ZERO),
             clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
         };
@@ -841,7 +841,7 @@ mod tests {
         assert!(block.contains("  seed:   0x8bee1752811ae873"), "{block}");
         assert!(
             block.contains(
-                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: -41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }"
+                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: 41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }"
             ),
             "{block}"
         );

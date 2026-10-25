@@ -99,8 +99,10 @@ every step, so a wall-clock step moves a wake-up at the next step rather than fr
 
 The wall half never runs backwards within a node. Every step's reading passes through a hold
 (`kernel::clock::WallHold`): a reading behind the latest one is held at the latest, and one
-more than `CLOCK_TOLERANCE` (60 s) behind stops the kernel by name, so a clock error extends a
-session or delays a tick by at most the tolerance. A restart loses the hold, so the same check
+more than `CLOCK_TOLERANCE` (60 s) behind stops the kernel by name. So each backward step of
+the clock extends sessions and delays ticks by at most the tolerance, and each step beyond it
+stops the node. Steps add up: a clock that steps back within the tolerance, catches up to the
+time it held, and steps back again has fallen behind by both, with no check firing. A restart loses the hold, so the same check
 runs at every open, whatever the node's role (a follower judges session expiry on reads with
 its own clock), at a promote (before its durable flip, so a refused promote leaves a
 follower), and at a hand-off's target, which stops at its write-gate flip because the hand-off
@@ -334,22 +336,31 @@ sub-project — nothing above the sim is testable without host-scoped crash/rest
 
 **Wall time and its faults** (0.3.0). `Sim::true_wall()` is virtual time plus the Unix base,
 and a clock's `wall()` (`Sim::clock`, or a host's `SimHost::clock`) is that plus its offset:
-`FaultConfig::clock_skew`, the same for every host, plus the drift its own faults added. A
-step back (`clock_step_back`: a chance per wall read, and the largest step) lowers the
-offset and leaves it there; downtime (`clock_downtime`: a chance per power cycle, and the
-largest jump) raises it, as if the machine had been off, while virtual time stays put. A
-process restart (`Sim::restart_process`) is not downtime. Each clock's two axes roll on keyed
-streams of its own, so hosts diverge from one another, and with an axis off nothing is
-drawn. They mark `clock:skewed` (once per clock, at its first read), `clock:stepped-back` and
-`clock:downtime` when they act. The sizes span both sides of `CLOCK_TOLERANCE`: skew within
-±120 s, steps up to 120 s, jumps up to three days, so the app harness sees the kernel's hold,
+its own skew, drawn once and uniform within ±`FaultConfig::clock_skew` (the run's magnitude),
+plus the drift its own faults added. A step back (`clock_step_back`: a chance per wall read,
+and the largest step) lowers the offset and leaves it there; downtime (`clock_downtime`: a
+chance per power cycle, and the largest jump) raises it, as if the machine had been off,
+while virtual time stays put. A process restart (`Sim::restart_process`) is not downtime. The
+drift compounds: it is the running sum of every step and jump, and nothing pulls a clock back
+toward true time, as nothing does for a machine without NTP, so a long run's offsets wander
+far past any single step. `SimClock::offset` reads one without drawing. Each clock's skew and
+two axes draw on keyed streams of its own, so hosts disagree from their first read and
+diverge further, and with an axis off nothing is drawn. They mark `clock:skewed` (once per
+clock, at its first read), `clock:stepped-back` (with a `:within-tolerance` or
+`:beyond-tolerance` sub-key by size) and `clock:downtime` (at the first read that shows the
+jump). The sizes span both sides of `CLOCK_TOLERANCE`: skew within ±120 s, steps up to 120 s,
+jumps up to three days, so the app harness sees the kernel's hold,
 its stop, and the open refusal that follows a stop. Only the app harness samples them
 (`run_app_universe`, each axis on in a quarter of runs, from its own stream, after every
 other field); `default()`, `none()` and the swarm runners leave them off, so no platform
 suite's pinned seed moved when they landed, and a platform property turns them on in its
 `run_universes_swarm_with!` `adjust`. A property judges expiry and lateness against
-`true_wall`, never against a host's reading. In an app workload the stop and the refusal are
-fallout (`checks::clock_refused`, `FaultReason::ClockRefused`).
+`true_wall`, never against a host's reading. The stop and the refusal (`checks::clock_refused`,
+`FaultReason::ClockRefused`) are a name, like the durable-horizon refusal: they are fallout
+only where a clock axis acted in the run (`checks::clock_fallout`), since a node whose clock
+is right is refused only by a bug. `Sim::quiesce_clock_faults` freezes every offset for a
+fault-free tail, which then waits out a refusal: the clock reaches the instant the refusal
+names (`checks::clock_reopens_after`) as virtual time passes.
 
 **Consequence for the concurrency model.** The core state machine is single-threaded —
 concurrency lives at the edges (HTTP handling, queue workers, replication) and is itself

@@ -1039,7 +1039,8 @@ is judged on wall time: `expires_at` is a `WallTime` (UTC nanoseconds since the
 Unix epoch, `charpente::core::io::WallTime`), and under the kernel each
 request's `now` is the node's `Clock::wall` reading, held so that it never runs
 backwards (§7, "Clock errors"). So a TTL means the same thing after a restart or
-a failover as before it, within one bound: a session that expired just before a
+a failover as before it, within one bound for each backward step of the clock
+(steps add up, §7): a session that expired just before a
 restart or a failover can resolve again for at most `CLOCK_TOLERANCE` (60 s)
 plus the time since the data directory last recorded a time, and never when the
 clocks are right. Expiry is *lazy*: a row is invisible the moment `now` passes
@@ -2634,8 +2635,12 @@ The wall time the kernel hands out (each request's `now`, a tick's, a retry's
 the reading holds at the latest value already used, for as far back as
 `CLOCK_TOLERANCE` (60 s, `charpente::core::io::CLOCK_TOLERANCE`, the skew OIDC
 already allows). A clock that falls further behind stops the node by name, and a
-stopped kernel ends the process. So a clock error can extend a session or delay
-a tick by at most the tolerance, never silently by a year:
+stopped kernel ends the process. So each backward step of the clock can extend
+sessions and delay ticks by at most the tolerance, and each step beyond it stops
+the node, never silently by a year. Steps add up: a clock that steps back 50 s,
+catches up to the time it held, and steps back 50 s again runs 100 s behind true
+time with no check firing, since neither step exceeds the tolerance. NTP is what keeps a clock from wandering;
+this bounds what one bad step can do:
 
 <!-- pinned -->
 ```text
@@ -3161,6 +3166,22 @@ and draws nothing. Call it before a phase whose verdict rests on a delivery
 completing. A stall there is a fault the property excuses, so a stall that drops
 the only clean attempt's tail leaves the universe with no verdict at all.
 
+A tail that opens a kernel needs the clock half too.
+`sim.quiesce_clock_faults()` ends the clock faults ("Wall time and its faults",
+below) for the rest of the universe, on every clock. No reading steps back and
+no power cycle jumps a clock forward after it, so each clock's offset stays
+where the run left it, skew included. Each skipped roll draws nothing, so a
+universe that never calls it replays exactly as before. It does not undo the
+past: a step back in an earlier phase can leave the clock more than the
+tolerance behind the latest time the store recorded, and then the tail's open is
+refused (§7). With the offset frozen, the clock reaches the instant the refusal
+names as virtual time passes. `clock_reopens_after(text)` (below) reads that
+instant. Sleep a little past it (`sim.clock().sleep(…)`), restart the process (a
+refused node exits, and its supervisor starts it again), and boot again. One
+wait is enough, since nothing moves the clock or the recorded time in between.
+Bound the loop anyway, and give the run up by name once the bound is spent. The
+worked example in "Calling the outside world in a sim" does this.
+
 ### Restarting the process, not the machine
 
 `sim.restart()` is a power cycle: every unsynced write survives, tears or
@@ -3215,20 +3236,29 @@ in a quarter of runs, from its own stream:
 
 | Axis (`FaultConfig` field) | What it does | Coverage key |
 |---|---|---|
-| `clock_skew` | every clock reads this many nanoseconds ahead (+) or behind (-) of true time, within ±120 s | `clock:skewed`, once per clock, at its first read |
-| `clock_step_back` | per wall read, the chance the clock steps back by up to 120 s, and stays there | `clock:stepped-back`, per step |
-| `clock_downtime` | per power cycle (`sim.restart()`, `host.restart()`), the chance the clock jumps forward by up to three days, as if the machine had been off; virtual time stays put, and `restart_process()` is not downtime | `clock:downtime`, per jump |
+| `clock_skew` | the run's largest skew, up to 120 s: each clock draws its own skew once, uniform within ±`clock_skew`, and reads that far ahead (+) or behind (-) of true time | `clock:skewed`, once per clock, at its first read |
+| `clock_step_back` | per wall read, the chance the clock steps back by up to 120 s, and stays there | `clock:stepped-back` per step, and `clock:stepped-back:within-tolerance` or `clock:stepped-back:beyond-tolerance` by its size against `CLOCK_TOLERANCE` |
+| `clock_downtime` | per power cycle (`sim.restart()`, `host.restart()`), the chance the clock jumps forward by up to three days, as if the machine had been off; virtual time stays put, and `restart_process()` is not downtime | `clock:downtime`, per jump, at the first reading that shows it |
 
-Each clock's step-backs and jumps are its own, so two hosts' clocks drift apart.
+Each clock's skew, step-backs and jumps are its own, so two hosts' clocks
+disagree from their first read. The faults compound. A clock's offset is its
+skew plus every step back and jump it has taken so far, and nothing pulls it
+back toward true time, just as a clock with no NTP keeps its error, so the
+offset wanders further as a run goes on. `sim.clock().offset()` (or
+`host.clock().offset()`) reports it at any moment and draws nothing.
 The sizes span both sides of `CLOCK_TOLERANCE` (60 s), so a run sees what a node
 does with a bad clock (§5, §7): it holds its wall reading at the latest time it
 used for a step back within the tolerance, stops by name for one beyond it
 (`clock went backwards: …`), and refuses to open while its clock is more than
 the tolerance behind the latest time its data directory recorded (`refusing to
-open: this node's wall clock …`). The stop and the refusal are fallout:
-`is_fault_fallout` accepts them, and `clock_refused` names them (below). The
-fault-free tail above does not quiesce the clock, so give up a run whose tail a
-clock stop or refusal ends; do not fail it.
+open: this node's wall clock …`). `clock_refused` names the stop and the
+refusal (below). They are fallout only where a clock fault acted:
+`clock_fallout(sim, text)` excuses one once a clock in this run has read with
+its own skew, stepped back, or shown a jump, and `is_fault_fallout` alone never
+does. A node whose clock is right is refused only by a bug, and the platform's
+suites run with the clock axes off, so a refusal there fails. An app workload's
+filter is `|t| is_fault_fallout(t) || clock_fallout(sim, t)`. The fault-free
+tail above quiesces the clock and then waits out a refusal.
 
 Judge expiry and lateness against `sim.true_wall()`, never against a node's
 reading: a skewed clock is the thing under test. The platform's own suites
@@ -3265,15 +3295,15 @@ retry to the reading it was decided at.
 
 ### The checkers
 
-`charpente_sim::checks` ships ten reusable oracles and one boot idiom — reach
+`charpente_sim::checks` ships eleven reusable oracles and two idioms, one for a
+boot and one for a tail's wait — reach
 for these before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
   is this the harness's own injected fault (or its consequences) rather
   than a bug your workload should fail on? It recognizes the sim's
   injected-fault wording (including the `read_error` axis), the WAL/engine
-  poison wording, redb's "close and re-open the database" latch, and the
-  kernel's clock stop and open/promote refusal (`clock_refused`, below). Used
+  poison wording, and redb's "close and re-open the database" latch. Used
   inside a workload to turn "the disk broke, as instructed" into "no answer
   this round" rather than a hard failure — never to swallow anything else.
   (`misdirected_write` is not in that list and cannot be: it returns `Ok`, so
@@ -3286,15 +3316,16 @@ for these before hand-rolling the same logic a fourth time:
   bases), and text cannot say which. So it is `false` here, and an open site
   asks `durable_refusal` (below) first, or, for one node of several,
   `SimHost::durable_corruption_fired()`. `boot_through_fallout` does that for
-  you.
+  you. **Nor does it excuse the kernel's clock stop or open/promote refusal**,
+  for the same reason: a clock fault or a platform bug produces it, and
+  `clock_fallout` (below) tells them apart.
 - `classify(text: &str) -> FaultReason` — the families, typed:
   `Injected`, `Poisoned`, `RedbLatch`, `DurableHorizon`, `ClockRefused`, or
-  `Unrelated` (`is_fault_fallout` is `Injected | Poisoned | RedbLatch |
-  ClockRefused`). Use it when your
+  `Unrelated` (`is_fault_fallout` is `Injected | Poisoned | RedbLatch`). Use it when your
   workload wants to accept some families and fail on others — e.g. "an
   injected fault is fallout this round, but a poisoned engine is a finding" —
-  or to name the family in a coverage key. `DurableHorizon` is a name, never
-  an excuse on its own. Matching on a variant instead of on substrings keeps
+  or to name the family in a coverage key. `DurableHorizon` and
+  `ClockRefused` are names, never excuses on their own. Matching on a variant instead of on substrings keeps
   the prose coupling in one place: if a platform error string is ever
   reworded, `classify` is the single site that must change, and it fails by
   name instead of leaking a wrong classification into whichever oracle saw
@@ -3303,12 +3334,21 @@ for these before hand-rolling the same logic a fourth time:
   (`clock went backwards: …`) and for its refusal to open or promote a node
   whose wall clock is more than `CLOCK_TOLERANCE` behind the latest time its
   data directory recorded (`refusing to open: this node's wall clock …`,
-  `refusing to promote: this node's wall clock …`). Both are what the clock
-  axes produce ("Wall time and its faults", above), so `is_fault_fallout`
-  accepts them. Ask this one where a workload must tell them from other
-  fallout: a fault-free tail quiesces the disk and outbound faults, not the
-  clock's, so there a clock refusal gives the run up and any other fallout is
-  a failure.
+  `refusing to promote: this node's wall clock …`). A name only: the clock
+  axes produce both ("Wall time and its faults", above), and so does a
+  platform bug that refuses a node whose clock is right.
+- `clock_fallout(sim: &Sim, text: &str) -> bool` — the excuse for those two:
+  true when `clock_refused(text)` holds and a clock fault acted in this run (a
+  clock read with its own skew, stepped back, or showed a downtime jump: its
+  `clock:*` coverage key fired). Where no clock fault acted, nothing excuses
+  the stop or the refusal. An app workload that runs a kernel filters fallout
+  with `|t| is_fault_fallout(t) || clock_fallout(sim, t)`; a workload that
+  never builds a kernel cannot see either text.
+- `clock_reopens_after(text: &str) -> Option<WallTime>` — the instant a clock
+  stop or refusal names as the one after which the node runs again (its final
+  "after <instant>", to the millisecond), or `None` for any other text. A
+  fault-free tail sleeps a little past it after `sim.quiesce_clock_faults()`,
+  restarts the process and boots again ("A fault-free tail", above).
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
@@ -3581,7 +3621,7 @@ use charpente::kernel::{JobError, Kernel, SimSource};
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{clock_fallout, is_fault_fallout};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -3708,19 +3748,23 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
     }
     let responses = source.responses();
 
+    // A kernel also stops, or refuses to open, on a clock too far behind:
+    // fallout only where the harness's clock faults acted ("Wall time and
+    // its faults" above).
+    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(kernel) => kernel,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(&e.to_string()) => {
             sim.give_up(format!("Kernel::new hit fault fallout: {e}"));
             return Ok(());
         }
         Err(e) => return Err(e.to_string()),
     };
     // The same event loop `serve` runs in production. An `Err` here means
-    // the engine poisoned mid-run — under an injected fault schedule that
-    // is fallout, not a bug.
+    // the engine poisoned mid-run, or the clock stopped it — under an
+    // injected fault schedule that is fallout, not a bug.
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(&e.to_string())
     {
         return Err(e.to_string());
     }
@@ -3957,6 +4001,7 @@ calls the three outbound checkers:
 
 ```rust
 use charpente::core::job::JobRow;
+use charpente::core::io::Clock as _;
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::{JobError, Kernel, SimSource};
@@ -3965,8 +4010,8 @@ use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, calls_have_durable_jobs, durable_corruption_fired, is_fault_fallout,
-    keys_are_per_job, outbound_settles_by_horizon,
+    boot_through_fallout, calls_have_durable_jobs, clock_fallout, clock_reopens_after,
+    durable_corruption_fired, is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon,
 };
 use charpente_sim::outbound::{Idempotent, Recorder};
 use serde::{Deserialize, Serialize};
@@ -4046,7 +4091,8 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         "mail.example",
         Idempotent::header("idempotency-key", Recorder::new()),
     );
-    let Some(app) = boot_through_fallout(sim, 8, is_fault_fallout, || build_app(sim))
+    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
+    let Some(app) = boot_through_fallout(sim, 8, fallout, || build_app(sim))
         .map_err(|e| e.to_string())?
     else {
         if sim.gave_up().is_none() {
@@ -4069,12 +4115,12 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
     match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
         Ok(mut kernel) => {
             if let Err(e) = kernel.run(&mut source)
-                && !is_fault_fallout(&e.to_string())
+                && !fallout(&e.to_string())
             {
                 return Err(e.to_string());
             }
         }
-        Err(e) if is_fault_fallout(&e.to_string()) => {}
+        Err(e) if fallout(&e.to_string()) => {}
         Err(e) => return Err(e.to_string()),
     }
 
@@ -4083,21 +4129,41 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
     sim.restart();
     sim.quiesce_disk_faults();
     sim.quiesce_outbound_faults();
-    let Some(app) = boot_through_fallout(sim, 8, is_fault_fallout, || build_app(sim))
-        .map_err(|e| e.to_string())?
-    else {
-        // A durable refusal gives the universe up by name; with disk faults
-        // off, nothing else should stop a boot.
-        return match sim.gave_up() {
-            Some(_) => Ok(()),
-            None => Err("the fault-free tail could not boot".to_string()),
+    sim.quiesce_clock_faults();
+    let mut waits = 0;
+    let mut kernel = loop {
+        let Some(app) = boot_through_fallout(sim, 8, fallout, || build_app(sim))
+            .map_err(|e| e.to_string())?
+        else {
+            // A durable refusal gives the universe up by name; with disk
+            // faults off, nothing else should stop a boot.
+            return match sim.gave_up() {
+                Some(_) => Ok(()),
+                None => Err("the fault-free tail could not boot".to_string()),
+            };
         };
+        let outbound = sim
+            .outbound(&app.outbound_hosts())
+            .map_err(|e| e.to_string())?;
+        let e = match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
+            Ok(kernel) => break kernel,
+            Err(e) => e.to_string(),
+        };
+        // An earlier step back left the clock behind the time the store
+        // recorded, so the open is refused. The clock's offset is frozen
+        // now: wait past the instant the refusal names, then restart.
+        let Some(at) = clock_reopens_after(&e).filter(|_| clock_fallout(sim, &e)) else {
+            return Err(e);
+        };
+        if waits == 2 {
+            sim.give_up(format!("the tail was refused after two waits: {e}"));
+            return Ok(());
+        }
+        waits += 1;
+        let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + SEC;
+        sim.clock().sleep(std::time::Duration::from_nanos(wait));
+        sim.restart_process();
     };
-    let outbound = sim
-        .outbound(&app.outbound_hosts())
-        .map_err(|e| e.to_string())?;
-    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))
-        .map_err(|e| e.to_string())?;
     // Past every backoff and deadline, with room to spare.
     let horizon = sim.now().as_nanos() + 600 * SEC;
     kernel
@@ -4218,7 +4284,7 @@ verbatim):
 ```text
 sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
   seed:   0x8bee1752811ae873
-  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: -41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }
+  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: 41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }
   fired:  crash:torn: 7, fault:sync_error: 4, restart: 2
   repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873
 ```
@@ -4235,9 +4301,9 @@ Five lines, each load-bearing:
   what kind of trouble was *possible*: `crash_torn: 0.664668` means torn
   writes were likely in this universe, not that any occurred. Do not read a
   diagnosis off this line — that is the next one's job. The last three fields
-  are the clock axes ("Wall time and its faults"): here every clock read
-  41.2 s behind true time, and each power cycle had an even chance of a jump
-  of up to three days.
+  are the clock axes ("Wall time and its faults"): here each clock drew its
+  own skew within ±41.2 s of true time, no reading stepped back, and each
+  power cycle had an even chance of a jump of up to three days.
 - `fired` is what ACTUALLY happened: the universe's coverage map, every
   fault and event that really occurred, with counts. This is the line to
   reason from. A high probability whose key is absent here never fired, and

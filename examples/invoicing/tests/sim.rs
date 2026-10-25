@@ -5,7 +5,9 @@ use charpente::core::table::{Codec, Id};
 use charpente::http::{App, Cursor, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::wire::{WireI64, WireU64};
-use charpente_sim::checks::{boot_through_fallout, is_fault_fallout, replays_identically};
+use charpente_sim::checks::{
+    boot_through_fallout, clock_fallout, is_fault_fallout, replays_identically,
+};
 use charpente_sim::{FaultConfig, Sim};
 use invoicing::model::{Customer, Invoice, InvoiceState, Receipt, Reminder};
 use invoicing::routes::{CreateCustomerBody, CreateInvoiceBody, LineItemInput};
@@ -39,6 +41,13 @@ fn build(sim: &Sim) -> std::io::Result<App> {
     invoicing::build_app(Box::new(sim.disk()), Box::new(sim.entropy()))
 }
 
+/// Fault fallout in this app's workloads: the families an error's text alone
+/// excuses, and the kernel's clock stop or refusal where the harness's clock
+/// faults fired (GUIDE §8, `clock_fallout`).
+fn fallout(sim: &Sim, text: &str) -> bool {
+    is_fault_fallout(text) || clock_fallout(sim, text)
+}
+
 /// How many boots the app gets, each failed boot followed by a restart, as a
 /// supervised process restarts (`checks::boot_through_fallout`).
 const BOOT_TRIES: u32 = 8;
@@ -65,7 +74,7 @@ fn login(kernel: &mut Kernel, sim: &mut Sim) -> Result<Option<String>, String> {
     );
     let responses = source.responses();
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -95,7 +104,7 @@ fn statuses_of(source: &SimSource) -> Result<Vec<u16>, String> {
 // ---- 1. no acknowledged write is lost under crash injection ---------------
 
 fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
-    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
         sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
@@ -103,7 +112,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(sim, &e.to_string()) => {
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
@@ -144,7 +153,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
         Request::new(Method::Post, "/invoices/1/finalize").header("authorization", &auth),
     );
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -156,7 +165,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     sim.restart(); // power-cycles the simulated disk: unsynced writes tear or vanish
     drop(kernel); // the old handle is dead after restart — reopen, per its own contract
 
-    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
         sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
@@ -164,7 +173,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
     };
     let snap = match app.db().snapshot() {
         Ok(s) => s,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(sim, &e.to_string()) => {
             return gave_up(
                 sim,
                 "invoicing:gave-up:reopen-snapshot",
@@ -201,7 +210,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 return Ok(());
             }
             Ok(None) => return Err("acked customer 1 missing after restart".to_string()),
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            Err(e) if fallout(sim, &e.to_string()) => {
                 return gave_up(
                     sim,
                     "invoicing:gave-up:customer-read",
@@ -222,7 +231,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
                 return Ok(());
             }
             Ok(None) => return Err("acked invoice 1 missing after restart".to_string()),
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            Err(e) if fallout(sim, &e.to_string()) => {
                 return gave_up(
                     sim,
                     "invoicing:gave-up:invoice-read",
@@ -256,7 +265,7 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
             Ok(None) => {
                 return Err("acked finalize but invoice 1 missing after restart".to_string());
             }
-            Err(e) if is_fault_fallout(&e.to_string()) => {
+            Err(e) if fallout(sim, &e.to_string()) => {
                 return gave_up(
                     sim,
                     "invoicing:gave-up:finalize-read",
@@ -282,14 +291,14 @@ fn app_replays_deterministically(sim: &mut Sim) -> Result<(), String> {
 /// A give-up here would land on `replays_identically`'s private worlds, which
 /// the harness never reads.
 fn scripted_flow(sim: &mut Sim) -> Result<Vec<u16>, String> {
-    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
         return Ok(vec![]);
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(vec![]),
+        Err(e) if fallout(sim, &e.to_string()) => return Ok(vec![]),
         Err(e) => return Err(e.to_string()),
     };
     let token = login(&mut kernel, sim)?.unwrap_or_default();
@@ -324,7 +333,7 @@ fn scripted_flow(sim: &mut Sim) -> Result<Vec<u16>, String> {
         Request::new(Method::Post, "/invoices/1/finalize").header("authorization", &auth),
     );
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -334,7 +343,7 @@ fn scripted_flow(sim: &mut Sim) -> Result<Vec<u16>, String> {
 // ---- 3. receipts match finalized invoices exactly (exactly-once) ----------
 
 fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
-    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
         sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
@@ -342,7 +351,7 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(sim, &e.to_string()) => {
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
@@ -389,7 +398,7 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
         );
     }
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -418,7 +427,7 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
             "no finalize acked and no receipt job or row exists, so exactly-once counted nothing"
                 .to_string(),
         ),
-        Err(msg) if is_fault_fallout(&msg) => gave_up(
+        Err(msg) if fallout(sim, &msg) => gave_up(
             sim,
             "invoicing:gave-up:receipts-read",
             format!("reading the receipts back hit fault fallout: {msg}"),
@@ -486,7 +495,7 @@ fn check_receipts(app: &App, finalize_acked: u64) -> Result<bool, String> {
 // ---- 4. overdue-reminder behavior over simulated months --------------------
 
 fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
-    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
         sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
@@ -494,7 +503,7 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(sim, &e.to_string()) => {
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
@@ -541,7 +550,7 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
         );
     }
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -559,7 +568,7 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
             "invoicing:gave-up:no-reminder",
             "no reminder fired, so no reminder was checked".to_string(),
         ),
-        Err(msg) if is_fault_fallout(&msg) => gave_up(
+        Err(msg) if fallout(sim, &msg) => gave_up(
             sim,
             "invoicing:gave-up:reminders-read",
             format!("reading the reminders back hit fault fallout: {msg}"),
@@ -865,7 +874,7 @@ fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
 ///   same (S3b review I1). No answer at all is fallout: a fault stopped the
 ///   kernel first.
 fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), String> {
-    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || build(sim))
+    let Some(app) = boot_through_fallout(sim, BOOT_TRIES, |t| fallout(sim, t), || build(sim))
         .map_err(|e| e.to_string())?
     else {
         sim.give_up(format!("the app never booted in {BOOT_TRIES} boots"));
@@ -873,7 +882,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     };
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(k) => k,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(sim, &e.to_string()) => {
             return gave_up(
                 sim,
                 "invoicing:gave-up:kernel-new",
@@ -892,7 +901,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         Request::new(Method::Post, "/keys").header("authorization", &auth),
     );
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -919,7 +928,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         Request::new(Method::Get, "/customers").header("authorization", &key_auth),
     );
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -943,8 +952,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             );
         }
         Some((status, body))
-            if (500..=599).contains(&status)
-                && is_fault_fallout(&String::from_utf8_lossy(&body)) =>
+            if (500..=599).contains(&status) && fallout(sim, &String::from_utf8_lossy(&body)) =>
         {
             return gave_up(
                 sim,
@@ -972,7 +980,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
     let key_hash = hash_token(&raw_key);
     let snap = match kernel.app().db().snapshot() {
         Ok(s) => s,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(sim, &e.to_string()) => {
             return gave_up(
                 sim,
                 "invoicing:gave-up:key-snapshot",
@@ -993,7 +1001,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
                 );
             }
         },
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(sim, &e.to_string()) => {
             return gave_up(
                 sim,
                 "invoicing:gave-up:key-lookup",
@@ -1012,7 +1020,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
             .header("authorization", &auth),
     );
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -1032,7 +1040,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         Request::new(Method::Get, "/customers").header("authorization", &key_auth),
     );
     if let Err(e) = kernel.run(&mut source)
-        && !is_fault_fallout(&e.to_string())
+        && !fallout(sim, &e.to_string())
     {
         return Err(e.to_string());
     }
@@ -1079,10 +1087,7 @@ fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), Stri
         // A 5xx whose body is fault fallout (a fault mid-ladder-resolution)
         // checked nothing about the revoked key. Any other answer comes from
         // no fault (an IO error answers 500 with its own text).
-        other
-            if (500..=599).contains(&other)
-                && is_fault_fallout(&String::from_utf8_lossy(&body)) =>
-        {
+        other if (500..=599).contains(&other) && fallout(sim, &String::from_utf8_lossy(&body)) => {
             gave_up(
                 sim,
                 "invoicing:gave-up:final-status",

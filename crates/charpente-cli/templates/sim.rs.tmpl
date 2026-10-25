@@ -10,7 +10,9 @@ use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, View};
 use charpente_sim::Sim;
-use charpente_sim::checks::{durable_corruption_fired, durable_refusal, is_fault_fallout};
+use charpente_sim::checks::{
+    clock_fallout, durable_corruption_fired, durable_refusal, is_fault_fallout,
+};
 use {{ident}}::{NewNote, Note, build_app};
 
 charpente_sim::sim_tests! {
@@ -41,18 +43,21 @@ fn open_app(sim: &mut Sim) -> Result<Option<App>, String> {
 }
 
 /// Runs the production event loop against a scripted source and hands the
-/// app back, or gives up on fault fallout.
+/// app back, or gives up on fault fallout. The kernel also stops, or refuses
+/// to open, on a clock too far behind; that is fallout only where the
+/// harness's clock faults fired (`clock_fallout`, GUIDE §8).
 fn run_kernel(sim: &mut Sim, app: App, source: &mut SimSource) -> Result<Option<App>, String> {
+    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
     let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
         Ok(kernel) => kernel,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
+        Err(e) if fallout(&e.to_string()) => {
             sim.give_up(format!("Kernel::new hit fault fallout: {e}"));
             return Ok(None);
         }
         Err(e) => return Err(e.to_string()),
     };
     if let Err(e) = kernel.run(source) {
-        if is_fault_fallout(&e.to_string()) {
+        if fallout(&e.to_string()) {
             sim.give_up(format!("the kernel loop hit fault fallout: {e}"));
             return Ok(None);
         }

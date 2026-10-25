@@ -5,17 +5,18 @@
 //! for one order is seen where the money would move.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use charpente::View;
-use charpente::core::io::{Entropy as _, IdempotencyKey};
+use charpente::core::io::{Clock as _, Entropy as _, IdempotencyKey};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::Codec as _;
 use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, calls_have_durable_jobs, clock_refused, durable_corruption_fired,
-    is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon,
+    boot_through_fallout, calls_have_durable_jobs, clock_fallout, clock_reopens_after,
+    durable_corruption_fired, is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon,
 };
 use charpente_sim::outbound::{Idempotent, Recorder};
 use outbound_fixture::{ChargeOrder, Order};
@@ -36,6 +37,17 @@ const BOOT_TRIES: u32 = 8;
 /// Faulted rounds before the tail, each ending in a power cycle.
 const ROUNDS: u32 = 3;
 
+/// How many refused opens the fault-free tail waits out. With the clock's
+/// faults ended, one wait reaches the instant the refusal names; the bound
+/// only makes a second refusal, a bug, end the universe by name.
+const CLOCK_WAITS: u32 = 2;
+
+/// Fault fallout here: the families an error's text alone excuses, and the
+/// kernel's clock stop or refusal where the harness's clock faults fired.
+fn fallout(sim: &Sim, text: &str) -> bool {
+    is_fault_fallout(text) || clock_fallout(sim, text)
+}
+
 /// Ends a universe that adjudicated nothing, marking `key`, the arm's name:
 /// the harness reports how many universes gave up, not why.
 fn gave_up(sim: &Sim, key: &'static str, reason: String) -> Result<(), String> {
@@ -45,9 +57,12 @@ fn gave_up(sim: &Sim, key: &'static str, reason: String) -> Result<(), String> {
 }
 
 fn boot(sim: &Sim) -> Result<Option<App>, String> {
-    boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, || {
-        outbound_fixture::build(Box::new(sim.disk()), Box::new(sim.entropy()))
-    })
+    boot_through_fallout(
+        sim,
+        BOOT_TRIES,
+        |t| fallout(sim, t),
+        || outbound_fixture::build(Box::new(sim.disk()), Box::new(sim.entropy())),
+    )
     .map_err(|e| format!("the app failed to open non-injected: {e}"))
 }
 
@@ -59,12 +74,12 @@ fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String
         .map_err(|e| e.to_string())?;
     let mut kernel = match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
         Ok(kernel) => kernel,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(Err(e.to_string())),
+        Err(e) if fallout(sim, &e.to_string()) => return Ok(Err(e.to_string())),
         Err(e) => return Err(format!("the kernel build failed non-injected: {e}")),
     };
     match kernel.run(source) {
         Ok(()) => Ok(Ok(kernel.into_app())),
-        Err(e) if is_fault_fallout(&e.to_string()) => Ok(Err(e.to_string())),
+        Err(e) if fallout(sim, &e.to_string()) => Ok(Err(e.to_string())),
         Err(e) => Err(format!("the kernel stopped non-injected: {e}")),
     }
 }
@@ -108,7 +123,7 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
                 }
             }
             Ok(_) => {}
-            Err(e) if is_fault_fallout(&e) => {
+            Err(e) if fallout(sim, &e) => {
                 drop(app);
                 sim.restart();
                 continue;
@@ -123,33 +138,45 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
     // 32 s (63.5 s in all), each with a 2 s deadline, well inside 600 s.
     sim.quiesce_disk_faults();
     sim.quiesce_outbound_faults();
-    let Some(app) = boot(sim)? else {
-        return if sim.gave_up().is_some() {
-            sim.cover("outbound-fixture:gave-up:boot");
-            Ok(())
-        } else {
-            Err("the fault-free tail could not boot".into())
+    sim.quiesce_clock_faults();
+    let mut waits = 0;
+    let mut app = loop {
+        let Some(app) = boot(sim)? else {
+            return if sim.gave_up().is_some() {
+                sim.cover("outbound-fixture:gave-up:boot");
+                Ok(())
+            } else {
+                Err("the fault-free tail could not boot".into())
+            };
         };
-    };
-    let horizon = sim.now().as_nanos() + 600 * SEC;
-    let mut app = match run(
-        sim,
-        app,
-        &mut SimSource::new(Box::new(sim.clock()), horizon),
-    )? {
-        Ok(app) => app,
-        // The tail quiesces the disk and outbound faults, not the clock's: a
-        // step back past CLOCK_TOLERANCE stops the kernel, or one in an
-        // earlier round left the clock behind what the store recorded and the
-        // open is refused. Nothing settled either way, so nothing is judged.
-        Err(e) if clock_refused(&e) => {
+        let horizon = sim.now().as_nanos() + 600 * SEC;
+        let e = match run(
+            sim,
+            app,
+            &mut SimSource::new(Box::new(sim.clock()), horizon),
+        )? {
+            Ok(app) => break app,
+            Err(e) => e,
+        };
+        // A step back in an earlier round left the clock behind the time the
+        // store recorded, and the open is refused. With the clock's faults
+        // ended its offset is frozen, so it reaches the instant the refusal
+        // names as virtual time passes: wait, and restart the process.
+        let Some(at) = clock_reopens_after(&e) else {
+            return Err(format!("the fault-free tail's kernel stopped: {e}"));
+        };
+        if waits == CLOCK_WAITS {
             return gave_up(
                 sim,
                 "outbound-fixture:gave-up:clock",
-                format!("the fault-free tail's kernel met the clock axes: {e}"),
+                format!("the fault-free tail was refused {waits} times after waiting: {e}"),
             );
         }
-        Err(e) => return Err(format!("the fault-free tail's kernel stopped: {e}")),
+        waits += 1;
+        sim.cover("outbound-fixture:waited-out-clock");
+        let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + SEC;
+        sim.clock().sleep(Duration::from_nanos(wait));
+        sim.restart_process();
     };
 
     let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;

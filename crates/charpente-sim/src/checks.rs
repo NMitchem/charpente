@@ -5,11 +5,12 @@
 //! injected fault inside the table store's open (follow-up 21), and
 //! `calls_have_durable_jobs`, `keys_are_per_job` and
 //! `outbound_settles_by_horizon` with outbound effects (outbound-effects
-//! spec §10) — more earn their way in the same way.
+//! spec §10), and `clock_refused`, `clock_fallout` and `clock_reopens_after`
+//! with the sim's clock axes (0.3.0) — more earn their way in the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use charpente_core::io::IdempotencyKey;
+use charpente_core::io::{IdempotencyKey, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::table::{Snapshot, View};
 
@@ -47,8 +48,8 @@ pub enum FaultReason {
 }
 
 /// Classifies `text` (an error's Display/to_string output) into one of five
-/// recognized families or `Unrelated`. Families 1-3 and 5 are fault fallout by
-/// their text alone ([`is_fault_fallout`]); family 4 is only named here:
+/// recognized families or `Unrelated`. Families 1-3 are fault fallout by their
+/// text alone ([`is_fault_fallout`]); families 4 and 5 are only named here:
 ///  1. the sim's own injected-fault wordings — including the `read_error`
 ///     axis (segment-mgmt T5), whose error text is "injected" too.
 ///     `misdirected_write` is NOT in this family and cannot be: it returns
@@ -71,12 +72,15 @@ pub enum FaultReason {
 ///     [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired)
 ///     for the refusing node in a multi-node one (S3b item 0),
 ///  5. the kernel's clock stop and its open/promote refusal
-///     ([`clock_refused`]), which the sim's clock axes produce. Whether one
-///     fired exactly when the clock was beyond `CLOCK_TOLERANCE` is a clock
-///     property's to judge, not this classifier's.
+///     ([`clock_refused`]). The sim's clock axes produce them, and so does a
+///     platform bug: a recovered floor above a time the store saw refuses a
+///     node whose clock is right. So this family is a name too, excused only
+///     where a clock axis fired ([`clock_fallout`]). Whether one fired exactly
+///     when the clock was beyond `CLOCK_TOLERANCE` is a clock property's to
+///     judge, not this classifier's.
 ///
 /// Anything else is `Unrelated`: NOT fallout, must fail the universe for
-/// adjudication. Recognizing families 1-3 and 5 cannot mask a real bug so long as
+/// adjudication. Recognizing families 1-3 cannot mask a real bug so long as
 /// the workload's end-state oracle (e.g. exactly-once on reopen) still runs
 /// either way.
 ///
@@ -105,9 +109,10 @@ pub fn classify(text: &str) -> FaultReason {
 }
 
 /// `true` for the families an error's text alone excuses: injected,
-/// poisoned, the redb latch and the clock stop or refusal (`classify`'s
-/// families 1-3 and 5). Never for the
-/// durable-horizon refusal: whether that is fallout depends on whether durable
+/// poisoned and the redb latch (`classify`'s families 1-3). Never for the
+/// clock stop or refusal, which [`clock_fallout`] excuses only where a clock
+/// axis fired, so a platform suite, whose clock axes are off, fails one. Never
+/// for the durable-horizon refusal: whether that is fallout depends on whether durable
 /// corruption fired, which text cannot say, so it is `false` here and a
 /// caller that retries or gives up on fallout fails it unless it asks
 /// [`durable_refusal`] (or, for one node of several,
@@ -117,24 +122,92 @@ pub fn classify(text: &str) -> FaultReason {
 pub fn is_fault_fallout(text: &str) -> bool {
     matches!(
         classify(text),
-        FaultReason::Injected
-            | FaultReason::Poisoned
-            | FaultReason::RedbLatch
-            | FaultReason::ClockRefused
+        FaultReason::Injected | FaultReason::Poisoned | FaultReason::RedbLatch
     )
 }
 
 /// `true` for the kernel's clock stop ("clock went backwards: …") and for its
 /// refusal to open or promote a node whose wall clock is more than
 /// `CLOCK_TOLERANCE` behind the latest time its data directory recorded
-/// (charpente's `kernel/clock.rs`). The sim's clock axes produce both: a step
-/// back past the tolerance stops the node, and it then cannot open again
-/// until true time catches up. So in an app workload they are fault fallout
-/// ([`is_fault_fallout`]), and a clock property marks one when it sees it.
+/// (charpente's `kernel/clock.rs`): `classify`'s `ClockRefused`. A name, not
+/// an excuse; a workload asks [`clock_fallout`] whether this run's faults
+/// explain one, and a clock property marks one when it sees it.
 pub fn clock_refused(text: &str) -> bool {
     text.contains("clock went backwards:")
         || text.contains("refusing to open: this node's wall clock")
         || text.contains("refusing to promote: this node's wall clock")
+}
+
+/// `true` when `text` is the kernel's clock stop or open/promote refusal
+/// ([`clock_refused`]) and one of the sim's clock axes acted in this run:
+/// a clock read with its own skew (`clock:skewed`), a step back
+/// (`clock:stepped-back`) or a downtime jump (`clock:downtime`). That is when
+/// the stop or refusal is fault fallout: a step back past the tolerance stops
+/// the node, and leaves it behind its store's recorded time until true time
+/// catches up, and two hosts' skews put one behind times the other recorded.
+/// Where no axis acted, nothing excuses one, and it is a platform bug, the
+/// rule [`durable_refusal`] follows for its family. An app workload's fallout
+/// filter is `|t| is_fault_fallout(t) || clock_fallout(sim, t)`.
+pub fn clock_fallout(sim: &Sim, text: &str) -> bool {
+    if !clock_refused(text) {
+        return false;
+    }
+    let coverage = sim.coverage();
+    ["clock:skewed", "clock:stepped-back", "clock:downtime"]
+        .iter()
+        .any(|key| coverage.get(key).copied().unwrap_or(0) > 0)
+}
+
+/// The instant a clock stop or refusal ([`clock_refused`]) names as the one
+/// after which the node runs again: its last "after <instant>", written to the
+/// millisecond, so wait a little past it. `None` for any other text. For a
+/// fault-free tail: after `Sim::quiesce_clock_faults` the clock's offset is
+/// frozen, so a node refused at open reaches this instant as virtual time
+/// passes, and a workload sleeps until then and restarts the process.
+pub fn clock_reopens_after(text: &str) -> Option<WallTime> {
+    if !clock_refused(text) {
+        return None;
+    }
+    let tail = &text[text.rfind(" after ")? + " after ".len()..];
+    let stamp = tail.get(..24)?;
+    let b = stamp.as_bytes();
+    let field = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = stamp.get(range)?;
+        digits
+            .bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| digits.parse().ok())?
+    };
+    if [b[4], b[7], b[10], b[13], b[16], b[19], b[23]] != *b"--T::.Z" {
+        return None;
+    }
+    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (hour, minute, second, millis) = (
+        field(11..13)?,
+        field(14..16)?,
+        field(17..19)?,
+        field(20..23)?,
+    );
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    // Howard Hinnant's days_from_civil, the inverse of `WallTime`'s Display.
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let nanos = u64::try_from(secs).ok()?.checked_mul(1_000_000_000)?;
+    Some(WallTime::from_nanos(
+        nanos.checked_add(millis as u64 * 1_000_000)?,
+    ))
 }
 
 /// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
@@ -595,13 +668,18 @@ mod tests {
     }
 
     /// The kernel's clock stop and its open and promote refusals (charpente's
-    /// `kernel/clock.rs`) are fallout of the sim's clock axes: a step back past
-    /// `CLOCK_TOLERANCE` stops a node, and it then cannot open until true time
-    /// catches up. One exemplar of each, verbatim, and no other family's
-    /// exemplar reads as one.
+    /// `kernel/clock.rs`) are a name, like the durable-horizon refusal: text
+    /// alone never excuses one, since a platform suite runs with the clock axes
+    /// off and a refusal there is a bug. `clock_fallout` excuses one only once
+    /// a clock axis acted in the run: a skewed read, a step back, or a read
+    /// after a downtime jump. One exemplar of each text, verbatim, and no
+    /// other family's exemplar reads as one.
     #[test]
-    fn the_clock_stop_and_refusal_are_fault_fallout() {
-        for text in [
+    fn a_clock_refusal_is_fallout_only_where_a_clock_axis_fired() {
+        use crate::FaultConfig;
+        use charpente_core::io::Clock;
+
+        let texts = [
             "clock went backwards: this node's wall clock reads 2026-01-01T00:00:39.000Z, 61s \
              behind 2026-01-01T00:01:40.000Z, the latest time it already used — more than the \
              60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather than extend \
@@ -618,10 +696,55 @@ mod tests {
              more than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock \
              (check NTP); if the clock is right, the recorded time came from a clock that ran \
              ahead, and the node will promote after 2026-01-01T00:00:40.000Z.",
-        ] {
+        ];
+        let quiet = Sim::with_faults(0xC10C_F001, FaultConfig::none());
+        quiet.clock().wall();
+        let skewed = Sim::with_faults(
+            0xC10C_F002,
+            FaultConfig {
+                clock_skew: 90_000_000_000,
+                ..FaultConfig::none()
+            },
+        );
+        let stepped = Sim::with_faults(
+            0xC10C_F003,
+            FaultConfig {
+                clock_step_back: (1.0, std::time::Duration::from_secs(120)),
+                ..FaultConfig::none()
+            },
+        );
+        let jumped = Sim::with_faults(
+            0xC10C_F004,
+            FaultConfig {
+                clock_downtime: (1.0, std::time::Duration::from_secs(3 * 86_400)),
+                ..FaultConfig::none()
+            },
+        );
+        jumped.restart();
+        for text in texts {
             assert_eq!(classify(text), FaultReason::ClockRefused, "{text}");
             assert!(clock_refused(text), "{text}");
-            assert!(is_fault_fallout(text), "{text}");
+            assert!(!is_fault_fallout(text), "text alone excuses it: {text}");
+            assert!(
+                !clock_fallout(&quiet, text),
+                "excused with no clock axis on: {text}"
+            );
+            assert!(
+                !clock_fallout(&jumped, text),
+                "excused by a jump no reading has shown yet: {text}"
+            );
+        }
+        skewed.clock().wall();
+        stepped.clock().wall();
+        jumped.clock().wall();
+        for (sim, axis) in [
+            (&skewed, "skew"),
+            (&stepped, "a step back"),
+            (&jumped, "downtime"),
+        ] {
+            for text in texts {
+                assert!(clock_fallout(sim, text), "not excused after {axis}: {text}");
+            }
         }
         for other in [
             "simulated disk write error (injected fault)",
@@ -634,6 +757,50 @@ mod tests {
         ] {
             assert!(!clock_refused(other), "{other}");
             assert_ne!(classify(other), FaultReason::ClockRefused, "{other}");
+            assert!(!clock_fallout(&stepped, other), "{other}");
+        }
+    }
+
+    /// The instant each clock text names round-trips through `WallTime`'s
+    /// Display, and nothing else parses.
+    #[test]
+    fn clock_reopens_after_reads_the_instant_each_clock_text_names() {
+        let stop = "clock went backwards: this node's wall clock reads 2026-01-01T00:00:39.000Z, \
+                    61s behind 2026-01-01T00:01:40.000Z, the latest time it already used — more \
+                    than the 60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather \
+                    than extend sessions or delay schedules by that much. Fix the system clock \
+                    (check NTP) and restart; if the clock is right, the earlier reading came from \
+                    a clock that ran ahead, and the node runs again after 2026-01-01T00:00:40.000Z.";
+        assert_eq!(
+            clock_reopens_after(stop),
+            Some(WallTime::from_nanos(1_767_225_640_000_000_000))
+        );
+        for verb in ["open", "promote"] {
+            let refusal = format!(
+                "refusing to {verb}: this node's wall clock reads 2024-02-29T23:59:58.250Z, \
+                 79.62s behind 2024-03-01T00:01:17.870Z, the latest time this data directory \
+                 recorded — more than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the \
+                 system clock (check NTP); if the clock is right, the recorded time came from a \
+                 clock that ran ahead, and the node will {verb} after 2024-03-01T00:00:17.870Z."
+            );
+            let at = clock_reopens_after(&refusal).expect(&refusal);
+            assert_eq!(at.to_string(), "2024-03-01T00:00:17.870Z");
+        }
+        let mut state = 0x0A57_7E11_u64;
+        for _ in 0..2_000 {
+            // Up to the year 2554, at millisecond precision.
+            let nanos = crate::rng::splitmix64(&mut state) / 1_000_000 * 1_000_000;
+            let t = WallTime::from_nanos(nanos);
+            let text = format!("clock went backwards: … the node runs again after {t}.");
+            assert_eq!(clock_reopens_after(&text), Some(t), "{t}");
+        }
+        for other in [
+            "simulated disk write error (injected fault): retry after 2026-01-01T00:00:40.000Z.",
+            "clock went backwards: the node runs again after a while.",
+            "clock went backwards: the node runs again after 2026-13-01T00:00:40.000Z.",
+            "clock went backwards: the node runs again after 2026-01-01T00:00:40.000",
+        ] {
+            assert_eq!(clock_reopens_after(other), None, "{other}");
         }
     }
 
