@@ -451,10 +451,9 @@ fn sim_with_line_deleted(name: &str, delete: &str) -> (PathBuf, std::process::Ou
     std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
     let lib = read(&app.join("src/lib.rs"));
     assert_eq!(
-        lib.matches(delete.trim()).count(),
+        lib.matches(delete).count(),
         1,
-        "the scaffold's src/lib.rs holds one `{}` line:\n{lib}",
-        delete.trim()
+        "the scaffold's src/lib.rs holds one {delete:?} line:\n{lib}"
     );
     std::fs::write(app.join("src/lib.rs"), lib.replacen(delete, "", 1)).unwrap();
     let out = charpente()
