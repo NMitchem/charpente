@@ -176,6 +176,7 @@ charpente test --sim                        # seeded fault-injection universes
 
 Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the second
 property goes red with a seed, and the seed replays. That is the whole pitch.
+Delete the `tx.emit` line instead and the third goes red: the event commits with the note and the job.
 
 | Doc | What it is |
 |---|---|

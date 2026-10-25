@@ -21,6 +21,7 @@
 - **`Sim::give_up` takes a fixed reason and a per-run detail: `give_up(reason: &'static str, detail: impl Display)`.** The CLI groups give-ups by reason and `--seed` shows the detail. Split a text that embeds an error, count or seq into its fixed part and the detail; a fixed reason passes `""`, and an empty detail is none. `Sim::gave_up()` returns `Option<&'static str>`, `Sim::gave_up_detail()` returns `Option<String>`, and `Outcome::GaveUp` is `{ reason: &'static str, detail: Option<String> }`.
 
 ### Changed
+- **The `charpente new` scaffold's sim draws its inputs and proves the event.** It posts 1 to 4 notes whose bodies and order come from `sim.input()`, so a failure shrinks to the fewest, simplest notes. A third check, `acked_post_implies_its_event_after_recovery`, requires each acked note's `NoteAdded` in the durable event log exactly once after recovery, so deleting `tx.emit` now goes red. The scaffold's recorded batch moves (named step S4).
 - **Cron keeps its grid.** A tick advances `next_due` to the schedule's next grid slot, `next_due + interval * ((now - next_due) / interval + 1)`, not to `now + interval`, so a late tick no longer drifts the phase. Catch-up still fires once.
 
 ### Added

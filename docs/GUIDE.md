@@ -50,7 +50,7 @@ build-directory name, and an existing path, each by name.
 | `.gitignore` | `/target` and `/data` |
 | `src/lib.rs` | one table, one route, one job, one event, and `build_app` |
 | `src/main.rs` | `charpente::launch(...)` — one line (§13) |
-| `tests/sim.rs` | two properties in the give-up idiom (§8) |
+| `tests/sim.rs` | three properties in the give-up idiom (§8), their inputs drawn with `sim.input()` |
 
 ### `Cargo.toml`
 

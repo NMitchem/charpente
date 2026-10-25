@@ -429,3 +429,113 @@ fn the_emitted_clippy_toml_is_a_subset_of_the_workspace_fence() {
         );
     }
 }
+
+/// A scaffold named `name`, patched to build against THIS workspace, with
+/// `delete` (a whole line of `src/lib.rs`) removed, and the sim run over the
+/// batch `--master-seed 0x1`. Returns the app dir and the run's output.
+// Rewriting the scaffold's manifest and src/lib.rs is edge tooling
+// (DESIGN.md §1): the rig making README's edit, not code the sim exercises.
+#[allow(clippy::disallowed_methods)]
+fn sim_with_line_deleted(name: &str, delete: &str) -> (PathBuf, std::process::Output) {
+    let dir = scratch(name);
+    let (code, _, err) = run_in(&dir, &["new", name]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let app = dir.join(name);
+    let ws = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let mut manifest = read(&app.join("Cargo.toml"));
+    manifest.push_str(&format!(
+        "\n[patch.crates-io]\ncharpente = {{ path = {:?} }}\ncharpente-sim = {{ path = {:?} }}\n",
+        ws.join("crates/charpente"),
+        ws.join("crates/charpente-sim")
+    ));
+    std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+    let lib = read(&app.join("src/lib.rs"));
+    assert_eq!(
+        lib.matches(delete.trim()).count(),
+        1,
+        "the scaffold's src/lib.rs holds one `{}` line:\n{lib}",
+        delete.trim()
+    );
+    std::fs::write(app.join("src/lib.rs"), lib.replacen(delete, "", 1)).unwrap();
+    let out = charpente()
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", target_dir())
+        .args(["test", "--sim", "--master-seed", "0x1"])
+        .output()
+        .unwrap();
+    (app, out)
+}
+
+/// The failure block for `check`, from its header to its repro line.
+fn failure_block(stdout: &str, check: &str) -> String {
+    let start = stdout
+        .find(&format!("sim failure in {check}: "))
+        .unwrap_or_else(|| panic!("{check} is the check that fails:\n{stdout}"));
+    let rest = &stdout[start..];
+    let repro_at = rest
+        .find("  repro:  ")
+        .expect("a block ends with its repro");
+    let end = repro_at + rest[repro_at..].find('\n').expect("the repro line ends");
+    rest[..end].to_string()
+}
+
+/// The scaffold's `tx.emit` line is the one an outside agent found nothing
+/// noticing the loss of: the event commits with the note and the job, and the
+/// third check reads the durable event log to prove it.
+#[test]
+fn deleting_the_emit_line_turns_the_event_check_red() {
+    let (_, out) = sim_with_line_deleted("noemit", "    tx.emit(NoteAdded { note: id });\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "deleting tx.emit goes red\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let block = failure_block(&stdout, "acked_post_implies_its_event_after_recovery");
+    assert!(
+        block.contains("event-durability violated"),
+        "and it fails for the reason the deletion causes:\n{block}"
+    );
+    for other in [
+        "acked_note_survives_a_restart",
+        "acked_post_implies_the_echo_after_recovery",
+    ] {
+        assert!(
+            !stdout.contains(&format!("sim failure in {other}")),
+            "{other} does not depend on the emit:\n{stdout}"
+        );
+    }
+}
+
+/// README's step, on the echo check: with the enqueue gone the echo check
+/// names the ack-durability reason and the event check stays green.
+#[test]
+fn deleting_the_enqueue_line_turns_the_echo_check_red() {
+    let (_, out) = sim_with_line_deleted("noenqueue", "    tx.enqueue(Echo { note: id });\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    let block = failure_block(&stdout, "acked_post_implies_the_echo_after_recovery");
+    assert!(block.contains("ack-durability violated"), "{block}");
+    assert!(
+        !stdout.contains("sim failure in acked_post_implies_its_event_after_recovery"),
+        "the event check does not depend on the enqueue:\n{stdout}"
+    );
+}
+
+/// The scaffold's notes, bodies and order are drawn, not written. This
+/// version's JSON report carries no per-check distinct-input count (Task 15),
+/// so the proof is a failure block's `inputs:` line, which names each draw.
+#[test]
+fn the_scaffold_draws_its_inputs() {
+    let (_, out) = sim_with_line_deleted("drawn", "    tx.emit(NoteAdded { note: id });\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let block = failure_block(&stdout, "acked_post_implies_its_event_after_recovery");
+    let inputs = block
+        .lines()
+        .find(|l| l.starts_with("  inputs:"))
+        .unwrap_or_else(|| panic!("a failure block names the inputs it drew:\n{block}"));
+    for name in ["notes", "order", "body"] {
+        assert!(inputs.contains(name), "`{name}` is drawn:\n{block}");
+    }
+}

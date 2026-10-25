@@ -1,11 +1,16 @@
-//! Two properties, both honest: each asserts a claim that holds under ANY
+//! Three properties, each honest: each asserts a claim that holds under ANY
 //! fault schedule and gives up — rather than passing — in a universe where
 //! injected faults stopped it before the claim could be tested (GUIDE §8).
+//! The notes, their bodies and their order are drawn with `sim.input()`, so a
+//! failure shrinks to the fewest, simplest notes that still fail.
 //!
 //! Run them: `charpente test --sim`. Watch one fail: delete the `tx.enqueue`
-//! line in `src/lib.rs` and run again.
+//! line in `src/lib.rs` and run again. Delete `tx.emit` and the third goes red.
 
+use charpente::core::db::Event;
+use charpente::core::event::EventRow;
 use charpente::core::job::{JobRow, JobStatus};
+use charpente::core::table::Codec;
 use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, View};
@@ -13,11 +18,12 @@ use charpente_sim::Sim;
 use charpente_sim::checks::{
     clock_fallout, durable_corruption_fired, durable_refusal, is_fault_fallout,
 };
-use {{ident}}::{NewNote, Note, build_app};
+use {{ident}}::{NewNote, Note, NoteAdded, build_app};
 
 charpente_sim::sim_tests! {
     acked_note_survives_a_restart require ["restart"],
     acked_post_implies_the_echo_after_recovery require ["restart"],
+    acked_post_implies_its_event_after_recovery require ["restart"],
 }
 
 const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
@@ -66,28 +72,55 @@ fn run_kernel(sim: &mut Sim, app: App, source: &mut SimSource) -> Result<Option<
     Ok(Some(kernel.into_app()))
 }
 
-/// POST one note, crash, reopen. Returns the reopened app and whether the
-/// POST was acked with a 200 — the only case in which there is a claim.
-fn post_then_crash(sim: &mut Sim) -> Result<Option<(App, bool)>, String> {
+/// The reopened app and each acked note's id and body.
+type Recovered = (App, Vec<(u64, String)>);
+
+/// POST 1-4 drawn notes (bodies and order drawn too), crash, reopen. Returns
+/// the reopened app and each acked note's id and body — the only notes there
+/// is a claim about.
+fn post_then_crash(sim: &mut Sim) -> Result<Option<Recovered>, String> {
+    let input = sim.input();
+    let count = input.between("notes", 1, 4);
+    let mut ids: Vec<u64> = (1..=count).collect();
+    input.shuffle("order", &mut ids);
+    let posts: Vec<(u64, String)> = ids
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                input.text("body", &["alpha", "bravo", "charlie", "delta"], 1, 3),
+            )
+        })
+        .collect();
+
     let Some(app) = open_app(sim)? else {
         return Ok(None);
     };
     let mut source = SimSource::new(Box::new(sim.clock()), 2 * SEC);
-    source.push_at(
-        0,
-        Request::new(Method::Post, "/notes/1").json(&NewNote {
-            body: "hello".to_string(),
-        }),
-    );
+    for (at, (id, body)) in posts.iter().enumerate() {
+        source.push_at(
+            at as u64 * 1_000_000,
+            Request::new(Method::Post, format!("/notes/{id}"))
+                .json(&NewNote { body: body.clone() }),
+        );
+    }
     let responses = source.responses();
     let Some(app) = run_kernel(sim, app, &mut source)? else {
         return Ok(None);
     };
-    let acked = responses
+    // The kernel answers in arrival order, one reply per POST.
+    let statuses: Vec<u16> = responses
         .lock()
         .map_err(|_| "responses lock poisoned".to_string())?
         .iter()
-        .any(|(status, _)| *status == 200);
+        .map(|(status, _)| *status)
+        .collect();
+    let acked: Vec<(u64, String)> = posts
+        .into_iter()
+        .zip(statuses)
+        .filter(|(_, status)| *status == 200)
+        .map(|(post, _)| post)
+        .collect();
     sim.restart();
     drop(app);
     let Some(app) = open_app(sim)? else {
@@ -96,16 +129,13 @@ fn post_then_crash(sim: &mut Sim) -> Result<Option<(App, bool)>, String> {
     Ok(Some((app, acked)))
 }
 
-/// An acked write is durable: after a crash the row is still there.
+/// An acked write is durable: after a crash every acked row is still there.
 fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
     let Some((app, acked)) = post_then_crash(sim)? else {
         return Ok(());
     };
-    if !acked {
-        sim.give_up(
-            "the POST was never acked, so durability has nothing to prove",
-            "",
-        );
+    if acked.is_empty() {
+        sim.give_up("no POST was acked, so durability has nothing to prove", "");
         return Ok(());
     }
     let snap = match app.db().snapshot() {
@@ -116,29 +146,38 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
         }
         Err(e) => return Err(e.to_string()),
     };
-    match snap.get::<Note>(Id::from_raw(1)) {
-        Ok(Some(_)) => Ok(()),
-        // Acked-but-lost is excused ONLY where the harness injected durable
-        // corruption into this universe (GUIDE §8, "Giving up").
-        Ok(None) if durable_corruption_fired(sim) => {
-            sim.give_up("durable corruption fired, so the acked row is excused", "");
-            Ok(())
+    for (id, body) in &acked {
+        match snap.get::<Note>(Id::from_raw(*id)) {
+            Ok(Some(note)) if note.body == *body => {}
+            Ok(Some(note)) => {
+                return Err(format!(
+                    "acked note {id} came back as {:?}, not the {body:?} it was acked with",
+                    note.body
+                ));
+            }
+            // Acked-but-lost is excused ONLY where the harness injected durable
+            // corruption into this universe (GUIDE §8, "Giving up").
+            Ok(None) if durable_corruption_fired(sim) => {
+                sim.give_up("durable corruption fired, so the acked row is excused", "");
+                return Ok(());
+            }
+            Ok(None) => return Err(format!("acked note {id} lost across a crash")),
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                sim.give_up("the read-back hit fault fallout", e);
+                return Ok(());
+            }
+            Err(e) => return Err(e.to_string()),
         }
-        Ok(None) => Err("acked note 1 lost across a crash".to_string()),
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up("the read-back hit fault fallout", e);
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
     }
+    Ok(())
 }
 
 /// The end-state oracle: two invariants that hold under any fault schedule.
 /// - Ack-durability: a 200 from `/notes/:id` committed its enqueue in the
-///   same log record, so an `Echo` job row exists.
-/// - Exactly-once: `echoed` is true iff an `Echo` job is Done — a job's
-///   effect and its Done mark commit as one record.
-fn check_invariants(app: &App, acked: bool) -> Result<(), String> {
+///   same log record, so each acked note has an `Echo` job row.
+/// - Exactly-once: the notes marked `echoed` number exactly the `Echo` jobs
+///   that are Done — a job's effect and its Done mark commit as one record.
+fn check_invariants(app: &App, acked: usize) -> Result<(), String> {
     let snap = app.db().snapshot().map_err(|e| e.to_string())?;
     let echo_jobs: Vec<JobRow> = snap
         .scan::<JobRow>()
@@ -146,26 +185,28 @@ fn check_invariants(app: &App, acked: bool) -> Result<(), String> {
         .into_iter()
         .filter(|job| job.name == "Echo")
         .collect();
-    if acked && echo_jobs.is_empty() {
-        return Err(
-            "ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — \
-             the enqueue did not commit with the row"
-                .to_string(),
-        );
+    if echo_jobs.len() < acked {
+        return Err(format!(
+            "ack-durability violated: {acked} POST(s) were acked with 200 but only {} Echo job(s) are durable — \
+             the enqueue did not commit with the row",
+            echo_jobs.len()
+        ));
     }
     let done = echo_jobs
         .iter()
         .filter(|job| job.status == JobStatus::Done)
         .count();
-    for note in snap.scan::<Note>().map_err(|e| e.to_string())? {
-        if note.echoed != (done > 0) {
-            return Err(format!(
-                "exactly-once violated: note {} reads echoed = {} but {done} Echo job(s) are Done — \
-                 a job's effect and its Done mark commit as one record",
-                note.id.raw(),
-                note.echoed
-            ));
-        }
+    let echoed = snap
+        .scan::<Note>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|note| note.echoed)
+        .count();
+    if echoed != done {
+        return Err(format!(
+            "exactly-once violated: {echoed} note(s) read echoed = true but {done} Echo job(s) are Done — \
+             a job's effect and its Done mark commit as one record"
+        ));
     }
     Ok(())
 }
@@ -182,7 +223,7 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
     let Some(app) = run_kernel(sim, app, &mut idle)? else {
         return Ok(());
     };
-    match check_invariants(&app, acked) {
+    match check_invariants(&app, acked.len()) {
         Ok(()) => Ok(()),
         // The oracle's own reads go through the same faulted disk.
         Err(msg) if is_fault_fallout(&msg) => {
@@ -191,4 +232,52 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
         }
         Err(msg) => Err(msg),
     }
+}
+
+/// An acked POST implies its realtime event: each acked note's `NoteAdded`
+/// is in the durable event log exactly once after recovery — the log a
+/// subscriber's resume reads. Delete `tx.emit` in `src/lib.rs` and this goes
+/// red with a seed.
+fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), String> {
+    let Some((app, acked)) = post_then_crash(sim)? else {
+        return Ok(());
+    };
+    if acked.is_empty() {
+        sim.give_up("no POST was acked, so its event has nothing to prove", "");
+        return Ok(());
+    }
+    let rows: Vec<EventRow> = match app.db().snapshot().and_then(|snap| snap.scan_from(0, 4096)) {
+        Ok(rows) => rows,
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up("the event-log read hit fault fallout", e);
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut events = Vec::new();
+    for row in rows.iter().filter(|row| row.name == NoteAdded::NAME) {
+        events.push(
+            NoteAdded::decode(&mut &row.payload[..])
+                .map_err(|e| e.to_string())?
+                .note,
+        );
+    }
+    for (id, _) in &acked {
+        let seen = events.iter().filter(|note| note.raw() == *id).count();
+        if seen == 1 {
+            continue;
+        }
+        if seen == 0 && durable_corruption_fired(sim) {
+            sim.give_up(
+                "durable corruption fired, so the acked event is excused",
+                "",
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "event-durability violated: note {id} was acked with 200 but its NoteAdded is in the event log {seen} time(s), not once — \
+             the emit did not commit with the row"
+        ));
+    }
+    Ok(())
 }
