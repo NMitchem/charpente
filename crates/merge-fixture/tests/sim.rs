@@ -14,11 +14,8 @@ use merge_fixture::{Best, Bid, Merge, build_app};
 const MASTER: &str = "0x4D455247";
 const MS: u64 = 1_000_000;
 
-fn run_tests(tests: &[SimTest], format: Option<&str>) -> (i32, String) {
-    let mut argv = vec!["--universes", "256", "--master-seed", MASTER, "--jobs", "1"];
-    if let Some(f) = format {
-        argv.extend(["--format", f]);
-    }
+fn run_tests(tests: &[SimTest]) -> (i32, String) {
+    let argv = ["--runs", "256", "--master-seed", MASTER, "--jobs", "1"];
     let args = HarnessArgs::parse(argv.into_iter().map(String::from)).unwrap();
     let mut out = Vec::new();
     let code = harness::run(tests, &args, &mut out);
@@ -171,7 +168,7 @@ fn scripted_inputs_cannot_see_latest_wins() {
         run: scripted_latest,
         require: &[],
     }];
-    let (code, out) = run_tests(&tests, None);
+    let (code, out) = run_tests(&tests);
     assert_eq!(code, 0, "{out}");
 }
 
@@ -182,7 +179,7 @@ fn generated_inputs_catch_latest_wins_and_shrink_it() {
         run: generated_latest,
         require: &[],
     }];
-    let (code, out) = run_tests(&tests, None);
+    let (code, out) = run_tests(&tests);
     assert_eq!(code, 1, "{out}");
     // The first block is the shrunk one: lo for every draw but the two amounts,
     // which stop at 2 then 1 (a later amount below an earlier one is the bug).
@@ -201,7 +198,20 @@ fn max_passes_under_generated_inputs() {
         run: generated_max,
         require: &["sometimes:drew_bids"],
     }];
-    let (code, out) = run_tests(&tests, Some("json"));
+    let (code, out) = run_tests(&tests);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("sometimes:drew_bids"), "{out}");
+    // The required key was met (an unmet one fails the check), and the tested
+    // runs drew well over a hundred distinct bid sequences.
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("check generated_max ... ok  ("))
+        .unwrap_or_else(|| panic!("{out}"));
+    let distinct: u64 = line
+        .split_once(" tested over ")
+        .and_then(|(_, rest)| rest.split_once(" distinct inputs"))
+        .unwrap_or_else(|| panic!("the check draws its bids: {line}"))
+        .0
+        .parse()
+        .unwrap();
+    assert!(distinct > 100, "{line}");
 }

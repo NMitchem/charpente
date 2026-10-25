@@ -2064,7 +2064,7 @@ Charpente treats the coding agent as the primary developer persona:
   deterministic. App crates write property workloads in `tests/sim.rs` (`harness = false`)
   registered via `charpente_sim::sim_tests! { name require ["fault:crash", …], … }` —
   workloads share the internal suite's signature, `fn(&mut Sim) -> Result<(), String>`;
-  `Err` and panics both fail a universe. `charpente test --sim [--universes N] [--seed
+  `Err` and panics both fail a universe. `charpente test --sim [--runs N] [--seed
   0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json] [--inputs HEX]
   [--faults-off AXIS,…] [--dir PATH]`
   builds the app's `sim` target via `cargo test --no-run` and execs it directly — build
@@ -2077,7 +2077,11 @@ Charpente treats the coding agent as the primary developer persona:
   `--faults-off` replay it with given input choices and fault axes off. Each check's
   first failure in a batch is shrunk, by replays under a 500-replay budget, to the
   smallest inputs and fewest fault axes that still fail it, and its repro replays
-  exactly that run. A failure message *is* a
+  exactly that run. The human report is in `cargo test`'s shape: one shrunk block per
+  failing check, then a line per check (`ok`, `FAILED` or `untested`, with how many runs
+  tested it, over how many distinct inputs, and how many were skipped), the skipped runs'
+  reasons counted, the checks that draw no inputs named, a result line, and the command
+  that reruns exactly the batch (GUIDE §8 "Reading a batch"). A failure message *is* a
   reproduction (`--seed 0x9f3a...`), so the agent's fix-verify cycle needs no flaky-test
   triage. `--format json` is the machine-readable surface: per-failure `{test, seed,
   master_seed, config, message, repro}`, `coverage`, `missing_coverage` (`{test, key}`

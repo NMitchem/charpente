@@ -23,14 +23,7 @@ fn outbound_fixture_dir() -> String {
 #[test]
 fn sim_green_run_exits_zero_and_prints_master_seed() {
     let out = charpente()
-        .args([
-            "test",
-            "--sim",
-            "--universes",
-            "16",
-            "--dir",
-            &fixture_dir(),
-        ])
+        .args(["test", "--sim", "--runs", "16", "--dir", &fixture_dir()])
         .output()
         .unwrap();
     assert!(
@@ -39,10 +32,21 @@ fn sim_green_run_exits_zero_and_prints_master_seed() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // Every batch ends with the command that reruns it, master seed included,
+    // and announces that seed on stderr before any run starts.
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let rerun = stdout.lines().last().unwrap_or_default();
     assert!(
-        stdout.contains("master seed: 0x"),
-        "every run prints its master seed:\n{stdout}"
+        rerun.starts_with("rerun exactly this batch: charpente test --sim --master-seed 0x")
+            && rerun.ends_with(" --runs 16"),
+        "every batch prints the command that reruns it:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "running 6 sim checks, 16 runs each, under random injected faults (master seed 0x"
+        ),
+        "{stderr}"
     );
 }
 
@@ -52,7 +56,7 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
         .args([
             "test",
             "--sim",
-            "--universes",
+            "--runs",
             "64",
             "--master-seed",
             "0x5eed",
@@ -65,6 +69,22 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("seed:   0x"), "failure block:\n{stdout}");
+    // One block per check, however many of its runs failed: the check line
+    // counts them.
+    assert_eq!(
+        stdout.matches("sim failure in sometimes_fails: ").count(),
+        1,
+        "{stdout}"
+    );
+    let failed: u64 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("check sometimes_fails "))
+        .and_then(|l| l.split_once(" tested: "))
+        .and_then(|(_, l)| l.strip_suffix(" failed)"))
+        .unwrap_or_else(|| panic!("the check line counts the failures:\n{stdout}"))
+        .parse()
+        .unwrap();
+    assert!(failed > 1, "non-vacuous: several runs failed:\n{stdout}");
     assert!(stdout.contains("repro:  charpente test --sim --filter sometimes_fails --seed 0x"));
     // The check's first failure is shrunk. `sometimes_fails` draws nothing and
     // fails on an entropy byte alone, so every fault axis that was on turns
@@ -107,13 +127,16 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
         replayed.contains(&unshrunk),
         "the repro replays the shrunk run\nbatch:\n{block}\nreplay:\n{replayed}"
     );
-    // The gap this closes: a failing run must still reveal its master seed
-    // (previously only an all-green run printed it, in the stdout summary
-    // line) — the startup line goes to stderr, before any universe runs.
+    // The gap this closes: a failing batch must still reveal its master seed
+    // (previously only an all-green batch printed it, in the stdout summary
+    // line) — the startup line goes to stderr, before any run starts.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("master seed") && stderr.contains("0x0000000000005eed"),
-        "startup line must announce the master seed even on a failing run:\n{stderr}"
+        stderr.contains(
+            "running 6 sim checks, 64 runs each, under random injected faults (master seed \
+             0x0000000000005eed)"
+        ),
+        "startup line must announce the master seed even on a failing batch:\n{stderr}"
     );
 }
 
@@ -174,7 +197,7 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
         .args([
             "test",
             "--sim",
-            "--universes",
+            "--runs",
             "64",
             "--master-seed",
             "0x5eed",
@@ -210,14 +233,39 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
         stdout.contains(r#""universe:gave-up":12"#),
         "give-up coverage must agree with the reported count:\n{stdout}"
     );
+    // And a third way: the human batch, byte for byte. GUIDE §8 "Reading a
+    // batch" quotes this output as its sample, pinned to this literal.
+    let human = charpente()
+        .args(["test", "--sim", "--runs", "64", "--master-seed", "0x5eed"])
+        .args(["--filter", "counter_roundtrip", "--dir", &fixture_dir()])
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout),
+        r#"
+check counter_roundtrip ... ok  (52 tested, 12 skipped)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  counter_roundtrip
+    10  Db::open after the crash never booted
+     2  the write was never acked, so durability has nothing to prove
+
+these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
+  counter_roundtrip
+
+sim result: ok. 1 passed; 0 failed. 52 of 64 runs tested a check.
+rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --filter counter_roundtrip
+"#
+    );
 }
 
 /// A universe whose acknowledged write was cut by durable corruption gives up;
 /// it does not pass, because nothing about durability was adjudicated (S3's
 /// sweep, 2026-10-01). One seed per excuse arm, each found by scanning harness
-/// universes. The harness reports no give-up reason, so each arm marks its own
-/// coverage key beside the give-up and the pin reads that key, along with the
-/// corruption axis that fired.
+/// universes. The JSON report these pins read carries no give-up reason, so
+/// each arm marks its own coverage key beside the give-up and the pin reads
+/// that key, along with the corruption axis that fired.
 #[test]
 fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
     for (dir, test, seed, arm) in [
@@ -273,7 +321,7 @@ fn a_universe_whose_acked_write_durable_corruption_cut_gives_up() {
 /// (S3b item 5), as does a universe that ended with nothing to check. One seed
 /// per arm the swarm reaches, found by scanning master seed 0x53b00051
 /// (invoicing, 1,024 universes) or 0x53b00033 (fixture, 256), replayed here
-/// one universe at a time. The harness reports no give-up
+/// one universe at a time. The JSON report these pins read carries no give-up
 /// reason, so each arm marks its own key and the pin reads it. The arms no
 /// scan reached (the read-backs, the key lookup, and the last read's
 /// statuses) give up the same way and have no seed; each property's `require`
@@ -443,18 +491,43 @@ fn a_batch_where_every_universe_gave_up_is_not_an_unqualified_success() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("all green"),
+        !stdout.contains("sim result: ok"),
         "a run that adjudicated nothing must not read as green:\n{stdout}"
     );
     assert!(
-        stdout.contains("0 verdict(s), 1 gave up"),
-        "the human report states the verdict/give-up split:\n{stdout}"
+        stdout.contains("\ncheck counter_roundtrip ... untested  (0 tested, 1 skipped)\n"),
+        "the check line states the tested/skipped split:\n{stdout}"
     );
     assert!(
-        stdout.contains("every universe of \"counter_roundtrip\" gave up")
-            && stdout.contains("adjudicated nothing"),
-        "an all-give-up test must say so by name:\n{stdout}"
+        stdout.contains("\n  counter_roundtrip — never tested: every run was skipped\n"),
+        "an untested check says so by name:\n{stdout}"
     );
+    assert!(
+        stdout.contains(
+            "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. 0 of 1 runs tested a \
+             check.\n"
+        ),
+        "{stdout}"
+    );
+}
+
+/// No backwards compatibility is owed: `--universes` is an unknown flag, the
+/// refusal lists the `--runs` that replaced it, and nothing runs.
+#[test]
+fn the_universes_flag_is_gone() {
+    let out = charpente()
+        .args(["test", "--sim", "--universes", "6", "--dir", &fixture_dir()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.lines().any(|l| l
+            == "error: unknown flag \"--universes\" — valid flags: --runs, --seed, \
+                --master-seed, --filter, --jobs, --format, --inputs, --faults-off, --dir"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty(), "it ran something");
 }
 
 #[test]

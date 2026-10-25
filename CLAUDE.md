@@ -75,7 +75,7 @@ item with the trigger that reopens it.
   requirement is skipped — `floor:` and `ceiling:` as well as `require:`. A green replay says that seed
   passes; it says nothing about any rate, and it cannot be used as evidence a floor or a
   ceiling holds.
-- App-level sim batch: `cargo run -p charpente-cli -- test --sim [--universes N]
+- App-level sim batch: `cargo run -p charpente-cli -- test --sim [--runs N]
   [--seed 0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json]
   [--dir PATH]` — dogfood target `--dir crates/sim-fixture`. Exit 0 green, 1 failures,
   2 usage/launch error. `--master-seed` replays a whole batch byte-identically.

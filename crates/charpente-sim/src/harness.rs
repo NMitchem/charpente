@@ -8,7 +8,7 @@
 //! downstream tooling.
 //!
 //! Batch model: one splitmix64 chain, seeded from the master seed, consumed
-//! in registry order — each selected test draws `args.universes` seeds in
+//! in registry order — each selected test draws `args.runs` seeds in
 //! turn. `--filter` selects tests BEFORE any seed is drawn, so a filtered
 //! run consumes a different (but still fully reproducible) prefix of the
 //! chain than an unfiltered one; that's why every repro line carries the
@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::rng::splitmix64;
 use crate::{
-    FAULT_AXES, FaultConfig, Sim, UniverseEnd, UniverseFailure, ambient_base_seed, axis_on,
-    run_app_universe,
+    FAULT_AXES, FaultConfig, Outcome, Sim, UniverseEnd, UniverseFailure, ambient_base_seed,
+    axis_on, run_app_universe,
 };
 
 /// One registered sim workload. `require` lists sometimes-coverage keys that
@@ -57,7 +57,7 @@ pub enum Format {
 
 #[derive(Debug)]
 pub struct HarnessArgs {
-    pub universes: u64,
+    pub runs: u64,
     pub seed: Option<u64>,
     pub master_seed: Option<u64>,
     pub filter: Option<String>,
@@ -71,11 +71,15 @@ pub struct HarnessArgs {
 }
 
 const VALID_FLAGS: &str =
-    "--universes, --seed, --master-seed, --filter, --jobs, --format, --inputs, --faults-off";
+    "--runs, --seed, --master-seed, --filter, --jobs, --format, --inputs, --faults-off";
+
+/// `--runs` when none is given; the rerun line names `--runs` only when the
+/// batch ran another count.
+const DEFAULT_RUNS: u64 = 256;
 
 impl HarnessArgs {
     pub fn parse(mut args: impl Iterator<Item = String>) -> Result<HarnessArgs, String> {
-        let mut universes = 256u64;
+        let mut runs = DEFAULT_RUNS;
         let mut seed = None;
         let mut master_seed = None;
         let mut filter = None;
@@ -86,7 +90,7 @@ impl HarnessArgs {
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
-                "--universes" => universes = parse_number(&mut args, &flag)?,
+                "--runs" => runs = parse_number(&mut args, &flag)?,
                 "--seed" => seed = Some(parse_hex(&mut args, &flag)?),
                 "--master-seed" => master_seed = Some(parse_hex(&mut args, &flag)?),
                 "--filter" => filter = Some(next_value(&mut args, &flag)?),
@@ -140,10 +144,10 @@ impl HarnessArgs {
             }
         }
 
-        if universes == 0 {
+        if runs == 0 {
             return Err(
-                "--universes must be at least 1 (0 universes is not a trustworthy signal — a \
-                 green run of zero universes proves nothing)"
+                "--runs must be at least 1 (0 runs is not a trustworthy signal — a green batch \
+                 of zero runs proves nothing)"
                     .to_string(),
             );
         }
@@ -164,7 +168,7 @@ impl HarnessArgs {
         }
 
         Ok(HarnessArgs {
-            universes,
+            runs,
             seed,
             master_seed,
             filter,
@@ -553,11 +557,75 @@ impl Report {
     }
 }
 
+/// A batch as the human output reads it: the `Report`, what each check adds
+/// to it, and the command that reruns the batch.
+struct Batch {
+    report: Report,
+    /// Parallel to `report.outcomes`, in registry order.
+    checks: Vec<CheckExtras>,
+    /// The command that reruns exactly this batch; `None` for a `--seed` run.
+    rerun: Option<String>,
+}
+
+/// One check's runs beyond its `TestOutcomes`. A check's tested runs are its
+/// passed and failed ones; its skipped runs gave up.
+#[derive(Debug)]
+struct CheckExtras {
+    passed: u64,
+    failed: u64,
+    /// Skipped runs by reason: count descending, then reason ascending.
+    skipped: Vec<(&'static str, u64)>,
+    /// How many distinct `drawn` lists, values included, the tested runs drew.
+    distinct_inputs: u64,
+    /// Whether any tested run drew an input.
+    drew: bool,
+    /// Each skipped run's detail, filled only under `--seed`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 16's --seed output prints it")
+    )]
+    details: Vec<String>,
+}
+
+/// A check's runs as they are tallied, in seed order.
+#[derive(Default)]
+struct CheckTally {
+    passed: u64,
+    failed: u64,
+    reasons: BTreeMap<&'static str, u64>,
+    inputs: BTreeSet<Vec<(&'static str, String)>>,
+    details: Vec<String>,
+}
+
+impl CheckTally {
+    fn tested(&mut self, drawn: &[(&'static str, String)]) {
+        self.inputs.insert(drawn.to_vec());
+    }
+
+    fn failure(&mut self, failed: &UniverseFailure) {
+        self.failed += 1;
+        self.tested(&failed.drawn);
+    }
+
+    fn into_extras(self) -> CheckExtras {
+        let mut skipped: Vec<(&'static str, u64)> = self.reasons.into_iter().collect();
+        skipped.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        CheckExtras {
+            passed: self.passed,
+            failed: self.failed,
+            skipped,
+            distinct_inputs: self.inputs.len() as u64,
+            drew: self.inputs.iter().any(|drawn| !drawn.is_empty()),
+            details: self.details,
+        }
+    }
+}
+
 /// Runs every test in `tests` whose name contains `args.filter` (all of them
-/// if unset) and writes a human report to `out`. Exit code: 0 green, 1 if
-/// any universe failed or a coverage requirement went unmet, 2 if the
-/// selection is empty — a filter that matches nothing is a usage error, not
-/// a green run of zero tests.
+/// if unset) and writes a human report to `out`. Exit code: 0 green (a batch
+/// whose every check is untested included), 1 if any run failed or a coverage
+/// requirement went unmet, 2 if the selection is empty — a filter that
+/// matches nothing is a usage error, not a green run of zero tests.
 pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) -> i32 {
     let selected: Vec<&SimTest> = tests
         .iter()
@@ -579,27 +647,42 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
         return 2;
     }
 
-    let report = match args.seed {
+    let batch = match args.seed {
         Some(seed) => run_single_seed(&selected, seed, args.inputs.as_deref(), &args.faults_off),
-        None => run_batch(
-            &selected,
-            args.master_seed.unwrap_or_else(ambient_base_seed),
-            args.universes,
-            args.jobs,
-        ),
+        None => {
+            let master_seed = args.master_seed.unwrap_or_else(ambient_base_seed);
+            let mut batch = run_batch(&selected, master_seed, args.runs, args.jobs);
+            batch.rerun = Some(rerun(master_seed, args.runs, args.filter.as_deref()));
+            batch
+        }
     };
 
     match args.format {
-        Format::Human => write_human(&report, out),
+        Format::Human => write_human(&batch, out),
         Format::Json => {
-            let _ = writeln!(out, "{}", report.to_json());
+            let _ = writeln!(out, "{}", batch.report.to_json());
         }
     }
+    let report = &batch.report;
     if report.failures.is_empty() && report.missing_coverage.is_empty() {
         0
     } else {
         1
     }
+}
+
+/// The command that reruns a batch exactly: its master seed, its run count
+/// unless that is the default, and its filter. `--jobs` changes nothing the
+/// batch prints, so it is left out.
+fn rerun(master_seed: u64, runs: u64, filter: Option<&str>) -> String {
+    let mut line = format!("charpente test --sim --master-seed {master_seed:#x}");
+    if runs != DEFAULT_RUNS {
+        line.push_str(&format!(" --runs {runs}"));
+    }
+    if let Some(filter) = filter {
+        line.push_str(&format!(" --filter {filter}"));
+    }
+    line
 }
 
 /// One run per test on `seed`, replaying `inputs` and with `faults_off`
@@ -611,7 +694,7 @@ fn run_single_seed(
     seed: u64,
     inputs: Option<&[u64]>,
     faults_off: &[&'static str],
-) -> Report {
+) -> Batch {
     let mut report = Report {
         master_seed: seed,
         universes: 1,
@@ -620,18 +703,28 @@ fn run_single_seed(
         missing_coverage: Vec::new(),
         outcomes: Vec::new(),
     };
+    let mut checks = Vec::new();
     for test in tests {
         let mut outcomes = TestOutcomes {
             test: test.name,
             verdicts: 0,
             gave_up: 0,
         };
+        let mut check = CheckTally::default();
         match run_app_universe(seed, inputs, faults_off, &test.run) {
             Ok(end) => {
-                tally(&mut outcomes, &end);
+                tally(&mut outcomes, &mut check, &end);
+                if let Outcome::GaveUp {
+                    detail: Some(detail),
+                    ..
+                } = &end.outcome
+                {
+                    check.details.push(detail.clone());
+                }
                 merge(&mut report.coverage, &end.coverage);
             }
             Err(failed) => {
+                check.failure(&failed);
                 let mut failure = Failure::of(test.name, seed, &failed);
                 failure.inputs = inputs.map(<[u64]>::to_vec);
                 failure.faults_off = faults_off.to_vec();
@@ -639,8 +732,13 @@ fn run_single_seed(
             }
         }
         report.outcomes.push(outcomes);
+        checks.push(check.into_extras());
     }
-    report
+    Batch {
+        report,
+        checks,
+        rerun: None,
+    }
 }
 
 impl Failure {
@@ -659,14 +757,30 @@ impl Failure {
     }
 }
 
-/// A universe that failed is neither: it never lands here (the failure branch
-/// files a `Failure` instead), so verdicts + gave_up + failures = universes.
-fn tally(outcomes: &mut TestOutcomes, end: &UniverseEnd) {
-    if end.outcome.gave_up() {
-        outcomes.gave_up += 1;
-    } else {
-        outcomes.verdicts += 1;
+/// A run that failed is neither: it never lands here (the failure branch
+/// files a `Failure` instead), so verdicts + gave_up + failures = runs.
+fn tally(outcomes: &mut TestOutcomes, check: &mut CheckTally, end: &UniverseEnd) {
+    match &end.outcome {
+        Outcome::GaveUp { reason, .. } => {
+            outcomes.gave_up += 1;
+            *check.reasons.entry(reason).or_insert(0) += 1;
+        }
+        Outcome::Verdict => {
+            outcomes.verdicts += 1;
+            check.passed += 1;
+            check.tested(&end.drawn);
+        }
     }
+}
+
+/// The line a batch prints on stderr before any run starts.
+fn startup_line(checks: usize, runs: u64, master_seed: u64) -> String {
+    format!(
+        "running {checks} sim {}, {runs} {} each, under random injected faults (master seed \
+         {master_seed:#018x})",
+        if checks == 1 { "check" } else { "checks" },
+        if runs == 1 { "run" } else { "runs" },
+    )
 }
 
 /// One (test, universe) unit of work: the seed is pre-derived on the main
@@ -674,15 +788,15 @@ fn tally(outcomes: &mut TestOutcomes, end: &UniverseEnd) {
 /// the seed each universe runs with.
 type UniverseOutcome = Result<UniverseEnd, UniverseFailure>;
 
-fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) -> Report {
-    // DESIGN §7: the master seed is printed at startup, before any universe
-    // runs — a failing run from OS entropy must still reveal the seed that
-    // would replay it. stderr, so `--format json`'s stdout stays pure JSON.
-    eprintln!("sim: {universes} universe(s) per test from master seed {master_seed:#018x}");
+fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize) -> Batch {
+    // DESIGN §7: the master seed is printed at startup, before any run starts
+    // — a failing batch from OS entropy must still reveal the seed that would
+    // replay it. stderr, so `--format json`'s stdout stays pure JSON.
+    eprintln!("{}", startup_line(tests.len(), runs, master_seed));
 
     let mut report = Report {
         master_seed,
-        universes,
+        universes: runs,
         failures: Vec::new(),
         coverage: BTreeMap::new(),
         missing_coverage: Vec::new(),
@@ -693,9 +807,9 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
     // order, before any work is distributed — this is the entire reason
     // `--jobs 1` and `--jobs 8` produce byte-identical reports.
     let mut state = master_seed;
-    let mut work: Vec<(usize, u64)> = Vec::with_capacity(tests.len() * universes as usize);
+    let mut work: Vec<(usize, u64)> = Vec::with_capacity(tests.len() * runs as usize);
     for test_index in 0..tests.len() {
-        for _ in 0..universes {
+        for _ in 0..runs {
             work.push((test_index, splitmix64(&mut state)));
         }
     }
@@ -710,6 +824,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
     // Each test's first failure in seed order (universe index, never
     // completion order), with where its `Failure` sits in the report.
     let mut firsts: Vec<(usize, usize, u64, UniverseFailure)> = Vec::new();
+    let mut checks = Vec::with_capacity(tests.len());
     for (test_index, test) in tests.iter().enumerate() {
         let mut covered: BTreeMap<&'static str, u64> = BTreeMap::new();
         let mut outcomes = TestOutcomes {
@@ -717,15 +832,17 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
             verdicts: 0,
             gave_up: 0,
         };
+        let mut check = CheckTally::default();
         let mut first = true;
-        for _ in 0..universes {
+        for _ in 0..runs {
             let (outcome, &(_, seed)) = results.next().expect("one result per work item");
             match outcome {
                 Ok(end) => {
-                    tally(&mut outcomes, &end);
+                    tally(&mut outcomes, &mut check, &end);
                     merge(&mut covered, &end.coverage);
                 }
                 Err(failed) => {
+                    check.failure(&failed);
                     report.failures.push(Failure::of(test.name, seed, &failed));
                     if first {
                         firsts.push((report.failures.len() - 1, test_index, seed, failed));
@@ -735,6 +852,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
             }
         }
         report.outcomes.push(outcomes);
+        checks.push(check.into_extras());
         merge(&mut report.coverage, &covered);
         for key in test.require {
             if covered.get(key).copied().unwrap_or(0) == 0 {
@@ -753,7 +871,11 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
     for ((at, ..), shrunk) in firsts.iter().zip(shrunk) {
         report.failures[*at].shrunk = Some(shrunk);
     }
-    report
+    Batch {
+        report,
+        checks,
+        rerun: None,
+    }
 }
 
 /// `work` over every item on a pool of `jobs` threads, returned in item
@@ -984,59 +1106,171 @@ fn json_escape(s: &str, out: &mut String) {
     }
 }
 
-fn write_human(report: &Report, out: &mut dyn std::io::Write) {
+/// At most this many skipped reasons print per check; the rest are counted.
+const REASONS_SHOWN: usize = 8;
+
+/// The batch in `cargo test`'s shape (GUIDE §8 "Reading a batch"): one block
+/// per failing check, the unmet coverage requirements, a line per check, the
+/// skipped runs' reasons, the checks that draw nothing, the result, and the
+/// command that reruns the batch.
+fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
+    let report = &batch.report;
+    // One block per check: its first failure in seed order, the one a batch
+    // shrinks. The check line counts the rest; JSON keeps every one.
+    let mut shown: BTreeSet<&str> = BTreeSet::new();
     for failure in &report.failures {
-        let _ = write!(out, "{}", human_failure_block(failure));
+        if shown.insert(failure.test) {
+            let _ = write!(out, "{}", human_failure_block(failure));
+        }
     }
     for (test, key) in &report.missing_coverage {
         let _ = writeln!(
             out,
-            "sim coverage requirement failed in {test}: \"{key}\" never occurred over {} \
-             universes — raise the universe count, adjust the workload, or drop the \
-             requirement (a required state that never occurs is an untested claim)",
+            "sim coverage requirement failed in {test}: \"{key}\" never occurred in {} runs — \
+             raise --runs, adjust the workload, or drop the requirement (a required state that \
+             never occurs is an untested claim)",
             report.universes
         );
     }
-    // Printed on green AND red runs, and printed unconditionally: a batch that
-    // adjudicated nothing must never read as an unqualified success, and "0
-    // gave up" is the claim being made rather than noise (MANIFESTO §9).
-    for o in &report.outcomes {
-        if o.gave_up > 0 {
-            let _ = writeln!(
-                out,
-                "sim: {} of {} universes of \"{}\" gave up — reached no verdict",
-                o.gave_up, report.universes, o.test
-            );
+
+    let width = report
+        .outcomes
+        .iter()
+        .map(|o| o.test.chars().count())
+        .max()
+        .unwrap_or(0);
+    let (mut passed, mut failed, mut untested, mut tested_runs) = (0, 0, 0, 0);
+    let _ = writeln!(out);
+    for (o, c) in report.outcomes.iter().zip(&batch.checks) {
+        let tested = c.passed + c.failed;
+        let skipped: u64 = c.skipped.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            c.passed, o.verdicts,
+            "{}: passed runs are its verdicts",
+            o.test
+        );
+        assert_eq!(
+            skipped, o.gave_up,
+            "{}: skipped runs are its give-ups",
+            o.test
+        );
+        let unmet: Vec<String> = report
+            .missing_coverage
+            .iter()
+            .filter(|(test, _)| test == o.test)
+            .map(|(_, key)| format!("\"{key}\""))
+            .collect();
+        tested_runs += tested;
+        // A check that tested nothing is untested, never ok, and a batch whose
+        // every check is untested never reads `ok` either: a batch that
+        // adjudicated nothing must never read as an unqualified success
+        // (MANIFESTO §9).
+        let status = if c.failed > 0 || !unmet.is_empty() {
+            failed += 1;
+            "FAILED"
+        } else if tested == 0 {
+            untested += 1;
+            "untested"
+        } else {
+            passed += 1;
+            "ok"
+        };
+        let mut counts = match c.drew {
+            true => format!("{tested} tested over {} distinct inputs", c.distinct_inputs),
+            false => format!("{tested} tested"),
+        };
+        if c.failed > 0 {
+            counts.push_str(&format!(": {} failed", c.failed));
+            if skipped > 0 {
+                counts.push_str(&format!("; {skipped} skipped"));
+            }
+        } else if skipped > 0 {
+            counts.push_str(&format!(", {skipped} skipped"));
         }
-        // `gave_up == universes`, not `verdicts == 0`: a batch where some
-        // universes FAILED and the rest gave up has zero verdicts too, and
-        // calling that "every universe gave up" would misreport a red run.
-        if report.universes > 0 && o.gave_up == report.universes {
-            let _ = writeln!(
-                out,
-                "sim: every universe of \"{}\" gave up — it adjudicated nothing over {} \
-                 universes; the property is vacuous until the faults it cannot survive are \
-                 narrowed",
-                o.test, report.universes
-            );
+        if !unmet.is_empty() {
+            counts.push_str(&format!("; required {} never occurred", unmet.join(", ")));
+        }
+        let dots = ".".repeat(width - o.test.chars().count() + 3);
+        let _ = writeln!(out, "check {} {dots} {status}  ({counts})", o.test);
+    }
+
+    if batch.checks.iter().any(|c| !c.skipped.is_empty()) {
+        let _ = writeln!(
+            out,
+            "\nskipped runs hit a fault before reaching the check, so they prove nothing either \
+             way:"
+        );
+        for (o, c) in report.outcomes.iter().zip(&batch.checks) {
+            if c.skipped.is_empty() {
+                continue;
+            }
+            let never = match c.passed + c.failed {
+                0 => " — never tested: every run was skipped",
+                _ => "",
+            };
+            let _ = writeln!(out, "  {}{never}", o.test);
+            let listed = &c.skipped[..c.skipped.len().min(REASONS_SHOWN)];
+            let width = listed[0].1.to_string().len();
+            for (reason, n) in listed {
+                let reason = reason
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                let _ = writeln!(out, "    {n:>width$}  {reason}");
+            }
+            let rest = &c.skipped[listed.len()..];
+            if !rest.is_empty() {
+                let runs: u64 = rest.iter().map(|(_, n)| n).sum();
+                let _ = writeln!(
+                    out,
+                    "    and {} more {} ({runs} {}): --format json lists every one",
+                    rest.len(),
+                    if rest.len() == 1 { "reason" } else { "reasons" },
+                    if runs == 1 { "run" } else { "runs" },
+                );
+            }
         }
     }
-    let status = match (report.failures.len(), report.missing_coverage.len()) {
-        (0, 0) => "no failures".to_string(),
-        (0, unmet) => format!("no failures, {unmet} unmet coverage requirement(s)"),
-        (failures, 0) => format!("{failures} failure(s)"),
-        (failures, unmet) => {
-            format!("{failures} failure(s), {unmet} unmet coverage requirement(s)")
+
+    // A check that tested nothing is left out: no run of it tested any case.
+    let scripted: Vec<&str> = report
+        .outcomes
+        .iter()
+        .zip(&batch.checks)
+        .filter(|(_, c)| c.passed + c.failed > 0 && !c.drew)
+        .map(|(o, _)| o.test)
+        .collect();
+    if !scripted.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nthese checks draw no inputs, so every run tested the same case — draw them with \
+             sim.input() (GUIDE §8):"
+        );
+        for check in scripted {
+            let _ = writeln!(out, "  {check}");
         }
+    }
+
+    let word = if failed > 0 {
+        "FAILED"
+    } else if passed == 0 {
+        "nothing tested"
+    } else {
+        "ok"
+    };
+    let untested = match untested {
+        0 => String::new(),
+        x => format!("; {x} untested"),
     };
     let _ = writeln!(
         out,
-        "sim: {} universe(s) per test, {} verdict(s), {} gave up, {status} (master seed: {:#018x})",
-        report.universes,
-        report.verdicts(),
-        report.gave_up(),
-        report.master_seed
+        "\nsim result: {word}. {passed} passed; {failed} failed{untested}. {tested_runs} of {} \
+         runs tested a check.",
+        report.outcomes.len() as u64 * report.universes
     );
+    if let Some(rerun) = &batch.rerun {
+        let _ = writeln!(out, "rerun exactly this batch: {rerun}");
+    }
 }
 
 /// The failure block (GUIDE §8 "Reading a failure"). A check's first failure
@@ -1130,7 +1364,7 @@ mod tests {
     }
 
     fn always_gives_up(sim: &mut Sim) -> Result<(), String> {
-        sim.give_up("toy give-up", "");
+        sim.give_up("the fixture always gives up", "");
         Ok(())
     }
 
@@ -1143,7 +1377,7 @@ mod tests {
     #[test]
     fn defaults_with_no_flags() {
         let args = parse(&[]).unwrap();
-        assert_eq!(args.universes, 256);
+        assert_eq!(args.runs, 256);
         assert_eq!(args.seed, None);
         assert_eq!(args.master_seed, None);
         assert_eq!(args.filter, None);
@@ -1152,9 +1386,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_universes() {
-        let args = parse(&["--universes", "10"]).unwrap();
-        assert_eq!(args.universes, 10);
+    fn parses_runs() {
+        let args = parse(&["--runs", "10"]).unwrap();
+        assert_eq!(args.runs, 10);
+    }
+
+    /// No backwards compatibility is owed: the old flag is an unknown flag,
+    /// and the refusal names the one that replaced it.
+    #[test]
+    fn the_universes_flag_is_gone() {
+        assert_eq!(
+            parse(&["--universes", "6"]).unwrap_err(),
+            "unknown flag \"--universes\" — valid flags: --runs, --seed, --master-seed, --filter, \
+             --jobs, --format, --inputs, --faults-off"
+        );
     }
 
     #[test]
@@ -1189,16 +1434,8 @@ mod tests {
 
     #[test]
     fn combines_multiple_flags() {
-        let args = parse(&[
-            "--universes",
-            "5",
-            "--filter",
-            "receipts",
-            "--format",
-            "json",
-        ])
-        .unwrap();
-        assert_eq!(args.universes, 5);
+        let args = parse(&["--runs", "5", "--filter", "receipts", "--format", "json"]).unwrap();
+        assert_eq!(args.runs, 5);
         assert_eq!(args.filter, Some("receipts".to_string()));
         assert_eq!(args.format, Format::Json);
     }
@@ -1208,7 +1445,7 @@ mod tests {
         let err = parse(&["--bogus"]).unwrap_err();
         assert!(err.contains("--bogus"), "{err}");
         for flag in [
-            "--universes",
+            "--runs",
             "--seed",
             "--master-seed",
             "--filter",
@@ -1227,8 +1464,8 @@ mod tests {
 
     #[test]
     fn bad_number_names_the_flag_and_the_bad_value() {
-        let err = parse(&["--universes", "abc"]).unwrap_err();
-        assert!(err.contains("--universes"), "{err}");
+        let err = parse(&["--runs", "abc"]).unwrap_err();
+        assert!(err.contains("--runs"), "{err}");
         assert!(err.contains("abc"), "{err}");
     }
 
@@ -1379,7 +1616,7 @@ mod tests {
             run: always_fails,
             require: &[],
         }];
-        let args = parse(&["--universes", "1"]).unwrap();
+        let args = parse(&["--runs", "1"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 1);
@@ -1395,7 +1632,7 @@ mod tests {
             run: always_ok,
             require: &[],
         }];
-        let args = parse(&["--universes", "2"]).unwrap();
+        let args = parse(&["--runs", "2"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 0);
@@ -1412,7 +1649,7 @@ mod tests {
             run: covers_something_else,
             require: &["never:happens"],
         }];
-        let args = parse(&["--universes", "3"]).unwrap();
+        let args = parse(&["--runs", "3"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 1);
@@ -1447,7 +1684,7 @@ mod tests {
             require: &[],
         }];
         let refs: Vec<&SimTest> = tests.iter().collect();
-        let report = run_single_seed(&refs, 0x1234, None, &[]);
+        let report = run_single_seed(&refs, 0x1234, None, &[]).report;
         assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
         assert_eq!(
             report.failures[0].coverage.get("restart").copied(),
@@ -1469,7 +1706,7 @@ mod tests {
             require: &[],
         }];
         let refs: Vec<&SimTest> = tests.iter().collect();
-        let report = run_single_seed(&refs, 0x1234, None, &[]);
+        let report = run_single_seed(&refs, 0x1234, None, &[]).report;
         let block = human_failure_block(&report.failures[0]);
         assert!(
             block.contains("fired:  nothing (no faults or events marked coverage"),
@@ -1541,7 +1778,7 @@ mod tests {
             require: &[],
         }];
         let refs: Vec<&SimTest> = tests.iter().collect();
-        let json = run_single_seed(&refs, 0x1234, None, &[]).to_json();
+        let json = run_single_seed(&refs, 0x1234, None, &[]).report.to_json();
         assert!(json.contains("\"coverage\":{\"restart\":1}"), "{json}");
     }
 
@@ -1578,7 +1815,7 @@ mod tests {
                 require: &[],
             },
         ];
-        let args = parse(&["--universes", "1", "--filter", "invoices"]).unwrap();
+        let args = parse(&["--runs", "1", "--filter", "invoices"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 0, "the failing test must be excluded by the filter");
@@ -1587,10 +1824,12 @@ mod tests {
     // --------------------------------------------------- parse hardening
 
     #[test]
-    fn universes_zero_is_a_usage_error() {
-        let err = parse(&["--universes", "0"]).unwrap_err();
-        assert!(err.contains("--universes"), "{err}");
-        assert!(err.contains('0'), "{err}");
+    fn runs_zero_is_a_usage_error() {
+        assert_eq!(
+            parse(&["--runs", "0"]).unwrap_err(),
+            "--runs must be at least 1 (0 runs is not a trustworthy signal — a green batch of \
+             zero runs proves nothing)"
+        );
     }
 
     #[test]
@@ -1631,8 +1870,8 @@ mod tests {
         };
         let master_seed = 0xf00d_beef_u64;
 
-        let sequential = run_batch(&[&test], master_seed, 64, 1);
-        let parallel = run_batch(&[&test], master_seed, 64, 8);
+        let sequential = run_batch(&[&test], master_seed, 64, 1).report;
+        let parallel = run_batch(&[&test], master_seed, 64, 8).report;
 
         assert!(
             !sequential.failures.is_empty(),
@@ -1675,7 +1914,7 @@ mod tests {
             run: covers_something_else,
             require: &["never:happens"],
         };
-        let report = run_batch(&[&test], 0x1234, 8, 4);
+        let report = run_batch(&[&test], 0x1234, 8, 4).report;
         assert_eq!(
             report.missing_coverage,
             vec![("that_test".to_string(), "never:happens".to_string())]
@@ -1693,7 +1932,7 @@ mod tests {
             run: covers_something_else,
             require: &["never:happens"],
         }];
-        let args = parse(&["--universes", "8", "--jobs", "4"]).unwrap();
+        let args = parse(&["--runs", "8", "--jobs", "4"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 1);
@@ -1701,7 +1940,11 @@ mod tests {
         assert!(text.contains("that_test"), "{text}");
         assert!(text.contains("never:happens"), "{text}");
         assert!(
-            text.contains("raise the universe count, adjust the workload, or drop the requirement"),
+            text.contains(
+                "sim coverage requirement failed in that_test: \"never:happens\" never occurred \
+                 in 8 runs — raise --runs, adjust the workload, or drop the requirement (a \
+                 required state that never occurs is an untested claim)\n"
+            ),
             "{text}"
         );
     }
@@ -1723,7 +1966,7 @@ mod tests {
             run: always_ok,
             require: &[],
         };
-        let report = run_batch(&[&gives_up, &passes], 0x1234, 4, 2);
+        let report = run_batch(&[&gives_up, &passes], 0x1234, 4, 2).report;
         assert_eq!(
             report.outcomes,
             vec![
@@ -1757,7 +2000,7 @@ mod tests {
             run: gives_up_then_fails,
             require: &[],
         };
-        let report = run_batch(&[&test], 0x1234, 3, 1);
+        let report = run_batch(&[&test], 0x1234, 3, 1).report;
         assert_eq!(report.failures.len(), 3);
         assert_eq!(report.verdicts(), 0);
         assert_eq!(report.gave_up(), 0, "a failed universe is neither");
@@ -1770,24 +2013,33 @@ mod tests {
             run: always_gives_up,
             require: &[],
         }];
-        let args = parse(&["--universes", "4"]).unwrap();
+        let args = parse(&["--runs", "4"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 0, "giving up is not a failure");
         let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains("all green"), "{text}");
-        assert!(text.contains("0 verdict(s), 4 gave up"), "{text}");
+        assert!(!text.contains("sim result: ok"), "{text}");
         assert!(
-            text.contains("every universe of \"gives_up\" gave up"),
+            text.contains("\ncheck gives_up ... untested  (0 tested, 4 skipped)\n"),
             "{text}"
         );
-        assert!(text.contains("adjudicated nothing"), "{text}");
+        assert!(
+            text.contains("\n  gives_up — never tested: every run was skipped\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. 0 of 4 runs tested \
+                 a check.\n"
+            ),
+            "{text}"
+        );
     }
 
-    /// The vacuity line is about universes that ADJUDICATED NOTHING, not about
-    /// a zero verdict count — a batch whose universes half failed and half gave
-    /// up also has zero verdicts, and calling that "every universe gave up"
-    /// would describe a red run as a vacuous green one.
+    /// "Never tested" is about a check whose every run was skipped, not about
+    /// a zero pass count: a check whose runs half failed and half gave up has
+    /// passed nothing too, and calling that untested would describe a red
+    /// check as a vacuous green one.
     #[test]
     fn a_batch_that_failed_is_not_reported_as_every_universe_gave_up() {
         fn gives_up_or_fails(sim: &mut Sim) -> Result<(), String> {
@@ -1806,29 +2058,35 @@ mod tests {
             run: gives_up_or_fails,
             require: &[],
         }];
-        let args = parse(&["--universes", "16", "--master-seed", "0xf00d"]).unwrap();
+        let args = parse(&["--runs", "16", "--master-seed", "0xf00d"]).unwrap();
         let mut out = Vec::new();
         assert_eq!(run(&tests, &args, &mut out), 1);
         let text = String::from_utf8(out).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("check mixed ... "))
+            .unwrap_or_else(|| panic!("{text}"));
+        let (failed, skipped) = line
+            .strip_prefix("check mixed ... FAILED  (")
+            .and_then(|l| l.strip_suffix(" skipped)"))
+            .and_then(|l| l.split_once(" failed; "))
+            .unwrap_or_else(|| panic!("a check with failures is FAILED: {line}"));
+        let (tested, failed) = failed.split_once(" tested: ").unwrap();
+        assert_eq!(tested, failed, "no run passed: {line}");
+        // Non-vacuity: this batch really does mix failures with skips, so the
+        // absence of the never-tested heading below is a decision, not an
+        // accident.
+        assert!(skipped.parse::<u64>().unwrap() > 0, "{line}");
+        assert!(text.contains("\n  mixed\n"), "{text}");
+        assert!(!text.contains("never tested"), "{text}");
         assert!(
-            text.contains("0 verdict(s)"),
-            "no universe adjudicated: {text}"
+            text.contains("\nsim result: FAILED. 0 passed; 1 failed. "),
+            "{text}"
         );
-        // Non-vacuity: this batch really does mix failures with give-ups, so
-        // the absence of the vacuity line below is a decision, not an accident.
-        assert!(
-            text.contains("universes of \"mixed\" gave up"),
-            "some universes must have given up for this test to mean anything: {text}"
-        );
-        assert!(
-            !text.contains("every universe of"),
-            "some universes FAILED — they did not give up: {text}"
-        );
-        assert!(text.contains("failure(s)"), "{text}");
     }
 
-    /// A run red only on coverage used to end "…, 0 failure(s)", which reads as
-    /// green to anyone skimming the last line.
+    /// A batch red only on coverage used to end "…, 0 failure(s)", which reads
+    /// as green to anyone skimming the last line.
     #[test]
     fn a_coverage_only_red_says_what_is_actually_unmet() {
         fn covers_something_else(sim: &mut Sim) -> Result<(), String> {
@@ -1840,31 +2098,43 @@ mod tests {
             run: covers_something_else,
             require: &["never:happens"],
         }];
-        let args = parse(&["--universes", "2"]).unwrap();
+        let args = parse(&["--runs", "2"]).unwrap();
         let mut out = Vec::new();
         assert_eq!(run(&tests, &args, &mut out), 1);
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("no failures, 1 unmet coverage requirement(s)"),
+            text.contains(
+                "\ncheck that_test ... FAILED  (2 tested; required \"never:happens\" never \
+                 occurred)\n"
+            ),
             "{text}"
         );
-        assert!(!text.contains("0 failure(s)"), "{text}");
+        assert!(
+            text.contains(
+                "\nsim result: FAILED. 0 passed; 1 failed. 2 of 2 runs tested a check.\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
-    fn a_fully_green_batch_still_states_its_verdict_count() {
+    fn a_fully_green_batch_still_states_how_many_runs_tested_a_check() {
         let tests = [SimTest {
             name: "always_ok",
             run: always_ok,
             require: &[],
         }];
-        let args = parse(&["--universes", "5"]).unwrap();
+        let args = parse(&["--runs", "5"]).unwrap();
         let mut out = Vec::new();
         assert_eq!(run(&tests, &args, &mut out), 0);
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("5 verdict(s), 0 gave up, no failures"),
-            "\"0 gave up\" is the claim being made, not noise: {text}"
+            text.contains("\ncheck always_ok ... ok  (5 tested)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nsim result: ok. 1 passed; 0 failed. 5 of 5 runs tested a check.\n"),
+            "\"5 of 5\" is the claim being made, not noise: {text}"
         );
     }
 
@@ -1875,7 +2145,7 @@ mod tests {
             run: always_gives_up,
             require: &[],
         };
-        let report = run_batch(&[&test], 0x1234, 6, 1);
+        let report = run_batch(&[&test], 0x1234, 6, 1).report;
         assert_eq!(report.coverage.get("universe:gave-up").copied(), Some(6));
     }
 
@@ -1889,7 +2159,7 @@ mod tests {
             require: &[],
         }];
         let args = parse(&[
-            "--universes",
+            "--runs",
             "1",
             "--master-seed",
             "0xabc123",
@@ -1941,7 +2211,7 @@ mod tests {
             run: always_fails,
             require: &[],
         }];
-        let args = parse(&["--universes", "1", "--format", "json"]).unwrap();
+        let args = parse(&["--runs", "1", "--format", "json"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 1);
@@ -1962,7 +2232,7 @@ mod tests {
             require: &[],
         }];
         let args = parse(&[
-            "--universes",
+            "--runs",
             "1",
             "--master-seed",
             "0xabc123",
@@ -2074,7 +2344,7 @@ mod tests {
     #[test]
     fn a_failure_shrinks_to_the_smallest_inputs_that_still_fail() {
         let tests = [sim_test("two_far_apart", two_far_apart)];
-        let flags = ["--universes", "4", "--master-seed", "0x5400", "--jobs", "2"];
+        let flags = ["--runs", "4", "--master-seed", "0x5400", "--jobs", "2"];
         let (code, out) = run_to_string(&tests, &flags);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, "two_far_apart");
@@ -2129,7 +2399,7 @@ mod tests {
         let axes = on(seed);
         let tests = [sim_test("always_fails", always_fails)];
         let master = format!("{master:#x}");
-        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", &master]);
+        let (code, out) = run_to_string(&tests, &["--runs", "1", "--master-seed", &master]);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, "always_fails");
         // Every axis that was on, in field order, one replay each.
@@ -2179,16 +2449,7 @@ mod tests {
     fn a_fault_dependent_draw_count_shrinks_deterministically_and_its_repro_replays() {
         let check = "draws_until_the_disk_gives_out";
         let tests = [sim_test(check, draws_until_the_disk_gives_out)];
-        let flags = |jobs| {
-            [
-                "--universes",
-                "24",
-                "--master-seed",
-                "0xd2aa",
-                "--jobs",
-                jobs,
-            ]
-        };
+        let flags = |jobs| ["--runs", "24", "--master-seed", "0xd2aa", "--jobs", jobs];
         let (code, out) = run_to_string(&tests, &flags("1"));
         assert_eq!(code, 1, "{out}");
         assert_eq!(run_to_string(&tests, &flags("1")).1, out, "two runs differ");
@@ -2210,7 +2471,7 @@ mod tests {
     fn a_slipped_shrink_prints_the_first_message_and_replays_the_shrunk_one() {
         let check = "two_far_apart_after_n";
         let tests = [sim_test(check, two_far_apart_after_n)];
-        let (code, out) = run_to_string(&tests, &["--universes", "4", "--master-seed", "0x5400"]);
+        let (code, out) = run_to_string(&tests, &["--runs", "4", "--master-seed", "0x5400"]);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, check);
         let shrunk = "after 2 draws, two are 500 or more apart";
@@ -2251,7 +2512,7 @@ mod tests {
     fn nothing_smaller_fails_prints_so() {
         let check = "fails_only_as_sampled";
         let tests = [sim_test(check, fails_only_as_sampled)];
-        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", "0x77"]);
+        let (code, out) = run_to_string(&tests, &["--runs", "1", "--master-seed", "0x77"]);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, check);
         let replays: u32 = line(block, "  shrunk: ")
@@ -2298,7 +2559,7 @@ mod tests {
     fn a_run_that_read_zeros_past_its_choices_replays_with_inputs() {
         let check = "fails_on_its_own_first_draw";
         let tests = [sim_test(check, fails_on_its_own_first_draw)];
-        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", "0x77"]);
+        let (code, out) = run_to_string(&tests, &["--runs", "1", "--master-seed", "0x77"]);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, check);
         let seed = {
@@ -2327,27 +2588,31 @@ mod tests {
 
     /// A clock axis sampled with a chance of 0 cannot fire whatever its size,
     /// so the shrink spends no replay on it and `faults off:` never lists it.
+    /// Master 0x24 is the first whose one run samples `clock_step_back` with a
+    /// chance of 0 and a size above 0 (found by scanning up from 0).
     #[test]
     fn an_axis_that_cannot_fire_is_never_listed_as_turned_off() {
-        let (master, seed) = (0u64..)
-            .map(|m| {
-                let mut s = m;
-                (m, splitmix64(&mut s))
-            })
-            .find(|&(_, s)| {
-                let cfg = crate::app_config(s, &[]);
-                cfg.clock_step_back.0 == 0.0 && cfg.clock_step_back.1 > Duration::ZERO
-            })
-            .unwrap();
+        const MASTER: u64 = 0x24;
+        let seed = {
+            let mut s = MASTER;
+            splitmix64(&mut s)
+        };
         let cfg = crate::app_config(seed, &[]);
+        assert!(
+            cfg.clock_step_back.0 == 0.0 && cfg.clock_step_back.1 > Duration::ZERO,
+            "master {MASTER:#x}'s run (seed {seed:#x}) no longer samples clock_step_back with a \
+             chance of 0 and a nonzero size, so it cannot pin this: {:?}. Re-find it as the \
+             first master, counting up from 0, whose run does.",
+            cfg.clock_step_back
+        );
         let axes: Vec<&str> = FAULT_AXES
             .into_iter()
             .filter(|a| axis_on(&cfg, a))
             .collect();
         assert!(!axes.contains(&"clock_step_back"), "{axes:?}");
         let tests = [sim_test("always_fails", always_fails)];
-        let master = format!("{master:#x}");
-        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", &master]);
+        let master = format!("{MASTER:#x}");
+        let (code, out) = run_to_string(&tests, &["--runs", "1", "--master-seed", &master]);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, "always_fails");
         assert!(
@@ -2374,16 +2639,7 @@ mod tests {
             sim_test(checks[0], two_far_apart),
             sim_test(checks[1], draws_until_the_disk_gives_out),
         ];
-        let flags = |jobs| {
-            [
-                "--universes",
-                "8",
-                "--master-seed",
-                "0x5400",
-                "--jobs",
-                jobs,
-            ]
-        };
+        let flags = |jobs| ["--runs", "8", "--master-seed", "0x5400", "--jobs", jobs];
         let (code, out) = run_to_string(&tests, &flags("1"));
         assert_eq!(code, 1, "{out}");
         assert_eq!(
@@ -2495,5 +2751,335 @@ mod tests {
             "--faults-off: \"corruption_scope\" is not a fault axis: it scopes bit_flip and \
              misdirected_write, so turn those off instead"
         );
+    }
+
+    // ------------------------------------------------- the batch's output
+
+    /// The seeds one check's runs get in a batch from `master`: the first
+    /// check's, or any check's when it is the only one selected.
+    fn batch_seeds(master: u64, runs: u64) -> Vec<u64> {
+        let mut state = master;
+        (0..runs).map(|_| splitmix64(&mut state)).collect()
+    }
+
+    #[test]
+    fn a_batch_prints_cargo_shaped_check_lines_reasons_and_a_rerun() {
+        let tests = [
+            sim_test("always_passes", always_ok),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let (code, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            out,
+            "\n\
+             check always_passes ..... ok  (6 tested)\n\
+             check always_gives_up ... untested  (0 tested, 6 skipped)\n\
+             \n\
+             skipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
+             \x20 always_gives_up — never tested: every run was skipped\n\
+             \x20   6  the fixture always gives up\n\
+             \n\
+             these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):\n\
+             \x20 always_passes\n\
+             \n\
+             sim result: ok. 1 passed; 0 failed; 1 untested. 6 of 12 runs tested a check.\n\
+             rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6\n"
+        );
+    }
+
+    #[test]
+    fn a_batch_where_every_check_is_untested_never_reads_ok() {
+        let tests = [sim_test("always_gives_up", always_gives_up)];
+        let (code, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
+        assert_eq!(code, 0, "an untested check is not a failure: {out}");
+        let result = out
+            .lines()
+            .find(|l| l.starts_with("sim result: "))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(
+            result.starts_with("sim result: nothing tested. 0 passed; 0 failed; 1 untested."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_rerun_line_carries_the_filter_and_a_non_default_run_count() {
+        let tests = [
+            sim_test("always_passes", always_ok),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let flags = [
+            "--filter",
+            "always_p",
+            "--runs",
+            "6",
+            "--master-seed",
+            "0x1234",
+        ];
+        let (_, out) = run_to_string(&tests, &flags);
+        let rerun = "rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6 \
+                     --filter always_p";
+        assert_eq!(out.lines().last(), Some(rerun), "{out}");
+        // The line is a command that reruns exactly this batch, byte for byte.
+        let args: Vec<&str> = rerun
+            .strip_prefix("rerun exactly this batch: charpente test --sim ")
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(run_to_string(&tests, &args).1, out);
+        // The default count and no filter add nothing after the master seed.
+        let (_, out) = run_to_string(&tests, &["--master-seed", "0x1234"]);
+        assert_eq!(
+            out.lines().last(),
+            Some("rerun exactly this batch: charpente test --sim --master-seed 0x1234"),
+            "{out}"
+        );
+    }
+
+    const TWELVE: [&str; 12] = [
+        "fallout: 0",
+        "fallout: 1",
+        "fallout: 2",
+        "fallout: 3",
+        "fallout: 4",
+        "fallout: 5",
+        "fallout: 6",
+        "fallout: 7",
+        "fallout: 8",
+        "fallout: 9",
+        "fallout: 10",
+        "fallout: 11",
+    ];
+
+    /// Which of `TWELVE` a seed gives up for: the first for half the seeds,
+    /// so the counts differ in width, and one of the other eleven otherwise.
+    fn twelfth(seed: u64) -> usize {
+        match seed % 2 {
+            0 => 0,
+            _ => 1 + (seed / 2 % 11) as usize,
+        }
+    }
+
+    fn gives_up_twelve_ways(sim: &mut Sim) -> Result<(), String> {
+        sim.give_up(TWELVE[twelfth(sim.seed())], "");
+        Ok(())
+    }
+
+    #[test]
+    fn more_than_eight_reasons_print_eight_and_count_the_rest_identically_under_any_jobs() {
+        let tests = [sim_test("gives_up_twelve_ways", gives_up_twelve_ways)];
+        let flags = |jobs| ["--runs", "256", "--master-seed", "0x1234", "--jobs", jobs];
+        let (code, out) = run_to_string(&tests, &flags("1"));
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            run_to_string(&tests, &flags("4")).1,
+            out,
+            "--jobs 4 differs"
+        );
+        // Each reason's count, worked out from the batch's seeds alone, then
+        // ordered by count descending and reason ascending.
+        let mut counts = [0u64; 12];
+        for seed in batch_seeds(0x1234, 256) {
+            counts[twelfth(seed)] += 1;
+        }
+        let mut reasons: Vec<(&str, u64)> = TWELVE.into_iter().zip(counts).collect();
+        reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        // Non-vacuous: every reason occurs, and the counts differ in width,
+        // so the right-alignment is exercised.
+        assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
+        assert!(reasons[0].1 >= 100 && reasons[7].1 < 100, "{reasons:?}");
+        let width = reasons[0].1.to_string().len();
+        let mut want = String::from(
+            "\nskipped runs hit a fault before reaching the check, so they prove nothing either \
+             way:\n  gives_up_twelve_ways — never tested: every run was skipped\n",
+        );
+        for (reason, n) in &reasons[..8] {
+            want.push_str(&format!("    {n:>width$}  {reason}\n"));
+        }
+        let rest: u64 = reasons[8..].iter().map(|(_, n)| n).sum();
+        want.push_str(&format!(
+            "    and 4 more reasons ({rest} runs): --format json lists every one\n\nsim result: "
+        ));
+        assert!(out.contains(&want), "want:\n{want}\nout:\n{out}");
+    }
+
+    /// Fails on some seeds, gives up on others and passes the rest.
+    fn fails_skips_or_passes(sim: &mut Sim) -> Result<(), String> {
+        match sim.seed() % 3 {
+            0 => Err("the seed is a multiple of 3".into()),
+            1 => {
+                sim.give_up("the seed is one past a multiple of 3", "");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[test]
+    fn a_check_with_failures_skips_and_an_unmet_requirement_says_all_three() {
+        let tests = [SimTest {
+            name: "fails_skips_or_passes",
+            run: fails_skips_or_passes,
+            require: &["never:marked"],
+        }];
+        let report = run_batch(&[&tests[0]], 0x1234, 24, 1).report;
+        let (o, f) = (&report.outcomes[0], report.failures.len() as u64);
+        assert!(
+            o.verdicts > 0 && o.gave_up > 0 && f > 0,
+            "non-vacuous: {o:?}, {f} failed"
+        );
+        let (code, out) = run_to_string(&tests, &["--runs", "24", "--master-seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        let want = format!(
+            "\ncheck fails_skips_or_passes ... FAILED  ({} tested: {f} failed; {} skipped; \
+             required \"never:marked\" never occurred)\n",
+            o.verdicts + f,
+            o.gave_up
+        );
+        assert!(out.contains(&want), "want:{want}\nout:\n{out}");
+        assert!(
+            out.contains("\nsim result: FAILED. 0 passed; 1 failed. "),
+            "{out}"
+        );
+    }
+
+    fn gives_up_with_escapes(sim: &mut Sim) -> Result<(), String> {
+        sim.give_up("line one\nline two\tend\r", "");
+        Ok(())
+    }
+
+    #[test]
+    fn a_reason_with_a_newline_stays_on_one_line() {
+        let tests = [sim_test("gives_up_with_escapes", gives_up_with_escapes)];
+        let (_, out) = run_to_string(&tests, &["--runs", "3", "--master-seed", "0x1234"]);
+        assert!(
+            out.contains(
+                "\n  gives_up_with_escapes — never tested: every run was skipped\n    3  line \
+                 one\\nline two\\tend\\r\n\nsim result: "
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_startup_line_names_checks_runs_and_the_master_seed() {
+        assert_eq!(
+            startup_line(2, 6, 0x1234),
+            "running 2 sim checks, 6 runs each, under random injected faults (master seed \
+             0x0000000000001234)"
+        );
+        assert_eq!(
+            startup_line(1, 1, 0x1234),
+            "running 1 sim check, 1 run each, under random injected faults (master seed \
+             0x0000000000001234)"
+        );
+    }
+
+    /// Draws a digit, then gives up on 7 or more, fails on 0 and passes
+    /// otherwise.
+    fn draws_a_digit(sim: &mut Sim) -> Result<(), String> {
+        match sim.input().between("n", 0, 9) {
+            7.. => {
+                sim.give_up("drew 7 or more", "");
+                Ok(())
+            }
+            0 => Err("drew 0".into()),
+            _ => Ok(()),
+        }
+    }
+
+    #[test]
+    fn a_check_that_drew_inputs_counts_them_and_one_that_did_not_is_listed() {
+        let tests = [
+            sim_test("draws_a_digit", draws_a_digit),
+            sim_test("draws_nothing", always_ok),
+        ];
+        let (code, out) = run_to_string(&tests, &["--runs", "64", "--master-seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        // Worked out from the batch's seeds alone: the digit each run draws.
+        let digits: Vec<u64> = batch_seeds(0x1234, 64)
+            .into_iter()
+            .map(|seed| Sim::new(seed).input().between("n", 0, 9))
+            .collect();
+        let tested: Vec<u64> = digits.iter().copied().filter(|&n| n < 7).collect();
+        let failed = tested.iter().filter(|&&n| n == 0).count();
+        let distinct = tested.iter().collect::<BTreeSet<_>>().len();
+        // Non-vacuous: the count is of distinct draws, values included (more
+        // than one), over the tested runs only (fewer than the runs; skipped
+        // runs drew other digits), a failed run's among them.
+        assert!(
+            1 < distinct && distinct < tested.len() && failed > 0 && digits.iter().any(|&n| n >= 7),
+            "{digits:?}"
+        );
+        assert!(
+            out.contains(&format!(
+                "\ncheck draws_a_digit ... FAILED  ({} tested over {distinct} distinct inputs: \
+                 {failed} failed; {} skipped)\n",
+                tested.len(),
+                digits.len() - tested.len()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("\ncheck draws_nothing ... ok  (64 tested)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "\n\nthese checks draw no inputs, so every run tested the same case — draw them \
+                 with sim.input() (GUIDE §8):\n  draws_nothing\n\nsim result: "
+            ),
+            "{out}"
+        );
+    }
+
+    /// R16: a check prints one failure block, its first in seed order, which
+    /// the batch shrinks; its line counts the rest. JSON keeps every one.
+    #[test]
+    fn a_check_with_several_failing_runs_prints_one_block_and_it_is_the_shrunk_one() {
+        let tests = [sim_test("always_fails", always_fails)];
+        let flags = ["--runs", "6", "--master-seed", "0x1234"];
+        let (code, out) = run_to_string(&tests, &flags);
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(
+            out.matches("sim failure in always_fails: ").count(),
+            1,
+            "{out}"
+        );
+        let block = first_block(&out, "always_fails");
+        assert!(line(block, "  shrunk: ").is_some(), "{block}");
+        let first = batch_seeds(0x1234, 6)[0];
+        assert_eq!(
+            line(block, "  seed:   "),
+            Some(format!("{first:#018x}").as_str()),
+            "the first failure in seed order: {block}"
+        );
+        assert!(
+            out.contains("\ncheck always_fails ... FAILED  (6 tested: 6 failed)\n"),
+            "{out}"
+        );
+        let (_, json) = run_to_string(&tests, &[&flags[..], &["--format", "json"]].concat());
+        assert_eq!(
+            json.matches("{\"test\":\"always_fails\",\"seed\":").count(),
+            6,
+            "{json}"
+        );
+    }
+
+    /// A `--seed` run keeps each skipped run's detail; a batch keeps none.
+    #[test]
+    fn only_a_replayed_seed_keeps_a_skipped_runs_detail() {
+        fn gives_up_with_a_detail(sim: &mut Sim) -> Result<(), String> {
+            sim.give_up("the fixture gives up", format!("on seed {:#x}", sim.seed()));
+            Ok(())
+        }
+        let test = sim_test("gives_up_with_a_detail", gives_up_with_a_detail);
+        let replayed = run_single_seed(&[&test], 0x1234, None, &[]);
+        assert_eq!(replayed.checks[0].details, ["on seed 0x1234"]);
+        assert_eq!(replayed.checks[0].skipped, [("the fixture gives up", 1)]);
+        let batch = run_batch(&[&test], 0x1234, 4, 1);
+        assert!(batch.checks[0].details.is_empty());
+        assert_eq!(batch.checks[0].skipped, [("the fixture gives up", 4)]);
     }
 }

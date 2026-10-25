@@ -1,6 +1,6 @@
 //! `charpente test --sim`: build the app crate's `sim` integration test
 //! target via cargo, then exec the resulting binary directly — the harness
-//! itself (arg parsing, universes, reporting) lives entirely in
+//! itself (arg parsing, runs, reporting) lives entirely in
 //! `charpente-sim::harness` and runs inside that binary. This module only
 //! knows how to find it and how to strip `--dir` out of the passthrough
 //! flags (spec: docs/superpowers/specs/2026-07-05-sim-cli-design.md).
@@ -17,7 +17,7 @@ use std::process::{Command, ExitStatus};
 /// take exactly one value — that's what lets a plain linear scan tell flags
 /// from values without knowing anything else about their meaning.
 const KNOWN_FLAGS: &[&str] = &[
-    "--universes",
+    "--runs",
     "--seed",
     "--master-seed",
     "--filter",
@@ -28,7 +28,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--dir",
 ];
 
-pub const USAGE: &str = "usage: charpente test --sim [--universes N] [--seed 0x…] \
+pub const USAGE: &str = "usage: charpente test --sim [--runs N] [--seed 0x…] \
 [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json] [--inputs HEX] \
 [--faults-off AXIS,…] [--dir PATH]\n\
        --dir PATH   the app crate directory to build and run sim tests from (default: .)";
@@ -204,16 +204,13 @@ mod tests {
 
     #[test]
     fn split_dir_extracts_dir_and_passes_through_the_rest() {
-        let args: Vec<String> = ["--universes", "16", "--dir", "../sim-fixture"]
+        let args: Vec<String> = ["--runs", "16", "--dir", "../sim-fixture"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let (dir, passthrough) = split_dir(&args).unwrap();
         assert_eq!(dir, "../sim-fixture");
-        assert_eq!(
-            passthrough,
-            vec!["--universes".to_string(), "16".to_string()]
-        );
+        assert_eq!(passthrough, vec!["--runs".to_string(), "16".to_string()]);
     }
 
     #[test]

@@ -3015,9 +3015,16 @@ When a check fails, its first failure is shrunk to the smallest draws that still
 fail it, and the failure block lists them by name on its `inputs:` line
 ("Shrinking a failure" below).
 
-### Giving up: a universe that reached no verdict
+A batch counts, on each check's line, how many distinct inputs its tested runs
+drew: two runs that drew the same values, under the same names and in the same
+order, count once.
+It is a count, never a threshold. A check whose workload draws nothing is named
+under the check lines, because every one of its runs tested the same scripted
+case, whatever the faults did ("Reading a batch" below).
 
-Sooner or later a workload hits a universe where the faults are severe enough
+### Giving up: a skipped run
+
+Sooner or later a workload hits a run where the faults are severe enough
 that it cannot test its claim at all: the database never opened, the write was
 never acknowledged, every recovery attempt was exhausted, or durable corruption
 cut the very record the claim was about. That is not a pass —
@@ -3079,8 +3086,8 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
     match db.snapshot().and_then(|snap| snap.get::<Counter>(Id::from_raw(1))) {
         Ok(Some(_)) => Ok(()),
         // The one loss the platform excuses on a single node, and an excused
-        // universe GIVES UP: the row's durability was not adjudicated, and a
-        // pass needs a verdict.
+        // run GIVES UP: the row's durability was not adjudicated, and a pass
+        // needs a verdict.
         Ok(None) if durable_corruption_fired(sim) => {
             sim.give_up("durable corruption cut the acked row, so durability was not adjudicated", "");
             Ok(())
@@ -3095,25 +3102,26 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
 }
 ```
 
-- `sim.give_up(reason, detail)` records the give-up **on the universe**, not in
+- `sim.give_up(reason, detail)` records the give-up **on the run**, not in
   the value you return. That is deliberate: a `Result` can be mapped back to
   `Ok(())` by a wrapper before the runner ever sees it, and for a long time
   that is exactly what happened — a property could report green having
-  concluded nothing over most of its universes.
+  concluded nothing over most of its runs.
 - **The reason is fixed text; the detail is this run's own.** `reason` is a
   `&'static str` that names the *kind* of give-up and embeds nothing that
-  varies between runs: no error text, count or seq. `charpente test --sim`
-  groups give-ups by reason, so a reason with a seq in it makes every universe
-  its own group and the grouping says nothing. What varies goes in `detail`
-  (anything `Display`: `e`, `format!("in {BOOT_TRIES} boots")`), which
-  `--seed` prints for the one universe it replays. A give-up with nothing to
-  add passes `""`, and an empty detail is none. `sim.gave_up()` reads the
-  reason and `sim.gave_up_detail()` the detail; `Outcome::GaveUp` carries both.
+  varies between runs: no error text, count or seq. A batch groups each
+  check's skipped runs by reason and counts each group, so a reason with a seq
+  in it makes every run its own group and the counts say nothing. What varies
+  goes in `detail` (anything `Display`: `e`, `format!("in {BOOT_TRIES}
+  boots")`): that one run's own text, which the batch does not print. A
+  give-up with nothing to add passes `""`, and an empty detail is none.
+  `sim.gave_up()` reads the reason and `sim.gave_up_detail()` the detail;
+  `Outcome::GaveUp` carries both.
 - First call wins, reason and detail together; later ones are consequences of
   the first.
 - **Give up and stop.** The record is sticky and nothing enforces terminality,
   so if you give up inside a retry arm and the loop then goes on to adjudicate,
-  the universe is still reported as a give-up and that verdict is thrown away.
+  the run is still reported as skipped and that verdict is thrown away.
   `give_up` and the `return`/`break` belong on the same arm. This bites hardest
   in a multi-round checker on your own `sim` (`acked_implies_durable`).
 - A workload that gives up and then returns `Err` is still a **failure**.
@@ -3140,8 +3148,8 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   adjudicating nothing with every batch green; a floor on the key would bound
   give-ups from below, which guards nothing. An app's `sim_tests!` takes no
   `ceiling:`. Its property `require`s instead the key its verdict marks, past
-  every give-up arm. That fails a batch in which no universe reached a
-  verdict, but not one whose rate merely drifted.
+  every give-up arm. That fails a batch in which no run reached a verdict,
+  but not one whose rate merely drifted.
 - A cap bounds what a property fails to conclude, not how much it checks, so
   pair it with a `floor: [("key", N)]` on the key that counts its checks
   (written before `ceiling:`, on either macro). A change that skips a round's
@@ -3154,22 +3162,53 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   both: the coverage keys are a floorable distribution over *causes*, and the
   outcome is the scalar the runner reports. Neither replaces the other.
 
-Every batch now states the split, whether or not anything gave up:
+Every batch states, check by check, how many runs tested the check and how many
+were skipped, and why each skipped run was skipped, whether or not anything was
+skipped. This is a pinned batch of `crates/sim-fixture`, `charpente test --sim
+--runs 64 --master-seed 0x5eed --filter counter_roundtrip`:
 
+<!-- pinned -->
 ```text
-sim: 64 universe(s) per test, 36 verdict(s), 28 gave up, no failures (master seed: 0x0000000000005eed)
+check counter_roundtrip ... ok  (52 tested, 12 skipped)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  counter_roundtrip
+    10  Db::open after the crash never booted
+     2  the write was never acked, so durability has nothing to prove
+
+these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
+  counter_roundtrip
+
+sim result: ok. 1 passed; 0 failed. 52 of 64 runs tested a check.
+rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --filter counter_roundtrip
 ```
 
-and a test where *every* universe gave up is called out by name, because a
-property that adjudicated nothing is vacuous no matter how green it looks:
+A check in which every run was skipped is `untested`, never `ok`, because a
+property that adjudicated nothing is vacuous no matter how green it looks. A
+batch whose every check is untested says `nothing tested`, and still exits 0.
+This is the harness's own fixture pair, a check that passes and one that always
+gives up, over six runs:
 
 ```text
-sim: every universe of "counter_roundtrip" gave up — it adjudicated nothing over 64 universes; the property is vacuous until the faults it cannot survive are narrowed
+check always_passes ..... ok  (6 tested)
+check always_gives_up ... untested  (0 tested, 6 skipped)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  always_gives_up — never tested: every run was skipped
+    6  the fixture always gives up
+
+these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
+  always_passes
+
+sim result: ok. 1 passed; 0 failed; 1 untested. 6 of 12 runs tested a check.
+rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6
 ```
+
+"Reading a batch" below describes each line.
 
 **Where the split is visible, and where it is not.** `charpente test --sim`
 always prints it: the sim binary is `harness = false`, so nothing captures its
-output. The platform's own internal suites print the same line —
+output. The platform's own internal suites print a line of their own —
 
 ```text
 charpente-sim [replication]: 38 of 128 universes reached a verdict, 90 gave up
@@ -4296,17 +4335,17 @@ the remote never made: seed `0xce5842050b68d0cb` fails with `phantom charge: job
 Run it from the app crate's own directory (or pass `--dir`):
 
 ```bash
-charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
+charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
     [--filter S] [--jobs N] [--format human|json] [--inputs HEX] \
     [--faults-off AXIS,…] [--dir PATH]
 ```
 
-- `--universes N` — how many fresh seeds to run **per selected test**
-  (default 256; must be at least 1 — a green run of zero universes proves
-  nothing).
+- `--runs N` — how many runs, each on a fresh seed, **per selected check**
+  (default 256; must be at least 1 — a green batch of zero runs proves
+  nothing). `--universes` is gone; it is an unknown flag.
 - `--seed 0x…` — bypass the batch entirely and run every selected test
   once, on this exact literal seed. Coverage `require`ments are skipped (one
-  universe can't be expected to hit everything a batch would). This is the
+  run can't be expected to hit everything a batch would). This is the
   replay flag: it is exactly what a failure's own `repro:` line uses. A
   replay is one run, so it shrinks nothing.
 - `--inputs HEX` — with `--seed`, replay these input choices instead of the
@@ -4323,14 +4362,15 @@ charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
   error.
 - `--master-seed 0x…` — pick where the batch's seed chain starts, instead
   of fresh OS entropy, for a byte-identical repeat of an entire batch
-  (every test's every universe). Cannot be combined with `--seed`.
+  (every check's every run). Cannot be combined with `--seed`. The batch's
+  last line is this flag with the batch's `--runs` and `--filter`.
 - `--filter S` — run only tests whose name contains `S`. Filtering happens
-  **before** any seed is drawn, so a filtered run consumes a different (but
+  **before** any seed is drawn, so a filtered batch consumes a different (but
   still fully reproducible) prefix of the seed chain than an unfiltered one
   — this is why every individual failure's repro line carries its own
-  universe seed rather than relying on the batch's master seed.
-- `--jobs N` — how many universes to run in parallel (default: the host's
-  available parallelism). Every universe's seed is pre-derived on the main
+  run's seed rather than relying on the batch's master seed.
+- `--jobs N` — how many runs to run in parallel (default: the host's
+  available parallelism). Every run's seed is pre-derived on the main
   thread, in registry order, before any work is handed out, so `--jobs 1`
   and `--jobs 8` run the identical seed sequence and produce byte-identical
   reports — worker scheduling is unobservable.
@@ -4347,16 +4387,69 @@ charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
   (default: `.`). This flag is consumed by the CLI itself; every other flag
   passes straight through to the sim binary the CLI builds and execs.
 
-Exit codes: **0** every universe of every selected test passed and every
-`require`d coverage key was hit (universes that *gave up* are reported, not
-failed — see "Giving up" above; a green run tells you how many reached a
-verdict, and reading that number is on you); **1** at least one universe failed, or a
-coverage requirement went unmet — the run itself completed, but something
-in it was red; **2** the run never got that far — a build failure, no
+Exit codes: **0** no run of any selected check failed and every `require`d
+coverage key was hit (skipped runs are reported, not failed — see "Giving up"
+above; a green batch says how many runs tested each check, and a batch whose
+every check is untested exits 0 too, its result line saying `nothing tested`);
+**1** at least one run failed, or a coverage requirement went unmet — the
+batch itself completed, but something in it was red; **2** the batch never got
+that far — a build failure, no
 `tests/sim.rs` target found, an unrecognized flag, `--inputs` or
 `--faults-off` without `--seed` or with a value they cannot read, a filter
 matching no tests, or the sim binary failing to launch or exiting by signal. Exit code
 2 means "rerun once this is fixed," not "here is a reproducible bug."
+
+### Reading a batch
+
+A batch prints, on stderr before any run starts, the line that names its master
+seed, so a batch you kill still shows the seed that reruns it:
+
+```text
+running 3 sim checks, 256 runs each, under random injected faults (master seed 0x0000000000000001)
+```
+
+Its report, on stdout, has the shape of `cargo test`'s ("Giving up" above
+shows two). In order:
+
+- **One failure block per failing check**: its first failure in seed order,
+  shrunk ("Reading a failure" and "Shrinking a failure" below). The check's
+  other failing runs print no block; its line counts them, and `--format json`
+  lists each one.
+- **A line per unmet requirement**: `sim coverage requirement failed in
+  <check>: "<key>" never occurred in <n> runs`, with what to do about it.
+- **A line per check**, in registry order: `check <name> ... <status>
+  (<counts>)`. A run that passed or failed *tested* the check; a run that gave
+  up was *skipped*. The status is `FAILED` when a run failed or a `require`d
+  key never occurred, `untested` when no run tested the check, and `ok`
+  otherwise. The counts are how many runs tested it (`52 tested`), how many
+  distinct inputs those runs drew when it draws any (`203 tested over 181
+  distinct inputs`, "Drawing inputs" above), how many failed (`64 tested: 16
+  failed`), how many were skipped, and the keys that never occurred
+  (`required "restart" never occurred`).
+- **The skipped runs' reasons**, under each check that skipped any, most
+  frequent first and then in byte order, each with its count. A check that
+  tested nothing is headed `— never tested: every run was skipped`. A check
+  lists at most eight reasons and counts the rest on one line; `\n`, `\r` and
+  `\t` in a reason print as those two-character escapes, so every reason stays
+  on one line.
+- **The checks that draw no inputs**, named, when any check with a tested run
+  drew none: each of their runs tested the same scripted case.
+- **The result**: `sim result: ok`, `FAILED`, or `nothing tested` when no check
+  passed and none failed, then how many checks passed, failed and (if any)
+  were untested, and how many of the batch's runs tested a check.
+- **The rerun command**: `rerun exactly this batch: charpente test --sim
+  --master-seed 0x…`, with `--runs` when the batch ran another count than 256
+  and `--filter` when it had one. Pasted, it prints this report again, byte
+  for byte, for any `--jobs`.
+
+There is no line for the faults that fired. To confirm that a fault a property
+depends on actually happened, `require` its coverage key (`sim_tests! {
+orders_charge_once require ["fault:outbound_refused"] }`): an unmet requirement
+fails the check, and its line names the key. That makes "the refused reply was
+exercised" a claim the batch checks rather than a number someone has to read.
+
+The human report is for reading, not parsing: read `--format json` in a
+program.
 
 ### Reading a failure, replaying its seed
 
@@ -4424,8 +4517,9 @@ in order:
   block without `shrunk:` and `first:`, since a replay is one run and shrinks
   nothing.
 
-The check's other failures in the batch print their own runs, unshrunk: no
-`shrunk:` line, and a repro that is the seed alone.
+The check's other failures in the batch print no block: its check line counts
+them (`64 tested: 16 failed`), and `--format json` lists each one, unshrunk,
+with a repro that is its seed alone.
 
 The same discipline extends outward: `run_universes!`/`run_universes_swarm!`
 (the frozen internal-suite macros the platform's own tests use) and

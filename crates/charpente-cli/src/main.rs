@@ -1,4 +1,4 @@
-//! `charpente` — the CLI: `test --sim` (seeded parallel universes),
+//! `charpente` — the CLI: `test --sim` (seeded parallel runs under faults),
 //! `test --mutants` (scoped mutation run; the ruling is in the oracle-density spec),
 //! `promote`/`switchover` (replication control verbs), `describe` (the
 //! machine-readable contract), `restore` (rebuild a data directory from an

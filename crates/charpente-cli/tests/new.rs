@@ -260,7 +260,7 @@ fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_th
         charpente()
             .current_dir(&app)
             .env("CARGO_TARGET_DIR", &target)
-            .args(["test", "--sim", "--universes", "64"]),
+            .args(["test", "--sim", "--runs", "64"]),
         "charpente test --sim on the scaffold",
     );
 }
@@ -531,29 +531,51 @@ fn deleting_the_enqueue_line_turns_the_echo_check_red() {
     );
 }
 
-/// The scaffold's notes, bodies and order are drawn, not written. This
-/// version's JSON report carries no per-check distinct-input count (Task 15),
-/// so the proof is a failure block's `inputs:` line, which names each draw.
+/// The scaffold's notes, bodies and order are drawn, not written: over the
+/// green batch at master seed 0x1, each check's line counts more than one
+/// distinct input among its tested runs.
 #[test]
 fn the_scaffold_draws_its_inputs() {
-    let (_, out) = sim_with_line_deleted("drawn", "    tx.emit(NoteAdded { note: id });\n");
+    let app = patched_scaffold("drawn");
+    let out = charpente()
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", target_dir())
+        .args(["test", "--sim", "--master-seed", "0x1"])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let block = failure_block(&stdout, "acked_post_implies_its_event_after_recovery");
-    let inputs = block
-        .lines()
-        .find(|l| l.starts_with("  inputs:"))
-        .unwrap_or_else(|| panic!("a failure block names the inputs it drew:\n{block}"));
-    for name in ["notes", "order", "body"] {
-        assert!(inputs.contains(name), "`{name}` is drawn:\n{block}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the scaffold is green:\n{stdout}"
+    );
+    for check in [
+        "acked_note_survives_a_restart",
+        "acked_post_implies_the_echo_after_recovery",
+        "acked_post_implies_its_event_after_recovery",
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(&format!("check {check} ")))
+            .unwrap_or_else(|| panic!("no check line for {check}:\n{stdout}"));
+        let distinct: u64 = line
+            .split_once(" tested over ")
+            .and_then(|(_, rest)| rest.split_once(" distinct inputs"))
+            .unwrap_or_else(|| panic!("{check} draws its inputs: {line}"))
+            .0
+            .parse()
+            .unwrap();
+        assert!(distinct > 1, "{line}");
     }
+    assert!(!stdout.contains("these checks draw no inputs"), "{stdout}");
 }
 
 /// Hard rule 3: the seed that once failed the echo check falsely. An ack was
 /// followed by media corruption (a misdirected write) that cut the enqueue's
-/// record, and the check blamed the platform. The CLI's report carries no
-/// give-up reason text, so the reason is pinned by what excuses it: the
-/// misdirected write must have fired in the replay. A re-keyed fault stream
-/// that no longer reaches corruption fails here rather than passing quietly.
+/// record, and the check blamed the platform. The replay must skip the run
+/// for that reason, by name, and the misdirected write that excuses it must
+/// have fired. A re-keyed fault stream that no longer reaches corruption
+/// fails here rather than passing quietly.
 #[test]
 fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
     let app = patched_scaffold("pinned");
@@ -586,5 +608,24 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
     assert!(
         report.contains("\"fault:misdirected_write\":1"),
         "and the corruption that excuses it fired:\n{report}"
+    );
+    // The JSON report carries no skipped reason; the human replay does.
+    let human = charpente()
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", target_dir())
+        .args([
+            "test",
+            "--sim",
+            "--filter",
+            "acked_post_implies_the_echo_after_recovery",
+            "--seed",
+            "0x535bb998c76a02ae",
+        ])
+        .output()
+        .unwrap();
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human.contains("  durable corruption fired, so the acked enqueue is excused\n"),
+        "skipped for corruption, by name:\n{human}"
     );
 }

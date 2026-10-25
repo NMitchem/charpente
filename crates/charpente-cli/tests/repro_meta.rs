@@ -26,7 +26,7 @@ fn a_failure_report_is_a_reproduction() {
         .args([
             "test",
             "--sim",
-            "--universes",
+            "--runs",
             "128",
             "--master-seed",
             "0xd00d1e",
@@ -92,7 +92,7 @@ fn master_seed_replay_is_byte_identical() {
             .args([
                 "test",
                 "--sim",
-                "--universes",
+                "--runs",
                 "64",
                 "--master-seed",
                 "0xabcd",
