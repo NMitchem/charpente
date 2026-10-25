@@ -98,11 +98,16 @@ once per step (`kernel::Now`); a stored wall due time (a job's `due_at`, a sched
 every step, so a wall-clock step moves a wake-up at the next step rather than freezing it.
 
 The wall half never runs backwards within a node. Every step's reading passes through a hold
-(`kernel::clock::WallHold`): a reading behind the latest one is held at the latest, and one
-more than `CLOCK_TOLERANCE` (60 s) behind stops the kernel by name. So each backward step of
-the clock extends sessions and delays ticks by at most the tolerance, and each step beyond it
-stops the node. Steps add up: a clock that steps back within the tolerance, catches up to the
-time it held, and steps back again has fallen behind by both, with no check firing. A restart loses the hold, so the same check
+(`kernel::clock::WallHold`): a reading at or behind the latest one is held at the latest, and
+one more than `CLOCK_TOLERANCE` (60 s) behind stops the kernel by name. The hold is bounded in
+time too: a reading still at or behind the held value more than the tolerance of monotonic time
+after that value last rose stops the kernel by name (`clock stalled`), which is how a clock
+that has stopped advancing shows. So each hold episode, a step back or a freeze, extends
+sessions and delays ticks by at most the tolerance before the node stops. What no check sees is
+a clock that runs slow, or steps within the tolerance adding up: a clock that steps back within
+the tolerance, catches up to the time it held, and steps back again has fallen behind by both.
+The node's own time stays consistent, and drifts against the clocks it is compared with (an
+identity provider's, another node's); NTP is what bounds that. A restart loses the hold, so the same check
 runs at every open, whatever the node's role (a follower judges session expiry on reads with
 its own clock), at a promote (before its durable flip, so a refused promote leaves a
 follower), and at a hand-off's target, which stops at its write-gate flip because the hand-off
@@ -350,12 +355,14 @@ clock, at its first read), `clock:stepped-back` (with a `:within-tolerance` or
 `:beyond-tolerance` sub-key by size) and `clock:downtime` (at the first read that shows the
 jump). The sizes span both sides of `CLOCK_TOLERANCE`: skew within ±120 s, steps up to 120 s,
 jumps up to three days, so the app harness sees the kernel's hold,
-its stop, and the open refusal that follows a stop. Only the app harness samples them
+its stops, and the open refusal that follows a stop. Only the app harness samples them
 (`run_app_universe`, each axis on in a quarter of runs, from its own stream, after every
 other field); `default()`, `none()` and the swarm runners leave them off, so no platform
 suite's pinned seed moved when they landed, and a platform property turns them on in its
-`run_universes_swarm_with!` `adjust`. A property judges expiry and lateness against
-`true_wall`, never against a host's reading. The stop and the refusal (`checks::clock_refused`,
+`run_universes_swarm_with!` `adjust`, which is handed the universe's seed so whatever it draws
+is keyed by the seed. A property holds a node to its guarantee against that node's own clock
+readings, and states the true-time form through each clock's offset from `true_wall`. The
+stops and the refusal (`checks::clock_refused`,
 `FaultReason::ClockRefused`) are a name, like the durable-horizon refusal: they are fallout
 only where a clock axis acted in the run (`checks::clock_fallout`), since a node whose clock
 is right is refused only by a bug. `Sim::quiesce_clock_faults` freezes every offset for a

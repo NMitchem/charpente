@@ -6255,7 +6255,7 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
     run_universes_swarm_with!(
         0x5A9E_0600,
         256,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         |sim: &mut Sim| receipt_upgrade_universe(sim),
         require: [
             "boot:booted-after-retry",
@@ -7066,7 +7066,7 @@ mod job_tenancy {
         run_universes_swarm_with!(
             0x70B5_0001,
             256,
-            |_cfg: &mut FaultConfig| {},
+            |_seed: u64, _cfg: &mut FaultConfig| {},
             job_tenancy_universe,
             require: [
                 "tenant:job_multi_tenant_write",

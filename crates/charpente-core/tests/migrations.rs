@@ -618,7 +618,7 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
     run_universes_swarm_with!(
         0x2EB7_2000,
         128,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         |sim: &mut Sim| migration_universe(sim, &twin),
         require: ["migrations:resumed-to-completion"],
         floor: [("migrations:resumed-to-completion", PLAIN_COMPLETED_FLOOR)],
@@ -1573,7 +1573,7 @@ fn migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninter
     run_universes_swarm_with!(
         0x2EB7_5000,
         128,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         |sim: &mut Sim| scoped_migration_universe(sim, rows_per_scope, &scopes, &twin),
         require: ["migrations:scoped-resumed-to-completion"],
         floor: [(

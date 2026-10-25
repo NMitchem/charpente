@@ -1144,7 +1144,7 @@ fn raw_credentials_never_touch_the_durable_store() {
     run_universes_swarm_with!(
         0x2EB3_0001,
         128,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         |sim: &mut Sim| {
             let r = raw_credentials_universe(sim);
             finish_auth_universe(sim, r)

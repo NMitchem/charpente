@@ -260,7 +260,7 @@ fn wal_survives_dir_entry_loss() {
     run_universes_swarm_with!(
         0x01D_D1E5,
         256,
-        |cfg: &mut FaultConfig| { cfg.dir_entry_loss = 0.5; },
+        |_seed: u64, cfg: &mut FaultConfig| { cfg.dir_entry_loss = 0.5; },
         |sim| wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize),
         require: ["fault:dir-entry", "restart"],
         floor: [("wal:prefix-checked", DIR_ENTRY_PREFIX_FLOOR)],
@@ -407,7 +407,7 @@ fn wal_survives_bit_flip() {
     run_universes_swarm_with!(
         0xB17_F11D_0100,
         256,
-        |cfg: &mut FaultConfig| {
+        |_seed: u64, cfg: &mut FaultConfig| {
             cfg.bit_flip = 0.1;
         },
         wal_survives_hot_axis,
@@ -422,7 +422,7 @@ fn wal_survives_misdirected_write() {
     run_universes_swarm_with!(
         0x1DEC_7ED0_0200,
         256,
-        |cfg: &mut FaultConfig| {
+        |_seed: u64, cfg: &mut FaultConfig| {
             cfg.misdirected_write = 0.1;
         },
         wal_survives_hot_axis,
@@ -437,7 +437,7 @@ fn wal_survives_read_error() {
     run_universes_swarm_with!(
         0x2EAD_0300,
         256,
-        |cfg: &mut FaultConfig| {
+        |_seed: u64, cfg: &mut FaultConfig| {
             cfg.read_error = 0.1;
         },
         wal_survives_hot_axis,
@@ -557,7 +557,7 @@ fn harness_catches_recovery_that_trusts_lengths_without_crc() {
         run_universes_swarm_with!(
             0xB17_F11D_0001,
             64,
-            |cfg: &mut FaultConfig| {
+            |_seed: u64, cfg: &mut FaultConfig| {
                 *cfg = FaultConfig::none();
                 cfg.bit_flip = 0.25;
             },
@@ -620,7 +620,7 @@ fn harness_catches_a_store_that_never_reads_back() {
         run_universes_swarm_with!(
             0x1DEC_7ED0_0002,
             64,
-            |cfg: &mut FaultConfig| {
+            |_seed: u64, cfg: &mut FaultConfig| {
                 *cfg = FaultConfig::none();
                 cfg.misdirected_write = 0.25;
             },
@@ -712,7 +712,7 @@ fn harness_catches_recovery_that_reads_through_errors_as_eof() {
         run_universes_swarm_with!(
             0x2EAD_0003,
             64,
-            |cfg: &mut FaultConfig| {
+            |_seed: u64, cfg: &mut FaultConfig| {
                 *cfg = FaultConfig::none();
                 cfg.read_error = 0.25;
             },
@@ -1489,7 +1489,7 @@ fn gc_interrupted_by_crash_never_leaves_a_gap() {
     run_universes_swarm_with!(
         0x6C_0001,
         256,
-        |cfg: &mut FaultConfig| {
+        |_seed: u64, cfg: &mut FaultConfig| {
             cfg.dir_entry_loss = 0.5;
         },
         gc_crash_workload,

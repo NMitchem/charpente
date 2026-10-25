@@ -1010,7 +1010,7 @@ fn follower_converges_to_the_primary_fingerprint() {
     run_universes_swarm_with!(
         0x2EB1_0001,
         256,
-        no_media_corruption,
+        |_seed: u64, cfg: &mut FaultConfig| no_media_corruption(cfg),
         |sim: &mut Sim| {
             let r = convergence_universe(sim);
             finish_universe(sim, r)
@@ -1375,7 +1375,7 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
     run_universes_swarm_with!(
         0x2EB1_0002,
         256,
-        no_media_corruption,
+        |_seed: u64, cfg: &mut FaultConfig| no_media_corruption(cfg),
         |sim: &mut Sim| {
             let r = seeding_universe(sim);
             finish_universe(sim, r)
@@ -4397,7 +4397,7 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
     run_universes_swarm_with!(
         0x2EB1_0009,
         256,
-        no_media_corruption,
+        |_seed: u64, cfg: &mut FaultConfig| no_media_corruption(cfg),
         |sim: &mut Sim| {
             let r = switchover_universe(sim);
             finish_universe(sim, r)
@@ -4848,7 +4848,7 @@ fn failover_preserves_everything_the_follower_acked() {
     run_universes_swarm_with!(
         0x2EB1_000A,
         128,
-        no_media_corruption,
+        |_seed: u64, cfg: &mut FaultConfig| no_media_corruption(cfg),
         |sim: &mut Sim| {
             let r = failover_universe(sim);
             finish_universe(sim, r)
@@ -7257,7 +7257,7 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
     run_universes_swarm_with!(
         0x2EB1_000E,
         128,
-        |cfg: &mut FaultConfig| {
+        |_seed: u64, cfg: &mut FaultConfig| {
             cfg.bit_flip = 0.02;
             cfg.misdirected_write = 0.005;
         },

@@ -66,8 +66,9 @@ use std::path::{Path, PathBuf};
 /// client's credential refusals (2026-10-14); 43 with the enqueue refusal of
 /// an `OUTBOUND` that contradicts the mounted `JobDef` (2026-10-15); 44 with
 /// the sim's no-model refusal for an outbound host (2026-10-15); 46 with the
-/// kernel's clock stop and its open/promote refusal (2026-10-23).
-const PINNED_FLOOR: usize = 49;
+/// kernel's clock stop and its open/promote refusal (2026-10-23); 50 with the
+/// kernel's clock-stalled stop (2026-10-25).
+const PINNED_FLOOR: usize = 50;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

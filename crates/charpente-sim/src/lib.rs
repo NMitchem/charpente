@@ -2479,15 +2479,19 @@ pub fn run_universes_swarm_in(
         require,
         floors,
         ceilings,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         f,
     );
 }
 
 /// `run_universes_swarm!` with a per-universe `FaultConfig` override: after
-/// the swarm samples a universe's config, `adjust` runs on it before the
-/// universe executes — for tests that want the swarm's per-universe variety
-/// with one axis forced hot (e.g. `dir_entry_loss`, not yet swarm-sampled).
+/// the swarm samples a universe's config, `adjust(seed, &mut cfg)` runs on it
+/// before the universe executes — for tests that want the swarm's
+/// per-universe variety with one axis forced hot (e.g. `dir_entry_loss`, not
+/// yet swarm-sampled). `seed` is the universe's: an adjust that draws its own
+/// values keys them by it, on a stream of its own (`sample_extended_fields`'
+/// way), so a change to `FaultConfig` moves none of them, and one that ignores
+/// it draws nothing.
 /// Unlike `run_universes_swarm!`, the base seed is explicit — this is for
 /// permanent, always-in-the-suite properties that must not flake batch to
 /// batch. A NEW macro: `run_universe`'s frozen replay contract is untouched
@@ -2588,7 +2592,7 @@ pub fn run_universes_swarm_with_in(
     require: &[&str],
     floors: &[(&str, u64)],
     ceilings: &[(&str, u64)],
-    adjust: impl Fn(&mut FaultConfig),
+    adjust: impl Fn(u64, &mut FaultConfig),
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
     let test_file = test_name(file);
@@ -2880,14 +2884,14 @@ fn turn_off(cfg: &mut FaultConfig, field: &str) {
 #[allow(clippy::result_large_err)] // see run_universe
 fn run_universe_with_adjust(
     seed: u64,
-    adjust: &dyn Fn(&mut FaultConfig),
+    adjust: &dyn Fn(u64, &mut FaultConfig),
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
 ) -> Result<UniverseEnd, (FaultConfig, BTreeMap<&'static str, u64>, String)> {
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
     sample_extended_fields(seed, &mut cfg);
-    adjust(&mut cfg);
+    adjust(seed, &mut cfg);
     cfg.validate(); // an adjust closure that produces an invalid config is a workload bug
     let mut sim = Sim::with_faults(seed, cfg.clone());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
@@ -2901,7 +2905,7 @@ fn run_one_swarm_with(
     package: &str,
     test_file: &str,
     seed: u64,
-    adjust: &impl Fn(&mut FaultConfig),
+    adjust: &impl Fn(u64, &mut FaultConfig),
     f: &impl Fn(&mut Sim) -> Result<(), String>,
 ) -> UniverseEnd {
     match run_universe_with_adjust(seed, adjust, f) {
@@ -4324,7 +4328,7 @@ mod tests {
                 &[],
                 &[("rare:key", 3)],
                 &[],
-                |_cfg: &mut FaultConfig| {},
+                |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
                     // Covered in the FIRST universe only: 1 seen against a
                     // floor of 3 is the shortfall shape `require:` would wave
@@ -4375,7 +4379,7 @@ mod tests {
             &[],
             &[("common:key", 4)],
             &[],
-            |_cfg: &mut FaultConfig| {},
+            |_seed: u64, _cfg: &mut FaultConfig| {},
             |sim: &mut Sim| {
                 sim.cover("common:key");
                 Ok(())
@@ -4394,7 +4398,7 @@ mod tests {
                 &[],
                 &[],
                 &[("universe:gave-up", 0)],
-                |_cfg: &mut FaultConfig| {},
+                |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
                     sim.give_up("this workload adjudicates nothing");
                     Ok(())
@@ -4421,7 +4425,7 @@ mod tests {
                 &[],
                 &[],
                 &[("universe:gave-up", cap)],
-                |_cfg: &mut FaultConfig| {},
+                |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
                     if give_up {
                         sim.give_up("this workload adjudicates nothing");

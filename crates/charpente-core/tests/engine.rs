@@ -4419,7 +4419,7 @@ fn the_store_never_outruns_the_log_across_process_restarts_and_power_cycles() {
     run_universes_swarm_with!(
         0xD1F0_000E,
         256,
-        |cfg: &mut FaultConfig| {
+        |_seed: u64, cfg: &mut FaultConfig| {
             cfg.bit_flip = 0.0;
             cfg.misdirected_write = 0.0;
         },

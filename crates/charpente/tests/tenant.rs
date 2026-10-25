@@ -1153,7 +1153,7 @@ fn every_scoped_read_returns_only_its_own_tenants_rows() {
     run_universes_swarm_with!(
         0x7E4A_0001,
         256,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         tenant_universe,
         require: [
             "tenant:multi_tenant_write",

@@ -3158,7 +3158,7 @@ fn a_reseed_cut_short_by_a_crash_boots_a_whole_timeline_or_refuses_by_name() {
     run_universes_swarm_with!(
         0x5EED_C0A1,
         256,
-        crash_model_only,
+        |_seed: u64, cfg: &mut FaultConfig| crash_model_only(cfg),
         |sim: &mut Sim| {
             let (base, crash_at) = crash_a_reseed(sim)?;
             // The reads below are the oracle's, not the node's: no fault may

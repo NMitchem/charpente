@@ -2478,7 +2478,7 @@ fn contended_request_bursts_survive_the_fault_matrix() {
     run_universes_swarm_with!(
         0x60C1_0009,
         256,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         burst_workload,
         require: [
             "request:contended",

@@ -9076,7 +9076,7 @@ fn archive_converges() {
     run_universes_swarm_with!(
         ARCHIVE_CONVERGENCE_BASE,
         256,
-        no_media_corruption_on_either_side,
+        |_seed: u64, cfg: &mut FaultConfig| no_media_corruption_on_either_side(cfg),
         |sim: &mut Sim| archive_convergence_universe(sim, ConvMode::Unscoped),
         require: [
             "archive:restored",
@@ -9125,7 +9125,7 @@ fn archive_converges_with_a_scoped_table() {
     run_universes_swarm_with!(
         ARCHIVE_SCOPED_CONVERGENCE_BASE,
         256,
-        no_media_corruption_on_either_side,
+        |_seed: u64, cfg: &mut FaultConfig| no_media_corruption_on_either_side(cfg),
         |sim: &mut Sim| archive_convergence_universe(sim, ConvMode::Scoped),
         require: [
             "archive:restored",

@@ -2635,17 +2635,37 @@ The wall time the kernel hands out (each request's `now`, a tick's, a retry's
 the reading holds at the latest value already used, for as far back as
 `CLOCK_TOLERANCE` (60 s, `charpente::core::io::CLOCK_TOLERANCE`, the skew OIDC
 already allows). A clock that falls further behind stops the node by name, and a
-stopped kernel ends the process. So each backward step of the clock can extend
-sessions and delay ticks by at most the tolerance, and each step beyond it stops
-the node, never silently by a year. Steps add up: a clock that steps back 50 s,
-catches up to the time it held, and steps back 50 s again runs 100 s behind true
-time with no check firing, since neither step exceeds the tolerance. NTP is what keeps a clock from wandering;
-this bounds what one bad step can do:
+stopped kernel ends the process:
 
 <!-- pinned -->
 ```text
 clock went backwards: this node's wall clock reads <wall>, <gap> behind <held>, the latest time it already used — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather than extend sessions or delay schedules by that much. Fix the system clock (check NTP) and restart; if the clock is right, the earlier reading came from a clock that ran ahead, and the node runs again after <held minus 60s>.
 ```
+
+The hold is bounded in time as well as in distance. A clock that has read at or
+behind the held value for more than the tolerance of elapsed time (the process's
+monotonic clock, counted from when the held value last rose) also stops the
+node. That is how a stuck clock shows, since its reading never falls behind the
+hold, and it also ends a step back the clock is slow to recover from:
+
+<!-- pinned -->
+```text
+clock stalled: this node's wall clock has not advanced past <held>, the latest time it already used, for <elapsed> of elapsed time — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather than hold sessions open and schedules still. Fix the system clock (check NTP) and restart.
+```
+
+So each hold episode, a step back or a freeze, extends sessions and delays ticks
+by at most the tolerance before the node stops by name, and a clock that stops
+advancing stops the node at the first read more than 60 s after it last moved.
+Two clock errors pass every check. A
+clock that runs slow never reads behind the hold. Steps within the tolerance add
+up: a clock that steps back 50 s, catches up to the time it held, and steps back
+50 s again runs 100 s behind true time, since neither step exceeds the
+tolerance and neither hold lasts longer than it. The node's own time stays
+consistent through both, but it drifts against every clock it is compared with:
+the identity provider's, which stamps an OIDC token's `exp` and `nbf`, and
+another node's, which minted the sessions a follower or a promoted node judges.
+Keep NTP on. It is what keeps a clock from wandering; the checks bound what one
+bad step or a stopped clock can do.
 
 A restart starts the hold over, so the same check runs whenever a node opens,
 whatever its role (a follower judges session expiry on reads with its own clock,
@@ -3249,9 +3269,10 @@ offset wanders further as a run goes on. `sim.clock().offset()` (or
 The sizes span both sides of `CLOCK_TOLERANCE` (60 s), so a run sees what a node
 does with a bad clock (§5, §7): it holds its wall reading at the latest time it
 used for a step back within the tolerance, stops by name for one beyond it
-(`clock went backwards: …`), and refuses to open while its clock is more than
-the tolerance behind the latest time its data directory recorded (`refusing to
-open: this node's wall clock …`). `clock_refused` names the stop and the
+(`clock went backwards: …`) or for a hold that lasts longer than the tolerance
+(`clock stalled: …`), and refuses to open while its clock is more than the
+tolerance behind the latest time its data directory recorded (`refusing to
+open: this node's wall clock …`). `clock_refused` names the stops and the
 refusal (below). They are fallout only where a clock fault acted:
 `clock_fallout(sim, text)` excuses one once a clock in this run has read with
 its own skew, stepped back, or shown a jump, and `is_fault_fallout` alone never
@@ -3260,16 +3281,22 @@ suites run with the clock axes off, so a refusal there fails. An app workload's
 filter is `|t| is_fault_fallout(t) || clock_fallout(sim, t)`. The fault-free
 tail above quiesces the clock and then waits out a refusal.
 
-Judge expiry and lateness against `sim.true_wall()`, never against a node's
-reading: a skewed clock is the thing under test. The platform's own suites
-(`run_universes_swarm!`, `Sim::new`, `FaultConfig::default()` and `none()`) leave
-the three axes off; a platform property turns them on in
-`run_universes_swarm_with!`'s `adjust`.
+A property that judges expiry and lateness judges two things. Against each
+node's own clock readings it holds the node to what it promises (below), which
+is exact. Against `sim.true_wall()` it states what that promise means in true
+time, written through each clock's offset, since a skewed clock is the thing
+under test and a bound that assumes the node's reading is true time fails on
+correct code. The platform's own suites (`run_universes_swarm!`, `Sim::new`,
+`FaultConfig::default()` and `none()`) leave the three axes off; a platform
+property turns them on in `run_universes_swarm_with!`'s `adjust`, which is
+handed the universe's seed with its config (`|seed, cfg| …`), so any value it
+draws comes from a stream keyed by that seed.
 
 `crates/charpente/tests/clock.rs` is the worked example. It runs four platform
 properties with all three axes on (sessions, a one-second schedule, retries, and
-the stop and refusal themselves) and a victim clock that fails two of them by
-name. It shows how to write the bounds.
+the stops and refusals themselves, on one node and on a follower promoted on its
+own host's clock) and a victim clock that fails two of them by name. It shows
+how to write the bounds.
 
 Write a bound through each clock's offset, the reading minus `sim.true_wall()`
 at that instant, never through `clock_skew`. A step back within the tolerance
@@ -3280,7 +3307,8 @@ allows only the skew fails on correct code.
 What a node does guarantee is relative to its own clock. The time it hands out
 is never behind its clock's reading, and never more than `CLOCK_TOLERANCE`
 ahead of it: the hold takes the larger, the stop fires past the tolerance, and
-the open refuses past it. That gives these bounds:
+the open refuses past it. Nor does it stay ahead for longer than the tolerance
+at a stretch, since the stall stop ends the hold. That gives these bounds:
 - A session resolves only while the clock judging it reads before its
   `expires_at`. In true time, it resolves no later than its TTL plus the
   tolerance after it was minted, plus however far the judging clock has fallen
@@ -3316,7 +3344,7 @@ for these before hand-rolling the same logic a fourth time:
   bases), and text cannot say which. So it is `false` here, and an open site
   asks `durable_refusal` (below) first, or, for one node of several,
   `SimHost::durable_corruption_fired()`. `boot_through_fallout` does that for
-  you. **Nor does it excuse the kernel's clock stop or open/promote refusal**,
+  you. **Nor does it excuse the kernel's clock stops or open/promote refusal**,
   for the same reason: a clock fault or a platform bug produces it, and
   `clock_fallout` (below) tells them apart.
 - `classify(text: &str) -> FaultReason` — the families, typed:
@@ -3330,25 +3358,28 @@ for these before hand-rolling the same logic a fourth time:
   reworded, `classify` is the single site that must change, and it fails by
   name instead of leaking a wrong classification into whichever oracle saw
   the text first.
-- `clock_refused(text: &str) -> bool` — true for the kernel's clock stop
-  (`clock went backwards: …`) and for its refusal to open or promote a node
+- `clock_refused(text: &str) -> bool` — true for the kernel's clock stops
+  (`clock went backwards: …`, `clock stalled: …`) and for its refusal to open or promote a node
   whose wall clock is more than `CLOCK_TOLERANCE` behind the latest time its
   data directory recorded (`refusing to open: this node's wall clock …`,
   `refusing to promote: this node's wall clock …`). A name only: the clock
   axes produce both ("Wall time and its faults", above), and so does a
   platform bug that refuses a node whose clock is right.
-- `clock_fallout(sim: &Sim, text: &str) -> bool` — the excuse for those two:
+- `clock_fallout(sim: &Sim, text: &str) -> bool` — the excuse for those:
   true when `clock_refused(text)` holds and a clock fault acted in this run (a
   clock read with its own skew, stepped back, or showed a downtime jump: its
   `clock:*` coverage key fired). Where no clock fault acted, nothing excuses
-  the stop or the refusal. An app workload that runs a kernel filters fallout
+  the stops or the refusal. An app workload that runs a kernel filters fallout
   with `|t| is_fault_fallout(t) || clock_fallout(sim, t)`; a workload that
   never builds a kernel cannot see either text.
 - `clock_reopens_after(text: &str) -> Option<WallTime>` — the instant a clock
   stop or refusal names as the one after which the node runs again (its final
   "after <instant>", to the millisecond), or `None` for any other text. A
   fault-free tail sleeps a little past it after `sim.quiesce_clock_faults()`,
-  restarts the process and boots again ("A fault-free tail", above).
+  restarts the process and boots again ("A fault-free tail", above). The stall
+  stop names no instant, so it is `None`: its clock stopped advancing, and no
+  wait fixes that. A quiesced clock still advances, so a tail's kernel never
+  stalls, and one that does is reported rather than waited out.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable

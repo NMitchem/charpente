@@ -2526,7 +2526,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     run_universes_swarm_with!(
         0x2EB2_0001,
         128,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         |sim: &mut Sim| realtime_workload(sim).map(|_trace| ()),
         require: [
             "boot:booted-after-retry",
@@ -3784,7 +3784,7 @@ fn a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix() {
     run_universes_swarm_with!(
         0x2EB2_5A10,
         180,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         |sim: &mut Sim| shapes_workload(sim),
         require: [
             "shapes:reshaped-frame",
@@ -5113,7 +5113,7 @@ fn follower_tails_and_the_failover_resume_divergence_property() {
     run_universes_swarm_with!(
         0x2EB2_0002,
         128,
-        no_media_corruption,
+        |_seed: u64, cfg: &mut FaultConfig| no_media_corruption(cfg),
         |sim: &mut Sim| {
             let r = multi_node_realtime_universe(sim);
             finish_rt_universe(sim, r)
@@ -6382,7 +6382,7 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
     run_universes_swarm_with!(
         SCOPED_REALTIME_BASE,
         128,
-        |_cfg: &mut FaultConfig| {},
+        |_seed: u64, _cfg: &mut FaultConfig| {},
         |sim: &mut Sim| scoped_realtime_workload(sim).map(|_trace| ()),
         require: [
             "boot:booted-after-retry",
@@ -9316,7 +9316,7 @@ mod tenancy_feeds {
         run_universes_swarm_with!(
             TENANCY_BASE,
             128,
-            |_cfg: &mut FaultConfig| {},
+            |_seed: u64, _cfg: &mut FaultConfig| {},
             |sim: &mut Sim| tenancy_universe(sim).map(|_trace| ()),
             require: [
                 "boot:booted-after-retry",

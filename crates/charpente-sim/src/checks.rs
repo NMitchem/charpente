@@ -41,7 +41,8 @@ pub enum FaultReason {
     /// fallout only where durable corruption fired on that node's disk,
     /// which its text cannot say, so [`is_fault_fallout`] never excuses it.
     DurableHorizon,
-    /// The kernel's clock stop or its open/promote refusal ([`clock_refused`]).
+    /// The kernel's clock stops (backwards or stalled) or its open/promote
+    /// refusal ([`clock_refused`]).
     ClockRefused,
     /// Everything else: NOT fallout; fails the universe for adjudication.
     Unrelated,
@@ -71,7 +72,7 @@ pub enum FaultReason {
 ///     excuses it: [`durable_refusal`] in a single-node workload, and
 ///     [`SimHost::durable_corruption_fired`](crate::SimHost::durable_corruption_fired)
 ///     for the refusing node in a multi-node one (S3b item 0),
-///  5. the kernel's clock stop and its open/promote refusal
+///  5. the kernel's clock stops and its open/promote refusal
 ///     ([`clock_refused`]). The sim's clock axes produce them, and so does a
 ///     platform bug: a recovered floor above a time the store saw refuses a
 ///     node whose clock is right. So this family is a name too, excused only
@@ -126,14 +127,16 @@ pub fn is_fault_fallout(text: &str) -> bool {
     )
 }
 
-/// `true` for the kernel's clock stop ("clock went backwards: …") and for its
-/// refusal to open or promote a node whose wall clock is more than
-/// `CLOCK_TOLERANCE` behind the latest time its data directory recorded
-/// (charpente's `kernel/clock.rs`): `classify`'s `ClockRefused`. A name, not
-/// an excuse; a workload asks [`clock_fallout`] whether this run's faults
-/// explain one, and a clock property marks one when it sees it.
+/// `true` for the kernel's clock stops ("clock went backwards: …" and
+/// "clock stalled: …") and for its refusal to open or promote a node whose
+/// wall clock is more than `CLOCK_TOLERANCE` behind the latest time its data
+/// directory recorded (charpente's `kernel/clock.rs`): `classify`'s
+/// `ClockRefused`. A name, not an excuse; a workload asks [`clock_fallout`]
+/// whether this run's faults explain one, and a clock property marks one
+/// when it sees it.
 pub fn clock_refused(text: &str) -> bool {
     text.contains("clock went backwards:")
+        || text.contains("clock stalled:")
         || text.contains("refusing to open: this node's wall clock")
         || text.contains("refusing to promote: this node's wall clock")
 }
@@ -142,8 +145,9 @@ pub fn clock_refused(text: &str) -> bool {
 /// ([`clock_refused`]) and one of the sim's clock axes acted in this run:
 /// a clock read with its own skew (`clock:skewed`), a step back
 /// (`clock:stepped-back`) or a downtime jump (`clock:downtime`). That is when
-/// the stop or refusal is fault fallout: a step back past the tolerance stops
-/// the node, and leaves it behind its store's recorded time until true time
+/// the stop or refusal is fault fallout: a step back past the tolerance, or
+/// one that keeps the clock at or below the hold for longer than that, stops the
+/// node, and leaves it behind its store's recorded time until true time
 /// catches up, and two hosts' skews put one behind times the other recorded.
 /// Where no axis acted, nothing excuses one, and it is a platform bug, the
 /// rule [`durable_refusal`] follows for its family. An app workload's fallout
@@ -160,10 +164,13 @@ pub fn clock_fallout(sim: &Sim, text: &str) -> bool {
 
 /// The instant a clock stop or refusal ([`clock_refused`]) names as the one
 /// after which the node runs again: its last "after <instant>", written to the
-/// millisecond, so wait a little past it. `None` for any other text. For a
-/// fault-free tail: after `Sim::quiesce_clock_faults` the clock's offset is
-/// frozen, so a node refused at open reaches this instant as virtual time
-/// passes, and a workload sleeps until then and restarts the process.
+/// millisecond, so wait a little past it. `None` for any other text, and for
+/// the stall stop ("clock stalled: …"), which names no instant: its clock
+/// stopped advancing, and no wait fixes that. For a fault-free tail: after
+/// `Sim::quiesce_clock_faults` the clock's offset is frozen, so a node refused
+/// at open reaches this instant as virtual time passes, and a workload sleeps
+/// until then and restarts the process. A frozen offset still advances, so a
+/// tail's kernel never stalls, and one that does is a bug the `None` reports.
 pub fn clock_reopens_after(text: &str) -> Option<WallTime> {
     if !clock_refused(text) {
         return None;
@@ -686,6 +693,11 @@ mod tests {
              sessions or delay schedules by that much. Fix the system clock (check NTP) and \
              restart; if the clock is right, the earlier reading came from a clock that ran \
              ahead, and the node runs again after 2026-01-01T00:00:40.000Z.",
+            "clock stalled: this node's wall clock has not advanced past \
+             2026-01-01T00:01:40.000Z, the latest time it already used, for 61s of elapsed time \
+             — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather \
+             than hold sessions open and schedules still. Fix the system clock (check NTP) and \
+             restart.",
             "refusing to open: this node's wall clock reads 2026-01-01T00:00:39.000Z, 61s behind \
              2026-01-01T00:01:40.000Z, the latest time this data directory recorded — more than \
              the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if \
@@ -794,6 +806,17 @@ mod tests {
             let text = format!("clock went backwards: … the node runs again after {t}.");
             assert_eq!(clock_reopens_after(&text), Some(t), "{t}");
         }
+        let stall = "clock stalled: this node's wall clock has not advanced past \
+                     2026-01-01T00:01:40.000Z, the latest time it already used, for 61s of \
+                     elapsed time — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The \
+                     node stopped rather than hold sessions open and schedules still. Fix the \
+                     system clock (check NTP) and restart.";
+        assert!(clock_refused(stall));
+        assert_eq!(
+            clock_reopens_after(stall),
+            None,
+            "a stall names no instant: a clock that stopped advancing is not waited out"
+        );
         for other in [
             "simulated disk write error (injected fault): retry after 2026-01-01T00:00:40.000Z.",
             "clock went backwards: the node runs again after a while.",

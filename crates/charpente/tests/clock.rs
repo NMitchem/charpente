@@ -1,10 +1,13 @@
 //! The time properties (0.3.0 spec §5 B). One workload drives a single node
 //! through several lives under all three sim clock faults (skew, step-backs,
 //! downtime) and records two things: what the node did, and what its clock
-//! read at every step. Four properties judge that record against true wall
-//! time (`Sim::true_wall`), each with `require` keys proving its axes fired.
-//! A naive victim, a clock that reads process uptime, fails the TTL and stall
-//! properties by name.
+//! read at every step. A second drives a primary and a follower, each on its
+//! own host and clock, and promotes the follower once the primary is gone.
+//! Four properties judge those records against each clock's readings, the
+//! guarantee the node makes, with the true-time form (`Sim::true_wall`)
+//! derived through each clock's offset, and each carries `require` keys
+//! proving its axes fired. A naive victim, a clock that reads process uptime,
+//! fails the TTL and stall properties by name.
 //!
 //! Every bound below is written through a clock's *offset*: its reading minus
 //! true wall time at that instant. It is never written through the universe's
@@ -19,11 +22,14 @@
 //! stop:
 //! - the hold takes the max of the reading and the held value;
 //! - a reading more than the tolerance behind the held value stops the node;
+//! - a reading at or behind the held value more than the tolerance of
+//!   virtual time after the held value last rose stops it too (a stall), so
+//!   `W` sits above `R` for at most the tolerance at a stretch;
 //! - an open whose reading is more than the tolerance behind the floor the
 //!   store recorded is refused, and otherwise starts the hold at that floor.
 //!
 //! Each property carries that band through to sessions, schedules and retries.
-//! The boundary property holds the band itself.
+//! The boundary property holds the band itself, on both workloads.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -32,12 +38,20 @@ use std::time::Duration;
 use charpente::auth::sweep::SESSION_SWEEP_NAME;
 use charpente::auth::{ApiKey, hash_token};
 use charpente::http::{ApiError, App, AppConfig, Ctx, Method, Request, Session};
-use charpente::kernel::{CronRow, JobError, Kernel, RequestSource, SimSource, Step, Wake};
+use charpente::kernel::{
+    CronRow, JobError, Kernel, RecordedResponses, RequestSource, SimSource, Step, Wake,
+};
+use charpente::repl::protocol::{Msg, decode, encode};
+use charpente::repl::role::Role;
+use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
 use charpente::{Db, Job, Schema, Tx, View, job, jobs, route, routes};
-use charpente_core::io::{CLOCK_TOLERANCE, Clock, Instant, WallTime};
+use charpente_core::io::{CLOCK_TOLERANCE, Clock, Instant, Net, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_sim::rng::{Rng, splitmix64};
-use charpente_sim::{FaultConfig, SIM_WALL_BASE_NANOS, Sim, SimClock, run_universes_swarm_with};
+use charpente_sim::{
+    FaultConfig, SIM_WALL_BASE_NANOS, Sim, SimClock, SimDisk, SimEntropy, SimHost,
+    run_universes_swarm_with,
+};
 
 const SEC: u64 = 1_000_000_000;
 const TOL: u64 = CLOCK_TOLERANCE.as_nanos() as u64;
@@ -103,11 +117,11 @@ impl Beat {
     }
 }
 
-fn open_app(sim: &Sim) -> std::io::Result<App> {
+fn open_app(disk: SimDisk, entropy: SimEntropy) -> std::io::Result<App> {
     Ok(App::open(
-        Box::new(sim.disk()),
+        Box::new(disk),
         Schema::new(),
-        Box::new(sim.entropy()),
+        Box::new(entropy),
         AppConfig {
             session_ttl: TTL,
             ..AppConfig::default()
@@ -121,14 +135,12 @@ fn open_app(sim: &Sim) -> std::io::Result<App> {
 /// The disk axes off and all three clock axes on. The properties judge time;
 /// the disk axes have their own suites, and with them on most universes end
 /// in IO fallout before a clock fault is reached. Crash collapse at a power
-/// cycle stays as sampled. `adjust` is handed no seed, so the clock draws key
-/// off the swarm-sampled config, which is itself a function of the seed.
-fn clock_axes(cfg: &mut FaultConfig) {
-    let mut state = format!("{cfg:?}")
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
+/// cycle stays as sampled. The draws come from a stream keyed by the
+/// universe's seed alone, so no change to `FaultConfig` moves them. Each clock
+/// draws its own skew within plus or minus `clock_skew`, so only its size is
+/// drawn here.
+fn clock_axes(seed: u64, cfg: &mut FaultConfig) {
+    let mut state = seed ^ 0xC10C_A8E5;
     let mut rng = Rng::new(splitmix64(&mut state));
     cfg.write_error = 0.0;
     cfg.sync_error = 0.0;
@@ -136,8 +148,7 @@ fn clock_axes(cfg: &mut FaultConfig) {
     cfg.bit_flip = 0.0;
     cfg.misdirected_write = 0.0;
     cfg.read_error = 0.0;
-    const SKEW: u64 = 120 * SEC;
-    cfg.clock_skew = rng.between(0, 2 * SKEW) as i64 - SKEW as i64;
+    cfg.clock_skew = rng.between(0, 120 * SEC) as i64;
     cfg.clock_step_back = (
         rng.between(5, 80) as f64 / 10_000.0,
         Duration::from_secs(120),
@@ -158,9 +169,8 @@ struct Read {
 }
 
 impl Read {
-    /// `Sim::true_wall` at this read. The clock holds no `Sim`, so it keeps
-    /// the virtual time, and true wall time is that plus the base, by
-    /// `Sim::true_wall`'s definition.
+    /// `Sim::true_wall` at this read: the virtual time plus the base, which
+    /// `TracedClock` checks against the sim's own offset at every read.
     fn true_wall(&self) -> u64 {
         SIM_WALL_BASE_NANOS + self.mono
     }
@@ -190,6 +200,11 @@ impl Clock for TracedClock {
     fn wall(&self) -> WallTime {
         let host = self.inner.wall().as_nanos();
         let mono = self.inner.now().as_nanos();
+        assert_eq!(
+            i128::from(host) - i128::from(self.inner.offset()),
+            i128::from(SIM_WALL_BASE_NANOS + mono),
+            "rig: a reading minus its clock's offset is not Sim::true_wall"
+        );
         let kernel = match self.uptime_since {
             None => host,
             Some(start) => SIM_WALL_BASE_NANOS + (mono - start),
@@ -258,6 +273,24 @@ enum Event {
         attempts: u32,
         from: u64,
         to: Option<u64>,
+    },
+    /// A promote's own read: `do_promote` reads the clock past the hold and
+    /// checks it against the store's floor before the durable role flip.
+    /// `accepted` is whether the write gate opened at that step; `refused` is
+    /// the `CtrlErr` text, filled in when the reply reaches the operator.
+    Promote {
+        read: usize,
+        floor: Option<u64>,
+        accepted: bool,
+        refused: Option<String>,
+    },
+    /// The hold starting over where the write gate opens (`after_repl_step`,
+    /// a promote's or a hand-off's): a read through the hold, then the floor
+    /// check with `promote` in its text.
+    Start {
+        read: usize,
+        floor: Option<u64>,
+        stopped: Option<String>,
     },
 }
 
@@ -381,7 +414,7 @@ fn schedule_due(db: &Db, name: &str) -> Result<u64, String> {
 /// past its restart, since its clock starts over at every attempt.
 fn open_node(sim: &Sim, rig: &mut Rig) -> Result<Option<Kernel>, String> {
     for _ in 0..OPEN_ATTEMPTS {
-        let app = open_app(sim).map_err(|e| format!("App::open: {e}"))?;
+        let app = open_app(sim.disk(), sim.entropy()).map_err(|e| format!("App::open: {e}"))?;
         let floor = recorded_floor(app.db())?;
         let read = rig.reads_len();
         let clock = TracedClock {
@@ -489,7 +522,7 @@ fn run_life(sim: &Sim, kernel: &mut Kernel, rig: &mut Rig) -> Result<End, String
             Ok(step) => step,
             Err(e) => {
                 let text = e.to_string();
-                if !text.starts_with("clock went backwards: this node's wall clock reads ") {
+                if !clock_stop(&text) {
                     return Err(format!(
                         "the kernel stopped, and only the clock's faults are on: {text}"
                     ));
@@ -527,7 +560,15 @@ fn run_life(sim: &Sim, kernel: &mut Kernel, rig: &mut Rig) -> Result<End, String
         if let Some((status, body)) = response {
             answered += 1;
             let ask = asked.take().ok_or("rig: a response with nothing asked")?;
-            answer(kernel, rig, read, ask, status, &body)?;
+            answer(
+                kernel,
+                &mut rig.events,
+                &mut rig.tokens,
+                read,
+                ask,
+                status,
+                &body,
+            )?;
         }
         let now = kernel.stats();
         if now.cron_ticks != stats.cron_ticks {
@@ -584,7 +625,8 @@ fn run_life(sim: &Sim, kernel: &mut Kernel, rig: &mut Rig) -> Result<End, String
 
 fn answer(
     kernel: &Kernel,
-    rig: &mut Rig,
+    events: &mut Vec<Event>,
+    tokens: &mut Vec<String>,
     read: usize,
     ask: Ask,
     status: u16,
@@ -606,12 +648,12 @@ fn answer(
                 .map_err(|e| format!("by_token_hash: {e}"))?
                 .pop()
                 .ok_or("an acknowledged login left no session row")?;
-            rig.events.push(Event::Mint {
+            events.push(Event::Mint {
                 read,
-                token: rig.tokens.len(),
+                token: tokens.len(),
                 expires_at: session.expires_at.as_nanos(),
             });
-            rig.tokens.push(token);
+            tokens.push(token);
             Ok(())
         }
         Ask::Key => {
@@ -625,7 +667,7 @@ fn answer(
                 .map_err(|e| format!("by_key_hash: {e}"))?
                 .pop()
                 .ok_or("an acknowledged key mint left no key row")?;
-            rig.events.push(Event::Key {
+            events.push(Event::Key {
                 read,
                 created_at: key.created_at.as_nanos(),
             });
@@ -638,12 +680,19 @@ fn answer(
                 401 if text.contains("unrecognized credential") => Seen::Unrecognized,
                 _ => return Err(unexpected()),
             };
-            rig.events.push(Event::Present { read, token, seen });
+            events.push(Event::Present { read, token, seen });
             Ok(())
         }
         Ask::Flaky if status == 200 => Ok(()),
         Ask::Flaky => Err(unexpected()),
     }
+}
+
+/// The kernel's two clock stops: a reading too far behind the hold, or a
+/// hold in effect for too long.
+fn clock_stop(text: &str) -> bool {
+    text.starts_with("clock went backwards: this node's wall clock reads ")
+        || text.starts_with("clock stalled: this node's wall clock has not advanced past ")
 }
 
 fn wall(nanos: u64) -> WallTime {
@@ -661,49 +710,116 @@ fn signed(nanos: i128) -> String {
 
 // --------------------------------------------------------------- the hold
 
+/// What the hold does with a read through it, given the held value `h` and
+/// the virtual time it rose to that value at (`WallHold::read`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rule {
+    /// More than the tolerance behind `h`: the node stops.
+    Backwards,
+    /// At or behind `h` more than the tolerance after `h` rose: the node
+    /// stops, after this long.
+    Stalled(u64),
+    /// Otherwise: the max of the reading and `h`.
+    Hands(u64),
+}
+
+fn rule(h: u64, raised: u64, r: Read) -> Rule {
+    if r.kernel < h.saturating_sub(TOL) {
+        Rule::Backwards
+    } else if r.kernel <= h && r.mono - raised > TOL {
+        Rule::Stalled(r.mono - raised)
+    } else {
+        Rule::Hands(h.max(r.kernel))
+    }
+}
+
 /// The hold at one read, replayed from the readings the kernel was handed:
-/// the held value before the read (`None` at an open, where the hold starts
-/// over) and the wall time the node handed out there (`None` where the read
-/// stopped the node or was refused). It follows what the node did, so one
-/// wrong decision does not cascade; the boundary property judges each
-/// decision against the rule, and the others use `handed` as the node's own
-/// time.
+/// the held value before the read and the virtual time it rose to it (`None`
+/// at an open, where the hold starts over), and the wall time the node handed
+/// out there (`None` where the read stopped the node or was refused, and at a
+/// promote's own read, which goes past the hold). It follows what the node
+/// did, so one wrong decision does not cascade; the boundary property judges
+/// each decision against the rule, and the others use `handed` as the node's
+/// own time.
 #[derive(Clone, Copy)]
 struct Held {
-    before: Option<u64>,
+    before: Option<(u64, u64)>,
     handed: Option<u64>,
 }
 
 fn replay_hold(t: &Trace) -> Result<Vec<Held>, String> {
     let mut out: Vec<Held> = Vec::with_capacity(t.reads.len());
-    let mut held: Option<u64> = None;
+    // The held value and the virtual time it rose to it.
+    let mut held: Option<(u64, u64)> = None;
     for event in &t.events {
-        let (read, before, handed) = match event {
+        let (read, before, after) = match event {
             Event::Open {
                 read,
                 floor,
                 refused,
                 ..
             } => {
-                let r = t.reads[*read].kernel;
-                let handed = refused.is_none().then(|| floor.map_or(r, |f| r.max(f)));
-                (*read, None, handed)
+                let r = t.reads[*read];
+                let after = refused
+                    .is_none()
+                    .then(|| (floor.map_or(r.kernel, |f| r.kernel.max(f)), r.mono));
+                (*read, None, after)
             }
             Event::Step { read, stopped, .. } => {
-                let h = held.ok_or("rig: a step with no open node")?;
-                let r = t.reads[*read].kernel;
-                (*read, Some(h), stopped.is_none().then(|| h.max(r)))
+                let (h, raised) = held.ok_or("rig: a step with no open node")?;
+                let r = t.reads[*read];
+                let after = match (stopped, rule(h, raised, r)) {
+                    (Some(_), _) => None,
+                    (None, Rule::Hands(w)) if w > h => Some((w, r.mono)),
+                    (None, Rule::Hands(_)) => Some((h, raised)),
+                    // The node ran on where the rule stops it: follow it.
+                    (None, _) => Some((h.max(r.kernel), raised)),
+                };
+                (*read, Some((h, raised)), after)
+            }
+            Event::Promote { read, .. } => {
+                let before = held.ok_or("rig: a promote with no open node")?;
+                if *read != out.len() {
+                    return Err(format!("rig: read {read} is not the next of {}", out.len()));
+                }
+                out.push(Held {
+                    before: Some(before),
+                    handed: None,
+                });
+                continue;
+            }
+            Event::Start {
+                read,
+                floor,
+                stopped,
+            } => {
+                let (h, raised) = held.ok_or("rig: a hold start with no open node")?;
+                let r = t.reads[*read];
+                let after = stopped.is_none().then(|| {
+                    let (w, at) = match rule(h, raised, r) {
+                        Rule::Hands(w) if w > h => (w, r.mono),
+                        _ => (h.max(r.kernel), raised),
+                    };
+                    match floor {
+                        Some(f) if *f > w => (*f, r.mono),
+                        _ => (w, at),
+                    }
+                });
+                (*read, Some((h, raised)), after)
             }
             _ => continue,
         };
         if read != out.len() {
             return Err(format!("rig: read {read} is not the next of {}", out.len()));
         }
-        out.push(Held { before, handed });
-        held = handed;
+        out.push(Held {
+            before,
+            handed: after.map(|(w, _)| w),
+        });
+        held = after;
     }
     if out.len() != t.reads.len() {
-        return Err("rig: a wall read belongs to no open or step".to_string());
+        return Err("rig: a wall read belongs to no open, step or promote".to_string());
     }
     Ok(out)
 }
@@ -750,12 +866,13 @@ fn handed(hold: &[Held], read: usize) -> Result<u64, String> {
 ///   session refused as expired never resolves again before a restart.
 ///
 /// A `401 unrecognized` for a minted token means the daily sweep deleted it,
-/// which it does for `expires_at <= W_tick <= R_tick + tol`, so some sweep
-/// tick before it must allow that. This catches a session lost with no sweep
-/// behind it. It cannot catch a sweep that deletes early: here the daily
-/// sweep ticks only right after a downtime jump, which has already expired
-/// every session it could reach. The sweep's `before` is pinned in
-/// tests/kernel.rs.
+/// which it does for `expires_at <= before`, where `before` is the tick's own
+/// `W_tick`, so some sweep tick before it must have handed out `W_tick >=
+/// expires_at` (the replayed hold's value, exactly). This catches a session
+/// lost with no sweep behind it. It cannot catch a sweep that deletes early:
+/// here the daily sweep ticks only right after a downtime jump, which has
+/// already expired every session it could reach. The sweep's `before` is
+/// pinned in tests/kernel.rs.
 fn check_ttl(sim: &Sim, t: &Trace) -> Result<(), String> {
     let hold = replay_hold(t)?;
     let mut life = 0u32;
@@ -781,7 +898,7 @@ fn check_ttl(sim: &Sim, t: &Trace) -> Result<(), String> {
                 minted.push((t.reads[*read], life, *expires_at));
             }
             Event::Tick { read, schedule, .. } if *schedule == SESSION_SWEEP_NAME => {
-                swept_through = swept_through.max(t.reads[*read].kernel + TOL);
+                swept_through = swept_through.max(handed(&hold, *read)?);
             }
             Event::Present { read, token, seen } => {
                 let r = t.reads[*read];
@@ -846,7 +963,7 @@ fn check_ttl(sim: &Sim, t: &Trace) -> Result<(), String> {
                         if swept_through < e {
                             return Err(format!(
                                 "{TTL_PROPERTY}: a session vanished before any sweep could \
-                                 delete it (the latest a sweep could reach was {}): {}",
+                                 delete it (the latest a sweep reached was {}): {}",
                                 wall(swept_through),
                                 session()
                             ));
@@ -1104,17 +1221,28 @@ fn check_retry(sim: &Sim, t: &Trace) -> Result<(), String> {
 }
 
 /// The boundary property, two-sided, on the readings the kernel was handed.
-/// The rule: an open is refused exactly when its reading is more than the
-/// tolerance behind the store's recorded floor, and a step stops exactly when
-/// its reading is more than the tolerance behind the held value. The checks:
+/// The rule:
+/// - an open is refused exactly when its reading is more than the tolerance
+///   behind the store's recorded floor;
+/// - a step stops exactly when its reading is more than the tolerance behind
+///   the held value, or is at or behind it more than the tolerance of virtual
+///   time after the held value rose (`Rule`);
+/// - a promote is refused exactly when its own read, which goes past the
+///   hold, is more than the tolerance behind the store's floor, and otherwise
+///   opens the write gate;
+/// - where the write gate opens, the hold reads by the step's rule, and then
+///   refuses exactly when the time it would hand out is more than the
+///   tolerance behind the floor.
+///
+/// The checks:
 /// - each stop and refusal fires whenever the rule says it must, and never
 ///   otherwise;
-/// - its text names the reading, the gap, and the held time or floor;
+/// - its text names the reading or held time, the gap, and the floor;
 /// - between stops, every time the node hands out (a session's `expires_at -
 ///   ttl`, a key's `created_at`) is the replayed hold's.
 ///
 /// Wherever a workload excuses a clock stop or refusal as a fault's fallout,
-/// this property is the oracle that neither fires without a clock beyond the
+/// this property is the oracle that none fires without a clock beyond the
 /// tolerance behind it.
 fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
     let hold = replay_hold(t)?;
@@ -1131,6 +1259,84 @@ fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
             ))
         }
     };
+    // The stop the hold's rule calls for at `read`, if any, as the text it
+    // must start with.
+    let stop = |read: usize| -> Result<Option<String>, String> {
+        let (h, raised) = hold[read].before.ok_or("rig: a step with no open node")?;
+        let r = t.reads[read];
+        Ok(match rule(h, raised, r) {
+            Rule::Backwards => Some(format!(
+                "clock went backwards: this node's wall clock reads {}, {:?} behind {}, ",
+                wall(r.kernel),
+                Duration::from_nanos(h - r.kernel),
+                wall(h)
+            )),
+            Rule::Stalled(d) => Some(format!(
+                "clock stalled: this node's wall clock has not advanced past {}, the latest \
+                 time it already used, for {:?} of elapsed time ",
+                wall(h),
+                Duration::from_nanos(d)
+            )),
+            Rule::Hands(_) => None,
+        })
+    };
+    let refusal = |verb: &str, r: u64, floor: Option<u64>| -> Option<String> {
+        floor.filter(|&f| r < f.saturating_sub(TOL)).map(|f| {
+            format!(
+                "refusing to {verb}: this node's wall clock reads {}, {:?} behind {}, ",
+                wall(r),
+                Duration::from_nanos(f - r),
+                wall(f)
+            )
+        })
+    };
+    // Each decision against the rule, both ways. `at` says what the rule
+    // was given there.
+    let judge = |site: &str,
+                 at: String,
+                 due: Option<String>,
+                 fired: Option<&String>|
+     -> Result<(), String> {
+        match (due, fired) {
+            (Some(named), Some(text)) if text.starts_with(&named) => Ok(()),
+            (Some(named), Some(text)) => Err(format!(
+                "{BOUNDARY_PROPERTY}: the {site} at {at} does not name its reading, held time \
+                 or floor (expected it to start {named:?}): {text}"
+            )),
+            (Some(named), None) => Err(format!(
+                "{BOUNDARY_PROPERTY}: the {site} at {at} went on, and the rule stops or \
+                 refuses it there with {named:?}"
+            )),
+            (None, Some(text)) => Err(format!(
+                "{BOUNDARY_PROPERTY}: the {site} at {at} stopped or was refused within the \
+                 tolerance: {text}"
+            )),
+            (None, None) => Ok(()),
+        }
+    };
+    let held_at = |read: usize| -> String {
+        let r = t.reads[read];
+        match hold[read].before {
+            Some((h, raised)) => format!(
+                "true wall {}, its clock reading {}, holding {} since {:?} before",
+                wall(r.true_wall()),
+                wall(r.kernel),
+                wall(h),
+                Duration::from_nanos(r.mono - raised)
+            ),
+            None => format!(
+                "true wall {}, its clock reading {}",
+                wall(r.true_wall()),
+                wall(r.kernel)
+            ),
+        }
+    };
+    let over = |read: usize, floor: Option<u64>| -> String {
+        match floor {
+            Some(f) => format!("{} over the floor {}", held_at(read), wall(f)),
+            None => format!("{} over no floor", held_at(read)),
+        }
+    };
     for event in &t.events {
         match event {
             Event::Open {
@@ -1140,84 +1346,72 @@ fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
                 ..
             } => {
                 let r = t.reads[*read].kernel;
-                let beyond = floor.filter(|&f| r < f.saturating_sub(TOL));
-                match (beyond, refused) {
-                    (Some(f), Some(text)) => {
-                        let named = format!(
-                            "refusing to open: this node's wall clock reads {}, {:?} behind {}, ",
-                            wall(r),
-                            Duration::from_nanos(f - r),
-                            wall(f)
-                        );
-                        if !text.starts_with(&named) {
-                            return Err(format!(
-                                "{BOUNDARY_PROPERTY}: the open refusal does not name its \
-                                 reading and floor (expected it to start {named:?}): {text}"
-                            ));
-                        }
-                    }
-                    (None, None) => {}
-                    (Some(f), None) => {
-                        return Err(format!(
-                            "{BOUNDARY_PROPERTY}: a node opened with its clock reading {}, \
-                             more than the tolerance behind {}, the latest time its data \
-                             directory recorded",
-                            wall(r),
-                            wall(f)
-                        ));
-                    }
-                    (None, Some(text)) => {
-                        return Err(format!(
-                            "{BOUNDARY_PROPERTY}: a node refused to open with its clock \
-                             reading {}, within the tolerance of its floor {:?}: {text}",
-                            wall(r),
-                            floor.map(wall)
-                        ));
-                    }
+                judge(
+                    "open",
+                    over(*read, *floor),
+                    refusal("open", r, *floor),
+                    refused.as_ref(),
+                )?;
+                if refused.is_none() && floor.is_some_and(|f| r < f) {
+                    sim.cover("clock:held:open");
                 }
             }
             Event::Step { read, stopped, .. } => {
-                let h = hold[*read].before.ok_or("rig: a step with no open node")?;
-                let r = t.reads[*read].kernel;
-                let beyond = r < h.saturating_sub(TOL);
-                match (beyond, stopped) {
-                    (true, Some(text)) => {
-                        let named = format!(
-                            "clock went backwards: this node's wall clock reads {}, {:?} behind \
-                             {}, ",
-                            wall(r),
-                            Duration::from_nanos(h - r),
-                            wall(h)
-                        );
-                        if !text.starts_with(&named) {
-                            return Err(format!(
-                                "{BOUNDARY_PROPERTY}: the stop does not name its reading and \
-                                 held time (expected it to start {named:?}): {text}"
-                            ));
-                        }
-                    }
-                    (false, None) => {
-                        if r < h {
-                            sim.cover("clock:held");
-                        }
-                    }
-                    (true, None) => {
-                        return Err(format!(
-                            "{BOUNDARY_PROPERTY}: the node ran on with its clock reading {}, \
-                             more than the tolerance behind {}, the latest time it used",
-                            wall(r),
-                            wall(h)
-                        ));
-                    }
-                    (false, Some(text)) => {
-                        return Err(format!(
-                            "{BOUNDARY_PROPERTY}: the node stopped with its clock reading {}, \
-                             within the tolerance of {}, the latest time it used: {text}",
-                            wall(r),
-                            wall(h)
-                        ));
-                    }
+                judge("step", held_at(*read), stop(*read)?, stopped.as_ref())?;
+                let (h, raised) = hold[*read].before.ok_or("rig: a step with no open node")?;
+                let r = t.reads[*read];
+                match (stopped, rule(h, raised, r)) {
+                    (Some(_), Rule::Stalled(_)) => sim.cover("clock:stalled"),
+                    (None, _) if r.kernel < h => sim.cover("clock:held"),
+                    _ => {}
                 }
+            }
+            Event::Promote {
+                read,
+                floor,
+                accepted,
+                refused,
+            } => {
+                let r = t.reads[*read].kernel;
+                let due = refusal("promote", r, *floor);
+                // The reply can be lost on its way to the operator; the
+                // write gate is the node's own answer.
+                if due.is_some() == *accepted {
+                    return Err(format!(
+                        "{BOUNDARY_PROPERTY}: a promote at {} {} the write gate",
+                        over(*read, *floor),
+                        if *accepted {
+                            "opened, more than the tolerance behind,"
+                        } else {
+                            "kept shut, within the tolerance,"
+                        }
+                    ));
+                }
+                if refused.is_some() {
+                    judge("promote", over(*read, *floor), due, refused.as_ref())?;
+                    sim.cover("clock:refused:promote");
+                } else if floor.is_some_and(|f| r < f) {
+                    sim.cover("clock:held:promote");
+                }
+            }
+            Event::Start {
+                read,
+                floor,
+                stopped,
+            } => {
+                let due = match stop(*read)? {
+                    Some(named) => Some(named),
+                    None => {
+                        let (h, _) = hold[*read].before.ok_or("rig: no open node")?;
+                        refusal("promote", h.max(t.reads[*read].kernel), *floor)
+                    }
+                };
+                judge(
+                    "write gate's hold start",
+                    over(*read, *floor),
+                    due,
+                    stopped.as_ref(),
+                )?;
             }
             Event::Mint {
                 read, expires_at, ..
@@ -1227,6 +1421,542 @@ fn check_boundary(sim: &Sim, t: &Trace) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// --------------------------------------------------------------- promote
+
+const PROMOTE_ATTEMPTS: u32 = 8;
+const ROUND_BUDGET: u32 = 20_000;
+
+/// One node of the promote workload, on its own host: its own disk, its own
+/// clock (skew, step-backs, downtime), and its own trace. The source and its
+/// responses outlive any one kernel.
+struct Node {
+    host: SimHost,
+    cfg: ReplConfig,
+    kernel: Option<Kernel>,
+    source: SimSource,
+    responses: RecordedResponses,
+    asked: Vec<Ask>,
+    tokens: Vec<String>,
+    reads: Arc<Mutex<Vec<Read>>>,
+    events: Vec<Event>,
+    /// A promote has been sent and its reply not yet seen.
+    promoting: bool,
+    /// The `Promote` event awaiting that reply.
+    promote: Option<usize>,
+    /// Still a follower: no promote has been accepted.
+    follower: bool,
+}
+
+impl Node {
+    fn new(sim: &Sim, name: &str, listen: &str, initial_role: Role) -> Node {
+        let follower = matches!(initial_role, Role::Follower { .. });
+        let source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+        let responses = source.responses();
+        Node {
+            host: sim.host(name),
+            cfg: ReplConfig {
+                listen: Some(listen.to_string()),
+                initial_role,
+                peer_secret: None,
+                strict_witnesses: false,
+            },
+            kernel: None,
+            source,
+            responses,
+            asked: Vec::new(),
+            tokens: Vec::new(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+            events: Vec::new(),
+            promoting: false,
+            promote: None,
+            follower,
+        }
+    }
+
+    fn reads_len(&self) -> usize {
+        self.reads.lock().expect("reads lock").len()
+    }
+
+    fn last_applied(&self) -> Option<u64> {
+        self.kernel
+            .as_ref()
+            .and_then(|k| k.app().db().last_applied())
+    }
+
+    fn into_trace(self) -> Trace {
+        Trace {
+            reads: self.reads.lock().expect("reads lock").clone(),
+            events: self.events,
+        }
+    }
+}
+
+/// Opens `node`'s kernel over its host's store, waiting out a refusal for
+/// the time it names and power-cycling the host before the next attempt.
+/// `false` once `OPEN_ATTEMPTS` refusals pass.
+fn open_replicated(sim: &Sim, node: &mut Node) -> Result<bool, String> {
+    for _ in 0..OPEN_ATTEMPTS {
+        let mut app = open_app(node.host.disk(), node.host.entropy())
+            .map_err(|e| format!("App::open on {}: {e}", node.host.name()))?;
+        let (repl, _) = Repl::open(
+            Box::new(node.host.net()),
+            Box::new(node.host.disk()),
+            node.cfg.clone(),
+            app.db_for_tests(),
+        )
+        .map_err(|e| format!("Repl::open on {}: {e}", node.host.name()))?;
+        let floor = recorded_floor(app.db())?;
+        let read = node.reads_len();
+        let clock = TracedClock {
+            inner: node.host.clock(),
+            uptime_since: None,
+            reads: node.reads.clone(),
+        };
+        let opened = Kernel::with_replication(app, Box::new(clock), repl);
+        if node.reads_len() != read + 1 {
+            return Err(format!(
+                "rig: Kernel::with_replication read the wall clock {} times",
+                node.reads_len() - read
+            ));
+        }
+        match opened {
+            Ok(mut kernel) => {
+                if kernel.app().db().writes_allowed() {
+                    kernel
+                        .app_mut_for_tests()
+                        .db_for_tests()
+                        .migrate_schema()
+                        .map_err(|e| format!("migrate_schema: {e}"))?;
+                }
+                node.events.push(Event::Open {
+                    read,
+                    floor,
+                    beat_due: None,
+                    refused: None,
+                });
+                node.kernel = Some(kernel);
+                return Ok(true);
+            }
+            Err(e) => {
+                let text = e.to_string();
+                if !text.starts_with("refusing to open: this node's wall clock reads ") {
+                    return Err(format!(
+                        "Kernel::with_replication failed on {}, and only the clock's and the \
+                         network's faults are on: {text}",
+                        node.host.name()
+                    ));
+                }
+                sim.cover("clock:refused");
+                sim.cover("clock:refused:open");
+                if node.follower {
+                    sim.cover("clock:refused:open:follower");
+                }
+                node.events.push(Event::Open {
+                    read,
+                    floor,
+                    beat_due: None,
+                    refused: Some(text),
+                });
+                let after = floor.unwrap_or(0).saturating_sub(TOL);
+                let reading = node.reads.lock().expect("reads lock")[read].kernel;
+                sim.clock()
+                    .sleep(Duration::from_nanos(after.saturating_sub(reading) + SEC));
+                node.host.restart();
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Steps `node` once and records what the step read. A step reads the wall
+/// clock once through the hold; a promote reads it again, past the hold, and
+/// a write gate opening reads it once more through the hold. `None` when the
+/// node is down, or stopped at this step.
+fn step_node(sim: &Sim, node: &mut Node) -> Result<Option<Step>, String> {
+    let reads_len = |reads: &Arc<Mutex<Vec<Read>>>| reads.lock().expect("reads lock").len();
+    let Some(kernel) = node.kernel.as_mut() else {
+        return Ok(None);
+    };
+    let gated = !kernel.app().db().writes_allowed();
+    let floor = if gated {
+        recorded_floor(kernel.app().db())?
+    } else {
+        None
+    };
+    let read = reads_len(&node.reads);
+    let answered = node.responses.lock().expect("responses lock").len();
+    let step = kernel.step(&mut node.source);
+    let n = reads_len(&node.reads) - read;
+    // `floor`, read before the step, is the one both checks read: the step
+    // that runs a control verb applies no record before it (`Repl::step`
+    // returns from `begin_control`), a primary applies none, and the
+    // schedules are upserted only after the hold starts.
+    let opened = gated && kernel.app().db().writes_allowed();
+    let stopped = match &step {
+        Ok(_) => None,
+        Err(e) => {
+            let text = e.to_string();
+            if !clock_stop(&text)
+                && !text.starts_with("refusing to promote: this node's wall clock reads ")
+            {
+                return Err(format!(
+                    "the kernel on {} stopped, and only the clock's and the network's faults \
+                     are on: {text}",
+                    node.host.name()
+                ));
+            }
+            Some(text)
+        }
+    };
+    let idle = match &step {
+        Ok(Step::Idle { deadline }) => Some(deadline.map(Instant::as_nanos)),
+        _ => None,
+    };
+    if opened != (n > 1 && (n == 3 || !node.promoting)) {
+        return Err(format!(
+            "rig: a step on {} read the wall clock {n} times, and the write gate {} \
+             (promoting: {})",
+            node.host.name(),
+            if opened { "opened" } else { "stayed as it was" },
+            node.promoting
+        ));
+    }
+    match (n, node.promoting) {
+        (1, _) => node.events.push(Event::Step {
+            read,
+            idle,
+            stopped: stopped.clone(),
+        }),
+        (2, true) if stopped.is_none() => {
+            node.events.push(Event::Step {
+                read,
+                idle,
+                stopped: None,
+            });
+            node.promote = Some(node.events.len());
+            node.events.push(Event::Promote {
+                read: read + 1,
+                floor,
+                accepted: opened,
+                refused: None,
+            });
+        }
+        (2, false) => {
+            node.events.push(Event::Step {
+                read,
+                idle,
+                stopped: None,
+            });
+            node.events.push(Event::Start {
+                read: read + 1,
+                floor,
+                stopped: stopped.clone(),
+            });
+        }
+        (3, true) => {
+            node.events.push(Event::Step {
+                read,
+                idle,
+                stopped: None,
+            });
+            node.promote = Some(node.events.len());
+            node.events.push(Event::Promote {
+                read: read + 1,
+                floor,
+                accepted: true,
+                refused: None,
+            });
+            node.events.push(Event::Start {
+                read: read + 2,
+                floor,
+                stopped: stopped.clone(),
+            });
+        }
+        _ => {
+            return Err(format!(
+                "rig: a step on {} read the wall clock {n} times (promoting: {}, stopped: \
+                 {stopped:?})",
+                node.host.name(),
+                node.promoting
+            ));
+        }
+    }
+    if let Some(text) = &stopped {
+        sim.cover("clock:refused");
+        sim.cover(if text.starts_with("refusing to promote") {
+            "clock:refused:start"
+        } else {
+            "clock:refused:stop"
+        });
+        node.kernel = None;
+        return Ok(None);
+    }
+    let step = step.expect("checked above");
+    let response = {
+        let recorded = node.responses.lock().expect("responses lock");
+        (recorded.len() > answered).then(|| recorded[answered].clone())
+    };
+    if let Some((status, body)) = response {
+        if node.asked.len() <= answered {
+            return Err("rig: a response with nothing asked".to_string());
+        }
+        let ask = node.asked[answered];
+        let kernel = node.kernel.as_ref().expect("checked above");
+        if status == 503 && String::from_utf8_lossy(&body).contains("not accepting writes yet") {
+            // A primary that restarted serves no write until its follower
+            // confirms it was never promoted; the write gate opening is
+            // judged where it happens (`Event::Start`).
+            sim.cover("promote:write-gated");
+            return Ok(Some(step));
+        }
+        answer(
+            kernel,
+            &mut node.events,
+            &mut node.tokens,
+            read,
+            ask,
+            status,
+            &body,
+        )?;
+    }
+    Ok(Some(step))
+}
+
+/// One round over the live nodes: each steps once. When none worked, virtual
+/// time moves to the earliest kernel deadline or message delivery, and never
+/// past `limit`. A node that stopped is power-cycled and reopened. `false`
+/// once a stopped node never reopens.
+fn round(sim: &Sim, nodes: &mut [&mut Node], limit: u64) -> Result<bool, String> {
+    let mut worked = false;
+    let mut deadlines: Vec<u64> = Vec::new();
+    for node in nodes.iter_mut() {
+        let live = node.kernel.is_some();
+        match step_node(sim, node)? {
+            Some(Step::Worked) => worked = true,
+            Some(Step::Idle { deadline }) => deadlines.extend(deadline.map(Instant::as_nanos)),
+            None if live => {
+                node.host.restart();
+                if !open_replicated(sim, node)? {
+                    return Ok(false);
+                }
+                worked = true;
+            }
+            None => {}
+        }
+    }
+    if worked {
+        return Ok(true);
+    }
+    let now = sim.now().as_nanos();
+    let next = deadlines
+        .into_iter()
+        .chain(sim.next_wakeup())
+        .filter(|&d| d > now)
+        .min()
+        .map_or(limit, |d| d.min(limit));
+    if next > now {
+        sim.clock().sleep(Duration::from_nanos(next - now));
+    }
+    Ok(true)
+}
+
+/// Rounds until `done`, or until virtual time reaches `until`. `None` once a
+/// stopped node never reopens.
+fn drive(
+    sim: &Sim,
+    nodes: &mut [&mut Node],
+    until: u64,
+    done: impl Fn(&[&mut Node]) -> bool,
+) -> Result<Option<bool>, String> {
+    for _ in 0..ROUND_BUDGET {
+        if done(nodes) {
+            return Ok(Some(true));
+        }
+        if sim.now().as_nanos() >= until {
+            return Ok(Some(false));
+        }
+        if !round(sim, nodes, until)? {
+            return Ok(None);
+        }
+    }
+    Err(format!(
+        "rig: {ROUND_BUDGET} rounds without reaching {}",
+        wall(until)
+    ))
+}
+
+/// Asks `nodes[0]` for `ask` and drives every node until it answers, then
+/// for a random gap. `false` when it does not answer in 30 s, or a node never
+/// reopens: the caller stops asking, since the answers are matched to the
+/// asks in order.
+fn ask(sim: &Sim, rng: &mut Rng, nodes: &mut [&mut Node], ask: Ask) -> Result<bool, String> {
+    let i = nodes[0].asked.len();
+    nodes[0].asked.push(ask);
+    let now = sim.now().as_nanos();
+    nodes[0].source.push_at(now, request(ask, &[]));
+    let answered = |n: &[&mut Node]| n[0].responses.lock().expect("responses lock").len() > i;
+    if drive(sim, nodes, now + 30 * SEC, answered)? != Some(true) {
+        return Ok(false);
+    }
+    let gap = sim.now().as_nanos() + rng.between(200, 3_000) * 1_000_000;
+    Ok(drive(sim, nodes, gap, |_| false)?.is_some())
+}
+
+/// Promotes `f` through the control verb, as an operator does after the
+/// primary is lost: asks, and waits out a refusal for the time it names, up
+/// to `PROMOTE_ATTEMPTS` times.
+fn promote(sim: &Sim, f: &mut Node, addr: &str) -> Result<(), String> {
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    for _ in 0..PROMOTE_ATTEMPTS {
+        if f.kernel.is_none() {
+            return Ok(());
+        }
+        let sent = sim.host("cli").net().connect(addr).and_then(|conn| {
+            conn.send(&encode(&Msg::CtrlPromote { secret: None }))?;
+            Ok(conn)
+        });
+        let Ok(conn) = sent else {
+            let until = sim.now().as_nanos() + SEC;
+            if drive(sim, &mut [&mut *f], until, |_| false)?.is_none() {
+                return Ok(());
+            }
+            continue;
+        };
+        f.promoting = true;
+        f.promote = None;
+        let until = sim.now().as_nanos() + 30 * SEC;
+        let mut reply = None;
+        for _ in 0..ROUND_BUDGET {
+            if sim.now().as_nanos() >= until || !round(sim, &mut [&mut *f], until)? {
+                break;
+            }
+            match conn.recv(&mut buf) {
+                Ok(Some(0)) | Err(_) => break,
+                Ok(Some(n)) => {
+                    reply = Some(decode(&buf[..n]).map_err(|e| format!("ctrl reply: {e}"))?);
+                    break;
+                }
+                Ok(None) => {}
+            }
+        }
+        f.promoting = false;
+        match reply {
+            // The boundary property judges the promote from the node's own
+            // step (`Event::Promote`); the reply only ends the attempts.
+            Some(Msg::CtrlOk { .. }) => {
+                sim.cover("clock:promoted");
+                f.follower = false;
+                return Ok(());
+            }
+            Some(Msg::CtrlErr { message })
+                if message == "cannot promote: this node is already the primary" =>
+            {
+                // An earlier attempt's answer was lost on its way back.
+                f.follower = false;
+                return Ok(());
+            }
+            Some(Msg::CtrlErr { message })
+                if message.starts_with("refusing to promote: this node's wall clock reads ") =>
+            {
+                let i = f
+                    .promote
+                    .take()
+                    .ok_or("rig: a promote refusal with no promote read")?;
+                let Event::Promote {
+                    read,
+                    floor,
+                    refused,
+                    ..
+                } = &mut f.events[i]
+                else {
+                    return Err("rig: the promote event is not a promote".to_string());
+                };
+                *refused = Some(message);
+                sim.cover("clock:refused");
+                let after = floor.unwrap_or(0).saturating_sub(TOL);
+                let reading = f.reads.lock().expect("reads lock")[*read].kernel;
+                sim.clock()
+                    .sleep(Duration::from_nanos(after.saturating_sub(reading) + SEC));
+            }
+            Some(other) => return Err(format!("the promote was answered {other:?}")),
+            // Lost with its connection; the next attempt asks again.
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// A primary and a follower, each on its own host and clock. The primary
+/// records times (keys, logins, its schedule's ticks) and ships them; the
+/// follower is power-cycled and reopens over them (spec §5 B's "every role is
+/// checked at open"); the primary is lost; and the follower is promoted and
+/// serves. Both nodes' traces go to the boundary property.
+fn promote_universe(sim: &Sim) -> Result<[Trace; 2], String> {
+    let mut rng = Rng::new(sim.seed() ^ 0xC10C_9A0E);
+    let mut p = Node::new(sim, "p", "p:1", Role::Primary);
+    let mut f = Node::new(
+        sim,
+        "f",
+        "f:1",
+        Role::Follower {
+            primary: "p:1".to_string(),
+        },
+    );
+    let converged = |n: &[&mut Node]| {
+        n[1].last_applied().is_some() && n[0].last_applied() == n[1].last_applied()
+    };
+    'run: {
+        if !open_replicated(sim, &mut p)? || !open_replicated(sim, &mut f)? {
+            break 'run;
+        }
+        for _ in 0..rng.between(3, 10) {
+            let next = if rng.chance(0.5) {
+                Ask::Key
+            } else {
+                Ask::Login
+            };
+            if !ask(sim, &mut rng, &mut [&mut p, &mut f], next)? {
+                break;
+            }
+        }
+        let until = sim.now().as_nanos() + 60 * SEC;
+        if drive(sim, &mut [&mut p, &mut f], until, converged)?.is_none() {
+            break 'run;
+        }
+        if rng.chance(0.75) {
+            drop(f.kernel.take());
+            f.host.restart();
+            if !open_replicated(sim, &mut f)? {
+                break 'run;
+            }
+            let until = sim.now().as_nanos() + 60 * SEC;
+            if drive(sim, &mut [&mut p, &mut f], until, converged)?.is_none() {
+                break 'run;
+            }
+        }
+        p.host.crash_now();
+        drop(p.kernel.take());
+        sim.clock().sleep(Duration::from_millis(rng.below(30_000)));
+        promote(sim, &mut f, "f:1")?;
+        if f.follower {
+            break 'run;
+        }
+        for _ in 0..rng.between(2, 6) {
+            let next = if rng.chance(0.5) {
+                Ask::Key
+            } else {
+                Ask::Login
+            };
+            if !ask(sim, &mut rng, &mut [&mut f], next)? {
+                break;
+            }
+        }
+    }
+    drop(p.kernel.take());
+    drop(f.kernel.take());
+    Ok([p.into_trace(), f.into_trace()])
 }
 
 // ----------------------------------------------------------------- tests
@@ -1296,6 +2026,34 @@ fn the_stop_and_the_refusal_fire_exactly_when_the_clock_is_beyond_tolerance() {
             "clock:refused:stop",
             "clock:refused:open",
             "clock:held",
+            "clock:held:open",
+            "clock:stalled",
+        ]
+    );
+}
+
+/// The boundary property's promote half (spec §5 B: "the stop and the
+/// open/promote refusal"), on a primary and a follower whose clocks each
+/// carry their own skew, step-backs and downtime: the follower's open over
+/// the times it replicated, and its promote, are judged by the same rule as
+/// the single node's.
+#[test]
+fn a_promote_is_refused_exactly_when_the_followers_clock_is_beyond_tolerance() {
+    run_universes_swarm_with!(
+        BASE,
+        UNIVERSES,
+        clock_axes,
+        |sim: &mut Sim| {
+            let [p, f] = promote_universe(sim)?;
+            check_boundary(sim, &p)?;
+            check_boundary(sim, &f)
+        },
+        require: [
+            "clock:skewed",
+            "clock:refused:open:follower",
+            "clock:refused:promote",
+            "clock:held:promote",
+            "clock:promoted",
         ]
     );
 }

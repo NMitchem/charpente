@@ -30,12 +30,18 @@ impl Now {
 }
 
 /// Keeps the wall time this node hands out from ever decreasing. A reading
-/// behind the latest one is held at the latest; a reading more than
-/// `CLOCK_TOLERANCE` behind it stops the node by name. So each backward step
-/// extends sessions and delays ticks by at most the tolerance, and repeated
-/// steps within it add up.
+/// at or behind the latest one is held at the latest. The node stops by name
+/// when a reading is more than `CLOCK_TOLERANCE` behind it, or when the hold
+/// has been in effect for more than the tolerance of monotonic time since the
+/// handed-out wall last rose, which is how a stuck clock shows. So each hold
+/// episode, a step back or a freeze, extends sessions and delays ticks by at
+/// most the tolerance before the node stops. What it cannot see: a clock that
+/// runs slow, and steps within the tolerance adding up against other clocks
+/// (the IdP's, another node's). NTP is what bounds those.
 pub(crate) struct WallHold {
-    held: Option<WallTime>,
+    /// The latest wall time handed out, and the monotonic instant it rose to
+    /// that value.
+    held: Option<(WallTime, Instant)>,
 }
 
 impl WallHold {
@@ -43,11 +49,13 @@ impl WallHold {
         WallHold { held: None }
     }
 
-    /// max(reading, held); Err(stop) when reading < held - CLOCK_TOLERANCE.
+    /// max(reading, held); Err(stop) when reading < held - CLOCK_TOLERANCE,
+    /// or when reading <= held more than CLOCK_TOLERANCE after held rose.
     pub(crate) fn read(&mut self, clock: &dyn Clock) -> io::Result<WallTime> {
         let reading = clock.wall();
-        let Some(held) = self.held else {
-            self.held = Some(reading);
+        let mono = clock.now();
+        let Some((held, raised_at)) = self.held else {
+            self.held = Some((reading, mono));
             return Ok(reading);
         };
         if reading < held.saturating_sub(CLOCK_TOLERANCE) {
@@ -62,14 +70,29 @@ impl WallHold {
                 held.saturating_sub(CLOCK_TOLERANCE)
             ))));
         }
-        let wall = reading.max(held);
-        self.held = Some(wall);
-        Ok(wall)
+        if reading <= held {
+            let stalled = mono.duration_since(raised_at);
+            if stalled > CLOCK_TOLERANCE {
+                return Err(io::Error::other(Refusal(format!(
+                    "clock stalled: this node's wall clock has not advanced past {held}, the \
+                     latest time it already used, for {stalled:?} of elapsed time — more than \
+                     the {CLOCK_TOLERANCE:?} charpente tolerates (CLOCK_TOLERANCE). The node \
+                     stopped rather than hold sessions open and schedules still. Fix the system \
+                     clock (check NTP) and restart."
+                ))));
+            }
+            return Ok(held);
+        }
+        self.held = Some((reading, mono));
+        Ok(reading)
     }
 
-    /// Raises `held` to `floor` (never lowers it).
-    pub(crate) fn seed(&mut self, floor: WallTime) {
-        self.held = Some(self.held.map_or(floor, |held| held.max(floor)));
+    /// Raises `held` to `floor` (never lowers it), as of `mono`.
+    fn seed(&mut self, floor: WallTime, mono: Instant) {
+        match self.held {
+            Some((held, _)) if held >= floor => {}
+            _ => self.held = Some((floor, mono)),
+        }
     }
 
     /// The check where a node becomes writable (`Kernel::build`'s open, and
@@ -89,7 +112,7 @@ impl WallHold {
         if let Some(refusal) = behind_floor(wall, floor, verb) {
             return Err(io::Error::other(Refusal(refusal)));
         }
-        self.seed(floor);
+        self.seed(floor, clock.now());
         Ok(wall.max(floor))
     }
 }
@@ -187,7 +210,7 @@ mod tests {
         let (clock, steer) = SteeredClock::new(sim.clock(), secs(100));
         let mut hold = WallHold::new();
         hold.read(&clock).unwrap();
-        hold.seed(secs(50));
+        hold.seed(secs(50), clock.now());
         steer.set(secs(45));
         assert_eq!(
             hold.read(&clock).unwrap(),
@@ -224,6 +247,94 @@ mod tests {
             Some(secs(40)),
             "a fault-free tail waits out the instant this names: reword it and \
              checks::clock_reopens_after must follow"
+        );
+    }
+
+    /// A wall clock that stops advancing never reads behind the hold, so only
+    /// the time the hold has been in effect can catch it: more than the
+    /// tolerance of monotonic time since the handed-out wall last rose stops
+    /// the node by name. Reads at the held time in between do not restart
+    /// that count, and steps within one virtual instant never fire it.
+    #[test]
+    fn a_wall_clock_frozen_past_the_tolerance_stops_by_name() {
+        let sim = Sim::with_faults(0x5C10_0005, FaultConfig::none());
+        let (clock, _steer) = SteeredClock::new(sim.clock(), secs(100));
+        let mut hold = WallHold::new();
+        assert_eq!(hold.read(&clock).unwrap(), secs(100));
+        assert_eq!(hold.read(&clock).unwrap(), secs(100), "the same instant");
+        sim.clock().sleep(Duration::from_secs(30));
+        assert_eq!(hold.read(&clock).unwrap(), secs(100), "frozen for 30s");
+        sim.clock().sleep(Duration::from_secs(30));
+        assert_eq!(
+            hold.read(&clock).unwrap(),
+            secs(100),
+            "frozen for exactly the tolerance still holds"
+        );
+        sim.clock().sleep(Duration::from_secs(1));
+        let err = hold.read(&clock).unwrap_err();
+        assert!(Refusal::of(&err).is_some(), "a named stop: {err}");
+        assert_eq!(
+            err.to_string(),
+            "clock stalled: this node's wall clock has not advanced past \
+             2026-01-01T00:01:40.000Z, the latest time it already used, for 61s of elapsed time \
+             — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The node stopped rather \
+             than hold sessions open and schedules still. Fix the system clock (check NTP) and \
+             restart."
+        );
+        assert!(
+            charpente_sim::checks::clock_refused(&err.to_string()),
+            "the sim's app workloads excuse this stop where a clock fault fired \
+             (checks::clock_fallout): reword it and checks::clock_refused must follow"
+        );
+        assert_eq!(
+            charpente_sim::checks::clock_reopens_after(&err.to_string()),
+            None,
+            "a stall names no instant to wait for (checks::clock_reopens_after): reword it \
+             and that must follow"
+        );
+    }
+
+    /// The same count bounds a step back: a hold episode, whatever starts
+    /// it, lasts at most the tolerance. A step the clock recovers from by
+    /// then holds; one that keeps the reading at or below the hold for longer
+    /// stops, even though no read was ever more than the tolerance behind.
+    #[test]
+    fn a_hold_ends_within_the_tolerance_or_stops_by_name() {
+        let sim = Sim::with_faults(0x5C10_0006, FaultConfig::none());
+        let (clock, steer) = SteeredClock::new(sim.clock(), secs(100));
+        let mut hold = WallHold::new();
+        assert_eq!(hold.read(&clock).unwrap(), secs(100));
+        sim.clock().sleep(Duration::from_secs(10));
+        steer.set(secs(50));
+        assert_eq!(hold.read(&clock).unwrap(), secs(100), "60s back holds");
+        sim.clock().sleep(Duration::from_secs(50));
+        steer.set(secs(100));
+        assert_eq!(
+            hold.read(&clock).unwrap(),
+            secs(100),
+            "back at the held time exactly the tolerance after it rose"
+        );
+        sim.clock().sleep(Duration::from_secs(1));
+        steer.set(secs(101));
+        assert_eq!(hold.read(&clock).unwrap(), secs(101), "recovered");
+
+        sim.clock().sleep(Duration::from_secs(50));
+        steer.set(secs(151 - 100));
+        assert_eq!(
+            hold.read(&clock).unwrap(),
+            secs(101),
+            "100s back, 50 s after the last rise: 50s behind the hold"
+        );
+        sim.clock().sleep(Duration::from_secs(11));
+        steer.set(secs(62));
+        let err = hold.read(&clock).unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "clock stalled: this node's wall clock has not advanced past \
+                 2026-01-01T00:01:41.000Z, the latest time it already used, for 61s of elapsed \
+                 time"
+            ),
+            "{err}"
         );
     }
 
