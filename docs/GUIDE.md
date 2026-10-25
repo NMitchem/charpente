@@ -4313,8 +4313,9 @@ charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
   ones the seed draws: each `sim.input()` draw reads the next, and every draw
   past the end reads 0. `HEX` is each choice as an unsigned LEB128 number, the
   bytes in lowercase hex, which is what a shrunk failure's `repro:` line
-  prints. Anything else (a character that is not lowercase hex, an odd
-  length, a number cut off or past 64 bits) is a usage error naming the flag.
+  prints. Anything else (an empty value, a character that is not lowercase
+  hex, an odd length, a number cut off or past 64 bits) is a usage error
+  naming the flag, so an unset `--inputs "$HEX"` never replays all zeros.
 - `--faults-off AXIS,…` — with `--seed`, turn these `FaultConfig` axes off
   (any field but `corruption_scope`, which scopes two axes rather than being
   one). The seed's config is sampled first and these are turned off after, so
@@ -4455,7 +4456,8 @@ round keeps nothing:
 3. search each choice down toward 0 (galloping up from 0, then bisecting), so a
    small value that fails is found even when the recorded choice is huge;
 4. turn off each fault axis that is on, one at a time, in `FaultConfig` field
-   order.
+   order. An axis is on when it could fire: a clock axis whose chance is 0 is
+   off whatever its size, so `faults off:` never lists it.
 
 A candidate is kept when the same check fails, with any message. One that
 passes or gives up is not kept, so a clock axis whose removal turns the failure
@@ -4468,7 +4470,9 @@ Shrinking runs on the first failure of each check in seed order, never in
 completion order, and each shrink depends only on its check, seed and first
 failure. Its budget is 500 replays, counted rather than timed, so the block is
 identical for any `--jobs` and on any machine. A shrink that spends the budget
-stops with the smallest run found so far.
+stops with the smallest run found so far. A workload that panics prints the
+panic's message on stderr each time a shrink replay panics; the report itself is
+on stdout, written once every shrink has finished.
 
 **A slipped shrink.** Any failure of the same check counts, so the smallest run
 can fail it for another reason than the first did. The headline is then the

@@ -139,6 +139,12 @@ fn the_repro_flags_refuse_by_name_and_run_nothing() {
             &["--seed", "0x1", "--faults-off", "disk_crash"][..],
             "--faults-off: \"disk_crash\" is not a FaultConfig field",
         ),
+        // An unset `--inputs "$HEX"` must not replay all zeros.
+        (
+            &["--seed", "0x1", "--inputs", ""][..],
+            "--inputs: \"\" is not a choice sequence (lowercase hex of LEB128 numbers, as a \
+             failure's repro line prints it)",
+        ),
     ] {
         let out = charpente()
             .args(["test", "--sim"])

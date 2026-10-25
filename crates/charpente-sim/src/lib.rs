@@ -3065,12 +3065,20 @@ pub(crate) const FAULT_AXES: [&str; 26] = [
     "clock_downtime",
 ];
 
-/// Whether the axis `field` is on in `cfg`: turning it off would change the
-/// config. Judged by `turn_off` itself, so the two cannot disagree.
+/// Whether the axis `field` is on in `cfg`: it could fire, and turning it off
+/// would change the config, judged by `turn_off` itself. A clock axis is a
+/// chance and a size, and a chance of 0 never fires whatever the size, so it
+/// is off even though `turn_off` would still zero its size (`sample_clock_fields`
+/// can draw a step-back chance of 0 beside its 120 s size).
 pub(crate) fn axis_on(cfg: &FaultConfig, field: &str) -> bool {
+    let never_fires = match field {
+        "clock_step_back" => cfg.clock_step_back.0 == 0.0,
+        "clock_downtime" => cfg.clock_downtime.0 == 0.0,
+        _ => false,
+    };
     let mut off = cfg.clone();
     turn_off(&mut off, field);
-    format!("{off:?}") != format!("{cfg:?}")
+    !never_fires && format!("{off:?}") != format!("{cfg:?}")
 }
 
 /// Turns off the `FaultConfig` field named `field`: a probability or a skew
@@ -4816,6 +4824,12 @@ mod tests {
                 assert_eq!(axis_on(&cfg, other), other != axis, "{axis} off, {other}");
             }
         }
+        // A clock axis with a chance of 0 cannot fire, whatever its size.
+        let mut cfg = every_axis_on.clone();
+        cfg.clock_step_back = (0.0, Duration::from_secs(120));
+        cfg.clock_downtime = (0.0, Duration::from_secs(3 * 86_400));
+        assert!(!axis_on(&cfg, "clock_step_back"));
+        assert!(!axis_on(&cfg, "clock_downtime"));
     }
 
     #[test]

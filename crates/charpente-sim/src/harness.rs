@@ -253,8 +253,12 @@ pub(crate) struct Shrunk {
     pub config: FaultConfig,
     /// Candidate runs replayed, kept or not; at most `SHRINK_BUDGET`.
     pub replays: u32,
-    /// Whether the repro must pass `--inputs`: false when the seed's own
-    /// stream draws these choices, because they begin the first failure's.
+    /// Whether the repro must pass `--inputs`: false only when the choices
+    /// the run consumed, zeros past the kept ones included, begin the first
+    /// failure's, which are the seed's own stream. Compared untrimmed: a run
+    /// that read 0s past its kept choices where the stream would give other
+    /// values needs `--inputs`, or the repro replays a different run
+    /// (`a_run_that_read_zeros_past_its_choices_replays_with_inputs`).
     pub replay_inputs: bool,
     /// False when nothing smaller failed, so this is the first failure itself.
     pub smaller: bool,
@@ -484,10 +488,14 @@ fn encode_inputs(choices: &[u64]) -> String {
     }
 }
 
-/// `encode_inputs` read back: `None` for a character that is not lowercase
-/// hex, an odd length, a number cut off mid-way, or one past 64 bits.
+/// `encode_inputs` read back: `None` for an empty value, a character that is
+/// not lowercase hex, an odd length, a number cut off mid-way, or one past 64
+/// bits. `encode_inputs` never prints an empty value, and the likeliest way to
+/// pass one is an unset shell variable, which must not replay all zeros.
 fn decode_inputs(hex: &str) -> Option<Vec<u64>> {
-    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    if hex.is_empty()
+        || !hex.len().is_multiple_of(2)
+        || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     {
         return None;
     }
@@ -2268,6 +2276,128 @@ mod tests {
         assert_eq!(replay(&tests, block, check), unshrunk(block));
     }
 
+    /// Draws three numbers and fails only when the first is the seed's own
+    /// stream value, so the shrink keeps the first and reads 0 for the other
+    /// two, where the seed's stream would give other values.
+    fn fails_on_its_own_first_draw(sim: &mut Sim) -> Result<(), String> {
+        let first = sim.input().between("n", 0, u64::MAX);
+        let _ = sim.input().between("n", 0, u64::MAX);
+        let _ = sim.input().between("n", 0, u64::MAX);
+        if first == crate::keyed_stream(sim.seed(), "inputs").next_u64() {
+            Err("the first draw is the seed's own".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The prefix rule behind every repro: the kept choices, trimmed, are a
+    /// prefix of the seed's own stream here, but the run read 0s after them,
+    /// so the repro must still pass `--inputs` or it replays the stream's
+    /// values instead (task 12 review I1).
+    #[test]
+    fn a_run_that_read_zeros_past_its_choices_replays_with_inputs() {
+        let check = "fails_on_its_own_first_draw";
+        let tests = [sim_test(check, fails_on_its_own_first_draw)];
+        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", "0x77"]);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, check);
+        let seed = {
+            let mut s = 0x77;
+            splitmix64(&mut s)
+        };
+        let own = crate::keyed_stream(seed, "inputs").next_u64();
+        assert_eq!(
+            line(block, "  inputs: "),
+            Some(format!("n={own}, n=0, n=0").as_str()),
+            "{block}"
+        );
+        // The trap: trimmed, the kept choices are exactly the stream's first
+        // value, a prefix of what the seed draws.
+        let repro = line(block, "  repro:  ").unwrap();
+        let hex = repro
+            .split(" --inputs ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("the run read 0s the seed would not draw: {block}"))
+            .split(' ')
+            .next()
+            .unwrap();
+        assert_eq!(decode_inputs(hex), Some(vec![own]), "{block}");
+        assert_eq!(replay(&tests, block, check), unshrunk(block));
+    }
+
+    /// A clock axis sampled with a chance of 0 cannot fire whatever its size,
+    /// so the shrink spends no replay on it and `faults off:` never lists it.
+    #[test]
+    fn an_axis_that_cannot_fire_is_never_listed_as_turned_off() {
+        let (master, seed) = (0u64..)
+            .map(|m| {
+                let mut s = m;
+                (m, splitmix64(&mut s))
+            })
+            .find(|&(_, s)| {
+                let cfg = crate::app_config(s, &[]);
+                cfg.clock_step_back.0 == 0.0 && cfg.clock_step_back.1 > Duration::ZERO
+            })
+            .unwrap();
+        let cfg = crate::app_config(seed, &[]);
+        let axes: Vec<&str> = FAULT_AXES
+            .into_iter()
+            .filter(|a| axis_on(&cfg, a))
+            .collect();
+        assert!(!axes.contains(&"clock_step_back"), "{axes:?}");
+        let tests = [sim_test("always_fails", always_fails)];
+        let master = format!("{master:#x}");
+        let (code, out) = run_to_string(&tests, &["--universes", "1", "--master-seed", &master]);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, "always_fails");
+        assert!(
+            line(block, "  config: ")
+                .unwrap()
+                .contains("clock_step_back: (0.0, 120s)"),
+            "{block}"
+        );
+        let want = format!(
+            "0 draws to 0, faults off: {}, in {} replays",
+            axes.join(", "),
+            axes.len()
+        );
+        assert_eq!(line(block, "  shrunk: "), Some(want.as_str()), "{block}");
+        assert_eq!(replay(&tests, block, "always_fails"), unshrunk(block));
+    }
+
+    /// Two checks fail in one batch: each one's first failure is shrunk, the
+    /// shrinks run in parallel, and the output does not depend on `--jobs`.
+    #[test]
+    fn every_failing_check_shrinks_its_first_failure_under_any_jobs() {
+        let checks = ["two_far_apart", "draws_until_the_disk_gives_out"];
+        let tests = [
+            sim_test(checks[0], two_far_apart),
+            sim_test(checks[1], draws_until_the_disk_gives_out),
+        ];
+        let flags = |jobs| {
+            [
+                "--universes",
+                "8",
+                "--master-seed",
+                "0x5400",
+                "--jobs",
+                jobs,
+            ]
+        };
+        let (code, out) = run_to_string(&tests, &flags("1"));
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(
+            run_to_string(&tests, &flags("4")).1,
+            out,
+            "--jobs 4 differs"
+        );
+        for check in checks {
+            let block = first_block(&out, check);
+            assert!(line(block, "  shrunk: ").is_some(), "{block}");
+            assert_eq!(replay(&tests, block, check), unshrunk(block));
+        }
+    }
+
     /// Fails while each of its sixty draws is at least 2^32, so every draw
     /// has a long way to shrink.
     fn sixty_large_draws(sim: &mut Sim) -> Result<(), String> {
@@ -2344,9 +2474,10 @@ mod tests {
             parse(&["--faults-off", "write_error"]).unwrap_err(),
             "--faults-off needs --seed: it replays one run with those faults off"
         );
-        // Not hex, odd length, upper case, a truncated number, one past 64
-        // bits, and stray whitespace.
-        for bad in ["zz", "0", "0A", "80", "ffffffffffffffffffff01", " 05"] {
+        // Empty (an unset shell variable must not replay all zeros), not
+        // hex, odd length, upper case, a truncated number, one past 64 bits,
+        // and stray whitespace.
+        for bad in ["", "zz", "0", "0A", "80", "ffffffffffffffffffff01", " 05"] {
             assert_eq!(
                 parse(&["--seed", "0x1", "--inputs", bad]).unwrap_err(),
                 format!(
