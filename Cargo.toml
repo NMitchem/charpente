@@ -8,6 +8,7 @@ members = [
     "crates/charpente-cli",
     "crates/charpente-tsgen",
     "crates/sim-fixture",
+    "crates/merge-fixture",
     "crates/outbound-fixture",
     "crates/clock-fixture",
     "crates/ts-fixture-app",

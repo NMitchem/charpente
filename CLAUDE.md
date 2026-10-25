@@ -64,7 +64,7 @@ item with the trigger that reopens it.
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/clock_restart/failover/hunts/outbound/
   realtime_resume/smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim; merge-fixture: sim;
   outbound-fixture: sim; invoicing: describe_golden/sim). Every list is exhaustive as
   written — if a name is missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
@@ -138,6 +138,8 @@ item with the trigger that reopens it.
   `client.ts`, behind the CLI's `gen-client`/`check-client` verbs.
 - `crates/sim-fixture` — minimal app the CLI dogfoods against; single-dep on `charpente`,
   so it also pins macro-path expansion.
+- `crates/merge-fixture` — the order-sensitive merge oracle: a latest-wins victim that scripted
+  inputs cannot catch and drawn inputs (`sim.input()`) catch and shrink to two arrivals.
 - `crates/outbound-fixture` — the app outbound effects are proven against: a launch-driven
   node binary and a TLS fake remote the edge harness drives (its own crate so
   sim-fixture's and invoicing's recorded batches never move).

@@ -1,0 +1,17 @@
+[package]
+name = "merge-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+charpente.workspace = true
+# The route's `Wire` request type derives serde, as the scaffold's does.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+charpente-sim = { path = "../charpente-sim" }
