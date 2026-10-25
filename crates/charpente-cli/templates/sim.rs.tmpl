@@ -33,14 +33,11 @@ const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
 /// Opens the app on this universe's disk, retrying a boot that faults
 /// stopped. A boot refused for durable corruption gives up by name only where
 /// the harness injected some; anywhere else it is a durability bug and fails
-/// (GUIDE §8). `None` means the universe is given up.
+/// (GUIDE §8). `None` means it never booted, given up by name only for that
+/// refusal.
 fn open_app(sim: &Sim, fallout: impl Fn(&str) -> bool) -> Result<Option<App>, String> {
     let boot = || build_app(Box::new(sim.disk()), Box::new(sim.entropy()));
-    let app = boot_through_fallout(sim, 8, fallout, boot).map_err(|e| e.to_string())?;
-    if app.is_none() && sim.gave_up().is_none() {
-        sim.give_up("the app never booted", "");
-    }
-    Ok(app)
+    boot_through_fallout(sim, 8, fallout, boot).map_err(|e| e.to_string())
 }
 
 /// Runs the production event loop against a scripted source under faults.
@@ -82,6 +79,9 @@ fn post_then_crash(sim: &mut Sim) -> Result<Option<Recovered>, String> {
         .collect();
 
     let Some(app) = open_app(sim, is_fault_fallout)? else {
+        if sim.gave_up().is_none() {
+            sim.give_up("the app never booted", "");
+        }
         return Ok(None);
     };
     let mut source = SimSource::new(Box::new(sim.clock()), 2 * SEC);
@@ -121,7 +121,12 @@ fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
     let mut waits = 0;
     loop {
         let Some(app) = open_app(sim, fallout)? else {
-            return Ok(None);
+            // A durable refusal gave the universe up by name; with disk
+            // faults off, nothing else should stop a boot.
+            return match sim.gave_up() {
+                Some(_) => Ok(None),
+                None => Err("the fault-free tail could not boot".to_string()),
+            };
         };
         let e = match Kernel::new(app, Box::new(sim.clock())) {
             Ok(kernel) => return Ok(Some(kernel)),
@@ -175,23 +180,44 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
-/// The end-state oracle: two invariants that hold under any fault schedule.
+/// An acked POST implies the job's effect once the queue has drained —
+/// through a crash in between. Two invariants hold under any fault schedule:
 /// - Ack-durability: a 200 from `/notes/:id` committed its enqueue in the
 ///   same log record, so each acked note has an `Echo` job row.
 /// - Exactly-once: the notes marked `echoed` number exactly the `Echo` jobs
 ///   that are Done — a job's effect and its Done mark commit as one record.
-fn check_invariants(app: &App, acked: usize) -> Result<(), String> {
-    let snap = app.db().snapshot().map_err(|e| e.to_string())?;
+///
+/// Delete `tx.enqueue` in `src/lib.rs`, or make `Echo::run` do nothing, and
+/// this goes red with a seed.
+fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), String> {
+    let Some((mut kernel, acked)) = post_then_crash(sim)? else {
+        return Ok(());
+    };
+    // No requests this time: the loop just runs whatever is due, then idles.
+    let mut idle = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    kernel.run(&mut idle).map_err(|e| e.to_string())?;
+    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
     let echo_jobs: Vec<JobRow> = snap
         .scan::<JobRow>()
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|job| job.name == "Echo")
         .collect();
-    if echo_jobs.len() < acked {
+    if echo_jobs.len() < acked.len() {
+        // Media corruption can cut a record whose reply was already sent
+        // (GUIDE §8, "Giving up"). Only this shortfall is excused: an
+        // exactly-once violation below fails even where corruption fired.
+        if durable_corruption_fired(sim) {
+            sim.give_up(
+                "durable corruption fired, so the acked enqueue is excused",
+                "",
+            );
+            return Ok(());
+        }
         return Err(format!(
-            "ack-durability violated: {acked} POST(s) were acked with 200 but only {} Echo job(s) are durable — \
+            "ack-durability violated: {} POST(s) were acked with 200 but only {} Echo job(s) are durable — \
              the enqueue did not commit with the row",
+            acked.len(),
             echo_jobs.len()
         ));
     }
@@ -212,27 +238,6 @@ fn check_invariants(app: &App, acked: usize) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// An acked POST implies the job's effect once the queue has drained —
-/// through a crash in between. Delete `tx.enqueue` in `src/lib.rs`, or make
-/// `Echo::run` do nothing, and this goes red with a seed.
-fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), String> {
-    let Some((mut kernel, acked)) = post_then_crash(sim)? else {
-        return Ok(());
-    };
-    // No requests this time: the loop just runs whatever is due, then idles.
-    let mut idle = SimSource::new(Box::new(sim.clock()), 60 * SEC);
-    kernel.run(&mut idle).map_err(|e| e.to_string())?;
-    match check_invariants(kernel.app(), acked.len()) {
-        // Media corruption can cut a record whose reply was already sent
-        // (GUIDE §8, "Giving up"); nowhere else is a lost enqueue excused.
-        Err(msg) if durable_corruption_fired(sim) => {
-            sim.give_up("durable corruption fired, so the end state is excused", msg);
-            Ok(())
-        }
-        result => result,
-    }
 }
 
 /// An acked POST implies its realtime event: each acked note's `NoteAdded`

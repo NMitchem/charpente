@@ -430,13 +430,12 @@ fn the_emitted_clippy_toml_is_a_subset_of_the_workspace_fence() {
     }
 }
 
-/// A scaffold named `name`, patched to build against THIS workspace, with
-/// `delete` (a whole line of `src/lib.rs`) removed, and the sim run over the
-/// batch `--master-seed 0x1`. Returns the app dir and the run's output.
-// Rewriting the scaffold's manifest and src/lib.rs is edge tooling
-// (DESIGN.md §1): the rig making README's edit, not code the sim exercises.
+/// A scaffold named `name`, its manifest patched to build against THIS
+/// workspace.
+// Rewriting the scaffold's manifest is edge tooling (DESIGN.md §1): the rig
+// setting up the build, not code the sim exercises.
 #[allow(clippy::disallowed_methods)]
-fn sim_with_line_deleted(name: &str, delete: &str) -> (PathBuf, std::process::Output) {
+fn patched_scaffold(name: &str) -> PathBuf {
     let dir = scratch(name);
     let (code, _, err) = run_in(&dir, &["new", name]);
     assert_eq!(code, 0, "stderr: {err}");
@@ -449,6 +448,16 @@ fn sim_with_line_deleted(name: &str, delete: &str) -> (PathBuf, std::process::Ou
         ws.join("crates/charpente-sim")
     ));
     std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+    app
+}
+
+/// A patched scaffold with `delete` (a whole line of `src/lib.rs`) removed,
+/// and the sim run over the batch `--master-seed 0x1`.
+// Rewriting the scaffold's src/lib.rs is edge tooling (DESIGN.md §1): the
+// rig making README's edit, not code the sim exercises.
+#[allow(clippy::disallowed_methods)]
+fn sim_with_line_deleted(name: &str, delete: &str) -> (PathBuf, std::process::Output) {
+    let app = patched_scaffold(name);
     let lib = read(&app.join("src/lib.rs"));
     assert_eq!(
         lib.matches(delete).count(),
@@ -537,4 +546,45 @@ fn the_scaffold_draws_its_inputs() {
     for name in ["notes", "order", "body"] {
         assert!(inputs.contains(name), "`{name}` is drawn:\n{block}");
     }
+}
+
+/// Hard rule 3: the seed that once failed the echo check falsely. An ack was
+/// followed by media corruption (a misdirected write) that cut the enqueue's
+/// record, and the check blamed the platform. The CLI's report carries no
+/// give-up reason text, so the reason is pinned by what excuses it: the
+/// misdirected write must have fired in the replay. A re-keyed fault stream
+/// that no longer reaches corruption fails here rather than passing quietly.
+#[test]
+fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
+    let app = patched_scaffold("pinned");
+    let out = charpente()
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", target_dir())
+        .args([
+            "test",
+            "--sim",
+            "--format",
+            "json",
+            "--filter",
+            "acked_post_implies_the_echo_after_recovery",
+            "--seed",
+            "0x535bb998c76a02ae",
+        ])
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the replay is not a failure:\n{report}"
+    );
+    assert!(report.contains("\"failures\":[]"), "{report}");
+    assert!(
+        report.contains("\"verdicts\":0,\"gave_up\":1"),
+        "the seed gives up, reaching no verdict:\n{report}"
+    );
+    assert!(
+        report.contains("\"fault:misdirected_write\":1"),
+        "and the corruption that excuses it fired:\n{report}"
+    );
 }
