@@ -31,7 +31,7 @@ fn boot(sim: &mut Sim, merge: Merge) -> Result<Option<App>, String> {
     let app =
         boot_through_fallout(sim, BOOT_TRIES, is_fault_fallout, open).map_err(|e| e.to_string())?;
     if app.is_none() {
-        sim.give_up("App::open never booted", format!("in {BOOT_TRIES} boots"));
+        sim.give_up("App::open never booted", "");
     }
     Ok(app)
 }

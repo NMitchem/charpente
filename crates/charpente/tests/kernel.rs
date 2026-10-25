@@ -3820,7 +3820,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     sim.give_up(
         "the final check never ran: every reopen in a row hit injected faults, so the last \
          round's jobs were never adjudicated",
-        format!("{FINAL_REOPENS} reopens"),
+        "",
     );
     Ok(())
 }
@@ -3900,7 +3900,7 @@ fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
             "boot:booted-after-retry",
         ],
         floor: [("job:done", KERNEL_JOB_DONE_FLOOR)],
-        ceiling: [("universe:gave-up", KERNEL_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", KERNEL_GAVE_UP_CEILING)]
     );
 }
 
@@ -6099,7 +6099,7 @@ fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
     else {
         sim.give_up(
             "the v1 binary never booted, so it enqueued nothing for v2 to refuse or drain",
-            format!("in {BOOT_TRIES} boots"),
+            "",
         );
         return Ok(());
     };
@@ -7009,7 +7009,7 @@ mod job_tenancy {
         sim.give_up(
             "the final check never ran: every reopen in a row hit injected faults, so the last \
              round's jobs were never adjudicated",
-            format!("{FINAL_REOPENS} reopens"),
+            "",
         );
         Ok(())
     }
@@ -7085,7 +7085,7 @@ mod job_tenancy {
                 "tenant:job_multi_tenant_write",
                 JOB_TENANCY_MULTI_TENANT_WRITE_FLOOR
             )],
-            ceiling: [("universe:gave-up", JOB_TENANCY_GAVE_UP_CEILING)]
+            ceiling: [("run:skipped", JOB_TENANCY_GAVE_UP_CEILING)]
         );
     }
 

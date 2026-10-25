@@ -733,7 +733,7 @@ fn tables_workload_traced(sim: &mut Sim) -> Result<Vec<String>, String> {
     sim.give_up(
         "the final check never ran: every attempt hit injected faults, so the last round's \
          records were never checked",
-        format!("{FINAL_ATTEMPTS} attempts"),
+        "",
     );
     Ok(rejected)
 }
@@ -811,7 +811,7 @@ fn tables_and_log_survive_the_fault_matrix() {
             "tables:store-rebuilt",
         ],
         floor: [("tables:checked", TABLES_CHECKED_FLOOR)],
-        ceiling: [("universe:gave-up", TABLES_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", TABLES_GAVE_UP_CEILING)]
     );
 }
 

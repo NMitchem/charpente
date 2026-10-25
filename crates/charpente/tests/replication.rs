@@ -266,7 +266,10 @@ fn finish_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("repl:inconclusive");
-            sim.give_up(INCONCLUSIVE, e);
+            sim.give_up(
+                INCONCLUSIVE,
+                e.replacen(&format!("{INCONCLUSIVE}: "), "", 1),
+            );
             Ok(())
         }
         other => other,

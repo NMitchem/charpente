@@ -25,7 +25,7 @@ point, one log.
 3. **Deterministic simulation.** `charpente test --sim` runs your *entire application* —
    HTTP, storage, queue, time, network — inside a deterministic simulator with seeded fault
    injection: torn writes, crashes at arbitrary commit points, partitions, clock skew.
-   Thousands of seeded universes per night; every failure reproducible from its seed.
+   Thousands of seeded runs per night; every failure reproducible from its seed.
 
 ## What it looks like
 
@@ -116,7 +116,7 @@ test --sim` — the deterministic simulator with seeded fault injection this
 whole platform is staked on. A docs-only agent then built
 [`examples/invoicing`](examples/invoicing) from these documents alone, with
 zero framework patches, and it runs green over 10,000 seeded
-fault-injection universes (master seed `0x483e230baed4922b`;
+fault-injection runs (master seed `0x483e230baed4922b`;
 [docs/LEDGER.md](docs/LEDGER.md), 2026-07-07). The
 dual-write bug class the second guarantee above claims to delete
 structurally is demonstrated, caught, and reverted at
@@ -171,7 +171,7 @@ the outbound side no `HTTP/2`, proxies, request signing (AWS `SigV4`) or streami
 cargo install charpente-cli
 charpente new myapp && cd myapp
 cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app
-charpente test --sim                        # seeded fault-injection universes
+charpente test --sim                        # seeded fault-injection runs
 ```
 
 Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the second

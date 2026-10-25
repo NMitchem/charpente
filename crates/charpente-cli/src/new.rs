@@ -152,7 +152,7 @@ pub fn run(args: &[String]) -> i32 {
     println!(
         "\n`{name}` is ready. Next:\n  cd {name}\n  cargo clippy --all-targets -- -D warnings   \
          # hard rule 1, in your app\n  charpente test --sim                        \
-         # seeded fault-injection universes"
+         # seeded fault-injection runs"
     );
     0
 }

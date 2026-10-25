@@ -230,7 +230,7 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
     // instead of giving up on its first faulted boot. Each split identical
     // across two runs. See `archive.rs`'s floor table.)
     assert!(
-        stdout.contains(r#""universe:gave-up":12"#),
+        stdout.contains(r#""run:skipped":12"#),
         "give-up coverage must agree with the reported count:\n{stdout}"
     );
     // And a third way: the human batch, byte for byte. GUIDE §8 "Reading a
@@ -495,19 +495,12 @@ fn a_batch_where_every_universe_gave_up_is_not_an_unqualified_success() {
         "a run that adjudicated nothing must not read as green:\n{stdout}"
     );
     assert!(
-        stdout.contains("\ncheck counter_roundtrip ... untested  (0 tested, 1 skipped)\n"),
-        "the check line states the tested/skipped split:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("\n  counter_roundtrip — never tested: every run was skipped\n"),
-        "an untested check says so by name:\n{stdout}"
-    );
-    assert!(
         stdout.contains(
-            "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. 0 of 1 runs tested a \
-             check.\n"
+            "\ncheck counter_roundtrip ... skipped\n    skipped: the write was never acked, so \
+             durability has nothing to prove\n\nsim result: nothing tested. 0 passed; 0 failed; \
+             1 skipped, on seed 0x3.\n"
         ),
-        "{stdout}"
+        "a replayed skipped run says why it was skipped:\n{stdout}"
     );
 }
 

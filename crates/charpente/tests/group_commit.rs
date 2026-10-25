@@ -2375,7 +2375,7 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
         Verify::Unreachable => sim.give_up(
             "the final coda never verified the watermark: every reopen hit injected faults, so \
              the last round's acked requests were never checked",
-            format!("{CODA_REOPENS} reopens"),
+            "",
         ),
         Verify::Refused => {}
     }
@@ -2493,7 +2493,7 @@ fn contended_request_bursts_survive_the_fault_matrix() {
         ],
         floor: [("oracle:verified", BURST_VERIFIED_FLOOR)],
         ceiling: [
-            ("universe:gave-up", BURST_GAVE_UP_CEILING),
+            ("run:skipped", BURST_GAVE_UP_CEILING),
             ("oracle:round-unreachable", BURST_ROUND_UNREACHABLE_CEILING)
         ]
     );

@@ -1182,7 +1182,7 @@ impl Sim {
 
     /// The event counts marked so far in this universe (`cover` plus the
     /// sim-internal auto-coverage: `fault:*`, `crash:*`, `restart`,
-    /// `universe:gave-up`).
+    /// `run:skipped`).
     pub fn coverage(&self) -> BTreeMap<&'static str, u64> {
         self.world.lock().coverage.clone()
     }
@@ -1213,7 +1213,7 @@ impl Sim {
     /// rounds 2 and 3 still run, so their verdict is thrown away silently.
     /// In a loop, `give_up` and `return`/`break` out belong on the same arm.
     ///
-    /// Also marks `universe:gave-up` coverage, so a give-up *rate* can be
+    /// Also marks `run:skipped` coverage, so a give-up *rate* can be
     /// capped with the swarm runners' `ceiling:` (a `floor:` on it would bound
     /// give-ups from below, which guards nothing).
     ///
@@ -1227,7 +1227,7 @@ impl Sim {
             // UNIVERSES that gave up, not calls to `give_up`, so a floor on
             // it reads as a rate and cross-checks the runner's reported count
             // exactly.
-            guard.cover("universe:gave-up");
+            guard.cover("run:skipped");
             let detail = detail.to_string();
             guard.gave_up = Some((reason, (!detail.is_empty()).then_some(detail)));
         }
@@ -2673,7 +2673,7 @@ pub fn run_universes_swarm_in(
 /// whose oracle can decay toward vacuous without ever reaching zero. A
 /// `ceiling: [("key", N), ...]` after either is the same check turned around:
 /// the batch fails when the key was covered more than N times. Its use is
-/// `("universe:gave-up", N)`, since a give-up is reported and never failed, so
+/// `("run:skipped", N)`, since a give-up is reported and never failed, so
 /// without a cap a property can drift toward adjudicating nothing with every
 /// batch green. Like floors and requires, ceilings are skipped under
 /// `CHARPENTE_SEED` and `CHARPENTE_BASE_SEED`.
@@ -2863,7 +2863,7 @@ pub fn run_universes_swarm_with_in(
          becomes decorative with the suite still green."
     );
     // `floor:` turned around, for a key that must stay rare. On
-    // `universe:gave-up` it is the one guard on a verdict rate: a give-up is
+    // `run:skipped` it is the one guard on a verdict rate: a give-up is
     // reported, never failed, so without a cap a property can drift toward
     // adjudicating nothing with every batch still green.
     let above: Vec<String> = ceilings
@@ -2878,7 +2878,7 @@ pub fn run_universes_swarm_with_in(
         "sim coverage ceiling failed in {test_file}: {above:?} over {universes} universes. \
          A ceiling caps a key that must stay rare: it rose because the property reaches that \
          state more often than when the cap was set, and why is the finding. On \
-         universe:gave-up it means fewer universes reached a verdict. Investigate before \
+         run:skipped it means fewer universes reached a verdict. Investigate before \
          touching it — raising a cap to match is how a property stops adjudicating with the \
          suite still green."
     );
@@ -4857,11 +4857,19 @@ mod tests {
     }
 
     #[test]
+    fn the_skipped_key_is_run_skipped() {
+        let sim = Sim::new(0x10_0005);
+        sim.give_up("a", "");
+        assert_eq!(sim.coverage().get("run:skipped"), Some(&1));
+        assert_eq!(sim.coverage().get("universe:gave-up"), None);
+    }
+
+    #[test]
     fn give_up_marks_the_skipped_key_once_per_run() {
         let sim = Sim::new(0x10_0004);
         sim.give_up("a", "x");
         sim.give_up("b", "y");
-        assert_eq!(sim.coverage().get("universe:gave-up"), Some(&1));
+        assert_eq!(sim.coverage().get("run:skipped"), Some(&1));
     }
 
     #[test]
@@ -4874,7 +4882,7 @@ mod tests {
                 4,
                 &[],
                 &[],
-                &[("universe:gave-up", 0)],
+                &[("run:skipped", 0)],
                 |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
                     sim.give_up("this workload adjudicates nothing", "");
@@ -4888,7 +4896,7 @@ mod tests {
             msg.contains("sim coverage ceiling failed in swarm_meta"),
             "{msg}"
         );
-        assert!(msg.contains("universe:gave-up: 4 over a cap of 0"), "{msg}");
+        assert!(msg.contains("run:skipped: 4 over a cap of 0"), "{msg}");
     }
 
     #[test]
@@ -4901,7 +4909,7 @@ mod tests {
                 4,
                 &[],
                 &[],
-                &[("universe:gave-up", cap)],
+                &[("run:skipped", cap)],
                 |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
                     if give_up {
@@ -4919,7 +4927,7 @@ mod tests {
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch(3, true)))
             .expect_err("4 give-ups against a cap of 3 must fail the batch");
         let msg = panic_message(&*payload);
-        assert!(msg.contains("universe:gave-up: 4 over a cap of 3"), "{msg}");
+        assert!(msg.contains("run:skipped: 4 over a cap of 3"), "{msg}");
     }
 
     #[test]

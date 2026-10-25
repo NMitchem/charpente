@@ -101,7 +101,7 @@ const EXEMPT: &[(&str, &str)] = &[
         "MANIFESTO §7; rhetorical, was \"99.9%\"",
     ),
     (
-        "Thousands of seeded universes per night",
+        "Thousands of seeded runs per night",
         "README guarantee 3: the sim's scale, substantiated by the recorded 10,000-universe batch \
          in the Status section below (seed-bearing) and the ledger, 2026-07-07",
     ),

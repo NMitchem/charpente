@@ -1462,7 +1462,7 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     sim.give_up(
         "the final verification never ran: every attempt hit injected faults, so the last \
          round's acked requests were never checked",
-        format!("{FINAL_ATTEMPTS} attempts"),
+        "",
     );
     Ok(responses)
 }
@@ -1510,7 +1510,7 @@ fn http_requests_survive_the_fault_matrix() {
             "boot:booted-after-retry",
         ],
         floor: [("http:round-verified", HTTP_ROUND_VERIFIED_FLOOR)],
-        ceiling: [("universe:gave-up", HTTP_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", HTTP_GAVE_UP_CEILING)]
     );
 }
 

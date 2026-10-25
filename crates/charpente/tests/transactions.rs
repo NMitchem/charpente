@@ -901,7 +901,7 @@ fn tx_workload_on(sim: &mut Sim, disk: &dyn Fn(&Sim) -> Box<dyn Disk>) -> Result
     sim.give_up(
         "the final verification never ran: every attempt hit injected faults, so the last \
          round's commits were never checked",
-        format!("{FINAL_ATTEMPTS} attempts"),
+        "",
     );
     Ok(())
 }
@@ -979,7 +979,7 @@ fn transactions_survive_the_fault_matrix() {
             "boot:booted-after-retry",
         ],
         floor: [("tx:round-verified", TX_ROUND_VERIFIED_FLOOR)],
-        ceiling: [("universe:gave-up", TX_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", TX_GAVE_UP_CEILING)]
     );
 }
 

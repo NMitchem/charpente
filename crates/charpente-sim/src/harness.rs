@@ -154,7 +154,7 @@ impl HarnessArgs {
         if seed.is_some() && master_seed.is_some() {
             return Err(
                 "--seed and --master-seed cannot be combined — --seed replays exactly one \
-                 literal universe, --master-seed only picks where a batch's seed chain starts"
+                 literal run, --master-seed only picks where a batch's seed chain starts"
                     .to_string(),
             );
         }
@@ -565,6 +565,9 @@ struct Batch {
     checks: Vec<CheckExtras>,
     /// The command that reruns exactly this batch; `None` for a `--seed` run.
     rerun: Option<String>,
+    /// For a `--seed` run: its seed, whether `--inputs` was given, and the
+    /// axes `--faults-off` turned off.
+    replay: Option<(u64, bool, Vec<&'static str>)>,
 }
 
 /// One check's runs beyond its `TestOutcomes`. A check's tested runs are its
@@ -580,10 +583,6 @@ struct CheckExtras {
     /// Whether any tested run drew an input.
     drew: bool,
     /// Each skipped run's detail, filled only under `--seed`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 16's --seed output prints it")
-    )]
     details: Vec<String>,
 }
 
@@ -738,6 +737,7 @@ fn run_single_seed(
         report,
         checks,
         rerun: None,
+        replay: Some((seed, inputs.is_some(), faults_off.to_vec())),
     }
 }
 
@@ -875,6 +875,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize) -> Ba
         report,
         checks,
         rerun: None,
+        replay: None,
     }
 }
 
@@ -1114,6 +1115,9 @@ const REASONS_SHOWN: usize = 8;
 /// skipped runs' reasons, the checks that draw nothing, the result, and the
 /// command that reruns the batch.
 fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
+    if let Some(replay) = &batch.replay {
+        return write_replay(batch, replay, out);
+    }
     let report = &batch.report;
     // One block per check: its first failure in seed order, the one a batch
     // shrinks. The check line counts the rest; JSON keeps every one.
@@ -1271,6 +1275,78 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
     if let Some(rerun) = &batch.rerun {
         let _ = writeln!(out, "rerun exactly this batch: {rerun}");
     }
+}
+
+/// A `--seed` replay in the batch's language: the failure blocks, a line per
+/// check saying ok, FAILED or skipped (a skipped run's reason and detail under
+/// it), and a result line naming the seed and what the replay was given.
+fn write_replay(
+    batch: &Batch,
+    (seed, inputs, faults_off): &(u64, bool, Vec<&'static str>),
+    out: &mut dyn std::io::Write,
+) {
+    let escape = |s: &str| {
+        s.replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    };
+    for failure in &batch.report.failures {
+        let _ = write!(out, "{}", human_failure_block(failure));
+    }
+    let width = batch
+        .report
+        .outcomes
+        .iter()
+        .map(|o| o.test.chars().count())
+        .max()
+        .unwrap_or(0);
+    let (mut passed, mut failed, mut skipped) = (0, 0, 0);
+    let _ = writeln!(out);
+    for (o, c) in batch.report.outcomes.iter().zip(&batch.checks) {
+        let status = if c.failed > 0 {
+            failed += 1;
+            "FAILED"
+        } else if c.passed > 0 {
+            passed += 1;
+            "ok"
+        } else {
+            skipped += 1;
+            "skipped"
+        };
+        let dots = ".".repeat(width - o.test.chars().count() + 3);
+        let _ = writeln!(out, "check {} {dots} {status}", o.test);
+        if status == "skipped" {
+            for (reason, _) in &c.skipped {
+                let _ = writeln!(out, "    skipped: {}", escape(reason));
+            }
+            for detail in &c.details {
+                let _ = writeln!(out, "    detail:  {}", escape(detail));
+            }
+        }
+    }
+    let word = if failed > 0 {
+        "FAILED"
+    } else if passed == 0 {
+        "nothing tested"
+    } else {
+        "ok"
+    };
+    let mut given = Vec::new();
+    if *inputs {
+        given.push("with the given inputs".to_string());
+    }
+    if !faults_off.is_empty() {
+        given.push(format!("with faults off: {}", faults_off.join(", ")));
+    }
+    let given = match given.is_empty() {
+        true => String::new(),
+        false => format!(" {}", given.join(", ")),
+    };
+    let _ = writeln!(
+        out,
+        "\nsim result: {word}. {passed} passed; {failed} failed; {skipped} skipped, on seed \
+         {seed:#x}{given}."
+    );
 }
 
 /// The failure block (GUIDE §8 "Reading a failure"). A check's first failure
@@ -2146,7 +2222,7 @@ mod tests {
             require: &[],
         };
         let report = run_batch(&[&test], 0x1234, 6, 1).report;
-        assert_eq!(report.coverage.get("universe:gave-up").copied(), Some(6));
+        assert_eq!(report.coverage.get("run:skipped").copied(), Some(6));
     }
 
     // -------------------------------------------------------------- JSON
@@ -3081,5 +3157,95 @@ mod tests {
         let batch = run_batch(&[&test], 0x1234, 4, 1);
         assert!(batch.checks[0].details.is_empty());
         assert_eq!(batch.checks[0].skipped, [("the fixture gives up", 4)]);
+    }
+
+    fn replay_seed(test: SimTest, extra: &[&str]) -> (i32, String) {
+        let mut flags = vec!["--seed", "0x1234"];
+        flags.extend_from_slice(extra);
+        run_to_string(&[test], &flags)
+    }
+
+    #[test]
+    fn a_replayed_seed_that_gave_up_with_a_detail_prints_both() {
+        fn gives_up_with_detail(sim: &mut Sim) -> Result<(), String> {
+            sim.give_up("the store hit fault fallout", "seq 14");
+            Ok(())
+        }
+        let (code, out) = replay_seed(sim_test("gives_up_with_detail", gives_up_with_detail), &[]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.ends_with(
+                "check gives_up_with_detail ... skipped\n    skipped: the store hit fault \
+                 fallout\n    detail:  seq 14\n\nsim result: nothing tested. 0 passed; 0 \
+                 failed; 1 skipped, on seed 0x1234.\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_replayed_seed_that_gave_up_without_a_detail_prints_no_detail_line() {
+        let (_, out) = replay_seed(sim_test("always_gives_up", always_gives_up), &[]);
+        assert!(
+            out.contains(
+                "check always_gives_up ... skipped\n    skipped: the fixture always gives up\n\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("detail:"), "{out}");
+    }
+
+    #[test]
+    fn a_replayed_failing_seed_prints_its_block_and_failed() {
+        let (code, out) = replay_seed(sim_test("always_fails", always_fails), &[]);
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("sim failure in always_fails: toy failure\n"),
+            "{out}"
+        );
+        assert!(out.contains("\ncheck always_fails ... FAILED\n"), "{out}");
+        assert!(
+            out.ends_with("\nsim result: FAILED. 0 passed; 1 failed; 0 skipped, on seed 0x1234.\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_replayed_passing_seed_says_ok() {
+        let (_, out) = replay_seed(sim_test("always_ok", always_ok), &[]);
+        assert!(
+            out.ends_with(
+                "\ncheck always_ok ... ok\n\nsim result: ok. 1 passed; 0 failed; 0 skipped, on seed 0x1234.\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("rerun"), "{out}");
+    }
+
+    #[test]
+    fn a_detail_with_a_newline_stays_on_one_line() {
+        fn newline_detail(sim: &mut Sim) -> Result<(), String> {
+            sim.give_up("a reason", "a\nb");
+            Ok(())
+        }
+        let (_, out) = replay_seed(sim_test("newline_detail", newline_detail), &[]);
+        assert!(out.contains("\n    detail:  a\\nb\n"), "{out}");
+    }
+
+    #[test]
+    fn replaying_with_inputs_says_so_on_the_result_line() {
+        let (_, out) = replay_seed(sim_test("always_ok", always_ok), &["--inputs", "03"]);
+        assert!(
+            out.ends_with(", on seed 0x1234 with the given inputs.\n"),
+            "{out}"
+        );
+        let (_, out) = replay_seed(
+            sim_test("always_ok", always_ok),
+            &["--faults-off", "read_error"],
+        );
+        assert!(
+            out.ends_with(", on seed 0x1234 with faults off: read_error.\n"),
+            "{out}"
+        );
     }
 }

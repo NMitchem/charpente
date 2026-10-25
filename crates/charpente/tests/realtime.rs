@@ -2471,7 +2471,7 @@ fn realtime_workload_judged(
             sim.give_up(
                 "no settle attempt completed without fault fallout, so there was no node to \
                  catch up from",
-                format!("{SETTLE_ATTEMPTS} attempts ({})", client.unsettled_report()),
+                client.unsettled_report(),
             );
             return Ok(client.trace);
         }
@@ -2539,7 +2539,7 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
             "fault:subscriber_stall"
         ],
         floor: [("realtime:frame-verified", FLAGSHIP_FRAMES_VERIFIED_FLOOR)],
-        ceiling: [("universe:gave-up", FLAGSHIP_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", FLAGSHIP_GAVE_UP_CEILING)]
     );
 }
 
@@ -3573,10 +3573,7 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
             Err(e) => return Err(format!("resume kernel.run failed non-injected: {e}")),
         }
     }
-    sim.give_up(
-        "no resume completed without fault fallout",
-        format!("{SHAPES_SETTLE_ATTEMPTS} attempts"),
-    );
+    sim.give_up("no resume completed without fault fallout", "");
     Ok(())
 }
 
@@ -5033,7 +5030,10 @@ fn finish_rt_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("realtime:multi-node-inconclusive");
-            sim.give_up(INCONCLUSIVE, e);
+            sim.give_up(
+                INCONCLUSIVE,
+                e.replacen(&format!("{INCONCLUSIVE}: "), "", 1),
+            );
             Ok(())
         }
         other => other,
@@ -6291,7 +6291,7 @@ fn scoped_realtime_workload_judged(
             sim.give_up(
                 "no settle attempt completed without fault fallout, so there was no node to \
                  catch up from",
-                format!("{SETTLE_ATTEMPTS} attempts ({})", client.unsettled_report()),
+                client.unsettled_report(),
             );
             return Ok(client.trace);
         }
@@ -6412,7 +6412,7 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
             ),
             ("realtime:resume-backlog", SCOPED_RESUME_BACKLOG_FLOOR)
         ],
-        ceiling: [("universe:gave-up", SCOPED_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", SCOPED_GAVE_UP_CEILING)]
     );
 }
 
@@ -9300,10 +9300,7 @@ mod tenancy_feeds {
                      head after the last recovery, so a cut it made could not be re-synced and \
                      there was no node to catch up from"
                 };
-                sim.give_up(
-                    why,
-                    format!("{SETTLE_ATTEMPTS} attempts ({})", u.unsettled_report()),
-                );
+                sim.give_up(why, u.unsettled_report());
                 return Ok(u.trace());
             }
             return Err(u.unsettled_report());
@@ -9363,7 +9360,7 @@ mod tenancy_feeds {
                 ),
                 ("realtime:resume-backlog", TENANCY_RESUME_BACKLOG_FLOOR)
             ],
-            ceiling: [("universe:gave-up", TENANCY_GAVE_UP_CEILING)]
+            ceiling: [("run:skipped", TENANCY_GAVE_UP_CEILING)]
         );
     }
 

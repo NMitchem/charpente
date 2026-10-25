@@ -36,7 +36,7 @@ Then scaffold an app and run its two gates:
 charpente new myapp
 cd myapp
 cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app
-charpente test --sim                        # seeded fault-injection universes
+charpente test --sim                        # seeded fault-injection runs
 ```
 
 `charpente new` writes six files and does nothing else — no `git init`, no build, no
@@ -954,7 +954,7 @@ commit point, so a login or a minted key is a durable, replicated
 transaction like any other. **Only the hash is ever stored:**
 `token_hash`/`key_hash` are lowercase-hex SHA-256 of the raw credential; the
 raw string exists only in the response that mints it and never reaches disk
-(a sim property scans every durable file in the universe and proves it).
+(a sim property scans every durable file in the run and proves it).
 
 Every request gets a `Ctx`, built inside the same transaction as your
 handler, carrying:
@@ -2873,7 +2873,7 @@ same kernel loop (§6–§7) production runs — see "Driving the whole app in a
 sim" below. Your handlers run completely unmodified; nothing about your app
 becomes "testable" specially, because it was already built on the traits.
 The product's core promise: the same seed always produces the same
-universe, so a failure a workload returns is not just a bug report — it is
+run, so a failure a workload returns is not just a bug report — it is
 a one-command reproduction, forever.
 
 ### `tests/sim.rs`
@@ -2882,13 +2882,13 @@ a one-command reproduction, forever.
 `[[test]] name = "sim", harness = false` target. `harness = false` matters
 here — it tells Cargo not to link the default libtest harness into that
 binary, so `charpente_sim::sim_tests! { ... }` can supply its own `main`
-instead, one that knows how to run many seeded universes and report on
+instead, one that knows how to run many seeded runs and report on
 them, rather than running a fixed list of `#[test]` functions once each.
 
 A workload is a plain function, `fn(&mut Sim) -> Result<(), String>`: `Ok(())`
-means the universe passed; `Err(message)` means it didn't, and so does a
+means the run passed; `Err(message)` means it didn't, and so does a
 panic (both turn into the same kind of failure record). There is a third
-ending — see "Giving up" below: a universe the injected faults stopped before
+ending — see "Giving up" below: a run the injected faults stopped before
 your property could be adjudicated at all. Say so with `sim.give_up(reason, detail)`;
 it is neither a pass nor a failure, and the report counts it separately.
 `sim_tests!` lists
@@ -2896,10 +2896,10 @@ the workloads to run by name, each optionally followed by `require [...]` —
 sometimes-coverage keys (`Sim::cover(&self, what: &'static str)`, so a key is a
 literal or a `const`, not a `format!`ed `String`; plus the sim's own auto-covered
 `fault:*`/`crash:*`/`restart` keys) that must be hit at least once across
-that test's universes in a batch run, or the batch fails even if every
-universe individually passed. A `require`d key that never fires is telling
+that test's runs in a batch run, or the batch fails even if every
+run individually passed. A `require`d key that never fires is telling
 you something real: either the workload never drives the system into that
-state, or the universe count is too low to make it likely.
+state, or the run count is too low to make it likely.
 
 ```rust
 use charpente::{Db, DbConfig, Id, Schema, TxError, View, table};
@@ -2923,7 +2923,7 @@ charpente_sim::sim_tests! {
 /// `sim_tests!` workloads return `Result<(), String>` — this one delegates
 /// to a helper that returns the interesting value instead, so the
 /// determinism checker below can reuse the exact same logic. `None` asserted
-/// nothing, and a pass needs a verdict, so it gives the universe up ("Giving
+/// nothing, and a pass needs a verdict, so it gives the run up ("Giving
 /// up" below).
 fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
     if counter_roundtrip_result(sim)?.is_none() {
@@ -2950,7 +2950,7 @@ fn counter_replays(sim: &mut Sim) -> Result<(), String> {
 /// redb's "close and re-open the database" latch; `boot_through_fallout`
 /// boots again on those, and excuses a refusal for durable corruption only
 /// where the harness injected some. Anything else is treated as a real bug
-/// and fails the universe.
+/// and fails the run.
 fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     let schema = || Schema::new().table::<Counter>();
     let open = || Db::open(Box::new(sim.disk()), DbConfig::default(), schema());
@@ -3113,7 +3113,7 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   check's skipped runs by reason and counts each group, so a reason with a seq
   in it makes every run its own group and the counts say nothing. What varies
   goes in `detail` (anything `Display`: `e`, `format!("in {BOOT_TRIES}
-  boots")`): that one run's own text, which the batch does not print. A
+  boots")`): that one run's own text, which a batch does not print and `--seed` prints under the skipped check as `detail:`. A
   give-up with nothing to add passes `""`, and an empty detail is none.
   `sim.gave_up()` reads the reason and `sim.gave_up_detail()` the detail;
   `Outcome::GaveUp` carries both.
@@ -3126,11 +3126,11 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   in a multi-round checker on your own `sim` (`acked_implies_durable`).
 - A workload that gives up and then returns `Err` is still a **failure**.
   Failures outrank give-ups.
-- It also marks the coverage key `universe:gave-up` — once per universe, not
+- It also marks the coverage key `run:skipped` — once per run, not
   once per call — so a give-up *rate* is counted like any other sometimes-key,
   and it cross-checks the reported count exactly. `ceiling:
-  [("universe:gave-up", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
-  caps it: the batch fails when more than N universes gave up, naming the key,
+  [("run:skipped", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
+  caps it: the batch fails when more than N runs gave up, naming the key,
   the count and the cap. Twenty of the platform's own swarm properties carry
   one:
   - kernel's exactly-once and job-tenancy properties;
@@ -3219,22 +3219,22 @@ charpente-sim [replication]: 38 of 128 universes reached a verdict, 90 gave up
 shows it either way). So do not expect a CI run to surface give-ups; go
 looking for them.
 
-Read that example line the right way round: **38** of those 128 universes
+Read that example line the right way round: **38** of those 128 runs
 adjudicated the property and **90** did not. It is a real measurement from
 `wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower`,
-and it means 70% of that property's universes prove nothing — which was
+and it means 70% of that property's runs prove nothing — which was
 invisible before the split was printed, and is the entire reason it is.
 
-### A fault-free tail for an end-of-universe check
+### A fault-free tail for an end-of-run check
 
-A check that runs at the end of a universe — a checkpoint, a graceful close, a
-byte comparison of two nodes' files — does IO, and the universe's
+A check that runs at the end of a run — a checkpoint, a graceful close, a
+byte comparison of two nodes' files — does IO, and the run's
 `FaultConfig` still applies to it. "No fault has fired so far" is a fact about
 the past: the check's own fsync can still draw an injected failure. Call
-`sim.quiesce_disk_faults()` first. For the rest of the universe, on every disk,
+`sim.quiesce_disk_faults()` first. For the rest of the run, on every disk,
 it disarms any pending crash countdown, and no injected read, write, sync or
 directory-barrier error, misdirected write or restart bit flip fires after it.
-Each skipped roll draws nothing, so a universe that never calls it
+Each skipped roll draws nothing, so a run that never calls it
 replays exactly as before. After it, an error in the check is a real failure,
 not fallout to classify. Network and object-store faults are untouched, and a
 restart still power-cycles: unsynced writes and directory entries collapse under
@@ -3242,8 +3242,8 @@ the crash model as usual (`crash_apply`, `crash_torn`, `dir_entry_loss`).
 
 An outbound workload's tail needs the outbound half as well.
 `sim.quiesce_outbound_faults()` ends the five outbound fault axes for the rest of
-the universe: no call started after it is refused, lost, throttled or slowed, or
-loses its reply. Each skipped roll draws nothing, so a universe that never calls
+the run: no call started after it is refused, lost, throttled or slowed, or
+loses its reply. Each skipped roll draws nothing, so a run that never calls
 it replays exactly as before. Latency stays, since it is not a fault, and a
 request already in flight keeps the fate it drew. Call both, then run past the
 last backoff and deadline. From there every call reaches its remote and its
@@ -3254,17 +3254,17 @@ A realtime workload's settle phase has the same need for a different fault. The
 subscriber-stall rate is the one fault axis the sim does not inject itself: a
 workload reads `sim.subscriber_stall()` and drives its own sink's stall closure
 at that rate. `sim.quiesce_subscriber_stalls()` makes that accessor read 0.0 for
-the rest of the universe, so a stall closure built after it never refuses a send
+the rest of the run, so a stall closure built after it never refuses a send
 and draws nothing. Call it before a phase whose verdict rests on a delivery
 completing. A stall there is a fault the property excuses, so a stall that drops
-the only clean attempt's tail leaves the universe with no verdict at all.
+the only clean attempt's tail leaves the run with no verdict at all.
 
 A tail that opens a kernel needs the clock half too.
 `sim.quiesce_clock_faults()` ends the clock faults ("Wall time and its faults",
-below) for the rest of the universe, on every clock. No reading steps back and
+below) for the rest of the run, on every clock. No reading steps back and
 no power cycle jumps a clock forward after it, so each clock's offset stays
 where the run left it, skew included. Each skipped roll draws nothing, so a
-universe that never calls it replays exactly as before. It does not undo the
+run that never calls it replays exactly as before. It does not undo the
 past: a step back in an earlier phase can leave the clock more than the
 tolerance behind the latest time the store recorded, and then the tail's open is
 refused (§7). With the offset frozen, the clock reaches the instant the refusal
@@ -3312,7 +3312,7 @@ unsynced write" from that list cannot be satisfied by a restart that quietly
 flushed.
 
 `restart_process()` draws from no random stream and clears no crash countdown,
-so the sim gained it without re-keying anyone's universes. Calling it does
+so the sim gained it without re-keying anyone's runs. Calling it does
 change everything your workload does afterwards, as any restart would. It marks
 `restart:process`, never `restart`. A crashed disk is power loss, and
 `restart_process()` refuses it by name: call `restart()` there. It covers the
@@ -3362,7 +3362,7 @@ under test and a bound that assumes the node's reading is true time fails on
 correct code. The platform's own suites (`run_universes_swarm!`, `Sim::new`,
 `FaultConfig::default()` and `none()`) leave the three axes off; a platform
 property turns them on in `run_universes_swarm_with!`'s `adjust`, which is
-handed the universe's seed with its config (`|seed, cfg| …`), so any value it
+handed the run's seed with its config (`|seed, cfg| …`), so any value it
 draws comes from a stream keyed by that seed.
 
 `crates/charpente/tests/clock.rs` is the worked example. It runs four platform
@@ -3458,11 +3458,11 @@ for these before hand-rolling the same logic a fourth time:
   `Sim::new(seed)`, and fails if the returned value or the durable
   end-state (`Sim::durable_fingerprint`) diverge. It always constructs
   plain `Sim::new` worlds — never a *swarm* `FaultConfig` (swarm testing:
-  the harness samples each universe's fault rates and latency ranges from
+  the harness samples each run's fault rates and latency ranges from
   its own seed, so a batch explores many fault mixes instead of every
-  universe sharing one fixed matrix) — so it re-runs the workload's logic
+  run sharing one fixed matrix) — so it re-runs the workload's logic
   under default fault rates rather than replaying the exact fault schedule
-  of the swarm universe that called it. **It takes a seed because it needs two
+  of the swarm run that called it. **It takes a seed because it needs two
   worlds identical at time zero**, which a sim that has already run cannot give
   it — the opposite of the checker below, and the rule is: a checker that needs
   a FRESH world takes a seed, one that continues THIS world takes `&mut Sim`.
@@ -3471,23 +3471,23 @@ for these before hand-rolling the same logic a fourth time:
   one round of work and returns the ids it promised are durable (classifying
   its own faults with `is_fault_fallout`, same as above), the sim restarts,
   and `verify` checks every id acked *so far* survived. A failure names the
-  round it broke on. A run where no round acked anything gives the universe
+  round it broke on. A run where no round acked anything gives the run
   up by name, since no `verify` could have failed. **Pass it your own `sim`, not `sim.seed()`** — it restarts
   the world you give it, so `require: ["restart"]` over it fires, the excuse
-  helpers below read the same world your workload ran in, and your universe's
+  helpers below read the same world your workload ran in, and your run's
   fault config actually applies. Until 2026-09-05 it took a seed and built its
   own `Sim::new` world, which silently did none of those three things; if you
   have code calling it with `sim.seed()`, that code was running outside its
   declared fault matrix and crediting coverage nowhere.
 - `durable_corruption_fired(sim: &Sim) -> bool` — true when a
   durable-corruption fault (`bit_flip` or `misdirected_write`) actually
-  fired in this universe. Those axes can corrupt an acked WAL record above
+  fired in this run. Those axes can corrupt an acked WAL record above
   the store's checkpoint horizon, and recovery then legitimately cuts it
   (an invalid frame is a torn tail unless provably below the horizon — the
   standard WAL convention; the un-checkpointed data had one local copy).
   Route an acked-durability check's *shortfall* through this so the loss is
-  excused only in universes where corruption was actually injected — the
-  strong oracle stands everywhere else. **An excused universe gives up**
+  excused only in runs where corruption was actually injected — the
+  strong oracle stands everywhere else. **An excused run gives up**
   (`sim.give_up(..)` and stop, as `counter_survives` under "Giving up" does):
   the record's durability was not adjudicated, and a pass needs a verdict, so
   an excuse that returns `Ok` without giving up is a vacuous pass. Never use it
@@ -3519,7 +3519,7 @@ for these before hand-rolling the same logic a fourth time:
   restarts and moves on. The one `None` the helper names itself is a boot
   refused for durable corruption at or below the store's horizon
   (`durable_refusal`, next): no restart clears bytes on the disk, so it stops
-  at once, marks `boot:durable-refusal` and gives the universe up under that
+  at once, marks `boot:durable-refusal` and gives the run up under that
   name. Where no durable corruption fired, the same refusal is a finding and
   comes back as `Err(e)`, unchanged. Use it at every boot, a round
   loop's included: an injected fault inside the table store's open is
@@ -3531,7 +3531,7 @@ for these before hand-rolling the same logic a fourth time:
   same rule for a loop that boots on its own, such as a final verification's
   reopen loop: call it on each failed boot's error before the fallout check,
   since `is_fault_fallout` turns the refusal down. `Ok(false)`: not
-  a durable refusal, carry on. `Ok(true)`: a refusal in a universe where
+  a durable refusal, carry on. `Ok(true)`: a refusal in a run where
   durable corruption fired, already given up under its own name and marked
   `boot:durable-refusal`, so end the loop. `Err(..)`: a refusal where none
   fired, which nothing excuses, so fail with the text it names. A loop that
@@ -3542,7 +3542,7 @@ for these before hand-rolling the same logic a fourth time:
   vanished, or a pending removal resurrected). A workload that routes
   `Db::open`'s "a segment is missing … refusing to guess" to a restore path
   must do so *only* when this returns true: the platform never leaves a
-  durable directory gap on its own, so a gap in a universe where the axis
+  durable directory gap on its own, so a gap in a run where the axis
   never fired is a real regression and must fail loud. In a multi-node
   workload, ask `SimHost::dir_entry_loss_fired()` instead: it answers for one
   host's disk, so one node's gap is never excused by entry loss on another.
@@ -3553,7 +3553,7 @@ for these before hand-rolling the same logic a fourth time:
   never by where the app put the key in the request. One sim box has one loss
   window, media corruption: a bit flip can cut an acknowledged enqueue whose
   call was already made, and then this check fails. Route a failure through
-  `durable_corruption_fired` and give the universe up where it fired, never
+  `durable_corruption_fired` and give the run up where it fired, never
   pass it, the same rule as any acked-durability shortfall.
 - `keys_are_per_job(snap: &Snapshot) -> Result<(), String>` — no two jobs carry
   one idempotency key. It catches two jobs sharing a key, which a constant or
@@ -3653,7 +3653,7 @@ fn verify(sim: &mut Sim, acked: &[String]) -> Result<(), String> {
 fn bytes_survive_restarts(sim: &mut Sim) -> Result<(), String> {
     // `sim`, not `sim.seed()`: the checker restarts the world you hand it, so
     // the `restart` coverage lands where the harness reads it and your
-    // universe's fault config is the one the property runs under.
+    // run's fault config is the one the property runs under.
     acked_implies_durable(sim, 5, drive(), verify)
 }
 ```
@@ -3674,10 +3674,10 @@ pieces:
   `.header("authorization", format!("Bearer {token}"))`.
 - **`SimSource`** is the scripted request source.
   `SimSource::new(Box::new(sim.clock()), horizon_nanos)` bounds the
-  universe at a virtual-time horizon; `push_at(at_nanos, request)`
+  run at a virtual-time horizon; `push_at(at_nanos, request)`
   schedules arrivals (in arrival order — pushing out of order is an
-  assert). Both times are absolute virtual nanoseconds on the universe's
-  clock, not offsets: a source built mid-universe adds
+  assert). Both times are absolute virtual nanoseconds on the run's
+  clock, not offsets: a source built mid-run adds
   `sim.now().as_nanos()`. `responses()` hands back a shared handle to the recorded
   `(status, body)` pairs, filled in as the kernel replies: one entry per
   request the kernel served (an SSE upgrade's opening response included), in
@@ -3689,7 +3689,7 @@ pieces:
   `kernel.run(&mut source)` then serves scripted requests at their virtual
   arrival times, runs due jobs, and ticks cron, exactly as in production —
   and since sleeping through an empty stretch just advances the virtual
-  clock, a two-hour universe finishes in milliseconds. `run` returns
+  clock, a two-hour run finishes in milliseconds. `run` returns
   `Ok(())` once nothing is left inside the horizon, `Err` if the engine
   poisoned mid-run (§9), or on a clock stop ("Wall time and its faults"). Afterwards, `kernel.stats()` snapshots the loop's
   counters (`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`,
@@ -3709,7 +3709,7 @@ pieces:
   `Kernel::with_outbound` instead (§6, "When a call fails").
 
 One mindset note before the example: under `charpente test --sim`, every
-universe gets its own swarm-sampled fault matrix, so exact-trace assertions
+run gets its own swarm-sampled fault matrix, so exact-trace assertions
 ("exactly 3 requests, exactly 5 jobs done") will fail whenever a fault
 fires. Assert *invariants* — claims that hold under any fault schedule —
 and classify operational failures with `is_fault_fallout`, like the
@@ -3785,7 +3785,7 @@ fn build_app(sim: &Sim) -> std::io::Result<App> {
     }))
 }
 
-/// The end-state oracle, run after the universe. Two invariants that hold
+/// The end-state oracle, run after the run. Two invariants that hold
 /// under ANY fault schedule:
 ///
 /// - Ack-after-durable, app-level: every 200 from `/hit` committed its
@@ -3830,11 +3830,11 @@ fn check_invariants(app: &App, acked: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// One whole-app universe: three requests arrive over three virtual
+/// One whole-app run: three requests arrive over three virtual
 /// seconds, each enqueueing a job; an hourly cron schedule ticks twice
 /// before the two-hour horizon; then the durable end-state is checked.
 fn whole_app(sim: &mut Sim) -> Result<(), String> {
-    // Each fault-fallout exit gives up: the universe checked nothing, and a
+    // Each fault-fallout exit gives up: the run checked nothing, and a
     // pass needs a verdict ("Giving up" above).
     let app = match build_app(sim) {
         Ok(app) => app,
@@ -3891,7 +3891,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
         Ok(()) => Ok(()),
         // The oracle's own reads go through the same faulted disk (e.g. the
         // store can latch after an earlier injected write error): fallout
-        // ends the universe with nothing asserted, a give-up; anything else is
+        // ends the run with nothing asserted, a give-up; anything else is
         // real.
         Err(msg) if is_fault_fallout(&msg) => {
             sim.give_up("the invariant check hit fault fallout", msg);
@@ -3903,7 +3903,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
 ```
 
 Register it like any workload — add `whole_app require ["kernel:served"]`
-to the `sim_tests! { ... }` list. Nothing limits a universe to one script,
+to the `sim_tests! { ... }` list. Nothing limits a run to one script,
 either: `run` returns when its source is exhausted, and the same kernel can
 be `run` again against a second `SimSource` — script a login phase, read
 the token out of its recorded responses, then script the authenticated
@@ -3913,7 +3913,7 @@ phase with `.header("authorization", format!("Bearer {token}"))`.
 
 Outbound HTTP goes through the `Outbound` IO trait, to hosts the app
 declares. In a sim, each declared host is a model you register: a `Remote`
-that lives inside the universe, runs on its seed, and answers each request
+that lives inside the run, runs on its seed, and answers each request
 when the request reaches it. The wire between the kernel and the model
 belongs to the sim, and the outbound fault axes act on that wire.
 
@@ -3986,7 +3986,7 @@ wrapped model is read as its wrapper: `|m: &Idempotent<StripeModel>|`, then
 `m.inner()`.
 
 The closure gets `&M`, never `&mut M`, so nothing reaches a model through
-`with_remote`. A model the workload must change mid-universe, such as one
+`with_remote`. A model the workload must change mid-run, such as one
 calmed for the fault-free tail, shares state with it from registration: the
 workload keeps a clone of an `Arc<AtomicBool>` and flips it between kernel
 runs. The model reads it when a request reaches it, so a request already on
@@ -4043,7 +4043,7 @@ first runs every delivery due by now, so what it shows is current with the
 clock.
 
 A request in flight at a crash still arrives; only its reply is lost. Models
-belong to the universe, not to the box, so `sim.restart()` leaves them and
+belong to the run, not to the box, so `sim.restart()` leaves them and
 every request already on the wire alone. The restarted process builds a new
 handle with `sim.outbound(…)`. A reply goes only to the handle that started
 its call, so a pre-restart reply has nowhere to land, even when the new
@@ -4082,7 +4082,7 @@ model's semantics, which is what `Idempotent` is for.
 
 `FaultConfig::default()`, which `Sim::new` uses, turns the five outbound
 faults off and sets latency to 1–50 ms. `FaultConfig::none()` makes every
-call instantaneous. A swarm universe samples all six fields in
+call instantaneous. A swarm run samples all six fields in
 `sample_extended_fields`, each from its own stream, so the existing axes'
 sampled values are unchanged:
 
@@ -4102,7 +4102,7 @@ drives any app, with two additions: a model behind each declared host, and a
 kernel built with `Kernel::with_outbound` over the sim's handle. Build the handle
 before the kernel, since `sim.outbound(&app.outbound_hosts())` borrows the app
 that `Kernel::with_outbound` takes. The workload below takes two orders under the
-universe's faults, then runs the fault-free tail ("A fault-free tail" above) and
+run's faults, then runs the fault-free tail ("A fault-free tail" above) and
 calls the three outbound checkers:
 
 ```rust
@@ -4241,7 +4241,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         let Some(app) = boot_through_fallout(sim, 8, fallout, || build_app(sim))
             .map_err(|e| e.to_string())?
         else {
-            // A durable refusal gives the universe up by name; with disk
+            // A durable refusal gives the run up by name; with disk
             // faults off, nothing else should stop a boot.
             return match sim.gave_up() {
                 Some(_) => Ok(()),
@@ -4296,7 +4296,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
 ```
 
 Register it as `receipts_settle_under_faults require ["outbound:checked"]`. A
-universe in which neither order committed passes all three checkers having
+run in which neither order committed passes all three checkers having
 checked nothing, which is why the coverage key is marked only where an
 outbound job exists. One kernel per faulted phase, as here, leaves room for
 that: under a swarm's `sync_error`, a kernel can poison early in a round and
@@ -4315,7 +4315,7 @@ swarm property: six payment jobs against
 with crashes, then the fault-free tail. Beside the three checkers it asserts
 that the remote applied no charge twice, and that every recorded payment is one
 the remote applied. Those two checks judge something only where a charge was
-called again, so the property floors how many universes re-called a key, and how
+called again, so the property floors how many runs re-called a key, and how
 many re-called it from a second process, rather than how many merely ran. Two
 planted bugs show what the checks are for, each pinned to the seed that caught
 it, and on both seeds the honest job passes with a verdict. `PayKeyless` leaves
@@ -4348,6 +4348,9 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   run can't be expected to hit everything a batch would). This is the
   replay flag: it is exactly what a failure's own `repro:` line uses. A
   replay is one run, so it shrinks nothing.
+  It prints each check as `ok`, `FAILED` or `skipped`; under a skipped check,
+  `skipped:` is the reason and `detail:` the run's own detail, and the
+  `sim result:` line ends with the seed.
 - `--inputs HEX` — with `--seed`, replay these input choices instead of the
   ones the seed draws: each `sim.input()` draw reads the next, and every draw
   past the end reads 0. `HEX` is each choice as an unsigned LEB128 number, the
@@ -4378,7 +4381,7 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   with `master_seed`, `universes`, `failures` (each the run as the batch ran
   it, unshrunk, carrying its own `test`,
   `seed`, `master_seed`, `config` — every fault axis, not a subset — its own
-  `coverage` of what actually fired in that universe, `message`, and a
+  `coverage` of what actually fired in that run, `message`, and a
   copy-pasteable `repro` command), `verdicts` and `gave_up` (batch totals), `outcomes` (the same
   split per test: `{test, verdicts, gave_up}`), `coverage`,
   `missing_coverage` (`{test, key}` pairs), and a trailing `summary`, for
@@ -4475,20 +4478,20 @@ in order:
 
 - The first line is that run's own `Err` message (or an absorbed panic
   payload) — the actual claim that failed.
-- `seed` is the one `u64` that determined this entire universe: virtual
+- `seed` is the one `u64` that determined this entire run: virtual
   time, every entropy draw, the fault matrix's decisions and, unless the
   repro passes `--inputs`, every `sim.input()` draw.
 - `config` is the run's `FaultConfig` — the fault rates and latency ranges
-  that were ENABLED (per-universe swarm sampling, glossed under the checkers
+  that were ENABLED (per-run swarm sampling, glossed under the checkers
   above): the seed's sampled config with the axes on the `shrunk:` line
   turned off. It is a set of probabilities, so it tells you what kind of
   trouble was *possible*: `crash_torn: 0.664668` means torn writes were
-  likely in this universe, not that any occurred. Do not read a diagnosis
+  likely in this run, not that any occurred. Do not read a diagnosis
   off this line — that is the next one's job. The last three fields are the
   clock axes ("Wall time and its faults"): here each clock drew its own skew
   within ±41.2 s of true time, no reading stepped back, and each power cycle
   had an even chance of a jump of up to three days.
-- `fired` is what ACTUALLY happened: the universe's coverage map, every
+- `fired` is what ACTUALLY happened: the run's coverage map, every
   fault and event that really occurred, with counts. This is the line to
   reason from. A high probability whose key is absent here never fired, and
   an explanation resting on it is wrong. `fired: nothing` is a real and
@@ -4526,8 +4529,8 @@ The same discipline extends outward: `run_universes!`/`run_universes_swarm!`
 `charpente test --sim` share one seed→behavior mapping, except that only
 `charpente test --sim` samples the clock axes. So `CHARPENTE_SEED=0x… cargo
 test -p <pkg> --test <file>` and `charpente test --sim --seed 0x…` are the
-same idea at two different layers, each replaying its own layer's universe: a
-failure's seed is always enough, on its own, to see the exact same universe
+same idea at two different layers, each replaying its own layer's run: a
+failure's seed is always enough, on its own, to see the exact same run
 again.
 
 ### Shrinking a failure
@@ -4580,7 +4583,7 @@ repro shows, then rerun the batch.
 Some properties fix their base seed (`run_universes_swarm_with!(BASE, N, …)`)
 so their `floor:` rates have a stable denominator. That is right for a rate and
 wrong for a correctness claim: a fixed base means the property only ever
-examines the same N universes, while a green run reads as though it examined
+examines the same N runs, while a green run reads as though it examined
 the space.
 
 `CHARPENTE_BASE_SEED=0x… cargo test -p <pkg> --test <file>` re-bases every
@@ -4610,7 +4613,7 @@ is hiding it. Two realtime properties were found exactly that way
 
 One caveat worth knowing before you chase a floor panic: an IO call consumes RNG
 draws, so changing *where* an IO operation happens inside code a property never
-names reshuffles every universe at a pinned base. Floors move for that reason far
+names reshuffles every run at a pinned base. Floors move for that reason far
 more often than they move because an oracle decayed.
 
 So a floor that falls after such a change is re-measured, not defended and not
@@ -4626,10 +4629,10 @@ error is deliberately strict: pure noise crosses it roughly a sixth to a quarter
 of the time, which errs toward stopping to look.
 
 A cap that rises after such a change asks a different question, because a
-give-up is not a lost verdict when the same universe used to pass having
+give-up is not a lost verdict when the same run used to pass having
 checked nothing. So judge the rise by the verdicts the property reached, over
 the same ten or more fresh bases: count its passes that covered its reach key
-(the key its `floor:` counts), and beside them its vacuous passes (universes
+(the key its `floor:` counts), and beside them its vacuous passes (runs
 that passed without covering that key). A cap may rise only if the passes
 covering the reach key did not fall by more than one Welch standard error.
 Then the new give-ups replaced vacuous passes, not verdicts, and the cap is
@@ -4649,13 +4652,13 @@ counts move batch to batch, both are margins over ten or more fresh batches.
 An ambient give-up cap is the larger of two numbers:
 - twice the largest fresh-batch count;
 - the smallest k with P(Poisson(lambda) > k) < 1e-4, where
-  lambda = n x U(x) / N. Here n is the universes in one batch, N the universes
+  lambda = n x U(x) / N. Here n is the runs in one batch, N the runs
   over all the fresh batches, and x the give-ups among them. U(x) is the exact
   one-sided 95% Poisson upper bound for x: 2.996 for x = 0, 4.744 for 1, and
   6.296 for 2.
 
 The second number matters where give-ups are rare. When no batch gave up,
-twice the largest count is 0, which one legitimately exhausted universe fails.
+twice the largest count is 0, which one legitimately exhausted run fails.
 When one batch gave up once, it is 2, which a healthy batch fails about once
 in eighty. Where counts are large the first number is the larger, and the
 second only confirms it.
@@ -4745,7 +4748,7 @@ $ charpente test --mutants … --property counter_bump_job_changes_the_row
 mutants: 1 total — 1 caught, 0 missed, 0 unviable, 0 timed out
 ```
 
-Both properties ran 256 universes and reached ~147 verdicts each, so neither
+Both properties ran 256 runs and reached ~147 verdicts each, so neither
 result is an artifact of a property that never executed. The only difference is
 the assertion: one checks the row is still *readable*, the other checks it now
 reads `hits = 2`.

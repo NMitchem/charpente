@@ -609,7 +609,8 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
         report.contains("\"fault:misdirected_write\":1"),
         "and the corruption that excuses it fired:\n{report}"
     );
-    // The JSON report carries no skipped reason; the human replay does.
+    // The JSON report carries no skipped reason; the human replay does, and
+    // this give-up has a fixed reason and no detail.
     let human = charpente()
         .current_dir(&app)
         .env("CARGO_TARGET_DIR", target_dir())
@@ -625,7 +626,12 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
         .unwrap();
     let human = String::from_utf8_lossy(&human.stdout);
     assert!(
-        human.contains("  durable corruption fired, so the acked enqueue is excused\n"),
+        human.ends_with(
+            "check acked_post_implies_the_echo_after_recovery ... skipped\n    skipped: durable \
+             corruption fired, so the acked enqueue is excused\n\nsim result: nothing tested. 0 \
+             passed; 0 failed; 1 skipped, on seed 0x535bb998c76a02ae.\n"
+        ),
         "skipped for corruption, by name:\n{human}"
     );
+    assert!(!human.contains("detail:"), "{human}");
 }

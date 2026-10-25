@@ -8857,7 +8857,7 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
         sim.cover("archive:verify_never_read_cleanly");
         sim.give_up(
             "the restored destination never read cleanly, so the restore was never verified",
-            format!("{CONV_VERIFY_ATTEMPTS} attempts"),
+            "",
         );
         return Ok(());
     }
@@ -9097,7 +9097,7 @@ fn archive_converges() {
             ("archive:restored_substantial", CONV_SUBSTANTIAL_FLOOR),
             ("archive:chained", CONV_CHAINED_FLOOR),
         ],
-        ceiling: [("universe:gave-up", CONV_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", CONV_GAVE_UP_CEILING)]
     );
 }
 
@@ -9147,7 +9147,7 @@ fn archive_converges_with_a_scoped_table() {
             ("archive:restored_substantial", CONV_SCOPED_SUBSTANTIAL_FLOOR),
             ("archive:chained", CONV_SCOPED_CHAINED_FLOOR),
         ],
-        ceiling: [("universe:gave-up", CONV_SCOPED_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", CONV_SCOPED_GAVE_UP_CEILING)]
     );
 }
 

@@ -2064,16 +2064,16 @@ Charpente treats the coding agent as the primary developer persona:
   deterministic. App crates write property workloads in `tests/sim.rs` (`harness = false`)
   registered via `charpente_sim::sim_tests! { name require ["fault:crash", …], … }` —
   workloads share the internal suite's signature, `fn(&mut Sim) -> Result<(), String>`;
-  `Err` and panics both fail a universe. `charpente test --sim [--runs N] [--seed
+  `Err` and panics both fail a run. `charpente test --sim [--runs N] [--seed
   0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json] [--inputs HEX]
   [--faults-off AXIS,…] [--dir PATH]`
   builds the app's `sim` target via `cargo test --no-run` and execs it directly — build
   errors surface verbatim, the compiler is already the oracle. Batch model: one master
   seed (OS entropy, printed at startup, or pinned via `--master-seed` for byte-identical
-  replay) derives per-universe seeds in registry order; `--jobs`-many workers race over an
+  replay) derives per-run seeds in registry order; `--jobs`-many workers race over an
   index counter, so scheduling changes nothing about the seed sequence or report order.
-  `--seed 0x…` replays exactly one universe and skips `require` coverage checks (one
-  universe can't be expected to hit everything a batch would); `--inputs` and
+  `--seed 0x…` replays exactly one run and skips `require` coverage checks (one
+  run can't be expected to hit everything a batch would); `--inputs` and
   `--faults-off` replay it with given input choices and fault axes off. Each check's
   first failure in a batch is shrunk, by replays under a 500-replay budget, to the
   smallest inputs and fewest fault axes that still fail it, and its repro replays

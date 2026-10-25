@@ -1084,7 +1084,7 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
     sim.give_up(
         "the final recovery never ran the oracle: every attempt hit injected faults, so the \
          last round's writes were never checked",
-        format!("{FINAL_ATTEMPTS} attempts"),
+        "",
     );
     Ok(())
 }
@@ -1162,7 +1162,7 @@ fn every_scoped_read_returns_only_its_own_tenants_rows() {
             "boot:booted-after-retry"
         ],
         floor: [("tenant:multi_tenant_write", TENANT_MULTI_TENANT_WRITE_FLOOR)],
-        ceiling: [("universe:gave-up", TENANT_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", TENANT_GAVE_UP_CEILING)]
     );
 }
 

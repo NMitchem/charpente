@@ -246,7 +246,7 @@ fn wal_survives_the_fault_matrix() {
             "restart",
         ],
         floor: [("wal:prefix-checked", FAULT_MATRIX_PREFIX_FLOOR)],
-        ceiling: [("universe:gave-up", FAULT_MATRIX_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", FAULT_MATRIX_GAVE_UP_CEILING)]
     );
 }
 
@@ -265,7 +265,7 @@ fn wal_survives_dir_entry_loss() {
         |sim| wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize),
         require: ["fault:dir-entry", "restart"],
         floor: [("wal:prefix-checked", DIR_ENTRY_PREFIX_FLOOR)],
-        ceiling: [("universe:gave-up", DIR_ENTRY_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", DIR_ENTRY_GAVE_UP_CEILING)]
     );
 }
 
@@ -414,7 +414,7 @@ fn wal_survives_bit_flip() {
         wal_survives_hot_axis,
         require: ["fault:bit_flip"],
         floor: [("wal:prefix-checked", BIT_FLIP_PREFIX_FLOOR)],
-        ceiling: [("universe:gave-up", BIT_FLIP_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", BIT_FLIP_GAVE_UP_CEILING)]
     );
 }
 
@@ -429,7 +429,7 @@ fn wal_survives_misdirected_write() {
         wal_survives_hot_axis,
         require: ["fault:misdirected_write"],
         floor: [("wal:prefix-checked", MISDIRECTED_PREFIX_FLOOR)],
-        ceiling: [("universe:gave-up", MISDIRECTED_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", MISDIRECTED_GAVE_UP_CEILING)]
     );
 }
 
@@ -444,7 +444,7 @@ fn wal_survives_read_error() {
         wal_survives_hot_axis,
         require: ["fault:read_error"],
         floor: [("wal:prefix-checked", READ_ERROR_PREFIX_FLOOR)],
-        ceiling: [("universe:gave-up", READ_ERROR_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", READ_ERROR_GAVE_UP_CEILING)]
     );
 }
 
@@ -1499,7 +1499,7 @@ fn gc_interrupted_by_crash_never_leaves_a_gap() {
         gc_crash_workload,
         require: ["restart"],
         floor: [("wal:gap-free-checked", GC_GAP_FREE_FLOOR)],
-        ceiling: [("universe:gave-up", GC_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", GC_GAVE_UP_CEILING)]
     );
 }
 

@@ -358,7 +358,7 @@ pub fn acked_implies_durable(
     if acked.is_empty() {
         sim.give_up(
             "acked-implies-durable: no round acked anything, so there was no claim to check",
-            format!("in {rounds} rounds"),
+            "",
         );
     }
     Ok(())
@@ -1034,7 +1034,11 @@ mod tests {
             sim.gave_up(),
             Some("acked-implies-durable: no round acked anything, so there was no claim to check")
         );
-        assert_eq!(sim.gave_up_detail().as_deref(), Some("in 3 rounds"));
+        assert_eq!(
+            sim.gave_up_detail(),
+            None,
+            "the round count is constant text, so it is no detail"
+        );
     }
 
     /// One ack in any round is a claim, and the run reaches a verdict on it.

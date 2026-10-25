@@ -1,5 +1,5 @@
 //! Three properties, each honest: each asserts a claim that holds under ANY
-//! fault schedule and gives up — rather than passing — in a universe where
+//! fault schedule and gives up — rather than passing — in a run where
 //! injected faults stopped it before the claim could be tested (GUIDE §8).
 //! The notes, their bodies and their order are drawn with `sim.input()`, so a
 //! failure shrinks to the fewest, simplest notes that still fail.
@@ -30,7 +30,7 @@ charpente_sim::sim_tests! {
 
 const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
 
-/// Opens the app on this universe's disk, retrying a boot that faults
+/// Opens the app on this run's disk, retrying a boot that faults
 /// stopped. A boot refused for durable corruption gives up by name only where
 /// the harness injected some; anywhere else it is a durability bug and fails
 /// (GUIDE §8). `None` means it never booted, given up by name only for that
@@ -41,7 +41,7 @@ fn open_app(sim: &Sim, fallout: impl Fn(&str) -> bool) -> Result<Option<App>, St
 }
 
 /// Runs the production event loop against a scripted source under faults.
-/// Fault fallout ends this phase, not the universe: the replies already sent
+/// Fault fallout ends this phase, not the run: the replies already sent
 /// stand, and the tail judges the recovery. The kernel also stops, or refuses
 /// to open, on a clock too far behind; that is fallout only where the
 /// harness's clock faults fired (`clock_fallout`, GUIDE §8).
@@ -121,7 +121,7 @@ fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
     let mut waits = 0;
     loop {
         let Some(app) = open_app(sim, fallout)? else {
-            // A durable refusal gave the universe up by name; with disk
+            // A durable refusal gave the run up by name; with disk
             // faults off, nothing else should stop a boot.
             return match sim.gave_up() {
                 Some(_) => Ok(None),
@@ -168,7 +168,7 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
                 ));
             }
             // Acked-but-lost is excused ONLY where the harness injected durable
-            // corruption into this universe (GUIDE §8, "Giving up").
+            // corruption into this run (GUIDE §8, "Giving up").
             Ok(None) if durable_corruption_fired(sim) => {
                 sim.give_up("durable corruption fired, so the acked row is excused", "");
                 return Ok(());

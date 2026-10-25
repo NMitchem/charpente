@@ -3232,7 +3232,7 @@ fn outbound_jobs_are_exactly_once_under_the_fault_matrix() {
                 OUTBOUND_RE_CALLED_ACROSS_RESTART_FLOOR
             ),
         ],
-        ceiling: [("universe:gave-up", OUTBOUND_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", OUTBOUND_GAVE_UP_CEILING)]
     );
 }
 

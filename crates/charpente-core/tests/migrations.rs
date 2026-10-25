@@ -631,7 +631,7 @@ fn migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin() {
         |sim: &mut Sim| migration_universe(sim, &twin),
         require: ["migrations:resumed-to-completion"],
         floor: [("migrations:resumed-to-completion", PLAIN_COMPLETED_FLOOR)],
-        ceiling: [("universe:gave-up", PLAIN_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", PLAIN_GAVE_UP_CEILING)]
     );
 }
 
@@ -648,7 +648,7 @@ const MIGRATE_NEVER_COMPLETED: &str = "open-and-migrate never completed: every r
 fn migration_universe(sim: &mut Sim, twin: &[(u64, u32, String)]) -> Result<(), String> {
     if !seed_v1_result(sim, 20)? {
         sim.cover("migrations:inconclusive");
-        sim.give_up(SEED_NEVER_COMPLETED, format!("{SEED_ROUNDS} rounds"));
+        sim.give_up(SEED_NEVER_COMPLETED, "");
         return Ok(());
     }
     let db_cfg = DbConfig {
@@ -660,7 +660,7 @@ fn migration_universe(sim: &mut Sim, twin: &[(u64, u32, String)]) -> Result<(), 
         // legitimately-remedied barrier, and the budget ran out before a
         // clean open+migrate. Nothing was compared, so nothing passes.
         sim.cover("migrations:inconclusive");
-        sim.give_up(MIGRATE_NEVER_COMPLETED, format!("{MIGRATE_ROUNDS} rounds"));
+        sim.give_up(MIGRATE_NEVER_COMPLETED, "");
         return Ok(());
     };
     sim.cover("migrations:resumed-to-completion");
@@ -1581,7 +1581,7 @@ fn migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninter
             "migrations:scoped-resumed-to-completion",
             SCOPED_COMPLETED_FLOOR
         )],
-        ceiling: [("universe:gave-up", SCOPED_GAVE_UP_CEILING)]
+        ceiling: [("run:skipped", SCOPED_GAVE_UP_CEILING)]
     );
 }
 
@@ -1594,7 +1594,7 @@ fn scoped_migration_universe(
 ) -> Result<(), String> {
     if !seed_scoped_v1_result(sim, rows_per_scope, scopes)? {
         sim.cover("migrations:scoped-inconclusive");
-        sim.give_up(SEED_NEVER_COMPLETED, format!("{SEED_ROUNDS} rounds"));
+        sim.give_up(SEED_NEVER_COMPLETED, "");
         return Ok(());
     }
     let db_cfg = DbConfig {
@@ -1603,7 +1603,7 @@ fn scoped_migration_universe(
     };
     let Some(db) = open_and_migrate_scoped_with_remedy(sim, db_cfg)? else {
         sim.cover("migrations:scoped-inconclusive");
-        sim.give_up(MIGRATE_NEVER_COMPLETED, format!("{MIGRATE_ROUNDS} rounds"));
+        sim.give_up(MIGRATE_NEVER_COMPLETED, "");
         return Ok(());
     };
     sim.cover("migrations:scoped-resumed-to-completion");
