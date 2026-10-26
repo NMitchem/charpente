@@ -55,7 +55,9 @@ fn the_guide_ships_in_the_charpente_crate() {
         "--no-verify",
     ]);
     let version = env!("CARGO_PKG_VERSION");
-    let krate = root().join(format!("target/package/charpente-{version}.crate"));
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| root().join("target"), |dir| root().join(dir));
+    let krate = target.join(format!("package/charpente-{version}.crate"));
     let packed = Command::new("tar")
         .arg("-xzOf")
         .arg(&krate)

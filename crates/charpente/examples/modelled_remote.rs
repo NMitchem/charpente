@@ -5,7 +5,7 @@
 //!
 //! Run it: `cargo run -p charpente --example modelled_remote`
 //!
-//! A drawn 1 to 3 orders are placed under the run's faults, the process is
+//! A drawn 4 to 8 orders are placed under the run's faults, the process is
 //! power-cycled, and a fault-free tail lets every charge settle. The claim:
 //! the gateway applies no order twice, and an order is paid exactly when its
 //! job is Done. Delete the idempotency key from `charge`'s call and
@@ -169,7 +169,7 @@ fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String
 }
 
 fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
-    let orders = sim.input().between("orders", 1, 3);
+    let orders = sim.input().between("orders", 4, 8);
     let calm = Arc::new(AtomicBool::new(false));
     sim.remote(
         "pay.example",
@@ -187,7 +187,7 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         let mut source = SimSource::new(Box::new(sim.clock()), start + 3 * SEC);
         for id in 1..=orders {
             source.push_at(
-                start + id * SEC / 10,
+                start + id * SEC / 20,
                 Request::new(Method::Post, format!("/orders/{id}")),
             );
         }

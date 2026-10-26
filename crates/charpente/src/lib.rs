@@ -22,6 +22,8 @@ pub mod archive;
 pub mod auth;
 pub mod describe;
 /// The guide, shipped in the crate so docs.rs and the registry copy carry it.
+// Not collected by `rustdoc --test`: GUIDE's blocks compile in guide-examples, and one serves.
+#[cfg(not(doctest))]
 pub mod guide {
     // GUIDE is written for a reader of the markdown file: bare fences hold
     // shell output and `<instant>` is prose, not a tag. Reworded for rustdoc,
