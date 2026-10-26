@@ -1291,7 +1291,7 @@ fn render_json(batch: &Batch) -> String {
 fn check_status(c: &CheckExtras, unmet: bool) -> &'static str {
     if c.failed > 0 || unmet {
         "FAILED"
-    } else if c.passed + c.failed == 0 {
+    } else if c.passed == 0 {
         "untested"
     } else {
         "ok"
@@ -1752,7 +1752,11 @@ mod tests {
         assert_eq!(args.master_seed, None);
         assert_eq!(args.filter, None);
         assert_eq!(args.format, Format::Human);
-        assert!(args.jobs >= 1, "jobs must default to at least 1");
+        assert_eq!(
+            args.jobs,
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            "--jobs defaults to the host's parallelism (GUIDE §8)"
+        );
     }
 
     #[test]
@@ -3158,38 +3162,77 @@ mod tests {
         assert_eq!(replay(&tests, block, check), unshrunk(block));
     }
 
-    /// Fails when its two draws in 0..=7 are equal and 3 or more.
-    fn two_equal_draws_of_3_or_more(sim: &mut Sim) -> Result<(), String> {
+    /// Fails when its two draws in 0..=7 are equal and 5 or more.
+    fn two_equal_draws_of_5_or_more(sim: &mut Sim) -> Result<(), String> {
         let a = sim.input().between("a", 0, 7);
         let b = sim.input().between("b", 0, 7);
-        if a == b && a >= 3 {
-            Err("two equal draws of 3 or more".into())
+        if a == b && a >= 5 {
+            Err("two equal draws of 5 or more".into())
         } else {
             Ok(())
         }
     }
 
-    /// From the same 4 and 4 as `equal_choices_are_lowered_together`, the
-    /// pair's smallest failure is 3 and 3, which only the group's bisection
-    /// reaches: its gallop passes at 1 and 2 and stops below 4, and 3 is the
-    /// midpoint between 2 and 4.
+    /// From 6 and 6 the pair's smallest failure is 5 and 5, which only the
+    /// group's bisection reaches. Its gallop passes at 1, 2 and 4 and stops
+    /// below 6, and 5 is the midpoint between 4 and 6, half their distance
+    /// past 4. Seed 0x2e is the first, counting up from 0, whose first failure
+    /// draws 6 and 6.
     #[test]
     fn a_group_bisects_to_its_smallest_failing_value() {
-        let test = sim_test("two_equal_draws_of_3_or_more", two_equal_draws_of_3_or_more);
-        let first = run_app_universe(0x1a, None, &[], &test.run).unwrap_err();
+        let test = sim_test("two_equal_draws_of_5_or_more", two_equal_draws_of_5_or_more);
+        let first = run_app_universe(0x2e, None, &[], &test.run).unwrap_err();
         assert_eq!(
             first.drawn,
-            [("a", "4".to_string()), ("b", "4".to_string())],
-            "seed 0x1a's first failure draws 4 and 4, so the one-choice passes stall at 4 and 4"
+            [("a", "6".to_string()), ("b", "6".to_string())],
+            "seed 0x2e's first failure draws 6 and 6, so the one-choice passes stall at 6 and 6"
         );
-        let shrunk = shrink(&test, 0x1a, &first);
+        let shrunk = shrink(&test, 0x2e, &first);
         assert_eq!(
             (shrunk.choices.as_slice(), shrunk.drawn.as_slice()),
             (
-                &[3, 3][..],
-                &[("a", "3".to_string()), ("b", "3".to_string())][..]
+                &[5, 5][..],
+                &[("a", "5".to_string()), ("b", "5".to_string())][..]
             ),
-            "the smallest failure is a=3, b=3; a=4, b=4 means the group was never bisected"
+            "the smallest failure is a=5, b=5; a=6, b=6 means the group was never bisected"
+        );
+    }
+
+    /// Fails when its two draws in 0..=7 are equal and are 1 or 6.
+    fn two_equal_draws_of_1_or_6(sim: &mut Sim) -> Result<(), String> {
+        let a = sim.input().between("a", 0, 7);
+        let b = sim.input().between("b", 0, 7);
+        if a == b && (a == 1 || a == 6) {
+            Err("two equal draws of 1 or 6".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// From 6 and 6 the group's gallop reaches 1 and 1, its first probe. A
+    /// bisection from 0 alone halves 6 and meets 3, 4 and 5, which all pass,
+    /// so it stops at 6 and 6 in every round: only the gallop probes 1. The
+    /// failing values must not be one run, or a later round's bisection from 0
+    /// finds what the gallop did. The same seed 0x2e as
+    /// `a_group_bisects_to_its_smallest_failing_value`.
+    #[test]
+    fn a_group_gallops_to_a_small_value_a_bisection_skips() {
+        let test = sim_test("two_equal_draws_of_1_or_6", two_equal_draws_of_1_or_6);
+        let first = run_app_universe(0x2e, None, &[], &test.run).unwrap_err();
+        assert_eq!(
+            first.drawn,
+            [("a", "6".to_string()), ("b", "6".to_string())],
+            "seed 0x2e's first failure draws 6 and 6"
+        );
+        let shrunk = shrink(&test, 0x2e, &first);
+        assert_eq!(
+            (shrunk.choices.as_slice(), shrunk.drawn.as_slice()),
+            (
+                &[1, 1][..],
+                &[("a", "1".to_string()), ("b", "1".to_string())][..]
+            ),
+            "the smallest failure is a=1, b=1; a=6, b=6 means the group was bisected without \
+             galloping"
         );
     }
 
@@ -3788,6 +3831,101 @@ mod tests {
             !json.contains("universe") && !json.contains("verdicts"),
             "{json}"
         );
+    }
+
+    fn covers_two_keys(sim: &mut Sim) -> Result<(), String> {
+        sim.cover("two:x");
+        sim.cover("two:y");
+        Ok(())
+    }
+
+    /// Every list the JSON prints with two entries or more, each separated by
+    /// one comma: two unmet keys, two coverage keys, three checks (one unmet,
+    /// one ok, one failing), two failures, and a shrunk failure's fault axes.
+    /// The ok check sits beside the unmet one, so `unmet` is read for this
+    /// check alone in both directions.
+    #[test]
+    fn the_json_separates_every_list_it_prints() {
+        let tests = [
+            SimTest {
+                name: "unmet_twice",
+                run: always_ok,
+                require: &["key:a", "key:b"],
+            },
+            sim_test("covers_two_keys", covers_two_keys),
+            sim_test("always_fails", always_fails),
+        ];
+        let flags = ["--runs", "2", "--master-seed", "0x5400", "--format", "json"];
+        let (code, json) = run_to_string(&tests, &flags);
+        assert_eq!(code, 1, "{json}");
+        assert_eq!(
+            between_keys(&json, "\"coverage\":", ",\"missing_coverage\":"),
+            "{\"two:x\":2,\"two:y\":2}"
+        );
+        assert_eq!(
+            between_keys(&json, "\"missing_coverage\":", ",\"checks\":"),
+            "[{\"check\":\"unmet_twice\",\"key\":\"key:a\"},\
+             {\"check\":\"unmet_twice\",\"key\":\"key:b\"}]"
+        );
+        let check = |name: &str, status: &str, passed: u64, failed: u64| {
+            format!(
+                "{{\"check\":\"{name}\",\"status\":\"{status}\",\"passed\":{passed},\
+                 \"failed\":{failed},\"skipped\":0,\"distinct_inputs\":1,\"drew_inputs\":false,\
+                 \"skipped_reasons\":[]}}"
+            )
+        };
+        assert_eq!(
+            between_keys(&json, "\"checks\":", ",\"failures\":"),
+            format!(
+                "[{},{},{}]",
+                check("unmet_twice", "FAILED", 2, 0),
+                check("covers_two_keys", "ok", 2, 0),
+                check("always_fails", "FAILED", 0, 2)
+            )
+        );
+        let failures = between_keys(&json, "\"failures\":", "\n");
+        let join = "\"},{\"check\":\"always_fails\",\"seed\":\"";
+        assert!(
+            failures.starts_with("[{\"check\":\"always_fails\",\"seed\":\"")
+                && failures.matches(join).count() == 1
+                && failures.ends_with("\"}]}")
+                && !failures.contains("}{"),
+            "two failures, one comma between them: {failures}"
+        );
+        let first = &failures[..failures.find(join).unwrap()];
+        let seed = first
+            .split("\"seed\":\"0x")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .map(|hex| u64::from_str_radix(hex, 16).unwrap())
+            .unwrap();
+        let cfg = crate::app_config(seed, &[]);
+        let axes: Vec<String> = FAULT_AXES
+            .into_iter()
+            .filter(|a| axis_on(&cfg, a))
+            .map(|a| format!("\"{a}\""))
+            .collect();
+        assert!(
+            axes.len() >= 2,
+            "non-vacuous: two axes or more to list: {axes:?}"
+        );
+        assert!(
+            first.contains(&format!(",\"faults_off\":[{}],", axes.join(","))),
+            "the shrunk failure turned off every axis that was on: {first}"
+        );
+        assert!(
+            failures[first.len()..].contains(",\"faults_off\":[],"),
+            "the other failure is unshrunk: {failures}"
+        );
+    }
+
+    /// Control characters are written as `\u00XX`; a space, the first
+    /// character past them, passes through as it is.
+    #[test]
+    fn json_escape_writes_control_characters_as_unicode_escapes() {
+        let mut out = String::new();
+        json_escape("\u{1}|\u{1f}| |~", &mut out);
+        assert_eq!(out, "\\u0001|\\u001f| |~");
     }
 
     #[test]

@@ -870,6 +870,54 @@ mod tests {
         }
     }
 
+    /// Each time field is refused alone one past its range, and the last
+    /// millisecond of a day is read. A text naming no real instant gives
+    /// `None`, never a wait for one.
+    #[test]
+    fn clock_reopens_after_refuses_each_time_field_past_its_range() {
+        let at = |stamp: &str| {
+            clock_reopens_after(&format!(
+                "clock went backwards: … the node runs again after {stamp}."
+            ))
+        };
+        for stamp in [
+            "2026-01-01T24:00:00.000Z",
+            "2026-01-01T23:60:00.000Z",
+            "2026-01-01T23:59:60.000Z",
+        ] {
+            assert_eq!(at(stamp), None, "{stamp}");
+        }
+        assert_eq!(
+            at("2026-01-01T23:59:59.999Z"),
+            Some(WallTime::from_nanos(1_767_311_999_999_000_000))
+        );
+    }
+
+    /// The date arithmetic across the months it treats apart: January and
+    /// February count from the year before, 29 February of a leap year, the
+    /// first of March after it, and a year boundary. Each instant's Display is
+    /// the text, and it is read back to the millisecond. Epoch milliseconds
+    /// from Python's `datetime`.
+    #[test]
+    fn clock_reopens_after_reads_dates_across_months_and_years() {
+        for (stamp, millis) in [
+            ("2023-01-31T08:15:30.125Z", 1_675_152_930_125_u64),
+            ("2023-02-01T00:00:00.000Z", 1_675_209_600_000),
+            ("2023-02-28T23:59:59.999Z", 1_677_628_799_999),
+            ("2024-02-29T12:34:56.789Z", 1_709_210_096_789),
+            ("2024-03-01T00:00:00.001Z", 1_709_251_200_001),
+            ("2025-12-31T23:59:59.999Z", 1_767_225_599_999),
+            ("2026-01-01T00:00:00.000Z", 1_767_225_600_000),
+        ] {
+            let t = WallTime::from_nanos(millis * 1_000_000);
+            assert_eq!(t.to_string(), stamp);
+            let text = format!(
+                "refusing to open: this node's wall clock … and the node will open after {t}."
+            );
+            assert_eq!(clock_reopens_after(&text), Some(t), "{stamp}");
+        }
+    }
+
     /// Each outcome, with what it leaves on the run: a clock refusal this run's
     /// faults explain is waited out (one second past its instant, then one
     /// process restart) and booted again; a third refusal gives up by name with
@@ -930,9 +978,12 @@ mod tests {
         );
         assert_eq!(sim.gave_up(), None);
 
+        // A fourth call panics, so a loop that never stops waiting fails here
+        // instead of sleeping forever.
         let mut boots = 0;
         let booted = wait_out_clock_refusal(&sim, || -> Result<Option<u32>, String> {
             boots += 1;
+            assert!(boots <= 3, "wait_out_clock_refusal booted a fourth time");
             Err(refused_until(&sim, 5_000_000_000))
         });
         assert_eq!(
