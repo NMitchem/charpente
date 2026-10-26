@@ -15,7 +15,11 @@ const MASTER: &str = "0x4D455247";
 const MS: u64 = 1_000_000;
 
 fn run_tests(tests: &[SimTest]) -> (i32, String) {
-    let argv = ["--runs", "256", "--master-seed", MASTER, "--jobs", "1"];
+    run_tests_at(tests, MASTER)
+}
+
+fn run_tests_at(tests: &[SimTest], master: &str) -> (i32, String) {
+    let argv = ["--runs", "256", "--master-seed", master, "--jobs", "1"];
     let args = HarnessArgs::parse(argv.into_iter().map(String::from)).unwrap();
     let mut out = Vec::new();
     let code = harness::run(tests, &args, &mut out);
@@ -190,6 +194,30 @@ fn generated_inputs_catch_latest_wins_and_shrink_it() {
         "{out}"
     );
     assert!(out.contains("  shrunk: 11 draws to 5, "), "{out}");
+}
+
+/// A batch whose first failure bid twice on lab 2. Lowering either lab alone
+/// puts the two bids on different labs, which passes, so it reaches lab 1
+/// only by lowering the two equal lab choices together.
+#[test]
+fn a_failure_on_lab_2_shrinks_to_lab_1() {
+    let tests = [SimTest {
+        name: "generated_latest",
+        run: generated_latest,
+        require: &[],
+    }];
+    let (code, out) = run_tests_at(&tests, "0xe27fde2a57487fee");
+    assert_eq!(code, 1, "{out}");
+    let first = out.lines().find(|l| l.starts_with("  first:  ")).unwrap();
+    assert!(
+        first.starts_with("  first:  after acked bid 1: lab 2's Best.amount is "),
+        "master 0xe27fde2a57487fee was chosen because its first failure is on lab 2: {out}"
+    );
+    let inputs = out.lines().find(|l| l.starts_with("  inputs:")).unwrap();
+    assert_eq!(
+        inputs, "  inputs: arrivals=2, lab=1, amount=2, lab=1, amount=1",
+        "{out}"
+    );
 }
 
 #[test]

@@ -3048,7 +3048,7 @@ empty slice. `text` panics when `min_words > max_words`, and on an empty
 `words` when `max_words` is above 0; with a `max_words` of 0 it draws `""`.
 Each message names the call and the draw, and says which argument to change.
 
-When a check fails, its first failure is shrunk to the smallest draws that still
+When a check fails, its first failure is shrunk to smaller draws that still
 fail it, and the failure block lists them by name on its `inputs:` line
 ("Shrinking a failure" below).
 
@@ -4612,14 +4612,14 @@ again.
 
 A failing run usually carries more than its bug: inputs that play no part, and
 fault axes that were on but did nothing to it. So the harness replays the first
-failure of each check with smaller choices and fewer faults, and keeps the
-smallest run that still fails the same check. That is the run the block shows.
-The rule is the same for every check: the smallest inputs, then the fewest fault
-axes, that still fail it.
+failure of each check with smaller choices and fewer faults, and keeps each
+smaller run that still fails the same check. The last one it keeps is the run
+the block shows. The rule is the same for every check: smaller inputs first,
+then fewer fault axes.
 
 It shrinks the recorded choice sequence, not the values (Hypothesis's approach):
 a smaller choice is a simpler value (`lo`, the first item, the identity order),
-and a draw past the end of the choices reads 0. Four passes repeat until a whole
+and a draw past the end of the choices reads 0. Five passes repeat until a whole
 round keeps nothing:
 
 1. delete chunks of the choices, 8, 4, 2 and then 1 long, from the end toward
@@ -4627,9 +4627,18 @@ round keeps nothing:
 2. set each choice to 0;
 3. search each choice down toward 0 (galloping up from 0, then bisecting), so a
    small value that fails is found even when the recorded choice is huge;
-4. turn off each fault axis that is on, one at a time, in `FaultConfig` field
+4. lower equal choices together: for each nonzero value two or more choices
+   hold, set all of them to 0 and then search them down toward 0 as one value,
+   then each pair of them the same way, so a failure that needs the same entity
+   drawn twice (the same lab, the same product) reaches the lowest one, where
+   lowering either draw alone makes the two differ and passes;
+5. turn off each fault axis that is on, one at a time, in `FaultConfig` field
    order. An axis is on when it could fire: a clock axis whose chance is 0 is
    off whatever its size, so `faults off:` never lists it.
+
+The run they end on is a local minimum: no step of these passes shrinks it and
+still fails. They do not search every smaller run, so a smaller one that fails
+the check can still exist.
 
 A candidate is kept when the same check fails, with any message. One that
 passes or gives up is not kept, so a clock axis whose removal turns the failure
