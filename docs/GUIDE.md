@@ -4414,11 +4414,11 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
 - `--inputs HEX` — with `--seed`, replay these input choices instead of the
   ones the seed draws: each `sim.input()` draw reads the next, and every draw
   past the end reads 0. A choice above its draw's range draws what it reduces
-  to, and the run records it reduced. `HEX` is each choice as an unsigned LEB128 number, the
-  bytes in lowercase hex, which is what a shrunk failure's `repro:` line
-  prints. Anything else (an empty value, a character that is not lowercase
-  hex, an odd length, a number cut off or past 64 bits) is a usage error
-  naming the flag, so an unset `--inputs "$HEX"` never replays all zeros.
+  to, and the run records it reduced. `HEX` is each choice as an unsigned
+  LEB128 number, the bytes in lowercase hex, which is what a shrunk failure's
+  `repro:` line prints. Anything else (an empty value, a character that is not
+  lowercase hex, an odd length, a number cut off or past 64 bits) is a usage
+  error naming the flag, so an unset `--inputs "$HEX"` never replays all zeros.
 - `--faults-off AXIS,…` — with `--seed`, turn these `FaultConfig` axes off
   (any field but `corruption_scope`, which scopes two axes rather than being
   one). The seed's config is sampled first and these are turned off after, so
@@ -4621,28 +4621,30 @@ A failing run usually carries more than its bug: inputs that play no part, and
 fault axes that were on but did nothing to it. So the harness replays the first
 failure of each check with smaller choices and fewer faults, and keeps each
 smaller run that still fails the same check. The last one it keeps is the run
-the block shows. The rule is the same for every check: smaller inputs first,
-then fewer fault axes.
+the block shows. The rule is the same for every check.
 
 It shrinks the recorded choice sequence, not the values (Hypothesis's approach):
 each choice is the one its draw used, so a smaller choice is a smaller, simpler
 value (`lo`, the first item, the identity order), and a draw past the end of
-the choices reads 0. Five passes repeat until a whole
-round keeps nothing:
+the choices reads 0. Five passes repeat until a whole round keeps nothing:
 
 1. delete chunks of the choices, 8, 4, 2 and then 1 long, from the end toward
    the start;
 2. set each choice to 0;
-3. search each choice down toward 0 (galloping up from 0, then bisecting), so a
-   small value that fails is found even when the recorded choice is huge;
-4. lower equal choices together: for each nonzero value two or more choices
+3. search each choice down toward 0 (galloping up from 1, then bisecting), so a
+   small value that fails is found even when the values between it and the
+   recorded choice pass;
+4. turn off each fault axis that is on, one at a time, in `FaultConfig` field
+   order. An axis is on when it could fire: a clock axis whose chance is 0 is
+   off whatever its size, so `faults off:` never lists it;
+5. lower equal choices together: for each nonzero value two or more choices
    hold, set all of them to 0 and then search them down toward 0 as one value,
    then each pair of them the same way, so a failure that needs the same entity
    drawn twice (the same lab, the same product) reaches the lowest one, where
-   lowering either draw alone makes the two differ and passes;
-5. turn off each fault axis that is on, one at a time, in `FaultConfig` field
-   order. An axis is on when it could fire: a clock axis whose chance is 0 is
-   off whatever its size, so `faults off:` never lists it.
+   lowering either draw alone makes the two differ and passes. It runs last
+   because k equal choices make k(k-1)/2 pairs, enough to spend the whole
+   budget: run earlier, they could leave on fault axes the failure does not
+   need.
 
 The run they end on is a local minimum: no step of these passes shrinks it and
 still fails. They do not search every smaller run, so a smaller one that fails
@@ -4663,7 +4665,7 @@ stops with the smallest run found so far. A workload that panics prints the
 panic's message on stderr each time a shrink replay panics; the report itself is
 on stdout, written once every shrink has finished.
 
-**A slipped shrink.** Any failure of the same check counts, so the smallest run
+**A slipped shrink.** Any failure of the same check counts, so the shrunk run
 can fail it for another reason than the first did. The headline is then the
 shrunk run's own message, `first:` keeps the original, and `repro:` replays the
 shrunk run. The original is the seed alone: drop `--inputs` and `--faults-off`
