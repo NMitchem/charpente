@@ -2991,6 +2991,23 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 }
 ```
 
+### Examples to copy
+
+Three compiled examples ship in the `charpente` crate, each a small batch
+that prints the report "Reading a batch" describes and exits with its code.
+Each is a whole `tests/sim.rs`: `sim_tests!` supplies `main`. Run one with
+`cargo run -p charpente --example <name>`:
+
+| Example | File | It shows |
+|---|---|---|
+| `drawn_inputs` | `crates/charpente/examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them, and a `require` on a key the check marks when it judged something |
+| `modelled_remote` | `crates/charpente/examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch for the fault-free tail, and the three outbound checkers |
+| `restart_under_faults` | `crates/charpente/examples/restart_under_faults.rs` | `boot_through_fallout`, a restart, a fault-free tail that waits out a clock refusal, and a `require ["restart"]` |
+
+In all three a skipped run gives a constant `reason` and puts the run's own
+text in the `detail`. The files are in the registry copy of the crate, and
+this guide is the `charpente::guide` page on docs.rs.
+
 ### Drawing inputs
 
 `sim.input()` is for the inputs a property must hold for: a name, an amount, an

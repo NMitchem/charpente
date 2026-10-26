@@ -10,6 +10,8 @@
 //! (`File`'s supertrait). Every container with order-dependent iteration is a
 //! BTree — replaying a seed must be byte-identical, forever.
 
+pub use charpente_core::io::{OutboundCall, OutboundReply};
+
 pub mod checks;
 mod disk;
 pub mod harness;

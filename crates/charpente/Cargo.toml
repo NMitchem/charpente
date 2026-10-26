@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
 
+# GUIDE's ```rust blocks compile in guide-examples; rustdoc must not also run them.
+[lib]
+doctest = false
+
 [dependencies]
 charpente-core.workspace = true
 charpente-macros.workspace = true
@@ -28,4 +32,4 @@ tower-service = "0.3.3"
 workspace = true
 
 [dev-dependencies]
-charpente-sim = { path = "../charpente-sim" }
+charpente-sim.workspace = true

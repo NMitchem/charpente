@@ -45,3 +45,15 @@ fn same_seed_replays_identically() {
         );
     }
 }
+
+/// A sim model is written against the outbound call types, which the
+/// simulator re-exports so a test names them without a `charpente` import.
+#[test]
+fn outbound_call_types_are_reexported() {
+    use charpente_sim::{OutboundCall, OutboundReply};
+    let _: fn(&OutboundCall) -> OutboundReply = |_| OutboundReply {
+        status: 200,
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+}

@@ -21,6 +21,14 @@ pub use serde;
 pub mod archive;
 pub mod auth;
 pub mod describe;
+/// The guide, shipped in the crate so docs.rs and the registry copy carry it.
+pub mod guide {
+    // GUIDE is written for a reader of the markdown file: bare fences hold
+    // shell output and `<instant>` is prose, not a tag. Reworded for rustdoc,
+    // it would drift from the file guide-examples compiles.
+    #![allow(rustdoc::invalid_rust_codeblocks, rustdoc::invalid_html_tags)]
+    #![doc = include_str!("../GUIDE.md")]
+}
 pub mod http;
 pub mod kernel;
 pub mod launch;
