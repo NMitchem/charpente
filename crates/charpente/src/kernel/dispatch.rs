@@ -592,29 +592,36 @@ impl Dispatcher {
 
     /// The one-job wrapper (group-commit T7, C-2; fix round I-2):
     /// `begin_group`, one `run_due_into`, then `commit` — the shape every
-    /// existing direct caller of `run_due` (ten call sites across
-    /// `tests/kernel.rs`) keeps compiling against unchanged. The kernel's
+    /// direct caller of `run_due` (all of them tests) compiles against. The kernel's
     /// own batched job arm calls `run_due_into` directly against a group it
     /// drains many jobs into instead.
     ///
-    /// **On a commit failure, this now applies `Db::transact`'s ruled policy
-    /// exactly** (`CommitFailure::invalidates`, db.rs:1438-1445/2256-2299 —
-    /// the ONE rule, so the single-transaction path, this wrapper and
-    /// `CronScheduler::tick`'s wrapper cannot answer the same question
-    /// differently). A fresh group used by no one else means
-    /// `records_before` is always `0`, so `invalidates(0, staged)` is the
-    /// whole question. Under the checkpoint arm (`applied == n`, already
-    /// reported through `poisoned()`/`store_failed()`) the job's outcome IS
-    /// durable: this returns `Ok(outcome)` and leaves the heap alone —
-    /// re-inserting `(due_at, id)` would put the heap at Pending while the
-    /// store says `Done`, exactly the state `run_due_into`'s own invariant
-    /// assert exists to catch. On every OTHER commit failure (an
-    /// append/sync failure, or a checkpoint failure nothing else reports),
-    /// nothing this call staged is trustworthy: the heap bookkeeping
-    /// `run_due_into` already did on the assumption commit would succeed is
-    /// undone — a `Retried` outcome's speculative NEW `due_at` entry is
-    /// removed first — and the heap is restored to the ORIGINAL `(due_at,
-    /// id)`, mirroring the `Io` arm above, one level up.
+    /// **On a commit failure, this answers exactly as `Db::transact`'s ruled
+    /// policy does** (`CommitFailure::invalidates`, the ONE rule, so the
+    /// single-transaction path, this wrapper and `CronScheduler::tick`'s
+    /// wrapper cannot answer the same question differently). A fresh group
+    /// used by no one else means `records_before` is always `0`, so
+    /// `invalidates(0, staged)` says whether the job's record reached the
+    /// store. It answers `Err` when the record did not reach it, and also when
+    /// it did but nothing else reports the failure (a horizon-breadcrumb sync,
+    /// which poisons nothing and latches nothing), so the failure is never
+    /// swallowed. Under the checkpoint arm already reported through
+    /// `poisoned()`/`store_failed()` it answers `Ok(outcome)`.
+    ///
+    /// **The heap follows the store, not the answer** — the same rule
+    /// `tick`'s cache follows. `run_due_into` did its heap bookkeeping on the
+    /// assumption the commit would succeed. Only a record that never reached
+    /// the store (`applied == 0`, an append/sync failure) is undone: a
+    /// `Retried` outcome's speculative NEW `due_at` entry is removed first,
+    /// and the heap is restored to the ORIGINAL `(due_at, id)`, mirroring the
+    /// `Io` arm above, one level up. When the record did reach it (`applied ==
+    /// n`, either checkpoint arm) the heap already says what the store says
+    /// and is left alone: a `Done` or `Dead` job is out of it, a `Retried` one
+    /// waits at its NEW `due_at`. Re-inserting the original `(due_at, id)`
+    /// there would put the heap at Pending while the store says `Done` —
+    /// exactly the state `run_due_into`'s own invariant assert exists to
+    /// catch — and the unreported arm leaves the `Db` writable, so the next
+    /// `run_due` would reach that assert.
     pub fn run_due(&mut self, db: &mut Db, now: Now) -> io::Result<JobOutcome> {
         let (due_at, id, outbound) = self.next_due().expect("run_due called with an empty heap");
         let mut group = db.begin_group()?;
@@ -643,7 +650,8 @@ impl Dispatcher {
             }
             (Ok(outcome), Err(failure)) => {
                 let reported_elsewhere = db.poisoned() || db.store_failed();
-                if failure.invalidates(0, staged) || !reported_elsewhere {
+                let invalidated = failure.invalidates(0, staged);
+                if invalidated {
                     if let JobOutcome::Retried {
                         due_at: new_due_at, ..
                     } = outcome
@@ -655,6 +663,8 @@ impl Dispatcher {
                         }
                     }
                     self.requeue(due_at, id, outbound);
+                }
+                if invalidated || !reported_elsewhere {
                     Err(failure.error)
                 } else {
                     Ok(outcome)

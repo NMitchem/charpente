@@ -3457,6 +3457,145 @@ fn a_tick_whose_checkpoint_failure_nothing_else_reports_answers_err_and_never_re
     );
 }
 
+/// One job enqueued by `enqueue` and noted, over a disk whose horizon
+/// breadcrumb (`<store_path>.horizon`) fails its next sync once armed, armed
+/// only afterwards: the sync that fails is the breadcrumb write in `run_due`'s
+/// own cadence checkpoint (`checkpoint_every: 1`). The store file and the WAL
+/// are delegated untouched.
+fn run_due_over_a_breadcrumb_fault(
+    seed: u64,
+    enqueue: impl FnOnce(&mut Tx),
+) -> (App, Dispatcher, Arc<AtomicU64>, std::io::Result<JobOutcome>) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let mut app = App::open(
+        Box::new(OneShotStoreSyncFaultDisk {
+            inner: sim.disk(),
+            store_path: format!("{}.horizon", latch_config().db.store_path),
+            armed: armed.clone(),
+            fired: fired.clone(),
+            reads: Arc::new(AtomicU64::new(0)),
+        }),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        latch_config(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp, AlwaysFails]);
+    let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+    let db = app.db_for_tests();
+    db.transact(|tx| {
+        enqueue(tx);
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    dispatcher.note_enqueued(db.drain_enqueued());
+    armed.store(true, Ordering::SeqCst);
+    let outcome = dispatcher.run_due(db, at(0));
+    (app, dispatcher, fired, outcome)
+}
+
+/// Asserts the breadcrumb arm a `run_due_over_a_breadcrumb_fault` test stands
+/// on, and returns the failure `run_due` answered with.
+fn breadcrumb_arm(
+    app: &mut App,
+    fired: &AtomicU64,
+    outcome: std::io::Result<JobOutcome>,
+) -> std::io::Error {
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the breadcrumb's sync must fail exactly once, in run_due's own cadence checkpoint"
+    );
+    let db = app.db_for_tests();
+    assert!(
+        !db.poisoned() && !db.store_failed(),
+        "a breadcrumb sync failure poisons nothing and latches nothing, or this is not the arm \
+         under test"
+    );
+    let err = outcome.expect_err(
+        "a checkpoint failure nothing else reports must reach the caller: swallowed, it freezes \
+         WAL GC and the breadcrumb with nobody told",
+    );
+    assert!(err.to_string().contains("simulated fsync failure"), "{err}");
+    err
+}
+
+/// `Dispatcher::run_due`'s wrapper on the third commit-failure arm, the twin
+/// of the cron test above. The job's batch applied and the store checkpointed,
+/// then the horizon breadcrumb's sync failed: nothing is poisoned or latched
+/// and the `Db` stays writable. `run_due` answers `Err`, because nothing else
+/// reports the failure, but the Done mark reached the store (`applied == n`),
+/// so the heap must not hold the job. Put back at its original place, the next
+/// `run_due` finds a row the heap calls Pending and the store calls Done, and
+/// `run_due_into`'s invariant assert stops the kernel over a disk fault.
+#[test]
+fn run_due_never_requeues_a_done_mark_the_store_holds_when_nothing_else_reports_the_failure() {
+    let (mut app, mut dispatcher, fired, outcome) =
+        run_due_over_a_breadcrumb_fault(0x20A3_0004, |tx| tx.enqueue(CountUp { slot: 1 }));
+    breadcrumb_arm(&mut app, &fired, outcome);
+    let db = app.db_for_tests();
+    let statuses = |db: &Db| -> Vec<JobStatus> {
+        let snap = db.snapshot().unwrap();
+        snap.scan::<JobRow>()
+            .unwrap()
+            .iter()
+            .map(|r| r.status)
+            .collect()
+    };
+    assert_eq!(statuses(db), [JobStatus::Done], "the Done mark is durable");
+    // The Db is still writable, so the dispatcher goes on: the next job must
+    // run, not trip over the first.
+    db.transact(|tx| {
+        tx.enqueue(CountUp { slot: 2 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    dispatcher.note_enqueued(db.drain_enqueued());
+    let next = dispatcher.run_due(db, at(0)).unwrap();
+    assert!(
+        matches!(next, JobOutcome::Done { id: 1 }),
+        "the next run_due must run the next job: {next:?}"
+    );
+    assert!(
+        !dispatcher.has_due(wall(u64::MAX)),
+        "both jobs are Done in the store, so the heap must hold neither"
+    );
+    assert_eq!(statuses(db), [JobStatus::Done, JobStatus::Done]);
+}
+
+/// The same arm with a job whose attempt fails. Its Retried record (attempts
+/// 1, `due_at` moved by the backoff) reached the store, so the heap must hold
+/// the job at that NEW `due_at`, which is what the store says. Restored to its
+/// original place it runs again at once, ahead of its backoff, against a row
+/// that already counts the attempt. Dropped from the heap, a Pending job waits
+/// for a restart.
+#[test]
+fn run_due_keeps_a_durable_retry_due_at_its_new_time_when_nothing_else_reports_the_failure() {
+    let (mut app, dispatcher, fired, outcome) =
+        run_due_over_a_breadcrumb_fault(0x20A3_0005, |tx| tx.enqueue(AlwaysFails {}));
+    breadcrumb_arm(&mut app, &fired, outcome);
+    let db = app.db_for_tests();
+    let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
+    assert_eq!(
+        (row.status, row.attempts),
+        (JobStatus::Pending, 1),
+        "the Retried record is durable: the attempt is counted and the job is Pending"
+    );
+    assert!(
+        row.due_at > WallTime::UNIX_EPOCH,
+        "the retry moved the job's due time past its enqueue: {:?}",
+        row.due_at
+    );
+    assert_eq!(
+        dispatcher.next_deadline(),
+        Some(row.due_at),
+        "the heap must mirror the store: the job is due again at the Retried record's due_at, \
+         not at its original place ahead of the backoff, and not missing"
+    );
+}
+
 /// The cron arm's batch is bounded at `MAX_BATCH` ticks, as the job arm's
 /// is: with 65 schedules due at one instant, the first cron step commits
 /// exactly 64 and the 65th waits for a later step. A 65th staged into the

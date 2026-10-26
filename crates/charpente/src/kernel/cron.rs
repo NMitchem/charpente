@@ -166,7 +166,8 @@ impl CronScheduler {
     /// swallowed. Under the checkpoint arm already reported through
     /// `poisoned()`/`store_failed()` it answers `Ok((name, catchup))`.
     ///
-    /// **The cache follows the store, not the answer.** `tick_into` advanced
+    /// **The cache follows the store, not the answer** — the same rule
+    /// `run_due`'s heap follows. `tick_into` advanced
     /// the ticked entry's cache on the assumption the commit would succeed.
     /// Only a record that never reached the store (`applied == 0`, an
     /// append/sync failure) rolls it back to `previous`, so the same interval
