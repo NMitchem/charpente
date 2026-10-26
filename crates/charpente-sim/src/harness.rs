@@ -621,9 +621,16 @@ struct Batch {
     checks: Vec<CheckExtras>,
     /// The command that reruns exactly this batch; `None` for a `--seed` run.
     rerun: Option<String>,
-    /// For a `--seed` run: its seed, whether `--inputs` was given, and the
-    /// axes `--faults-off` turned off.
-    replay: Option<(u64, bool, Vec<&'static str>)>,
+    /// What a `--seed` run replayed; `None` for a batch.
+    replay: Option<Replay>,
+}
+
+/// A `--seed` run: its seed, the `--inputs` it was given, and the axes
+/// `--faults-off` turned off.
+struct Replay {
+    seed: u64,
+    inputs: Option<Vec<u64>>,
+    faults_off: Vec<&'static str>,
 }
 
 /// One check's runs beyond its `TestOutcomes`. A check's tested runs are its
@@ -676,19 +683,22 @@ impl CheckTally {
     }
 }
 
-/// Runs every test in `tests` whose name contains `args.filter` (all of them
-/// if unset) and writes a human report to `out`. Exit code: 0 green (a batch
-/// whose every check is untested included), 1 if any run failed or a coverage
-/// requirement went unmet, 2 if the selection is empty — a filter that
-/// matches nothing is a usage error, not a green run of zero tests.
+/// Runs the tests `args.filter` selects (all of them if unset) and writes a
+/// human report to `out`. A filter that is a test's whole name selects that
+/// test alone, so a repro's `--filter {check}` replays one check even when
+/// another check's name contains it; any other filter selects every test
+/// whose name contains it. Exit code: 0 green (a batch whose every check is
+/// untested included), 1 if any run failed or a coverage requirement went
+/// unmet, 2 if the selection is empty — a filter that matches nothing is a
+/// usage error, not a green run of zero tests.
 pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) -> i32 {
-    let selected: Vec<&SimTest> = tests
-        .iter()
-        .filter(|t| match &args.filter {
-            Some(f) => t.name.contains(f.as_str()),
-            None => true,
-        })
-        .collect();
+    let selected: Vec<&SimTest> = match args.filter.as_deref() {
+        None => tests.iter().collect(),
+        Some(f) if tests.iter().any(|t| t.name == f) => {
+            tests.iter().filter(|t| t.name == f).collect()
+        }
+        Some(f) => tests.iter().filter(|t| t.name.contains(f)).collect(),
+    };
     if selected.is_empty() {
         let _ = writeln!(
             out,
@@ -795,7 +805,11 @@ fn run_single_seed(
         report,
         checks,
         rerun: None,
-        replay: Some((seed, inputs.is_some(), faults_off.to_vec())),
+        replay: Some(Replay {
+            seed,
+            inputs: inputs.map(<[u64]>::to_vec),
+            faults_off: faults_off.to_vec(),
+        }),
     }
 }
 
@@ -995,10 +1009,29 @@ fn render_json(batch: &Batch) -> String {
         failed += c.failed;
         skipped += c.skipped.iter().map(|(_, n)| n).sum::<u64>();
     }
+    // A replay's seed reruns one run, not a batch, so it is never named
+    // `master_seed`: fed back as `--master-seed` it would run another batch.
+    match &batch.replay {
+        None => out.push_str(&format!("{{\"master_seed\":\"{:#x}\"", report.master_seed)),
+        Some(replay) => {
+            out.push_str(&format!("{{\"seed\":\"{:#x}\"", replay.seed));
+            if let Some(choices) = &replay.inputs {
+                out.push_str(&format!(",\"inputs\":\"{}\"", encode_inputs(choices)));
+            }
+            if !replay.faults_off.is_empty() {
+                let axes: Vec<String> = replay
+                    .faults_off
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect();
+                out.push_str(&format!(",\"faults_off\":[{}]", axes.join(",")));
+            }
+        }
+    }
     out.push_str(&format!(
-        "{{\"master_seed\":\"{:#x}\",\"runs\":{},\"passed\":{passed},\"failed\":{failed},\
-         \"skipped\":{skipped},\"coverage\":",
-        report.master_seed, report.universes,
+        ",\"runs\":{},\"passed\":{passed},\"failed\":{failed},\"skipped\":{skipped},\
+         \"coverage\":",
+        report.universes,
     ));
     coverage_json(&report.coverage, &mut out);
 
@@ -1035,6 +1068,18 @@ fn render_json(batch: &Batch) -> String {
             c.distinct_inputs,
             c.drew,
         ));
+        // A detail attaches to its reason by index, which is sound only
+        // because a `--seed` replay, the one run that keeps details, has one
+        // run per check: one skipped reason, and its detail if it had one.
+        assert!(
+            c.details.is_empty()
+                || (batch.replay.is_some() && c.skipped.len() == 1 && c.details.len() == 1),
+            "{}: {} details for {} skipped reasons, but only a `--seed` replay keeps a detail, \
+             one run per check",
+            o.test,
+            c.details.len(),
+            c.skipped.len()
+        );
         for (j, (reason, n)) in c.skipped.iter().enumerate() {
             if j > 0 {
                 out.push(',');
@@ -1042,8 +1087,6 @@ fn render_json(batch: &Batch) -> String {
             out.push_str("{\"reason\":\"");
             json_escape(reason, &mut out);
             out.push_str(&format!("\",\"count\":{n}"));
-            // Only a `--seed` replay keeps details, one per skipped run, and
-            // it has one run per check.
             if let Some(detail) = c.details.get(j) {
                 out.push_str(",\"detail\":\"");
                 json_escape(detail, &mut out);
@@ -1059,17 +1102,17 @@ fn render_json(batch: &Batch) -> String {
         if i > 0 {
             out.push(',');
         }
-        let (message, config, coverage, drawn, inputs, faults_off) = failure_run(f);
+        let shown = failure_run(f);
         out.push_str("{\"check\":\"");
         json_escape(f.test, &mut out);
         out.push_str(&format!("\",\"seed\":\"{:#x}\",\"config\":", f.seed));
-        config_json(config, &mut out);
+        config_json(shown.config, &mut out);
         out.push_str(",\"fired\":");
-        coverage_json(coverage, &mut out);
+        coverage_json(shown.coverage, &mut out);
         out.push_str(",\"message\":\"");
-        json_escape(message, &mut out);
+        json_escape(shown.message, &mut out);
         out.push_str("\",\"inputs\":[");
-        for (j, (name, value)) in drawn.iter().enumerate() {
+        for (j, (name, value)) in shown.drawn.iter().enumerate() {
             if j > 0 {
                 out.push(',');
             }
@@ -1080,7 +1123,7 @@ fn render_json(batch: &Batch) -> String {
             out.push_str("\"}");
         }
         out.push_str("],\"faults_off\":[");
-        for (j, axis) in faults_off.iter().enumerate() {
+        for (j, axis) in shown.faults_off.iter().enumerate() {
             if j > 0 {
                 out.push(',');
             }
@@ -1097,7 +1140,10 @@ fn render_json(batch: &Batch) -> String {
             }
         }
         out.push_str(&format!(",\"replays\":{replays},\"repro\":\""));
-        json_escape(&repro(f.test, f.seed, inputs, faults_off), &mut out);
+        json_escape(
+            &repro(f.test, f.seed, shown.inputs, shown.faults_off),
+            &mut out,
+        );
         out.push_str("\"}");
     }
     out.push_str("]}");
@@ -1376,11 +1422,7 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
 /// A `--seed` replay in the batch's language: the failure blocks, a line per
 /// check saying ok, FAILED or skipped (a skipped run's reason and detail under
 /// it), and a result line naming the seed and what the replay was given.
-fn write_replay(
-    batch: &Batch,
-    (seed, inputs, faults_off): &(u64, bool, Vec<&'static str>),
-    out: &mut dyn std::io::Write,
-) {
+fn write_replay(batch: &Batch, replay: &Replay, out: &mut dyn std::io::Write) {
     let escape = |s: &str| {
         s.replace('\n', "\\n")
             .replace('\r', "\\r")
@@ -1428,11 +1470,11 @@ fn write_replay(
         "ok"
     };
     let mut given = Vec::new();
-    if *inputs {
+    if replay.inputs.is_some() {
         given.push("with the given inputs".to_string());
     }
-    if !faults_off.is_empty() {
-        given.push(format!("with faults off: {}", faults_off.join(", ")));
+    if !replay.faults_off.is_empty() {
+        given.push(format!("with faults off: {}", replay.faults_off.join(", ")));
     }
     let given = match given.is_empty() {
         true => String::new(),
@@ -1441,40 +1483,40 @@ fn write_replay(
     let _ = writeln!(
         out,
         "\nsim result: {word}. {passed} passed; {failed} failed; {skipped} skipped, on seed \
-         {seed:#x}{given}."
+         {:#x}{given}.",
+        replay.seed
     );
 }
 
 /// The run a failure's record describes: the shrunk run when there is one,
 /// else the failure itself, with the inputs and fault axes its repro passes.
-#[allow(clippy::type_complexity)]
-fn failure_run(
-    f: &Failure,
-) -> (
-    &String,
-    &FaultConfig,
-    &BTreeMap<&'static str, u64>,
-    &Vec<(&'static str, String)>,
-    Option<&[u64]>,
-    &[&'static str],
-) {
+struct FailureRun<'a> {
+    message: &'a str,
+    config: &'a FaultConfig,
+    coverage: &'a BTreeMap<&'static str, u64>,
+    drawn: &'a [(&'static str, String)],
+    inputs: Option<&'a [u64]>,
+    faults_off: &'a [&'static str],
+}
+
+fn failure_run(f: &Failure) -> FailureRun<'_> {
     match &f.shrunk {
-        Some(s) => (
-            &s.message,
-            &s.config,
-            &s.coverage,
-            &s.drawn,
-            s.replay_inputs.then_some(&s.choices[..]),
-            &s.faults_off[..],
-        ),
-        None => (
-            &f.message,
-            &f.config,
-            &f.coverage,
-            &f.drawn,
-            f.inputs.as_deref(),
-            &f.faults_off[..],
-        ),
+        Some(s) => FailureRun {
+            message: &s.message,
+            config: &s.config,
+            coverage: &s.coverage,
+            drawn: &s.drawn,
+            inputs: s.replay_inputs.then_some(&s.choices[..]),
+            faults_off: &s.faults_off,
+        },
+        None => FailureRun {
+            message: &f.message,
+            config: &f.config,
+            coverage: &f.coverage,
+            drawn: &f.drawn,
+            inputs: f.inputs.as_deref(),
+            faults_off: &f.faults_off,
+        },
     }
 }
 
@@ -1484,15 +1526,21 @@ fn failure_run(
 /// message; its repro replays the shrunk run. The check's other failures get
 /// no block, only the count on its line. A `--seed` replay prints its own run.
 fn human_failure_block(f: &Failure) -> String {
-    let (message, config, coverage, drawn, inputs, faults_off) = failure_run(f);
+    let shown = failure_run(f);
     let mut block = format!(
-        "\nsim failure in {}: {message}\n  seed:   {:#018x}\n  config: {config:?}\n  fired:  {}\n",
+        "\nsim failure in {}: {}\n  seed:   {:#018x}\n  config: {:?}\n  fired:  {}\n",
         f.test,
+        shown.message,
         f.seed,
-        crate::render_fired(coverage),
+        shown.config,
+        crate::render_fired(shown.coverage),
     );
-    if !drawn.is_empty() {
-        let inputs: Vec<String> = drawn.iter().map(|(n, v)| format!("{n}={v}")).collect();
+    if !shown.drawn.is_empty() {
+        let inputs: Vec<String> = shown
+            .drawn
+            .iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect();
         block.push_str(&format!("  inputs: {}\n", inputs.join(", ")));
     }
     if let Some(s) = &f.shrunk {
@@ -1519,7 +1567,7 @@ fn human_failure_block(f: &Failure) -> String {
     }
     block.push_str(&format!(
         "  repro:  {}\n",
-        repro(f.test, f.seed, inputs, faults_off)
+        repro(f.test, f.seed, shown.inputs, shown.faults_off)
     ));
     block
 }
@@ -1795,6 +1843,33 @@ mod tests {
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 2);
+    }
+
+    /// A repro's `--filter {check}` replays that check alone, even when
+    /// another check's name contains it: a name that is a check's whole name
+    /// selects that check, and only a filter that names none selects by
+    /// substring.
+    #[test]
+    fn a_filter_naming_a_check_exactly_selects_it_alone() {
+        let tests = [
+            sim_test("charge", always_fails),
+            sim_test("charge_twice", always_ok),
+        ];
+        let (code, out) = run_to_string(&tests, &["--filter", "charge", "--seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains("\ncheck charge ... FAILED\n"), "{out}");
+        assert!(!out.contains("charge_twice"), "{out}");
+
+        let (code, out) = run_to_string(&tests, &["--filter", "charg", "--runs", "1"]);
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("\ncheck charge ......... FAILED  (1 tested: 1 failed)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\ncheck charge_twice ... ok  (1 tested)\n"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -3495,9 +3570,99 @@ mod tests {
             "{json}"
         );
         assert!(
-            json.starts_with("{\"master_seed\":\"0x1234\",\"runs\":1,"),
+            json.starts_with("{\"seed\":\"0x1234\",\"runs\":1,"),
             "{json}"
         );
+    }
+
+    /// A replay's JSON names the seed it replayed as `seed`, never as a
+    /// `master_seed` that would rerun some other batch, and the `--inputs`
+    /// and `--faults-off` it was given, as its human result line does.
+    #[test]
+    fn a_replay_s_json_names_its_seed_and_what_it_was_given() {
+        let tests = [sim_test("always_ok", always_ok)];
+        let (code, json) = run_to_string(&tests, &["--seed", "0x1234", "--format", "json"]);
+        assert_eq!(code, 0, "{json}");
+        assert!(
+            json.starts_with("{\"seed\":\"0x1234\",\"runs\":1,\"passed\":1,"),
+            "{json}"
+        );
+        assert!(!json.contains("master_seed"), "{json}");
+        assert!(!json.contains("\"inputs\""), "{json}");
+        assert!(!json.contains("\"faults_off\""), "{json}");
+
+        let (code, json) = run_to_string(
+            &tests,
+            &[
+                "--seed",
+                "0x1234",
+                "--inputs",
+                "03c801",
+                "--faults-off",
+                "read_error,bit_flip",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(code, 0, "{json}");
+        assert!(
+            json.starts_with(
+                "{\"seed\":\"0x1234\",\"inputs\":\"03c801\",\
+                 \"faults_off\":[\"bit_flip\",\"read_error\"],\"runs\":1,\"passed\":1,"
+            ),
+            "{json}"
+        );
+
+        let (_, json) = run_to_string(
+            &tests,
+            &[
+                "--seed",
+                "0x1234",
+                "--faults-off",
+                "read_error",
+                "--format",
+                "json",
+            ],
+        );
+        assert!(
+            json.starts_with("{\"seed\":\"0x1234\",\"faults_off\":[\"read_error\"],\"runs\":1,"),
+            "{json}"
+        );
+    }
+
+    /// A detail attaches to its reason by index, which holds only for a
+    /// replay's one run per check: anything else is refused by name.
+    #[test]
+    #[should_panic(
+        expected = "two_reasons: 1 details for 2 skipped reasons, but only a `--seed` \
+                               replay keeps a detail, one run per check"
+    )]
+    fn a_detail_outside_a_replay_is_refused_by_name() {
+        let batch = Batch {
+            report: Report {
+                master_seed: 0x1234,
+                universes: 2,
+                failures: Vec::new(),
+                coverage: BTreeMap::new(),
+                missing_coverage: Vec::new(),
+                outcomes: vec![TestOutcomes {
+                    test: "two_reasons",
+                    verdicts: 0,
+                    gave_up: 2,
+                }],
+            },
+            checks: vec![CheckExtras {
+                passed: 0,
+                failed: 0,
+                skipped: vec![("first", 1), ("second", 1)],
+                distinct_inputs: 0,
+                drew: false,
+                details: vec!["the first run's detail".to_string()],
+            }],
+            rerun: None,
+            replay: None,
+        };
+        render_json(&batch);
     }
 
     #[test]

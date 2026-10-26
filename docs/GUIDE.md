@@ -3039,7 +3039,9 @@ let note = i.text("note", &["x", "y"], 1, 4);
 It is the workload's own script only: a modelled remote keeps its own `Rng`. A
 drawn input tests how the app handles what its model stand-in returns, never
 the real model's behaviour. `between` panics when `lo > hi`, and `pick` on an
-empty slice; each message names the call and the draw.
+empty slice. `text` panics when `min_words > max_words`, and on an empty
+`words` when `max_words` is above 0; with a `max_words` of 0 it draws `""`.
+Each message names the call and the draw, and says which argument to change.
 
 When a check fails, its first failure is shrunk to the smallest draws that still
 fail it, and the failure block lists them by name on its `inputs:` line
@@ -4415,7 +4417,10 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   of fresh OS entropy, for a byte-identical repeat of an entire batch
   (every check's every run). Cannot be combined with `--seed`. The batch's
   last line is this flag with the batch's `--runs` and `--filter`.
-- `--filter S` — run only tests whose name contains `S`. Filtering happens
+- `--filter S` — run only the check named `S` when there is one, and
+  otherwise every check whose name contains `S`. A failure's `repro:` line
+  names its check, so it replays that check alone even when another check's
+  name contains it (`charge` and `charge_twice`). Filtering happens
   **before** any seed is drawn, so a filtered batch consumes a different (but
   still fully reproducible) prefix of the seed chain than an unfiltered one
   — this is why every individual failure's repro line carries its own
@@ -4429,7 +4434,11 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   every fact the human report prints, keys in this order: `master_seed`,
   `runs`, `passed`, `failed` and `skipped` (run totals over every check),
   `coverage`, `missing_coverage` (`{check, key}` pairs), `checks` and
-  `failures`. Each of `checks`, in registry order, is `{check, status, passed,
+  `failures`. Under `--seed`, `seed` stands where `master_seed` does, since
+  the replayed seed fed back as `--master-seed` would run another batch. It is
+  followed by `inputs`, the choices `--inputs` gave in that flag's encoding,
+  when the replay was given them, and `faults_off`, the axes `--faults-off`
+  turned off in field order, when it was given those. Each of `checks`, in registry order, is `{check, status, passed,
   failed, skipped, distinct_inputs, drew_inputs, skipped_reasons}`: `status` is
   `ok`, `FAILED` or `untested` (under `--seed` too, where the human line says
   `skipped`), and `skipped_reasons` lists every reason, uncapped, as `{reason,

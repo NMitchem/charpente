@@ -3367,6 +3367,29 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "sim.input().text(\"memo\", .., 3, 1): min_words is above \
+                               max_words; pass the smaller count first")]
+    fn text_with_min_above_max_names_the_call() {
+        Sim::new(1).input().text("memo", &["rush"], 3, 1);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "sim.input().text(\"memo\", ..): `words` is empty but up to 2 \
+                               words are wanted; pass at least one word or a max_words of 0"
+    )]
+    fn text_with_no_words_names_the_call() {
+        Sim::new(1).input().text("memo", &[], 0, 2);
+    }
+
+    /// The empty-`words` refusal's other operand: wanting no words from no
+    /// words is a draw of `""`, never a panic.
+    #[test]
+    fn text_with_no_words_and_a_max_of_zero_draws_nothing() {
+        assert_eq!(Sim::new(1).input().text("memo", &[], 0, 0), "");
+    }
+
+    #[test]
     fn virtual_time_advances_only_by_simulation() {
         let sim = Sim::with_faults(1, FaultConfig::none());
         assert_eq!(sim.now(), Instant::ZERO);

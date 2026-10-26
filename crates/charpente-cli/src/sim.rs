@@ -31,6 +31,7 @@ const KNOWN_FLAGS: &[&str] = &[
 pub const USAGE: &str = "usage: charpente test --sim [--runs N] [--seed 0x…] \
 [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json] [--inputs HEX] \
 [--faults-off AXIS,…] [--dir PATH]\n\
+       --filter S   the check named S if there is one, else every check whose name contains S\n\
        --dir PATH   the app crate directory to build and run sim tests from (default: .)";
 
 /// Runs `test --sim`'s runner-flag args (everything after `--sim`). Returns
