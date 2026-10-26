@@ -3522,6 +3522,72 @@ fn an_upsert_whose_row_reached_the_store_caches_its_next_due_when_nothing_else_r
     );
 }
 
+/// `CronScheduler::upsert` when only the WAL is poisoned, the twin of
+/// `a_tick_that_applied_before_only_the_wal_was_poisoned_answers_ok_and_never_re_fires`.
+/// The row's batch applied, then the upsert's cadence checkpoint failed in the
+/// WAL's segment GC, which poisons the engine and latches nothing. So
+/// `Db::poisoned()` reports the failure while `Db::store_failed()` is false,
+/// and upsert answers `Ok` with the row's `next_due` cached. This is the one
+/// arm where the two latches differ: `Db::poisoned()` ORs `store_failed()` in,
+/// so a latched store always reads poisoned too.
+#[test]
+fn an_upsert_that_applied_before_only_the_wal_was_poisoned_answers_ok_and_caches_its_next_due() {
+    let sim = Sim::with_faults(0x20A3_0007, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let mut app = App::open(
+        Box::new(OneShotWalFaultDisk {
+            inner: sim.disk(),
+            fault: WalFault::GcList,
+            armed: armed.clone(),
+            fired: fired.clone(),
+        }),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        latch_config(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp])
+    .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
+        slot: 1,
+    });
+    let entries = app
+        .take_cron_entries_for_tests()
+        .into_iter()
+        .filter(|entry| entry.name == "hourly-count")
+        .collect();
+    let mut cron = CronScheduler::new(entries);
+    let db = app.db_for_tests();
+    armed.store(true, Ordering::SeqCst);
+    let outcome = cron.upsert(db, wall(HOUR));
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the WAL list must fail exactly once, in the upsert's own cadence checkpoint"
+    );
+    assert!(
+        db.poisoned() && !db.store_failed(),
+        "a WAL GC failure poisons the engine and leaves the store unlatched, or this is not the \
+         arm under test"
+    );
+    outcome.unwrap_or_else(|e| {
+        panic!(
+            "upsert must answer Ok for a row that reached the store: the checkpoint failure ({e}) \
+             is already reported through Db::poisoned(), the engine's WAL poison, not a store latch"
+        )
+    });
+    assert_eq!(
+        stored_next_due(db, "hourly-count"),
+        wall(2 * HOUR),
+        "the upsert's row reached the store (applied == n)"
+    );
+    assert_eq!(
+        (cron.next_deadline(), cron.has_due(wall(HOUR))),
+        (Some(wall(2 * HOUR)), false),
+        "the cache must mirror the row"
+    );
+}
+
 /// One job enqueued by `enqueue` and noted, over a disk whose horizon
 /// breadcrumb (`<store_path>.horizon`) fails its next sync once armed, armed
 /// only afterwards: the sync that fails is the breadcrumb write in `run_due`'s
