@@ -3298,6 +3298,21 @@ mod tests {
         assert!(sim.input_record().0.iter().all(|&c| c == 0));
     }
 
+    /// A choice maps into `lo..=hi` as `lo + choice % (hi - lo + 1)`, so a
+    /// span of 898 for 3..=900: 897 is the top value and 898 wraps to `lo`.
+    /// Every value stays inside the bounds whatever the choice, the full range
+    /// above a nonzero `lo` included.
+    #[test]
+    fn between_maps_a_choice_into_its_bounds_by_their_span() {
+        let sim = Sim::new(1);
+        sim.replay_choices(&[0, 5, 897, 898, u64::MAX, u64::MAX]);
+        let i = sim.input();
+        let got: Vec<u64> = (0..5).map(|_| i.between("n", 3, 900)).collect();
+        assert_eq!(got, [3, 8, 900, 3, 3 + u64::MAX % 898]);
+        // 1..=u64::MAX spans u64::MAX values, so the choice u64::MAX wraps to 1.
+        assert_eq!(i.between("n", 1, u64::MAX), 1);
+    }
+
     #[test]
     fn shuffle_with_zero_choices_is_identity() {
         let sim = Sim::new(1);

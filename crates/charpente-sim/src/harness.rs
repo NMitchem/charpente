@@ -287,6 +287,11 @@ const SHRINK_BUDGET: u32 = 500;
 /// lexicographically smaller choices, or one more axis off), so each round
 /// shrinks or ends the loop. It depends only on its arguments, so the result
 /// is identical for any `--jobs`.
+///
+/// The budget counts replays, and a candidate already tried is skipped
+/// without one, so termination cannot rest on the budget alone: every loop
+/// here either walks a range or asserts the progress each step makes, and a
+/// pass that stopped making it panics by name rather than spinning.
 fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
     let mut s = Shrinker {
         test,
@@ -305,7 +310,11 @@ fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
             smaller: false,
         },
     };
-    loop {
+    // A round that does not return changed the best, which only a kept
+    // candidate does, and every kept candidate was a replay. So round `r`
+    // (from 0) continues only with at least `r + 1` replays spent, and round
+    // `SHRINK_BUDGET - 1` always returns.
+    for _ in 0..SHRINK_BUDGET {
         let round = (s.best.choices.clone(), s.best.faults_off.clone());
         s.delete_chunks();
         s.zero_each();
@@ -315,6 +324,11 @@ fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
             return s.best;
         }
     }
+    unreachable!(
+        "shrink ran {SHRINK_BUDGET} rounds without either keeping nothing in one or spending its \
+         {SHRINK_BUDGET}-replay budget, but each round that goes on kept a candidate, and keeping \
+         one is a replay: a round that kept nothing must end the loop"
+    )
 }
 
 struct Shrinker<'a> {
@@ -375,6 +389,16 @@ impl Shrinker<'_> {
                 let mut c = self.best.choices.clone();
                 c.drain(i..i + size);
                 at = if self.try_keep(&c, self.best.faults_off.clone()) {
+                    // A kept candidate is the new best, cut by at least
+                    // `size`; without that, `i` is retried forever.
+                    assert!(
+                        self.best.choices.len() <= c.len(),
+                        "shrink invariant: delete_chunks kept a candidate {} choices long, but \
+                         the best is still {} long. A kept candidate replaces the best with no \
+                         more than itself",
+                        c.len(),
+                        self.best.choices.len()
+                    );
                     // What now sits at `i` is new, so try `i` again.
                     self.best
                         .choices
@@ -389,12 +413,12 @@ impl Shrinker<'_> {
     }
 
     fn zero_each(&mut self) {
-        let mut i = 0;
-        while i < self.best.choices.len() {
-            if self.best.choices[i] != 0 {
+        // The best only shortens as candidates are kept, so its length now
+        // bounds the walk.
+        for i in 0..self.best.choices.len() {
+            if self.best.choices.get(i).is_some_and(|&c| c != 0) {
                 self.keep_choice(i, 0);
             }
-            i += 1;
         }
     }
 
@@ -405,20 +429,36 @@ impl Shrinker<'_> {
     /// (`lo + raw % span`), so a choice billions of spans up fails exactly as
     /// one inside the first span does, and a plain bisection of
     /// `0..choice` would settle on one far up.
+    ///
+    /// Each step must move: a kept value lands strictly below `hi`, and a
+    /// bisection's `mid` strictly between `lo` and `hi`. A candidate already
+    /// tried is skipped without a replay, so a step that did not move would
+    /// propose it forever without spending the budget, and the asserts below
+    /// turn that into a named panic.
     fn search_each_toward_zero(&mut self) {
-        let mut i = 0;
-        'choices: while i < self.best.choices.len() {
-            let (mut lo, mut hi) = (0, self.best.choices[i]);
+        // The best only shortens as candidates are kept, so its length now
+        // bounds the walk; once it is shorter than `i + 1`, nothing is left.
+        for i in 0..self.best.choices.len() {
+            let Some(&choice) = self.best.choices.get(i) else {
+                return;
+            };
+            let (mut lo, mut hi) = (0, choice);
             let mut probe = Some(1u64);
             while let Some(p) = probe.filter(|&p| p < hi) {
                 if self.spent() {
                     return;
                 }
                 if self.keep_choice(i, p) {
-                    match self.best.choices.get(i) {
-                        Some(&v) => hi = v,
-                        None => continue 'choices,
-                    }
+                    let Some(&v) = self.best.choices.get(i) else {
+                        return;
+                    };
+                    assert!(
+                        v < hi,
+                        "shrink invariant: search_each_toward_zero kept choice {i} at {v}, not \
+                         below the {hi} it searched under. A kept candidate is the new, smaller \
+                         best"
+                    );
+                    hi = v;
                     break;
                 }
                 lo = p;
@@ -429,16 +469,26 @@ impl Shrinker<'_> {
                     return;
                 }
                 let mid = lo + (hi - lo) / 2;
+                assert!(
+                    lo < mid && mid < hi,
+                    "shrink invariant: search_each_toward_zero bisected choice {i} at {mid}, not \
+                     strictly between {lo} and {hi}"
+                );
                 if self.keep_choice(i, mid) {
-                    match self.best.choices.get(i) {
-                        Some(&v) => hi = v,
-                        None => continue 'choices,
-                    }
+                    let Some(&v) = self.best.choices.get(i) else {
+                        return;
+                    };
+                    assert!(
+                        v < hi,
+                        "shrink invariant: search_each_toward_zero kept choice {i} at {v}, not \
+                         below the {hi} it searched under. A kept candidate is the new, smaller \
+                         best"
+                    );
+                    hi = v;
                 } else {
                     lo = mid;
                 }
             }
-            i += 1;
         }
     }
 
@@ -474,16 +524,22 @@ fn trimmed(choices: &[u64]) -> Vec<u64> {
 fn encode_inputs(choices: &[u64]) -> String {
     let mut hex = String::new();
     for &choice in choices {
+        // Seven bits a byte: nine continuation bytes carry 63 of a u64's 64
+        // bits, so at most nine are written and what is left fits the last.
         let mut v = choice;
-        loop {
-            let low = (v & 0x7f) as u8;
-            v >>= 7;
-            if v == 0 {
-                hex.push_str(&format!("{low:02x}"));
+        for _ in 0..9 {
+            if v < 0x80 {
                 break;
             }
-            hex.push_str(&format!("{:02x}", low | 0x80));
+            hex.push_str(&format!("{:02x}", (v & 0x7f) as u8 | 0x80));
+            v >>= 7;
         }
+        assert!(
+            v < 0x80,
+            "encode_inputs: {choice} left {v} after nine LEB128 continuation bytes, more than \
+             its last byte holds"
+        );
+        hex.push_str(&format!("{v:02x}"));
     }
     if hex.is_empty() {
         "00".to_string()
@@ -2744,6 +2800,47 @@ mod tests {
         assert!(block.contains(", in 500 replays\n"), "{block}");
     }
 
+    /// Fails while its first draw is even and its second is not 0.
+    fn even_then_nonzero(sim: &mut Sim) -> Result<(), String> {
+        let x = sim.input().between("x", 0, 1000);
+        let y = sim.input().between("y", 0, 1000);
+        if x.is_multiple_of(2) && y != 0 {
+            Err("an even draw, then one that is not 0".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Pass 2 (set each choice to 0) is the only pass that reaches
+    /// `even_then_nonzero`'s smallest failure, x=0 then y=1. The binary search
+    /// starts at 1 and takes 0 as passing, so on its own it settles x at 2.
+    /// Deleting x shifts y into its place and deleting y reads y as 0, so no
+    /// deletion fails either.
+    #[test]
+    fn only_zeroing_a_choice_reaches_a_failure_whose_smallest_draw_is_zero() {
+        let test = sim_test("even_then_nonzero", even_then_nonzero);
+        let first = run_app_universe(0x5eed, None, &[], &test.run).unwrap_err();
+        assert_eq!(
+            first.drawn,
+            [("x", "160".to_string()), ("y", "72".to_string())],
+            "seed 0x5eed's first failure has an even x that is not 0, so pass 2 has a choice to \
+             zero and the search one to settle"
+        );
+        let shrunk = shrink(&test, 0x5eed, &first);
+        assert_eq!(
+            (shrunk.choices.as_slice(), shrunk.drawn.as_slice()),
+            (
+                &[0, 1][..],
+                &[("x", "0".to_string()), ("y", "1".to_string())][..]
+            ),
+            "the smallest failure is x=0, y=1; x=2 means pass 2 never zeroed x"
+        );
+        assert_eq!(
+            (shrunk.message.as_str(), shrunk.smaller),
+            ("an even draw, then one that is not 0", true)
+        );
+    }
+
     #[test]
     fn the_repro_flags_parse_what_a_repro_line_prints() {
         let choices = vec![0, 1, 127, 128, 300, u64::MAX];
@@ -2781,9 +2878,19 @@ mod tests {
             "--faults-off needs --seed: it replays one run with those faults off"
         );
         // Empty (an unset shell variable must not replay all zeros), not
-        // hex, odd length, upper case, a truncated number, one past 64 bits,
-        // and stray whitespace.
-        for bad in ["", "zz", "0", "0A", "80", "ffffffffffffffffffff01", " 05"] {
+        // hex, odd length, upper case, a truncated number, one past 64 bits
+        // (an eleventh byte, or a tenth carrying more than bit 63: "…ff01" is
+        // u64::MAX), and stray whitespace.
+        for bad in [
+            "",
+            "zz",
+            "0",
+            "0A",
+            "80",
+            "ffffffffffffffffffff01",
+            "ffffffffffffffffff02",
+            " 05",
+        ] {
             assert_eq!(
                 parse(&["--seed", "0x1", "--inputs", bad]).unwrap_err(),
                 format!(
