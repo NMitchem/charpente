@@ -3,6 +3,7 @@ name = "charpente-core"
 description = "Deterministic core of charpente: IO traits, log, transaction engine."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

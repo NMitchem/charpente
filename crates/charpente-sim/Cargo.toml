@@ -3,6 +3,7 @@ name = "charpente-sim"
 description = "Deterministic simulator for charpente: seeded PRNG, virtual time, fault matrix."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

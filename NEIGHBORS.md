@@ -82,8 +82,8 @@ on why); for charpente to add their features is milestone work.
 
 **Shrinking a failing run**
 - Hypothesis (hypothesis.works) shrinks the recorded sequence of choices a test consumed,
-  not the generated values, so any value built from those choices shrinks with no
-  per-type shrinker. `sim.input()` and the shrinker follow that model: a run records the
+  not the generated values, so any value built from those choices shrinks without a
+  per-type shrink strategy. `sim.input()` and the shrinker follow that model: a run records the
   raw choices it drew, a smaller choice is a simpler value, and a failure is replayed with
   smaller sequences.
 - proptest (github.com/proptest-rs/proptest) keeps a value tree per strategy, and

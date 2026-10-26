@@ -3,6 +3,7 @@ name = "charpente-tsgen"
 description = "Contract -> TypeScript client codegen: a pure function from Contract to .ts source."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

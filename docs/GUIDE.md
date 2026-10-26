@@ -86,6 +86,10 @@ disallowed_methods = "deny"
 disallowed_types = "deny"
 ```
 
+`rust-version` is the oldest toolchain the app builds with. Cargo checks it
+before compiling anything, and an older `rustc` is refused by name, with the
+version the package requires and the one it found.
+
 `charpente-sim` is dev-only: it drives your app's tables, routes, jobs, and
 time through a deterministic simulator with seeded fault injection, and
 never links into the shipped binary. The `[[test]] name = "sim", harness =
@@ -4416,6 +4420,9 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   tried and `repro` replays the shrunk run. Every other failure is its own
   unshrunk run: its own drawn `inputs`, `faults_off` `[]`, `replays` 0, no
   `first_message`, and a `repro` that is its seed alone. Seeds are hex strings.
+  The two report different totals: the human result line counts checks, and
+  the JSON's top-level `passed`, `failed` and `skipped` count runs, each the sum
+  of that field over `checks[]`.
 - `--dir PATH` — the app crate directory to build and run sim tests from
   (default: `.`). This flag is consumed by the CLI itself; every other flag
   passes straight through to the sim binary the CLI builds and execs.
@@ -5220,7 +5227,8 @@ poison.
 
 Read the message literally: **committed data is safe.** A store latch is not a
 durability failure. The WAL is intact and authoritative, and the write whose
-checkpoint failed is already in it — that write got a 500, but it is on disk.
+checkpoint failed is already in it: its record reached the store before the
+checkpoint ran, so it got its 200, and then the kernel stopped.
 What died is the *handle*, and with it the node's ability to checkpoint at all,
 which is why serving on would be wrong rather than merely untidy: WAL GC and
 the `.horizon` breadcrumb both stall behind a checkpoint that can never
