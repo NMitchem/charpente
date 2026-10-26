@@ -28,9 +28,13 @@ fn main() {
         (Some("new"), _) => new::run(&args[1..]),
         (Some("gen-client"), _) => genclient::generate(&args[1..]),
         (Some("check-client"), _) => genclient::check(&args[1..]),
+        (Some("--version" | "-V"), _) => {
+            println!("charpente {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         _ => {
             eprintln!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "usage: charpente --version\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 sim::USAGE,
                 mutants::USAGE,
                 ctl::USAGE,

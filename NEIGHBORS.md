@@ -80,6 +80,19 @@ on why); for charpente to add their features is milestone work.
   are injected and replayed from a seed; and the idempotency keys are minted at staging
   rather than derived from ids or app data (DECISIONS §14).
 
+**Shrinking a failing run**
+- Hypothesis (hypothesis.works) shrinks the recorded sequence of choices a test consumed,
+  not the generated values, so any value built from those choices shrinks with no
+  per-type shrinker. `sim.input()` and the shrinker follow that model: a run records the
+  raw choices it drew, a smaller choice is a simpler value, and a failure is replayed with
+  smaller sequences.
+- proptest (github.com/proptest-rs/proptest) keeps a value tree per strategy, and
+  shrinking walks each value through the strategy that generated it. Listed for contrast:
+  charpente has no strategies to carry.
+- Where charpente differs from both: the fault axes are part of the same shrink, turned
+  off one at a time, and a candidate counts only if it still fails the same check, since
+  a smaller input can move where faults land and slip to a different bug.
+
 **Deployment/scale stance**
 - "Use One Big Server" (specbranch.com, 2022) — the capacity math behind MANIFESTO §7.
 - SQLite "when to use" doc — the original single-node honesty argument.

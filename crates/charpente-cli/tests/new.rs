@@ -189,7 +189,8 @@ fn no_placeholder_survives_rendering_and_the_ident_is_underscored() {
     assert!(read(&app.join("Cargo.toml")).contains("name = \"my-app\""));
     assert!(read(&app.join("src/main.rs")).contains("my_app::build_app"));
     assert!(read(&app.join("tests/sim.rs")).contains("use my_app::"));
-    assert!(read(&app.join("Cargo.toml")).contains("charpente = \"0.2\""));
+    assert!(read(&app.join("Cargo.toml")).contains("charpente = \"0.3\""));
+    assert!(read(&app.join("Cargo.toml")).contains("rust-version = \"1.99\""));
 }
 
 /// The workspace's target directory, derived from the binary under test so
@@ -216,7 +217,7 @@ fn run_ok(cmd: &mut Command, what: &str) {
 
 /// The scaffold, built against THIS workspace rather than crates.io. The
 /// Cargo book's own mechanism for an unpublished version: `[patch.crates-io]`
-/// satisfies the app's `charpente = "0.2"` with the path crate's 0.2.0
+/// satisfies the app's `charpente = "0.3"` with the path crate's 0.3.0
 /// whether or not the registry has it yet. The only delta from a stranger's
 /// build is the registry itself, which scripts/publish.sh's dry-run covers.
 #[test]

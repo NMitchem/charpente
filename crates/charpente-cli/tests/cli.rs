@@ -1024,3 +1024,26 @@ fn mutants_passes_an_explicit_timeout_through_without_a_timing_run() {
         "the operator's timeout reaches the tool unchanged: {mutants}"
     );
 }
+
+#[test]
+fn version_prints_the_name_and_version_and_exits_zero() {
+    for flag in ["--version", "-V"] {
+        let out = charpente().arg(flag).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("charpente {}\n", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_argument_still_prints_usage_and_exits_two() {
+    let out = charpente().arg("--bogus").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage: charpente --version"), "{stderr}");
+    assert!(stderr.contains("usage: charpente new <name>"), "{stderr}");
+}

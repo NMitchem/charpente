@@ -31,7 +31,7 @@ const USAGE: &str = "usage: charpente describe [--dir PATH] [--format json|human
 // asserts full equality against this copy rather than a substring. Kept in
 // sync by hand: this crate cannot depend on the `invoicing` example crate.
 const GOLDEN: &str = r#"{
-  "charpente_version": "0.2.0",
+  "charpente_version": "0.3.0",
   "tables": [
     {
       "name": "ApiKey",

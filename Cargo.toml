@@ -19,16 +19,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NMitchem/charpente"
 
 [workspace.dependencies]
-charpente-core = { path = "crates/charpente-core", version = "0.2.0" }
-charpente-macros = { path = "crates/charpente-macros", version = "0.2.0" }
-charpente = { path = "crates/charpente", version = "0.2.0" }
-charpente-sim = { path = "crates/charpente-sim", version = "0.2.0" }
+charpente-core = { path = "crates/charpente-core", version = "0.3.0" }
+charpente-macros = { path = "crates/charpente-macros", version = "0.3.0" }
+charpente = { path = "crates/charpente", version = "0.3.0" }
+charpente-sim = { path = "crates/charpente-sim", version = "0.3.0" }
 
 # Hard rule 1 (CLAUDE.md): ambient nondeterminism is banned mechanically, not by
 # review. The deny-list itself lives in clippy.toml at the workspace root.

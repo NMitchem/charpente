@@ -269,7 +269,7 @@ that is a claim about charpente is in docs/BENCH.md or absent, and every other f
 cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
 the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, three from 0.3.0's oracle-density review, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
@@ -326,6 +326,9 @@ and the one attempt was refused (2026-10-15), so it is owed.
 | **Credential row ids drawn independently of the secret** (testimony row 12) | The first app that must show a key's or session's id to someone other than its holder. Today a `Session`'s or `ApiKey`'s id is the first 64 bits of its secret's draw (GUIDE §5). |
 | **Revocation that ends what a credential minted** (review I5) | The first app whose revoke must also end the sessions and keys minted by a request that presented the revoked credential. Today revoking a key ends that key alone (GUIDE §5), so a session traded for it stays live until it expires. |
 | **The outbound client's clean-build compile delta** (owed since 2026-10-15; spec §16 exit 7; docs/BENCH.md, "Compile latency of the outbound client (2026-10-15) — refused, no delta published") | Either an instrument change that lands for its own stated reason, which is what lets `scripts/compile-bench.sh` start again, or a clean build reported as an adoption cost. The refused run (sha 3b9529cb, handler-body `Unstable`) stays attempt 1 and is never re-rolled; no gate moves to unblock it. |
+| **Coverage-guided fault and input search** | A mutant that survives drawn inputs because the case that distinguishes it is too rare for uniform draws. The second agent's surviving mutant (2026-10-22) is caught by plain drawn inputs. |
+| **An agent-integration contract (MCP tools) generated from `describe`** | The first app whose consumer is an agent calling it as tools. |
+| **One outbound job over several declared hosts** | The first app where duplicated outbound jobs cause a defect, not only boilerplate. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,

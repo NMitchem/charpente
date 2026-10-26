@@ -170,12 +170,11 @@ the outbound side no `HTTP/2`, proxies, request signing (AWS `SigV4`) or streami
 ```text
 cargo install charpente-cli
 charpente new myapp && cd myapp
-cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app
+cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app (no clippy? rustup component add clippy)
 charpente test --sim                        # seeded fault-injection runs
 ```
 
-Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the second
-property goes red with a seed, and the seed replays. That is the whole pitch.
+Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the check `acked_post_implies_the_echo_after_recovery` goes FAILED with the smallest inputs that break it and a command that replays them. That is the whole pitch.
 Delete the `tx.emit` line instead and the third goes red: the event commits with the note and the job.
 
 | Doc | What it is |

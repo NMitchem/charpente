@@ -39,7 +39,21 @@ fn the_guide_ships_in_the_charpente_crate() {
 
     // The packaged bytes, not the working tree's: package, then read the
     // file back out of the tarball.
-    cargo(&["package", "-p", "charpente", "--allow-dirty", "--no-verify"]);
+    // Packaged together: the unpublished sibling versions resolve from the
+    // workspace, not crates.io.
+    cargo(&[
+        "package",
+        "-p",
+        "charpente-core",
+        "-p",
+        "charpente-macros",
+        "-p",
+        "charpente-sim",
+        "-p",
+        "charpente",
+        "--allow-dirty",
+        "--no-verify",
+    ]);
     let version = env!("CARGO_PKG_VERSION");
     let krate = root().join(format!("target/package/charpente-{version}.crate"));
     let packed = Command::new("tar")
