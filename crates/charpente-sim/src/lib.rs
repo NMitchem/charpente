@@ -963,34 +963,52 @@ fn fingerprint_files(files: &BTreeMap<String, FileState>) -> u64 {
 }
 
 /// What `Sim::input` has drawn: from `rng` on a normal run, from `replay`
-/// (then 0s) when the harness replays a recorded sequence.
+/// (then 0s) when the harness replays a recorded sequence. `choices` holds
+/// each draw's choice as the draw used it, reduced into its range.
 struct InputLog {
     rng: Rng,
     replay: Option<(Vec<u64>, usize)>,
     choices: Vec<u64>,
     drawn: Vec<(&'static str, String)>,
+    /// Whether every draw used the choice the seed's own stream gives it, so
+    /// the seed alone replays these inputs. Always true without a replay.
+    follows_seed: bool,
 }
 
 impl InputLog {
-    fn raw(&mut self) -> u64 {
-        let raw = match &mut self.replay {
+    /// The next choice in `0..span` (the whole `u64` when `span` is `None`,
+    /// a `between` over every value): the raw value reduced by the span, the
+    /// smallest raw value that draws the same value. That is what the run
+    /// records, so a choice and the value it draws are one-to-one for a
+    /// draw, a smaller choice is a smaller value, and two equal values drawn
+    /// with the same bounds are equal choices.
+    ///
+    /// The stream is read once per draw under a replay too, and its value
+    /// reduced by this draw's span: a replay with the seed alone would run
+    /// the same up to this draw and draw exactly that, so comparing the two
+    /// says whether it replays this run. Comparing against the first
+    /// failure's choices would not: a fault turned off can change a draw's
+    /// span, and the same choice then sits on another raw value.
+    fn choose(&mut self, span: Option<u64>) -> u64 {
+        let reduce = |raw: u64| span.map_or(raw, |span| raw % span);
+        let own = reduce(self.rng.next_u64());
+        let choice = match &mut self.replay {
             Some((c, at)) => {
                 let v = c.get(*at).copied().unwrap_or(0);
                 *at += 1;
-                v
+                reduce(v)
             }
-            None => self.rng.next_u64(),
+            None => own,
         };
-        self.choices.push(raw);
-        raw
+        self.follows_seed &= choice == own;
+        self.choices.push(choice);
+        choice
     }
 
+    /// `lo` plus a choice below the span: `lo..=hi` holds `hi - lo + 1`
+    /// values, or every `u64` when that overflows, and then `lo` is 0.
     fn between(&mut self, lo: u64, hi: u64) -> u64 {
-        let raw = self.raw();
-        match (hi - lo).checked_add(1) {
-            Some(span) => lo + raw % span,
-            None => lo.saturating_add(raw),
-        }
+        lo + self.choose((hi - lo).checked_add(1))
     }
 }
 
@@ -1025,8 +1043,7 @@ impl Input<'_> {
              pass at least one item"
         );
         let mut g = self.log();
-        let raw = g.inputs.raw();
-        let item = &items[(raw % items.len() as u64) as usize];
+        let item = &items[g.inputs.choose(Some(items.len() as u64)) as usize];
         g.inputs.drawn.push((name, format!("{item:?}")));
         item
     }
@@ -1035,7 +1052,7 @@ impl Input<'_> {
     pub fn shuffle<T: std::fmt::Debug>(&self, name: &'static str, items: &mut [T]) {
         let mut g = self.log();
         for i in 0..items.len() {
-            let j = i + (g.inputs.raw() % (items.len() - i) as u64) as usize;
+            let j = i + g.inputs.choose(Some((items.len() - i) as u64)) as usize;
             items.swap(i, j);
         }
         g.inputs.drawn.push((name, format!("{items:?}")));
@@ -1065,8 +1082,7 @@ impl Input<'_> {
         let n = g.inputs.between(min_words as u64, max_words as u64) as usize;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            let raw = g.inputs.raw();
-            out.push(words[(raw % words.len() as u64) as usize]);
+            out.push(words[g.inputs.choose(Some(words.len() as u64)) as usize]);
         }
         let text = out.join(" ");
         g.inputs.drawn.push((name, format!("{text:?}")));
@@ -1112,6 +1128,7 @@ impl Sim {
                         replay: None,
                         choices: Vec::new(),
                         drawn: Vec::new(),
+                        follows_seed: true,
                     },
                     hosts: BTreeMap::new(),
                     disk_faults_off: false,
@@ -1130,8 +1147,8 @@ impl Sim {
 
     /// The workload's inputs: the values the property must hold for, drawn
     /// from their own stream (`keyed_stream(seed, "inputs")`), so drawing
-    /// moves no fault draw. Every draw is recorded as raw choices, which the
-    /// harness replays and shrinks.
+    /// moves no fault draw. Every draw records the choice it used, the raw
+    /// value reduced into its range, which the harness replays and shrinks.
     ///
     /// This is the workload's own script only. A modelled remote (an outbound
     /// stand-in) keeps its own `Rng`. Values shrink toward `lo`, the first
@@ -2914,7 +2931,8 @@ impl Outcome {
 pub struct UniverseEnd {
     pub outcome: Outcome,
     pub coverage: BTreeMap<&'static str, u64>,
-    /// The raw input choices the run consumed, and each input by name.
+    /// The input choices the run used, each reduced into its draw's range,
+    /// and each input by name.
     pub choices: Vec<u64>,
     pub drawn: Vec<(&'static str, String)>,
 }
@@ -2981,6 +2999,9 @@ pub(crate) struct UniverseFailure {
     pub message: String,
     pub choices: Vec<u64>,
     pub drawn: Vec<(&'static str, String)>,
+    /// Whether the seed alone draws `choices`: every draw used the choice the
+    /// seed's own stream gives it (`InputLog::choose`).
+    pub follows_seed: bool,
 }
 
 /// The config one run of `charpente test --sim` runs under: `run_universe`'s
@@ -3025,6 +3046,7 @@ pub(crate) fn run_app_universe(
             message,
             choices,
             drawn,
+            follows_seed: sim.world.lock().inputs.follows_seed,
         }
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
@@ -3288,6 +3310,65 @@ mod tests {
         again.replay_choices(&choices);
         assert_eq!(draw_some(&again), want);
         assert_eq!(again.input_record(), (choices, drawn));
+    }
+
+    /// Each draw records the choice it used: the raw stream value reduced
+    /// into the draw's range, the smallest raw value that draws the same
+    /// value. The value is the one the raw value gives, and the stream is
+    /// read once per draw.
+    #[test]
+    fn a_draw_records_the_choice_it_used_reduced_into_its_range() {
+        let sim = Sim::new(21);
+        let i = sim.input();
+        let n = i.between("n", 3, 900);
+        let p = *i.pick("p", &["a", "b", "c"]);
+        let mut order = [1, 2, 3, 4];
+        i.shuffle("order", &mut order);
+        let t = i.text("t", &["x", "y", "z"], 1, 4);
+        let mut stream = keyed_stream(21, "inputs");
+        let mut raw = Vec::new();
+        let mut want = Vec::new();
+        let mut take = |span: u64| {
+            let r = stream.next_u64();
+            raw.push(r);
+            want.push(r % span);
+            r % span
+        };
+        assert_eq!(n, 3 + take(898));
+        assert_eq!(p, ["a", "b", "c"][take(3) as usize]);
+        let mut shuffled = [1, 2, 3, 4];
+        for i in 0..4 {
+            let j = i + take(4 - i as u64) as usize;
+            shuffled.swap(i, j);
+        }
+        assert_eq!(order, shuffled);
+        let words: Vec<&str> = (0..1 + take(4))
+            .map(|_| ["x", "y", "z"][take(3) as usize])
+            .collect();
+        assert_eq!(t, words.join(" "));
+        let (choices, _) = sim.input_record();
+        assert_eq!(
+            choices, want,
+            "each choice is its raw value reduced: {raw:?}"
+        );
+        assert_ne!(choices, raw, "non-vacuous: a raw value was above its span");
+    }
+
+    /// A choice above its draw's range, as a hand-typed `--inputs` can give,
+    /// draws what its reduced form draws, and is recorded reduced.
+    #[test]
+    fn a_replayed_choice_above_its_range_draws_as_its_reduced_form() {
+        let run = |choices: &[u64]| {
+            let sim = Sim::new(1);
+            sim.replay_choices(choices);
+            (draw_some(&sim), sim.input_record())
+        };
+        let (big, big_record) = run(&[898 + 7, 3 + 2, 4 + 2, 3 + 1]);
+        let (small, small_record) = run(&[7, 2, 2, 1]);
+        assert_eq!(big, (10, "c", "y x x".to_string()));
+        assert_eq!(big, small);
+        assert_eq!(big_record, small_record);
+        assert_eq!(big_record.0, [7, 2, 2, 1, 0, 0]);
     }
 
     #[test]

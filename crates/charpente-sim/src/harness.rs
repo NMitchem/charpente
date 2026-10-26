@@ -258,12 +258,13 @@ pub(crate) struct Shrunk {
     pub config: FaultConfig,
     /// Candidate runs replayed, kept or not; at most `SHRINK_BUDGET`.
     pub replays: u32,
-    /// Whether the repro must pass `--inputs`: false only when the choices
-    /// the run consumed, zeros past the kept ones included, begin the first
-    /// failure's, which are the seed's own stream. Compared untrimmed: a run
-    /// that read 0s past its kept choices where the stream would give other
-    /// values needs `--inputs`, or the repro replays a different run
-    /// (`a_run_that_read_zeros_past_its_choices_replays_with_inputs`).
+    /// Whether the repro must pass `--inputs`: false only when the seed's
+    /// own stream gives every choice the run used, the 0s it read past the
+    /// kept ones included (`a_run_that_read_zeros_past_its_choices_replays_with_inputs`).
+    /// Each draw is judged in its own range: a fault turned off can change a
+    /// draw's range, and the first failure's choice there is then not what
+    /// the seed draws
+    /// (`a_repro_passes_inputs_when_the_seed_would_draw_another_value_there`).
     pub replay_inputs: bool,
     /// False when nothing smaller failed, so this is the first failure itself.
     pub smaller: bool,
@@ -302,7 +303,6 @@ fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
     let mut s = Shrinker {
         test,
         seed,
-        first_choices: &first.choices,
         tried: BTreeSet::new(),
         best: Shrunk {
             choices: trimmed(&first.choices),
@@ -341,7 +341,6 @@ fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
 struct Shrinker<'a> {
     test: &'a SimTest,
     seed: u64,
-    first_choices: &'a [u64],
     tried: BTreeSet<(Vec<u64>, Vec<&'static str>)>,
     best: Shrunk,
 }
@@ -376,7 +375,7 @@ impl Shrinker<'_> {
             "a replay consumed choices it was not given"
         );
         self.best = Shrunk {
-            replay_inputs: !self.first_choices.starts_with(&failed.choices),
+            replay_inputs: !failed.follows_seed,
             choices: kept,
             faults_off,
             drawn: failed.drawn,
@@ -3090,6 +3089,73 @@ mod tests {
             (shrunk.message.as_str(), shrunk.smaller),
             ("two equal draws that are not 0", true)
         );
+    }
+
+    /// A choice is recorded as the draw used it, reduced into its range, so
+    /// equal values are equal choices and searching one lowers its value.
+    /// Recorded raw, a 3, 5, 6 or 7 in 0..=7 is a different huge number in
+    /// each draw: no power of two the search probes reduces to it, its
+    /// bisection lands on a value that depends on the raw draw, and the two
+    /// never form a group. Each seed here is the first, counting up from 0,
+    /// whose first failure draws that value twice.
+    #[test]
+    fn equal_draws_of_any_value_shrink_to_the_smallest_pair() {
+        let test = sim_test("two_equal_draws", two_equal_draws);
+        for (seed, value) in [(0x14, "5"), (0x17, "3"), (0x2e, "6"), (0x38, "7")] {
+            let first = run_app_universe(seed, None, &[], &test.run).unwrap_err();
+            assert_eq!(
+                first.drawn,
+                [("a", value.to_string()), ("b", value.to_string())],
+                "seed {seed:#x}'s first failure draws {value} twice"
+            );
+            let shrunk = shrink(&test, seed, &first);
+            assert_eq!(
+                (shrunk.choices.as_slice(), shrunk.drawn.as_slice()),
+                (
+                    &[1, 1][..],
+                    &[("a", "1".to_string()), ("b", "1".to_string())][..]
+                ),
+                "seed {seed:#x}: the smallest failure is a=1, b=1, in {} replays",
+                shrunk.replays
+            );
+        }
+    }
+
+    /// Draws one number in 0..=9 while any fault axis is on and in 0..=8
+    /// once none is, and fails when it is 7.
+    fn seven_in_a_range_the_faults_set(sim: &mut Sim) -> Result<(), String> {
+        let on = FAULT_AXES.iter().any(|a| axis_on(&sim.world.cfg, a));
+        match sim.input().between("n", 0, if on { 9 } else { 8 }) {
+            7 => Err("drew 7".into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The repro leaves out `--inputs` only when the seed's own stream gives
+    /// every choice the shrunk run used. A matching prefix of the first
+    /// failure's choices is not enough: here turning the faults off moves the
+    /// draw's range from 0..=9 to 0..=8, so the shrunk run's 7 is the first
+    /// run's own choice while the seed's raw value draws something else in
+    /// the narrower range. Master 0x0 is the first, counting up from 0, whose
+    /// batch shows it.
+    #[test]
+    fn a_repro_passes_inputs_when_the_seed_would_draw_another_value_there() {
+        let check = "seven_in_a_range_the_faults_set";
+        let tests = [sim_test(check, seven_in_a_range_the_faults_set)];
+        let (code, out) = run_to_string(&tests, &["--runs", "8", "--master-seed", "0x0"]);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, check);
+        assert_eq!(line(block, "  inputs: "), Some("n=7"), "{block}");
+        let seed = u64::from_str_radix(&line(block, "  seed:   ").unwrap()[2..], 16).unwrap();
+        let raw = crate::keyed_stream(seed, "inputs").next_u64();
+        assert!(
+            raw % 10 == 7 && raw % 9 != 7,
+            "the first run drew 7 in 0..=9, and the seed alone draws another value in 0..=8: \
+             {raw}: {block}"
+        );
+        let repro = line(block, "  repro:  ").unwrap();
+        assert!(repro.contains(" --inputs 07 "), "{block}");
+        assert_eq!(replay(&tests, block, check), unshrunk(block));
     }
 
     /// Fails when its two draws in 0..=7 are equal and 3 or more.

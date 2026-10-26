@@ -3030,8 +3030,11 @@ this guide is the `charpente::guide` page on docs.rs.
 
 `sim.input()` is for the inputs a property must hold for: a name, an amount, an
 order of operations. Each draw comes from a stream of its own, so drawing moves
-no fault, and the harness records every draw as a raw choice sequence it can
-replay and shrink.
+no fault, and the harness records each draw's choice in a sequence it can replay
+and shrink. The choice is the one the draw used: the stream's raw value reduced
+into the draw's range, which is the smallest raw value that draws the same
+value. So a choice and its value are one to one, and two equal values drawn
+with the same bounds are equal choices.
 
 ```text
 let i = sim.input();
@@ -4408,7 +4411,8 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   `sim result:` line ends with the seed.
 - `--inputs HEX` — with `--seed`, replay these input choices instead of the
   ones the seed draws: each `sim.input()` draw reads the next, and every draw
-  past the end reads 0. `HEX` is each choice as an unsigned LEB128 number, the
+  past the end reads 0. A choice above its draw's range draws what it reduces
+  to, and the run records it reduced. `HEX` is each choice as an unsigned LEB128 number, the
   bytes in lowercase hex, which is what a shrunk failure's `repro:` line
   prints. Anything else (an empty value, a character that is not lowercase
   hex, an odd length, a number cut off or past 64 bits) is a usage error
@@ -4618,8 +4622,9 @@ the block shows. The rule is the same for every check: smaller inputs first,
 then fewer fault axes.
 
 It shrinks the recorded choice sequence, not the values (Hypothesis's approach):
-a smaller choice is a simpler value (`lo`, the first item, the identity order),
-and a draw past the end of the choices reads 0. Five passes repeat until a whole
+each choice is the one its draw used, so a smaller choice is a smaller, simpler
+value (`lo`, the first item, the identity order), and a draw past the end of
+the choices reads 0. Five passes repeat until a whole
 round keeps nothing:
 
 1. delete chunks of the choices, 8, 4, 2 and then 1 long, from the end toward
