@@ -1025,6 +1025,11 @@ impl App {
             Err(failure) if failure.invalidates(0, wrote) => {
                 Handled::Response(tx_error_response(TxError::Io(failure.error)))
             }
+            // The record reached the store, so the answer stands. Unlike
+            // `Db::transact`, this path does not report a failure nothing else
+            // reports (`Db::poisoned()`/`store_failed()` both false): it
+            // answers one request and has no loop to stop, and the kernel's
+            // request arm shares the gap (its comment, and PLAN's v1.x row).
             Err(_) => handled,
         }
     }

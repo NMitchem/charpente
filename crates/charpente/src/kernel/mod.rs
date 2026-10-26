@@ -784,11 +784,21 @@ impl Kernel {
                     handled.into_iter().zip(replies).zip(saw)
                 {
                     // A request keeps its response unless a record it saw —
-                    // or its own — is the one left uncertain. The same rule
-                    // `Db::transact` and `App::handle_or_subscribe` apply to
-                    // their batch of one, so no path can drift. The 500 means
+                    // or its own — is the one left uncertain: the
+                    // `CommitFailure::invalidates` rule `Db::transact` and
+                    // `App::handle_or_subscribe` apply to their batch of one,
+                    // so no path answers a request differently. The 500 means
                     // "unknown", never "rejected": per spec §4 the record may
-                    // still be durable and apply on restart.
+                    // still be durable and apply on restart. What this arm
+                    // does NOT share is `Db::transact`'s other half, "only
+                    // swallow a failure something else reports": a checkpoint
+                    // failure that keeps every answer and poisons nothing (the
+                    // horizon breadcrumb's sync) is reported by no one until
+                    // the next job or cron commit stops the kernel, at most a
+                    // day on a node that serves only requests. Stopping here
+                    // moved pinned realtime universes and coverage floors
+                    // (0.3.0 final review, M1), so it waits for its PLAN v1.x
+                    // row's trigger.
                     if let Some(failure) = &failure
                         && failure.invalidates(before, staged)
                     {

@@ -42,8 +42,7 @@
 
 ### Fixed
 - Production time was process uptime, so after a restart or failover cron stalled until uptime caught up, sessions outlived their TTL, an expired OIDC token was accepted and any token with nbf was refused. Every stored or compared time is now wall-clock time (WallTime).
-- **`CronScheduler::tick` and `Dispatcher::run_due` no longer undo in-memory state for a commit whose record reached the store.** Before, after a checkpoint failure that nothing else reports (the horizon breadcrumb's sync, which poisons and latches nothing), `tick` rolled its schedule back and re-enqueued an interval the store already held on its next call, and `run_due` put a Done job back in its heap and panicked on its next call. Both still answer `Err` there. These are the one-schedule and one-job wrappers tests call directly; the kernel's own cron and job arms always stopped on a commit failure.
-
+- **`CronScheduler::tick` and `Dispatcher::run_due` no longer undo in-memory state for a commit whose record reached the store, and `CronScheduler::upsert` follows the same rule.** Before, after a checkpoint failure that nothing else reports (the horizon breadcrumb's sync, which poisons and latches nothing), `tick` rolled its schedule back and re-enqueued an interval the store already held on its next call, `run_due` put a Done job back in its heap and panicked on its next call, and `upsert` left a new schedule's cache at `UNIX_EPOCH`, so it ticked at once. All three still answer `Err` there. These are the wrappers tests call directly; the kernel's own cron and job arms always stopped on a commit failure, and every production caller of `upsert` propagates its `Err`.
 ## 0.2.0 (2026-10-17)
 
 ### Added: outbound effects

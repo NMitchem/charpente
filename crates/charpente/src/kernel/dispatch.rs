@@ -592,9 +592,9 @@ impl Dispatcher {
 
     /// The one-job wrapper (group-commit T7, C-2; fix round I-2):
     /// `begin_group`, one `run_due_into`, then `commit` — the shape every
-    /// direct caller of `run_due` (all of them tests) compiles against. The kernel's
-    /// own batched job arm calls `run_due_into` directly against a group it
-    /// drains many jobs into instead.
+    /// direct caller of `run_due` (all of them tests) compiles against. The
+    /// kernel's own batched job arm calls `run_due_into` directly against a
+    /// group it drains many jobs into instead.
     ///
     /// **On a commit failure, this answers exactly as `Db::transact`'s ruled
     /// policy does** (`CommitFailure::invalidates`, the ONE rule, so the
@@ -611,8 +611,8 @@ impl Dispatcher {
     /// **The heap follows the store, not the answer** — the same rule
     /// `tick`'s cache follows. `run_due_into` did its heap bookkeeping on the
     /// assumption the commit would succeed. Only a record that never reached
-    /// the store (`applied == 0`, an append/sync failure) is undone: a
-    /// `Retried` outcome's speculative NEW `due_at` entry is removed first,
+    /// the store (`applied == 0`, an append, sync or apply failure) is undone:
+    /// a `Retried` outcome's speculative NEW `due_at` entry is removed first,
     /// and the heap is restored to the ORIGINAL `(due_at, id)`, mirroring the
     /// `Io` arm above, one level up. When the record did reach it (`applied ==
     /// n`, either checkpoint arm) the heap already says what the store says

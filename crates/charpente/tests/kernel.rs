@@ -3457,6 +3457,71 @@ fn a_tick_whose_checkpoint_failure_nothing_else_reports_answers_err_and_never_re
     );
 }
 
+/// `CronScheduler::upsert` on the same third arm, under `tick`'s one rule: the
+/// cache follows the store, not the answer. A new schedule's row reached the
+/// store, then the breadcrumb's sync failed, so `upsert` answers `Err` (nothing
+/// else reports the failure) and its cache must still hold the row's `next_due`.
+/// Left at `UNIX_EPOCH`, the schedule is due at once: it ticks an interval
+/// early, on a grid anchored at 1970, against a `Db` that is still writable.
+/// Only the app's own schedule is kept, so the upsert writes exactly one row.
+#[test]
+fn an_upsert_whose_row_reached_the_store_caches_its_next_due_when_nothing_else_reports_it() {
+    let sim = Sim::with_faults(0x20A3_0006, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let mut app = App::open(
+        Box::new(OneShotStoreSyncFaultDisk {
+            inner: sim.disk(),
+            store_path: format!("{}.horizon", latch_config().db.store_path),
+            armed: armed.clone(),
+            fired: fired.clone(),
+            reads: Arc::new(AtomicU64::new(0)),
+        }),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        latch_config(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp])
+    .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
+        slot: 1,
+    });
+    let entries = app
+        .take_cron_entries_for_tests()
+        .into_iter()
+        .filter(|entry| entry.name == "hourly-count")
+        .collect();
+    let mut cron = CronScheduler::new(entries);
+    let db = app.db_for_tests();
+    armed.store(true, Ordering::SeqCst);
+    let err = cron.upsert(db, wall(HOUR)).expect_err(
+        "a checkpoint failure nothing else reports must reach the caller: swallowed, it freezes \
+         WAL GC and the breadcrumb with nobody told",
+    );
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the breadcrumb's sync must fail exactly once, in the upsert's own cadence checkpoint"
+    );
+    assert!(err.to_string().contains("simulated fsync failure"), "{err}");
+    assert!(
+        !db.poisoned() && !db.store_failed(),
+        "a breadcrumb sync failure poisons nothing and latches nothing, or this is not the arm \
+         under test"
+    );
+    assert_eq!(
+        stored_next_due(db, "hourly-count"),
+        wall(2 * HOUR),
+        "the upsert's row reached the store (applied == n)"
+    );
+    assert_eq!(
+        (cron.next_deadline(), cron.has_due(wall(HOUR))),
+        (Some(wall(2 * HOUR)), false),
+        "the cache must mirror the row. Left at UNIX_EPOCH, the schedule ticks at once, an \
+         interval early, on a grid anchored at 1970"
+    );
+}
+
 /// One job enqueued by `enqueue` and noted, over a disk whose horizon
 /// breadcrumb (`<store_path>.horizon`) fails its next sync once armed, armed
 /// only afterwards: the sync that fails is the breadcrumb write in `run_due`'s

@@ -77,15 +77,33 @@ impl CronScheduler {
                     }
                 }
             };
-            // Cache updates only after the commit succeeds (matching `tick`):
-            // a failed write must not leave the cache pointing at a row that
-            // was never durably written.
-            db.transact(|tx| {
-                tx.put(&row);
-                Ok::<(), io::Error>(())
-            })
-            .map_err(flatten)?;
-            *cached = row.next_due;
+            // `tick`'s one rule: the cache follows the store, not the answer.
+            // The answer is `Db::transact`'s (`Err` unless the failure is
+            // reported elsewhere), and the cache takes the row's `next_due`
+            // whenever the row reached the store, so a row that is durable
+            // never leaves its schedule due at `UNIX_EPOCH`.
+            let mut group = db.begin_group()?;
+            let result = group
+                .stage(|tx| {
+                    tx.put(&row);
+                    Ok::<(), io::Error>(())
+                })
+                .map_err(flatten);
+            let staged = !group.is_empty();
+            match (result, group.commit()) {
+                (Ok(()), Ok(())) => *cached = row.next_due,
+                (Ok(()), Err(failure)) => {
+                    let invalidated = failure.invalidates(0, staged);
+                    if !invalidated {
+                        *cached = row.next_due;
+                    }
+                    if invalidated || !(db.poisoned() || db.store_failed()) {
+                        return Err(failure.error);
+                    }
+                }
+                (Err(e), Ok(())) => return Err(e),
+                (Err(_), Err(failure)) => return Err(failure.error),
+            }
         }
         Ok(())
     }
@@ -149,10 +167,10 @@ impl CronScheduler {
     }
 
     /// The one-schedule wrapper (group-commit T7, C-2):
-    /// `begin_group` + one `tick_into` + `commit` — the shape both existing
-    /// direct callers of `tick` (`tests/kernel.rs`) keep compiling against
-    /// unchanged. The kernel's own batched cron arm calls `tick_into`
-    /// directly against a group it drains several ticks into instead.
+    /// `begin_group` + one `tick_into` + `commit`. Its callers are all tests
+    /// (`tests/kernel.rs`, and `kernel/clock.rs`'s floor test). The kernel's
+    /// own batched cron arm calls `tick_into` directly against a group it
+    /// drains several ticks into instead.
     ///
     /// **On a commit failure, this answers exactly as `Db::transact`'s ruled
     /// policy does** (`CommitFailure::invalidates`, the ONE rule, so the
@@ -167,10 +185,10 @@ impl CronScheduler {
     /// `poisoned()`/`store_failed()` it answers `Ok((name, catchup))`.
     ///
     /// **The cache follows the store, not the answer** — the same rule
-    /// `run_due`'s heap follows. `tick_into` advanced
-    /// the ticked entry's cache on the assumption the commit would succeed.
-    /// Only a record that never reached the store (`applied == 0`, an
-    /// append/sync failure) rolls it back to `previous`, so the same interval
+    /// `run_due`'s heap and `upsert`'s cache follow. `tick_into` advanced the
+    /// ticked entry's cache on the assumption the commit would succeed. Only
+    /// a record that never reached the store (`applied == 0`, an append, sync
+    /// or apply failure) rolls it back to `previous`, so the same interval
     /// ticks again. When the record did reach it (`applied == n`, either
     /// checkpoint arm) the advance and its enqueue are durable and the cache
     /// stays where `tick_into` put it: rolled back, it would re-tick and
