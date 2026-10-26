@@ -7,9 +7,9 @@ You have a fresh Linux machine for this, with no network access. Run every comma
 Your sources are the following, and nothing else:
 - this brief;
 - `README.md` beside it;
-- the documentation that ships inside the `charpente` crate: its `GUIDE.md` and `examples/`. This machine's cargo reads crates from a directory registry, so they are at `/opt/registry/charpente-0.3.0/GUIDE.md` and `/opt/registry/charpente-0.3.0/examples/`.
+- the documentation that ships inside the `charpente` crate: its `GUIDE.md`, its `examples/`, and the four files under its `tests/` that GUIDE names as worked examples: `tests/clock.rs`, `tests/outbound.rs`, `tests/describe.rs` and `tests/realtime.rs`. This machine's cargo reads crates from a directory registry, so they are at `/opt/registry/charpente-0.3.0/GUIDE.md`, `/opt/registry/charpente-0.3.0/examples/` and `/opt/registry/charpente-0.3.0/tests/`.
 
-Do not read the platform's implementation. That means no `src/` or `tests/` of any charpente crate, and nothing online. If the documentation does not tell you how to do something, record that in `FINDINGS.md` and choose the simplest thing it does support. Never patch the framework.
+Do not read the platform's implementation. That means no `src/` of any charpente crate, no other file under `tests/`, and nothing online. If the documentation does not tell you how to do something, record that in `FINDINGS.md` and choose the simplest thing it does support. Never patch the framework.
 
 ## Setup
 
