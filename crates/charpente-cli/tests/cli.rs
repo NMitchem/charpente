@@ -246,8 +246,6 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
     assert_eq!(
         String::from_utf8_lossy(&human.stdout),
         r#"
-check counter_roundtrip ... ok  (52 tested, 12 skipped)
-
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
     10  Db::open after the crash never booted in 8 boots
@@ -255,6 +253,8 @@ skipped runs hit a fault before reaching the check, so they prove nothing either
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
   counter_roundtrip
+
+check counter_roundtrip ... ok  (52 tested, 12 skipped)
 
 sim result: ok. 1 passed; 0 failed. 52 of 64 runs tested a check.
 rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --filter counter_roundtrip

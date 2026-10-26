@@ -3060,7 +3060,7 @@ A batch counts, on each check's line, how many distinct inputs its tested runs
 drew: two runs that drew the same values, under the same names and in the same
 order, count once.
 It is a count, never a threshold. A check whose workload draws nothing is named
-under the check lines, because every one of its runs tested the same scripted
+above the check lines, because every one of its runs tested the same scripted
 case, whatever the faults did ("Reading a batch" below).
 
 ### Giving up: a skipped run
@@ -3213,8 +3213,6 @@ prints no reasons block at all. This is a pinned batch of `crates/sim-fixture`,
 
 <!-- pinned -->
 ```text
-check counter_roundtrip ... ok  (52 tested, 12 skipped)
-
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
     10  Db::open after the crash never booted in 8 boots
@@ -3222,6 +3220,8 @@ skipped runs hit a fault before reaching the check, so they prove nothing either
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
   counter_roundtrip
+
+check counter_roundtrip ... ok  (52 tested, 12 skipped)
 
 sim result: ok. 1 passed; 0 failed. 52 of 64 runs tested a check.
 rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --filter counter_roundtrip
@@ -3234,15 +3234,15 @@ This is the harness's own fixture pair, a check that passes and one that always
 gives up, over six runs:
 
 ```text
-check always_passes ..... ok  (6 tested)
-check always_gives_up ... untested  (0 tested, 6 skipped)
-
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   always_gives_up — never tested: every run was skipped
     6  the fixture always gives up
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
   always_passes
+
+check always_passes ..... ok  (6 tested)
+check always_gives_up ... untested  (0 tested, 6 skipped)
 
 sim result: ok. 1 passed; 0 failed; 1 untested. 6 of 12 runs tested a check.
 rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6
@@ -4493,7 +4493,9 @@ running 3 sim checks, 256 runs each, under random injected faults (master seed 0
 ```
 
 Its report, on stdout, has the shape of `cargo test`'s ("Giving up" above
-shows two). In order:
+shows two). Like `cargo test`'s, it closes with a line per check directly
+above the result, so the last lines of the output carry every check's status
+and counts beside the verdict. In order:
 
 - **One failure block per failing check**: its first failure in seed order,
   shrunk ("Reading a failure" and "Shrinking a failure" below). The check's
@@ -4501,6 +4503,14 @@ shows two). In order:
   lists each one.
 - **A line per unmet requirement**: `sim coverage requirement failed in
   <check>: "<key>" never occurred in <n> runs`, with what to do about it.
+- **The skipped runs' reasons**, under each check that skipped any, most
+  frequent first and then in byte order, each with its count. A check that
+  tested nothing is headed `— never tested: every run was skipped`. A check
+  lists at most eight reasons and counts the rest on one line; `\n`, `\r` and
+  `\t` in a reason print as those two-character escapes, so every reason stays
+  on one line.
+- **The checks that draw no inputs**, named, when any check with a tested run
+  drew none: each of their runs tested the same scripted case.
 - **A line per check**, in registry order: `check <name> ... <status>
   (<counts>)`. A run that passed or failed *tested* the check; a run that gave
   up was *skipped*. The status is `FAILED` when a run failed or a `require`d
@@ -4511,14 +4521,6 @@ shows two). In order:
   (`64 tested: 16 failed`), how many were skipped when any were (`52 tested,
   12 skipped`), and the keys that never occurred (`required "restart" never
   occurred`).
-- **The skipped runs' reasons**, under each check that skipped any, most
-  frequent first and then in byte order, each with its count. A check that
-  tested nothing is headed `— never tested: every run was skipped`. A check
-  lists at most eight reasons and counts the rest on one line; `\n`, `\r` and
-  `\t` in a reason print as those two-character escapes, so every reason stays
-  on one line.
-- **The checks that draw no inputs**, named, when any check with a tested run
-  drew none: each of their runs tested the same scripted case.
 - **The result**: `sim result: ok`, `FAILED`, or `nothing tested` when no check
   passed and none failed, then how many checks passed, failed and (if any)
   were untested, and how many of the batch's runs tested a check.

@@ -1434,9 +1434,10 @@ fn json_escape(s: &str, out: &mut String) {
 const REASONS_SHOWN: usize = 8;
 
 /// The batch in `cargo test`'s shape (GUIDE §8 "Reading a batch"): one block
-/// per failing check, the unmet coverage requirements, a line per check, the
-/// skipped runs' reasons, the checks that draw nothing, the result, and the
-/// command that reruns the batch.
+/// per failing check, the unmet coverage requirements, the skipped runs'
+/// reasons, the checks that draw nothing, a line per check, the result, and
+/// the command that reruns the batch. The check lines sit directly above the
+/// result, so a tail of the output carries every check's counts.
 fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
     if let Some(replay) = &batch.replay {
         return write_replay(batch, replay, out);
@@ -1458,63 +1459,6 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
              never occurs is an untested claim)",
             report.universes
         );
-    }
-
-    let width = report
-        .outcomes
-        .iter()
-        .map(|o| o.test.chars().count())
-        .max()
-        .unwrap_or(0);
-    let (mut passed, mut failed, mut untested, mut tested_runs) = (0, 0, 0, 0);
-    let _ = writeln!(out);
-    for (o, c) in report.outcomes.iter().zip(&batch.checks) {
-        let tested = c.passed + c.failed;
-        let skipped: u64 = c.skipped.iter().map(|(_, n)| n).sum();
-        assert_eq!(
-            c.passed, o.verdicts,
-            "{}: passed runs are its verdicts",
-            o.test
-        );
-        assert_eq!(
-            skipped, o.gave_up,
-            "{}: skipped runs are its give-ups",
-            o.test
-        );
-        let unmet: Vec<String> = report
-            .missing_coverage
-            .iter()
-            .filter(|(test, _)| test == o.test)
-            .map(|(_, key)| format!("\"{key}\""))
-            .collect();
-        tested_runs += tested;
-        // A check that tested nothing is untested, never ok, and a batch whose
-        // every check is untested never reads `ok` either: a batch that
-        // adjudicated nothing must never read as an unqualified success
-        // (MANIFESTO §9).
-        let status = check_status(c, !unmet.is_empty());
-        match status {
-            "FAILED" => failed += 1,
-            "untested" => untested += 1,
-            _ => passed += 1,
-        }
-        let mut counts = match c.drew {
-            true => format!("{tested} tested over {} distinct inputs", c.distinct_inputs),
-            false => format!("{tested} tested"),
-        };
-        if c.failed > 0 {
-            counts.push_str(&format!(": {} failed", c.failed));
-            if skipped > 0 {
-                counts.push_str(&format!("; {skipped} skipped"));
-            }
-        } else if skipped > 0 {
-            counts.push_str(&format!(", {skipped} skipped"));
-        }
-        if !unmet.is_empty() {
-            counts.push_str(&format!("; required {} never occurred", unmet.join(", ")));
-        }
-        let dots = ".".repeat(width - o.test.chars().count() + 3);
-        let _ = writeln!(out, "check {} {dots} {status}  ({counts})", o.test);
     }
 
     if batch.checks.iter().any(|c| !c.skipped.is_empty()) {
@@ -1572,6 +1516,63 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
         for check in scripted {
             let _ = writeln!(out, "  {check}");
         }
+    }
+
+    let width = report
+        .outcomes
+        .iter()
+        .map(|o| o.test.chars().count())
+        .max()
+        .unwrap_or(0);
+    let (mut passed, mut failed, mut untested, mut tested_runs) = (0, 0, 0, 0);
+    let _ = writeln!(out);
+    for (o, c) in report.outcomes.iter().zip(&batch.checks) {
+        let tested = c.passed + c.failed;
+        let skipped: u64 = c.skipped.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            c.passed, o.verdicts,
+            "{}: passed runs are its verdicts",
+            o.test
+        );
+        assert_eq!(
+            skipped, o.gave_up,
+            "{}: skipped runs are its give-ups",
+            o.test
+        );
+        let unmet: Vec<String> = report
+            .missing_coverage
+            .iter()
+            .filter(|(test, _)| test == o.test)
+            .map(|(_, key)| format!("\"{key}\""))
+            .collect();
+        tested_runs += tested;
+        // A check that tested nothing is untested, never ok, and a batch whose
+        // every check is untested never reads `ok` either: a batch that
+        // adjudicated nothing must never read as an unqualified success
+        // (MANIFESTO §9).
+        let status = check_status(c, !unmet.is_empty());
+        match status {
+            "FAILED" => failed += 1,
+            "untested" => untested += 1,
+            _ => passed += 1,
+        }
+        let mut counts = match c.drew {
+            true => format!("{tested} tested over {} distinct inputs", c.distinct_inputs),
+            false => format!("{tested} tested"),
+        };
+        if c.failed > 0 {
+            counts.push_str(&format!(": {} failed", c.failed));
+            if skipped > 0 {
+                counts.push_str(&format!("; {skipped} skipped"));
+            }
+        } else if skipped > 0 {
+            counts.push_str(&format!(", {skipped} skipped"));
+        }
+        if !unmet.is_empty() {
+            counts.push_str(&format!("; required {} never occurred", unmet.join(", ")));
+        }
+        let dots = ".".repeat(width - o.test.chars().count() + 3);
+        let _ = writeln!(out, "check {} {dots} {status}  ({counts})", o.test);
     }
 
     let word = if failed > 0 {
@@ -3958,9 +3959,6 @@ mod tests {
         assert_eq!(
             out,
             "\n\
-             check always_passes ..... ok  (6 tested)\n\
-             check always_gives_up ... untested  (0 tested, 6 skipped)\n\
-             \n\
              skipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
              \x20 always_gives_up — never tested: every run was skipped\n\
              \x20   6  the fixture always gives up\n\
@@ -3968,8 +3966,57 @@ mod tests {
              these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):\n\
              \x20 always_passes\n\
              \n\
+             check always_passes ..... ok  (6 tested)\n\
+             check always_gives_up ... untested  (0 tested, 6 skipped)\n\
+             \n\
              sim result: ok. 1 passed; 0 failed; 1 untested. 6 of 12 runs tested a check.\n\
              rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6\n"
+        );
+    }
+
+    /// R42: a batch ends on its check lines, directly above the result line,
+    /// so the last lines a reader tails carry each check's status and counts
+    /// beside the verdict, as `cargo test` ends on its per-test lines and
+    /// `test result:`. The failure blocks, the skipped runs' reasons and the
+    /// checks that draw nothing all come before them.
+    #[test]
+    fn the_check_lines_come_after_the_skipped_runs_and_directly_above_the_result() {
+        let tests = [
+            sim_test("fails_skips_or_passes", fails_skips_or_passes),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let batch = run_batch(&[&tests[0], &tests[1]], 0x1234, 24, 1);
+        let c = &batch.checks[0];
+        let skipped: u64 = c.skipped.iter().map(|(_, n)| n).sum();
+        assert!(
+            c.passed > 0 && c.failed > 0 && skipped > 0,
+            "non-vacuous: {c:?}"
+        );
+        let (code, out) = run_to_string(&tests, &["--runs", "24", "--master-seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        let tested = c.passed + c.failed;
+        let tail = format!(
+            "\n\
+             these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):\n\
+             \x20 fails_skips_or_passes\n\
+             \n\
+             check fails_skips_or_passes ... FAILED  ({tested} tested: {} failed; {skipped} skipped)\n\
+             check always_gives_up ......... untested  (0 tested, 24 skipped)\n\
+             \n\
+             sim result: FAILED. 0 passed; 1 failed; 1 untested. {tested} of 48 runs tested a check.\n\
+             rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 24\n",
+            c.failed
+        );
+        assert!(out.ends_with(&tail), "want the tail:\n{tail}\nout:\n{out}");
+        let at = |text: &str| {
+            out.find(text)
+                .unwrap_or_else(|| panic!("no {text:?}:\n{out}"))
+        };
+        let failure = at("\nsim failure in fails_skips_or_passes: ");
+        let reasons = at("\nskipped runs hit a fault before reaching the check");
+        assert!(
+            failure < reasons && reasons < out.len() - tail.len(),
+            "the failure block, then the skipped runs, then the tail:\n{out}"
         );
     }
 
@@ -4087,7 +4134,8 @@ mod tests {
         }
         let rest: u64 = reasons[8..].iter().map(|(_, n)| n).sum();
         want.push_str(&format!(
-            "    and 4 more reasons ({rest} runs): --format json lists every one\n\nsim result: "
+            "    and 4 more reasons ({rest} runs): --format json lists every one\n\ncheck \
+             gives_up_twelve_ways ... untested  (0 tested, 256 skipped)\n\nsim result: "
         ));
         assert!(out.contains(&want), "want:\n{want}\nout:\n{out}");
     }
@@ -4144,7 +4192,8 @@ mod tests {
         assert!(
             out.contains(
                 "\n  gives_up_with_escapes — never tested: every run was skipped\n    3  line \
-                 one\\nline two\\tend\\r\n\nsim result: "
+                 one\\nline two\\tend\\r\n\ncheck gives_up_with_escapes ... untested  (0 tested, 3 \
+                 skipped)\n\nsim result: "
             ),
             "{out}"
         );
@@ -4216,7 +4265,7 @@ mod tests {
         assert!(
             out.contains(
                 "\n\nthese checks draw no inputs, so every run tested the same case — draw them \
-                 with sim.input() (GUIDE §8):\n  draws_nothing\n\nsim result: "
+                 with sim.input() (GUIDE §8):\n  draws_nothing\n\ncheck draws_a_digit ... FAILED  ("
             ),
             "{out}"
         );

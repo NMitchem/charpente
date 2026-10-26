@@ -2079,12 +2079,13 @@ Charpente treats the coding agent as the primary developer persona:
   inputs and fewer fault axes that still fail it, until no step of the shrink passes
   makes the run smaller (a local minimum, GUIDE §8) or its budget runs out, which can
   stop it short of one, and its repro replays exactly that run. The human report is
-  in `cargo test`'s shape: one shrunk block per failing check, then a line per check
+  in `cargo test`'s shape: one shrunk block per failing check, the skipped runs'
+  reasons counted and the checks that draw no inputs named, then a line per check
   (`ok`, `FAILED` or `untested`, with how many runs tested it, over how many distinct
-  inputs, and how many were skipped), the skipped runs' reasons counted, the checks
-  that draw no inputs named, a result line, and the command that reruns exactly the
-  batch (GUIDE §8 "Reading a batch"). A failure message *is* a reproduction
-  (`--seed 0x9f3a...`), so the agent's fix-verify cycle needs no flaky-test
+  inputs, and how many were skipped) directly above a result line and the command
+  that reruns exactly the batch, so a tail of the report carries every check's
+  counts beside the verdict (GUIDE §8 "Reading a batch"). A failure message *is* a
+  reproduction (`--seed 0x9f3a...`), so the agent's fix-verify cycle needs no flaky-test
   triage. `--format json` is the machine-readable surface and carries every fact the human report
   does: `runs` and run totals, `coverage`, `missing_coverage` (`{check, key}` pairs for
   `require`d keys never hit), per-check `{check, status, passed, failed, skipped,
