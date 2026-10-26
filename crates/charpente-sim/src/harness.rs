@@ -279,27 +279,34 @@ const SHRINK_BUDGET: u32 = 500;
 /// check's first failure, in seed order) by replaying candidates, each run by
 /// `run_app_universe` exactly as `--seed --inputs --faults-off` would run it.
 /// A candidate is kept when it fails the same check, with any message; a run
-/// that passes or gives up has not. Candidates come from five passes, repeated
-/// until a round keeps nothing or the budget is spent:
+/// that passes or gives up has not. Candidates come from five passes, in
+/// rounds repeated until a round keeps nothing or the budget is spent:
 /// 1. delete chunks of the choices (8, 4, 2, then 1 long, from the end);
 /// 2. set each choice to 0;
 /// 3. binary-search each choice toward 0;
 /// 4. turn off each fault axis that is on, in `FaultConfig` field order;
-/// 5. lower equal choices together: each nonzero value two or more choices
-///    hold, at all of its positions and then at each pair of them, set to 0
-///    and then binary-searched toward 0 as one value.
+/// 5. only in a round where passes 1-4 kept nothing, lower equal choices
+///    together: each nonzero value two or more choices hold, at all of its
+///    positions and then at each pair of them, set to 0 and then
+///    binary-searched toward 0 as one value.
 ///
-/// Pass 5 runs last because k equal choices make k(k-1)/2 pairs, enough to
-/// spend the whole budget. Run before pass 4, they left on fault axes the
-/// failure does not need, which the block then blames
-/// (`a_large_group_of_needed_equal_choices_leaves_no_fault_axis_on`).
+/// Pass 5 is there for the stall passes 1-4 cannot leave, two equal choices
+/// that must move together, and it is the one pass whose cost grows faster
+/// than the choices: k equal choices make k(k-1)/2 pairs, enough to spend the
+/// whole budget. Run while passes 1-4 could still shrink the run, it spent
+/// the budget they needed: it left on fault axes the failure does not need
+/// (`a_large_group_of_needed_equal_choices_leaves_no_fault_axis_on`), and an
+/// input above what fails once those axes are off
+/// (`the_equal_choices_pass_waits_until_the_other_passes_keep_nothing`). So
+/// it runs only once nothing cheaper can make progress.
 ///
 /// Every candidate is strictly smaller than the best so far (shorter or
 /// lexicographically smaller choices, or one more axis off), so each round
-/// shrinks or ends the loop. What it ends on is a local minimum: no step of
-/// these passes shrinks it and still fails, which is not a search of every
-/// smaller run. It depends only on its arguments, so the result is identical
-/// for any `--jobs`.
+/// shrinks or ends the loop. A round that keeps nothing ends it on a local
+/// minimum: no step of these passes shrinks the run and still fails, which is
+/// not a search of every smaller run. A spent budget ends it where the budget
+/// ran out, which can be short of one. It depends only on its arguments, so
+/// the result is identical for any `--jobs`.
 ///
 /// The budget counts replays, and a candidate already tried is skipped
 /// without one, so termination cannot rest on the budget alone: every loop
@@ -317,7 +324,9 @@ fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
         s.zero_each();
         s.search_each_toward_zero();
         s.turn_off_axes();
-        s.lower_equal_together();
+        if (&s.best.choices, &s.best.faults_off) == (&round.0, &round.1) {
+            s.lower_equal_together();
+        }
         if s.spent() || (&s.best.choices, &s.best.faults_off) == (&round.0, &round.1) {
             return s.best;
         }
@@ -3316,7 +3325,8 @@ mod tests {
     /// together, so the pairs cannot starve them: k equal choices make
     /// k(k-1)/2 pairs, each a replay. The 33 ones this failure needs make 528,
     /// and walked before the axes they spent the whole budget with every axis
-    /// still on, so the block blamed faults that play no part. Each seed is
+    /// still on, so the block blamed faults that play no part. The pass now
+    /// runs only in a round where the other four kept nothing. Each seed is
     /// one of the first five, counting up from 0, whose first failure has
     /// three or more fault axes on.
     #[test]
@@ -3398,6 +3408,123 @@ mod tests {
             (9, false),
             "one replay per candidate, and none kept"
         );
+    }
+
+    /// Fails when its first two draws in 0..=7 are equal and its third is
+    /// not 0.
+    fn an_equal_pair_then_a_nonzero(sim: &mut Sim) -> Result<(), String> {
+        let a = sim.input().between("a", 0, 7);
+        let b = sim.input().between("b", 0, 7);
+        let c = sim.input().between("c", 0, 7);
+        if a == b && c >= 1 {
+            Err("two equal draws, then one that is not 0".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A group the equal-choices pass keeps ends it. From 3, 3, 6 the 3s are
+    /// kept at 0, the pass's first candidate, and nothing is tried after: the
+    /// 3s' one pair, walked next, would offer 0 at both again, a candidate
+    /// equal to the new best, which `try_keep` refuses by name. Seed 0x17 is
+    /// the first, counting up from 0, whose first failure draws two equal
+    /// values that are not 0.
+    #[test]
+    fn a_kept_group_ends_the_equal_choices_pass() {
+        let test = sim_test("an_equal_pair_then_a_nonzero", an_equal_pair_then_a_nonzero);
+        let seeds: Vec<u64> = (0..=0x17)
+            .filter(|&seed| {
+                run_app_universe(seed, None, &[], &test.run).is_err_and(|f| f.choices[0] != 0)
+            })
+            .collect();
+        assert_eq!(
+            seeds,
+            [0x17],
+            "the first seed whose first failure draws two equal values that are not 0"
+        );
+        let first = run_app_universe(0x17, None, &[], &test.run).unwrap_err();
+        assert_eq!(
+            first.drawn,
+            [("a", "3"), ("b", "3"), ("c", "6")].map(|(n, v)| (n, v.to_string()))
+        );
+        let mut s = Shrinker::new(&test, 0x17, &first);
+        s.lower_equal_together();
+        assert_eq!(
+            (s.best.choices.as_slice(), s.best.replays),
+            (&[0, 0, 6][..], 1),
+            "the 3s kept at 0, the first candidate"
+        );
+        assert_eq!(
+            s.tried,
+            BTreeSet::from([(vec![0, 0, 6], Vec::new())]),
+            "nothing tried after the keep"
+        );
+    }
+
+    /// Draws sixty bits and then z in 0..=100, and fails when 33 or more bits
+    /// are 1 and z is at least 50 while any fault axis is on, or at least 10
+    /// once none is: turning the axes off opens a further shrink of z, as a
+    /// fault turned off can (GUIDE §8).
+    fn thirty_three_ones_and_a_z_the_faults_set(sim: &mut Sim) -> Result<(), String> {
+        let ones = (0..60)
+            .filter(|_| sim.input().between("bit", 0, 1) == 1)
+            .count();
+        let z = sim.input().between("z", 0, 100);
+        let on = FAULT_AXES.iter().any(|a| axis_on(&sim.world.cfg, a));
+        if ones >= 33 && z >= if on { 50 } else { 10 } {
+            Err(format!("{ones} of 60 bits are 1 and z is {z}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The equal-choices pass runs only in a round where the other four kept
+    /// nothing. Here round 1's search can take z only to 50 while the axes
+    /// are on, and pass 4 then turns them off, which lets z fail from 10. Run
+    /// in that round, the pass's 528 pairs of the 33 ones spent the budget
+    /// before round 2's search lowered z, and the block reported z at 50.
+    /// Each seed is one of the first four, counting up from 0, whose first
+    /// failure has a fault axis on.
+    #[test]
+    fn the_equal_choices_pass_waits_until_the_other_passes_keep_nothing() {
+        let test = sim_test(
+            "thirty_three_ones_and_a_z_the_faults_set",
+            thirty_three_ones_and_a_z_the_faults_set,
+        );
+        let on = |config: &FaultConfig| FAULT_AXES.iter().filter(|&&a| axis_on(config, a)).count();
+        let seeds: Vec<u64> = (0..=0x21)
+            .filter(|&seed| {
+                run_app_universe(seed, None, &[], &test.run).is_err_and(|f| on(&f.config) >= 1)
+            })
+            .collect();
+        assert_eq!(
+            seeds,
+            [0xf, 0x18, 0x1f, 0x21],
+            "the first four seeds, counting up from 0, whose first failure has a fault axis on"
+        );
+        for seed in seeds {
+            let first = run_app_universe(seed, None, &[], &test.run).unwrap_err();
+            let shrunk = shrink(&test, seed, &first);
+            let ones = shrunk
+                .drawn
+                .iter()
+                .filter(|(n, v)| *n == "bit" && v == "1")
+                .count();
+            let z = shrunk.drawn.iter().find(|(n, _)| *n == "z");
+            assert_eq!(
+                (
+                    z.map(|(_, v)| v.as_str()),
+                    ones,
+                    shrunk.faults_off.len(),
+                    on(&shrunk.config)
+                ),
+                (Some("10"), 33, on(&first.config), 0),
+                "seed {seed:#x}: z at 10, the 33 ones the failure needs, and every axis that was \
+                 on turned off; faults off {:?}, in {} replays",
+                shrunk.faults_off,
+                shrunk.replays
+            );
+        }
     }
 
     #[test]

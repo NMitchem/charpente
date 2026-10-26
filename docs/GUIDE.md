@@ -4626,7 +4626,8 @@ the block shows. The rule is the same for every check.
 It shrinks the recorded choice sequence, not the values (Hypothesis's approach):
 each choice is the one its draw used, so a smaller choice is a smaller, simpler
 value (`lo`, the first item, the identity order), and a draw past the end of
-the choices reads 0. Five passes repeat until a whole round keeps nothing:
+the choices reads 0. Its passes run in rounds, repeated until a whole round
+keeps nothing:
 
 1. delete chunks of the choices, 8, 4, 2 and then 1 long, from the end toward
    the start;
@@ -4637,18 +4638,22 @@ the choices reads 0. Five passes repeat until a whole round keeps nothing:
 4. turn off each fault axis that is on, one at a time, in `FaultConfig` field
    order. An axis is on when it could fire: a clock axis whose chance is 0 is
    off whatever its size, so `faults off:` never lists it;
-5. lower equal choices together: for each nonzero value two or more choices
-   hold, set all of them to 0 and then search them down toward 0 as one value,
-   then each pair of them the same way, so a failure that needs the same entity
-   drawn twice (the same lab, the same product) reaches the lowest one, where
-   lowering either draw alone makes the two differ and passes. It runs last
-   because k equal choices make k(k-1)/2 pairs, enough to spend the whole
-   budget: run earlier, they could leave on fault axes the failure does not
-   need.
+5. only in a round where the first four kept nothing, lower equal choices
+   together: for each nonzero value two or more choices hold, set all of them
+   to 0 and then search them down toward 0 as one value, then each pair of them
+   the same way, so a failure that needs the same entity drawn twice (the same
+   lab, the same product) reaches the lowest one, where lowering either draw
+   alone makes the two differ and passes. That stall is a round where the first
+   four keep nothing, and the pass waits for one because k equal choices make
+   k(k-1)/2 pairs, enough to spend the whole budget: run while the other passes
+   can still shrink the run, it could leave on fault axes the failure does not
+   need, or inputs larger than it needs.
 
-The run they end on is a local minimum: no step of these passes shrinks it and
-still fails. They do not search every smaller run, so a smaller one that fails
-the check can still exist.
+A round that keeps nothing ends the shrink on a local minimum: no step of these
+passes shrinks the run and still fails. They do not search every smaller run,
+so a smaller one that fails the check can still exist. A shrink that spends its
+budget (below) ends where the budget ran out, which can be short of a local
+minimum.
 
 A candidate is kept when the same check fails, with any message. One that
 passes or gives up is not kept, so a clock axis whose removal turns the failure
