@@ -4638,16 +4638,19 @@ keeps nothing:
 4. turn off each fault axis that is on, one at a time, in `FaultConfig` field
    order. An axis is on when it could fire: a clock axis whose chance is 0 is
    off whatever its size, so `faults off:` never lists it;
-5. only in a round where the first four kept nothing, lower equal choices
-   together: for each nonzero value two or more choices hold, set all of them
-   to 0 and then search them down toward 0 as one value, then each pair of them
-   the same way, so a failure that needs the same entity drawn twice (the same
-   lab, the same product) reaches the lowest one, where lowering either draw
-   alone makes the two differ and passes. That stall is a round where the first
-   four keep nothing, and the pass waits for one because k equal choices make
-   k(k-1)/2 pairs, enough to spend the whole budget: run while the other passes
-   can still shrink the run, it could leave on fault axes the failure does not
-   need, or inputs larger than it needs.
+5. lower equal choices together: for each nonzero value two or more choices
+   hold, set all of them to 0 and then search them down toward 0 as one value,
+   so a failure that needs the same entity drawn twice (the same lab, the same
+   product) reaches the lowest one, where lowering either draw alone makes the
+   two differ and passes. Then, only in a round where everything before kept
+   nothing, an axis turned off counting as a keep, each pair of those choices
+   the same way, for a value that also sits where the failure does not need
+   it. A whole group costs one candidate and a search, as cheap as passes 2
+   and 3, so whole groups are tried in every round, right after pass 4. The
+   pairs wait because k equal choices make k(k-1)/2 of them, enough to spend
+   the whole budget: run while the other passes can still shrink the run,
+   they could leave on fault axes the failure does not need, or inputs larger
+   than it needs.
 
 A round that keeps nothing ends the shrink on a local minimum: no step of these
 passes shrinks the run and still fails. They do not search every smaller run,
