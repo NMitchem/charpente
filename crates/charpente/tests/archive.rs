@@ -5669,6 +5669,57 @@ fn restore_reproduces_the_source_at_the_archived_frontier() {
     );
 }
 
+/// A WAL segment seals by bytes, so a segment too small for two frames holds
+/// exactly one record and its `SegmentRef` spans `base_seq == end_seq`. Any
+/// `segment_bytes` below two of a node's largest frames produces that shape.
+/// The archive must ship such a chain and restore must read it back:
+/// `Manifest::decode` refuses a span only when `base_seq > end_seq`.
+#[test]
+fn a_chain_of_one_record_segments_archives_and_restores() {
+    let sim = Sim::with_faults(0x20A3_0010, FaultConfig::none());
+    let mut cfg = DbConfig::default();
+    // A `Rec` frame fits in 64 bytes; two never do.
+    cfg.wal.segment_bytes = 64;
+    let mut src = Db::open(Box::new(sim.disk()), cfg, restore_schema()).unwrap();
+    let mut arc = Archive::open(archive_config(0, 8 << 20), &mut src).unwrap();
+    let store = SimObjectStore::new();
+    write_records(&mut src, 4);
+    step_until_idle(&mut arc, &src, &store);
+    write_records_at(&mut src, 4, 6);
+    step_until_idle(&mut arc, &src, &store);
+    assert_eq!(
+        src.last_applied(),
+        Some(9),
+        "the fixture must commit exactly one record per row, or `source_at` is not the \
+         source's state at a seq"
+    );
+    let m = read_manifest(&store).expect("an archived generation");
+    assert!(
+        m.segments.len() >= 2 && m.segments.iter().all(|s| s.base_seq == s.end_seq),
+        "every shipped segment must hold exactly one record, or this test proves nothing about \
+         them: {:?}",
+        m.segments
+    );
+    let f = archived_frontier(&store);
+    let dst_sim = fresh_sim();
+    let report = restore(
+        &store,
+        Box::new(dst_sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!((report.applied_seq, report.segments), (f, m.segments.len()));
+    let dst = Db::open(Box::new(dst_sim.disk()), restore_cfg(), restore_schema()).unwrap();
+    assert_eq!(
+        logical_rows(&dst),
+        source_at(&src, f),
+        "the restored Db is not logically equal to the source at the archived frontier"
+    );
+}
+
 #[test]
 fn restore_refuses_a_diverged_local_timeline_and_names_both_frontiers() {
     let (_src, store) = archived_db_with_rows(1_000);

@@ -1181,6 +1181,22 @@ mod tests {
         );
     }
 
+    // The span check's other side: a segment holding one record spans base_seq ==
+    // end_seq, which is a span, not a refusal. A WAL segment seals by bytes, so one
+    // that cannot fit two frames holds exactly one (`tests/archive.rs`'s
+    // `a_chain_of_one_record_segments_archives_and_restores` ships such a chain).
+    #[test]
+    fn a_one_record_segment_roundtrips_alone_and_mid_chain() {
+        let span = |base_seq, end_seq| SegmentRef { base_seq, end_seq };
+        for segments in [
+            vec![span(4096, 4096)],
+            vec![span(0, 4095), span(4096, 4096), span(4097, 8191)],
+        ] {
+            let m = one_segment_manifest(segments);
+            assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
+        }
+    }
+
     #[test]
     fn keys_are_stable_and_zero_padded() {
         assert_eq!(manifest_key("bk"), "bk/manifest");
@@ -1224,6 +1240,30 @@ mod tests {
         assert!(
             !t.contains("valid CRC"),
             "must not claim a CRC that was never computed: {t}"
+        );
+    }
+
+    // The truncation refusal's floor is its own text, "4 bytes minimum": exactly 4 bytes
+    // is a trailing CRC over an empty body, so it is checked, never refused as too short.
+    // Both outcomes of that check are pinned. A CRC that is not the empty body's fails
+    // the check, and the empty body's own CRC (0) passes it, so the refusal comes from
+    // the first field read and "despite a valid CRC" is true there.
+    #[test]
+    fn a_four_byte_object_is_a_crc_over_an_empty_body_not_too_short() {
+        assert_eq!(crc32(&[]), 0, "the CRC32 of an empty body");
+        let e = Manifest::decode(&0xdead_beef_u32.to_le_bytes()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "manifest failed its CRC check (stored deadbeef, computed 00000000) — a torn write \
+             or a corrupted read; never restore from it. Re-fetch the object and retry; if the \
+             mismatch persists, restore from the previous generation instead"
+        );
+        let e = Manifest::decode(&[0u8; 4]).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "manifest is malformed (a field runs past the end of the manifest) despite a valid \
+             CRC — refuse rather than parse whatever fields survived; restore from a previous \
+             generation instead"
         );
     }
 
@@ -1385,6 +1425,20 @@ mod tests {
             t.contains("exceeds the archive's snapshot meta size cap"),
             "must be refused by the size cap: {t}"
         );
+    }
+
+    // The cap is inclusive on both sides of the codec (F7): `encode` admits a meta of
+    // exactly SNAPSHOT_META_MAX_BYTES, so `decode` must too, or this module ships a meta
+    // its own decoder refuses. The first table's name is padded until the encoding lands
+    // on the cap exactly.
+    #[test]
+    fn a_snapshot_meta_exactly_at_the_size_cap_roundtrips() {
+        let mut m = meta();
+        let pad = SNAPSHOT_META_MAX_BYTES - m.encode().len();
+        m.tables[0].name.push_str(&"r".repeat(pad));
+        let bytes = m.encode();
+        assert_eq!(bytes.len(), SNAPSHOT_META_MAX_BYTES, "padded to the cap");
+        assert_eq!(SnapshotMeta::decode(&bytes).unwrap(), m);
     }
 
     // The key-parse precondition `snapshot_batch_key` asserts on the producer
