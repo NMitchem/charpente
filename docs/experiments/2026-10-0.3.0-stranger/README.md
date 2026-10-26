@@ -32,6 +32,7 @@ A miss is a finding about the output. It is fixed as its own pinned change and t
 | Attempt | Sha / version | README sha256 | Image | Network | Resumes | Green | Red | Replay (stranger) | Replay (controller) | Sealed | (a) | (b) | (c) | (d) | (e) | Verdict |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | `523fc7b8` (registry; R40) | `cbaf3242…` | `rust@sha256:931c2c05…` | none | 0 | pass (call 13) | pass (call 16) | identical (call 17) | identical | yes | **miss** | met | met | met | met | **FAIL on (a)** |
+| 2 | `1106cdf0` | `cbaf3242…` | `rust@sha256:931c2c05…` | none | 0 | pass (call 10) | pass (call 13) | identical (call 14) | identical | yes | **miss** | met | met | met | met | **FAIL on (a)** |
 
 `523fc7b8` is the registry the attempt ran on. The round that followed changed only `#[cfg(test)]` code, GUIDE §8 and doc-comment text, and PLAN, all of which the brief puts out of reach; README.md was unchanged (Ruling R40, progress.md).
 
@@ -80,3 +81,27 @@ Launched 2026-10-26T18:15:21Z, headless, session `829eb860-f230-4ddc-a5d1-ab22c0
 | 13 | README's clippy step ("hard rule 1") cannot run here: no clippy, `rustup component add` is offline, and the vendored registry has no clippy | right | calls 9–11; README:173 |
 | 14 | the last run was on the restored `lib.rs`: `3 passed; 0 failed`, 665 of 768 runs tested, master `0xd3bd6d26ee164b9a` | right | call 21 |
 | 15 | a pass means the faults that seed drew broke no check, not that the app is proven correct | right | GUIDE §8's own reading of a green batch |
+
+## Attempt 2
+
+Attempt 2 ran on a registry built at `1106cdf0`, which carries R42's fix: the batch ends on its check lines, directly above `sim result:`. It launched at 2026-10-26T20:12:18Z, headless, as session `89793b60-9d0d-40f7-86be-9fd312f849d3`. The session took 22 turns and 157 s, and made 18 box calls. Two of those calls exited non-zero, and both were environment probes: call 3 listed an absent `~/.cargo/bin`, and call 8 was an offline `rustup component add clippy`. There was no resume. The report and the follow-up are in [`attempt-2/report.md`](attempt-2/report.md).
+
+**The mechanical bar.**
+- **Green, call 10** (master `0x82dc8265b9aba391`, `EXIT=0`): 215, 254 and 201 runs tested, `670 of 768`.
+- **Red, call 13,** after deleting `tx.enqueue` in call 11 (master `0xbb4bd2377a45095d`, `EXIT=1`): `acked_post_implies_the_echo_after_recovery` FAILED in 203 of 254 tested runs. The shrink went 5 draws to 3, with nine axes off, in 10 replays.
+- **Both replays** print byte-identical six-line blocks. That is the stranger's (call 14) and the controller's (second fresh box, `attempt-2/replay/`, with the call-11 deletion re-applied). Each matches the batch block minus `shrunk:` and `first:`, per R41.
+
+**Sealing: sealed.** The box side has five hits:
+- call 3, which lists cargo's `bin/`;
+- calls 7, 10, 13 and 17, wait loops flagged for `$(seq 1 N)`.
+
+None reads source. The mac side has one hit: `ls -la && ./box '…'` in the run directory, which also accounts for 17 agent calls against 18 box start lines.
+
+**Spec §6.7.**
+- **(a) Missed.** The report gives "3 checks × 256 runs = 768 runs, `3 passed; 0 failed`" and "~100 runs that *skipped*" (98, right), and no check's tested count. Asked about its last sim run (call 17, `tx.emit` deleted), it gave "failed in all 219 runs that tested it" for the failing check, which is right, and only "stayed green" for the other two. Both attempts carried the result line's aggregate rather than the check lines' counts.
+- **(b) Met.** It gives "no POST was acked", the most common reason in every batch, and "app never booted".
+- **(c) Met.** It reports `notes=1, order=[1], body="alpha"`, 5 draws → 3.
+- **(d) Met.** It calls the output "honest" about skipped runs. Its caveat is the offline clippy.
+- **(e) Met.** Every claim is right: the scaffold's five files and three properties (calls 4–5), the install from a local mirror, the replay "byte-identical … from the seed alone" (call 14 and the controller's replay), the emit failure's message (call 17), and the restore by byte copy without a re-run (call 18; the follow-up says so itself).
+
+**The finding, and its fix.** Every reader quotes the result line, and the result line gives an aggregate, `N of M runs tested a check`. That sum also lets a check tested in a few runs hide behind well-tested ones. Ruling R43 has the result line give each check's tested runs, in the order of the check lines above it. The change is pinned in its own commit, and attempt 3, the last under the cap of three, runs on a registry rebuilt at that head.

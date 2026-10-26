@@ -1,0 +1,21 @@
+running 3 sim checks, 256 runs each, under random injected faults (master seed 0x82dc8265b9aba391)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  acked_note_survives_a_restart
+    36  no POST was acked, so durability has nothing to prove
+     4  the app never booted
+     1  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+  acked_post_implies_the_echo_after_recovery
+    2  the app never booted
+  acked_post_implies_its_event_after_recovery
+    51  no POST was acked, so its event has nothing to prove
+     4  the app never booted
+
+check acked_note_survives_a_restart ................. ok  (215 tested over 197 distinct inputs, 41 skipped)
+check acked_post_implies_the_echo_after_recovery .... ok  (254 tested over 211 distinct inputs, 2 skipped)
+check acked_post_implies_its_event_after_recovery ... ok  (201 tested over 183 distinct inputs, 55 skipped)
+
+sim result: ok. 3 passed; 0 failed. 670 of 768 runs tested a check.
+rerun exactly this batch: charpente test --sim --master-seed 0x82dc8265b9aba391
+EXIT=0
+
