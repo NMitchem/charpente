@@ -6,11 +6,14 @@
 //! `calls_have_durable_jobs`, `keys_are_per_job` and
 //! `outbound_settles_by_horizon` with outbound effects (outbound-effects
 //! spec §10), and `clock_refused`, `clock_fallout` and `clock_reopens_after`
-//! with the sim's clock axes (0.3.0) — more earn their way in the same way.
+//! with the sim's clock axes (0.3.0), and `wait_out_clock_refusal` once the
+//! tail loop that uses the last two had five copies (0.3.0) — more earn their
+//! way in the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
-use charpente_core::io::{IdempotencyKey, WallTime};
+use charpente_core::io::{Clock, IdempotencyKey, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::table::{Snapshot, View};
 
@@ -217,6 +220,45 @@ pub fn clock_reopens_after(text: &str) -> Option<WallTime> {
     ))
 }
 
+/// A fault-free tail's boot loop, waiting out a clock refusal (GUIDE §8, "A
+/// fault-free tail"). Calls `boot` and returns what it returns, `Ok(Some(t))`
+/// booted and `Ok(None)` given up by the caller, unless it fails with a clock
+/// stop or refusal that this run's clock faults explain ([`clock_fallout`])
+/// and that names an instant ([`clock_reopens_after`]). Then it sleeps one
+/// second past that instant on `sim.clock()`, restarts the process
+/// (`Sim::restart_process`: a refused node exits, and its supervisor starts it
+/// again) and calls `boot` again. One wait is enough, since nothing moves the
+/// clock or the recorded time in between; it waits twice at most, and a third
+/// refusal gives the run up by name with the refusal as its detail and returns
+/// `Ok(None)`. Any other error comes back unchanged, the stall stop included:
+/// it names no instant, because no wait fixes a clock that stopped advancing.
+/// Call it after `Sim::quiesce_clock_faults`, which freezes the clock's offset
+/// so it reaches the instant as virtual time passes.
+pub fn wait_out_clock_refusal<T>(
+    sim: &Sim,
+    mut boot: impl FnMut() -> Result<Option<T>, String>,
+) -> Result<Option<T>, String> {
+    let mut waits = 0;
+    loop {
+        let refusal = match boot() {
+            Ok(booted) => return Ok(booted),
+            Err(e) => e,
+        };
+        let Some(at) = clock_reopens_after(&refusal).filter(|_| clock_fallout(sim, &refusal))
+        else {
+            return Err(refusal);
+        };
+        if waits == 2 {
+            sim.give_up("the tail was refused after two waits", refusal);
+            return Ok(None);
+        }
+        waits += 1;
+        let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + 1_000_000_000;
+        sim.clock().sleep(Duration::from_nanos(wait));
+        sim.restart_process();
+    }
+}
+
 /// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
 /// actually fired in this universe. The oracle companion to those two axes:
 /// an acked record they corrupted ABOVE the store's checkpoint horizon is
@@ -358,7 +400,7 @@ pub fn acked_implies_durable(
     if acked.is_empty() {
         sim.give_up(
             "acked-implies-durable: no round acked anything, so there was no claim to check",
-            "",
+            format!("{rounds} rounds"),
         );
     }
     Ok(())
@@ -828,6 +870,125 @@ mod tests {
         }
     }
 
+    /// Each outcome, with what it leaves on the run: a clock refusal this run's
+    /// faults explain is waited out (one second past its instant, then one
+    /// process restart) and booted again; a third refusal gives up by name with
+    /// the refusal as the detail; and anything else, the stall stop or a
+    /// refusal no clock fault explains included, comes back at once, with no
+    /// wait and no restart.
+    #[test]
+    fn wait_out_clock_refusal_waits_past_the_instant_twice_at_most() {
+        use crate::FaultConfig;
+
+        // A skew acted at the first read, so `clock_fallout` excuses a clock
+        // refusal on this run.
+        let sim = Sim::with_faults(
+            0xC10C_F005,
+            FaultConfig {
+                clock_skew: 90_000_000_000,
+                ..FaultConfig::none()
+            },
+        );
+        let refused_until = |sim: &Sim, ahead: u64| {
+            let at = WallTime::from_nanos(sim.clock().wall().as_nanos() + ahead);
+            format!("refusing to open: this node's wall clock … and the node will open after {at}.")
+        };
+        let restarts = |sim: &Sim| sim.coverage().get("restart:process").copied().unwrap_or(0);
+
+        let mut boots = 0;
+        let booted = wait_out_clock_refusal(&sim, || {
+            boots += 1;
+            Ok(Some(boots))
+        });
+        assert_eq!(booted, Ok(Some(1)), "a clean boot is returned as it is");
+        assert_eq!(
+            (sim.now().as_nanos(), restarts(&sim)),
+            (0, 0),
+            "with no refusal there is no wait and no restart"
+        );
+
+        let first = refused_until(&sim, 30_000_000_000);
+        // The text names its instant to the millisecond.
+        let wait = clock_reopens_after(&first).unwrap().as_nanos() - sim.clock().wall().as_nanos()
+            + 1_000_000_000;
+        assert!((30_000_000_000..=31_000_000_000).contains(&wait), "{wait}");
+        let mut boots = 0;
+        let booted = wait_out_clock_refusal(&sim, || {
+            boots += 1;
+            if boots == 1 {
+                Err(first.clone())
+            } else {
+                Ok(Some(boots))
+            }
+        });
+        assert_eq!(booted, Ok(Some(2)), "boots again after the wait");
+        assert_eq!(
+            (sim.now().as_nanos(), restarts(&sim)),
+            (wait, 1),
+            "one wait sleeps one second past the instant the refusal names, then restarts the \
+             process once"
+        );
+        assert_eq!(sim.gave_up(), None);
+
+        let mut boots = 0;
+        let booted = wait_out_clock_refusal(&sim, || -> Result<Option<u32>, String> {
+            boots += 1;
+            Err(refused_until(&sim, 5_000_000_000))
+        });
+        assert_eq!(
+            (booted, boots, restarts(&sim)),
+            (Ok(None), 3, 3),
+            "three refusals: two waits, each with its restart, and no third"
+        );
+        assert_eq!(sim.gave_up(), Some("the tail was refused after two waits"));
+        assert!(
+            sim.gave_up_detail()
+                .is_some_and(|d| d.starts_with("refusing to open: ")),
+            "the detail is the last refusal: {:?}",
+            sim.gave_up_detail()
+        );
+
+        let stall = "clock stalled: this node's wall clock has not advanced past \
+                     2026-01-01T00:01:40.000Z, the latest time it already used, for 61s of \
+                     elapsed time — more than the 60s charpente tolerates (CLOCK_TOLERANCE). The \
+                     node stopped rather than hold sessions open and schedules still. Fix the \
+                     system clock (check NTP) and restart.";
+        let quiet = Sim::with_faults(0xC10C_F006, FaultConfig::none());
+        for (sim, text) in [
+            (&sim, stall.to_string()),
+            (
+                &sim,
+                "simulated disk write error (injected fault)".to_string(),
+            ),
+            (&quiet, refused_until(&quiet, 5_000_000_000)),
+        ] {
+            let (now, before) = (sim.now(), restarts(sim));
+            let mut boots = 0;
+            let out = wait_out_clock_refusal(sim, || -> Result<Option<()>, String> {
+                boots += 1;
+                Err(text.clone())
+            });
+            assert_eq!(out, Err(text.clone()), "comes back unchanged");
+            assert_eq!(
+                (boots, sim.now(), restarts(sim)),
+                (1, now, before),
+                "no wait and no restart: {text}"
+            );
+        }
+        assert!(quiet.gave_up().is_none());
+        let mut ended = false;
+        let out = wait_out_clock_refusal(&quiet, || -> Result<Option<()>, String> {
+            assert!(!ended, "boot is not called again after it gave up");
+            ended = true;
+            Ok(None)
+        });
+        assert_eq!(
+            out,
+            Ok(None),
+            "the caller's own give-up is returned as it is"
+        );
+    }
+
     // ------------------------------------------- durable_corruption_fired
 
     #[test]
@@ -1035,9 +1196,10 @@ mod tests {
             Some("acked-implies-durable: no round acked anything, so there was no claim to check")
         );
         assert_eq!(
-            sim.gave_up_detail(),
-            None,
-            "the round count is constant text, so it is no detail"
+            sim.gave_up_detail().as_deref(),
+            Some("3 rounds"),
+            "the round count is the caller's runtime value, so it is the detail, never part of \
+             the fixed reason"
         );
     }
 

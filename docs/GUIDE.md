@@ -3000,8 +3000,16 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 
 Three compiled examples ship in the `charpente` crate, each a small batch
 that prints the report "Reading a batch" describes and exits with its code.
-Each is a whole `tests/sim.rs`: `sim_tests!` supplies `main`. Run one with
-`cargo run -p charpente --example <name>`:
+Each is a whole `tests/sim.rs`: `sim_tests!` supplies `main`, and the file
+declares its own tables, routes and jobs.
+
+- **In your app**, copy one to `tests/sim.rs` and run `charpente test --sim`.
+  It needs only the manifest `charpente new` writes.
+- **In a charpente checkout**, run `cargo run -p charpente --example <name>`.
+  Cargo refuses `-p charpente` anywhere else. The batch's last line names
+  `charpente test --sim --master-seed 0x…`; for an example, pass the same flags
+  after `--` instead: `cargo run -p charpente --example <name> -- --master-seed
+  0x…` reruns that batch byte for byte.
 
 | Example | File | It shows |
 |---|---|---|
@@ -3297,8 +3305,9 @@ names as virtual time passes. `clock_reopens_after(text)` (below) reads that
 instant. Sleep a little past it (`sim.clock().sleep(…)`), restart the process (a
 refused node exits, and its supervisor starts it again), and boot again. One
 wait is enough, since nothing moves the clock or the recorded time in between.
-Bound the loop anyway, and give the run up by name once the bound is spent. The
-worked example in "Calling the outside world in a sim" does this.
+Bound the loop anyway, and give the run up by name once the bound is spent.
+`wait_out_clock_refusal(sim, boot)` (below) is that loop, and the worked
+example in "Calling the outside world in a sim" uses it.
 
 ### Restarting the process, not the machine
 
@@ -3421,9 +3430,9 @@ retry to the reading it was decided at.
 
 ### The checkers
 
-`charpente_sim::checks` ships eleven reusable oracles and two idioms, one for a
-boot and one for a tail's wait — reach
-for these before hand-rolling the same logic a fourth time:
+`charpente_sim::checks` ships fifteen functions: twelve reusable oracles, and
+three idioms, one for a boot and two for a tail that waits out a clock
+refusal. Reach for these before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
   is this the harness's own injected fault (or its consequences) rather
@@ -3478,6 +3487,17 @@ for these before hand-rolling the same logic a fourth time:
   stop names no instant, so it is `None`: its clock stopped advancing, and no
   wait fixes that. A quiesced clock still advances, so a tail's kernel never
   stalls, and one that does is reported rather than waited out.
+- `wait_out_clock_refusal(sim: &Sim, boot: impl FnMut() -> Result<Option<T>, String>) -> Result<Option<T>, String>`
+  — that wait, as a loop. It calls `boot` (your boot and kernel, returning
+  `Ok(Some(_))` once booted, `Ok(None)` when it gave the run up, and the error's
+  text otherwise) and returns what it returns, unless the error is a clock stop
+  or refusal that `clock_fallout` excuses and that names an instant. Then it
+  sleeps one second past that instant, restarts the process, and calls `boot`
+  again, twice at most: a third refusal gives the run up as `the tail was
+  refused after two waits`, with the refusal as its detail. Any other error,
+  the stall stop included, comes back unchanged. Call it after
+  `sim.quiesce_clock_faults()`; the worked example in "Calling the outside
+  world in a sim" uses it, and so do the three examples.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
@@ -3497,7 +3517,8 @@ for these before hand-rolling the same logic a fourth time:
   its own faults with `is_fault_fallout`, same as above), the sim restarts,
   and `verify` checks every id acked *so far* survived. A failure names the
   round it broke on. A run where no round acked anything gives the run
-  up by name, since no `verify` could have failed. **Pass it your own `sim`, not `sim.seed()`** — it restarts
+  up by name, with the round count as its detail, since no `verify` could
+  have failed. **Pass it your own `sim`, not `sim.seed()`** — it restarts
   the world you give it, so `require: ["restart"]` over it fires, the excuse
   helpers below read the same world your workload ran in, and your run's
   fault config actually applies. Until 2026-09-05 it took a seed and built its
@@ -3591,9 +3612,21 @@ for these before hand-rolling the same logic a fourth time:
 
 ```rust,ignore
 pub fn classify(text: &str) -> FaultReason   // Injected | Poisoned | RedbLatch
-                                             // | DurableHorizon | Unrelated
+                                             // | DurableHorizon | ClockRefused
+                                             // | Unrelated
 
 pub fn is_fault_fallout(text: &str) -> bool
+
+pub fn clock_refused(text: &str) -> bool
+
+pub fn clock_fallout(sim: &Sim, text: &str) -> bool
+
+pub fn clock_reopens_after(text: &str) -> Option<WallTime>
+
+pub fn wait_out_clock_refusal<T>(
+    sim: &Sim,
+    boot: impl FnMut() -> Result<Option<T>, String>,
+) -> Result<Option<T>, String>
 
 pub fn durable_corruption_fired(sim: &Sim) -> bool
 
@@ -4132,7 +4165,6 @@ calls the three outbound checkers:
 
 ```rust
 use charpente::core::job::JobRow;
-use charpente::core::io::Clock as _;
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::{JobError, Kernel, SimSource};
@@ -4141,8 +4173,8 @@ use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, calls_have_durable_jobs, clock_fallout, clock_reopens_after,
-    durable_corruption_fired, is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon,
+    boot_through_fallout, calls_have_durable_jobs, clock_fallout, durable_corruption_fired,
+    is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon, wait_out_clock_refusal,
 };
 use charpente_sim::outbound::{Idempotent, Recorder};
 use serde::{Deserialize, Serialize};
@@ -4261,39 +4293,30 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
     sim.quiesce_disk_faults();
     sim.quiesce_outbound_faults();
     sim.quiesce_clock_faults();
-    let mut waits = 0;
-    let mut kernel = loop {
+    // An earlier step back can leave the clock behind the time the store
+    // recorded, so the open is refused. The clock's offset is frozen now, and
+    // `wait_out_clock_refusal` waits past the instant the refusal names,
+    // restarts the process and boots again.
+    let Some(mut kernel) = wait_out_clock_refusal(sim, || {
         let Some(app) = boot_through_fallout(sim, 8, fallout, || build_app(sim))
             .map_err(|e| e.to_string())?
         else {
             // A durable refusal gives the run up by name; with disk
             // faults off, nothing else should stop a boot.
             return match sim.gave_up() {
-                Some(_) => Ok(()),
+                Some(_) => Ok(None),
                 None => Err("the fault-free tail could not boot".to_string()),
             };
         };
         let outbound = sim
             .outbound(&app.outbound_hosts())
             .map_err(|e| e.to_string())?;
-        let e = match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
-            Ok(kernel) => break kernel,
-            Err(e) => e.to_string(),
-        };
-        // An earlier step back left the clock behind the time the store
-        // recorded, so the open is refused. The clock's offset is frozen
-        // now: wait past the instant the refusal names, then restart.
-        let Some(at) = clock_reopens_after(&e).filter(|_| clock_fallout(sim, &e)) else {
-            return Err(e);
-        };
-        if waits == 2 {
-            sim.give_up("the tail was refused after two waits", e);
-            return Ok(());
-        }
-        waits += 1;
-        let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + SEC;
-        sim.clock().sleep(std::time::Duration::from_nanos(wait));
-        sim.restart_process();
+        Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))
+            .map(Some)
+            .map_err(|e| e.to_string())
+    })?
+    else {
+        return Ok(());
     };
     // Past every backoff and deadline, with room to spare.
     let horizon = sim.now().as_nanos() + 600 * SEC;
@@ -6537,12 +6560,14 @@ subscribe is just a `GET` request whose kernel response is an upgrade instead of
 one-shot reply, recorded as a `SimSinkHandle`:
 
 ```rust
+use charpente::core::event::EventRow;
 use charpente::event;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::wire::WireU64;
-use charpente::{Schema, Tx, Wire, route, routes};
+use charpente::{Schema, Tx, View, Wire, route, routes};
 use charpente_sim::Sim;
+use charpente_sim::checks::{clock_fallout, is_fault_fallout};
 use serde::{Deserialize, Serialize};
 
 const SEC: u64 = 1_000_000_000;
@@ -6584,9 +6609,21 @@ fn build_app(sim: &Sim) -> std::io::Result<App> {
 
 /// A client that always resumes with its last-received id.seq sees no gap and
 /// no duplicate across a disconnect+reconnect — the property this whole
-/// design exists to prove (DESIGN §6, PLAN M1's exit criterion).
+/// design exists to prove (DESIGN §6, PLAN M1's exit criterion). Fault
+/// fallout, a clock stop included, ends the run with nothing judged, so it
+/// gives up, with the filter §8's whole-app workload uses. A faulted POST can
+/// answer 500 without emitting, so the claim is judged against the durable
+/// event log, never against a hand-counted list of ids.
 fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
-    let app = build_app(sim).map_err(|e| e.to_string())?;
+    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
+    let app = match build_app(sim) {
+        Ok(app) => app,
+        Err(e) if fallout(&e.to_string()) => {
+            sim.give_up("the app never booted", e);
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
     source.push_at(0, Request::new(Method::Get, "/feed"));
     for n in 0..3u64 {
@@ -6596,34 +6633,78 @@ fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
         );
     }
     let sinks = source.sinks();
-    let mut kernel = Kernel::new(app, Box::new(sim.clock())).map_err(|e| e.to_string())?;
-    kernel.run(&mut source).map_err(|e| e.to_string())?;
+    let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+        Ok(kernel) => kernel,
+        Err(e) if fallout(&e.to_string()) => {
+            sim.give_up("Kernel::new hit fault fallout", e);
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    match kernel.run(&mut source) {
+        Err(e) if fallout(&e.to_string()) => {
+            sim.give_up("the first connection's run hit fault fallout", e);
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+        Ok(()) => {}
+    }
 
     // Resume from the second frame the connection actually saw — never from
     // a hand-computed id; the client only ever knows what it received.
-    let resume_cursor = {
+    let cursor = {
         let handles = sinks.lock().map_err(|_| "sinks lock poisoned".to_string())?;
-        let frames = handles[0].frames();
-        Cursor {
-            id: frames[1].id,
-            seq: frames[1].seq,
+        match handles.first().map(|h| h.frames()) {
+            Some(frames) if frames.len() >= 2 => Cursor {
+                id: frames[1].id,
+                seq: frames[1].seq,
+            },
+            _ => {
+                sim.give_up("the first connection saw fewer than two frames", "");
+                return Ok(());
+            }
         }
-        .wire()
     };
     source.push_at(
         4 * SEC,
-        Request::new(Method::Get, format!("/feed?cursor={resume_cursor}")),
+        Request::new(Method::Get, format!("/feed?cursor={}", cursor.wire())),
     );
     source.push_at(
         5 * SEC,
         Request::new(Method::Post, "/ping").json(&PingBody { n: WireU64(3) }),
     );
-    kernel.run(&mut source).map_err(|e| e.to_string())?;
+    match kernel.run(&mut source) {
+        Err(e) if fallout(&e.to_string()) => {
+            sim.give_up("the resumed connection's run hit fault fallout", e);
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+        Ok(()) => {}
+    }
 
     let handles = sinks.lock().map_err(|_| "sinks lock poisoned".to_string())?;
-    let resumed: Vec<u64> = handles[1].frames().iter().map(|f| f.id).collect();
-    if resumed != vec![2, 3] {
-        return Err(format!("expected [2, 3], got {resumed:?} — gap or duplicate"));
+    let Some(resumed) = handles.get(1) else {
+        sim.give_up("the resumed subscribe never upgraded", "");
+        return Ok(());
+    };
+    let got: Vec<u64> = resumed.frames().iter().map(|f| f.id).collect();
+    // Every event the log holds after the cursor, in order, exactly once.
+    let logged: Vec<EventRow> = match kernel.app().db().snapshot().and_then(|snap| {
+        snap.scan_from(cursor.id + 1, 64)
+    }) {
+        Ok(rows) => rows,
+        Err(e) if fallout(&e.to_string()) => {
+            sim.give_up("reading the event log hit fault fallout", e);
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let want: Vec<u64> = logged.iter().map(|row| row.id.raw()).collect();
+    if got != want {
+        return Err(format!(
+            "the resumed connection received {got:?}, but the log holds {want:?} after the \
+             cursor — a gap or a duplicate"
+        ));
     }
     Ok(())
 }

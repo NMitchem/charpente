@@ -3,9 +3,11 @@
 //! busy, and it dedupes by idempotency key as a real one does) replays with
 //! the seed.
 //!
-//! Run it: `cargo run -p charpente --example modelled_remote`
+//! Run it in your app: copy this file to `tests/sim.rs` and run
+//! `charpente test --sim`. In a charpente checkout: `cargo run -p charpente
+//! --example modelled_remote`, with any flag after `--` (`-- --master-seed 0x…`).
 //!
-//! A drawn 4 to 8 orders are placed under the run's faults, the process is
+//! A drawn 48 to 96 orders are placed under the run's faults, the process is
 //! power-cycled, and a fault-free tail lets every charge settle. The claim:
 //! the gateway applies no order twice, and an order is paid exactly when its
 //! job is Done. Delete the idempotency key from `charge`'s call and
@@ -15,9 +17,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use charpente::core::io::{Clock as _, OutboundCall, OutboundReply};
+use charpente::core::io::{OutboundCall, OutboundReply};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::Codec as _;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
@@ -26,8 +27,8 @@ use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, Schema, Tx, View, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, calls_have_durable_jobs, clock_fallout, clock_reopens_after,
-    durable_corruption_fired, is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon,
+    boot_through_fallout, calls_have_durable_jobs, clock_fallout, durable_corruption_fired,
+    is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon, wait_out_clock_refusal,
 };
 use charpente_sim::outbound::Remote;
 use charpente_sim::rng::Rng;
@@ -135,7 +136,11 @@ impl Remote for Gateway {
 
 // `fault:outbound_lost_reply` is what makes "once" a claim: a lost reply is
 // the only way a charge is sent twice. The gateway's own 503s retry without
-// it, so a batch that never lost a reply would pass a double charge.
+// it, so a batch that never lost a reply would pass a double charge. The
+// axis is on in a quarter of runs, at a rate under 3% a call, so the order
+// count is what makes it fire: with 48 to 96 orders a reply is lost in about
+// one run in seventeen, and a 256-run batch misses it about once in five
+// million batches. With 4 to 8 orders it missed 15 batches in 1000.
 charpente_sim::sim_tests! {
     each_order_is_charged_once require ["fault:outbound_lost_reply", "outbound:checked"],
 }
@@ -169,7 +174,7 @@ fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String
 }
 
 fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
-    let orders = sim.input().between("orders", 4, 8);
+    let orders = sim.input().between("orders", 48, 96);
     let calm = Arc::new(AtomicBool::new(false));
     sim.remote(
         "pay.example",
@@ -180,14 +185,14 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         },
     );
 
-    // The faulted phase: post the orders, run past the first retries, and
-    // power-cycle with a charge possibly in flight.
+    // The faulted phase: post the orders 20 ms apart, run past the first
+    // retries, and power-cycle with a charge possibly in flight.
     if let Some(app) = boot(sim)? {
         let start = sim.now().as_nanos();
         let mut source = SimSource::new(Box::new(sim.clock()), start + 3 * SEC);
         for id in 1..=orders {
             source.push_at(
-                start + id * SEC / 20,
+                start + id * SEC / 50,
                 Request::new(Method::Post, format!("/orders/{id}")),
             );
         }
@@ -201,36 +206,27 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
     sim.quiesce_disk_faults();
     sim.quiesce_outbound_faults();
     sim.quiesce_clock_faults();
-    let mut waits = 0;
-    let mut app = loop {
+    // An earlier step back can leave the clock behind the time the store
+    // recorded: `wait_out_clock_refusal` waits past the instant the refusal
+    // names, restarts the process and boots again.
+    let Some(mut app) = wait_out_clock_refusal(sim, || {
         let Some(app) = boot(sim)? else {
-            if sim.gave_up().is_none() {
-                return Err("the fault-free tail could not boot".to_string());
-            }
-            return Ok(());
+            return match sim.gave_up() {
+                Some(_) => Ok(None),
+                None => Err("the fault-free tail could not boot".to_string()),
+            };
         };
         let horizon = sim.now().as_nanos() + 600 * SEC;
-        let refusal = match run(
+        run(
             sim,
             app,
             &mut SimSource::new(Box::new(sim.clock()), horizon),
-        )? {
-            Ok(app) => break app,
-            Err(text) => text,
-        };
-        // An earlier step back left the clock behind the time the store
-        // recorded: wait past the instant the refusal names, then restart.
-        let Some(at) = clock_reopens_after(&refusal) else {
-            return Err(format!("the fault-free tail's kernel stopped: {refusal}"));
-        };
-        if waits == 2 {
-            sim.give_up("the tail was refused after two waits", refusal);
-            return Ok(());
-        }
-        waits += 1;
-        let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + SEC;
-        sim.clock().sleep(Duration::from_nanos(wait));
-        sim.restart_process();
+        )?
+        .map(Some)
+        .map_err(|stop| format!("the fault-free tail's kernel stopped: {stop}"))
+    })?
+    else {
+        return Ok(());
     };
 
     let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;

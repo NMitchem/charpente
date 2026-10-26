@@ -2,7 +2,9 @@
 //! across a power cycle, and the check judges the recovery in a fault-free
 //! tail.
 //!
-//! Run it: `cargo run -p charpente --example restart_under_faults`
+//! Run it in your app: copy this file to `tests/sim.rs` and run
+//! `charpente test --sim`. In a charpente checkout: `cargo run -p charpente
+//! --example restart_under_faults`, with any flag after `--` (`-- --master-seed 0x…`).
 //!
 //! The faulted phase posts entries through the production kernel loop while
 //! the simulated disk and clock misbehave. A fault ends that phase, not the
@@ -12,14 +14,13 @@
 //! `tx.put` in `add_entry` and run again to watch it go red with a seed
 //! (GUIDE §8, "A fault-free tail for an end-of-run check").
 
-use charpente::core::io::Clock as _;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, Schema, Tx, View, Wire, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, clock_fallout, clock_reopens_after, durable_corruption_fired,
-    is_fault_fallout,
+    boot_through_fallout, clock_fallout, durable_corruption_fired, is_fault_fallout,
+    wait_out_clock_refusal,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,14 +67,13 @@ fn open_app(sim: &Sim, fallout: impl Fn(&str) -> bool) -> Result<Option<App>, St
 
 /// Boots the recovered app in the fault-free tail. It waits out only a clock
 /// refusal, the one stop a frozen clock cures: an earlier step back left the
-/// clock behind the time the store recorded, so wait past the instant the
-/// refusal names and restart the process.
+/// clock behind the time the store recorded, so `wait_out_clock_refusal`
+/// waits past the instant the refusal names and restarts the process.
 fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
     sim.quiesce_disk_faults();
     sim.quiesce_clock_faults();
     let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    let mut waits = 0;
-    loop {
+    wait_out_clock_refusal(sim, || {
         let Some(app) = open_app(sim, fallout)? else {
             // Only a durable refusal gives the run up here; with disk faults
             // off, nothing else should stop a boot.
@@ -82,23 +82,10 @@ fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
                 None => Err("the fault-free tail could not boot".to_string()),
             };
         };
-        let refusal = match Kernel::new(app, Box::new(sim.clock())) {
-            Ok(kernel) => return Ok(Some(kernel)),
-            Err(e) => e.to_string(),
-        };
-        let Some(at) = clock_reopens_after(&refusal).filter(|_| clock_fallout(sim, &refusal))
-        else {
-            return Err(refusal);
-        };
-        if waits == 2 {
-            sim.give_up("the tail was refused after two waits", refusal);
-            return Ok(None);
-        }
-        waits += 1;
-        let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + SEC;
-        sim.clock().sleep(std::time::Duration::from_nanos(wait));
-        sim.restart_process();
-    }
+        Kernel::new(app, Box::new(sim.clock()))
+            .map(Some)
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// An acked entry is durable: after a crash every acked row is still there,

@@ -1,7 +1,9 @@
 //! Drawn inputs: a property that holds for ANY bids, checked on bids the
 //! simulator draws, and shrunk to the fewest and simplest when it fails.
 //!
-//! Run it: `cargo run -p charpente --example drawn_inputs`
+//! Run it in your app: copy this file to `tests/sim.rs` and run
+//! `charpente test --sim`. In a charpente checkout: `cargo run -p charpente
+//! --example drawn_inputs`, with any flag after `--` (`-- --master-seed 0x…`).
 //!
 //! The app keeps the highest bid per lab, and the check posts 2 to 6 drawn
 //! bids, in a drawn order, through the production kernel loop. Hand-written
@@ -22,14 +24,13 @@
 //! `main`, which parses `--runs`, `--seed` and the rest, runs the batch and
 //! exits with its code.
 
-use charpente::core::io::Clock as _;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, Schema, Tx, View, Wire, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, clock_fallout, clock_reopens_after, durable_corruption_fired,
-    is_fault_fallout,
+    boot_through_fallout, clock_fallout, durable_corruption_fired, is_fault_fallout,
+    wait_out_clock_refusal,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,8 +69,7 @@ charpente_sim::sim_tests! {
     the_highest_acked_bid_stands require ["restart", "sometimes:judged_a_lab"],
 }
 
-const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
-const MS: u64 = 1_000_000;
+const MS: u64 = 1_000_000; // SimSource timestamps are virtual nanoseconds
 
 fn open_app(sim: &Sim, fallout: impl Fn(&str) -> bool) -> Result<Option<App>, String> {
     let open = || {
@@ -87,13 +87,13 @@ fn open_app(sim: &Sim, fallout: impl Fn(&str) -> bool) -> Result<Option<App>, St
 /// The fault-free tail: the faults that cost a bid its ack are over, so the
 /// recovery is judged whole. It waits out only a clock refusal, the one stop
 /// a frozen clock cures: an earlier step back left the clock behind the time
-/// the store recorded, so wait past the instant the refusal names and restart.
+/// the store recorded, so `wait_out_clock_refusal` waits past the instant the
+/// refusal names and restarts.
 fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
     sim.quiesce_disk_faults();
     sim.quiesce_clock_faults();
     let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    let mut waits = 0;
-    loop {
+    wait_out_clock_refusal(sim, || {
         let Some(app) = open_app(sim, fallout)? else {
             // Only a durable refusal gives the run up here.
             return match sim.gave_up() {
@@ -101,23 +101,10 @@ fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
                 None => Err("the fault-free tail could not boot".to_string()),
             };
         };
-        let refusal = match Kernel::new(app, Box::new(sim.clock())) {
-            Ok(kernel) => return Ok(Some(kernel)),
-            Err(e) => e.to_string(),
-        };
-        let Some(at) = clock_reopens_after(&refusal).filter(|_| clock_fallout(sim, &refusal))
-        else {
-            return Err(refusal);
-        };
-        if waits == 2 {
-            sim.give_up("the tail was refused after two waits", refusal);
-            return Ok(None);
-        }
-        waits += 1;
-        let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + SEC;
-        sim.clock().sleep(std::time::Duration::from_nanos(wait));
-        sim.restart_process();
-    }
+        Kernel::new(app, Box::new(sim.clock()))
+            .map(Some)
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// The highest bid per lab stands, whatever order the bids arrive in, and
@@ -127,7 +114,10 @@ fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
 /// - the memo a lab holds is one that was sent for that lab.
 ///
 /// A bid with no ack may or may not have landed before the fault, and the
-/// tail re-sends it, so the claims bound the row rather than pin it.
+/// tail re-sends it, so the claims bound the row rather than pin it. The
+/// re-send is optional: without it the tail judges only the bids the faulted
+/// phase acked. It weakens the durability claim only for a lab whose re-sent
+/// bid outranks a lost ack, since that lab holds the higher amount either way.
 fn the_highest_acked_bid_stands(sim: &mut Sim) -> Result<(), String> {
     // Every draw is named and recorded: a failure lists them on its
     // `inputs:` line, shrunk, and `--inputs` replays them.
@@ -182,12 +172,14 @@ fn the_highest_acked_bid_stands(sim: &mut Sim) -> Result<(), String> {
     };
     // A client re-sends the bids it never saw acked. The fault-free tail acks
     // them, so every run judges a merge that saw its bids, in a drawn order,
-    // across a power cycle.
-    let mut retry = SimSource::new(Box::new(sim.clock()), 100 * MS);
+    // across a power cycle. A source built mid-run adds `sim.now()`: the
+    // tail's wait can already have passed any absolute time.
+    let start = sim.now().as_nanos();
+    let mut retry = SimSource::new(Box::new(sim.clock()), start + 100 * MS);
     let unacked: Vec<usize> = (0..bids.len()).filter(|i| statuses[*i] != 200).collect();
     for (at, i) in unacked.iter().enumerate() {
         retry.push_at(
-            at as u64 * MS,
+            start + at as u64 * MS,
             Request::new(Method::Post, "/bids").json(&bids[*i]),
         );
     }
