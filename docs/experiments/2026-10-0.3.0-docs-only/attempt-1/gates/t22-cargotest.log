@@ -1,0 +1,127 @@
+   Compiling cfg-if v1.0.4
+   Compiling zeroize v1.9.0
+   Compiling const-oid v0.9.6
+   Compiling pin-project-lite v0.2.17
+   Compiling libc v0.2.186
+   Compiling typenum v1.20.1
+   Compiling itoa v1.0.18
+   Compiling base64ct v1.8.3
+   Compiling bytes v1.12.0
+   Compiling futures-core v0.3.32
+   Compiling once_cell v1.21.4
+   Compiling libm v0.2.16
+   Compiling zerocopy v0.8.54
+   Compiling smallvec v1.15.2
+   Compiling rustls-pki-types v1.15.1
+   Compiling untrusted v0.9.0
+   Compiling serde_core v1.0.228
+   Compiling try-lock v0.2.5
+   Compiling subtle v2.6.1
+   Compiling httparse v1.10.1
+   Compiling want v0.3.1
+   Compiling tracing-core v0.1.36
+   Compiling pem-rfc7468 v0.7.0
+   Compiling futures-channel v0.3.32
+   Compiling spin v0.9.9
+   Compiling http v1.4.2
+   Compiling der v0.7.10
+   Compiling getrandom v0.2.17
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling generic-array v0.14.7
+   Compiling rand_core v0.6.4
+   Compiling ring v0.17.14
+   Compiling futures-task v0.3.33
+   Compiling num-traits v0.2.19
+   Compiling httpdate v1.0.3
+   Compiling tokio v1.52.3
+   Compiling atomic-waker v1.1.2
+   Compiling futures-util v0.3.32
+   Compiling http-body v1.0.1
+   Compiling tracing v0.1.44
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling redb v4.3.0
+   Compiling lazy_static v1.5.0
+   Compiling tower-service v0.3.3
+   Compiling spki v0.7.3
+   Compiling num-integer v0.1.46
+   Compiling signature v2.2.0
+   Compiling zmij v1.0.21
+   Compiling cpufeatures v0.2.17
+   Compiling pkcs8 v0.10.2
+   Compiling memchr v2.8.2
+   Compiling sha2 v0.10.9
+   Compiling num-iter v0.1.46
+   Compiling pkcs1 v0.7.5
+   Compiling http-body-util v0.1.3
+   Compiling webpki-roots v1.0.9
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling rustls-webpki v0.103.15
+   Compiling rustls v0.23.46
+   Compiling ppv-lite86 v0.2.21
+   Compiling hyper v1.10.1
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.7
+   Compiling num-bigint-dig v0.8.6
+   Compiling charpente-core v0.3.0
+   Compiling hyper-util v0.1.20
+   Compiling rsa v0.9.10
+   Compiling charpente-sim v0.3.0
+   Compiling tokio-rustls v0.26.6
+   Compiling hyper-rustls v0.27.10
+   Compiling charpente v0.3.0
+   Compiling pricewatch v0.1.0 (/private/tmp/claude-501/-Users-noahmitchem-Documents-GitHub-charpente/42232499-9150-442e-bdc3-4e542cd35548/scratchpad/t22gate/pricewatch)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.71s
+     Running unittests src/lib.rs (target/debug/deps/pricewatch-144f91b6a7c72295)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/pricewatch-90c3cfaa10297361)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim.rs (target/debug/deps/sim-e6621422d90c2f33)
+running 5 sim checks, 256 runs each, under random injected faults (master seed 0x6756fcbbae116b6a)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  acked_report_survives_restarts
+    48  setup: faults kept a step from its ack in every round
+     8  no report was acked under faults, so durability has nothing to prove
+     1  durable corruption cut an acked setup step, so the tail is not judged
+     1  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+  kept_values_ignore_arrival_order
+    53  setup: faults kept a step from its ack in every round
+     3  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+     1  durable corruption cut an acked setup step, so the tail is not judged
+  a_redelivered_report_counts_once
+    67  setup: faults kept a step from its ack in every round
+     1  durable corruption cut an acked setup step, so the tail is not judged
+     1  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+  a_bad_amount_is_refused_by_name
+    42  setup: faults kept a step from its ack in every round
+     2  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+  only_the_right_credentials_reach_each_route
+    51  setup: faults kept a step from its ack in every round
+     2  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+
+check acked_report_survives_restarts ................ ok  (198 tested over 198 distinct inputs, 58 skipped)
+check kept_values_ignore_arrival_order .............. ok  (199 tested over 198 distinct inputs, 57 skipped)
+check a_redelivered_report_counts_once .............. ok  (187 tested over 184 distinct inputs, 69 skipped)
+check a_bad_amount_is_refused_by_name ............... ok  (212 tested over 212 distinct inputs, 44 skipped)
+check only_the_right_credentials_reach_each_route ... ok  (203 tested over 203 distinct inputs, 53 skipped)
+
+sim result: ok. 5 passed; 0 failed. 999 of 1280 runs tested a check.
+rerun exactly this batch: charpente test --sim --master-seed 0x6756fcbbae116b6a
+   Doc-tests pricewatch
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

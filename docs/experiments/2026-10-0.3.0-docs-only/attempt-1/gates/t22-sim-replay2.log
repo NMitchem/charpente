@@ -1,0 +1,28 @@
+running 5 sim checks, 256 runs each, under random injected faults (master seed 0x2c0cbfefeb3ad9c2)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  acked_report_survives_restarts
+    51  setup: faults kept a step from its ack in every round
+    10  no report was acked under faults, so durability has nothing to prove
+     3  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+  kept_values_ignore_arrival_order
+    50  setup: faults kept a step from its ack in every round
+     2  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+  a_redelivered_report_counts_once
+    45  setup: faults kept a step from its ack in every round
+     4  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+  a_bad_amount_is_refused_by_name
+    41  setup: faults kept a step from its ack in every round
+     1  durable corruption cut an acked setup step, so the tail is not judged
+  only_the_right_credentials_reach_each_route
+    52  setup: faults kept a step from its ack in every round
+     3  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+
+check acked_report_survives_restarts ................ ok  (192 tested over 190 distinct inputs, 64 skipped)
+check kept_values_ignore_arrival_order .............. ok  (204 tested over 204 distinct inputs, 52 skipped)
+check a_redelivered_report_counts_once .............. ok  (207 tested over 207 distinct inputs, 49 skipped)
+check a_bad_amount_is_refused_by_name ............... ok  (214 tested over 214 distinct inputs, 42 skipped)
+check only_the_right_credentials_reach_each_route ... ok  (201 tested over 200 distinct inputs, 55 skipped)
+
+sim result: ok. 5 passed; 0 failed. 1018 of 1280 runs tested a check.
+rerun exactly this batch: charpente test --sim --master-seed 0x2c0cbfefeb3ad9c2

@@ -1,0 +1,43 @@
+commit feb8a8d
+FINDINGS.md: mutants output, hand mutants, final batch; tests/sim.rs: doc comment
+
+
+ FINDINGS.md  | 95 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ tests/sim.rs |  2 +-
+ 2 files changed, 96 insertions(+), 1 deletion(-)
+commit 803f5bb
+src/merge.rs: latest_rank as a plain tuple so cargo-mutants can mutate it; FINDINGS.md: first entries
+
+
+ FINDINGS.md  | 110 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/merge.rs |   9 +++--
+ 2 files changed, 116 insertions(+), 3 deletions(-)
+commit 200c905
+tests/sim.rs: five properties over one faulted scenario; src/lib.rs: operator claim rotates the key
+
+
+ Cargo.lock   |    1 +
+ Cargo.toml   |    1 +
+ src/lib.rs   |   11 +-
+ tests/sim.rs | 1078 +++++++++++++++++++++++++++++++++++++++++++++++-----------
+ 4 files changed, 885 insertions(+), 206 deletions(-)
+commit 28096d7
+src/lib.rs, src/merge.rs, src/main.rs: products, sources, reports and the order-free merge
+
+
+ Cargo.lock   | 926 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib.rs   | 375 +++++++++++++++++++++---
+ src/main.rs  |   5 +
+ src/merge.rs |  62 ++++
+ 4 files changed, 1326 insertions(+), 42 deletions(-)
+commit c07de02
+pricewatch: scaffold from charpente new
+
+
+ .gitignore   |   2 +
+ Cargo.toml   |  20 +++++
+ clippy.toml  |  41 +++++++++
+ src/lib.rs   |  74 ++++++++++++++++
+ src/main.rs  |   3 +
+ tests/sim.rs | 274 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 414 insertions(+)

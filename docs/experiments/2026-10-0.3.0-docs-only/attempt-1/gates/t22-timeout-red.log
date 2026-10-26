@@ -1,0 +1,26 @@
+Found 82 mutants to test
+ok       Unmutated baseline in 9s build + 5s test
+ INFO Auto-set test timeout to 30s
+TIMEOUT  src/lib.rs:130:18: replace += with *= in next_report_id in 1s build + 30s test
+TIMEOUT  src/merge.rs:40:5: replace lowest_rank -> (i64, u64, u64) with (0, 0, 1) in 1s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (1, 0, -1) in 0s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (1, 1, 0) in 1s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (1, 1, 1) in 1s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (1, 1, -1) in 1s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (-1, 0, 0) in 0s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (-1, 0, 1) in 0s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (-1, 0, -1) in 0s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (-1, 1, 0) in 0s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (-1, 1, 1) in 0s build + 30s test
+TIMEOUT  src/merge.rs:47:5: replace latest_rank -> (i128, u64, i64) with (-1, 1, -1) in 0s build + 30s test
+TIMEOUT  src/merge.rs:47:6: delete - in latest_rank in 0s build + 30s test
+TIMEOUT  src/merge.rs:52:5: replace check_amount -> Result<i64, String> with Ok(0) in 0s build + 30s test
+TIMEOUT  src/merge.rs:52:5: replace check_amount -> Result<i64, String> with Ok(1) in 0s build + 30s test
+TIMEOUT  src/merge.rs:52:21: replace > with == in check_amount in 0s build + 30s test
+TIMEOUT  src/merge.rs:52:5: replace check_amount -> Result<i64, String> with Ok(-1) in 0s build + 30s test
+TIMEOUT  src/merge.rs:52:21: replace > with < in check_amount in 0s build + 30s test
+TIMEOUT  src/merge.rs:64:5: replace report_key -> String with String::new() in 1s build + 30s test
+TIMEOUT  src/merge.rs:64:5: replace report_key -> String with "xyzzy".into() in 1s build + 30s test
+82 mutants tested in 7m: 39 caught, 23 unviable, 20 timeouts
+mutants: 82 total — 39 caught, 0 missed, 23 unviable, 20 timed out
+  20 TIMED OUT: unresolved, NOT caught — raise --timeout and rerun before reading this batch as clean.
