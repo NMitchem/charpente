@@ -9820,3 +9820,42 @@ fn a_manifest_without_a_format_is_refused_at_restore_and_adopt() {
         assert!(arc.stopped());
     }
 }
+
+/// The same refusal at the archive's other manifest-decoding site, the
+/// ownership check in front of a swap (`CheckingOwner`): a manifest another
+/// release writes to this prefix while this writer is part-way through a
+/// generation is refused with the same text, and this writer stops without
+/// swapping over it.
+#[test]
+fn a_manifest_from_another_release_mid_run_stops_this_writer_by_name() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+    step_until_idle(&mut arc, &db, &store);
+    let mut foreign = read_manifest(&store).expect("a manifest");
+    assert_eq!(
+        foreign.writer, WRITER,
+        "the fixture did not establish a generation of its own first, so the check in front of \
+         a swap is not what is being tested"
+    );
+    foreign.format = 2;
+    let foreign = foreign.encode();
+    plant(&store, &[(manifest_key(PREFIX), foreign.clone())]);
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT); // work to do, so the check is reached
+
+    let e = step_until_error(&mut arc, &db, &store);
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "this archive was written by another charpente release (manifest format 2, this \
+             release reads {MANIFEST_FORMAT}); charpente does not migrate its own formats \
+             between releases (DECISIONS §15) — archive to a fresh bucket prefix from a node \
+             running this release"
+        )
+    );
+    assert!(arc.stopped(), "the archive did not reach a verdict");
+    assert_eq!(
+        get_object(&store, &manifest_key(PREFIX)).expect("a manifest object"),
+        foreign,
+        "the archive swapped over a manifest another release wrote"
+    );
+}

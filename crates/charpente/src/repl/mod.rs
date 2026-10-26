@@ -958,7 +958,7 @@ impl Repl {
         // more than CLOCK_TOLERANCE behind the latest time this data directory
         // recorded stays a follower (0.3.0 spec §5 B).
         if let Some(floor) = recorded_wall_floor(&db.snapshot()?)?
-            && let Some(refusal) = behind_floor(clock.wall(), floor, "promote")
+            && let Some(refusal) = behind_floor(clock.wall(), floor, "promote", "promote")
         {
             self.reply_ctrl(ctrl_id, &Msg::CtrlErr { message: refusal }, now);
             return Ok(());

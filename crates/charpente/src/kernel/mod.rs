@@ -338,7 +338,7 @@ impl Kernel {
         // not being promoted.
         let mut hold = WallHold::new();
         let floor = recorded_wall_floor(&app.db().snapshot()?)?;
-        let wall = hold.start(&*clock, floor, "open")?;
+        let wall = hold.start(&*clock, floor, "open", "open")?;
         // `cron.upsert` writes the schedule rows — skip it whenever the write
         // gate is shut (its transaction would be refused, and on a follower
         // the rows arrive by replication anyway); `after_repl_step` re-runs it
@@ -1253,10 +1253,12 @@ impl Kernel {
             // opened as a primary was checked at open and has held at or above
             // its floor since, while a follower's floor rose with every record
             // it applied. The hand-off is the primary's point of no return, so
-            // its target stops here by name instead. Read before `upsert`
-            // writes this node's schedules.
+            // its target stops here by name instead. Its role has already
+            // flipped, so the restart that follows opens it: the text says it
+            // will open, as the open check's own refusal then says too. Read
+            // before `upsert` writes this node's schedules.
             let floor = recorded_wall_floor(&self.app.db().snapshot()?)?;
-            let wall = self.hold.start(&*self.clock, floor, "promote")?;
+            let wall = self.hold.start(&*self.clock, floor, "promote", "open")?;
             self.cron.upsert(self.app.db_mut(), wall)?;
             let snap = self.app.db_mut().snapshot()?;
             self.dispatcher.rebuild(&snap)?;

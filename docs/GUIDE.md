@@ -2683,14 +2683,19 @@ tolerance behind that time, and otherwise starts its hold there:
 
 <!-- pinned -->
 ```text
-refusing to <verb>: this node's wall clock reads <wall>, <gap> behind <floor>, the latest time this data directory recorded — more than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if the clock is right, the recorded time came from a clock that ran ahead, and the node will <verb> after <floor minus 60s>.
+refusing to <verb>: this node's wall clock reads <wall>, <gap> behind <floor>, the latest time this data directory recorded — more than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if the clock is right, the recorded time came from a clock that ran ahead, and the node will <then> after <floor minus 60s>.
 ```
 
-`<verb>` is `open` or `promote`. At open the refusal stops the kernel. A refused
-promote answers `CtrlErr` with the text before the durable role flip, so the
-node stays a follower. A switchover's target cannot refuse the hand-off (§10:
-once sent, there is no abort), so the switchover completes and the target's
-kernel stops with `promote` in the text. No flag skips either check.
+`<verb>` is `open` or `promote`, and `<then>` is what the node does once its
+clock reaches the instant the text names. At open the refusal stops the kernel,
+and `<then>` is `open`. A refused promote answers `CtrlErr` with the text before
+the durable role flip, so the node stays a follower, and `<then>` is `promote`:
+promote it again after that instant. A switchover's target cannot refuse the
+hand-off (§10: once sent, there is no abort), so the switchover completes and
+the target's kernel stops with `promote` as `<verb>` and `open` as `<then>`. Its
+role flipped with the hand-off, so the restart that follows opens it as a
+primary: until its clock reaches the same instant, that open refuses with `open`
+in both places. No flag skips either check.
 
 The recorded time is a lower bound, as recent as the last key minted or a
 schedule's last tick or creation (the built-in session sweep ticks daily). A clock behind true time by

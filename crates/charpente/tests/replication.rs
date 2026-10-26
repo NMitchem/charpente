@@ -12036,8 +12036,43 @@ fn a_switchover_onto_a_follower_far_behind_completes_and_the_target_stops_by_nam
          behind 2026-10-22T03:04:05.123Z, the latest time this data directory recorded — more \
          than the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); \
          if the clock is right, the recorded time came from a clock that ran ahead, and the \
-         node will promote after 2026-10-22T03:03:05.123Z."
+         node will open after 2026-10-22T03:03:05.123Z."
     );
+
+    // The target's role flipped with the hand-off, so the operator's restart
+    // opens it as a primary: the same check, at open, naming the same
+    // instant. "Will open after" is what both texts promise, and at that
+    // instant the node opens.
+    let app = f.kernel.take().unwrap().into_app();
+    f.host.restart();
+    drop(app);
+    let err = match clocked_kernel(
+        &sim,
+        &f.host,
+        &f.repl_cfg,
+        primary.saturating_sub(Duration::from_secs(120)),
+    ) {
+        Ok(_) => panic!("the hand-off's target, 120s behind its store, opened on restart"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        "refusing to open: this node's wall clock reads 2026-10-22T03:02:05.123Z, 120s behind \
+         2026-10-22T03:04:05.123Z, the latest time this data directory recorded — more than \
+         the 60s charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if \
+         the clock is right, the recorded time came from a clock that ran ahead, and the node \
+         will open after 2026-10-22T03:03:05.123Z."
+    );
+    f.host.restart();
+    match clocked_kernel(
+        &sim,
+        &f.host,
+        &f.repl_cfg,
+        primary.saturating_sub(Duration::from_secs(60)),
+    ) {
+        Ok(kernel) => assert!(kernel.is_primary(), "it opens as the primary it was handed"),
+        Err(e) => panic!("the hand-off's target was refused at the instant its text named: {e}"),
+    }
 }
 
 /// A primary restarted with a witness opens write-gated, but it is opening,

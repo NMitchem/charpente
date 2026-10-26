@@ -97,19 +97,22 @@ impl WallHold {
 
     /// The check where a node becomes writable (`Kernel::build`'s open, and
     /// `after_repl_step`'s write gate opening): refuses to `verb` when this
-    /// node's wall time is more than `CLOCK_TOLERANCE` behind `floor`, and
-    /// otherwise holds at the floor. Returns the wall time to start from.
+    /// node's wall time is more than `CLOCK_TOLERANCE` behind `floor`, saying
+    /// the node will `then` after the instant the check passes
+    /// ([`behind_floor`]), and otherwise holds at the floor. Returns the wall
+    /// time to start from.
     pub(crate) fn start(
         &mut self,
         clock: &dyn Clock,
         floor: Option<WallTime>,
         verb: &str,
+        then: &str,
     ) -> io::Result<WallTime> {
         let wall = self.read(clock)?;
         let Some(floor) = floor else {
             return Ok(wall);
         };
-        if let Some(refusal) = behind_floor(wall, floor, verb) {
+        if let Some(refusal) = behind_floor(wall, floor, verb, then) {
             return Err(io::Error::other(Refusal(refusal)));
         }
         self.seed(floor, clock.now());
@@ -133,15 +136,24 @@ pub(crate) fn recorded_wall_floor(snap: &Snapshot) -> io::Result<Option<WallTime
 
 /// The refusal to `verb` (`open`, `promote`) when `wall` is more than
 /// `CLOCK_TOLERANCE` behind `floor`, the latest time the data directory
-/// recorded; `None` otherwise.
-pub(crate) fn behind_floor(wall: WallTime, floor: WallTime, verb: &str) -> Option<String> {
+/// recorded; `None` otherwise. `then` is what the node does once its clock
+/// reaches the instant the text names: a refused promote leaves a follower
+/// that can be promoted again, so `promote`; an open, or a hand-off's target
+/// whose role has already flipped, is past only by a restart that opens it,
+/// so `open`.
+pub(crate) fn behind_floor(
+    wall: WallTime,
+    floor: WallTime,
+    verb: &str,
+    then: &str,
+) -> Option<String> {
     (wall < floor.saturating_sub(CLOCK_TOLERANCE)).then(|| {
         format!(
             "refusing to {verb}: this node's wall clock reads {wall}, {:?} behind {floor}, the \
              latest time this data directory recorded — more than the {CLOCK_TOLERANCE:?} \
              charpente tolerates (CLOCK_TOLERANCE). Fix the system clock (check NTP); if the \
              clock is right, the recorded time came from a clock that ran ahead, and the node \
-             will {verb} after {}.",
+             will {then} after {}.",
             floor.saturating_duration_since(wall),
             floor.saturating_sub(CLOCK_TOLERANCE)
         )
@@ -340,11 +352,15 @@ mod tests {
 
     #[test]
     fn only_a_clock_beyond_the_tolerance_is_refused() {
-        assert_eq!(behind_floor(secs(40), secs(100), "open"), None);
-        assert_eq!(behind_floor(secs(100), secs(40), "open"), None);
-        assert!(behind_floor(secs(39), secs(100), "open").is_some());
-        for verb in ["open", "promote"] {
-            let refusal = behind_floor(secs(39), secs(100), verb).unwrap();
+        assert_eq!(behind_floor(secs(40), secs(100), "open", "open"), None);
+        assert_eq!(behind_floor(secs(100), secs(40), "open", "open"), None);
+        assert!(behind_floor(secs(39), secs(100), "open", "open").is_some());
+        for (verb, then) in [
+            ("open", "open"),
+            ("promote", "promote"),
+            ("promote", "open"),
+        ] {
+            let refusal = behind_floor(secs(39), secs(100), verb, then).unwrap();
             assert!(
                 charpente_sim::checks::clock_refused(&refusal),
                 "the sim's app workloads excuse this refusal where a clock fault fired \
