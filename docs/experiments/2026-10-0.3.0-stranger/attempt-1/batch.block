@@ -1,0 +1,8 @@
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: 1 POST(s) were acked with 200 but only 0 Echo job(s) are durable — the enqueue did not commit with the row
+  seed:   0x1caac4a7d88a8c9d
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 0ns), clock_skew: 0, clock_step_back: (0.0, 0ns), clock_downtime: (0.0, 0ns) }
+  fired:  restart: 1
+  inputs: notes=1, order=[1], body="alpha"
+  shrunk: 6 draws to 3, faults off: write_error, sync_error, crash_apply, crash_torn, bit_flip, object_lost_ack, outbound_latency, disk_latency, in 10 replays
+  first:  ack-durability violated: 4 POST(s) were acked with 200 but only 0 Echo job(s) are durable — the enqueue did not commit with the row
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x1caac4a7d88a8c9d --inputs 00 --faults-off write_error,sync_error,crash_apply,crash_torn,bit_flip,object_lost_ack,outbound_latency,disk_latency

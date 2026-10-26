@@ -1,0 +1,31 @@
+=== DONE ===
+running 3 sim checks, 256 runs each, under random injected faults (master seed 0x52a91d2d9766b4d0)
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: 1 POST(s) were acked with 200 but only 0 Echo job(s) are durable — the enqueue did not commit with the row
+  seed:   0x1caac4a7d88a8c9d
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 0ns), clock_skew: 0, clock_step_back: (0.0, 0ns), clock_downtime: (0.0, 0ns) }
+  fired:  restart: 1
+  inputs: notes=1, order=[1], body="alpha"
+  shrunk: 6 draws to 3, faults off: write_error, sync_error, crash_apply, crash_torn, bit_flip, object_lost_ack, outbound_latency, disk_latency, in 10 replays
+  first:  ack-durability violated: 4 POST(s) were acked with 200 but only 0 Echo job(s) are durable — the enqueue did not commit with the row
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0x1caac4a7d88a8c9d --inputs 00 --faults-off write_error,sync_error,crash_apply,crash_torn,bit_flip,object_lost_ack,outbound_latency,disk_latency
+
+check acked_note_survives_a_restart ................. ok  (221 tested over 195 distinct inputs, 35 skipped)
+check acked_post_implies_the_echo_after_recovery .... FAILED  (252 tested over 230 distinct inputs: 206 failed; 4 skipped)
+check acked_post_implies_its_event_after_recovery ... ok  (215 tested over 193 distinct inputs, 41 skipped)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  acked_note_survives_a_restart
+    33  no POST was acked, so durability has nothing to prove
+     2  the app never booted
+  acked_post_implies_the_echo_after_recovery
+    3  the app never booted
+    1  durable corruption fired, so the acked enqueue is excused
+  acked_post_implies_its_event_after_recovery
+    38  no POST was acked, so its event has nothing to prove
+     2  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated
+     1  the app never booted
+
+sim result: FAILED. 2 passed; 1 failed. 688 of 768 runs tested a check.
+rerun exactly this batch: charpente test --sim --master-seed 0x52a91d2d9766b4d0
+
