@@ -174,7 +174,7 @@ cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app (no clipp
 charpente test --sim                        # seeded fault-injection runs
 ```
 
-Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the check `acked_post_implies_the_echo_after_recovery` goes FAILED with the smallest inputs that break it and a command that replays them. That is the whole pitch.
+Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the check `acked_post_implies_the_echo_after_recovery` goes FAILED with the inputs that break it, shrunk to a run no shrinking step can make smaller, and a command that replays them. That is the whole pitch.
 Delete the `tx.emit` line instead and the third goes red: the event commits with the note and the job.
 
 | Doc | What it is |

@@ -3016,15 +3016,16 @@ declares its own tables, routes and jobs.
   after `--` instead: `cargo run -p charpente --example <name> -- --master-seed
   0x…` reruns that batch byte for byte.
 
-| Example | File | It shows |
+| Example | File, in the `charpente` crate | It shows |
 |---|---|---|
-| `drawn_inputs` | `crates/charpente/examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them, and a `require` on a key the check marks when it judged something |
-| `modelled_remote` | `crates/charpente/examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch for the fault-free tail, and the three outbound checkers |
-| `restart_under_faults` | `crates/charpente/examples/restart_under_faults.rs` | `boot_through_fallout`, a restart, a fault-free tail that waits out a clock refusal, and a `require ["restart"]` |
+| `drawn_inputs` | `examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them, and a `require` on a key the check marks when it judged something |
+| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch for the fault-free tail, and the three outbound checkers |
+| `restart_under_faults` | `examples/restart_under_faults.rs` | `boot_through_fallout`, a restart, a fault-free tail that waits out a clock refusal, and a `require ["restart"]` |
 
 In all three a skipped run gives a constant `reason` and puts the run's own
-text in the `detail`. The files are in the registry copy of the crate, and
-this guide is the `charpente::guide` page on docs.rs.
+text in the `detail`. The files are in the registry copy of the crate, under
+`crates/charpente/examples/` in a checkout, and this guide is the
+`charpente::guide` page on docs.rs.
 
 ### Drawing inputs
 
@@ -3409,11 +3410,12 @@ property turns them on in `run_universes_swarm_with!`'s `adjust`, which is
 handed the run's seed with its config (`|seed, cfg| …`), so any value it
 draws comes from a stream keyed by that seed.
 
-`crates/charpente/tests/clock.rs` is the worked example. It runs four platform
-properties with all three axes on (sessions, a one-second schedule, retries, and
-the stops and refusals themselves, on one node and on a follower promoted on its
-own host's clock) and a victim clock that fails two of them by name. It shows
-how to write the bounds.
+`tests/clock.rs` in the `charpente` crate (`crates/charpente/tests/clock.rs` in
+a checkout) is the worked example. It runs four platform properties with all
+three axes on (sessions, a one-second schedule, retries, and the stops and
+refusals themselves, on one node and on a follower promoted on its own host's
+clock) and a victim clock that fails two of them by name. It shows how to write
+the bounds.
 
 Write a bound through each clock's offset, the reading minus `sim.true_wall()`
 at that instant, never through `clock_skew`. A step back within the tolerance
@@ -4367,8 +4369,8 @@ of the last one's `responses()`, until the phase's time is up.
 
 **Why the key matters.** The platform mints the key and keeps it across every
 retry, but only the app puts it in the request, and only the remote can act on
-it. `crates/charpente/tests/outbound.rs` runs a workload like this one as a
-swarm property: six payment jobs against
+it. `tests/outbound.rs` in the `charpente` crate runs a workload like this one
+as a swarm property: six payment jobs against
 `Idempotent::header("idempotency-key", Recorder::new())`, three faulted rounds
 with crashes, then the fault-free tail. Beside the three checkers it asserts
 that the remote applied no charge twice, and that every recorded payment is one
@@ -4447,10 +4449,11 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   the replayed seed fed back as `--master-seed` would run another batch. It is
   followed by `inputs`, the choices `--inputs` gave in that flag's encoding,
   when the replay was given them, and `faults_off`, the axes `--faults-off`
-  turned off in field order, when it was given those. Each of `checks`, in registry order, is `{check, status, passed,
-  failed, skipped, distinct_inputs, drew_inputs, skipped_reasons}`: `status` is
-  `ok`, `FAILED` or `untested` (under `--seed` too, where the human line says
-  `skipped`), and `skipped_reasons` lists every reason, uncapped, as `{reason,
+  turned off in field order, when it was given those. Each of `checks`, in
+  registry order, is `{check, status, passed, failed, skipped, distinct_inputs,
+  drew_inputs, skipped_reasons}`: `status` is `ok`, `FAILED` or `untested`
+  (under `--seed` too, where the human line says `skipped`), and
+  `skipped_reasons` lists every reason, uncapped, as `{reason,
   count}` by count descending then reason, plus `detail` under `--seed`, the one
   run's own text. Each of `failures` lists every failing run, in seed order, as
   `{check, seed, config, fired, message, inputs, faults_off, first_message,
@@ -6313,8 +6316,8 @@ assert_eq!(declared, actual);
 ```
 
 Order counts — the declaration's order is the contract's order — so write `emits(...)`
-in the same order the handler chains `of`/`and`. `crates/charpente/tests/describe.rs`
-and `crates/charpente/tests/realtime.rs` both carry this check; copy one into your own
+in the same order the handler chains `of`/`and`. The `charpente` crate's `tests/describe.rs`
+and `tests/realtime.rs` both carry this check; copy one into your own
 app's tests and every stream route you declare stays honest for free.
 
 **One thing to know before you copy it: the probe really runs your handler**, inside a

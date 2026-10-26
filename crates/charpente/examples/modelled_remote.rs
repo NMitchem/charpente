@@ -208,8 +208,12 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
     sim.quiesce_clock_faults();
     // An earlier step back can leave the clock behind the time the store
     // recorded: `wait_out_clock_refusal` waits past the instant the refusal
-    // names, restarts the process and boots again.
-    let Some(mut app) = wait_out_clock_refusal(sim, || {
+    // names, restarts the process and boots again. A kernel stop is named
+    // after the helper returns, so a refusal it gives the run up on is the
+    // detail as the kernel wrote it.
+    let mut stopped = false;
+    let tail = wait_out_clock_refusal(sim, || {
+        stopped = false;
         let Some(app) = boot(sim)? else {
             return match sim.gave_up() {
                 Some(_) => Ok(None),
@@ -217,13 +221,17 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
             };
         };
         let horizon = sim.now().as_nanos() + 600 * SEC;
-        run(
+        let ran = run(
             sim,
             app,
             &mut SimSource::new(Box::new(sim.clock()), horizon),
-        )?
-        .map(Some)
-        .map_err(|stop| format!("the fault-free tail's kernel stopped: {stop}"))
+        )?;
+        stopped = ran.is_err();
+        ran.map(Some)
+    });
+    let Some(mut app) = tail.map_err(|e| match stopped {
+        true => format!("the fault-free tail's kernel stopped: {e}"),
+        false => e,
     })?
     else {
         return Ok(());

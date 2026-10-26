@@ -3318,9 +3318,11 @@ mod tests {
             "--faults-off needs --seed: it replays one run with those faults off"
         );
         // Empty (an unset shell variable must not replay all zeros), not
-        // hex, odd length, upper case, a truncated number, one past 64 bits
-        // (an eleventh byte, or a tenth carrying more than bit 63: "…ff01" is
-        // u64::MAX), and stray whitespace.
+        // hex, odd length, upper case, a truncated number, one past 64 bits,
+        // and stray whitespace. Past 64 bits is two refusals: a tenth byte
+        // carrying more than bit 63 ("…ff02", and "…ffff01", whose tenth byte
+        // is 0xff, where u64::MAX's "…ff01" has 0x01), and an eleventh byte
+        // after a tenth that carries bit 63 and continues ("…ff8101").
         for bad in [
             "",
             "zz",
@@ -3329,6 +3331,7 @@ mod tests {
             "80",
             "ffffffffffffffffffff01",
             "ffffffffffffffffff02",
+            "ffffffffffffffffff8101",
             " 05",
         ] {
             assert_eq!(

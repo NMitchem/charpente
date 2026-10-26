@@ -2075,8 +2075,9 @@ Charpente treats the coding agent as the primary developer persona:
   `--seed 0x…` replays exactly one run and skips `require` coverage checks (one
   run can't be expected to hit everything a batch would); `--inputs` and
   `--faults-off` replay it with given input choices and fault axes off. Each check's
-  first failure in a batch is shrunk, by replays under a 500-replay budget, to the
-  smallest inputs and fewest fault axes that still fail it, and its repro replays
+  first failure in a batch is shrunk, by replays under a 500-replay budget, to smaller
+  inputs and fewer fault axes that still fail it, until no step of the shrink passes
+  makes the run smaller (a local minimum, GUIDE §8), and its repro replays
   exactly that run. The human report is in `cargo test`'s shape: one shrunk block per
   failing check, then a line per check (`ok`, `FAILED` or `untested`, with how many runs
   tested it, over how many distinct inputs, and how many were skipped), the skipped runs'
