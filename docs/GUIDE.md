@@ -3223,7 +3223,7 @@ these checks draw no inputs, so every run tested the same case — draw them wit
 
 check counter_roundtrip ... ok  (52 tested, 12 skipped)
 
-sim result: ok. 1 passed; 0 failed. 52 of 64 runs tested a check.
+sim result: ok. 1 passed; 0 failed. Runs tested: 52 of 64.
 rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --filter counter_roundtrip
 ```
 
@@ -3244,7 +3244,7 @@ these checks draw no inputs, so every run tested the same case — draw them wit
 check always_passes ..... ok  (6 tested)
 check always_gives_up ... untested  (0 tested, 6 skipped)
 
-sim result: ok. 1 passed; 0 failed; 1 untested. 6 of 12 runs tested a check.
+sim result: ok. 1 passed; 0 failed; 1 untested. Runs tested per check, in the order above: 6, 0 of 6.
 rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6
 ```
 
@@ -4464,9 +4464,9 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   tried and `repro` replays the shrunk run. Every other failure is its own
   unshrunk run: its own drawn `inputs`, `faults_off` `[]`, `replays` 0, no
   `first_message`, and a `repro` that is its seed alone. Seeds are hex strings.
-  The two report different totals: the human result line counts checks, and
-  the JSON's top-level `passed`, `failed` and `skipped` count runs, each the sum
-  of that field over `checks[]`.
+  The two report different totals: the human result line's passed and failed
+  count checks, and the JSON's top-level `passed`, `failed` and `skipped` count
+  runs, each the sum of that field over `checks[]`.
 - `--dir PATH` — the app crate directory to build and run sim tests from
   (default: `.`). This flag is consumed by the CLI itself; every other flag
   passes straight through to the sim binary the CLI builds and execs.
@@ -4523,7 +4523,12 @@ and counts beside the verdict. In order:
   occurred`).
 - **The result**: `sim result: ok`, `FAILED`, or `nothing tested` when no check
   passed and none failed, then how many checks passed, failed and (if any)
-  were untested, and how many of the batch's runs tested a check.
+  were untested, and then how many runs tested each check, in the order of the
+  check lines above it, an untested check as 0:
+  `Runs tested per check, in the order above: 209, 251, 214 of 256.`, or
+  `Runs tested: 251 of 256.` when the batch ran one check. There is no total
+  across checks, because a total lets a check tested in 3 of its runs hide
+  behind two tested in 250 of theirs.
 - **The rerun command**: `rerun exactly this batch: charpente test --sim
   --master-seed 0x…`, with `--runs` when the batch ran another count than 256
   and `--filter` when it had one. Pasted, it prints this report again, byte

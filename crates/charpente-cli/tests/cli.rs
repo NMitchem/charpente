@@ -256,7 +256,7 @@ these checks draw no inputs, so every run tested the same case — draw them wit
 
 check counter_roundtrip ... ok  (52 tested, 12 skipped)
 
-sim result: ok. 1 passed; 0 failed. 52 of 64 runs tested a check.
+sim result: ok. 1 passed; 0 failed. Runs tested: 52 of 64.
 rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --filter counter_roundtrip
 "#
     );

@@ -73,7 +73,7 @@ sim: 1024 universe(s) per test, all green (master seed: 0xd9334e2eda1d4e3c)
 (Transcript preserved as it was printed; `--universes` is now `--runs`. That
 summary line has since been retired: a batch now prints a line per check with
 how many runs tested it and how many, if any, were skipped, then a result line,
-`sim result: ok. N passed; 0 failed. T of R runs tested a check.`, in place of
+`sim result: ok. N passed; 0 failed. Runs tested per check, in the order above: T1, T2, … of R.`, in place of
 "all green", because "green" was equally true of a universe that gave up and one
 that adjudicated. Its last line is the command that reruns it exactly. Since 2026-10-01
 `acked_writes_survive_restart` calls `Sim::give_up` when durable corruption cut

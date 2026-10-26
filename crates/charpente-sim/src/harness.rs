@@ -1524,7 +1524,8 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
         .map(|o| o.test.chars().count())
         .max()
         .unwrap_or(0);
-    let (mut passed, mut failed, mut untested, mut tested_runs) = (0, 0, 0, 0);
+    let (mut passed, mut failed, mut untested) = (0, 0, 0);
+    let mut tested_runs: Vec<String> = Vec::new();
     let _ = writeln!(out);
     for (o, c) in report.outcomes.iter().zip(&batch.checks) {
         let tested = c.passed + c.failed;
@@ -1545,7 +1546,7 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
             .filter(|(test, _)| test == o.test)
             .map(|(_, key)| format!("\"{key}\""))
             .collect();
-        tested_runs += tested;
+        tested_runs.push(tested.to_string());
         // A check that tested nothing is untested, never ok, and a batch whose
         // every check is untested never reads `ok` either: a batch that
         // adjudicated nothing must never read as an unqualified success
@@ -1586,11 +1587,22 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
         0 => String::new(),
         x => format!("; {x} untested"),
     };
+    // Each check's tested runs, never a total across checks: a total lets a
+    // check tested in a few of its runs hide behind checks tested in nearly
+    // all of theirs.
+    assert!(
+        !tested_runs.is_empty(),
+        "a batch selects at least one check"
+    );
+    let label = match tested_runs.len() {
+        1 => "Runs tested",
+        _ => "Runs tested per check, in the order above",
+    };
     let _ = writeln!(
         out,
-        "\nsim result: {word}. {passed} passed; {failed} failed{untested}. {tested_runs} of {} \
-         runs tested a check.",
-        report.outcomes.len() as u64 * report.universes
+        "\nsim result: {word}. {passed} passed; {failed} failed{untested}. {label}: {} of {}.",
+        tested_runs.join(", "),
+        report.universes
     );
     if let Some(rerun) = &batch.rerun {
         let _ = writeln!(out, "rerun exactly this batch: {rerun}");
@@ -2474,8 +2486,8 @@ mod tests {
         );
         assert!(
             text.contains(
-                "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. 0 of 4 runs tested \
-                 a check.\n"
+                "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. Runs tested: 0 of \
+                 4.\n"
             ),
             "{text}"
         );
@@ -2555,9 +2567,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(
-                "\nsim result: FAILED. 0 passed; 1 failed. 2 of 2 runs tested a check.\n"
-            ),
+            text.contains("\nsim result: FAILED. 0 passed; 1 failed. Runs tested: 2 of 2.\n"),
             "{text}"
         );
     }
@@ -2578,7 +2588,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\nsim result: ok. 1 passed; 0 failed. 5 of 5 runs tested a check.\n"),
+            text.contains("\nsim result: ok. 1 passed; 0 failed. Runs tested: 5 of 5.\n"),
             "\"5 of 5\" is the claim being made, not noise: {text}"
         );
     }
@@ -3969,7 +3979,7 @@ mod tests {
              check always_passes ..... ok  (6 tested)\n\
              check always_gives_up ... untested  (0 tested, 6 skipped)\n\
              \n\
-             sim result: ok. 1 passed; 0 failed; 1 untested. 6 of 12 runs tested a check.\n\
+             sim result: ok. 1 passed; 0 failed; 1 untested. Runs tested per check, in the order above: 6, 0 of 6.\n\
              rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6\n"
         );
     }
@@ -4003,7 +4013,7 @@ mod tests {
              check fails_skips_or_passes ... FAILED  ({tested} tested: {} failed; {skipped} skipped)\n\
              check always_gives_up ......... untested  (0 tested, 24 skipped)\n\
              \n\
-             sim result: FAILED. 0 passed; 1 failed; 1 untested. {tested} of 48 runs tested a check.\n\
+             sim result: FAILED. 0 passed; 1 failed; 1 untested. Runs tested per check, in the order above: {tested}, 0 of 24.\n\
              rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 24\n",
             c.failed
         );
@@ -4018,6 +4028,54 @@ mod tests {
             failure < reasons && reasons < out.len() - tail.len(),
             "the failure block, then the skipped runs, then the tail:\n{out}"
         );
+    }
+
+    /// R43: the result line gives each check's tested runs, in the order of
+    /// the check lines above it, an untested check as 0. A total across checks
+    /// would let a check tested in a few of its runs hide behind checks tested
+    /// in nearly all of theirs, so there is none.
+    #[test]
+    fn the_result_line_gives_each_checks_tested_runs_in_the_order_of_the_check_lines() {
+        fn skips_a_quarter(sim: &mut Sim) -> Result<(), String> {
+            if sim.seed().is_multiple_of(4) {
+                sim.give_up("the seed is a multiple of 4", "");
+            }
+            Ok(())
+        }
+        let tests = [
+            sim_test("skips_a_quarter", skips_a_quarter),
+            sim_test("always_passes", always_ok),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let (code, out) = run_to_string(&tests, &["--runs", "64", "--master-seed", "0x1234"]);
+        assert_eq!(code, 0, "{out}");
+        // Worked out from the batch's seeds alone: the first check's tested runs.
+        let quarter = batch_seeds(0x1234, 64)
+            .into_iter()
+            .filter(|seed| !seed.is_multiple_of(4))
+            .count();
+        assert!(0 < quarter && quarter < 64, "non-vacuous: {quarter}");
+        let result = format!(
+            "sim result: ok. 2 passed; 0 failed; 1 untested. Runs tested per check, in the \
+             order above: {quarter}, 64, 0 of 64."
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[lines.len() - 2], result, "{out}");
+        // The list is the check lines' own counts, in their order.
+        let from_check_lines: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("check "))
+            .map(|l| {
+                l.split_once("  (")
+                    .and_then(|(_, counts)| counts.split_once(" tested"))
+                    .unwrap_or_else(|| panic!("{l}"))
+                    .0
+            })
+            .collect();
+        assert_eq!(from_check_lines, [quarter.to_string().as_str(), "64", "0"]);
+        // No total across checks, in the old words or as a number.
+        assert!(!out.contains("runs tested a check"), "{out}");
+        assert!(!out.contains(&format!("{} of 192", quarter + 64)), "{out}");
     }
 
     #[test]
