@@ -1481,7 +1481,10 @@ mod tests {
     /// A `RequestSource` that fails by name after `max` kernel steps (`step` polls
     /// its source once per iteration), so a kernel that never stops (a tick that
     /// never runs, a deadline already past) fails the test instead of spinning it
-    /// forever.
+    /// forever. It also fails by name on a park with no deadline: `ProdSource`
+    /// then waits for a request, the tests using this send none, and a cron
+    /// whose deadline is never named would hang the suite there, never reaching
+    /// the step bound.
     struct Bounded<S> {
         inner: S,
         steps: u32,
@@ -1502,6 +1505,14 @@ mod tests {
         }
 
         fn wait_until(&mut self, deadline: Option<Instant>) -> kernel::Wake {
+            assert!(
+                deadline.is_some(),
+                "the kernel parked with no deadline after {} steps and no request is coming, so \
+                 it would wait forever: it should stop when {}, and nothing named a deadline \
+                 for it",
+                self.steps,
+                self.stops_when
+            );
             self.inner.wait_until(deadline)
         }
     }

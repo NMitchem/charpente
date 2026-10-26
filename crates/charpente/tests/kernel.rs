@@ -3172,6 +3172,291 @@ fn run_due_answers_ok_when_only_the_wal_is_poisoned_after_the_batch_applied() {
     assert_eq!(row.status, JobStatus::Done, "durable in the store");
 }
 
+/// `CountUp` schedules over `disk`, mounted in this order, schedule `i` every
+/// `hours` and enqueuing `CountUp { slot: i + 1 }`, upserted at 0. The upsert
+/// commits before a test arms its one-shot fault, so the fault lands on a
+/// tick's own commit. `fires[i]` counts the enqueues schedule `i`'s ticks
+/// stage, which a tick does whether or not the commit after it lands.
+fn cron_over(
+    sim: &Sim,
+    disk: Box<dyn charpente_core::io::Disk>,
+    cfg: AppConfig,
+    schedules: &[(&'static str, u64)],
+) -> (App, CronScheduler, Vec<Arc<AtomicU64>>) {
+    let mut app = App::open(
+        disk,
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        cfg,
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp]);
+    let mut fires = Vec::new();
+    for (i, &(name, hours)) in schedules.iter().enumerate() {
+        let count = Arc::new(AtomicU64::new(0));
+        fires.push(count.clone());
+        let slot = i as u64 + 1;
+        app = app.schedule(name, Duration::from_secs(3600 * hours), move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            CountUp { slot }
+        });
+    }
+    let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
+    cron.upsert(app.db_for_tests(), wall(0)).unwrap();
+    (app, cron, fires)
+}
+
+/// The `CountUp` slot of every job in the store, in id order: which
+/// schedule enqueued each one.
+fn enqueued_slots(db: &Db) -> Vec<u64> {
+    db.snapshot()
+        .unwrap()
+        .scan::<JobRow>()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            assert_eq!(
+                row.name,
+                CountUp::NAME,
+                "only the CountUp schedules are ever due in these tests"
+            );
+            CountUp::decode(&mut &row.payload[..]).unwrap().slot
+        })
+        .collect()
+}
+
+/// The `next_due` the store holds for schedule `name`.
+fn stored_next_due(db: &Db, name: &str) -> WallTime {
+    let snap = db.snapshot().unwrap();
+    charpente::kernel::CronRow::by_name(&snap, &name.to_string())
+        .unwrap()
+        .pop()
+        .unwrap()
+        .next_due
+}
+
+/// `CronScheduler::tick`, append/sync arm (I-2's ruled policy): a WAL sync
+/// failure in the tick's own commit leaves `applied == 0`, so neither the
+/// schedule's advance nor its enqueue reached the store. The interval is still
+/// owed: `tick` answers `Err`, the ticked schedule re-fires, and after
+/// recovery the interval is enqueued exactly once.
+///
+/// `tick` finds the entry to roll back by name, and an `App` holds several:
+/// the platform's daily session sweep is always entry 0, then `two-hourly`,
+/// then the `hourly-count` that ticks. Nothing but `hourly-count` is due at 1h,
+/// so whichever schedule the next tick fires at 1h names the entry the rollback
+/// restored.
+#[test]
+fn a_tick_the_store_never_saw_re_fires_its_own_schedule_and_is_enqueued_once_after_recovery() {
+    let sim = Sim::with_faults(0x20A3_0001, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let schedules = [("two-hourly", 2), ("hourly-count", 1)];
+    let (mut app, mut cron, fires) = cron_over(
+        &sim,
+        Box::new(OneShotWalFaultDisk {
+            inner: sim.disk(),
+            fault: WalFault::Sync,
+            armed: armed.clone(),
+            fired: fired.clone(),
+        }),
+        crash_config(),
+        &schedules,
+    );
+    let db = app.db_for_tests();
+    armed.store(true, Ordering::SeqCst);
+    let err = cron.tick(db, wall(HOUR)).expect_err(
+        "the schedule's advance never reached the store (applied == 0), so tick must not answer \
+         Ok: a poisoned engine reports the failure, it does not make the record durable",
+    );
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the WAL sync must fail exactly once, on the tick's own commit"
+    );
+    assert!(
+        db.poisoned() && !db.store_failed(),
+        "an append/sync failure poisons the engine and leaves the store alone, or this is not \
+         the arm under test"
+    );
+    assert!(err.to_string().contains("simulated fsync failure"), "{err}");
+    assert_eq!(
+        (enqueued_slots(db), stored_next_due(db, "hourly-count")),
+        (vec![], wall(HOUR)),
+        "nothing durable says the interval ran: no job, and the row still due at 1h"
+    );
+    assert_eq!(
+        cron.next_deadline(),
+        Some(wall(HOUR)),
+        "the interval is owed again, so the ticked entry's cache must roll back to the 1h it was \
+         due at; left advanced, nothing re-fires an interval the store never recorded"
+    );
+    // The re-fire, at the same now. The poisoned engine refuses its commit
+    // too, but the schedule it stages names the entry the rollback restored.
+    let again = cron
+        .tick(db, wall(HOUR))
+        .expect_err("the engine is poisoned, so the re-fire's commit is refused as well");
+    assert!(again.to_string().contains("WAL poisoned"), "{again}");
+    assert_eq!(
+        [
+            fires[0].load(Ordering::SeqCst),
+            fires[1].load(Ordering::SeqCst)
+        ],
+        [0, 2],
+        "the re-fire must be hourly-count's again. Nothing else is due at 1h (two-hourly at 2h, \
+         the session sweep at 24h), so a re-fire that is not hourly-count's means the rollback \
+         restored an entry that did not tick and left hourly-count advanced past an interval \
+         the store never recorded"
+    );
+    // Recovery. Under FaultConfig::none() a power cycle applies no unsynced
+    // write (crash_apply 0), so the tick's WAL frame is gone with the rest.
+    drop(app);
+    sim.restart();
+    let (mut app, mut cron, _) = cron_over(&sim, Box::new(sim.disk()), crash_config(), &schedules);
+    let db = app.db_for_tests();
+    assert_eq!(
+        (enqueued_slots(db), cron.next_deadline()),
+        (vec![], Some(wall(HOUR))),
+        "the power cycle dropped the unsynced tick, so the reopened store still owes the 1h \
+         interval, which is the recovery this test is about"
+    );
+    assert_eq!(cron.tick(db, wall(HOUR)).unwrap(), ("hourly-count", false));
+    assert!(!cron.has_due(wall(HOUR)), "the 1h interval is paid");
+    assert_eq!(
+        enqueued_slots(db),
+        vec![2],
+        "after recovery the 1h interval is enqueued exactly once, by hourly-count (slot 2), and \
+         two-hourly not at all"
+    );
+}
+
+/// The cron twin of `run_due_answers_ok_when_only_the_wal_is_poisoned_after_the_
+/// batch_applied`: the tick's batch applied, then its cadence checkpoint failed
+/// in the WAL's segment GC, which poisons the engine and latches nothing.
+/// `applied == n`, so the advance and the enqueue are durable and
+/// `Db::poisoned()` already reports the failure. `tick` answers `Ok` and never
+/// re-enqueues the interval. `tick_answers_ok_when_the_commit_failure_is_a_
+/// reported_elsewhere_checkpoint` covers the store-latch side of the same arm,
+/// where `poisoned()` and `store_failed()` are both true; only this side has
+/// one without the other.
+#[test]
+fn a_tick_that_applied_before_only_the_wal_was_poisoned_answers_ok_and_never_re_fires() {
+    let sim = Sim::with_faults(0x20A3_0002, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let (mut app, mut cron, _) = cron_over(
+        &sim,
+        Box::new(OneShotWalFaultDisk {
+            inner: sim.disk(),
+            fault: WalFault::GcList,
+            armed: armed.clone(),
+            fired: fired.clone(),
+        }),
+        latch_config(),
+        &[("hourly-count", 1)],
+    );
+    let db = app.db_for_tests();
+    armed.store(true, Ordering::SeqCst);
+    let outcome = cron.tick(db, wall(HOUR));
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the WAL list must fail exactly once, in the tick's own cadence checkpoint"
+    );
+    assert!(
+        db.poisoned() && !db.store_failed(),
+        "a WAL GC failure poisons the engine and leaves the store unlatched, or this is not the \
+         arm under test"
+    );
+    let outcome = outcome.unwrap_or_else(|e| {
+        panic!(
+            "tick must answer Ok for a schedule whose advance reached the store: the checkpoint \
+             failure ({e}) is already reported through Db::poisoned(), the engine's WAL poison, \
+             not a store latch"
+        )
+    });
+    assert_eq!(outcome, ("hourly-count", false));
+    assert_eq!(
+        (enqueued_slots(db), stored_next_due(db, "hourly-count")),
+        (vec![1], wall(2 * HOUR)),
+        "durable in the store: one job, and the row advanced to 2h"
+    );
+    assert_eq!(
+        (cron.next_deadline(), cron.has_due(wall(HOUR))),
+        (Some(wall(2 * HOUR)), false),
+        "the 1h interval is durable, so it is never ticked again: a cache rolled back here \
+         re-enqueues it against a store that already holds it"
+    );
+}
+
+/// The third commit-failure arm. The tick's batch applied and the store
+/// checkpointed, then the horizon breadcrumb's sync failed. That write is raw
+/// `Disk` IO behind neither the WAL's guard nor the store's backend, so it
+/// poisons nothing, latches nothing, and the `Db` stays writable
+/// (`Db::transact`'s I-1 comment). `tick` must still answer `Err`, because
+/// nothing else will report the failure. But the record reached the store
+/// (`applied == n`), so the cache stays advanced: rolled back, the next tick
+/// re-fires the same interval on a healthy `Db` and enqueues it twice.
+#[test]
+fn a_tick_whose_checkpoint_failure_nothing_else_reports_answers_err_and_never_re_fires() {
+    let sim = Sim::with_faults(0x20A3_0003, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    // `OneShotStoreSyncFaultDisk` fails the next sync of the one path it is
+    // given, and here that is the breadcrumb (`<store_path>.horizon`); the
+    // store file and the WAL are delegated untouched.
+    let (mut app, mut cron, fires) = cron_over(
+        &sim,
+        Box::new(OneShotStoreSyncFaultDisk {
+            inner: sim.disk(),
+            store_path: format!("{}.horizon", latch_config().db.store_path),
+            armed: armed.clone(),
+            fired: fired.clone(),
+            reads: Arc::new(AtomicU64::new(0)),
+        }),
+        latch_config(),
+        &[("hourly-count", 1)],
+    );
+    let db = app.db_for_tests();
+    armed.store(true, Ordering::SeqCst);
+    let err = cron.tick(db, wall(HOUR)).expect_err(
+        "a checkpoint failure nothing else reports must reach the caller: swallowed, it freezes \
+         WAL GC and the breadcrumb with nobody told",
+    );
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the breadcrumb's sync must fail exactly once, in the tick's own cadence checkpoint"
+    );
+    assert!(err.to_string().contains("simulated fsync failure"), "{err}");
+    assert!(
+        !db.poisoned() && !db.store_failed(),
+        "a breadcrumb sync failure poisons nothing and latches nothing, or this is not the arm \
+         under test"
+    );
+    assert_eq!(
+        (enqueued_slots(db), stored_next_due(db, "hourly-count")),
+        (vec![1], wall(2 * HOUR)),
+        "the tick's record reached the store (applied == n): its job and its advance are durable"
+    );
+    assert_eq!(
+        (cron.next_deadline(), cron.has_due(wall(HOUR))),
+        (Some(wall(2 * HOUR)), false),
+        "the cache must mirror the row. Rolled back to 1h, the next tick re-fires an interval \
+         the store already enqueued, on a Db that is still writable"
+    );
+    // The Db recovers in process: the next interval ticks and commits.
+    assert_eq!(
+        cron.tick(db, wall(2 * HOUR)).unwrap(),
+        ("hourly-count", false)
+    );
+    assert_eq!(
+        (enqueued_slots(db), fires[0].load(Ordering::SeqCst)),
+        (vec![1, 1], 2),
+        "two intervals, two ticks, two jobs: each interval enqueued exactly once"
+    );
+}
+
 /// The cron arm's batch is bounded at `MAX_BATCH` ticks, as the job arm's
 /// is: with 65 schedules due at one instant, the first cron step commits
 /// exactly 64 and the 65th waits for a later step. A 65th staged into the

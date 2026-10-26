@@ -154,26 +154,33 @@ impl CronScheduler {
     /// unchanged. The kernel's own batched cron arm calls `tick_into`
     /// directly against a group it drains several ticks into instead.
     ///
-    /// **On a commit failure, this now applies `Db::transact`'s ruled
-    /// policy exactly** (`CommitFailure::invalidates`, db.rs:1438-1445/
-    /// 2256-2299 — the ONE rule, so the single-transaction path,
-    /// `Dispatcher::run_due`'s wrapper and this one cannot answer the same
-    /// question differently — see `run_due`'s doc). A fresh group used by no
-    /// one else means `records_before` is always `0`, so `invalidates(0,
-    /// staged)` is the whole question. Under the checkpoint arm (`applied ==
-    /// n`, already reported through `poisoned()`/`store_failed()`) the
-    /// schedule's advance IS durable: this returns `Ok((name, catchup))` and
-    /// leaves the cache alone — rolling `*cached` back to `previous` here
-    /// would re-tick and re-enqueue the SAME interval the next time
-    /// `has_due` is checked, against a store that already has the enqueue
-    /// and the advanced `next_due`. On every OTHER commit failure, `tick_into`
-    /// already advanced the ticked entry's in-memory cache on the assumption
-    /// the commit below would succeed — undo that, since nothing this call
-    /// staged reached the store either way. `(name, previous)` is peeked
-    /// with the SAME selection `tick_into` makes (deterministic over the
-    /// same `self.entries`/`now`, and nothing mutates `self.entries` in
-    /// between), so it names the entry `tick_into` actually picked without
-    /// `tick_into` itself having to hand it back.
+    /// **On a commit failure, this answers exactly as `Db::transact`'s ruled
+    /// policy does** (`CommitFailure::invalidates`, the ONE rule, so the
+    /// single-transaction path, `Dispatcher::run_due`'s wrapper and this one
+    /// cannot answer the same question differently — see `run_due`'s doc). A
+    /// fresh group used by no one else means `records_before` is always `0`,
+    /// so `invalidates(0, staged)` says whether the tick's record reached the
+    /// store. It answers `Err` when the record did not reach it, and also when
+    /// it did but nothing else reports the failure (a horizon-breadcrumb sync,
+    /// which poisons nothing and latches nothing), so the failure is never
+    /// swallowed. Under the checkpoint arm already reported through
+    /// `poisoned()`/`store_failed()` it answers `Ok((name, catchup))`.
+    ///
+    /// **The cache follows the store, not the answer.** `tick_into` advanced
+    /// the ticked entry's cache on the assumption the commit would succeed.
+    /// Only a record that never reached the store (`applied == 0`, an
+    /// append/sync failure) rolls it back to `previous`, so the same interval
+    /// ticks again. When the record did reach it (`applied == n`, either
+    /// checkpoint arm) the advance and its enqueue are durable and the cache
+    /// stays where `tick_into` put it: rolled back, it would re-tick and
+    /// re-enqueue the SAME interval the next time `has_due` is checked,
+    /// against a store that already holds both — and the unreported arm
+    /// leaves the `Db` writable, so that second enqueue would commit
+    /// (`CommitFailure`: records `0..applied` must not be retried).
+    /// `(name, previous)` is peeked with the SAME selection `tick_into` makes
+    /// (deterministic over the same `self.entries`/`now`, and nothing mutates
+    /// `self.entries` in between), so it names the entry `tick_into` actually
+    /// picked without `tick_into` itself having to hand it back.
     pub fn tick(&mut self, db: &mut Db, now: WallTime) -> io::Result<(&'static str, bool)> {
         let (name, previous) = self
             .entries
@@ -191,7 +198,8 @@ impl CronScheduler {
             (Ok(out), Ok(())) => Ok(out),
             (Ok(out), Err(failure)) => {
                 let reported_elsewhere = db.poisoned() || db.store_failed();
-                if failure.invalidates(0, staged) || !reported_elsewhere {
+                let invalidated = failure.invalidates(0, staged);
+                if invalidated {
                     // Entry names are unique by construction — `App::schedule`
                     // asserts it at mount time (fix round M-5, hard rule 4:
                     // assert the negative space instead of silently doing
@@ -212,6 +220,8 @@ impl CronScheduler {
                             )
                         });
                     *cached = previous;
+                }
+                if invalidated || !reported_elsewhere {
                     Err(failure.error)
                 } else {
                     Ok(out)
