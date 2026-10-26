@@ -4650,6 +4650,9 @@ keeps nothing:
    pairs wait because k equal choices make k(k-1)/2 of them, enough to spend
    the whole budget: run while the other passes can still shrink the run,
    they could leave on fault axes the failure does not need, or inputs larger
+   than it needs. Waiting costs a whole round of the other passes first, so
+   among many choices the budget can run out before a needed pair is tried;
+   the shrunk run then still fails the check and replays, with more draws
    than it needs.
 
 A round that keeps nothing ends the shrink on a local minimum: no step of these

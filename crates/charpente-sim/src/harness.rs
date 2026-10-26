@@ -303,9 +303,16 @@ const SHRINK_BUDGET: u32 = 500;
 /// the other passes needed, which left on fault axes the failure does not
 /// need (`a_large_group_of_needed_equal_choices_leaves_no_fault_axis_on`) and
 /// an input above what fails once those axes are off
-/// (`the_equal_pairs_wait_until_everything_else_keeps_nothing`), and an axis
-/// turned off is a keep like any other
-/// (`a_round_that_only_turns_an_axis_off_is_not_quiet`).
+/// (`the_equal_pairs_wait_until_everything_else_keeps_nothing`). Any keep
+/// ends the quiet: an axis turned off
+/// (`a_round_that_only_turns_an_axis_off_is_not_quiet`) or a choice kept by
+/// any step, the whole groups' included
+/// (`a_round_that_kept_a_choice_is_not_quiet`), and a kept pair starts
+/// another round (`a_kept_pair_starts_another_round`). Waiting costs a whole
+/// round of the other passes first, so among many choices the budget can run
+/// out before a needed pair is tried. That run still fails the check and
+/// replays, with more draws than it needs, where a fault left on or a
+/// fault-coupled input left high would point the fix at the wrong cause.
 ///
 /// Every candidate is strictly smaller than the best so far (shorter or
 /// lexicographically smaller choices, or one more axis off), so each round
@@ -3647,6 +3654,137 @@ mod tests {
                 "seed {seed:#x}: z at 10, the 33 ones, and every axis that was on turned off; \
                  faults off {:?}, in {} replays",
                 shrunk.faults_off,
+                shrunk.replays
+            );
+        }
+    }
+
+    /// Draws two pairs in 0..=7, forty bits and z in 0..=100, and fails when
+    /// each pair is equal, 25 or more bits are 1 and z is at least ten times
+    /// the second pair's value plus 10.
+    fn two_pairs_and_a_z_behind_the_second(sim: &mut Sim) -> Result<(), String> {
+        let a1 = sim.input().between("a1", 0, 7);
+        let b1 = sim.input().between("b1", 0, 7);
+        let a2 = sim.input().between("a2", 0, 7);
+        let b2 = sim.input().between("b2", 0, 7);
+        let ones = (0..40)
+            .filter(|_| sim.input().between("bit", 0, 1) == 1)
+            .count();
+        let z = sim.input().between("z", 0, 100);
+        if a1 == b1 && a2 == b2 && ones >= 25 && z >= 10 * a2 + 10 {
+            Err(format!("{ones} of 40 bits are 1 and z is {z}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A round that kept a choice is not quiet, whichever step kept it. Here
+    /// z can fall to 10 only once the second pair reaches 0. A round whose
+    /// pairs ran after a keep that changed only the choices, the whole-group
+    /// step's lowering of that pair among them, spent the budget on the 300
+    /// pairs of the 25 ones before the next round's search lowered z, and
+    /// the block reported z at 40 or 70. Each seed is one of the first two,
+    /// counting up from 0, whose first failure draws two pairs of different
+    /// values, each 2 or more.
+    #[test]
+    fn a_round_that_kept_a_choice_is_not_quiet() {
+        let test = sim_test(
+            "two_pairs_and_a_z_behind_the_second",
+            two_pairs_and_a_z_behind_the_second,
+        );
+        let seeds: Vec<u64> = (0..=0x290e)
+            .filter(|&seed| {
+                run_app_universe(seed, None, &[], &test.run).is_err_and(|f| {
+                    let c = &f.choices;
+                    c[0] >= 2 && c[2] >= 2 && c[0] != c[2]
+                })
+            })
+            .collect();
+        assert_eq!(
+            seeds,
+            [0x1bd8, 0x290e],
+            "the first two seeds, counting up from 0, whose first failure draws two pairs of \
+             different values, each 2 or more"
+        );
+        let on = |config: &FaultConfig| FAULT_AXES.iter().filter(|&&a| axis_on(config, a)).count();
+        for seed in seeds {
+            let first = run_app_universe(seed, None, &[], &test.run).unwrap_err();
+            let shrunk = shrink(&test, seed, &first);
+            let value = |name: &str| {
+                shrunk
+                    .drawn
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            let ones = shrunk
+                .drawn
+                .iter()
+                .filter(|(n, v)| *n == "bit" && v == "1")
+                .count();
+            assert_eq!(
+                (
+                    ["a1", "b1", "a2", "b2"].map(value),
+                    ones,
+                    value("z"),
+                    shrunk.faults_off.len(),
+                    on(&shrunk.config)
+                ),
+                ([Some("0"); 4], 25, Some("10"), on(&first.config), 0),
+                "seed {seed:#x}: both pairs at 0, the 25 ones, z at 10, and every axis that was on \
+                 turned off; faults off {:?}, in {} replays",
+                shrunk.faults_off,
+                shrunk.replays
+            );
+        }
+    }
+
+    /// Draws a in 0..=7, 16 draws x in 0..=100, p in 0..=7 and then b in
+    /// 0..=7, and fails when a and b are equal, p is at least 5 and every x
+    /// is at least a.
+    fn a_pair_around_16_draws_and_a_5(sim: &mut Sim) -> Result<(), String> {
+        let a = sim.input().between("a", 0, 7);
+        let xs: Vec<u64> = (0..16).map(|_| sim.input().between("x", 0, 100)).collect();
+        let p = sim.input().between("p", 0, 7);
+        let b = sim.input().between("b", 0, 7);
+        if a == b && p >= 5 && xs.iter().all(|&x| x >= a) {
+            Err(format!("a and b are {a}, p is {p}, and every x reaches a"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A kept pair starts another round. From a = 5 the search lowers every
+    /// x and p to 5 as well, so the run is one value everywhere. Its whole
+    /// group cannot move, since p must stay at 5 or more, and only the pair
+    /// (a, b) can. Once that pair is kept at 0, the next round lowers every x
+    /// to 0, where ending the shrink on the pair's keep left them at 5. Each
+    /// seed is one of the first two, counting up from 0, whose first failure
+    /// draws a = 5.
+    #[test]
+    fn a_kept_pair_starts_another_round() {
+        let test = sim_test(
+            "a_pair_around_16_draws_and_a_5",
+            a_pair_around_16_draws_and_a_5,
+        );
+        let seeds: Vec<u64> = (0..=0x1553)
+            .filter(|&seed| {
+                run_app_universe(seed, None, &[], &test.run).is_err_and(|f| f.choices[0] == 5)
+            })
+            .collect();
+        assert_eq!(
+            seeds,
+            [0x299, 0x1553],
+            "the first two seeds, counting up from 0, whose first failure draws a = 5"
+        );
+        let mut least = vec![0; 17];
+        least.push(5);
+        for seed in seeds {
+            let first = run_app_universe(seed, None, &[], &test.run).unwrap_err();
+            let shrunk = shrink(&test, seed, &first);
+            assert_eq!(
+                shrunk.choices, least,
+                "seed {seed:#x}: a, b and every x at 0, and p at 5, in {} replays",
                 shrunk.replays
             );
         }
