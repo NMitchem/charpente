@@ -33,6 +33,7 @@ A miss is a finding about the output. It is fixed as its own pinned change and t
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | `523fc7b8` (registry; R40) | `cbaf3242…` | `rust@sha256:931c2c05…` | none | 0 | pass (call 13) | pass (call 16) | identical (call 17) | identical | yes | **miss** | met | met | met | met | **FAIL on (a)** |
 | 2 | `1106cdf0` | `cbaf3242…` | `rust@sha256:931c2c05…` | none | 0 | pass (call 10) | pass (call 13) | identical (call 14) | identical | yes | **miss** | met | met | met | met | **FAIL on (a)** |
+| 3 | `81b4e8be` | `cbaf3242…` | `rust@sha256:931c2c05…` | none | 0 | pass (call 8) | pass (call 10) | identical (call 11) | identical | yes | **met** | met | met | met | met | **PASS** |
 
 `523fc7b8` is the registry the attempt ran on. The round that followed changed only `#[cfg(test)]` code, GUIDE §8 and doc-comment text, and PLAN, all of which the brief puts out of reach; README.md was unchanged (Ruling R40, progress.md).
 
@@ -105,3 +106,35 @@ None reads source. The mac side has one hit: `ls -la && ./box '…'` in the run 
 - **(e) Met.** Every claim is right: the scaffold's five files and three properties (calls 4–5), the install from a local mirror, the replay "byte-identical … from the seed alone" (call 14 and the controller's replay), the emit failure's message (call 17), and the restore by byte copy without a re-run (call 18; the follow-up says so itself).
 
 **The finding, and its fix.** Every reader quotes the result line, and the result line gives an aggregate, `N of M runs tested a check`. That sum also lets a check tested in a few runs hide behind well-tested ones. Ruling R43 has the result line give each check's tested runs, in the order of the check lines above it. The change is pinned in its own commit, and attempt 3, the last under the cap of three, runs on a registry rebuilt at that head.
+
+## Attempt 3
+
+Attempt 3 is the last attempt under the cap of three. It ran on a registry built at `81b4e8be`, which carries R43: the result line gives each check's tested runs. That head also carries the docs-only build's platform fixes, R44–R49, and none of them is in the README. The session launched headless at 2026-10-27T07:21:34Z as `fc8a4ca2-2946-4c92-90dc-6a6c5b90a97c`. It took 20 turns and 123 s, made 14 box calls that all exited 0, and was never resumed. Its report and follow-up are in [`attempt-3/report.md`](attempt-3/report.md).
+
+**The mechanical bar**
+- **Green, call 8.** The three checks tested 205, 251 and 219 runs.
+- **Red, call 10.** After call 9 deleted `tx.enqueue`, `acked_post_implies_the_echo_after_recovery` failed in 210 of 250 tested runs. It shrank 5 draws to 3, giving `notes=1, order=[1], body="alpha"`.
+- **Both replays match.** The stranger's replay (call 11) and the controller's (a second fresh box, `attempt-3/replay/`, with call 9's deletion re-applied) print byte-identical blocks. Each equals the batch block minus `shrunk:` and `first:` (R41).
+
+**Sealing: sealed.**
+- **Box side, one hit: call 7.** It was an environment probe. It printed cargo's `config.toml` (the `/opt/registry` source replacement), listed the files named `*clippy*` (names only, eight of them under `/opt/registry`) and printed the environment. It read no source.
+- **Mac side, one hit:** an `ls -la` of the run directory.
+- **Calls:** 14 agent calls, 14 box start lines.
+
+**Spec §6.7**
+- **(a) Met.** Asked what its last sim run told it, the stranger answered: "all three checks passed: 205, 253 and 205 of 256 runs actually tested the property, and the rest were skipped because a fault stopped them before the check could run". That is call 14's result line exactly, `Runs tested per check, in the order above: 205, 253, 205 of 256.`. It also said what it had not kept: "I filtered the output to the result lines, so I didn't record that batch's master seed and can't replay it exactly" (call 14 greps for `check acked|sim result`).
+- **(b) Met.** The report gives "no POST was acked, so durability has nothing to prove", and the follow-up says skips are "because a fault stopped them before the check could run".
+- **(c) Met.** The report gives the shrunk input `notes=1, body="alpha"` and the faults turned off, and says the printed repro reproduced "the identical failure deterministically".
+- **(d) Met.** The report says the skipped runs were "honestly accounted for". The follow-up says a pass is "evidence for those claims, not proof".
+- **(e) Met.** Every claim is right:
+  - the scaffold's files, its one table, route, job and event, and its three properties (call 4);
+  - the install from the vendored registry (calls 1–3);
+  - both failure messages, quoted in substance: "1 POST(s) were acked with 200 but only 0 Echo job(s) are durable — the enqueue did not commit with the row" and "its NoteAdded is in the event log 0 time(s), not once";
+  - `tx.emit`'s deletion failing the third check alone (call 13);
+  - the restore to green (call 14);
+  - `describe`'s tables, fingerprints, route and jobs (call 14);
+  - clippy's absence: no component, and `rustup component add` cannot reach `static.rust-lang.org` (calls 5–6).
+
+**Testimony.** The stranger read README's "charpente `0.1.0` is on crates.io" (README:133) against the mirror's 0.3.0. The sentence is true, since 0.1.0 is on crates.io, but it reads stale in a 0.3.0 README. README is left as this attempt read it, so that what ships is what was tested. Updating the line is for the publish.
+
+**Verdict: PASS** on attempt 3, after two misses on (a). Both misses were findings about the output, and each was fixed as its own pinned change: R42 moved the check lines to the end of the output, and R43 gave each check's count on the result line every reader quotes.

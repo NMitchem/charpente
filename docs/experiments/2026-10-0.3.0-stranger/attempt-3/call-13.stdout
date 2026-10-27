@@ -1,0 +1,9 @@
+sim failure in acked_post_implies_its_event_after_recovery: event-durability violated: note 1 was acked with 200 but its NoteAdded is in the event log 0 time(s), not once — the emit did not commit with the row
+  inputs: notes=1, order=[1], body="alpha"
+  shrunk: 3 draws to 3, faults off: write_error, sync_error, crash_torn, bit_flip, object_put_error, object_get_error, object_lost_ack, outbound_throttle, disk_latency, net_latency, in 11 replays
+  repro:  charpente test --sim --filter acked_post_implies_its_event_after_recovery --seed 0x941f0cb49d1d53a7 --inputs 00 --faults-off write_error,sync_error,crash_torn,bit_flip,object_put_error,object_get_error,object_lost_ack,outbound_throttle,disk_latency,net_latency
+check acked_note_survives_a_restart ................. ok  (210 tested over 182 distinct inputs, 46 skipped)
+check acked_post_implies_the_echo_after_recovery .... ok  (254 tested over 221 distinct inputs, 2 skipped)
+check acked_post_implies_its_event_after_recovery ... FAILED  (200 tested over 170 distinct inputs: 200 failed; 56 skipped)
+sim result: FAILED. 2 passed; 1 failed. Runs tested per check, in the order above: 210, 254, 200 of 256.
+

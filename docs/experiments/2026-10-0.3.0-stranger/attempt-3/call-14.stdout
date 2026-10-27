@@ -1,0 +1,33 @@
+check acked_note_survives_a_restart ................. ok  (205 tested over 183 distinct inputs, 51 skipped)
+check acked_post_implies_the_echo_after_recovery .... ok  (253 tested over 226 distinct inputs, 3 skipped)
+check acked_post_implies_its_event_after_recovery ... ok  (205 tested over 175 distinct inputs, 51 skipped)
+sim result: ok. 3 passed; 0 failed. Runs tested per check, in the order above: 205, 253, 205 of 256.
+=== describe ===
+tables:
+  ApiKey v1 fingerprint=0xb6931b19a48870e7 indexes=[key_hash] migrations=[] scoped=false builtin=true
+  CronRow v1 fingerprint=0x5f6f0f0da4f50b50 indexes=[name] migrations=[] scoped=false builtin=true
+  Note v1 fingerprint=0x448088ba9d4ac660 indexes=[] migrations=[] scoped=false builtin=false
+  Session v1 fingerprint=0xb47e2d9afc3894 indexes=[token_hash] migrations=[] scoped=false builtin=true
+  charpente.events v1 fingerprint=none indexes=[] migrations=[] scoped=false builtin=true
+  charpente.jobs v1 fingerprint=none indexes=[] migrations=[] scoped=false builtin=true
+  charpente.schema_versions v1 fingerprint=none indexes=[] migrations=[] scoped=false builtin=true
+routes:
+  POST /notes/:id name=add_note auth=false public_scope=none cross_tenant=false stream=false
+    params=[ParamInfo { name: "id", schema: Id("Note") }] request=Some(Ref("NewNote")) response=Id("Note") error=Ref("ApiError") emits=[]
+events:
+jobs:
+  SessionSweep max=5 backoff_nanos=30000000000 scoped_by=none cross_tenant=false builtin=true outbound=none
+  Echo max=5 backoff_nanos=30000000000 scoped_by=none cross_tenant=false builtin=false outbound=none
+cron:
+  charpente.session_sweep interval_nanos=86400000000000 builtin=true
+outbound_hosts:
+config:
+  body_cap=1048576
+  session_ttl=2592000000000000
+  store_path=tables.redb
+  retain_segments=2
+  checkpoint_every=4096
+  event_retention=65536
+  migration_batch_size=1000
+  oidc=false
+

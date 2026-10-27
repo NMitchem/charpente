@@ -1,0 +1,32 @@
+running 3 sim checks, 256 runs each, under random injected faults (master seed 0x0be29c13d9b6827e)
+
+sim failure in acked_post_implies_the_echo_after_recovery: ack-durability violated: 1 POST(s) were acked with 200 but only 0 Echo job(s) are durable — the enqueue did not commit with the row
+  seed:   0xa849d5e25a3b3f4a
+  config: FaultConfig { write_error: 0.0, sync_error: 0.0, crash_apply: 0.0, crash_torn: 0.0, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 0ns), clock_skew: 0, clock_step_back: (0.0, 0ns), clock_downtime: (0.0, 0ns) }
+  fired:  restart: 1
+  inputs: notes=1, order=[1], body="alpha"
+  shrunk: 5 draws to 3, faults off: sync_error, crash_apply, crash_torn, dir_entry_loss, object_put_error, outbound_lost_reply, outbound_latency, net_latency, clock_skew, in 11 replays
+  first:  ack-durability violated: 3 POST(s) were acked with 200 but only 0 Echo job(s) are durable — the enqueue did not commit with the row
+  repro:  charpente test --sim --filter acked_post_implies_the_echo_after_recovery --seed 0xa849d5e25a3b3f4a --inputs 00 --faults-off sync_error,crash_apply,crash_torn,dir_entry_loss,object_put_error,outbound_lost_reply,outbound_latency,net_latency,clock_skew
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  acked_note_survives_a_restart
+    45  no POST was acked, so durability has nothing to prove (first: --seed 0x31f760a1da606887)
+     2  the app never booted (first: --seed 0x2a91b26ad379bb0a)
+     1  durable corruption fired, so the acked row is excused (first: --seed 0x5a70d8ce3c4653c)
+  acked_post_implies_the_echo_after_recovery
+    4  the app never booted (first: --seed 0xea9700c30c00f89c)
+    2  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x51a48bcb4d097422)
+  acked_post_implies_its_event_after_recovery
+    49  no POST was acked, so its event has nothing to prove (first: --seed 0x1d5e377788d6f9c2)
+     2  the app never booted (first: --seed 0x5018fa834d6fdfcc)
+     1  durable corruption fired, so the acked event is excused (first: --seed 0xee4265a6e70b44fe)
+     1  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x5ebb2cb386de5ced)
+
+check acked_note_survives_a_restart ................. ok  (208 tested over 183 distinct inputs, 48 skipped)
+check acked_post_implies_the_echo_after_recovery .... FAILED  (250 tested over 219 distinct inputs: 210 failed; 6 skipped)
+check acked_post_implies_its_event_after_recovery ... ok  (203 tested over 174 distinct inputs, 53 skipped)
+
+sim result: FAILED. 2 passed; 1 failed. Runs tested per check, in the order above: 208, 250, 203 of 256.
+rerun exactly this batch: charpente test --sim --master-seed 0xbe29c13d9b6827e
+
