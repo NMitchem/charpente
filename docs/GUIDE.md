@@ -2907,7 +2907,9 @@ sometimes-coverage keys (`Sim::cover(&self, what: &'static str)`, so a key is a
 literal or a `const`, not a `format!`ed `String`; plus the sim's own auto-covered
 `fault:*`/`crash:*`/`restart` keys) that must be hit at least once across
 that test's runs in a batch run, or the batch fails even if every
-run individually passed. A `require`d key that never fires is telling
+run individually passed. Every run counts toward it, passed, skipped and
+failed alike: a run that reached the state and then failed tested it. A
+`require`d key that never fires is telling
 you something real: either the workload never drives the system into that
 state, or the run count is too low to make it likely.
 
@@ -4502,7 +4504,9 @@ and counts beside the verdict. In order:
   other failing runs print no block; its line counts them, and `--format json`
   lists each one.
 - **A line per unmet requirement**: `sim coverage requirement failed in
-  <check>: "<key>" never occurred in <n> runs`, with what to do about it.
+  <check>: "<key>" never occurred in <n> runs`, with what to do about it. The
+  `<n>` is every run of the check, and every one of them counts, failed and
+  skipped runs included, so the key truly never fired.
 - **The skipped runs' reasons**, under each check that skipped any, most
   frequent first and then in byte order, each with its count. A check that
   tested nothing is headed `— never tested: every run was skipped`. A check

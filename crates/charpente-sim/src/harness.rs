@@ -224,11 +224,12 @@ pub struct Failure {
     pub seed: u64,
     pub config: FaultConfig,
     /// What actually fired in THIS universe. `config` is the enabled axes and
-    /// their probabilities; this is the events. Kept per-failure rather than
-    /// folded into `Report::coverage` (which stays the batch statistic that
-    /// `require:`/floors are measured against, unchanged) — the question a
-    /// failure raises is "which axis explains THIS universe", and the batch
-    /// aggregate cannot answer it.
+    /// their probabilities; this is the events. A batch also merges it into
+    /// `Report::coverage`, the statistic `require:` is measured against, as it
+    /// does a passed or skipped run's: a failing run that reached a required
+    /// state tested it. It is kept here as well because the question a failure
+    /// raises is "which axis explains THIS universe", and the batch aggregate
+    /// cannot answer it.
     pub coverage: BTreeMap<&'static str, u64>,
     pub message: String,
     /// The inputs this run drew, by name, in draw order.
@@ -1092,6 +1093,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize) -> Ba
                 }
                 Err(failed) => {
                     check.failure(&failed);
+                    merge(&mut covered, &failed.coverage);
                     report.failures.push(Failure::of(test.name, seed, &failed));
                     if first {
                         firsts.push((report.failures.len() - 1, test_index, seed, failed));
@@ -2569,6 +2571,78 @@ mod tests {
         assert!(
             text.contains("\nsim result: FAILED. 0 passed; 1 failed. Runs tested: 2 of 2.\n"),
             "{text}"
+        );
+    }
+
+    /// Reaches a state and then fails on even seeds; passes on odd ones
+    /// without reaching it.
+    fn fails_where_it_reaches(sim: &mut Sim) -> Result<(), String> {
+        if sim.seed().is_multiple_of(2) {
+            sim.cover("state:reached");
+            return Err("failed after reaching the state".into());
+        }
+        Ok(())
+    }
+
+    /// R44: a required key that a failing run fired has occurred, because the
+    /// run reached the state and tested it. Only a key that no run fires,
+    /// passing, skipped or failing, is unmet, in the same sentence as before.
+    #[test]
+    fn a_required_key_that_only_failing_runs_fired_has_occurred() {
+        let tests = [SimTest {
+            name: "fails_where_it_reaches",
+            run: fails_where_it_reaches,
+            require: &["state:reached", "state:never"],
+        }];
+        // Worked out from the batch's seeds alone: the runs that fail.
+        let failing = batch_seeds(0x1234, 16)
+            .into_iter()
+            .filter(|seed| seed.is_multiple_of(2))
+            .count();
+        assert!(0 < failing && failing < 16, "non-vacuous: {failing}");
+        let flags = ["--runs", "16", "--master-seed", "0x1234"];
+        let (code, out) = run_to_string(&tests, &flags);
+        assert_eq!(code, 1, "{out}");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("check fails_where_it_reaches "))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert_eq!(
+            line,
+            format!(
+                "check fails_where_it_reaches ... FAILED  (16 tested: {failing} failed; required \
+                 \"state:never\" never occurred)"
+            ),
+            "{out}"
+        );
+        let unmet: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("sim coverage requirement failed in "))
+            .collect();
+        assert_eq!(
+            unmet,
+            [
+                "sim coverage requirement failed in fails_where_it_reaches: \"state:never\" never \
+                 occurred in 16 runs — raise --runs, adjust the workload, or drop the requirement \
+                 (a required state that never occurs is an untested claim)"
+            ],
+            "{out}"
+        );
+        let (_, json) = run_to_string(&tests, &[&flags[..], &["--format", "json"]].concat());
+        assert!(
+            json.contains(
+                ",\"missing_coverage\":[{\"check\":\"fails_where_it_reaches\",\"key\":\"state:never\"}],"
+            ),
+            "{json}"
+        );
+        let coverage = json
+            .split_once(",\"coverage\":")
+            .and_then(|(_, rest)| rest.split_once(",\"missing_coverage\":"))
+            .unwrap_or_else(|| panic!("{json}"))
+            .0;
+        assert!(
+            coverage.contains(&format!("\"state:reached\":{failing}")),
+            "the batch coverage counts every failing run's hit: {coverage}"
         );
     }
 
