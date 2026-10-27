@@ -236,12 +236,14 @@ pub struct Failure {
     pub seed: u64,
     pub config: FaultConfig,
     /// What actually fired in THIS universe. `config` is the enabled axes and
-    /// their probabilities; this is the events. A batch also merges it into
-    /// `Report::coverage`, the statistic `require:` is measured against, as it
-    /// does a passed or skipped run's: a failing run that reached a required
-    /// state tested it. It is kept here as well because the question a failure
-    /// raises is "which axis explains THIS universe", and the batch aggregate
-    /// cannot answer it.
+    /// their probabilities; this is the events. A batch, and a `--seed`
+    /// replay, also merge it into `Report::coverage`, the statistic `require:`
+    /// is measured against, as they do a passed or skipped run's: a failing
+    /// run that reached a required state tested it. They leave out its
+    /// `run:skipped`, which a run that gave up and then failed carries: that
+    /// run failed, it was not skipped. It is kept here as well because the
+    /// question a failure raises is "which axis explains THIS universe", and
+    /// the batch aggregate cannot answer it.
     pub coverage: BTreeMap<&'static str, u64>,
     pub message: String,
     /// The inputs this run drew, by name, in draw order.
@@ -999,6 +1001,7 @@ fn run_single_seed(
             }
             Err(failed) => {
                 check.failure(&failed);
+                merge_failed(&mut report.coverage, &failed.coverage);
                 let mut failure = Failure::of(test.name, seed, &failed);
                 failure.inputs = inputs.map(<[u64]>::to_vec);
                 failure.faults_off = faults_off.to_vec();
@@ -1123,7 +1126,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize, shrin
                 }
                 Err(failed) => {
                     check.failure(&failed);
-                    merge(&mut covered, &failed.coverage);
+                    merge_failed(&mut covered, &failed.coverage);
                     report.failures.push(Failure::of(test.name, seed, &failed));
                     if first {
                         firsts.push((report.failures.len() - 1, test_index, seed, failed));
@@ -1206,6 +1209,18 @@ fn in_parallel<T: Sync, R: Send>(
 fn merge(into: &mut BTreeMap<&'static str, u64>, from: &BTreeMap<&'static str, u64>) {
     for (key, count) in from {
         *into.entry(key).or_insert(0) += count;
+    }
+}
+
+/// A failed run's coverage, less `run:skipped`: a run that gave up and then
+/// failed is a failure, not a skip (GUIDE §8, "Giving up"), so the key keeps
+/// counting skipped runs exactly. Its other keys count, since the run reached
+/// those states.
+fn merge_failed(into: &mut BTreeMap<&'static str, u64>, from: &BTreeMap<&'static str, u64>) {
+    for (key, count) in from {
+        if *key != "run:skipped" {
+            *into.entry(key).or_insert(0) += count;
+        }
     }
 }
 
@@ -2694,6 +2709,73 @@ mod tests {
         assert!(
             coverage.contains(&format!("\"state:reached\":{failing}")),
             "the batch coverage counts every failing run's hit: {coverage}"
+        );
+    }
+
+    /// Gives up and then fails on odd seeds, reaching a state first; gives
+    /// up cleanly on multiples of 4; passes the rest.
+    fn gives_up_then_fails(sim: &mut Sim) -> Result<(), String> {
+        if sim.seed() % 2 == 1 {
+            sim.cover("state:failed");
+            sim.give_up("the fixture gives up first", "");
+            return Err("and then fails".into());
+        }
+        if sim.seed().is_multiple_of(4) {
+            sim.give_up("the seed is a multiple of 4", "");
+        }
+        Ok(())
+    }
+
+    /// R44's merge leaves out a failed run's `run:skipped`: a run that gave
+    /// up and then failed is a failure, not a skip, so the key still equals
+    /// the skipped count exactly (GUIDE §8, "Giving up"), and its other keys
+    /// still count.
+    #[test]
+    fn a_failed_run_that_gave_up_first_is_not_counted_as_skipped() {
+        let tests = [sim_test("gives_up_then_fails", gives_up_then_fails)];
+        let seeds = batch_seeds(0x1234, 16);
+        let failed = seeds.iter().filter(|&&s| s % 2 == 1).count();
+        let skipped = seeds.iter().filter(|&&s| s.is_multiple_of(4)).count();
+        // Non-vacuous: runs fail, runs skip, and each failed run marked the key.
+        assert!(failed > 0 && skipped > 0, "{failed} {skipped}");
+        let batch = run_batch(&[&tests[0]], 0x1234, 16, 1, true);
+        assert!(
+            batch
+                .report
+                .failures
+                .iter()
+                .all(|f| f.coverage.get("run:skipped") == Some(&1))
+        );
+        let (code, json) = run_to_string(
+            &tests,
+            &[
+                "--runs",
+                "16",
+                "--master-seed",
+                "0x1234",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(code, 1, "{json}");
+        assert!(
+            json.contains(&format!(
+                ",\"failed\":{failed},\"skipped\":{skipped},\"coverage\":{{\"run:skipped\":{skipped},\
+                 \"state:failed\":{failed}}},"
+            )),
+            "{json}"
+        );
+        // A replay of one failing run puts its keys in the top-level coverage
+        // by the same rule, as a batch of it would.
+        let odd = seeds.iter().find(|&&s| s % 2 == 1).unwrap();
+        let (code, json) = run_to_string(
+            &tests,
+            &["--seed", &format!("{odd:#x}"), "--format", "json"],
+        );
+        assert_eq!(code, 1, "{json}");
+        assert!(
+            json.contains(",\"coverage\":{\"state:failed\":1},"),
+            "{json}"
         );
     }
 

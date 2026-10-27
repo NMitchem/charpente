@@ -3176,7 +3176,10 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   Failures outrank give-ups.
 - It also marks the coverage key `run:skipped` — once per run, not
   once per call — so a give-up *rate* is counted like any other sometimes-key,
-  and it cross-checks the reported count exactly. `ceiling:
+  and it cross-checks the reported count exactly. A run that gives up and
+  then returns `Err` is counted as failed, so `charpente test --sim` counts
+  every key it reached, toward `require` and in the JSON's `coverage`, except
+  its `run:skipped`. `ceiling:
   [("run:skipped", N)]` on `run_universes_swarm!`/`run_universes_swarm_with!`
   caps it: the batch fails when more than N runs gave up, naming the key,
   the count and the cap. Twenty of the platform's own swarm properties carry
