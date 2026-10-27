@@ -926,7 +926,12 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
                 args.jobs,
                 !args.no_shrink,
             );
-            batch.rerun = Some(rerun(master_seed, args.runs, args.filter.as_deref()));
+            batch.rerun = Some(rerun(
+                master_seed,
+                args.runs,
+                args.filter.as_deref(),
+                args.no_shrink,
+            ));
             batch
         }
     };
@@ -949,9 +954,17 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
 /// unless that is the default, and its filter unless it is empty. `--jobs`
 /// changes nothing the batch prints, so it is left out. An empty filter
 /// selects every check, as none does, and printed it would end the line in a
-/// bare `--filter`, which is refused for want of a value.
-fn rerun(master_seed: u64, runs: u64, filter: Option<&str>) -> String {
-    let mut line = format!("charpente test --sim --master-seed {master_seed:#x}");
+/// bare `--filter`, which is refused for want of a value. A batch that did not
+/// shrink says so first, `CHARPENTE_SIM_NO_SHRINK=1 charpente …`: without the
+/// variable the pasted command shrinks, and prints another report.
+fn rerun(master_seed: u64, runs: u64, filter: Option<&str>, no_shrink: bool) -> String {
+    let mut line = String::new();
+    if no_shrink {
+        line.push_str(&format!("{NO_SHRINK_ENV}=1 "));
+    }
+    line.push_str(&format!(
+        "charpente test --sim --master-seed {master_seed:#x}"
+    ));
     if runs != DEFAULT_RUNS {
         line.push_str(&format!(" --runs {runs}"));
     }
@@ -4696,6 +4709,42 @@ mod tests {
             entry.ends_with(",\"not_shrunk\":\"CHARPENTE_SIM_NO_SHRINK is set\",\"replays\":0"),
             "{json}"
         );
+    }
+
+    /// R49: a batch that did not shrink ends with a rerun line that sets the
+    /// variable, so pasted it prints that report again, byte for byte; a batch
+    /// that shrinks keeps the line it had.
+    #[test]
+    fn the_rerun_line_sets_the_no_shrink_variable_its_report_was_made_under() {
+        let tests = [sim_test("draws_a_digit", draws_a_digit)];
+        let batch = |no_shrink: bool, flags: &[&str]| {
+            let mut args = parse(flags).unwrap();
+            args.no_shrink = no_shrink;
+            let mut out = Vec::new();
+            assert_eq!(run(&tests, &args, &mut out), 1);
+            String::from_utf8(out).unwrap()
+        };
+        // In the order the rerun line gives them.
+        let flags = ["--master-seed", "0x1234", "--runs", "64"];
+        let shrinking = batch(false, &flags);
+        assert_eq!(
+            shrinking.lines().last(),
+            Some("rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 64"),
+            "{shrinking}"
+        );
+        let unshrunk = batch(true, &flags);
+        let rerun = unshrunk.lines().last().unwrap();
+        let pasted: Vec<&str> = rerun
+            .strip_prefix(
+                "rerun exactly this batch: CHARPENTE_SIM_NO_SHRINK=1 charpente test --sim ",
+            )
+            .unwrap_or_else(|| panic!("{unshrunk}"))
+            .split(' ')
+            .collect();
+        assert_eq!(pasted, flags, "{rerun}");
+        assert_eq!(batch(true, &pasted), unshrunk);
+        // Non-vacuous: the same flags without the variable print another report.
+        assert_ne!(batch(false, &pasted), unshrunk);
     }
 
     /// R16: a check prints one failure block, its first in seed order, which

@@ -4553,7 +4553,10 @@ and counts beside the verdict. In order:
 - **The rerun command**: `rerun exactly this batch: charpente test --sim
   --master-seed 0x…`, with `--runs` when the batch ran another count than 256
   and `--filter` when it had one. Pasted, it prints this report again, byte
-  for byte, for any `--jobs`.
+  for byte, for any `--jobs`. A batch run under `CHARPENTE_SIM_NO_SHRINK`
+  ("Finding a one-sided property" below) did not shrink, and its line starts
+  `CHARPENTE_SIM_NO_SHRINK=1 charpente test --sim`, so the pasted command
+  does not shrink either.
 
 There is no line for the faults that fired. To confirm that a fault a property
 depends on actually happened, `require` its coverage key (`sim_tests! {
@@ -4971,8 +4974,10 @@ shrinking off, and a failing check prints its first failure as it ran:
 
 Its `repro:` replays that run, `--format json` gives it `"replays":0` and
 `"not_shrunk":"CHARPENTE_SIM_NO_SHRINK is set"`, and every run and verdict is
-the one a plain batch reaches. A caught mutant then costs no more than its
-green baseline, so cargo-mutants' own five-times timeout holds for an app
+the one a plain batch reaches. The batch's rerun line starts
+`CHARPENTE_SIM_NO_SHRINK=1 charpente test --sim …`, so pasted from a mutant's
+log it prints that report again. A caught mutant then costs about its green
+baseline: no shrink is added, so cargo-mutants' own five-times timeout holds for an app
 (`--file src/… --test-package <app>`), and so does the verb's derived one. It
 is an environment variable rather than a harness flag because a test set can
 mix your sim with libtest binaries, which refuse a flag they do not know. A

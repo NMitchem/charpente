@@ -496,6 +496,20 @@ fn no_outcomes_diagnosis(code: Option<i32>, path: &str, err: &str) -> String {
     }
 }
 
+/// The run's record, or the error that names its path and the shape the verb
+/// reads: another cargo-mutants version may write another one, and the install
+/// probe checks only that the tool runs.
+fn parse_outcomes(text: &str, path: &str) -> Result<Outcomes, String> {
+    serde_json::from_str(text).map_err(|e| {
+        format!(
+            "error: could not parse {path}: {e}\n  the verb reads cargo-mutants 27.1.0's \
+             outcomes.json, and this one has another shape: check `cargo mutants --version`, \
+             and install the pinned version with\n  cargo install cargo-mutants --version \
+             27.1.0 --locked"
+        )
+    })
+}
+
 /// Reads the run's own record and turns every "nothing was measured" shape
 /// into a loud failure. The tool's exit code is NOT consulted for the
 /// verdict — it is 0 both for a clean sweep and for a filter that selected
@@ -516,10 +530,10 @@ fn report(path: &std::path::Path, property: Option<&str>, code: Option<i32>) -> 
             return 2;
         }
     };
-    let o: Outcomes = match serde_json::from_str(&text) {
+    let o = match parse_outcomes(&text, &path.display().to_string()) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("error: could not parse {}: {e}", path.display());
+            eprintln!("{e}");
             return 2;
         }
     };
@@ -738,6 +752,30 @@ mod tests {
     }
 
     const OK_BASELINE: &str = r#""outcomes":[{"scenario":"Baseline","summary":"Success"}]"#;
+
+    /// A record in another shape than 27.1.0's, here a mutant with no `file`,
+    /// is refused with its path, the version the verb reads and the line that
+    /// installs it (CLAUDE.md hard rule 5).
+    #[test]
+    fn a_record_in_another_shape_names_the_version_the_verb_reads() {
+        let record = r#"{"total_mutants":1,"caught":1,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{"scenario":"Baseline","summary":"Success"},
+            {"scenario":{"Mutant":{"path":"src/lib.rs"}},"summary":"CaughtMutant"}]}"#;
+        let Err(e) = parse_outcomes(record, "out/outcomes.json") else {
+            panic!("a mutant with no `file` parses");
+        };
+        let (first, rest) = e.split_once('\n').unwrap_or_else(|| panic!("{e}"));
+        assert!(
+            first.starts_with("error: could not parse out/outcomes.json: missing field `file`"),
+            "{e}"
+        );
+        assert_eq!(
+            rest,
+            "  the verb reads cargo-mutants 27.1.0's outcomes.json, and this one has another \
+             shape: check `cargo mutants --version`, and install the pinned version with\n  \
+             cargo install cargo-mutants --version 27.1.0 --locked",
+        );
+    }
 
     #[test]
     fn every_viable_mutant_caught_is_the_only_green() {

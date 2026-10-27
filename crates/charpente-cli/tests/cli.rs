@@ -188,6 +188,15 @@ fn the_sim_binary_reads_the_no_shrink_variable_from_its_environment() {
             human.contains(unshrunk),
             "CHARPENTE_SIM_NO_SHRINK={value:?}:\n{human}"
         );
+        // Its rerun line sets the variable, so pasted it reprints this report.
+        assert_eq!(
+            human.lines().last(),
+            Some(
+                "rerun exactly this batch: CHARPENTE_SIM_NO_SHRINK=1 charpente test --sim \
+                 --master-seed 0x5eed --runs 64 --filter sometimes_fails"
+            ),
+            "CHARPENTE_SIM_NO_SHRINK={value:?}:\n{human}"
+        );
     }
     let json = batch("1", "json");
     assert!(
