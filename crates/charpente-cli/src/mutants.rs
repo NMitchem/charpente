@@ -374,6 +374,8 @@ pub fn run(args: &[String]) -> i32 {
         &out_dir.join("mutants.out/outcomes.json"),
         opts.property.as_deref(),
         status.code(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
     )
 }
 
@@ -514,8 +516,16 @@ fn parse_outcomes(text: &str, path: &str) -> Result<Outcomes, String> {
 /// into a loud failure. The tool's exit code is NOT consulted for the
 /// verdict — it is 0 both for a clean sweep and for a filter that selected
 /// nothing — and IS consulted in exactly one place, when there is no record
-/// at all (`no_outcomes_diagnosis`).
-fn report(path: &std::path::Path, property: Option<&str>, code: Option<i32>) -> i32 {
+/// at all (`no_outcomes_diagnosis`). A run that measured nothing (code 2)
+/// is an error and goes to `err`; any other verdict is the run's result and
+/// goes to `out`. The verb passes stdout and stderr.
+fn report(
+    path: &std::path::Path,
+    property: Option<&str>,
+    code: Option<i32>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
     // Reading cargo-mutants' own run record is edge tooling, outside the
     // deterministic core (DESIGN.md §1) — nothing inside charpente-core
     // touches the filesystem directly.
@@ -523,26 +533,28 @@ fn report(path: &std::path::Path, property: Option<&str>, code: Option<i32>) -> 
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) => {
-            eprintln!(
+            writeln!(
+                err,
                 "{}",
                 no_outcomes_diagnosis(code, &path.display().to_string(), &e.to_string())
-            );
+            )
+            .expect("failed printing to stderr");
             return 2;
         }
     };
     let o = match parse_outcomes(&text, &path.display().to_string()) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("{e}");
+            writeln!(err, "{e}").expect("failed printing to stderr");
             return 2;
         }
     };
     let v = verdict(&o, &path.display().to_string(), property);
     for line in &v.lines {
         if v.code == 2 {
-            eprintln!("{line}");
+            writeln!(err, "{line}").expect("failed printing to stderr");
         } else {
-            println!("{line}");
+            writeln!(out, "{line}").expect("failed printing to stdout");
         }
     }
     v.code
@@ -752,6 +764,73 @@ mod tests {
     }
 
     const OK_BASELINE: &str = r#""outcomes":[{"scenario":"Baseline","summary":"Success"}]"#;
+
+    /// R50: a run that measured nothing (code 2) is reported on stderr, and a
+    /// result, a clean one or a finding, on stdout, so a script reading the
+    /// verb's stdout never takes an error for a result.
+    // Writing the records `report` reads is edge tooling, as `report` is.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_run_that_measured_nothing_is_reported_on_stderr_and_a_result_on_stdout() {
+        let dir =
+            std::env::temp_dir().join(format!("charpente-mutants-report-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let report_of = |name: &str, record: Option<&str>| {
+            let path = dir.join(name);
+            if let Some(record) = record {
+                std::fs::write(&path, record).expect("write the record");
+            }
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = report(&path, None, Some(0), &mut out, &mut err);
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let failed_baseline = r#"{"total_mutants":3,"caught":0,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{"scenario":"Baseline","summary":"Failure"}]}"#;
+        let (code, out, err) = report_of("failed-baseline.json", Some(failed_baseline));
+        assert_eq!((code, out.as_str()), (2, ""), "{err}");
+        assert!(
+            err.starts_with("error: the UNMUTATED baseline was not green (Failure)")
+                && err.ends_with(" may not).\n")
+                && err.lines().count() == 1,
+            "{err}"
+        );
+        for (name, record) in [
+            ("missing.json", None),
+            ("another-shape.json", Some(r#"{"total_mutants":1}"#)),
+        ] {
+            let (code, out, err) = report_of(name, record);
+            assert_eq!((code, out.as_str()), (2, ""), "{name}: {err}");
+            assert!(err.starts_with("error: "), "{name}: {err}");
+        }
+        let clean = format!(
+            r#"{{"total_mutants":5,"caught":5,"missed":0,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
+        );
+        let (code, out, err) = report_of("clean.json", Some(&clean));
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (
+                0,
+                "mutants: 5 total — 5 caught, 0 missed, 0 unviable, 0 timed out\n",
+                ""
+            )
+        );
+        let missed = format!(
+            r#"{{"total_mutants":5,"caught":4,"missed":1,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
+        );
+        let (code, out, err) = report_of("missed.json", Some(&missed));
+        assert_eq!((code, err.as_str()), (1, ""), "{out}");
+        assert!(
+            out.starts_with(
+                "mutants: 5 total — 4 caught, 1 missed, 0 unviable, 0 timed out\n  1 MISSED: "
+            ),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A record in another shape than 27.1.0's, here a mutant with no `file`,
     /// is refused with its path, the version the verb reads and the line that
