@@ -832,8 +832,9 @@ struct Replay {
 struct CheckExtras {
     passed: u64,
     failed: u64,
-    /// Skipped runs by reason: count descending, then reason ascending.
-    skipped: Vec<(&'static str, u64)>,
+    /// Skipped runs by reason, each with its count and the seed of its first
+    /// run in run order: count descending, then reason ascending.
+    skipped: Vec<(&'static str, u64, u64)>,
     /// How many distinct `drawn` lists, values included, the tested runs drew.
     distinct_inputs: u64,
     /// Whether any tested run drew an input.
@@ -847,7 +848,10 @@ struct CheckExtras {
 struct CheckTally {
     passed: u64,
     failed: u64,
-    reasons: BTreeMap<&'static str, u64>,
+    /// Each reason's count and the seed of its first run. Runs are tallied in
+    /// run order, never completion order, so the first seed is the same for
+    /// any `--jobs`.
+    reasons: BTreeMap<&'static str, (u64, u64)>,
     inputs: BTreeSet<Vec<(&'static str, String)>>,
     details: Vec<String>,
 }
@@ -863,7 +867,11 @@ impl CheckTally {
     }
 
     fn into_extras(self) -> CheckExtras {
-        let mut skipped: Vec<(&'static str, u64)> = self.reasons.into_iter().collect();
+        let mut skipped: Vec<(&'static str, u64, u64)> = self
+            .reasons
+            .into_iter()
+            .map(|(reason, (n, first))| (reason, n, first))
+            .collect();
         skipped.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         CheckExtras {
             passed: self.passed,
@@ -979,7 +987,7 @@ fn run_single_seed(
         let mut check = CheckTally::default();
         match run_app_universe(seed, inputs, faults_off, &test.run) {
             Ok(end) => {
-                tally(&mut outcomes, &mut check, &end);
+                tally(&mut outcomes, &mut check, seed, &end);
                 if let Outcome::GaveUp {
                     detail: Some(detail),
                     ..
@@ -1031,11 +1039,11 @@ impl Failure {
 
 /// A run that failed is neither: it never lands here (the failure branch
 /// files a `Failure` instead), so verdicts + gave_up + failures = runs.
-fn tally(outcomes: &mut TestOutcomes, check: &mut CheckTally, end: &UniverseEnd) {
+fn tally(outcomes: &mut TestOutcomes, check: &mut CheckTally, seed: u64, end: &UniverseEnd) {
     match &end.outcome {
         Outcome::GaveUp { reason, .. } => {
             outcomes.gave_up += 1;
-            *check.reasons.entry(reason).or_insert(0) += 1;
+            check.reasons.entry(reason).or_insert((0, seed)).0 += 1;
         }
         Outcome::Verdict => {
             outcomes.verdicts += 1;
@@ -1110,7 +1118,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize, shrin
             let (outcome, &(_, seed)) = results.next().expect("one result per work item");
             match outcome {
                 Ok(end) => {
-                    tally(&mut outcomes, &mut check, &end);
+                    tally(&mut outcomes, &mut check, seed, &end);
                     merge(&mut covered, &end.coverage);
                 }
                 Err(failed) => {
@@ -1214,7 +1222,7 @@ fn render_json(batch: &Batch) -> String {
     for c in &batch.checks {
         passed += c.passed;
         failed += c.failed;
-        skipped += c.skipped.iter().map(|(_, n)| n).sum::<u64>();
+        skipped += c.skipped.iter().map(|(_, n, _)| n).sum::<u64>();
     }
     // A replay's seed reruns one run, not a batch, so it is never named
     // `master_seed`: fed back as `--master-seed` it would run another batch.
@@ -1271,7 +1279,7 @@ fn render_json(batch: &Batch) -> String {
             check_status(c, unmet),
             c.passed,
             c.failed,
-            c.skipped.iter().map(|(_, n)| n).sum::<u64>(),
+            c.skipped.iter().map(|(_, n, _)| n).sum::<u64>(),
             c.distinct_inputs,
             c.drew,
         ));
@@ -1287,13 +1295,13 @@ fn render_json(batch: &Batch) -> String {
             c.details.len(),
             c.skipped.len()
         );
-        for (j, (reason, n)) in c.skipped.iter().enumerate() {
+        for (j, (reason, n, first)) in c.skipped.iter().enumerate() {
             if j > 0 {
                 out.push(',');
             }
             out.push_str("{\"reason\":\"");
             json_escape(reason, &mut out);
-            out.push_str(&format!("\",\"count\":{n}"));
+            out.push_str(&format!("\",\"count\":{n},\"first_seed\":\"{first:#x}\""));
             if let Some(detail) = c.details.get(j) {
                 out.push_str(",\"detail\":\"");
                 json_escape(detail, &mut out);
@@ -1511,16 +1519,16 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
             let _ = writeln!(out, "  {}{never}", o.test);
             let listed = &c.skipped[..c.skipped.len().min(REASONS_SHOWN)];
             let width = listed[0].1.to_string().len();
-            for (reason, n) in listed {
+            for (reason, n, first) in listed {
                 let reason = reason
                     .replace('\n', "\\n")
                     .replace('\r', "\\r")
                     .replace('\t', "\\t");
-                let _ = writeln!(out, "    {n:>width$}  {reason}");
+                let _ = writeln!(out, "    {n:>width$}  {reason} (first: --seed {first:#x})");
             }
             let rest = &c.skipped[listed.len()..];
             if !rest.is_empty() {
-                let runs: u64 = rest.iter().map(|(_, n)| n).sum();
+                let runs: u64 = rest.iter().map(|(_, n, _)| n).sum();
                 let _ = writeln!(
                     out,
                     "    and {} more {} ({runs} {}): --format json lists every one",
@@ -1562,7 +1570,7 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
     let _ = writeln!(out);
     for (o, c) in report.outcomes.iter().zip(&batch.checks) {
         let tested = c.passed + c.failed;
-        let skipped: u64 = c.skipped.iter().map(|(_, n)| n).sum();
+        let skipped: u64 = c.skipped.iter().map(|(_, n, _)| n).sum();
         assert_eq!(
             c.passed, o.verdicts,
             "{}: passed runs are its verdicts",
@@ -1677,7 +1685,7 @@ fn write_replay(batch: &Batch, replay: &Replay, out: &mut dyn std::io::Write) {
         let dots = ".".repeat(width - o.test.chars().count() + 3);
         let _ = writeln!(out, "check {} {dots} {status}", o.test);
         if status == "skipped" {
-            for (reason, _) in &c.skipped {
+            for (reason, ..) in &c.skipped {
                 let _ = writeln!(out, "    skipped: {}", escape(reason));
             }
             for detail in &c.details {
@@ -4084,12 +4092,15 @@ mod tests {
         ];
         let (code, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
         assert_eq!(code, 0, "{out}");
+        // The second check's runs take the batch's seeds after the first's.
+        let first = batch_seeds(0x1234, 12)[6];
         assert_eq!(
             out,
-            "\n\
+            format!(
+                "\n\
              skipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
              \x20 always_gives_up — never tested: every run was skipped\n\
-             \x20   6  the fixture always gives up\n\
+             \x20   6  the fixture always gives up (first: --seed {first:#x})\n\
              \n\
              these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):\n\
              \x20 always_passes\n\
@@ -4099,6 +4110,7 @@ mod tests {
              \n\
              sim result: ok. 1 passed; 0 failed; 1 untested. Runs tested per check, in the order above: 6, 0 of 6.\n\
              rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6\n"
+            )
         );
     }
 
@@ -4115,7 +4127,7 @@ mod tests {
         ];
         let batch = run_batch(&[&tests[0], &tests[1]], 0x1234, 24, 1, true);
         let c = &batch.checks[0];
-        let skipped: u64 = c.skipped.iter().map(|(_, n)| n).sum();
+        let skipped: u64 = c.skipped.iter().map(|(_, n, _)| n).sum();
         assert!(
             c.passed > 0 && c.failed > 0 && skipped > 0,
             "non-vacuous: {c:?}"
@@ -4277,6 +4289,20 @@ mod tests {
         Ok(())
     }
 
+    /// Each of `TWELVE`'s counts in a batch of `gives_up_twelve_ways`, and the
+    /// seed of its first run, worked out from the batch's seeds alone.
+    fn twelve_reasons(master: u64, runs: u64) -> ([u64; 12], [u64; 12]) {
+        let (mut counts, mut firsts) = ([0u64; 12], [0u64; 12]);
+        for seed in batch_seeds(master, runs) {
+            let i = twelfth(seed);
+            if counts[i] == 0 {
+                firsts[i] = seed;
+            }
+            counts[i] += 1;
+        }
+        (counts, firsts)
+    }
+
     #[test]
     fn more_than_eight_reasons_print_eight_and_count_the_rest_identically_under_any_jobs() {
         let tests = [sim_test("gives_up_twelve_ways", gives_up_twelve_ways)];
@@ -4290,11 +4316,9 @@ mod tests {
         );
         // Each reason's count, worked out from the batch's seeds alone, then
         // ordered by count descending and reason ascending.
-        let mut counts = [0u64; 12];
-        for seed in batch_seeds(0x1234, 256) {
-            counts[twelfth(seed)] += 1;
-        }
-        let mut reasons: Vec<(&str, u64)> = TWELVE.into_iter().zip(counts).collect();
+        let (counts, firsts) = twelve_reasons(0x1234, 256);
+        let mut reasons: Vec<(&str, u64, u64)> =
+            (0..12).map(|i| (TWELVE[i], counts[i], firsts[i])).collect();
         reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         // Non-vacuous: every reason occurs, and the counts differ in width,
         // so the right-alignment is exercised.
@@ -4305,15 +4329,95 @@ mod tests {
             "\nskipped runs hit a fault before reaching the check, so they prove nothing either \
              way:\n  gives_up_twelve_ways — never tested: every run was skipped\n",
         );
-        for (reason, n) in &reasons[..8] {
-            want.push_str(&format!("    {n:>width$}  {reason}\n"));
+        for (reason, n, first) in &reasons[..8] {
+            want.push_str(&format!(
+                "    {n:>width$}  {reason} (first: --seed {first:#x})\n"
+            ));
         }
-        let rest: u64 = reasons[8..].iter().map(|(_, n)| n).sum();
+        let rest: u64 = reasons[8..].iter().map(|(_, n, _)| n).sum();
         want.push_str(&format!(
             "    and 4 more reasons ({rest} runs): --format json lists every one\n\ncheck \
              gives_up_twelve_ways ... untested  (0 tested, 256 skipped)\n\nsim result: "
         ));
         assert!(out.contains(&want), "want:\n{want}\nout:\n{out}");
+    }
+
+    /// Gives up for one of two reasons on two seeds in three; passes the rest.
+    fn skips_two_ways(sim: &mut Sim) -> Result<(), String> {
+        match sim.seed() % 3 {
+            0 => sim.give_up("the seed is a multiple of 3", ""),
+            1 => sim.give_up("the seed is one past a multiple of 3", ""),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// R47: each skipped reason gives the seed of the first run, in run order,
+    /// that skipped for it, whatever `--jobs` is, and `--seed` with that seed
+    /// replays a run that skips for that reason.
+    #[test]
+    fn each_skipped_reason_gives_its_first_runs_seed_and_the_seed_replays_it() {
+        let tests = [sim_test("skips_two_ways", skips_two_ways)];
+        // Worked out from the batch's seeds alone.
+        let seeds = batch_seeds(0x1234, 32);
+        let of = |r: u64| -> Vec<u64> { seeds.iter().copied().filter(|s| s % 3 == r).collect() };
+        let (zero, one) = (of(0), of(1));
+        // Non-vacuous: each reason has several runs, so the first is not the
+        // last, and for one of them the first in run order is not the
+        // smallest seed.
+        assert!(zero.len() > 1 && one.len() > 1, "{seeds:x?}");
+        assert!(
+            zero[0] != *zero.iter().min().unwrap() || one[0] != *one.iter().min().unwrap(),
+            "{seeds:x?}"
+        );
+        let mut want = vec![
+            (zero.len(), "the seed is a multiple of 3", zero[0]),
+            (one.len(), "the seed is one past a multiple of 3", one[0]),
+        ];
+        want.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        let width = want[0].0.to_string().len();
+
+        let flags = |jobs| ["--runs", "32", "--master-seed", "0x1234", "--jobs", jobs];
+        let (code, out) = run_to_string(&tests, &flags("1"));
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            run_to_string(&tests, &flags("4")).1,
+            out,
+            "--jobs 4 differs"
+        );
+        let reasons: String = want
+            .iter()
+            .map(|(n, reason, seed)| {
+                format!("    {n:>width$}  {reason} (first: --seed {seed:#x})\n")
+            })
+            .collect();
+        assert!(
+            out.contains(&format!("\n  skips_two_ways\n{reasons}\n")),
+            "want:\n{reasons}\nout:\n{out}"
+        );
+        for (_, reason, seed) in &want {
+            let seed = format!("{seed:#x}");
+            let (code, replayed) =
+                run_to_string(&tests, &["--filter", "skips_two_ways", "--seed", &seed]);
+            assert_eq!(code, 0, "{replayed}");
+            assert!(
+                replayed.contains(&format!(
+                    "\ncheck skips_two_ways ... skipped\n    skipped: {reason}\n"
+                )),
+                "--seed {seed} replays a skip for its reason:\n{replayed}"
+            );
+        }
+        let (_, json) = run_to_string(&tests, &[&flags("1")[..], &["--format", "json"]].concat());
+        let entries: Vec<String> = want
+            .iter()
+            .map(|(n, reason, seed)| {
+                format!("{{\"reason\":\"{reason}\",\"count\":{n},\"first_seed\":\"{seed:#x}\"}}")
+            })
+            .collect();
+        assert!(
+            json.contains(&format!("\"skipped_reasons\":[{}]", entries.join(","))),
+            "{json}"
+        );
     }
 
     /// Fails on some seeds, gives up on others and passes the rest.
@@ -4365,12 +4469,13 @@ mod tests {
     fn a_reason_with_a_newline_stays_on_one_line() {
         let tests = [sim_test("gives_up_with_escapes", gives_up_with_escapes)];
         let (_, out) = run_to_string(&tests, &["--runs", "3", "--master-seed", "0x1234"]);
+        let first = batch_seeds(0x1234, 3)[0];
         assert!(
-            out.contains(
+            out.contains(&format!(
                 "\n  gives_up_with_escapes — never tested: every run was skipped\n    3  line \
-                 one\\nline two\\tend\\r\n\ncheck gives_up_with_escapes ... untested  (0 tested, 3 \
-                 skipped)\n\nsim result: "
-            ),
+                 one\\nline two\\tend\\r (first: --seed {first:#x})\n\ncheck gives_up_with_escapes \
+                 ... untested  (0 tested, 3 skipped)\n\nsim result: "
+            )),
             "{out}"
         );
     }
@@ -4555,10 +4660,16 @@ mod tests {
         let test = sim_test("gives_up_with_a_detail", gives_up_with_a_detail);
         let replayed = run_single_seed(&[&test], 0x1234, None, &[]);
         assert_eq!(replayed.checks[0].details, ["on seed 0x1234"]);
-        assert_eq!(replayed.checks[0].skipped, [("the fixture gives up", 1)]);
+        assert_eq!(
+            replayed.checks[0].skipped,
+            [("the fixture gives up", 1, 0x1234)]
+        );
         let batch = run_batch(&[&test], 0x1234, 4, 1, true);
         assert!(batch.checks[0].details.is_empty());
-        assert_eq!(batch.checks[0].skipped, [("the fixture gives up", 4)]);
+        assert_eq!(
+            batch.checks[0].skipped,
+            [("the fixture gives up", 4, batch_seeds(0x1234, 4)[0])]
+        );
     }
 
     fn replay_seed(test: SimTest, extra: &[&str]) -> (i32, String) {
@@ -4670,6 +4781,7 @@ mod tests {
         let failed = tested.iter().filter(|&&n| n == 0).count();
         let skipped = digits.len() - tested.len();
         let distinct = tested.iter().collect::<BTreeSet<_>>().len();
+        let first_skip = batch_seeds(0x1234, 64)[digits.iter().position(|&n| n >= 7).unwrap()];
         // Non-vacuous: failures, skips and several distinct inputs all occur.
         assert!(failed > 0 && skipped > 0 && distinct > 1, "{digits:?}");
         let passed = tested.len() - failed;
@@ -4695,7 +4807,7 @@ mod tests {
                 "[{{\"check\":\"draws_a_digit\",\"status\":\"FAILED\",\"passed\":{passed},\
                  \"failed\":{failed},\"skipped\":{skipped},\"distinct_inputs\":{distinct},\
                  \"drew_inputs\":true,\"skipped_reasons\":[{{\"reason\":\"drew 7 or more\",\
-                 \"count\":{skipped}}}]}},{{\"check\":\"draws_nothing\",\"status\":\"ok\",\
+                 \"count\":{skipped},\"first_seed\":\"{first_skip:#x}\"}}]}},{{\"check\":\"draws_nothing\",\"status\":\"ok\",\
                  \"passed\":64,\"failed\":0,\"skipped\":0,\"distinct_inputs\":1,\
                  \"drew_inputs\":false,\"skipped_reasons\":[]}}]"
             )
@@ -4818,16 +4930,16 @@ mod tests {
         ];
         let (code, json) = run_to_string(&tests, &flags);
         assert_eq!(code, 0, "{json}");
-        let mut counts = [0u64; 12];
-        for seed in batch_seeds(0x1234, 256) {
-            counts[twelfth(seed)] += 1;
-        }
-        let mut reasons: Vec<(&str, u64)> = TWELVE.into_iter().zip(counts).collect();
+        let (counts, firsts) = twelve_reasons(0x1234, 256);
+        let mut reasons: Vec<(&str, u64, u64)> =
+            (0..12).map(|i| (TWELVE[i], counts[i], firsts[i])).collect();
         reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
         let want: Vec<String> = reasons
             .iter()
-            .map(|(r, n)| format!("{{\"reason\":\"{r}\",\"count\":{n}}}"))
+            .map(|(r, n, first)| {
+                format!("{{\"reason\":\"{r}\",\"count\":{n},\"first_seed\":\"{first:#x}\"}}")
+            })
             .collect();
         assert!(
             json.contains(&format!("\"skipped_reasons\":[{}]", want.join(","))),
@@ -4902,7 +5014,7 @@ mod tests {
                 "{\"check\":\"gives_up_with_detail\",\"status\":\"untested\",\"passed\":0,\
                  \"failed\":0,\"skipped\":1,\"distinct_inputs\":0,\"drew_inputs\":false,\
                  \"skipped_reasons\":[{\"reason\":\"the store hit fault fallout\",\"count\":1,\
-                 \"detail\":\"seq \\\"14\\\"\"}]}"
+                 \"first_seed\":\"0x1234\",\"detail\":\"seq \\\"14\\\"\"}]}"
             ),
             "{json}"
         );
@@ -4991,7 +5103,7 @@ mod tests {
             checks: vec![CheckExtras {
                 passed: 0,
                 failed: 0,
-                skipped: vec![("first", 1), ("second", 1)],
+                skipped: vec![("first", 1, 0x1), ("second", 1, 0x2)],
                 distinct_inputs: 0,
                 drew: false,
                 details: vec!["the first run's detail".to_string()],

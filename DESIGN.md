@@ -2080,7 +2080,8 @@ Charpente treats the coding agent as the primary developer persona:
   makes the run smaller (a local minimum, GUIDE §8) or its budget runs out, which can
   stop it short of one, and its repro replays exactly that run. The human report is
   in `cargo test`'s shape: one shrunk block per failing check, the skipped runs'
-  reasons counted and the checks that draw no inputs named, then a line per check
+  reasons counted, each with its first run's seed, and the checks that draw no
+  inputs named, then a line per check
   (`ok`, `FAILED` or `untested`, with how many runs tested it, over how many distinct
   inputs, and how many were skipped) directly above a result line and the command
   that reruns exactly the batch, so a tail of the report carries every check's
@@ -2089,7 +2090,8 @@ Charpente treats the coding agent as the primary developer persona:
   triage. `--format json` is the machine-readable surface and carries every fact the human report
   does: `runs` and run totals, `coverage`, `missing_coverage` (`{check, key}` pairs for
   `require`d keys never hit), per-check `{check, status, passed, failed, skipped,
-  distinct_inputs, drew_inputs, skipped_reasons}` with every skipped reason, and every
+  distinct_inputs, drew_inputs, skipped_reasons}` with every skipped reason and its first
+  run's seed, and every
   failure as `{check, seed, config, fired, message, inputs, faults_off, first_message,
   not_shrunk, replays, repro}` (GUIDE §8). Ships with the public
   checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/

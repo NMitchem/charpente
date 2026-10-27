@@ -3156,7 +3156,10 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   check's skipped runs by reason and counts each group, so a reason with a seq
   in it makes every run its own group and the counts say nothing. What varies
   goes in `detail` (anything `Display`, such as the fallout error `e`): that one
-  run's own text, which a batch does not print and `--seed` prints under the skipped check as `detail:`. A
+  run's own text, which a batch does not print and `--seed` prints under the
+  skipped check as `detail:`. A batch gives each reason the seed of its first
+  run, `(first: --seed 0x…)`, so `charpente test --sim --filter <check> --seed
+  0x…` replays that run and prints its detail. A
   constant such as a retry count is fixed text, so it belongs in the reason
   (`"Db::open never booted in 8 boots"`), not the detail. A give-up with
   nothing to add passes `""`, and an empty detail is none.
@@ -3217,8 +3220,8 @@ prints no reasons block at all. This is a pinned batch of `crates/sim-fixture`,
 ```text
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
-    10  Db::open after the crash never booted in 8 boots
-     2  the write was never acked, so durability has nothing to prove
+    10  Db::open after the crash never booted in 8 boots (first: --seed 0x553274161bbf8475)
+     2  the write was never acked, so durability has nothing to prove (first: --seed 0x70d29b6c7d22528d)
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
   counter_roundtrip
@@ -3238,7 +3241,7 @@ gives up, over six runs:
 ```text
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   always_gives_up — never tested: every run was skipped
-    6  the fixture always gives up
+    6  the fixture always gives up (first: --seed 0x3071c63893f2dcbd)
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
   always_passes
@@ -4456,8 +4459,9 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   drew_inputs, skipped_reasons}`: `status` is `ok`, `FAILED` or `untested`
   (under `--seed` too, where the human line says `skipped`), and
   `skipped_reasons` lists every reason, uncapped, as `{reason,
-  count}` by count descending then reason, plus `detail` under `--seed`, the one
-  run's own text. Each of `failures` lists every failing run, in seed order, as
+  count, first_seed}` by count descending then reason, `first_seed` being the
+  seed of the reason's first run in run order, plus `detail` under `--seed`,
+  the one run's own text. Each of `failures` lists every failing run, in seed order, as
   `{check, seed, config, fired, message, inputs, faults_off, first_message,
   not_shrunk, replays, repro}`, with `config` carrying every fault axis. A
   check's first failure is the one a batch shrinks: its `inputs` are
@@ -4512,7 +4516,10 @@ and counts beside the verdict. In order:
   `<n>` is every run of the check, and every one of them counts, failed and
   skipped runs included, so the key truly never fired.
 - **The skipped runs' reasons**, under each check that skipped any, most
-  frequent first and then in byte order, each with its count. A check that
+  frequent first and then in byte order, each with its count and the seed of
+  its first run in run order, the same for any `--jobs`: `(first: --seed
+  0x…)`. With `--filter <check>`, that seed replays a run that skipped for that
+  reason and prints its detail. A check that
   tested nothing is headed `— never tested: every run was skipped`. A check
   lists at most eight reasons and counts the rest on one line; `\n`, `\r` and
   `\t` in a reason print as those two-character escapes, so every reason stays

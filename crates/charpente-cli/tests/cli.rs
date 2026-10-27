@@ -252,8 +252,8 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
         r#"
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
-    10  Db::open after the crash never booted in 8 boots
-     2  the write was never acked, so durability has nothing to prove
+    10  Db::open after the crash never booted in 8 boots (first: --seed 0x553274161bbf8475)
+     2  the write was never acked, so durability has nothing to prove (first: --seed 0x70d29b6c7d22528d)
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
   counter_roundtrip
