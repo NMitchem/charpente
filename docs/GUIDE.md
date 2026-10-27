@@ -4822,6 +4822,16 @@ go red?** It runs your suite repeatedly against deliberately broken copies of
 your source (patched in a scratch directory — nothing about the mutation touches
 your tree or ships), and a mutant that survives is a gap in your oracles.
 
+It asks that question only where cargo-mutants can build a broken copy. The
+tool replaces a function's whole body with a value of its return type, and swaps
+operators (`<` for `<=`, `+` for `-`, `&&` for `||`); it never deletes a
+statement. A body replacement needs a value of the return type that the tool can
+build: `()`, `Ok(())`, `0`, `true`, a `Default::default()`. So a function that
+returns a type with no `Default`, a `std::cmp::Reverse`, or an id type gets no
+body replacement at all, and a handler whose whole effect is its writes keeps
+them in every mutant. Check those writes in a property, or delete them by hand
+and watch a check go red.
+
 ```
 scripts/mutants.sh --file src/jobs.rs
 ```
@@ -4846,8 +4856,9 @@ mutants: 1 total — 0 caught, 1 missed, 0 unviable, 0 timed out
 ```
 
 cargo-mutants' own lines pass through (the `MISSED` line above is one). To
-them the verb adds the summary, a MISSED or TIMED OUT paragraph and, when it
-derives `--timeout`, its timing line (below); it names no caught mutant. The
+them the verb adds the summary, a MISSED or TIMED OUT paragraph, the functions
+no viable mutant measured (below) and, when it derives `--timeout`, its timing
+line (below); it names no caught mutant. The
 run directory is cargo-mutants' own per-mutant record, at
 `target/charpente-mutants/mutants.out/` under the directory the verb ran in
 (`--dir`, default `.`): `outcomes.json`; `caught.txt`, `missed.txt`,
@@ -4880,9 +4891,30 @@ in any other crate must name its own package here, or its mutants are
 judged by suites that never exercise them and all report MISSED.
 
 **Two results that are not findings.** `unviable` means the mutant did not
-compile — your types rejected it, which is the compile-time contract doing its
-job. `timed out` means the run did **not resolve**: it is not a catch, and the
-verb will not let it read as one.
+compile. Sometimes your types rejected a plausible bug, which is the
+compile-time contract doing its job; often the tool could not build a value of
+the return type (`Default::default()` for a type with no `Default`), and then
+nothing was tested. A function whose every mutant was unviable is **untested**:
+the run says nothing about it either way. The verb names each one below its
+summary, grouped by file, and like an untested sim check it does not fail the
+run on its own:
+
+```text
+mutants: 82 total — 59 caught, 0 missed, 23 unviable, 0 timed out
+  12 functions had no viable mutant, so this run says nothing about them (untested):
+    src/lib.rs
+      Prices::lowest
+      submit_report
+    src/merge.rs
+      latest
+      lowest
+  To measure one, give its return type a value cargo-mutants can build, such as a derived Default, or check its effect in a property (GUIDE §8 "Finding a one-sided property").
+```
+
+(The list is cut here; the run named all twelve.) To measure such a function,
+give its return type a value the tool can build, such as a derived `Default` or
+a plain tuple, or check its effect in a property. `timed out` means the run did
+**not resolve**: it is not a catch, and the verb will not let it read as one.
 
 The timeout follows the scope too. cargo-mutants times its own baseline over
 one package, the mutated file's, while every mutant runs all the packages in

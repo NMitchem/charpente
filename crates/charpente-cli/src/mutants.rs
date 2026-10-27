@@ -18,7 +18,11 @@
 //!
 //! Both are the "absent measurement wearing the shape of a passing one" shape
 //! this sub-project exists to remove, so every one of them is turned into a
-//! loud failure below rather than a green line. The exit code is read in ONE
+//! loud failure below rather than a green line. The same shape at function
+//! grain, a function whose every mutant was unviable, is named as untested
+//! instead, beside the totals: a return type the tool cannot build would
+//! otherwise fail every run, so it is treated as the sim treats an untested
+//! check. The exit code is read in ONE
 //! place only: with no `outcomes.json` at all, exit 0 is the filter shape
 //! above and anything else is the tool dying before it ran — which this verb
 //! used to blame on the filter (observed 2026-09-12: a missing `--output`
@@ -34,6 +38,7 @@
 //! (mutants missed) or failed to resolve (timeouts), 2 usage, infrastructure,
 //! or a baseline that was not green.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -119,8 +124,28 @@ struct Outcomes {
 
 #[derive(serde::Deserialize)]
 struct Outcome {
-    scenario: serde_json::Value,
+    scenario: Scenario,
     summary: String,
+}
+
+/// cargo-mutants' `scenario`: the unmutated baseline, or one mutant.
+#[derive(serde::Deserialize)]
+enum Scenario {
+    Baseline,
+    Mutant(Mutant),
+}
+
+/// A mutant's file and the function it sits in, absent for a mutant outside
+/// any function.
+#[derive(serde::Deserialize)]
+struct Mutant {
+    file: String,
+    function: Option<Function>,
+}
+
+#[derive(serde::Deserialize)]
+struct Function {
+    function_name: String,
 }
 
 /// `Some(refusal)` when the effective `--jobs` (flag or `CARGO_MUTANTS_JOBS`,
@@ -505,7 +530,7 @@ fn verdict(o: &Outcomes, where_: &str, property: Option<&str>) -> Verdict {
     if let Some(bad) = o
         .outcomes
         .iter()
-        .find(|x| x.scenario == "Baseline" && x.summary != "Success")
+        .find(|x| matches!(x.scenario, Scenario::Baseline) && x.summary != "Success")
     {
         return Verdict {
             code: 2,
@@ -572,6 +597,50 @@ fn verdict(o: &Outcomes, where_: &str, property: Option<&str>) -> Verdict {
             o.timeout
         ));
         code = 1;
+    }
+    // A function whose every mutant was unviable was never measured: the
+    // zero-mutant run's absent measurement, at function grain. It is named,
+    // as the sim names an untested check, and is never a failure on its own,
+    // since a return type the tool cannot build would fail every run.
+    let mut measured: BTreeMap<(&str, &str), bool> = BTreeMap::new();
+    for x in &o.outcomes {
+        if let Scenario::Mutant(m) = &x.scenario {
+            let function = m
+                .function
+                .as_ref()
+                .map_or("(outside any function)", |f| f.function_name.as_str());
+            *measured.entry((m.file.as_str(), function)).or_insert(false) |=
+                x.summary != "Unviable";
+        }
+    }
+    let untested: Vec<(&str, &str)> = measured
+        .into_iter()
+        .filter(|&(_, measured)| !measured)
+        .map(|(at, _)| at)
+        .collect();
+    if !untested.is_empty() {
+        lines.push(match untested.len() {
+            1 => "  1 function had no viable mutant, so this run says nothing about it (untested):"
+                .to_string(),
+            n => format!(
+                "  {n} functions had no viable mutant, so this run says nothing about them \
+                 (untested):"
+            ),
+        });
+        let mut file = "";
+        for &(at, function) in &untested {
+            if at != file {
+                lines.push(format!("    {at}"));
+                file = at;
+            }
+            lines.push(format!("      {function}"));
+        }
+        lines.push(
+            "  To measure one, give its return type a value cargo-mutants can build, such as a \
+             derived Default, or check its effect in a property (GUIDE §8 \"Finding a one-sided \
+             property\")."
+                .to_string(),
+        );
     }
     Verdict { code, lines }
 }
@@ -757,6 +826,114 @@ mod tests {
         assert_eq!(v.code, 1);
         assert!(
             v.lines.iter().any(|l| l.contains("MISSED")),
+            "{:?}",
+            v.lines
+        );
+    }
+
+    /// One mutant's record in cargo-mutants 27.1.0's `outcomes.json` shape,
+    /// the fields this verb reads where a real record carries them (the
+    /// `Prices::lowest` record below is one, verbatim but for its timings).
+    fn mutant(file: &str, function: &str, summary: &str) -> String {
+        format!(
+            r#"{{"scenario":{{"Mutant":{{"name":"{file}:1:1: replace {function}","package":"app","file":"{file}","function":{{"function_name":"{function}","return_type":"-> T"}},"replacement":"Default::default()","genre":"FnValue"}}}},"summary":"{summary}"}}"#
+        )
+    }
+
+    fn run_of(counts: &str, mutants: &[String]) -> Outcomes {
+        outcomes(&format!(
+            r#"{{{counts},"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{}]}}"#,
+            mutants.join(",")
+        ))
+    }
+
+    /// From the T22 build's run (cargo-mutants 27.1.0), less `phase_results`.
+    const REAL_UNVIABLE: &str = r#"{"scenario":{"Mutant":{"name":"src/lib.rs:88:9: replace Prices::lowest -> Obs with Default::default()","package":"pricewatch","file":"src/lib.rs","function":{"function_name":"Prices::lowest","return_type":"-> Obs","span":{"start":{"line":87,"column":5},"end":{"line":93,"column":6}}},"span":{"start":{"line":88,"column":9},"end":{"line":92,"column":10}},"replacement":"Default::default()","genre":"FnValue"}},"summary":"Unviable","log_path":"log/src__lib.rs_line_88_col_9.log","diff_path":"diff/src__lib.rs_line_88_col_9.diff"}"#;
+
+    /// R45: a function whose every mutant was unviable was never measured,
+    /// so the verb names it below the totals, grouped by file, and the run
+    /// still exits by its missed and timed-out mutants alone (none here).
+    #[test]
+    fn a_function_whose_every_mutant_is_unviable_is_named_untested() {
+        let v = verdict(
+            &run_of(
+                r#""total_mutants":6,"caught":3,"missed":0,"timeout":0,"unviable":3"#,
+                &[
+                    mutant("src/merge.rs", "lowest", "Unviable"),
+                    mutant("src/merge.rs", "lowest", "Unviable"),
+                    mutant("src/lib.rs", "submit_report", "CaughtMutant"),
+                    REAL_UNVIABLE.to_string(),
+                    mutant("src/lib.rs", "read_product", "CaughtMutant"),
+                    mutant("src/lib.rs", "read_product", "CaughtMutant"),
+                ],
+            ),
+            "out",
+            None,
+        );
+        assert_eq!(
+            v.code, 0,
+            "untested is named, never a failure: {:?}",
+            v.lines
+        );
+        assert_eq!(
+            v.lines,
+            [
+                "mutants: 6 total — 3 caught, 0 missed, 3 unviable, 0 timed out",
+                "  2 functions had no viable mutant, so this run says nothing about them \
+                 (untested):",
+                "    src/lib.rs",
+                "      Prices::lowest",
+                "    src/merge.rs",
+                "      lowest",
+                "  To measure one, give its return type a value cargo-mutants can build, such \
+                 as a derived Default, or check its effect in a property (GUIDE §8 \"Finding \
+                 a one-sided property\").",
+            ]
+        );
+    }
+
+    /// A single viable mutant measures its function, whatever the tool made
+    /// of the rest: caught, missed and timed out each count as viable.
+    #[test]
+    fn a_function_with_one_viable_mutant_is_not_named() {
+        for viable in ["CaughtMutant", "MissedMutant", "Timeout"] {
+            let v = verdict(
+                &run_of(
+                    r#""total_mutants":3,"caught":1,"missed":0,"timeout":0,"unviable":2"#,
+                    &[
+                        mutant("src/merge.rs", "latest", "Unviable"),
+                        mutant("src/merge.rs", "latest", viable),
+                        mutant("src/merge.rs", "latest", "Unviable"),
+                    ],
+                ),
+                "out",
+                None,
+            );
+            assert!(
+                !v.lines.iter().any(|l| l.contains("no viable mutant")),
+                "{viable}: {:?}",
+                v.lines
+            );
+        }
+        // One function per name: `latest` in another file is its own.
+        let v = verdict(
+            &run_of(
+                r#""total_mutants":2,"caught":1,"missed":0,"timeout":0,"unviable":1"#,
+                &[
+                    mutant("src/merge.rs", "latest", "CaughtMutant"),
+                    mutant("src/lib.rs", "latest", "Unviable"),
+                ],
+            ),
+            "out",
+            None,
+        );
+        assert_eq!(
+            v.lines[1..3],
+            [
+                "  1 function had no viable mutant, so this run says nothing about it \
+                 (untested):",
+                "    src/lib.rs",
+            ],
             "{:?}",
             v.lines
         );
