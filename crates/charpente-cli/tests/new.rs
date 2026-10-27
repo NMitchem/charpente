@@ -8,9 +8,14 @@ use std::process::Command;
 // Process spawning and scratch directories are edge tooling here, outside
 // the deterministic core (DESIGN.md §1): this file drives the built binary
 // as a real subprocess, exactly as a user would.
+// `charpente test --mutants` exports CHARPENTE_SIM_NO_SHRINK to every test
+// it runs, these included; removed here, so the batches below shrink as
+// they assert whatever runs them.
 #[allow(clippy::disallowed_methods)]
 fn charpente() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_charpente"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_charpente"));
+    command.env_remove("CHARPENTE_SIM_NO_SHRINK");
+    command
 }
 
 /// A fresh, empty scratch directory named for the test, under the OS temp

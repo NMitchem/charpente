@@ -3243,13 +3243,17 @@ macro_rules! sim_tests {
                     require: &[$($($key),*)?],
                 },
             )+];
-            let args = match $crate::harness::HarnessArgs::parse(::std::env::args().skip(1)) {
+            let mut args = match $crate::harness::HarnessArgs::parse(::std::env::args().skip(1)) {
                 Ok(args) => args,
                 Err(usage) => {
                     ::std::eprintln!("{usage}");
                     ::std::process::exit(2);
                 }
             };
+            // Read once, here and nowhere else: under `charpente test
+            // --mutants` a failing check reports its first failure unshrunk.
+            args.no_shrink = ::std::env::var_os($crate::harness::NO_SHRINK_ENV)
+                .is_some_and(|value| !value.is_empty());
             let code = $crate::harness::run(tests, &args, &mut ::std::io::stdout().lock());
             ::std::process::exit(code);
         }

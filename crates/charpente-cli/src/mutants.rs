@@ -88,6 +88,17 @@ const DEFAULT_TARGETS: &[&str] = &[
 /// real tree does not guarantee a green baseline in a scratch copy.
 const DEFAULT_TEST_PACKAGES: &[&str] = &["charpente-core", "charpente-sim"];
 
+/// Set on cargo-mutants and on the timing run, so every test binary they run
+/// inherits it: an app's sim harness then reports a failing check's first
+/// failure unshrunk. A mutant needs only red or green, and a shrink of up to
+/// 500 serial replays would spend the timeout a caught mutant is judged by.
+/// An environment variable, not a harness flag: in a mixed test set a flag
+/// would also reach libtest binaries, which refuse one they do not know.
+/// charpente-sim's `harness::NO_SHRINK_ENV`, spelled out here because this
+/// crate does not link charpente-sim; guide-examples' `hook_census` holds the
+/// two spellings equal.
+const NO_SHRINK_ENV: &str = "CHARPENTE_SIM_NO_SHRINK";
+
 pub const USAGE: &str = "usage: charpente test --mutants [--file PATH]… [--re REGEX] \
 [--dir PATH] [--timeout SECS] [--jobs N]\n\
        --file PATH  a source file to mutate (repeatable; default: the oracle-bearing set)\n\
@@ -105,7 +116,10 @@ sibling is enough to report a mutant CAUGHT.\n\
        --timeout    per-mutant test timeout in seconds; a TIMEOUT IS NOT A CATCH. Without it, \
 the test packages are timed with one `cargo test` first and the verb passes 5x that whenever \
 they are not exactly the --files' one package (the default set is two), because \
-cargo-mutants' own baseline times only the mutated file's package";
+cargo-mutants' own baseline times only the mutated file's package\n\
+       Every test the verb runs, the timing run's and each mutant's, sees \
+CHARPENTE_SIM_NO_SHRINK=1, so a failing sim check reports its first failure unshrunk: a mutant \
+needs only red or green, and a shrink would spend the timeout.";
 
 /// The fields of `mutants.out/outcomes.json` this verb reads. Deserialized
 /// rather than string-scanned (unlike `sim.rs`'s scan of cargo's message
@@ -345,6 +359,7 @@ pub fn run(args: &[String]) -> i32 {
     let status = Command::new("cargo")
         .args(&argv)
         .current_dir(&opts.dir)
+        .env(NO_SHRINK_ENV, "1")
         .status();
 
     let status = match status {
@@ -428,6 +443,7 @@ fn time_the_package_set(dir: &str, packages: &[String]) -> Result<f64, String> {
         let status = Command::new("cargo")
             .args(args)
             .current_dir(dir)
+            .env(NO_SHRINK_ENV, "1")
             .status()
             .map_err(|e| {
                 format!(

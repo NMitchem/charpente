@@ -2,10 +2,14 @@ use std::process::Command;
 
 // Process spawning is edge tooling here, outside the deterministic core
 // (DESIGN.md §1) — this test drives the built `charpente` binary as a real
-// subprocess, exactly as a user would.
+// subprocess, exactly as a user would. `charpente test --mutants` exports
+// CHARPENTE_SIM_NO_SHRINK to every test it runs, these included; removed
+// here, so the batches below shrink as they assert whatever runs them.
 #[allow(clippy::disallowed_methods)]
 fn charpente() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_charpente"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_charpente"));
+    command.env_remove("CHARPENTE_SIM_NO_SHRINK");
+    command
 }
 
 fn fixture_dir() -> String {
@@ -607,7 +611,8 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 
 /// A `cargo` placed first on PATH so the verb's `Command::new("cargo")`
 /// resolves to it. It records every invocation's arguments, one line each,
-/// in call order. It answers the verb's install probe, `cargo mutants
+/// in call order, each followed by an indented line with the
+/// CHARPENTE_SIM_NO_SHRINK it saw (`unset` when absent). It answers the verb's install probe, `cargo mutants
 /// --version`, with exit 0. For `cargo mutants` it also records whether the `--output`
 /// directory existed at call time, then exits with `$SHIM_EXIT`; any other
 /// cargo call (the verb's own timing run) exits `$SHIM_TEST_EXIT`. The real tool needs that
@@ -685,6 +690,7 @@ fn run_mutants_with_cargo_shim_in(
         &shim,
         "#!/bin/sh\n\
          echo \"cargo $*\" >> \"$SHIM_RECORD\"\n\
+         echo \"  CHARPENTE_SIM_NO_SHRINK=${CHARPENTE_SIM_NO_SHRINK-unset}\" >> \"$SHIM_RECORD\"\n\
          [ \"$1\" = mutants ] || exit \"$SHIM_TEST_EXIT\"\n\
          if [ \"$2\" = --version ]; then echo 'cargo-mutants 27.1.0'; exit \"$SHIM_VERSION_EXIT\"; fi\n\
          out=\n\
@@ -839,6 +845,34 @@ fn mutants_times_the_whole_package_set_before_the_tool_when_no_timeout_is_given(
         stdout.contains("s of wall time"),
         "and the measured baseline itself; stdout:\n{stdout}"
     );
+}
+
+/// R46: the verb sets CHARPENTE_SIM_NO_SHRINK on cargo-mutants, which every
+/// test binary it runs inherits, and on its own timing run, so a caught
+/// mutant spends no shrink against its timeout. `charpente()` removes the
+/// variable, so the shim sees only what the verb set.
+#[cfg(unix)]
+#[test]
+fn mutants_turns_shrinking_off_for_the_tool_and_its_timing_run() {
+    let (_, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &["--test-package", "pkg-a", "--test-package", "pkg-b"],
+    );
+    for run in [
+        "cargo test --package pkg-a --package pkg-b",
+        "cargo mutants --output",
+    ] {
+        let at = recorded
+            .iter()
+            .position(|l| l.starts_with(run))
+            .unwrap_or_else(|| panic!("no `{run}`; the shim saw {recorded:?}"));
+        assert_eq!(
+            recorded[at + 1],
+            "  CHARPENTE_SIM_NO_SHRINK=1",
+            "`{run}`: the shim saw {recorded:?}"
+        );
+    }
 }
 
 /// A machine without cargo-mutants learns that before the timing run, which

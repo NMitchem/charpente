@@ -2091,7 +2091,7 @@ Charpente treats the coding agent as the primary developer persona:
   `require`d keys never hit), per-check `{check, status, passed, failed, skipped,
   distinct_inputs, drew_inputs, skipped_reasons}` with every skipped reason, and every
   failure as `{check, seed, config, fired, message, inputs, faults_off, first_message,
-  replays, repro}` (GUIDE §8). Ships with the public
+  not_shrunk, replays, repro}` (GUIDE §8). Ships with the public
   checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/
   redb-latch fallout classifier, productized out of four hand-rolled internal copies; a
   durable-horizon refusal is never fallout by its text and is judged by `durable_refusal`,

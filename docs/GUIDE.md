@@ -4459,16 +4459,20 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   count}` by count descending then reason, plus `detail` under `--seed`, the one
   run's own text. Each of `failures` lists every failing run, in seed order, as
   `{check, seed, config, fired, message, inputs, faults_off, first_message,
-  replays, repro}`, with `config` carrying every fault axis. A check's first
-  failure is the one a batch shrinks: its `inputs` are `{name, value}` pairs of
-  the shrunk run, `message` is the shrunk run's, `first_message` appears only
-  when the shrink slipped to another message, `replays` counts the candidates
-  tried and `repro` replays the shrunk run. Every other failure is its own
-  unshrunk run: its own drawn `inputs`, `faults_off` `[]`, `replays` 0, no
-  `first_message`, and a `repro` that is its seed alone. Seeds are hex strings.
-  The two report different totals: the human result line's passed and failed
-  count checks, and the JSON's top-level `passed`, `failed` and `skipped` count
-  runs, each the sum of that field over `checks[]`.
+  not_shrunk, replays, repro}`, with `config` carrying every fault axis. A
+  check's first failure is the one a batch shrinks: its `inputs` are
+  `{name, value}` pairs of the shrunk run, `message` is the shrunk run's,
+  `first_message` appears only when the shrink slipped to another message,
+  `replays` counts the candidates tried and `repro` replays the shrunk run.
+  With shrinking off (under `charpente test --mutants`, "The timeout follows
+  the scope too" below) it is its own run instead, with `not_shrunk` saying
+  why and `replays` 0; no other failure carries `not_shrunk`. Every other
+  failure is its own unshrunk run: its own drawn `inputs`, `faults_off` `[]`,
+  `replays` 0, no `first_message`, and a `repro` that is its seed alone.
+  Seeds are hex strings. The two report different totals: the human result
+  line's passed and failed count checks, and the JSON's top-level `passed`,
+  `failed` and `skipped` count runs, each the sum of that field over
+  `checks[]`.
 - `--dir PATH` — the app crate directory to build and run sim tests from
   (default: `.`). This flag is consumed by the CLI itself; every other flag
   passes straight through to the sim binary the CLI builds and execs.
@@ -4683,7 +4687,10 @@ Shrinking runs on the first failure of each check in seed order, never in
 completion order, and each shrink depends only on its check, seed and first
 failure. Its budget is 500 replays, counted rather than timed, so the block is
 identical for any `--jobs` and on any machine. A shrink that spends the budget
-stops with the smallest run found so far. A workload that panics prints the
+stops with the smallest run found so far. Those replays run one after another,
+so a check's shrink can take several times as long as the batch that found it;
+under `charpente test --mutants` the harness does not shrink at all ("The
+timeout follows the scope too", below). A workload that panics prints the
 panic's message on stderr each time a shrink replay panics; the report itself is
 on stdout, written once every shrink has finished.
 
@@ -4931,6 +4938,30 @@ Under `--property` each mutant runs that one sim property, less than the set
 that was timed, so the line says the time is an upper bound on a mutant's run
 instead. An explicit `--timeout SECS` skips the timing run and is passed through
 as given.
+
+A caught mutant is a red batch, and a red batch normally shrinks each failing
+check's first failure, up to 500 replays one after another ("Shrinking a
+failure" above). That can cost several times the green baseline, more than any
+timeout derived from it. So the verb sets `CHARPENTE_SIM_NO_SHRINK=1` on
+cargo-mutants and on its timing run, and every test binary they run inherits
+it. `sim_tests!` reads it once at startup; set to any non-empty value, it turns
+shrinking off, and a failing check prints its first failure as it ran:
+
+```text
+  shrunk: skipped, because CHARPENTE_SIM_NO_SHRINK is set (charpente test --mutants sets it: a mutant needs only red or green); this is the first failure as it ran
+```
+
+Its `repro:` replays that run, `--format json` gives it `"replays":0` and
+`"not_shrunk":"CHARPENTE_SIM_NO_SHRINK is set"`, and every run and verdict is
+the one a plain batch reaches. A caught mutant then costs no more than its
+green baseline, so cargo-mutants' own five-times timeout holds for an app
+(`--file src/… --test-package <app>`), and so does the verb's derived one. It
+is an environment variable rather than a harness flag because a test set can
+mix your sim with libtest binaries, which refuse a flag they do not know. A
+test of yours that spawns a sim and asserts on its shrink inherits the variable
+under `--mutants` too: remove it from the child's environment
+(`Command::env_remove("CHARPENTE_SIM_NO_SHRINK")`), as charpente's own CLI
+tests do.
 
 **It is not part of `cargo test`.** Every mutant is a rebuild plus a test run,
 so this is an on-demand instrument like the edge harness below, not something

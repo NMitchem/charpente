@@ -30,6 +30,12 @@
 //! link charpente. The two must be one rule, so a host the attribute accepts is
 //! one `Host::new` accepts and the reverse; the test below holds them
 //! byte-identical from the signature line through the closing brace.
+//!
+//! And one more of the same kind: `charpente test --mutants` sets the variable
+//! an app's sim harness reads to turn shrinking off, and charpente-cli does not
+//! link charpente-sim, so it spells the name itself. A drift would leave every
+//! caught mutant shrinking against its timeout with nothing red, so the last
+//! test holds the CLI's spelling to `charpente_sim::harness::NO_SHRINK_ENV`.
 
 // Walking the repo's sources is build tooling outside the deterministic
 // boundary, the same sanctioned-edge pattern as tests/doc_inventory.rs.
@@ -194,4 +200,19 @@ fn the_runtime_and_macro_host_name_rules_are_byte_identical() {
             n + 1
         );
     }
+}
+
+#[test]
+fn the_verb_sets_the_no_shrink_variable_the_harness_reads() {
+    let file = "crates/charpente-cli/src/mutants.rs";
+    let src = fs::read_to_string(repo().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+    let want = format!(
+        "const NO_SHRINK_ENV: &str = \"{}\";",
+        charpente_sim::harness::NO_SHRINK_ENV
+    );
+    assert!(
+        src.contains(&want),
+        "{file} must spell the harness's variable exactly, `{want}`: the verb sets it so an \
+         app's sim does not shrink under mutation, and a different name is never read"
+    );
 }

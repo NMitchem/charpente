@@ -69,7 +69,18 @@ pub struct HarnessArgs {
     /// `--faults-off`: the `FaultConfig` axes a `--seed` run turns off, in
     /// field order.
     pub faults_off: Vec<&'static str>,
+    /// Report each check's first failure as it ran, without shrinking it.
+    /// No flag sets it: `sim_tests!` reads [`NO_SHRINK_ENV`], which
+    /// `charpente test --mutants` sets, since a mutant needs only red or
+    /// green and a shrink would spend its timeout.
+    pub no_shrink: bool,
 }
+
+/// The environment variable that turns shrinking off in an app's harness.
+/// An environment variable rather than a flag because `charpente test
+/// --mutants` must reach every test binary cargo-mutants runs, and a libtest
+/// binary in the same test set refuses an unknown flag.
+pub const NO_SHRINK_ENV: &str = "CHARPENTE_SIM_NO_SHRINK";
 
 const VALID_FLAGS: &str =
     "--runs, --seed, --master-seed, --filter, --jobs, --format, --inputs, --faults-off";
@@ -177,6 +188,7 @@ impl HarnessArgs {
             format,
             inputs,
             faults_off,
+            no_shrink: false,
         })
     }
 }
@@ -239,6 +251,9 @@ pub struct Failure {
     pub(crate) faults_off: Vec<&'static str>,
     /// A check's first failure in a batch, shrunk.
     pub(crate) shrunk: Option<Shrunk>,
+    /// A check's first failure in a batch run with shrinking off
+    /// (`HarnessArgs::no_shrink`): reported as it ran, and saying so.
+    pub(crate) not_shrunk: bool,
 }
 
 /// The smallest run `shrink` found that still fails the check: the shortest
@@ -894,7 +909,13 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
         Some(seed) => run_single_seed(&selected, seed, args.inputs.as_deref(), &args.faults_off),
         None => {
             let master_seed = args.master_seed.unwrap_or_else(ambient_base_seed);
-            let mut batch = run_batch(&selected, master_seed, args.runs, args.jobs);
+            let mut batch = run_batch(
+                &selected,
+                master_seed,
+                args.runs,
+                args.jobs,
+                !args.no_shrink,
+            );
             batch.rerun = Some(rerun(master_seed, args.runs, args.filter.as_deref()));
             batch
         }
@@ -1003,6 +1024,7 @@ impl Failure {
             inputs: None,
             faults_off: Vec::new(),
             shrunk: None,
+            not_shrunk: false,
         }
     }
 }
@@ -1038,7 +1060,7 @@ fn startup_line(checks: usize, runs: u64, master_seed: u64) -> String {
 /// the seed each universe runs with.
 type UniverseOutcome = Result<UniverseEnd, UniverseFailure>;
 
-fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize) -> Batch {
+fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize, shrinks: bool) -> Batch {
     // DESIGN §7: the master seed is printed at startup, before any run starts
     // — a failing batch from OS entropy must still reveal the seed that would
     // replay it. stderr, so `--format json`'s stdout stays pure JSON.
@@ -1116,11 +1138,17 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, runs: u64, jobs: usize) -> Ba
 
     // Each shrink is a function of its check, seed and failure alone, so
     // running them in parallel changes nothing but the wall time.
-    let shrunk = in_parallel(&firsts, jobs, |(_, test, seed, failed)| {
-        shrink(tests[*test], *seed, failed)
-    });
-    for ((at, ..), shrunk) in firsts.iter().zip(shrunk) {
-        report.failures[*at].shrunk = Some(shrunk);
+    if shrinks {
+        let shrunk = in_parallel(&firsts, jobs, |(_, test, seed, failed)| {
+            shrink(tests[*test], *seed, failed)
+        });
+        for ((at, ..), shrunk) in firsts.iter().zip(shrunk) {
+            report.failures[*at].shrunk = Some(shrunk);
+        }
+    } else {
+        for (at, ..) in &firsts {
+            report.failures[*at].not_shrunk = true;
+        }
     }
     Batch {
         report,
@@ -1309,6 +1337,9 @@ fn render_json(batch: &Batch) -> String {
             out.push_str(&format!("\"{axis}\""));
         }
         out.push(']');
+        if f.not_shrunk {
+            out.push_str(&format!(",\"not_shrunk\":\"{NO_SHRINK_ENV} is set\""));
+        }
         let mut replays = 0;
         if let Some(s) = &f.shrunk {
             replays = s.replays;
@@ -1757,6 +1788,17 @@ fn human_failure_block(f: &Failure) -> String {
             block.push_str(&format!("  first:  {}\n", f.message));
         }
     }
+    assert!(
+        !(f.not_shrunk && f.shrunk.is_some()),
+        "{}: a failure is shrunk or reported as it ran, never both",
+        f.test
+    );
+    if f.not_shrunk {
+        block.push_str(&format!(
+            "  shrunk: skipped, because {NO_SHRINK_ENV} is set (charpente test --mutants sets it: \
+             a mutant needs only red or green); this is the first failure as it ran\n"
+        ));
+    }
     block.push_str(&format!(
         "  repro:  {}\n",
         repro(f.test, f.seed, shown.inputs, shown.faults_off)
@@ -1967,6 +2009,7 @@ mod tests {
                 replay_inputs: true,
                 smaller: true,
             }),
+            not_shrunk: false,
         };
         // The binding copy, line for line: each label padded so the values
         // align, `inputs:` because the run drew, `first:` because the shrink
@@ -2329,8 +2372,8 @@ mod tests {
         };
         let master_seed = 0xf00d_beef_u64;
 
-        let sequential = run_batch(&[&test], master_seed, 64, 1).report;
-        let parallel = run_batch(&[&test], master_seed, 64, 8).report;
+        let sequential = run_batch(&[&test], master_seed, 64, 1, true).report;
+        let parallel = run_batch(&[&test], master_seed, 64, 8, true).report;
 
         assert!(
             !sequential.failures.is_empty(),
@@ -2373,7 +2416,7 @@ mod tests {
             run: covers_something_else,
             require: &["never:happens"],
         };
-        let report = run_batch(&[&test], 0x1234, 8, 4).report;
+        let report = run_batch(&[&test], 0x1234, 8, 4, true).report;
         assert_eq!(
             report.missing_coverage,
             vec![("that_test".to_string(), "never:happens".to_string())]
@@ -2425,7 +2468,7 @@ mod tests {
             run: always_ok,
             require: &[],
         };
-        let report = run_batch(&[&gives_up, &passes], 0x1234, 4, 2).report;
+        let report = run_batch(&[&gives_up, &passes], 0x1234, 4, 2, true).report;
         assert_eq!(
             report.outcomes,
             vec![
@@ -2459,7 +2502,7 @@ mod tests {
             run: gives_up_then_fails,
             require: &[],
         };
-        let report = run_batch(&[&test], 0x1234, 3, 1).report;
+        let report = run_batch(&[&test], 0x1234, 3, 1, true).report;
         assert_eq!(report.failures.len(), 3);
         assert_eq!(report.verdicts(), 0);
         assert_eq!(report.gave_up(), 0, "a failed universe is neither");
@@ -2674,7 +2717,7 @@ mod tests {
             run: always_gives_up,
             require: &[],
         };
-        let report = run_batch(&[&test], 0x1234, 6, 1).report;
+        let report = run_batch(&[&test], 0x1234, 6, 1, true).report;
         assert_eq!(report.coverage.get("run:skipped").copied(), Some(6));
     }
 
@@ -3136,6 +3179,7 @@ mod tests {
             inputs: None,
             faults_off: Vec::new(),
             shrunk: Some(shrunk),
+            not_shrunk: false,
         };
         let block = human_failure_block(&failure);
         assert!(block.contains(", in 500 replays\n"), "{block}");
@@ -4069,7 +4113,7 @@ mod tests {
             sim_test("fails_skips_or_passes", fails_skips_or_passes),
             sim_test("always_gives_up", always_gives_up),
         ];
-        let batch = run_batch(&[&tests[0], &tests[1]], 0x1234, 24, 1);
+        let batch = run_batch(&[&tests[0], &tests[1]], 0x1234, 24, 1, true);
         let c = &batch.checks[0];
         let skipped: u64 = c.skipped.iter().map(|(_, n)| n).sum();
         assert!(
@@ -4291,7 +4335,7 @@ mod tests {
             run: fails_skips_or_passes,
             require: &["never:marked"],
         }];
-        let report = run_batch(&[&tests[0]], 0x1234, 24, 1).report;
+        let report = run_batch(&[&tests[0]], 0x1234, 24, 1, true).report;
         let (o, f) = (&report.outcomes[0], report.failures.len() as u64);
         assert!(
             o.verdicts > 0 && o.gave_up > 0 && f > 0,
@@ -4403,6 +4447,70 @@ mod tests {
         );
     }
 
+    /// R46: with shrinking off, as `charpente test --mutants` turns it off, a
+    /// failing check's block is its first failure as it ran. No replay is
+    /// spent, the block's `shrunk:` line says why instead of claiming a
+    /// shrink, and the repro replays that first failure exactly.
+    #[test]
+    fn with_shrinking_off_a_failure_is_reported_as_it_ran() {
+        let tests = [sim_test("draws_a_digit", draws_a_digit)];
+        let flags = ["--runs", "64", "--master-seed", "0x1234"];
+        let unshrunk_run = |format: &[&str]| {
+            let mut args = parse(&[&flags[..], format].concat()).unwrap();
+            args.no_shrink = true;
+            let mut out = Vec::new();
+            let code = run(&tests, &args, &mut out);
+            (code, String::from_utf8(out).unwrap())
+        };
+        // Non-vacuous: the same batch shrinks when shrinking is on.
+        let (_, shrinking) = run_to_string(&tests, &flags);
+        let shrunk = line(first_block(&shrinking, "draws_a_digit"), "  shrunk: ").unwrap();
+        assert!(!shrunk.ends_with(" in 0 replays"), "{shrunk}");
+
+        let (code, out) = unshrunk_run(&[]);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, "draws_a_digit");
+        assert_eq!(
+            line(block, "  shrunk: "),
+            Some(
+                "skipped, because CHARPENTE_SIM_NO_SHRINK is set (charpente test --mutants sets \
+                 it: a mutant needs only red or green); this is the first failure as it ran"
+            ),
+            "{block}"
+        );
+        // The first failure in seed order, with the input it drew.
+        let seeds = batch_seeds(0x1234, 64);
+        let first = *seeds
+            .iter()
+            .find(|&&seed| Sim::new(seed).input().between("n", 0, 9) == 0)
+            .unwrap();
+        assert_eq!(
+            line(block, "  seed:   "),
+            Some(format!("{first:#018x}").as_str()),
+            "{block}"
+        );
+        assert_eq!(line(block, "  inputs: "), Some("n=0"), "{block}");
+        assert_eq!(
+            line(block, "  repro:  "),
+            Some(format!("charpente test --sim --filter draws_a_digit --seed {first:#x}").as_str()),
+            "{block}"
+        );
+        assert_eq!(replay(&tests, block, "draws_a_digit"), unshrunk(block));
+        // JSON: no replay spent, and why.
+        let (_, json) = unshrunk_run(&["--format", "json"]);
+        let entry = json
+            .split_once(&format!(
+                "{{\"check\":\"draws_a_digit\",\"seed\":\"{first:#x}\""
+            ))
+            .and_then(|(_, rest)| rest.split_once(",\"repro\":"))
+            .unwrap_or_else(|| panic!("{json}"))
+            .0;
+        assert!(
+            entry.ends_with(",\"not_shrunk\":\"CHARPENTE_SIM_NO_SHRINK is set\",\"replays\":0"),
+            "{json}"
+        );
+    }
+
     /// R16: a check prints one failure block, its first in seed order, which
     /// the batch shrinks; its line counts the rest. JSON keeps every one.
     #[test]
@@ -4448,7 +4556,7 @@ mod tests {
         let replayed = run_single_seed(&[&test], 0x1234, None, &[]);
         assert_eq!(replayed.checks[0].details, ["on seed 0x1234"]);
         assert_eq!(replayed.checks[0].skipped, [("the fixture gives up", 1)]);
-        let batch = run_batch(&[&test], 0x1234, 4, 1);
+        let batch = run_batch(&[&test], 0x1234, 4, 1, true);
         assert!(batch.checks[0].details.is_empty());
         assert_eq!(batch.checks[0].skipped, [("the fixture gives up", 4)]);
     }
