@@ -144,6 +144,67 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
     );
 }
 
+/// R46's middle link, the one only a real sim binary has: `sim_tests!`'s
+/// `main` reads CHARPENTE_SIM_NO_SHRINK from its environment, which is how
+/// the value `charpente test --mutants` sets reaches the harness. Any
+/// non-empty value turns shrinking off, `0` included; an empty one shrinks.
+#[test]
+fn the_sim_binary_reads_the_no_shrink_variable_from_its_environment() {
+    let batch = |value: &str, format: &str| {
+        let out = charpente()
+            .args([
+                "test",
+                "--sim",
+                "--runs",
+                "64",
+                "--master-seed",
+                "0x5eed",
+                "--filter",
+                "sometimes_fails",
+                "--format",
+                format,
+                "--dir",
+                &fixture_dir(),
+            ])
+            .env("CHARPENTE_FIXTURE_FAIL", "1")
+            .env("CHARPENTE_SIM_NO_SHRINK", value)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "CHARPENTE_SIM_NO_SHRINK={value:?}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    };
+    let unshrunk = "\n  shrunk: skipped, because CHARPENTE_SIM_NO_SHRINK is set (charpente test \
+                    --mutants sets it: a mutant needs only red or green); this is the first \
+                    failure as it ran\n";
+    for value in ["1", "0"] {
+        let human = batch(value, "human");
+        assert!(
+            human.contains(unshrunk),
+            "CHARPENTE_SIM_NO_SHRINK={value:?}:\n{human}"
+        );
+    }
+    let json = batch("1", "json");
+    assert!(
+        json.contains(",\"not_shrunk\":\"CHARPENTE_SIM_NO_SHRINK is set\",\"replays\":0,"),
+        "{json}"
+    );
+    // Empty reads as unset, so the check's first failure, the first listed,
+    // shrinks and spends replays; the rest carry 0 either way.
+    let json = batch("", "json");
+    let first_replays: u64 = json
+        .split_once("\"replays\":")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("a failure carries its replays: {json}"));
+    assert!(!json.contains("not_shrunk") && first_replays > 0, "{json}");
+}
+
 /// The repro flags' refusals (Review Focus 3): each names its flag, exits 2,
 /// and runs nothing — never a panic, and never a default run in its place.
 #[test]
