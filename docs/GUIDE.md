@@ -3982,7 +3982,10 @@ to the `sim_tests! { ... }` list. Nothing limits a run to one script,
 either: `run` returns when its source is exhausted, and the same kernel can
 be `run` again against a second `SimSource` — script a login phase, read
 the token out of its recorded responses, then script the authenticated
-phase with `.header("authorization", format!("Bearer {token}"))`.
+phase with `.header("authorization", format!("Bearer {token}"))`. A kernel
+whose `run` returned `Err` has stopped and is never `run` again: restart
+(`sim.restart_process()`, or `sim.restart()` for a power cycle), rebuild the
+app and open a new `Kernel`, as production restarts a stopped process.
 
 ### The outside world: remote models
 
@@ -4847,8 +4850,13 @@ them in every mutant. Check those writes in a property, or delete them by hand
 and watch a check go red.
 
 ```
-scripts/mutants.sh --file src/jobs.rs
+charpente test --mutants --file src/jobs.rs --test-package myapp
 ```
+
+`--test-package` names your app's package, so your own tests judge the mutants
+(without it the verb uses charpente's own suites; "Scope is part of the claim",
+below). This repository runs the verb through `scripts/mutants.sh`, its own
+wrapper for its own crates, which does not ship.
 
 A mutant reported **MISSED** is the finding. Worked example, from this repo's own
 fixture app — one job whose whole effect is a counter bump, and two properties
