@@ -8250,3 +8250,880 @@ CA's name constraint admits only `pay.fixture` and its subdomains. Then PLAN's v
 each on its trigger.
 
 **Follow-up (2026-10-22): 0.2.0's close-out.** Published 2026-10-17 (Noah, `scripts/publish.sh --for-real` from f6eb65b6; each crate's index cksum equals its packaged `.crate` sha256), with a registry smoke from crates.io (install, new, clippy, 256-universe sim) green. Criterion 6's CI half: run 39048921595 on f6eb65b6, green, workspace step 92/92. Criterion 4's nightly half: edge-harness run 39125650197 at f6eb65b6 (2026-10-18), green, and green on every night since through 39782557724 (2026-10-22). CHANGELOG's 0.2.0 heading now carries its date.
+
+## 2026-10-27 — 0.3.0 built: wall time that survives a restart, drawn inputs that shrink, a sim report that reads cold, GUIDE and examples inside the crate
+
+**Why.** Two outside agents built apps on 0.2.0 and reported back (relayed by Noah,
+2026-10-22), and spec §1 checked each claim against the code. Production time was process
+uptime: `ProdClock` counted from its own construction and `serve` built one per process, so
+after a restart a cron schedule stayed silent until the new process's uptime passed the old
+one's, a session outlived its TTL by the old process's uptime, and OIDC compared Unix-second
+`exp`/`nbf` against uptime nanoseconds, so an expired token was never refused and any token
+carrying `nbf` always was. The sim hid it because its clock is one continuous world clock
+and `FaultConfig` had no clock axis, though MANIFESTO §6 lists clock skew among the faults it
+injects. The sim also drew the world's faults but never the app's inputs: the second agent's
+"latest wins instead of max amount" mutation survived every universe the agent ran, because its
+scripted arrival order made the latest event the largest. Deleting the scaffold's `tx.emit`
+stayed green for the same reason. GUIDE shipped in none of the 0.2.0 crates, so the second
+agent read the platform's tests instead ("your tests are your documentation whether you meant
+it or not"). And 0.2.1's readable sim output had never shipped. 0.3.0 fixes all of it in one
+release, under the two principles Noah wrote down on 2026-10-22: charpente's own APIs and
+formats change in place, and nothing migrates between minors.
+
+Spec `docs/superpowers/specs/2026-10-22-0.3.0-design.md` (`28f3e9c3`, approved by Noah
+2026-10-22; the builder check's answers folded in the same day as controller calls,
+`e0c8d8c5`), plan `docs/superpowers/plans/2026-10-22-0.3.0.md` (`cff0917d`), Tasks 0–23,
+executed subagent-driven. The spec supersedes the 0.2.1 spec and plan (`d972ef9d`,
+`342cfb58`, "readable sim output"): Noah decided to fold 0.2.1 into 0.3.0, `28f3e9c3` deletes
+both, and Tasks 15 and 16 took their binding copy from them. Noah's instruction for the run
+(progress.md's header): "you are in charge. Abide by the design and manifest documents", "i
+will have zero input from here on out so do not ask any questions". Task 14 ran on the branch
+`t14-scaffold` in a scratch worktree, and Task 20's mutation fixes on `t20-mutants` and
+`t20-mutants-sim` in `../charpente-gate`; each was cherry-picked onto `main`. From Task 20's
+evidence on, the mutation runs, the gate and the edge rig ran in `../charpente-gate` and the
+merge fixture's fresh bases in `../charpente-seeds`, each set to the head it measured, while
+determinism, oracle 3 and the clock and scaffold bases ran in the main tree. Tasks 21 and
+22 ran headless in offline Docker boxes, and their records are
+`docs/experiments/2026-10-0.3.0-stranger/` and `docs/experiments/2026-10-0.3.0-docs-only/`.
+DECISIONS §15 is new (`232a6bb7`). Workspace `.superpowers/sdd/2026-10-22-0.3.0/` (gitignored,
+so absent from a fresh clone): `progress.md` there is the full record of every ruling the
+release took (R1–R50), each with its reason and its cost if wrong, and every report and log
+named below is in that directory.
+
+**Shipped.** Seventy-five commits, `f6eb65b6..cba9386b` (`f6eb65b6` is `origin/main`, the
+commit 0.2.0 was published from): seventy-four to `158d4c4f`, then round 11's one. All are on
+`main` and none is pushed; this entry is the seventy-sixth. Tasks 1–19 each closed on an
+approving review after at most two fix rounds (progress.md's `Task N: complete` lines). Task
+20's evidence and its scoped reviews then reopened the code in rounds 2–6 and 11, and the two
+outside runs' findings were fixed in rounds 7–10; each round was its own pinned change with its
+own re-evidence.
+- **Spec and plan** `28f3e9c3`, `e0c8d8c5`, `cff0917d`, after the 0.2.1 spec and plan they
+  supersede, `d972ef9d` and `342cfb58`.
+- **T0** `98c4a45d`: 0.2.0's close-out (the follow-up line above, CHANGELOG's date); the
+  oracle-3 baselines and the base gate at `cff0917d`.
+- **T1** `232a6bb7`: the two principles in MANIFESTO §8, DECISIONS §15 and DESIGN §5.
+- **T2** `a2992e6c`: `WallTime` and `Clock::wall`, beside an `Instant` no table can hold (a
+  trybuild pin), and one `ProdClock` per node.
+- **T3** `7043f889`, `950dee62`: three wire oracles, `crates/edge-harness/tests/clock_restart.rs`
+  against the new `crates/clock-fixture`, red on `7043f889`.
+- **T4** `32288f43`: every stored or compared time is wall time (sessions, keys, cron's
+  `next_due`, retry `due_at`, the sweep cutoff, OIDC `exp`/`nbf`), from a census of every
+  `Clock` reading (`clock-census.md`); the wire oracles go green (named step S1).
+- **T5** `51567d5c`, `44c65736`: the bounded 60 s hold, the named stop, and the open and
+  promote floor recovered from stored times, on every role (R3, R4).
+- **T6** `30e7d6a4`, `f077a174`: cron keeps its grid (named step S2); a zero interval is
+  refused by name.
+- **T7** `34dbf005`, `5c612629`: a 0.2 data directory, peer or archive bucket is refused by
+  name with the fix (`PROTO_VERSION` 6 → 7, `MANIFEST_FORMAT` 3), and a no-bytes guard over
+  the three hand-written platform tables (R6).
+- **T8** `22723164`, `a5ab44dd`: the sim's wall reading and its three clock axes (per-host
+  skew, step back, downtime), on the app harness path only (named step S3; R8–R10).
+- **T9** `0540c30e`, `7d9ba14f`: the time properties and an uptime-clock victim that fails
+  them by name; a stuck wall clock stops the node by name (R11); the promote half (R12).
+- **T10** `f90b89ce`: `give_up` takes a fixed reason and a per-run detail, changed in place.
+- **T11** `23798cad`: `sim.input()`, drawn from its own stream and recorded as choices.
+- **T12** `14743500`, `210de794`: shrinking, `--inputs`/`--faults-off`, and the failure block.
+- **T13** `be4191e2`, `66669d21`: `crates/merge-fixture`, the order-sensitive merge oracle.
+- **T14** `0a06e5eb`, `5e0bdefa`, `7337873d` (from `t14-scaffold`'s `4c377649`, `cb982816`,
+  `20d2faab`): the scaffold draws its notes, bodies and order, and a third check proves the
+  event (named step S4).
+- **T15** `93a47374`, `866298f6`: the batch's cargo-shaped output; `--universes` → `--runs`.
+- **T16** `9c699b14`, `2658cb23`: the single-seed replay; `universe:gave-up` → `run:skipped`.
+- **T17** `55624b13`: `--format json` carries what the human output says.
+- **T18** `073342f9`, `f9b95156`: GUIDE inside the `charpente` crate (`charpente::guide`), the
+  compiled examples `drawn_inputs`, `modelled_remote` and `restart_under_faults`, the
+  `OutboundCall`/`OutboundReply` re-exports, and `guide_ships`.
+- **T19** `3b17dde3`: the release cut, 0.3.0 unreleased: `charpente --version`, README's
+  "Try it", the scaffold's `rust-version = "1.99"`, NEIGHBORS' Hypothesis and proptest entry
+  (R17), PLAN's three rows, every install-facing version.
+- **T20 mutation sweep** `959a44a9`, `f89cc43d`, `6a105a73` (from `t20-mutants`' `2ab658ad`,
+  `088668e2`, `2b33ad81`): two commit-failure defects in test-facing wrappers fixed (R24), and
+  the manifest's boundary pins.
+- **Final-review fix wave** `9dcb6275`, `97edf30f`, `48c4252a` (the cherry-pick of
+  `t20-mutants-sim`'s `ff3f4351`: the shrinker's survivors and timeouts), `23b02e7b`,
+  `08a085f7`, `1962c4fa`, `7fc5c730`: the 21 items of R27.
+- **T21/T22 records** `c7d15e27`: both experiment directories and briefs, written before
+  either run; `884fbf29`: the docs-only brief admits the four `tests/` files GUIDE names (R36).
+- **Task 20's evidence rounds** `babae9d1` (equal choices lowered together, R28), `bede90d0`
+  (a draw records its reduced choice, R34), `24460ec9` and `db20085d` (the final head's
+  survivors, R32), `6a74ba3c` (the "local minimum" wording, and the re-review's N1–N5, R31);
+  then `09bc3b44` (round 2's review, R35).
+- **Round 4** `ad9d7ec2`: the equal-choices pass runs only in a round where passes 1–4 kept
+  nothing (R37), with round 3's m-1 and m-2 pinned red first.
+- **Round 5** `523fc7b8`: the whole groups of equal choices are lowered in every round and
+  only their pairs wait for a quiet round (R38, round 4's I-1', m-1' and m-2').
+- **Round 6** `ab831621`: tests and docs only (R39): the split's three transitions pinned, the
+  pair stall's cost in GUIDE §8 and the `shrink` doc, and PLAN's v1.x row for a pair search
+  that does not wait.
+- **Round 7** `1106cdf0`: the batch ends on its check lines, directly above `sim result:` (R42,
+  the stranger's attempt 1).
+- **Round 8** `c56415b3`: the result line gives each check's tested runs (R43, attempt 2).
+- **Round 9** `43ead430` (R44), `7f771699` (R45), `d368076a` (R46), `ce42034e` (R47),
+  `2129ce0b` (R48): the docs-only build's platform findings, one commit per ruling, each red
+  first.
+- **Round 10** `85158fd3`, `8d04a2da`, `6bfe162e`, `81b4e8be`: the rounds 8–9 review's
+  Important, its four Minors and three of its notes (R49).
+- **Round 11** `cba9386b`: the final head's one mutation survivor, `report`'s stream
+  choice in `crates/charpente-cli/src/mutants.rs`, pinned (R50).
+- **Experiment records** `318e589d` (the stranger's attempt 1), `3cc2afa4` (attempt 2),
+  `c415f879` (the docs-only build's attempt 1) and `158d4c4f` (the stranger's attempt 3), each
+  committed once its attempt was adjudicated, the first three before the fixes they called for.
+
+**What the reviews found.** The whole-branch review ran before Task 20's final evidence,
+once every task's code was on `main` (R25), so that the evidence covers the fix wave too.
+`final-review.md` (opus, read-only, six passes over `cff0917d..6a105a73`): "Ready to ship
+after fixes? Yes.", 0 Critical, 2 Important, 11 Minor. I1: the PLAN v1.x rows that R3 and R6
+promised were missing, because T19's dispatch carried only the spec's three (the
+controller's omission). I2: GUIDE, CHANGELOG and each example said to run
+`cargo run -p charpente --example <name>`, which cargo refuses outside a charpente checkout
+(probe: "package(s) `dep` not found in workspace"), and Task 22's agent would have tried it
+first. The Minors: the request arm keeps its 200s on a checkpoint failure nothing else
+reports (M1, pre-0.3.0, `48a7ea50`); `upsert`'s cache rule stale since `959a44a9` (M2);
+GUIDE's checker count and signature block (M3); a `--seed` replay's JSON naming the replayed
+seed `master_seed` (M4); three breaks missing from CHANGELOG (M5); `--filter`'s substring
+match, which made a repro ambiguous when one check's name contains another's (M6); GUIDE
+§11's tail excusing no fallout (M7); mid-run sources with absolute horizons in the scaffold
+and `drawn_inputs` (M8); GUIDE §9's "got a 500" (M9); three untested texts (M10); and
+`guide_ships` not pinning `examples/` (M11). It agreed with all twelve parked items.
+
+The fix wave (`final-fix-brief.md`, R27) took all 21 items: both Importants, every Minor and
+the parked items. Item 21 (M1) took the brief's fallback: the stop moved six realtime tests,
+three pinned-seed scenarios and three swarm floors (`realtime:frame-verified: 1020 of 1049
+required`), so it was reverted, its comment corrected, and its trigger given a PLAN v1.x row
+(`final-fix-report.md`). `modelled_remote`'s ambient flake went from 15 in 1,000 unseeded runs
+to 0 in 1,000, twice, at 48 to 96 orders per run (estimated batch miss 1.9e-7), and each
+example was proven as a copied `tests/sim.rs` (254, 198 and 212 of 256 runs tested). The
+re-review (`final-rereview.md`, opus, git-only, seven passes over `6a105a73..7fc5c730`):
+"Verdict: CLEAN", items 1–21 addressed, `48c4252a` clean, and five Minors N1–N5 folded into
+the next round (R31). N3, GUIDE's examples table giving checkout paths the registry copy
+lacks, had to land before Task 22.
+
+Task 20's evidence then reopened the code: the fresh seeds found a shrink that stopped on a
+local minimum (R28, criterion 4), and the final head's mutation run found survivors (R32,
+criterion 5). Those fixes and N1–N5 were round 2, and rounds 2 to 5 each got a scoped review
+by one independent opus reviewer, the same one throughout. Round 2's review
+(`round2-review.md`, over `c7d15e27..6a74ba3c`): NEEDS FIXES, 0 Critical, 1 Important, 3
+Minor, with determinism, `24460ec9`, `db20085d` and the docs clean. I-1: the equal-choices
+pass's pairs walk spent the 500-replay budget before the axes pass ran. With 60
+`between(0,1)` draws failing at 33 ones or more, seeds 0x4/0xd/0xf/0x15/0x18 ended with 0 of
+9/6/12/10/9 axes off after 500 replays, where with the pass disabled every axis came off in
+128–183; and the pass built O(k²) groups, about 9M (0.4–0.6 GB) at 6,000 choices. Round 3
+(`09bc3b44`, R35) fixed I-1 and the three Minors. Round 3's review (`round3-review.md`, over
+`6a74ba3c..09bc3b44`): NEEDS FIXES, 0 Critical, 0 Important, 2 Minor, with I-1 fixed (the
+reviewer's own probe turned every axis off on all five seeds and kept the 33 ones), the lazy
+walk's replayed candidates, order and keeps byte-identical to `6a74ba3c`'s over 4,000
+generated cases, and the docs clean. m-1: nothing pinned that a keep of a value's full group
+ends the pass; without that `return`, `a == b && c >= 1` (seed 0x17, first failure 3, 3, 6)
+panics "a shrink candidate must be smaller than the best so far" instead of shrinking to
+[0, 0, 1]. m-2: CHANGELOG and DESIGN §7 said a shrink always ends on a local minimum, and the
+reviewer measured a spent budget ending short of one (the spec delta below). Round 4 (R37,
+`ad9d7ec2`) answered both: m-1's pin (seed 0x17: exactly [0, 0, 6] in one replay, nothing
+tried after the keep) and m-2's probe as a test that derives its seeds (0xf, 0x18, 0x1f and
+0x21 reach z=10 with every axis off, red at the old shrinker at z=50).
+
+Round 4's review (`round4-review.md`, over `884fbf29..ad9d7ec2`): NEEDS FIXES, 0 Critical, 1
+Important, 2 Minor, with m-1 and m-2 fixed, R37's control flow, termination, asserts and
+`--jobs` intact, the merge master `0xe27fde2a57487fee`'s 27 → 32 replays traced to exactly
+the quiet round's five new candidates (the same result), and the docs accurate. I-1': R37
+also held pass 5's linear whole-group step behind a whole quiet round of passes 1–4, which
+costs a few hundred replays at 20–40 choices. Over the reviewer's 335-shrink probe
+`r4_pair_unlocks` (a needed equal pair among n draws, each at least the pair's value), 6
+ended larger at `ad9d7ec2` than at `09bc3b44` and none smaller (hi=7, order=2, n=40, seed
+0x11: `09bc3b44` reached `[]` in 454 replays, `ad9d7ec2` 42 choices of 7 in 500), and replays
+rose 32% (45,488 against 34,483). The reviewer's scratch split, the whole groups in every
+round and the pairs only in a quiet round, matched `09bc3b44` on all 335 and kept round 2's
+I-1 and round 3's m-2 fixed. m-1': the quiet test's `faults_off` operand was unpinned:
+dropping it left all 86 harness tests green and moved probe seeds 0x49 and 0x92 from z=10 to
+z=50. m-2': a ragged 47-column line in DESIGN §7. R38 took the split (round 5, `523fc7b8`).
+
+Round 5's review (`round5-review.md`, over `ad9d7ec2..523fc7b8`): NEEDS FIXES, 0 Critical, 0
+Important, 2 Minor, with I-1' fixed (the 335-case grid byte-identical to `09bc3b44`'s, replay
+sum 34,483, its test red at `ad9d7ec2`'s placement), m-1' fixed (red with the operand
+dropped), m-2' reflowed, and no regression against `ad9d7ec2` on any probe. m-a: three of the
+split's transitions were unpinned, and each was observable on a probe shape: the quiet test
+without its choices half (23 of 23 shrinks larger), a pair keep ending the shrink instead of
+starting a round (18 of 53), and the quiet test read before the whole-group step (12 of 12).
+m-b: a stall only a pair can leave, among about two dozen draws, still ended on the budget
+where `09bc3b44` reached the minimum (n=24: 5 of 6 seeds; seed 0xbcf 27 choices of 5 in 500
+replays, against `[0 ×25, 5]` in 425–434), never worse than `ad9d7ec2`, and with no fix R38
+allows. R39 accepted m-b's cost, wrote it down and gave it a PLAN row, and sent m-a to round 6
+as tests only, checked by the controller instead of another review. Round 6's pins
+(`ab831621`): `a_round_that_kept_a_choice_is_not_quiet` (seeds 0x1bd8 and 0x290e) and
+`a_kept_pair_starts_another_round` (0x299 and 0x1553). The controller re-ran each RED in a
+scratch worktree at `ab831621` with its own target (`logs/r6verify-*`): the control 2 of 2
+ok, and each of the three mutations failed exactly its target test (under x10, seed 0x299:
+"a, b and every x at 0, and p at 5, in 346 replays"). Per its report, round 6 moved no shrink:
+the 11 merge masters byte-identical, and the 335-case grid equal to `09bc3b44`'s. Round 7
+(`1106cdf0`, R42) had no scoped review: the controller read its non-test hunk, and the
+stranger's attempt 2 ran on it.
+
+The docs-only build's review (`t22-review.md`, opus, the app and the platform at `1106cdf0`):
+MEETS THE BAR on conditions 1 and 2, 0 Critical, 3 Important, 10 Minor, and all three
+Importants platform defects, which the record's README says are fixed before the publish. The
+controller verified each at `1106cdf0`. (a) `run_batch` merged a run's coverage into what
+`require:` reads only in its `Ok` arm, so `"…" never occurred in {n} runs` counted passed and
+skipped runs while naming all of them: under the reviewer's mutation M5, 52 of 52 failing runs
+fired `pricewatch:judged`, which the sentence said never occurred, and its advice, "drop the
+requirement", would delete an oracle (R44). (b) The mutants verb printed totals only, so "0
+missed" hid every function in which no mutant was viable: 12 in the controller's own
+`outcomes.json` for the app, both merge folds and the handler that applies them among them
+(the review counted 13 with no viable body replacement; `next_report_id`'s operator mutants
+are viable and caught), and 4 in the platform's own `harness.rs` run at `1106cdf0`, while
+GUIDE §8 called an unviable mutant "the compile-time contract doing its job" (R45). (c) With
+no `--timeout`,
+cargo-mutants' 5× auto timeout is measured on a green baseline, while a caught mutant's shrink
+adds up to 500 serial replays per failing check: under the builder's own invocation (`--jobs
+4`, 12 cores), 20 of the 59 mutants `--timeout 300` catches read TIMEOUT (`82 total — 39
+caught, 0 missed, 23 unviable, 20 timed out`, exit 1, `t22-timeout-red.sh`). That fails safe,
+since a timeout exits 1, but the default invocation could not give a sim-tested app a clean
+run (R46). Six Minors were platform doc gaps: GUIDE says to `--seed` a skipped run and no
+output gave one's seed (R47); GUIDE §8 told an app to run `scripts/mutants.sh`, which does not
+ship, and overstated what cargo-mutants generates; nothing said that a kernel whose `run`
+returned `Err` is rebuilt; and there is no worked first-credential example and no sanctioned
+way for deploy-time configuration to reach a handler (R48). The other four are the app's and
+the proof's (Open, below).
+
+The rounds 8–9 review (`round89-review.md`, a fresh opus reviewer, over
+`3cc2afa4..2129ce0b`): NEEDS FIXES, 0 Critical, 1 Important, 4 Minor, with R43, R44, R45, R47
+and R48 doing what their rulings say, the probes bearing out their docs, and R46's behaviour
+correct with its hazard sweep complete. I1: nothing pinned `sim_tests!`'s read of
+`CHARPENTE_SIM_NO_SHRINK`, the link between the verb setting it and the harness skipping the
+shrink. A hand mutant disabling the read was live (sim-fixture shrank again with the variable
+set), while `cli` 27 of 27, `repro_meta` 2 of 2, sim-fixture, merge-fixture and `hook_census`
+stayed green, since cargo-mutants never mutates inside `macro_rules!`; T22's (c) could have
+reopened with nothing saying so. The Minors: a failed run that gave up first added to
+`coverage["run:skipped"]` (probe: 11 against `skipped` 3), against GUIDE §8's exact
+cross-check, and a failing `--seed` replay's coverage reached no top-level `coverage`
+(R44-m1); a function cargo-mutants writes no mutant for at all, such as a `new` returning
+`Self` or anything inside `assert!`, is neither measured nor named, and GUIDE did not say so
+(R45-m1); under the variable the rerun line did not reprint the report, against GUIDE's "byte
+for byte" (R46-m1); CHANGELOG's struct-literal break omitted `HarnessArgs::no_shrink` (X-m1).
+Its notes: `d368076a`'s message overstated DESIGN, the `outcomes.json` parse error named no
+fix, and GUIDE's "costs no more than its green baseline" was approximate. R49 took all five
+and those three notes (round 10). The controller proved I1's test red itself, in
+`../charpente-gate` at `81b4e8be`: the control passed, the reviewer's mutant
+(`.is_some_and(|_value| false)`) failed at `cli.rs:187` with `shrunk: 0 draws to 0, … in 10
+replays`, and the file was restored by `git checkout` and `touch` to sha `042d81e1c898`, tree
+clean.
+
+**Exit criteria (spec §6), each with its evidence.** The final evidence ran at `81b4e8be`,
+the code head after round 10 (progress.md's "Final evidence at 81b4e8be"). `158d4c4f` adds
+only the stranger's record, and round 11 (`cba9386b`) changes only charpente-cli, so the
+sim evidence stands at its head and only the gate and the edge rig re-ran there (R50). Each
+earlier head the rounds produced (`ad9d7ec2`, `523fc7b8`, `1106cdf0`) got the same chain, and
+those runs are named below where they moved something.
+
+1. **Text pins: met.** `final-review.md`: "The harness copy matches spec §6.1, and every item
+   on that list has a pin": green, red, unmet coverage, all-skipped, capped reasons, a
+   `--seed` replay of a skipped run and of a failing one, a shrunk failure, scripted inputs,
+   the stale directory and the stale peer. The fix wave pinned the three texts M10 found
+   (`Input::text`'s two panics, the archive's `CheckingOwner` arm, the hand-off target's
+   "will open after"), and `doc_truth`'s pinned floor went 46 → 49 for GUIDE's three new
+   refusal blocks (Task 7). Every line rounds 7–10 added or moved landed pinned in its own
+   commit, red first: the batch's order (R42, `1106cdf0`: the rule test, four reordered
+   harness pins and `cli.rs`'s block), the result line (R43, `c56415b3`: six harness tests and
+   `cli.rs`'s pin), the coverage sentence and its negative space (R44), the verb's untested
+   lines (R45), the unshrunk `shrunk: skipped …` line and `"not_shrunk"` in JSON (R46, and
+   through the CLI in `85158fd3`), the skipped reasons' `(first: --seed 0x…)` (R47), and the
+   rerun line under `CHARPENTE_SIM_NO_SHRINK` and the `could not parse` error's fix text
+   (`6bfe162e`).
+2. **Determinism: met.** Oracle 3 replays six batches at 256 runs per check (`crates/sim-fixture`
+   and `examples/invoicing` at `0x912313adf8115ad0` and `0x483e230baed4922b`,
+   `crates/outbound-fixture` at `0xf207f4dcbfade216`, the scaffold at `0x1`) and diffs master
+   seed, runs, coverage, missing coverage, each check's passed and skipped, and each failure's
+   check, seed and message (`oracle3-filter.jq`) against baselines recorded at `cff0917d`
+   before any code changed. Task 0 showed it able to fail: a planted +1 gave rc 1 naming
+   `myapp-0x1`. The final run at `81b4e8be` (`oracle3-final5/`): all six exit 0. On the way,
+   `oracle3-final` at `884fbf29` read all six diffs 0 bytes with every raw JSON
+   byte-identical to `oracle3-round3`'s, `final2` (`ad9d7ec2`) and `final3` (`523fc7b8`) were
+   byte-identical to the run before, and the rounds' own runs kept the raw JSON identical
+   through round 8 (R42 and R43 change only the human output); round 9's moved only by R47's
+   `first_seed`, and round 10's equals round 9's. Batches moved only at the named steps
+   (passed/skipped per check; progress.md's S1–S4 table and `task-14-report.md`):
+
+   | Step | Task | Batches moved | Before → after | Reason |
+   |---|---|---|---|---|
+   | S1 stored times on the sim's Unix-scale wall reading | T4 | none | six diffs 0 bytes | the rescale changes no decision |
+   | S2 cron's grid | T6 | none | six diffs 0 bytes | no recorded batch runs a cron whose grid moved |
+   | S3 the app harness's clock axes | T8 and its fix round (S3r1) | all six | invoicing `0x483e…` receipts 101/155 → 99/157, overdue 103/153 → 98/158; myapp echo 90/166 → 89/167; outbound-fixture `orders_charge_once` 250/6 → 245/11 → (S3r1) 249/7; sim-fixture coverage only; no failures anywhere | the clock axes make runs draw differently; S3r1: per-host skew (R9), a jump marked only where a reading shows it, the outbound tail waiting out a clock refusal (R10) |
+   | S4 the scaffold's drawn inputs and third check | T14 (S4, S4r1, S4r2) | `myapp-0x1` only | S4: survive 89/167 → 78/178, echo 89/167 → 85/171, event (new) 77/179; S4r1: 203/53, 252/4, 213/43; S4r2: nothing | drawn inputs and a third check re-key the runs; S4r1's fault-free recovery tail |
+
+   Every other oracle-3 run (task2 through task17, shrink-dup, r34, round2 through round10,
+   final, final2, final3 and final5) exited 0 with no re-baseline. R34 was declared a named
+   step in advance and moved nothing (`oracle3-r34` byte-identical to the run before it). The
+   recorded batches are all green, so R44's change to what a failed run counts cannot reach
+   them. The platform suites' pinned seeds moved only inside S2: two replication pins,
+   `0x9827a4c2014d41d4` → `0xc881457d826c1d2c` and `0x78f5713c6b6cd7cd` →
+   `0x6916df3d6c5c3ac1`, re-found from base `0x2EB1_000E` because cron's tick times shift
+   those universes, each asserting its reason (Task 6's review). The clock axes stay off the
+   platform path: 13 base-seed coverage blocks identical at T8, 22 at its fix round and 45 at
+   T9's fix round, each against the commit before.
+
+   Byte identity across runs and `--jobs` (spec §6.2): `determinism.sh` runs sim-fixture
+   through the CLI at `--runs 256 --master-seed 0x5EED0302`, green and red
+   (`CHARPENTE_FIXTURE_FAIL=1`), human and JSON, twice each at `--jobs 1` and `--jobs 12`, 16
+   outputs. Its failing check draws nothing ("0 draws to 0"), so `determinism2.sh` runs the
+   scaffold's README red batch (`tx.enqueue` deleted), which draws and shrinks, 8 outputs. At
+   `09bc3b44` both read 0 differing (human 2,684 B, JSON 267,925 B, exit 1; "shrunk: 4 draws
+   to 3", six axes off, "in 8 replays", a repro carrying `--inputs 00`), and all 24 were
+   byte-identical to the `6a74ba3c` run's; at `ad9d7ec2` and `523fc7b8` all 24 were again
+   byte-identical to the run before. At `1106cdf0`, where R42 moved the output's order, and at
+   `81b4e8be`: 16 outputs and 8 outputs, 0 differing each. A repro replays exactly what it
+   prints: round 2's reviewer replayed 118 of 118 printed repros byte for byte, 4 of them
+   without `--inputs`, and the old prefix rule failed that probe at `0x4`
+   (`round2-review.md`). Across machines: the docs-only builder's final batch, run on Linux
+   aarch64 under rustc 1.99.1, replayed byte for byte from its master seed on macOS aarch64
+   under rustc 1.99.0 (criterion 8).
+3. **The clock oracles: met.** The three wire oracles went red before the fix
+   (`logs/task4-red-clock_restart.log`, at `950dee62`: 0 passed, 3 failed, "the 1 s schedule
+   did not tick within 2.5 s of a restart: 5 at restart, 5 after", "a 2 s session, 3 s after
+   a restart: 200 \"alice\"", "exp an hour ago: 200 \"bob\"; exp in an hour, nbf a minute
+   ago: 401 ...not yet valid...") and green after it (`logs/task4-green-clock_restart.log`, at
+   `32288f43`: 3 passed). In the edge rig they were green at every head the final evidence
+   measured (`884fbf29`, `ad9d7ec2`, `523fc7b8`, `81b4e8be`), and failed at `1106cdf0` only on
+   a macOS launch stall (criterion 6). The sim half, `crates/charpente/tests/clock.rs`, runs
+   under all three clock axes: a session never
+   resolves past its TTL plus the tolerance, a schedule never stalls past one interval plus
+   the tolerance, no retry runs before its `due_at`, and the stop, the open refusal and the
+   promote refusal fire exactly beyond the tolerance, with
+   `an_uptime_clock_fails_the_ttl_and_stall_properties_by_name` as the victim. Task 9's
+   reviewer read 16 mutant logs: one change per property turns it red. At the pinned base
+   `0xC10C_0001`, 256 universes, every `require:` is met (Task 9's fix round, as progress.md
+   counts them: stalled 17, held at open 651, refused at promote 18, held at promote 63,
+   follower open refusals 277, promoted 256). The fresh bases were drawn from `/dev/urandom`
+   on 2026-10-25 and recorded in progress.md before anything ran: `0xc928857300a6b1a5`,
+   `0x9050ab46e9362935`, `0xabe130dde4c46a2a`, `0x8ec768eeb0ae4508`, `0xc1f113da6707e693`,
+   `0x92ebafde3747b3c2`, `0xa0f5c9a10298eef0`, `0x7909dc8be591da5e`, `0x93f7ee7460660317`,
+   `0xf8c7e0f6515b42c0`. At `7fc5c730` (`logs/t20s3-clock-*`) and again at `884fbf29`
+   (`logs/t20s7-clock-*`): 10 of 10 exit 0, each `test result: ok. 6 passed` with its five
+   swarm properties re-based, and all 50 batches in `t20s7` read "256 of 256 universes
+   reached a verdict, 0 gave up": 12,800 universes, 0 failures, every coverage count and
+   verdict identical between the two runs. At `ad9d7ec2` (`t20s9`) and `523fc7b8` (`t20s11`)
+   every coverage count and verdict was identical to `t20s7`'s, and at `81b4e8be` (`t20s15`)
+   10 of 10 exit 0, five properties re-based at each, verdict lines identical to `t20s11`'s.
+   Under `CHARPENTE_BASE_SEED` the runner skips `require:`, `floor:` and `ceiling:` (each
+   log's re-basing line says so), so these batches are evidence about failures only. Task 9's
+   own fresh bases (`0xbcb622f4b7bd3424`, `0x8dc2a2a2c6a8b337`, `0x190906d64bc62ecf`) were
+   green at `0540c30e` and `7d9ba14f`, and the three apps ran a fresh master after each task
+   that moved behaviour, all clean (`0x7a540004102e0001`, `0x5c105eed7a5b0c03`,
+   `0xe2d9d7d8dd3df24b` at 512 runs per check; `0x20261023c10c0008`, `0x20261025c10c0011`,
+   `0x20261025c10c9001` at 1,024).
+4. **The inputs oracle: met.** `crates/merge-fixture`: the latest-wins mutant passes the
+   scripted workload (exit 0, the control) and fails the drawn one (exit 1), and the correct
+   max-wins merge passes the drawn one. At its pinned master `0x4D455247`, 256 runs, the
+   failure shrinks to `inputs: arrivals=2, lab=1, amount=2, lab=1, amount=1`, two arrivals,
+   the later one smaller ("shrunk: 11 draws to 5", 18 replays at `09bc3b44`), pinned exactly
+   in `crates/merge-fixture/tests/sim.rs`; the implementers' eleven-master sweeps (this master
+   and the ten bases below) saw only `0xe27fde2a57487fee`'s replays move through round 9.
+   After Task 13's fix round max-wins tests 167 of 256 runs and latest-wins 83 (from 114 and
+   44), and max-wins reads 167 tested over 167 distinct inputs (Task 15). Fresh bases,
+   recorded before any run: `0xca8d538455ed288e`, `0xe27fde2a57487fee`,
+   `0xc451955a6ce346f3`, `0xffb1450da7349442`, `0xa69b628274d43742`, `0xa6d06c1003c26a8c`,
+   `0x533fa52644a334fb`, `0xfae18950def42fe0`, `0xe2a8493303a69614`, `0xc6785147f8a6fdb4`,
+   each run with the canonical inputs and distinct > 100 asserted (the master-specific "11
+   draws to 5" printed instead). At `7fc5c730`
+   (`logs/t20s3-merge-*`) 9 of 10 held: at `0xe27fde2a57487fee` the shrink stopped at
+   `arrivals=2, lab=2, amount=2, lab=2, amount=1` ("5 draws to 5", 34 replays). Both lab
+   choices were raw 1, lowering either alone splits the bids across labs and passes, and every
+   pass moved one choice. R28 fixed the shrinker, not the test (`babae9d1`, red first). From
+   `babae9d1` on, all ten reach the canonical inputs (`t20s4`, `t20s5`); at `09bc3b44`
+   (`logs/t20s6-merge-*`) 10 of 10 exit 0, `test result: ok. 4 passed`, canonical at every
+   base, in 24, 27, 30, 22, 20, 21, 25, 18, 17 and 23 replays, with 149–170 distinct inputs
+   under max-wins. Each later head held all ten, canonical at every base: at `ad9d7ec2`
+   (`t20s8`) every shrunk block identical but `0xe27fde2a57487fee`'s replays, 27 → 32 (R37's
+   quiet round, traced by round 4's review); at `523fc7b8` (`t20s10`) identical to `t20s8`,
+   replays included; at `1106cdf0` (`t20s12`) identical as sets, only their order moved
+   (R42); and at `81b4e8be` (`logs/t20s14-*`, in `../charpente-seeds`) 10 of 10 exit 0,
+   `4 passed` each, the shrunk blocks, replay counts and max-wins check lines identical to
+   `t20s12`'s at all ten. The scaffold's three checks, over ten more fresh bases
+   (`0xea469a0b63b4c542`, `0x403c6b0583608eb4`, `0x7a7ac3f089365649`, `0xfcfd52be40071442`,
+   `0x9b7013373e355772`, `0x91fd5d49a83ae5e5`, `0xef6510a7223708cb`, `0x974b5a22e8cede46`,
+   `0x1b8d82ce77a10748`, `0x44a892a0bbf18721`), at `7fc5c730` and at `884fbf29`
+   (`logs/t20s7-progress.log`): 10 of 10 exit 0, "sim result: ok. 3 passed; 0 failed",
+   666–688 of 768 runs tested, the check lines identical between the two runs; at
+   `ad9d7ec2`, `523fc7b8` and `81b4e8be` (`t20s9`, `t20s11`, `t20s15`) 10 of 10 exit 0 again,
+   and at `81b4e8be` the check lines identical to `t20s11`'s at all ten.
+5. **Mutation: one survivor at `81b4e8be`, which round 11 pins (its row below); every other
+   scope catches every viable mutant, and no exclusion was added.** Scope: plan Task 20 step
+   2's list, plus the oracle-bearing `checks.rs` parsers 0.3.0 added, the `run_due` fix, and
+   from `81b4e8be` the whole of the mutants verb, which R45 and R46 changed. Each run named
+   the test package that exercises its file, and each row is that scope's last run, on a file
+   unchanged since. `git diff --stat 884fbf29 158d4c4f`
+   over the table's files lists only `harness.rs` and `mutants.rs`, each re-run at its head,
+   and charpente-sim's `lib.rs`, which changed only inside `sim_tests!` (R46's read, 6 lines),
+   where cargo-mutants writes no mutant; `dispatch.rs` has changed only in comments since its
+   run at `2b33ad81`, cherry-picked as `6a105a73`:
+
+   | Scope | At | Total | Caught | Missed | Unviable | Timed out | Log |
+   |---|---|---|---|---|---|---|---|
+   | `kernel/clock.rs` | `7fc5c730` | 22 | 18 | 0 | 4 | 0 | `mutants/fin-clock.log` |
+   | `kernel/cron.rs` | `6a74ba3c` | 36 | 32 | 0 | 4 | 0 | `mutants/r2-cron.log` |
+   | `harness.rs`, the whole file | `81b4e8be` | 305 | 296 | 0 | 9 | 0 | `mutants/r7-harness.log` |
+   | `lib.rs`: `sim.input()` | `6a74ba3c` | 45 | 39 | 0 | 6 | 0 | `mutants/r2-sim-input.log` |
+   | `checks.rs`: the clock checkers, the wait helper, `acked_implies_durable` | `6a74ba3c` | 96 | 94 | 0 | 2 | 0 | `mutants/r2-checks-clock.log` |
+   | `archive/manifest.rs`: `check_crc`, `check_contiguous`, `SnapshotMeta::decode` | `088668e2` | 19 | 18 | 0 | 1 | 0 | `task-20m-report.md` |
+   | `kernel/dispatch.rs`: `run_due`, `run_due_into` | `2b33ad81` | 8 | 6 | 0 | 2 | 0 | `task-20m-report.md` |
+   | `db.rs`: `is_platform_table`, `drift_msg` | `55624b13` | 5 | 5 | 0 | 0 | 0 | `mutants/db-refusal.log` |
+   | `repl/session.rs`: `decide_hello` | `55624b13` | 23 | 21 | 0 | 2 | 0 | `mutants/repl-hello.log` |
+   | `archive/restore.rs`: `prepare` | `55624b13` | 4 | 3 | 0 | 1 | 0 | `mutants/restore-prepare.log` |
+   | charpente-cli `mutants.rs`, the whole file | `cba9386b` | 60 | 56 | 0 | 4 | 0 | `logs/t21c-mutants.log` |
+
+   `archive/manifest.rs` ran whole at `55624b13` first (105 mutants, 90 caught, 3 MISSED, 12
+   unviable, `mutants/manifest.log`); its row is the re-run of the three functions the
+   survivors sat in. Six runs found survivors, and each MISSED became a behaviour test proved
+   red by hand, but for one guard `09bc3b44` deletes (below); round 11's red is in
+   `task-21c-report.md`. At `55624b13`: `cron.rs` 4 MISSED in `CronScheduler::tick`'s
+   commit-failure rollback and 1 TIMEOUT (`next_deadline` → `None`), and `manifest.rs` 3
+   boundary MISSED,
+   every MISSED line older than 0.3.0 (R23); closing them found the two wrapper defects (R24),
+   seeds `0x20A3_0001`–`0x20A3_0005`. At `6a105a73`: the input code 1 MISSED, and the shrinker
+   5 MISSED (the whole zero pass was removable unnoticed) and 12 TIMEOUT, because the budget
+   was charged only on a replay and a loop that stopped replaying never ended; `48c4252a` caps
+   the rounds at the budget with a named `unreachable!` and adds progress asserts, so a
+   timeout mutant fails by name in at most 2 s. At `7fc5c730` (`mutants/fin-*.log`): `cron.rs`
+   1 MISSED (`upsert`'s reported-elsewhere operands), `harness.rs` 12 MISSED and 6 TIMEOUT of
+   270, `checks.rs` 3 MISSED and 5 TIMEOUT of 96, sent to one round by R32 (`24460ec9`,
+   `db20085d`; `check_status`'s equivalent arm rewritten as `passed == 0`, not excluded). At
+   `babae9d1` the equal-choices pass had 2 MISSED of 107 (`mutants/shrink2.log`), and at
+   `6a74ba3c` 2 of 304, both in `equal_groups` (`mutants/r2-harness.log`): `09bc3b44` deletes a
+   guard whose mutant only tried one candidate twice, which no output can observe, rather than
+   exclude an unkillable equivalent, and its exact-candidates test pins the other operand.
+   From `09bc3b44` on, `harness.rs` read 0 missed and 0 timed out at every head: 300 → 291
+   caught at `09bc3b44`, 301 → 292 at `ad9d7ec2`, `523fc7b8` and `1106cdf0`, and 305 → 296 at
+   `81b4e8be`. At `81b4e8be` (`mutants/r7-mutants.log`) the mutants verb, whole for the first
+   time: 60 total — 55 caught, 1 MISSED, 4 unviable, 0 timed out. The MISSED is
+   `mutants.rs:542:19: replace == with != in report`, the choice of stdout or stderr for a
+   verdict's lines, a line from 2026-09-07 that no test observed; R50 sent it to round 11 as a
+   property to write, not an exclusion (R23). Round 9's scoped run of the verb's changed
+   functions had read 0 missed (`verdict` 14 caught, 1 unviable; `run` and
+   `time_the_package_set` 9 of 9).
+
+   From `7f771699` the verb also names, beside its totals, each function in which no mutant
+   was viable, as untested (R45). At `81b4e8be` it names four in `harness.rs`
+   (`Failure::of`, `failure_run`, `parse_number`, `run_single_seed`, as at `1106cdf0`) and one
+   in `mutants.rs` (`parse_outcomes`). They stay named and are not chased: each is exercised by
+   its callers' tests, and R45's rule names without failing (R50; Open, below).
+
+   `.cargo/mutants.toml` is untouched (R32). One instrument note: `lib.rs`'s scoped re-run
+   at `ff3f4351`, at the verb's automatic `--timeout 29`, read 28 TIMEOUTs, all stalled in
+   charpente-core's unmutated test binary under machine contention, and read 0 missed and 0
+   timed out at `--timeout 180` (`task-20m-report.md`). A timeout is not a catch, so the runs
+   from `babae9d1` on used `--timeout 600`.
+6. **Gate: met locally; CI and the nightly are pending the push.** `final-chain.sh` in
+   `../charpente-gate` ran the full gate and then the edge rig (`scripts/edge-harness.sh`,
+   `--ignored --test-threads=1`) at each code head. Against T0's base gate at `cff0917d` (92 of
+   92 `test result: ok`, 1,967 passed, 60 ignored): at `884fbf29`, 100 of 100, libtest passed
+   2,107 (gate.sh printed 2,121, counting the 14 `sim result:` passes T0's output did not
+   print), 63 ignored (clock_restart's three), and the edge rig exit 0, 11 `test result: ok`,
+   45 passed. The suite differences are in progress.md (`gate-diff.pl`, `gate-names.pl`,
+   `logs/gate-final-names.txt`): nine suites new and one gone (charpente's doc-tests,
+   `doctest = false` since T18), and charpente-sim's lib 164 → 242 among the counts. At
+   `ad9d7ec2`, `523fc7b8` and `1106cdf0` only charpente-sim's lib moved (244, 246, 249: each
+   round's tests). At `81b4e8be` (`logs/final-chain5.progress`): `cargo fmt --all --check` 0,
+   clippy 0, `cargo test --workspace --no-fail-fast` exit 0, 100 of 100 `test result: ok`, 0
+   failed, passed 2,140 by gate.sh's count, 63 ignored; the edge rig exit 0, 11 `test result:
+   ok`, 0 failed, 45 passed, green on its first run.
+
+   The edge rig failed once at `1106cdf0`, on the machine and not the code: exit 101,
+   `clock_restart` 1 passed and 2 failed with "spawn clock_node: node at 127.0.0.1:… never
+   accepted a connection within 10s", stderr empty, no data dir created. Nothing between
+   `523fc7b8` (edge green) and `1106cdf0` touches `clock_node`, the kernel or the rig. The same
+   binary, its mtime unchanged through every re-run, accepted after 5.09 s when started
+   directly cold and then in 0.13 s five times; `clock_restart` re-run alone passed 0, 1 and 1
+   of 3, failing in different tests each time, then 3 of 3; and a harness-spawned `clock_node`
+   sampled 4 s after its spawn had its main thread at `_dyld_start` (STAT `SN`), held by macOS
+   before any charpente code ran: the launch-time code-signing assessment, with syspolicyd at
+   about 18% CPU. Recorded as environment, with no rig change, since CI's nightly runs on
+   Linux (`logs/edge-clock-restart-rerun*-1106cdf0.log`). The rig's next run, at `81b4e8be`,
+   was green on its first run.
+
+   At round 11's head, `cba9386b`, whose change is charpente-cli only:
+   `logs/final-chain6.progress`: `cargo fmt --all --check` 0, clippy 0, `cargo test --workspace
+   --no-fail-fast` exit 0, 100 of 100 `test result: ok`, 0 failed, passed 2,141 by gate.sh's
+   count, 63 ignored; against `81b4e8be` only charpente-cli's binary unit tests moved, 75 → 76
+   (round 11's test, `gate-diff.pl`).
+   The edge rig there: exit 0, 11 `test result: ok`, 0 failed, 45 passed.
+7. **A stranger reads it: met on attempt 3 of 3.** Task 21, recorded in
+   `docs/experiments/2026-10-0.3.0-stranger/` (`318e589d`, `3cc2afa4`, `158d4c4f`). Every
+   attempt ran headless (R29) in a fresh box with no network, on the image
+   `rust@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc` (rustc
+   1.99.1, which meets the scaffold's `rust-version`; no clippy), with `BRIEF.md` sha256
+   `dae25ebb…74dd9` (the launch run's) and README sha256 `cbaf3242…` (the repo's, unchanged
+   through all three), against a registry rebuilt at the head under test (6 crates, 117
+   source directories, GUIDE.md equal to `docs/GUIDE.md`; `launch-outside.sh` refuses a
+   registry not built at HEAD). Every attempt passed the launch run's mechanical bar: the green
+   batch, the red batch after `tx.enqueue` is deleted, and the stranger's replay and the
+   controller's replay in a second fresh box printing byte-identical blocks, each the batch
+   block minus its `shrunk:` and `first:` lines (R41). Every attempt was sealed. Two missed
+   spec §6.7 (a) on the per-check tested count, and each miss was fixed as its own pinned
+   change before the next attempt, as §6.7 requires.
+   - **Attempt 1,** on the registry at `523fc7b8` (R40), 2026-10-26T18:15:21Z: 25 turns, 147 s,
+     21 box calls, all exit 0. Green at master `0x757496059e186415` (674 of 768 runs tested);
+     red at `0x52a91d2d9766b4d0`, the echo check FAILED in 206 of its 252 tested runs, shrunk
+     6 draws to 3 with 8 axes off in 10 replays. (b)–(e) met. (a) missed: the report never gave
+     a check's tested count (they were 209, 251 and 214), and the follow-up gave the aggregate,
+     "665 of 768 runs testing a check", and said it had read only the last 8 lines, which held
+     the skipped-runs block's tail and the result line. R42 (`1106cdf0`) moved the check lines
+     to the end of the batch.
+   - **Attempt 2,** on the registry at `1106cdf0`, 20:12:18Z: 22 turns, 157 s, 18 box calls,
+     two non-zero, both environment probes. Green at `0x82dc8265b9aba391` (215, 254 and 201
+     tested); red at `0xbb4bd2377a45095d`, 203 of 254 failing, 5 draws to 3 with nine axes off.
+     (b)–(e) met. (a) missed again: "3 checks × 256 runs = 768 runs, 3 passed", and in the
+     follow-up only the failing check's count ("failed in all 219 runs that tested it"), the
+     other two "stayed green". Both strangers carried the result line's aggregate. R43
+     (`c56415b3`) put each check's count on that line.
+   - **Attempt 3,** on the registry at `81b4e8be`, 2026-10-27T07:21:34Z: 20 turns, 123 s, 14
+     box calls, all exit 0, no resume. Green at call 8 (205, 251 and 219 tested); red at call
+     10, the echo check FAILED in 210 of 250, shrunk 5 draws to 3 (`notes=1, order=[1],
+     body="alpha"`); the stranger's replay (call 11) and the controller's identical. Sealed:
+     one box-side hit, call 7's environment probe (cargo's `config.toml`, the names of files
+     matching `*clippy*`, the environment), and 14 agent calls against 14 box starts. (a) met:
+     asked what its last run told it, it answered "all three checks passed: 205, 253 and 205
+     of 256 runs actually tested the property, and the rest were skipped because a fault
+     stopped them before the check could run", which is call 14's result line exactly (`Runs
+     tested per check, in the order above: 205, 253, 205 of 256.`). (b) "no POST was acked,
+     so durability has nothing to prove"; (c) the shrunk `notes=1, body="alpha"` and the
+     faults turned off; (d) the skipped runs "honestly accounted for"; (e) every claim right
+     (the record's census). **Verdict: PASS.** Its one piece of testimony, README:133's
+     "charpente `0.1.0` is on crates.io" read against the mirror's 0.3.0, is left as tested
+     (Open).
+8. **A docs-only build: MEETS THE BAR, on attempt 1.** Task 22, recorded in
+   `docs/experiments/2026-10-0.3.0-docs-only/` (`c415f879`). One headless Opus builder (R29),
+   offline on `charpente-t22-box:mutants-27.1.0` (image id
+   `sha256:f7db863a76ac520bbb584d40243cbc8ac9be1be76955dccbd58ce48eef5dd145`, R26), against the
+   registry built at `1106cdf0`, with the "price watch" brief committed before the run
+   (`c7d15e27`, amended before it by R36 in `884fbf29`; sha256 `6f9262bc…`). It ended
+   2026-10-26T20:49:18Z after 133 turns and 2,218.8 s, with 128 Bash calls (22 refused by the
+   session's permission check, which read Rust closures and Markdown tables as pipes; the 106
+   allowed carry exactly the box's 118 starts) and no resume. It delivered `pricewatch` in
+   five commits (src 437 lines, `tests/sim.rs` 952, `FINDINGS.md` 205): sim 5 of 5 ok at
+   master `0x2c0cbfefeb3ad9c2` (1,018 of 1,280 runs tested), and `--mutants` 82 — 59 caught,
+   0 missed, 23 unviable at `--timeout 300`, after its first run, at the automatic 26 s, read
+   105 — 39 caught, 65 unviable, 1 timed out and it rewrote `latest_rank` off
+   `std::cmp::Reverse` so that its mutants became viable. The committed streams redact the
+   operator's address, which the builder's `git config user.email` line carried.
+   - **Zero framework patches: met.** No `[patch]` and no `path` in its `Cargo.toml`, every
+     charpente crate in `Cargo.lock` from the registry, and the registry inside the box
+     byte-identical to the local one (5,985 files). Sealed: the 44 box-side hits are GUIDE
+     reads, one `examples/` read, an `ls` of the crate root, `examples/` and `tests/` (names
+     only), `ls /opt/registry` and the builder's own writes; no `src/` read.
+   - **Zero Criticals a platform oracle should have caught: met.** The review found 0
+     Critical, and thirteen hand mutations of its own were all caught.
+   - **`--mutants` clean, with no hand pass: met.** The controller's second gate pass, under
+     `charpente 0.3.0` from the registry on macOS aarch64 with rustc 1.99.0:
+     `--file src/merge.rs --file src/lib.rs --test-package pricewatch --jobs 3 --timeout 300`,
+     `82 total — 59 caught, 0 missed, 23 unviable, 0 timed out`, exit 0, the builder's numbers.
+     The builder's final 28-line batch replayed byte for byte from its master seed; clippy
+     1.99.0 `--all-targets -D warnings` exit 0 (R30); `cargo test` exit 0, 3 `test result:
+     ok`.
+
+   The three platform defects (What the reviews found) were fixed before the publish, in
+   round 9 and with round 10's pins, and checked end to end at `2129ce0b` against the
+   delivered app (`t22-e2e.sh`, the app `[patch]`ed onto that head's crates, its release CLI).
+   R46: the builder's own invocation with no `--timeout` (`--jobs 4`, automatic 28 s) read
+   `82 total — 59 caught, 0 missed, 23 unviable, 0 timed out`, exit 0, where `1106cdf0` read
+   20 timed out. R45: "12 functions had no viable mutant, so this run says nothing about them
+   (untested):", grouped by file, the 12 the controller counted. R44: the review's M5 no
+   longer names `pricewatch:judged` (fired in 168 failing runs; its coverage 258 where it read
+   90), and the three keys it still names fired in no run, failed or not. The green batch's
+   result line read `Runs tested per check, in the order above: 192, 204, 207, 214, 201 of
+   256.`, the builder's counts. T22 is not re-run (progress.md's sequence after R48): its bar
+   is met, and these are the fixes its findings called for.
+9. **After the publish: Noah's.** Task 23, then the registry smoke: install, `--version`,
+   `new`, clippy, sim.
+
+**Rulings.** `progress.md` holds every one; these are the ones a later reader needs. The spec
+is the record of what Noah approved and is not edited, so its deltas come first.
+- **Spec delta: the across-restart bound (R3).** Spec §5 B: "across a restart or failover, a
+  session that expired just before it can resolve again for at most the tolerance". Shipped:
+  for at most the time since the store's latest recorded time plus `CLOCK_TOLERANCE`. The
+  spec fixes the mechanism, a floor recovered from stored times "so the log format and every
+  pinned seed's byte counts stay as they are", and its stated limit follows only for a fresh
+  floor, which needs a persisted wall reading: the log change the spec refused. GUIDE and
+  DESIGN state the precise bound (DESIGN's first wording understated it by the tolerance,
+  Task 5's review I1), Task 9's TTL property is written against it, and PLAN's row "A stored
+  wall reading" carries the trigger.
+- **Spec delta: "never silently by a year" (R11, R13).** Spec §5 B says a clock error can
+  extend a session or delay a tick "by at most the tolerance, never silently by a year".
+  Task 9's review found that a stuck wall clock never tripped the hold, so time froze with
+  nothing said: sessions never expired and schedules never ticked. R11: the node stops by
+  name ("clock stalled: this node's wall clock has not advanced past {held}, the latest time
+  it already used, for {d} of elapsed time — more than the 60s charpente tolerates") once
+  that has lasted more than `CLOCK_TOLERANCE` of monotonic time, so each freeze is bounded by
+  the tolerance, with no false stop from rate drift. R13: the spec's sentence stays as Noah
+  approved it, and GUIDE §7, DESIGN §1 and the `WallHold` doc carry the precise statement.
+  What stays undetected is a clock that runs slow, and sub-tolerance steps accumulating
+  relative to other clocks (OIDC and IdP time, sessions minted on another node); "at most the
+  tolerance" holds per step, and held step-backs accumulate.
+- **Spec delta: "the smallest run" (R28, R33, R35, R37, R38, R39).** Spec §3 and §5 C: "the
+  smallest run that still fails the same check is kept". Shipped: a run none of the shrink
+  passes can make smaller, a local minimum, because the passes do not search every smaller
+  run (progress.md's alignment line); README, DESIGN §7, CHANGELOG and GUIDE §8 say so
+  (`6a74ba3c`). R28 added the pass that brought `0xe27fde2a57487fee` to the canonical inputs:
+  equal nonzero choices lowered together, and each pair of positions holding one value
+  (R33). A shrink that spends its 500-replay budget ends where the budget ran out, which can
+  be short of a local minimum. R35 moved the equal-choices pass after the axes pass, so its
+  pairs no longer leave unneeded fault axes on. Round 3's review then measured the same
+  starvation for inputs: at seeds 0xf/0x18/0x1f/0x21 a shrink reported z=50 in 500 replays,
+  where with the pass disabled it reached z=10, a verified local minimum, in 455–487. R37
+  superseded R35's placement: the pass ran only in a round where passes 1–4 kept nothing,
+  which is exactly the stall R28 introduced it for, with no cap and no new constant, and
+  R35's laziness stayed; CHANGELOG and DESIGN took GUIDE §8's budget wording (`ad9d7ec2`).
+  Round 4's review measured R37 holding back the linear whole-group step too (I-1'), so R38
+  split the pass (`523fc7b8`): the whole groups are lowered in every round, right after the
+  axes, and only the pairs wait for a quiet round, one in which everything else, the whole
+  groups included, kept nothing, where "kept" means the choices or `faults_off` changed; any
+  keep starts another round. Only the pairs are quadratic, and they are what starved the axes
+  (round 2) and the inputs (round 3). R39 accepted the split's one measured cost, round 5's
+  m-b, because no placement of the pairs walk wins on every shape. Run in every round, it
+  misattributes faults and fault-coupled inputs, which misleads the fix (GUIDE §8's warning);
+  run only in quiet rounds, a stall only a pair can leave, among about two dozen draws, can
+  end on the budget, still naming the check, the seed, the faults and a repro that replays.
+  GUIDE §8 and the `shrink` doc state that cost, and PLAN's v1.x row "A pair search that does
+  not wait for a quiet round" carries its trigger. From R39 on, further shrink-heuristic
+  trade-offs are ledgered as owed, not given another round, while correctness defects (a
+  panic, a wrong repro, nondeterminism) are still fixed.
+- **Spec delta: the batch's shape (R42, R43).** Spec §5 D carries the shape Noah approved on
+  2026-10-17: the check lines, then the skipped-runs block, then a result line ending `178 of
+  512 runs tested a check.` Spec §6.7's own rule changed it twice: "A miss is a finding about
+  the output: fix it and run a new attempt, recording both. It is never argued away." R42
+  (`1106cdf0`): the batch ends with the check lines directly above `sim result:` and the
+  rerun line, after the failure blocks, the unmet requirements, the skipped-runs block and the
+  no-inputs block, so the last lines a reader tails carry each check's status and counts
+  beside the verdict, as `cargo test` ends on its per-test summary. R43 (`c56415b3`): the
+  result line gives each check's tested runs in the order of the check lines above it
+  (`Runs tested per check, in the order above: 203, 256, 249, 212, 231, 256 of 256.`; with
+  one check, `Runs tested: 52 of 64.`) in place of the aggregate. Both strangers quoted the
+  result line and carried its aggregate, and an aggregate summed over checks lets a check
+  tested in 3 of 256 runs hide behind two tested in 250, the overstatement 0.2.0's strangers
+  named. The list is joined with ", ", the output's own separator, where the ruling's
+  illustration used "and". The JSON is unchanged under both, and the single-seed replay
+  already ended on its check lines.
+- **Spec delta: what `require:` counts (R44, R49).** Spec §5 D says "A check with an unmet
+  `require` is `FAILED`" and not which runs count. The first cut counted a key as occurred
+  only when a passed or skipped run fired it. From `43ead430` a key a failed run fired has
+  occurred: failed runs' coverage merges into the batch coverage that `require:`, `floor:`
+  and `ceiling:` read. Why: the requirement exists to catch an untested claim, and a run that
+  reached the state and then failed tested it; a green batch has no failed runs, so its
+  output and JSON cannot move. R49 (`8d04a2da`) merges a failed run's coverage without
+  `run:skipped`, since a run that gave up and then failed was not skipped, which keeps GUIDE
+  §8's exact cross-check of that key against the skipped count, and a failing `--seed` replay
+  applies the same rule.
+- **Spec delta: an environment variable the verb sets (R46, R49).** The spec adds no
+  environment variable. Shipped (`d368076a`): under `charpente test --mutants` the verb sets
+  `CHARPENTE_SIM_NO_SHRINK=1` on cargo-mutants and on its timing run, every test binary
+  inherits it, and `sim_tests!` reads it once into `HarnessArgs::no_shrink`, so a failing
+  check reports its first failure unshrunk and its `shrunk:` line says so. Why: a mutant needs
+  only red or green, so a caught mutant then costs about its green baseline and
+  cargo-mutants' 5× automatic timeout holds; a shrink-aware timeout would still spend minutes
+  per caught mutant on a minimization nobody reads; and harness arguments would reach the
+  libtest binaries of a mixed test set, which reject unknown flags. It is not a flag on
+  determinism: every run and verdict is unchanged, and only the minimization after a failure
+  is skipped. Every platform test that spawns a harness binary removes the variable from its
+  child's environment, `hook_census` holds the CLI's spelling to
+  `charpente_sim::harness::NO_SHRINK_ENV`, and R49 pinned the read itself through the CLI
+  (`85158fd3`) and made the rerun line carry the variable, so that it reprints the unshrunk
+  report (`6bfe162e`).
+- **Spec delta: what "distinct inputs" counts, and R34's false premise.** Spec §5 C: "how many
+  distinct choice sequences the check's tested runs consumed". The check line counts distinct
+  drawn-value lists, as GUIDE states; the final review declined to judge it, since spec §7
+  leaves counting and wording to the builder. R34's addendum claimed the counts were
+  overstated, as distinct raw `u64` sequences. They were not: `CheckExtras.distinct_inputs`
+  already counted distinct `drawn` lists (`babae9d1` harness.rs:779-814), and no count moved
+  (`t20s5`: the same distinct counts at all ten merge bases). The controller had repeated
+  the claim to Noah ("the distinct-input counts are overstated") and later corrected it. R34
+  stands on its other grounds: a draw records its reduced choice, one to one with its value,
+  so a search toward zero lowers the value and equal values under equal bounds are equal
+  choices for R28's pass, with the same values and stream consumption, so no run moved. It
+  also changed the repro rule: `--inputs` is left out only when the seed's own stream gives
+  every choice in each draw's range. Master `0x0` printed a repro that passed under the old
+  prefix rule, and `a_repro_passes_inputs_when_the_seed_would_draw_another_value_there` pins
+  it.
+- **Every role is checked at open (R4).** Spec §5 B binds ("Opening a node, or promoting a
+  follower") over the plan's narrowing to a single node or primary, because a follower judges
+  session expiry on reads with its own wall clock.
+- **The hand-written platform tables stay ungated (R6).** Gating `charpente.jobs`, `.events`
+  and `.schema_versions` adds an adoption record to every universe's first job or event
+  write, moving recorded batches outside a named step, and a 0.2 directory is refused anyway
+  through `CronRow`, which every writable start records. A no-bytes guard over the three rows'
+  fields and encoded bytes fails at the change with its consequence named.
+- **Clock faults in the app harness (R8, R9, R10).** A clock refusal is excused only when a
+  clock axis fired in that run, never by its text alone (R8, overruling the brief): the
+  platform suites run with the axes off, so a clock refusal there is a bug. Skew is per host,
+  as spec §5 B says (R9). The fault-free tail quiesces the clock and waits out an open
+  refusal (R10), now `checks::wait_out_clock_refusal` (`23b02e7b`).
+- **The output (R16, R20, R22).** The human output prints one failure block per check, the
+  first by seed order and the one shrunk, and counts the rest. The JSON keeps every failure;
+  each failure after a check's first carries its own unshrunk run (`replays: 0`) and an exact
+  `--seed` repro. Its top-level `passed`, `failed` and `skipped` count runs, while the human
+  result line counts checks, and GUIDE §8 says so.
+- **The commit-failure wrappers (R23, R24).** R23: the pre-0.3.0 survivors in Task 20's files
+  are in scope, because a line's age does not exempt it. Closing them found the unreported
+  checkpoint arm, where the horizon breadcrumb's sync fails and nothing is poisoned or
+  latched. There `CronScheduler::tick` answered `Err` but rolled back a schedule the store
+  already held, so its next call enqueued the interval twice, and `Dispatcher::run_due` put a
+  Done job back in its heap, so its next call panicked on "job 0 in the heap is not Pending".
+  Both now undo state only when `invalidates(0, staged)`, the Ok/Err answer is unchanged, and
+  `upsert` follows the same rule (`97edf30f`, final review M2). **R24's framing was wrong,
+  and Task 20m's review corrected it:** no production kernel path calls `run_due` or `tick`.
+  `Ready::Job` and `Ready::Cron` use `run_due_into` and `tick_into` and return `Err` on any
+  commit failure, `Kernel::run` propagates it, and `serve` exits 1. So the defect was in a
+  public test-facing wrapper that panicked or double-enqueued on its next call, not a kernel
+  panic under a disk fault. The fix stands, and CHANGELOG's `### Fixed` line names the
+  wrappers.
+- **The final review before the final evidence (R25),** so that oracle 3, the mutation runs,
+  the fresh seeds, the gate and the two outside runs measure the code that ships.
+- **Declined (R27),** as binding copy: the unpluralised counts ("1 distinct inputs", "1 of 1
+  runs", "1 draws"), and the unquoted `--filter` on the rerun line, since check names are
+  Rust identifiers.
+- **How Tasks 21 and 22 run (R26, R29, R30, R36).** Both launch headless (`claude -p …
+  --restricted --tools Bash,Read …`, the launch run's Ruling P1-final), not through the Agent
+  tool the plan names, because an Agent-tool dispatch carries this session's CLAUDE.md and
+  memory (R29). Task 22's image adds only cargo-mutants 27.1.0, which its bar runs (R26); it
+  has no clippy, so the controller runs clippy on the delivered app (R30); and its brief
+  admits the four packaged `tests/` files GUIDE names as worked examples, still barring
+  `src/`, every other `tests/` file and the network (R36).
+- **The stranger before round 6 (R40).** Task 21 launched on the registry built at
+  `523fc7b8` without waiting for round 6, whose changes (`#[cfg(test)]` code, GUIDE §8 and
+  doc-comment text, PLAN) the stranger's brief puts out of reach ("Use only the README; don't
+  read charpente's source code"), with README.md unchanged. The controller checked it at
+  `ab831621`: README untouched, and the harness hunks only the `shrink` doc comment and the
+  test module. Task 22, which reads GUIDE, waited. Cost if wrong: a re-run on the final
+  registry.
+- **Block identity for a shrunk failure (R41),** ruled after attempt 1: the launch run's
+  "identical block" bar compares a replay's block with the batch block minus its `shrunk:`
+  and `first:` lines. Those two lines describe the shrink, not the run, and GUIDE §8 says a
+  `--seed` replay shrinks nothing, so a replay cannot print them; the six lines left are what
+  the bar tests, byte for byte. `tools/block.sh`'s seed filter matches the repro line's last
+  word, which in 0.3.0 is the `--faults-off` list, so the blocks were extracted without a
+  seed.
+- **Untested functions are named, not failed (R45, R50).** From `7f771699` the verb names,
+  below its totals and grouped by file, every function in which no mutant was viable ("N
+  functions had no viable mutant, so this run says nothing about them"), with its exit
+  status unchanged, as the sim names an untested check and still exits by its failures. Such
+  a function is the verb's own "absent measurement wearing the shape of a passing one" at
+  function grain, and exit 1 would fail every run on constructors no tool can build. GUIDE §8
+  says what cargo-mutants generates, that an unviable mutant can be the tool's limit rather
+  than the types', and how to make a function measurable, and from `81b4e8be` that a function
+  the tool writes no mutant for at all is absent from the record, so the verb can neither
+  measure nor name it. R50 leaves the five platform functions named at `81b4e8be` named.
+- **A skipped run's seed (R47).** Each skipped-reason line gives the seed of its first run in
+  run order, `(first: --seed 0x…)`, and JSON's `skipped_reasons` carry it as `first_seed`
+  (`ce42034e`), because GUIDE's one instruction for a skipped run's detail, `--seed`, had no
+  seed to act on: hard rule 5's one-command repro, applied to the skip GUIDE tells a reader to
+  inspect.
+- **Docs, and a design question left for Noah (R48).** GUIDE §8 gives an app's mutation
+  invocation, `charpente test --mutants --file src/… --test-package <app>`, and says
+  `scripts/mutants.sh` is this repository's own wrapper and does not ship; it also says a
+  kernel whose `run` returned `Err` is restarted and rebuilt (`2129ce0b`). A worked
+  first-credential example, and a way for deploy configuration to reach a handler, are a
+  design question (is a set-once static sanctioned? the fence cannot see one), which "zero
+  input" does not answer: a PLAN v1.x row, ledgered as testimony, for Noah.
+- **The rounds 8–9 review's findings (R49),** all five and three of its notes, in four
+  commits, each red first. The controller re-verified the four by reading and proved I1's red
+  itself, without another full review, because each finding was pinned and the reviewer's
+  probes named. Cost if wrong: one more scoped look.
+- **The final head's survivor (R50).** The MISSED at `mutants.rs:542:19` is a property to
+  write, not an exclusion (R23): round 11 pins `report`'s stream choice, red under the
+  mutant, with the whole file re-run to 0 missed and the CLI's output and exit codes
+  byte-identical. Then the gate runs at its head; the sim evidence stands, since no sim code
+  moves.
+- **No DECISIONS sign-off is owed.** DECISIONS has no entry on time (spec §1), shrinking,
+  drawn inputs or mutation (progress.md's alignment line), nor on the batch's output, so no
+  ruling here contradicts one. §15 is new (Task 1).
+
+**Record corrections.**
+- `final-fix-report.md`'s concern 4 says CLAUDE.md's guide-examples list omits
+  `guide_ships`. It does not: `git show 7fc5c730:CLAUDE.md` line 67 lists it (progress.md).
+- Task 14's dispatch said the scaffold used `quiesce_clock_faults`. It never did
+  (progress.md, Task 14).
+- Task 4 found a Task 3 oracle defect: `an_oidc_token_is_judged_on_unix_time` matched
+  `its "exp" claim` against a JSON body whose quotes arrive escaped, so its expired half could
+  never pass, and the 200 masked it at RED. `32288f43` matches the escaped form.
+- `modelled_remote`'s ambient flake at 4 to 8 orders per run reads 10 of 1,000 in
+  progress.md (the controller's measurement after `f9b95156`) and 15 of 1,000 in
+  `final-fix-report.md` (the fix round's own baseline): two samples of the same workload,
+  every red run `"fault:outbound_lost_reply" never occurred in 256 runs`. The fix's 0 of
+  1,000, run twice, stands against both.
+- progress.md's Task 20 step 1 line records `oracle3-final` at `09bc3b44`. It ran on `main`
+  at `884fbf29` (started 11:37, after the brief's commit at 11:34), whose code is identical,
+  since `884fbf29` touches only the docs-only brief (progress.md's correction line).
+- The first launch of the stranger's attempt 1, at 14:14, stopped at `launch-outside.sh`'s
+  own layout check before claude started: `ls` ordered `box BRIEF.md README.md`, and the check
+  wanted C order. The box log was 0 bytes; the empty run directory, log and container were
+  removed, the check now sorts with `LC_ALL=C`, and the relaunch is attempt 1.
+- The controller's first pass of the docs-only gates (`t22-gates.sh`) ran under a pre-0.3.0
+  `charpente`. `cargo install charpente-cli` there exited 101, because `cargo install` reads
+  only `$CARGO_HOME`'s config and not the project's `.cargo/config.toml`, so the replay and
+  the `--mutants` run went through the `~/.cargo/bin/charpente` already on the machine, whose
+  usage still printed `--universes`; and the replay's compare read only stdout, where the
+  startup line is on stderr, which produced a false "differs". It was caught by the install
+  log's exit 101 and by the reviewer's alert at the top of `t22-review.md`. Its numbers are
+  set aside, and the second pass (`t22-gates2.sh`), under `charpente 0.3.0` installed with
+  `--config` flags (`t22-install2.log`), is the evidence in criterion 8.
+- Three background launches of the final evidence at `81b4e8be` ran nothing: their relative
+  redirects did not resolve. Their own output caught it ("no such file or directory:
+  logs/…"), and they were relaunched with absolute paths.
+- Resetting `../charpente-seeds` to `81b4e8be`, the controller read only the first 12 lines
+  of the worktree's diff and discarded its second scratch hunk, the one that prints, rather
+  than asserts, the master-specific `shrunk: 11 draws to 5` pin and the max-wins check line
+  as `FRESH`. The run caught it: 8 of 10 bases FAILED on exactly that pin (`13 draws to 5` at
+  `0xca8d…`, the canonical inputs reached). The hunk was recreated to the `FRESH` format the
+  `t20s12` logs show and the bases re-run (criterion 4); the failing run's log is kept as
+  `t20s14-progress-no-scratch-edit.log`.
+- The controller's first diagnostic of the `1106cdf0` edge stall started a stray
+  `clock_node` with no environment, so it listened on 127.0.0.1:8091 with `./data` in the
+  workspace directory. It was found during the same diagnosis, killed, and its data directory
+  removed.
+- `d368076a`'s message says "`--help`, DESIGN §7 and CHANGELOG name" the variable. DESIGN §7
+  gained only `not_shrunk` in that commit (the rounds 8–9 review's note); it says what is true
+  under the variable from `6bfe162e` on.
+
+**Open, deliberately.** PLAN's v1.x table gains eight rows from 0.3.0, each with its
+trigger: coverage-guided fault and input search, an MCP agent-integration contract generated
+from `describe`, and one outbound job over several declared hosts (spec §3's non-goals, Task
+19); a stored wall reading (R3) and gating the hand-written platform tables (R6) (final
+review I1, `9dcb6275`); a pair search that does not wait for a quiet round (R39, `ab831621`);
+the request arm stopping on a checkpoint failure nothing else reports (final review M1,
+`97edf30f`); and a worked first-credential example with a sanctioned way for deploy-time
+configuration to reach a handler (R48, `2129ce0b`). For the publish: README:133's
+"charpente `0.1.0` is on crates.io", true but stale in a 0.3.0 README, which the stranger's
+attempt 3 read and which is left as tested, so that what ships is what was tested. The five
+platform functions the mutants verb names as untested at `81b4e8be` (`harness.rs`'s
+`Failure::of`, `failure_run`, `parse_number` and `run_single_seed`; `mutants.rs`'s
+`parse_outcomes`) stay named, not chased (R50). `CHARPENTE_SIM_NO_SHRINK` turns shrinking off
+for any non-empty value, `0` included (round 9's concern 1), pinned as it stands
+(`85158fd3`). A kernel `run` after `Err` is documented as restart-and-rebuild (R48) and not
+refused (the rounds 8–9 review's note). macOS's launch-time assessment can hold a freshly
+built binary at `_dyld_start` past the edge rig's 10 s accept window under load (`1106cdf0`,
+criterion 6): no rig change, since CI's nightly runs on Linux, and a local stall is re-run and
+recorded. The docs-only build's app-side and proof Minors are testimony, with the app kept in
+its record: the operator claim's hardening (no throttle, a short-circuit compare), an unknown
+source's listing, source keys that cannot be revoked, and two properties that judge only their
+refuse side, whose siblings cover the other. Deferred in progress.md and not closed: Task 9's
+M5 (a 1 ns sweep pin, the class oracle for the one platform mutation that stayed green, a
+sweep deleting early), its M6 (disk axes off) and a switchover branch so `clock:refused:start`
+can be required; Task 8's two (no app batch requires `clock:downtime`, and R8's gate excuses a
+clock refusal in a single-clock run, which the final review declined to judge because the
+two-sided property in `tests/clock.rs` is the refusal oracle); Task 7's M3, M5, M6 and M8;
+Task 5's duplicated `KNode` literal and the stop's "runs again after", a sufficient condition
+only; Task 13's tainted lab, which stops being checked for its earlier acked bids; Task 3's
+untested `clock_node` defaults; and Task 1's note that DECISIONS §15's "under no oracle the
+sim exercises daily" slightly overclaims. For Noah, from the final review: a recorded time
+far ahead of real time keeps a node closed until real time catches up, with no override,
+which is spec §5 B's explicit design (hard rule 2). Out of scope, from the re-review: ambient
+master seeds come from `SystemTime` nanos, so parallel launches can repeat one
+(`modelled_remote`'s 1,000-run measurements held 994, 998 and 999 distinct masters), and
+`doc_truth` checks pinned text against source, not output. Neither outside run's image has
+clippy, and README's `rustup component add clippy` cannot run offline, which all three
+stranger attempts reported: recorded, not fixed, as in the launch run, and the controller ran
+clippy on the docs-only app (R30). `t14-scaffold`, `t20-mutants` and `t20-mutants-sim` are on
+`main` by cherry-pick, and progress.md's reboot line owes `t14-scaffold` a prune at the
+finish.
+
+**Next.** Noah's push and Task 23, which is Noah's: `scripts/publish.sh`'s full-verify dry
+run at the signed head, `--for-real`, the registry smoke and CHANGELOG's date, with
+README:133's sentence updated for the publish. GUIDE §1 already reads `charpente = "0.3"`,
+which crates.io cannot resolve until 0.3.0 is published. Then `ci.yml` on the pushed tip and
+the next nightly `edge-harness.yml` run (criterion 6's other halves), each recorded here in a
+one-line follow-up with its run id.
