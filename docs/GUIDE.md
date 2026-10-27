@@ -4846,14 +4846,22 @@ your source (patched in a scratch directory — nothing about the mutation touch
 your tree or ships), and a mutant that survives is a gap in your oracles.
 
 It asks that question only where cargo-mutants can build a broken copy. The
-tool replaces a function's whole body with a value of its return type, and swaps
-operators (`<` for `<=`, `+` for `-`, `&&` for `||`); it never deletes a
+tool replaces a function's whole body with a value of its return type; swaps
+operators (`<` for `<=`, `+` for `-`, `&&` for `||`); deletes a match arm when
+a `_` arm would catch what it matched, and replaces a match guard with `true`
+or `false`; deletes a unary `!` or `-`; and deletes a field from a struct
+literal that fills the rest with `..Default::default()`. It never deletes a
 statement. A body replacement needs a value of the return type that the tool can
 build: `()`, `Ok(())`, `0`, `true`, a `Default::default()`. So a function that
 returns a type with no `Default`, a `std::cmp::Reverse`, or an id type gets no
-body replacement at all, and a handler whose whole effect is its writes keeps
-them in every mutant. Check those writes in a property, or delete them by hand
-and watch a check go red.
+body replacement that compiles (the one the tool writes reads `unviable`,
+below), and a handler whose whole effect is its writes keeps them in every
+mutant. Some functions get no mutant at all: a method named `new` that returns
+`Self`, a function with an empty body, and anything inside a macro such as
+`assert!`. Such a function is absent from the run's record, so the verb can
+neither measure it nor name it as untested; a constructor whose validation is
+an `assert!` is invisible to the instrument. Check those writes and that
+validation in a property, and delete them by hand to watch a check go red.
 
 ```
 charpente test --mutants --file src/jobs.rs --test-package myapp
@@ -4941,7 +4949,10 @@ mutants: 82 total — 59 caught, 0 missed, 23 unviable, 0 timed out
 
 (The list is cut here; the run named all twelve.) To measure such a function,
 give its return type a value the tool can build, such as a derived `Default` or
-a plain tuple, or check its effect in a property. `timed out` means the run did
+a plain tuple, or check its effect in a property. A property alone does not
+make the verb measure the function, so the next run names it again: what
+proves the property is the hand deletion above, deleting the effect and
+watching a check go red. `timed out` means the run did
 **not resolve**: it is not a catch, and the verb will not let it read as one.
 
 The timeout follows the scope too. cargo-mutants times its own baseline over
