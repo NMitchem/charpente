@@ -361,7 +361,7 @@ fn deleting_the_scaffolds_enqueue_turns_the_second_property_red_with_a_seed_that
     // less the lines only shrinking prints, byte for byte.
     let unshrunk = block
         .lines()
-        .filter(|l| !l.starts_with("  shrunk: ") && !l.starts_with("  first:  "))
+        .filter(|l| !l.starts_with("  shrunk: ") && !l.starts_with("  before shrinking: "))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(

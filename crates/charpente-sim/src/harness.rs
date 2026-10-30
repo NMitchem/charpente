@@ -1781,17 +1781,16 @@ fn failure_run(f: &Failure) -> FailureRun<'_> {
 
 /// The failure block (GUIDE §8 "Reading a failure"). A batch prints one per
 /// failing check: its first failure, shrunk, with a `shrunk:` line saying how
-/// it shrank and a `first:` line when the shrunk run failed with another
+/// it shrank and a `before shrinking:` line when the shrunk run failed with another
 /// message; its repro replays the shrunk run. The check's other failures get
 /// no block, only the count on its line. A `--seed` replay prints its own run.
 fn human_failure_block(f: &Failure) -> String {
     let shown = failure_run(f);
     let mut block = format!(
-        "\nsim failure in {}: {}\n  seed:   {:#018x}\n  config: {:?}\n  fired:  {}\n",
+        "\nsim failure in {}: {}\n  seed:   {:#018x}\n  fired:  {}\n",
         f.test,
         shown.message,
         f.seed,
-        shown.config,
         crate::render_fired(shown.coverage),
     );
     if !shown.drawn.is_empty() {
@@ -1821,7 +1820,7 @@ fn human_failure_block(f: &Failure) -> String {
             ));
         }
         if s.message != f.message {
-            block.push_str(&format!("  first:  {}\n", f.message));
+            block.push_str(&format!("  before shrinking: {}\n", f.message));
         }
     }
     assert!(
@@ -2020,7 +2019,6 @@ mod tests {
             clock_step_back: (0.0, Duration::ZERO),
             clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
         };
-        let config_line = "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: 41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }\n";
         let mut failure = Failure {
             test: "receipts_exactly_once",
             seed: 0x8bee_1752_811a_e873,
@@ -2048,20 +2046,17 @@ mod tests {
             not_shrunk: false,
         };
         // The binding copy, line for line: each label padded so the values
-        // align, `inputs:` because the run drew, `first:` because the shrink
+        // align, `inputs:` because the run drew, `before shrinking:` because the shrink
         // slipped to another message, and a repro that replays the shrunk run.
         assert_eq!(
             human_failure_block(&failure),
-            format!(
-                "\nsim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3\n\
+            "\nsim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3\n\
                  \x20 seed:   0x8bee1752811ae873\n\
-                 {config_line}\
                  \x20 fired:  fault:dir-entry: 3, restart: 7\n\
                  \x20 inputs: key=3, order=[1, 0]\n\
                  \x20 shrunk: 3 draws to 2, faults off: bit_flip, read_error, in 87 replays\n\
-                 \x20 first:  exactly-once violated: hits 3, done 1 for key 812\n\
+                 \x20 before shrinking: exactly-once violated: hits 3, done 1 for key 812\n\
                  \x20 repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873 --inputs 03c801 --faults-off bit_flip,read_error\n"
-            )
         );
 
         // Nothing smaller failed: the block is the first failure's own, the
@@ -2080,15 +2075,12 @@ mod tests {
         });
         assert_eq!(
             human_failure_block(&failure),
-            format!(
-                "\nsim failure in receipts_exactly_once: exactly-once violated: hits 3, done 1 for key 812\n\
+            "\nsim failure in receipts_exactly_once: exactly-once violated: hits 3, done 1 for key 812\n\
                  \x20 seed:   0x8bee1752811ae873\n\
-                 {config_line}\
                  \x20 fired:  fault:crash: 2\n\
                  \x20 inputs: key=812, key=77, order=[1, 0]\n\
                  \x20 shrunk: nothing smaller fails, in 41 replays\n\
                  \x20 repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873\n"
-            )
         );
 
         // A run that drew nothing has no `inputs:` line.
@@ -2254,8 +2246,7 @@ mod tests {
 
     /// `config_json` listed four probabilities and two latencies, so the
     /// machine-readable record omitted the axis a diagnosis actually turned on.
-    /// Pinned against `{cfg:?}` — the human format, which has always printed
-    /// every field — so adding a `FaultConfig` field without adding it here
+    /// Pinned against `{cfg:?}`, the Debug rendering that prints every field, so adding a `FaultConfig` field without adding it here
     /// reddens this test instead of silently reopening the hole.
     #[test]
     fn config_json_carries_every_fault_axis() {
@@ -2298,7 +2289,7 @@ mod tests {
         {
             assert!(
                 json.contains(&format!("\"{field}\":")),
-                "config_json omits `{field}`, which the human format prints: {json}"
+                "config_json omits `{field}`, which Debug prints: {json}"
             );
         }
         assert!(json.contains("\"dir_entry_loss\":0.477"), "{json}");
@@ -2867,6 +2858,25 @@ mod tests {
 
     /// The first failure block for `check` in `out`: its headline through its
     /// repro line.
+    /// The same batch under `--format json` still carries the failing run's config.
+    fn assert_json_keeps_config(
+        tests: &[SimTest],
+        args: &[&str],
+        seed: u64,
+        axes: &[&'static str],
+    ) {
+        let mut flags = args.to_vec();
+        flags.extend(["--format", "json"]);
+        let (code, out) = run_to_string(tests, &flags);
+        assert_eq!(code, 1, "{out}");
+        let mut want = String::from("\"config\":");
+        config_json(&crate::app_config(seed, axes), &mut want);
+        assert!(
+            out.contains(&want),
+            "the JSON failure record lost its config {want}: {out}"
+        );
+    }
+
     fn first_block<'a>(out: &'a str, check: &str) -> &'a str {
         let start = out
             .find(&format!("sim failure in {check}: "))
@@ -2898,7 +2908,7 @@ mod tests {
     fn unshrunk(block: &str) -> String {
         block
             .lines()
-            .filter(|l| !l.starts_with("  shrunk: ") && !l.starts_with("  first:  "))
+            .filter(|l| !l.starts_with("  shrunk: ") && !l.starts_with("  before shrinking: "))
             .map(|l| format!("{l}\n"))
             .collect()
     }
@@ -2954,7 +2964,7 @@ mod tests {
         assert!(rest.starts_with("2, faults off: "), "{block}");
         assert!(rest.ends_with(" replays"), "{block}");
         assert_eq!(
-            line(block, "  first:  "),
+            line(block, "  before shrinking: "),
             None,
             "a fixed message cannot slip: {block}"
         );
@@ -3002,8 +3012,14 @@ mod tests {
             axes.len()
         );
         assert_eq!(line(block, "  shrunk: "), Some(want.as_str()), "{block}");
-        let config = format!("{:?}", crate::app_config(seed, &axes));
-        assert_eq!(line(block, "  config: "), Some(config.as_str()), "{block}");
+        // The human block carries no config line; the JSON record keeps it.
+        assert!(!block.contains("  config:"), "{block}");
+        assert_json_keeps_config(
+            &tests,
+            &["--runs", "1", "--master-seed", &master],
+            seed,
+            &axes,
+        );
         let repro = line(block, "  repro:  ").unwrap();
         assert!(
             repro.ends_with(&format!(" --faults-off {}", axes.join(","))),
@@ -3072,7 +3088,7 @@ mod tests {
             block.starts_with(&format!("sim failure in {check}: {shrunk}\n")),
             "the headline is the shrunk run's own message: {block}"
         );
-        let first = line(block, "  first:  ")
+        let first = line(block, "  before shrinking: ")
             .unwrap_or_else(|| panic!("a slipped shrink prints the first message: {block}"));
         assert_ne!(first, shrunk, "{block}");
         assert!(
@@ -3115,7 +3131,7 @@ mod tests {
             .parse()
             .unwrap();
         assert!(replays > 0 && replays <= SHRINK_BUDGET, "it tried: {block}");
-        assert_eq!(line(block, "  first:  "), None, "{block}");
+        assert_eq!(line(block, "  before shrinking: "), None, "{block}");
         assert_eq!(
             line(block, "  repro:  "),
             Some(
@@ -3208,11 +3224,12 @@ mod tests {
         let (code, out) = run_to_string(&tests, &["--runs", "1", "--master-seed", &master]);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, "always_fails");
-        assert!(
-            line(block, "  config: ")
-                .unwrap()
-                .contains("clock_step_back: (0.0, 120s)"),
-            "{block}"
+        assert!(!block.contains("  config:"), "{block}");
+        assert_json_keeps_config(
+            &tests,
+            &["--runs", "1", "--master-seed", &master],
+            seed,
+            &axes,
         );
         let want = format!(
             "0 draws to 0, faults off: {}, in {} replays",

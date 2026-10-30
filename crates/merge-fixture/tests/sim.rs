@@ -231,9 +231,12 @@ fn a_failure_on_lab_2_shrinks_to_lab_1() {
     }];
     let (code, out) = run_tests_at(&tests, "0xe27fde2a57487fee");
     assert_eq!(code, 1, "{out}");
-    let first = out.lines().find(|l| l.starts_with("  first:  ")).unwrap();
+    let first = out
+        .lines()
+        .find(|l| l.starts_with("  before shrinking: "))
+        .unwrap();
     assert!(
-        first.starts_with("  first:  after acked bid 1: lab 2's Best.amount is "),
+        first.starts_with("  before shrinking: after acked bid 1: lab 2's Best.amount is "),
         "master 0xe27fde2a57487fee was chosen because its first failure is on lab 2: {out}"
     );
     let inputs = out.lines().find(|l| l.starts_with("  inputs:")).unwrap();

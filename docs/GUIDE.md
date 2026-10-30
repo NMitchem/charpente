@@ -3990,7 +3990,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
 
 Register it like any workload — add `whole_app require ["kernel:served"]`
 to the `sim_tests! { ... }` list. Nothing limits a run to one script,
-either: `run` returns when its source is exhausted, and the same kernel can
+either: `run` returns once nothing is left inside the horizon, and the same kernel can
 be `run` again against a second `SimSource` — script a login phase, read
 the token out of its recorded responses, then script the authenticated
 phase with `.header("authorization", format!("Bearer {token}"))`. A kernel
@@ -4577,22 +4577,20 @@ program.
 ### Reading a failure, replaying its seed
 
 A human-format failure looks like this (a pinned test in `charpente-sim`'s
-harness holds its shape, these lines in this order, with this `config` line
-verbatim):
+harness holds its shape, these lines in this order):
 
 ```text
 sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
   seed:   0x8bee1752811ae873
-  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: "wal/", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, outbound_refused: 0.0, outbound_lost_request: 0.0, outbound_lost_reply: 0.0, outbound_throttle: 0.0, outbound_slow: 0.0, outbound_latency: (0ns, 0ns), disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms), clock_skew: 41207118532, clock_step_back: (0.0, 0ns), clock_downtime: (0.5, 259200s) }
   fired:  fault:dir-entry: 3, restart: 7
   inputs: key=3, order=[1, 0]
   shrunk: 3 draws to 2, faults off: bit_flip, read_error, in 87 replays
-  first:  exactly-once violated: hits 3, done 1 for key 812
+  before shrinking: exactly-once violated: hits 3, done 1 for key 812
   repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873 --inputs 03c801 --faults-off bit_flip,read_error
 ```
 
 This is a check's first failure in the batch, shrunk ("Shrinking a failure"
-below): every line but `first:` describes the smallest run the harness found
+below): every line but `before shrinking:` describes the smallest run the harness found
 that still fails the check, and `repro:` replays exactly that run. Each line,
 in order:
 
@@ -4601,16 +4599,6 @@ in order:
 - `seed` is the one `u64` that determined this entire run: virtual
   time, every entropy draw, the fault matrix's decisions and, unless the
   repro passes `--inputs`, every `sim.input()` draw.
-- `config` is the run's `FaultConfig` — the fault rates and latency ranges
-  that were ENABLED (per-run swarm sampling, glossed under the checkers
-  above): the seed's sampled config with the axes on the `shrunk:` line
-  turned off. It is a set of probabilities, so it tells you what kind of
-  trouble was *possible*: `crash_torn: 0.664668` means torn writes were
-  likely in this run, not that any occurred. Do not read a diagnosis
-  off this line — that is the next one's job. The last three fields are the
-  clock axes ("Wall time and its faults"): here each clock drew its own skew
-  within ±41.2 s of true time, no reading stepped back, and each power cycle
-  had an even chance of a jump of up to three days.
 - `fired` is what ACTUALLY happened: the run's coverage map, every
   fault and event that really occurred, with counts. This is the line to
   reason from. A high probability whose key is absent here never fired, and
@@ -4629,7 +4617,7 @@ in order:
   fault turned off can let a loop run longer. `shrunk: nothing smaller fails, in N replays`
   means no smaller run failed the check, so the block is the first failure's
   own and its repro is the seed alone.
-- `first` is the first failure's message, printed only when the shrunk run
+- `before shrinking` is the first failure's message, printed only when the shrunk run
   failed the check with another one (a slipped shrink, below).
 - `repro` is not advice, it **is** the reproduction: paste that exact line
   and the same run happens again, byte for byte. `--seed` replays a literal
@@ -4637,7 +4625,7 @@ in order:
   ones the seed draws, and `--faults-off` only when it turned axes off (both
   above). There is no separate "figure out how to reproduce this" step —
   the failure message already did that work. Replaying it prints the same
-  block without `shrunk:` and `first:`, since a replay is one run and shrinks
+  block without `shrunk:` and `before shrinking:`, since a replay is one run and shrinks
   nothing.
 
 The check's other failures in the batch print no block: its check line counts
@@ -4719,7 +4707,7 @@ on stdout, written once every shrink has finished.
 
 **A slipped shrink.** Any failure of the same check counts, so the shrunk run
 can fail it for another reason than the first did. The headline is then the
-shrunk run's own message, `first:` keeps the original, and `repro:` replays the
+shrunk run's own message, `before shrinking:` keeps the original, and `repro:` replays the
 shrunk run. The original is the seed alone: drop `--inputs` and `--faults-off`
 from the repro. When the two messages name different bugs, fix the one the
 repro shows, then rerun the batch.
