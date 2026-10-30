@@ -22,6 +22,10 @@ charpente.workspace = true
 charpente-tsgen = { path = "../charpente-tsgen", version = "0.3.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# mutants: reads the dependency tables of each workspace manifest to refuse a relative
+# path cargo-mutants will not rewrite; a line scan cannot tell [target.*.dev-dependencies]
+# from a value. Pure parsing, no IO, no threads, no time. Cargo.lock already carries it.
+toml = "=1.1.8"
 
 [lints]
 workspace = true

@@ -5009,8 +5009,19 @@ so this is an on-demand instrument like the edge harness below, not something
 your inner loop pays for. Scope it at a file or a function (`--file`, `--re`)
 rather than turning it loose on a whole workspace. It needs the pinned tool:
 `cargo install cargo-mutants --version 27.1.0 --locked`. The verb checks for it
-(`cargo mutants --version`) before anything else runs, so a machine without it
-exits 2 with that install line rather than after a timing run.
+(`cargo mutants --version`) before the timing run, so a machine without it
+exits 2 with that install line rather than after one.
+
+Two failures of cargo-mutants' unmutated baseline are named instead of left to a
+generic "baseline was not green". cargo-mutants builds in a scratch copy of the
+workspace under the temp dir, and 27.1.0 rewrites a relative `path` only in
+`[dependencies]`, `[replace]` and `[patch]`. So before the install check the verb
+reads every workspace member's `[dev-dependencies]`, `[build-dependencies]` and
+`[target.*.…-dependencies]` tables, and a relative `path` that points outside the
+workspace root exits 2 naming the manifest, the table and the dependency; give it
+an absolute path, or move it under `[patch.crates-io]`. And a baseline whose log
+says `No space left on device` names the temp dir and `TMPDIR`: point `TMPDIR` at
+a disk with room for a full build of the workspace.
 
 ### A note on the edge harness (platform dev tooling, not app surface)
 

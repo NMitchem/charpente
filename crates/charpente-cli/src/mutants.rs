@@ -140,6 +140,8 @@ struct Outcomes {
 struct Outcome {
     scenario: Scenario,
     summary: String,
+    /// Relative to `mutants.out`; the baseline's is its build/test log.
+    log_path: Option<String>,
 }
 
 /// cargo-mutants' `scenario`: the unmutated baseline, or one mutant.
@@ -198,6 +200,114 @@ fn shared_target_dir_refusal(
     ))
 }
 
+/// The tables cargo-mutants 27.1.0 does not rewrite a relative `path` in. It rewrites
+/// `[dependencies]`, `[replace]` and `[patch]` only, so in these the copy under
+/// the temp dir resolves `../outside` against itself and the unmutated baseline
+/// fails with a bare "no matching package". Measured 2026-10-30: the same
+/// manifest, with `outside` moved inside the workspace root, goes green, so the
+/// copied tree is `workspace_root`; and a NON-test workspace member's entry
+/// fails the baseline too, since cargo loads every member to resolve the workspace.
+fn unrewritten_path_refusal(
+    manifest: &std::path::Path,
+    copied_root: &std::path::Path,
+) -> Option<String> {
+    // Reading manifests is edge tooling (DESIGN.md §1).
+    #[allow(clippy::disallowed_methods)]
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let doc: toml::Table = text.parse().ok()?;
+    let mut tables: Vec<(String, &toml::Table)> = Vec::new();
+    for kind in ["dev-dependencies", "build-dependencies"] {
+        if let Some(t) = doc.get(kind).and_then(toml::Value::as_table) {
+            tables.push((kind.to_string(), t));
+        }
+        if let Some(targets) = doc.get("target").and_then(toml::Value::as_table) {
+            for (spec, body) in targets {
+                if let Some(t) = body.get(kind).and_then(toml::Value::as_table) {
+                    let bare = spec
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c));
+                    let spec = if bare {
+                        spec.clone()
+                    } else {
+                        format!("'{spec}'")
+                    };
+                    tables.push((format!("target.{spec}.{kind}"), t));
+                }
+            }
+        }
+    }
+    let base = manifest.parent()?;
+    for (table, deps) in tables {
+        for (name, dep) in deps {
+            let Some(path) = dep.get("path").and_then(toml::Value::as_str) else {
+                continue;
+            };
+            let path = std::path::Path::new(path);
+            if path.is_absolute() {
+                continue;
+            }
+            // Lexical: the target need not exist for the copy to miss it.
+            let mut at = base.to_path_buf();
+            for part in path.components() {
+                match part {
+                    std::path::Component::ParentDir => {
+                        at.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    part => at.push(part),
+                }
+            }
+            if !at.starts_with(copied_root) {
+                return Some(format!(
+                    "error: {}: [{table}] {name} = {{ path = \"{}\" }} is a relative path outside \
+                     the tree cargo-mutants copies ({}), and cargo-mutants 27.1.0 rewrites \
+                     relative paths only in [dependencies], [replace] and [patch], so the copy \
+                     cannot find it and the unmutated baseline fails. Give it an absolute path, \
+                     or move it under [patch.crates-io].",
+                    manifest.display(),
+                    path.display(),
+                    copied_root.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The first refusal over every workspace member of the tree `dir` belongs to.
+/// `None` when `cargo metadata` cannot say (cargo-mutants then fails with its own
+/// error, printed above the verb's).
+fn unrewritten_path_refusal_in(dir: &str) -> Option<String> {
+    #[allow(clippy::disallowed_methods)]
+    let out = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let root = PathBuf::from(meta.get("workspace_root")?.as_str()?);
+    meta.get("packages")?
+        .as_array()?
+        .iter()
+        .filter_map(|p| p.get("manifest_path")?.as_str())
+        .find_map(|m| unrewritten_path_refusal(std::path::Path::new(m), &root))
+}
+
+/// The verdict line for a baseline that failed because cargo-mutants' scratch
+/// copy ran out of disk, or `None` for any other failure. `log` is the baseline's log.
+fn out_of_disk_line(log: &str, tmp: &std::path::Path, tmpdir: Option<&str>) -> Option<String> {
+    log.contains("No space left on device").then(|| {
+        format!(
+            "error: the unmutated baseline ran out of disk space in cargo-mutants' scratch copy \
+             under {} — point TMPDIR at a disk with room for a full build of this workspace \
+             (TMPDIR is {})",
+            tmp.display(),
+            tmpdir.unwrap_or("unset")
+        )
+    })
+}
+
 pub fn run(args: &[String]) -> i32 {
     let opts = match parse(args) {
         Ok(opts) => opts,
@@ -215,6 +325,11 @@ pub fn run(args: &[String]) -> i32 {
     if let Some(refusal) =
         shared_target_dir_refusal(jobs, std::env::var_os("CARGO_TARGET_DIR").as_deref())
     {
+        eprintln!("{refusal}");
+        return 2;
+    }
+
+    if let Some(refusal) = unrewritten_path_refusal_in(&opts.dir) {
         eprintln!("{refusal}");
         return 2;
     }
@@ -549,6 +664,25 @@ fn report(
             return 2;
         }
     };
+    let baseline_log = o
+        .outcomes
+        .iter()
+        .find(|x| matches!(x.scenario, Scenario::Baseline) && x.summary != "Success")
+        .and_then(|x| x.log_path.as_deref())
+        .and_then(|rel| {
+            #[allow(clippy::disallowed_methods)]
+            std::fs::read_to_string(path.parent()?.join(rel)).ok()
+        });
+    if let Some(line) = baseline_log.and_then(|log| {
+        out_of_disk_line(
+            &log,
+            &std::env::temp_dir(),
+            std::env::var("TMPDIR").ok().as_deref(),
+        )
+    }) {
+        writeln!(err, "{line}").expect("failed printing to stderr");
+        return 2;
+    }
     let v = verdict(&o, &path.display().to_string(), property);
     for line in &v.lines {
         if v.code == 2 {
@@ -912,6 +1046,66 @@ mod tests {
             "the diagnosis must be the baseline, not the zero count it also produces: {:?}",
             v.lines
         );
+    }
+
+    /// Step 3: a baseline that failed for lack of disk names the scratch location and
+    /// TMPDIR; any other failed baseline is left to `verdict`'s generic text.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_baseline_that_ran_out_of_disk_names_tmpdir() {
+        let dir = std::env::temp_dir().join(format!("charpente-disk-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("log")).expect("scratch");
+        let json = r#"{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{"scenario":"Baseline","summary":"Failure","log_path":"log/baseline.log"}]}"#;
+        std::fs::write(dir.join("outcomes.json"), json).expect("outcomes");
+        let report_of = || {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = report(
+                &dir.join("outcomes.json"),
+                None,
+                Some(2),
+                &mut out,
+                &mut err,
+            );
+            (code, String::from_utf8(err).expect("utf8"))
+        };
+        std::fs::write(
+            dir.join("log/baseline.log"),
+            "error: No space left on device (os error 28)\n",
+        )
+        .expect("log");
+        let (code, err) = report_of();
+        assert_eq!(code, 2);
+        assert!(
+            err.starts_with(
+                "error: the unmutated baseline ran out of disk space in cargo-mutants' scratch \
+                 copy under "
+            ) && err.contains(
+                " — point TMPDIR at a disk with room for a full build of this workspace (TMPDIR is "
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            out_of_disk_line("No space left on device", std::path::Path::new("/t"), None)
+                .as_deref(),
+            Some(
+                "error: the unmutated baseline ran out of disk space in cargo-mutants' scratch copy \
+                 under /t — point TMPDIR at a disk with room for a full build of this workspace \
+                 (TMPDIR is unset)"
+            )
+        );
+        std::fs::write(
+            dir.join("log/baseline.log"),
+            "error: no matching package named `x`\n",
+        )
+        .expect("log");
+        let (code, err) = report_of();
+        assert_eq!(code, 2);
+        assert!(
+            err.starts_with("error: the UNMUTATED baseline was not green"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

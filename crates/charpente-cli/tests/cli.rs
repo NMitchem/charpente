@@ -1151,3 +1151,179 @@ fn an_unknown_argument_still_prints_usage_and_exits_two() {
     assert!(stderr.contains("usage: charpente --version"), "{stderr}");
     assert!(stderr.contains("usage: charpente new <name>"), "{stderr}");
 }
+
+/// A scratch workspace at `<tmp>/<tag>/ws` with a sibling `<tmp>/<tag>/outside` crate;
+/// `app_manifest_tail` is appended to the member `app`'s manifest. Returns `(base, ws)`.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+fn mutants_scratch_with(
+    tag: &str,
+    app_manifest_tail: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("charpente-t2-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let ws = base.join("ws");
+    for (dir, name) in [(ws.join("app"), "app"), (base.join("outside"), "outside")] {
+        std::fs::create_dir_all(dir.join("src")).expect("scratch crate");
+        std::fs::write(dir.join("src/lib.rs"), "").expect("source");
+        let tail = if name == "app" { app_manifest_tail } else { "" };
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{tail}"
+            ),
+        )
+        .expect("manifest");
+    }
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+    )
+    .expect("workspace manifest");
+    (base, ws)
+}
+
+/// Runs the verb over `ws` with a PATH that has no cargo-mutants shim: the refusal must
+/// come before the install probe, so nothing here needs the tool.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+fn mutants_over(ws: &std::path::Path) -> std::process::Output {
+    charpente()
+        .args([
+            "test",
+            "--mutants",
+            "--test-package",
+            "app",
+            "--file",
+            "app/src/lib.rs",
+            "--dir",
+        ])
+        .arg(ws)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_MUTANTS_JOBS")
+        .output()
+        .expect("charpente binary runs")
+}
+
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+#[test]
+fn a_relative_dev_dependency_outside_the_tree_is_refused() {
+    let (base, ws) = mutants_scratch_with(
+        "refused",
+        "\n[dev-dependencies]\noutside = { path = \"../../outside\" }\n",
+    );
+    let out = mutants_over(&ws);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let root = std::fs::canonicalize(&ws).expect("ws exists");
+    let manifest = root.join("app/Cargo.toml");
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert_eq!(
+        stderr.trim_end(),
+        format!(
+            "error: {}: [dev-dependencies] outside = {{ path = \"../../outside\" }} is a relative \
+             path outside the tree cargo-mutants copies ({}), and cargo-mutants 27.1.0 rewrites \
+             relative paths only in [dependencies], [replace] and [patch], so the copy cannot \
+             find it and the unmutated baseline fails. Give it an absolute path, or move it \
+             under [patch.crates-io].",
+            manifest.display(),
+            root.display()
+        )
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A non-test workspace member's entry fails the copied baseline too (measured 2026-10-30:
+/// cargo loads every member to resolve the workspace), so the scan covers every member,
+/// not only the `--test-package`s.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+#[test]
+fn a_relative_dev_dependency_in_a_member_that_is_not_a_test_package_is_refused() {
+    let (base, ws) = mutants_scratch_with("member", "");
+    std::fs::create_dir_all(ws.join("other/src")).expect("other");
+    std::fs::write(ws.join("other/src/lib.rs"), "").expect("source");
+    std::fs::write(
+        ws.join("other/Cargo.toml"),
+        "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dev-dependencies]\noutside = { path = \"../../outside\" }\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"other\"]\nresolver = \"2\"\n",
+    )
+    .expect("workspace manifest");
+    let out = mutants_over(&ws);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("other/Cargo.toml: [dev-dependencies] outside = "),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+#[test]
+fn a_relative_dev_dependency_inside_the_tree_is_not_refused() {
+    let (base, ws) = mutants_scratch_with(
+        "inside",
+        "\n[dev-dependencies]\napp2 = { path = \"../app2\" }\n",
+    );
+    std::fs::create_dir_all(ws.join("app2/src")).expect("app2");
+    std::fs::write(ws.join("app2/src/lib.rs"), "").expect("source");
+    std::fs::write(
+        ws.join("app2/Cargo.toml"),
+        "[package]\nname = \"app2\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    let out = mutants_over(&ws);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("relative path outside the tree"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+#[test]
+fn an_absolute_dev_dependency_outside_the_tree_is_not_refused() {
+    let base = std::env::temp_dir().join(format!("charpente-t2-{}-absolute", std::process::id()));
+    let abs = base.join("outside");
+    let tail = format!(
+        "\n[dev-dependencies]\noutside = {{ path = \"{}\" }}\n",
+        abs.display()
+    );
+    let (_, ws) = mutants_scratch_with("absolute", &tail);
+    let out = mutants_over(&ws);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("relative path outside the tree"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+#[test]
+fn a_relative_target_build_dependency_outside_the_tree_is_refused() {
+    let (base, ws) = mutants_scratch_with(
+        "target",
+        "\n[target.'cfg(unix)'.build-dependencies]\noutside = { path = \"../../outside\" }\n",
+    );
+    let out = mutants_over(&ws);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(
+            "[target.'cfg(unix)'.build-dependencies] outside = { path = \"../../outside\" }"
+        ),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
