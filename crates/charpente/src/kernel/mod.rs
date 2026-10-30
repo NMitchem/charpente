@@ -395,6 +395,10 @@ impl Kernel {
     /// name, a wall clock that went backwards past `CLOCK_TOLERANCE`, or a
     /// hand-off's target too far behind its data. Thin wrapper over `step`:
     /// it owns the park, `step` owns the decision.
+    ///
+    /// After `Ok(())` the same kernel can `run` again against another
+    /// source. After `Err` it has stopped and is never run again: restart,
+    /// rebuild the app and build a new kernel (`Kernel::app`).
     pub fn run(&mut self, source: &mut dyn RequestSource) -> io::Result<()> {
         // The role-aware schema gate (spec §2): single-node and primary
         // kernels migrate before serving anything; followers skip (their
@@ -1304,9 +1308,16 @@ impl Kernel {
         self.archive_notice.take()
     }
 
-    /// Borrows the mounted App — tests read `db().last_applied()`/snapshots
-    /// without consuming the kernel (`into_app` is the consuming form).
-    #[doc(hidden)]
+    /// Borrows the mounted App, the way a test reads the end state:
+    /// `kernel.app().db().snapshot()`. The kernel keeps its App for life,
+    /// because building it moved the App's job definitions, outbound hosts
+    /// and cron entries into the kernel, and a second kernel on what is left
+    /// would run no jobs and no cron. To go on after `run` returns, there
+    /// are two shapes: `run` this same kernel again against another
+    /// `SimSource`; or restart (`sim.restart_process()`, or `sim.restart()`
+    /// for a power cycle), rebuild the app and build a new kernel, as a
+    /// supervisor restarts a stopped process. A kernel whose `run` returned
+    /// `Err` has stopped, and only the second shape goes on from it.
     pub fn app(&self) -> &App {
         &self.app
     }
@@ -1329,11 +1340,6 @@ impl Kernel {
     /// Mirrors `Repl::is_primary`; a non-replicated kernel is always primary.
     pub fn is_primary(&self) -> bool {
         self.repl.as_ref().is_none_or(Repl::is_primary)
-    }
-
-    /// Hands the mounted App back for post-run inspection in tests.
-    pub fn into_app(self) -> App {
-        self.app
     }
 }
 

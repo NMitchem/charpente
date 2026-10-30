@@ -72,9 +72,10 @@ fn boot(sim: &Sim) -> Result<Option<App>, String> {
     .map_err(|e| format!("the app failed to open non-injected: {e}"))
 }
 
-/// One kernel over `source`. Fault fallout stops it (`Ok(Err(text))`, the
-/// fallout's text); anything else fails the universe.
-fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String>, String> {
+/// One kernel over `source`, handed back with its App for the end state.
+/// Fault fallout stops it (`Ok(Err(text))`, the fallout's text); anything
+/// else fails the universe.
+fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<Kernel, String>, String> {
     let outbound = sim
         .outbound(&app.outbound_hosts())
         .map_err(|e| e.to_string())?;
@@ -84,7 +85,7 @@ fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String
         Err(e) => return Err(format!("the kernel build failed non-injected: {e}")),
     };
     match kernel.run(source) {
-        Ok(()) => Ok(Ok(kernel.into_app())),
+        Ok(()) => Ok(Ok(kernel)),
         Err(e) if fallout(sim, &e.to_string()) => Ok(Err(e.to_string())),
         Err(e) => Err(format!("the kernel stopped non-injected: {e}")),
     }
@@ -146,7 +147,7 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
     sim.quiesce_outbound_faults();
     sim.quiesce_clock_faults();
     let mut waits = 0;
-    let mut app = loop {
+    let kernel = loop {
         let Some(app) = boot(sim)? else {
             return if sim.gave_up().is_some() {
                 sim.cover("outbound-fixture:gave-up:boot");
@@ -161,7 +162,7 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
             app,
             &mut SimSource::new(Box::new(sim.clock()), horizon),
         )? {
-            Ok(app) => break app,
+            Ok(kernel) => break kernel,
             Err(e) => e,
         };
         // A step back in an earlier round left the clock behind the time the
@@ -189,7 +190,7 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         sim.restart_process();
     };
 
-    let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;
+    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
     keys_are_per_job(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {

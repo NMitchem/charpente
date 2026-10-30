@@ -3772,8 +3772,14 @@ pieces:
   poisoned mid-run (§9), or on a clock stop ("Wall time and its faults"). Afterwards, `kernel.stats()` snapshots the loop's
   counters (`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`,
   `cron_ticks`, `cron_catchups`, and §6's outbound counters) and
-  `kernel.into_app()` hands the `App` back — `app.db().snapshot()` reads the
-  durable end-state. A tenant's rows read through `snap.scan_scoped::<R>(tenant)`
+  `kernel.app().db().snapshot()` reads the durable end-state. The kernel
+  keeps its `App` for life: building it moved the app's job definitions,
+  outbound hosts and cron entries into the kernel, so there is no second
+  kernel on the same `App`. To go on, `run` the same kernel again against
+  another `SimSource`, or restart (`sim.restart_process()`, or
+  `sim.restart()` for a power cycle), rebuild the app and build a new
+  kernel; the paragraph after the example says when each fits. A tenant's
+  rows read through `snap.scan_scoped::<R>(tenant)`
   and `snap.get_scoped(tenant, id)`, where `tenant` is its raw id (§16). The job
   queue reads through `snap.scan::<JobRow>()`; `charpente::core::job::JobRow`'s
   fields are all `pub`: `id: Id<JobRow>`, `name: String`, `payload: Vec<u8>`,
@@ -3964,8 +3970,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
         .filter(|(status, _)| *status == 200)
         .count() as u64;
 
-    let app = kernel.into_app();
-    match check_invariants(&app, acked) {
+    match check_invariants(kernel.app(), acked) {
         Ok(()) => Ok(()),
         // The oracle's own reads go through the same faulted disk (e.g. the
         // store can latch after an earlier injected write error): fallout
@@ -4347,8 +4352,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         .run(&mut SimSource::new(Box::new(sim.clock()), horizon))
         .map_err(|e| e.to_string())?;
 
-    let app = kernel.into_app();
-    let snap = app.db().snapshot().map_err(|e| e.to_string())?;
+    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
     keys_are_per_job(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {

@@ -41,13 +41,27 @@ fn boot(sim: &mut Sim, merge: Merge) -> Result<Option<App>, String> {
     Ok(app)
 }
 
+/// Starts the process a supervisor runs: the app booted and its kernel built.
+/// `None` when the boot gave the universe up; `Some(Err(text))` when the
+/// kernel stopped before it served anything, so the next bid finds the
+/// process down.
+fn start(sim: &mut Sim, merge: Merge) -> Result<Option<Result<Kernel, String>>, String> {
+    let Some(app) = boot(sim, merge)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        Kernel::new(app, Box::new(sim.clock())).map_err(|e| e.to_string()),
+    ))
+}
+
 /// Posts `bids` (lab, amount) one at a time, each through the production
 /// kernel loop, and after every acked bid checks each lab's `Best.amount`
 /// against the maximum amount acked for that lab so far. A bid that was not
 /// acked makes its lab unjudgeable from then on (it may or may not have
-/// landed); the other lab is still checked.
+/// landed); the other lab is still checked. One kernel serves every bid's
+/// source for as long as its process lives; only a stop restarts it.
 fn bids_hold_the_max(sim: &mut Sim, merge: Merge, bids: &[(u64, u32)]) -> Result<(), String> {
-    let Some(mut app) = boot(sim, merge)? else {
+    let Some(mut process) = start(sim, merge)? else {
         return Ok(());
     };
     let mut max_acked = [0u64; 2];
@@ -64,33 +78,31 @@ fn bids_hold_the_max(sim: &mut Sim, merge: Merge, bids: &[(u64, u32)]) -> Result
             }),
         );
         let responses = source.responses();
-        let stopped = match Kernel::new(app, Box::new(sim.clock())) {
-            Ok(mut kernel) => match kernel.run(&mut source) {
-                Ok(()) => Ok(kernel.into_app()),
-                Err(e) => Err(e.to_string()),
-            },
-            Err(e) => Err(e.to_string()),
+        let ran = match &mut process {
+            Ok(kernel) => kernel.run(&mut source).map_err(|e| e.to_string()),
+            Err(text) => Err(text.clone()),
         };
-        // A node that stops on fault fallout is rebooted, as a supervisor
+        // A node that stops on fault fallout is restarted, as a supervisor
         // would; the bid it was serving and its lab are then unjudgeable.
-        app = match stopped {
-            Ok(running) => running,
-            Err(text) => {
-                if !(is_fault_fallout(&text) || clock_fallout(sim, &text)) {
-                    return Err(text);
-                }
-                tainted[slot] = true;
-                if sim.disk_crashed() {
-                    sim.restart();
-                } else {
-                    sim.restart_process();
-                }
-                let Some(rebooted) = boot(sim, merge)? else {
-                    return Ok(());
-                };
-                app = rebooted;
-                continue;
+        if let Err(text) = ran {
+            if !(is_fault_fallout(&text) || clock_fallout(sim, &text)) {
+                return Err(text);
             }
+            tainted[slot] = true;
+            drop(process);
+            if sim.disk_crashed() {
+                sim.restart();
+            } else {
+                sim.restart_process();
+            }
+            let Some(restarted) = start(sim, merge)? else {
+                return Ok(());
+            };
+            process = restarted;
+            continue;
+        }
+        let Ok(kernel) = &process else {
+            unreachable!("a stopped process answered Err above");
         };
         let acked = responses
             .lock()
@@ -102,7 +114,7 @@ fn bids_hold_the_max(sim: &mut Sim, merge: Merge, bids: &[(u64, u32)]) -> Result
             continue;
         }
         max_acked[slot] = max_acked[slot].max(u64::from(*amount));
-        let snap = match app.db().snapshot() {
+        let snap = match kernel.app().db().snapshot() {
             Ok(snap) => snap,
             Err(e) if is_fault_fallout(&e.to_string()) => {
                 sim.give_up("the snapshot hit fault fallout", e);

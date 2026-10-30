@@ -156,8 +156,9 @@ fn boot(sim: &Sim) -> Result<Option<App>, String> {
     boot_through_fallout(sim, 8, |t| fallout(sim, t), || build_app(sim)).map_err(|e| e.to_string())
 }
 
-/// One kernel over `source`: the app back, or the fallout's text.
-fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String>, String> {
+/// One kernel over `source`: the kernel back, its App inside for the end
+/// state, or the fallout's text.
+fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<Kernel, String>, String> {
     let outbound = sim
         .outbound(&app.outbound_hosts())
         .map_err(|e| e.to_string())?;
@@ -167,7 +168,7 @@ fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<App, String
         Err(e) => return Err(e.to_string()),
     };
     match kernel.run(source) {
-        Ok(()) => Ok(Ok(kernel.into_app())),
+        Ok(()) => Ok(Ok(kernel)),
         Err(e) if fallout(sim, &e.to_string()) => Ok(Err(e.to_string())),
         Err(e) => Err(e.to_string()),
     }
@@ -229,7 +230,7 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         stopped = ran.is_err();
         ran.map(Some)
     });
-    let Some(mut app) = tail.map_err(|e| match stopped {
+    let Some(kernel) = tail.map_err(|e| match stopped {
         true => format!("the fault-free tail's kernel stopped: {e}"),
         false => e,
     })?
@@ -237,7 +238,7 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         return Ok(());
     };
 
-    let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;
+    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
     keys_are_per_job(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {

@@ -958,7 +958,7 @@ fn two_same_row_jobs_in_one_batch_see_each_others_writes() {
          still services one job per step is the pre-T7 shape and this \
          assertion is meant to catch exactly that"
     );
-    let app = kernel.into_app();
+    let app = kernel.app();
     let snap = app.db().snapshot().unwrap();
     let hits = snap.scan::<Hit>().unwrap();
     assert_eq!(
@@ -1176,7 +1176,7 @@ fn two_same_row_requests_in_one_batch_see_each_others_writes() {
         .collect();
     assert_eq!(statuses, vec![200, 200]);
 
-    let app = kernel.into_app();
+    let app = kernel.app();
     let snap = app.db().snapshot().unwrap();
     let hits = snap.scan::<Hit>().unwrap();
     assert_eq!(hits.len(), 1);
@@ -1540,7 +1540,7 @@ fn a_panicking_job_leaves_its_batch_siblings_correct() {
         "the panicking job takes the retry path, not the dead-letter one"
     );
 
-    let app = kernel.into_app();
+    let app = kernel.app();
     let snap = app.db().snapshot().unwrap();
     let hits = snap.scan::<Hit>().unwrap();
     assert_eq!(
@@ -1734,7 +1734,7 @@ fn a_batchs_second_first_write_does_not_duplicate_the_adoption_row() {
          first (which does carry the adoption): {sizes:?}"
     );
 
-    let app = kernel.into_app();
+    let app = kernel.app();
     let snap = app.db().snapshot().unwrap();
     let sv: Option<SchemaVersion> = snap.get(schema_version_id("Hit")).unwrap();
     assert!(sv.is_some(), "Hit must be adopted after its first write");
@@ -1859,7 +1859,7 @@ fn adopted_state_survives_a_commit_failure_correctly_per_arm() {
             "the retry, on a fresh engine, must succeed cleanly: {statuses2:?}"
         );
 
-        let app2 = kernel2.into_app();
+        let app2 = kernel2.app();
         let snap = app2.db().snapshot().unwrap();
         let sv: Option<SchemaVersion> = snap.get(schema_version_id("Hit")).unwrap();
         assert!(
@@ -1942,7 +1942,7 @@ fn adopted_state_survives_a_commit_failure_correctly_per_arm() {
             1,
             "one request in the batch means one WAL append: {batch:?}"
         );
-        let mut app = kernel.into_app();
+        let app = kernel.app_mut_for_tests();
         let before_probe = trace.entries().len();
         let probe = app.db_for_tests().transact(|tx| {
             // A fresh id, so this is unambiguously a new row and cannot
@@ -2004,7 +2004,7 @@ fn adopted_state_survives_a_commit_failure_correctly_per_arm() {
             "the follow-up write must land cleanly: {statuses2:?}"
         );
 
-        let app2 = kernel2.into_app();
+        let app2 = kernel2.app();
         let snap = app2.db().snapshot().unwrap();
         let sv: Option<SchemaVersion> = snap.get(schema_version_id("Hit")).unwrap();
         assert!(sv.is_some(), "Hit must still be adopted");

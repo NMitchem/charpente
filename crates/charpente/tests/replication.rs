@@ -12043,9 +12043,9 @@ fn a_switchover_onto_a_follower_far_behind_completes_and_the_target_stops_by_nam
     // opens it as a primary: the same check, at open, naming the same
     // instant. "Will open after" is what both texts promise, and at that
     // instant the node opens.
-    let app = f.kernel.take().unwrap().into_app();
+    let kernel = f.kernel.take().unwrap();
     f.host.restart();
-    drop(app);
+    drop(kernel);
     let err = match clocked_kernel(
         &sim,
         &f.host,
@@ -12090,9 +12090,8 @@ fn a_witness_gated_primary_far_behind_its_store_refuses_to_open() {
     source.push_at(now, Request::new(Method::Post, "/clock-key"));
     kernel.run(&mut source).unwrap();
     assert_eq!(responses.lock().unwrap()[0].0, 200, "the key is minted");
-    let app = kernel.into_app();
     h.restart();
-    drop(app);
+    drop(kernel);
     store_witnesses(&h.disk(), &["w:1".to_string()]).unwrap();
     let err = match clocked_kernel(
         &sim,
@@ -12133,9 +12132,9 @@ fn a_follower_far_behind_its_store_refuses_to_open_by_name() {
     .unwrap();
     assert_eq!(status, 200, "the primary mints a key at its wall time");
     krun_until(&sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
-    let app = f.kernel.take().unwrap().into_app();
+    let kernel = f.kernel.take().unwrap();
     f.host.restart();
-    drop(app);
+    drop(kernel);
     let cfg = follower_cfg("f:1", "p:1");
     let err = match clocked_kernel(
         &sim,

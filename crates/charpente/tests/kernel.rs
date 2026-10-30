@@ -2776,7 +2776,7 @@ fn kernel_stops_on_a_latched_store() {
     // nothing. This is also the repo's only LIVE observation of redb's real
     // PreviousIo prose — which is `checks::classify`'s third needle, and the
     // string the stop message below deliberately carries.
-    let mut app = kernel.into_app();
+    let app = kernel.app_mut_for_tests();
     let refused = app
         .db_for_tests()
         .checkpoint()
@@ -3811,7 +3811,7 @@ fn loop_serves_requests_runs_jobs_and_ticks_cron() {
     assert_eq!(recorded.len(), 3);
     assert!(recorded.iter().all(|(status, _)| *status == 200));
 
-    let mut app = kernel.into_app();
+    let app = kernel.app_mut_for_tests();
     let snap = app.db_for_tests().snapshot().unwrap();
     let counters = snap.scan::<Counter>().unwrap();
     // slots 0,1,2 hit once each; cron slot 777 hit twice.
@@ -4499,7 +4499,7 @@ fn always_failing_job_dies_and_the_monthly_cron_ticks_120_times() {
         "neither schedule — monthly or the platform's built-in daily sweep \
          (auth T6) — ever needs catch-up in this quiet decade-long run"
     );
-    let app = kernel.into_app();
+    let app = kernel.app();
     // stats.cron_ticks now aggregates BOTH schedules: "monthly" and the
     // platform's built-in daily session-expiry sweep, which every App gets
     // with no opt-in (auth T6) — over ten years that's ~3650 extra ticks,
@@ -4521,7 +4521,7 @@ fn always_failing_job_dies_and_the_monthly_cron_ticks_120_times() {
     assert_eq!(monthly_hits, 121, "the monthly schedule's own tick count");
     // ...and this whole decade of queue traffic ran in well under a second
     // of wall time, or the suite would be unshippable. Virtual time works.
-    drop(app);
+    drop(kernel);
 }
 
 /// A deliberately WRONG executor: handler effects commit first, the
@@ -4828,7 +4828,7 @@ fn session_sweep_deletes_expired_rows_on_tick() {
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
     kernel.run(&mut source).unwrap();
 
-    let app = kernel.into_app();
+    let app = kernel.app();
     let sessions = app.db().snapshot().unwrap().scan::<Session>().unwrap();
     assert_eq!(
         sessions.len(),
@@ -4881,9 +4881,8 @@ fn a_store_that_recorded(sim: &Sim) {
     let (mut kernel, _) = hold_kernel(sim, WallTime::from_nanos(RECORDED)).unwrap();
     let (status, _) = hold_serve(sim, &mut kernel, Request::new(Method::Post, "/hold-key"));
     assert_eq!(status, 200, "the key is minted");
-    let app = kernel.into_app();
     sim.restart();
-    drop(app);
+    drop(kernel);
 }
 
 /// 0.3.0 spec §5 B: a node whose wall clock is more than `CLOCK_TOLERANCE`
@@ -5420,7 +5419,7 @@ fn kernel_migrates_the_schema_before_the_first_request_is_served() {
     let mut source = SimSource::new(Box::new(sim.clock()), SEC);
     kernel.run(&mut source).unwrap();
 
-    let mut app = kernel.into_app();
+    let app = kernel.app_mut_for_tests();
     let mut rows: Vec<Gadget> = app.db_for_tests().snapshot().unwrap().scan().unwrap();
     rows.sort_by_key(|r| r.id.raw());
     assert_eq!(rows.len(), 3);
@@ -5775,7 +5774,7 @@ fn an_enqueue_of_another_shape_of_a_mounted_job_is_refused_by_name() {
         (responses[0].0, body["error"].as_str()),
         (500, Some(enqueue_refusal().as_str()))
     );
-    let mut app = kernel.into_app();
+    let app = kernel.app_mut_for_tests();
     let receipts = app
         .db_for_tests()
         .snapshot()
@@ -5875,7 +5874,7 @@ fn an_enqueue_of_an_unmounted_job_type_keeps_the_not_registered_path() {
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
     kernel.run(&mut source).unwrap();
     assert_eq!(responses.lock().unwrap()[0].0, 200);
-    let mut app = kernel.into_app();
+    let app = kernel.app_mut_for_tests();
     let rows: Vec<JobRow> = app
         .db_for_tests()
         .snapshot()
@@ -5940,7 +5939,7 @@ fn a_job_handler_enqueuing_another_shape_of_a_mounted_job_dead_letters_by_name()
     kernel
         .run(&mut SimSource::new(Box::new(sim.clock()), SEC))
         .unwrap();
-    let mut app = kernel.into_app();
+    let app = kernel.app_mut_for_tests();
     let rows = app
         .db_for_tests()
         .snapshot()
@@ -6050,7 +6049,7 @@ fn a_job_writing_another_scope_shape_of_a_registered_table_dead_letters_by_name(
         .unwrap();
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
     let ran = kernel.run(&mut SimSource::new(Box::new(sim.clock()), SEC));
-    let mut app = kernel.into_app();
+    let app = kernel.app_mut_for_tests();
     let db = app.db_for_tests();
     let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
     let settled = |name: &str| {

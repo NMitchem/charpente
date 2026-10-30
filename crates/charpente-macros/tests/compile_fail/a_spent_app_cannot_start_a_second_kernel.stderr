@@ -1,0 +1,11 @@
+error[E0599]: no method named `into_app` found for struct `Kernel` in the current scope
+  --> tests/compile_fail/a_spent_app_cannot_start_a_second_kernel.rs:10:24
+   |
+10 |     Kernel::new(kernel.into_app(), clock)
+   |                        ^^^^^^^^
+   |
+help: there is a method `into` with a similar name
+   |
+10 -     Kernel::new(kernel.into_app(), clock)
+10 +     Kernel::new(kernel.into(), clock)
+   |

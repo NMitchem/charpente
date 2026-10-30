@@ -431,8 +431,7 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
         sim.cover("kernel:served");
     }
 
-    let app = kernel.into_app();
-    match check_receipts(&app, finalize_acked) {
+    match check_receipts(kernel.app(), finalize_acked) {
         Ok(true) => {
             sim.cover("invoicing:receipts-checked");
             Ok(())
@@ -573,8 +572,7 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
         return Err(e.to_string());
     }
 
-    let app = kernel.into_app();
-    match check_reminders(&app) {
+    match check_reminders(kernel.app()) {
         Ok(true) => {
             sim.cover("reminder:sent");
             Ok(())
