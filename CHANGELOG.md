@@ -2,7 +2,7 @@
 
 ## 0.4.0 (unreleased)
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-27)
 
 ### Breaking changes
 - **`Clock` gains `wall()`; an implementor adds it.** `WallTime` is new.
