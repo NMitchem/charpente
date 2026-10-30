@@ -5,6 +5,9 @@
 ### Breaking changes
 - **`Kernel::into_app` is gone, so a second kernel on a spent `App` does not compile.** Building a kernel moves the App's job definitions, outbound hosts and cron entries into it. A `Kernel::new` on the App `into_app` handed back answered requests and nothing else: it ticked no cron, and a job enqueued on it stayed Pending with `job "…" is not registered — add it to the jobs![…] list passed to App::mount_jobs`, which sent the reader to a list that already named the job. A kernel now keeps its App for life. Read the end state through `kernel.app()` (`kernel.app().db().snapshot()`), which is no longer hidden from the docs, or `kernel.app_mut_for_tests()`; a helper that returned the `App` returns the `Kernel`. To go on after `run`, run the same kernel again against another `SimSource`, or restart (`sim.restart_process()`, or `sim.restart()` for a power cycle), rebuild the app and build a new kernel. GUIDE §8 says when each fits.
 
+### Fixed
+- **A job enqueued through a kernel's App between two runs of that kernel runs in the next one.** Only the end of a step that did work fed such an enqueue to the due-heap, so a `run` whose source held no request, with no schedule due, left the job Pending with no error. `Kernel::run` now feeds it before its first step. Production builds a kernel and runs it once, so a served app is unaffected.
+
 ## 0.3.0 (2026-10-27)
 
 ### Breaking changes

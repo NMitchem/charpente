@@ -3778,7 +3778,10 @@ pieces:
   kernel on the same `App`. To go on, `run` the same kernel again against
   another `SimSource`, or restart (`sim.restart_process()`, or
   `sim.restart()` for a power cycle), rebuild the app and build a new
-  kernel; the paragraph after the example says when each fits. A tenant's
+  kernel; the paragraph after the example says when each fits. A job
+  enqueued between two runs of one kernel, through
+  `kernel.app_mut_for_tests().db_for_tests().transact(…)`, is picked up when
+  the next `run` starts. A tenant's
   rows read through `snap.scan_scoped::<R>(tenant)`
   and `snap.get_scoped(tenant, id)`, where `tenant` is its raw id (§16). The job
   queue reads through `snap.scan::<JobRow>()`; `charpente::core::job::JobRow`'s

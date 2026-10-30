@@ -41,17 +41,25 @@ fn boot(sim: &mut Sim, merge: Merge) -> Result<Option<App>, String> {
     Ok(app)
 }
 
+/// Fault fallout: the families an error's text alone excuses, and the
+/// kernel's clock stop or refusal where this run's clock faults acted.
+fn fallout(sim: &Sim, text: &str) -> bool {
+    is_fault_fallout(text) || clock_fallout(sim, text)
+}
+
 /// Starts the process a supervisor runs: the app booted and its kernel built.
 /// `None` when the boot gave the universe up; `Some(Err(text))` when the
-/// kernel stopped before it served anything, so the next bid finds the
-/// process down.
+/// kernel's build hit fault fallout, so the next bid finds the process down.
+/// Any other build error fails the universe.
 fn start(sim: &mut Sim, merge: Merge) -> Result<Option<Result<Kernel, String>>, String> {
     let Some(app) = boot(sim, merge)? else {
         return Ok(None);
     };
-    Ok(Some(
-        Kernel::new(app, Box::new(sim.clock())).map_err(|e| e.to_string()),
-    ))
+    match Kernel::new(app, Box::new(sim.clock())) {
+        Ok(kernel) => Ok(Some(Ok(kernel))),
+        Err(e) if fallout(sim, &e.to_string()) => Ok(Some(Err(e.to_string()))),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Posts `bids` (lab, amount) one at a time, each through the production
@@ -79,30 +87,33 @@ fn bids_hold_the_max(sim: &mut Sim, merge: Merge, bids: &[(u64, u32)]) -> Result
         );
         let responses = source.responses();
         let ran = match &mut process {
-            Ok(kernel) => kernel.run(&mut source).map_err(|e| e.to_string()),
+            Ok(kernel) => match kernel.run(&mut source) {
+                Ok(()) => Ok(kernel),
+                Err(e) => Err(e.to_string()),
+            },
             Err(text) => Err(text.clone()),
         };
         // A node that stops on fault fallout is restarted, as a supervisor
         // would; the bid it was serving and its lab are then unjudgeable.
-        if let Err(text) = ran {
-            if !(is_fault_fallout(&text) || clock_fallout(sim, &text)) {
-                return Err(text);
+        let kernel = match ran {
+            Ok(kernel) => kernel,
+            Err(text) => {
+                if !fallout(sim, &text) {
+                    return Err(text);
+                }
+                tainted[slot] = true;
+                drop(process);
+                if sim.disk_crashed() {
+                    sim.restart();
+                } else {
+                    sim.restart_process();
+                }
+                let Some(restarted) = start(sim, merge)? else {
+                    return Ok(());
+                };
+                process = restarted;
+                continue;
             }
-            tainted[slot] = true;
-            drop(process);
-            if sim.disk_crashed() {
-                sim.restart();
-            } else {
-                sim.restart_process();
-            }
-            let Some(restarted) = start(sim, merge)? else {
-                return Ok(());
-            };
-            process = restarted;
-            continue;
-        }
-        let Ok(kernel) = &process else {
-            unreachable!("a stopped process answered Err above");
         };
         let acked = responses
             .lock()

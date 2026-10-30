@@ -124,7 +124,8 @@ enum Ready {
 
 /// The deterministic kernel: one `App`, one due-heap, one cron schedule, one
 /// clock, run by `run` against whatever `RequestSource` is handed in — hyper
-/// in production, `SimSource` under the simulator.
+/// in production, `SimSource` under the simulator. It keeps its `App` for
+/// life; `Kernel::app` reads the end state and says how to go on after `run`.
 pub struct Kernel {
     app: App,
     dispatcher: Dispatcher,
@@ -397,9 +398,21 @@ impl Kernel {
     /// it owns the park, `step` owns the decision.
     ///
     /// After `Ok(())` the same kernel can `run` again against another
-    /// source. After `Err` it has stopped and is never run again: restart,
-    /// rebuild the app and build a new kernel (`Kernel::app`).
+    /// source, and a job enqueued through its App in between is picked up
+    /// when that `run` starts. After `Err` it has stopped and is never run
+    /// again: restart, rebuild the app and build a new kernel (`Kernel::app`).
     pub fn run(&mut self, source: &mut dyn RequestSource) -> io::Result<()> {
+        // A job enqueued through the App outside a step (between two runs, or
+        // between `build` and the first) sits in the drain buffer, which only
+        // the end of a step that did work feeds to the heap: a run with no
+        // request and no due schedule would leave it Pending with no error.
+        // Nothing drained here is in the heap already, since `build` discarded
+        // the buffer after rebuilding the heap from the store, and every
+        // working step drains it. Fed only while writable, as `step` feeds it.
+        let enqueued = self.app.db_mut().drain_enqueued();
+        if self.app.db().writes_allowed() {
+            self.dispatcher.note_enqueued(enqueued);
+        }
         // The role-aware schema gate (spec §2): single-node and primary
         // kernels migrate before serving anything; followers skip (their
         // migration arrives by shipping) and run it at promote instead.
@@ -1317,7 +1330,9 @@ impl Kernel {
     /// `SimSource`; or restart (`sim.restart_process()`, or `sim.restart()`
     /// for a power cycle), rebuild the app and build a new kernel, as a
     /// supervisor restarts a stopped process. A kernel whose `run` returned
-    /// `Err` has stopped, and only the second shape goes on from it.
+    /// `Err` has stopped, and only the second shape goes on from it. In the
+    /// first shape, a job enqueued between runs (through `app_mut_for_tests`)
+    /// is picked up when the next `run` starts.
     pub fn app(&self) -> &App {
         &self.app
     }

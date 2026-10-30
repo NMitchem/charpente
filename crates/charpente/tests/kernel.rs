@@ -3827,6 +3827,62 @@ fn loop_serves_requests_runs_jobs_and_ticks_cron() {
     assert!(jobs.iter().all(|j| j.status == JobStatus::Done));
 }
 
+/// The kernel keeps its App for life, so going on after `run` means running
+/// the same kernel again. A job enqueued through its App between two runs
+/// must run in the second one, even when nothing else in that run wakes the
+/// kernel: no request, and no schedule due (the built-in daily sweep is the
+/// only one, and it is not due inside 20 s).
+#[test]
+fn a_job_enqueued_between_runs_of_one_kernel_runs_in_the_next() {
+    // Fault-free, so the seed only names the universe; it continues the
+    // 0x7A13 series of this file's kernel-loop tests.
+    let sim = Sim::with_faults(0x7A13_0007, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 10 * SEC))
+        .unwrap();
+
+    kernel
+        .app_mut_for_tests()
+        .db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(CountUp { slot: 7 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 20 * SEC))
+        .unwrap();
+
+    let snap = kernel.app().db().snapshot().unwrap();
+    let hits = snap
+        .get::<Counter>(Id::from_raw(7))
+        .unwrap()
+        .map_or(0, |c| c.hits);
+    let jobs: Vec<_> = snap
+        .scan::<JobRow>()
+        .unwrap()
+        .into_iter()
+        .map(|j| (j.name, j.status, j.attempts))
+        .collect();
+    let stats = kernel.stats();
+    assert_eq!(
+        (stats.jobs_done, stats.cron_ticks, hits),
+        (1, 0, 1),
+        "the job enqueued between the runs must run in the second run, with no request or cron \
+         tick to wake the kernel; jobs: {jobs:?}"
+    );
+    assert_eq!(jobs, vec![("CountUp".to_string(), JobStatus::Done, 0)]);
+}
+
 #[test]
 fn loop_replays_identically_for_the_same_seed() {
     let trace = |seed: u64| {
