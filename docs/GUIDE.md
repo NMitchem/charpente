@@ -2006,6 +2006,13 @@ where the remote reads one, the `idempotency-key` header above or a field of the
 body, so a remote that honours it applies a repeated request once. It is not
 `enqueue_keyed`'s app key.
 
+The minted key belongs to one job and covers that job's retries and
+re-dispatches. An effect the app may enqueue more than once, a redrive after
+Dead or a re-issued step, is a new job with a new key. So its `call` must send
+an id of the effect itself, a field of the payload, or a remote that honours
+keys applies the effect twice. Platform support for a re-issued job that keeps
+its effect's key is planned for 0.5.0 (PLAN).
+
 Because the key is drawn as the enqueue is staged, an outbound job is enqueued
 only in a transaction the platform opens: a route's, a job's or a cron tick's.
 `Db::transact` and `Db::begin_group` (§4) cannot mint, and an outbound enqueue
@@ -3781,7 +3788,7 @@ pieces:
   `sim.restart()` for a power cycle), rebuild the app and build a new
   kernel; the paragraph after the example says when each fits. A job
   enqueued between two runs of one kernel, through
-  `kernel.app_mut_for_tests().db_for_tests().transact(…)`, is picked up when
+  `kernel.app_mut_for_tests().transact_for_tests(|tx| …)`, is picked up when
   the next `run` starts. A tenant's
   rows read through `snap.scan_scoped::<R>(tenant)`
   and `snap.get_scoped(tenant, id)`, where `tenant` is its raw id (§16). The job

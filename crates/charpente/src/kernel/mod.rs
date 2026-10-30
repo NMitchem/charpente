@@ -1331,7 +1331,7 @@ impl Kernel {
     /// for a power cycle), rebuild the app and build a new kernel, as a
     /// supervisor restarts a stopped process. A kernel whose `run` returned
     /// `Err` has stopped, and only the second shape goes on from it. In the
-    /// first shape, a job enqueued between runs (through `app_mut_for_tests`)
+    /// first shape, a job enqueued between runs (through `app_mut_for_tests().transact_for_tests(…)`)
     /// is picked up when the next `run` starts.
     pub fn app(&self) -> &App {
         &self.app

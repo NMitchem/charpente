@@ -92,6 +92,15 @@ fn build_app(sim: &Sim) -> std::io::Result<App> {
     .outbound(Host::new("pay.example")))
 }
 
+// The remote's side is not exactly-once. `settle` commits at most once, so
+// the app's state stays exactly-once, but a remote that ignores the key may
+// apply a retry twice; this gateway dedupes, so the claim below holds. The
+// minted key belongs to one job: an effect the app may enqueue again (a
+// redrive, a re-issued step) is a new job with a new key, so its call must
+// send an id of the effect itself, as `order=<id>` does here. Platform
+// support for a re-issued job that keeps its effect's key is planned for
+// 0.5.0 (PLAN).
+
 /// The gateway. It answers 503 one request in five until the workload calms
 /// it, and a request it accepts is applied once per idempotency key: a repeat
 /// of a key gets the first charge back and moves no money.
