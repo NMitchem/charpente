@@ -271,6 +271,17 @@ the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `clai
 
 ## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, three from 0.3.0's oracle-density review, three from 0.3.0's rulings, one from 0.3.0's final review, one from 0.3.0's docs-only build, each with the trigger that reopens it
 
+**In progress: 0.4.0, the oracle as hard to get wrong as the app** (spec
+[docs/superpowers/specs/2026-10-28-0.4.0-design.md](docs/superpowers/specs/2026-10-28-0.4.0-design.md)),
+from three outside agents' builds on 0.3.0: no second kernel on a spent App, a check that
+tested nothing fails, a library helper for the recovery code every app pastes, a shrinker
+that deletes whole items, a mutation run that fits a session, typed event reads, and the
+API on one compiled page. **Named next: 0.5.0, what apps build because the platform does
+not:** a hook committed with a job's Dead mark (the Dead row below, its trigger met by the
+third agent's build, 2026-10-29), a transaction's own time (two of the three agents built
+a clock by hand), and a re-issued job that keeps its effect's key. Their rows land with
+0.4.0's records.
+
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
 and none does. They are listed with their triggers so that "is it time yet" has a
