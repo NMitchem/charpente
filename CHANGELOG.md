@@ -10,6 +10,7 @@
 - **The human failure block drops its `config:` line and labels the unshrunk message `before shrinking:`.** The line was a dump of every fault rate, which `fired:` already answers with what happened; `--format json` keeps the config. `first:` read as the first of something and meant the message before the shrink; it is now `  before shrinking: `. A script that matched `  first:  ` or `  config: ` in the human block must match the new label or read the JSON. GUIDE §8 also says `run` returns once nothing is left inside the horizon, as it does earlier in the section.
 
 ### Fixed
+- **A private `#[route]` handler in another module mounts.** The marker struct inherited the handler's visibility, so `routes![handlers::x]` from the crate root hit E0603 on a struct the app never wrote. A private handler's marker is now `pub(crate)`; a `pub`, `pub(crate)` or `pub(super)` handler keeps its own visibility. `#[job]` is unchanged: it sits on the app's own struct, where rustc's E0603 and its "make it pub" fix are right. GUIDE §5 says so.
 - **A job enqueued through a kernel's App between two runs of that kernel runs in the next one.** Only the end of a step that did work fed such an enqueue to the due-heap, so a `run` whose source held no request, with no schedule due, left the job Pending with no error. `Kernel::run` now feeds it before its first step. Production builds a kernel and runs it once, so a served app is unaffected.
 
 ## 0.3.0 (2026-10-27)

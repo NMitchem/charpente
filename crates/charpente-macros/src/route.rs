@@ -306,7 +306,10 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     let name = &func.sig.ident;
     let name_str = name.to_string();
-    let vis = &func.vis;
+    let vis = match &func.vis {
+        syn::Visibility::Inherited => quote!(pub(crate)),
+        v => quote!(#v),
+    };
 
     let mut inputs = func.sig.inputs.iter();
     let tx_ok = matches!(
@@ -636,7 +639,10 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     let name = &func.sig.ident;
     let name_str = name.to_string();
-    let vis = &func.vis;
+    let vis = match &func.vis {
+        syn::Visibility::Inherited => quote!(pub(crate)),
+        v => quote!(#v),
+    };
 
     let mut inputs = func.sig.inputs.iter();
     let tx_ok = matches!(
