@@ -528,7 +528,10 @@ writes first, then any writes already staged in the same commit batch —
 `transact` runs a batch of exactly one, so that level is always empty here —
 then the store snapshot the batch began from. `Tx` implements `View` (`get`,
 `scan`, `scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as
-it does on a `Snapshot`, for every table of the app's own. The platform's own
+it does on a `Snapshot`, for every table of the app's own. An index read
+(`by_<field>`, `scan_by`) sees the transaction's own writes like any other
+read: a row put under the key is in it, and a row deleted, or put again under
+another key, is not. The platform's own
 tables are read through a `Snapshot` alone (§16, "Where the guarantee stops").
 On `Ok`, every buffered write, enqueue, and emit
 commits as ONE durable log record — all or nothing — and only then applies
@@ -604,7 +607,10 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
 
 `Job` needs `Codec`, a `NAME` and a `FINGERPRINT`, implemented by hand today
 (v0); `#[job]` derives the rest of a job's registration for you (a later
-section). `#[event]` derives everything an event needs in one step: `Codec`
+section). Write a hand-written struct `Codec` as `SendReceipt`'s is: its
+fields' own codecs in declaration order, decoded in that same order, which is
+the layout `#[table]`, `#[job]` and `#[event]` derive (§2), so reordering a
+field changes the bytes. `#[event]` derives everything an event needs in one step: `Codec`
 (the log format), `Event` (`NAME` is the snake_case of the type name — §11 has
 the exact splitting rule — and `FINGERPRINT` is the payload's structural
 fingerprint, recorded beside every emit, §11 "Changing an event"), `Serialize`
@@ -2749,8 +2755,10 @@ cron tick is already one transaction, "what time is it" becomes an
 ordinary table read instead of a call to an ambient clock, and the clock
 inherits cron's catch-up rule (above) for free — a tick after downtime
 still advances the counter by exactly one step, never backfilling every
-missed interval, which is exactly the semantics most "advance the current
-period" logic wants anyway.
+missed interval. That suits "advance the current period" logic, but not a
+deadline: the counter takes one step for all the intervals a downtime
+missed, so it lags the wall clock by about the time the node was down, and a
+deadline built on it ("7 days after the hold") fires late by that much.
 
 ```rust
 use charpente::core::table::Id;
@@ -3396,10 +3404,25 @@ the same request with what the first one did, and change nothing:
 the scaffold's `add_note` a note already stored with the same body. A request
 that reuses the id with other content is a
 conflict, not a repeat: refuse it with a 4xx that names the conflict and the
-fix, as `add_note` does for a note that already holds another body. A route
+fix, as `add_note` does for a note that already holds another body. Key a
+state transition (a pickup, a cancel) by an id of its own, such as `PUT
+/pickups/:pickup_id` naming the hold in its body and stored as a row: under
+`POST /holds/:id/pickup` a retry of a pickup that landed and a fresh pickup of
+a hold already picked up are the same bytes, while with its own id a repeat
+finds its row and answers alike and a new pickup of a hold no longer waiting
+is refused. A route
 that fails this is an app defect the re-send found, and its check goes red
 with a seed. Fix the route: dropping below the helper to skip the re-send
 hides the defect.
+
+**Seed fixtures in the build closure, not in the phase.** A `Drive` phase is a
+fixed request list, so a key one request mints cannot feed a later one, and
+every setup request sent ahead of a claim's own writes pushes them later into
+the faulted phase, where fewer get acked and more runs give up: so write the
+fixtures (an `ApiKey` row in §5's storage form, whose raw key the requests
+present, and the rows a claim only reads) in the closure `Drive::new` takes,
+through `App::transact_for_tests`, each only when it is absent, since the
+closure runs on every boot.
 
 `recover` gives `Ok(None)` when the run gave up by name, on a boot refused for
 durable corruption and on nothing else. Return `Ok(())` then. Its errors fail
