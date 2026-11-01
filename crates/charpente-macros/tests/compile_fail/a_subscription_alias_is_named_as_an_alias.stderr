@@ -1,0 +1,5 @@
+error: an SSE route returns Result<Subscription, ApiError>, and `handler`'s success type is not spelled `Subscription` — #[route] reads the return type as written, before type aliases resolve, so an alias of `Subscription` is refused like any other type; write `-> Result<Subscription, ApiError>` with `charpente::http::Subscription` itself, not an alias
+  --> tests/compile_fail/a_subscription_alias_is_named_as_an_alias.rs:21:13
+   |
+21 | ) -> Result<Tail, charpente::http::ApiError> {
+   |             ^^^^

@@ -1,0 +1,5 @@
+error: an SSE route returns Result<Subscription, ApiError>, and `handler`'s return type is not written that way — #[route] reads it as written, before type aliases resolve, so an alias of `ApiError` or of the whole `Result` is refused too; write `-> Result<Subscription, ApiError>`
+  --> tests/compile_fail/an_sse_route_spells_out_its_error_type.rs:18:6
+   |
+18 | ) -> Result<charpente::http::Subscription, String> {
+   |      ^^^^^^

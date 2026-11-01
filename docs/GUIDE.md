@@ -6492,6 +6492,10 @@ fn handler(tx: &mut Tx, [captures,] ctx: &Ctx, cursor: Option<Cursor>)
     -> Result<Subscription, ApiError>
 ```
 
+`#[route]` reads that return type as written, before type aliases resolve, so spell it out:
+`Result<Tail, ApiError>` with `type Tail = Subscription` is refused, and the error names
+the spelling that compiles.
+
 ```rust
 use charpente::event;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};

@@ -733,11 +733,36 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
              `-> Result<Subscription, ApiError>`",
         ));
     };
-    if !is_subscription_result(ret_ty) {
-        return Err(Error::new(
-            ret_ty.span(),
-            "an SSE route returns Result<Subscription, ApiError> — got a different return type",
-        ));
+    match result_args(ret_ty) {
+        Some((ok, err))
+            if last_segment_is(ok, "Subscription") && last_segment_is(err, "ApiError") => {}
+        // `type Tail = Subscription;` then `Result<Tail, ApiError>` is the right
+        // type, so "a different return type" would name the wrong cause
+        // (statuspage FINDINGS #6).
+        Some((ok, _)) if !last_segment_is(ok, "Subscription") => {
+            return Err(Error::new(
+                ok.span(),
+                format!(
+                    "an SSE route returns Result<Subscription, ApiError>, and `{name_str}`'s \
+                     success type is not spelled `Subscription` — #[route] reads the return \
+                     type as written, before type aliases resolve, so an alias of \
+                     `Subscription` is refused like any other type; write \
+                     `-> Result<Subscription, ApiError>` with `charpente::http::Subscription` \
+                     itself, not an alias"
+                ),
+            ));
+        }
+        _ => {
+            return Err(Error::new(
+                ret_ty.span(),
+                format!(
+                    "an SSE route returns Result<Subscription, ApiError>, and `{name_str}`'s \
+                     return type is not written that way — #[route] reads it as written, before \
+                     type aliases resolve, so an alias of `ApiError` or of the whole `Result` \
+                     is refused too; write `-> Result<Subscription, ApiError>`"
+                ),
+            ));
+        }
     }
 
     let glue_name = format_ident!("__charpente_route_{name}");
@@ -893,20 +918,19 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
     })
 }
 
-/// Checks the syntactic shape `Result<Subscription, ApiError>` (a macro
-/// can't do full type-checking — a mismatch that slips past this still
-/// fails to compile against `SubGlue`'s signature, just with rustc's own
-/// message instead of this one).
-fn is_subscription_result(ty: &Type) -> bool {
-    let Type::Path(path) = ty else { return false };
-    let Some(seg) = path.path.segments.last() else {
-        return false;
-    };
+/// The two type arguments of a return type written `Result<A, B>`. Syntactic
+/// only: a macro runs before type aliases resolve, so it sees an alias's name,
+/// never the type it stands for. A mismatch that slips past the checks on these
+/// still fails to compile against `SubGlue`'s signature, just with rustc's own
+/// message instead of the macro's.
+fn result_args(ty: &Type) -> Option<(&Type, &Type)> {
+    let Type::Path(path) = ty else { return None };
+    let seg = path.path.segments.last()?;
     if seg.ident != "Result" {
-        return false;
+        return None;
     }
     let PathArguments::AngleBracketed(generics) = &seg.arguments else {
-        return false;
+        return None;
     };
     let types: Vec<&Type> = generics
         .args
@@ -916,9 +940,10 @@ fn is_subscription_result(ty: &Type) -> bool {
             _ => None,
         })
         .collect();
-    types.len() == 2
-        && last_segment_is(types[0], "Subscription")
-        && last_segment_is(types[1], "ApiError")
+    match types[..] {
+        [ok, err] => Some((ok, err)),
+        _ => None,
+    }
 }
 
 fn last_segment_is(ty: &Type, ident: &str) -> bool {
