@@ -2514,17 +2514,23 @@ pub fn run_universes_from_in(
 /// fails a `charpente test --sim` batch. Seed derivation is untouched: the
 /// runners stay frozen in what each seed runs.
 fn report_outcomes(test_file: &str, universes: u64, gave_up: u64) {
-    let verdicts = universes - gave_up;
-    eprintln!(
-        "charpente-sim [{test_file}]: {verdicts} of {universes} universes reached a verdict, \
-         {gave_up} gave up"
-    );
+    eprintln!("{}", outcomes_line(test_file, universes, gave_up));
     assert!(
         gave_up < universes || universes == 0,
         "charpente-sim [{test_file}]: every universe gave up, so this test adjudicated nothing \
          over {universes} universes and fails. Raise its universe count, or change the workload \
          until universes reach a verdict."
     );
+}
+
+/// `report_outcomes`' line, apart from the `eprintln!` so a test can read it:
+/// what goes to stderr under libtest no test can.
+fn outcomes_line(test_file: &str, universes: u64, gave_up: u64) -> String {
+    let verdicts = universes - gave_up;
+    format!(
+        "charpente-sim [{test_file}]: {verdicts} of {universes} universes reached a verdict, \
+         {gave_up} gave up"
+    )
 }
 
 fn describe_outcome(outcome: &Outcome) -> String {
@@ -5094,6 +5100,21 @@ mod tests {
             .expect_err("3 give-ups against a cap of 2 must fail the batch");
         let msg = panic_message(&*payload);
         assert!(msg.contains("run:skipped: 3 over a cap of 2"), "{msg}");
+    }
+
+    /// The line both runners print counts the universes that reached a
+    /// verdict, the batch less its give-ups: GUIDE §8's example, and a batch
+    /// with none.
+    #[test]
+    fn the_outcomes_line_counts_verdicts_as_the_universes_less_the_give_ups() {
+        assert_eq!(
+            outcomes_line("replication", 128, 90),
+            "charpente-sim [replication]: 38 of 128 universes reached a verdict, 90 gave up"
+        );
+        assert_eq!(
+            outcomes_line("kernel", 64, 0),
+            "charpente-sim [kernel]: 64 of 64 universes reached a verdict, 0 gave up"
+        );
     }
 
     /// A platform test in which every universe gave up adjudicated nothing, so
