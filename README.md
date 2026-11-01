@@ -130,10 +130,13 @@ real TCP with `kill -9` and TCP-proxy fault injection.
 
 **M2 closed 2026-09-13; M3 — launch — shipped 2026-10-10.** M2 shipped six sub-projects,
 dropped one, and reclassified the rest to after launch with the trigger that reopens each
-([PLAN.md](PLAN.md)). M3 was the finish line before this went public. charpente `0.1.0` is
-on crates.io, and a stranger given only this README installed it, scaffolded an app, and
-reached a red sim with a seed that replays
-([docs/experiments/2026-10-launch-run](docs/experiments/2026-10-launch-run/)). A third
+([PLAN.md](PLAN.md)). M3 was the finish line before this went public. charpente went to
+crates.io as `0.1.0`, and a stranger given only this README installed it, scaffolded an app,
+and reached a red sim with a seed that replays
+([docs/experiments/2026-10-launch-run](docs/experiments/2026-10-launch-run/)).
+[CHANGELOG.md](CHANGELOG.md) dates every release since: its newest dated section is the
+latest on crates.io (`0.3.0` as this line was written), and a section it marks unreleased
+is not published yet. A third
 docs-only agent build passed review with zero Criticals the platform should have caught.
 Every number in this file is measured or gone. The first two of
 M2's sub-projects — an honest benchmark harness and primary-side group commit — have their

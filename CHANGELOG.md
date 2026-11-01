@@ -13,6 +13,7 @@
 
 ### Changed
 - **`charpente test --mutants` refuses a relative dev-, build- or target-dependency path outside the workspace root, and names `TMPDIR` when the scratch copy runs out of disk.** cargo-mutants 27.1.0 rewrites relative paths only in `[dependencies]`, `[replace]` and `[patch]`, so a `[dev-dependencies]` entry such as `{ path = "../outside" }` failed the unmutated baseline in its scratch copy with "no matching package named `outside`", which the verb reported as a generic red baseline. The verb now reads the manifest of every workspace member (a member that is not a `--test-package` fails the copied baseline too), under either spelling cargo reads (`[dev_dependencies]` and `[build_dependencies]` included), exits 2 before the install check, and names the manifest, the table as the manifest spells it, the dependency and the fix (an absolute path, or `[patch.crates-io]`). A baseline log saying `No space left on device` now gets a line naming the temp dir and `TMPDIR`. GUIDE §8 says both.
+- **The install-facing versions are 0.4.** `charpente new` writes `charpente = "0.4"` and `charpente-sim = "0.4"`, as GUIDE §1's manifest block does, and the six crates are 0.4.0.
 
 ### Added
 - **`SimSource::answers()` returns one slot per `push_at`, in push order.** A slot stays `None` until its own request is answered, so a run that stops mid-source says which requests it never reached; `responses()` is unchanged. `Request` is now `Clone`, and `charpente-sim` depends on `charpente` (the recovery helper's groundwork).

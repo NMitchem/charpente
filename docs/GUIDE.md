@@ -71,11 +71,11 @@ edition = "2024"
 rust-version = "1.99"
 
 [dependencies]
-charpente = "0.3"
+charpente = "0.4"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-charpente-sim = "0.3"
+charpente-sim = "0.4"
 
 [[test]]
 name = "sim"
@@ -7445,7 +7445,7 @@ memorizing a list:
 
 ```json
 {
-  "charpente_version": "0.3.0",
+  "charpente_version": "0.4.0",
   "tables": [
     {
       "name": "ApiKey",
