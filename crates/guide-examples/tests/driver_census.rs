@@ -29,7 +29,12 @@ use std::path::{Path, PathBuf};
 /// carries a comment giving the reason it may name a recovery step, such as
 /// a file that shows the API rather than drives an app. An entry whose file
 /// is gone fails the census, so an exemption cannot outlive its file.
-const EXEMPT: &[&str] = &[];
+const EXEMPT: &[&str] = &[
+    // The API reference page names every public function, the steps the
+    // drive wraps included (tests/api_census.rs holds it to that). Its
+    // `main` is empty and it never runs, so it drives no app.
+    "crates/charpente/examples/api.rs",
+];
 
 /// The text that makes a line a site, and what it is. A line is reported
 /// once, under the first that matches.

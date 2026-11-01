@@ -1,5 +1,10 @@
 # Building an app on charpente
 
+Look up a signature first in `examples/api.rs`, which ships in the `charpente` crate
+(`crates/charpente/examples/api.rs` in a checkout): one compiled page that uses every
+attribute, transaction method, `App` and kernel call, and sim helper with its types, while
+this guide teaches how each one is used.
+
 *(This file is compile-gated: every `rust` code block below is extracted
 and built by `crates/guide-examples` — `cargo build -p guide-examples` fails
 if a block stops compiling. A `text` block preceded by the line

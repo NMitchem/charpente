@@ -1,8 +1,9 @@
 //! GUIDE travels inside the `charpente` crate, so docs.rs and the registry
 //! copy carry it. The workspace's copy is `docs/GUIDE.md`; the crate reaches
 //! it through `crates/charpente/GUIDE.md`, and this gate packages the crate
-//! and compares the bytes that would be published. The three sim examples
-//! GUIDE §8 names ship beside it, and the gate checks they are listed.
+//! and compares the bytes that would be published. The examples GUIDE names
+//! (the API page, and the three sim examples of §8) ship beside it, and the
+//! gate checks they are listed.
 
 // Packages the crate and reads files at test time: build tooling outside the
 // deterministic boundary, the same sanctioned edge as this crate's build.rs.
@@ -37,17 +38,24 @@ fn the_guide_ships_in_the_charpente_crate() {
         "`cargo package --list -p charpente` must list GUIDE.md so docs.rs and the registry copy \
          carry the guide; it lists:\n{listed}"
     );
-    // GUIDE §8 "Examples to copy" sends a reader to these three files in the
-    // registry copy, so an `include` or `exclude` edit must not drop one.
-    for example in [
-        "examples/drawn_inputs.rs",
-        "examples/modelled_remote.rs",
-        "examples/restart_under_faults.rs",
+    // GUIDE sends a reader to these files in the registry copy, so an
+    // `include` or `exclude` edit must not drop one.
+    for (example, named_in) in [
+        ("examples/api.rs", "GUIDE's opening paragraph"),
+        ("examples/drawn_inputs.rs", "GUIDE §8 \"Examples to copy\""),
+        (
+            "examples/modelled_remote.rs",
+            "GUIDE §8 \"Examples to copy\"",
+        ),
+        (
+            "examples/restart_under_faults.rs",
+            "GUIDE §8 \"Examples to copy\"",
+        ),
     ] {
         assert!(
             listed.lines().any(|l| l == example),
-            "`cargo package --list -p charpente` must list {example}: GUIDE §8 \"Examples to \
-             copy\" names it as shipped in the registry copy; it lists:\n{listed}"
+            "`cargo package --list -p charpente` must list {example}: {named_in} names it as \
+             shipped in the registry copy; it lists:\n{listed}"
         );
     }
 

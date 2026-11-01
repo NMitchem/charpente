@@ -65,7 +65,7 @@ item with the trigger that reopens it.
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/clock_restart/failover/hunts/outbound/
   realtime_resume/smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/driver_census/guide_ships/hook_census/mutants_exclusions; sim-fixture: sim; merge-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: api_census/claims_census/describe_contract/doc_inventory/doc_truth/driver_census/guide_ships/hook_census/mutants_exclusions; sim-fixture: sim; merge-fixture: sim;
   outbound-fixture: sim; invoicing: describe_golden/sim). Every list is exhaustive as
   written — if a name is missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
