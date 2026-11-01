@@ -9,11 +9,11 @@
 use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use charpente::core::io::{
-    HttpMethod, IdempotencyKey as CallKey, Outbound, OutboundCall, OutboundReply,
+    Disk, File, HttpMethod, IdempotencyKey as CallKey, Outbound, OutboundCall, OutboundReply,
 };
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
@@ -24,7 +24,7 @@ use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
 use charpente_sim::drive::{Drive, Phase};
 use charpente_sim::outbound::Remote;
 use charpente_sim::rng::Rng;
-use charpente_sim::{FaultConfig, Sim};
+use charpente_sim::{FaultConfig, Sim, SimDisk};
 
 #[table(global)]
 struct Note {
@@ -736,4 +736,139 @@ fn a_tail_kernel_stop_is_reported_in_the_kernels_words() {
          made durability unknowable) — the request received its 500; restart the process to \
          recover from the WAL"
     );
+}
+
+/// The faulted phase's kernel, the two ways it ends: fault fallout ends the
+/// phase, and anything else fails it with its own text. Each case is the
+/// build's doing, so no faults run and no seed is searched.
+#[test]
+fn a_kernel_build_lost_to_fallout_ends_the_faulted_phase() {
+    // The first boot arms a crash on the kernel's first disk op (offset 0 of
+    // the search in `a_tail_kernel_stop_is_reported_in_the_kernels_words`):
+    // the App opens, and the kernel cannot be built.
+    let sim = Sim::with_faults(0xD7_7000, FaultConfig::none());
+    let boots = Cell::new(0u32);
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        let app = notes(sim)?;
+        boots.set(boots.get() + 1);
+        if boots.get() == 1 {
+            sim.crash_disk_after(0);
+        }
+        Ok(app)
+    });
+    let phase = drive
+        .faulted_phase(&posts(&[1, 2]), Duration::from_secs(1))
+        .expect("fallout building the kernel ends the phase, never fails it");
+    assert!(
+        sim.disk_crashed() && boots.get() == 1,
+        "the case: one boot, and its kernel's build met the crash"
+    );
+    assert_eq!(shape(&phase.answers), ["-", "-"], "nothing was sent");
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "a kernel lost to fallout is no give-up"
+    );
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(1))
+        .unwrap()
+        .expect("the fault-free tail boots");
+    assert_eq!(
+        (recovered.status(0), recovered.status(1)),
+        (Some(200), Some(200)),
+        "the tail sends what the lost kernel never answered"
+    );
+}
+
+#[test]
+fn a_kernel_refused_by_name_fails_the_faulted_phase_with_its_text() {
+    // The job calls mail.example and the app declares no Host for it: the
+    // kernel refuses to build, by name. A refusal is not fault fallout.
+    let sim = Sim::with_faults(0xD7_4000, FaultConfig::none());
+    sim.remote("mail.example", Counting(Arc::new(AtomicU64::new(0))));
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        Ok(App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Note>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )?
+        .mount(routes![send_mail])
+        .mount_jobs(jobs![Mail]))
+    });
+    let err = drive
+        .faulted_phase(&mails(1..=1), Duration::from_secs(1))
+        .err()
+        .expect("the kernel refuses to build");
+    assert_eq!(
+        err,
+        "kernel: job Mail calls mail.example, which has no Host entry — add \
+         app.outbound(Host::new(\"mail.example\")) with the credentials it needs (GUIDE §6)"
+    );
+}
+
+/// Set by `unplug`'s handler, after which `Unplugged` refuses every
+/// `Disk::open`. Only the test below mounts `unplug` or opens `Unplugged`.
+static UNPLUGGED: AtomicBool = AtomicBool::new(false);
+
+#[route(POST "/unplug/:id", public)]
+fn unplug(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    UNPLUGGED.store(true, Ordering::Relaxed);
+    tx.put(&Note { id, n: id.raw() });
+    Ok(id)
+}
+
+/// The sim's disk until `unplug` runs; then every `open` fails with an error
+/// of the test's own, which names no fault, so nothing reads it as fallout.
+struct Unplugged(SimDisk);
+
+impl Disk for Unplugged {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        if UNPLUGGED.load(Ordering::Relaxed) {
+            return Err(io::Error::other("the test unplugged the disk"));
+        }
+        self.0.open(path)
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.0.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.0.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.0.sync_dir(prefix)
+    }
+}
+
+#[test]
+fn a_kernel_stop_that_is_not_fallout_fails_the_faulted_phase_with_its_text() {
+    // The request is answered, and the kernel's clean-shutdown checkpoint
+    // then cannot open its file: the run stops on an error that is not fault
+    // fallout.
+    let sim = Sim::with_faults(0xD7_7000, FaultConfig::none());
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        Ok(App::open(
+            Box::new(Unplugged(sim.disk())),
+            Schema::new().table::<Note>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )?
+        .mount(routes![unplug]))
+    });
+    let unplug_one = [(
+        Duration::from_millis(1),
+        Request::new(Method::Post, "/unplug/1"),
+    )];
+    let err = drive
+        .faulted_phase(&unplug_one, Duration::from_secs(1))
+        .err()
+        .expect("the kernel's run stops on an error that is not fallout");
+    assert!(
+        UNPLUGGED.load(Ordering::Relaxed),
+        "the case: the handler ran, so the stop came from the kernel's run, not its build"
+    );
+    assert_eq!(err, "the test unplugged the disk");
 }
