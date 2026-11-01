@@ -5,13 +5,18 @@
 //! recovery paste decided runs its own way: one gave up on a first boot lost to
 //! fallout and another went on, one re-sent every non-200 and the rest
 //! re-sent nothing. `Drive` makes each of those one decision. Held by a walk:
-//! no non-comment line in those files calls `wait_out_clock_refusal` or
-//! `boot_through_fallout`, or defines a `fn recover`.
+//! no non-comment line in those files names `wait_out_clock_refusal` or
+//! `boot_through_fallout`, builds a kernel or a request source, quiesces
+//! faults, or defines a `fn recover`. A workload built on `Drive` needs none
+//! of them.
 //!
-//! Scope: a site is a non-comment line containing `wait_out_clock_refusal(`,
-//! `boot_through_fallout(`, `fn recover(` or `fn recover<`. A mention in prose
-//! is in a comment and is not a site; a string literal carrying that text is
-//! reported, loudly and by line, the right direction for a census.
+//! Scope: a site is a non-comment line containing one of `STEPS`. The two
+//! helpers are matched by name, not by call, so an import, a `use … as`
+//! alias, a turbofish and the function passed as a value are sites too. A
+//! mention in prose is in a comment and is not a site; a string literal
+//! carrying that text is reported, loudly and by line, the right direction for
+//! a census. Still missed: a hand tail built entirely through some other
+//! helper.
 
 // Walking the repo's sources is build tooling outside the deterministic
 // boundary, the same sanctioned-edge pattern as tests/hook_census.rs.
@@ -26,10 +31,15 @@ use std::path::{Path, PathBuf};
 /// is gone fails the census, so an exemption cannot outlive its file.
 const EXEMPT: &[&str] = &[];
 
-/// The text that makes a line a site, and what it is.
-const STEPS: [(&str, &str); 4] = [
-    ("wait_out_clock_refusal(", "calls wait_out_clock_refusal"),
-    ("boot_through_fallout(", "calls boot_through_fallout"),
+/// The text that makes a line a site, and what it is. A line is reported
+/// once, under the first that matches.
+const STEPS: [(&str, &str); 8] = [
+    ("wait_out_clock_refusal", "names wait_out_clock_refusal"),
+    ("boot_through_fallout", "names boot_through_fallout"),
+    ("Kernel::new(", "builds a kernel by hand"),
+    ("Kernel::with_outbound(", "builds a kernel by hand"),
+    ("SimSource::new(", "builds a request source by hand"),
+    ("quiesce_", "quiesces faults by hand"),
     ("fn recover(", "defines fn recover"),
     ("fn recover<", "defines fn recover"),
 ];
@@ -131,41 +141,43 @@ fn no_example_or_scaffold_template_drives_recovery_by_hand() {
 #[test]
 fn a_mention_in_a_comment_is_not_a_site() {
     let src = "// wait_out_clock_refusal(sim, boot)\n/// boot_through_fallout(sim, 8, f, b)\n\
-               //! fn recover(sim: &Sim)\nlet x = 1;\n";
+               //! fn recover(sim: &Sim)\n// sim.quiesce_disk_faults()\n\
+               /// Kernel::new(app, clock) and SimSource::new(clock, horizon)\nlet x = 1;\n";
     assert!(sites_in(src).is_empty());
 }
 
 #[test]
 fn each_step_is_a_site_by_line() {
-    let src = "use charpente_sim::checks::{boot_through_fallout, wait_out_clock_refusal};\n\
+    let src = "use charpente_sim::checks::{boot_through_fallout, wait_out_clock_refusal as wait};\n\
                fn recover(sim: &Sim) {\n\
-               wait_out_clock_refusal(sim, || {\n\
-               boot_through_fallout(sim, 8, f, b)\n\
+               wait(sim, || {\n\
+               boot_through_fallout::<App, String>(sim, 8, f, b)\n\
                fn recovered(sim: &Sim) {}\n\
-               fn recover<T>(t: T) {}\n";
+               fn recover<T>(t: T) {}\n\
+               sim.quiesce_disk_faults();\n\
+               let kernel = Kernel::new(app, clock)?;\n\
+               let kernel = Kernel::with_outbound(app, clock, out)?;\n\
+               let mut source = SimSource::new(clock, horizon);\n";
+    let sites: Vec<(usize, &str)> = sites_in(src)
+        .into_iter()
+        .map(|(line, what, _)| (line, what))
+        .collect();
     assert_eq!(
-        sites_in(src),
-        vec![
-            (
-                2,
-                "defines fn recover",
-                "fn recover(sim: &Sim) {".to_string()
-            ),
-            (
-                3,
-                "calls wait_out_clock_refusal",
-                "wait_out_clock_refusal(sim, || {".to_string()
-            ),
-            (
-                4,
-                "calls boot_through_fallout",
-                "boot_through_fallout(sim, 8, f, b)".to_string()
-            ),
-            (
-                6,
-                "defines fn recover",
-                "fn recover<T>(t: T) {}".to_string()
-            ),
+        sites,
+        [
+            (1, "names wait_out_clock_refusal"),
+            (2, "defines fn recover"),
+            (4, "names boot_through_fallout"),
+            (6, "defines fn recover"),
+            (7, "quiesces faults by hand"),
+            (8, "builds a kernel by hand"),
+            (9, "builds a kernel by hand"),
+            (10, "builds a request source by hand"),
         ]
+    );
+    assert_eq!(
+        sites_in(src)[0].2,
+        "use charpente_sim::checks::{boot_through_fallout, wait_out_clock_refusal as wait};",
+        "a site carries its line's text, trimmed"
     );
 }

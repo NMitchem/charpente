@@ -21,15 +21,17 @@
 //! Run them: `charpente test --sim`. Watch one fail: delete the `tx.enqueue`
 //! line in `src/lib.rs` and run again. Delete `tx.emit` and the third goes red.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use charpente::core::job::{JobRow, JobStatus};
+use charpente::core::table::Codec;
 use charpente::http::{App, Method, Request};
 use charpente::{Id, View};
 use charpente_sim::Sim;
 use charpente_sim::checks::{durable_corruption_fired, events};
 use charpente_sim::drive::{Drive, Recovered};
-use {{ident}}::{NewNote, Note, NoteAdded, build_app};
+use {{ident}}::{Echo, NewNote, Note, NoteAdded, build_app};
 
 charpente_sim::sim_tests! {
     acked_note_survives_a_restart require ["restart"],
@@ -136,6 +138,8 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
 ///   same log record, so each acked note has an `Echo` job row.
 /// - Exactly-once: the notes marked `echoed` number exactly the `Echo` jobs
 ///   that are Done — a job's effect and its Done mark commit as one record.
+///   Each add enqueues one `Echo` in the note's own record, so two for one
+///   note mean the route added it twice, a cause told apart first.
 ///
 /// Delete `tx.enqueue` in `src/lib.rs`, or make `Echo::run` do nothing, and
 /// this goes red with a seed.
@@ -171,6 +175,17 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
              the enqueue did not commit with the row",
             acked.len(),
             echo_jobs.len()
+        ));
+    }
+    let mut per_note: BTreeMap<u64, usize> = BTreeMap::new();
+    for job in &echo_jobs {
+        let echo = Echo::decode(&mut &job.payload[..]).map_err(|e| e.to_string())?;
+        *per_note.entry(echo.note.raw()).or_insert(0) += 1;
+    }
+    if let Some((note, jobs)) = per_note.iter().find(|(_, jobs)| **jobs > 1) {
+        return Err(format!(
+            "exactly-once violated: note {note} has {jobs} Echo jobs — it was added twice, so it is echoed twice: \
+             a re-sent POST /notes/{note} whose first send landed must not enqueue again (src/lib.rs, add_note)"
         ));
     }
     let done = echo_jobs

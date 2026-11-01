@@ -47,15 +47,22 @@ impl Echo {
 }
 
 /// Three effects, one commit: the row, the job and the event all become
-/// true together or not at all. There is no way to split them. A note that
-/// is already stored is answered as added and changes nothing: a client
-/// re-sends a POST it never saw answered, as the sim's tail does, and a note
-/// whose first send landed must not be echoed or announced twice.
+/// true together or not at all. There is no way to split them. A note is
+/// written once. The same note again is answered as added and changes
+/// nothing: a client re-sends a POST it never saw answered, as the sim's tail
+/// does, and a note whose first send landed must not be echoed or announced
+/// twice. The same id with another body is a conflict, refused with a 400.
 // `public`: the scaffold has no principals yet — GUIDE §5 (Sessions) is where `auth` starts.
 #[route(POST "/notes/:id", public)]
 fn add_note(tx: &mut Tx, id: Id<Note>, body: NewNote) -> Result<Id<Note>, ApiError> {
-    if tx.get(id)?.is_some() {
-        return Ok(id);
+    if let Some(note) = tx.get(id)? {
+        if note.body == body.body {
+            return Ok(id);
+        }
+        return Err(ApiError::BadRequest(format!(
+            "note {} already holds another body — a note is written once; post the new body under a new id",
+            id.raw()
+        )));
     }
     tx.put(&Note {
         id,

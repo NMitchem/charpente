@@ -177,7 +177,8 @@ item with the trigger that reopens it.
   `tests/mutants_exclusions.rs` pins the known-equivalent mutant list's size and demands a
   rationale per entry.
   `tests/driver_census.rs` holds that no shipped example or scaffold template drives
-  recovery by hand (`wait_out_clock_refusal`, `boot_through_fallout`, a `fn recover`):
+  recovery by hand (names `wait_out_clock_refusal` or `boot_through_fallout`, builds a
+  kernel or request source, quiesces faults, or defines a `fn recover`):
   `charpente_sim::drive` is their only home, and an exemption is by path with its reason.
 - `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock
   binaries over real TCP, `kill -9`, TCP-proxy fault injection.

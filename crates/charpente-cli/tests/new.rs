@@ -554,22 +554,122 @@ fn deleting_the_enqueue_line_turns_the_echo_check_red() {
     );
 }
 
+/// `add_note`'s guard, whole: a stored note's id answered as added for the
+/// same body, refused for another.
+const ADD_NOTE_GUARD: &str = "    if let Some(note) = tx.get(id)? {
+        if note.body == body.body {
+            return Ok(id);
+        }
+        return Err(ApiError::BadRequest(format!(
+            \"note {} already holds another body — a note is written once; post the new body under a new id\",
+            id.raw()
+        )));
+    }
+";
+
 /// The route's retry guard: the sim's tail re-sends a POST the faulted phase
 /// left unanswered, and a note whose first send landed anyway must not be
 /// put, enqueued and emitted a second time. Without the guard the echo check
-/// counts two Done Echo jobs for one note. Found when the scaffold moved onto
-/// `charpente_sim::drive` (0.4.0, named step N3): 5 runs of the batch at
-/// master seed 0x1 failed this way, one of them seed 0x6f623889546ec486.
+/// finds two Echo jobs for one note and names the route as the cause. Found
+/// when the scaffold moved onto `charpente_sim::drive` (0.4.0, named step N3):
+/// 5 runs of the batch at master seed 0x1 failed this way, one of them seed
+/// 0x6f623889546ec486.
 #[test]
 fn deleting_the_retry_guard_turns_the_echo_check_red_on_a_resend() {
-    let (_, out) = sim_with_line_deleted(
-        "noguard",
-        "    if tx.get(id)?.is_some() {\n        return Ok(id);\n    }\n",
-    );
+    let (_, out) = sim_with_line_deleted("noguard", ADD_NOTE_GUARD);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
     let block = failure_block(&stdout, "acked_post_implies_the_echo_after_recovery");
-    assert!(block.contains("exactly-once violated"), "{block}");
+    assert!(
+        block.contains("exactly-once violated: note ")
+            && block.contains(
+                " Echo jobs — it was added twice, so it is echoed twice: a re-sent POST /notes/"
+            )
+            && block
+                .contains(" whose first send landed must not enqueue again (src/lib.rs, add_note)"),
+        "the echo check names the route as the cause:\n{block}"
+    );
+}
+
+/// `tests/sim.rs` for a scaffold named `conflict`: note 5 posted with one body
+/// twice, then with another, in a fault-free world of the workload's own.
+const CONFLICT_SIM: &str = r##"use std::time::Duration;
+
+use charpente::http::{Method, Request};
+use charpente_sim::drive::Drive;
+use charpente_sim::{FaultConfig, Sim};
+use conflict::{NewNote, build_app};
+
+charpente_sim::sim_tests! {
+    a_reused_id_with_another_body_is_refused,
+}
+
+fn a_reused_id_with_another_body_is_refused(_: &mut Sim) -> Result<(), String> {
+    let sim = Sim::with_faults(1, FaultConfig::none());
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        build_app(Box::new(sim.disk()), Box::new(sim.entropy()))
+    });
+    let post = |at: u64, body: &str| {
+        (
+            Duration::from_millis(at),
+            Request::new(Method::Post, "/notes/5").json(&NewNote {
+                body: body.to_string(),
+            }),
+        )
+    };
+    let phase = drive.faulted_phase(
+        &[post(0, "alpha"), post(1, "alpha"), post(2, "bravo")],
+        Duration::from_secs(1),
+    )?;
+    let got: Vec<Option<(u16, String)>> = phase
+        .answers
+        .iter()
+        .map(|a| a.as_ref().map(|(s, b)| (*s, String::from_utf8_lossy(b).into_owned())))
+        .collect();
+    let want = vec![
+        Some((200, "\"5\"".to_string())),
+        Some((200, "\"5\"".to_string())),
+        Some((
+            400,
+            r#"{"error":"note 5 already holds another body — a note is written once; post the new body under a new id"}"#
+                .to_string(),
+        )),
+    ];
+    if got != want {
+        return Err(format!("note 5 posted alpha, alpha, bravo was answered {got:?}"));
+    }
+    Ok(())
+}
+"##;
+
+/// The guard's other half: a POST that reuses a stored note's id with another
+/// body is a conflict, not a client's retry, and is refused naming the
+/// conflict and the fix (hard rule 5). The scaffold's own sim never reuses an
+/// id, so this replaces its `tests/sim.rs` with a workload that does.
+#[test]
+// Writing the workload into the scaffold is edge tooling (DESIGN.md §1): the
+// rig setting up the test, not code the sim exercises.
+#[allow(clippy::disallowed_methods)]
+fn a_reused_note_id_with_another_body_is_refused_naming_the_conflict() {
+    let app = patched_scaffold("conflict");
+    std::fs::write(app.join("tests/sim.rs"), CONFLICT_SIM).unwrap();
+    let out = charpente()
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", target_dir())
+        .args(["test", "--sim", "--runs", "1"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("check a_reused_id_with_another_body_is_refused ... ok"),
+        "{stdout}"
+    );
 }
 
 /// The scaffold's inputs vary: over the green batch at master seed 0x1, each

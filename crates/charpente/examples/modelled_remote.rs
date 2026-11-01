@@ -93,7 +93,12 @@ impl Charge {
 /// is already stored is answered as placed and changes nothing: a client
 /// re-sends an order it never saw answered, as the drive's tail does, and an
 /// order whose first send landed before its answer was lost must not get a
-/// second charge under a fresh key.
+/// second charge under a fresh key. The request is the order's id alone, so
+/// a repeat is always the same request; a route whose request carries data
+/// refuses other data under a stored id (GUIDE §8, "A route the tail re-sends
+/// must be safe to receive twice"). Delete the three lines of the guard and
+/// `-- --master-seed 0xf931428f591be3a4` fails 22 of 242 tested runs
+/// (`--seed 0x74e75093966cb76d`, shrunk to `orders=48`).
 #[route(POST "/orders/:id", public)]
 fn place_order(tx: &mut Tx, id: Id<Order>) -> Result<Id<Order>, ApiError> {
     if tx.get(id)?.is_some() {
@@ -227,21 +232,41 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         return Err(e);
     }
 
+    let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
+    let mut charges = Vec::new();
+    for row in jobs.iter().filter(|row| row.outbound_key.is_some()) {
+        charges.push((
+            row,
+            Charge::decode(&mut &row.payload[..]).map_err(|e| e.to_string())?,
+        ));
+    }
     let charged = sim.with_remote("pay.example", |g: &Gateway| g.charged.clone());
     let mut per_order: BTreeMap<u64, u32> = BTreeMap::new();
     for order in &charged {
         *per_order.entry(*order).or_insert(0) += 1;
     }
     if let Some((order, n)) = per_order.iter().find(|(_, n)| **n > 1) {
+        // Two Charge jobs for one order mean the route placed it twice, each
+        // job with its own key; one job applied twice is a re-call with no key.
+        let placed = charges
+            .iter()
+            .filter(|(_, job)| job.order.raw() == *order)
+            .count();
+        if placed > 1 {
+            return Err(format!(
+                "double charge: pay.example applied order {order} {n} times, and the store holds \
+                 {placed} Charge jobs for it — the order was placed twice (a re-sent POST \
+                 /orders/{order} whose first send landed), so each call carried its own job's \
+                 key: make place_order answer an order that is already stored"
+            ));
+        }
         return Err(format!(
             "double charge: pay.example applied order {order} {n} times — a re-call carried no \
              idempotency key the gateway could dedupe on"
         ));
     }
-    let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
     let mut judged = 0;
-    for row in jobs.iter().filter(|row| row.outbound_key.is_some()) {
-        let job = Charge::decode(&mut &row.payload[..]).map_err(|e| e.to_string())?;
+    for (row, job) in &charges {
         let order = snap
             .get::<Order>(job.order)
             .map_err(|e| e.to_string())?

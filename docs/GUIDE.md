@@ -1360,7 +1360,9 @@ confirmation.** What that means in practice:
 Operationally this is the same epistemic class as any `TxError::Io`, so
 handle it the same way: a blind retry is safe only where the operation is
 idempotent in your own schema — the platform does not dedupe for you, and
-§6 is explicit that an `enqueue_keyed` key is carried, not indexed. After the
+§6 is explicit that an `enqueue_keyed` key is carried, not indexed. A sim's
+fault-free tail re-sends such a request too, so a route it reaches must be
+safe to receive twice (§8, "A fault-free tail for an end-of-run check"). After the
 restart, the honest way to learn what happened is to read the state back
 rather than infer it from the status code.
 
@@ -3339,15 +3341,27 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    your code: flip them between the two calls.
 4. **Re-send what went unanswered.** Every request whose answer is `None`,
    or a 5xx whose body is fault fallout, is sent again at the tail's start. A
-   4xx, or a handler's own 5xx, is the app's answer and is not re-sent. The
-   re-sent answers come back in `recovered.resent`, apart from the phase's,
-   because a request that went unanswered may or may not have landed. So a
-   claim about acked requests reads `phase.status(i) == Some(200)`, and a
-   check that wants the two merged merges them itself
-   (`examples/drawn_inputs.rs`). The re-send is a client's retry, so a route
-   must be safe to receive twice: a POST whose first send landed before its
-   answer was lost comes again. `modelled_remote`'s `place_order` and the
-   scaffold's `add_note` answer a row that already landed and change nothing.
+   4xx, or a handler's own 5xx, is the app's answer and is not re-sent.
+   Fallout is read from the body's text (`is_fault_fallout`), so a handler's
+   own 5xx whose message reads as fallout ("injected", say) is re-sent too.
+   The re-sent answers come back in `recovered.resent`, apart from the
+   phase's, because a request that went unanswered may or may not have
+   landed. So a claim about acked requests reads `phase.status(i) ==
+   Some(200)`, and a check that wants the two merged merges them itself
+   (`examples/drawn_inputs.rs`).
+
+**A route the tail re-sends must be safe to receive twice.** `Drive`
+re-sends, and a request that went unanswered may have landed, so its re-send
+is the second delivery a production client's retry makes. Answer a repeat of
+the same request with what the first one did, and change nothing:
+`modelled_remote`'s `place_order` answers an order that is already stored, and
+the scaffold's `add_note` a note already stored with the same body. A request
+that reuses the id with other content is a
+conflict, not a repeat: refuse it with a 4xx that names the conflict and the
+fix, as `add_note` does for a note that already holds another body. A route
+that fails this is an app defect the re-send found, and its check goes red
+with a seed. Fix the route: dropping below the helper to skip the re-send
+hides the defect.
 
 `recover` gives `Ok(None)` when the run gave up by name: on a boot refused for
 durable corruption, or on a clock refusal that outlasted two waits. Return
@@ -3367,12 +3381,14 @@ A workload with more than that builds it from the pieces this section and
 `Kernel::new` or `Kernel::with_outbound` over a `SimSource`, the quiesce calls
 below and `wait_out_clock_refusal`. Examples are several faulted rounds, a
 supervisor loop inside the phase, a script that reads one phase's answers to
-build the next, several nodes, a check between the phase and the tail, and a
-tail that must not re-send. Keep each step's rule as `Drive` has it:
+build the next, several nodes, and a check between the phase and the tail. A
+route that cannot take the re-send is not a reason to drop below it: fix the
+route (above). Keep each step's rule as `Drive` has it:
 - use the fallout filter in every step;
 - treat a crash in the faulted phase as the crash under test, not a skip;
 - quiesce before the tail boots, and wait out a clock refusal;
-- give up only on a durable refusal.
+- give up only on a durable refusal;
+- re-send in the tail what went unanswered, to routes safe to receive twice.
 
 A check that runs at the end of a run — a checkpoint, a graceful close, a
 byte comparison of two nodes' files — does IO, and the run's
@@ -3858,6 +3874,11 @@ cron multiplexed on one loop — is just as drivable, because the loop itself
 sim test runs the identical loop code against a scripted timeline.
 `charpente_sim::drive` runs that loop through the four steps of "A fault-free
 tail for an end-of-run check" above, and the example below is built on it.
+Its tail re-sends what went unanswered, so every route a workload sends must
+be safe to receive twice (that section, "A route the tail re-sends must be
+safe to receive twice"). `hit` below takes the re-send by design: it counts
+landings, and both of its invariants are stated over jobs, so a hit that
+lands twice is two Done jobs and two hits.
 
 **Requests** are built with the public builder: `Request::new(Method::Post,
 "/hit")`, then `.header(key, value)` (keys are lowercased for you) and
@@ -4352,7 +4373,8 @@ struct OrderBody {
 fn order(tx: &mut Tx, body: OrderBody) -> Result<WireU64, ApiError> {
     let id: Id<Receipt> = Id::from_raw(body.order.0);
     // The tail re-sends an order the phase left unanswered: one that landed
-    // anyway is answered as placed, with no second receipt.
+    // anyway is answered as placed, with no second receipt. The request is
+    // the order's id alone, so a repeat is always the same request.
     if tx.get(id)?.is_some() {
         return Ok(body.order);
     }
