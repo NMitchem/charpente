@@ -457,7 +457,7 @@ fn patched_scaffold(name: &str) -> PathBuf {
     app
 }
 
-/// A patched scaffold with `delete` (a whole line of `src/lib.rs`) removed,
+/// A patched scaffold with `delete` (whole lines of `src/lib.rs`) removed,
 /// and the sim run over the batch `--master-seed 0x1`.
 // Rewriting the scaffold's src/lib.rs is edge tooling (DESIGN.md §1): the
 // rig making README's edit, not code the sim exercises.
@@ -547,6 +547,24 @@ fn deleting_the_enqueue_line_turns_the_echo_check_red() {
         !stdout.contains("sim failure in acked_post_implies_its_event_after_recovery"),
         "the event check does not depend on the enqueue:\n{stdout}"
     );
+}
+
+/// The route's retry guard: the sim's tail re-sends a POST the faulted phase
+/// left unanswered, and a note whose first send landed anyway must not be
+/// put, enqueued and emitted a second time. Without the guard the echo check
+/// counts two Done Echo jobs for one note. Found when the scaffold moved onto
+/// `charpente_sim::drive` (0.4.0, named step N3): 5 runs of the batch at
+/// master seed 0x1 failed this way, one of them seed 0x6f623889546ec486.
+#[test]
+fn deleting_the_retry_guard_turns_the_echo_check_red_on_a_resend() {
+    let (_, out) = sim_with_line_deleted(
+        "noguard",
+        "    if tx.get(id)?.is_some() {\n        return Ok(id);\n    }\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    let block = failure_block(&stdout, "acked_post_implies_the_echo_after_recovery");
+    assert!(block.contains("exactly-once violated"), "{block}");
 }
 
 /// The scaffold's inputs vary: over the green batch at master seed 0x1, each

@@ -13,23 +13,40 @@
 //! job is Done. Delete the idempotency key from `charge`'s call and
 //! the gateway sees a fresh key on every retry, so a lost reply charges twice
 //! and the run goes red (GUIDE §8, "The outside world: remote models").
+//!
+//! `charpente_sim::drive` runs the four steps (GUIDE §8, "A fault-free tail
+//! for an end-of-run check"):
+//! 1. Boot: the app boots through fault fallout, booting again as a
+//!    supervisor would; a first boot that never gets past it leaves the
+//!    faulted phase empty, and the run goes on.
+//! 2. Faulted phase: the orders are placed under the run's faults, with the
+//!    sim's outbound handle, since the app declares a host. A fault ends the
+//!    phase, and the replies already sent stand.
+//! 3. Fault-free tail: a power cycle, the disk, clock and outbound faults
+//!    switched off, a clock refusal waited out, and the app booted again and
+//!    run to a horizon past every backoff and deadline. The gateway's own
+//!    switch is the workload's: it calms the gateway before the tail.
+//! 4. Re-send: the tail places again every order the phase left unanswered,
+//!    as a client that never saw its answer would.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use charpente::core::io::{OutboundCall, OutboundReply};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::Codec as _;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
-use charpente::kernel::{JobError, Kernel, SimSource};
+use charpente::kernel::JobError;
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, Schema, Tx, View, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, calls_have_durable_jobs, clock_fallout, durable_corruption_fired,
-    is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon, wait_out_clock_refusal,
+    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_job,
+    outbound_settles_by_horizon,
 };
+use charpente_sim::drive::Drive;
 use charpente_sim::outbound::Remote;
 use charpente_sim::rng::Rng;
 
@@ -72,9 +89,16 @@ impl Charge {
     }
 }
 
-/// Puts the order and enqueues its charge in one transaction.
+/// Puts the order and enqueues its charge in one transaction. An order that
+/// is already stored is answered as placed and changes nothing: a client
+/// re-sends an order it never saw answered, as the drive's tail does, and an
+/// order whose first send landed before its answer was lost must not get a
+/// second charge under a fresh key.
 #[route(POST "/orders/:id", public)]
 fn place_order(tx: &mut Tx, id: Id<Order>) -> Result<Id<Order>, ApiError> {
+    if tx.get(id)?.is_some() {
+        return Ok(id);
+    }
     tx.put(&Order { id, paid: false });
     tx.enqueue(Charge { order: id });
     Ok(id)
@@ -154,35 +178,6 @@ charpente_sim::sim_tests! {
     each_order_is_charged_once require ["fault:outbound_lost_reply", "outbound:checked"],
 }
 
-const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
-
-/// A fault, or a clock too far behind, ends the phase it hits, not the run.
-fn fallout(sim: &Sim, text: &str) -> bool {
-    is_fault_fallout(text) || clock_fallout(sim, text)
-}
-
-fn boot(sim: &Sim) -> Result<Option<App>, String> {
-    boot_through_fallout(sim, 8, |t| fallout(sim, t), || build_app(sim)).map_err(|e| e.to_string())
-}
-
-/// One kernel over `source`: the kernel back, its App inside for the end
-/// state, or the fallout's text.
-fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<Kernel, String>, String> {
-    let outbound = sim
-        .outbound(&app.outbound_hosts())
-        .map_err(|e| e.to_string())?;
-    let mut kernel = match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
-        Ok(kernel) => kernel,
-        Err(e) if fallout(sim, &e.to_string()) => return Ok(Err(e.to_string())),
-        Err(e) => return Err(e.to_string()),
-    };
-    match kernel.run(source) {
-        Ok(()) => Ok(Ok(kernel)),
-        Err(e) if fallout(sim, &e.to_string()) => Ok(Err(e.to_string())),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
     let orders = sim.input().between("orders", 48, 96);
     let calm = Arc::new(AtomicBool::new(false));
@@ -195,59 +190,31 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         },
     );
 
-    // The faulted phase: post the orders 20 ms apart, run past the first
-    // retries, and power-cycle with a charge possibly in flight.
-    if let Some(app) = boot(sim)? {
-        let start = sim.now().as_nanos();
-        let mut source = SimSource::new(Box::new(sim.clock()), start + 3 * SEC);
-        for id in 1..=orders {
-            source.push_at(
-                start + id * SEC / 50,
+    // The faulted phase: post the orders 20 ms apart and run past the first
+    // retries; the tail's power cycle may find a charge in flight.
+    let requests: Vec<(Duration, Request)> = (1..=orders)
+        .map(|id| {
+            (
+                Duration::from_millis(id * 20),
                 Request::new(Method::Post, format!("/orders/{id}")),
-            );
-        }
-        drop(run(sim, app, &mut source)?);
-    }
-    sim.restart();
-
-    // The fault-free tail (GUIDE §8): eight attempts back off 0.5 s doubling
-    // to 32 s, each with a 2 s deadline, well inside the 600 s horizon.
+            )
+        })
+        .collect();
+    let drive = Drive::new(sim, build_app);
+    let phase = drive.faulted_phase(&requests, Duration::from_secs(3))?;
+    // The fault-free tail: eight attempts back off 0.5 s doubling to 32 s,
+    // each with a 2 s deadline, well inside the 600 s horizon.
     calm.store(true, Ordering::Relaxed);
-    sim.quiesce_disk_faults();
-    sim.quiesce_outbound_faults();
-    sim.quiesce_clock_faults();
-    // An earlier step back can leave the clock behind the time the store
-    // recorded: `wait_out_clock_refusal` waits past the instant the refusal
-    // names, restarts the process and boots again. A kernel stop is named
-    // after the helper returns, so a refusal it gives the run up on is the
-    // detail as the kernel wrote it.
-    let mut stopped = false;
-    let tail = wait_out_clock_refusal(sim, || {
-        stopped = false;
-        let Some(app) = boot(sim)? else {
-            return match sim.gave_up() {
-                Some(_) => Ok(None),
-                None => Err("the fault-free tail could not boot".to_string()),
-            };
-        };
-        let horizon = sim.now().as_nanos() + 600 * SEC;
-        let ran = run(
-            sim,
-            app,
-            &mut SimSource::new(Box::new(sim.clock()), horizon),
-        )?;
-        stopped = ran.is_err();
-        ran.map(Some)
-    });
-    let Some(kernel) = tail.map_err(|e| match stopped {
-        true => format!("the fault-free tail's kernel stopped: {e}"),
-        false => e,
-    })?
-    else {
-        return Ok(());
+    let Some(recovered) = drive.recover(&phase, Duration::from_secs(600))? else {
+        return Ok(()); // given up by name
     };
 
-    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
+        .map_err(|e| e.to_string())?;
     keys_are_per_job(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {

@@ -4,21 +4,31 @@
 //! The notes, their bodies and their order are drawn with `sim.input()`, so a
 //! failure shrinks to the fewest, simplest notes that still fail.
 //!
+//! Each property drives the app with `charpente_sim::drive` (GUIDE §8, "A
+//! fault-free tail for an end-of-run check"), in four steps:
+//! 1. Boot: the app boots through fault fallout, booting again as a
+//!    supervisor would; a first boot that never gets past it leaves the
+//!    faulted phase empty, and the run goes on.
+//! 2. Faulted phase: the notes are posted through the production kernel loop
+//!    under the run's faults. A fault ends the phase, not the run, and the
+//!    replies already sent stand.
+//! 3. Fault-free tail: a power cycle, the faults switched off, a clock
+//!    refusal waited out, and the app booted again and run for a minute, so
+//!    every due job drains.
+//! 4. Re-send: the tail posts again every note the phase left unanswered, as
+//!    a client that never saw its answer would.
+//!
 //! Run them: `charpente test --sim`. Watch one fail: delete the `tx.enqueue`
 //! line in `src/lib.rs` and run again. Delete `tx.emit` and the third goes red.
 
-use charpente::core::db::Event;
-use charpente::core::event::EventRow;
+use std::time::Duration;
+
 use charpente::core::job::{JobRow, JobStatus};
-use charpente::core::table::Codec;
 use charpente::http::{App, Method, Request};
-use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, View};
 use charpente_sim::Sim;
-use charpente_sim::checks::{
-    boot_through_fallout, clock_fallout, durable_corruption_fired, is_fault_fallout,
-    wait_out_clock_refusal,
-};
+use charpente_sim::checks::{durable_corruption_fired, events};
+use charpente_sim::drive::{Drive, Recovered};
 use {{ident}}::{NewNote, Note, NoteAdded, build_app};
 
 charpente_sim::sim_tests! {
@@ -27,42 +37,21 @@ charpente_sim::sim_tests! {
     acked_post_implies_its_event_after_recovery require ["restart"],
 }
 
-const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
-
-/// Opens the app on this run's disk, retrying a boot that faults
-/// stopped. A boot refused for durable corruption gives up by name only where
-/// the harness injected some; anywhere else it is a durability bug and fails
-/// (GUIDE §8). `None` means it never booted, given up by name only for that
-/// refusal.
-fn open_app(sim: &Sim, fallout: impl Fn(&str) -> bool) -> Result<Option<App>, String> {
-    let boot = || build_app(Box::new(sim.disk()), Box::new(sim.entropy()));
-    boot_through_fallout(sim, 8, fallout, boot).map_err(|e| e.to_string())
+/// The app on this run's disk. The drive calls it once per boot.
+fn app(sim: &Sim) -> std::io::Result<App> {
+    build_app(Box::new(sim.disk()), Box::new(sim.entropy()))
 }
 
-/// Runs the production event loop against a scripted source under faults.
-/// Fault fallout ends this phase, not the run: the replies already sent
-/// stand, and the tail judges the recovery. The kernel also stops, or refuses
-/// to open, on a clock too far behind; that is fallout only where the
-/// harness's clock faults fired (`clock_fallout`, GUIDE §8).
-fn run_kernel(sim: &Sim, app: App, source: &mut SimSource) -> Result<(), String> {
-    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    match Kernel::new(app, Box::new(sim.clock())) {
-        Ok(mut kernel) => match kernel.run(source) {
-            Err(e) if !fallout(&e.to_string()) => Err(e.to_string()),
-            _ => Ok(()),
-        },
-        Err(e) if fallout(&e.to_string()) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// The recovered kernel and each acked note's id and body.
-type Recovered = (Kernel, Vec<(u64, String)>);
+/// The recovered tail and each note the faulted phase acked, with its body.
+type Acked = (Recovered, Vec<(u64, String)>);
 
 /// POST 1-4 drawn notes (bodies and order drawn too) under faults, crash, and
-/// recover in a fault-free tail. Returns the recovered kernel and each acked
-/// note's id and body — the only notes there is a claim about.
-fn post_then_crash(sim: &mut Sim) -> Result<Option<Recovered>, String> {
+/// recover in a fault-free tail. Returns the tail's kernel and each acked
+/// note's id and body — the only notes there is a claim about. A note the
+/// phase left unanswered may or may not have landed: the tail re-sends it,
+/// and its answer is the tail's (`Recovered::resent`), so no claim names it.
+/// `None` means the run was given up by name.
+fn post_then_crash(sim: &mut Sim) -> Result<Option<Acked>, String> {
     let input = sim.input();
     let count = input.between("notes", 1, 4);
     let mut ids: Vec<u64> = (1..=count).collect();
@@ -76,73 +65,48 @@ fn post_then_crash(sim: &mut Sim) -> Result<Option<Recovered>, String> {
             )
         })
         .collect();
+    // One note a millisecond, counted from the phase's start.
+    let requests: Vec<(Duration, Request)> = posts
+        .iter()
+        .enumerate()
+        .map(|(at, (id, body))| {
+            (
+                Duration::from_millis(at as u64),
+                Request::new(Method::Post, format!("/notes/{id}"))
+                    .json(&NewNote { body: body.clone() }),
+            )
+        })
+        .collect();
 
-    let Some(app) = open_app(sim, is_fault_fallout)? else {
-        if sim.gave_up().is_none() {
-            sim.give_up("the app never booted", "");
-        }
+    let drive = Drive::new(sim, app);
+    let phase = drive.faulted_phase(&requests, Duration::from_secs(2))?;
+    let Some(recovered) = drive.recover(&phase, Duration::from_secs(60))? else {
         return Ok(None);
     };
-    let mut source = SimSource::new(Box::new(sim.clock()), 2 * SEC);
-    for (at, (id, body)) in posts.iter().enumerate() {
-        source.push_at(
-            at as u64 * 1_000_000,
-            Request::new(Method::Post, format!("/notes/{id}"))
-                .json(&NewNote { body: body.clone() }),
-        );
-    }
-    let responses = source.responses();
-    run_kernel(sim, app, &mut source)?;
-    // The kernel answers in arrival order, one reply per POST.
-    let statuses: Vec<u16> = responses
-        .lock()
-        .map_err(|_| "responses lock poisoned".to_string())?
-        .iter()
-        .map(|(status, _)| *status)
-        .collect();
-    let acked: Vec<(u64, String)> = posts
+    let acked = posts
         .into_iter()
-        .zip(statuses)
-        .filter(|(_, status)| *status == 200)
-        .map(|(post, _)| post)
+        .enumerate()
+        .filter(|(i, _)| phase.status(*i) == Some(200))
+        .map(|(_, post)| post)
         .collect();
-    sim.restart();
-    Ok(recover(sim)?.map(|kernel| (kernel, acked)))
-}
-
-/// The fault-free tail (GUIDE §8): the faults that cost the claim its ack are
-/// over, so the recovery is judged whole. It boots through fallout already armed
-/// and waits out only a clock refusal, the one stop a frozen clock cures: an
-/// earlier step back can leave the clock behind the time the store recorded.
-fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
-    sim.quiesce_disk_faults();
-    sim.quiesce_clock_faults();
-    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    wait_out_clock_refusal(sim, || {
-        let Some(app) = open_app(sim, fallout)? else {
-            // A durable refusal gave the run up by name; with disk
-            // faults off, nothing else should stop a boot.
-            return match sim.gave_up() {
-                Some(_) => Ok(None),
-                None => Err("the fault-free tail could not boot".to_string()),
-            };
-        };
-        Kernel::new(app, Box::new(sim.clock()))
-            .map(Some)
-            .map_err(|e| e.to_string())
-    })
+    Ok(Some((recovered, acked)))
 }
 
 /// An acked write is durable: after a crash every acked row is still there.
 fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
-    let Some((kernel, acked)) = post_then_crash(sim)? else {
+    let Some((recovered, acked)) = post_then_crash(sim)? else {
         return Ok(());
     };
     if acked.is_empty() {
         sim.give_up("no POST was acked, so durability has nothing to prove", "");
         return Ok(());
     }
-    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
+        .map_err(|e| e.to_string())?;
     for (id, body) in &acked {
         match snap.get::<Note>(Id::from_raw(*id)) {
             Ok(Some(note)) if note.body == *body => {}
@@ -166,7 +130,8 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
 }
 
 /// An acked POST implies the job's effect once the queue has drained —
-/// through a crash in between. Two invariants hold under any fault schedule:
+/// through a crash in between, and the tail's minute drains it. Two
+/// invariants hold under any fault schedule:
 /// - Ack-durability: a 200 from `/notes/:id` committed its enqueue in the
 ///   same log record, so each acked note has an `Echo` job row.
 /// - Exactly-once: the notes marked `echoed` number exactly the `Echo` jobs
@@ -175,15 +140,15 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
 /// Delete `tx.enqueue` in `src/lib.rs`, or make `Echo::run` do nothing, and
 /// this goes red with a seed.
 fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), String> {
-    let Some((mut kernel, acked)) = post_then_crash(sim)? else {
+    let Some((recovered, acked)) = post_then_crash(sim)? else {
         return Ok(());
     };
-    // No requests this time: the loop just runs whatever is due, then idles
-    // for a minute. A source built mid-run adds `sim.now()` (GUIDE §8): the
-    // tail's wait can already have passed any absolute horizon.
-    let mut idle = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
-    kernel.run(&mut idle).map_err(|e| e.to_string())?;
-    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
+        .map_err(|e| e.to_string())?;
     let echo_jobs: Vec<JobRow> = snap
         .scan::<JobRow>()
         .map_err(|e| e.to_string())?
@@ -232,29 +197,24 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
 /// subscriber's resume reads. Delete `tx.emit` in `src/lib.rs` and this goes
 /// red with a seed.
 fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), String> {
-    let Some((kernel, acked)) = post_then_crash(sim)? else {
+    let Some((recovered, acked)) = post_then_crash(sim)? else {
         return Ok(());
     };
     if acked.is_empty() {
         sim.give_up("no POST was acked, so its event has nothing to prove", "");
         return Ok(());
     }
-    let rows: Vec<EventRow> = kernel
+    let snap = recovered
+        .kernel
         .app()
         .db()
         .snapshot()
-        .and_then(|snap| snap.scan_from(0, 4096))
         .map_err(|e| e.to_string())?;
-    let mut events = Vec::new();
-    for row in rows.iter().filter(|row| row.name == NoteAdded::NAME) {
-        events.push(
-            NoteAdded::decode(&mut &row.payload[..])
-                .map_err(|e| e.to_string())?
-                .note,
-        );
-    }
+    // Every page of the log, decoded as the app's own type (GUIDE §8, "The
+    // checkers").
+    let added = events::<NoteAdded>(&snap)?;
     for (id, _) in &acked {
-        let seen = events.iter().filter(|note| note.raw() == *id).count();
+        let seen = added.iter().filter(|e| e.note.raw() == *id).count();
         if seen == 1 {
             continue;
         }

@@ -64,7 +64,7 @@ item with the trigger that reopens it.
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/clock_restart/failover/hunts/outbound/
   realtime_resume/smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/guide_ships/hook_census/mutants_exclusions; sim-fixture: sim; merge-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/driver_census/guide_ships/hook_census/mutants_exclusions; sim-fixture: sim; merge-fixture: sim;
   outbound-fixture: sim; invoicing: describe_golden/sim). Every list is exhaustive as
   written — if a name is missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
@@ -163,6 +163,9 @@ item with the trigger that reopens it.
   byte-identical.
   `tests/mutants_exclusions.rs` pins the known-equivalent mutant list's size and demands a
   rationale per entry.
+  `tests/driver_census.rs` holds that no shipped example or scaffold template drives
+  recovery by hand (`wait_out_clock_refusal`, `boot_through_fallout`, a `fn recover`):
+  `charpente_sim::drive` is their only home, and an exemption is by path with its reason.
 - `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock
   binaries over real TCP, `kill -9`, TCP-proxy fault injection.
 - `crates/bench-harness` — the benchmark instrument, also outside the boundary. Each layer

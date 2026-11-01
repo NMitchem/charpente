@@ -47,10 +47,16 @@ impl Echo {
 }
 
 /// Three effects, one commit: the row, the job and the event all become
-/// true together or not at all. There is no way to split them.
+/// true together or not at all. There is no way to split them. A note that
+/// is already stored is answered as added and changes nothing: a client
+/// re-sends a POST it never saw answered, as the sim's tail does, and a note
+/// whose first send landed must not be echoed or announced twice.
 // `public`: the scaffold has no principals yet — GUIDE §5 (Sessions) is where `auth` starts.
 #[route(POST "/notes/:id", public)]
 fn add_note(tx: &mut Tx, id: Id<Note>, body: NewNote) -> Result<Id<Note>, ApiError> {
+    if tx.get(id)?.is_some() {
+        return Ok(id);
+    }
     tx.put(&Note {
         id,
         body: body.body,

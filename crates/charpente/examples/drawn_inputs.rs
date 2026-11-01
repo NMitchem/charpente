@@ -13,25 +13,33 @@
 //! `place_bid`'s `Some(best) if best.amount >= amount` arm, so the latest bid
 //! always wins, and run it again to watch that.
 //!
-//! Faults end the faulted phase, not the run. After a fault, or a power cycle,
-//! the app is rebooted in a fault-free tail and the recovered state is judged
-//! against the same bounds: "every acked bid is held" is exactly the
+//! Faults end the faulted phase, not the run, and the recovered state is
+//! judged against the same bounds: "every acked bid is held" is exactly the
 //! durability claim. Giving up at the first fault instead would skip nearly
-//! half the runs and test nothing about them (GUIDE §8, "A fault-free tail for
-//! an end-of-run check").
+//! half the runs and test nothing about them. `charpente_sim::drive` runs the
+//! four steps (GUIDE §8, "A fault-free tail for an end-of-run check"):
+//! 1. Boot: the app boots through fault fallout, booting again as a
+//!    supervisor would; a first boot that never gets past it leaves the
+//!    faulted phase empty, and the run goes on.
+//! 2. Faulted phase: the bids are posted under the run's faults. A fault ends
+//!    the phase, and the replies already sent stand.
+//! 3. Fault-free tail: a power cycle, the faults switched off, a clock
+//!    refusal waited out, and the app booted again.
+//! 4. Re-send: the tail sends again every bid the phase left unanswered, as a
+//!    client that never saw its ack would, and reports those answers apart.
+//!    This check merges them into its judgement itself.
 //!
 //! The same file is the shape of a `tests/sim.rs`: `sim_tests!` supplies
 //! `main`, which parses `--runs`, `--seed` and the rest, runs the batch and
 //! exits with its code.
 
+use std::time::Duration;
+
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
-use charpente::kernel::{Kernel, SimSource};
 use charpente::{Id, Schema, Tx, View, Wire, route, routes, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::{
-    boot_through_fallout, clock_fallout, durable_corruption_fired, is_fault_fallout,
-    wait_out_clock_refusal,
-};
+use charpente_sim::checks::durable_corruption_fired;
+use charpente_sim::drive::Drive;
 use serde::{Deserialize, Serialize};
 
 #[table(global)]
@@ -69,42 +77,16 @@ charpente_sim::sim_tests! {
     the_highest_acked_bid_stands require ["restart", "sometimes:judged_a_lab"],
 }
 
-const MS: u64 = 1_000_000; // SimSource timestamps are virtual nanoseconds
-
-fn open_app(sim: &Sim, fallout: impl Fn(&str) -> bool) -> Result<Option<App>, String> {
-    let open = || {
-        App::open(
-            Box::new(sim.disk()),
-            Schema::new().table::<Best>(),
-            Box::new(sim.entropy()),
-            AppConfig::default(),
-        )
-        .map(|app| app.mount(routes![place_bid]))
-    };
-    boot_through_fallout(sim, 8, fallout, open).map_err(|e| e.to_string())
-}
-
-/// The fault-free tail: the faults that cost a bid its ack are over, so the
-/// recovery is judged whole. It waits out only a clock refusal, the one stop
-/// a frozen clock cures: an earlier step back left the clock behind the time
-/// the store recorded, so `wait_out_clock_refusal` waits past the instant the
-/// refusal names and restarts.
-fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
-    sim.quiesce_disk_faults();
-    sim.quiesce_clock_faults();
-    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    wait_out_clock_refusal(sim, || {
-        let Some(app) = open_app(sim, fallout)? else {
-            // Only a durable refusal gives the run up here.
-            return match sim.gave_up() {
-                Some(_) => Ok(None),
-                None => Err("the fault-free tail could not boot".to_string()),
-            };
-        };
-        Kernel::new(app, Box::new(sim.clock()))
-            .map(Some)
-            .map_err(|e| e.to_string())
-    })
+/// How the app builds itself on the run's disk. The drive calls it once per
+/// boot.
+fn build_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Best>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![place_bid]))
 }
 
 /// The highest bid per lab stands, whatever order the bids arrive in, and
@@ -114,10 +96,11 @@ fn recover(sim: &Sim) -> Result<Option<Kernel>, String> {
 /// - the memo a lab holds is one that was sent for that lab.
 ///
 /// A bid with no ack may or may not have landed before the fault, and the
-/// tail re-sends it, so the claims bound the row rather than pin it. The
-/// re-send is optional: without it the tail judges only the bids the faulted
-/// phase acked. It weakens the durability claim only for a lab whose re-sent
-/// bid outranks a lost ack, since that lab holds the higher amount either way.
+/// tail re-sends it, so the claims bound the row rather than pin it. Merging
+/// the re-sent answers in weakens the durability claim only for a lab whose
+/// re-sent bid outranks a lost ack, since that lab holds the higher amount
+/// either way; without the merge the check judges only the bids the faulted
+/// phase acked.
 fn the_highest_acked_bid_stands(sim: &mut Sim) -> Result<(), String> {
     // Every draw is named and recorded: a failure lists them on its
     // `inputs:` line, shrunk, and `--inputs` replays them.
@@ -134,67 +117,35 @@ fn the_highest_acked_bid_stands(sim: &mut Sim) -> Result<(), String> {
         })
         .collect();
 
-    // The faulted phase. Fault fallout ends it, not the run: the replies
-    // already sent stand, and the tail judges the recovery.
-    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    let Some(app) = open_app(sim, is_fault_fallout)? else {
-        // A durable refusal already gave the run up by name.
-        if sim.gave_up().is_none() {
-            sim.give_up("the app never booted", "");
-        }
-        return Ok(());
-    };
-    let mut source = SimSource::new(Box::new(sim.clock()), 100 * MS);
-    for (at, b) in bids.iter().enumerate() {
-        source.push_at(at as u64 * MS, Request::new(Method::Post, "/bids").json(b));
-    }
-    let responses = source.responses();
-    match Kernel::new(app, Box::new(sim.clock())) {
-        Ok(mut kernel) => match kernel.run(&mut source) {
-            Err(e) if !fallout(&e.to_string()) => return Err(e.to_string()),
-            _ => {}
-        },
-        Err(e) if !fallout(&e.to_string()) => return Err(e.to_string()),
-        Err(_) => {}
-    }
-    // The kernel answers in arrival order, one reply per POST.
-    let mut statuses: Vec<u16> = responses
-        .lock()
-        .map_err(|_| "responses lock poisoned".to_string())?
+    // One bid a millisecond, counted from the phase's start.
+    let requests: Vec<(Duration, Request)> = bids
         .iter()
-        .map(|(status, _)| *status)
+        .enumerate()
+        .map(|(at, b)| {
+            (
+                Duration::from_millis(at as u64),
+                Request::new(Method::Post, "/bids").json(b),
+            )
+        })
         .collect();
-    statuses.resize(bids.len(), 0); // no reply: the fault came first
 
-    sim.restart();
-    let Some(mut kernel) = recover(sim)? else {
-        return Ok(());
+    let drive = Drive::new(sim, build_app);
+    let phase = drive.faulted_phase(&requests, Duration::from_millis(100))?;
+    let Some(recovered) = drive.recover(&phase, Duration::from_millis(100))? else {
+        return Ok(()); // given up by name, on a durable refusal
     };
-    // A client re-sends the bids it never saw acked. The fault-free tail acks
-    // them, so every run judges a merge that saw its bids, in a drawn order,
-    // across a power cycle. A source built mid-run adds `sim.now()`: the
-    // tail's wait can already have passed any absolute time.
-    let start = sim.now().as_nanos();
-    let mut retry = SimSource::new(Box::new(sim.clock()), start + 100 * MS);
-    let unacked: Vec<usize> = (0..bids.len()).filter(|i| statuses[*i] != 200).collect();
-    for (at, i) in unacked.iter().enumerate() {
-        retry.push_at(
-            start + at as u64 * MS,
-            Request::new(Method::Post, "/bids").json(&bids[*i]),
-        );
-    }
-    let retried = retry.responses();
-    kernel.run(&mut retry).map_err(|e| e.to_string())?;
-    let replies: Vec<u16> = retried
-        .lock()
-        .map_err(|_| "responses lock poisoned".to_string())?
-        .iter()
-        .map(|(status, _)| *status)
+    // The tail acks what it re-sent, so every run judges a merge that saw its
+    // bids, in a drawn order, across a power cycle. A re-sent bid's answer is
+    // the tail's; any other bid's is the phase's, `None` for none.
+    let statuses: Vec<Option<u16>> = (0..bids.len())
+        .map(|i| recovered.status(i).or(phase.status(i)))
         .collect();
-    for (i, status) in unacked.iter().zip(replies) {
-        statuses[*i] = status;
-    }
-    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
+        .map_err(|e| e.to_string())?;
     let mut judged = false;
     for lab in [1u64, 2] {
         let sent = || {
@@ -203,7 +154,7 @@ fn the_highest_acked_bid_stands(sim: &mut Sim) -> Result<(), String> {
                 .filter(|(b, _)| b.lab.raw() == lab)
         };
         let acked_max = sent()
-            .filter(|(_, s)| **s == 200)
+            .filter(|(_, s)| **s == Some(200))
             .map(|(b, _)| b.amount)
             .max();
         let sent_max = sent().map(|(b, _)| b.amount).max();

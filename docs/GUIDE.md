@@ -3028,12 +3028,13 @@ declares its own tables, routes and jobs.
 
 | Example | File, in the `charpente` crate | It shows |
 |---|---|---|
-| `drawn_inputs` | `examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them, and a `require` on a key the check marks when it judged something |
-| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch for the fault-free tail, and the three outbound checkers |
-| `restart_under_faults` | `examples/restart_under_faults.rs` | `boot_through_fallout`, a restart, a fault-free tail that waits out a clock refusal, and a `require ["restart"]` |
+| `drawn_inputs` | `examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them and merges the tail's re-sent answers into its judgement, and a `require` on a key the check marks when it judged something |
+| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch flipped between the faulted phase and the tail, a route safe to receive twice, and the three outbound checkers |
+| `restart_under_faults` | `examples/restart_under_faults.rs` | the recovery drive's four steps over a power cycle, a claim about the faulted phase's acks only, and a `require ["restart"]` |
 
-In all three a skipped run gives a constant `reason` and puts the run's own
-text in the `detail`. The files are in the registry copy of the crate, under
+All three drive the app with `charpente_sim::drive` ("A fault-free tail for an
+end-of-run check" below). In all three a skipped run gives a constant `reason`
+and puts the run's own text in the `detail`. The files are in the registry copy of the crate, under
 `crates/charpente/examples/` in a checkout, and this guide is the
 `charpente::guide` page on docs.rs.
 
@@ -3302,6 +3303,77 @@ invisible before the split was printed, and is the entire reason it is.
 
 ### A fault-free tail for an end-of-run check
 
+A recovery under faults is four steps, and `charpente_sim::drive` runs them.
+The app supplies how it builds itself on the run's sim and what to send;
+"Driving the whole app in a sim" below has a compiled workload built on it.
+
+```text
+let drive = Drive::new(sim, build_app); // build_app: Fn(&Sim) -> io::Result<App>
+let phase = drive.faulted_phase(&requests, Duration::from_secs(2))?; // steps 1 and 2
+calm.store(true, Ordering::Relaxed); // a remote model's own switch stays yours
+let Some(recovered) = drive.recover(&phase, Duration::from_secs(60))? else {
+    return Ok(()); // given up by name
+}; // steps 3 and 4
+let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
+```
+
+1. **Boot through fallout.** `faulted_phase` boots the app with
+   `boot_through_fallout` (below), up to eight boots, restarting between
+   them as a supervisor would. A first boot that never gets past fault
+   fallout is no give-up: the phase is empty, and `recover` sends
+   everything. In every step, fault fallout means `is_fault_fallout(t) ||
+   clock_fallout(sim, t)`.
+2. **A faulted phase.** The requests, each an offset from the instant the app
+   booted and in arrival order, run through one kernel under the run's faults
+   until nothing is left inside the horizon. The kernel gets the sim's
+   outbound handle exactly when the app declares hosts. Fault fallout ends
+   the phase: it is the crash under test, never a give-up and never a skip,
+   and the answers already recorded stand. `phase.answers[i]` is request
+   `i`'s `(status, body)`, or `None` when it went unanswered;
+   `phase.status(i)` is its status.
+3. **A fault-free tail.** `recover` power-cycles (`sim.restart()`),
+   quiesces the disk and clock faults, and the outbound faults when the app
+   declares hosts. It waits out a clock refusal, boots, and runs the kernel to
+   `tail` past the instant it booted, so due jobs, retries and cron drain. A
+   remote model's own switches, such as `modelled_remote`'s `calm`, stay in
+   your code: flip them between the two calls.
+4. **Re-send what went unanswered.** Every request whose answer is `None`,
+   or a 5xx whose body is fault fallout, is sent again at the tail's start. A
+   4xx, or a handler's own 5xx, is the app's answer and is not re-sent. The
+   re-sent answers come back in `recovered.resent`, apart from the phase's,
+   because a request that went unanswered may or may not have landed. So a
+   claim about acked requests reads `phase.status(i) == Some(200)`, and a
+   check that wants the two merged merges them itself
+   (`examples/drawn_inputs.rs`). The re-send is a client's retry, so a route
+   must be safe to receive twice: a POST whose first send landed before its
+   answer was lost comes again. `modelled_remote`'s `place_order` and the
+   scaffold's `add_note` answer a row that already landed and change nothing.
+
+`recover` gives `Ok(None)` when the run gave up by name: on a boot refused for
+durable corruption, or on a clock refusal that outlasted two waits. Return
+`Ok(())` then. Its errors fail the run:
+
+- `the fault-free tail could not boot`: every boot met fault fallout, and
+  nothing gave the run up.
+- `the fault-free tail could not boot: <error>`: a boot, or the kernel's
+  build, failed with an error of its own.
+- `the fault-free tail's kernel stopped: <error>`, in the kernel's words.
+- `the app calls <host>, but the workload registered no model for it — call
+  sim.remote("<host>", …) before Drive::faulted_phase`, from either call.
+
+**When to drop below the helper.** `Drive` is one faulted phase and one tail.
+A workload with more than that builds it from the pieces this section and
+"Driving the whole app in a sim" describe: `boot_through_fallout`,
+`Kernel::new` or `Kernel::with_outbound` over a `SimSource`, the quiesce calls
+below and `wait_out_clock_refusal`. Examples are several faulted rounds, a
+supervisor loop inside the phase, a script that reads one phase's answers to
+build the next, several nodes, a check between the phase and the tail, and a
+tail that must not re-send. Keep each step's rule as `Drive` has it:
+- use the fallout filter in every step;
+- treat a crash in the faulted phase as the crash under test, not a skip;
+- quiesce before the tail boots, and wait out a clock refusal;
+- give up only on a durable refusal.
+
 A check that runs at the end of a run — a checkpoint, a graceful close, a
 byte comparison of two nodes' files — does IO, and the run's
 `FaultConfig` still applies to it. "No fault has fired so far" is a fact about
@@ -3348,8 +3420,8 @@ instant. Sleep a little past it (`sim.clock().sleep(…)`), restart the process 
 refused node exits, and its supervisor starts it again), and boot again. One
 wait is enough, since nothing moves the clock or the recorded time in between.
 Bound the loop anyway, and give the run up by name once the bound is spent.
-`wait_out_clock_refusal(sim, boot)` (below) is that loop, and the worked
-example in "Calling the outside world in a sim" uses it.
+`wait_out_clock_refusal(sim, boot)` (below) is that loop, and `Drive::recover`
+runs it around the tail's boot.
 
 ### Restarting the process, not the machine
 
@@ -3539,8 +3611,8 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   again, twice at most: a third refusal gives the run up as `the tail was
   refused after two waits`, with the refusal as its detail. Any other error,
   the stall stop included, comes back unchanged. Call it after
-  `sim.quiesce_clock_faults()`; the worked example in "Calling the outside
-  world in a sim" uses it, and so do the three examples.
+  `sim.quiesce_clock_faults()`; `Drive::recover` runs it around the tail's
+  boot, so only a workload below the helper calls it.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
@@ -3783,67 +3855,45 @@ The workloads above drive `Db` directly. The full app — routes, jobs, and
 cron multiplexed on one loop — is just as drivable, because the loop itself
 (`charpente::kernel::Kernel`) sits inside the deterministic boundary:
 `charpente::serve` (§5) runs it against hyper's channel in production; a
-sim test runs the identical loop code against a scripted timeline. Three
-pieces:
+sim test runs the identical loop code against a scripted timeline.
+`charpente_sim::drive` runs that loop through the four steps of "A fault-free
+tail for an end-of-run check" above, and the example below is built on it.
 
-- **Requests** are built with the public builder: `Request::new(Method::Post,
-  "/hit")`, then `.header(key, value)` (keys are lowercased for you) and
-  `.json(&value)` for a JSON body. An authenticated request carries its
-  session token (§5) the same way production traffic does:
-  `.header("authorization", format!("Bearer {token}"))`.
-- **`SimSource`** is the scripted request source.
-  `SimSource::new(Box::new(sim.clock()), horizon_nanos)` bounds the
-  run at a virtual-time horizon; `push_at(at_nanos, request)`
-  schedules arrivals (in arrival order — pushing out of order is an
-  assert). Both times are absolute virtual nanoseconds on the run's
-  clock, not offsets: a source built mid-run adds
-  `sim.now().as_nanos()`. `responses()` hands back a shared handle to the recorded
-  `(status, body)` pairs, filled in as the kernel replies: one entry per
-  request the kernel served (an SSE upgrade's opening response included), in
-  arrival order. A request it never served, past the horizon or after `run`
-  stopped on a poisoned engine, records nothing, so the entries are a prefix
-  of the script and entry `i` answers the `i`-th push.
-- **`Kernel::new(app, Box::new(sim.clock()))`** consumes the mounted `App`
-  (upserting cron rows and rebuilding the job due-heap — §6, §7);
-  `kernel.run(&mut source)` then serves scripted requests at their virtual
-  arrival times, runs due jobs, and ticks cron, exactly as in production —
-  and since sleeping through an empty stretch just advances the virtual
-  clock, a two-hour run finishes in milliseconds. `run` returns
-  `Ok(())` once nothing is left inside the horizon, `Err` if the engine
-  poisoned mid-run (§9), or on a clock stop ("Wall time and its faults"). Afterwards, `kernel.stats()` snapshots the loop's
-  counters (`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`,
-  `cron_ticks`, `cron_catchups`, and §6's outbound counters) and
-  `kernel.app().db().snapshot()` reads the durable end-state. The kernel
-  keeps its `App` for life: building it moved the app's job definitions,
-  outbound hosts and cron entries into the kernel, so there is no second
-  kernel on the same `App`. To go on, `run` the same kernel again against
-  another `SimSource`, or restart (`sim.restart_process()`, or
-  `sim.restart()` for a power cycle), rebuild the app and build a new
-  kernel; the paragraph after the example says when each fits. A job
-  enqueued between two runs of one kernel, through
-  `kernel.app_mut_for_tests().transact_for_tests(|tx| …)`, is picked up when
-  the next `run` starts. A tenant's
-  rows read through `snap.scan_scoped::<R>(tenant)`
-  and `snap.get_scoped(tenant, id)`, where `tenant` is its raw id (§16). The job
-  queue reads through `snap.scan::<JobRow>()`; `charpente::core::job::JobRow`'s
-  fields are all `pub`: `id: Id<JobRow>`, `name: String`, `payload: Vec<u8>`,
-  `key: Option<String>`, `status: JobStatus` (`Pending`, `Done` or `Dead`),
-  `attempts: u32`, `due_at: WallTime` (`charpente::core::io::WallTime`;
-  `WallTime::UNIX_EPOCH` means due now), `last_error: Option<String>`, `shape:
-  Option<u64>`, `scope: Option<u64>` (the tenant's raw id; `None` for a global
-  job) and `outbound_key: Option<[u8; 16]>` (`Some` on an outbound job: the
-  bytes of the key its calls carry, as a `Delivered`'s `key.as_bytes()`
-  returns them, below). An app that mounts an outbound job builds its kernel with
-  `Kernel::with_outbound` instead (§6, "When a call fails").
+**Requests** are built with the public builder: `Request::new(Method::Post,
+"/hit")`, then `.header(key, value)` (keys are lowercased for you) and
+`.json(&value)` for a JSON body. An authenticated request carries its
+session token (§5) the same way production traffic does:
+`.header("authorization", format!("Bearer {token}"))`. `Drive::faulted_phase`
+takes each with the offset it arrives at, counted from the instant the app
+booted.
+
+**The end state.** `recovered.kernel` is the tail's kernel, which keeps its
+`App`. `kernel.app().db().snapshot()` reads the durable end-state, and
+`kernel.stats()` snapshots the loop's counters for the tail's run
+(`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`, `cron_ticks`,
+`cron_catchups`, and §6's outbound counters). A tenant's
+rows read through `snap.scan_scoped::<R>(tenant)`
+and `snap.get_scoped(tenant, id)`, where `tenant` is its raw id (§16). The job
+queue reads through `snap.scan::<JobRow>()`; `charpente::core::job::JobRow`'s
+fields are all `pub`: `id: Id<JobRow>`, `name: String`, `payload: Vec<u8>`,
+`key: Option<String>`, `status: JobStatus` (`Pending`, `Done` or `Dead`),
+`attempts: u32`, `due_at: WallTime` (`charpente::core::io::WallTime`;
+`WallTime::UNIX_EPOCH` means due now), `last_error: Option<String>`, `shape:
+Option<u64>`, `scope: Option<u64>` (the tenant's raw id; `None` for a global
+job) and `outbound_key: Option<[u8; 16]>` (`Some` on an outbound job: the
+bytes of the key its calls carry, as a `Delivered`'s `key.as_bytes()`
+returns them, below).
 
 One mindset note before the example: under `charpente test --sim`, every
 run gets its own swarm-sampled fault matrix, so exact-trace assertions
 ("exactly 3 requests, exactly 5 jobs done") will fail whenever a fault
-fires. Assert *invariants* — claims that hold under any fault schedule —
-and classify operational failures with `is_fault_fallout`, like the
-`Db`-level workload above, plus `clock_fallout(sim, text)` for a clock stop or
-refusal, which `is_fault_fallout` alone never excuses (the example below
-and "Wall time and its faults" show the filter). (For an exact-trace test, build your own
+fires. Assert *invariants* — claims that hold under any fault schedule.
+`Drive` classifies the kernel's own failures. After the tail, the disk's
+faults are off, so an error in the end-state check is a real failure. A
+workload below the helper classifies its own with `is_fault_fallout`, like
+the `Db`-level workload above, plus `clock_fallout(sim, text)` for a clock
+stop or refusal, which `is_fault_fallout` alone never excuses ("Wall time and
+its faults"). (For an exact-trace test, build your own
 fault-free world inside the workload: `Sim::with_faults(seed,
 FaultConfig::none())`.)
 
@@ -3851,16 +3901,14 @@ FaultConfig::none())`.)
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, Id};
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
-use charpente::kernel::{JobError, Kernel, SimSource};
+use charpente::kernel::JobError;
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::{clock_fallout, is_fault_fallout};
+use charpente_sim::drive::Drive;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
-
-const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
 
 #[table(global)]
 struct Counter {
@@ -3920,7 +3968,7 @@ fn build_app(sim: &Sim) -> std::io::Result<App> {
 ///   enqueue in the same log record, so at least `acked` request-slot
 ///   CountUp rows exist. `>=`, not `==`: a request that got a 500 for a
 ///   platform Io failure is ambiguous (§4) — its record may have landed
-///   anyway.
+///   anyway, and the tail sends it again.
 /// - Exactly-once (§6), checked from the outside: per slot, counter hits
 ///   ≡ Done job rows — a handler's effects and its Done-mark commit as one
 ///   record, so no fault schedule can split them.
@@ -3958,80 +4006,80 @@ fn check_invariants(app: &App, acked: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// One whole-app run: three requests arrive over three virtual
-/// seconds, each enqueueing a job; an hourly cron schedule ticks twice
-/// before the two-hour horizon; then the durable end-state is checked.
+/// One whole-app run: three requests arrive over three virtual seconds
+/// under the run's faults, each enqueueing a job; the fault-free tail runs
+/// two hours, so the hourly schedule ticks twice and every job drains; then
+/// the durable end-state is checked.
 fn whole_app(sim: &mut Sim) -> Result<(), String> {
-    // Each fault-fallout exit gives up: the run checked nothing, and a
-    // pass needs a verdict ("Giving up" above).
-    let app = match build_app(sim) {
-        Ok(app) => app,
-        Err(e) if is_fault_fallout(&e.to_string()) => {
-            sim.give_up("the app never booted", e);
-            return Ok(());
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-
-    let mut source = SimSource::new(Box::new(sim.clock()), 2 * 3600 * SEC + SEC);
-    for slot in 0..3u64 {
-        source.push_at(
-            slot * SEC,
-            Request::new(Method::Post, "/hit").json(&HitBody { slot: WireU64(slot) }),
-        );
-    }
-    let responses = source.responses();
-
-    // A kernel also stops, or refuses to open, on a clock too far behind:
-    // fallout only where the harness's clock faults acted ("Wall time and
-    // its faults" above).
-    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
-        Ok(kernel) => kernel,
-        Err(e) if fallout(&e.to_string()) => {
-            sim.give_up("Kernel::new hit fault fallout", e);
-            return Ok(());
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    // The same event loop `serve` runs in production. An `Err` here means
-    // the engine poisoned mid-run, or the clock stopped it — under an
-    // injected fault schedule that is fallout, not a bug.
-    if let Err(e) = kernel.run(&mut source)
-        && !fallout(&e.to_string())
-    {
-        return Err(e.to_string());
-    }
-
-    let stats = kernel.stats();
-    if stats.requests > 0 {
+    let requests: Vec<(Duration, Request)> = (0..3u64)
+        .map(|slot| {
+            (
+                Duration::from_secs(slot),
+                Request::new(Method::Post, "/hit").json(&HitBody { slot: WireU64(slot) }),
+            )
+        })
+        .collect();
+    let drive = Drive::new(sim, build_app);
+    // Steps 1 and 2: fault fallout ends the phase, never the run, and a first
+    // boot lost to it leaves the phase empty.
+    let phase = drive.faulted_phase(&requests, Duration::from_secs(10))?;
+    if phase.answers.iter().any(Option::is_some) {
         sim.cover("kernel:served"); // pair with `require ["kernel:served"]`
     }
-    let acked = responses
-        .lock()
-        .map_err(|_| "responses lock poisoned".to_string())?
-        .iter()
-        .filter(|(status, _)| *status == 200)
+    // Steps 3 and 4: a power cycle, then a fault-free tail that re-sends what
+    // went unanswered and runs two hours past its boot.
+    let Some(recovered) = drive.recover(&phase, Duration::from_secs(2 * 3600 + 1))? else {
+        return Ok(()); // given up by name, on a durable refusal
+    };
+    // Only the phase's 200s are acks a client saw before the crash; the
+    // tail's answers to what it re-sent are `recovered.resent`.
+    let acked = (0..requests.len())
+        .filter(|&i| phase.status(i) == Some(200))
         .count() as u64;
-
-    match check_invariants(kernel.app(), acked) {
-        Ok(()) => Ok(()),
-        // The oracle's own reads go through the same faulted disk (e.g. the
-        // store can latch after an earlier injected write error): fallout
-        // ends the run with nothing asserted, a give-up; anything else is
-        // real.
-        Err(msg) if is_fault_fallout(&msg) => {
-            sim.give_up("the invariant check hit fault fallout", msg);
-            Ok(())
-        }
-        Err(msg) => Err(msg),
-    }
+    check_invariants(recovered.kernel.app(), acked)
 }
 ```
 
 Register it like any workload — add `whole_app require ["kernel:served"]`
-to the `sim_tests! { ... }` list. Nothing limits a run to one script,
-either: `run` returns once nothing is left inside the horizon, and the same kernel can
+to the `sim_tests! { ... }` list.
+
+**Below the helper.** These are the pieces `Drive` is built from, for a
+workload that needs more than one faulted phase and one tail ("When to drop
+below the helper" above):
+
+- **`SimSource`** is the scripted request source.
+  `SimSource::new(Box::new(sim.clock()), horizon_nanos)` bounds the
+  run at a virtual-time horizon; `push_at(at_nanos, request)`
+  schedules arrivals (in arrival order — pushing out of order is an
+  assert). Both times are absolute virtual nanoseconds on the run's
+  clock, not offsets: a source built mid-run adds
+  `sim.now().as_nanos()`. `responses()` hands back a shared handle to the recorded
+  `(status, body)` pairs, filled in as the kernel replies: one entry per
+  request the kernel served (an SSE upgrade's opening response included), in
+  arrival order. A request it never served, past the horizon or after `run`
+  stopped on a poisoned engine, records nothing, so the entries are a prefix
+  of the script and entry `i` answers the `i`-th push.
+- **`Kernel::new(app, Box::new(sim.clock()))`** consumes the mounted `App`
+  (upserting cron rows and rebuilding the job due-heap — §6, §7);
+  `kernel.run(&mut source)` then serves scripted requests at their virtual
+  arrival times, runs due jobs, and ticks cron, exactly as in production —
+  and since sleeping through an empty stretch just advances the virtual
+  clock, a two-hour run finishes in milliseconds. `run` returns
+  `Ok(())` once nothing is left inside the horizon, `Err` if the engine
+  poisoned mid-run (§9), or on a clock stop ("Wall time and its faults"). The kernel
+  keeps its `App` for life: building it moved the app's job definitions,
+  outbound hosts and cron entries into the kernel, so there is no second
+  kernel on the same `App`. To go on, `run` the same kernel again against
+  another `SimSource`, or restart (`sim.restart_process()`, or
+  `sim.restart()` for a power cycle), rebuild the app and build a new
+  kernel; the next paragraph says when each fits. A job
+  enqueued between two runs of one kernel, through
+  `kernel.app_mut_for_tests().transact_for_tests(|tx| …)`, is picked up when
+  the next `run` starts. An app that mounts an outbound job builds its kernel with
+  `Kernel::with_outbound` instead (§6, "When a call fails").
+
+Nothing limits a run to one script: `run` returns once nothing is left
+inside the horizon, and the same kernel can
 be `run` again against a second `SimSource` — script a login phase, read
 the token out of its recorded responses, then script the authenticated
 phase with `.header("authorization", format!("Bearer {token}"))`. A kernel
@@ -4228,10 +4276,13 @@ sampled values are unchanged:
 ### Calling the outside world in a sim
 
 An app with an outbound job is driven the way "Driving the whole app in a sim"
-drives any app, with two additions: a model behind each declared host, and a
-kernel built with `Kernel::with_outbound` over the sim's handle. Build the handle
-before the kernel, since `sim.outbound(&app.outbound_hosts())` borrows the app
-that `Kernel::with_outbound` takes. The workload below takes two orders under the
+drives any app, with one addition: a model behind each declared host,
+registered with `sim.remote` before `Drive::faulted_phase`. `Drive` builds each
+kernel with `Kernel::with_outbound` over the sim's handle exactly when the app
+declares hosts, and quiesces the outbound faults in the tail. Below the
+helper, build the handle before the kernel, since
+`sim.outbound(&app.outbound_hosts())` borrows the app that
+`Kernel::with_outbound` takes. The workload below takes two orders under the
 run's faults, then runs the fault-free tail ("A fault-free tail" above) and
 calls the three outbound checkers:
 
@@ -4239,19 +4290,19 @@ calls the three outbound checkers:
 use charpente::core::job::JobRow;
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
-use charpente::kernel::{JobError, Kernel, SimSource};
+use charpente::kernel::JobError;
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    boot_through_fallout, calls_have_durable_jobs, clock_fallout, durable_corruption_fired,
-    is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon, wait_out_clock_refusal,
+    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_job,
+    outbound_settles_by_horizon,
 };
+use charpente_sim::drive::Drive;
 use charpente_sim::outbound::{Idempotent, Recorder};
 use serde::{Deserialize, Serialize};
-
-const SEC: u64 = 1_000_000_000;
+use std::time::Duration;
 
 #[table(global)]
 struct Receipt {
@@ -4299,10 +4350,13 @@ struct OrderBody {
 
 #[route(POST "/order", public)]
 fn order(tx: &mut Tx, body: OrderBody) -> Result<WireU64, ApiError> {
-    tx.put(&Receipt {
-        id: Id::from_raw(body.order.0),
-        sent: false,
-    });
+    let id: Id<Receipt> = Id::from_raw(body.order.0);
+    // The tail re-sends an order the phase left unanswered: one that landed
+    // anyway is answered as placed, with no second receipt.
+    if tx.get(id)?.is_some() {
+        return Ok(body.order);
+    }
+    tx.put(&Receipt { id, sent: false });
     tx.enqueue(SendReceipt {
         order: body.order.0,
     });
@@ -4326,77 +4380,31 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         "mail.example",
         Idempotent::header("idempotency-key", Recorder::new()),
     );
-    let fallout = |text: &str| is_fault_fallout(text) || clock_fallout(sim, text);
-    let Some(app) = boot_through_fallout(sim, 8, fallout, || build_app(sim))
-        .map_err(|e| e.to_string())?
-    else {
-        if sim.gave_up().is_none() {
-            sim.give_up("the app never booted", "");
-        }
+    let requests: Vec<(Duration, Request)> = (0..2u64)
+        .map(|order| {
+            (
+                Duration::from_secs(order),
+                Request::new(Method::Post, "/order").json(&OrderBody {
+                    order: WireU64(order),
+                }),
+            )
+        })
+        .collect();
+    let drive = Drive::new(sim, build_app);
+    let phase = drive.faulted_phase(&requests, Duration::from_secs(30))?;
+    // The tail's power cycle may find a call in flight; the job is still
+    // Pending, and its next call carries the same key. 600 s is past every
+    // backoff and deadline, with room to spare.
+    let Some(recovered) = drive.recover(&phase, Duration::from_secs(600))? else {
         return Ok(());
     };
-    let mut source = SimSource::new(Box::new(sim.clock()), 30 * SEC);
-    for order in 0..2u64 {
-        source.push_at(
-            order * SEC,
-            Request::new(Method::Post, "/order").json(&OrderBody {
-                order: WireU64(order),
-            }),
-        );
-    }
-    let outbound = sim
-        .outbound(&app.outbound_hosts())
-        .map_err(|e| e.to_string())?;
-    match Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)) {
-        Ok(mut kernel) => {
-            if let Err(e) = kernel.run(&mut source)
-                && !fallout(&e.to_string())
-            {
-                return Err(e.to_string());
-            }
-        }
-        Err(e) if fallout(&e.to_string()) => {}
-        Err(e) => return Err(e.to_string()),
-    }
 
-    // The fault-free tail. The power cycle may leave a call in flight; the
-    // job is still Pending, and its next call carries the same key.
-    sim.restart();
-    sim.quiesce_disk_faults();
-    sim.quiesce_outbound_faults();
-    sim.quiesce_clock_faults();
-    // An earlier step back can leave the clock behind the time the store
-    // recorded, so the open is refused. The clock's offset is frozen now, and
-    // `wait_out_clock_refusal` waits past the instant the refusal names,
-    // restarts the process and boots again.
-    let Some(mut kernel) = wait_out_clock_refusal(sim, || {
-        let Some(app) = boot_through_fallout(sim, 8, fallout, || build_app(sim))
-            .map_err(|e| e.to_string())?
-        else {
-            // A durable refusal gives the run up by name; with disk
-            // faults off, nothing else should stop a boot.
-            return match sim.gave_up() {
-                Some(_) => Ok(None),
-                None => Err("the fault-free tail could not boot".to_string()),
-            };
-        };
-        let outbound = sim
-            .outbound(&app.outbound_hosts())
-            .map_err(|e| e.to_string())?;
-        Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound))
-            .map(Some)
-            .map_err(|e| e.to_string())
-    })?
-    else {
-        return Ok(());
-    };
-    // Past every backoff and deadline, with room to spare.
-    let horizon = sim.now().as_nanos() + 600 * SEC;
-    kernel
-        .run(&mut SimSource::new(Box::new(sim.clock()), horizon))
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
         .map_err(|e| e.to_string())?;
-
-    let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
     keys_are_per_job(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
@@ -4415,12 +4423,13 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
 ```
 
 Register it as `receipts_settle_under_faults require ["outbound:checked"]`. A
-run in which neither order committed passes all three checkers having
-checked nothing, which is why the coverage key is marked only where an
-outbound job exists. One kernel per faulted phase, as here, leaves room for
-that: under a swarm's `sync_error`, a kernel can poison early in a round and
-`run` stops, leaving the rest of the script unanswered (`responses()` above).
-A workload that wants verdicts runs the phase as a supervisor loop: restart
+run in which no order committed passes all three checkers having checked
+nothing, which is why the coverage key is marked only where an outbound job
+exists. The tail places again what the phase left unanswered, so such a run
+is rare. `Drive`'s faulted phase is one kernel: under a swarm's `sync_error`,
+a kernel can poison early and `run` stops, leaving the rest of the phase's
+script for the tail. A workload that wants more of its work done under
+faults drops below the helper and runs the phase as a supervisor loop: restart
 the process (`sim.restart_process()`, or `sim.restart()` once
 `sim.disk_crashed()`), boot through `boot_through_fallout`, build a fresh
 handle and kernel, and re-send in a new `SimSource` every request past the end
@@ -6938,18 +6947,30 @@ fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
         return Ok(());
     };
     let got: Vec<u64> = resumed.frames().iter().map(|f| f.id).collect();
-    // Every event the log holds after the cursor, in order, exactly once.
-    let logged: Vec<EventRow> = match kernel.app().db().snapshot().and_then(|snap| {
-        snap.scan_from(cursor.id + 1, 64)
-    }) {
-        Ok(rows) => rows,
+    // Every event the log holds after the cursor, in order, exactly once. It
+    // is read a page at a time until a short page: one capped `scan_from`
+    // would cut a log longer than the page and compare only its prefix.
+    let read_log = || -> std::io::Result<Vec<u64>> {
+        let snap = kernel.app().db().snapshot()?;
+        let mut ids = Vec::new();
+        let mut from = cursor.id + 1;
+        loop {
+            let page: Vec<EventRow> = snap.scan_from(from, 64)?;
+            ids.extend(page.iter().map(|row| row.id.raw()));
+            match page.last() {
+                Some(last) if page.len() == 64 => from = last.id.raw() + 1,
+                _ => return Ok(ids),
+            }
+        }
+    };
+    let want = match read_log() {
+        Ok(ids) => ids,
         Err(e) if fallout(&e.to_string()) => {
             sim.give_up("reading the event log hit fault fallout", e);
             return Ok(());
         }
         Err(e) => return Err(e.to_string()),
     };
-    let want: Vec<u64> = logged.iter().map(|row| row.id.raw()).collect();
     if got != want {
         return Err(format!(
             "the resumed connection received {got:?}, but the log holds {want:?} after the \
