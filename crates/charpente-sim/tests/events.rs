@@ -116,6 +116,9 @@ fn events_reads_past_one_page() {
     assert_eq!(got, (0..total).collect::<Vec<_>>());
 }
 
+/// The fix clause every "does not decode" error ends on (hard rule 5).
+const UNDECODABLE: &str = " — it was written by a different shape of the event, through a change inside a type one of its fields holds, which the fingerprint cannot see (GUIDE §12), so read it with the type that wrote it; if no such type changed, the stored bytes are corrupt";
+
 /// A hand-written event type reading `Opened`'s rows: same name, so the
 /// reader selects them; `fingerprint` and decode are the knobs.
 macro_rules! reads_opened_as {
@@ -165,7 +168,7 @@ fn a_payload_that_does_not_decode_names_the_event_and_row() {
     assert_eq!(
         err,
         format!(
-            "events: event \"{name}\" row {id} does not decode: row decode: needed 8 bytes for u64, 0 left — schema drift or corruption"
+            "events: event \"{name}\" row {id} does not decode: row decode: needed 8 bytes for u64, 0 left — schema drift or corruption{UNDECODABLE}"
         ),
         "{err}"
     );
@@ -187,7 +190,7 @@ fn bytes_left_over_after_the_payload_are_an_err() {
     assert_eq!(
         err,
         format!(
-            "events: event \"{name}\" row {id} does not decode: 7 bytes left over after the payload"
+            "events: event \"{name}\" row {id} does not decode: 7 bytes left over after the payload{UNDECODABLE}"
         ),
         "{err}"
     );
@@ -204,15 +207,21 @@ fn a_row_written_under_another_shape_is_an_err_naming_both_fingerprints() {
         err,
         format!(
             "events: event \"{name}\" row {id} was written under fingerprint {written:#018x}, \
-             but this type's is 0x0000000000001234; the log holds another shape of the event"
+             but this type's is 0x0000000000001234; the log holds another shape of the event — \
+             read it with the type that wrote it (a changed event is a new #[event] type under a \
+             new name, GUIDE §11)"
         ),
         "{err}"
     );
 }
 
-/// The first page ends on a row `events` skips (a `Closed`), so the next page
-/// must start after it: a cursor that advanced only on matches would reread
-/// it forever or drop what follows.
+/// The first page ends on a row `events` skips (a `Closed`), so it holds one
+/// match fewer than it has rows: a reader that ended on a page short of
+/// matches, not of rows, would stop here and drop the two rows after it. A
+/// cursor that advanced only past matched rows passes this test: page 2
+/// starts on the skipped row, skips it again and reads on, with the same
+/// result. `events_reads_on_past_a_whole_page_of_skipped_rows` is the test
+/// for that cursor.
 #[test]
 fn events_reads_on_when_a_full_page_ends_on_a_skipped_row() {
     let mut db = open(0xE7E0_0005);
@@ -234,6 +243,11 @@ fn events_reads_on_when_a_full_page_ends_on_a_skipped_row() {
     assert_eq!(nums(&events::<Opened>(&snap).unwrap(), |e| e.n.0), want);
 }
 
+/// `events`' page-end test through the tenant filter: the first page ends on
+/// tenant 2's row, so tenant 1's read of it holds one match fewer than rows,
+/// and a reader that ended on a page short of matches would drop the two rows
+/// after it. Like that test, it cannot see a cursor that advanced only past
+/// matched rows: page 2 rereads the one skipped row and reads on.
 #[test]
 fn events_scoped_reads_on_when_a_full_page_ends_on_another_tenant() {
     let mut db = open(0xE7E0_0006);
@@ -261,4 +275,29 @@ fn events_scoped_reads_on_when_a_full_page_ends_on_another_tenant() {
         nums(&events_scoped::<Paid>(&snap, 2).unwrap(), |e| e.n.0),
         [last]
     );
+}
+
+/// A whole page of rows `events` skips, then one it reads. The cursor must
+/// advance past every row read, matched or not. A cursor that advanced only
+/// past matched rows would stay at 0 after this page and read the same full
+/// page again, forever: under that mutant this test HANGS rather than fails,
+/// so a run that never finishes is its red.
+#[test]
+fn events_reads_on_past_a_whole_page_of_skipped_rows() {
+    let mut db = open(0xE7E0_0007);
+    for i in 0..EVENTS_PAGE as u64 {
+        db.transact(|tx| {
+            tx.emit(Closed { n: WireU64(i) });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    }
+    db.transact(|tx| {
+        tx.emit(Opened { n: WireU64(7) });
+        Ok::<(), io::Error>(())
+    })
+    .unwrap();
+    let snap = db.snapshot().unwrap();
+    assert_eq!(nums(&events::<Opened>(&snap).unwrap(), |e| e.n.0), [7]);
+    assert_eq!(events::<Closed>(&snap).unwrap().len(), EVENTS_PAGE);
 }

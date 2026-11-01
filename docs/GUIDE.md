@@ -3653,15 +3653,16 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   the last backoff and deadline. A job still Pending there was lost by the
   kernel.
 - `events::<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>` and
-  `events_scoped::<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>`
-  — the durable event log read as your own event types, in log order: every
-  row named `E::NAME` (for `events_scoped`, only those emitted in that
-  tenant's scope, `tenant` being the raw id), decoded. `events_scoped` takes
-  only a `#[event(scoped_by = ..)]` type; a global one does not compile there.
-  They read every page of the log (`EVENTS_PAGE` rows a call), so a long run
-  is read whole. A row is decoded only under the shape it was written with: a
-  different fingerprint, a payload that does not decode, or bytes left over
-  after it is an `Err` naming the event and the row id, never a skipped row.
+  `events_scoped::<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
+  where E::Scope: Tenant` — the durable event log read as your own event
+  types, in log order: every row named `E::NAME` (for `events_scoped`, only
+  those emitted in that tenant's scope, `tenant` being the raw id), decoded.
+  `events_scoped` takes only a `#[event(scoped_by = ..)]` type; a global one
+  does not compile there. They read every page of the log (`EVENTS_PAGE`
+  rows a call), so a long run is read whole. A row is decoded only under the
+  shape it was written with: a different fingerprint, a payload that does not
+  decode, or bytes left over after it is an `Err` naming the event, the row
+  id and the fix (read it with the type that wrote it), never a skipped row.
   Use them instead of scanning `EventRow` and decoding by hand.
 
 ```rust,ignore

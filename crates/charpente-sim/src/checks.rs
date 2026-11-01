@@ -536,7 +536,8 @@ pub const EVENTS_PAGE: usize = 256;
 /// [`EVENTS_PAGE`] events. A row is decoded only under the shape it was
 /// written with, as delivery does: a different fingerprint, a payload that
 /// does not decode as `E`, or bytes left over after it is an `Err` naming the
-/// event and the row id, never a skipped row.
+/// event, the row id and the fix (read it with the type that wrote it), never
+/// a skipped row.
 pub fn events<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String> {
     read_events("events", snap, None)
 }
@@ -576,22 +577,29 @@ fn read_events<E: Event>(
                     .map_or("none".to_string(), |shape| format!("{shape:#018x}"));
                 return Err(format!(
                     "{who}: event \"{}\" row {id} was written under fingerprint {written}, but \
-                     this type's is {:#018x}; the log holds another shape of the event",
+                     this type's is {:#018x}; the log holds another shape of the event — read it \
+                     with the type that wrote it (a changed event is a new #[event] type under a \
+                     new name, GUIDE §11)",
                     E::NAME,
                     E::FINGERPRINT
                 ));
             }
+            let undecodable = |detail: String| {
+                format!(
+                    "{who}: event \"{}\" row {id} does not decode: {detail} — it was written by a \
+                     different shape of the event, through a change inside a type one of its \
+                     fields holds, which the fingerprint cannot see (GUIDE §12), so read it with \
+                     the type that wrote it; if no such type changed, the stored bytes are corrupt",
+                    E::NAME
+                )
+            };
             let mut input = &row.payload[..];
-            let event = E::decode(&mut input).map_err(|e| {
-                format!("{who}: event \"{}\" row {id} does not decode: {e}", E::NAME)
-            })?;
+            let event = E::decode(&mut input).map_err(|e| undecodable(e.to_string()))?;
             if !input.is_empty() {
-                return Err(format!(
-                    "{who}: event \"{}\" row {id} does not decode: {} bytes left over after the \
-                     payload",
-                    E::NAME,
+                return Err(undecodable(format!(
+                    "{} bytes left over after the payload",
                     input.len()
-                ));
+                )));
             }
             out.push(event);
         }
