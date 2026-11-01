@@ -2125,15 +2125,20 @@ fn a_relative_target_build_dependency_outside_the_tree_is_refused() {
 /// Cargo still reads the underscore spellings in an edition-2021 manifest (the
 /// scratch app's edition), and a real cargo-mutants 27.1.0 baseline fails on
 /// them as on the hyphenated ones, so they are refused too, each named as the
-/// manifest spells it.
+/// manifest spells it. A target table keyed by a bare triple is named bare,
+/// as the manifest spells it, where a `cfg(…)` key keeps its quotes.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
 #[test]
-fn a_relative_path_under_cargos_underscore_spelling_is_refused_as_spelled() {
+fn a_relative_path_is_refused_under_its_table_as_spelled() {
     for (tag, table) in [
         ("underscore-dev", "dev_dependencies"),
         ("underscore-build", "build_dependencies"),
         ("underscore-target", "target.'cfg(unix)'.dev_dependencies"),
+        (
+            "bare-triple",
+            "target.x86_64-unknown-linux-gnu.dev-dependencies",
+        ),
     ] {
         let (base, ws) = mutants_scratch_with(
             tag,

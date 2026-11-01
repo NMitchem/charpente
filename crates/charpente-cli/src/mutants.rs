@@ -451,14 +451,20 @@ fn has_sim_harness(manifest: &str) -> bool {
 
 /// A fresh master seed for a run given none, as charpente-sim's private
 /// `ambient_base_seed` draws one: the verb prints it and its rerun line, so
-/// freshness costs no reproducibility. splitmix64's finalizer spreads nearby
-/// clock reads apart.
+/// freshness costs no reproducibility.
 // Reading the wall clock is edge tooling, outside the deterministic core (DESIGN.md §1).
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 fn fresh_master_seed() -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos()) as u64;
+    spread(nanos)
+}
+
+/// One splitmix64 step from state `nanos`, which spreads nearby clock reads
+/// apart: charpente-sim's `rng::splitmix64`, spelled out because this crate
+/// does not link charpente-sim.
+fn spread(nanos: u64) -> u64 {
     let mut z = nanos.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -1787,6 +1793,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Only a failed baseline's log is read for its cause. A green baseline
+    /// whose log says it ran out of disk (a test that prints the words, say)
+    /// is green, and the run reports its verdicts.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_green_baseline_is_never_read_as_out_of_disk() {
+        let dir = std::env::temp_dir().join(format!("charpente-green-disk-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("log")).expect("scratch");
+        std::fs::write(
+            dir.join("log/baseline.log"),
+            "error: No space left on device (os error 28)\n",
+        )
+        .expect("log");
+        let json = format!(
+            r#"{{"total_mutants":1,"caught":1,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{{"scenario":"Baseline","summary":"Success","log_path":"log/baseline.log"}},{}]}}"#,
+            named(3, "every_run", "CaughtMutant")
+        );
+        std::fs::write(dir.join("outcomes.json"), json).expect("outcomes");
+        let (code, out, err) = one_pass_report(&dir.join("outcomes.json"), Some(0));
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert!(
+            out.starts_with(
+                "mutants: each mutant's verdict, and the pass that decided it:\n  caught   \
+                 src/lib.rs:3:5: replace every_run with () (one full pass)\nmutants: 1 total — 1 \
+                 caught, 0 missed, 0 unviable, 0 timed out\n"
+            ),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A sim batch with an untested check exits 1, so an unmutated baseline can
     /// be red for that alone. The error names the check, read from the baseline's
     /// own log through `log_path`, and no other cause: the fixture log also holds
@@ -2452,5 +2490,27 @@ mod tests {
         ] {
             assert_eq!(parse(&bad.map(String::from)).err(), Some(2), "{bad:?}");
         }
+    }
+
+    /// A seed drawn for a run given none differs from the last one drawn, once
+    /// the clock has moved. The bound keeps a constant seed from looping
+    /// forever; the clock ticks long before it.
+    #[test]
+    fn a_fresh_master_seed_is_fresh() {
+        let first = fresh_master_seed();
+        assert!(
+            (0..1_000_000).any(|_| fresh_master_seed() != first),
+            "a million draws of the master seed all gave {first:#x}"
+        );
+    }
+
+    /// `spread` is one splitmix64 step, so it gives splitmix64's published
+    /// outputs. From state 0, the first two are 0xe220a8397b1dcdaf and
+    /// 0x6e789e6aa1b965f4 (Vigna's reference splitmix64.c, prng.di.unimi.it).
+    /// The second is the step from state 0 plus one golden gamma.
+    #[test]
+    fn spread_is_one_splitmix64_step() {
+        assert_eq!(spread(0), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(spread(0x9e37_79b9_7f4a_7c15), 0x6e78_9e6a_a1b9_65f4);
     }
 }
