@@ -578,13 +578,15 @@ fn a_replayed_skipped_run_is_not_an_unqualified_success() {
         !stdout.contains("sim result: ok"),
         "a run that adjudicated nothing must not read as green:\n{stdout}"
     );
+    // The `fired:` line is the run's coverage less its `run:skipped`, as a
+    // failure block prints it: what to reason from about a give-up.
     assert!(
         stdout.contains(
             "\ncheck counter_roundtrip ... skipped\n    skipped: the write was never acked, so \
-             durability has nothing to prove\n\nsim result: nothing tested. 0 passed; 0 failed; \
-             1 skipped, on seed 0x3.\n"
+             durability has nothing to prove\n    fired:   fault:write_error: 1, restart: 1\n\n\
+             sim result: nothing tested. 0 passed; 0 failed; 1 skipped, on seed 0x3.\n"
         ),
-        "a replayed skipped run says why it was skipped:\n{stdout}"
+        "a replayed skipped run says why it was skipped and what fired:\n{stdout}"
     );
 }
 

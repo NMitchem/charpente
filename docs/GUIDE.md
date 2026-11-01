@@ -3183,7 +3183,9 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   run's own text, which a batch does not print and `--seed` prints under the
   skipped check as `detail:`. A batch gives each reason the seed of its first
   run, `(first: --seed 0x…)`, so `charpente test --sim --filter <check> --seed
-  0x…` replays that run and prints its detail. A
+  0x…` replays that run and prints its detail, then a `fired:` line: what
+  fired in that run, rendered as a failure block's `fired:` line is (less its
+  own `run:skipped`), the line to reason from about why it gave up. A
   constant such as a retry count is fixed text, so it belongs in the reason
   (`"Db::open never booted in 8 boots"`), not the detail. A give-up with
   nothing to add passes `""`, and an empty detail is none.

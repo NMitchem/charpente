@@ -780,7 +780,8 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
         "and the corruption that excuses it fired:\n{report}"
     );
     // The human replay prints the skipped reason, and this give-up has a
-    // fixed reason and no detail.
+    // fixed reason and no detail; its `fired:` line names the misdirected
+    // write that excuses it.
     let human = charpente()
         .current_dir(&app)
         .env("CARGO_TARGET_DIR", target_dir())
@@ -798,8 +799,10 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
     assert!(
         human.ends_with(
             "check acked_post_implies_the_echo_after_recovery ... skipped\n    skipped: durable \
-             corruption fired, so the acked enqueue is excused\n\nsim result: nothing tested. 0 \
-             passed; 0 failed; 1 skipped, on seed 0x535bb998c76a02ae.\n"
+             corruption fired, so the acked enqueue is excused\n    fired:   clock:skewed: 1, \
+             crash:dropped: 2, fault:misdirected_write: 1, fault:write_error: 1, restart: 1\n\n\
+             sim result: nothing tested. 0 passed; 0 failed; 1 skipped, on seed \
+             0x535bb998c76a02ae.\n"
         ),
         "skipped for corruption, by name:\n{human}"
     );

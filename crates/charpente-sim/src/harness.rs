@@ -968,6 +968,9 @@ struct CheckExtras {
     drew: bool,
     /// Each skipped run's detail, filled only under `--seed`.
     details: Vec<String>,
+    /// Each skipped run's coverage less `run:skipped`, rendered as a failure
+    /// block's `fired:` line renders it; filled only under `--seed`.
+    fired: Vec<String>,
 }
 
 /// A check's runs as they are tallied, in seed order.
@@ -981,6 +984,7 @@ struct CheckTally {
     reasons: BTreeMap<&'static str, (u64, u64)>,
     inputs: BTreeSet<Vec<(&'static str, String)>>,
     details: Vec<String>,
+    fired: Vec<String>,
 }
 
 impl CheckTally {
@@ -1007,6 +1011,7 @@ impl CheckTally {
             distinct_inputs: self.inputs.len() as u64,
             drew: self.inputs.iter().any(|drawn| !drawn.is_empty()),
             details: self.details,
+            fired: self.fired,
         }
     }
 }
@@ -1176,12 +1181,11 @@ fn run_single_seed(
         match run_app_universe(seed, inputs, faults_off, &test.run) {
             Ok(end) => {
                 tally(&mut outcomes, &mut check, seed, &end);
-                if let Outcome::GaveUp {
-                    detail: Some(detail),
-                    ..
-                } = &end.outcome
-                {
-                    check.details.push(detail.clone());
+                if let Outcome::GaveUp { detail, .. } = &end.outcome {
+                    check.details.extend(detail.clone());
+                    let mut fired = end.coverage.clone();
+                    fired.remove("run:skipped");
+                    check.fired.push(crate::render_fired(&fired));
                 }
                 merge(&mut report.coverage, &end.coverage);
             }
@@ -1905,8 +1909,9 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
 }
 
 /// A `--seed` replay in the batch's language: the failure blocks, a line per
-/// check saying ok, FAILED or skipped (a skipped run's reason and detail under
-/// it), and a result line naming the seed and what the replay was given.
+/// check saying ok, FAILED or skipped (a skipped run's reason, detail and
+/// `fired:` line under it), and a result line naming the seed and what the
+/// replay was given.
 fn write_replay(batch: &Batch, replay: &Replay, out: &mut dyn std::io::Write) {
     let escape = |s: &str| {
         s.replace('\n', "\\n")
@@ -1944,6 +1949,9 @@ fn write_replay(batch: &Batch, replay: &Replay, out: &mut dyn std::io::Write) {
             }
             for detail in &c.details {
                 let _ = writeln!(out, "    detail:  {}", escape(detail));
+            }
+            for fired in &c.fired {
+                let _ = writeln!(out, "    fired:   {fired}");
             }
         }
     }
@@ -5728,8 +5736,35 @@ mod tests {
         assert!(
             out.ends_with(
                 "check gives_up_with_detail ... skipped\n    skipped: the store hit fault \
-                 fallout\n    detail:  seq 14\n\nsim result: nothing tested. 0 passed; 0 \
+                 fallout\n    detail:  seq 14\n    fired:   nothing (no faults or events \
+                 marked coverage in this universe)\n\nsim result: nothing tested. 0 passed; 0 \
                  failed; 1 skipped, on seed 0x1234.\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A replayed skip prints what fired in its run, through the function a
+    /// failure block's `fired:` line uses and less its own `run:skipped`, so
+    /// a give-up can be reasoned from without a `--format json` detour
+    /// (docs-only build review I3).
+    #[test]
+    fn a_replayed_seed_that_gave_up_prints_what_fired() {
+        fn fires_then_gives_up(sim: &mut Sim) -> Result<(), String> {
+            sim.cover("fault:write_error");
+            sim.cover("fault:write_error");
+            sim.cover("boot:retried");
+            sim.give_up("the store hit fault fallout", "seq 14");
+            Ok(())
+        }
+        let (code, out) = replay_seed(sim_test("fires_then_gives_up", fires_then_gives_up), &[]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.ends_with(
+                "check fires_then_gives_up ... skipped\n    skipped: the store hit fault \
+                 fallout\n    detail:  seq 14\n    fired:   boot:retried: 1, \
+                 fault:write_error: 2\n\nsim result: nothing tested. 0 passed; 0 failed; 1 \
+                 skipped, on seed 0x1234.\n"
             ),
             "{out}"
         );
@@ -5740,7 +5775,9 @@ mod tests {
         let (_, out) = replay_seed(sim_test("always_gives_up", always_gives_up), &[]);
         assert!(
             out.contains(
-                "check always_gives_up ... skipped\n    skipped: the fixture always gives up\n\n"
+                "check always_gives_up ... skipped\n    skipped: the fixture always gives \
+                 up\n    fired:   nothing (no faults or events marked coverage in this \
+                 universe)\n\n"
             ),
             "{out}"
         );
@@ -6150,6 +6187,7 @@ mod tests {
                 distinct_inputs: 0,
                 drew: false,
                 details: vec!["the first run's detail".to_string()],
+                fired: Vec::new(),
             }],
             rerun: None,
             replay: None,
