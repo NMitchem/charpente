@@ -299,7 +299,9 @@ const SHRINK_BUDGET: u32 = 500;
 /// A candidate is kept when it fails the same check, with any message; a run
 /// that passes or gives up has not. Candidates come from five passes, in
 /// rounds repeated until a round keeps nothing or the budget is spent:
-/// 1. delete chunks of the choices (8, 4, 2, then 1 long, from the end);
+/// 1. delete chunks of the choices (8, 4, 2, then 1 long, from the end),
+///    then whole items: each run of choices from one draw to the next draw
+///    of the same name, two or more choices long, last first;
 /// 2. set each choice to 0;
 /// 3. binary-search each choice toward 0;
 /// 4. turn off each fault axis that is on, in `FaultConfig` field order;
@@ -332,6 +334,18 @@ const SHRINK_BUDGET: u32 = 500;
 /// replays, with more draws than it needs, where a fault left on or a
 /// fault-coupled input left high would point the fix at the wrong cause.
 ///
+/// Pass 1's items are there for a record of several draws, which no chunk
+/// of 8, 4, 2 or 1 removes whole at every position: a partial cut shifts
+/// every later draw, and the run passes
+/// (`a_record_of_three_draws_is_deleted_whole`). An item of one choice is a
+/// chunk of 1, so items cost a replay only where they are longer, and a run
+/// whose repeated draws are one choice each shrinks exactly as before. Two
+/// other ways were tried and refused. Every chunk length from 8 to 1 cut the
+/// items too, but over dozens of choices it spent the budget the later passes
+/// needed, as the pairs run early did, and four of the tests named above went
+/// red. Items deleted before the chunks left one of the 105 record
+/// failures above its minimum.
+///
 /// Every candidate is strictly smaller than the best so far (shorter or
 /// lexicographically smaller choices, or one more axis off), so each round
 /// shrinks or ends the loop. A round that keeps nothing ends it on a local
@@ -353,6 +367,7 @@ fn shrink(test: &SimTest, seed: u64, first: &UniverseFailure) -> Shrunk {
     for _ in 0..SHRINK_BUDGET {
         let round = (s.best.choices.clone(), s.best.faults_off.clone());
         s.delete_chunks();
+        s.delete_items();
         s.zero_each();
         s.search_each_toward_zero();
         s.turn_off_axes();
@@ -376,6 +391,9 @@ struct Shrinker<'a> {
     seed: u64,
     tried: BTreeSet<(Vec<u64>, Vec<&'static str>)>,
     best: Shrunk,
+    /// Where each of the best run's draws begins in its choices, parallel to
+    /// `best.drawn`.
+    starts: Vec<usize>,
 }
 
 impl<'a> Shrinker<'a> {
@@ -385,6 +403,7 @@ impl<'a> Shrinker<'a> {
             test,
             seed,
             tried: BTreeSet::new(),
+            starts: first.starts.clone(),
             best: Shrunk {
                 choices: trimmed(&first.choices),
                 faults_off: Vec::new(),
@@ -427,6 +446,7 @@ impl<'a> Shrinker<'a> {
             (kept.len(), &kept) <= (choices.len(), &choices),
             "a replay consumed choices it was not given"
         );
+        self.starts = failed.starts;
         self.best = Shrunk {
             replay_inputs: !failed.follows_seed,
             choices: kept,
@@ -439,6 +459,47 @@ impl<'a> Shrinker<'a> {
             smaller: true,
         };
         true
+    }
+
+    /// Deletes whole items, last first: each run of choices from one draw to
+    /// the next draw of the same name, when that run is two or more choices
+    /// and the best holds all of it (`shrink` says why). The draws are the
+    /// best run's own, so after a keep they are read again.
+    fn delete_items(&mut self) {
+        let mut at = self.best.drawn.len();
+        while let Some(k) = at.checked_sub(1) {
+            assert_eq!(
+                self.starts.len(),
+                self.best.drawn.len(),
+                "shrink invariant: the best run records where each of its draws starts"
+            );
+            let name = self.best.drawn[k].0;
+            let next = (k + 1..self.best.drawn.len()).find(|&m| self.best.drawn[m].0 == name);
+            let item = next.map(|m| self.starts[k]..self.starts[m]);
+            let Some(item) = item.filter(|i| i.len() >= 2 && i.end <= self.best.choices.len())
+            else {
+                at = k;
+                continue;
+            };
+            let len = self.best.choices.len();
+            let mut c = self.best.choices.clone();
+            c.drain(item);
+            at = match self.try_keep(&c, self.best.faults_off.clone()) {
+                true => {
+                    // Each keep shortens the best; without that, `k` is
+                    // retried forever.
+                    assert!(
+                        self.best.choices.len() < len,
+                        "shrink invariant: delete_items kept a candidate, but the best is still \
+                         {len} choices long. A kept candidate replaces the best with no more \
+                         than itself, which is shorter"
+                    );
+                    // The new best's draws are new, so try `k` again.
+                    (k + 1).min(self.best.drawn.len())
+                }
+                false => k,
+            };
+        }
     }
 
     fn delete_chunks(&mut self) {
@@ -4361,6 +4422,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Draws 2 to 6 items, each a template, an acquirer and a target story,
+    /// shuffles them, then an amount per item in that order, which counts
+    /// only for templates 1 and 4. Each story holds its latest amount where
+    /// its largest acked one was meant: a latest-wins merge, as a record of
+    /// three draws.
+    fn latest_wins_over_three_draw_items(sim: &mut Sim) -> Result<(), String> {
+        let input = sim.input();
+        let count = input.between("items", 2, 6);
+        let mut items: Vec<(u64, u64, u64)> = (0..count)
+            .map(|_| {
+                (
+                    *input.pick("tmpl", &[0, 1, 2, 3, 4]),
+                    *input.pick("acq", &[0, 1, 2, 7]),
+                    *input.pick("tgt", &[3, 4, 5, 6]),
+                )
+            })
+            .collect();
+        input.shuffle("order", &mut items);
+        let (mut held, mut max) = ([0u64; 7], [0u64; 7]);
+        for (tmpl, _, tgt) in items {
+            let n = input.between("amount", 1, 1000);
+            let amount = if tmpl == 1 || tmpl == 4 { n } else { 0 };
+            held[tgt as usize] = amount;
+            max[tgt as usize] = max[tgt as usize].max(amount);
+        }
+        match (3..=6).find(|&t| held[t] != max[t]) {
+            Some(t) => Err(format!(
+                "story {t} holds {} but {} was acked",
+                held[t], max[t]
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// `latest_wins_over_three_draw_items` with an item of one draw, a
+    /// template, and one story.
+    fn latest_wins_over_one_draw_items(sim: &mut Sim) -> Result<(), String> {
+        let input = sim.input();
+        let count = input.between("items", 2, 6);
+        let mut items: Vec<u64> = (0..count)
+            .map(|_| *input.pick("tmpl", &[0, 1, 2, 3, 4]))
+            .collect();
+        input.shuffle("order", &mut items);
+        let (mut held, mut max) = (0, 0);
+        for tmpl in items {
+            let n = input.between("amount", 1, 1000);
+            held = if tmpl == 1 || tmpl == 4 { n } else { 0 };
+            max = max.max(held);
+        }
+        match held != max {
+            true => Err(format!("story holds {held} but {max} was acked")),
+            false => Ok(()),
+        }
+    }
+
+    /// Shrinks that stopped above the minimum: seed, choices, replays.
+    type Above = Vec<(u64, Vec<u64>, u32)>;
+
+    /// Every failure of `test` among seeds 0..300, shrunk: how many failed,
+    /// the replays their shrinks spent in all, and those that stopped above
+    /// `[0, 1]`, the minimum, with what they stopped at.
+    fn shrunk_above_the_minimum(test: &SimTest) -> (usize, u32, Above) {
+        let (mut failed, mut replays) = (0, 0);
+        let mut above = Vec::new();
+        for seed in 0..300 {
+            let Err(first) = run_app_universe(seed, None, &[], &test.run) else {
+                continue;
+            };
+            failed += 1;
+            let shrunk = shrink(test, seed, &first);
+            replays += shrunk.replays;
+            if shrunk.choices != [0, 1] {
+                above.push((seed, shrunk.choices, shrunk.replays));
+            }
+        }
+        (failed, replays, above)
+    }
+
+    /// An item of three draws comes out whole. The minimum is two items, the
+    /// first with template 1 (`[0, 1]`, the rest 0s): its amount is acked,
+    /// and the second item's 0 then overwrites it. With chunks of 8, 4, 2 and
+    /// 1 alone, a cut that is not one whole item shifts the later draws so
+    /// the run passes, and 38 of these 105 failures stopped above the
+    /// minimum, 24 at `[1, 0, 0, 0, 1]`, three items where two fail (0.4.0
+    /// spec §1 item 4). The failing count is asserted so a change to the
+    /// draws cannot empty the test. The replays the shrinks spend are pinned
+    /// too; chunks alone spent 3792 over these failures.
+    #[test]
+    fn a_record_of_three_draws_is_deleted_whole() {
+        let test = sim_test("three_draw_items", latest_wins_over_three_draw_items);
+        let (failed, replays, above) = shrunk_above_the_minimum(&test);
+        assert_eq!(failed, 105, "seeds 0..300 whose first run fails");
+        assert_eq!(
+            above,
+            [],
+            "every failure shrinks to [0, 1]; these stopped above it (seed, choices, replays)"
+        );
+        assert_eq!(replays, 3505, "the replays the 105 shrinks spent in all");
+    }
+
+    /// The control: an item of one draw already comes out whole, since chunks
+    /// of 1 are deleted. Items of one choice are left to those chunks, so its
+    /// shrinks spend exactly the replays they spent before items were deleted
+    /// whole.
+    #[test]
+    fn a_record_of_one_draw_is_deleted_whole() {
+        let test = sim_test("one_draw_items", latest_wins_over_one_draw_items);
+        let (failed, replays, above) = shrunk_above_the_minimum(&test);
+        assert_eq!(failed, 178, "seeds 0..300 whose first run fails");
+        assert_eq!(
+            above,
+            [],
+            "every failure shrinks to [0, 1]; these stopped above it (seed, choices, replays)"
+        );
+        assert_eq!(replays, 3610, "the replays the 178 shrinks spent in all");
     }
 
     #[test]

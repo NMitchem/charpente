@@ -970,6 +970,9 @@ struct InputLog {
     replay: Option<(Vec<u64>, usize)>,
     choices: Vec<u64>,
     drawn: Vec<(&'static str, String)>,
+    /// Where each draw's choices begin in `choices`, in draw order: the
+    /// shrinker deletes an item whole by its draws' names and these.
+    starts: Vec<usize>,
     /// Whether every draw used the choice the seed's own stream gives it, so
     /// the seed alone replays these inputs. Always true without a replay.
     follows_seed: bool,
@@ -1010,6 +1013,13 @@ impl InputLog {
     fn between(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.choose((hi - lo).checked_add(1))
     }
+
+    /// Records a finished draw: its name, its value, and `start`, the length
+    /// of `choices` before it drew.
+    fn drew(&mut self, name: &'static str, value: String, start: usize) {
+        self.drawn.push((name, value));
+        self.starts.push(start);
+    }
 }
 
 /// A workload's input draws; see `Sim::input`.
@@ -1030,8 +1040,9 @@ impl Input<'_> {
              pass the smaller bound first"
         );
         let mut g = self.log();
+        let start = g.inputs.choices.len();
         let v = g.inputs.between(lo, hi);
-        g.inputs.drawn.push((name, format!("{v:?}")));
+        g.inputs.drew(name, format!("{v:?}"), start);
         v
     }
 
@@ -1043,19 +1054,21 @@ impl Input<'_> {
              pass at least one item"
         );
         let mut g = self.log();
+        let start = g.inputs.choices.len();
         let item = &items[g.inputs.choose(Some(items.len() as u64)) as usize];
-        g.inputs.drawn.push((name, format!("{item:?}")));
+        g.inputs.drew(name, format!("{item:?}"), start);
         item
     }
 
     /// Reorders `items` in place; shrinks toward the order given.
     pub fn shuffle<T: std::fmt::Debug>(&self, name: &'static str, items: &mut [T]) {
         let mut g = self.log();
+        let start = g.inputs.choices.len();
         for i in 0..items.len() {
             let j = i + g.inputs.choose(Some((items.len() - i) as u64)) as usize;
             items.swap(i, j);
         }
-        g.inputs.drawn.push((name, format!("{items:?}")));
+        g.inputs.drew(name, format!("{items:?}"), start);
     }
 
     /// Between `min_words` and `max_words` words from `words`, space-joined;
@@ -1079,13 +1092,14 @@ impl Input<'_> {
              pass at least one word or a max_words of 0"
         );
         let mut g = self.log();
+        let start = g.inputs.choices.len();
         let n = g.inputs.between(min_words as u64, max_words as u64) as usize;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(words[g.inputs.choose(Some(words.len() as u64)) as usize]);
         }
         let text = out.join(" ");
-        g.inputs.drawn.push((name, format!("{text:?}")));
+        g.inputs.drew(name, format!("{text:?}"), start);
         text
     }
 }
@@ -1128,6 +1142,7 @@ impl Sim {
                         replay: None,
                         choices: Vec::new(),
                         drawn: Vec::new(),
+                        starts: Vec::new(),
                         follows_seed: true,
                     },
                     hosts: BTreeMap::new(),
@@ -3002,6 +3017,8 @@ pub(crate) struct UniverseFailure {
     pub message: String,
     pub choices: Vec<u64>,
     pub drawn: Vec<(&'static str, String)>,
+    /// Where each of `drawn`'s draws begins in `choices`.
+    pub starts: Vec<usize>,
     /// Whether the seed alone draws `choices`: every draw used the choice the
     /// seed's own stream gives it (`InputLog::choose`).
     pub follows_seed: bool,
@@ -3043,13 +3060,18 @@ pub(crate) fn run_app_universe(
     }
     let failure = |sim: &Sim, message: String| {
         let (choices, drawn) = sim.input_record();
+        let (starts, follows_seed) = {
+            let g = sim.world.lock();
+            (g.inputs.starts.clone(), g.inputs.follows_seed)
+        };
         UniverseFailure {
             config: cfg.clone(),
             coverage: sim.coverage(),
             message,
             choices,
             drawn,
-            follows_seed: sim.world.lock().inputs.follows_seed,
+            starts,
+            follows_seed,
         }
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {

@@ -4706,7 +4706,12 @@ the choices reads 0. Its passes run in rounds, repeated until a whole round
 keeps nothing:
 
 1. delete chunks of the choices, 8, 4, 2 and then 1 long, from the end toward
-   the start;
+   the start, and then whole items, last first. An item is the choices from
+   one draw to the next draw of the same name, when that is two or more
+   choices: an item drawn as a template, an acquirer and a target comes out
+   in one step, where a cut that is not a whole item shifts every later draw
+   and the run usually passes. So give the draws that make up an item the
+   same names each time, as a loop does;
 2. set each choice to 0;
 3. search each choice down toward 0 (galloping up from 1, then bisecting), so a
    small value that fails is found even when the values between it and the
