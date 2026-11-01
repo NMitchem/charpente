@@ -769,10 +769,14 @@ named, the root included:
   exactly like its param (`:id` needs an argument named `id`). Its type
   must implement **both** `FromParam` (parses the path segment; a bad one
   fails as a named 400, not a panic) **and** `Wire` (§13 — the client needs
-  a schema for it too). `String` and `Id<T>` (any `T`) satisfy both. `u64`
-  implements `FromParam` but not `Wire` — a bare `u64` path param is a
-  compile error naming the fix (`Id<T>` for a row id, or `WireU64`); use
-  `Id<T>` for a row id.
+  a schema for it too). `String`, and `Id<T>` for a `#[table]` type `T`,
+  satisfy both: `Id<T>` crosses the wire only because its schema names
+  `T`'s table, so an `Id` of a plain struct is a compile error naming the
+  fix. Any other id is carried as a `WireU64` in a body or response field,
+  and as a `String` in a path param, because `WireU64` is not `FromParam`.
+  `u64` implements `FromParam` but not `Wire` — a bare `u64` path param is
+  a compile error whose note names `Id<T>` and `WireU64`; in a path param,
+  use `Id<T>` for a row id and `String` for any other number.
 - Then at most one JSON body argument, of any type that is both an owned
   deserializable AND `Wire` (`serde::de::DeserializeOwned + Wire` — the
   glue's actual bound); a type borrowing from the input won't compile, and

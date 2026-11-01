@@ -1,0 +1,21 @@
+error[E0277]: `NotATable` is not a table: no `#[table]` declares it
+  --> tests/compile_fail/route_id_of_a_non_table_param.rs:14:9
+   |
+14 |     id: charpente::Id<NotATable>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^ `NotATable` is not a `#[table]` type
+   |
+help: the trait `Row` is not implemented for `NotATable`
+  --> tests/compile_fail/route_id_of_a_non_table_param.rs:9:1
+   |
+ 9 | struct NotATable;
+   | ^^^^^^^^^^^^^^^^
+   = note: if this is `Id<NotATable>` crossing the wire (a path param, or a body, response or event field): `Id<T>` crosses the wire only for a `#[table]` type `T`, because its schema names `T`'s table — declare `NotATable` with `#[table]`, or carry the id as a `WireU64` in a body, response or event field, or as a `String` in a path param
+   = note: otherwise: declare `NotATable` with `#[table]` — `Row` is implemented by `#[table]`, never by hand
+   = help: the following other types implement trait `Row`:
+             CronRow
+             EventRow
+             JobRow
+             SchemaVersion
+             charpente::auth::ApiKey
+             charpente::http::Session
+   = note: required for `charpente::Id<NotATable>` to implement `Wire`

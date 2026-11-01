@@ -328,6 +328,22 @@ pub struct Unscoped;
 pub struct PlatformOwned;
 
 /// A table row. Implemented by `#[table]`, not by hand.
+///
+/// The diagnostic's first note is for `Id<T>`'s `Wire` impl in `charpente`,
+/// bounded on `T: Row` because the schema names `T::TABLE`: rustc reports
+/// that nested bound, not `Wire`, so `Wire`'s own text never fires for an
+/// `Id` of a plain struct, and this is the only place a fix can be named.
+/// It names `String` for a path param because `WireU64` is not `FromParam`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a table: no `#[table]` declares it",
+    label = "`{Self}` is not a `#[table]` type",
+    note = "if this is `Id<{Self}>` crossing the wire (a path param, or a body, response or \
+            event field): `Id<T>` crosses the wire only for a `#[table]` type `T`, because its \
+            schema names `T`'s table — declare `{Self}` with `#[table]`, or carry the id as a \
+            `WireU64` in a body, response or event field, or as a `String` in a path param",
+    note = "otherwise: declare `{Self}` with `#[table]` — `Row` is implemented by `#[table]`, \
+            never by hand"
+)]
 pub trait Row: Sized + 'static {
     /// The tenant scope this row is partitioned by, or `Unscoped`.
     /// Set by `#[table(scoped_by = …)]`. DESIGN §8's last bullet
