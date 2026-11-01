@@ -13,6 +13,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use charpente_core::db::Event;
+use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, IdempotencyKey, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::table::{Snapshot, View};
@@ -522,6 +524,66 @@ pub fn durable_refusal(sim: &Sim, text: &str) -> Result<bool, String> {
         text,
     );
     Ok(true)
+}
+
+/// Rows `events` reads per `scan_from` call; it pages until a call returns
+/// fewer, so no read is capped at one page.
+pub const EVENTS_PAGE: usize = 256;
+
+/// Every durable event of type `E` in `snap`, decoded, in log order, across
+/// every tenant. Reads the whole log a page at a time, so it holds past
+/// [`EVENTS_PAGE`] events. A payload that does not decode as `E` is an `Err`
+/// naming the event, the row id and the decode error, never a skipped row.
+pub fn events<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String> {
+    read_events("events", snap, None)
+}
+
+/// [`events`] for the events emitted in one tenant's scope (`#[event(scoped_by
+/// = ..)]`), where `tenant` is the raw id.
+pub fn events_scoped<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String> {
+    read_events("events_scoped", snap, Some(tenant))
+}
+
+// `EventRow` is one platform table holding every tenant's rows, so a tenant's
+// events are the rows whose `scope` matches, not a `scan_from_scoped` range.
+fn read_events<E: Event>(
+    who: &str,
+    snap: &Snapshot,
+    tenant: Option<u64>,
+) -> Result<Vec<E>, String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    loop {
+        let page: Vec<EventRow> = snap
+            .scan_from(from, EVENTS_PAGE)
+            .map_err(|e| format!("{who}: reading the event log from id {from}: {e}"))?;
+        for row in &page {
+            from = row.id.raw() + 1;
+            if row.name != E::NAME || tenant.is_some_and(|t| row.scope != Some(t)) {
+                continue;
+            }
+            let mut input = &row.payload[..];
+            let event = E::decode(&mut input).map_err(|e| {
+                format!(
+                    "{who}: event \"{}\" row {} does not decode as {}: {e}",
+                    E::NAME,
+                    row.id.raw(),
+                    std::any::type_name::<E>()
+                )
+            })?;
+            assert!(
+                input.is_empty(),
+                "{who}: event \"{}\" row {} left {} undecoded bytes",
+                E::NAME,
+                row.id.raw(),
+                input.len()
+            );
+            out.push(event);
+        }
+        if page.len() < EVENTS_PAGE {
+            return Ok(out);
+        }
+    }
 }
 
 /// Every call that reached a remote carries the key of a job in `snap`, the

@@ -12,6 +12,7 @@
 
 ### Added
 - **`SimSource::answers()` returns one slot per `push_at`, in push order.** A slot stays `None` until its own request is answered, so a run that stops mid-source says which requests it never reached; `responses()` is unchanged. `Request` is now `Clone`, and `charpente-sim` depends on `charpente` (the recovery helper's groundwork).
+- **`checks::events::<E>` and `checks::events_scoped::<E>` read the durable event log as the app's own event types.** In log order, every page of it, so no sim test decodes `EventRow` by hand; a payload that does not decode is an `Err` naming the event and the row.
 
 ### Fixed
 - **A private `#[route]` handler in another module mounts.** The marker struct inherited the handler's visibility, so `routes![handlers::x]` from the crate root hit E0603 on a struct the app never wrote. A private handler's marker is now `pub(crate)`; a `pub`, `pub(crate)` or `pub(super)` handler keeps its own visibility. `#[job]` is unchanged: it sits on the app's own struct, where rustc's E0603 and its "make it pub" fix are right. GUIDE §5 says so.

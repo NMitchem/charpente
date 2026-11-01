@@ -60,7 +60,7 @@ item with the trigger that reopens it.
   member's `tests/` (charpente: archive/auth/clock/describe/group_commit/http/kernel/outbound/realtime/
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
-  charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-cli: cli/ctl/
+  charpente-sim: crash_recovery/determinism/events/net_partition/wal; charpente-cli: cli/ctl/
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/clock_restart/failover/hunts/outbound/
   realtime_resume/smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;

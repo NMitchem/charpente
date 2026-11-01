@@ -3473,8 +3473,8 @@ retry to the reading it was decided at.
 
 ### The checkers
 
-`charpente_sim::checks` ships fifteen functions: twelve reusable oracles, and
-three idioms, one for a boot and two for a tail that waits out a clock
+`charpente_sim::checks` ships seventeen functions: twelve reusable oracles, two
+typed event reads, and three idioms, one for a boot and two for a tail that waits out a clock
 refusal. Reach for these before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
@@ -3652,6 +3652,14 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and a run past
   the last backoff and deadline. A job still Pending there was lost by the
   kernel.
+- `events::<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>` and
+  `events_scoped::<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>`
+  — the durable event log read as your own event types, in log order: every
+  row named `E::NAME` (for `events_scoped`, only those emitted in that tenant's
+  scope, `tenant` being the raw id), decoded. They read every page of the log
+  (`EVENTS_PAGE` rows a call), so a long run is read whole. A payload that does
+  not decode is an `Err` naming the event, the row id and the decode error, never
+  a skipped row. Use them instead of scanning `EventRow` and decoding by hand.
 
 ```rust,ignore
 pub fn classify(text: &str) -> FaultReason   // Injected | Poisoned | RedbLatch
@@ -3701,6 +3709,10 @@ pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String>
 pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String>
 
 pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>
+
+pub fn events<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>
+
+pub fn events_scoped<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
 ```
 
 A worked `acked_implies_durable` example — a toy that writes one byte per
