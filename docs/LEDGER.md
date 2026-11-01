@@ -9378,8 +9378,29 @@ changes `charpente-sim`, a fixture's sim test, a CLI test and the docs.
        - scripted inputs green, 10 of 10.
      - **At `8511ca04`.** The four apps re-ran at the same bases, since the fix wave touched `drive` and the template: 40 of 40 green. 39 of the 40 JSON reports are byte-identical to the first run's. The one that moved is the scaffold at `0x1c9f…`, whose echo check had one run go from passed to skipped. That is the per-note ack check taking the corruption excuse where the count had passed.
      - **Skip rates.** Per check, summed over the ten bases: `drawn_inputs` 0.6%, `modelled_remote` 4.1%, `restart_under_faults` 16.8%, and the scaffold 0.7%, 15.4% and 17.3%. Per single batch they run from 0.0% to 20.7%. Every skip carries a named reason: no POST acked, or a durable-corruption refusal no restart clears.
-8. **A docs-only build: pending, Task 18.** The brief is committed (`7e496abf`). The run is
-   Noah's to start, in a fresh offline box with the 0.4.0 crates and clippy installed.
+8. **A docs-only build: MEETS THE BAR, on attempt 1.** Task 18, recorded in
+   `docs/experiments/2026-10-0.4.0-docs-only/` (`47fae2e3`).
+   - **The run.** One headless Opus builder, offline, against the registry packaged at `4126037f`, in 0.3.0's box image plus clippy (`charpente-t18-box:clippy-mutants-27.1.0`). It built `holdqueue`, a library hold queue, in 68 minutes and 101 turns.
+   - **The bar, met in full:**
+     - (a) no framework patch;
+     - (b) every run goes through `charpente_sim::drive` with no hand recovery, and the app emits no event;
+     - (c) 8 checks × 256, every one tested;
+     - (d) its own `--mutants` found 11 MISSED on the first run, in repeat and conflict comparisons. It wrote two properties, and the second run gave `119 total — 82 caught, 0 missed, 37 unviable`;
+     - (e) the review rebuilt each of the three shrunk failures' exact source and replayed every single-item deletion, and none still fails;
+     - (f) no Critical.
+   - **The controller's gates.** The registry is byte-identical in and out of the box. clippy and `cargo test` are clean. The final batch and the mutation run, each replayed by its printed command on macOS, give identical lines.
+   - **AG-5's first field timing.** Each two-pass run took about 22 minutes in the box, and the controller's re-run took 1073 s. That is an observation, not a BENCH figure.
+   - **Platform defects found and fixed before the publish**, each red first:
+     - `7907e283`: GUIDE §5 said `Id<T>` of any `T` crosses the wire, and `Row` now names the fix;
+     - `9386f2ea`: the API page's public `login` minted for a body-named subject, and a census now holds every shipped example;
+     - `009911e7`: a skipped run's `--seed` replay prints `fired:`;
+     - `78bf2fa4`: `--faults-off` lists the axes;
+     - `ac360050`: the `u64` note no longer offers `WireU64` for a path param, where it does not compile;
+     - then GUIDE and PLAN in `20cac74f`, `e4addec7` and `48cf2f7f`;
+     - and the fixes' own review in `0f27e0f2` (CHANGELOG entries, the event-field wording, the census's stated limits, GUIDE's axis list pinned) and `6b5df554` (invoicing's two body-named logins, a PLAN row).
+   - **The shrinker's stall on a count-prefixed loop** (64 draws kept where 28 fail) is a GUIDE note and a PLAN row, not a shrinker change: (e)'s bar holds.
+   - **Every finding has a disposition** in the record's README.
+   - **The builder put the operator's account email in its box's git config**, and the committed transcripts carry `<operator-email>` in its place.
 9. **After the publish: Noah's.** Install, `--version`, `new`, clippy, sim.
 
 **Rulings.** `progress.md` holds every one, 60-odd, each with its reason and its cost if wrong. These are the ones a later reader needs, spec deltas first.
@@ -9656,14 +9677,17 @@ tallied from these tables.
 - **The three examples do not build from the registry tarball.** Their path-only dev-dependency on `charpente-sim` is stripped at publish, as `charpente-macros`' is. GUIDE promises `cargo run --example` only in a checkout.
 - **Rows whose triggers the testimony census finds met, with no release yet:**
   - mechanical enforcement of the `durable_corruption_fired` rule (statuspage I-5 was first, outbound I1 second);
-  - a worked first-credential example (four builds each invented one);
+  - a worked first-credential example (five builds have now invented one, holdqueue's by trust on first use);
+  - the small-API-gaps row (P9), whose trigger `TxError: Display` now meets;
   - Dead reachable, which is 0.5.0's scope.
 
   These are scheduling, and Noah's.
 - **The fix wave's code and the clock helper's fix were not put through the mutation instrument again.** Each change landed red-first under its own test instead.
 
 **Next.**
-- **Task 18, the docs-only build.** It is Noah's to start: a fresh offline box with the packaged 0.4.0 crates and clippy installed. No box image has carried clippy yet (LR-3). The review is against spec §6.8 (a)–(f). For (e), a reported shrunk failure is replayed with one item removed, and it must stop failing. Every finding gets a disposition under the testimony rule, and a platform defect is fixed before the publish.
+- **Task 18 is done** (criterion 8 above).
+  - The last full gate was at `ac360050`: fmt and clippy clean, 104/104 `test result: ok`, 2220 passed, 0 failed, 64 ignored, and the six recorded batches equal to baseline.
+  - `0f27e0f2` (tests, diagnostic text, CHANGELOG) was judged by `charpente-macros` 3/3, `guide-examples` 11/11, fmt and workspace clippy. `6b5df554` and `47fae2e3` are docs.
 - **The push**, Noah's: this entry and the commits above.
 - **Task 19, the publish**, Noah's:
   - run `scripts/publish.sh`'s full-verify dry run at the signed head;
