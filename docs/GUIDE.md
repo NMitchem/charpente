@@ -3393,9 +3393,12 @@ A workload with more than that builds it from the pieces this section and
 `Kernel::new` or `Kernel::with_outbound` over a `SimSource`, the quiesce calls
 below and `wait_out_clock_refusal`. Examples are several faulted rounds, a
 supervisor loop inside the phase, a script that reads one phase's answers to
-build the next, several nodes, and a check between the phase and the tail. A
-route that cannot take the re-send is not a reason to drop below it: fix the
-route (above). Keep each step's rule as `Drive` has it:
+build the next, several nodes, a check between the phase and the tail, and a
+check that reads the frames an SSE subscriber received (`source.sinks()`):
+`Drive` hands back neither phase's source, so it exposes no frames. §11's
+"Testing a tail in sim" builds its source by hand to read them. A route that
+cannot take the re-send is not a reason to drop below it: fix the route
+(above). Keep each step's rule as `Drive` has it:
 - use the fallout filter in every step;
 - treat a crash in the faulted phase as the crash under test, not a skip;
 - quiesce before the tail boots, and wait out a clock refusal;
@@ -4097,7 +4100,10 @@ below the helper" above):
   request the kernel served (an SSE upgrade's opening response included), in
   arrival order. A request it never served, past the horizon or after `run`
   stopped on a poisoned engine, records nothing, so the entries are a prefix
-  of the script and entry `i` answers the `i`-th push.
+  of the script and entry `i` answers the `i`-th push. `answers()` hands back
+  the same replies by slot, one per `push_at` in push order: slot `i` is the
+  `i`-th push's own `(status, body)`, and `None` until that request is
+  answered, so a run that stopped says which requests it never reached.
 - **`Kernel::new(app, Box::new(sim.clock()))`** consumes the mounted `App`
   (upserting cron rows and rebuilding the job due-heap — §6, §7);
   `kernel.run(&mut source)` then serves scripted requests at their virtual
@@ -4472,8 +4478,13 @@ script for the tail. A workload that wants more of its work done under
 faults drops below the helper and runs the phase as a supervisor loop: restart
 the process (`sim.restart_process()`, or `sim.restart()` once
 `sim.disk_crashed()`), boot through `boot_through_fallout`, build a fresh
-handle and kernel, and re-send in a new `SimSource` every request past the end
-of the last one's `responses()`, until the phase's time is up.
+handle and kernel, and re-send in a new `SimSource` every request the last one
+left unanswered, until the phase's time is up. Read that from the last
+source's `answers()`, slot by slot, by the rule `Drive` applies: a `None`
+slot, or a 5xx whose body is fault fallout
+(`is_fault_fallout(t) || clock_fallout(sim, t)`). A 4xx, or a handler's own
+5xx, is the app's answer and is not re-sent, so counting `responses()` to find
+where the script stopped is not enough.
 
 **Why the key matters.** The platform mints the key and keeps it across every
 retry, but only the app puts it in the request, and only the remote can act on
