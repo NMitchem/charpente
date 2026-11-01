@@ -4949,8 +4949,9 @@ that drive it identically and differ only in what they assert:
 $ charpente test --mutants --file crates/sim-fixture/src/lib.rs \
     --re 'BumpCounter::run.*Ok' --test-package sim-fixture \
     --property counter_bump_job_leaves_the_row_readable
-
-MISSED   crates/sim-fixture/src/lib.rs:40:9: replace BumpCounter::run -> Result<(), JobError> with Ok(())
+…
+mutants: each mutant's verdict, and the pass that decided it:
+  MISSED   crates/sim-fixture/src/lib.rs:40:9: replace BumpCounter::run -> Result<(), JobError> with Ok(()) (pass 2)
 mutants: 1 total — 0 caught, 1 missed, 0 unviable, 0 timed out
   1 MISSED, judged by "counter_bump_job_leaves_the_row_readable" ALONE: that property
   runs, reaches a verdict, and does not notice this change — it is ONE-SIDED with
@@ -4958,20 +4959,27 @@ mutants: 1 total — 0 caught, 1 missed, 0 unviable, 0 timed out
   Fix: assert the EFFECT the mutated code produces (a value that differs when it does
   not run), not merely that the surrounding state is still readable. The surviving
   diff is in the run directory.
+  two passes on master seed 0x151da62aeec8e187: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only, and pass 2 judged what it did not catch at the full count
+rerun exactly this mutation run: charpente test --mutants --file crates/sim-fixture/src/lib.rs --re 'BumpCounter::run.*Ok' --test-package sim-fixture --property counter_bump_job_leaves_the_row_readable --master-seed 0x151da62aeec8e187
 ```
 
-cargo-mutants' own lines pass through (the `MISSED` line above is one). To
-them the verb adds the summary, a MISSED or TIMED OUT paragraph, the functions
-no viable mutant measured (below) and, when it derives `--timeout`, its timing
-line (below); it names no caught mutant. The
+cargo-mutants' own lines pass through above the report (cut here at `…`), one
+pass's after another, with the verb's lines saying which pass they belong to.
+The report is the verb's: each mutant with its verdict and the pass that
+decided it, the summary, a MISSED or TIMED OUT paragraph, the functions no
+viable mutant measured (below), the passes and the master seed, and the
+command that reruns the run (two passes and the seed, below). When it derives
+`--timeout` it prints its timing line first (below). The
 run directory is cargo-mutants' own per-mutant record, at
 `target/charpente-mutants/mutants.out/` under the directory the verb ran in
 (`--dir`, default `.`): `outcomes.json`; `caught.txt`, `missed.txt`,
 `timeout.txt` and `unviable.txt`, one mutant per line; and `diff/`, one patch
 per mutant named by its file, line and column, where a MISSED mutant's
-surviving diff is. The previous run's record moves to `mutants.out.old`. Both
-sit under `target/`, which the scaffold's `.gitignore` leaves out of the
-repository.
+surviving diff is. The previous record moves to `mutants.out.old`, so after a
+pass 2 `mutants.out` holds pass 2's record, with the mutants pass 1 caught or
+found unviable listed in `previously_caught.txt`, and `mutants.out.old` holds
+pass 1's. Both sit under `target/`, which the scaffold's `.gitignore` leaves
+out of the repository.
 
 The same mutant, judged by the honest sibling, is **CAUGHT**:
 
@@ -5037,15 +5045,20 @@ mutants: `cargo test` over charpente-core, charpente-sim took 8.6 s of wall time
 
 Under `--property` each mutant runs that one sim property, less than the set
 that was timed, so the line says the time is an upper bound on a mutant's run
-instead. An explicit `--timeout SECS` skips the timing run and is passed through
-as given.
+instead. In a run of two passes (below) each pass gets its own timeout, timed
+under that pass's variables: pass 1's line starts `mutants: pass 1: ` and times
+the set at pass 1's run count, and pass 2's starts `mutants: pass 2: ` and is
+the full-count run the verb makes before either pass, which runs what each
+pass-2 mutant runs, `--property` included. An explicit `--timeout SECS` skips
+the timing runs and is passed to every pass as given; the full-count run still
+happens, since it judges the baseline.
 
 A caught mutant is a red batch, and a red batch normally shrinks each failing
 check's first failure, up to 500 replays one after another ("Shrinking a
 failure" above). That can cost several times the green baseline, more than any
 timeout derived from it. So the verb sets `CHARPENTE_SIM_NO_SHRINK=1` on
-cargo-mutants and on its timing run, and every test binary they run inherits
-it. `sim_tests!` reads it once at startup; set to any non-empty value, it turns
+cargo-mutants and on its own `cargo test` runs, and every test binary they run
+inherits it. `sim_tests!` reads it once at startup; set to any non-empty value, it turns
 shrinking off, and a failing check prints its first failure as it ran:
 
 ```text
@@ -5061,10 +5074,8 @@ baseline: no shrink is added, so cargo-mutants' own five-times timeout holds for
 (`--file src/… --test-package <app>`), and so does the verb's derived one. It
 is an environment variable rather than a harness flag because a test set can
 mix your sim with libtest binaries, which refuse a flag they do not know. A
-test of yours that spawns a sim and asserts on its shrink inherits the variable
-under `--mutants` too: remove it from the child's environment
-(`Command::env_remove("CHARPENTE_SIM_NO_SHRINK")`), as charpente's own CLI
-tests do.
+test of yours that spawns a sim inherits it under `--mutants` too, with the
+two variables below; "Two passes" says which to remove.
 
 `sim_tests!` reads two more variables at startup, for the same reason, and
 exits 2 naming the variable when it cannot read one. Each is unset when
@@ -5089,13 +5100,72 @@ it left to the full count:
 quick pass: the first <n> of each check's <runs> runs, failed runs judged only — coverage and untested checks are judged at the full count
 ```
 
+**Two passes over an app, on one master seed.** The verb uses both
+variables. When a `--test-package` has a `sim_tests!` harness (a `[[test]]`
+named `sim` with `harness = false`, as `charpente new` writes it), the run is
+two passes. Pass 1 judges every mutant with `CHARPENTE_SIM_FIRST_RUNS=32`
+(`--first-runs N` sets another count), so only a failed run counts, and a
+mutant that one of those runs notices is judged on them alone. Pass 2 judges
+at the full count only the mutants pass 1 missed or timed out: cargo-mutants'
+`--iterate` skips the ones pass 1's record lists as caught or unviable. A
+quick pass's runs are a prefix of the full count's for every check, so a run
+that fails in pass 1 fails at the full count too, and every mutant pass 1 did
+not catch gets the full count in pass 2. Each mutant's verdict is therefore
+the one a single full pass gives. Before either pass the verb runs `cargo test`
+over the test set once at the full count (with `--property`'s filter when it
+is given). That run is the baseline pass 2 judges against. An unmet `require`
+or a check that tested nothing makes it red, and the verb exits 2 before any
+mutant runs, even when pass 1 leaves pass 2 nothing to judge. A test package
+with no `sim_tests!` harness, such as charpente's own `run_universes!`
+suites, which write their run counts in source, runs in full in both passes,
+and the report names it. When no test package has the harness, the run is
+one full pass.
+
+Every process the verb starts gets the run's master seed as
+`CHARPENTE_SIM_MASTER_SEED`: `--master-seed 0x…` if you give one, else one it
+draws and prints first. Every sim batch in both passes derives its runs from
+that seed, and so does the rerun. The report ends on the passes, the seed and the command that
+repeats the run. From this repository's exactness test, whose fixture holds one
+mutant every run catches, one that only a run past the 32nd catches, and one
+that only an unmet `require` catches:
+
+```text
+mutants: each mutant's verdict, and the pass that decided it:
+  caught   src/lib.rs:11:5: replace mark_every_run with () (pass 1)
+  caught   src/lib.rs:16:5: replace mark_in_band with () (pass 2)
+  caught   src/lib.rs:21:5: replace mark_covered with () (pass 2)
+mutants: 3 total — 3 caught, 0 missed, 0 unviable, 0 timed out
+  two passes on master seed 0x3: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only, and pass 2 judged what it did not catch at the full count
+rerun exactly this mutation run: charpente test --mutants --file src/lib.rs --test-package exact --first-runs 32 --master-seed 0x3
+```
+
+At `--first-runs 256`, the full count, pass 1 of the same run catches all
+three, and each verdict is the same. The report's other closing lines name
+the test packages judged at the full count, and end a run of one pass:
+
+<!-- pinned -->
+```text
+  judged at the full count in both passes, with no sim_tests! harness to take a quick pass: <packages>
+  one full pass on master seed <seed>: no test package has a sim_tests! harness to take a quick pass (<packages>)
+rerun exactly this mutation run: charpente test --mutants <flags> --master-seed <seed>
+```
+
+A value in the rerun line that a shell would split or expand, such as a
+`--re` holding `.*`, is single-quoted. A test of yours that spawns a sim and
+asserts on its exit code or its shrink inherits all three variables under
+`--mutants`. Under pass 1's `CHARPENTE_SIM_FIRST_RUNS` an unmet `require` or
+a check that tested nothing exits 0. Remove them from the child's environment
+(`Command::env_remove("CHARPENTE_SIM_NO_SHRINK")`, and the same for
+`CHARPENTE_SIM_MASTER_SEED` and `CHARPENTE_SIM_FIRST_RUNS`), as charpente's own
+CLI tests do.
+
 **It is not part of `cargo test`.** Every mutant is a rebuild plus a test run,
 so this is an on-demand instrument like the edge harness below, not something
 your inner loop pays for. Scope it at a file or a function (`--file`, `--re`)
 rather than turning it loose on a whole workspace. It needs the pinned tool:
 `cargo install cargo-mutants --version 27.1.0 --locked`. The verb checks for it
-(`cargo mutants --version`) before the timing run, so a machine without it
-exits 2 with that install line rather than after one.
+(`cargo mutants --version`) before its own test runs, so a machine without it
+exits 2 with that install line rather than after them.
 
 Three failures of cargo-mutants' unmutated baseline are named instead of left to a
 generic "baseline was not green". cargo-mutants builds in a scratch copy of the
@@ -5110,7 +5180,10 @@ under `[patch.crates-io]`. A baseline whose log says `No space left on device`
 names the temp dir and `TMPDIR`: point `TMPDIR` at a disk with room for a full
 build of the workspace. And a baseline red because a sim check tested nothing
 (an untested check fails the batch, "Giving up" above) names that check: fix
-its setup so runs reach it, or scope `--property` to a check that runs.
+its setup so runs reach it, or scope `--property` to a check that runs. The
+verb names it the same way when its own `cargo test` is the baseline that
+went red, the timing run or the full-count run before two passes, and prints
+that run's output above the error.
 
 ### A note on the edge harness (platform dev tooling, not app surface)
 

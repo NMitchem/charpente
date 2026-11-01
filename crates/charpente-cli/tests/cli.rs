@@ -3,12 +3,17 @@ use std::process::Command;
 // Process spawning is edge tooling here, outside the deterministic core
 // (DESIGN.md §1) — this test drives the built `charpente` binary as a real
 // subprocess, exactly as a user would. `charpente test --mutants` exports
-// CHARPENTE_SIM_NO_SHRINK to every test it runs, these included; removed
-// here, so the batches below shrink as they assert whatever runs them.
+// CHARPENTE_SIM_NO_SHRINK, CHARPENTE_SIM_MASTER_SEED and, in its first pass,
+// CHARPENTE_SIM_FIRST_RUNS to every test it runs, these included; removed
+// here, so the batches below shrink, draw their own seeds and run in full,
+// asserting the same exit codes whatever runs them.
 #[allow(clippy::disallowed_methods)]
 fn charpente() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_charpente"));
-    command.env_remove("CHARPENTE_SIM_NO_SHRINK");
+    command
+        .env_remove("CHARPENTE_SIM_NO_SHRINK")
+        .env_remove("CHARPENTE_SIM_MASTER_SEED")
+        .env_remove("CHARPENTE_SIM_FIRST_RUNS");
     command
 }
 
@@ -681,8 +686,9 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 
 /// A `cargo` placed first on PATH so the verb's `Command::new("cargo")`
 /// resolves to it. It records every invocation's arguments, one line each,
-/// in call order, each followed by an indented line with the
-/// CHARPENTE_SIM_NO_SHRINK it saw (`unset` when absent). It answers the verb's install probe, `cargo mutants
+/// in call order, each followed by three indented lines with the
+/// CHARPENTE_SIM_NO_SHRINK, CHARPENTE_SIM_FIRST_RUNS and
+/// CHARPENTE_SIM_MASTER_SEED it saw (`unset` when absent). It answers the verb's install probe, `cargo mutants
 /// --version`, with exit 0. For `cargo mutants` it also records whether the `--output`
 /// directory existed at call time, then exits with `$SHIM_EXIT`; any other
 /// cargo call (the verb's own timing run) exits `$SHIM_TEST_EXIT`. The real tool needs that
@@ -691,10 +697,16 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 /// `./target` is never created. CI does not install cargo-mutants, so the
 /// verb's own behaviour is pinned against a stand-in that fails the same way
 /// on demand. `extra` is appended to the verb's arguments. The scratch
-/// workspace holds two one-file crates, `pkg-a` and `pkg-b`, so a `--file`
-/// under either has a package the verb can read. With `$SHIM_OUTCOMES` set,
+/// workspace holds three one-file crates, `pkg-a`, `pkg-b` and `app`, so a
+/// `--file` under any has a package the verb can read, and `cargo metadata`
+/// answers with the three: `app` alone declares the `sim_tests!` target, so
+/// `--test-package app` makes the run two passes. With `$SHIM_OUTCOMES` set,
 /// `cargo mutants` copies that directory in as `<--output>/mutants.out`, the
-/// run record the verb then reads.
+/// run record the verb then reads, moving an earlier one to `mutants.out.old`
+/// as the tool does; a call with `--iterate` (pass 2) copies
+/// `$SHIM_OUTCOMES_ITERATE` instead. A `cargo test --no-run` exits
+/// `$SHIM_BUILD_EXIT` when it is set, and a timed `cargo test` prints
+/// `$SHIM_TEST_STDOUT`'s file first when that is set.
 // Writing the shim and the scratch workspace is edge tooling outside the
 // deterministic core (DESIGN.md §1), the same shape as tests/genclient.rs.
 #[cfg(unix)]
@@ -745,36 +757,70 @@ fn run_mutants_with_cargo_shim_in(
     let bin = scratch.join("bin");
     let ws = scratch.join("ws");
     std::fs::create_dir_all(&bin).expect("shim bin dir");
-    for pkg in ["pkg-a", "pkg-b"] {
+    let mut packages = Vec::new();
+    for pkg in ["pkg-a", "pkg-b", "app"] {
         std::fs::create_dir_all(ws.join(pkg).join("src")).expect("scratch crate");
         // `[lib]` first, with a name of its own, as a real manifest may: a
         // reader that takes the first `name` in the file gets the wrong one.
+        let sim = if pkg == "app" {
+            "\n[[test]]\nname = \"sim\"\nharness = false\n"
+        } else {
+            ""
+        };
+        let manifest = ws.join(pkg).join("Cargo.toml");
         std::fs::write(
-            ws.join(pkg).join("Cargo.toml"),
+            &manifest,
             format!(
                 "[lib]\nname = \"lib_of_{pkg}\"\npath = \"src/lib.rs\"\n\n\
-                 [package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\n"
+                 [package]\nname = \"{pkg}\"\nversion = \"0.1.0\"\n{sim}"
             ),
         )
         .expect("scratch manifest");
         std::fs::write(ws.join(pkg).join("src/lib.rs"), "").expect("scratch source");
+        packages.push(format!(
+            r#"{{"name":"{pkg}","manifest_path":"{}"}}"#,
+            manifest.display()
+        ));
     }
+    let metadata = scratch.join("metadata.json");
+    std::fs::write(
+        &metadata,
+        format!(
+            r#"{{"workspace_root":"{}","packages":[{}]}}"#,
+            ws.display(),
+            packages.join(",")
+        ),
+    )
+    .expect("scratch metadata");
     let shim = bin.join("cargo");
     std::fs::write(
         &shim,
         "#!/bin/sh\n\
          echo \"cargo $*\" >> \"$SHIM_RECORD\"\n\
          echo \"  CHARPENTE_SIM_NO_SHRINK=${CHARPENTE_SIM_NO_SHRINK-unset}\" >> \"$SHIM_RECORD\"\n\
+         echo \"  CHARPENTE_SIM_FIRST_RUNS=${CHARPENTE_SIM_FIRST_RUNS-unset}\" >> \"$SHIM_RECORD\"\n\
+         echo \"  CHARPENTE_SIM_MASTER_SEED=${CHARPENTE_SIM_MASTER_SEED-unset}\" >> \"$SHIM_RECORD\"\n\
+         if [ \"$1\" = metadata ]; then cat \"$SHIM_METADATA\"; exit 0; fi\n\
+         if [ \"$1\" = test ] && [ \"$2\" = --no-run ]; then exit \"${SHIM_BUILD_EXIT:-$SHIM_TEST_EXIT}\"; fi\n\
+         if [ \"$1\" = test ] && [ -n \"$SHIM_TEST_STDOUT\" ]; then cat \"$SHIM_TEST_STDOUT\"; fi\n\
          [ \"$1\" = mutants ] || exit \"$SHIM_TEST_EXIT\"\n\
          if [ \"$2\" = --version ]; then echo 'cargo-mutants 27.1.0'; exit \"$SHIM_VERSION_EXIT\"; fi\n\
          out=\n\
+         iterate=\n\
          while [ $# -gt 0 ]; do\n\
            if [ \"$1\" = --output ]; then out=$2; fi\n\
+           if [ \"$1\" = --iterate ]; then iterate=1; fi\n\
            shift\n\
          done\n\
          if [ -d \"$out\" ]; then echo 'output existed' >> \"$SHIM_RECORD\"; \
          else echo 'output missing' >> \"$SHIM_RECORD\"; fi\n\
-         if [ -n \"$SHIM_OUTCOMES\" ]; then cp -R \"$SHIM_OUTCOMES\" \"$out/mutants.out\"; fi\n\
+         src=$SHIM_OUTCOMES\n\
+         if [ -n \"$iterate\" ]; then src=$SHIM_OUTCOMES_ITERATE; fi\n\
+         if [ -n \"$src\" ]; then\n\
+           rm -rf \"$out/mutants.out.old\"\n\
+           if [ -d \"$out/mutants.out\" ]; then mv \"$out/mutants.out\" \"$out/mutants.out.old\"; fi\n\
+           cp -R \"$src\" \"$out/mutants.out\"\n\
+         fi\n\
          echo \"shim: cargo-mutants stand-in exiting $SHIM_EXIT\" >&2\n\
          exit \"$SHIM_EXIT\"\n",
     )
@@ -801,9 +847,13 @@ fn run_mutants_with_cargo_shim_in(
         .env("SHIM_TEST_EXIT", test_exit)
         .env("SHIM_VERSION_EXIT", version_exit)
         .env("SHIM_RECORD", &record)
+        .env("SHIM_METADATA", &metadata)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_MUTANTS_JOBS")
         .env_remove("SHIM_OUTCOMES")
+        .env_remove("SHIM_OUTCOMES_ITERATE")
+        .env_remove("SHIM_BUILD_EXIT")
+        .env_remove("SHIM_TEST_STDOUT")
         .envs(envs.iter().copied())
         .output()
         .expect("charpente binary runs");
@@ -1134,6 +1184,371 @@ fn mutants_passes_an_explicit_timeout_through_without_a_timing_run() {
     assert!(
         mutants.ends_with("--timeout 60"),
         "the operator's timeout reaches the tool unchanged: {mutants}"
+    );
+}
+
+/// A pass's record dir under `base`: `outcomes.json` with these counters
+/// (total, caught, missed, timeout, unviable) and mutants (`(name, summary)`),
+/// after a green baseline.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+fn pass_record(
+    base: &std::path::Path,
+    pass: &str,
+    counts: [u64; 5],
+    mutants: &[(&str, &str)],
+) -> std::path::PathBuf {
+    let dir = base.join(pass);
+    std::fs::create_dir_all(&dir).expect("record dir");
+    let [total, caught, missed, timeout, unviable] = counts;
+    let mutants: Vec<String> = mutants
+        .iter()
+        .map(|(name, summary)| {
+            format!(
+                r#"{{"scenario":{{"Mutant":{{"name":"app/src/lib.rs:{name} with ()","file":"app/src/lib.rs","function":{{"function_name":"f"}}}}}},"summary":"{summary}"}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("outcomes.json"),
+        format!(
+            r#"{{"total_mutants":{total},"caught":{caught},"missed":{missed},"timeout":{timeout},"unviable":{unviable},"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{}]}}"#,
+            mutants.join(",")
+        ),
+    )
+    .expect("outcomes");
+    dir
+}
+
+/// The three variables the shim recorded under the call at `at`.
+#[cfg(unix)]
+fn env_under(recorded: &[String], at: usize) -> &[String] {
+    &recorded[at + 1..at + 4]
+}
+
+/// Spec §4 E over an app (a `--test-package` with a `sim_tests!` harness): the
+/// unmutated tests at the full count first, then pass 1 with
+/// CHARPENTE_SIM_FIRST_RUNS=32, then pass 2 over pass 1's survivors through
+/// cargo-mutants' `--iterate` with no run count at all, every process on the
+/// given master seed. The report tags each mutant with the pass that decided
+/// it and ends on the command that reruns the run.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn mutants_over_an_app_runs_two_passes_on_one_master_seed() {
+    let base =
+        std::env::temp_dir().join(format!("charpente-mutants-passes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let first = pass_record(
+        &base,
+        "first",
+        [3, 1, 1, 1, 0],
+        &[
+            ("3:5: replace every_run", "CaughtMutant"),
+            ("7:5: replace in_band", "MissedMutant"),
+            ("11:5: replace slow", "Timeout"),
+        ],
+    );
+    let second = pass_record(
+        &base,
+        "second",
+        [2, 1, 1, 0, 0],
+        &[
+            ("7:5: replace in_band", "CaughtMutant"),
+            ("11:5: replace slow", "MissedMutant"),
+        ],
+    );
+    let (out, recorded) = run_mutants_with_cargo_shim_in(
+        "0",
+        "0",
+        "0",
+        &[
+            "--file",
+            "app/src/lib.rs",
+            "--test-package",
+            "app",
+            "--master-seed",
+            "0xABC",
+        ],
+        false,
+        &[
+            ("SHIM_OUTCOMES", &first),
+            ("SHIM_OUTCOMES_ITERATE", &second),
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "one mutant missed:\n{stdout}");
+    let gate = recorded
+        .iter()
+        .position(|l| l == "cargo test --package app")
+        .unwrap_or_else(|| panic!("no full-count run over app; the shim saw {recorded:?}"));
+    let passes: Vec<usize> = (0..recorded.len())
+        .filter(|&i| recorded[i].starts_with("cargo mutants --output"))
+        .collect();
+    assert_eq!(passes.len(), 2, "two passes; the shim saw {recorded:?}");
+    assert!(
+        gate < passes[0]
+            && !recorded[passes[0]].contains("--iterate")
+            && recorded[passes[1]].contains(" --iterate"),
+        "the full-count run, pass 1, then pass 2 over the survivors; the shim saw {recorded:?}"
+    );
+    for (at, first_runs) in [(gate, "unset"), (passes[0], "32"), (passes[1], "unset")] {
+        assert_eq!(
+            env_under(&recorded, at),
+            [
+                "  CHARPENTE_SIM_NO_SHRINK=1".to_string(),
+                format!("  CHARPENTE_SIM_FIRST_RUNS={first_runs}"),
+                "  CHARPENTE_SIM_MASTER_SEED=0xabc".to_string(),
+            ],
+            "`{}`: the shim saw {recorded:?}",
+            recorded[at]
+        );
+    }
+    assert!(
+        stdout.starts_with(
+            "mutants: master seed 0xabc, set on every test this run starts as \
+             CHARPENTE_SIM_MASTER_SEED\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "mutants: each mutant's verdict, and the pass that decided it:\n\
+             \x20 caught   app/src/lib.rs:3:5: replace every_run with () (pass 1)\n\
+             \x20 caught   app/src/lib.rs:7:5: replace in_band with () (pass 2)\n\
+             \x20 MISSED   app/src/lib.rs:11:5: replace slow with () (pass 2)\n\
+             mutants: 3 total — 2 caught, 1 missed, 0 unviable, 0 timed out\n"
+        ),
+        "{stdout}"
+    );
+    let rerun = stdout.lines().last().unwrap_or_default();
+    assert!(
+        rerun.starts_with("rerun exactly this mutation run: charpente test --mutants --dir ")
+            && rerun.ends_with(
+                " --re no-such-mutant-anywhere --file app/src/lib.rs --test-package app \
+                 --master-seed 0xabc"
+            ),
+        "{stdout}"
+    );
+}
+
+/// R-T13: the full-count run judges the unmutated baseline whether or not
+/// pass 2 has mutants to judge, and a pass 1 that caught every mutant leaves
+/// no second cargo-mutants run.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn mutants_judges_the_full_count_baseline_when_pass_1_leaves_pass_2_nothing() {
+    let base =
+        std::env::temp_dir().join(format!("charpente-mutants-caught-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let first = pass_record(
+        &base,
+        "first",
+        [1, 1, 0, 0, 0],
+        &[("3:5: replace every_run", "CaughtMutant")],
+    );
+    let (out, recorded) = run_mutants_with_cargo_shim_in(
+        "0",
+        "0",
+        "0",
+        &["--test-package", "app", "--file", "app/src/lib.rs"],
+        false,
+        &[("SHIM_OUTCOMES", &first)],
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        recorded.iter().any(|l| l == "cargo test --package app"),
+        "the full-count run happens; the shim saw {recorded:?}"
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|l| l.starts_with("cargo mutants --output"))
+            .count(),
+        1,
+        "no pass 2; the shim saw {recorded:?}"
+    );
+    assert!(
+        stdout
+            .contains("mutants: pass 1 caught every viable mutant, so pass 2 has none to judge\n")
+            && stdout
+                .contains("  caught   app/src/lib.rs:3:5: replace every_run with () (pass 1)\n"),
+        "{stdout}"
+    );
+}
+
+/// GUIDE §8: a baseline red because a sim check tested nothing names that
+/// check on every path, the verb's own `cargo test` runs included: the timing
+/// run of a one-pass run whose test set differs from the tool's baseline, and
+/// the full-count run of a two-pass one. Any other red keeps the generic text,
+/// naming what the run was for.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn mutants_names_an_untested_check_when_its_own_test_run_is_red_for_it() {
+    let base = std::env::temp_dir().join(format!("charpente-mutants-own-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("scratch");
+    let untested = base.join("untested.txt");
+    std::fs::write(
+        &untested,
+        "check echo_matches .... ok  (256 tested)\n\
+         check note_survives ... untested  (0 tested, 256 skipped)\n",
+    )
+    .expect("test output");
+    let failing = base.join("failing.txt");
+    std::fs::write(
+        &failing,
+        "check echo_matches ... FAILED  (256 tested: 3 failed)\n",
+    )
+    .expect("test output");
+    let built = std::path::Path::new("0");
+    for (packages, output, want) in [
+        (
+            &["--test-package", "pkg-a", "--test-package", "pkg-b"][..],
+            &untested,
+            "error: the UNMUTATED baseline was not green: check note_survives tested nothing, \
+             and a check that tested nothing fails the batch. Fix its setup, or scope \
+             --property to a check that runs.",
+        ),
+        (
+            &["--test-package", "app"][..],
+            &untested,
+            "error: the UNMUTATED baseline was not green: check note_survives tested nothing, \
+             and a check that tested nothing fails the batch. Fix its setup, or scope \
+             --property to a check that runs.",
+        ),
+        (
+            &["--test-package", "app"][..],
+            &failing,
+            "error: `cargo test --package app` exited 1 at the full count, the baseline pass 2 \
+             judges against — the unmutated suite is not green, so no mutant result would mean \
+             anything (cargo-mutants' own baseline refuses it too). Fix the suite first.",
+        ),
+    ] {
+        let (out, recorded) = run_mutants_with_cargo_shim_in(
+            "0",
+            "0",
+            "1",
+            packages,
+            false,
+            &[("SHIM_BUILD_EXIT", built), ("SHIM_TEST_STDOUT", output)],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(2), "{packages:?}: {stderr}");
+        assert_eq!(stderr.lines().last(), Some(want), "{packages:?}: {stderr}");
+        assert!(
+            stdout.contains("check note_survives ... untested") == (output == &untested),
+            "the red run's own output is printed above the error: {stdout}"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|l| l.starts_with("cargo mutants --output")),
+            "{packages:?}: cargo-mutants must not run; the shim saw {recorded:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Given no `--master-seed`, the verb draws one, prints it, and sets the same
+/// value on every process it starts; one full pass, with no sim_tests!
+/// harness among the test packages, never sets a run count.
+#[cfg(unix)]
+#[test]
+fn mutants_draws_a_master_seed_prints_it_and_sets_it_on_every_test() {
+    let (out, recorded) = run_mutants_with_cargo_shim(
+        "0",
+        "0",
+        &["--test-package", "pkg-a", "--test-package", "pkg-b"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let seed = stdout
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("mutants: master seed "))
+        .and_then(|l| l.split(',').next())
+        .unwrap_or_else(|| panic!("the seed is the first line: {stdout}"));
+    for run in [
+        "cargo test --package pkg-a --package pkg-b",
+        "cargo mutants --output",
+    ] {
+        let at = recorded
+            .iter()
+            .position(|l| l.starts_with(run))
+            .unwrap_or_else(|| panic!("no `{run}`; the shim saw {recorded:?}"));
+        assert_eq!(
+            env_under(&recorded, at)[1..],
+            [
+                "  CHARPENTE_SIM_FIRST_RUNS=unset".to_string(),
+                format!("  CHARPENTE_SIM_MASTER_SEED={seed}"),
+            ],
+            "`{run}`: the shim saw {recorded:?}"
+        );
+    }
+}
+
+/// An exported CHARPENTE_SIM_FIRST_RUNS never reaches a full-count run: the
+/// verb removes it from every process but pass 1's, which it sets itself.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn mutants_removes_an_exported_run_count_from_every_full_count_run() {
+    let base =
+        std::env::temp_dir().join(format!("charpente-mutants-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let first = pass_record(
+        &base,
+        "first",
+        [1, 0, 1, 0, 0],
+        &[("3:5: replace every_run", "MissedMutant")],
+    );
+    let second = pass_record(
+        &base,
+        "second",
+        [1, 1, 0, 0, 0],
+        &[("3:5: replace every_run", "CaughtMutant")],
+    );
+    let (_, recorded) = run_mutants_with_cargo_shim_in(
+        "0",
+        "0",
+        "0",
+        &[
+            "--test-package",
+            "app",
+            "--file",
+            "app/src/lib.rs",
+            "--first-runs",
+            "8",
+        ],
+        false,
+        &[
+            ("SHIM_OUTCOMES", &first),
+            ("SHIM_OUTCOMES_ITERATE", &second),
+            ("CHARPENTE_SIM_FIRST_RUNS", std::path::Path::new("2")),
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    let seen: Vec<&str> = (0..recorded.len())
+        .filter(|&i| {
+            recorded[i].starts_with("cargo test --package")
+                || recorded[i].starts_with("cargo mutants --output")
+        })
+        .map(|i| recorded[i + 2].as_str())
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            "  CHARPENTE_SIM_FIRST_RUNS=unset",
+            "  CHARPENTE_SIM_FIRST_RUNS=8",
+            "  CHARPENTE_SIM_FIRST_RUNS=unset",
+        ],
+        "the shim saw {recorded:?}"
     );
 }
 

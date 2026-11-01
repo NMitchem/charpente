@@ -37,8 +37,18 @@
 //! Exit codes: 0 every viable mutant was caught, 1 the run produced a finding
 //! (mutants missed) or failed to resolve (timeouts), 2 usage, infrastructure,
 //! or a baseline that was not green.
+//!
+//! Over an app, a test package with a `sim_tests!` harness, the run is two
+//! passes on one master seed (0.4.0 spec §4 E). Pass 1 judges every mutant on
+//! the first `--first-runs` runs of each check, where only a failed run counts;
+//! pass 2 judges what pass 1 missed or timed out at the full count. A quick
+//! pass's runs are a prefix of the full count's for every check, so the
+//! verdicts are the ones a single full pass gives. Before either pass the verb
+//! runs the unmutated tests once at the full count, so the coverage rules and
+//! the untested rule judge the baseline even when pass 2 has nothing to judge.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -53,7 +63,12 @@ const KNOWN_FLAGS: &[&str] = &[
     "--jobs",
     "--test-package",
     "--property",
+    "--first-runs",
+    "--master-seed",
 ];
+
+/// Pass 1's runs per check when `--first-runs` is not given.
+const DEFAULT_FIRST_RUNS: u64 = 32;
 
 /// The default target set: the oracle-bearing files. A mutation run over the
 /// whole workspace is 4193 mutants (measured 2026-09-07) and would take days,
@@ -99,8 +114,19 @@ const DEFAULT_TEST_PACKAGES: &[&str] = &["charpente-core", "charpente-sim"];
 /// two spellings equal.
 const NO_SHRINK_ENV: &str = "CHARPENTE_SIM_NO_SHRINK";
 
+/// Set to the run's master seed on every process the verb starts, so every
+/// sim batch in both passes draws the same runs, and the rerun line repeats
+/// them. charpente-sim's `harness::MASTER_SEED_ENV`, spelled out for
+/// `NO_SHRINK_ENV`'s reason and held equal by the same census.
+const MASTER_SEED_ENV: &str = "CHARPENTE_SIM_MASTER_SEED";
+
+/// Set on pass 1 only, and removed everywhere else, so a value exported in the
+/// verb's own environment cannot make a full-count run a quick pass.
+/// charpente-sim's `harness::FIRST_RUNS_ENV`, held equal the same way.
+const FIRST_RUNS_ENV: &str = "CHARPENTE_SIM_FIRST_RUNS";
+
 pub const USAGE: &str = "usage: charpente test --mutants [--file PATH]… [--re REGEX] \
-[--dir PATH] [--timeout SECS] [--jobs N]\n\
+[--dir PATH] [--timeout SECS] [--jobs N] [--first-runs N] [--master-seed 0x…]\n\
        --file PATH  a source file to mutate (repeatable; default: the oracle-bearing set)\n\
        --re REGEX   only mutants whose description matches\n\
        --dir PATH   the workspace directory to run in (default: .)\n\
@@ -117,9 +143,16 @@ sibling is enough to report a mutant CAUGHT.\n\
 the test packages are timed with one `cargo test` first and the verb passes 5x that whenever \
 they are not exactly the --files' one package (the default set is two), because \
 cargo-mutants' own baseline times only the mutated file's package\n\
+       --first-runs N  pass 1's runs per sim check (default 32). When a --test-package has \
+a sim_tests! harness (tests/sim.rs, harness = false), pass 1 judges every mutant on the first N \
+runs of each check, failed runs only, and pass 2 judges what it missed or timed out at the full \
+count; the verdicts are a single full pass's. Packages without that harness run in full in both.\n\
+       --master-seed 0x…  the master seed every sim batch in the run derives its runs from \
+(default: drawn fresh and printed); the report's last line reruns the run with it\n\
        Every test the verb runs, the timing run's and each mutant's, sees \
 CHARPENTE_SIM_NO_SHRINK=1, so a failing sim check reports its first failure unshrunk: a mutant \
-needs only red or green, and a shrink would spend the timeout.";
+needs only red or green, and a shrink would spend the timeout. Each also sees \
+CHARPENTE_SIM_MASTER_SEED, and pass 1's see CHARPENTE_SIM_FIRST_RUNS.";
 
 /// The fields of `mutants.out/outcomes.json` this verb reads. Deserialized
 /// rather than string-scanned (unlike `sim.rs`'s scan of cargo's message
@@ -142,6 +175,18 @@ struct Outcome {
     summary: String,
     /// Relative to `mutants.out`; the baseline's is its build/test log.
     log_path: Option<String>,
+    /// The pass this verdict came from; set by the verb, not read.
+    #[serde(skip)]
+    pass: Pass,
+}
+
+/// The pass that decided a mutant: a run's one full pass, or pass 1 or 2 of two.
+#[derive(Clone, Copy, Default)]
+enum Pass {
+    #[default]
+    Only,
+    First,
+    Second,
 }
 
 /// cargo-mutants' `scenario`: the unmutated baseline, or one mutant.
@@ -151,11 +196,13 @@ enum Scenario {
     Mutant(Mutant),
 }
 
-/// A mutant's file and the function it sits in, absent for a mutant outside
-/// any function.
+/// A mutant's file, its name (file, line, column and change, the key pass 2's
+/// `--iterate` matches on), and the function it sits in, absent for a mutant
+/// outside any function.
 #[derive(serde::Deserialize)]
 struct Mutant {
     file: String,
+    name: String,
     function: Option<Function>,
 }
 
@@ -283,10 +330,10 @@ fn unrewritten_path_refusal(
     None
 }
 
-/// The first refusal over every workspace member of the tree `dir` belongs to.
-/// `None` when `cargo metadata` cannot say: the next cargo command, the verb's own
-/// timing run or cargo-mutants itself, then fails with cargo's own error.
-fn unrewritten_path_refusal_in(dir: &str) -> Option<String> {
+/// `cargo metadata --no-deps` for the tree `dir` belongs to, or `None` when
+/// cargo cannot say: the next cargo command, the verb's own timing run or
+/// cargo-mutants itself, then fails with cargo's own error.
+fn workspace_metadata(dir: &str) -> Option<serde_json::Value> {
     #[allow(clippy::disallowed_methods)]
     let out = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -294,7 +341,11 @@ fn unrewritten_path_refusal_in(dir: &str) -> Option<String> {
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// The first refusal over every workspace member in `meta`.
+fn unrewritten_path_refusal_in(meta: &serde_json::Value) -> Option<String> {
     let root = PathBuf::from(meta.get("workspace_root")?.as_str()?);
     meta.get("packages")?
         .as_array()?
@@ -329,6 +380,119 @@ fn untested_check(log: &str) -> Option<&str> {
     })
 }
 
+/// The error for an unmutated baseline that a sim check testing nothing made
+/// red, or `None` when `log` names no such check. One text for every baseline
+/// the verb judges: cargo-mutants' own, read from its log, and the verb's own
+/// `cargo test` runs, read from their output. A sim batch with an untested
+/// check exits 1, so the baseline is red for that reason alone, and a generic
+/// text would send the reader hunting for a failing test that does not exist.
+fn untested_baseline(log: &str) -> Option<String> {
+    untested_check(log).map(|check| {
+        format!(
+            "error: the UNMUTATED baseline was not green: check {check} tested nothing, and a \
+             check that tested nothing fails the batch. Fix its setup, or scope --property to a \
+             check that runs."
+        )
+    })
+}
+
+/// The test packages with a `sim_tests!` harness: a `[[test]]` named `sim` with
+/// `harness = false`, the convention `sim.rs`'s `find_sim_executable` assumes.
+/// Only that harness reads `FIRST_RUNS_ENV`, so only these take a quick pass,
+/// and the rest run in full in both passes. Empty when `cargo metadata` cannot
+/// say, which makes the run one full pass: slower, never another verdict.
+fn sim_harness_packages(meta: Option<&serde_json::Value>, test_packages: &[String]) -> Vec<String> {
+    let Some(packages) = meta.and_then(|m| m.get("packages")?.as_array()) else {
+        return Vec::new();
+    };
+    test_packages
+        .iter()
+        .filter(|name| {
+            packages.iter().any(|p| {
+                p.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str())
+                    && p.get("manifest_path")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|path| {
+                            // Reading manifests is edge tooling (DESIGN.md §1).
+                            #[allow(clippy::disallowed_methods)]
+                            std::fs::read_to_string(path).ok()
+                        })
+                        .is_some_and(|text| has_sim_harness(&text))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether a manifest declares the `sim_tests!` target: `[[test]]` with
+/// `name = "sim"` and `harness = false`.
+fn has_sim_harness(manifest: &str) -> bool {
+    let Ok(doc) = manifest.parse::<toml::Table>() else {
+        return false;
+    };
+    doc.get("test")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|tests| {
+            tests.iter().any(|t| {
+                t.get("name").and_then(toml::Value::as_str) == Some("sim")
+                    && t.get("harness").and_then(toml::Value::as_bool) == Some(false)
+            })
+        })
+}
+
+/// A fresh master seed for a run given none, as charpente-sim's private
+/// `ambient_base_seed` draws one: the verb prints it and its rerun line, so
+/// freshness costs no reproducibility. splitmix64's finalizer spreads nearby
+/// clock reads apart.
+// Reading the wall clock is edge tooling, outside the deterministic core (DESIGN.md §1).
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+fn fresh_master_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos()) as u64;
+    let mut z = nanos.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Sets the environment every process the verb starts runs under: shrinking
+/// off, the run's master seed, and pass 1's run count, or no run count at all.
+fn sim_env(command: &mut Command, master_seed: u64, first_runs: Option<u64>) -> &mut Command {
+    command
+        .env(NO_SHRINK_ENV, "1")
+        .env(MASTER_SEED_ENV, format!("{master_seed:#x}"));
+    match first_runs {
+        Some(n) => command.env(FIRST_RUNS_ENV, n.to_string()),
+        None => command.env_remove(FIRST_RUNS_ENV),
+    }
+}
+
+/// The command that reruns this mutation run: the flags given, in order, less
+/// any `--master-seed`, then `--master-seed` with the seed this run used. A
+/// value a shell would split or expand is single-quoted, so a `--re` holding
+/// `.*` pastes whole.
+fn rerun_line(args: &[String], master_seed: u64) -> String {
+    let mut line = "rerun exactly this mutation run: charpente test --mutants".to_string();
+    // `parse` has checked that `args` is flag and value pairs.
+    for pair in args.chunks(2).filter(|pair| pair[0] != "--master-seed") {
+        for word in pair {
+            line.push(' ');
+            if !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:,@+".contains(c))
+            {
+                line.push_str(word);
+            } else {
+                line.push_str(&format!("'{}'", word.replace('\'', r"'\''")));
+            }
+        }
+    }
+    line.push_str(&format!(" --master-seed {master_seed:#x}"));
+    line
+}
+
 pub fn run(args: &[String]) -> i32 {
     let opts = match parse(args) {
         Ok(opts) => opts,
@@ -350,7 +514,8 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
 
-    if let Some(refusal) = unrewritten_path_refusal_in(&opts.dir) {
+    let meta = workspace_metadata(&opts.dir);
+    if let Some(refusal) = meta.as_ref().and_then(unrewritten_path_refusal_in) {
         eprintln!("{refusal}");
         return 2;
     }
@@ -409,70 +574,19 @@ pub fn run(args: &[String]) -> i32 {
         argv.push("--test-package".into());
         argv.push(pkg.clone());
     }
-    if let Some(prop) = &opts.property {
-        // The app-side convention this CLI already assumes elsewhere
-        // (`sim.rs`'s `find_sim_executable`): the sim target is `tests/sim.rs`
-        // with `harness = false`, so its own `--filter` reaches it only after a
-        // bare `--`. Naming `--test sim` is not optional: without it the args
-        // also reach the crate's libtest targets, which have no `--filter` flag
-        // and exit 101 — failing the BASELINE rather than filtering anything.
-        for a in ["--cargo-test-arg", "--test", "--cargo-test-arg", "sim"] {
-            argv.push(a.into());
-        }
-        for a in ["--cargo-test-arg", "--", "--cargo-test-arg", "--filter"] {
-            argv.push(a.into());
-        }
-        argv.push("--cargo-test-arg".into());
-        argv.push(prop.clone());
-    }
-    let timeout = match &opts.timeout {
-        Some(t) => Some(t.clone()),
-        // cargo-mutants 27.1.0 times its baseline over ONE package, the
-        // mutated file's, while every mutant runs all the test packages: its
-        // auto-timeout is then too short whenever those differ, and a
-        // slow-but-caught mutant reads TIMEOUT. So the verb measures the set
-        // itself. Wall time, not CPU time: `--timeout` is a
-        // wall-clock bound on this same command, so wall time is its unit.
-        // CPU time would undershoot a suite that sleeps or waits (the serve
-        // and edge tests do) and overshoot a parallel one. And the error a
-        // wall-time measurement can carry (a machine that slept or was busy
-        // mid-run) only lengthens it, which is the safe side for a timeout.
-        None if baseline_differs(&opts.dir, &opts.files, &opts.test_packages) => {
-            match time_the_package_set(&opts.dir, &opts.test_packages) {
-                Ok(secs) => {
-                    let derived = derived_timeout(secs);
-                    // Under --property each mutant runs one sim property, a
-                    // subset of what was timed, so the time only bounds it.
-                    let what = match &opts.property {
-                        None => "that is what each mutant runs".to_string(),
-                        Some(p) => format!(
-                            "each mutant runs only the sim property `{p}`, so that is an upper \
-                             bound on a mutant's run"
-                        ),
-                    };
-                    println!(
-                        "mutants: `cargo test` over {} took {secs:.1} s of wall time; {what}, \
-                         and cargo-mutants' own baseline times only the mutated file's package, \
-                         so the verb is passing --timeout {derived} (5x)",
-                        opts.test_packages.join(", ")
-                    );
-                    Some(derived.to_string())
-                }
-                Err(msg) => {
-                    eprintln!("{msg}");
-                    return 2;
-                }
-            }
-        }
-        None => None,
+    // The app-side convention this CLI already assumes elsewhere (`sim.rs`'s
+    // `find_sim_executable`): the sim target is `tests/sim.rs` with
+    // `harness = false`, so its own `--filter` reaches it only after a bare
+    // `--`. Naming `--test sim` is not optional: without it the args also
+    // reach the crate's libtest targets, which have no `--filter` flag and
+    // exit 101, failing the BASELINE rather than filtering anything.
+    let property_args: Vec<&str> = match &opts.property {
+        Some(prop) => vec!["--test", "sim", "--", "--filter", prop],
+        None => Vec::new(),
     };
-    if let Some(t) = &timeout {
-        argv.push("--timeout".into());
-        argv.push(t.clone());
-    }
-    if let Some(j) = &opts.jobs {
-        argv.push("--jobs".into());
-        argv.push(j.clone());
+    for arg in &property_args {
+        argv.push("--cargo-test-arg".into());
+        argv.push((*arg).into());
     }
 
     // cargo-mutants needs `--output`'s parent to exist and dies with its own
@@ -488,30 +602,240 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
 
-    // Process spawning is edge tooling here, outside the deterministic core
-    // (DESIGN.md §1) — this shells out to cargo-mutants, which patches a
-    // scratch copy of the tree; nothing inside the core spawns processes.
-    #[allow(clippy::disallowed_methods)]
-    let status = Command::new("cargo")
-        .args(&argv)
-        .current_dir(&opts.dir)
-        .env(NO_SHRINK_ENV, "1")
-        .status();
+    let master_seed = opts.master_seed.unwrap_or_else(fresh_master_seed);
+    println!(
+        "mutants: master seed {master_seed:#x}, set on every test this run starts as \
+         {MASTER_SEED_ENV}"
+    );
+    let sims = sim_harness_packages(meta.as_ref(), &opts.test_packages);
+    // cargo-mutants 27.1.0 times its baseline over ONE package, the mutated
+    // file's, while every mutant runs all the test packages: its auto-timeout
+    // is then too short whenever those differ, and a slow-but-caught mutant
+    // reads TIMEOUT. So the verb times the set itself (`time_the_package_set`).
+    let differs =
+        opts.timeout.is_none() && baseline_differs(&opts.dir, &opts.files, &opts.test_packages);
+    let outcomes = out_dir.join("mutants.out/outcomes.json");
+    let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
+    let mut run = Run {
+        args,
+        master_seed,
+        first_runs: None,
+        full_count: opts
+            .test_packages
+            .iter()
+            .filter(|pkg| !sims.contains(pkg))
+            .cloned()
+            .collect(),
+        property: opts.property.as_deref(),
+        where_: display(&outcomes),
+    };
 
-    let status = match status {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!("error: failed to run cargo-mutants: {e}");
+    if sims.is_empty() {
+        let timeout = match pass_timeout(&opts, differs, master_seed, None, "") {
+            Ok(timeout) => timeout,
+            Err(code) => return code,
+        };
+        let code = match mutants_pass(&opts, &argv, &[], timeout.as_deref(), master_seed, None) {
+            Ok(code) => code,
+            Err(code) => return code,
+        };
+        return match read_pass(&outcomes, code, &mut stderr) {
+            Ok(only) => report(only, None, &run, &mut stdout, &mut stderr),
+            Err(code) => code,
+        };
+    }
+
+    let first_runs = opts.first_runs;
+    run.first_runs = Some(first_runs);
+    println!(
+        "mutants: {} {} a sim_tests! harness, so this run is two passes: pass 1 judges every \
+         mutant on the first {first_runs} runs of each check, failed runs only, and pass 2 \
+         judges what pass 1 missed or timed out at the full count",
+        sims.join(", "),
+        if sims.len() == 1 { "has" } else { "have" }
+    );
+    // The unmutated tests at the full count, before either pass: the baseline
+    // pass 2 judges against, which the coverage rules and the untested rule
+    // must judge even when pass 1 leaves pass 2 nothing (spec §4 E). It runs
+    // what each pass-2 mutant runs, so it also times pass 2.
+    let secs = match time_the_package_set(
+        &opts.dir,
+        &opts.test_packages,
+        &property_args,
+        master_seed,
+        None,
+        "at the full count, the baseline pass 2 judges against",
+    ) {
+        Ok(secs) => secs,
+        Err(msg) => {
+            eprintln!("{msg}");
             return 2;
         }
     };
+    let over = format!("{} at the full count", opts.test_packages.join(", "));
+    let full_timeout = match &opts.timeout {
+        Some(t) => Some(t.clone()),
+        None if differs => {
+            let derived = derived_timeout(secs);
+            println!(
+                "{}",
+                timing_line(
+                    "pass 2: ",
+                    &over,
+                    secs,
+                    "that is what each mutant runs",
+                    derived
+                )
+            );
+            Some(derived.to_string())
+        }
+        None => {
+            println!("mutants: `cargo test` over {over} is green ({secs:.1} s of wall time)");
+            None
+        }
+    };
+    let quick_timeout =
+        match pass_timeout(&opts, differs, master_seed, Some(first_runs), "pass 1: ") {
+            Ok(timeout) => timeout,
+            Err(code) => return code,
+        };
+    println!(
+        "mutants: pass 1 of 2, {FIRST_RUNS_ENV}={first_runs}: a MISSED or TIMEOUT line from it is \
+         judged again in pass 2"
+    );
+    let code = match mutants_pass(
+        &opts,
+        &argv,
+        &[],
+        quick_timeout.as_deref(),
+        master_seed,
+        Some(first_runs),
+    ) {
+        Ok(code) => code,
+        Err(code) => return code,
+    };
+    let first = match read_pass(&outcomes, code, &mut stderr) {
+        Ok(first) => first,
+        Err(code) => return code,
+    };
+    let left = first.missed + first.timeout;
+    if left == 0 {
+        println!("mutants: pass 1 caught every viable mutant, so pass 2 has none to judge");
+        return report(first, None, &run, &mut stdout, &mut stderr);
+    }
+    // `--iterate` skips the mutants the record in `--output` lists as caught
+    // or unviable, matching on each mutant's name, and moves that record to
+    // `mutants.out.old`; pass 1's is already read.
+    println!(
+        "mutants: pass 2 of 2, at the full count: the {left} mutant{} pass 1 did not catch",
+        if left == 1 { "" } else { "s" }
+    );
+    let code = match mutants_pass(
+        &opts,
+        &argv,
+        &["--iterate"],
+        full_timeout.as_deref(),
+        master_seed,
+        None,
+    ) {
+        Ok(code) => code,
+        Err(code) => return code,
+    };
+    match read_pass(&outcomes, code, &mut stderr) {
+        Ok(second) => report(first, Some(second), &run, &mut stdout, &mut stderr),
+        Err(code) => code,
+    }
+}
 
-    report(
-        &out_dir.join("mutants.out/outcomes.json"),
-        opts.property.as_deref(),
-        status.code(),
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
+/// One cargo-mutants pass: `argv`, then `extra` (pass 2's `--iterate`), the
+/// pass's timeout and `--jobs`, under the pass's environment. `Ok` carries the
+/// tool's exit code, which `read_pass` reads only when it left no record.
+// Process spawning is edge tooling here, outside the deterministic core
+// (DESIGN.md §1) — this shells out to cargo-mutants, which patches a scratch
+// copy of the tree; nothing inside the core spawns processes.
+#[allow(clippy::disallowed_methods)]
+fn mutants_pass(
+    opts: &Opts,
+    argv: &[String],
+    extra: &[&str],
+    timeout: Option<&str>,
+    master_seed: u64,
+    first_runs: Option<u64>,
+) -> Result<Option<i32>, i32> {
+    let mut command = Command::new("cargo");
+    command.args(argv).args(extra);
+    if let Some(t) = timeout {
+        command.args(["--timeout", t]);
+    }
+    if let Some(j) = &opts.jobs {
+        command.args(["--jobs", j]);
+    }
+    match sim_env(&mut command, master_seed, first_runs)
+        .current_dir(&opts.dir)
+        .status()
+    {
+        Ok(status) => Ok(status.code()),
+        Err(e) => {
+            eprintln!("error: failed to run cargo-mutants: {e}");
+            Err(2)
+        }
+    }
+}
+
+/// The `--timeout` for a pass with no explicit one: five times a timed
+/// `cargo test` over the whole test set, under the pass's environment, when
+/// cargo-mutants' own baseline times another command (`differs`), else the
+/// tool's own. `label` names the pass in the timing line.
+fn pass_timeout(
+    opts: &Opts,
+    differs: bool,
+    master_seed: u64,
+    first_runs: Option<u64>,
+    label: &str,
+) -> Result<Option<String>, i32> {
+    if let Some(t) = &opts.timeout {
+        return Ok(Some(t.clone()));
+    }
+    if !differs {
+        return Ok(None);
+    }
+    match time_the_package_set(
+        &opts.dir,
+        &opts.test_packages,
+        &[],
+        master_seed,
+        first_runs,
+        "while timing the test set for --timeout",
+    ) {
+        Ok(secs) => {
+            let derived = derived_timeout(secs);
+            // Under --property each mutant runs one sim property, a subset of
+            // what was timed, so the time only bounds it.
+            let what = match &opts.property {
+                None => "that is what each mutant runs".to_string(),
+                Some(p) => format!(
+                    "each mutant runs only the sim property `{p}`, so that is an upper bound on \
+                     a mutant's run"
+                ),
+            };
+            println!(
+                "{}",
+                timing_line(label, &opts.test_packages.join(", "), secs, &what, derived)
+            );
+            Ok(Some(derived.to_string()))
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            Err(2)
+        }
+    }
+}
+
+fn timing_line(label: &str, over: &str, secs: f64, what: &str, derived: u64) -> String {
+    format!(
+        "mutants: {label}`cargo test` over {over} took {secs:.1} s of wall time; {what}, and \
+         cargo-mutants' own baseline times only the mutated file's package, so the verb is \
+         passing --timeout {derived} (5x)"
     )
 }
 
@@ -565,47 +889,80 @@ fn derived_timeout(secs: f64) -> u64 {
 }
 
 /// Builds the package set's tests, then times one `cargo test` over all of
-/// them — the command each mutant runs — in wall-clock seconds. The build is
-/// outside the measurement, as it is in cargo-mutants' own baseline.
+/// them, `tail` appended, under the pass's environment, in wall-clock seconds.
+/// The build is outside the measurement, as it is in cargo-mutants' own
+/// baseline. Wall time, not CPU time: `--timeout` is a wall-clock bound on
+/// this same command, so wall time is its unit. CPU time would undershoot a
+/// suite that sleeps or waits (the serve and edge tests do) and overshoot a
+/// parallel one. And the error a wall-time measurement can carry (a machine
+/// that slept or was busy mid-run) only lengthens it, the safe side for a
+/// timeout.
+///
+/// The timed run's output is held, and printed only when the run is red,
+/// above the error: a run red because a sim check tested nothing gets the
+/// same error cargo-mutants' baseline would (`untested_baseline`). `why` says
+/// what the run was for, in the error for any other red.
 // Spawning cargo and reading the wall clock are edge tooling, outside the
 // deterministic core (DESIGN.md §1).
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
-fn time_the_package_set(dir: &str, packages: &[String]) -> Result<f64, String> {
+fn time_the_package_set(
+    dir: &str,
+    packages: &[String],
+    tail: &[&str],
+    master_seed: u64,
+    first_runs: Option<u64>,
+    why: &str,
+) -> Result<f64, String> {
     let mut args: Vec<&str> = vec!["test"];
     for pkg in packages {
         args.push("--package");
         args.push(pkg);
     }
     let build = [&args[..1], &["--no-run"], &args[1..]].concat();
-    let run = |args: &[&str]| -> Result<(), String> {
-        let status = Command::new("cargo")
-            .args(args)
-            .current_dir(dir)
-            .env(NO_SHRINK_ENV, "1")
-            .status()
-            .map_err(|e| {
-                format!(
-                    "error: could not run `cargo {}` to time the test set: {e}",
-                    args.join(" ")
-                )
-            })?;
-        if status.success() {
-            return Ok(());
-        }
-        Err(format!(
-            "error: `cargo {}` exited {} while timing the test set for --timeout — the \
-             unmutated suite is not green, so no mutant result would mean anything \
-             (cargo-mutants' own baseline refuses it too). Fix the suite first.",
-            args.join(" "),
-            status
-                .code()
-                .map_or("on a signal".to_string(), |c| c.to_string())
-        ))
+    args.extend(tail);
+    let cargo = |args: &[&str]| {
+        let mut command = Command::new("cargo");
+        command.args(args).current_dir(dir);
+        sim_env(&mut command, master_seed, first_runs);
+        command
     };
-    run(&build)?;
+    let red = |args: &[&str], code: Option<i32>| {
+        format!(
+            "error: `cargo {}` exited {} {why} — the unmutated suite is not green, so no \
+             mutant result would mean anything (cargo-mutants' own baseline refuses it too). \
+             Fix the suite first.",
+            args.join(" "),
+            code.map_or("on a signal".to_string(), |c| c.to_string())
+        )
+    };
+    let could_not = |args: &[&str], e: std::io::Error| {
+        format!(
+            "error: could not run `cargo {}` to time the test set: {e}",
+            args.join(" ")
+        )
+    };
+    let status = cargo(&build).status().map_err(|e| could_not(&build, e))?;
+    if !status.success() {
+        return Err(red(&build, status.code()));
+    }
     let start = std::time::Instant::now();
-    run(&args)?;
-    Ok(start.elapsed().as_secs_f64())
+    let out = cargo(&args).output().map_err(|e| could_not(&args, e))?;
+    let secs = start.elapsed().as_secs_f64();
+    if out.status.success() {
+        return Ok(secs);
+    }
+    std::io::stdout()
+        .write_all(&out.stdout)
+        .expect("failed printing to stdout");
+    std::io::stderr()
+        .write_all(&out.stderr)
+        .expect("failed printing to stderr");
+    let log = [
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    ]
+    .concat();
+    Err(untested_baseline(&log).unwrap_or_else(|| red(&args, out.status.code())))
 }
 
 /// What to say when the run left no `outcomes.json` at all. The tool's exit
@@ -648,20 +1005,16 @@ fn parse_outcomes(text: &str, path: &str) -> Result<Outcomes, String> {
     })
 }
 
-/// Reads the run's own record and turns every "nothing was measured" shape
-/// into a loud failure. The tool's exit code is NOT consulted for the
-/// verdict — it is 0 both for a clean sweep and for a filter that selected
-/// nothing — and IS consulted in exactly one place, when there is no record
-/// at all (`no_outcomes_diagnosis`). A run that measured nothing (code 2)
-/// is an error and goes to `err`; any other verdict is the run's result and
-/// goes to `out`. The verb passes stdout and stderr.
-fn report(
+/// Reads one pass's record and turns every "nothing was measured" shape into a
+/// loud failure, written to `err`, whose exit code is the `Err`. The tool's
+/// exit code is NOT consulted for the verdict — it is 0 both for a clean sweep
+/// and for a filter that selected nothing — and IS consulted in exactly one
+/// place, when there is no record at all (`no_outcomes_diagnosis`).
+fn read_pass(
     path: &std::path::Path,
-    property: Option<&str>,
     code: Option<i32>,
-    out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
-) -> i32 {
+) -> Result<Outcomes, i32> {
     // Reading cargo-mutants' own run record is edge tooling, outside the
     // deterministic core (DESIGN.md §1) — nothing inside charpente-core
     // touches the filesystem directly.
@@ -675,14 +1028,14 @@ fn report(
                 no_outcomes_diagnosis(code, &path.display().to_string(), &e.to_string())
             )
             .expect("failed printing to stderr");
-            return 2;
+            return Err(2);
         }
     };
     let o = match parse_outcomes(&text, &path.display().to_string()) {
         Ok(o) => o,
         Err(e) => {
             writeln!(err, "{e}").expect("failed printing to stderr");
-            return 2;
+            return Err(2);
         }
     };
     let baseline_log = o
@@ -702,22 +1055,153 @@ fn report(
         )
     }) {
         writeln!(err, "{line}").expect("failed printing to stderr");
-        return 2;
+        return Err(2);
     }
     let v = verdict(
         &o,
         &path.display().to_string(),
-        property,
+        None,
         baseline_log.as_deref(),
     );
-    for line in &v.lines {
-        if v.code == 2 {
+    if v.code == 2 {
+        for line in &v.lines {
             writeln!(err, "{line}").expect("failed printing to stderr");
-        } else {
-            writeln!(out, "{line}").expect("failed printing to stdout");
         }
+        return Err(2);
+    }
+    Ok(o)
+}
+
+/// What the report says about the run around its verdicts.
+struct Run<'a> {
+    /// The verb's own arguments, which the rerun line repeats.
+    args: &'a [String],
+    master_seed: u64,
+    /// Pass 1's runs per check, or `None` for a run of one full pass.
+    first_runs: Option<u64>,
+    /// The test packages with no `sim_tests!` harness, judged at the full
+    /// count in every pass.
+    full_count: Vec<String>,
+    property: Option<&'a str>,
+    /// Where the record is, for `verdict`'s text.
+    where_: String,
+}
+
+/// The run's result, from its one pass, or from pass 1 with pass 2's verdicts
+/// in place of the mutants pass 2 judged again: each mutant's verdict and the
+/// pass that decided it, the totals and their findings (`verdict`), the
+/// packages judged at the full count, the master seed and the command that
+/// reruns the run. It goes to `out`; `err` gets the one error, two passes that
+/// do not add up to one run.
+fn report(
+    first: Outcomes,
+    second: Option<Outcomes>,
+    run: &Run,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    let o = match merge(first, second, run.first_runs.is_some()) {
+        Ok(o) => o,
+        Err(e) => {
+            writeln!(err, "{e}").expect("failed printing to stderr");
+            return 2;
+        }
+    };
+    let mut lines = Vec::new();
+    for x in &o.outcomes {
+        let Scenario::Mutant(m) = &x.scenario else {
+            continue;
+        };
+        if lines.is_empty() {
+            lines.push("mutants: each mutant's verdict, and the pass that decided it:".to_string());
+        }
+        let word = match x.summary.as_str() {
+            "CaughtMutant" => "caught",
+            "MissedMutant" => "MISSED",
+            "Timeout" => "TIMEOUT",
+            "Unviable" => "unviable",
+            other => other,
+        };
+        let pass = match x.pass {
+            Pass::Only => "one full pass",
+            Pass::First => "pass 1",
+            Pass::Second => "pass 2",
+        };
+        lines.push(format!("  {word:<8} {} ({pass})", m.name));
+    }
+    let v = verdict(&o, &run.where_, run.property, None);
+    lines.extend(v.lines);
+    let seed = run.master_seed;
+    match run.first_runs {
+        Some(n) => {
+            lines.push(format!(
+                "  two passes on master seed {seed:#x}: pass 1 judged every mutant on the first \
+                 {n} runs of each sim check, failed runs only, and pass 2 judged what it did not \
+                 catch at the full count"
+            ));
+            if !run.full_count.is_empty() {
+                lines.push(format!(
+                    "  judged at the full count in both passes, with no sim_tests! harness to \
+                     take a quick pass: {}",
+                    run.full_count.join(", ")
+                ));
+            }
+        }
+        None => lines.push(format!(
+            "  one full pass on master seed {seed:#x}: no test package has a sim_tests! harness \
+             to take a quick pass ({})",
+            run.full_count.join(", ")
+        )),
+    }
+    lines.push(rerun_line(run.args, seed));
+    for line in &lines {
+        writeln!(out, "{line}").expect("failed printing to stdout");
     }
     v.code
+}
+
+/// Pass 1's record, each mutant tagged with its pass, with pass 2's verdict in
+/// place of each mutant pass 2 judged again: the verdicts one full pass gives.
+/// Pass 2 judges exactly the mutants pass 1 missed or timed out, matched by
+/// name, so anything else means the tree changed between the passes.
+fn merge(mut first: Outcomes, second: Option<Outcomes>, two: bool) -> Result<Outcomes, String> {
+    for x in &mut first.outcomes {
+        x.pass = if two { Pass::First } else { Pass::Only };
+    }
+    let Some(second) = second else {
+        return Ok(first);
+    };
+    let left = first.missed + first.timeout;
+    let mut matched = 0;
+    for x in second.outcomes {
+        let Scenario::Mutant(m) = &x.scenario else {
+            continue;
+        };
+        let Some(slot) = first.outcomes.iter_mut().find(|y| {
+            matches!(&y.scenario, Scenario::Mutant(n) if n.name == m.name)
+                && matches!(y.summary.as_str(), "MissedMutant" | "Timeout")
+        }) else {
+            continue;
+        };
+        *slot = Outcome {
+            pass: Pass::Second,
+            ..x
+        };
+        matched += 1;
+    }
+    if second.total_mutants != left || matched != left {
+        return Err(format!(
+            "error: pass 1 left {left} mutants uncaught, and pass 2 judged {} of which {matched} \
+             were among them — the source changed between the passes, so their verdicts are \
+             not one run's. Rerun with the same --master-seed on a tree nothing edits meanwhile.",
+            second.total_mutants
+        ));
+    }
+    first.caught += second.caught;
+    first.missed = second.missed;
+    first.timeout = second.timeout;
+    first.unviable += second.unviable;
+    Ok(first)
 }
 
 struct Verdict {
@@ -740,17 +1224,10 @@ fn verdict(
         .iter()
         .find(|x| matches!(x.scenario, Scenario::Baseline) && x.summary != "Success")
     {
-        // A sim batch with an untested check exits 1, so the baseline is red for
-        // that reason alone; the generic text would send the reader hunting
-        // for a failing test that does not exist.
-        if let Some(check) = baseline_log.and_then(untested_check) {
+        if let Some(line) = baseline_log.and_then(untested_baseline) {
             return Verdict {
                 code: 2,
-                lines: vec![format!(
-                    "error: the UNMUTATED baseline was not green: check {check} tested \
-                     nothing, and a check that tested nothing fails the batch. Fix its setup, \
-                     or scope --property to a check that runs."
-                )],
+                lines: vec![line],
             };
         }
         return Verdict {
@@ -874,6 +1351,8 @@ struct Opts {
     property: Option<String>,
     timeout: Option<String>,
     jobs: Option<String>,
+    first_runs: u64,
+    master_seed: Option<u64>,
 }
 
 fn parse(args: &[String]) -> Result<Opts, i32> {
@@ -884,6 +1363,8 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
     let mut property = None;
     let mut timeout = None;
     let mut jobs = None;
+    let mut first_runs = DEFAULT_FIRST_RUNS;
+    let mut master_seed = None;
 
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -906,6 +1387,32 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
             "--property" => property = Some(value.clone()),
             "--timeout" => timeout = Some(value.clone()),
             "--jobs" => jobs = Some(value.clone()),
+            "--first-runs" => match value.parse() {
+                Ok(n) if n > 0 => first_runs = n,
+                _ => {
+                    eprintln!(
+                        "error: --first-runs expects a number of runs, 1 or more, got \
+                         \"{value}\"\n\n{USAGE}"
+                    );
+                    return Err(2);
+                }
+            },
+            "--master-seed" => {
+                let digits = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                    .unwrap_or(value);
+                match u64::from_str_radix(digits, 16) {
+                    Ok(seed) => master_seed = Some(seed),
+                    Err(_) => {
+                        eprintln!(
+                            "error: --master-seed expects a hex value like 0xdeadbeef, got \
+                             \"{value}\"\n\n{USAGE}"
+                        );
+                        return Err(2);
+                    }
+                }
+            }
             _ => unreachable!("KNOWN_FLAGS and this match are the same list"),
         }
     }
@@ -927,6 +1434,8 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
         property,
         timeout,
         jobs,
+        first_runs,
+        master_seed,
     })
 }
 
@@ -944,6 +1453,34 @@ mod tests {
 
     const OK_BASELINE: &str = r#""outcomes":[{"scenario":"Baseline","summary":"Success"}]"#;
 
+    /// A run's context for `report`: master seed 0x1, no flags given, and
+    /// `first_runs` for two passes or `None` for one.
+    fn run_ctx(first_runs: Option<u64>, full_count: &[&str]) -> Run<'static> {
+        Run {
+            args: &[],
+            master_seed: 0x1,
+            first_runs,
+            full_count: full_count.iter().map(|s| (*s).to_string()).collect(),
+            property: None,
+            where_: "out".to_string(),
+        }
+    }
+
+    /// `path`'s record read as the verb reads a pass's, then reported as a run
+    /// of that one pass: the exit code, stdout and stderr.
+    fn one_pass_report(path: &std::path::Path, code: Option<i32>) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = match read_pass(path, code, &mut err) {
+            Ok(only) => report(only, None, &run_ctx(None, &["app"]), &mut out, &mut err),
+            Err(code) => code,
+        };
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
     /// R50: a run that measured nothing (code 2) is reported on stderr, and a
     /// result, a clean one or a finding, on stdout, so a script reading the
     /// verb's stdout never takes an error for a result.
@@ -959,13 +1496,7 @@ mod tests {
             if let Some(record) = record {
                 std::fs::write(&path, record).expect("write the record");
             }
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = report(&path, None, Some(0), &mut out, &mut err);
-            (
-                code,
-                String::from_utf8(out).unwrap(),
-                String::from_utf8(err).unwrap(),
-            )
+            one_pass_report(&path, Some(0))
         };
         let failed_baseline = r#"{"total_mutants":3,"caught":0,"missed":0,"timeout":0,"unviable":0,
             "outcomes":[{"scenario":"Baseline","summary":"Failure"}]}"#;
@@ -993,7 +1524,10 @@ mod tests {
             (code, out.as_str(), err.as_str()),
             (
                 0,
-                "mutants: 5 total — 5 caught, 0 missed, 0 unviable, 0 timed out\n",
+                "mutants: 5 total — 5 caught, 0 missed, 0 unviable, 0 timed out\n  one full pass \
+                 on master seed 0x1: no test package has a sim_tests! harness to take a quick \
+                 pass (app)\nrerun exactly this mutation run: charpente test --mutants \
+                 --master-seed 0x1\n",
                 ""
             )
         );
@@ -1107,15 +1641,8 @@ mod tests {
             "outcomes":[{"scenario":"Baseline","summary":"Failure","log_path":"log/baseline.log"}]}"#;
         std::fs::write(dir.join("outcomes.json"), json).expect("outcomes");
         let report_of = || {
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = report(
-                &dir.join("outcomes.json"),
-                None,
-                Some(2),
-                &mut out,
-                &mut err,
-            );
-            (code, String::from_utf8(err).expect("utf8"))
+            let (code, _, err) = one_pass_report(&dir.join("outcomes.json"), Some(2));
+            (code, err)
         };
         std::fs::write(
             dir.join("log/baseline.log"),
@@ -1125,7 +1652,7 @@ mod tests {
         let (code, err) = report_of();
         assert_eq!(code, 2);
         // The whole line, written out rather than rebuilt with `out_of_disk_line`,
-        // so `report` passing another path or dropping the variable is red here.
+        // so `read_pass` passing another path or dropping the variable is red here.
         // A known TMPDIR is set in a child process by tests/cli.rs, since setting
         // it here would move every other test's `temp_dir()`.
         assert_eq!(
@@ -1186,21 +1713,7 @@ mod tests {
         let json = r#"{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,
             "outcomes":[{"scenario":"Baseline","summary":"Failure","log_path":"log/baseline.log"}]}"#;
         std::fs::write(dir.join("outcomes.json"), json).expect("outcomes");
-        let report_of = || {
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = report(
-                &dir.join("outcomes.json"),
-                None,
-                Some(2),
-                &mut out,
-                &mut err,
-            );
-            (
-                code,
-                String::from_utf8(out).unwrap(),
-                String::from_utf8(err).unwrap(),
-            )
-        };
+        let report_of = || one_pass_report(&dir.join("outcomes.json"), Some(2));
         std::fs::write(
             dir.join("log/baseline.log"),
             "*** baseline\n\n*** cargo test --package=app\n     Running tests/sim.rs \
@@ -1490,5 +2003,254 @@ mod tests {
         let msg = no_outcomes_diagnosis(None, "x", "e");
         assert!(msg.starts_with("error: cargo-mutants was killed by a signal before measuring"));
         assert!(!msg.contains("matched no mutants"));
+    }
+
+    /// One mutant's record, named as cargo-mutants names it.
+    fn named(line: u32, function: &str, summary: &str) -> String {
+        format!(
+            r#"{{"scenario":{{"Mutant":{{"name":"src/lib.rs:{line}:5: replace {function} with ()","file":"src/lib.rs","function":{{"function_name":"{function}"}}}}}},"summary":"{summary}"}}"#
+        )
+    }
+
+    /// A pass's record with these counters and mutants, after a green baseline.
+    fn record(counts: [u64; 5], mutants: &[String]) -> String {
+        let [total, caught, missed, timeout, unviable] = counts;
+        format!(
+            r#"{{"total_mutants":{total},"caught":{caught},"missed":{missed},"timeout":{timeout},"unviable":{unviable},"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{}]}}"#,
+            mutants.join(",")
+        )
+    }
+
+    /// Writes each record to its own `outcomes.json` and reads it back as the
+    /// verb reads a pass's.
+    // Writing the records `read_pass` reads is edge tooling, as `read_pass` is.
+    #[allow(clippy::disallowed_methods)]
+    fn passes_from_files(tag: &str, records: &[String]) -> Vec<Outcomes> {
+        let dir =
+            std::env::temp_dir().join(format!("charpente-mutants-{tag}-{}", std::process::id()));
+        let read = records
+            .iter()
+            .enumerate()
+            .map(|(n, text)| {
+                let path = dir.join(format!("pass-{n}/outcomes.json"));
+                std::fs::create_dir_all(path.parent().unwrap()).expect("scratch");
+                std::fs::write(&path, text).expect("record");
+                let mut err = Vec::new();
+                read_pass(&path, Some(0), &mut err)
+                    .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&err)))
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        read
+    }
+
+    /// Spec §4 E: pass 2's verdict replaces pass 1's for each mutant pass 2
+    /// judged again, each mutant is tagged with the pass that decided it, and
+    /// the totals, the findings and the tail are one run's. The rerun line
+    /// repeats the flags given with this run's seed in place of the one given.
+    #[test]
+    fn two_passes_report_as_one_run_each_mutant_tagged_with_the_pass_that_decided_it() {
+        let mut passes = passes_from_files(
+            "merge",
+            &[
+                record(
+                    [5, 1, 2, 1, 1],
+                    &[
+                        named(3, "every_run", "CaughtMutant"),
+                        named(7, "in_band", "MissedMutant"),
+                        named(11, "covered", "MissedMutant"),
+                        named(15, "slow", "Timeout"),
+                        named(19, "opaque", "Unviable"),
+                    ],
+                ),
+                record(
+                    [3, 2, 1, 0, 0],
+                    &[
+                        named(7, "in_band", "CaughtMutant"),
+                        named(11, "covered", "MissedMutant"),
+                        named(15, "slow", "CaughtMutant"),
+                    ],
+                ),
+            ],
+        );
+        let second = passes.pop();
+        let first = passes.pop().expect("two records");
+        let args = [
+            "--file",
+            "src/lib.rs",
+            "--re",
+            "in|cov",
+            "--master-seed",
+            "0x5",
+        ]
+        .map(String::from);
+        let run = Run {
+            args: &args,
+            master_seed: 0xabc,
+            ..run_ctx(Some(32), &["charpente-core"])
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = report(first, second, &run, &mut out, &mut err);
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert_eq!((code, err.as_str()), (1, ""), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[..7],
+            [
+                "mutants: each mutant's verdict, and the pass that decided it:",
+                "  caught   src/lib.rs:3:5: replace every_run with () (pass 1)",
+                "  caught   src/lib.rs:7:5: replace in_band with () (pass 2)",
+                "  MISSED   src/lib.rs:11:5: replace covered with () (pass 2)",
+                "  caught   src/lib.rs:15:5: replace slow with () (pass 2)",
+                "  unviable src/lib.rs:19:5: replace opaque with () (pass 1)",
+                "mutants: 5 total — 3 caught, 1 missed, 1 unviable, 0 timed out",
+            ],
+            "{out}"
+        );
+        assert!(lines[7].starts_with("  1 MISSED: "), "{out}");
+        assert!(
+            !out.contains("TIMED OUT"),
+            "pass 2 resolved the timeout: {out}"
+        );
+        assert_eq!(
+            lines[lines.len() - 3..],
+            [
+                "  two passes on master seed 0xabc: pass 1 judged every mutant on the first 32 \
+                 runs of each sim check, failed runs only, and pass 2 judged what it did not \
+                 catch at the full count",
+                "  judged at the full count in both passes, with no sim_tests! harness to take a \
+                 quick pass: charpente-core",
+                "rerun exactly this mutation run: charpente test --mutants --file src/lib.rs --re \
+                 'in|cov' --master-seed 0xabc",
+            ],
+            "{out}"
+        );
+        // Pass 1 alone, when it left pass 2 nothing: every tag is pass 1's.
+        let first = passes_from_files(
+            "merge-one",
+            &[record(
+                [1, 1, 0, 0, 0],
+                &[named(3, "every_run", "CaughtMutant")],
+            )],
+        )
+        .pop()
+        .expect("one record");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = report(first, None, &run_ctx(Some(32), &[]), &mut out, &mut err);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!((code, err.as_slice()), (0, &b""[..]), "{out}");
+        assert!(
+            out.contains("  caught   src/lib.rs:3:5: replace every_run with () (pass 1)\n")
+                && !out.contains("judged at the full count in both passes"),
+            "{out}"
+        );
+    }
+
+    /// Two passes add up to one run only when pass 2 judged exactly the
+    /// mutants pass 1 left, by name; a tree edited between them moves a name,
+    /// and the report refuses rather than mix two trees' verdicts.
+    #[test]
+    fn passes_that_do_not_add_up_are_refused() {
+        let mut passes = passes_from_files(
+            "shifted",
+            &[
+                record(
+                    [2, 1, 1, 0, 0],
+                    &[
+                        named(3, "every_run", "CaughtMutant"),
+                        named(7, "in_band", "MissedMutant"),
+                    ],
+                ),
+                record([1, 1, 0, 0, 0], &[named(8, "in_band", "CaughtMutant")]),
+            ],
+        );
+        let second = passes.pop();
+        let first = passes.pop().expect("two records");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = report(first, second, &run_ctx(Some(32), &[]), &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!((code, out.as_slice()), (2, &b""[..]), "{err}");
+        assert_eq!(
+            err,
+            "error: pass 1 left 1 mutants uncaught, and pass 2 judged 1 of which 0 were among \
+             them — the source changed between the passes, so their verdicts are not one run's. \
+             Rerun with the same --master-seed on a tree nothing edits meanwhile.\n"
+        );
+    }
+
+    /// Spec §4 E: only a `sim_tests!` harness reads the quick pass's variable,
+    /// so only a package declaring one takes a quick pass; the rest, and every
+    /// package when `cargo metadata` cannot say, run in full.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn only_a_package_with_a_sim_tests_harness_takes_a_quick_pass() {
+        let app = "[package]\nname = \"app\"\n\n[[test]]\nname = \"sim\"\nharness = false\n";
+        assert!(has_sim_harness(app));
+        for platform in [
+            "[package]\nname = \"core\"\n",
+            "[[test]]\nname = \"sim\"\n",
+            "[[test]]\nname = \"sim\"\nharness = true\n",
+            "[[test]]\nname = \"wal\"\nharness = false\n",
+            "[[test\n",
+        ] {
+            assert!(!has_sim_harness(platform), "{platform}");
+        }
+        let dir =
+            std::env::temp_dir().join(format!("charpente-mutants-split-{}", std::process::id()));
+        let mut packages = Vec::new();
+        for (name, manifest) in [("app", app), ("core", "[package]\nname = \"core\"\n")] {
+            let path = dir.join(name).join("Cargo.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).expect("scratch");
+            std::fs::write(&path, manifest).expect("manifest");
+            packages.push(serde_json::json!({"name": name, "manifest_path": display(&path)}));
+        }
+        let meta = serde_json::json!({ "packages": packages });
+        let test_packages = ["core", "app", "absent"].map(String::from);
+        assert_eq!(sim_harness_packages(Some(&meta), &test_packages), ["app"]);
+        assert!(sim_harness_packages(None, &test_packages).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_rerun_line_quotes_what_a_shell_would_expand() {
+        let args = [
+            "--re",
+            "BumpCounter::run.*Ok",
+            "--master-seed",
+            "0X5",
+            "--property",
+            "it's",
+            "--dir",
+            "../app",
+        ]
+        .map(String::from);
+        assert_eq!(
+            rerun_line(&args, 0xbeef),
+            "rerun exactly this mutation run: charpente test --mutants --re \
+             'BumpCounter::run.*Ok' --property 'it'\\''s' --dir ../app --master-seed 0xbeef"
+        );
+        assert_eq!(
+            rerun_line(&[], 0x1),
+            "rerun exactly this mutation run: charpente test --mutants --master-seed 0x1"
+        );
+    }
+
+    #[test]
+    fn first_runs_defaults_to_32_and_the_master_seed_reads_as_hex() {
+        let opts = parse(&[]).expect("no flags parse");
+        assert_eq!((opts.first_runs, opts.master_seed), (32, None));
+        let opts = parse(&["--first-runs", "8", "--master-seed", "0xBEEF"].map(String::from))
+            .expect("parses");
+        assert_eq!((opts.first_runs, opts.master_seed), (8, Some(0xbeef)));
+        for bad in [
+            ["--first-runs", "0"],
+            ["--first-runs", "x"],
+            ["--master-seed", "zz"],
+        ] {
+            assert_eq!(parse(&bad.map(String::from)).err(), Some(2), "{bad:?}");
+        }
     }
 }

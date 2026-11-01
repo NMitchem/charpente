@@ -95,7 +95,14 @@ item with the trigger that reopens it.
   `cargo test` over the test set and passes `--timeout` as 5x that wall time, printing
   both numbers (an upper bound under `--property`); without that, slow-but-caught mutants
   read TIMEOUT. It checks `cargo mutants --version` before any of that, so a missing tool
-  costs no timing run. Exit 0 every
+  costs no timing run. When a `--test-package` has a `sim_tests!` harness (an app), the run
+  is two passes on one printed master seed (`--master-seed`, else drawn): pass 1 judges every
+  mutant on the first `--first-runs` (32) runs of each check, failed runs only, and pass 2
+  re-judges its MISSED and TIMEOUT mutants at the full count via cargo-mutants' `--iterate`,
+  after one full-count `cargo test` that judges the baseline either way; the verdicts are a
+  single full pass's (`tests/new.rs`'s ignored `the_quick_pass_matches_…` proves it, run by
+  hand). The default test set has no such harness, so a default run is one full pass. The
+  report's last line is the command that reruns the run exactly. Exit 0 every
   viable mutant caught, 1 a finding (**MISSED** = no oracle noticed, i.e. a one-sided
   property) or an unresolved run (**a timeout is not a catch**), 2 usage, infrastructure,
   or a baseline that was not green.

@@ -8,13 +8,18 @@ use std::process::Command;
 // (DESIGN.md §1) — this test drives the built `charpente` binary as a real
 // subprocess, exactly as a user would (duplicated from tests/cli.rs:
 // integration tests are separate binaries).
-// `charpente test --mutants` exports CHARPENTE_SIM_NO_SHRINK to every test
-// it runs, these included; removed here, so the batches below shrink as
-// they assert whatever runs them.
+// `charpente test --mutants` exports CHARPENTE_SIM_NO_SHRINK,
+// CHARPENTE_SIM_MASTER_SEED and, in its first pass, CHARPENTE_SIM_FIRST_RUNS
+// to every test it runs, these included; removed here, so the batches below
+// shrink, draw their own seeds and run in full, asserting the same exit codes
+// whatever runs them.
 #[allow(clippy::disallowed_methods)]
 fn charpente() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_charpente"));
-    command.env_remove("CHARPENTE_SIM_NO_SHRINK");
+    command
+        .env_remove("CHARPENTE_SIM_NO_SHRINK")
+        .env_remove("CHARPENTE_SIM_MASTER_SEED")
+        .env_remove("CHARPENTE_SIM_FIRST_RUNS");
     command
 }
 

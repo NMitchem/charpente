@@ -8,13 +8,18 @@ use std::process::Command;
 // Process spawning and scratch directories are edge tooling here, outside
 // the deterministic core (DESIGN.md §1): this file drives the built binary
 // as a real subprocess, exactly as a user would.
-// `charpente test --mutants` exports CHARPENTE_SIM_NO_SHRINK to every test
-// it runs, these included; removed here, so the batches below shrink as
-// they assert whatever runs them.
+// `charpente test --mutants` exports CHARPENTE_SIM_NO_SHRINK,
+// CHARPENTE_SIM_MASTER_SEED and, in its first pass, CHARPENTE_SIM_FIRST_RUNS
+// to every test it runs, these included; removed here, so the batches below
+// shrink, draw their own seeds and run in full, asserting the same exit codes
+// whatever runs them.
 #[allow(clippy::disallowed_methods)]
 fn charpente() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_charpente"));
-    command.env_remove("CHARPENTE_SIM_NO_SHRINK");
+    command
+        .env_remove("CHARPENTE_SIM_NO_SHRINK")
+        .env_remove("CHARPENTE_SIM_MASTER_SEED")
+        .env_remove("CHARPENTE_SIM_FIRST_RUNS");
     command
 }
 
@@ -671,4 +676,119 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
         "skipped for corruption, by name:\n{human}"
     );
     assert!(!human.contains("detail:"), "{human}");
+}
+
+/// The exactness test's master seed. Under it, the first 32 runs of
+/// `a_value_in_the_band_marks` draw no `v` below 2 and its 256 runs draw one 4
+/// times, so only the full count catches `mark_in_band`'s mutant. Found by hand
+/// on 2026-11-01 with that function emptied, all three checks unfiltered as the
+/// verb runs them: `CHARPENTE_SIM_FIRST_RUNS=32 CHARPENTE_SIM_MASTER_SEED=0x3`
+/// exits 0, and the full count exits 1 with `4 failed`. 0x1 and 0x2 land in
+/// the band within 32 runs, so under them the passes would agree for no reason.
+const EXACT_SEED: &str = "0x3";
+
+/// Spec §4 E and §6.4: the quick pass is exact. The fixture
+/// (`tests/fixtures/mutants-exact/`) holds three mutants: one every run
+/// catches, one only a run past the 32nd catches (the band, under
+/// `EXACT_SEED`), and one only an unmet `require` catches, which a quick pass
+/// never judges. The verb at `--first-runs 32` must decide the first in pass 1
+/// and the other two in pass 2; at `--first-runs 256`, the full count, pass 1
+/// is one full pass and decides all three. Each mutant's verdict is the same
+/// in both. Neither run shares a target dir: each pass builds in its own
+/// scratch copy, as an app author's run does, so no pass can judge another
+/// tree's build.
+#[test]
+#[ignore = "runs cargo-mutants 27.1.0 over a scratch app three times, a full build each: \
+            cargo test -p charpente-cli --test new -- --ignored the_quick_pass_matches"]
+// Rewriting the scaffold's sources is edge tooling (DESIGN.md §1): the rig
+// setting up the fixture, not code the sim exercises.
+#[allow(clippy::disallowed_methods)]
+fn the_quick_pass_matches_a_single_full_pass_mutant_by_mutant() {
+    let app = patched_scaffold("exact");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mutants-exact");
+    for (from, to) in [("lib.rs", "src/lib.rs"), ("sim.rs", "tests/sim.rs")] {
+        std::fs::write(app.join(to), read(&fixtures.join(from))).unwrap();
+    }
+    // The fixture's lib.rs has no `build_app` for the scaffold's binary to
+    // call, and a binary would add mutants of its own.
+    std::fs::remove_file(app.join("src/main.rs")).unwrap();
+    // Each mutant's (function, verdict, pass), as the verb's report lists them.
+    let run = |first_runs: &str| -> Vec<(String, String, String)> {
+        let out = charpente()
+            .current_dir(&app)
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_MUTANTS_JOBS")
+            .args([
+                "test",
+                "--mutants",
+                "--file",
+                "src/lib.rs",
+                "--test-package",
+            ])
+            .args([
+                "exact",
+                "--first-runs",
+                first_runs,
+                "--master-seed",
+                EXACT_SEED,
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        println!(
+            "==== --first-runs {first_runs}: exit {:?}\n---- stdout\n{stdout}---- stderr\n{stderr}",
+            out.status.code()
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "every mutant is caught:\n{stdout}"
+        );
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let (word, rest) = line.strip_prefix("  ")?.split_once(' ')?;
+                let (name, pass) = rest.trim_start().rsplit_once(" (")?;
+                let pass = pass.strip_suffix(')')?;
+                let function = name.split("replace ").nth(1)?.split(' ').next()?;
+                pass.starts_with("pass ")
+                    .then(|| (function.to_string(), word.to_string(), pass.to_string()))
+            })
+            .collect()
+    };
+    let owned = |rows: &[(&str, &str, &str)]| -> Vec<(String, String, String)> {
+        rows.iter()
+            .map(|(f, w, p)| (f.to_string(), w.to_string(), p.to_string()))
+            .collect()
+    };
+    let quick = run("32");
+    assert_eq!(
+        quick,
+        owned(&[
+            ("mark_every_run", "caught", "pass 1"),
+            ("mark_in_band", "caught", "pass 2"),
+            ("mark_covered", "caught", "pass 2"),
+        ]),
+        "at 32 runs pass 1 misses the band and judges no `require`"
+    );
+    let full = run("256");
+    assert_eq!(
+        full,
+        owned(&[
+            ("mark_every_run", "caught", "pass 1"),
+            ("mark_in_band", "caught", "pass 1"),
+            ("mark_covered", "caught", "pass 1"),
+        ]),
+        "at the full count, one pass decides all three"
+    );
+    let verdicts = |rows: &[(String, String, String)]| -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(f, w, _)| (f.clone(), w.clone()))
+            .collect()
+    };
+    assert_eq!(verdicts(&quick), verdicts(&full), "mutant by mutant");
+    // The scaffold's own target dir holds a full build; the test passed, so
+    // nothing in it is evidence.
+    let _ = std::fs::remove_dir_all(app.parent().expect("the scaffold's scratch dir"));
 }
