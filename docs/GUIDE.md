@@ -3336,7 +3336,11 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    clock_fallout(sim, t)`.
 2. **A faulted phase.** The requests, each an offset from the instant the app
    booted and in arrival order, run through one kernel under the run's faults
-   until nothing is left inside the horizon. The kernel gets the sim's
+   until nothing is left inside the horizon. An offset past the horizon
+   panics before anything runs, since the phase would never send that
+   request, naming the last offset, the horizon and the fix: raise the
+   horizon past the last request, or space the requests closer. An offset
+   equal to the horizon is sent. The kernel gets the sim's
    outbound handle exactly when the app declares hosts. Fault fallout ends
    the phase: it is the crash under test, never a give-up and never a skip,
    and the answers already recorded stand. `phase.answers[i]` is request

@@ -129,11 +129,28 @@ impl<'s> Drive<'s> {
     ///   (`Sim::remote`): `the app calls <host>, but the workload registered
     ///   no model for it — call sim.remote("<host>", …) before
     ///   Drive::faulted_phase`.
+    ///
+    /// Panics, before anything runs, when a request's offset lies past
+    /// `horizon`: the phase would never send it, and it would leave the
+    /// faults unnoticed. The text names the last offset, the horizon and the
+    /// fix (raise the horizon past the last request, or space the requests
+    /// closer). An offset equal to `horizon` is served.
     pub fn faulted_phase(
         &self,
         requests: &[(Duration, Request)],
         horizon: Duration,
     ) -> Result<Phase, String> {
+        // The source serves a request at the horizon and none past it, so a
+        // later offset would leave the faults silently: its answer stays
+        // `None` and only the tail sends it.
+        let last = requests.iter().map(|(at, _)| *at).max().unwrap_or_default();
+        assert!(
+            last <= horizon,
+            "contract: Drive::faulted_phase's last request is {last:?} from the phase's start, \
+             past its {horizon:?} horizon, so the faulted phase would never send it and only \
+             the fault-free tail would — raise the horizon past the last request, or space the \
+             requests closer"
+        );
         let sim = self.sim;
         let mut phase = Phase {
             requests: requests.iter().map(|(_, r)| r.clone()).collect(),

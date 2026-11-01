@@ -724,6 +724,41 @@ fn recover_refuses_a_phase_without_one_answer_per_request() {
     let _ = drive.recover(&phase, Duration::from_secs(1));
 }
 
+/// A request past the faulted phase's horizon would never be sent under
+/// faults: the phase's source stops at the horizon, its answer stays `None`,
+/// and only the fault-free tail sends it. A request exactly at the horizon is
+/// still served, so the contract is on the last offset alone.
+#[test]
+#[should_panic(
+    expected = "contract: Drive::faulted_phase's last request is 1.5s from the phase's start, \
+                past its 1s horizon, so the faulted phase would never send it and only the \
+                fault-free tail would — raise the horizon past the last request, or space the \
+                requests closer"
+)]
+fn faulted_phase_refuses_a_request_past_its_horizon() {
+    // No faults: the contract panics before the sim runs anything, so any
+    // seed shows it.
+    let sim = Sim::with_faults(0xD7_5001, FaultConfig::none());
+    let drive = Drive::new(&sim, notes);
+    let requests = [
+        (Duration::from_secs(1), post(1)),
+        (Duration::from_millis(1500), post(2)),
+    ];
+    let _ = drive.faulted_phase(&requests, Duration::from_secs(1));
+}
+
+/// The contract's boundary: a request exactly at the horizon is no breach,
+/// and the phase sends it.
+#[test]
+fn a_request_at_the_horizon_is_sent_in_the_phase() {
+    let sim = Sim::with_faults(0xD7_5001, FaultConfig::none());
+    let drive = Drive::new(&sim, notes);
+    let phase = drive
+        .faulted_phase(&[(Duration::from_secs(1), post(1))], Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(phase.answers, vec![Some((200, id_body(1)))]);
+}
+
 /// The tail's three ways not to boot, each with its own text. No faults run:
 /// each failure is the build's doing, so no seed is needed to show it, and
 /// the drive sends one request through a hand-built phase.
