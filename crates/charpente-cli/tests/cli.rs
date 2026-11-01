@@ -704,9 +704,15 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 /// `cargo mutants` copies that directory in as `<--output>/mutants.out`, the
 /// run record the verb then reads, moving an earlier one to `mutants.out.old`
 /// as the tool does; a call with `--iterate` (pass 2) copies
-/// `$SHIM_OUTCOMES_ITERATE` instead. A `cargo test --no-run` exits
-/// `$SHIM_BUILD_EXIT` when it is set, and a timed `cargo test` prints
-/// `$SHIM_TEST_STDOUT`'s file first when that is set.
+/// `$SHIM_OUTCOMES_ITERATE` instead, and with that unset it writes nothing and
+/// exits `$SHIM_ITERATE_EXIT` when that is set (a pass 2 that died). A
+/// `cargo test --no-run` exits `$SHIM_BUILD_EXIT` when it is set, and a timed
+/// `cargo test` prints `$SHIM_TEST_STDOUT`'s file first when that is set, and
+/// sleeps `$SHIM_SLEEP_FULL` seconds when that is set and
+/// CHARPENTE_SIM_FIRST_RUNS is not, so a full-count run takes measurably
+/// longer than a quick one. With `$SHIM_EARLIER_RECORD` set, the install
+/// probe (run in `--dir`, before the verb notes the record there) copies that
+/// directory's `outcomes.json` in as an earlier run's record.
 // Writing the shim and the scratch workspace is edge tooling outside the
 // deterministic core (DESIGN.md §1), the same shape as tests/genclient.rs.
 #[cfg(unix)]
@@ -803,7 +809,13 @@ fn run_mutants_with_cargo_shim_in(
          if [ \"$1\" = metadata ]; then cat \"$SHIM_METADATA\"; exit 0; fi\n\
          if [ \"$1\" = test ] && [ \"$2\" = --no-run ]; then exit \"${SHIM_BUILD_EXIT:-$SHIM_TEST_EXIT}\"; fi\n\
          if [ \"$1\" = test ] && [ -n \"$SHIM_TEST_STDOUT\" ]; then cat \"$SHIM_TEST_STDOUT\"; fi\n\
+         if [ \"$1\" = test ] && [ -n \"$SHIM_SLEEP_FULL\" ] && [ -z \"$CHARPENTE_SIM_FIRST_RUNS\" ]; \
+         then sleep \"$SHIM_SLEEP_FULL\"; fi\n\
          [ \"$1\" = mutants ] || exit \"$SHIM_TEST_EXIT\"\n\
+         if [ \"$2\" = --version ] && [ -n \"$SHIM_EARLIER_RECORD\" ]; then\n\
+           mkdir -p target/charpente-mutants/mutants.out\n\
+           cp \"$SHIM_EARLIER_RECORD/outcomes.json\" target/charpente-mutants/mutants.out/\n\
+         fi\n\
          if [ \"$2\" = --version ]; then echo 'cargo-mutants 27.1.0'; exit \"$SHIM_VERSION_EXIT\"; fi\n\
          out=\n\
          iterate=\n\
@@ -816,6 +828,9 @@ fn run_mutants_with_cargo_shim_in(
          else echo 'output missing' >> \"$SHIM_RECORD\"; fi\n\
          src=$SHIM_OUTCOMES\n\
          if [ -n \"$iterate\" ]; then src=$SHIM_OUTCOMES_ITERATE; fi\n\
+         if [ -n \"$iterate\" ] && [ -z \"$src\" ] && [ -n \"$SHIM_ITERATE_EXIT\" ]; then\n\
+           echo 'shim: pass 2 died before writing a record' >&2; exit \"$SHIM_ITERATE_EXIT\"\n\
+         fi\n\
          if [ -n \"$src\" ]; then\n\
            rm -rf \"$out/mutants.out.old\"\n\
            if [ -d \"$out/mutants.out\" ]; then mv \"$out/mutants.out\" \"$out/mutants.out.old\"; fi\n\
@@ -854,6 +869,9 @@ fn run_mutants_with_cargo_shim_in(
         .env_remove("SHIM_OUTCOMES_ITERATE")
         .env_remove("SHIM_BUILD_EXIT")
         .env_remove("SHIM_TEST_STDOUT")
+        .env_remove("SHIM_SLEEP_FULL")
+        .env_remove("SHIM_ITERATE_EXIT")
+        .env_remove("SHIM_EARLIER_RECORD")
         .envs(envs.iter().copied())
         .output()
         .expect("charpente binary runs");
@@ -1189,7 +1207,8 @@ fn mutants_passes_an_explicit_timeout_through_without_a_timing_run() {
 
 /// A pass's record dir under `base`: `outcomes.json` with these counters
 /// (total, caught, missed, timeout, unviable) and mutants (`(name, summary)`),
-/// after a green baseline.
+/// after a green baseline. Its `start_time` is `pass`, so two passes' records
+/// differ as two real runs' do.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
 fn pass_record(
@@ -1212,7 +1231,7 @@ fn pass_record(
     std::fs::write(
         dir.join("outcomes.json"),
         format!(
-            r#"{{"total_mutants":{total},"caught":{caught},"missed":{missed},"timeout":{timeout},"unviable":{unviable},"outcomes":[{{"scenario":"Baseline","summary":"Success"}},{}]}}"#,
+            r#"{{"total_mutants":{total},"caught":{caught},"missed":{missed},"timeout":{timeout},"unviable":{unviable},"start_time":"{pass}","outcomes":[{{"scenario":"Baseline","summary":"Success"}},{}]}}"#,
             mutants.join(",")
         ),
     )
@@ -1305,20 +1324,34 @@ fn mutants_over_an_app_runs_two_passes_on_one_master_seed() {
             recorded[at]
         );
     }
+    let (masked, _, _) = mask_timings(&stdout);
     assert!(
-        stdout.starts_with(
+        masked.starts_with(
             "mutants: master seed 0xabc, set on every test this run starts as \
-             CHARPENTE_SIM_MASTER_SEED\n"
+             CHARPENTE_SIM_MASTER_SEED\n\
+             mutants: this run is two passes, for the sim_tests! harness in app: pass 1 judges \
+             every mutant on the first 32 runs of each check, failed runs only unless that is \
+             the check's full count, and pass 2 judges what pass 1 missed or timed out at the \
+             full count\n\
+             mutants: running `cargo test --package app` at the full count, the baseline pass 2 \
+             judges against; its output shows only if it fails\n\
+             mutants: `cargo test` over app at the full count is green (<s> s of wall time)\n\
+             mutants: pass 1 of 2, CHARPENTE_SIM_FIRST_RUNS=32: a MISSED or TIMEOUT line from it \
+             is judged again in pass 2\n\
+             mutants: pass 2 of 2, at the full count: the 2 mutants pass 1 did not catch\n\
+             mutants: each mutant's verdict, and the pass that decided it:\n\
+             \x20 caught   app/src/lib.rs:3:5: replace every_run with () (pass 1)\n\
+             \x20 caught   app/src/lib.rs:7:5: replace in_band with () (pass 2)\n\
+             \x20 MISSED   app/src/lib.rs:11:5: replace slow with () (pass 2)\n\
+             mutants: 3 total — 2 caught, 1 missed, 0 unviable, 0 timed out\n"
         ),
         "{stdout}"
     );
     assert!(
         stdout.contains(
-            "mutants: each mutant's verdict, and the pass that decided it:\n\
-             \x20 caught   app/src/lib.rs:3:5: replace every_run with () (pass 1)\n\
-             \x20 caught   app/src/lib.rs:7:5: replace in_band with () (pass 2)\n\
-             \x20 MISSED   app/src/lib.rs:11:5: replace slow with () (pass 2)\n\
-             mutants: 3 total — 2 caught, 1 missed, 0 unviable, 0 timed out\n"
+            "\n  two passes on master seed 0xabc: pass 1 judged every mutant on the first 32 runs \
+             of each sim check, failed runs only unless that is the check's full count, and pass \
+             2 judged the 2 it did not catch at the full count\n"
         ),
         "{stdout}"
     );
@@ -1550,6 +1583,271 @@ fn mutants_removes_an_exported_run_count_from_every_full_count_run() {
         ],
         "the shim saw {recorded:?}"
     );
+}
+
+/// `stdout` with each wall time masked to `<s>` and each derived timeout to
+/// `<n>`, so every line can be pinned whole, and the masked values in the
+/// order they appeared.
+#[cfg(unix)]
+fn mask_timings(stdout: &str) -> (String, Vec<f64>, Vec<u64>) {
+    let (mut masked, mut secs, mut timeouts) = (String::new(), Vec::new(), Vec::new());
+    for line in stdout.lines() {
+        let mut line = line.to_string();
+        if let Some(end) = line.find(" s of wall time") {
+            let start = line[..end]
+                .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .map_or(0, |i| i + 1);
+            secs.push(line[start..end].parse().expect("seconds"));
+            line.replace_range(start..end, "<s>");
+        }
+        if let Some(end) = line.find(" (5x)") {
+            let start = line[..end].rfind(' ').map_or(0, |i| i + 1);
+            timeouts.push(line[start..end].parse().expect("a timeout"));
+            line.replace_range(start..end, "<n>");
+        }
+        masked.push_str(&line);
+        masked.push('\n');
+    }
+    (masked, secs, timeouts)
+}
+
+/// Each `cargo test` run (builds left out) and each cargo-mutants pass the
+/// shim recorded, in order, with the CHARPENTE_SIM_FIRST_RUNS it saw.
+#[cfg(unix)]
+fn runs_and_run_counts(recorded: &[String]) -> Vec<(&str, &str)> {
+    (0..recorded.len())
+        .filter(|&i| {
+            recorded[i].starts_with("cargo test --package")
+                || recorded[i].starts_with("cargo mutants --output")
+        })
+        .map(|i| {
+            let count = recorded[i + 2].trim_start();
+            (
+                recorded[i].as_str(),
+                count
+                    .strip_prefix("CHARPENTE_SIM_FIRST_RUNS=")
+                    .unwrap_or(count),
+            )
+        })
+        .collect()
+}
+
+/// Review I1 and I2, R-T13: over a test set that differs from cargo-mutants'
+/// own baseline (two test packages here), the full-count run before pass 1
+/// times pass 2, a run at `--first-runs` then times pass 1, and each pass gets
+/// five times its own run. The shim sleeps 1 s on a full-count `cargo test`
+/// only, so the two timeouts differ (about 6 against 1), and a pass handed the
+/// other's is red here. With `--timeout 60` the full-count run still judges the
+/// baseline, nothing is timed, and both passes get 60. Every line the verb
+/// prints is pinned whole, wall times and derived timeouts masked.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn mutants_times_each_pass_at_its_own_run_count() {
+    let base = std::env::temp_dir().join(format!("charpente-mutants-timed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let first = pass_record(
+        &base,
+        "first",
+        [2, 1, 1, 0, 0],
+        &[
+            ("3:5: replace every_run", "CaughtMutant"),
+            ("7:5: replace in_band", "MissedMutant"),
+        ],
+    );
+    let second = pass_record(
+        &base,
+        "second",
+        [1, 1, 0, 0, 0],
+        &[("7:5: replace in_band", "CaughtMutant")],
+    );
+    let envs = [
+        ("SHIM_OUTCOMES", first.as_path()),
+        ("SHIM_OUTCOMES_ITERATE", second.as_path()),
+        ("SHIM_SLEEP_FULL", std::path::Path::new("1")),
+    ];
+    let args = [
+        "--test-package",
+        "app",
+        "--test-package",
+        "pkg-a",
+        "--file",
+        "app/src/lib.rs",
+        "--master-seed",
+        "0x5",
+    ];
+    let (out, recorded) = run_mutants_with_cargo_shim_in("0", "0", "0", &args, false, &envs);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let (masked, secs, timeouts) = mask_timings(&stdout);
+    let [full, quick] = timeouts[..] else {
+        panic!("two timing lines, pass 2's then pass 1's: {stdout}")
+    };
+    assert!(
+        secs[0] >= 1.0 && full >= 5 && quick < full,
+        "the full-count run slept 1 s and the quick one did not: {stdout}"
+    );
+    let runs = runs_and_run_counts(&recorded);
+    assert!(
+        runs.len() == 4
+            && runs[..2]
+                == [
+                    ("cargo test --package app --package pkg-a", "unset"),
+                    ("cargo test --package app --package pkg-a", "32"),
+                ]
+            && runs[2].1 == "32"
+            && !runs[2].0.contains("--iterate")
+            && runs[2].0.ends_with(&format!(" --timeout {quick}"))
+            && runs[3].1 == "unset"
+            && runs[3].0.ends_with(&format!(" --iterate --timeout {full}")),
+        "the full-count run, pass 1's timing run, pass 1 at {quick} s, pass 2 at {full} s; \
+         the shim saw {recorded:?}"
+    );
+    let (head, rerun) = masked.trim_end().rsplit_once('\n').expect("lines");
+    let opening = "mutants: master seed 0x5, set on every test this run starts as \
+                   CHARPENTE_SIM_MASTER_SEED\n\
+                   mutants: this run is two passes, for the sim_tests! harness in app: pass 1 \
+                   judges every mutant on the first 32 runs of each check, failed runs only \
+                   unless that is the check's full count, and pass 2 judges what pass 1 missed or \
+                   timed out at the full count\n\
+                   mutants: running `cargo test --package app --package pkg-a` at the full count, \
+                   the baseline pass 2 judges against; its output shows only if it fails\n";
+    let passes = "mutants: pass 1 of 2, CHARPENTE_SIM_FIRST_RUNS=32: a MISSED or TIMEOUT line \
+                  from it is judged again in pass 2\n\
+                  mutants: pass 2 of 2, at the full count: the 1 mutant pass 1 did not catch\n\
+                  mutants: each mutant's verdict, and the pass that decided it:\n\
+                  \x20 caught   app/src/lib.rs:3:5: replace every_run with () (pass 1)\n\
+                  \x20 caught   app/src/lib.rs:7:5: replace in_band with () (pass 2)\n\
+                  mutants: 2 total — 2 caught, 0 missed, 0 unviable, 0 timed out\n\
+                  \x20 two passes on master seed 0x5: pass 1 judged every mutant on the first 32 \
+                  runs of each sim check, failed runs only unless that is the check's full \
+                  count, and pass 2 judged the 1 it did not catch at the full count\n\
+                  \x20 judged at the full count in both passes, with no sim_tests! harness to \
+                  take a quick pass: pkg-a";
+    assert_eq!(
+        head,
+        format!(
+            "{opening}\
+             mutants: pass 2: `cargo test` over app, pkg-a at the full count took <s> s of wall \
+             time; that is what each mutant runs, and cargo-mutants' own baseline times only \
+             the mutated file's package, so the verb is passing --timeout <n> (5x)\n\
+             mutants: running `cargo test --package app --package pkg-a` while timing the test \
+             set for --timeout; its output shows only if it fails\n\
+             mutants: pass 1: `cargo test` over app, pkg-a on the first 32 runs of each sim \
+             check took <s> s of wall time; that is what each mutant runs, and cargo-mutants' \
+             own baseline times only the mutated file's package, so the verb is passing \
+             --timeout <n> (5x)\n\
+             {passes}"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        rerun.ends_with(
+            " --re no-such-mutant-anywhere --test-package app --test-package pkg-a --file \
+             app/src/lib.rs --master-seed 0x5"
+        ),
+        "{stdout}"
+    );
+
+    let args = [&args[..], &["--timeout", "60"]].concat();
+    let (out, recorded) = run_mutants_with_cargo_shim_in("0", "0", "0", &args, false, &envs);
+    let _ = std::fs::remove_dir_all(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let runs = runs_and_run_counts(&recorded);
+    assert!(
+        runs.len() == 3
+            && runs[0] == ("cargo test --package app --package pkg-a", "unset")
+            && runs[1].1 == "32"
+            && runs[1].0.ends_with(" --timeout 60")
+            && runs[2].1 == "unset"
+            && runs[2].0.ends_with(" --iterate --timeout 60"),
+        "the full-count run, then both passes at 60 s; the shim saw {recorded:?}"
+    );
+    let (masked, _, timeouts) = mask_timings(&stdout);
+    assert!(timeouts.is_empty(), "{stdout}");
+    let (head, _) = masked.trim_end().rsplit_once('\n').expect("lines");
+    assert_eq!(
+        head,
+        format!(
+            "{opening}\
+             mutants: `cargo test` over app, pkg-a at the full count is green (<s> s of wall \
+             time)\n\
+             {passes}"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Review M3: a pass whose cargo-mutants died before moving the record in
+/// `--output` aside leaves an earlier one there, an earlier run's in a run of
+/// one pass and pass 1's in pass 2. That record's `start_time` is the one the
+/// verb noted before the pass, so the verb exits 2 saying nothing was
+/// measured, rather than report its verdicts as the pass's own.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn mutants_refuses_a_record_its_pass_did_not_write() {
+    let base = std::env::temp_dir().join(format!("charpente-mutants-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let earlier = pass_record(
+        &base,
+        "earlier",
+        [1, 1, 0, 0, 0],
+        &[("3:5: replace every_run", "CaughtMutant")],
+    );
+    let first = pass_record(
+        &base,
+        "first",
+        [1, 0, 1, 0, 0],
+        &[("3:5: replace every_run", "MissedMutant")],
+    );
+    let died = std::path::Path::new("1");
+    for (args, envs, stale, passes) in [
+        (
+            &["--test-package", "pkg-a", "--test-package", "pkg-b"][..],
+            &[("SHIM_EARLIER_RECORD", earlier.as_path())][..],
+            "earlier",
+            1,
+        ),
+        (
+            &["--test-package", "app", "--file", "app/src/lib.rs"][..],
+            &[
+                ("SHIM_OUTCOMES", first.as_path()),
+                ("SHIM_ITERATE_EXIT", died),
+            ][..],
+            "first",
+            2,
+        ),
+    ] {
+        let (out, recorded) = run_mutants_with_cargo_shim_in("0", "1", "0", args, false, envs);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(2), "{stale}: {stderr}");
+        let last = stderr.lines().last().unwrap_or_default();
+        assert!(
+            last.starts_with("error: cargo-mutants exited 1 and left ")
+                && last.ends_with(&format!(
+                    "/target/charpente-mutants/mutants.out/outcomes.json as it found it \
+                     (start_time {stale}, an earlier pass's or run's record) — NOTHING WAS \
+                     MEASURED in this pass; its own error is printed above this line."
+                )),
+            "{stale}: {stderr}"
+        );
+        assert!(
+            !stdout.contains("mutants: each mutant's verdict"),
+            "{stale}: no report from a record the pass did not write: {stdout}"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|l| l.starts_with("cargo mutants --output"))
+                .count(),
+            passes,
+            "{stale}: the shim saw {recorded:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

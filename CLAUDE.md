@@ -92,16 +92,21 @@ item with the trigger that reopens it.
   package (the mutated file's) while every mutant runs every test package, so whenever
   those differ (two or more test packages, as the default set is, or one that is not
   every `--file`'s package) and no `--timeout` is given, the verb first times one
-  `cargo test` over the test set and passes `--timeout` as 5x that wall time, printing
+  `cargo test` over the test set (in a one-pass run; two passes time each pass) and passes `--timeout` as 5x that wall time, printing
   both numbers (an upper bound under `--property`); without that, slow-but-caught mutants
   read TIMEOUT. It checks `cargo mutants --version` before any of that, so a missing tool
   costs no timing run. When a `--test-package` has a `sim_tests!` harness (an app), the run
-  is two passes on one printed master seed (`--master-seed`, else drawn): pass 1 judges every
-  mutant on the first `--first-runs` (32) runs of each check, failed runs only, and pass 2
-  re-judges its MISSED and TIMEOUT mutants at the full count via cargo-mutants' `--iterate`,
-  after one full-count `cargo test` that judges the baseline either way; the verdicts are a
-  single full pass's (`tests/new.rs`'s ignored `the_quick_pass_matches_…` proves it, run by
-  hand). The default test set has no such harness, so a default run is one full pass. The
+  is two passes on one printed master seed (`--master-seed`, else drawn). Before pass 1 the
+  verb runs one full-count `cargo test` over the test set (`--property`-scoped), which judges
+  the baseline even when pass 2 gets nothing; then pass 1 judges every mutant on the first
+  `--first-runs` (32) runs of each check, failed runs only, and pass 2 re-judges its MISSED
+  and TIMEOUT mutants at the full count via cargo-mutants' `--iterate`. Where the sets differ
+  there are two timing runs: that full-count run times pass 2, exactly even under
+  `--property`, and a second at `--first-runs` times pass 1 (an upper bound under
+  `--property`); an explicit `--timeout` skips the second only. The verdicts are a single full
+  pass's, except that a mutant which fails an early run and then hangs is caught in pass 1
+  where a full pass would time out (`tests/new.rs`'s ignored `the_quick_pass_matches_…`
+  proves the rest, run by hand). The default test set has no such harness, so a default run is one full pass. The
   report's last line is the command that reruns the run exactly. Exit 0 every
   viable mutant caught, 1 a finding (**MISSED** = no oracle noticed, i.e. a one-sided
   property) or an unresolved run (**a timeout is not a catch**), 2 usage, infrastructure,

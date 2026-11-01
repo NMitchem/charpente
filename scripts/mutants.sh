@@ -25,8 +25,13 @@
 # exactly the --files' one package (two or more, as the default set is, or one
 # that is another crate's) and no --timeout is given, the verb times one
 # `cargo test` over the test set first and passes 5x that as --timeout,
-# printing both numbers.
-# An explicit --timeout SECS skips the timing run.
+# printing both numbers. Over an app (a --test-package with a sim_tests!
+# harness) the run is two passes, and the verb first runs `cargo test` over
+# the test set at the full count, before pass 1: it judges the baseline, and
+# it times pass 2 exactly, --property filter included. A second timing run at
+# --first-runs then times pass 1 (an upper bound under --property).
+# An explicit --timeout SECS skips the timing runs, but not that full-count
+# run, which judges the baseline whatever the timeout.
 #
 # Requires the pinned tool:
 #   cargo install cargo-mutants --version 27.1.0 --locked

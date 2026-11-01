@@ -4959,7 +4959,7 @@ mutants: 1 total — 0 caught, 1 missed, 0 unviable, 0 timed out
   Fix: assert the EFFECT the mutated code produces (a value that differs when it does
   not run), not merely that the surrounding state is still readable. The surviving
   diff is in the run directory.
-  two passes on master seed 0x151da62aeec8e187: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only, and pass 2 judged what it did not catch at the full count
+  two passes on master seed 0x151da62aeec8e187: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only unless that is the check's full count, and pass 2 judged the 1 it did not catch at the full count
 rerun exactly this mutation run: charpente test --mutants --file crates/sim-fixture/src/lib.rs --re 'BumpCounter::run.*Ok' --test-package sim-fixture --property counter_bump_job_leaves_the_row_readable --master-seed 0x151da62aeec8e187
 ```
 
@@ -4969,8 +4969,11 @@ The report is the verb's: each mutant with its verdict and the pass that
 decided it, the summary, a MISSED or TIMED OUT paragraph, the functions no
 viable mutant measured (below), the passes and the master seed, and the
 command that reruns the run (two passes and the seed, below). When it derives
-`--timeout` it prints its timing line first (below). The
-run directory is cargo-mutants' own per-mutant record, at
+`--timeout` it prints its timing line first (below). The verb holds the output
+of its own `cargo test` runs and prints it only when a run is red, so before
+each one it prints a line naming it,
+``mutants: running `cargo test …` <what for>; its output shows only if it fails``.
+The run directory is cargo-mutants' own per-mutant record, at
 `target/charpente-mutants/mutants.out/` under the directory the verb ran in
 (`--dir`, default `.`): `outcomes.json`; `caught.txt`, `missed.txt`,
 `timeout.txt` and `unviable.txt`, one mutant per line; and `diff/`, one patch
@@ -4984,8 +4987,14 @@ out of the repository.
 The same mutant, judged by the honest sibling, is **CAUGHT**:
 
 ```
-$ charpente test --mutants … --property counter_bump_job_changes_the_row
+$ charpente test --mutants … --property counter_bump_job_changes_the_row --master-seed 0x151da62aeec8e187
+…
+mutants: pass 1 caught every viable mutant, so pass 2 has none to judge
+mutants: each mutant's verdict, and the pass that decided it:
+  caught   crates/sim-fixture/src/lib.rs:40:9: replace BumpCounter::run -> Result<(), JobError> with Ok(()) (pass 1)
 mutants: 1 total — 1 caught, 0 missed, 0 unviable, 0 timed out
+  two passes on master seed 0x151da62aeec8e187: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only unless that is the check's full count, and it caught every viable one, so pass 2 had none to judge
+rerun exactly this mutation run: charpente test --mutants --file crates/sim-fixture/src/lib.rs --re 'BumpCounter::run.*Ok' --test-package sim-fixture --property counter_bump_job_changes_the_row --master-seed 0x151da62aeec8e187
 ```
 
 Both properties ran 256 runs and reached ~147 verdicts each, so neither
@@ -5111,7 +5120,9 @@ at the full count only the mutants pass 1 missed or timed out: cargo-mutants'
 quick pass's runs are a prefix of the full count's for every check, so a run
 that fails in pass 1 fails at the full count too, and every mutant pass 1 did
 not catch gets the full count in pass 2. Each mutant's verdict is therefore
-the one a single full pass gives. Before either pass the verb runs `cargo test`
+the one a single full pass gives, with one difference, where pass 1 is the
+stricter: a mutant that fails an early run and then hangs is caught in pass 1,
+where a single full pass would time out on it. Before either pass the verb runs `cargo test`
 over the test set once at the full count (with `--property`'s filter when it
 is given). That run is the baseline pass 2 judges against. An unmet `require`
 or a check that tested nothing makes it red, and the verb exits 2 before any
@@ -5135,7 +5146,7 @@ mutants: each mutant's verdict, and the pass that decided it:
   caught   src/lib.rs:16:5: replace mark_in_band with () (pass 2)
   caught   src/lib.rs:21:5: replace mark_covered with () (pass 2)
 mutants: 3 total — 3 caught, 0 missed, 0 unviable, 0 timed out
-  two passes on master seed 0x3: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only, and pass 2 judged what it did not catch at the full count
+  two passes on master seed 0x3: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only unless that is the check's full count, and pass 2 judged the 2 it did not catch at the full count
 rerun exactly this mutation run: charpente test --mutants --file src/lib.rs --test-package exact --first-runs 32 --master-seed 0x3
 ```
 
