@@ -145,15 +145,19 @@ impl HarnessArgs {
                 "--faults-off" => {
                     for name in next_value(&mut args, &flag)?.split(',') {
                         let Some(&axis) = FAULT_AXES.iter().find(|a| **a == name) else {
-                            // A field, but a scope rather than an axis, so the
-                            // binding refusal's "not a FaultConfig field" would
-                            // be false for it.
+                            // A field, but a scope rather than an axis, so its
+                            // refusal names the two axes it scopes: those are
+                            // what turning it off would have meant.
                             return Err(if name == "corruption_scope" {
                                 "--faults-off: \"corruption_scope\" is not a fault axis: it \
                                  scopes bit_flip and misdirected_write, so turn those off instead"
                                     .to_string()
                             } else {
-                                format!("--faults-off: \"{name}\" is not a FaultConfig field")
+                                format!(
+                                    "--faults-off: \"{name}\" is not a fault axis — valid axes: \
+                                     {}",
+                                    FAULT_AXES.join(", ")
+                                )
                             });
                         };
                         if !faults_off.contains(&axis) {
@@ -4793,7 +4797,13 @@ mod tests {
         }
         assert_eq!(
             parse(&["--seed", "0x1", "--faults-off", "write_error,disk_crash"]).unwrap_err(),
-            "--faults-off: \"disk_crash\" is not a FaultConfig field"
+            "--faults-off: \"disk_crash\" is not a fault axis — valid axes: write_error, \
+             sync_error, crash_apply, crash_torn, dir_entry_loss, bit_flip, misdirected_write, \
+             read_error, object_put_error, object_get_error, object_lost_ack, \
+             object_delete_error, conn_drop, net_spike, subscriber_stall, outbound_refused, \
+             outbound_lost_request, outbound_lost_reply, outbound_throttle, outbound_slow, \
+             outbound_latency, disk_latency, net_latency, clock_skew, clock_step_back, \
+             clock_downtime"
         );
         assert_eq!(
             parse(&["--seed", "0x1", "--faults-off", "corruption_scope"]).unwrap_err(),

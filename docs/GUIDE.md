@@ -4542,8 +4542,8 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   replay flag: it is exactly what a failure's own `repro:` line uses. A
   replay is one run, so it shrinks nothing.
   It prints each check as `ok`, `FAILED` or `skipped`; under a skipped check,
-  `skipped:` is the reason and `detail:` the run's own detail, and the
-  `sim result:` line ends with the seed.
+  `skipped:` is the reason, `detail:` the run's own detail and `fired:` what
+  fired in the run, and the `sim result:` line ends with the seed.
 - `--inputs HEX` — with `--seed`, replay these input choices instead of the
   ones the seed draws: each `sim.input()` draw reads the next, and every draw
   past the end reads 0. A choice above its draw's range draws what it reduces
@@ -4554,9 +4554,16 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   error naming the flag, so an unset `--inputs "$HEX"` never replays all zeros.
 - `--faults-off AXIS,…` — with `--seed`, turn these `FaultConfig` axes off
   (any field but `corruption_scope`, which scopes two axes rather than being
-  one). The seed's config is sampled first and these are turned off after, so
-  every other field is the seed's own. A name that is not a field is a usage
-  error.
+  one). The axes are `write_error`, `sync_error`, `crash_apply`, `crash_torn`,
+  `dir_entry_loss`, `bit_flip`, `misdirected_write`, `read_error`,
+  `object_put_error`, `object_get_error`, `object_lost_ack`,
+  `object_delete_error`, `conn_drop`, `net_spike`, `subscriber_stall`,
+  `outbound_refused`, `outbound_lost_request`, `outbound_lost_reply`,
+  `outbound_throttle`, `outbound_slow`, `outbound_latency`, `disk_latency`,
+  `net_latency`, `clock_skew`, `clock_step_back` and `clock_downtime`. The
+  seed's config is sampled first and these are turned off after, so every
+  other field is the seed's own. A name that is not an axis is a usage error
+  that lists them.
 - `--master-seed 0x…` — pick where the batch's seed chain starts, instead
   of fresh OS entropy, for a byte-identical repeat of an entire batch
   (every check's every run). Cannot be combined with `--seed`. The batch's

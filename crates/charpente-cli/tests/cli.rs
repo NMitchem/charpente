@@ -239,7 +239,13 @@ fn the_repro_flags_refuse_by_name_and_run_nothing() {
         ),
         (
             &["--seed", "0x1", "--faults-off", "disk_crash"][..],
-            "--faults-off: \"disk_crash\" is not a FaultConfig field",
+            "--faults-off: \"disk_crash\" is not a fault axis — valid axes: write_error, \
+             sync_error, crash_apply, crash_torn, dir_entry_loss, bit_flip, misdirected_write, \
+             read_error, object_put_error, object_get_error, object_lost_ack, \
+             object_delete_error, conn_drop, net_spike, subscriber_stall, outbound_refused, \
+             outbound_lost_request, outbound_lost_reply, outbound_throttle, outbound_slow, \
+             outbound_latency, disk_latency, net_latency, clock_skew, clock_step_back, \
+             clock_downtime",
         ),
         // An unset `--inputs "$HEX"` must not replay all zeros.
         (
