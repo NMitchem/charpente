@@ -77,8 +77,10 @@ item with the trigger that reopens it.
   ceiling holds.
 - App-level sim batch: `cargo run -p charpente-cli -- test --sim [--runs N]
   [--seed 0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json]
-  [--dir PATH]` — dogfood target `--dir crates/sim-fixture`. Exit 0 green, 1 failures,
-  2 usage/launch error. `--master-seed` replays a whole batch byte-identically.
+  [--dir PATH]` — dogfood target `--dir crates/sim-fixture`. Exit 0 green, 1 failures
+  (an untested check, one whose every run was skipped, is a failure; a `--seed` replay of
+  a skipped run exits 0), 2 usage/launch error. `--master-seed` replays a whole batch
+  byte-identically.
 - **Mutation instrument (on demand, NOT in `cargo test --workspace`):** `scripts/mutants.sh`
   wraps `charpente test --mutants [--file PATH]… [--re REGEX] [--timeout SECS]`. Needs
   `cargo install cargo-mutants --version 27.1.0 --locked`. Scoped by design — the whole

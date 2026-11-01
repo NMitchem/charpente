@@ -5,9 +5,9 @@
 //! knows how to find it and how to strip `--dir` out of the passthrough
 //! flags (spec: docs/superpowers/specs/2026-07-05-sim-cli-design.md).
 //!
-//! Exit codes: 0 green, 1 sim failures (the sim binary's own code, passed
-//! through unchanged), 2 build, usage, or infrastructure errors (this
-//! layer's own failures — see `exit_code_for`).
+//! Exit codes: 0 green, 1 sim failures, an untested check included (the sim
+//! binary's own code, passed through unchanged), 2 build, usage, or
+//! infrastructure errors (this layer's own failures — see `exit_code_for`).
 
 use std::io::Write as _;
 use std::process::{Command, ExitStatus};
@@ -57,7 +57,8 @@ pub fn run(args: &[String]) -> i32 {
 
 /// Maps the sim binary's completed `Command` result to `test --sim`'s own
 /// exit code. The child's own code passes through unchanged (0 green, 1 sim
-/// failures, occasionally 2 for the sim binary's own usage errors) — that
+/// failures or an untested check, occasionally 2 for the sim binary's own
+/// usage errors) — that
 /// code is the sim binary's contract, not this layer's to reinterpret. A
 /// child that produced *no* code at all is this layer's problem instead:
 /// killed by a signal (`status.code()` is `None`), or never launched at all

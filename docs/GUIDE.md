@@ -3244,15 +3244,22 @@ rerun exactly this batch: charpente test --sim --master-seed 0x5eed --runs 64 --
 ```
 
 A check in which every run was skipped is `untested`, never `ok`, because a
-property that adjudicated nothing is vacuous no matter how green it looks. A
-batch whose every check is untested says `nothing tested`, and still exits 0.
-This is the harness's own fixture pair, a check that passes and one that always
-gives up, over six runs:
+property that adjudicated nothing is vacuous no matter how green it looks, and
+an untested check fails the batch. The batch exits 1, the same as for a failed
+run, including when `--filter` narrowed it to that one check. Its result line
+says `FAILED`, or `nothing tested` when no check was tested at all. A line
+after the skipped runs' reasons names the fixes: raise `--runs`, change the
+setup until runs reach the check, or delete the check. A run count small enough
+for every run of a check to be skipped, `--runs 1` while iterating for one,
+fails the same way. A `--seed` replay of a skipped run is not a batch: it
+prints the run's reason and detail, and exits 0. This is the harness's own
+fixture pair, a check that passes and one that always gives up, over six runs:
 
 ```text
 skipped runs hit a fault before reaching the check, so they prove nothing either way:
   always_gives_up — never tested: every run was skipped
     6  the fixture always gives up (first: --seed 0x3071c63893f2dcbd)
+a check that tested nothing proves nothing, so the batch fails: the reasons above say where its runs stopped. Raise --runs, change the setup until runs reach the check (charpente_sim::drive runs the faulted phase, the recovery and the re-sends), or delete the check.
 
 these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):
   always_passes
@@ -3260,7 +3267,7 @@ these checks draw no inputs, so every run tested the same case — draw them wit
 check always_passes ..... ok  (6 tested)
 check always_gives_up ... untested  (0 tested, 6 skipped)
 
-sim result: ok. 1 passed; 0 failed; 1 untested. Runs tested per check, in the order above: 6, 0 of 6.
+sim result: FAILED. 1 passed; 0 failed; 1 untested. Runs tested per check, in the order above: 6, 0 of 6.
 rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6
 ```
 
@@ -3277,7 +3284,15 @@ charpente-sim [replication]: 38 of 128 universes reached a verdict, 90 gave up
 — but that one goes to stderr from inside a libtest `#[test]`, so **a passing
 `cargo test` swallows it.** Add `-- --nocapture` to see it (a failing test
 shows it either way). So do not expect a CI run to surface give-ups; go
-looking for them.
+looking for them. The one exception is a test in which every universe gave up,
+which fails, as an untested check fails a batch:
+
+```text
+charpente-sim [wal]: every universe gave up, so this test adjudicated nothing over 64 universes and fails. Raise its universe count, or change the workload until universes reach a verdict.
+```
+
+A `CHARPENTE_SEED` replay of one universe that gave up still passes, as a
+`--seed` replay of a skipped run exits 0.
 
 Read that example line the right way round: **38** of those 128 runs
 adjudicated the property and **90** did not. It is a real measurement from
@@ -4470,8 +4485,11 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
 - `--format human|json` — human is the default; `json` emits one object with
   every fact the human report prints, keys in this order: `master_seed`,
   `runs`, `passed`, `failed` and `skipped` (run totals over every check),
-  `coverage`, `missing_coverage` (`{check, key}` pairs), `checks` and
-  `failures`. Under `--seed`, `seed` stands where `master_seed` does, since
+  `coverage`, `missing_coverage` (`{check, key}` pairs), `checks`,
+  `failures`, `result` and `exit`. `result` is the human result line's word
+  (`ok`, `FAILED` or `nothing tested`) and `exit` the code the run exits with,
+  so a record read later still says whether the batch failed, an untested
+  check included. Under `--seed`, `seed` stands where `master_seed` does, since
   the replayed seed fed back as `--master-seed` would run another batch. It is
   followed by `inputs`, the choices `--inputs` gave in that flag's encoding,
   when the replay was given them, and `faults_off`, the axes `--faults-off`
@@ -4502,12 +4520,15 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   (default: `.`). This flag is consumed by the CLI itself; every other flag
   passes straight through to the sim binary the CLI builds and execs.
 
-Exit codes: **0** no run of any selected check failed and every `require`d
-coverage key was hit (skipped runs are reported, not failed — see "Giving up"
-above; a green batch says how many runs tested each check, and a batch whose
-every check is untested exits 0 too, its result line saying `nothing tested`);
-**1** at least one run failed, or a coverage requirement went unmet — the
-batch itself completed, but something in it was red; **2** the batch never got
+Exit codes: **0** no run of any selected check failed, every `require`d
+coverage key was hit, and every selected check was tested by at least one run
+(skipped runs are reported, not failed — see "Giving up" above; a green batch
+says how many runs tested each check); **1** at least one run failed, a
+coverage requirement went unmet, or a check tested nothing because every one of
+its runs was skipped (its result line then says `FAILED`, or `nothing tested`
+when no check was tested) — the batch itself completed, but something in it
+was red or proved nothing. A `--seed` replay replays one run per check, not a
+batch, so a skipped run there exits 0; **2** the batch never got
 that far — a build failure, no
 `tests/sim.rs` target found, an unrecognized flag, `--inputs` or
 `--faults-off` without `--seed` or with a value they cannot read, a filter
@@ -4544,7 +4565,9 @@ and counts beside the verdict. In order:
   tested nothing is headed `— never tested: every run was skipped`. A check
   lists at most eight reasons and counts the rest on one line; `\n`, `\r` and
   `\t` in a reason print as those two-character escapes, so every reason stays
-  on one line.
+  on one line. When a check tested nothing, one line follows the reasons,
+  `a check that tested nothing proves nothing, so the batch fails: …`, which
+  names the fixes ("Giving up" above shows it).
 - **The checks that draw no inputs**, named, when any check with a tested run
   drew none: each of their runs tested the same scripted case.
 - **A line per check**, in registry order: `check <name> ... <status>
@@ -4557,8 +4580,10 @@ and counts beside the verdict. In order:
   (`64 tested: 16 failed`), how many were skipped when any were (`52 tested,
   12 skipped`), and the keys that never occurred (`required "restart" never
   occurred`).
-- **The result**: `sim result: ok`, `FAILED`, or `nothing tested` when no check
-  passed and none failed, then how many checks passed, failed and (if any)
+- **The result**: `sim result: ok` when every check passed, `FAILED` when a
+  check failed or tested nothing, or `nothing tested` when no check passed and
+  none failed (a batch that reads `FAILED` or `nothing tested` exits 1), then
+  how many checks passed, failed and (if any)
   were untested, and then how many runs tested each check, in the order of the
   check lines above it, an untested check as 0:
   `Runs tested per check, in the order above: 209, 251, 214 of 256.`, or
@@ -5008,16 +5033,20 @@ rather than turning it loose on a whole workspace. It needs the pinned tool:
 (`cargo mutants --version`) before the timing run, so a machine without it
 exits 2 with that install line rather than after one.
 
-Two failures of cargo-mutants' unmutated baseline are named instead of left to a
+Three failures of cargo-mutants' unmutated baseline are named instead of left to a
 generic "baseline was not green". cargo-mutants builds in a scratch copy of the
 workspace under the temp dir, and 27.1.0 rewrites a relative `path` only in
 `[dependencies]`, `[replace]` and `[patch]`. So before the install check the verb
 reads every workspace member's `[dev-dependencies]`, `[build-dependencies]` and
-`[target.*.…-dependencies]` tables, and a relative `path` that points outside the
-workspace root exits 2 naming the manifest, the table and the dependency; give it
-an absolute path, or move it under `[patch.crates-io]`. And a baseline whose log
-says `No space left on device` names the temp dir and `TMPDIR`: point `TMPDIR` at
-a disk with room for a full build of the workspace.
+`[target.*.…-dependencies]` tables, under either spelling cargo reads (the
+underscore one, `[dev_dependencies]`, included), and a relative `path` that
+points outside the workspace root exits 2 naming the manifest, the table as the
+manifest spells it and the dependency; give it an absolute path, or move it
+under `[patch.crates-io]`. A baseline whose log says `No space left on device`
+names the temp dir and `TMPDIR`: point `TMPDIR` at a disk with room for a full
+build of the workspace. And a baseline red because a sim check tested nothing
+(an untested check fails the batch, "Giving up" above) names that check: fix
+its setup so runs reach it, or scope `--property` to a check that runs.
 
 ### A note on the edge harness (platform dev tooling, not app surface)
 

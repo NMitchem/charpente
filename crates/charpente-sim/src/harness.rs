@@ -890,10 +890,11 @@ impl CheckTally {
 /// human report to `out`. A filter that is a test's whole name selects that
 /// test alone, so a repro's `--filter {check}` replays one check even when
 /// another check's name contains it; any other filter selects every test
-/// whose name contains it. Exit code: 0 green (a batch whose every check is
-/// untested included), 1 if any run failed or a coverage requirement went
-/// unmet, 2 if the selection is empty — a filter that matches nothing is a
-/// usage error, not a green run of zero tests.
+/// whose name contains it. Exit code (`batch_verdict`): 0 green, 1 if any
+/// run failed, a coverage requirement went unmet, or, in a batch, a check
+/// tested nothing (a `--seed` replay of a skipped run exits 0), 2 if the
+/// selection is empty — a filter that matches nothing is a usage error, not
+/// a green run of zero tests.
 pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) -> i32 {
     let selected: Vec<&SimTest> = match args.filter.as_deref() {
         None => tests.iter().collect(),
@@ -942,12 +943,44 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
             let _ = writeln!(out, "{}", render_json(&batch));
         }
     }
+    batch_verdict(&batch).1
+}
+
+/// The batch's verdict: the word its result line gives and the code it exits
+/// with, the same in both formats. A batch fails when a run failed, a
+/// required key never occurred, or a check tested nothing: a check that
+/// adjudicated nothing is vacuous, and a batch green over it is the
+/// unqualified success MANIFESTO §9 forbids. Every check untested reads
+/// `nothing tested`, and fails too. A `--seed` replay runs one run per check,
+/// not a batch, so a skipped run there is reported, not failed.
+fn batch_verdict(batch: &Batch) -> (&'static str, i32) {
     let report = &batch.report;
-    if report.failures.is_empty() && report.missing_coverage.is_empty() {
-        0
-    } else {
-        1
+    let (mut passed, mut failed, mut untested) = (false, false, false);
+    for (o, c) in report.outcomes.iter().zip(&batch.checks) {
+        let unmet = report
+            .missing_coverage
+            .iter()
+            .any(|(test, _)| test == o.test);
+        match check_status(c, unmet) {
+            "FAILED" => failed = true,
+            "untested" => untested = true,
+            _ => passed = true,
+        }
     }
+    assert_eq!(
+        failed,
+        !report.failures.is_empty() || !report.missing_coverage.is_empty(),
+        "a check is FAILED exactly when a run failed or a requirement went unmet"
+    );
+    let untested_fails = untested && batch.replay.is_none();
+    let word = if failed || (untested_fails && passed) {
+        "FAILED"
+    } else if !passed {
+        "nothing tested"
+    } else {
+        "ok"
+    };
+    (word, i32::from(failed || untested_fails))
 }
 
 /// The command that reruns a batch exactly: its master seed, its run count
@@ -1238,11 +1271,11 @@ fn merge_failed(into: &mut BTreeMap<&'static str, u64>, from: &BTreeMap<&'static
 }
 
 /// The batch as JSON, with every fact the human output prints (GUIDE §8
-/// "Reading the JSON"). Hand-assembled, no dependency: the key order is a
-/// pinned contract downstream tooling parses. Seeds are hex strings, never
-/// JSON numbers: a `u64` routinely exceeds 2^53, the largest integer a
-/// JSON-consuming float type holds exactly. Every failure is listed; only a
-/// check's first carries the shrink.
+/// "Reading the JSON"), its result and exit code included. Hand-assembled, no
+/// dependency: the key order is a pinned contract downstream tooling parses.
+/// Seeds are hex strings, never JSON numbers: a `u64` routinely exceeds 2^53,
+/// the largest integer a JSON-consuming float type holds exactly. Every
+/// failure is listed; only a check's first carries the shrink.
 fn render_json(batch: &Batch) -> String {
     let report = &batch.report;
     let mut out = String::new();
@@ -1392,7 +1425,10 @@ fn render_json(batch: &Batch) -> String {
         );
         out.push_str("\"}");
     }
-    out.push_str("]}");
+    // Last, as the human report ends on its result line: a record read apart
+    // from the process still says whether the batch failed.
+    let (word, code) = batch_verdict(batch);
+    out.push_str(&format!("],\"result\":\"{word}\",\"exit\":{code}}}"));
     out
 }
 
@@ -1530,6 +1566,15 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
         );
     }
 
+    // `--runs` is at least 1, so a check that tested nothing skipped every run,
+    // and the block below, which ends on the untested fix line, is printed.
+    assert!(
+        batch
+            .checks
+            .iter()
+            .all(|c| c.passed + c.failed > 0 || !c.skipped.is_empty()),
+        "a check with no tested run skipped every run"
+    );
     if batch.checks.iter().any(|c| !c.skipped.is_empty()) {
         let _ = writeln!(
             out,
@@ -1565,6 +1610,15 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
                     if runs == 1 { "run" } else { "runs" },
                 );
             }
+        }
+        if batch.checks.iter().any(|c| c.passed + c.failed == 0) {
+            let _ = writeln!(
+                out,
+                "a check that tested nothing proves nothing, so the batch fails: the reasons \
+                 above say where its runs stopped. Raise --runs, change the setup until runs \
+                 reach the check (charpente_sim::drive runs the faulted phase, the recovery and \
+                 the re-sends), or delete the check."
+            );
         }
     }
 
@@ -1616,10 +1670,8 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
             .map(|(_, key)| format!("\"{key}\""))
             .collect();
         tested_runs.push(tested.to_string());
-        // A check that tested nothing is untested, never ok, and a batch whose
-        // every check is untested never reads `ok` either: a batch that
-        // adjudicated nothing must never read as an unqualified success
-        // (MANIFESTO §9).
+        // A check that tested nothing is untested, never ok, and fails the
+        // batch (`batch_verdict`).
         let status = check_status(c, !unmet.is_empty());
         match status {
             "FAILED" => failed += 1,
@@ -1645,13 +1697,7 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
         let _ = writeln!(out, "check {} {dots} {status}  ({counts})", o.test);
     }
 
-    let word = if failed > 0 {
-        "FAILED"
-    } else if passed == 0 {
-        "nothing tested"
-    } else {
-        "ok"
-    };
+    let (word, _) = batch_verdict(batch);
     let untested = match untested {
         0 => String::new(),
         x => format!("; {x} untested"),
@@ -1721,13 +1767,7 @@ fn write_replay(batch: &Batch, replay: &Replay, out: &mut dyn std::io::Write) {
             }
         }
     }
-    let word = if failed > 0 {
-        "FAILED"
-    } else if passed == 0 {
-        "nothing tested"
-    } else {
-        "ok"
-    };
+    let (word, _) = batch_verdict(batch);
     let mut given = Vec::new();
     if replay.inputs.is_some() {
         given.push("with the given inputs".to_string());
@@ -1781,9 +1821,10 @@ fn failure_run(f: &Failure) -> FailureRun<'_> {
 
 /// The failure block (GUIDE §8 "Reading a failure"). A batch prints one per
 /// failing check: its first failure, shrunk, with a `shrunk:` line saying how
-/// it shrank and a `before shrinking:` line when the shrunk run failed with another
-/// message; its repro replays the shrunk run. The check's other failures get
-/// no block, only the count on its line. A `--seed` replay prints its own run.
+/// it shrank and a `before shrinking:` line when the shrunk run failed with
+/// another message; its repro replays the shrunk run. The check's other
+/// failures get no block, only the count on its line. A `--seed` replay
+/// prints its own run.
 fn human_failure_block(f: &Failure) -> String {
     let shown = failure_run(f);
     let mut block = format!(
@@ -2046,8 +2087,9 @@ mod tests {
             not_shrunk: false,
         };
         // The binding copy, line for line: each label padded so the values
-        // align, `inputs:` because the run drew, `before shrinking:` because the shrink
-        // slipped to another message, and a repro that replays the shrunk run.
+        // align, `inputs:` because the run drew, `before shrinking:` because the
+        // shrink slipped to another message, and a repro that replays the shrunk
+        // run.
         assert_eq!(
             human_failure_block(&failure),
             "\nsim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3\n\
@@ -2246,8 +2288,9 @@ mod tests {
 
     /// `config_json` listed four probabilities and two latencies, so the
     /// machine-readable record omitted the axis a diagnosis actually turned on.
-    /// Pinned against `{cfg:?}`, the Debug rendering that prints every field, so adding a `FaultConfig` field without adding it here
-    /// reddens this test instead of silently reopening the hole.
+    /// Pinned against `{cfg:?}`, the Debug rendering that prints every field,
+    /// so adding a `FaultConfig` field without adding it here reddens this test
+    /// instead of silently reopening the hole.
     #[test]
     fn config_json_carries_every_fault_axis() {
         let cfg = FaultConfig {
@@ -2535,8 +2578,10 @@ mod tests {
         assert_eq!(report.gave_up(), 0, "a failed universe is neither");
     }
 
+    /// A batch that adjudicated nothing neither prints as green nor exits as
+    /// green: its result line still says `nothing tested`, and it exits 1.
     #[test]
-    fn a_batch_that_adjudicated_nothing_does_not_print_as_green() {
+    fn a_batch_where_every_check_is_untested_exits_1() {
         let tests = [SimTest {
             name: "gives_up",
             run: always_gives_up,
@@ -2545,8 +2590,11 @@ mod tests {
         let args = parse(&["--runs", "4"]).unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
-        assert_eq!(code, 0, "giving up is not a failure");
         let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            code, 1,
+            "a check that tested nothing fails the batch: {text}"
+        );
         assert!(!text.contains("sim result: ok"), "{text}");
         assert!(
             text.contains("\ncheck gives_up ... untested  (0 tested, 4 skipped)\n"),
@@ -2562,6 +2610,205 @@ mod tests {
                  4.\n"
             ),
             "{text}"
+        );
+    }
+
+    /// The line a batch with an untested check prints after the skipped runs'
+    /// reasons (hard rule 5), written out here rather than taken from the source.
+    const UNTESTED_FIX: &str = "a check that tested nothing proves nothing, so the batch fails: \
+        the reasons above say where its runs stopped. Raise --runs, change the setup until runs \
+        reach the check (charpente_sim::drive runs the faulted phase, the recovery and the \
+        re-sends), or delete the check.";
+
+    /// One check tested and one untested: the batch exits 1, and its result
+    /// line says FAILED, never ok, beside the counts it always gave.
+    #[test]
+    fn a_batch_with_an_untested_check_exits_1() {
+        let tests = [
+            sim_test("always_passes", always_ok),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let (code, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("\nsim result: FAILED. 1 passed; 0 failed; 1 untested. "),
+            "{out}"
+        );
+        assert!(!out.contains("sim result: ok"), "{out}");
+    }
+
+    /// `--filter` narrowing a batch to its one untested check leaves a batch:
+    /// it exits 1, and its result line says `nothing tested`. The check it
+    /// filtered out, run alone, is green.
+    #[test]
+    fn a_filter_that_selects_only_an_untested_check_exits_1() {
+        let tests = [
+            sim_test("always_passes", always_ok),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let batch = |filter: &str| {
+            run_to_string(
+                &tests,
+                &["--runs", "6", "--master-seed", "0x1234", "--filter", filter],
+            )
+        };
+        let (code, out) = batch("always_gives_up");
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("\ncheck always_gives_up ... untested  (0 tested, 6 skipped)\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. Runs tested: 0 \
+                 of 6.\nrerun exactly this batch: charpente test --sim --master-seed 0x1234 \
+                 --runs 6 --filter always_gives_up\n"
+            ),
+            "{out}"
+        );
+        let (code, out) = batch("always_passes");
+        assert_eq!(code, 0, "{out}");
+    }
+
+    /// The fix follows the skipped runs' reasons directly, so a reader who
+    /// sees "never tested" sees what to do next. Skipped runs alone print no
+    /// fix line and keep a batch green, as long as every check was tested.
+    #[test]
+    fn the_untested_fix_line_follows_the_skipped_reasons() {
+        let tests = [
+            sim_test("always_passes", always_ok),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let (_, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
+        let first = batch_seeds(0x1234, 12)[6];
+        let block = format!(
+            "\nskipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
+             \x20 always_gives_up — never tested: every run was skipped\n\
+             \x20   6  the fixture always gives up (first: --seed {first:#x})\n\
+             {UNTESTED_FIX}\n\
+             \n\
+             these checks draw no inputs"
+        );
+        assert!(out.starts_with(&block), "want:\n{block}\nout:\n{out}");
+        assert_eq!(out.matches(UNTESTED_FIX).count(), 1, "{out}");
+
+        let tests = [sim_test("skips_two_ways", skips_two_ways)];
+        let (code, out) = run_to_string(&tests, &["--runs", "32", "--master-seed", "0x1234"]);
+        assert!(
+            out.contains("\nskipped runs hit a fault before reaching the check")
+                && out.contains("\nsim result: ok. 1 passed; 0 failed. "),
+            "non-vacuous: runs skipped and the check was tested: {out}"
+        );
+        assert_eq!(code, 0, "{out}");
+        assert!(!out.contains("a check that tested nothing"), "{out}");
+    }
+
+    /// Review Focus 3: iterating at `--runs 1` (or 4) with the one run skipped
+    /// fails the batch, and the fix line says to raise `--runs` among its fixes.
+    #[test]
+    fn a_one_run_batch_whose_run_skipped_exits_1_and_names_runs() {
+        let tests = [sim_test("always_gives_up", always_gives_up)];
+        let (code, out) = run_to_string(&tests, &["--runs", "1", "--master-seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        let first = batch_seeds(0x1234, 1)[0];
+        assert!(
+            out.contains(&format!("(first: --seed {first:#x})\n{UNTESTED_FIX}\n")),
+            "{out}"
+        );
+        assert!(out.contains(" Raise --runs, "), "{out}");
+        assert!(
+            out.ends_with(
+                "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. Runs tested: 0 \
+                 of 1.\nrerun exactly this batch: charpente test --sim --master-seed 0x1234 \
+                 --runs 1\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A `--seed` replay runs one run per check, not a batch: a skipped run
+    /// prints its reason and exits 0, with no fix line, in both formats.
+    #[test]
+    fn a_seed_replay_of_a_skipped_run_still_exits_0() {
+        let tests = [sim_test("always_gives_up", always_gives_up)];
+        let (code, out) = run_to_string(&tests, &["--seed", "0x1234"]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains(
+                "\ncheck always_gives_up ... skipped\n    skipped: the fixture always gives up\n"
+            ) && out.ends_with(
+                "\nsim result: nothing tested. 0 passed; 0 failed; 1 skipped, on seed 0x1234.\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("a check that tested nothing"), "{out}");
+        let (code, json) = run_to_string(&tests, &["--seed", "0x1234", "--format", "json"]);
+        assert_eq!(code, 0, "{json}");
+        assert!(
+            json.ends_with(",\"result\":\"nothing tested\",\"exit\":0}\n"),
+            "{json}"
+        );
+    }
+
+    /// JSON keeps the check's `untested` status and ends on the batch's result
+    /// and exit code, the human result line's word and the code `run` returns.
+    #[test]
+    fn json_carries_untested_and_the_batch_exit() {
+        let tests = [
+            sim_test("always_passes", always_ok),
+            sim_test("always_gives_up", always_gives_up),
+            sim_test("always_fails", always_fails),
+        ];
+        let json = |filter: &str| {
+            run_to_string(
+                &tests,
+                &[
+                    "--runs",
+                    "6",
+                    "--master-seed",
+                    "0x1234",
+                    "--format",
+                    "json",
+                    "--filter",
+                    filter,
+                ],
+            )
+        };
+        let (code, out) = json("always_");
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains(
+                "{\"check\":\"always_gives_up\",\"status\":\"untested\",\"passed\":0,\
+                 \"failed\":0,\"skipped\":6,"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(",\"result\":\"FAILED\",\"exit\":1}\n"),
+            "{out}"
+        );
+        for (filter, code, tail) in [
+            (
+                "always_gives_up",
+                1,
+                ",\"result\":\"nothing tested\",\"exit\":1}\n",
+            ),
+            ("always_passes", 0, ",\"result\":\"ok\",\"exit\":0}\n"),
+            ("always_fails", 1, ",\"result\":\"FAILED\",\"exit\":1}\n"),
+        ] {
+            let (got, out) = json(filter);
+            assert_eq!(got, code, "{filter}: {out}");
+            assert!(out.ends_with(tail), "{filter}: {out}");
+        }
+        // The pass and the untested check alone: FAILED for the untested one.
+        let (code, out) = run_to_string(
+            &tests[..2],
+            &["--runs", "6", "--master-seed", "0x1234", "--format", "json"],
+        );
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.ends_with("],\"failures\":[],\"result\":\"FAILED\",\"exit\":1}\n"),
+            "{out}"
         );
     }
 
@@ -2856,9 +3103,8 @@ mod tests {
         (code, String::from_utf8(out).unwrap())
     }
 
-    /// The first failure block for `check` in `out`: its headline through its
-    /// repro line.
-    /// The same batch under `--format json` still carries the failing run's config.
+    /// The same batch under `--format json` still carries the failing run's
+    /// config.
     fn assert_json_keeps_config(
         tests: &[SimTest],
         args: &[&str],
@@ -2877,6 +3123,8 @@ mod tests {
         );
     }
 
+    /// The first failure block for `check` in `out`: its headline through its
+    /// repro line.
     fn first_block<'a>(out: &'a str, check: &str) -> &'a str {
         let start = out
             .find(&format!("sim failure in {check}: "))
@@ -4203,7 +4451,7 @@ mod tests {
             sim_test("always_gives_up", always_gives_up),
         ];
         let (code, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
-        assert_eq!(code, 0, "{out}");
+        assert_eq!(code, 1, "{out}");
         // The second check's runs take the batch's seeds after the first's.
         let first = batch_seeds(0x1234, 12)[6];
         assert_eq!(
@@ -4213,6 +4461,7 @@ mod tests {
              skipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
              \x20 always_gives_up — never tested: every run was skipped\n\
              \x20   6  the fixture always gives up (first: --seed {first:#x})\n\
+             {UNTESTED_FIX}\n\
              \n\
              these checks draw no inputs, so every run tested the same case — draw them with sim.input() (GUIDE §8):\n\
              \x20 always_passes\n\
@@ -4220,7 +4469,7 @@ mod tests {
              check always_passes ..... ok  (6 tested)\n\
              check always_gives_up ... untested  (0 tested, 6 skipped)\n\
              \n\
-             sim result: ok. 1 passed; 0 failed; 1 untested. Runs tested per check, in the order above: 6, 0 of 6.\n\
+             sim result: FAILED. 1 passed; 0 failed; 1 untested. Runs tested per check, in the order above: 6, 0 of 6.\n\
              rerun exactly this batch: charpente test --sim --master-seed 0x1234 --runs 6\n"
             )
         );
@@ -4290,7 +4539,7 @@ mod tests {
             sim_test("always_gives_up", always_gives_up),
         ];
         let (code, out) = run_to_string(&tests, &["--runs", "64", "--master-seed", "0x1234"]);
-        assert_eq!(code, 0, "{out}");
+        assert_eq!(code, 1, "the untested check fails the batch: {out}");
         // Worked out from the batch's seeds alone: the first check's tested runs.
         let quarter = batch_seeds(0x1234, 64)
             .into_iter()
@@ -4298,7 +4547,7 @@ mod tests {
             .count();
         assert!(0 < quarter && quarter < 64, "non-vacuous: {quarter}");
         let result = format!(
-            "sim result: ok. 2 passed; 0 failed; 1 untested. Runs tested per check, in the \
+            "sim result: FAILED. 2 passed; 0 failed; 1 untested. Runs tested per check, in the \
              order above: {quarter}, 64, 0 of 64."
         );
         let lines: Vec<&str> = out.lines().collect();
@@ -4324,7 +4573,7 @@ mod tests {
     fn a_batch_where_every_check_is_untested_never_reads_ok() {
         let tests = [sim_test("always_gives_up", always_gives_up)];
         let (code, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
-        assert_eq!(code, 0, "an untested check is not a failure: {out}");
+        assert_eq!(code, 1, "an untested check fails the batch: {out}");
         let result = out
             .lines()
             .find(|l| l.starts_with("sim result: "))
@@ -4420,7 +4669,7 @@ mod tests {
         let tests = [sim_test("gives_up_twelve_ways", gives_up_twelve_ways)];
         let flags = |jobs| ["--runs", "256", "--master-seed", "0x1234", "--jobs", jobs];
         let (code, out) = run_to_string(&tests, &flags("1"));
-        assert_eq!(code, 0, "{out}");
+        assert_eq!(code, 1, "the check tested nothing: {out}");
         assert_eq!(
             run_to_string(&tests, &flags("4")).1,
             out,
@@ -4448,8 +4697,8 @@ mod tests {
         }
         let rest: u64 = reasons[8..].iter().map(|(_, n, _)| n).sum();
         want.push_str(&format!(
-            "    and 4 more reasons ({rest} runs): --format json lists every one\n\ncheck \
-             gives_up_twelve_ways ... untested  (0 tested, 256 skipped)\n\nsim result: "
+            "    and 4 more reasons ({rest} runs): --format json lists every one\n{UNTESTED_FIX}\
+             \n\ncheck gives_up_twelve_ways ... untested  (0 tested, 256 skipped)\n\nsim result: "
         ));
         assert!(out.contains(&want), "want:\n{want}\nout:\n{out}");
     }
@@ -4585,8 +4834,8 @@ mod tests {
         assert!(
             out.contains(&format!(
                 "\n  gives_up_with_escapes — never tested: every run was skipped\n    3  line \
-                 one\\nline two\\tend\\r (first: --seed {first:#x})\n\ncheck gives_up_with_escapes \
-                 ... untested  (0 tested, 3 skipped)\n\nsim result: "
+                 one\\nline two\\tend\\r (first: --seed {first:#x})\n{UNTESTED_FIX}\n\ncheck \
+                 gives_up_with_escapes ... untested  (0 tested, 3 skipped)\n\nsim result: "
             )),
             "{out}"
         );
@@ -5020,14 +5269,18 @@ mod tests {
                 check("always_fails", "FAILED", 0, 2)
             )
         );
-        let failures = between_keys(&json, "\"failures\":", "\n");
+        let failures = between_keys(&json, "\"failures\":", ",\"result\":");
         let join = "\"},{\"check\":\"always_fails\",\"seed\":\"";
         assert!(
             failures.starts_with("[{\"check\":\"always_fails\",\"seed\":\"")
                 && failures.matches(join).count() == 1
-                && failures.ends_with("\"}]}")
+                && failures.ends_with("\"}]")
                 && !failures.contains("}{"),
             "two failures, one comma between them: {failures}"
+        );
+        assert!(
+            json.ends_with("\"}],\"result\":\"FAILED\",\"exit\":1}\n"),
+            "{json}"
         );
         let first = &failures[..failures.find(join).unwrap()];
         let seed = first
@@ -5077,7 +5330,7 @@ mod tests {
             "json",
         ];
         let (code, json) = run_to_string(&tests, &flags);
-        assert_eq!(code, 0, "{json}");
+        assert_eq!(code, 1, "the check tested nothing: {json}");
         let (counts, firsts) = twelve_reasons(0x1234, 256);
         let mut reasons: Vec<(&str, u64, u64)> =
             (0..12).map(|i| (TWELVE[i], counts[i], firsts[i])).collect();

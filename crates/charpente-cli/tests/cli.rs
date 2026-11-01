@@ -692,7 +692,9 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 /// verb's own behaviour is pinned against a stand-in that fails the same way
 /// on demand. `extra` is appended to the verb's arguments. The scratch
 /// workspace holds two one-file crates, `pkg-a` and `pkg-b`, so a `--file`
-/// under either has a package the verb can read.
+/// under either has a package the verb can read. With `$SHIM_OUTCOMES` set,
+/// `cargo mutants` copies that directory in as `<--output>/mutants.out`, the
+/// run record the verb then reads.
 // Writing the shim and the scratch workspace is edge tooling outside the
 // deterministic core (DESIGN.md §1), the same shape as tests/genclient.rs.
 #[cfg(unix)]
@@ -714,11 +716,12 @@ fn run_mutants_with_cargo_shim_probed(
     test_exit: &str,
     extra: &[&str],
 ) -> (std::process::Output, Vec<String>) {
-    run_mutants_with_cargo_shim_in(version_exit, shim_exit, test_exit, extra, false)
+    run_mutants_with_cargo_shim_in(version_exit, shim_exit, test_exit, extra, false, &[])
 }
 
 /// The shim run, with `--dir` given as the absolute scratch workspace or, when
 /// `relative_dir`, as `ws` from the scratch directory the verb then runs in.
+/// `envs` is set on the verb's process.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)]
 fn run_mutants_with_cargo_shim_in(
@@ -727,6 +730,7 @@ fn run_mutants_with_cargo_shim_in(
     test_exit: &str,
     extra: &[&str],
     relative_dir: bool,
+    envs: &[(&str, &std::path::Path)],
 ) -> (std::process::Output, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     // Tests run in parallel threads of one process, so pid alone is not a
@@ -770,6 +774,7 @@ fn run_mutants_with_cargo_shim_in(
          done\n\
          if [ -d \"$out\" ]; then echo 'output existed' >> \"$SHIM_RECORD\"; \
          else echo 'output missing' >> \"$SHIM_RECORD\"; fi\n\
+         if [ -n \"$SHIM_OUTCOMES\" ]; then cp -R \"$SHIM_OUTCOMES\" \"$out/mutants.out\"; fi\n\
          echo \"shim: cargo-mutants stand-in exiting $SHIM_EXIT\" >&2\n\
          exit \"$SHIM_EXIT\"\n",
     )
@@ -798,6 +803,8 @@ fn run_mutants_with_cargo_shim_in(
         .env("SHIM_RECORD", &record)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_MUTANTS_JOBS")
+        .env_remove("SHIM_OUTCOMES")
+        .envs(envs.iter().copied())
         .output()
         .expect("charpente binary runs");
     let recorded = std::fs::read_to_string(&record).unwrap_or_else(|e| {
@@ -866,7 +873,8 @@ fn mutants_creates_the_output_dir_before_spawning_the_tool() {
 #[cfg(unix)]
 #[test]
 fn mutants_with_a_relative_dir_hands_the_tool_an_output_dir_that_exists() {
-    let (_, recorded) = run_mutants_with_cargo_shim_in("0", "0", "0", &["--timeout", "60"], true);
+    let (_, recorded) =
+        run_mutants_with_cargo_shim_in("0", "0", "0", &["--timeout", "60"], true, &[]);
     assert_eq!(
         recorded.last().map(String::as_str),
         Some("output existed"),
@@ -1152,6 +1160,69 @@ fn an_unknown_argument_still_prints_usage_and_exits_two() {
     assert!(stderr.contains("usage: charpente new <name>"), "{stderr}");
 }
 
+/// A failed baseline's log, read through the real verb from the record the tool
+/// left. A baseline out of disk names the scratch copy's location and TMPDIR as
+/// the verb's own process has them, here a known TMPDIR set on that process
+/// alone (setting it in this one would move every other test's `temp_dir()`).
+/// A baseline red because a sim check tested nothing names that check.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn a_failed_baselines_log_is_named_through_the_real_verb() {
+    let base =
+        std::env::temp_dir().join(format!("charpente-mutants-record-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let record = base.join("mutants.out");
+    let known = base.join("known-tmp");
+    std::fs::create_dir_all(record.join("log")).expect("record dir");
+    std::fs::create_dir_all(&known).expect("known TMPDIR");
+    std::fs::write(
+        record.join("outcomes.json"),
+        r#"{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{"scenario":"Baseline","summary":"Failure","log_path":"log/baseline.log"}]}"#,
+    )
+    .expect("outcomes");
+    for (log, want) in [
+        (
+            "error: No space left on device (os error 28)\n",
+            format!(
+                "error: the unmutated baseline ran out of disk space in cargo-mutants' scratch \
+                 copy under {k} — point TMPDIR at a disk with room for a full build of this \
+                 workspace (TMPDIR is {k})",
+                k = known.display()
+            ),
+        ),
+        (
+            "check echo_matches .... ok  (256 tested)\n\
+             check note_survives ... untested  (0 tested, 256 skipped)\n",
+            "error: the UNMUTATED baseline was not green: check note_survives tested nothing, \
+             and a check that tested nothing fails the batch. Fix its setup, or scope \
+             --property to a check that runs."
+                .to_string(),
+        ),
+    ] {
+        std::fs::write(record.join("log/baseline.log"), log).expect("baseline log");
+        let (out, recorded) = run_mutants_with_cargo_shim_in(
+            "0",
+            "0",
+            "0",
+            &["--timeout", "60"],
+            false,
+            &[("SHIM_OUTCOMES", &record), ("TMPDIR", &known)],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+        assert!(
+            recorded
+                .iter()
+                .any(|l| l.starts_with("cargo mutants --output")),
+            "the record came from the tool's run; the shim saw {recorded:?}"
+        );
+        assert_eq!(stderr.lines().last(), Some(want.as_str()), "{stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A scratch workspace at `<tmp>/<tag>/ws` with a sibling `<tmp>/<tag>/outside` crate;
 /// `app_manifest_tail` is appended to the member `app`'s manifest. Returns `(base, ws)`.
 #[cfg(unix)]
@@ -1160,7 +1231,10 @@ fn mutants_scratch_with(
     tag: &str,
     app_manifest_tail: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
-    let base = std::env::temp_dir().join(format!("charpente-t2-{}-{tag}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "charpente-mutants-path-{}-{tag}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&base);
     let ws = base.join("ws");
     for (dir, name) in [(ws.join("app"), "app"), (base.join("outside"), "outside")] {
@@ -1292,7 +1366,10 @@ fn a_relative_dev_dependency_inside_the_tree_is_not_refused() {
 #[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
 #[test]
 fn an_absolute_dev_dependency_outside_the_tree_is_not_refused() {
-    let base = std::env::temp_dir().join(format!("charpente-t2-{}-absolute", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "charpente-mutants-path-{}-absolute",
+        std::process::id()
+    ));
     let abs = base.join("outside");
     let tail = format!(
         "\n[dev-dependencies]\noutside = {{ path = \"{}\" }}\n",
@@ -1326,4 +1403,41 @@ fn a_relative_target_build_dependency_outside_the_tree_is_refused() {
         "{stderr}"
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Cargo still reads the underscore spellings in an edition-2021 manifest (the
+/// scratch app's edition), and a real cargo-mutants 27.1.0 baseline fails on
+/// them as on the hyphenated ones, so they are refused too, each named as the
+/// manifest spells it.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch crates are edge tooling (DESIGN.md §1)
+#[test]
+fn a_relative_path_under_cargos_underscore_spelling_is_refused_as_spelled() {
+    for (tag, table) in [
+        ("underscore-dev", "dev_dependencies"),
+        ("underscore-build", "build_dependencies"),
+        ("underscore-target", "target.'cfg(unix)'.dev_dependencies"),
+    ] {
+        let (base, ws) = mutants_scratch_with(
+            tag,
+            &format!("\n[{table}]\noutside = {{ path = \"../../outside\" }}\n"),
+        );
+        let out = mutants_over(&ws);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let root = std::fs::canonicalize(&ws).expect("ws exists");
+        assert_eq!(out.status.code(), Some(2), "[{table}] stderr:\n{stderr}");
+        assert_eq!(
+            stderr.trim_end(),
+            format!(
+                "error: {}: [{table}] outside = {{ path = \"../../outside\" }} is a relative \
+                 path outside the tree cargo-mutants copies ({}), and cargo-mutants 27.1.0 \
+                 rewrites relative paths only in [dependencies], [replace] and [patch], so the \
+                 copy cannot find it and the unmutated baseline fails. Give it an absolute \
+                 path, or move it under [patch.crates-io].",
+                root.join("app/Cargo.toml").display(),
+                root.display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

@@ -2493,19 +2493,22 @@ pub fn run_universes_from_in(
 
 /// The line that makes MANIFESTO §9's sentence sayable: how many of a batch's
 /// universes actually reached a verdict. Printed by both runners, always —
-/// "0 gave up" is the claim being made, not noise.
+/// "0 gave up" is the claim being made, not noise. A test in which every
+/// universe gave up adjudicated nothing, so it fails, as an untested check
+/// fails a `charpente test --sim` batch. Seed derivation is untouched: the
+/// runners stay frozen in what each seed runs.
 fn report_outcomes(test_file: &str, universes: u64, gave_up: u64) {
     let verdicts = universes - gave_up;
     eprintln!(
         "charpente-sim [{test_file}]: {verdicts} of {universes} universes reached a verdict, \
          {gave_up} gave up"
     );
-    if gave_up == universes && universes > 0 {
-        eprintln!(
-            "charpente-sim [{test_file}]: every universe gave up — this property adjudicated \
-             nothing over {universes} universes"
-        );
-    }
+    assert!(
+        gave_up < universes || universes == 0,
+        "charpente-sim [{test_file}]: every universe gave up, so this test adjudicated nothing \
+         over {universes} universes and fails. Raise its universe count, or change the workload \
+         until universes reach a verdict."
+    );
 }
 
 fn describe_outcome(outcome: &Outcome) -> String {
@@ -4997,8 +5000,13 @@ mod tests {
         assert_eq!(sim.coverage().get("run:skipped"), Some(&1));
     }
 
+    /// The first universe reaches a verdict and the other three give up: a
+    /// batch in which every universe gave up fails before any ceiling is read
+    /// (`a_test_in_which_every_universe_gave_up_fails`), so the ceiling is
+    /// measured where it is the only thing that fails.
     #[test]
     fn a_give_up_rate_above_its_ceiling_fails_the_batch_naming_key_count_and_cap() {
+        let seen = std::sync::atomic::AtomicUsize::new(0);
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_universes_swarm_with_in(
                 "charpente-sim",
@@ -5010,7 +5018,9 @@ mod tests {
                 &[("run:skipped", 0)],
                 |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
-                    sim.give_up("this workload adjudicates nothing", "");
+                    if seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                        sim.give_up("this workload adjudicates nothing", "");
+                    }
                     Ok(())
                 },
             );
@@ -5021,12 +5031,15 @@ mod tests {
             msg.contains("sim coverage ceiling failed in swarm_meta"),
             "{msg}"
         );
-        assert!(msg.contains("run:skipped: 4 over a cap of 0"), "{msg}");
+        assert!(msg.contains("run:skipped: 3 over a cap of 0"), "{msg}");
     }
 
+    /// As above, the first universe reaches a verdict and the other three give
+    /// up, so the three give-ups are measured against the cap and nothing else.
     #[test]
     fn a_ceiling_that_holds_does_not_fail_the_batch() {
         let batch = |cap: u64, give_up: bool| {
+            let seen = std::sync::atomic::AtomicUsize::new(0);
             run_universes_swarm_with_in(
                 "charpente-sim",
                 "swarm_meta.rs",
@@ -5037,7 +5050,7 @@ mod tests {
                 &[("run:skipped", cap)],
                 |_seed: u64, _cfg: &mut FaultConfig| {},
                 |sim: &mut Sim| {
-                    if give_up {
+                    if give_up && seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
                         sim.give_up("this workload adjudicates nothing", "");
                     }
                     Ok(())
@@ -5047,12 +5060,67 @@ mod tests {
         // A key never marked counts as zero, which a cap of zero allows.
         batch(0, false);
         // At the cap is not above it...
-        batch(4, true);
+        batch(3, true);
         // ...and one under it is.
-        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch(3, true)))
-            .expect_err("4 give-ups against a cap of 3 must fail the batch");
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch(2, true)))
+            .expect_err("3 give-ups against a cap of 2 must fail the batch");
         let msg = panic_message(&*payload);
-        assert!(msg.contains("run:skipped: 4 over a cap of 3"), "{msg}");
+        assert!(msg.contains("run:skipped: 3 over a cap of 2"), "{msg}");
+    }
+
+    /// A platform test in which every universe gave up adjudicated nothing, so
+    /// it fails, under either runner, as an untested check fails a
+    /// `charpente test --sim` batch. One universe reaching a verdict is enough
+    /// to pass.
+    #[test]
+    fn a_test_in_which_every_universe_gave_up_fails() {
+        let want = "charpente-sim [all_give_up]: every universe gave up, so this test adjudicated \
+                    nothing over 3 universes and fails. Raise its universe count, or change the \
+                    workload until universes reach a verdict.";
+        let gives_up = |sim: &mut Sim| {
+            sim.give_up("this workload adjudicates nothing", "");
+            Ok(())
+        };
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_universes_from_in(
+                "charpente-sim",
+                "crates/x/tests/all_give_up.rs",
+                0x5100_0005,
+                3,
+                gives_up,
+            );
+        }))
+        .expect_err("a test in which every universe gave up must fail");
+        assert_eq!(panic_message(&*payload), want);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_universes_swarm_with_in(
+                "charpente-sim",
+                "crates/x/tests/all_give_up.rs",
+                0x5100_0006,
+                3,
+                &[],
+                &[],
+                &[],
+                |_seed: u64, _cfg: &mut FaultConfig| {},
+                gives_up,
+            );
+        }))
+        .expect_err("the swarm runner fails it too");
+        assert_eq!(panic_message(&*payload), want);
+        // Non-vacuous: the same workload passes once one universe reaches a verdict.
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        run_universes_from_in(
+            "charpente-sim",
+            "crates/x/tests/all_give_up.rs",
+            0x5100_0005,
+            3,
+            |sim: &mut Sim| {
+                if seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                    sim.give_up("this workload adjudicates nothing", "");
+                }
+                Ok(())
+            },
+        );
     }
 
     #[test]

@@ -207,6 +207,10 @@ fn shared_target_dir_refusal(
 /// manifest, with `outside` moved inside the workspace root, goes green, so the
 /// copied tree is `workspace_root`; and a NON-test workspace member's entry
 /// fails the baseline too, since cargo loads every member to resolve the workspace.
+/// Cargo still reads the underscore spellings `[dev_dependencies]` and
+/// `[build_dependencies]` in an edition-2021 manifest, and a real 27.1.0 baseline
+/// fails on them the same way, so both spellings are scanned and the refusal
+/// prints the table as the manifest spells it.
 fn unrewritten_path_refusal(
     manifest: &std::path::Path,
     copied_root: &std::path::Path,
@@ -216,7 +220,12 @@ fn unrewritten_path_refusal(
     let text = std::fs::read_to_string(manifest).ok()?;
     let doc: toml::Table = text.parse().ok()?;
     let mut tables: Vec<(String, &toml::Table)> = Vec::new();
-    for kind in ["dev-dependencies", "build-dependencies"] {
+    for kind in [
+        "dev-dependencies",
+        "dev_dependencies",
+        "build-dependencies",
+        "build_dependencies",
+    ] {
         if let Some(t) = doc.get(kind).and_then(toml::Value::as_table) {
             tables.push((kind.to_string(), t));
         }
@@ -275,8 +284,8 @@ fn unrewritten_path_refusal(
 }
 
 /// The first refusal over every workspace member of the tree `dir` belongs to.
-/// `None` when `cargo metadata` cannot say (cargo-mutants then fails with its own
-/// error, printed above the verb's).
+/// `None` when `cargo metadata` cannot say: the next cargo command, the verb's own
+/// timing run or cargo-mutants itself, then fails with cargo's own error.
 fn unrewritten_path_refusal_in(dir: &str) -> Option<String> {
     #[allow(clippy::disallowed_methods)]
     let out = Command::new("cargo")
@@ -305,6 +314,18 @@ fn out_of_disk_line(log: &str, tmp: &std::path::Path, tmpdir: Option<&str>) -> O
             tmp.display(),
             tmpdir.unwrap_or("unset")
         )
+    })
+}
+
+/// The first check a baseline's log reports as untested: the sim's check line,
+/// `check <name> ... untested  (0 tested, N skipped)`, which cargo-mutants'
+/// log carries as the sim binary printed it.
+fn untested_check(log: &str) -> Option<&str> {
+    log.lines().find_map(|line| {
+        let (name, rest) = line.strip_prefix("check ")?.split_once(' ')?;
+        rest.trim_start_matches('.')
+            .starts_with(" untested  (")
+            .then_some(name)
     })
 }
 
@@ -673,9 +694,9 @@ fn report(
             #[allow(clippy::disallowed_methods)]
             std::fs::read_to_string(path.parent()?.join(rel)).ok()
         });
-    if let Some(line) = baseline_log.and_then(|log| {
+    if let Some(line) = baseline_log.as_deref().and_then(|log| {
         out_of_disk_line(
-            &log,
+            log,
             &std::env::temp_dir(),
             std::env::var("TMPDIR").ok().as_deref(),
         )
@@ -683,7 +704,12 @@ fn report(
         writeln!(err, "{line}").expect("failed printing to stderr");
         return 2;
     }
-    let v = verdict(&o, &path.display().to_string(), property);
+    let v = verdict(
+        &o,
+        &path.display().to_string(),
+        property,
+        baseline_log.as_deref(),
+    );
     for line in &v.lines {
         if v.code == 2 {
             writeln!(err, "{line}").expect("failed printing to stderr");
@@ -702,12 +728,31 @@ struct Verdict {
 /// The decision, split out of `report`'s IO so the ruling's two anti-vacuity
 /// rules are TESTED rather than merely intended — the spec requires exactly
 /// that, and an untested honesty gate is the thing it is guarding against.
-fn verdict(o: &Outcomes, where_: &str, property: Option<&str>) -> Verdict {
+/// `baseline_log` is a failed baseline's log, which `report` reads.
+fn verdict(
+    o: &Outcomes,
+    where_: &str,
+    property: Option<&str>,
+    baseline_log: Option<&str>,
+) -> Verdict {
     if let Some(bad) = o
         .outcomes
         .iter()
         .find(|x| matches!(x.scenario, Scenario::Baseline) && x.summary != "Success")
     {
+        // A sim batch with an untested check exits 1, so the baseline is red for
+        // that reason alone; the generic text would send the reader hunting
+        // for a failing test that does not exist.
+        if let Some(check) = baseline_log.and_then(untested_check) {
+            return Verdict {
+                code: 2,
+                lines: vec![format!(
+                    "error: the UNMUTATED baseline was not green: check {check} tested \
+                     nothing, and a check that tested nothing fails the batch. Fix its setup, \
+                     or scope --property to a check that runs."
+                )],
+            };
+        }
         return Verdict {
             code: 2,
             lines: vec![format!(
@@ -998,6 +1043,7 @@ mod tests {
             )),
             "out",
             None,
+            None,
         );
         assert_eq!(v.code, 0, "{:?}", v.lines);
     }
@@ -1009,6 +1055,7 @@ mod tests {
                 r#"{{"total_mutants":5,"caught":4,"missed":0,"timeout":1,"unviable":0,{OK_BASELINE}}}"#
             )),
             "out",
+            None,
             None,
         );
         assert_eq!(
@@ -1038,6 +1085,7 @@ mod tests {
                    "outcomes":[{"scenario":"Baseline","summary":"Failure"}]}"#,
             ),
             "out",
+            None,
             None,
         );
         assert_eq!(v.code, 2, "{:?}", v.lines);
@@ -1076,14 +1124,19 @@ mod tests {
         .expect("log");
         let (code, err) = report_of();
         assert_eq!(code, 2);
-        assert!(
-            err.starts_with(
+        // The whole line, written out rather than rebuilt with `out_of_disk_line`,
+        // so `report` passing another path or dropping the variable is red here.
+        // A known TMPDIR is set in a child process by tests/cli.rs, since setting
+        // it here would move every other test's `temp_dir()`.
+        assert_eq!(
+            err,
+            format!(
                 "error: the unmutated baseline ran out of disk space in cargo-mutants' scratch \
-                 copy under "
-            ) && err.contains(
-                " — point TMPDIR at a disk with room for a full build of this workspace (TMPDIR is "
-            ),
-            "{err}"
+                 copy under {} — point TMPDIR at a disk with room for a full build of this \
+                 workspace (TMPDIR is {})\n",
+                std::env::temp_dir().display(),
+                std::env::var("TMPDIR").as_deref().unwrap_or("unset")
+            )
         );
         assert_eq!(
             out_of_disk_line("No space left on device", std::path::Path::new("/t"), None)
@@ -1092,6 +1145,19 @@ mod tests {
                 "error: the unmutated baseline ran out of disk space in cargo-mutants' scratch copy \
                  under /t — point TMPDIR at a disk with room for a full build of this workspace \
                  (TMPDIR is unset)"
+            )
+        );
+        assert_eq!(
+            out_of_disk_line(
+                "No space left on device",
+                std::path::Path::new("/big/T"),
+                Some("/big")
+            )
+            .as_deref(),
+            Some(
+                "error: the unmutated baseline ran out of disk space in cargo-mutants' scratch copy \
+                 under /big/T — point TMPDIR at a disk with room for a full build of this \
+                 workspace (TMPDIR is /big)"
             )
         );
         std::fs::write(
@@ -1108,6 +1174,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A sim batch with an untested check exits 1, so an unmutated baseline can
+    /// be red for that alone. The error names the check, read from the baseline's
+    /// own log through `log_path`, and no other cause: the fixture log also holds
+    /// an `ok` check and a red `test result:` that would point elsewhere.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_baseline_red_for_an_untested_check_names_the_check() {
+        let dir = std::env::temp_dir().join(format!("charpente-untested-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("log")).expect("scratch");
+        let json = r#"{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{"scenario":"Baseline","summary":"Failure","log_path":"log/baseline.log"}]}"#;
+        std::fs::write(dir.join("outcomes.json"), json).expect("outcomes");
+        let report_of = || {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = report(
+                &dir.join("outcomes.json"),
+                None,
+                Some(2),
+                &mut out,
+                &mut err,
+            );
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        std::fs::write(
+            dir.join("log/baseline.log"),
+            "*** baseline\n\n*** cargo test --package=app\n     Running tests/sim.rs \
+             (target/debug/deps/sim-0123456789abcdef)\n\
+             running 2 sim checks, 256 runs each, under random injected faults (master seed 0x1)\n\
+             \n\
+             skipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
+             \x20 note_survives — never tested: every run was skipped\n\
+             \x20   256  no POST /notes became durable (first: --seed 0x2)\n\
+             \n\
+             check echo_matches .... ok  (256 tested)\n\
+             check note_survives ... untested  (0 tested, 256 skipped)\n\
+             \n\
+             sim result: FAILED. 1 passed; 0 failed; 1 untested. Runs tested per check, in the \
+             order above: 256, 0 of 256.\n\
+             error: test failed, to rerun pass `--test sim`\n",
+        )
+        .expect("log");
+        let (code, out, err) = report_of();
+        assert_eq!((code, out.as_str()), (2, ""), "{err}");
+        assert_eq!(
+            err,
+            "error: the UNMUTATED baseline was not green: check note_survives tested nothing, \
+             and a check that tested nothing fails the batch. Fix its setup, or scope --property \
+             to a check that runs.\n"
+        );
+        // A red baseline whose log names no untested check keeps the generic text.
+        std::fs::write(
+            dir.join("log/baseline.log"),
+            "check echo_matches ... FAILED  (256 tested: 3 failed)\n",
+        )
+        .expect("log");
+        let (code, _, err) = report_of();
+        assert_eq!(code, 2);
+        assert!(
+            err.starts_with("error: the UNMUTATED baseline was not green (Failure) — "),
+            "{err}"
+        );
+        assert_eq!(
+            untested_check("check a ... untested  (0 tested, 4 skipped)"),
+            Some("a")
+        );
+        assert_eq!(untested_check("check untested ... ok  (4 tested)"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn zero_mutants_is_not_a_clean_run() {
         let v = verdict(
@@ -1115,6 +1254,7 @@ mod tests {
                 r#"{{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
             )),
             "out",
+            None,
             None,
         );
         assert_eq!(v.code, 2, "{:?}", v.lines);
@@ -1130,6 +1270,7 @@ mod tests {
             )),
             "out",
             Some("counter_bump_job_leaves_the_row_readable"),
+            None,
         );
         assert_eq!(v.code, 1);
         let text = v.lines.join(" ");
@@ -1148,6 +1289,7 @@ mod tests {
                 r#"{{"total_mutants":5,"caught":4,"missed":1,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
             )),
             "out",
+            None,
             None,
         );
         assert_eq!(v.code, 1);
@@ -1196,6 +1338,7 @@ mod tests {
             ),
             "out",
             None,
+            None,
         );
         assert_eq!(
             v.code, 0,
@@ -1235,6 +1378,7 @@ mod tests {
                 ),
                 "out",
                 None,
+                None,
             );
             assert!(
                 !v.lines.iter().any(|l| l.contains("no viable mutant")),
@@ -1252,6 +1396,7 @@ mod tests {
                 ],
             ),
             "out",
+            None,
             None,
         );
         assert_eq!(

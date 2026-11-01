@@ -2096,9 +2096,10 @@ Charpente treats the coding agent as the primary developer persona:
   does: `runs` and run totals, `coverage`, `missing_coverage` (`{check, key}` pairs for
   `require`d keys never hit), per-check `{check, status, passed, failed, skipped,
   distinct_inputs, drew_inputs, skipped_reasons}` with every skipped reason and its first
-  run's seed, and every
+  run's seed, every
   failure as `{check, seed, config, fired, message, inputs, faults_off, first_message,
-  not_shrunk, replays, repro}` (GUIDE §8). Ships with the public
+  not_shrunk, replays, repro}`, and last the batch's `result` and `exit` (GUIDE §8). Ships
+  with the public
   checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/
   redb-latch fallout classifier, productized out of four hand-rolled internal copies; a
   durable-horizon refusal is never fallout by its text and is judged by `durable_refusal`,
@@ -2118,8 +2119,11 @@ Charpente treats the coding agent as the primary developer persona:
   are the same two scoped to a host, for a multi-node workload whose excuse must name the
   node the fault fired on, and `SimHost::durable_corruption_count`/`dir_entry_loss_count`
   are their counts, so a workload that wipes a host's data reads them at the wipe and
-  excuses a later refusal only by a fault since then. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
-  build/usage/infrastructure error.
+  excuses a later refusal only by a fault since then. Exit codes: 0 green, 1 sim failures,
+  unmet coverage, or a check that tested nothing (every run skipped: a vacuous check fails
+  the batch; a `--seed` replay of a skipped run exits 0), 2 build/usage/infrastructure
+  error. The platform's own runners hold the same rule: a test in which every universe gave
+  up fails.
 - **The edge harness (v0, implemented; `crates/edge-harness`).** The sim owns everything
   below the IO traits; the edge harness owns everything above them that only a real
   process can show. It drives **real built binaries** (`examples/invoicing/src/bin/node.rs`
