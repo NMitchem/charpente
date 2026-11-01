@@ -7959,6 +7959,79 @@ fn an_unanswered_request_leaves_its_own_slot_none() {
     );
 }
 
+// ------------- SimSource::wait_until: what woke it, and the sleep it asks for
+
+/// The sim's clock, recording every sleep it is asked for, in nanoseconds.
+struct SleepLog {
+    inner: charpente_sim::SimClock,
+    sleeps: Arc<Mutex<Vec<u64>>>,
+}
+
+impl charpente_core::io::Clock for SleepLog {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+
+    fn wall(&self) -> WallTime {
+        self.inner.wall()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).expect("a test sleep fits u64 nanos");
+        self.sleeps.lock().unwrap().push(nanos);
+        self.inner.sleep(duration);
+    }
+}
+
+/// `Wake`'s contract, held where `Kernel::run` cannot see it: it reads only
+/// `Shutdown`, so a source that swapped `Ready` and `Deadline`, or slept when
+/// nothing had to pass, would run every kernel test the same. `Ready` means a
+/// request arrived and the next `poll()` returns it; `Deadline`, that the
+/// deadline came first with nothing new. Each wait sleeps exactly the gap to
+/// the earlier of the two, and not at all when that instant is now.
+#[test]
+fn wait_until_names_what_woke_it_and_sleeps_only_the_gap() {
+    use charpente_core::io::Clock;
+    let sim = Sim::with_faults(0xA45_0002, FaultConfig::none());
+    let sleeps = Arc::new(Mutex::new(Vec::new()));
+    let clock = SleepLog {
+        inner: sim.clock(),
+        sleeps: Arc::clone(&sleeps),
+    };
+    let start = sim.clock().now().as_nanos();
+    let mut source = SimSource::new(Box::new(clock), start + 10 * SEC);
+    source.push_at(start + 2 * SEC, Request::new(Method::Get, "/a"));
+
+    let deadline = Instant::from_nanos(start + SEC);
+    assert!(
+        matches!(source.wait_until(Some(deadline)), Wake::Deadline),
+        "the deadline comes before the arrival"
+    );
+    assert!(source.poll().is_none(), "a deadline wake has nothing new");
+    assert!(
+        matches!(source.wait_until(None), Wake::Ready),
+        "the arrival wakes it"
+    );
+    assert!(source.poll().is_some(), "a ready wake's poll returns it");
+
+    // An arrival due now: ready at once.
+    source.push_at(start + 2 * SEC, Request::new(Method::Get, "/b"));
+    assert!(
+        matches!(source.wait_until(None), Wake::Ready),
+        "an arrival due now is ready"
+    );
+    assert!(source.poll().is_some(), "and its poll returns it");
+    assert!(
+        matches!(source.wait_until(None), Wake::Shutdown),
+        "nothing left inside the horizon"
+    );
+    assert_eq!(
+        *sleeps.lock().unwrap(),
+        [SEC, SEC],
+        "one second to the deadline, one to the arrival, and none for an arrival due now"
+    );
+}
+
 #[test]
 fn request_clones_equal() {
     let request = Request::new(Method::Post, "/hit?cursor=5.9")
