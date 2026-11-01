@@ -7,13 +7,14 @@
 //! `outbound_settles_by_horizon` with outbound effects (outbound-effects
 //! spec §10), and `clock_refused`, `clock_fallout` and `clock_reopens_after`
 //! with the sim's clock axes (0.3.0), and `wait_out_clock_refusal` once the
-//! tail loop that uses the last two had five copies (0.3.0) — more earn their
-//! way in the same way.
+//! tail loop that uses the last two had five copies (0.3.0), and `events` and
+//! `events_scoped` when sim tests kept decoding `EventRow` by hand (0.4.0) —
+//! more earn their way in the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use charpente_core::db::Event;
+use charpente_core::db::{Event, Tenant};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, IdempotencyKey, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
@@ -532,15 +533,21 @@ pub const EVENTS_PAGE: usize = 256;
 
 /// Every durable event of type `E` in `snap`, decoded, in log order, across
 /// every tenant. Reads the whole log a page at a time, so it holds past
-/// [`EVENTS_PAGE`] events. A payload that does not decode as `E` is an `Err`
-/// naming the event, the row id and the decode error, never a skipped row.
+/// [`EVENTS_PAGE`] events. A row is decoded only under the shape it was
+/// written with, as delivery does: a different fingerprint, a payload that
+/// does not decode as `E`, or bytes left over after it is an `Err` naming the
+/// event and the row id, never a skipped row.
 pub fn events<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String> {
     read_events("events", snap, None)
 }
 
 /// [`events`] for the events emitted in one tenant's scope (`#[event(scoped_by
-/// = ..)]`), where `tenant` is the raw id.
-pub fn events_scoped<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String> {
+/// = ..)]`), where `tenant` is the raw id. A `#[event(global)]` type does not
+/// compile here: it has no tenant, so the read could only be empty.
+pub fn events_scoped<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
+where
+    E::Scope: Tenant,
+{
     read_events("events_scoped", snap, Some(tenant))
 }
 
@@ -562,22 +569,30 @@ fn read_events<E: Event>(
             if row.name != E::NAME || tenant.is_some_and(|t| row.scope != Some(t)) {
                 continue;
             }
+            let id = row.id.raw();
+            if row.shape != Some(E::FINGERPRINT) {
+                let written = row
+                    .shape
+                    .map_or("none".to_string(), |shape| format!("{shape:#018x}"));
+                return Err(format!(
+                    "{who}: event \"{}\" row {id} was written under fingerprint {written}, but \
+                     this type's is {:#018x}; the log holds another shape of the event",
+                    E::NAME,
+                    E::FINGERPRINT
+                ));
+            }
             let mut input = &row.payload[..];
             let event = E::decode(&mut input).map_err(|e| {
-                format!(
-                    "{who}: event \"{}\" row {} does not decode as {}: {e}",
-                    E::NAME,
-                    row.id.raw(),
-                    std::any::type_name::<E>()
-                )
+                format!("{who}: event \"{}\" row {id} does not decode: {e}", E::NAME)
             })?;
-            assert!(
-                input.is_empty(),
-                "{who}: event \"{}\" row {} left {} undecoded bytes",
-                E::NAME,
-                row.id.raw(),
-                input.len()
-            );
+            if !input.is_empty() {
+                return Err(format!(
+                    "{who}: event \"{}\" row {id} does not decode: {} bytes left over after the \
+                     payload",
+                    E::NAME,
+                    input.len()
+                ));
+            }
             out.push(event);
         }
         if page.len() < EVENTS_PAGE {

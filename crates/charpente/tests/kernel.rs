@@ -7916,7 +7916,7 @@ fn answers_has_one_slot_per_pushed_request_in_push_order() {
 /// write-error rate; `None` when the app cannot even open on this seed.
 type Slots = Vec<Option<(u16, Vec<u8>)>>;
 
-fn answers_under_write_errors(seed: u64) -> Option<Slots> {
+fn answers_under_write_errors(seed: u64) -> Option<(Slots, Option<String>)> {
     let faults = FaultConfig {
         write_error: 0.5,
         ..FaultConfig::none()
@@ -7926,9 +7926,9 @@ fn answers_under_write_errors(seed: u64) -> Option<Slots> {
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).ok()?;
     let mut source = answers_source(&sim, &[1, 2, 3, 4, 5, 6]);
     let answers = source.answers();
-    let _ = kernel.run(&mut source);
+    let stopped = kernel.run(&mut source).err().map(|e| e.to_string());
     let slots = answers.lock().unwrap().clone();
-    Some(slots)
+    Some((slots, stopped))
 }
 
 /// Seed 855 is the first in 0..2000 where the 0.5 write-error rate lets
@@ -7936,7 +7936,12 @@ fn answers_under_write_errors(seed: u64) -> Option<Slots> {
 /// engine so the kernel stops with requests 3..=6 never polled.
 #[test]
 fn an_unanswered_request_leaves_its_own_slot_none() {
-    let slots = answers_under_write_errors(855).expect("seed 855 opens");
+    let (slots, stopped) = answers_under_write_errors(855).expect("seed 855 opens");
+    let stopped = stopped.expect("the kernel stopped before the source ran dry");
+    assert!(
+        stopped.contains("poisoned"),
+        "it stopped because the write error poisoned the engine: {stopped}"
+    );
     assert_eq!(slots.len(), 6, "one slot per push_at, answered or not");
     let (status, body) = slots[0].as_ref().expect("request 1 was answered");
     assert_eq!(*status, 200, "request 1 keeps its own answer");
