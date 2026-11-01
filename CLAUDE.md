@@ -40,7 +40,8 @@ fine later), porting existing apps, and feature flags on determinism.
 ## What this is
 
 An agent-native, single-binary Rust backend platform. M0 through M3 (launch) are complete,
-and 0.1.0 is on crates.io (see "Current state" below). The milestones and exit criteria in
+and charpente is on crates.io, launched as 0.1.0 (CHANGELOG's newest dated section names the
+latest release; see "Current state" below). The milestones and exit criteria in
 PLAN.md were the roadmap, and its "After launch (v1.x)" table holds what comes next, each
 item with the trigger that reopens it.
 
