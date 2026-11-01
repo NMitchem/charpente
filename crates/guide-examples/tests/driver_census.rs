@@ -17,6 +17,17 @@
 //! carrying that text is reported, loudly and by line, the right direction for
 //! a census. Still missed: a hand tail built entirely through some other
 //! helper.
+//!
+//! One more census of the same files, plus every ```rust block in GUIDE: no
+//! `#[route]` handler mints a credential for a subject its request body names.
+//! charpente has no password check, so a `create_session` or `create_api_key`
+//! whose subject the body chose lets anyone log in as anyone (GUIDE §5's
+//! `login`), and the API page, which GUIDE sends readers to first, once showed
+//! exactly that (0.4.0 docs-only build review I2). A site is a mint call whose
+//! subject argument names the handler's body argument (any argument but `tx`,
+//! `ctx` and the route's `:params`), directly or through a `let` bound from
+//! it. Still missed: a mint in a helper the handler calls, and a binding made
+//! by a `match` arm or a closure.
 
 // Walking the repo's sources is build tooling outside the deterministic
 // boundary, the same sanctioned-edge pattern as tests/hook_census.rs.
@@ -80,25 +91,27 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn no_example_or_scaffold_template_drives_recovery_by_hand() {
-    let root = repo();
-    let examples = "crates/charpente/examples";
-    let templates = "crates/charpente-cli/templates";
+/// The files agents copy, by path from `root`: every `.rs` example in
+/// `crates/charpente/examples/` and every template `charpente new` renders.
+fn copied_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
-    walk(&root.join(examples), &mut files);
+    walk(&root.join("crates/charpente/examples"), &mut files);
     files.retain(|p| p.extension().is_some_and(|x| x == "rs"));
     // Every template is rendered into the app `charpente new` writes,
     // whatever its extension (`lib.rs` is one).
-    walk(&root.join(templates), &mut files);
-    let rel = |path: &Path| {
-        path.strip_prefix(&root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
-    };
-    let mut files: Vec<String> = files.iter().map(|p| rel(p)).collect();
+    walk(&root.join("crates/charpente-cli/templates"), &mut files);
+    let mut files: Vec<String> = files
+        .iter()
+        .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string())
+        .collect();
     files.sort();
+    files
+}
+
+#[test]
+fn no_example_or_scaffold_template_drives_recovery_by_hand() {
+    let root = repo();
+    let files = copied_files(&root);
     for want in [
         "crates/charpente/examples/drawn_inputs.rs",
         "crates/charpente/examples/modelled_remote.rs",
@@ -184,5 +197,281 @@ fn each_step_is_a_site_by_line() {
         sites_in(src)[0].2,
         "use charpente_sim::checks::{boot_through_fallout, wait_out_clock_refusal as wait};",
         "a site carries its line's text, trimmed"
+    );
+}
+
+/// The calls that mint a credential for the subject they are handed.
+const MINTS: [&str; 2] = ["create_session(", "create_api_key("];
+
+/// The text from the `(` or `{` at byte `open` of `src` through its match, or
+/// `None` when it never closes (a GUIDE fragment can stop mid-item).
+fn balanced(src: &str, open: usize) -> Option<&str> {
+    let (o, c) = match src.as_bytes()[open] {
+        b'(' => (b'(', b')'),
+        b'{' => (b'{', b'}'),
+        b => panic!("balanced: {:?} at byte {open} is not ( or {{", b as char),
+    };
+    let mut depth = 0;
+    for (i, b) in src.bytes().enumerate().skip(open) {
+        if b == o {
+            depth += 1;
+        } else if b == c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&src[open..=i]);
+            }
+        }
+    }
+    None
+}
+
+/// `list` cut at its top-level commas.
+fn split_top(list: &str) -> Vec<&str> {
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut out = Vec::new();
+    for (i, c) in list.char_indices() {
+        match c {
+            '(' | '<' | '[' | '{' => depth += 1,
+            ')' | '>' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&list[start..]);
+    out
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Whether `text` names the variable `name`: the identifier on its own, not
+/// a field or method of something else (`.name`) or a path segment (`::name`).
+fn names_var(text: &str, name: &str) -> bool {
+    text.match_indices(name).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + name.len()..].chars().next();
+        !before.is_some_and(|c| is_ident(c) || c == '.' || c == ':') && !after.is_some_and(is_ident)
+    })
+}
+
+/// `(line, what)` for every credential mint in a `#[route]` handler of `src`
+/// whose subject argument names the handler's body argument, directly or
+/// through a `let` bound from it; and how many mints were judged.
+fn body_minted(src: &str) -> (Vec<(usize, String)>, usize) {
+    // Comment lines go and newlines stay, so a byte offset keeps its line.
+    let code = src
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line_of = |at: usize| code[..at].matches('\n').count() + 1;
+    let mut sites = Vec::new();
+    let mut judged = 0;
+    let attrs = code
+        .match_indices("route(")
+        .filter(|(i, _)| code[..*i].ends_with("#[") || code[..*i].ends_with("#[charpente::"));
+    for (at, _) in attrs {
+        let open = at + "route".len();
+        let Some(attr) = balanced(&code, open) else {
+            continue;
+        };
+        let pattern = attr.split('"').nth(1).unwrap_or("");
+        let params: Vec<&str> = pattern
+            .split('/')
+            .filter_map(|s| s.strip_prefix(':'))
+            .collect();
+        let after = open + attr.len();
+        let Some(args_at) = code[after..].find("fn ").and_then(|f| {
+            let f = after + f;
+            code[f..].find('(').map(|p| f + p)
+        }) else {
+            continue;
+        };
+        let Some(args) = balanced(&code, args_at) else {
+            continue;
+        };
+        let sig_end = args_at + args.len();
+        let Some(body_at) = code[sig_end..].find('{').map(|b| sig_end + b) else {
+            continue;
+        };
+        let Some(body) = balanced(&code, body_at) else {
+            continue;
+        };
+        let mut tainted: Vec<String> = split_top(&args[1..args.len() - 1])
+            .iter()
+            .filter_map(|arg| arg.split_once(':'))
+            .map(|(name, _)| name.trim().trim_start_matches("mut ").trim().to_string())
+            .filter(|name| name != "tx" && name != "ctx" && !params.contains(&name.as_str()))
+            .collect();
+        let mut offset = body_at;
+        for stmt in body.split_inclusive(';') {
+            let let_at = stmt
+                .match_indices("let ")
+                .find(|(i, _)| !stmt[..*i].chars().next_back().is_some_and(is_ident));
+            let binding = let_at.and_then(|(i, _)| stmt[i + 4..].split_once('='));
+            if let Some((pat, init)) = binding
+                && tainted.iter().any(|t| names_var(init, t))
+            {
+                let bound = pat
+                    .split(|c: char| !is_ident(c))
+                    .filter(|w| w.starts_with(|c: char| c.is_ascii_lowercase() || c == '_'))
+                    .filter(|w| !["_", "mut", "ref"].contains(w));
+                tainted.extend(bound.map(str::to_string));
+            }
+            for mint in MINTS {
+                for (i, _) in stmt.match_indices(mint) {
+                    let Some(call) = balanced(&code, offset + i + mint.len() - 1) else {
+                        continue;
+                    };
+                    judged += 1;
+                    let subject = split_top(&call[1..call.len() - 1])
+                        .get(1)
+                        .map_or("", |s| s.trim());
+                    if let Some(from) = tainted.iter().find(|t| names_var(subject, t)) {
+                        sites.push((
+                            line_of(offset + i),
+                            format!(
+                                "{}{call} mints for `{subject}`, which comes from the request \
+                                 body (`{from}`)",
+                                &mint[..mint.len() - 1]
+                            ),
+                        ));
+                    }
+                }
+            }
+            offset += stmt.len();
+        }
+    }
+    (sites, judged)
+}
+
+/// GUIDE with every line outside a ```rust block blanked, so a line number is
+/// GUIDE's own.
+fn guide_rust(src: &str) -> String {
+    let mut inside = false;
+    src.lines()
+        .map(|l| {
+            let fence = l.trim_start();
+            if fence.starts_with("```") {
+                inside = fence.starts_with("```rust");
+                ""
+            } else if inside {
+                l
+            } else {
+                ""
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn no_example_template_or_guide_block_mints_for_a_subject_the_body_names() {
+    let root = repo();
+    let mut sources: Vec<(String, String)> = copied_files(&root)
+        .into_iter()
+        .map(|f| {
+            let src = fs::read_to_string(root.join(&f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+            (f, src)
+        })
+        .collect();
+    let guide = "docs/GUIDE.md";
+    let text = fs::read_to_string(root.join(guide)).unwrap_or_else(|e| panic!("{guide}: {e}"));
+    sources.push((guide.to_string(), guide_rust(&text)));
+
+    let mut judged = Vec::new();
+    let mut sites = Vec::new();
+    for (file, src) in &sources {
+        let (found, mints) = body_minted(src);
+        if mints > 0 {
+            judged.push(file.as_str());
+        }
+        sites.extend(
+            found
+                .into_iter()
+                .map(|(line, what)| format!("{file}:{line}: {what}")),
+        );
+    }
+    for want in ["crates/charpente/examples/api.rs", guide] {
+        assert!(
+            judged.contains(&want),
+            "the credential census judged no mint in {want}, which has some — a parser that \
+             finds no handler passes vacuously; judged: {judged:?}"
+        );
+    }
+    assert!(
+        sites.is_empty(),
+        "{} handler(s) mint a credential for a subject the request body names, in a file \
+         agents copy:\n  {}\n\
+         contract: charpente has no password check, so a session or an API key minted for a \
+         body-named subject lets anyone log in as anyone (GUIDE §5, \"never mint for a subject \
+         a request body names\").\n\
+         fix: make the route `auth` and mint for the caller's own subject, \
+         `ctx.principal().expect(\"auth route\").subject().to_string()`, as GUIDE §5's `login` \
+         does; a first credential comes from something the app trusts, such as an IdP or a \
+         signup route that mints for a subject it has just created.",
+        sites.len(),
+        sites.join("\n  "),
+    );
+}
+
+#[test]
+fn a_subject_from_the_body_is_a_site_and_one_from_the_principal_is_not() {
+    let src = r#"
+#[route(POST "/login", public)]
+fn login(tx: &mut Tx, body: Login, ctx: &Ctx) -> Result<String, ApiError> {
+    // Ok(ctx.create_session(tx, body.subject)) in a comment is not judged
+    Ok(ctx.create_session(tx, body.subject))
+}
+
+#[charpente::route(POST "/signin", public)]
+fn signin(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_session(tx, subject))
+}
+
+#[route(POST "/keys", auth)]
+fn mint(tx: &mut Tx, body: KeyBody, ctx: &Ctx) -> Result<String, ApiError> {
+    let who = body.owner.clone();
+    let label = body.label;
+    Ok(ctx.create_api_key(
+        tx,
+        who,
+    ))
+}
+
+#[route(POST "/users/:subject/keys", auth)]
+fn for_user(tx: &mut Tx, subject: String, body: KeyBody, ctx: &Ctx) -> Result<String, ApiError> {
+    let me = ctx.principal().expect("auth route").subject().to_string();
+    let _ = (subject, body.label);
+    Ok(ctx.create_api_key(tx, me))
+}
+"#;
+    let (sites, judged) = body_minted(src);
+    assert_eq!(
+        judged, 4,
+        "every uncommented mint in a route handler is judged"
+    );
+    let lines: Vec<usize> = sites.iter().map(|(line, _)| *line).collect();
+    assert_eq!(
+        lines,
+        [5, 10, 17],
+        "a body field, a whole-body subject and a let bound from the body are sites; a \
+         principal's subject and a path param are not: {sites:?}"
+    );
+    assert_eq!(
+        sites[0].1,
+        "create_session(tx, body.subject) mints for `body.subject`, which comes from the request \
+         body (`body`)"
     );
 }

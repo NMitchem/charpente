@@ -203,11 +203,6 @@ mod attributes {
         pub due_day: Option<String>,
     }
 
-    #[derive(Wire, Deserialize)]
-    pub struct Login {
-        pub subject: String,
-    }
-
     // An event derives its own `Serialize` and `Wire`: a subscriber receives
     // its JSON. Its `NAME` is the type's snake_case, `note_added`.
     #[event(global)]
@@ -374,20 +369,29 @@ mod attributes {
         Ok(())
     }
 
-    #[route(POST "/login", public)]
-    fn login(tx: &mut Tx, body: Login, ctx: &Ctx) -> Result<String, ApiError> {
-        // A session for `subject` that expires after the app's session TTL.
-        // One mint per request, shared with `create_api_key`.
-        Ok(ctx.create_session(tx, body.subject))
+    // `auth`: the caller presented a credential (a session, an API key or an
+    // OIDC token), so `ctx.principal()` is `Some`. A login trades a key or a
+    // token for a session in the caller's own subject. charpente has no
+    // password check, so never mint for a subject a request body names: that
+    // lets anyone log in as anyone.
+    #[route(POST "/login", auth)]
+    fn login(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+        let principal: &Principal = ctx.principal().expect("auth route");
+        // `Session` and `ApiKey` carry the matched row's id; `Oidc` has no row.
+        // A session that could buy a session would outlive its TTL and logout.
+        if let Via::Session(_) = principal.via() {
+            return Err(ApiError::BadRequest(
+                "log in with an API key or an OIDC token, not a session".to_string(),
+            ));
+        }
+        // A session that expires after the app's session TTL. One mint per
+        // request, shared with `create_api_key`.
+        Ok(ctx.create_session(tx, principal.subject().to_string()))
     }
 
-    // `auth`: the caller presented a credential (a session, an API key or an
-    // OIDC token), so `ctx.principal()` is `Some`.
     #[route(POST "/keys", auth)]
     fn mint_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
         let subject = ctx.principal().map(|p| p.subject().to_string());
-        // `Session` and `ApiKey` carry the matched row's id; `Oidc` has no row.
-        let _via: Option<Via> = ctx.principal().map(|p| p.via());
         // `"ck_"` and 64 hex characters; only its hash is stored.
         Ok(ctx.create_api_key(tx, subject.unwrap_or_default()))
     }
