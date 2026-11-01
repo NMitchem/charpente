@@ -134,11 +134,10 @@ dropped one, and reclassified the rest to after launch with the trigger that reo
 crates.io as `0.1.0`, and a stranger given only this README installed it, scaffolded an app,
 and reached a red sim with a seed that replays
 ([docs/experiments/2026-10-launch-run](docs/experiments/2026-10-launch-run/)).
-[CHANGELOG.md](CHANGELOG.md) dates every release since: its newest dated section is the
-latest on crates.io (`0.3.0` as this line was written), and a section it marks unreleased
-is not published yet. A third
-docs-only agent build passed review with zero Criticals the platform should have caught.
-Every number in this file is measured or gone. The first two of
+[CHANGELOG.md](CHANGELOG.md) records every release since, and dates each one after its
+crates are on crates.io (the newest dated section was `0.3.0` when this line was written).
+A third docs-only agent build passed review with zero Criticals the platform should have
+caught. Every number in this file is measured or gone. The first two of
 M2's sub-projects — an honest benchmark harness and primary-side group commit — have their
 numbers in [docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`:
 one connection costs one durable fsync per transaction, ~215 durable records/sec on that

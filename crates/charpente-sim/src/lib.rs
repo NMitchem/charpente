@@ -2711,9 +2711,9 @@ pub fn run_universes_swarm_in(
 /// whose oracle can decay toward vacuous without ever reaching zero. A
 /// `ceiling: [("key", N), ...]` after either is the same check turned around:
 /// the batch fails when the key was covered more than N times. Its use is
-/// `("run:skipped", N)`, since a single give-up is reported and never failed,
-/// so without a cap a property can drift toward adjudicating almost nothing
-/// with every batch green. Like floors and requires, ceilings are skipped under
+/// `("run:skipped", N)`, since one give-up among verdicts is reported and never
+/// failed, so without a cap a property can drift toward adjudicating almost
+/// nothing with every batch green. Like floors and requires, ceilings are skipped under
 /// `CHARPENTE_SEED` and `CHARPENTE_BASE_SEED`. The all-give-up rule is not a
 /// rate measured at a base, so it still holds under `CHARPENTE_BASE_SEED`: a
 /// re-based test in which every universe gave up fails. A `CHARPENTE_SEED`
