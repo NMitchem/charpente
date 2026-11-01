@@ -9159,8 +9159,9 @@ final fix wave ran in `../charpente-mut`. Each lane was cherry-picked or fast-fo
 `progress.md` holds every ruling with its reason and its cost if wrong, and every report and
 log named below is in that directory.
 
-**Shipped.** Fifty-eight commits, `7113e8f3..8511ca04`, all on `main` and none pushed; this
-entry is the next. Each task closed on an approving review after at most one fix round
+**Shipped.** Fifty-eight commits, `7113e8f3..8511ca04`, then this entry (`30b04392`), the
+clock helper's fix (`3ef9fdb1`) and this entry's correction for it. All are on `main` and
+none is pushed. Each task closed on an approving review after at most one fix round
 (progress.md's `Task N: complete` lines).
 - **Spec and plan** `437f1e76`, `49bc5eea`, and the amendment `064a0794`.
 - **T0** `fe5b519d`, `bf255375`: CHANGELOG opens 0.4.0 and dates 0.3.0 released 2026-10-27,
@@ -9224,6 +9225,15 @@ entry is the next. Each task closed on an approving review after at most one fix
   - `8c3a6893`, `488db73a`, `7312e83f`: the two-pass `merge` defect refused, and 13 more
     survivors caught.
 - **Final fix wave** `deb31714`, `29b900bd`, `9942c68d`, `cc86c70a`, `8f2d209f`, `9b0fd673`, `800f1170`, `8511ca04`: the final review's I1 and M1–M6 (below), `Kernel::step`'s doc on the between-run drain, and a GUIDE reflow.
+- **The clock helper** `3ef9fdb1`: `checks::wait_out_clock_refusal` fails a third clock
+  refusal as a platform clock defect instead of giving the run up. outbound-fixture's own
+  tail loop now does the same, and `Drive::recover` drops its workaround. Noah asked whether
+  any ruling went against DESIGN or MANIFESTO, and the one parking this did. DESIGN excuses
+  a refusal only where an injected fault explains it, "otherwise it fails as the platform
+  durability bug it would be" (DESIGN.md:1494-1499). The helper's own doc says one wait
+  always suffices, so no fault explains a third refusal. The parking's stated reason, that
+  the change would move outbound-fixture's recorded tail code, was also wrong: no recorded
+  or fresh batch reaches the branch.
 
 **What the reviews found.** Every task got a review that wrote to a file before it returned. Opus reviewed the core work, and sonnet did the small diffs and the re-reviews.
 - **Approved as they stood:**
@@ -9259,7 +9269,15 @@ The final whole-branch review (`final-review.md`, opus, over `7113e8f3..9570a582
 The one fix wave took I1 option (a), M1–M6, the `step` doc note and a GUIDE reflow. M7 is recorded here, and M8 goes to the publish checklist. Its re-review (`final-rereview.md`, sonnet, over `7312e83f..8511ca04`) read CLEAN, 0/0/0, with all ten items addressed.
 
 **Exit criteria (spec §6), each with its evidence.** The final evidence ran at `8511ca04`
-(`logs/final-evidence.log`).
+(`logs/final-evidence.log`). After the clock helper's fix, it ran again at `3ef9fdb1`:
+- oracle 3: all six exit 0, and outbound-fixture's batch is unchanged;
+- `determinism.sh` and `determinism2.sh`: 16 and 8 outputs, 0 differing;
+- the fresh-base re-run: 40 of 40 green, every report byte-identical to `8511ca04`'s;
+- the workspace gate: fmt 0, clippy 0, 104 of 104 ok, 2,217 passed, 0 failed, 64 ignored
+  (`logs/*-clockfix*`).
+
+The edge harness stands at `8511ca04`, because the fix touches no code the rig runs: it
+changes `charpente-sim`, a fixture's sim test, a CLI test and the docs.
 
 1. **Text pins: met.** Every new or changed line landed pinned against its exact text, in the commit that made it:
    - the untested result and its fix line (`da4173ce`; 9 tests red first, `logs/t6-red.log`);
@@ -9273,7 +9291,9 @@ The one fix wave took I1 option (a), M1–M6, the `step` doc note and a GUIDE re
    - the two cross-pass refusals (`8c3a6893`);
    - the tail the clock keeps refusing (`deb31714`);
    - the horizon contract (`8511ca04`);
-   - the scaffold's two event-check texts (`29b900bd`).
+   - the scaffold's two event-check texts (`29b900bd`);
+   - the clock helper's platform-defect text (`3ef9fdb1`; red first, "a third refusal fails
+     the run: None").
 
    `doc_truth`'s pinned floor went 51 → 53 for GUIDE's new pinned blocks (`f06a20e6`, `70e92134`).
 2. **Determinism: met.** Oracle 3 replays six batches at 256 runs per check and diffs everything a batch decides against baselines recorded at `fe5b519d`, before any code changed:
@@ -9379,6 +9399,7 @@ The one fix wave took I1 option (a), M1–M6, the `step` doc note and a GUIDE re
 - **AG-5 is FIXED with no wall time.** Task 17's runs were each one pass, and docs/BENCH.md carries no mutation figure. Task 18's docs-only build is the first field timing of the two-pass verb.
 - **The final review ran before the final evidence** (as 0.3.0's R25), so the evidence covers the fix wave.
 - **I1 took option (a)**, so `recover` fails a tail the clock keeps refusing.
+  `3ef9fdb1` moved the same rule into `wait_out_clock_refusal` itself, for every caller.
 - **M6's assert landed only after the implementer proved, from each workload's draw bounds, that no shipped workload can pass its horizon.** The tightest is `modelled_remote`: 96 orders at 20 ms apart against 3 s.
 - **M8 goes to the publish**, beside CHANGELOG's date: PLAN's "In progress: 0.4.0" is true until then.
 
@@ -9618,7 +9639,11 @@ tallied from these tables.
 
 
 **Open, deliberately.**
-- **`checks::wait_out_clock_refusal` still gives up on a third clock refusal** for its other callers: `outbound-fixture`'s own tail, and any app below the helper. That contradicts GUIDE's below-the-helper rule, "give up only on a durable refusal". §11's "Testing a tail in sim", which GUIDE's drop-below list now points at, gives up on fault fallout too. No recorded or fresh batch hits either. Changing the helper moves `outbound-fixture`'s recorded tail code, so it waits for the helper's next change. Until then a below-the-helper app skips, rather than fails, a platform clock defect.
+- **§11's "Testing a tail in sim" gives up on fault fallout in its one faulted phase**, and
+  GUIDE's drop-below list now points at it for realtime checks. DESIGN allows those
+  give-ups, because an injected fault explains each one. But GUIDE's drop-below rules say to
+  treat a crash in the faulted phase as the crash under test, so the example and the rules
+  disagree. That is a GUIDE consistency question, and the example stays as it is.
 - **Unpinned:**
   - `events_scoped`'s `E::Scope: Tenant` bound. The bound is itself the compile-time contract. Since `charpente-sim` now depends on `charpente`, a `compile_fail` doctest could pin it without a new edge, though weakly.
   - The scaffold's per-note ack check has no pin that tells it from a count. The enqueue-deletion tests go red under both.
@@ -9635,7 +9660,7 @@ tallied from these tables.
   - Dead reachable, which is 0.5.0's scope.
 
   These are scheduling, and Noah's.
-- **The fix wave's code was not put through the mutation instrument again.** Each change landed red-first under its own test instead.
+- **The fix wave's code and the clock helper's fix were not put through the mutation instrument again.** Each change landed red-first under its own test instead.
 
 **Next.**
 - **Task 18, the docs-only build.** It is Noah's to start: a fresh offline box with the packaged 0.4.0 crates and clippy installed. No box image has carried clippy yet (LR-3). The review is against spec §6.8 (a)–(f). For (e), a reported shrunk failure is replayed with one item removed, and it must stop failing. Every finding gets a disposition under the testimony rule, and a platform defect is fixed before the publish.
