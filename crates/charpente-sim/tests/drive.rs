@@ -12,15 +12,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use charpente::auth::ApiKey;
 use charpente::core::io::{
-    Disk, File, HttpMethod, IdempotencyKey as CallKey, Outbound, OutboundCall, OutboundReply,
+    Clock, Disk, File, HttpMethod, IdempotencyKey as CallKey, Outbound, OutboundCall,
+    OutboundReply, WallTime,
 };
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::JobError;
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, Schema, Snapshot, Tx, View, job, jobs, route, routes, table};
-use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{clock_reopens_after, durable_corruption_fired, is_fault_fallout};
 use charpente_sim::drive::{Drive, Phase};
 use charpente_sim::outbound::Remote;
 use charpente_sim::rng::Rng;
@@ -494,6 +496,73 @@ fn a_clock_stop_ends_the_phase_and_the_tail_waits_out_the_refusal() {
         shape(&recovered.resent),
         [vec!["-"; 15], vec!["200"; 15]].concat(),
         "the tail re-sends the 15 the stop left unanswered"
+    );
+}
+
+/// A tail the clock keeps refusing fails the run. Each build stamps an API
+/// key an hour ahead of the node's clock, so the kernel's open is refused
+/// again after every wait. A real store's refusal clears after one wait, so a
+/// third is a platform clock defect, never a give-up.
+#[test]
+fn a_tail_the_clock_keeps_refusing_fails_the_run() {
+    // Only the clock's skew is on, and it acts at the build's first read, so
+    // `clock_fallout` excuses every refusal and each is waited out. Every
+    // boot is refused by construction, so any seed with a skew shows it.
+    let sim = Sim::with_faults(
+        0xD7_9000,
+        FaultConfig {
+            clock_skew: 90_000_000_000,
+            ..FaultConfig::none()
+        },
+    );
+    let boots = Cell::new(0u64);
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        boots.set(boots.get() + 1);
+        let mut app = notes(sim)?;
+        let ahead = WallTime::from_nanos(sim.clock().wall().as_nanos() + 3_600_000_000_000);
+        app.transact_for_tests(|tx| {
+            tx.put(&ApiKey {
+                id: Id::from_raw(boots.get()),
+                key_hash: String::new(),
+                subject: "ahead".to_string(),
+                created_at: ahead,
+            });
+            Ok::<(), io::Error>(())
+        })
+        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        Ok(app)
+    });
+    let phase = Phase {
+        requests: vec![post(1)],
+        answers: vec![None],
+    };
+    let err = match drive.recover(&phase, Duration::from_secs(1)) {
+        Err(err) => err,
+        Ok(recovered) => panic!(
+            "a tail the clock refuses after two waits fails the run, but it booted: {}, gave up: \
+             {:?}",
+            recovered.is_some(),
+            sim.gave_up()
+        ),
+    };
+    let cov = |key: &str| sim.coverage().get(key).copied();
+    assert_eq!(cov("clock:skewed"), Some(1), "the case: a clock axis acted");
+    assert_eq!(
+        (boots.get(), cov("restart:process")),
+        (3, Some(2)),
+        "three refusals: two waits, each with its restart, and no third"
+    );
+    let defect = "the fault-free tail could not boot: its open was refused for the clock a \
+                  third time, after two waits past the instant each refusal named. One wait \
+                  always suffices, since nothing moves the clock or the recorded time in \
+                  between, so this is a platform clock defect, not the app's: ";
+    let refusal = err
+        .strip_prefix(defect)
+        .unwrap_or_else(|| panic!("the text names the defect: {err}"));
+    assert!(
+        refusal.starts_with("refusing to open: this node's wall clock reads ")
+            && clock_reopens_after(refusal).is_some(),
+        "the refusal's own text follows, once: {refusal}"
     );
 }
 

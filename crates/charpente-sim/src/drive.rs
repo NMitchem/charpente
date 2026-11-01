@@ -192,14 +192,20 @@ impl<'s> Drive<'s> {
     ///   [`Recovered::resent`], apart from the phase's.
     ///
     /// `Ok(None)`: the run gave up, on a boot refused for durable corruption
-    /// where it fired (`boot_through_fallout`), or on a clock refusal that
-    /// outlasted two waits (`wait_out_clock_refusal`). The give-up is named
-    /// on `sim`; the caller returns `Ok(())`.
+    /// where it fired (`boot_through_fallout`), and on nothing else. The
+    /// give-up is named on `sim`; the caller returns `Ok(())`.
     ///
     /// # Errors
     ///
     /// - Every boot met fault fallout, and nothing gave the run up: `the
     ///   fault-free tail could not boot`.
+    /// - The kernel's open was refused for the clock a third time, after
+    ///   two waits: `the fault-free tail could not boot: its open was refused
+    ///   for the clock a third time, after two waits past the instant each
+    ///   refusal named. One wait always suffices, since nothing moves the
+    ///   clock or the recorded time in between, so this is a platform clock
+    ///   defect, not the app's: <refusal>`. It fails the run rather than
+    ///   giving it up, because a skip would hide the defect.
     /// - Any other failure to boot or to build the kernel: `the fault-free
     ///   tail could not boot: <error>`.
     /// - The tail's kernel stopped: `the fault-free tail's kernel stopped:
@@ -221,10 +227,18 @@ impl<'s> Drive<'s> {
         sim.restart();
         sim.quiesce_disk_faults();
         sim.quiesce_clock_faults();
+        // `wait_out_clock_refusal` gives `Ok(None)` for the boot's own give-up
+        // and for a third clock refusal. Only the first is a give-up here: one
+        // wait always suffices, so the third is a defect the run fails on.
+        let mut gave_up = false;
+        let mut refused = String::new();
         let booted = wait_out_clock_refusal(sim, || {
             let Some(app) = self.boot().map_err(|e| format!("{COULD_NOT_BOOT}: {e}"))? else {
                 return match sim.gave_up() {
-                    Some(_) => Ok(None),
+                    Some(_) => {
+                        gave_up = true;
+                        Ok(None)
+                    }
                     None => Err(COULD_NOT_BOOT.to_string()),
                 };
             };
@@ -234,11 +248,22 @@ impl<'s> Drive<'s> {
             }
             match self.kernel(app, &hosts)? {
                 Ok(kernel) => Ok(Some(kernel)),
-                Err(e) => Err(format!("{COULD_NOT_BOOT}: {e}")),
+                Err(e) => {
+                    refused = e.to_string();
+                    Err(format!("{COULD_NOT_BOOT}: {refused}"))
+                }
             }
         })?;
         let Some(mut kernel) = booted else {
-            return Ok(None);
+            if gave_up {
+                return Ok(None);
+            }
+            return Err(format!(
+                "{COULD_NOT_BOOT}: its open was refused for the clock a third time, after two \
+                 waits past the instant each refusal named. One wait always suffices, since \
+                 nothing moves the clock or the recorded time in between, so this is a platform \
+                 clock defect, not the app's: {refused}"
+            ));
         };
         let start = sim.now().as_nanos();
         let mut source = SimSource::new(Box::new(sim.clock()), after(start, tail));

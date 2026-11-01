@@ -3370,12 +3370,17 @@ that fails this is an app defect the re-send found, and its check goes red
 with a seed. Fix the route: dropping below the helper to skip the re-send
 hides the defect.
 
-`recover` gives `Ok(None)` when the run gave up by name: on a boot refused for
-durable corruption, or on a clock refusal that outlasted two waits. Return
-`Ok(())` then. Its errors fail the run:
+`recover` gives `Ok(None)` when the run gave up by name, on a boot refused for
+durable corruption and on nothing else. Return `Ok(())` then. Its errors fail
+the run:
 
 - `the fault-free tail could not boot`: every boot met fault fallout, and
   nothing gave the run up.
+- `the fault-free tail could not boot: its open was refused for the clock a
+  third time, after two waits past the instant each refusal named. …, so
+  this is a platform clock defect, not the app's: <refusal>`. One wait always
+  suffices, so a refusal that outlasts two is a charpente defect, and the run
+  fails on it rather than hiding it as a skip.
 - `the fault-free tail could not boot: <error>`: a boot, or the kernel's
   build, failed with an error of its own.
 - `the fault-free tail's kernel stopped: <error>`, in the kernel's words.
@@ -3444,7 +3449,8 @@ refused node exits, and its supervisor starts it again), and boot again. One
 wait is enough, since nothing moves the clock or the recorded time in between.
 Bound the loop anyway, and give the run up by name once the bound is spent.
 `wait_out_clock_refusal(sim, boot)` (below) is that loop, and `Drive::recover`
-runs it around the tail's boot.
+runs it around the tail's boot and fails the run where the loop's bound is
+spent, since one wait always suffices.
 
 ### Restarting the process, not the machine
 
@@ -3635,7 +3641,8 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   refused after two waits`, with the refusal as its detail. Any other error,
   the stall stop included, comes back unchanged. Call it after
   `sim.quiesce_clock_faults()`; `Drive::recover` runs it around the tail's
-  boot, so only a workload below the helper calls it.
+  boot, and fails the run on a third refusal instead of giving it up, so only
+  a workload below the helper calls it.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
