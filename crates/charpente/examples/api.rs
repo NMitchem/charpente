@@ -750,6 +750,17 @@ fn kernel(
     // `None` unless the text is `"<id>.<seq>"`; the kernel answers such a
     // cursor with a 400 before the handler runs.
     let _cursor: Option<Cursor> = Cursor::parse("5.9");
+    // Test-only, between two runs of one kernel: both methods are hidden from
+    // the docs. One minting transaction on the kernel's App, so it can
+    // enqueue an outbound job too; the next `run` picks the job up as it
+    // starts.
+    let _seeded: Result<(), TxError<ApiError>> =
+        kernel
+            .app_mut_for_tests()
+            .transact_for_tests(|tx: &mut Tx| -> Result<(), ApiError> {
+                tx.enqueue(Reindex {});
+                Ok(())
+            });
     // One iteration: `Worked`, or `Idle { deadline }` without waiting.
     let _step: Step = kernel.step(&mut source)?;
     let _stats: KernelStats = kernel.stats();
