@@ -5179,15 +5179,15 @@ stricter: a mutant that fails an early run and then hangs is caught in pass 1,
 where a single full pass would time out on it. A pass 2 that does not add up
 with pass 1, because it judged another set of mutants than pass 1 left or
 called one that pass 1 built unviable, makes the verb exit 2 rather than mix
-two runs' verdicts: rerun with the same `--master-seed`. Before either pass the verb runs `cargo test`
-over the test set once at the full count (with `--property`'s filter when it
-is given). That run is the baseline pass 2 judges against. An unmet `require`
-or a check that tested nothing makes it red, and the verb exits 2 before any
-mutant runs, even when pass 1 leaves pass 2 nothing to judge. A test package
-with no `sim_tests!` harness, such as charpente's own `run_universes!`
-suites, which write their run counts in source, runs in full in both passes,
-and the report names it. When no test package has the harness, the run is
-one full pass.
+two runs' verdicts: rerun with the same `--master-seed`. Before either pass
+the verb runs `cargo test` over the test set once at the full count (with
+`--property`'s filter when it is given). That run is the baseline pass 2
+judges against. An unmet `require` or a check that tested nothing makes it
+red, and the verb exits 2 before any mutant runs, even when pass 1 leaves pass
+2 nothing to judge. A test package with no `sim_tests!` harness, such as
+charpente's own `run_universes!` suites, which write their run counts in
+source, runs in full in both passes, and the report names it. When no test
+package has the harness, the run is one full pass.
 
 Every process the verb starts gets the run's master seed as
 `CHARPENTE_SIM_MASTER_SEED`: `--master-seed 0x…` if you give one, else one it
