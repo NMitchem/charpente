@@ -135,7 +135,9 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
 /// through a crash in between, and the tail's minute drains it. Two
 /// invariants hold under any fault schedule:
 /// - Ack-durability: a 200 from `/notes/:id` committed its enqueue in the
-///   same log record, so each acked note has an `Echo` job row.
+///   same log record, so each acked note has its own `Echo` job row. It is
+///   checked note by note, not by count: the tail's re-sent notes add jobs
+///   too, and one of theirs must not make up for an acked note's.
 /// - Exactly-once: the notes marked `echoed` number exactly the `Echo` jobs
 ///   that are Done — a job's effect and its Done mark commit as one record.
 ///   Each add enqueues one `Echo` in the note's own record, so two for one
@@ -159,9 +161,14 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
         .into_iter()
         .filter(|job| job.name == "Echo")
         .collect();
-    if echo_jobs.len() < acked.len() {
+    let mut per_note: BTreeMap<u64, usize> = BTreeMap::new();
+    for job in &echo_jobs {
+        let echo = Echo::decode(&mut &job.payload[..]).map_err(|e| e.to_string())?;
+        *per_note.entry(echo.note.raw()).or_insert(0) += 1;
+    }
+    if let Some((id, _)) = acked.iter().find(|(id, _)| !per_note.contains_key(id)) {
         // Media corruption can cut a record whose reply was already sent
-        // (GUIDE §8, "Giving up"). Only this shortfall is excused: an
+        // (GUIDE §8, "Giving up"). Only this loss is excused: an
         // exactly-once violation below fails even where corruption fired.
         if durable_corruption_fired(sim) {
             sim.give_up(
@@ -171,16 +178,9 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
             return Ok(());
         }
         return Err(format!(
-            "ack-durability violated: {} POST(s) were acked with 200 but only {} Echo job(s) are durable — \
-             the enqueue did not commit with the row",
-            acked.len(),
-            echo_jobs.len()
+            "ack-durability violated: note {id} was acked with 200 but has no durable Echo job — \
+             the enqueue did not commit with the row"
         ));
-    }
-    let mut per_note: BTreeMap<u64, usize> = BTreeMap::new();
-    for job in &echo_jobs {
-        let echo = Echo::decode(&mut &job.payload[..]).map_err(|e| e.to_string())?;
-        *per_note.entry(echo.note.raw()).or_insert(0) += 1;
     }
     if let Some((note, jobs)) = per_note.iter().find(|(_, jobs)| **jobs > 1) {
         return Err(format!(
@@ -209,8 +209,9 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
 
 /// An acked POST implies its realtime event: each acked note's `NoteAdded`
 /// is in the durable event log exactly once after recovery — the log a
-/// subscriber's resume reads. Delete `tx.emit` in `src/lib.rs` and this goes
-/// red with a seed.
+/// subscriber's resume reads. None means the emit did not commit with the
+/// row; more than one means the route emitted it again for the same note.
+/// Delete `tx.emit` in `src/lib.rs` and this goes red with a seed.
 fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), String> {
     let Some((recovered, acked)) = post_then_crash(sim)? else {
         return Ok(());
@@ -230,20 +231,25 @@ fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), Stri
     let added = events::<NoteAdded>(&snap)?;
     for (id, _) in &acked {
         let seen = added.iter().filter(|e| e.note.raw() == *id).count();
-        if seen == 1 {
-            continue;
+        if seen > 1 {
+            return Err(format!(
+                "exactly-once violated: note {id} has {seen} NoteAdded events — the route emitted it more than once: \
+                 a note emits once, when it is first added, and a repeat of a stored note must not emit again (src/lib.rs, add_note)"
+            ));
         }
-        if seen == 0 && durable_corruption_fired(sim) {
-            sim.give_up(
-                "durable corruption fired, so the acked event is excused",
-                "",
-            );
-            return Ok(());
+        if seen == 0 {
+            if durable_corruption_fired(sim) {
+                sim.give_up(
+                    "durable corruption fired, so the acked event is excused",
+                    "",
+                );
+                return Ok(());
+            }
+            return Err(format!(
+                "event-durability violated: note {id} was acked with 200 but its NoteAdded is not in the event log — \
+                 the emit did not commit with the row"
+            ));
         }
-        return Err(format!(
-            "event-durability violated: note {id} was acked with 200 but its NoteAdded is in the event log {seen} time(s), not once — \
-             the emit did not commit with the row"
-        ));
     }
     Ok(())
 }

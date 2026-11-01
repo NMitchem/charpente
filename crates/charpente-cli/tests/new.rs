@@ -464,18 +464,24 @@ fn patched_scaffold(name: &str) -> PathBuf {
 
 /// A patched scaffold with `delete` (whole lines of `src/lib.rs`) removed,
 /// and the sim run over the batch `--master-seed 0x1`.
+fn sim_with_line_deleted(name: &str, delete: &str) -> (PathBuf, std::process::Output) {
+    sim_with_line_replaced(name, delete, "")
+}
+
+/// A patched scaffold with `from` (whole lines of `src/lib.rs`) replaced by
+/// `to`, and the sim run over the batch `--master-seed 0x1`.
 // Rewriting the scaffold's src/lib.rs is edge tooling (DESIGN.md §1): the
 // rig making README's edit, not code the sim exercises.
 #[allow(clippy::disallowed_methods)]
-fn sim_with_line_deleted(name: &str, delete: &str) -> (PathBuf, std::process::Output) {
+fn sim_with_line_replaced(name: &str, from: &str, to: &str) -> (PathBuf, std::process::Output) {
     let app = patched_scaffold(name);
     let lib = read(&app.join("src/lib.rs"));
     assert_eq!(
-        lib.matches(delete).count(),
+        lib.matches(from).count(),
         1,
-        "the scaffold's src/lib.rs holds one {delete:?} line:\n{lib}"
+        "the scaffold's src/lib.rs holds one {from:?} line:\n{lib}"
     );
-    std::fs::write(app.join("src/lib.rs"), lib.replacen(delete, "", 1)).unwrap();
+    std::fs::write(app.join("src/lib.rs"), lib.replacen(from, to, 1)).unwrap();
     let out = charpente()
         .current_dir(&app)
         .env("CARGO_TARGET_DIR", target_dir())
@@ -588,6 +594,28 @@ fn deleting_the_retry_guard_turns_the_echo_check_red_on_a_resend() {
             && block
                 .contains(" whose first send landed must not enqueue again (src/lib.rs, add_note)"),
         "the echo check names the route as the cause:\n{block}"
+    );
+}
+
+/// The event check's other half: an acked note whose `NoteAdded` is in the
+/// log more than once names the route, as the echo check's duplicate does,
+/// and not the platform's commit. The tail never re-sends an acked note, so
+/// the edit that reaches it is a route that emits twice for one note.
+#[test]
+fn emitting_twice_turns_the_event_check_red_naming_the_route() {
+    let emit = "    tx.emit(NoteAdded { note: id });\n";
+    let (_, out) = sim_with_line_replaced("twoemits", emit, &emit.repeat(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    let block = failure_block(&stdout, "acked_post_implies_its_event_after_recovery");
+    assert!(
+        block.contains("exactly-once violated: note ")
+            && block.contains(
+                " has 2 NoteAdded events — the route emitted it more than once: a note emits \
+                 once, when it is first added, and a repeat of a stored note must not emit again \
+                 (src/lib.rs, add_note)"
+            ),
+        "the event check names the route as the cause:\n{block}"
     );
 }
 
