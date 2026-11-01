@@ -14,6 +14,7 @@ pub use charpente_core::io::{OutboundCall, OutboundReply};
 
 pub mod checks;
 mod disk;
+pub mod drive;
 pub mod harness;
 mod net;
 pub mod object;

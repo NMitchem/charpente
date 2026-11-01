@@ -60,7 +60,7 @@ item with the trigger that reopens it.
   member's `tests/` (charpente: archive/auth/clock/describe/group_commit/http/kernel/outbound/realtime/
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
-  charpente-sim: crash_recovery/determinism/events/net_partition/wal; charpente-cli: cli/ctl/
+  charpente-sim: crash_recovery/determinism/drive/events/net_partition/wal; charpente-cli: cli/ctl/
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/clock_restart/failover/hunts/outbound/
   realtime_resume/smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
@@ -134,7 +134,9 @@ item with the trigger that reopens it.
   paths, so app crates depend on `charpente` alone.
 - `crates/charpente-sim` — simulator (seeded xoshiro, virtual time, fault matrix), the
   frozen `run_universes!` runner + swarm runner, `harness` (the `charpente test --sim`
-  runtime), `checks` (the public checker library). Depends on `charpente` (for `drive`);
+  runtime), `checks` (the public checker library), `drive` (the recovery helper: a
+  faulted phase, then a fault-free tail that re-sends what went unanswered). Depends on
+  `charpente` (for `drive`);
   `charpente`'s dev-dependency back on it is path-only, as charpente-macros' is.
 - `crates/charpente-cli` — the `charpente` binary; edge tooling, may spawn processes.
 - `crates/charpente-tsgen` — the TypeScript client emitter: route/event types to
