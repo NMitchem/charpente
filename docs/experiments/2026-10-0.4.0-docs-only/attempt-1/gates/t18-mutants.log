@@ -1,0 +1,169 @@
+mutants: master seed 0x2c5fe249bb7ccc00, set on every test this run starts as CHARPENTE_SIM_MASTER_SEED
+mutants: this run is two passes, for the sim_tests! harness in holdqueue: pass 1 judges every mutant on the first 32 runs of each check, failed runs only unless that is the check's full count, and pass 2 judges what pass 1 missed or timed out at the full count
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+  Executable unittests src/lib.rs (target/debug/deps/holdqueue-f5936d1db08384d1)
+  Executable unittests src/main.rs (target/debug/deps/holdqueue-1a0ef7b7a7ef9429)
+  Executable tests/sim.rs (target/debug/deps/sim-eebea7228f5f3e47)
+mutants: running `cargo test --package holdqueue` at the full count, the baseline pass 2 judges against; its output shows only if it fails
+mutants: `cargo test` over holdqueue at the full count is green (44.5 s of wall time)
+mutants: pass 1 of 2, CHARPENTE_SIM_FIRST_RUNS=32: a MISSED or TIMEOUT line from it is judged again in pass 2
+Found 119 mutants to test
+ok       Unmutated baseline in 8s build + 6s test
+ INFO Auto-set test timeout to 31s
+MISSED   src/queue.rs:130:27: replace + with - in overdue in 0s build + 22s test
+MISSED   src/queue.rs:386:5: replace tick -> io::Result<()> with Ok(()) in 1s build + 5s test
+MISSED   src/queue.rs:388:16: replace += with -= in tick in 1s build + 13s test
+MISSED   src/queue.rs:388:16: replace += with *= in tick in 0s build + 6s test
+MISSED   src/queue.rs:417:9: replace Tick::run -> Result<(), JobError> with Ok(()) in 1s build + 5s test
+119 mutants tested in 11m: 5 missed, 77 caught, 37 unviable
+mutants: pass 2 of 2, at the full count: the 5 mutants pass 1 did not catch
+ INFO Iteration excludes 114 previously caught or unviable mutants
+Found 5 mutants to test
+ok       Unmutated baseline in 8s build + 49s test
+ INFO Auto-set test timeout to 246s
+5 mutants tested in 7m: 5 caught
+mutants: each mutant's verdict, and the pass that decided it:
+  caught   src/lib.rs:68:9: replace Stock::free -> u32 with 0 (pass 1)
+  caught   src/lib.rs:68:9: replace Stock::free -> u32 with 1 (pass 1)
+  caught   src/lib.rs:68:51: replace + with - in Stock::free (pass 1)
+  caught   src/lib.rs:68:51: replace + with * in Stock::free (pass 1)
+  unviable src/lib.rs:147:9: replace <impl From<Stock> for StockView>::from -> Self with Default::default() (pass 1)
+  unviable src/lib.rs:170:9: replace <impl From<Hold> for HoldView>::from -> Self with Default::default() (pass 1)
+  caught   src/lib.rs:188:5: replace subject -> Result<String, ApiError> with Ok(String::new()) (pass 1)
+  caught   src/lib.rs:188:5: replace subject -> Result<String, ApiError> with Ok("xyzzy".into()) (pass 1)
+  caught   src/lib.rs:195:5: replace require_operator -> Result<(), ApiError> with Ok(()) (pass 1)
+  caught   src/lib.rs:196:12: replace == with != in require_operator (pass 1)
+  unviable src/lib.rs:207:5: replace require_patron -> Result<Id<Patron>, ApiError> with Ok(Id::new()) (pass 1)
+  unviable src/lib.rs:207:5: replace require_patron -> Result<Id<Patron>, ApiError> with Ok(Id::from_iter([Default::default()])) (pass 1)
+  unviable src/lib.rs:207:5: replace require_patron -> Result<Id<Patron>, ApiError> with Ok(Id::new(Default::default())) (pass 1)
+  unviable src/lib.rs:207:5: replace require_patron -> Result<Id<Patron>, ApiError> with Ok(Id::from(Default::default())) (pass 1)
+  caught   src/lib.rs:220:5: replace patron_subject -> String with String::new() (pass 1)
+  caught   src/lib.rs:220:5: replace patron_subject -> String with "xyzzy".into() (pass 1)
+  caught   src/lib.rs:229:5: replace bootstrap_operator -> Result<String, ApiError> with Ok(String::new()) (pass 1)
+  caught   src/lib.rs:229:5: replace bootstrap_operator -> Result<String, ApiError> with Ok("xyzzy".into()) (pass 1)
+  caught   src/lib.rs:242:5: replace mint_patron_key -> Result<String, ApiError> with Ok(String::new()) (pass 1)
+  caught   src/lib.rs:242:5: replace mint_patron_key -> Result<String, ApiError> with Ok("xyzzy".into()) (pass 1)
+  unviable src/lib.rs:250:5: replace put_branch -> Result<Id<Branch>, ApiError> with Ok(Id::new()) (pass 1)
+  unviable src/lib.rs:250:5: replace put_branch -> Result<Id<Branch>, ApiError> with Ok(Id::from_iter([Default::default()])) (pass 1)
+  unviable src/lib.rs:250:5: replace put_branch -> Result<Id<Branch>, ApiError> with Ok(Id::new(Default::default())) (pass 1)
+  unviable src/lib.rs:250:5: replace put_branch -> Result<Id<Branch>, ApiError> with Ok(Id::from(Default::default())) (pass 1)
+  unviable src/lib.rs:261:5: replace put_title -> Result<Id<Title>, ApiError> with Ok(Id::new()) (pass 1)
+  unviable src/lib.rs:261:5: replace put_title -> Result<Id<Title>, ApiError> with Ok(Id::from_iter([Default::default()])) (pass 1)
+  unviable src/lib.rs:261:5: replace put_title -> Result<Id<Title>, ApiError> with Ok(Id::new(Default::default())) (pass 1)
+  unviable src/lib.rs:261:5: replace put_title -> Result<Id<Title>, ApiError> with Ok(Id::from(Default::default())) (pass 1)
+  unviable src/lib.rs:279:5: replace put_copies -> Result<StockView, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/lib.rs:286:5: replace record_return -> Result<StockView, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/lib.rs:293:5: replace waiting_queue -> Result<HoldList, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/lib.rs:304:5: replace pick_up -> Result<HoldView, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/lib.rs:315:5: replace place_hold -> Result<HoldView, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/lib.rs:322:5: replace cancel_hold -> Result<HoldView, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/lib.rs:329:5: replace my_holds -> Result<HoldList, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/lib.rs:339:5: replace my_hold -> Result<HoldView, ApiError> with Ok(Default::default()) (pass 1)
+  caught   src/lib.rs:341:20: replace match guard h.patron == patron with true in my_hold (pass 1)
+  caught   src/lib.rs:341:20: replace match guard h.patron == patron with false in my_hold (pass 1)
+  caught   src/lib.rs:341:29: replace == with != in my_hold (pass 1)
+  unviable src/lib.rs:351:5: replace build_app -> io::Result<App> with Ok(Default::default()) (pass 1)
+  caught   src/notify.rs:43:9: replace NotifyReady::call -> Result<Option<Call>, JobError> with Ok(None) (pass 1)
+  unviable src/notify.rs:43:9: replace NotifyReady::call -> Result<Option<Call>, JobError> with Ok(Some(Default::default())) (pass 1)
+  caught   src/notify.rs:68:9: replace NotifyReady::settle -> Result<(), JobError> with Ok(()) (pass 1)
+  caught   src/notify.rs:69:12: delete ! in NotifyReady::settle (pass 1)
+  caught   src/queue.rs:21:32: replace * with + (pass 1)
+  caught   src/queue.rs:21:32: replace * with / (pass 1)
+  caught   src/queue.rs:41:9: replace HoldState::name -> &str with "" (pass 1)
+  caught   src/queue.rs:41:9: replace HoldState::name -> &str with "xyzzy" (pass 1)
+  caught   src/queue.rs:52:9: replace HoldState::allowed -> &str with "" (pass 1)
+  caught   src/queue.rs:52:9: replace HoldState::allowed -> &str with "xyzzy" (pass 1)
+  caught   src/queue.rs:68:9: replace <impl Codec for HoldState>::encode with () (pass 1)
+  unviable src/queue.rs:79:9: replace <impl Codec for HoldState>::decode -> io::Result<Self> with Ok(Default::default()) (pass 1)
+  caught   src/queue.rs:106:5: replace next -> io::Result<u64> with Ok(0) (pass 1)
+  caught   src/queue.rs:106:5: replace next -> io::Result<u64> with Ok(1) (pass 1)
+  caught   src/queue.rs:109:18: replace += with -= in next (pass 1)
+  caught   src/queue.rs:109:18: replace += with *= in next (pass 1)
+  caught   src/queue.rs:124:5: replace hour -> io::Result<u64> with Ok(0) (pass 1)
+  caught   src/queue.rs:124:5: replace hour -> io::Result<u64> with Ok(1) (pass 1)
+  caught   src/queue.rs:130:5: replace overdue -> bool with true (pass 1)
+  caught   src/queue.rs:130:5: replace overdue -> bool with false (pass 1)
+  caught   src/queue.rs:130:14: replace > with == in overdue (pass 1)
+  caught   src/queue.rs:130:14: replace > with < in overdue (pass 1)
+  caught   src/queue.rs:130:14: replace > with >= in overdue (pass 1)
+  caught   src/queue.rs:130:27: replace + with - in overdue (pass 2)
+  caught   src/queue.rs:130:27: replace + with * in overdue (pass 1)
+  caught   src/queue.rs:135:5: replace slot_key -> String with String::new() (pass 1)
+  caught   src/queue.rs:135:5: replace slot_key -> String with "xyzzy".into() (pass 1)
+  caught   src/queue.rs:140:5: replace find_stock -> io::Result<Option<Stock>> with Ok(None) (pass 1)
+  unviable src/queue.rs:140:5: replace find_stock -> io::Result<Option<Stock>> with Ok(Some(Default::default())) (pass 1)
+  caught   src/queue.rs:146:5: replace waiting -> io::Result<Vec<Hold>> with Ok(vec![]) (pass 1)
+  unviable src/queue.rs:146:5: replace waiting -> io::Result<Vec<Hold>> with Ok(vec![Default::default()]) (pass 1)
+  caught   src/queue.rs:148:29: replace == with != in waiting (pass 1)
+  caught   src/queue.rs:158:5: replace serve -> io::Result<Option<Stock>> with Ok(None) (pass 1)
+  unviable src/queue.rs:158:5: replace serve -> io::Result<Option<Stock>> with Ok(Some(Default::default())) (pass 1)
+  caught   src/queue.rs:163:25: replace == with != in serve (pass 1)
+  caught   src/queue.rs:169:25: replace += with -= in serve (pass 1)
+  caught   src/queue.rs:169:25: replace += with *= in serve (pass 1)
+  unviable src/queue.rs:178:5: replace no_branch -> ApiError with Default::default() (pass 1)
+  unviable src/queue.rs:185:5: replace no_title -> ApiError with Default::default() (pass 1)
+  unviable src/queue.rs:194:5: replace refuse -> ApiError with Default::default() (pass 1)
+  unviable src/queue.rs:206:5: replace set_copies -> Result<Stock, ApiError> with Ok(Default::default()) (pass 1)
+  caught   src/queue.rs:224:15: replace < with == in set_copies (pass 1)
+  caught   src/queue.rs:224:15: replace < with > in set_copies (pass 1)
+  caught   src/queue.rs:224:15: replace < with <= in set_copies (pass 1)
+  caught   src/queue.rs:224:33: replace + with - in set_copies (pass 1)
+  caught   src/queue.rs:224:33: replace + with * in set_copies (pass 1)
+  unviable src/queue.rs:249:5: replace place -> Result<Hold, ApiError> with Ok(Default::default()) (pass 1)
+  caught   src/queue.rs:250:57: replace && with || in place (pass 1)
+  caught   src/queue.rs:250:34: replace && with || in place (pass 1)
+  caught   src/queue.rs:250:24: replace == with != in place (pass 1)
+  caught   src/queue.rs:250:48: replace == with != in place (pass 1)
+  caught   src/queue.rs:250:72: replace == with != in place (pass 1)
+  caught   src/queue.rs:286:5: replace end -> io::Result<()> with Ok(()) (pass 1)
+  unviable src/queue.rs:296:5: replace stock_of -> Result<Stock, ApiError> with Ok(Default::default()) (pass 1)
+  unviable src/queue.rs:309:5: replace pick_up -> Result<Hold, ApiError> with Ok(Default::default()) (pass 1)
+  caught   src/queue.rs:313:29: replace -= with += in pick_up (pass 1)
+  caught   src/queue.rs:313:29: replace -= with /= in pick_up (pass 1)
+  caught   src/queue.rs:314:27: replace += with -= in pick_up (pass 1)
+  caught   src/queue.rs:314:27: replace += with *= in pick_up (pass 1)
+  unviable src/queue.rs:328:5: replace cancel -> Result<Hold, ApiError> with Ok(Default::default()) (pass 1)
+  caught   src/queue.rs:329:23: replace match guard hold.patron == patron with true in cancel (pass 1)
+  caught   src/queue.rs:329:23: replace match guard hold.patron == patron with false in cancel (pass 1)
+  caught   src/queue.rs:329:35: replace == with != in cancel (pass 1)
+  caught   src/queue.rs:339:29: replace -= with += in cancel (pass 1)
+  caught   src/queue.rs:339:29: replace -= with /= in cancel (pass 1)
+  unviable src/queue.rs:353:5: replace record_return -> Result<Stock, ApiError> with Ok(Default::default()) (pass 1)
+  caught   src/queue.rs:354:34: replace && with || in record_return (pass 1)
+  caught   src/queue.rs:354:24: replace == with != in record_return (pass 1)
+  caught   src/queue.rs:354:48: replace == with != in record_return (pass 1)
+  caught   src/queue.rs:370:22: replace == with != in record_return (pass 1)
+  caught   src/queue.rs:377:19: replace -= with += in record_return (pass 1)
+  caught   src/queue.rs:377:19: replace -= with /= in record_return (pass 1)
+  caught   src/queue.rs:386:5: replace tick -> io::Result<()> with Ok(()) (pass 2)
+  caught   src/queue.rs:388:16: replace += with -= in tick (pass 2)
+  caught   src/queue.rs:388:16: replace += with *= in tick (pass 2)
+  caught   src/queue.rs:395:12: delete ! in tick (pass 1)
+  caught   src/queue.rs:399:29: replace -= with += in tick (pass 1)
+  caught   src/queue.rs:399:29: replace -= with /= in tick (pass 1)
+  caught   src/queue.rs:417:9: replace Tick::run -> Result<(), JobError> with Ok(()) (pass 2)
+mutants: 119 total — 82 caught, 0 missed, 37 unviable, 0 timed out
+  18 functions had no viable mutant, so this run says nothing about them (untested):
+    src/lib.rs
+      <impl From<Hold> for HoldView>::from
+      <impl From<Stock> for StockView>::from
+      build_app
+      cancel_hold
+      my_holds
+      pick_up
+      place_hold
+      put_branch
+      put_copies
+      put_title
+      record_return
+      require_patron
+      waiting_queue
+    src/queue.rs
+      <impl Codec for HoldState>::decode
+      no_branch
+      no_title
+      refuse
+      stock_of
+  To measure one, give its return type a value cargo-mutants can build, such as a derived Default, or check its effect in a property (GUIDE §8 "Finding a one-sided property").
+  two passes on master seed 0x2c5fe249bb7ccc00: pass 1 judged every mutant on the first 32 runs of each sim check, failed runs only unless that is the check's full count, and pass 2 judged the 5 it did not catch at the full count
+rerun exactly this mutation run: charpente test --mutants --file src/queue.rs --file src/notify.rs --file src/lib.rs --test-package holdqueue --master-seed 0x2c5fe249bb7ccc00

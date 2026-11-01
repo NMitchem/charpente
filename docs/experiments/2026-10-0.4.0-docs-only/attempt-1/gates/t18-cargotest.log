@@ -1,0 +1,131 @@
+   Compiling cfg-if v1.0.4
+   Compiling zeroize v1.9.0
+   Compiling const-oid v0.9.6
+   Compiling pin-project-lite v0.2.17
+   Compiling typenum v1.20.1
+   Compiling libc v0.2.186
+   Compiling itoa v1.0.18
+   Compiling once_cell v1.21.4
+   Compiling bytes v1.12.0
+   Compiling base64ct v1.8.3
+   Compiling futures-core v0.3.32
+   Compiling libm v0.2.16
+   Compiling zerocopy v0.8.54
+   Compiling untrusted v0.9.0
+   Compiling rustls-pki-types v1.15.1
+   Compiling smallvec v1.15.2
+   Compiling subtle v2.6.1
+   Compiling try-lock v0.2.5
+   Compiling tracing-core v0.1.36
+   Compiling serde_core v1.0.228
+   Compiling want v0.3.1
+   Compiling pem-rfc7468 v0.7.0
+   Compiling httparse v1.10.1
+   Compiling futures-channel v0.3.32
+   Compiling der v0.7.10
+   Compiling http v1.4.2
+   Compiling getrandom v0.2.17
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling spin v0.9.9
+   Compiling futures-task v0.3.33
+   Compiling generic-array v0.14.7
+   Compiling rand_core v0.6.4
+   Compiling ring v0.17.14
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling tokio v1.52.3
+   Compiling futures-util v0.3.32
+   Compiling lazy_static v1.5.0
+   Compiling num-traits v0.2.19
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling tracing v0.1.44
+   Compiling tower-service v0.3.3
+   Compiling digest v0.10.7
+   Compiling http-body v1.0.1
+   Compiling zmij v1.0.21
+   Compiling signature v2.2.0
+   Compiling redb v4.3.0
+   Compiling num-integer v0.1.46
+   Compiling spki v0.7.3
+   Compiling cpufeatures v0.2.17
+   Compiling memchr v2.8.2
+   Compiling pkcs8 v0.10.2
+   Compiling num-iter v0.1.46
+   Compiling sha2 v0.10.9
+   Compiling http-body-util v0.1.3
+   Compiling webpki-roots v1.0.9
+   Compiling rustls-webpki v0.103.15
+   Compiling pkcs1 v0.7.5
+   Compiling rustls v0.23.46
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling hyper v1.10.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.7
+   Compiling hyper-util v0.1.20
+   Compiling charpente-core v0.4.0
+   Compiling num-bigint-dig v0.8.6
+   Compiling rsa v0.9.10
+   Compiling tokio-rustls v0.26.6
+   Compiling hyper-rustls v0.27.10
+   Compiling charpente v0.4.0
+   Compiling holdqueue v0.1.0 (/private/tmp/claude-501/-Users-noahmitchem-Documents-GitHub-charpente/3bb3689e-6bb7-482d-9e02-5f9383087b24/scratchpad/t18gate/holdqueue)
+   Compiling charpente-sim v0.4.0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.32s
+     Running unittests src/lib.rs (target/debug/deps/holdqueue-f5936d1db08384d1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/holdqueue-1a0ef7b7a7ef9429)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim.rs (target/debug/deps/sim-eebea7228f5f3e47)
+running 8 sim checks, 256 runs each, under random injected faults (master seed 0xbe45d1f194e8f3d2)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  an_acked_hold_is_never_lost
+    116  no placement, pickup or cancel was acked, so durability has nothing to prove (first: --seed 0xa8efad961b31cf3a)
+     16  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xf829648c3c68eacb)
+      2  durable corruption fired, so an acked record is excused (first: --seed 0x6386d528a8d57006)
+  copies_go_to_holds_in_placement_order
+    12  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x118de2c1e8bec113)
+  copies_are_never_set_aside_twice_or_beyond_stock
+    12  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xe09d6f9bf18be46b)
+  a_hold_is_ready_once_and_its_patron_is_told
+    12  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x12452897626882f5)
+  refused_transitions_name_what_is_allowed
+    20  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x304d268deb81fb52)
+     1  durable corruption fired, so an acked record is excused (first: --seed 0xda09839a3c25a7dc)
+  callers_reach_only_what_is_theirs
+    12  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x8baf36b904864c29)
+     1  durable corruption fired, so an acked record is excused (first: --seed 0x418843fd1a9aab9b)
+  repeats_are_answered_alike_and_conflicts_by_name
+    13  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x35fa1601237676a3)
+  ready_holds_expire_after_seven_days
+    11  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xb2a477b9e340c291)
+
+check an_acked_hold_is_never_lost ........................ ok  (122 tested over 122 distinct inputs, 134 skipped)
+check copies_go_to_holds_in_placement_order .............. ok  (244 tested over 244 distinct inputs, 12 skipped)
+check copies_are_never_set_aside_twice_or_beyond_stock ... ok  (244 tested over 244 distinct inputs, 12 skipped)
+check a_hold_is_ready_once_and_its_patron_is_told ........ ok  (244 tested over 244 distinct inputs, 12 skipped)
+check refused_transitions_name_what_is_allowed ........... ok  (235 tested over 235 distinct inputs, 21 skipped)
+check callers_reach_only_what_is_theirs .................. ok  (243 tested over 243 distinct inputs, 13 skipped)
+check repeats_are_answered_alike_and_conflicts_by_name ... ok  (243 tested over 243 distinct inputs, 13 skipped)
+check ready_holds_expire_after_seven_days ................ ok  (245 tested over 245 distinct inputs, 11 skipped)
+
+sim result: ok. 8 passed; 0 failed. Runs tested per check, in the order above: 122, 244, 244, 244, 235, 243, 243, 245 of 256.
+rerun exactly this batch: charpente test --sim --master-seed 0xbe45d1f194e8f3d2
+   Doc-tests holdqueue
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

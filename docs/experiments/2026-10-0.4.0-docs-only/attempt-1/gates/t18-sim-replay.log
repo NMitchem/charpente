@@ -1,0 +1,34 @@
+running 8 sim checks, 256 runs each, under random injected faults (master seed 0x4a3bc8dfdc80c1da)
+
+skipped runs hit a fault before reaching the check, so they prove nothing either way:
+  an_acked_hold_is_never_lost
+    118  no placement, pickup or cancel was acked, so durability has nothing to prove (first: --seed 0xb8993ed0c11a4c0c)
+     13  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xe94862597a99ca81)
+      2  durable corruption fired, so an acked record is excused (first: --seed 0x52503a3818a321b8)
+  copies_go_to_holds_in_placement_order
+    3  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xb8b80770ccdf5bd2)
+  copies_are_never_set_aside_twice_or_beyond_stock
+    11  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x4e622c63761764dd)
+  a_hold_is_ready_once_and_its_patron_is_told
+    15  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x8d52e608039bf0d7)
+  refused_transitions_name_what_is_allowed
+    9  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x5094917992581e6a)
+  callers_reach_only_what_is_theirs
+    11  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x77e9630901600e3e)
+  repeats_are_answered_alike_and_conflicts_by_name
+    10  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0x48111cc664b27d96)
+     1  durable corruption fired, so an acked record is excused (first: --seed 0x643be0ecedbc923c)
+  ready_holds_expire_after_seven_days
+    17  the boot was refused for durable corruption at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xff32ce0c2d1d1136)
+
+check an_acked_hold_is_never_lost ........................ ok  (123 tested over 123 distinct inputs, 133 skipped)
+check copies_go_to_holds_in_placement_order .............. ok  (253 tested over 253 distinct inputs, 3 skipped)
+check copies_are_never_set_aside_twice_or_beyond_stock ... ok  (245 tested over 245 distinct inputs, 11 skipped)
+check a_hold_is_ready_once_and_its_patron_is_told ........ ok  (241 tested over 241 distinct inputs, 15 skipped)
+check refused_transitions_name_what_is_allowed ........... ok  (247 tested over 247 distinct inputs, 9 skipped)
+check callers_reach_only_what_is_theirs .................. ok  (245 tested over 245 distinct inputs, 11 skipped)
+check repeats_are_answered_alike_and_conflicts_by_name ... ok  (245 tested over 245 distinct inputs, 11 skipped)
+check ready_holds_expire_after_seven_days ................ ok  (239 tested over 239 distinct inputs, 17 skipped)
+
+sim result: ok. 8 passed; 0 failed. Runs tested per check, in the order above: 123, 253, 245, 241, 247, 245, 245, 239 of 256.
+rerun exactly this batch: charpente test --sim --master-seed 0x4a3bc8dfdc80c1da

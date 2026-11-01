@@ -1,0 +1,24 @@
+db0472a 2026-11-01T14:51:29Z FINDINGS.md: friction ledger, final sim output, full --mutants output
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+cc0d4da 2026-11-01T14:30:20Z tests/sim.rs: send repeats, one-field conflicts, lowering restocks, bootstrap, key mint and own reads; checks 7-8 judge their answers by name
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+6da2431 2026-11-01T14:01:04Z tests/sim.rs: excuse corruption-cut transitions as give-ups; place holds within seconds of boot
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+2683251 2026-11-01T13:57:09Z tests/sim.rs: six sim properties over one drawn scenario under the fault matrix
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+bfc96ce 2026-11-01T13:57:09Z src/lib.rs, src/queue.rs, src/notify.rs: hold queue app (tables, routes, state machine, hourly expiry tick, outbound notification)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+f3ace75 2026-11-01T13:47:03Z holdqueue: scaffold from charpente new (Cargo.toml, clippy.toml, .gitignore, src/lib.rs, src/main.rs, tests/sim.rs)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+

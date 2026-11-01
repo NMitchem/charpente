@@ -1,0 +1,22 @@
+[package]
+name = "holdqueue"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[dependencies]
+charpente = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+charpente-sim = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+
+[[test]]
+name = "sim"
+harness = false
+
+[lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"

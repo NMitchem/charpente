@@ -1,0 +1,4 @@
+# Claude Code's own session file for the stranger. Its harness context carries the
+# operator's email address, and spec §8's record is box.jsonl + agent.jsonl, which do not.
+# The file stays beside the record on the operator's machine; its sha256 is in the ledger.
+attempt-*/agent.session.jsonl
