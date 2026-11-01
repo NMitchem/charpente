@@ -1664,7 +1664,8 @@ fn mutants_times_each_pass_at_its_own_run_count() {
     let envs = [
         ("SHIM_OUTCOMES", first.as_path()),
         ("SHIM_OUTCOMES_ITERATE", second.as_path()),
-        ("SHIM_SLEEP_FULL", std::path::Path::new("1")),
+        // 5 s, not 1: the quick run must stay well under the full one even on a loaded machine.
+        ("SHIM_SLEEP_FULL", std::path::Path::new("5")),
     ];
     let args = [
         "--test-package",
@@ -1684,8 +1685,8 @@ fn mutants_times_each_pass_at_its_own_run_count() {
         panic!("two timing lines, pass 2's then pass 1's: {stdout}")
     };
     assert!(
-        secs[0] >= 1.0 && full >= 5 && quick < full,
-        "the full-count run slept 1 s and the quick one did not: {stdout}"
+        secs[0] >= 5.0 && full >= 25 && quick < full,
+        "the full-count run slept 5 s and the quick one did not: {stdout}"
     );
     let runs = runs_and_run_counts(&recorded);
     assert!(
