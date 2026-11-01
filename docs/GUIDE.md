@@ -4485,7 +4485,9 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
 - `--master-seed 0x…` — pick where the batch's seed chain starts, instead
   of fresh OS entropy, for a byte-identical repeat of an entire batch
   (every check's every run). Cannot be combined with `--seed`. The batch's
-  last line is this flag with the batch's `--runs` and `--filter`.
+  last line is this flag with the batch's `--runs` and `--filter`. Without
+  the flag, `CHARPENTE_SIM_MASTER_SEED=0x…` in the environment picks it
+  instead ("Finding a one-sided property" below); the flag wins.
 - `--filter S` — run only the check named `S` when there is one, and
   otherwise every check whose name contains `S`. A failure's `repro:` line
   names its check, so it replays that check alone even when another check's
@@ -4506,8 +4508,12 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   `failures`, `result` and `exit`. `result` is the human result line's word
   (`ok`, `FAILED` or `nothing tested`) and `exit` the code the run exits with,
   so a record read later still says whether the batch failed, an untested
-  check included. Under `--seed`, `seed` stands where `master_seed` does, since
-  the replayed seed fed back as `--master-seed` would run another batch. It is
+  check included. A quick pass (`CHARPENTE_SIM_FIRST_RUNS`, "Finding a
+  one-sided property" below) ends on one more key, `quick_pass`, as
+  `{first_runs, full_runs}`, since its `result` and `exit` judged failed runs
+  only; its `runs` is the runs it ran of each check. Under `--seed`, `seed`
+  stands where `master_seed` does, since the replayed seed fed back as
+  `--master-seed` would run another batch. It is
   followed by `inputs`, the choices `--inputs` gave in that flag's encoding,
   when the replay was given them, and `faults_off`, the axes `--faults-off`
   turned off in field order, when it was given those. Each of `checks`, in
@@ -4545,8 +4551,9 @@ coverage requirement went unmet, or a check tested nothing because every one of
 its runs was skipped (its result line then says `FAILED`, or `nothing tested`
 when no check was tested) — the batch itself completed, but something in it
 was red or proved nothing. A `--seed` replay replays one run per check, not a
-batch, so a skipped run there exits 0; **2** the batch never got
-that far — a build failure, no
+batch, so a skipped run there exits 0, and a quick pass judges failed runs
+only, so it exits 1 for a failed run and for nothing else; **2** the batch
+never got that far — a build failure, no
 `tests/sim.rs` target found, an unrecognized flag, `--inputs` or
 `--faults-off` without `--seed` or with a value they cannot read, a filter
 matching no tests, or the sim binary failing to launch or exiting by signal. Exit code
@@ -4613,7 +4620,9 @@ and counts beside the verdict. In order:
   for byte, for any `--jobs`. A batch run under `CHARPENTE_SIM_NO_SHRINK`
   ("Finding a one-sided property" below) did not shrink, and its line starts
   `CHARPENTE_SIM_NO_SHRINK=1 charpente test --sim`, so the pasted command
-  does not shrink either.
+  does not shrink either. A quick pass's line carries
+  `CHARPENTE_SIM_FIRST_RUNS=N` the same way, and its quick-pass line follows
+  it.
 
 There is no line for the faults that fired. To confirm that a fault a property
 depends on actually happened, `require` its coverage key (`sim_tests! {
@@ -5046,6 +5055,27 @@ test of yours that spawns a sim and asserts on its shrink inherits the variable
 under `--mutants` too: remove it from the child's environment
 (`Command::env_remove("CHARPENTE_SIM_NO_SHRINK")`), as charpente's own CLI
 tests do.
+
+`sim_tests!` reads two more variables at startup, for the same reason, and
+exits 2 naming the variable when it cannot read one. Each is unset when
+empty, and a `--seed` replay ignores both: it runs its one seed.
+`CHARPENTE_SIM_MASTER_SEED=0x…` is the batch's master seed when
+`--master-seed` is not given (the flag wins), so every test binary a run
+starts judges the same runs. `CHARPENTE_SIM_FIRST_RUNS=N`, a number of 1 or
+more, makes the batch a quick pass. It derives every check's seeds for the
+full `--runs` count, as a full batch does, and runs only the first N of each,
+so its runs are a prefix of the full batch's for every check; `--runs N`
+would give every check after the first other seeds. A quick pass judges
+failed runs only: it exits 1 when a run failed and 0 otherwise, since a
+`require` and a check that tested nothing depend on how many runs there were.
+It shrinks as a batch does unless `CHARPENTE_SIM_NO_SHRINK` is set too. Its
+rerun line starts `CHARPENTE_SIM_FIRST_RUNS=N`, and its last line says what
+it left to the full count:
+
+<!-- pinned -->
+```text
+quick pass: the first <n> of each check's <runs> runs, failed runs judged only — coverage and untested checks are judged at the full count
+```
 
 **It is not part of `cargo test`.** Every mutant is a rebuild plus a test run,
 so this is an on-demand instrument like the edge harness below, not something
