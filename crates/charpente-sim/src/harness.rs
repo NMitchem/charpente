@@ -2759,9 +2759,10 @@ mod tests {
     }
 
     /// A batch that adjudicated nothing neither prints as green nor exits as
-    /// green: its result line still says `nothing tested`, and it exits 1.
+    /// green: its first and only result line says `nothing tested`, never
+    /// `ok`, and it exits 1.
     #[test]
-    fn a_batch_where_every_check_is_untested_exits_1() {
+    fn a_batch_where_every_check_is_untested_exits_1_and_never_reads_ok() {
         let tests = [SimTest {
             name: "gives_up",
             run: always_gives_up,
@@ -2784,11 +2785,13 @@ mod tests {
             text.contains("\n  gives_up — never tested: every run was skipped\n"),
             "{text}"
         );
-        assert!(
-            text.contains(
-                "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. Runs tested: 0 of \
-                 4.\n"
-            ),
+        let results: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("sim result: "))
+            .collect();
+        assert_eq!(
+            results,
+            ["sim result: nothing tested. 0 passed; 0 failed; 1 untested. Runs tested: 0 of 4."],
             "{text}"
         );
     }
@@ -4923,21 +4926,6 @@ mod tests {
         // No total across checks, in the old words or as a number.
         assert!(!out.contains("runs tested a check"), "{out}");
         assert!(!out.contains(&format!("{} of 192", quarter + 64)), "{out}");
-    }
-
-    #[test]
-    fn a_batch_where_every_check_is_untested_never_reads_ok() {
-        let tests = [sim_test("always_gives_up", always_gives_up)];
-        let (code, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
-        assert_eq!(code, 1, "an untested check fails the batch: {out}");
-        let result = out
-            .lines()
-            .find(|l| l.starts_with("sim result: "))
-            .unwrap_or_else(|| panic!("{out}"));
-        assert!(
-            result.starts_with("sim result: nothing tested. 0 passed; 0 failed; 1 untested."),
-            "{out}"
-        );
     }
 
     #[test]

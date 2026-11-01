@@ -546,14 +546,16 @@ fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
     }
 }
 
-/// The sentence this whole change exists to make true (MANIFESTO §9): a batch
-/// in which every universe gave up must not print as an unqualified success.
+/// The sentence this whole change exists to make true (MANIFESTO §9): a run
+/// that tested nothing must not print as an unqualified success, and that
+/// holds for a `--seed` replay of a skipped run too. (A batch with an untested
+/// check also exits 1; harness.rs's untested tests pin that.)
 /// Seed 0x3 is a measured give-up universe of `counter_roundtrip`: the first
 /// seed counting up from 0x1 whose universe gives up, re-found 2026-10-01 when
 /// S5 with D1 re-rolled the fixture's universes and 0x1 began reaching a
 /// verdict.
 #[test]
-fn a_batch_where_every_universe_gave_up_is_not_an_unqualified_success() {
+fn a_replayed_skipped_run_is_not_an_unqualified_success() {
     let out = charpente()
         .args([
             "test",
@@ -567,8 +569,9 @@ fn a_batch_where_every_universe_gave_up_is_not_an_unqualified_success() {
         ])
         .output()
         .unwrap();
-    // Still exit 0: giving up is not a failure. The claim is about what the
-    // run SAYS, not what it returns.
+    // Still exit 0: a check that tested nothing fails a batch, and a `--seed`
+    // replay of a skipped run is one run, not a batch (0.4.0 spec §4 B). The
+    // claim here is about what the replay SAYS, not what it returns.
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

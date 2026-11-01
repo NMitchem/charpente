@@ -4614,12 +4614,15 @@ and counts beside the verdict. In order:
   (`64 tested: 16 failed`), how many were skipped when any were (`52 tested,
   12 skipped`), and the keys that never occurred (`required "restart" never
   occurred`).
-- **The result**: `sim result: ok` when every check passed, `FAILED` when a
-  check failed or tested nothing, or `nothing tested` when no check passed and
-  none failed (a batch that reads `FAILED` or `nothing tested` exits 1), then
-  how many checks passed, failed and (if any)
-  were untested, and then how many runs tested each check, in the order of the
-  check lines above it, an untested check as 0:
+- **The result**: `sim result: ok` when every check line reads `ok`, `FAILED`
+  when one reads `FAILED` or when one reads `untested` and another `ok`, and
+  `nothing tested` when every one reads `untested`. A batch that reads `FAILED`
+  or `nothing tested` exits 1. A quick pass ("Finding a one-sided property"
+  below) judges failed runs only, so there an `untested` line beside an `ok`
+  one reads `ok`, and only `FAILED` exits 1. The word is followed by how many
+  checks passed, failed and (if any) were untested, and then how many runs
+  tested each check, in the order of the check lines above it, an untested
+  check as 0:
   `Runs tested per check, in the order above: 209, 251, 214 of 256.`, or
   `Runs tested: 251 of 256.` when the batch ran one check. There is no total
   across checks, because a total lets a check tested in 3 of its runs hide
