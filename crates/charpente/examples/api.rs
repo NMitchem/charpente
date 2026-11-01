@@ -723,7 +723,7 @@ fn kernel(
     source.push_stall(Box::new(|| false));
     // Slot `i` is the `i`th `push_at`'s reply, `None` while unanswered.
     let _answers: Answers = source.answers();
-    // The same replies in answer order, without the slots.
+    // The same `(status, body)` replies in answer order, without the slots.
     let _responses: RecordedResponses = source.responses();
     // A handle per SSE upgrade, in upgrade order.
     let sinks: SinkHandles = source.sinks();
@@ -735,6 +735,9 @@ fn kernel(
     // client resumes with (an error frame's are not).
     for sink in sinks.lock().expect("no earlier panic").iter() {
         let frames: Vec<EventFrame> = sink.frames();
+        // The event's `NAME` (or a platform frame's `charpente.*` name), and its
+        // payload as JSON text.
+        let _event: Option<(&str, &str)> = frames.first().map(|f| (f.name, f.json.as_str()));
         let _resume: Option<String> = frames.last().map(|f| {
             Cursor {
                 id: f.id,
@@ -1133,6 +1136,8 @@ fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
         Duration::from_millis(1),
         Request::new(Method::Post, "/orgs/1/memos/7")
             .header("authorization", "Bearer <token>")
+            // Any `Serialize` value; it sets the body only, no content-type,
+            // and panics if the value does not serialize.
             .json(&body),
     )];
     // Boot through fallout, then run the requests under the run's faults

@@ -6690,6 +6690,11 @@ quotes the 401 a request would get (status and message), which says the route re
 credential, so the probe cannot run it. Leave that route out of
 the drift test too; widening it to `public(Org)` so a test can read it is not the fix.
 
+The probe feeds each `:param` the literal `"0"`, which parses for every `FromParam` the
+platform ships (`u64`, `String`, `Id<T>`). A handler that refuses `0`, such as a lookup
+that answers 404 for a row that does not exist, comes back as the probe's error naming the
+route and quoting the status and message a request would get.
+
 ### Cursor semantics
 
 The platform extracts the client's resume cursor *before* the handler runs, so an
