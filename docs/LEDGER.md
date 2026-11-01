@@ -9714,4 +9714,4 @@ tallied from these tables.
 - **0.3.0's close-out**, owed since its entry:
   - `ci.yml` run `40504042875` on its pushed tip `7113e8f3`: success (2026-10-27);
   - the first nightly `edge-harness.yml` on that tip, run `40509742277`: success (2026-10-27), and every nightly since on it is green through `41315211563` (2026-11-01).
-- **Found by the smoke.** `charpente new`'s usage line still says the scaffold has "two sim properties" (`crates/charpente-cli/src/new.rs:11`), but 0.4.0's scaffold writes three: `29b900bd` added the per-note ack check. The text ships in 0.4.0's binary, and the fix goes on main for the next release, with a pin that counts the template's checks.
+- **Found by the smoke.** `charpente new`'s usage line still says the scaffold has "two sim properties" (`crates/charpente-cli/src/new.rs:11`), but the scaffold has written three since `0a06e5eb` (2026-10-25, the event check), so 0.3.0's binary carried the stale line too, and 0.4.0's still does. The fix goes on main for the next release, with a pin that counts the template's checks.
