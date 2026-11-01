@@ -443,6 +443,13 @@ impl Kernel {
     /// ready source (the same-shape decision, DESIGN §1), and return `Worked`;
     /// or, when nothing is ready, return `Idle { deadline }` without parking.
     /// The replication kernel arm and the park tick land here in T8.
+    ///
+    /// A job enqueued through the App between steps
+    /// (`app_mut_for_tests().transact_for_tests(…)`) reaches the due-heap only
+    /// when the next `run` starts or at the end of the next step that does
+    /// work. A step that finds nothing else ready goes `Idle` and leaves it
+    /// out, deadline included, so a test that steps an idle kernel by hand
+    /// never sees the job run until it calls `run`.
     pub fn step(&mut self, source: &mut dyn RequestSource) -> io::Result<Step> {
         if self.pending.is_none() {
             self.pending = source.poll();
