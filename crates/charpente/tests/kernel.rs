@@ -7878,3 +7878,91 @@ mod job_tenancy {
         }
     }
 }
+
+// ------------- SimSource::answers: one slot per pushed request, in push order
+
+fn answers_source(sim: &Sim, slots: &[u64]) -> SimSource {
+    let mut source = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    for (i, &slot) in slots.iter().enumerate() {
+        let request = Request::new(Method::Post, "/hit").json(&Hit {
+            slot: WireU64(slot),
+        });
+        source.push_at((i as u64 + 1) * SEC, request);
+    }
+    source
+}
+
+#[test]
+fn answers_has_one_slot_per_pushed_request_in_push_order() {
+    let sim = Sim::with_faults(0xA45_0001, FaultConfig::none());
+    let app = loop_app(&sim).unwrap();
+    let mut source = answers_source(&sim, &[11, 22, 33]);
+    let answers = source.answers();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+    let slots = answers.lock().unwrap();
+    assert_eq!(slots.len(), 3, "one slot per push_at");
+    for (slot, want) in slots.iter().zip([11u64, 22, 33]) {
+        let (status, body) = slot.as_ref().expect("fault-free run answers every request");
+        assert_eq!(*status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(body).trim_matches('"'),
+            want.to_string()
+        );
+    }
+}
+
+/// Run six `/hit` requests (slots 1..=6, one second apart) under a heavy
+/// write-error rate; `None` when the app cannot even open on this seed.
+type Slots = Vec<Option<(u16, Vec<u8>)>>;
+
+fn answers_under_write_errors(seed: u64) -> Option<Slots> {
+    let faults = FaultConfig {
+        write_error: 0.5,
+        ..FaultConfig::none()
+    };
+    let sim = Sim::with_faults(seed, faults);
+    let app = kernel_crash_app(&sim).ok()?;
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).ok()?;
+    let mut source = answers_source(&sim, &[1, 2, 3, 4, 5, 6]);
+    let answers = source.answers();
+    let _ = kernel.run(&mut source);
+    let slots = answers.lock().unwrap().clone();
+    Some(slots)
+}
+
+/// Seed 855 is the first in 0..2000 where the 0.5 write-error rate lets
+/// request 1 commit (200) and fails request 2's commit (500), poisoning the
+/// engine so the kernel stops with requests 3..=6 never polled.
+#[test]
+fn an_unanswered_request_leaves_its_own_slot_none() {
+    let slots = answers_under_write_errors(855).expect("seed 855 opens");
+    assert_eq!(slots.len(), 6, "one slot per push_at, answered or not");
+    let (status, body) = slots[0].as_ref().expect("request 1 was answered");
+    assert_eq!(*status, 200, "request 1 keeps its own answer");
+    assert_eq!(String::from_utf8_lossy(body).trim_matches('"'), "1");
+    let (status, body) = slots[1].as_ref().expect("request 2 was answered");
+    assert_eq!(*status, 500, "request 2 is the write-error 500");
+    assert_ne!(
+        String::from_utf8_lossy(body).trim_matches('"'),
+        "1",
+        "request 2's slot must not hold request 1's answer"
+    );
+    assert!(
+        slots[2..].iter().all(|s| s.is_none()),
+        "slots after the stop stay None: {slots:?}"
+    );
+}
+
+#[test]
+fn request_clones_equal() {
+    let request = Request::new(Method::Post, "/hit?cursor=5.9")
+        .header("x-k", "v")
+        .json(&Hit { slot: WireU64(7) });
+    let copy = request.clone();
+    assert_eq!(copy.method, request.method);
+    assert_eq!(copy.path, request.path);
+    assert_eq!(copy.query, request.query);
+    assert_eq!(copy.headers, request.headers);
+    assert_eq!(copy.body, request.body);
+}

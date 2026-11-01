@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 charpente-core.workspace = true
+charpente.workspace = true
 
 [lints]
 workspace = true

@@ -134,7 +134,8 @@ item with the trigger that reopens it.
   paths, so app crates depend on `charpente` alone.
 - `crates/charpente-sim` — simulator (seeded xoshiro, virtual time, fault matrix), the
   frozen `run_universes!` runner + swarm runner, `harness` (the `charpente test --sim`
-  runtime), `checks` (the public checker library).
+  runtime), `checks` (the public checker library). Depends on `charpente` (for `drive`);
+  `charpente`'s dev-dependency back on it is path-only, as charpente-macros' is.
 - `crates/charpente-cli` — the `charpente` binary; edge tooling, may spawn processes.
 - `crates/charpente-tsgen` — the TypeScript client emitter: route/event types to
   `client.ts`, behind the CLI's `gen-client`/`check-client` verbs.

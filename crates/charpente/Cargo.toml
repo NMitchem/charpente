@@ -33,4 +33,6 @@ tower-service = "0.3.3"
 workspace = true
 
 [dev-dependencies]
-charpente-sim.workspace = true
+# Cyclic dev-dependency, path-only (cargo strips it from the published manifest):
+# charpente-sim depends on charpente for `drive`, as charpente-macros does for its case files.
+charpente-sim = { path = "../charpente-sim" }

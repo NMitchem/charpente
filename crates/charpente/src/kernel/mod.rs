@@ -1514,6 +1514,10 @@ fn io_500(e: io::Error) -> Response {
 /// doesn't trip clippy's type-complexity lint at every use site.
 pub type RecordedResponses = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
 
+/// One slot per `SimSource::push_at`, in push order: `None` until that
+/// request is answered, then its own `(status, body)`.
+pub type Answers = Arc<Mutex<Vec<Option<(u16, Vec<u8>)>>>>;
+
 /// `SimSinkHandle`s `SimSource` hands back, one per SSE upgrade it has
 /// produced, in upgrade order — the realtime counterpart to
 /// `RecordedResponses`.
@@ -1529,6 +1533,8 @@ pub struct SimSource {
     clock: Box<dyn Clock>,
     script: VecDeque<(u64, Request)>,
     responses: RecordedResponses,
+    answers: Answers,
+    next_slot: usize,
     horizon: u64,
     stalls: StallQueue,
     sinks: SinkHandles,
@@ -1540,6 +1546,8 @@ impl SimSource {
             clock,
             script: VecDeque::new(),
             responses: Arc::new(Mutex::new(Vec::new())),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            next_slot: 0,
             horizon: horizon_nanos,
             stalls: Arc::new(Mutex::new(VecDeque::new())),
             sinks: Arc::new(Mutex::new(Vec::new())),
@@ -1553,6 +1561,17 @@ impl SimSource {
             "SimSource script must be pushed in arrival order"
         );
         self.script.push_back((at_nanos, request));
+        self.answers
+            .lock()
+            .expect("answers lock poisoned by an earlier panic")
+            .push(None);
+    }
+
+    /// Per-request answers: slot `i` is the `i`th `push_at`'s own reply, or
+    /// `None` while that request is unanswered (the kernel stopped first).
+    /// `responses()` is the same replies in answer order, without the slots.
+    pub fn answers(&self) -> Answers {
+        self.answers.clone()
     }
 
     pub fn responses(&self) -> RecordedResponses {
@@ -1586,7 +1605,11 @@ impl RequestSource for SimSource {
         let now = self.clock.now().as_nanos();
         if self.script.front().is_some_and(|&(at, _)| at <= now) {
             let (_, request) = self.script.pop_front().expect("checked");
+            let slot = self.next_slot;
+            self.next_slot += 1;
             let reply: Reply = Box::new(SimReply {
+                slot,
+                answers: self.answers.clone(),
                 sink: self.responses.clone(),
                 stalls: self.stalls.clone(),
                 sinks: self.sinks.clone(),
@@ -1625,13 +1648,31 @@ impl RequestSource for SimSource {
 /// closure (`SimSource::push_stall`), defaulting to one that never stalls —
 /// and stashes the matching `SimSinkHandle` for `SimSource::sinks()`.
 struct SimReply {
+    slot: usize,
+    answers: Answers,
     sink: RecordedResponses,
     stalls: StallQueue,
     sinks: SinkHandles,
 }
 
+impl SimReply {
+    fn answer(&self, response: &Response) {
+        let mut slots = self
+            .answers
+            .lock()
+            .expect("answers lock poisoned by an earlier panic");
+        assert!(
+            slots[self.slot].is_none(),
+            "SimSource slot {} answered twice",
+            self.slot
+        );
+        slots[self.slot] = Some((response.status, response.body.clone()));
+    }
+}
+
 impl Respond for SimReply {
     fn send(self: Box<Self>, response: Response) {
+        self.answer(&response);
         self.sink
             .lock()
             .expect("responses lock poisoned by an earlier panic")
@@ -1639,6 +1680,7 @@ impl Respond for SimReply {
     }
 
     fn stream(self: Box<Self>, response: Response) -> Box<dyn EventSink> {
+        self.answer(&response);
         self.sink
             .lock()
             .expect("responses lock poisoned by an earlier panic")

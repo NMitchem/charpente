@@ -69,6 +69,7 @@ impl Method {
 /// with the wire. Header keys are lowercase. `path` never carries a query
 /// string — `Request::new` splits it into `query` at construction, the only
 /// v0 consumer being the SSE `cursor` query parameter (`?cursor=<id>.<seq>`).
+#[derive(Clone)]
 pub struct Request {
     pub method: Method,
     pub path: String,
