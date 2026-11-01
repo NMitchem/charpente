@@ -41,7 +41,10 @@ fn the_guide_ships_in_the_charpente_crate() {
     // GUIDE sends a reader to these files in the registry copy, so an
     // `include` or `exclude` edit must not drop one.
     for (example, named_in) in [
-        ("examples/api.rs", "GUIDE's opening paragraph"),
+        (
+            "examples/api.rs",
+            "GUIDE's opening paragraph and §8 \"Examples to copy\"",
+        ),
         ("examples/drawn_inputs.rs", "GUIDE §8 \"Examples to copy\""),
         (
             "examples/modelled_remote.rs",

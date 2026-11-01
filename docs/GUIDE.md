@@ -3020,13 +3020,15 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 
 ### Examples to copy
 
-Three compiled examples ship in the `charpente` crate, each a small batch
-that prints the report "Reading a batch" describes and exits with its code.
-Each is a whole `tests/sim.rs`: `sim_tests!` supplies `main`, and the file
-declares its own tables, routes and jobs.
+Four compiled examples ship in the `charpente` crate. `examples/api.rs` is
+the API page this guide opens with, read and never run: its `main` is empty.
+The other three are each a small batch that prints the report "Reading a
+batch" describes and exits with its code. Each is a whole `tests/sim.rs`:
+`sim_tests!` supplies `main`, and the file declares its own tables, routes
+and jobs.
 
-- **In your app**, copy one to `tests/sim.rs` and run `charpente test --sim`.
-  It needs only the manifest `charpente new` writes.
+- **In your app**, copy one of the three to `tests/sim.rs` and run
+  `charpente test --sim`. It needs only the manifest `charpente new` writes.
 - **In a charpente checkout**, run `cargo run -p charpente --example <name>`.
   Cargo refuses `-p charpente` anywhere else. The batch's last line names
   `charpente test --sim --master-seed 0x…`; for an example, pass the same flags

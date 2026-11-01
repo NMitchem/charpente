@@ -8,22 +8,19 @@
 //!
 //! The sections, in order: `attributes` (with what a handler, a job and a
 //! tenant type are handed), `tx`, `scoped_tx`, `app`, `kernel`, `snapshot`
-//! (the end state), `sim`, `input`, `remotes`, `checks`, `drive`. A sim test
-//! of an app under faults starts at `drive`, which boots the app, runs the
-//! requests and recovers, so it rarely calls `kernel` or the boot helpers in
-//! `checks` itself. A `tests/sim.rs` lists its checks, each a
-//! `fn(&mut Sim) -> Result<(), String>`, in
-//! `charpente_sim::sim_tests! { a_check require ["restart"], }`, which writes
-//! `main`; a `require` key must be marked in at least one of the check's runs
-//! in a batch.
+//! (the end state), `suites` (how a sim test file runs its checks), `sim`,
+//! `input`, `remotes`, `checks`, `drive`. A sim test of an app under faults
+//! starts at `drive`, which boots the app, runs the requests and recovers,
+//! so it rarely calls `kernel` or the boot helpers in `checks` itself.
 //!
 //! `crates/guide-examples/tests/api_census.rs` holds this page: a public
-//! function added to one of these surfaces fails that test until a line here
-//! uses it.
+//! function added to a surface it lists fails that test unless the section
+//! holding it already calls a function of that name.
 
 // Nothing here is called, since `main` is empty.
 #![allow(dead_code)]
 
+use std::any::TypeId;
 use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
@@ -31,21 +28,25 @@ use std::time::Duration;
 use charpente::archive::Archive;
 use charpente::auth::{OidcConfig, Principal};
 use charpente::core::db::{CommitFailure, Group};
-use charpente::core::io::{Instant, ObjectStore, OutboundCall, OutboundReply, WallTime};
+use charpente::core::io::{
+    Disk, Entropy, IdempotencyKey, Instant, ObjectStore, OutboundCall, OutboundReply, WallTime,
+};
 use charpente::core::job::JobRow;
+use charpente::core::migration::MigrationStep;
 use charpente::core::table::Row;
 use charpente::describe::Contract;
 use charpente::http::{
-    ApiError, App, AppConfig, Ctx, Handled, Method, Request, Response, StagedDispatch, Subscription,
+    ApiError, App, AppConfig, Ctx, Cursor, Handled, Method, Request, Response, StagedDispatch,
+    Subscription,
 };
 use charpente::kernel::{
-    Answers, Kernel, KernelStats, RecordedResponses, SimSource, SinkHandles, Step,
+    Answers, EventFrame, Kernel, KernelStats, RecordedResponses, SimSource, SinkHandles, Step,
 };
 use charpente::outbound::Host;
 use charpente::repl::Repl;
 use charpente::{
-    CrossTenant, Id, Schema, Scoped, ScopedTx, Snapshot, Subscribe, TenantAdmission, Tx, View,
-    events, jobs, routes,
+    CrossTenant, Id, Schema, Scoped, ScopedTx, Snapshot, Subscribe, TenantAdmission, Tx, TxError,
+    View, events, jobs, routes,
 };
 use charpente_sim::checks::{
     FaultReason, acked_implies_durable, boot_through_fallout, calls_have_durable_jobs, classify,
@@ -54,54 +55,58 @@ use charpente_sim::checks::{
     keys_are_per_job, outbound_settles_by_horizon, replays_identically, wait_out_clock_refusal,
 };
 use charpente_sim::drive::{Drive, Phase, Recovered};
+use charpente_sim::object::SimObjectStore;
 use charpente_sim::outbound::{Delivered, Idempotent, Recorder, Remote, SimOutbound, from_fn};
 use charpente_sim::rng::Rng;
 use charpente_sim::{FaultConfig, Input, Sim, SimClock, SimDisk, SimEntropy, SimHost, SimNet};
 
 use attributes::{
-    Charge, Memo, MemoAdded, Note, NoteAdded, NoteBody, Notify, Org, Reindex, Rollup,
+    Charge, Memo, MemoAdded, MemoDeleted, Note, NoteAdded, NoteBody, NoteDeleted, Notify, Org,
+    Reindex, Rollup,
 };
 
 fn main() {}
 
-/// How this page's app builds itself, the function `Drive::new` takes: the
-/// `app` section's builder without OIDC and the one-off calls. It runs once
-/// per boot, so it builds the same app every time.
-fn build(sim: &Sim) -> io::Result<App> {
+/// The app built from every route, job and event on this page, on the disk
+/// and entropy it is handed: the builder `charpente::launch` takes. It runs
+/// once per boot, so it builds the same app every time.
+fn open_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> {
     let schema = Schema::new()
         .table::<Org>()
         .table::<Note>()
         .migration::<Note>("Note")
         .table::<Memo>();
-    Ok(App::open(
-        Box::new(sim.disk()),
-        schema,
-        Box::new(sim.entropy()),
-        AppConfig::default(),
-    )?
-    .mount(routes![
-        attributes::put_note,
-        attributes::login,
-        attributes::mint_key,
-        attributes::logout,
-        attributes::count_memos,
-        attributes::add_memo,
-        attributes::all_memos,
-        attributes::memo_feed,
-        attributes::note_feed,
-    ])
-    .mount_jobs(jobs![Reindex, Notify, Rollup, Charge])
-    .mount_events(events![NoteAdded, MemoAdded])
-    .schedule("reindex", Duration::from_secs(3600), || Reindex {})
-    .outbound(Host::new("pay.example").bearer_env("PAY_KEY")))
+    Ok(App::open(disk, schema, entropy, AppConfig::default())?
+        .mount(routes![
+            attributes::put_note,
+            attributes::relabel_note,
+            attributes::delete_note,
+            attributes::login,
+            attributes::mint_key,
+            attributes::logout,
+            attributes::count_memos,
+            attributes::add_memo,
+            attributes::all_memos,
+            attributes::memo_feed,
+            attributes::note_feed,
+        ])
+        .mount_jobs(jobs![Reindex, Notify, Rollup, Charge])
+        .mount_events(events![NoteAdded, NoteDeleted, MemoAdded, MemoDeleted])
+        .schedule("reindex", Duration::from_secs(3600), || Reindex {})
+        .outbound(Host::new("pay.example").bearer_env("PAY_KEY")))
+}
+
+/// `open_app` on the sim's disk and entropy: the function `Drive::new` takes.
+fn sim_app(sim: &Sim) -> io::Result<App> {
+    open_app(Box::new(sim.disk()), Box::new(sim.entropy()))
 }
 
 /// Each attribute with every argument it takes, and what a handler, a job
 /// and a tenant type are handed: `Ctx`, `Call`, `Reply`, `Tenant::authorize`.
 mod attributes {
-    use charpente::auth::Principal;
+    use charpente::auth::{Principal, Via};
     use charpente::core::migration::{MigrationError, TableMigration};
-    use charpente::http::{ApiError, Ctx, Cursor, Session, Subscription};
+    use charpente::http::{ApiError, Ctx, Cursor, Response, Session, Subscription};
     use charpente::kernel::JobError;
     use charpente::outbound::{Call, IdempotencyKey, Reply};
     use charpente::wire::WireU64;
@@ -210,9 +215,19 @@ mod attributes {
         pub id: Id<Note>,
     }
 
+    #[event(global)]
+    pub struct NoteDeleted {
+        pub id: Id<Note>,
+    }
+
     // Emitted only on `Org`'s `ScopedTx`, delivered only to that tenant's feed.
     #[event(scoped_by = Org)]
     pub struct MemoAdded {
+        pub id: Id<Memo>,
+    }
+
+    #[event(scoped_by = Org)]
+    pub struct MemoDeleted {
         pub id: Id<Memo>,
     }
 
@@ -224,8 +239,9 @@ mod attributes {
 
     impl Reindex {
         // You write `run`; `#[job]` derives none. It is its own transaction:
-        // `Err(JobError::App(..))` is a failed attempt and commits nothing,
-        // `Err(JobError::Io(..))` is a platform fault and not an attempt.
+        // `Err(JobError::App(..))` is a failed attempt and commits nothing.
+        // `Err(JobError::Io(..))` (what `?` on a read gives) is a platform
+        // fault, not an attempt: the kernel stops.
         fn run(self, tx: &mut Tx) -> Result<(), JobError> {
             let _notes: Vec<Note> = tx.scan()?;
             Ok(())
@@ -317,10 +333,11 @@ mod attributes {
     // `METHOD "/path/:param"` (GET, POST, PUT, PATCH, DELETE, SSE), then
     // exactly one of `auth`, `public` or `public(<tenant type>)`. The
     // arguments, in this order: `tx: &mut Tx`; one per `:param`, named after
-    // it, in path order; at most one JSON body; `cap: &CrossTenant` on a
-    // `cross_tenant` route; optionally `ctx: &Ctx` last. It returns
-    // `Result<T, ApiError>`, `T: Serialize + Wire`, answered as a 200.
-    #[route(POST "/notes/:id", public)]
+    // it, in path order; at most one JSON body; optionally `cap:
+    // &CrossTenant` on a `cross_tenant` route; optionally `ctx: &Ctx` last.
+    // It returns `Result<T, ApiError>`, `T: Serialize + Wire`, answered as a
+    // 200.
+    #[route(PUT "/notes/:id", public)]
     fn put_note(
         tx: &mut Tx,
         id: Id<Note>,
@@ -338,11 +355,29 @@ mod attributes {
         Ok(id)
     }
 
+    #[route(PATCH "/notes/:id", auth)]
+    fn relabel_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<(), ApiError> {
+        // `?` on a read makes an IO error `ApiError::Internal`.
+        let mut note: Note = tx.get(id)?.ok_or(ApiError::NotFound)?;
+        note.label = body.label;
+        tx.put(&note);
+        // What an `Err` is answered with: 400, 401, 404 or 500 by variant,
+        // the message as `{"error": ..}`.
+        let _answer: Response = ApiError::NotFound.response();
+        Ok(())
+    }
+
+    #[route(DELETE "/notes/:id", auth)]
+    fn delete_note(tx: &mut Tx, id: Id<Note>) -> Result<(), ApiError> {
+        tx.delete(id);
+        tx.emit(NoteDeleted { id });
+        Ok(())
+    }
+
     #[route(POST "/login", public)]
     fn login(tx: &mut Tx, body: Login, ctx: &Ctx) -> Result<String, ApiError> {
-        // Login: a session for `subject`, its token returned, expiring after
-        // the app's session TTL. One mint per request, shared with
-        // `create_api_key`.
+        // A session for `subject` that expires after the app's session TTL.
+        // One mint per request, shared with `create_api_key`.
         Ok(ctx.create_session(tx, body.subject))
     }
 
@@ -351,6 +386,8 @@ mod attributes {
     #[route(POST "/keys", auth)]
     fn mint_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
         let subject = ctx.principal().map(|p| p.subject().to_string());
+        // `Session` and `ApiKey` carry the matched row's id; `Oidc` has no row.
+        let _via: Option<Via> = ctx.principal().map(|p| p.via());
         // `"ck_"` and 64 hex characters; only its hash is stored.
         Ok(ctx.create_api_key(tx, subject.unwrap_or_default()))
     }
@@ -408,9 +445,10 @@ mod attributes {
 
     // `SSE` is a stream: its handler ends `ctx: &Ctx, cursor: Option<Cursor>`
     // and returns `Result<Subscription, ApiError>`, spelled out (an alias is
-    // refused). `emits(..)` declares what it carries, for `describe` and the
-    // generated client.
-    #[route(SSE "/orgs/:org/feed", auth, emits(MemoAdded))]
+    // refused). `cursor` comes from `Last-Event-ID`, else the `cursor` query
+    // parameter; `None` tails from now. `emits(..)` declares what it
+    // carries, for `describe` and the generated client.
+    #[route(SSE "/orgs/:org/feed", auth, emits(MemoAdded, MemoDeleted))]
     fn memo_feed(
         tx: &mut Tx,
         org: Id<Org>,
@@ -418,15 +456,23 @@ mod attributes {
         cursor: Option<Cursor>,
     ) -> Result<Subscription, ApiError> {
         let tx = tx.scope::<Org>(org, ctx)?;
-        Ok(tx.subscription::<MemoAdded>().cursor(cursor).into())
+        Ok(tx
+            .subscription::<MemoAdded>()
+            .and::<MemoDeleted>()
+            .cursor(cursor)
+            .into())
     }
 
-    // A global feed: `Subscription::of::<Ev>()`, narrowed by `.key(..)` to
-    // events emitted with that key.
-    #[route(SSE "/feed", public, emits(NoteAdded))]
+    // A global feed: `Subscription::of::<Ev>()`, more global types with
+    // `.and::<Ev>()` (a scoped event does not compile in either), narrowed
+    // by `.key(..)` to events emitted with that key.
+    #[route(SSE "/feed", public, emits(NoteAdded, NoteDeleted))]
     fn note_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
         let _ = (tx, ctx);
-        Ok(Subscription::of::<NoteAdded>().key("user:7").cursor(cursor))
+        Ok(Subscription::of::<NoteAdded>()
+            .and::<NoteDeleted>()
+            .key("user:7")
+            .cursor(cursor))
     }
 }
 
@@ -502,7 +548,7 @@ fn scoped_tx(tx: &mut ScopedTx<'_, '_, Org>, memo: Memo) -> Result<(), ApiError>
     tx.put(&memo);
     tx.delete(id);
     // Recorded with this tenant, so only this tenant's feed delivers it.
-    tx.emit(MemoAdded { id });
+    tx.emit(MemoDeleted { id });
     tx.emit_keyed("author:ann", MemoAdded { id });
     // A scoped job, run in this tenant.
     tx.enqueue(Notify { memo: id });
@@ -512,9 +558,15 @@ fn scoped_tx(tx: &mut ScopedTx<'_, '_, Org>, memo: Memo) -> Result<(), ApiError>
     (**tx).emit(NoteAdded {
         id: Id::from_raw(id.raw()),
     });
-    // This tenant's feed (`use charpente::Subscribe`); `.into()` makes it an
-    // SSE handler's `Subscription`.
-    let _feed: Subscription = tx.subscription::<MemoAdded>().key("author:ann").into();
+    // This tenant's feed (`use charpente::Subscribe`), with more of its
+    // event types through `.and`; `.into()` makes it an SSE handler's
+    // `Subscription`.
+    let _feed: Subscription = tx
+        .subscription::<MemoAdded>()
+        .and::<MemoDeleted>()
+        .key("author:ann")
+        .cursor(None)
+        .into();
     Ok(())
 }
 
@@ -527,6 +579,13 @@ fn app(sim: &Sim, oidc: OidcConfig) -> io::Result<()> {
         .table::<Note>()
         .migration::<Note>("Note")
         .table::<Memo>();
+    // Read back by the platform: the names sorted, each scoped table's
+    // tenant type, a table's migration steps, and its `(version,
+    // fingerprint)`.
+    let _names: Vec<&'static str> = schema.table_names();
+    let _tenants: Vec<(&'static str, TypeId, &'static str)> = schema.table_tenants();
+    let _steps: &[MigrationStep] = schema.migrations_for("Note");
+    let _meta: Option<(u32, Option<u64>)> = schema.table_meta("Note");
     // Opens the store on `disk`, recovering what it holds, with the app's
     // tables and the platform's own (sessions, API keys, cron).
     let mut app = App::open(
@@ -563,6 +622,11 @@ fn app(sim: &Sim, oidc: OidcConfig) -> io::Result<()> {
     let _mail: Host =
         Host::new("mail.example").header_env("x-postmark-server-token", "POSTMARK_TOKEN");
     let _ledger: Host = Host::new("ledger.example").basic_env("LEDGER_USER", "LEDGER_PASS");
+    // A binary's `main`. With no verb it serves on `addr` with its store in
+    // `data_dir`; `describe` prints the contract and `restore` restores from
+    // an archive. It picks the disk (a temporary one for `describe`), so it
+    // takes the builder, not an `App`.
+    let _main = || charpente::launch("0.0.0.0:8080", "./data", open_app);
     // The hosts the mounted jobs call, sorted: what `sim.outbound(..)` takes.
     // Read it before building a kernel, which takes the job defs.
     let _hosts: Vec<&'static str> = app.outbound_hosts();
@@ -582,10 +646,44 @@ fn app(sim: &Sim, oidc: OidcConfig) -> io::Result<()> {
     // `handle_at`, handing back a stream route's `Subscription`.
     let _either: Handled =
         app.handle_or_subscribe(Request::new(Method::Get, "/feed"), WallTime::from_nanos(1));
-    // Many requests staged into one group and committed with one sync. A
-    // non-empty `Group` that is dropped, not committed, panics.
-    let (group, _dispatch): (Group, StagedDispatch) = app.begin_group()?;
-    let _committed: Result<(), CommitFailure> = group.commit();
+    // Built by hand, as a check states the answer it expects. `error`'s body
+    // is `{"error": message}`; `sse_headers` is the empty 200 a stream opens
+    // with.
+    let _expected: [Response; 3] = [
+        Response::json(200, &7),
+        Response::error(404, "not found"),
+        Response::sse_headers(),
+    ];
+    // Many requests staged into one group and committed with one sync, as
+    // the kernel batches them. A non-empty `Group` that is dropped, not
+    // committed, panics.
+    let (mut group, dispatch): (Group, StagedDispatch) = app.begin_group()?;
+    // One request, routed and staged. Each stage sees every earlier stage's
+    // writes; none is durable before `commit`.
+    let _staged: Handled = dispatch.stage_or_subscribe(
+        &mut group,
+        Request::new(Method::Get, "/feed"),
+        WallTime::from_nanos(1),
+    );
+    // A transaction of your own. `Err`, or no effects, leaves the group as
+    // it was.
+    let _count: Result<usize, TxError<ApiError>> =
+        group.stage(|tx: &mut Tx| -> Result<usize, ApiError> { Ok(tx.scan::<Note>()?.len()) });
+    // The only constructors of the tokens a `cross_tenant` route or job is
+    // handed and `admit_scope` takes.
+    let _cap: CrossTenant = group.cross_tenant_cap();
+    let _admission: TenantAdmission = group.tenant_admission();
+    // Records awaiting `commit`: a stage that returned `Err` or wrote
+    // nothing adds none.
+    let _records: usize = group.len();
+    let _nothing: bool = group.is_empty();
+    // On `Err`, whether a request that ran when the group held
+    // `records_before` records, and staged one or not, saw a write that
+    // failed to apply, and so cannot be answered as committed.
+    let committed: Result<(), CommitFailure> = group.commit();
+    if let Err(failure) = &committed {
+        let _unsure: bool = failure.invalidates(0, false);
+    }
     Ok(())
 }
 
@@ -598,26 +696,57 @@ fn kernel(
     archive: impl Fn() -> (Archive, Box<dyn ObjectStore>),
 ) -> io::Result<()> {
     // An `Err` (a named refusal) for an app that mounts an outbound job (use
-    // `with_outbound`), a Pending job enqueued under another shape, or a wall
-    // clock behind the time the data directory recorded.
-    let mut kernel: Kernel = Kernel::new(build(sim)?, Box::new(sim.clock()))?;
+    // `with_outbound`), a Pending job enqueued under another shape, a wall
+    // clock more than `CLOCK_TOLERANCE` behind the time the data directory
+    // recorded, or a `Host` set that does not match the jobs' hosts.
+    let mut kernel: Kernel = Kernel::new(sim_app(sim)?, Box::new(sim.clock()))?;
     // Both `horizon_nanos` and `push_at`'s time are absolute virtual
     // nanoseconds, not offsets: add them to `sim.now()`.
     let start = sim.now().as_nanos();
     let mut source = SimSource::new(Box::new(sim.clock()), start + 60_000_000_000);
-    // In arrival order (asserted).
-    source.push_at(start + 1_000_000, Request::new(Method::Get, "/feed"));
+    // In arrival order (asserted). A `?query` is split off the path, with no
+    // percent-decoding.
+    source.push_at(
+        start + 1_000_000,
+        Request::new(Method::Get, "/feed?cursor=5.9"),
+    );
+    source.push_at(
+        start + 2_000_000,
+        Request::new(Method::Put, "/notes/1")
+            .header("authorization", "Bearer <token>")
+            .json(&serde_json::json!({ "text": "hi", "label": "urgent" })),
+    );
+    // Upper case only, and no `SSE`: a stream route is requested with `GET`.
+    let _patch: Option<Method> = Method::parse("PATCH");
+    let _name: &'static str = Method::Patch.name();
     // A stall for the next SSE upgrade: `true` makes a send report `Full`.
     source.push_stall(Box::new(|| false));
     // Slot `i` is the `i`th `push_at`'s reply, `None` while unanswered.
     let _answers: Answers = source.answers();
     // The same replies in answer order, without the slots.
     let _responses: RecordedResponses = source.responses();
-    // A handle per SSE upgrade, in upgrade order: the frames each accepted.
-    let _sinks: SinkHandles = source.sinks();
+    // A handle per SSE upgrade, in upgrade order.
+    let sinks: SinkHandles = source.sinks();
     // `Ok(())` once nothing is left inside the horizon. After `Ok` it can run
     // again on another source; after `Err` it has stopped for good.
     kernel.run(&mut source)?;
+    // The frames each upgrade's subscriber accepted, and `closed` once the
+    // kernel dropped its tail. A frame's `id` and `seq` are the cursor a
+    // client resumes with (an error frame's are not).
+    for sink in sinks.lock().expect("no earlier panic").iter() {
+        let frames: Vec<EventFrame> = sink.frames();
+        let _resume: Option<String> = frames.last().map(|f| {
+            Cursor {
+                id: f.id,
+                seq: f.seq,
+            }
+            .wire()
+        });
+        let _ended: bool = sink.closed();
+    }
+    // `None` unless the text is `"<id>.<seq>"`; the kernel answers such a
+    // cursor with a 400 before the handler runs.
+    let _cursor: Option<Cursor> = Cursor::parse("5.9");
     // One iteration: `Worked`, or `Idle { deadline }` without waiting.
     let _step: Step = kernel.step(&mut source)?;
     let _stats: KernelStats = kernel.stats();
@@ -630,20 +759,21 @@ fn kernel(
     let _notice: Option<String> = kernel.take_archive_notice();
     // For an app with outbound jobs. The handle comes from the app's hosts,
     // read before the app moves.
-    let app = build(sim)?;
+    let app = sim_app(sim)?;
     let calls: SimOutbound = sim.outbound(&app.outbound_hosts())?;
     let _calling: Kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(calls))?;
     // A replicated node (GUIDE §10): a follower serves reads, never jobs or
     // cron.
-    let _replicated: Kernel = Kernel::with_replication(build(sim)?, Box::new(sim.clock()), repl())?;
+    let _replicated: Kernel =
+        Kernel::with_replication(sim_app(sim)?, Box::new(sim.clock()), repl())?;
     // `Archive::open` must already have run against this app's store (GUIDE
     // §15).
     let (shipper, store) = archive();
     let _archived: Kernel =
-        Kernel::with_archive(build(sim)?, Box::new(sim.clock()), shipper, store)?;
+        Kernel::with_archive(sim_app(sim)?, Box::new(sim.clock()), shipper, store)?;
     // Any of the three together.
     let (shipper, store) = archive();
-    let _all: Kernel = Kernel::builder(build(sim)?, Box::new(sim.clock()))
+    let _all: Kernel = Kernel::builder(sim_app(sim)?, Box::new(sim.clock()))
         .replication(repl())
         .archive(shipper, store)
         .outbound(Box::new(sim.outbound(&["pay.example"])?))
@@ -681,6 +811,44 @@ fn snapshot(kernel: &Kernel, org: Id<Org>, id: Id<Memo>) -> io::Result<()> {
     Ok(())
 }
 
+/// How a sim test file runs its checks. An app's `tests/sim.rs` lists them in
+/// `sim_tests!` for `charpente test --sim`; the `run_universes` macros are
+/// the runners of charpente's own `cargo test` suites.
+fn suites() {
+    // A check: one universe, `Ok(())` when the property held.
+    fn memo_survives(sim: &mut Sim) -> Result<(), String> {
+        sim.cover("memo:judged");
+        Ok(())
+    }
+    // Writes the file's `main`. A `require` key must be marked in at least
+    // one of that check's runs in a batch; a `--seed` replay checks none.
+    charpente_sim::sim_tests! { memo_survives require ["memo:judged"] }
+    // One fault matrix for every universe, from a fresh base seed or, with
+    // `_from`, a fixed one. `CHARPENTE_SEED=0x…` replays one universe and
+    // skips every `require:`, `floor:` and `ceiling:`.
+    charpente_sim::run_universes!(64, memo_survives);
+    charpente_sim::run_universes_from!(0x5eed, 64, memo_survives);
+    // Each universe samples its own `FaultConfig::swarm`. `ceiling:` fails the
+    // batch when a key is marked more than N times.
+    charpente_sim::run_universes_swarm!(
+        64,
+        memo_survives,
+        require: ["memo:judged"],
+        ceiling: [("run:skipped", 8)]
+    );
+    // A fixed base, and `adjust` edits each universe's config, handed that
+    // universe's seed. `floor:` fails the batch when a key is marked fewer
+    // than N times.
+    charpente_sim::run_universes_swarm_with!(
+        0x5eed,
+        64,
+        |_seed: u64, cfg: &mut FaultConfig| cfg.write_error = 0.0,
+        memo_survives,
+        require: ["memo:judged"],
+        floor: [("memo:judged", 32)]
+    );
+}
+
 /// `Sim`: one seeded universe, with virtual time, disks, clocks, entropy, a
 /// network and remote models, handed to each check. Everything it does is
 /// a function of its seed.
@@ -690,17 +858,33 @@ fn sim(seed: u64) -> io::Result<()> {
     // `with_faults(seed, FaultConfig::none())` runs none.
     let _defaults: Sim = Sim::new(seed);
     let sim: Sim = Sim::with_faults(seed, FaultConfig::none());
+    // Each axis in or out, an active one's rate drawn from a wide range that
+    // includes extremes `default()` never visits: the sampler
+    // `run_universes_swarm!` uses.
+    let _drawn: FaultConfig = FaultConfig::swarm(&mut Rng::new(seed));
     let _seed: u64 = sim.seed();
     // The run's drawn inputs: see `input`.
     let _input: Input = sim.input();
     // What an app and a kernel are built on, all in this one world.
     let _disk: SimDisk = sim.disk();
     let _entropy: SimEntropy = sim.entropy();
-    let _clock: SimClock = sim.clock();
-    let _now: Instant = sim.now();
+    let clock: SimClock = sim.clock();
+    // Its offset from `sim.true_wall()` in nanoseconds (skew, step-backs,
+    // downtime); it draws nothing.
+    let _offset: i64 = clock.offset();
+    // Virtual nanoseconds since the universe began; no table stores one.
+    // `duration_since` panics on a later argument.
+    let now: Instant = sim.now();
+    let _ns: u64 = now.as_nanos();
+    let _elapsed: Duration = now.duration_since(Instant::from_nanos(0));
     // Virtual time on the wall, with no host's skew: judge expiry and
-    // lateness against this, never against a host's clock.
-    let _wall: WallTime = sim.true_wall();
+    // lateness against this, never against a host's clock. Nanoseconds since
+    // the Unix epoch, the type of every stored time.
+    let wall: WallTime = sim.true_wall();
+    let _wall_ns: u64 = wall.as_nanos();
+    let _minute_ago: WallTime = wall.saturating_sub(Duration::from_secs(60));
+    // Zero when the argument is later.
+    let _since: Duration = wall.saturating_duration_since(WallTime::from_nanos(0));
     // Marks a named event (by convention `"<area>:<what>"`), for `require`.
     sim.cover("memo:judged");
     let _marks: BTreeMap<&'static str, u64> = sim.coverage();
@@ -735,10 +919,33 @@ fn sim(seed: u64) -> io::Result<()> {
     let _fingerprint: u64 = sim.durable_fingerprint();
     // Several nodes: a host has its own disk and fault streams; `net` is a
     // host's endpoint on the shared network, cut and healed by name.
-    let _replica: SimHost = sim.host("replica");
+    let replica: SimHost = sim.host("replica");
     let _endpoint: SimNet = sim.net("primary");
     sim.partition("primary", "replica");
     sim.repair("primary", "replica");
+    // A node built on this host: its own disk, entropy and clock (with its
+    // own skew), and its endpoint, `sim.net(replica.name())`.
+    let _host: &str = replica.name();
+    let _node: (SimDisk, SimEntropy, SimClock, SimNet) = (
+        replica.disk(),
+        replica.entropy(),
+        replica.clock(),
+        replica.net(),
+    );
+    // `Sim`'s crash and power cycle, on this host alone. `crash_now` and
+    // `restart` also tear down its network presence.
+    replica.crash_after(3);
+    replica.crash_now();
+    replica.restart();
+    let _replica_bytes: u64 = replica.durable_fingerprint();
+    // `checks::durable_corruption_fired` and `dir_entry_loss_fired` on this
+    // host alone: a refusal on one node is excused only by a fault on that
+    // node. The counts only grow; read them at a wipe, and excuse a later
+    // refusal only by a fault since.
+    let _corrupted: bool = replica.durable_corruption_fired();
+    let _lost: bool = replica.dir_entry_loss_fired();
+    let _corruptions: u64 = replica.durable_corruption_count();
+    let _losses: u64 = replica.dir_entry_loss_count();
     // When the next message in flight can be delivered, for a multi-node
     // scheduler to jump to.
     let _wake: Option<u64> = sim.next_wakeup();
@@ -751,6 +958,13 @@ fn sim(seed: u64) -> io::Result<()> {
     let _seen: usize = sim.with_remote("pay.example", |r: &Recorder| r.calls().len());
     // Every request that reached a remote so far.
     let _delivered: Vec<Delivered> = sim.outbound_deliveries();
+    // The archive's bucket (GUIDE §15). `with_faults` draws its put, get,
+    // lost-ack and delete faults on streams no other fault moves.
+    let _calm: SimObjectStore = SimObjectStore::new();
+    let bucket: SimObjectStore = SimObjectStore::with_faults(seed, FaultConfig::default());
+    // The next put fails after the store accepted it.
+    bucket.fail_next_put();
+    let _objects: Vec<String> = bucket.keys();
     Ok(())
 }
 
@@ -775,7 +989,6 @@ fn input(sim: &Sim) {
 /// model)` registers, run when a call reaches it. Its variance comes from the
 /// `Rng` it is handed, and it never calls back into the `Sim`.
 fn remotes(sim: &Sim) {
-    // A closure as a model.
     sim.remote(
         "mail.example",
         from_fn(|_call: &OutboundCall| OutboundReply {
@@ -809,11 +1022,17 @@ fn remotes(sim: &Sim) {
     impl Remote for Ledger {
         // Runs when the request reaches the remote, at its drawn delivery time.
         fn handle(&mut self, _call: &OutboundCall, rng: &mut Rng) -> OutboundReply {
+            // The model's own seeded stream: `chance(p)`, `below(n)` in
+            // `0..n`, `between(lo, hi)` inclusive, and raw `next_u64`/`fill`.
             let status = if rng.chance(0.1) { 503 } else { 200 };
+            let _shard: u64 = rng.below(4);
+            let _cents: u64 = rng.between(1, 500);
+            let mut receipt = [0u8; 8];
+            rng.fill(&mut receipt);
             self.posted += u64::from(status == 200);
             OutboundReply {
                 status,
-                headers: Vec::new(),
+                headers: vec![("receipt-id".into(), rng.next_u64().to_string())],
                 body: Vec::new(),
             }
         }
@@ -824,7 +1043,7 @@ fn remotes(sim: &Sim) {
 /// `charpente_sim::checks`: the platform's oracles and its fault-fallout
 /// vocabulary. A test on `drive` uses the end-state ones; the boot and clock
 /// helpers are what `drive` runs.
-fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>) -> Result<(), String> {
+fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>, job: &JobRow) -> Result<(), String> {
     // Every durable event of type `E`, as the app's own type, in log order,
     // every page of the log. A row of another shape is an `Err` naming it.
     let _added: Vec<NoteAdded> = events::<NoteAdded>(snap)?;
@@ -832,6 +1051,7 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>) -> Result<(), String> {
     let _memos: Vec<MemoAdded> = events_scoped::<MemoAdded>(snap, org.raw())?;
     // Excuses an acked row's loss only in a run where durable corruption
     // (`bit_flip`, `misdirected_write`) fired: give the run up, never pass it.
+    // On several nodes, ask the node's `SimHost` instead.
     let _excused: bool = durable_corruption_fired(sim);
     // The same, for a directory entry lost or brought back
     // (`dir_entry_loss`): a missing-segment refusal is excused only there.
@@ -842,34 +1062,47 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>) -> Result<(), String> {
     calls_have_durable_jobs(sim, snap)?;
     keys_are_per_job(snap)?;
     outbound_settles_by_horizon(snap)?;
+    // An outbound job's key, rebuilt from its row to find among the calls a
+    // remote received.
+    if let Some(raw) = job.outbound_key {
+        let key: IdempotencyKey = IdempotencyKey::from_bytes(raw);
+        let _hex: &str = key.as_str();
+        let _bytes: &[u8; 16] = key.as_bytes();
+    }
     // An error's text sorted into a fault family. `is_fault_fallout` is true
     // for the families text alone excuses: injected, poisoned, redb's latch.
-    let _family: FaultReason = classify("injected write error");
-    let _fallout: bool = is_fault_fallout("injected write error");
+    let _family: FaultReason = classify("injected read error");
+    let _fallout: bool = is_fault_fallout("injected read error");
     // A clock stop or refusal is fallout only where a clock fault fired; an
     // app's filter is `is_fault_fallout(t) || clock_fallout(sim, t)`.
-    let _clock: bool = clock_refused("clock went backwards");
-    let _clock_fallout: bool = clock_fallout(sim, "clock went backwards");
+    let stopped = "clock went backwards: this node's wall clock reads \
+                   2026-01-01T00:00:39.000Z, 61s behind 2026-01-01T00:01:40.000Z, … and the \
+                   node runs again after 2026-01-01T00:00:40.000Z.";
+    let _clock: bool = clock_refused(stopped);
+    let _clock_fallout: bool = clock_fallout(sim, stopped);
     // The instant a clock refusal names; `None` for other text and for the
     // stall stop.
-    let _reopens: Option<WallTime> = clock_reopens_after("clock went backwards");
+    let _reopens: Option<WallTime> = clock_reopens_after(stopped);
     // A durable-horizon refusal: `Ok(true)` gave the run up because durable
     // corruption fired, `Err` when nothing excuses it.
-    let _ended: bool = durable_refusal(sim, "refusing to open")?;
+    let _ended: bool = durable_refusal(
+        sim,
+        "log frame 7 is invalid but at-or-below the store's durable horizon 9 — …",
+    )?;
     // Up to `tries` boots through the fallout `is_fallout` accepts; `Ok(None)`
     // when every boot met it, or a durable refusal gave the run up.
     let _app: Option<App> = boot_through_fallout(
         sim,
         8,
         |t| is_fault_fallout(t) || clock_fallout(sim, t),
-        || build(sim),
+        || sim_app(sim),
     )
     .map_err(|e| e.to_string())?;
     // A tail's boot, after `sim.quiesce_clock_faults()`: waits past the
     // instant a clock refusal names and boots again; a third refusal gives
     // the run up.
     let _booted: Option<App> = wait_out_clock_refusal(sim, || {
-        boot_through_fallout(sim, 8, is_fault_fallout, || build(sim)).map_err(|e| e.to_string())
+        boot_through_fallout(sim, 8, is_fault_fallout, || sim_app(sim)).map_err(|e| e.to_string())
     })?;
     // `workload` twice, each on a fresh `Sim::new(seed)`: the results and the
     // durable bytes must match.
@@ -879,7 +1112,12 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>) -> Result<(), String> {
     )?;
     // `rounds` of drive, power cycle, verify, on this `Sim`: every id acked
     // so far must still be there. A run that acked nothing gives up.
-    acked_implies_durable(sim, 3, |_sim| Ok(Vec::new()), |_sim, _acked| Ok(()))?;
+    acked_implies_durable(
+        sim,
+        3,
+        |_sim: &mut Sim| -> Result<Vec<String>, String> { Ok(Vec::new()) },
+        |_sim: &mut Sim, _acked: &[String]| Ok(()),
+    )?;
     Ok(())
 }
 
@@ -888,8 +1126,8 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>) -> Result<(), String> {
 /// under faults starts here (GUIDE §8, "A fault-free tail for an end-of-run
 /// check").
 fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
-    // `build` opens and mounts the app on the sim's disk, once per boot.
-    let drive: Drive = Drive::new(sim, build);
+    // `sim_app` builds the app on the sim's disk, once per boot.
+    let drive: Drive = Drive::new(sim, sim_app);
     // `(offset from the phase's start, request)`, in arrival order.
     let requests: Vec<(Duration, Request)> = vec![(
         Duration::from_millis(1),
@@ -905,10 +1143,11 @@ fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
     // `requests[i]`'s status (`phase.answers[i]` holds the body too), `None`
     // when the phase left it unanswered.
     let _acked: Option<u16> = phase.status(0);
-    // Power-cycle, switch faults off, wait out a clock refusal, boot, re-send
-    // each request with no answer or a fallout 5xx, and run `tail` past the
-    // boot so jobs, retries and cron drain. `Ok(None)`: the run gave up by
-    // name, so the check returns `Ok(())`.
+    // Power-cycle, quiesce disk and clock faults (outbound too when the app
+    // declares hosts), wait out a clock refusal, boot, re-send each request
+    // with no answer or a fallout 5xx, and run `tail` past the boot so jobs,
+    // retries and cron drain. `Ok(None)`: the run gave up by name, so the
+    // check returns `Ok(())`.
     let Some(recovered): Option<Recovered> = drive.recover(&phase, Duration::from_secs(30))? else {
         return Ok(());
     };
