@@ -781,8 +781,8 @@ named, the root included:
   fix. Any other id is carried as a `WireU64` in a body or response field,
   and as a `String` in a path param, because `WireU64` is not `FromParam`.
   `u64` implements `FromParam` but not `Wire` — a bare `u64` path param is
-  a compile error whose note names `Id<T>` and `WireU64`; in a path param,
-  use `Id<T>` for a row id and `String` for any other number.
+  a compile error whose note names all three fixes: `Id<T>` for a row id,
+  `WireU64` in a body or response field, and `String` in a path param.
 - Then at most one JSON body argument, of any type that is both an owned
   deserializable AND `Wire` (`serde::de::DeserializeOwned + Wire` — the
   glue's actual bound); a type borrowing from the input won't compile, and

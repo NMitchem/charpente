@@ -171,7 +171,7 @@ impl TypeRegistry {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot cross the wire",
     label = "no `Wire` impl for `{Self}`",
-    note = "if this is `u64` or `i64`: values above 2^53 lose precision in JavaScript clients, silently — use `Id<T>` for a row id, or `WireU64`/`WireI64` to carry it as a string",
+    note = "if this is `u64` or `i64`: values above 2^53 lose precision in JavaScript clients, silently — use `Id<T>` for a row id; in a body or response field, `WireU64`/`WireI64` carry it as a string; a path param that is not a row id takes a `String` and parses it, since `WireU64`/`WireI64` are not `FromParam`",
     note = "otherwise: add `#[derive(Wire)]` to `{Self}`"
 )]
 pub trait Wire {
