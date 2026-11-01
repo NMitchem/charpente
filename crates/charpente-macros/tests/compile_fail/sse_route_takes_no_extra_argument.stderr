@@ -1,0 +1,5 @@
+error: an SSE route handler is `fn notes(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError>` — one argument per :param in "/notes" (path order), then `ctx`, then `cursor` (with `cap: &CrossTenant` between the :params and `ctx` on a `cross_tenant` route)
+  --> tests/compile_fail/sse_route_takes_no_extra_argument.rs:15:1
+   |
+15 | fn notes(
+   | ^^

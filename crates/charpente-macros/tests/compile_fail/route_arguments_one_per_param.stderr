@@ -1,0 +1,5 @@
+error: `note_revision` takes 1 argument(s) after `tx` (excluding `ctx`) but the path "/notes/:id/:rev" has 2 :param(s) — write one argument per :param (same name, path order) plus at most one JSON body argument
+  --> tests/compile_fail/route_arguments_one_per_param.rs:14:1
+   |
+14 | fn note_revision(
+   | ^^
