@@ -3082,6 +3082,25 @@ When a check fails, its first failure is shrunk to smaller draws that still
 fail it, and the failure block lists them by name on its `inputs:` line
 ("Shrinking a failure" below).
 
+A loop's length decides how well it shrinks. When the length is a drawn count
+(`let n = i.between("notes", 1, 4);` and then `n` items, the shape of the
+scaffold's `tests/sim.rs` and `drawn_inputs.rs`), deleting one item leaves the
+count stale: the loop reads the next item's draws in its place, the draws after
+the loop shift, and the run usually passes, while lowering the count alone
+drops the last item instead. So the shrink can keep items a smaller count would
+drop. The failure still replays and is still the failure it was, but the shrunk
+run may not be minimal. When the items after the first matter to a failure (a
+later item, or a draw after the loop, depends on them), draw a "one more?"
+choice before each item instead, so that deleting an item deletes exactly its
+draws:
+
+```text
+let mut qtys = Vec::new();
+while qtys.len() < 6 && *i.pick("more", &[false, true]) {  // shrinks toward stopping
+    qtys.push(i.between("qty", 1, 500));
+}
+```
+
 A batch counts, on each check's line, how many distinct inputs its tested runs
 drew: two runs that drew the same values, under the same names and in the same
 order, count once.
@@ -4805,7 +4824,8 @@ keeps nothing:
    choices: an item drawn as a template, an acquirer and a target comes out
    in one step, where a cut that is not a whole item shifts every later draw
    and the run usually passes. So give the draws that make up an item the
-   same names each time, as a loop does;
+   same names each time, as a loop does, and end the loop on a drawn "more"
+   rather than a drawn count ("Drawing inputs" above);
 2. set each choice to 0;
 3. search each choice down toward 0 (galloping up from 1, then bisecting), so a
    small value that fails is found even when the values between it and the
