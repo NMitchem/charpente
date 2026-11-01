@@ -26,8 +26,11 @@
 //! exactly that (0.4.0 docs-only build review I2). A site is a mint call whose
 //! subject argument names the handler's body argument (any argument but `tx`,
 //! `ctx` and the route's `:params`), directly or through a `let` bound from
-//! it. Still missed: a mint in a helper the handler calls, and a binding made
-//! by a `match` arm or a closure.
+//! it. Still missed: a mint in a helper the handler calls, a binding made by a
+//! `match` arm, a `for` pattern or a plain assignment, and a UFCS call
+//! (`Ctx::create_session(ctx, tx, …)`, whose subject is the third argument).
+//! Over-flagged: a subject read back from a row built from the body, even when
+//! the row's id is fresh, so a signup binds its new id first and mints for that.
 
 // Walking the repo's sources is build tooling outside the deterministic
 // boundary, the same sanctioned-edge pattern as tests/hook_census.rs.
@@ -420,7 +423,8 @@ fn no_example_template_or_guide_block_mints_for_a_subject_the_body_names() {
          fix: make the route `auth` and mint for the caller's own subject, \
          `ctx.principal().expect(\"auth route\").subject().to_string()`, as GUIDE §5's `login` \
          does; a first credential comes from something the app trusts, such as an IdP or a \
-         signup route that mints for a subject it has just created.",
+         signup route that mints for a subject it has just created (bind the new id first \
+         and mint for it: a subject read back from a row built from the body is flagged).",
         sites.len(),
         sites.join("\n  "),
     );

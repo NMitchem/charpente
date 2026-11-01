@@ -3,7 +3,7 @@
 //! of a plain struct has no wire impl. This pins `Row`'s own
 //! `on_unimplemented` text firing from a route's path param, the position the
 //! 0.4.0 docs-only build hit (`Id<Patron>`, review I1): the error must name
-//! both fixes, `#[table]` on the type or a `WireU64` carrier.
+//! `#[table]` on the type, or a `String` path param (`WireU64` is not `FromParam`).
 use charpente::route;
 
 struct NotATable;

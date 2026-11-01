@@ -527,3 +527,37 @@ fn an_unmarked_text_block_is_not_pinned() {
     );
     assert_eq!(pinned[0].lines, vec![(4, "marked line".to_string())]);
 }
+
+/// GUIDE §8's `--faults-off` bullet names the axes by hand. The refusal lists them from
+/// `FAULT_AXES`, which charpente-sim pins to `FaultConfig`'s fields, so this pins GUIDE's copy to
+/// those same fields: a new axis cannot leave the list stale with every gate green.
+#[test]
+fn guides_faults_off_axes_are_fault_configs_fields() {
+    let fields: Vec<String> = format!("{:?}", charpente_sim::FaultConfig::default())
+        .split(&['{', '}', ',', ' '][..])
+        .filter(|t| t.ends_with(':'))
+        .map(|t| t.trim_end_matches(':').to_string())
+        .filter(|f| f != "corruption_scope")
+        .collect();
+    let guide = fs::read_to_string(repo().join("docs/GUIDE.md")).expect("docs/GUIDE.md");
+    let bullet = guide
+        .split("- `--faults-off AXIS,…`")
+        .nth(1)
+        .expect("docs/GUIDE.md has the `--faults-off AXIS,…` bullet");
+    let list = bullet
+        .split("The axes are ")
+        .nth(1)
+        .and_then(|rest| rest.split("`. ").next())
+        .expect("the `--faults-off` bullet says \"The axes are …\"");
+    let listed: Vec<String> = list
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        listed, fields,
+        "docs/GUIDE.md's `--faults-off` bullet must list every FaultConfig axis, in field \
+         order: add or remove the names that differ"
+    );
+}
