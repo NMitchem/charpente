@@ -135,7 +135,7 @@ crates.io as `0.1.0`, and a stranger given only this README installed it, scaffo
 and reached a red sim with a seed that replays
 ([docs/experiments/2026-10-launch-run](docs/experiments/2026-10-launch-run/)).
 [CHANGELOG.md](CHANGELOG.md) records every release since, and dates each one after its
-crates are on crates.io (the newest dated section was `0.3.0` when this line was written).
+crates are on crates.io (the newest dated section was `0.4.0` when this line was written).
 A third docs-only agent build passed review with zero Criticals the platform should have
 caught. Every number in this file is measured or gone. The first two of
 M2's sub-projects — an honest benchmark harness and primary-side group commit — have their

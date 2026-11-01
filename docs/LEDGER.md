@@ -9696,3 +9696,22 @@ tallied from these tables.
   - date CHANGELOG's 0.4.0 heading;
   - turn PLAN's "In progress: 0.4.0" into shipped;
   - close out 0.3.0's publish in this ledger with the date and the CI run ids.
+
+## 2026-11-01 — 0.4.0 published to crates.io
+
+- **The publish.** Noah ran `scripts/publish.sh --for-real` at `535bcbb9`, the pushed tip (`7113e8f3..535bcbb9`, 73 commits). Its full-verify packaging built all six crates, and `charpente-core`, `charpente-macros`, `charpente`, `charpente-sim`, `charpente-tsgen` and `charpente-cli` 0.4.0 are on crates.io.
+- **The registry smoke (exit criterion 9).** It ran with rustc 1.99.0, in an empty directory with no cargo config, so every crate came from crates.io (`Cargo.lock`: `registry+https://github.com/rust-lang/crates.io-index` throughout).
+  - `cargo install charpente-cli --version 0.4.0 --locked` exits 0.
+  - `charpente --version` prints `charpente 0.4.0`.
+  - `charpente new smokeapp` writes `charpente = "0.4"` and `charpente-sim = "0.4"`.
+  - `cargo clippy --all-targets -- -D warnings` exits 0.
+  - `charpente test --sim` exits 0: `sim result: ok. 3 passed; 0 failed`, tested 205, 254 and 210 of 256, master `0x1385748f621e0098`.
+- **Records.**
+  - CHANGELOG's heading is dated `0.4.0 (2026-11-01)`.
+  - PLAN reads "Shipped 2026-11-01: 0.4.0".
+  - README names `0.4.0` as the newest dated section.
+- **CI.** `ci.yml` run `41331921799` on `535bcbb9` was in progress at the publish. The first nightly `edge-harness.yml` on it is due 2026-11-02. Each gets a one-line follow-up here.
+- **0.3.0's close-out**, owed since its entry:
+  - `ci.yml` run `40504042875` on its pushed tip `7113e8f3`: success (2026-10-27);
+  - the first nightly `edge-harness.yml` on that tip, run `40509742277`: success (2026-10-27), and every nightly since on it is green through `41315211563` (2026-11-01).
+- **Found by the smoke.** `charpente new`'s usage line still says the scaffold has "two sim properties" (`crates/charpente-cli/src/new.rs:11`), but 0.4.0's scaffold writes three: `29b900bd` added the per-note ack check. The text ships in 0.4.0's binary, and the fix goes on main for the next release, with a pin that counts the template's checks.
