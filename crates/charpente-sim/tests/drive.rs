@@ -6,6 +6,7 @@
 //! renames the universe fails on that assertion instead of passing on
 //! another case.
 
+use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -550,4 +551,87 @@ fn recover_refuses_a_phase_without_one_answer_per_request() {
         answers: vec![None],
     };
     let _ = drive.recover(&phase, Duration::from_secs(1));
+}
+
+/// The tail's three ways not to boot, each with its own text. No faults run:
+/// each failure is the build's doing, so no seed is needed to show it, and
+/// the drive sends one request through a hand-built phase.
+#[test]
+fn a_tail_that_cannot_boot_says_so() {
+    let send_one = || Phase {
+        requests: vec![post(1)],
+        answers: vec![None],
+    };
+
+    // Every boot meets fault fallout: each one arms a crash on its first disk
+    // op, so all eight crash and nothing gives the run up.
+    let sim = Sim::with_faults(0xD7_7000, FaultConfig::none());
+    let boots = Cell::new(0u32);
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        boots.set(boots.get() + 1);
+        sim.crash_disk_after(0);
+        notes(sim)
+    });
+    let err = drive
+        .recover(&send_one(), Duration::from_secs(1))
+        .err()
+        .expect("eight boots lost to fallout");
+    assert_eq!(err, "the fault-free tail could not boot");
+    assert_eq!(boots.get(), 8);
+    assert_eq!(sim.coverage().get("boot:exhausted").copied(), Some(1));
+    assert_eq!(sim.gave_up(), None);
+
+    // The app opens, and the kernel cannot be built: a crash on the kernel's
+    // first disk op (offset 0 of the search in the next test).
+    let sim = Sim::with_faults(0xD7_7000, FaultConfig::none());
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        let app = notes(sim)?;
+        sim.crash_disk_after(0);
+        Ok(app)
+    });
+    let err = drive
+        .recover(&send_one(), Duration::from_secs(1))
+        .err()
+        .expect("the kernel cannot be built");
+    assert_eq!(
+        err,
+        "the fault-free tail could not boot: simulated crash: the disk is gone until Sim::restart()"
+    );
+
+    // The build fails with an error of its own, not fault fallout.
+    let sim = Sim::with_faults(0xD7_7000, FaultConfig::none());
+    let drive = Drive::new(&sim, |_: &Sim| Err(io::Error::other("the schema moved")));
+    let err = drive
+        .recover(&send_one(), Duration::from_secs(1))
+        .err()
+        .expect("the build fails");
+    assert_eq!(err, "the fault-free tail could not boot: the schema moved");
+}
+
+#[test]
+fn a_tail_kernel_stop_is_reported_in_the_kernels_words() {
+    // No faults. The build arms a crash two disk ops after the tail's App
+    // opens: a search of offsets 0..40 put 0 and 1 in the kernel's build, 2 to
+    // 4 in the re-sent request's commit (the engine poisons and the kernel
+    // stops, as here), and 29 on past the run.
+    let sim = Sim::with_faults(0xD7_7000, FaultConfig::none());
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        let app = notes(sim)?;
+        sim.crash_disk_after(2);
+        Ok(app)
+    });
+    let phase = Phase {
+        requests: vec![post(1), post(2)],
+        answers: vec![None, None],
+    };
+    let err = drive
+        .recover(&phase, Duration::from_secs(1))
+        .err()
+        .expect("the tail's kernel stops");
+    assert_eq!(
+        err,
+        "the fault-free tail's kernel stopped: kernel stopped: the engine is poisoned (a \
+         request-path IO failure made durability unknowable) — the request received its 500; \
+         restart the process to recover from the WAL"
+    );
 }
