@@ -5062,7 +5062,9 @@ empty, and a `--seed` replay ignores both: it runs its one seed.
 `CHARPENTE_SIM_MASTER_SEED=0x…` is the batch's master seed when
 `--master-seed` is not given (the flag wins), so every test binary a run
 starts judges the same runs. `CHARPENTE_SIM_FIRST_RUNS=N`, a number of 1 or
-more, makes the batch a quick pass. It derives every check's seeds for the
+more, makes the batch a quick pass when N is below `--runs`; at or above it,
+every seed runs, and the batch is a full one, judged as one, with no
+quick-pass line. A quick pass derives every check's seeds for the
 full `--runs` count, as a full batch does, and runs only the first N of each,
 so its runs are a prefix of the full batch's for every check; `--runs N`
 would give every check after the first other seeds. A quick pass judges

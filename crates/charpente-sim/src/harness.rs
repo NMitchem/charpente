@@ -75,8 +75,9 @@ pub struct HarnessArgs {
     /// green and a shrink would spend its timeout.
     pub no_shrink: bool,
     /// A quick pass: run only the first `n` of each check's `runs` seeds,
-    /// derived for the full count, and judge failed runs only. No flag sets
-    /// it: `sim_tests!` reads [`FIRST_RUNS_ENV`].
+    /// derived for the full count, and judge failed runs only. An `n` of
+    /// `runs` or more runs every seed, so that batch is a full one, judged as
+    /// one. No flag sets it: `sim_tests!` reads [`FIRST_RUNS_ENV`].
     pub first_runs: Option<u64>,
 }
 
@@ -394,8 +395,12 @@ const SHRINK_BUDGET: u32 = 500;
 /// of 8, 4, 2 or 1 removes whole at every position: a partial cut shifts
 /// every later draw, and the run passes
 /// (`a_record_of_three_draws_is_deleted_whole`). An item of one choice is a
-/// chunk of 1, so items cost a replay only where they are longer, and a run
-/// whose repeated draws are one choice each shrinks exactly as before. Two
+/// chunk of 1, so items cost a replay only where they are longer. A run in
+/// which each draw's next draw of the same name follows it directly, a draw
+/// of one choice, shrinks exactly as before; one with an item of two or more
+/// choices can spend another number of replays, even when each of its draws
+/// is one choice (merge-fixture's lab and amount, one more replay for master
+/// 0xe27fde2a57487fee). Two
 /// other ways were tried and refused. Every chunk length from 8 to 1 cut the
 /// items too, but over dozens of choices it spent the budget the later passes
 /// needed, as the pairs run early did, and four of the tests named above went
@@ -1261,8 +1266,10 @@ fn run_batch(
     jobs: usize,
     shrinks: bool,
 ) -> Batch {
-    // A quick pass runs the first `ran` of each check's `runs`.
-    let ran = first_runs.map_or(runs, |n| n.min(runs));
+    // A quick pass runs the first `ran` of each check's `runs`. A count of
+    // `runs` or more runs them all, so that batch is a full one, judged as one.
+    let quick = first_runs.filter(|&n| n < runs);
+    let ran = quick.unwrap_or(runs);
     // DESIGN §7: the master seed is printed at startup, before any run starts
     // — a failing batch from OS entropy must still reveal the seed that would
     // replay it. stderr, so `--format json`'s stdout stays pure JSON.
@@ -1335,7 +1342,7 @@ fn run_batch(
         checks.push(check.into_extras());
         merge(&mut report.coverage, &covered);
         // A quick pass leaves `require` to the full count.
-        let required: &[&str] = match first_runs {
+        let required: &[&str] = match quick {
             None => test.require,
             Some(_) => &[],
         };
@@ -1367,7 +1374,7 @@ fn run_batch(
         checks,
         rerun: None,
         replay: None,
-        full_runs: first_runs.map(|_| runs),
+        full_runs: quick.map(|_| runs),
     }
 }
 
@@ -4636,6 +4643,65 @@ mod tests {
         assert_eq!(replays, 3505, "the replays the 105 shrinks spent in all");
     }
 
+    /// Draws three items of three draws each, `p`, `q` and `r` in 0..=9, and
+    /// fails when the first item's `p` is 1 and some item is (2, 2, 2).
+    fn a_one_first_and_a_two_two_two(sim: &mut Sim) -> Result<(), String> {
+        let input = sim.input();
+        let items: Vec<(u64, u64, u64)> = (0..3)
+            .map(|_| {
+                (
+                    input.between("p", 0, 9),
+                    input.between("q", 0, 9),
+                    input.between("r", 0, 9),
+                )
+            })
+            .collect();
+        match items[0].0 == 1 && items.contains(&(2, 2, 2)) {
+            true => Err("the first p is 1 and an item is (2, 2, 2)".into()),
+            false => Ok(()),
+        }
+    }
+
+    /// After a kept item, the item that now sits where it was cut is tried
+    /// at once. From 1, 1, 1, 3, 3, 3, 2, 2, 2, no chunk of 8, 4, 2 or 1
+    /// keeps, and the items pass deletes the (3, 3, 3), which fails. The
+    /// (2, 2, 2) has moved into its place, and the retry tries deleting it
+    /// too, which passes: a replay that moving on to the draw before would
+    /// not spend. The shrunk run is the same either way, so the retried
+    /// candidate and the replay count are what pin it. Seed 0x1 is
+    /// arbitrary: the check reads no fault, so any seed shows it.
+    #[test]
+    fn a_kept_item_is_tried_again_where_it_was_cut() {
+        const SEED: u64 = 0x1;
+        let test = sim_test(
+            "a_one_first_and_a_two_two_two",
+            a_one_first_and_a_two_two_two,
+        );
+        let replayed = [1, 1, 1, 3, 3, 3, 2, 2, 2];
+        let first = run_app_universe(SEED, Some(&replayed), &[], &test.run).unwrap_err();
+        let mut s = Shrinker::new(&test, SEED, &first);
+        s.delete_chunks();
+        assert_eq!(s.best.choices, replayed, "no chunk keeps");
+        s.delete_items();
+        assert_eq!(
+            s.best.choices,
+            [1, 1, 1, 2, 2, 2],
+            "the (3, 3, 3) is deleted"
+        );
+        assert!(
+            s.tried.contains(&(vec![1, 1, 1], Vec::new())),
+            "the (2, 2, 2) that moved into its place is tried: {:?}",
+            s.tried
+        );
+        let shrunk = shrink(&test, SEED, &first);
+        assert_eq!(
+            (shrunk.choices.as_slice(), shrunk.replays),
+            (&[1, 0, 0, 2, 2, 2][..], 66),
+            "the same run as without the retry, which spends 65 replays; faults off {:?}",
+            shrunk.faults_off
+        );
+    }
+
     /// The control: an item of one draw already comes out whole, since chunks
     /// of 1 are deleted. Items of one choice are left to those chunks, so its
     /// shrinks spend exactly the replays they spent before items were deleted
@@ -5358,10 +5424,44 @@ mod tests {
             failed_seeds(&quick, "second"),
             "non-vacuous: --runs 5 gives the second check other seeds"
         );
-        // A count past the full one runs the full one.
-        let over = run_batch(&checks, 0x1234, 16, Some(40), 4, false);
-        assert_eq!(over.report.universes, 16);
-        assert_eq!(failed_seeds(&over, "second"), failed_seeds(&full, "second"));
+        // A count of the full one or more runs every seed: a full batch.
+        for first in [16, 40] {
+            let over = run_batch(&checks, 0x1234, 16, Some(first), 4, false);
+            assert_eq!((over.report.universes, over.full_runs), (16, None));
+            assert_eq!(failed_seeds(&over, "second"), failed_seeds(&full, "second"));
+        }
+    }
+
+    /// A count of `--runs` or more runs every seed, so the batch is a full
+    /// one and is judged as one: an unmet `require` and an untested check
+    /// fail it, and it prints no quick-pass line. Its report is the full
+    /// batch's, byte for byte, in both formats, its rerun line included.
+    #[test]
+    fn a_first_runs_count_of_the_runs_or_more_is_a_full_batch() {
+        let tests = [
+            SimTest {
+                name: "unmet",
+                run: covers_something_else,
+                require: &["never:happens"],
+            },
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        for format in ["human", "json"] {
+            let batch = |first_runs: Option<u64>| {
+                let flags = ["--runs", "8", "--master-seed", "0x1234", "--format", format];
+                let mut args = parse(&flags).unwrap();
+                args.first_runs = first_runs;
+                let mut out = Vec::new();
+                let code = run(&tests, &args, &mut out);
+                (code, String::from_utf8(out).unwrap())
+            };
+            let full = batch(None);
+            assert_eq!(full.0, 1, "{}", full.1);
+            for first in [8, 20] {
+                assert_eq!(batch(Some(first)), full, "{format}, a count of {first}");
+            }
+            assert!(!full.1.contains("quick pass"), "{}", full.1);
+        }
     }
 
     fn covers_something_else(sim: &mut Sim) -> Result<(), String> {
@@ -5410,6 +5510,23 @@ mod tests {
                 quick_pass_line(3, 8)
             )),
             "{out}"
+        );
+        // With every check untested it reads `nothing tested`, and exits 0.
+        let mut args = parse(&["--runs", "8", "--master-seed", "0x1234"]).unwrap();
+        args.first_runs = Some(3);
+        let mut only = Vec::new();
+        assert_eq!(run(&tests[1..], &args, &mut only), 0);
+        let only = String::from_utf8(only).unwrap();
+        assert!(
+            only.contains(
+                "\nsim result: nothing tested. 0 passed; 0 failed; 1 untested. Runs tested: 0 \
+                 of 3.\n"
+            ),
+            "{only}"
+        );
+        assert!(
+            only.ends_with(&format!("\n{}\n", quick_pass_line(3, 8))),
+            "{only}"
         );
         let (code, json) = batch(Some(3), "json");
         assert_eq!(code, 0, "{json}");
@@ -5531,6 +5648,17 @@ mod tests {
                 format!(
                     "CHARPENTE_SIM_FIRST_RUNS expects a number of runs, 1 or more, got \"{bad}\""
                 )
+            );
+        }
+        // A value that is not UTF-8 is refused by name.
+        #[cfg(unix)]
+        for var in [FIRST_RUNS_ENV, MASTER_SEED_ENV] {
+            use std::os::unix::ffi::OsStringExt;
+            let lookup =
+                |name: &str| (name == var).then(|| std::ffi::OsString::from_vec(vec![b'3', 0xff]));
+            assert_eq!(
+                parse(&[]).unwrap().with_env(lookup).unwrap_err(),
+                format!("{var} is not UTF-8: \"3\\xFF\"")
             );
         }
         // The variable that turns shrinking off reads as it always did.

@@ -2069,7 +2069,8 @@ Charpente treats the coding agent as the primary developer persona:
   [--faults-off AXIS,…] [--dir PATH]`
   builds the app's `sim` target via `cargo test --no-run` and execs it directly — build
   errors surface verbatim, the compiler is already the oracle. Batch model: one master
-  seed (OS entropy, printed at startup, or pinned via `--master-seed` for byte-identical
+  seed (OS entropy, printed at startup, or pinned via `--master-seed`, or
+  `CHARPENTE_SIM_MASTER_SEED` when the flag is absent, for byte-identical
   replay) derives per-run seeds in registry order; `--jobs`-many workers race over an
   index counter, so scheduling changes nothing about the seed sequence or report order.
   `--seed 0x…` replays exactly one run and skips `require` coverage checks (one
@@ -2090,7 +2091,14 @@ Charpente treats the coding agent as the primary developer persona:
   `CHARPENTE_SIM_NO_SHRINK`, which `charpente test --mutants` sets because a
   mutant needs only red or green, the blocks are unshrunk, each `shrunk:` line
   saying it was skipped and why, and the rerun command starts by setting the
-  variable. A failure message *is* a
+  variable. Under `CHARPENTE_SIM_FIRST_RUNS=N`, N below `--runs`, the batch is a
+  quick pass: it derives every check's seeds for the full count, runs the first N
+  of each (a prefix of the full batch's, for every check), and judges failed runs
+  only, exiting 1 for a failed run and for nothing else, since `require` and the
+  untested rule depend on the run count; its rerun command sets the variable,
+  and its last line says what it left to the full count. Both variables are read
+  in `sim_tests!` beside `CHARPENTE_SIM_NO_SHRINK`, and a `--seed` replay
+  ignores them. A failure message *is* a
   reproduction (`--seed 0x9f3a...`), so the agent's fix-verify cycle needs no flaky-test
   triage. `--format json` is the machine-readable surface and carries every fact the human report
   does: `runs` and run totals, `coverage`, `missing_coverage` (`{check, key}` pairs for
@@ -2098,7 +2106,8 @@ Charpente treats the coding agent as the primary developer persona:
   distinct_inputs, drew_inputs, skipped_reasons}` with every skipped reason and its first
   run's seed, every
   failure as `{check, seed, config, fired, message, inputs, faults_off, first_message,
-  not_shrunk, replays, repro}`, and last the batch's `result` and `exit` (GUIDE §8). Ships
+  not_shrunk, replays, repro}`, and last the batch's `result` and `exit`, then,
+  in a quick pass only, `quick_pass` (`{first_runs, full_runs}`) (GUIDE §8). Ships
   with the public
   checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/
   redb-latch fallout classifier, productized out of four hand-rolled internal copies; a
