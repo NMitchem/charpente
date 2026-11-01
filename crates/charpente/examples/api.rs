@@ -1113,8 +1113,8 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>, job: &JobRow) -> Result<
     )
     .map_err(|e| e.to_string())?;
     // A tail's boot, after `sim.quiesce_clock_faults()`: waits past the
-    // instant a clock refusal names and boots again; a third refusal gives
-    // the run up.
+    // instant a clock refusal names and boots again; a third refusal is an
+    // `Err` naming a platform clock defect, never a give-up.
     let _booted: Option<App> = wait_out_clock_refusal(sim, || {
         boot_through_fallout(sim, 8, is_fault_fallout, || sim_app(sim)).map_err(|e| e.to_string())
     })?;

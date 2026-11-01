@@ -540,7 +540,7 @@ fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
             assert!(stdout.contains(key), "seed {seed}: {key}\n{stdout}");
         }
         assert!(
-            !stdout.contains("outbound-fixture:gave-up:clock"),
+            !stdout.contains("platform clock defect"),
             "seed {seed}: the tail's wait did not open the node:\n{stdout}"
         );
     }

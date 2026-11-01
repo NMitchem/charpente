@@ -232,8 +232,10 @@ pub fn clock_reopens_after(text: &str) -> Option<WallTime> {
 /// (`Sim::restart_process`: a refused node exits, and its supervisor starts it
 /// again) and calls `boot` again. One wait is enough, since nothing moves the
 /// clock or the recorded time in between; it waits twice at most, and a third
-/// refusal gives the run up by name with the refusal as its detail and returns
-/// `Ok(None)`. Any other error comes back unchanged, the stall stop included:
+/// refusal is an `Err` naming a platform clock defect, with the refusal last.
+/// It never gives that run up: no injected fault explains a third refusal,
+/// and a skip would hide the defect. Any other error comes back unchanged,
+/// the stall stop included:
 /// it names no instant, because no wait fixes a clock that stopped advancing.
 /// Call it after `Sim::quiesce_clock_faults`, which freezes the clock's offset
 /// so it reaches the instant as virtual time passes.
@@ -252,8 +254,12 @@ pub fn wait_out_clock_refusal<T>(
             return Err(refusal);
         };
         if waits == 2 {
-            sim.give_up("the tail was refused after two waits", refusal);
-            return Ok(None);
+            return Err(format!(
+                "the boot was refused for the clock a third time, after two waits past the \
+                 instant each refusal named. One wait always suffices, since nothing moves the \
+                 clock or the recorded time in between, so this is a platform clock defect, not \
+                 the app's: report it with this run's seed. The third refusal: {refusal}"
+            ));
         }
         waits += 1;
         let wait = at.as_nanos().saturating_sub(sim.clock().wall().as_nanos()) + 1_000_000_000;
@@ -1013,8 +1019,8 @@ mod tests {
 
     /// Each outcome, with what it leaves on the run: a clock refusal this run's
     /// faults explain is waited out (one second past its instant, then one
-    /// process restart) and booted again; a third refusal gives up by name with
-    /// the refusal as the detail; and anything else, the stall stop or a
+    /// process restart) and booted again; a third refusal fails, naming a
+    /// platform clock defect, and gives nothing up; and anything else, the stall stop or a
     /// refusal no clock fault explains included, comes back at once, with no
     /// wait and no restart.
     #[test]
@@ -1080,17 +1086,22 @@ mod tests {
             Err(refused_until(&sim, 5_000_000_000))
         });
         assert_eq!(
-            (booted, boots, restarts(&sim)),
-            (Ok(None), 3, 3),
+            (boots, restarts(&sim)),
+            (3, 3),
             "three refusals: two waits, each with its restart, and no third"
         );
-        assert_eq!(sim.gave_up(), Some("the tail was refused after two waits"));
+        let defect = "the boot was refused for the clock a third time, after two waits past the \
+                      instant each refusal named. One wait always suffices, since nothing moves \
+                      the clock or the recorded time in between, so this is a platform clock \
+                      defect, not the app's: report it with this run's seed. The third refusal: \
+                      ";
+        let err = booted.expect_err("a third refusal fails the run");
         assert!(
-            sim.gave_up_detail()
-                .is_some_and(|d| d.starts_with("refusing to open: ")),
-            "the detail is the last refusal: {:?}",
-            sim.gave_up_detail()
+            err.strip_prefix(defect)
+                .is_some_and(|refusal| refusal.starts_with("refusing to open: ")),
+            "the text names the defect, then the last refusal: {err}"
         );
+        assert_eq!(sim.gave_up(), None, "a platform defect is never a give-up");
 
         let stall = "clock stalled: this node's wall clock has not advanced past \
                      2026-01-01T00:01:40.000Z, the latest time it already used, for 61s of \

@@ -3382,9 +3382,10 @@ the run:
 
 - `the fault-free tail could not boot`: every boot met fault fallout, and
   nothing gave the run up.
-- `the fault-free tail could not boot: its open was refused for the clock a
-  third time, after two waits past the instant each refusal named. …, so
-  this is a platform clock defect, not the app's: <refusal>`. One wait always
+- `the boot was refused for the clock a third time, after two waits past the
+  instant each refusal named. …, so this is a platform clock defect, not the
+  app's: report it with this run's seed. The third refusal: the fault-free tail
+  could not boot: <refusal>`, from `wait_out_clock_refusal`. One wait always
   suffices, so a refusal that outlasts two is a charpente defect, and the run
   fails on it rather than hiding it as a skip.
 - `the fault-free tail could not boot: <error>`: a boot, or the kernel's
@@ -3456,10 +3457,10 @@ names as virtual time passes. `clock_reopens_after(text)` (below) reads that
 instant. Sleep a little past it (`sim.clock().sleep(…)`), restart the process (a
 refused node exits, and its supervisor starts it again), and boot again. One
 wait is enough, since nothing moves the clock or the recorded time in between.
-Bound the loop anyway, and give the run up by name once the bound is spent.
-`wait_out_clock_refusal(sim, boot)` (below) is that loop, and `Drive::recover`
-runs it around the tail's boot and fails the run where the loop's bound is
-spent, since one wait always suffices.
+Bound the loop anyway, and fail the run by name once the bound is spent: no
+injected fault explains a refusal one wait did not clear, so it is a platform
+defect, and a skip would hide it. `wait_out_clock_refusal(sim, boot)` (below)
+is that loop, and `Drive::recover` runs it around the tail's boot.
 
 ### Restarting the process, not the machine
 
@@ -3646,12 +3647,13 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   text otherwise) and returns what it returns, unless the error is a clock stop
   or refusal that `clock_fallout` excuses and that names an instant. Then it
   sleeps one second past that instant, restarts the process, and calls `boot`
-  again, twice at most: a third refusal gives the run up as `the tail was
-  refused after two waits`, with the refusal as its detail. Any other error,
-  the stall stop included, comes back unchanged. Call it after
-  `sim.quiesce_clock_faults()`; `Drive::recover` runs it around the tail's
-  boot, and fails the run on a third refusal instead of giving it up, so only
-  a workload below the helper calls it.
+  again, twice at most: a third refusal is an `Err` that fails the run, `the
+  boot was refused for the clock a third time, … a platform clock defect, not
+  the app's: report it with this run's seed. The third refusal: <refusal>`,
+  and never a give-up. Any other error, the stall stop included, comes back
+  unchanged. Call it after `sim.quiesce_clock_faults()`; `Drive::recover`
+  runs it around the tail's boot, so only a workload below the helper calls
+  it.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable

@@ -39,7 +39,7 @@ const ROUNDS: u32 = 3;
 
 /// How many refused opens the fault-free tail waits out. With the clock's
 /// faults ended, one wait reaches the instant the refusal names; the refusal
-/// after the last of these waits, a bug, ends the universe by name.
+/// after the last of these waits is a platform bug, and fails the run by name.
 const CLOCK_WAITS: u32 = 2;
 
 /// Fault fallout here: the families an error's text alone excuses, and the
@@ -176,12 +176,12 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
             _ => return Err(format!("the fault-free tail's kernel stopped: {e}")),
         };
         if waits == CLOCK_WAITS {
-            return gave_up(
-                sim,
-                "outbound-fixture:gave-up:clock",
-                "the fault-free tail was still refused after waiting out every refusal it allows",
-                format!("refused {} times, the last after waiting: {e}", waits + 1),
-            );
+            return Err(format!(
+                "the fault-free tail was refused for the clock {} times, the last after {waits} \
+                 waits past the instant each refusal named. One wait always suffices, so this is \
+                 a platform clock defect, not the app's: {e}",
+                waits + 1
+            ));
         }
         waits += 1;
         sim.cover("outbound-fixture:waited-out-clock");

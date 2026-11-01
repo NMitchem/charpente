@@ -552,10 +552,11 @@ fn a_tail_the_clock_keeps_refusing_fails_the_run() {
         (3, Some(2)),
         "three refusals: two waits, each with its restart, and no third"
     );
-    let defect = "the fault-free tail could not boot: its open was refused for the clock a \
-                  third time, after two waits past the instant each refusal named. One wait \
-                  always suffices, since nothing moves the clock or the recorded time in \
-                  between, so this is a platform clock defect, not the app's: ";
+    let defect = "the boot was refused for the clock a third time, after two waits past the \
+                  instant each refusal named. One wait always suffices, since nothing moves the \
+                  clock or the recorded time in between, so this is a platform clock defect, \
+                  not the app's: report it with this run's seed. The third refusal: the \
+                  fault-free tail could not boot: ";
     let refusal = err
         .strip_prefix(defect)
         .unwrap_or_else(|| panic!("the text names the defect: {err}"));
