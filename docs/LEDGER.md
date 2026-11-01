@@ -9127,3 +9127,523 @@ README:133's sentence updated for the publish. GUIDE §1 already reads `charpent
 which crates.io cannot resolve until 0.3.0 is published. Then `ci.yml` on the pushed tip and
 the next nightly `edge-harness.yml` run (criterion 6's other halves), each recorded here in a
 one-line follow-up with its run id.
+
+## 2026-11-01 — 0.4.0 built: a spent App that does not compile, an untested check that fails, one recovery helper, typed event reads, item-shaped shrinking, a mutation run that fits a session, the API on one page
+
+**Why.** Three outside agents built on 0.3.0 and reported back (relayed by Noah, 2026-10-28
+and 2026-10-29): a commitment ledger (A), a newswire merge rebuilt on drawn inputs (B), and
+an agent runtime with tenants and outbound model calls (C). No guarantee broke. Deleting
+`tx.enqueue` or `tx.emit` went red, B's latest-wins mutant failed 230 of 994 drawn runs, and
+every printed repro replayed. What hurt was writing the checks, not the app:
+- a second kernel on a spent App ran no jobs or cron and named the wrong fix. The statuspage
+  build had reported this on 2026-09-21, and it came back because testimony got no disposition;
+- a check that tested nothing passed the batch, which was 0.3.0's own anti-goal;
+- every app pasted the same recovery code from the examples, and the hand-written copies
+  skipped most runs;
+- events were decoded by hand from `EventRow`;
+- a record of several draws shrank one draw at a time and stopped above its minimum;
+- a mutation run did not fit a working session.
+
+Noah's framing: agents are the main users of this product, so what they hit outranks anyone's
+list of big items. 0.4.0's theme is the oracle as hard to get wrong as the app.
+
+Spec `docs/superpowers/specs/2026-10-28-0.4.0-design.md` (`437f1e76`), amended once in
+execution (`064a0794`: a quick pass is the exit-code rule's second exception, as §4 E already
+described). Plan `docs/superpowers/plans/2026-10-28-0.4.0.md` (`49bc5eea`): Tasks 0–19,
+executed subagent-driven, under Noah's "We can skip the questions. You know exactly what the
+users of the product said". Tasks 7–8 and 11–13 ran as two lanes, the second in the worktree
+`../charpente-laneb`, and Tasks 16 and 14 also ran there. The Task 17 mutation work and the
+final fix wave ran in `../charpente-mut`. Each lane was cherry-picked or fast-forwarded onto
+`main` after its own gate, so every sha below is `main`'s. The workspace
+`.superpowers/sdd/2026-10-28-0.4.0/` is gitignored, so it is absent from a fresh clone. Its
+`progress.md` holds every ruling with its reason and its cost if wrong, and every report and
+log named below is in that directory.
+
+**Shipped.** Fifty-eight commits, `7113e8f3..8511ca04`, all on `main` and none pushed; this
+entry is the next. Each task closed on an approving review after at most one fix round
+(progress.md's `Task N: complete` lines).
+- **Spec and plan** `437f1e76`, `49bc5eea`, and the amendment `064a0794`.
+- **T0** `fe5b519d`, `bf255375`: CHANGELOG opens 0.4.0 and dates 0.3.0 released 2026-10-27,
+  from the registry's `created_at`. Oracle 3's baselines are recorded at `fe5b519d` and shown
+  able to fail. The base gate ran at `49bc5eea`.
+- **T1** `2d5fbc22`, `8b46de6c`: `into_app` is gone, so a second kernel on a spent App does
+  not compile (a trybuild pin). `Kernel::run` feeds a job enqueued between two runs to the heap
+  before its first step (a ruled behaviour fix beyond A.1, pinned by the reviewer's cron-off
+  probe).
+- **T2** `ceb7fb97`: the mutants verb refuses a relative dev-dependency path that points
+  outside the copied tree, before cargo-mutants' baseline fails with the wrong message.
+- **T3** `9639f2c4`: the human failure block drops the `FaultConfig` dump (JSON keeps it) and
+  labels the unshrunk message `before shrinking:`.
+- **T4** `3f1bf64d`: a route handler mounts from any module of its crate.
+- **T5** `fca473d3`: a re-issued effect is a new job with a new key, and the modelled-remote
+  example says the remote's side is not exactly-once.
+- **T6** `da4173ce`, `dc8b9d4b`: a check that tested nothing fails the batch, and so does a
+  platform test in which every universe gave up (named step N2). CHANGELOG lists both breaks.
+- **T7** `9a6f3f09`: `charpente-sim` depends on `charpente`, for `drive`. `charpente`'s
+  dev-dependency back is path-only, as `charpente-macros`' is. `Request` is `Clone`, and
+  `SimSource::answers` gives one slot per request, `None` until answered.
+- **T8** `4f9c8b6a`, `3ea575ee`, `2b1295b1`: `checks::events::<E>` and `events_scoped::<E>`
+  read the durable event log as the app's own types, every page of it. They refuse a row of
+  another shape or with bytes left over by name, with the fix.
+- **T9** `8624cc34`, `bbe32ba6`, `4e056849`: `charpente_sim::drive`, which is the faulted
+  phase, then the fault-free tail, then the re-sends. It applies one behaviour per step, and
+  its three failure texts are pinned.
+- **T10** `799bafcc`, `c14b1b6e`, `f080c3ea`: the three examples and the scaffold run on
+  `drive`, and `driver_census` holds that no shipped example drives recovery by hand (named
+  step N3). The tail's re-send found a real double charge and an exactly-once failure, so
+  re-sent routes refuse a reused id with another body by name. GUIDE's bold rule: "A route the
+  tail re-sends must be safe to receive twice".
+- **T11** `c7d7ee62`: the shrinker deletes whole items, meaning the choices from one draw to
+  the next draw of the same name (named step N4).
+- **T12** `1834ea93`, `7a512662`, `f06a20e6`:
+  - `CHARPENTE_SIM_FIRST_RUNS` runs the first n of each check's full seeds and judges failed
+    runs only;
+  - `CHARPENTE_SIM_MASTER_SEED` pins a batch;
+  - `doc_truth`'s pinned floor goes 51 → 52.
+- **T13** `9f4cfe82`, `cf13a7a4`, `dad0b150`, `70e92134`: the two-pass mutants verb.
+  - It judges every mutant on the first 32 runs, then only the survivors at the full count,
+    on one printed master seed.
+  - Each pass's timeout and every new line are pinned.
+  - `the_quick_pass_matches_a_single_full_pass_mutant_by_mutant` proves the verdicts equal.
+  - Floor 52 → 53.
+- **T14** `301d13d2`, `fe10fa22`, `76b0ce6b`, `565089cc`: `examples/api.rs`, the API on one
+  page, compiled, with every line commented, and held by `api_census` (52 scan rows; attribute
+  words read from the macro parsers).
+- **T15**: the testimony census (below), read-only, at `da4173ce`.
+- **T16** `6b9335b1`, `d3980e9e`, `6a3d6cae`, `b3a903d5`, `2634efec`, `80a67c63`:
+  - the SSE route alias (SP-26);
+  - Task 6's parked minors;
+  - version 0.4.0, README, PLAN's v1.x rows from the spec and the census, and the testimony
+    rule in PLAN's docs-only bar;
+  - CLAUDE.md's crates.io and CHANGELOG-dating lines.
+- **T18's brief** `7e496abf`: `docs/experiments/2026-10-0.4.0-docs-only/BRIEF.md`, written
+  before the run: a library hold queue.
+- **T17 mutation follow-up**:
+  - `3d517729`, `fd20d2ae`, `841a1509`, `af2b6832`, `9570a582`: 11 survivors caught, plus
+    `SimReply::stream`'s answer pinned;
+  - `8c3a6893`, `488db73a`, `7312e83f`: the two-pass `merge` defect refused, and 13 more
+    survivors caught.
+- **Final fix wave** `deb31714`, `29b900bd`, `9942c68d`, `cc86c70a`, `8f2d209f`, `9b0fd673`, `800f1170`, `8511ca04`: the final review's I1 and M1–M6 (below), `Kernel::step`'s doc on the between-run drain, and a GUIDE reflow.
+
+**What the reviews found.** Every task got a review that wrote to a file before it returned. Opus reviewed the core work, and sonnet did the small diffs and the re-reviews.
+- **Approved as they stood:**
+  - T2: opus, 0/0/5;
+  - T3: sonnet, 0/0/3;
+  - T4: sonnet, 0/0/3;
+  - T5: sonnet, 0/0/2;
+  - T9: opus, 0/0/8. The reviewer re-ran drive 11/11.
+- **T6** (opus): Spec ✅, 0/1/5. Its one Important was plan-mandated: an exit-code change belongs under `### Breaking changes`, not `### Changed`, and the ruling took the break heading.
+- **Approved after one fix round:**
+  - **T1** (opus): 0/1/4. The Important was the between-run enqueue that `Kernel::run` now feeds to the heap.
+  - **T7–T8** (opus): T7 approved, T8 Spec ❌ on one item, 0/1/8. The missed item was refusing bytes left over after a row decodes. The re-review approved with two leftovers, and `2b1295b1` closed one: a whole page of skipped rows. The other, `events_scoped`'s `Tenant` bound, stays unpinned. The bound is itself the compile-time contract.
+  - **T11–T12** (opus): Spec ✅, 0/6/7. I1 was the item pass's retry after a keep, pinned red under its mutant.
+  - **T13** (opus): 0/2/9. The re-review's one ⚠️ was a load-sensitive timing assertion, which the controller fixed in `dad0b150` (the shim sleeps 5 s).
+  - **T10** (opus): 0/3/4. The reviewer reproduced the double-charge red in an isolated copy (key deleted 142/242 red, guard deleted 22/242 red).
+  - **T14** (opus): 0/2/11, with about 90 page comments checked against the code. The re-review sampled 17 more and found none false.
+  - **The records bundle (T16)** (opus): 0/2/7.
+- **Task 17's mutants fix** (sonnet): Spec ✅, approved, 0/0/3. The splitmix64 vectors were recomputed independently.
+
+The final whole-branch review (`final-review.md`, opus, over `7113e8f3..9570a582`, 47 commits) said "Ready to release? With fixes": 0 Critical, 1 Important, 8 Minor. It ran cargo-mutants itself over `Shrinker::delete_items`, which Task 17's scope had missed (the plan named `delete_chunks`): 9 of 9 caught.
+- **I1.** `Drive::recover` turned a tail the clock kept refusing into a give-up, through `wait_out_clock_refusal`'s two-waits give-up. That is against spec §2's anti-goal and plan Task 9, which say such a boot is `Err`.
+- **The Minors:**
+  - M1, the scaffold template: the ack check counted jobs instead of checking each note, and the event check blamed the commit for a note seen twice;
+  - M2: GUIDE never named `SimSource::answers()`;
+  - M3: GUIDE's list of when to drop below the helper omitted realtime checks;
+  - M4: the API page lacked the between-run enqueue `Kernel::app`'s doc teaches;
+  - M5: `#[route]` widened only a private handler's visibility;
+  - M6: a request past the faulted phase's horizon silently moved to the tail;
+  - M7: the `delete_items` scope;
+  - M8: PLAN's "In progress: 0.4.0".
+- **Parked items:** every one was triaged Closed or May-stay, except PLAN citing the testimony census before it is in the repo. This entry lands it.
+
+The one fix wave took I1 option (a), M1–M6, the `step` doc note and a GUIDE reflow. M7 is recorded here, and M8 goes to the publish checklist. Its re-review (`final-rereview.md`, sonnet, over `7312e83f..8511ca04`) read CLEAN, 0/0/0, with all ten items addressed.
+
+**Exit criteria (spec §6), each with its evidence.** The final evidence ran at `8511ca04`
+(`logs/final-evidence.log`).
+
+1. **Text pins: met.** Every new or changed line landed pinned against its exact text, in the commit that made it:
+   - the untested result and its fix line (`da4173ce`; 9 tests red first, `logs/t6-red.log`);
+   - the dev-dependency refusal (`ceb7fb97`);
+   - the disk-space naming, pinned whole with TMPDIR set (Task 6);
+   - the `before shrinking:` label (`9639f2c4`);
+   - the mutants report with its passes, seed and rerun command, and each pass's timeout (`cf13a7a4`);
+   - drive's three failure texts (`bbe32ba6`);
+   - the typed event reads' shape and decode errors (`2b1295b1`);
+   - the SSE alias refusal (`6b9335b1`);
+   - the two cross-pass refusals (`8c3a6893`);
+   - the tail the clock keeps refusing (`deb31714`);
+   - the horizon contract (`8511ca04`);
+   - the scaffold's two event-check texts (`29b900bd`).
+
+   `doc_truth`'s pinned floor went 51 → 53 for GUIDE's new pinned blocks (`f06a20e6`, `70e92134`).
+2. **Determinism: met.** Oracle 3 replays six batches at 256 runs per check and diffs everything a batch decides against baselines recorded at `fe5b519d`, before any code changed:
+   - `crates/sim-fixture` and `examples/invoicing` at `0x912313adf8115ad0` and `0x483e230baed4922b`;
+   - `crates/outbound-fixture` at `0xf207f4dcbfade216`;
+   - the scaffold at `0x1`.
+
+   Task 0 showed it can fail: a planted 211 → 212 gave exit 1, naming that batch only. The final run, at `8511ca04` (`logs/oracle3-final.log`): all six exit 0 against the N3 baseline. The fix wave's per-note ack check therefore moved nothing in `myapp-0x1`.
+
+   Batches moved only at the named steps (progress.md's table):
+
+   | Step | Task | Before → after | Reason |
+   |---|---|---|---|
+   | N1, a spent App's second kernel | T1 | merge-fixture's four batches byte-identical (`bf255375` → `2d5fbc22`) | the spec predicted a move; the per-bid `Kernel::new` did nothing observable inside 10 ms horizons |
+   | N2, an untested check fails | T6 | no recorded batch and no platform suite moved; 10 sweep packages 70/70 ok | no recorded batch held an untested check. Two runner unit tests whose workloads gave up in every universe now let one reach a verdict, and eight harness pins moved to the new rule |
+   | N3, the examples and scaffold on `drive` | T10 | `myapp-0x1`: survive 203/53 → 205/51, echo 252/4 → 253/3, event 213/43 → 212/44, exit 0; the other five byte-identical | drive's boot rule (a first boot lost to fallout reaches the tail), its phase timing, power cycle and re-sends re-key later runs. Re-baselined, with the old baseline kept. Lane B's merge (`merge2`) equalled it byte for byte |
+   | N4, the item pass | T11 | 105 probe seeds: 38 above `[0,1]` → 105 of 105 at `[0,1]`, 3,792 → 3,505 replays; merge-fixture `0xe27f…` 32 → 33 replays, same result | whole items come out in one step; nothing grew |
+
+   **Byte identity across runs and `--jobs`** (spec §3), at `8511ca04`:
+   - `determinism.sh`: sim-fixture through the CLI at `--runs 256 --master-seed 0x5EED0302`, green and red (`CHARPENTE_FIXTURE_FAIL=1`), human and JSON, twice each at `--jobs 1` and `--jobs 12`. 16 outputs, 0 differing.
+   - `determinism2.sh`: the scaffold's red batch, with `tx.enqueue` deleted. It draws and shrinks: `shrunk: 4 draws to 3`, six fault axes off, in 8 replays, and the echo check fails 212 of 256. 8 outputs, 0 differing.
+3. **Red before green: met.**
+   - **The spent App.** The spec's probe ticked cron 10 times on the first kernel and 0 on the second. Now a second kernel on a spent App does not compile (a trybuild pin).
+   - **The untested check.** At `da4173ce`, 9 tests went red first, for the intended reasons (`logs/t6-red.log`).
+   - **The record-shaped shrink.** Over 105 failing probe seeds at `dc8b9d4b`, 38 stopped above the minimum `[0,1]` (24 at `[1,0,0,0,1]`) in 3,792 replays. After the item pass, 105 of 105 reach `[0,1]` in 3,505 (named step N4).
+   - **The relative dev-dependency.** Step 0 measured that a member with an outside relative dev-dependency breaks the copied baseline under cargo-mutants 27.1.0's rewrite, and the refusal now names it first (`ceb7fb97`).
+   - **Every later pin went red first, for its own reason**, as each commit's message records. The four from the fix wave, for example:
+     - "the tail was refused after two waits" under the old `recover`;
+     - the commit blamed for a doubled emit under the old template;
+     - E0603 at `7312e83f`;
+     - "did not panic as expected" without the horizon assert.
+4. **The quick pass is exact: met.** The fixture is `the_quick_pass_matches_a_single_full_pass_mutant_by_mutant` (`#[ignore]`d, run by hand on master seed `0x3`). Its three mutants are:
+   - `mark_every_run`, which the first pass catches;
+   - `mark_in_band`, which only a run past the first 32 catches. Seed `0x3`'s first 32 runs of the band check miss it, and its 256 hit it 4 times;
+   - `mark_covered`, whose only red at 32 would be an unmet `require`.
+
+   Results at `--first-runs 32`:
+   - pass 1 read `3 mutants tested: 2 missed, 1 caught`;
+   - pass 2 caught both;
+   - at 256, pass 1 caught all three.
+
+   The caught and missed sets are equal mutant by mutant. The control, with pass 2 skipped, is red. The test ran at T13 (`logs/t13-exact.log`, 42.66 s), again after its fix round (`t13-fix1-exact.log`), and again at `8511ca04`, after `merge`'s refusal landed (`logs/t17-exact-final.log`: 1 passed in 48.40 s; each verdict line names the pass that decided it).
+5. **The two censuses: met.**
+   - **`driver_census`** (`799bafcc`) holds that no shipped example or scaffold template drives recovery by hand. It went red with a copied `recover` left in an example, and green after. `examples/api.rs` is exempt by path, with its reason.
+   - **`api_census`** (`301d13d2`, `fe10fa22`) holds that every public item in the listed surfaces appears on the page. It went red with a method left off (probes P2 and P3 fail naming the item; P1, a same-name case, passes, which is its documented limit, and its control fails), and green after.
+   - **The page compiles** as an example: `cargo build -p charpente --examples`.
+6. **Mutation: met.** All runs used cargo-mutants 27.1.0 through `scripts/mutants.sh`, with `--jobs 1` and each target's `--test-package` named. Every `--re` was checked against `cargo mutants --list` first, and the listed count equals the run's total in every row. The run was made in `../charpente-mut` from `f080c3ea` (`task-17-mutation-report.md`). In all: 408 mutants over 7 targets, 356 caught, 27 unviable, 25 MISSED, 0 timed out. No test package named carries a `sim_tests!` harness, so every run was one full pass.
+
+   | target | `--re` | caught / unviable / missed | after |
+   |---|---|---|---|
+   | `kernel/mod.rs` | `SimSource\|SimReply` | 18 / 3 / 2 | `841a1509`; re-run 2 of 2 caught |
+   | `drive.rs` | whole file | 21 / 4 / 3 | `3d517729`; re-run 24 / 4 / 0 |
+   | `checks.rs` | `events` | 13 / 3 / 0 | — |
+   | `harness.rs` | `run`, the quick pass, `delete_chunks`, `write_human` | 89 / 3 / 0 | — |
+   | `lib.rs` | `report_outcomes` | 2 / 0 / 1 | `fd20d2ae`; re-run 5 / 0 / 0 |
+   | `mutants.rs` (cli) | whole file | 131 / 8 / 14 | `8c3a6893`, `488db73a`; re-run over the changed functions 37 / 3 / 0 of 40 |
+   | `route.rs` (macros) | whole file | 82 / 6 / 5 | `9570a582`; re-run 5 of 5 caught |
+
+   - **Each fix was shown red by hand.** Every survivor got a test or a property that went red under its own mutant, applied by hand. The file was then restored with `git checkout` and its hash checked against HEAD.
+   - **Untested functions.** These are functions every mutant of which was unviable. `SimReply::stream`'s answer was deleted by hand, and every charpente and charpente-sim test stayed green. That line is 0.4.0's, so it is now pinned (`af2b6832`). `parse_outcomes` and `sim_env` were broken 8 ways by hand, and every break went red in existing tests. Of route.rs's three, two are held in-package and `result_ok_type` by invoicing's `describe_golden`.
+   - **One survivor was a defect.** `mutants.rs`'s `merge` accepted a pass-2 Unviable for a mutant pass 1 built. That turned a MISSED into "unviable (pass 2)" and exit 0, a false green from the honesty gate itself. It is now refused by name, with exit 2 (`8c3a6893`).
+   - **The scope gap.** The final review ran `Shrinker::delete_items`, the item pass the plan's scope missed: 9 of 9 caught.
+   - **No exclusions.** `.cargo/mutants.toml` is unchanged, and `mutants_exclusions` still pins 2.
+   - **The fix wave's code was not put through the instrument again.** That is `recover`'s new arm, the horizon assert, the route visibility arm and the template. Each landed red-first under its own test instead.
+7. **The gate: met locally; CI and the nightly are Noah's.**
+   - **The workspace gate** ran at `8511ca04` in the main tree, with HEAD unchanged and the tree clean across the run (`logs/gate-final.*`):
+     - fmt 0;
+     - clippy with the deny-list 0;
+     - `cargo test --workspace --no-fail-fast` exit 0, with 104 `test result:` lines, all 104 ok;
+     - passed 2,217, failed 0, ignored 64.
+
+     Task 0's base gate at `49bc5eea` read 100 of 100 (passed 2,127, ignored 63). The differences:
+     - four new suites: `charpente-sim`'s `drive` and `events`, and `guide-examples`' `driver_census` and `api_census`;
+     - one more ignored test: `new.rs`'s hand-run exactness test.
+   - **The edge harness:** `scripts/edge-harness.sh` at `8511ca04` (`logs/t17-edge-final.log`) exited 0: 11 of 11 result lines ok, and 45 ignored tests run with 0 failed. That is stock release binaries over real TCP, with `kill -9` and a TCP proxy injecting faults, the same 45 as at `565089cc`.
+   - **Fresh bases:**
+     - **The draw.** Ten were drawn from `/dev/urandom` and recorded before anything ran: `0xc0f65e85aa9c1bc7`, `0xfa7ff1252284b960`, `0x1c9f93fc4302200e`, `0x8d0d006a583b1e20`, `0xdb906667f70dfa5a`, `0x6a270bd19ab098fa`, `0xe7066afaf81d299a`, `0xf7ed8a86499c24c6`, `0x98ad7efeeaf24228`, `0x42e0b3b35a4022f6`.
+     - **At `f080c3ea`.** Each of the three examples and the scaffold ran 256 runs per check at every base: 40 of 40 exit 0, result ok, no untested check, no failure.
+     - **merge-fixture.** It is a plain libtest suite that pins its own master, so `--master-seed` does not apply. Its three seed-independent claims ran at each base through a scratch-only test (a ruling):
+       - Max green, 10 of 10, 135–174 tested;
+       - the latest-wins victim caught, 10 of 10, every one shrunk to `arrivals=2, lab=1, amount=2, lab=1, amount=1`;
+       - scripted inputs green, 10 of 10.
+     - **At `8511ca04`.** The four apps re-ran at the same bases, since the fix wave touched `drive` and the template: 40 of 40 green. 39 of the 40 JSON reports are byte-identical to the first run's. The one that moved is the scaffold at `0x1c9f…`, whose echo check had one run go from passed to skipped. That is the per-note ack check taking the corruption excuse where the count had passed.
+     - **Skip rates.** Per check, summed over the ten bases: `drawn_inputs` 0.6%, `modelled_remote` 4.1%, `restart_under_faults` 16.8%, and the scaffold 0.7%, 15.4% and 17.3%. Per single batch they run from 0.0% to 20.7%. Every skip carries a named reason: no POST acked, or a durable-corruption refusal no restart clears.
+8. **A docs-only build: pending, Task 18.** The brief is committed (`7e496abf`). The run is
+   Noah's to start, in a fresh offline box with the 0.4.0 crates and clippy installed.
+9. **After the publish: Noah's.** Install, `--version`, `new`, clippy, sim.
+
+**Rulings.** `progress.md` holds every one, 60-odd, each with its reason and its cost if wrong. These are the ones a later reader needs, spec deltas first.
+- **The quick pass is the exit-code rule's second exception** (`064a0794`). A first-runs pass judges failed runs only, and `require` and the untested rule are judged at the full count. This amends spec §3 in execution, as §4 E already described.
+- **N1 was predicted to move merge-fixture's pins, and moved nothing.** The prediction was wrong, not the step. A spent App's second kernel did nothing observable inside the fixture's 10 ms horizons.
+- **`Kernel::run` feeds a job enqueued between two runs to the heap before its first step** (T1, beyond A.1's text). The reviewer's cron-off probe showed the job otherwise waited. `step` does not drain, and its doc says so (`9b0fd673`).
+- **An exit-code change and a changed output shape go under `### Breaking changes`**, overriding the plan's `### Changed` (T6). The spec says CHANGELOG "lists every break".
+- **Task 2's refusal scans every workspace member's manifest**, not only the test packages. Step 0 measured that a non-test member's outside relative dev-dependency also breaks cargo-mutants' copied baseline.
+- **R-T12: the quick pass does not turn shrinking off itself**, since the verb already sets `CHARPENTE_SIM_NO_SHRINK` for every process it starts. **R-T13: the verb runs one full-count `cargo test` before pass 1**, and a red one is exit 2 naming the untested check, so pass 2's baseline is judged even when pass 1 leaves it nothing.
+- **R-PACE and R-LANES** (2026-10-31, after Noah asked why the run was so slow).
+  - Verification is scoped to each task's packages, with workspace gates at checkpoints and small same-shape work batched.
+  - After Task 6, two code lanes ran in separate worktrees with their own target dirs. They shared no code path, only GUIDE, CHANGELOG and CLAUDE.md text, which the controller merged.
+- **The tail's re-send is ratified, with retry guards** (T10). Re-sending what went unanswered found a real double charge (22 of 242 runs red with the guard deleted) and an exactly-once failure (5 of 256). So a re-sent route refuses a reused id with another body by name. GUIDE's `hit` route takes the re-send by design: it counts landings, and its invariants are over jobs.
+- **SP-18, the sim dropping a request the production edge would answer 500, is harmless under `drive`**, and gets no new row. `drive` re-sends a `None` answer and a fallout 5xx alike.
+- **merge-fixture's fresh-base evidence is a scratch harness** over its three seed-independent claims, because its suite pins its own master.
+- **Fix `mutants.rs`'s `merge` defect in 0.4.0**, before the final gate: it is Task 13's own code, and a false green from the honesty gate is the class 0.4.0 exists to close.
+- **AG-5 is FIXED with no wall time.** Task 17's runs were each one pass, and docs/BENCH.md carries no mutation figure. Task 18's docs-only build is the first field timing of the two-pass verb.
+- **The final review ran before the final evidence** (as 0.3.0's R25), so the evidence covers the fix wave.
+- **I1 took option (a)**, so `recover` fails a tail the clock keeps refusing.
+- **M6's assert landed only after the implementer proved, from each workload's draw bounds, that no shipped workload can pass its horizon.** The tightest is `modelled_remote`: 96 orders at 20 ms apart against 3 s.
+- **M8 goes to the publish**, beside CHANGELOG's date: PLAN's "In progress: 0.4.0" is true until then.
+
+**The testimony census (spec §4 G, Task 15).** The testimony rule now in PLAN's docs-only bar says every finding a docs-only or stranger build reports ends with a disposition: fixed (with the commit), a PLAN v1.x row (with its trigger), or refused (with the reason). Task 15 applied it backward, read-only, at `da4173ce` (2026-10-31). Its sources are every directory under `docs/experiments/`, `examples/invoicing/FINDINGS.md`, and the three 0.3.0 agents through spec §1. Each claim was checked against the code or docs at that head, and a fix a ledger or commit message claimed counted only after reading the code it names. Shas from before the 2026-10-10 rewrite were mapped through `docs/commit-map-2026-10-10.txt`. Task 16 landed the census's ten proposed rows (P1–P10) and the met triggers in PLAN's v1.x table (`6a3d6cae`, `2634efec`). Task 17 refreshed it on 2026-11-01: the 14 rows pending a 0.4.0 task and the 2 that joined 0.4.0 are FIXED, with `main`'s shas. Its evidence columns cite line numbers at `da4173ce`.
+
+- **FIXED**: the commit is given, and the fix was read at the head.
+- **ROW-EXISTING**: an existing PLAN v1.x row.
+- **ROW-SPEC**: a row the 0.4.0 spec names, which Task 16 landed.
+- **ROW-NEW**: a row the census proposed (P1–P10), which Task 16 landed.
+- **REFUSED**: the reason and the doc that settles it. This includes wrong claims, and review findings about an app's own code that carry no platform claim.
+- **N/A**: no finding to act on.
+- **RECURS**: reported by two or more builds. A finding appears once, under its earliest source.
+
+| Disposition | Findings |
+|---|---|
+| FIXED | 70 (54 at census time; refresh 2026-11-01: 14 PENDING-0.4.0 and 2 JOINS-0.4.0 landed) |
+| PENDING-0.4.0 | 0 (14 at census time) |
+| ROW-EXISTING | 8 |
+| ROW-SPEC (Task 16 lands, spec-named) | 4 |
+| ROW-NEW (census-proposed, P1-P10) | 15 findings → 10 rows |
+| REFUSED | 29 (5 wrong claims, 8 by design or settled, 16 app-side) |
+| JOINS-0.4.0 | 0 (2 at census time) |
+| N/A | 17 rows (4 of them bundles of confirmed claims) |
+| OPEN with a fix claimed that the code contradicts | 0 |
+
+**RECURS: 22 findings.** Spent App (SP-17), untested check (AG-2), recovery driver (OB-11),
+events by hand (AG-10), Dead invisible (OB-18), time in a transaction (INV-1), first credential
+(HD-11), login trusts the body (HD-10), password (HD-12), corruption excuse (SP-10), statement
+deletion (SP-23), replay checker's fresh worlds (HD-3), id-counter side channel (SP-6), no 403
+(SP-15), skips readability (LR-1), clippy in the box (LR-3), `config:` dump (AG-7a), mutation cost
+(AG-5), `responses()` short (INV-9), module mounting (INV-8), `Request::json` bound (INV-7), and
+`Snapshot`'s scoped reads (SP-31).
+
+**examples/invoicing/FINDINGS.md (M0, 2026-07-07)**
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| INV-1 | FINDINGS:9-42 | A transaction cannot read the time, so the app builds a cron-advanced `AppClock` row. | ROW-SPEC: "a transaction's own time", named for 0.5.0 (spec §4 G:468-470; PLAN.md:279-283) | The logical-clock pattern is documented (`3834db44`, "post-M0 friction fixes — time source"; GUIDE:2733). There is still no `tx.now()`, and spec:150 says "a transaction has no time". Related existing row: PLAN.md:343 (stored wall reading, R3). | **RECURS**: helpdesk FINDINGS:73-78, :244-245; statuspage FINDINGS:372-373; agents A and C (spec:149-152, :163) |
+| INV-2 | FINDINGS:44-64 | No documented id-generation primitive for rows created inside a transaction. | FIXED `3834db44` (doc) | GUIDE:285-332 teaches the counter row and says there is no platform primitive "in v0" (:294). The pattern's hazards are P3. | |
+| INV-3 | FINDINGS:66-77 | Unclear whether `Id<T>` is `Serialize`. | FIXED `3834db44` | GUIDE:848-851: `Id<T>` serializes as a decimal string (text later revised in `15457da4`). | |
+| INV-4 | FINDINGS:79-87 | `#[index]`'s bound is shown only on `Id` and `String`. | FIXED `3834db44` | GUIDE:224, "`#[index]` works on any `Codec` field, including a hand-rolled enum". | |
+| INV-5 | FINDINGS:91-101 | A struct's `Codec` being its fields' codecs concatenated in order is never stated as a general rule. | ROW-NEW (P10b) | GUIDE:187 states it for `#[table]` only. GUIDE:547-560 hand-writes `impl Codec for SendReceipt`. | |
+| INV-6 | FINDINGS:102-105 | `App::schedule`'s interval-overflow panic fires at kernel start (documented). | N/A | The builder notes it is documented. | |
+| INV-7 | FINDINGS:106-111 | Nothing says `Request::json` requires `T: Serialize`. | FIXED `301d13d2`, `fe10fa22` and `565089cc`: `examples/api.rs` builds a `Request` with `.json(&body)` and says it takes any `Serialize` value, sets the body only, and panics if the value does not serialize | GUIDE:3758 says "`.json(&value)` for a JSON body" and states no bound. Helpdesk's version of the claim, "no example derives `Serialize`", was struck as wrong (HD-4). | **RECURS**: helpdesk FINDINGS:132-141 |
+| INV-8 | FINDINGS:128-133 | `routes![…]`/`jobs![…]` accept bare identifiers only, not `routes::login`. | FIXED `05268fcd` (paths, 2026-07-25) and `3f1bf64d` (Task 5: a private handler in a submodule mounts) | HEAD `crates/charpente/src/http/router.rs:127-131` and `kernel/dispatch.rs:231-234` take `$handler:path`. route.rs:309-311 and :642-644 give the marker struct `pub(crate)` for an inherited visibility. | **RECURS**: agent C (spec:139-143) |
+| INV-9 | FINDINGS:140-153 | `responses()` has fewer entries than requests pushed when the kernel halts, so positional reads go wrong. | FIXED `b2276241` (doc) | GUIDE:3766-3771: "one entry per request the kernel served … a prefix of the script". The sim/production divergence is SP-18. | **RECURS**: statuspage FINDINGS:142-152 (#27, #29); outbound T19-T20 (FINDINGS L48-53) |
+| INV-10 | FINDINGS:113-124, :134-139, :154-161 | Praise: the error index is accurate, and the sim machinery worked first time. | N/A | | |
+
+**docs/experiments/2026-09-helpdesk (2026-09-03)**
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| HD-1 | README:27-34 (F1); FINDINGS:143-194 | A raw redb panic trace prints while the run is green, and it destroyed the agent's durability property. | FIXED `44a01837` (redb 4.3.0 returns `Err` for a torn open; the open fence and its panic-hook filter are deleted) | HEAD: no `set_hook`/`take_hook` in `crates/charpente{,-core}/src`. `crates/guide-examples/tests/hook_census.rs` requires no installer. `edge-harness/tests/unopenable_store.rs` is the printed-output oracle. LEDGER 2026-09-22 verified F1 closed against its repro. | |
+| HD-2 | README:35-46 (F2); FINDINGS:196-213, :248-249 | `acked_implies_durable` takes a seed and builds its own `Sim`, so `require ["restart"]` cannot fire and the fault matrix is zeroed. | FIXED `a503990b` | HEAD checks.rs:377-382 takes `sim: &mut Sim`, with the rationale at :356-376. | |
+| HD-3 | README:39-46 (F2's second consequence) | Checkers that build `Sim::new` run under `FaultConfig::default()`, outside the universe's matrix. Still true of `replays_identically`. | ROW-NEW (P5) | HEAD checks.rs:310-336: two `Sim::new(seed)` worlds, documented as such. | **RECURS**: statuspage review M-3 (:368-375); outbound review Minor 9 (:228) |
+| HD-4 | README:47-50 (F4); FINDINGS:132-141 | "No GUIDE example derives `Serialize` on a route body." | REFUSED: wrong claim | helpdesk README:47-50 (GUIDE then `:2039` `HitBody`). HEAD GUIDE:3947 still sends `HitBody` with `.json`. | |
+| HD-5 | README:11-13 (review Critical) | An unauthenticated `POST /agents/:id` lets anyone join any org. | FIXED `a477a749` (a route declares `auth` or `public`, neither is the default) | LEDGER 2026-09-16: the rebased helpdesk is refused at both Critical sites. PLAN.md:222-228. HEAD GUIDE:344. | |
+| HD-6 | README:12-14 (review Critical) | An unscoped `tx.get(id)?.is_some()` works as a cross-tenant existence oracle. | FIXED `7559f58a` (GUIDE §16, tenant scoping) and `a477a749` (a table declares `scoped_by` or `global`) | HEAD GUIDE:9250-9254: a scoped table is unreachable through a `Tx` without `tx.scope`. | |
+| HD-7 | README:14-15 (review Critical) | Five one-sided sim properties: deleting the SLA sweep stays green. | FIXED `d4d97e7e` (`charpente test --mutants`) | PLAN.md:204-206. HEAD `crates/charpente-cli/src/mutants.rs`. | |
+| HD-8 | README:15-17 | The branch added `examples/helpdesk` to `members` and reddened `doc_inventory`. | N/A | The inventory gate did its job on an unmerged branch. | |
+| HD-9 | FINDINGS:15-22 | GUIDE documents no tenant-scoping surface. | FIXED `7559f58a` | HEAD GUIDE §16 (:8677). | |
+| HD-10 | FINDINGS:58-65 | GUIDE's `/login` mints a session for whatever subject the body names. | FIXED `b2276241`, `bbb28217` | HEAD GUIDE:1067-1085: `login` is `auth`, trades a verified credential, refuses a session, and warns against minting for a body-named subject. | **RECURS**: statuspage FINDINGS:57-68 and review I-2 (:276-278); outbound T3 (FINDINGS L16-17) |
+| HD-11 | FINDINGS:58-65, :243 | There is no bootstrap for an org's first credential and no invite scheme, so a public route mints one. | ROW-EXISTING: PLAN.md:347, "A worked first-credential example, and a sanctioned way for deploy-time configuration to reach a handler". Trigger: "A second app that needs either". **The census finds the trigger met** (summary). | HEAD GUIDE:1072-1074 sanctions it in prose and shows no worked example. | **RECURS**: statuspage review I-2 and FINDINGS:57-68; outbound review Minor 1 and T5; pricewatch FINDINGS:52-57 and review (e) |
+| HD-12 | FINDINGS:241-242 | No password or credential-verification scheme. | ROW-NEW (P6). Doc half FIXED `b2276241`: GUIDE:1072, "charpente has no password check". | `hash_token` is public with zero GUIDE hits (statuspage #11 RWR). | **RECURS**: statuspage #10, #11, platform finding 9 (README:345-347); outbound T4 (FINDINGS L17-18) |
+| HD-13 | FINDINGS:243 | No permission model for who may do what inside an org. | ROW-NEW (P7) | GUIDE:9390-9391: "API-key scopes and permissions are their own future design", with no row. | |
+| HD-14 | FINDINGS:120-130, :246-247 | GUIDE §1's `Cargo.toml` assumes published crates, and a workspace member must find its own wiring. | FIXED `262b0b2a` (`charpente new`) and the publish path | PLAN.md:212-221: GUIDE §1's block is held byte-identical to the verb's output. 0.1.0 and later are on crates.io. | |
+
+**docs/experiments/2026-09-statuspage (2026-09-24)**
+
+`#n` is the README census claim (README:262-312). `PFn` is a platform finding (README:321-357).
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| SP-1 | README:49-77 (C-1), :326-327 (PF2); review.md:111 | `#[event]` evolution is unguarded, delivery decode is whole-node-fatal, and the error names neither event nor fix. | FIXED `3171aea3` (a reshaped event ends its tail with `charpente.reshaped` and a named 409), with the payload-shapes series (LEDGER 2026-09-25) | The rest is deferred to existing rows PLAN.md:321-323. | |
+| SP-2 | README:79-102 (C-2); review.md:173 | The isolation property never drives most operator writes across orgs. | REFUSED: app-side, a one-sided property (ruling README:91-98) | The platform halves are SP-3, SP-22 and SP-23. | |
+| SP-3 | README:321-325 (PF1); FINDINGS:18-31 (#3) | A job cannot open a tenant scope the documented way, and `open_scope` is undocumented. | FIXED `c0337637` (a `#[job(scoped_by = Org)]` runs in its enqueuer's tenant) | HEAD GUIDE:2379, and GUIDE:9250-9252 (a scoped job receives the tenant's `ScopedTx`). | |
+| SP-4 | review.md:249-268 (I-1) | Write authorization rests on the `auth` keyword alone. Flipping writes to `public` stayed green. | FIXED `e77cbd7d` ("statuspage I-1 pinned") and `e793b16c` (`authorize` takes `&Principal`) | HEAD GUIDE:8828-8832: a credential-free scope line is a named 401, and `authorize` is never asked about nobody. | |
+| SP-5 | FINDINGS:76-81 (#15) | A public route that scopes with `ctx` refuses another org's operator, so it needs the anonymous form. | FIXED `e77cbd7d` (`public(Org)` admits by declaration) | HEAD GUIDE:8833-8835. | |
+| SP-6 | review.md:286-315 (I-3) | One app-wide id counter makes public responses a cross-org side channel. | ROW-NEW (P3) | HEAD GUIDE:285-332 still shows one `#[table(global)]` counter and gives no warning. | **RECURS**: outbound review Minor 2 (:221) |
+| SP-7 | README:338-340 (PF6); FINDINGS:283-304 (#40-#44) | A corruption cut voids history-dependent expectations (they must be judged at check time) and rewinds app id counters, so "Ids stay globally unique" is false on a single node. | ROW-NEW (P3) | HEAD GUIDE:3557-3569 covers the excuse but neither check-time judging nor re-minting. GUIDE:8791 and :9389 still say "globally unique". | |
+| SP-8 | README:351-352 (PF11); review.md:312-315 | One global event id and seq space leaks other orgs' volume through any public feed. | ROW-NEW (P4) | HEAD GUIDE:6483, :6503: the cursor is a global `<id>.<seq>`. | |
+| SP-9 | review.md:317-334 (I-4) | The notification oracle takes "at resolve time" from the implementation. | REFUSED: app-side ("no claim", review.md:333-334) | | |
+| SP-10 | review.md:336-351 (I-5) | The app excuses a cross-org 200 under `durable_corruption_fired`. | ROW-EXISTING: PLAN.md:336, "Mechanical enforcement of GUIDE §8's rule that `durable_corruption_fired` may excuse a give-up, never wrong data". Trigger: "The second app found routing …". **The census finds the trigger met**: statuspage was first. | HEAD GUIDE:3567-3569 states the rule in prose only. | **RECURS**: outbound review I1 (:105-130) |
+| SP-11 | review.md:357-361 (M-1) | Maintenance incidents are born in Monitoring. | REFUSED: app-side | | |
+| SP-12 | review.md:362-367 (M-2) | "One row per email" is not guarded. | REFUSED: app-side (a one-sided property) | | |
+| SP-13 | review.md:376-383 (M-4) | Oracle checks compare the path to itself. | REFUSED: app-side | | |
+| SP-14 | review.md:384-386 (M-5, the sweep) | The maintenance sweep is O(all windows ever). | REFUSED: app-side | | |
+| SP-15 | review.md:389-391 (M-6) | A cross-org refusal is a 400 naming both orgs, and `ApiError` has no 403. | FIXED `b2276241` (doc) | HEAD GUIDE:1258-1261: "There is no 403 … pick one of the variants above", and `revoke_key` answers `NotFound`. | **RECURS**: outbound T7 (FINDINGS L26); pricewatch FINDINGS:71-72 |
+| SP-16 | README:328-331 (PF3); FINDINGS:163-177 (#31-#35) | The upgrade barrier's remedy cannot be performed on a `launch` binary: no clean exit, no signal handler, and the exit checkpoint is unreachable. #32's SIGINT and #34's checkpoint (both RWR) belong here. | ROW-NEW (P2), evidence for the trigger exists | HEAD GUIDE:7071-7073 ("shut down cleanly (a clean exit always checkpoints)") against GUIDE:1422 ("no graceful shutdown in v0"). `git grep -i 'sigterm\|sigint\|ctrl_c\|signal::'` over `crates/charpente{,-core}/src` has 0 hits. | |
+| SP-17 | README:332-333 (PF4), :247-248; FINDINGS:97-110 (#19) | `Kernel::into_app` returns a spent App: jobs fail naming the wrong fix, and cron silently stops. | FIXED `2d5fbc22` (`into_app` removed; a trybuild pin) and `8b46de6c` (`run` feeds a job enqueued between runs) | HEAD: `into_app` appears only in `crates/charpente-macros/tests/compile_fail/a_spent_app_cannot_start_a_second_kernel.rs`. kernel/mod.rs:405. GUIDE:3779-3788. | **RECURS**: agent A (spec:29-43). It was ledgered as testimony on 2026-09-24 with no row, and it recurred. |
+| SP-18 | README:334-337 (PF5); FINDINGS:142-152 (#27 RWR, #29) | The sim records no reply for a request a stopped kernel dropped, while production answers `500 "the kernel dropped the request"`. | FIXED in effect by Task 9 (`8624cc34`). Drive re-sends an unanswered request and a fallout 5xx alike (drive.rs `unanswered`), so an app on Drive never meets the divergence. `Phase::answers`' doc names `None` as "went unanswered: the phase ended on fault fallout first". Judged harmless by the controller (ledger, 2026-11-01): no new row. Residual: an app below the helper that counts 500s sees `None` where production answers 500. Doc half FIXED `b2276241`. | The record-level divergence stays. Task 17 should confirm that the helper makes it harmless to every shipped driver, or give it a row. | |
+| SP-19 | README:240-243, :341-342 (PF7) | §8's own `whole_app` and `counter_roundtrip` map fault fallout to `Ok(())` with no `give_up`. | FIXED `3200b1af` | HEAD GUIDE:2948-2953 (`counter_roundtrip` gives up on `None`), :3936-3939 and :3990-3993 (`whole_app` gives up). | |
+| SP-20 | README:243-246, :343-344 (PF8) | A `launch` node whose kernel stops answers 500 forever and never exits. | FIXED `ed78de8a` (a stopped kernel ends the process) | HEAD `crates/charpente/src/launch.rs:66` (`process::exit(code)`), :156 (`server.wait()`). | |
+| SP-21 | README:345-347 (PF9); FINDINGS:57-68 (#10) | Auth is credentials-only and never says so. | FIXED `b2276241` (doc) | HEAD GUIDE:1068-1074. The password half is HD-12. | |
+| SP-22 | README:99-102, :348-349 (PF10, membership) | The membership table is necessarily outside the type-level guarantee, and §16 never says so. | ROW-NEW (P10a) | HEAD GUIDE:8851: `authorize(_tx: &Tx, …)`. No §16 sentence says it. | |
+| SP-23 | README:349-350 (PF10, instrument); README:93-98 | `--mutants` cannot see a one-statement guard (no mutant removes a scope line), and §8 did not state that granularity. | ROW-NEW (P1), evidence for the trigger exists. Doc half FIXED `2129ce0b`. | HEAD GUIDE:4850-4864: "It never deletes a statement … delete them by hand". | **RECURS**: outbound review Minor 11, I2, platform finding 4; pricewatch FINDINGS:163-184, review.md:162 |
+| SP-24 | FINDINGS:36-38 (#4) | `.scope()` needs `use charpente::Scoped`, and the prose never says so. | FIXED `301d13d2`, `fe10fa22` (`examples/api.rs` names `use charpente::Scoped` at the scope line) | GUIDE code blocks import it (GUIDE:1642, :5945). No prose does. | |
+| SP-25 | FINDINGS:39-40 (#5) | `ScopedTx`'s path is not shown. | FIXED `301d13d2` (`examples/api.rs` imports `charpente::ScopedTx` by path) | GUIDE:1642 and :2547 now import `charpente::{…, ScopedTx, …}` in code. | |
+| SP-26 | FINDINGS:41-46 (#6) | An SSE handler's return type is checked textually, so an alias is refused. | FIXED `6b9335b1` (was JOINS-0.4.0; see the top section) | HEAD route.rs:736-740 and :900-905 at census time. | |
+| SP-27 | FINDINGS:47-48 (#7) | `ApiError` has no `Display`. | ROW-NEW (P9) | HEAD: no `Display for ApiError` in `crates/`. | |
+| SP-28 | FINDINGS:49-51 (#8) | `Codec` has no impl for `Vec<T: Codec>`. | ROW-NEW (P9) | HEAD `crates/charpente-core/src/table.rs`: ints, `WallTime`, `bool`, `Vec<u8>`, `String`, `Option<T>`, `Id<T>`. | |
+| SP-29 | FINDINGS:52-53 (#9) | `describe --format human` is the fastest mount-conflict check. | N/A | A suggestion. Mount conflicts are named at `App::mount` (GUIDE:5267). | |
+| SP-30 | FINDINGS:61-62 (#12) | No OIDC without a static JWKS. | REFUSED: by design | DESIGN.md:2213 ("static-JWKS only") and :2227-2228 ("A JWKS refresh is now expressible as a global outbound cron job; the platform still ships none"). | |
+| SP-31 | FINDINGS:85-88 (#16) | §16 never names `Snapshot`'s scoped reads. | FIXED `b2276241` (doc) | HEAD GUIDE:3793-3794, :9260-9263. | **RECURS**: outbound T41; agent C grepped for `scan_scoped` (spec:121; its signature half is AG-8a) |
+| SP-33 | FINDINGS:89-91 (#17) | `Sim::now()` is undocumented. | FIXED `22723164` | HEAD GUIDE:3384, :3765-3766. | |
+| SP-34 | FINDINGS:92-93 (#18) | `serde_json` is not re-exported. | ROW-NEW (P9) | HEAD `crates/charpente/src/lib.rs` does not re-export it. `templates/Cargo.toml.tmpl`'s dev-dependencies list only `charpente-sim`. | |
+| SP-35 | FINDINGS:111-116 (#20) | A subscriber dropped before its first frame can only resume from now, and §11 does not say so. | FIXED `cd5b3909` (doc) | HEAD GUIDE:6485-6492. | |
+| SP-36 | FINDINGS:117-121 (#21) | "Replies stay positional through a crash." | REFUSED: wrong claim, retracted by the builder (README:187-190) | | |
+| SP-37 | FINDINGS:129-131 (#23) | `is_fault_fallout` reads a 500's body too. | N/A | It works. GUIDE:3465 says it classifies error text, and a 500 body is text. | |
+| SP-38 | FINDINGS:132-133 (#24) | `EventFrame`'s `name` and `json` fields are undocumented. | FIXED by `565089cc`: `examples/api.rs` reads an `EventFrame`'s `name` (the event's `NAME` or a platform frame's `charpente.*`) and `json` | HEAD GUIDE has 0 hits for `EventFrame`. Code: `crates/charpente/src/kernel/tail.rs:62-67`. | |
+| SP-39 | FINDINGS:134-135 (#25) | `responses()` yields `(u16, Vec<u8>)`, not the pair GUIDE implies. | FIXED `fe10fa22` and `565089cc`: `examples/api.rs` binds `responses()` as `RecordedResponses`, `(status, body)` replies in answer order | HEAD GUIDE:3767 still says "`(status, body)` pairs" with no types. | |
+| SP-40 | FINDINGS:147-149 (#28) | "In production that is a connection reset, so the harness is honest." | REFUSED: wrong claim (README:191-197). Production answers a named 500. | The divergence itself is SP-18. | |
+| SP-41 | FINDINGS:178-182 (#36) | The drift probe feeds `"0"` to every `:param`, and §11 does not say so. | FIXED by `565089cc`: GUIDE §11's drift-probe paragraph says each `:param` is fed `"0"` and what a handler that refuses it gets (`subscription_event_names` is `#[doc(hidden)]`, so the API page does not hold it) | HEAD: rustdoc only (`crates/charpente/src/http/app.rs:38-41`, :873). GUIDE:6436-6447 is silent. | |
+| SP-42 | FINDINGS:183-184 (#37) | `MigrationInfo` has no `Debug`. | ROW-NEW (P9) | HEAD `crates/charpente/src/describe.rs:76-77`: `#[derive(Serialize)]` only. | |
+| SP-44 | FINDINGS:69-73 (#13 RWR); review.md:386-388 (M-5, the key half); README:346 (PF9) | `create_api_key` returns only the raw key, so the app found its row by diffing a scan. | FIXED `b2276241` (doc) | HEAD GUIDE:1002-1006: the id is the raw key's first 16 hex characters. The `key_hash` index also finds it (README:212-218). | |
+| SP-43 | README census #1, #2, #14, #22, #26, #30, #38, #45-#49 | Confirmed observations: the scaffold's six files, its give-up example, `App::open` registering auth tables, the give-up budget, decoding a job payload, §12 on a scoped table, unviable as type refusal, the 28 repros replaying, give-ups as the fault rate, `--master-seed`, `acked_implies_durable` taking `sim`, and the backoff arithmetic. | N/A (bundle, 12 claims) | Rulings at README:264-312. | |
+| — | FINDINGS:270-272, :343 (#39) | A mutation run costs a rebuild plus a batch per mutant: 84 min, then 1h47m. | see AG-5 | | |
+| — | FINDINGS:357-361 (restarts) | A kernel per phase became a kernel per process lifetime. One request per run. | see SP-17, SP-18, OB-11 | | |
+
+**docs/experiments/2026-10-launch-run (2026-10-10)**
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| LR-1 | README:71-79, :138-139; census #6, #26-#28; attempt-1 report:8; attempt-2 report:19 | The give-up counts overstate what was tested, and no output says why a universe gave up. | FIXED `93a47374` (tested and skipped counts per check, skipped reasons), `ce42034e` (first seed per reason), `1106cdf0` and `c56415b3` (check lines last; per-check tested counts on the result line), `da4173ce` (an untested check fails the batch and the output names the fix) | HEAD harness.rs:1555 (`(first: --seed …)`), :1668 ("Runs tested per check"). `git show da4173ce:crates/charpente-sim/src/harness.rs` :951-983. The skip rate hand-written drivers cause is OB-11, FIXED. | **RECURS**: both launch attempts; pricewatch FINDINGS:92-98 and review (d); agent B, "unreadable skips" (spec:161) |
+| LR-2 | README:92-93, :140; census #4, #30 | `charpente --version` prints the usage text. | FIXED `3b17dde3` | HEAD `crates/charpente-cli/src/main.rs:31`. | |
+| LR-3 | README:88-91, :141-142; census #5, #17 | README's clippy step assumes the clippy component, and the box image has none. | FIXED `3b17dde3` (README:173: "no clippy? rustup component add clippy") | The offline residue is environment, as every report says itself. See the process note. | **RECURS**: launch ×2; 0.3.0 stranger ×3 (reports 28, 30, 30); pricewatch FINDINGS:73-76 and report:3 |
+| LR-4 | README:143-144; census #29 | "The second property" should name the property it means. | FIXED `3b17dde3` | HEAD README:177 names `acked_post_implies_the_echo_after_recovery`. | |
+| LR-5 | README:94-96; census #10 | README's doc links were dead (the repository was private). | FIXED (no commit: the repository was made public before attempt 2) | README:94-96. | |
+| LR-6 | census #11 | No bare-metal Linux benchmark exists. | ROW-EXISTING: PLAN.md:320, "Bare-metal Linux BENCH run". Trigger: "A Linux box Noah runs docs/BENCH.md's protocol on." | | |
+| LR-7 | census #1-#3, #7-#9, #12-#16, #18-#25, #31 | Confirmed observations (the scaffold, the red batch, replay, refusals by name, the rehearsal registry, the harness's sleep block, the BENCH machine). | N/A (bundle, 22 claims) | Rulings at README:100-131. | |
+
+**docs/experiments/2026-10-outbound (2026-10-14)**
+
+`T` is `attempt-1/testimony.md`, which censuses FINDINGS line by line. `I`/`Minor` are `attempt-1/review.md`.
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| OB-1 | testimony.md:46-50 (T6; FINDINGS L24-25) | §5's `revoke_key` deletes any key by id for any caller. | FIXED `b2276241` | HEAD GUIDE:1111-1122 checks `key.subject == caller` and answers `NotFound` otherwise. | |
+| OB-2 | testimony.md:55-60 (T8; L27) | "A non-member is refused with 400, as every §16 example does." | REFUSED: wrong claim, in "every" (testimony.md:56-60) | | |
+| OB-3 | testimony.md:65-78 (T10-T12; L33-36) | `OutboundCall` and `OutboundReply`: no path, no fields, no reply constructor, and no `impl Remote` example. | FIXED `b2276241` | HEAD GUIDE:4094-4097 (`use charpente::core::io::{OutboundCall, OutboundReply}`) and the compiled `Remote` example. | |
+| OB-4 | testimony.md:80-84 (T13; L36-37) | The model `Rng`'s path and methods are undocumented. | FIXED `b2276241` | HEAD GUIDE:4097. | |
+| OB-5 | testimony.md:86-87, :238-241 (T14, T39; L37-38, L137) | `JobRow`'s `scope` and `outbound_key` have undocumented types. | FIXED `b2276241` | HEAD GUIDE:3795-3802: the full field list with types. | |
+| OB-6 | testimony.md:89-97 (T15, T16; L39) | `Delivered`'s field types and `Via::ApiKey`'s payload type are unstated. | FIXED `b2276241` | HEAD GUIDE:969-972. | |
+| OB-7 | testimony.md:99-103 (T17; L40-41); review Minor 10 (:229) | `with_remote` lends `&M` only, and no way to signal a model is documented. | FIXED `b2276241` (doc) | HEAD GUIDE:4085 ("`&M`, never `&mut M`") and the shared-state switch in the `Remote` example. | |
+| OB-8 | testimony.md:105-109, :243-248 (T18, T40; L43-45, L139) | `Idempotent` stores and replays any first reply, so a model 503 replays until the job is Dead, and no variant declines to store a transient failure. | ROW-NEW (P8). T40's "undocumented" was wrong. | HEAD GUIDE:4066-4067. `crates/charpente-sim/src/outbound.rs:85-157`. | |
+| OB-9 | testimony.md:121-124 (T21; L55-56) | `push_at` and the horizon are absolute nanoseconds, unstated. | FIXED `b2276241` | HEAD GUIDE:3765-3766. | |
+| OB-10 | testimony.md:126-130 (T22; L57) | `sim.cover` takes `&'static str`, unstated. | FIXED `b2276241` | HEAD GUIDE:2914. | |
+| OB-11 | testimony.md:132-137, :291-294 (T23; L58-64); README:163-169 | One `kernel.run` per round poisons early under `sync_error`, the rest go unanswered, and the driver becomes a hand-written supervisor that re-boots and re-sends. This is the canonical recovery-driver row. | FIXED: Task 7 `9a6f3f09` (`Request: Clone`, `SimSource::answers`); Task 9 `8624cc34`, `bbe32ba6`, `4e056849` (`charpente_sim::drive`); Task 10 `799bafcc`, `c14b1b6e` (the examples and the scaffold run on Drive, held by `driver_census`). Doc half FIXED `b2276241`. Skip rate at 10 fresh bases × 256 runs (Task 17 Step 3): 0.6% to 17.3% per check, every remaining skip with a named reason (no POST acked; a durable-corruption refusal no restart clears). | HEAD: no `drive` helper. Every example and `templates/sim.rs.tmpl` carry their own copy (spec:56-60). | **RECURS**: pricewatch FINDINGS:19-23, :108-110 (restart 2, 75% setup give-ups); statuspage FINDINGS:357-361; agents A, B, C (spec:56-73) |
+| OB-12 | testimony.md:151-155 (T25, T26; L92-93) | An API key's or session's id is the first 64 bits of its secret, and GUIDE does not say so. | ROW-EXISTING: PLAN.md:337, "Credential row ids drawn independently of the secret". Trigger: "The first app that must show a key's or session's id to someone other than its holder". Doc half FIXED `b2276241`. | HEAD GUIDE:1002-1006. | |
+| OB-13 | testimony.md:163-164 (T28; L97-98) | No sim oracle can notice a `Host` declared without its credential. | REFUSED: by design. A credential's value never enters the sim. | HEAD GUIDE:2078 ("the value never enters the log, the sim, an error text or `describe`"). A missing env var refuses start (T30). | |
+| OB-14 | testimony.md:172-176, :189-197 (T31, T34, T35; L104-112) | The verb prints only its summary and names no caught mutant, and no doc names where `outcomes.json` is written. | FIXED `b2276241` (doc) and `7f771699` (untested functions named) | HEAD GUIDE:4902-4903. mutants.rs:22-24. | |
+| OB-15 | testimony.md:231-236 (T38; L137) | "`attempts` is undocumented." | REFUSED: wrong claim (testimony.md:232-235). The type half is fixed in `b2276241`. | | |
+| OB-16 | review.md:132-149 (I2, app half) | The isolation property never reads `page_detail`. | REFUSED: app-side. The platform half is SP-23. | | |
+| OB-17 | review.md:151-176 (I3); README:177-185 | No per-host, timeout-fired coverage key. `Classify`'s 30 s timeout is dead in the sim. | ROW-EXISTING: PLAN.md:334, "A per-host coverage key for an outbound timeout that fired". Trigger: "The first app that must `require` that its own timeout path ran." | | |
+| OB-18 | review.md:178-202 (I4); README:186-196 | Dead is unreachable in the sim, and an app cannot see its own Dead job. | ROW-EXISTING: PLAN.md:335, "Dead reachable in the sim, and a hook or documented path…". The trigger is met (agent C, spec:145-149). 0.5.0 (PLAN.md:279-283). | | **RECURS**: agent C (spec:145-149, :162) |
+| OB-20 | review.md:204-216 (I5) | Revoking a key does not end the sessions and keys it minted. | ROW-EXISTING: PLAN.md:338, "Revocation that ends what a credential minted". Doc half FIXED `b2276241` (GUIDE:990-992). | | |
+| OB-21 | review.md:222 (Minor 3) | No `label.is_none()` guard in `settle`. | REFUSED: app-side | | |
+| OB-22 | review.md:223 (Minor 4) | A non-`{"id"}` 200 makes `reply.json()?` fail. | REFUSED: app-side | | |
+| OB-23 | review.md:224 (Minor 5) | `logout` with an API key answers 200 and revokes nothing. | REFUSED: documented platform behaviour, an app-route choice | HEAD GUIDE:993-994 ("deletes the current session (logout); a no-op without one"). | |
+| OB-24 | review.md:225 (Minor 6) | The on-call durability check is end-state only. | REFUSED: app-side | | |
+| OB-25 | review.md:226 (Minor 7) | The page and label properties skip an org with no final read. | REFUSED: app-side | | |
+| OB-26 | review.md:227 (Minor 8) | Cross-org probes use only the founder's key. | REFUSED: app-side | | |
+| OB-27 | testimony.md:183-187 (T33; L108-110) | Why cargo-mutants made no match-arm mutant. | N/A: a claim about cargo-mutants internals. It feeds P1. | | |
+| OB-28 | T1, T2, T5, T9, T20, T24, T27, T29, T30, T32, T36, T37; README:50-54 (the scan note) | Confirmed observations, and the shared-scratchpad process note. | N/A (bundle, 13 items) | | |
+| — | T3, T4, T7, T19, T41; I1; Minors 1, 2, 9, 11 | (dedupe) | see HD-10, HD-12, SP-15, INV-9, SP-31, SP-10, HD-11, SP-6, HD-3, SP-23 | | |
+
+**docs/experiments/2026-10-0.3.0-docs-only (pricewatch, 2026-10-26)**
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| PW-1 | README:36; FINDINGS:99-103; review.md:81-103 | `required "…" never occurred` counted only passed and skipped runs. | FIXED `43ead430` (R44) | | |
+| PW-2 | README:37; FINDINGS:139-145; report:20 | "0 missed" hid functions with no viable mutant. | FIXED `7f771699` (R45) | HEAD mutants.rs:22-24 names them as untested. | |
+| PW-3 | README:38; FINDINGS:133-138 | The auto-timeout ignores the shrink a caught mutant triggers. | FIXED `d368076a` (R46) | HEAD harness.rs:83 `CHARPENTE_SIM_NO_SHRINK`. | |
+| PW-4 | FINDINGS:52-57; review (e) :140-149 | No worked first-credential example. | see HD-11 (ROW-EXISTING PLAN.md:347) | | |
+| PW-5 | README:44; FINDINGS:58-60; review.md:171, :184 | No sanctioned way for deploy-time configuration to reach a handler. The secret sits in a `OnceLock` the fence cannot see. | ROW-EXISTING: PLAN.md:347 (the same row's second half). Trigger: "A second app that needs either." | | |
+| PW-6 | README:42; review.md:108, :162 | GUIDE told an app to run `scripts/mutants.sh` and overstated what cargo-mutants generates. | FIXED `2129ce0b` (R48) | HEAD GUIDE:4850-4876. The instrument limit is SP-23 (P1). | |
+| PW-7 | README:43; FINDINGS:42-46; review.md:166 | GUIDE never said a kernel whose `run` returned `Err` is rebuilt. | FIXED `2129ce0b` (R48) | HEAD GUIDE:3779-3788. | |
+| PW-8 | FINDINGS:38-41; review.md:165 | May `durable_corruption_fired` excuse a lost setup step? | N/A ("not an issue", review.md:165) | | |
+| PW-9 | FINDINGS:47-48 | §14's 64-bit integers serialize as strings. | N/A (answered, review.md:167) | | |
+| PW-10 | FINDINGS:61-70 | Report identity and tie rules the brief leaves open. | N/A: app-side design (review.md:168-169) | | |
+| PW-11 | FINDINGS:104-107 | 16 runs in 0.12 s looks as if nothing ran. | N/A: virtual time, by design (review.md:174) | | |
+| PW-12 | FINDINGS:80-91; report:15 | The sim found a stale test, and `fired:` diagnosed a lost setup. | N/A (positive) | | |
+| PW-13 | review.md:40 (S1-m1) | The operator-claim route has no throttle and a short-circuit compare. | REFUSED: app-side | | |
+| PW-14 | review.md:41 (S1-m2) | An unknown source's listing answers `200 []`. | REFUSED: app-side | | |
+| PW-15 | review.md:42 (S1-m3) | A source key can never be revoked. | REFUSED: app-side | | |
+| PW-16 | review.md:72 (S2-m1) | Two properties judge only their refusal side. | REFUSED: app-side (the siblings close the gap) | | |
+| PW-17 | report:25 | The session's permission checker read Rust closures as shell pipes. | N/A: environment | | |
+| — | FINDINGS:71-76, :85-91, :92-98, :163-184; FINDINGS:19-23 | (dedupe) | see SP-15, AG-7a, LR-1, SP-23, OB-11; clippy LR-3 | | |
+
+**docs/experiments/2026-10-0.3.0-stranger (2026-10-27)**
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| ST-1 | README:58, :64 (attempt 1, (a) missed) | Per-check tested counts sat above a tail's reach. | FIXED `1106cdf0` (R42) | | |
+| ST-2 | README:102, :108 (attempt 2, (a) missed) | The result line gave only an aggregate tested count. | FIXED `c56415b3` (R43) | HEAD harness.rs:1668. | |
+| ST-3 | README:138; attempt-3 report:11 | README:133 says "charpente `0.1.0` is on crates.io" against a 0.3.0 mirror. The record deferred the fix to "the publish", and the publish did not make it. | FIXED `6a3d6cae`, `b3a903d5`, `80a67c63`, `2634efec` (was JOINS-0.4.0; see the top section) | HEAD README:133-134 at census time. | |
+| ST-5 | attempt-3 report:38 | Filtering to the result lines lost the batch's master seed. | N/A. The rerun line prints directly below `sim result:`, and the stranger's grep excluded it. | | |
+| ST-6 | README census, attempts 1-3 (README:66-84, :106, :129-136) | Confirmed claims (the scaffold, the red and green batches, replay, `describe`). | N/A (bundle, every claim ruled right) | | |
+| — | reports (clippy) | (dedupe) | see LR-3 | | |
+
+**The three 0.3.0 agents (spec §1, `docs/superpowers/specs/2026-10-28-0.4.0-design.md`)**
+
+| ID | Source | Finding | Disposition | Evidence | RECURS |
+|---|---|---|---|---|---|
+| AG-1 | spec:29-43 | A second kernel on a spent App runs no jobs or cron and names the wrong fix. `modelled_remote.rs` returns `into_app`. | see SP-17 (FIXED `2d5fbc22`, `8b46de6c`) | HEAD `modelled_remote.rs` has no `into_app`. | **RECURS** (SP-17) |
+| AG-2 | spec:45-54 | A check that tested nothing passes the batch, and the result line begins `sim result: ok`. | FIXED `da4173ce` (Task 6, named step N2) | `git show da4173ce:crates/charpente-sim/src/harness.rs` :951-983: `untested_fails` makes the exit code 1 outside a `--seed` replay. | **RECURS**: agents A and B (spec:51-53, :161) |
+| AG-3 | spec:56-73 | Every app pastes the same recovery code, and hand-written drivers skip most runs. | see OB-11 (FIXED) | | **RECURS** |
+| AG-4 | spec:67-70 (C) | `Request` derives nothing, so an unanswered request cannot be re-sent without rebuilding it. | FIXED `9a6f3f09` (`Request: Clone`, `SimSource::answers`) | HEAD `crates/charpente/src/http/mod.rs:72`: `pub struct Request` with no derive. | |
+| AG-5 | spec:85-90 (A) | A mutation run does not fit a working session: 8 mutants, 28 minutes, and no way to judge at fewer runs. | FIXED: Task 12 `1834ea93`, `7a512662` (`CHARPENTE_SIM_FIRST_RUNS`, the quick pass); Task 13 `9f4cfe82`, `cf13a7a4`, `dad0b150` (the two-pass verb: every mutant judged at `--first-runs` 32, only its MISSED and TIMEOUT re-judged at the full count, on one printed master seed; `the_quick_pass_matches_a_single_full_pass_mutant_by_mutant` proves the verdicts equal a full pass's) | The fix is to the mechanism, and the time saved has not been measured. Task 17's seven mutation runs were each one pass, since no test package they named carries a `sim_tests!` harness, so they do not time the two-pass verb. docs/BENCH.md carries no mutation figure. Task 18's docs-only build runs the verb on an app (BRIEF: "record its full output"), which makes it the first field timing. | **RECURS**: statuspage FINDINGS:270-272 (84 min), :343 (1h47m) |
+| AG-6 | spec:89-90 | Each mutant's batch draws its own ambient master seed, so two runs judge different universes. | FIXED `9f4cfe82` (one pinned master seed for every mutant, `--master-seed`) and `1834ea93` (`CHARPENTE_SIM_MASTER_SEED`) | spec cites harness.rs:921 and lib.rs:2573. | |
+| AG-21 | spec:75-83 (B) | The shrinker cannot delete an item that spans several draws. | FIXED `c7d7ee62` (the shrinker's item pass; named step N4) | The existing row PLAN.md:345 (R39 pair search) is distinct (spec:83). | |
+| AG-22 | spec:92-98 (A) | The mutants verb blames `CARGO_BIN_EXE_…` for a baseline that a relative dev-dependency path broke. | FIXED `ceb7fb97` | HEAD mutants.rs:205-240 (`unrewritten_path_refusal`). | |
+| AG-23 | spec:98-99 (A) | A scratch build that fills `/tmp` names no `TMPDIR`. | FIXED `ceb7fb97` | HEAD mutants.rs:303-304, :1084. | |
+| AG-7a | spec:104-106 | The failure block prints the 27-field `FaultConfig` dump above `fired:`. | FIXED `9639f2c4` | HEAD harness.rs:1795-1825: no `config:` line. JSON keeps the config. | **RECURS**: agent B; pricewatch FINDINGS:89-91 |
+| AG-7b | spec:107-110 (B) | `first:` reads as a different failure. | FIXED `9639f2c4` | HEAD harness.rs:1823: `before shrinking:`. | |
+| AG-7c | spec:111-115 (A) | GUIDE says both that `run` returns at the horizon and that it returns "when its source is exhausted". | FIXED `9639f2c4` | HEAD GUIDE:3779, :4001. | |
+| AG-8a | spec:117-124 (C; also B, A) | No single page lists every attribute, transaction method and sim helper with its signature. C grepped core for `EventRow`'s fields, `scan_scoped`, and `scan_from` (which needs `View` imported). | FIXED `301d13d2`, `fe10fa22` (`examples/api.rs`, held by `api_census`: 52 scanned surfaces, attribute words read from the parsers) | | |
+| AG-8b | spec:124-126 (B) | B asked for the "remote's side is not exactly-once" sentence where it reads. | FIXED `fca473d3` | HEAD `crates/charpente/examples/modelled_remote.rs:95-97`. | |
+| AG-9r | spec:128-133 (C) | A re-issued effect gets a fresh key, and GUIDE says nothing about re-issue. C asked for a caller-chosen key. | ROW-SPEC: "a re-issued job that keeps its effect's key", 0.5.0 (spec:469; PLAN.md:282-283). Doc half FIXED `fca473d3`. | HEAD GUIDE:2010-2014. | |
+| AG-10 | spec:135-137 | Events are read by hand: A's 40-line `event_counts`, C's grep for `EventRow`. | FIXED `4f9c8b6a`, `3ea575ee`, `2b1295b1` (`checks::events::<E>`, `events_scoped::<E>`); the scaffold reads its events with them (`799bafcc`) | HEAD `crates/charpente-sim/src/checks.rs` has no typed event read. | **RECURS**: agents A and C |
+| AG-11 | spec:139-143 | A private handler in a submodule cannot be mounted (E0603 on generated code). | see INV-8 (FIXED `3f1bf64d`) | | **RECURS** (INV-8) |
+| AG-12a | spec:145-149, :162 | A Dead job is invisible to an app, so C built a watchdog and a redrive. | see OB-18 (ROW-EXISTING PLAN.md:335, due) | | **RECURS** (OB-18) |
+| AG-12b | spec:149-152, :163 | A and C each built a logical clock. | see INV-1 (ROW-SPEC) | | **RECURS** (INV-1) |
+| AG-13 | spec:154-156 (C) | Four test failures appear only when run as root. | REFUSED: by design. `chmod_that_bites` fails such a pin on purpose. | spec:154-156; `crates/charpente/tests/support/mod.rs:14-40`. | |
+| AG-14 | spec:158, :189-193 (A, first ask) | A spec language that generates the app. | REFUSED | spec §2:189-193; MANIFESTO §3 (the best reviewer wins, not the best autocomplete). | |
+| AG-15 | spec:159, :198-201 (A, second ask) | Templates for common properties, such as derived event-proof checks. | ROW-SPEC (spec §2:198-201). **Its trigger as written is narrow, not unfireable** (see above; PLAN `2634efec` keeps both channels). The vacuity half of the ask is AG-2. | | |
+| AG-16 | spec:160, :207-209 (A, fourth ask) | Structured compiler errors and a fix verb. | REFUSED | spec §2:207-209: cargo emits JSON diagnostics, the sim has `--format json`, and machine-applicable suggestions from a proc macro need unstable `proc_macro::Diagnostic`. | |
+| AG-17 | spec:160, :194-197 (A, sixth ask) | A state-machine language. | ROW-SPEC (spec §2:194-197) | | |
+| AG-18 | spec:161 (B) | Unreadable skips. | see LR-1 (FIXED, with the fix line from `da4173ce`) and OB-11 (the driver-caused skip rate, FIXED) | | **RECURS** (LR-1) |
+| AG-19 | spec:163-164, :217-221 (C) | Gentler faults at startup. | REFUSED | spec §2:217-221. LEDGER 2026-09-07, "the `RECOVER_ATTEMPTS` call, answered: raise nothing" (docs/LEDGER.md:4197): the give-ups are the fault rate. | |
+| AG-20 | spec:222-224 (C) | A host that is not a literal in `#[job(outbound = …)]`. | REFUSED: the literal is what puts every host into `describe` (0.3.0 spec §3) | spec §2:222-224. The existing row PLAN.md:342 ("One outbound job over several declared hosts") stands. | |
+
+**Counting notes.** Rows whose disposition reads "see …" are dedupe pointers to the row that
+carries the finding, and are not counted again (AG-1, AG-3, AG-11, AG-12a, AG-12b, AG-18, PW-4,
+and the "—" rows). Every other row counts once under its disposition. The summary's counts are
+tallied from these tables.
+
+
+**Open, deliberately.**
+- **`checks::wait_out_clock_refusal` still gives up on a third clock refusal** for its other callers: `outbound-fixture`'s own tail, and any app below the helper. That contradicts GUIDE's below-the-helper rule, "give up only on a durable refusal". §11's "Testing a tail in sim", which GUIDE's drop-below list now points at, gives up on fault fallout too. No recorded or fresh batch hits either. Changing the helper moves `outbound-fixture`'s recorded tail code, so it waits for the helper's next change. Until then a below-the-helper app skips, rather than fails, a platform clock defect.
+- **Unpinned:**
+  - `events_scoped`'s `E::Scope: Tenant` bound. The bound is itself the compile-time contract. Since `charpente-sim` now depends on `charpente`, a `compile_fail` doctest could pin it without a new edge, though weakly.
+  - The scaffold's per-note ack check has no pin that tells it from a count. The enqueue-deletion tests go red under both.
+  - `api_census`'s attribute-word regions have no minimum word count.
+- **Cosmetic or narrow:**
+  - Under `recover`'s new failure the sim also records the give-up, so a hand-written runner reading `gave_up()` sees both, while the harness counts a failure.
+  - `expand_sse`'s fallback arm covers a non-`Result` return too.
+  - GUIDE has one more overlong line, near the mutants section.
+  - Two fix-wave commit messages swap `doc_truth`'s and `doc_inventory`'s counts (12 and 3); `final-fix-report.md` corrects them.
+- **The three examples do not build from the registry tarball.** Their path-only dev-dependency on `charpente-sim` is stripped at publish, as `charpente-macros`' is. GUIDE promises `cargo run --example` only in a checkout.
+- **Rows whose triggers the testimony census finds met, with no release yet:**
+  - mechanical enforcement of the `durable_corruption_fired` rule (statuspage I-5 was first, outbound I1 second);
+  - a worked first-credential example (four builds each invented one);
+  - Dead reachable, which is 0.5.0's scope.
+
+  These are scheduling, and Noah's.
+- **The fix wave's code was not put through the mutation instrument again.** Each change landed red-first under its own test instead.
+
+**Next.**
+- **Task 18, the docs-only build.** It is Noah's to start: a fresh offline box with the packaged 0.4.0 crates and clippy installed. No box image has carried clippy yet (LR-3). The review is against spec §6.8 (a)–(f). For (e), a reported shrunk failure is replayed with one item removed, and it must stop failing. Every finding gets a disposition under the testimony rule, and a platform defect is fixed before the publish.
+- **The push**, Noah's: this entry and the commits above.
+- **Task 19, the publish**, Noah's:
+  - run `scripts/publish.sh`'s full-verify dry run at the signed head;
+  - run `--for-real`;
+  - do the registry smoke: install, `--version`, `new`, clippy, sim;
+  - date CHANGELOG's 0.4.0 heading;
+  - turn PLAN's "In progress: 0.4.0" into shipped;
+  - close out 0.3.0's publish in this ledger with the date and the CI run ids.
