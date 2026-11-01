@@ -1163,6 +1163,9 @@ fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
     // `requests[i]`'s status (`phase.answers[i]` holds the body too), `None`
     // when the phase left it unanswered.
     let _acked: Option<u16> = phase.status(0);
+    // Each request's answer as `(status, body)`, the body the response's raw
+    // bytes (JSON for a route that returns a value).
+    let _answers: &Vec<Option<(u16, Vec<u8>)>> = &phase.answers;
     // Power-cycle, quiesce disk and clock faults (outbound too when the app
     // declares hosts), wait out a clock refusal, boot, re-send each request
     // with no answer or a fallout 5xx, and run `tail` past the boot so jobs,
@@ -1176,6 +1179,8 @@ fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
     // call: an unanswered request may have landed before the fault, so its
     // re-send can be its second arrival.
     let _status: Option<u16> = recovered.status(0).or(phase.status(0));
+    // Each re-send's `(status, body)`, by the index of the request it re-sent.
+    let _resent: &Vec<Option<(u16, Vec<u8>)>> = &recovered.resent;
     let snap: Snapshot = recovered
         .kernel
         .app()
