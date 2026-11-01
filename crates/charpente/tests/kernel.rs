@@ -7959,6 +7959,41 @@ fn an_unanswered_request_leaves_its_own_slot_none() {
     );
 }
 
+/// An SSE upgrade is answered too: its opening response fills its own slot,
+/// as a one-shot reply's does. Left `None`, `charpente_sim::drive` would read
+/// the subscribe as unanswered and send it again in the tail. The instrument
+/// cannot see this (`SimReply::stream`'s only mutant does not compile), so
+/// the property holds it: delete `stream`'s `self.answer` and this goes red.
+#[test]
+fn an_sse_upgrade_fills_its_own_slot_with_its_opening_response() {
+    let sim = Sim::with_faults(0xA45_0003, FaultConfig::none());
+    let app = tail_app(&sim, charpente::DbConfig::default());
+    let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
+    source.push_at(0, Request::new(Method::Get, "/feed"));
+    source.push_at(
+        SEC,
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(1) }),
+    );
+    let (answers, responses, sinks) = (source.answers(), source.responses(), source.sinks());
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    assert_eq!(sinks.lock().unwrap().len(), 1, "the case: one SSE upgrade");
+    let responses = responses.lock().unwrap();
+    assert_eq!(
+        responses.len(),
+        2,
+        "the upgrade and the emit, in answer order"
+    );
+    let slots = answers.lock().unwrap();
+    assert_eq!(
+        slots[0].as_ref(),
+        Some(&responses[0]),
+        "the upgrade's slot holds its opening response"
+    );
+    assert_eq!(slots[1].as_ref(), Some(&responses[1]), "the emit's own");
+}
+
 // ------------- SimSource::wait_until: what woke it, and the sleep it asks for
 
 /// The sim's clock, recording every sleep it is asked for, in nanoseconds.
