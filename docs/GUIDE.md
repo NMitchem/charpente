@@ -3962,6 +3962,10 @@ struct HitBody {
     slot: WireU64,
 }
 
+// Takes the tail's re-send by design: a hit that lands twice is two jobs, and
+// the invariants below count jobs. A route whose property is exactly-once
+// answers a row that already landed instead (GUIDE §8, "A route the tail
+// re-sends must be safe to receive twice").
 #[route(POST "/hit", public)]
 fn hit(tx: &mut Tx, body: HitBody) -> Result<WireU64, ApiError> {
     tx.enqueue(CountUp { slot: body.slot.0 });
