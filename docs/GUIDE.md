@@ -5158,7 +5158,10 @@ that fails in pass 1 fails at the full count too, and every mutant pass 1 did
 not catch gets the full count in pass 2. Each mutant's verdict is therefore
 the one a single full pass gives, with one difference, where pass 1 is the
 stricter: a mutant that fails an early run and then hangs is caught in pass 1,
-where a single full pass would time out on it. Before either pass the verb runs `cargo test`
+where a single full pass would time out on it. A pass 2 that does not add up
+with pass 1, because it judged another set of mutants than pass 1 left or
+called one that pass 1 built unviable, makes the verb exit 2 rather than mix
+two runs' verdicts: rerun with the same `--master-seed`. Before either pass the verb runs `cargo test`
 over the test set once at the full count (with `--property`'s filter when it
 is given). That run is the baseline pass 2 judges against. An unmet `require`
 or a check that tested nothing makes it red, and the verb exits 2 before any
