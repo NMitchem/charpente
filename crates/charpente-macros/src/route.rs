@@ -223,6 +223,19 @@ fn arg_name(pat: &PatType) -> Option<String> {
     }
 }
 
+/// The marker struct's visibility (0.4.0 A.5): `pub` as written, and
+/// `pub(crate)` for every other handler, since `routes![…]` may name the
+/// marker from anywhere in the crate. A private, `pub(self)`, `pub(super)` or
+/// `pub(in path)` handler's own visibility would give E0603 on a struct the
+/// app never wrote. Widening is safe: the marker is inert, and the impl that
+/// calls the handler stays in the handler's module.
+fn marker_vis(vis: &syn::Visibility) -> TokenStream {
+    match vis {
+        syn::Visibility::Public(_) => quote!(#vis),
+        _ => quote!(pub(crate)),
+    }
+}
+
 /// `public(Scope)`'s emission: the `PublicScope` the `Route` carries. `name`
 /// is read through `::charpente::tenant::tenant_name`. Its `TenantScope`
 /// bound refuses a scope type with no membership check, with the same
@@ -306,10 +319,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     let name = &func.sig.ident;
     let name_str = name.to_string();
-    let vis = match &func.vis {
-        syn::Visibility::Inherited => quote!(pub(crate)),
-        v => quote!(#v),
-    };
+    let vis = marker_vis(&func.vis);
 
     let mut inputs = func.sig.inputs.iter();
     let tx_ok = matches!(
@@ -639,10 +649,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
 
     let name = &func.sig.ident;
     let name_str = name.to_string();
-    let vis = match &func.vis {
-        syn::Visibility::Inherited => quote!(pub(crate)),
-        v => quote!(#v),
-    };
+    let vis = marker_vis(&func.vis);
 
     let mut inputs = func.sig.inputs.iter();
     let tx_ok = matches!(

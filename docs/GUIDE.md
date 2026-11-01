@@ -759,8 +759,10 @@ tenant it opens (see "A route's stance" below); a route that says none is a
 compile error naming all three; `auth` is covered under Sessions below). The
 macro checks the
 function's argument list against the path and emits the glue that extracts,
-decodes, and dispatches to it. The handler can live in any module of the crate, private
-or not, and `routes![handlers::x]` mounts it from the root:
+decodes, and dispatches to it. The handler can live in any module of the crate,
+with any visibility of its own (private, `pub(super)`, `pub(in path)` or
+wider), and `routes![handlers::x]` mounts it from wherever its module can be
+named, the root included:
 
 - The first argument must be named exactly `tx`, typed `&mut Tx`.
 - Then one argument per `:param` in the path, **in path order**, each named
