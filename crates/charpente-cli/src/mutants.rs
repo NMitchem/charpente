@@ -1227,7 +1227,8 @@ fn report(
 /// place of each mutant pass 2 judged again: the verdicts one full pass gives,
 /// but for a mutant that fails an early run and then hangs, which pass 1
 /// catches where a full pass would time out. Pass 2 judges exactly the mutants
-/// pass 1 missed or timed out, matched by name, so anything else is refused.
+/// pass 1 missed or timed out, matched by name, so anything else is refused,
+/// and so is pass 2 calling one of them unviable: pass 1 built it.
 fn merge(mut first: Outcomes, second: Option<Outcomes>, two: bool) -> Result<Outcomes, String> {
     for x in &mut first.outcomes {
         x.pass = if two { Pass::First } else { Pass::Only };
@@ -1247,6 +1248,17 @@ fn merge(mut first: Outcomes, second: Option<Outcomes>, two: bool) -> Result<Out
         }) else {
             continue;
         };
+        if x.summary == "Unviable" {
+            return Err(format!(
+                "error: pass 2 called {} unviable, but pass 1 built it and did not catch it, and \
+                 a mutant pass 1 built cannot be unviable in pass 2: pass 2's build failed for a \
+                 reason outside the mutation (its scratch copy, the disk, the toolchain), so its \
+                 verdict is not one run's. Read as one, it would put an unviable, which does not \
+                 fail the run, in place of pass 1's uncaught verdict, which does. Rerun with the \
+                 same --master-seed under cargo-mutants 27.1.0, on a tree nothing edits meanwhile.",
+                m.name
+            ));
+        }
         *slot = Outcome {
             pass: Pass::Second,
             ..x
@@ -1269,7 +1281,12 @@ fn merge(mut first: Outcomes, second: Option<Outcomes>, two: bool) -> Result<Out
     first.caught += second.caught;
     first.missed = second.missed;
     first.timeout = second.timeout;
-    first.unviable += second.unviable;
+    // Pass 2 judged only mutants pass 1 built, and an unviable among them is
+    // refused above, so pass 1's unviable count is the run's.
+    assert_eq!(
+        second.unviable, 0,
+        "pass 2's record counts an unviable mutant its outcomes do not list"
+    );
     Ok(first)
 }
 
@@ -2266,6 +2283,53 @@ mod tests {
             (count(1, "mutant"), count(2, "mutant"), count(0, "mutant")),
             ("1 mutant".into(), "2 mutants".into(), "0 mutants".into())
         );
+    }
+
+    /// A mutant pass 1 built and did not catch cannot be unviable in pass 2: its
+    /// build failed there for a reason outside the mutation. Merged, pass 2's
+    /// unviable replaced pass 1's MISSED and the run exited 0, where a single
+    /// full pass exits 1 (found by the 0.4.0 mutation step through `+= -> -=` on
+    /// the unviable count), so the report refuses it, after a pass-1 TIMEOUT too.
+    #[test]
+    fn pass_2_calling_a_mutant_pass_1_built_unviable_is_refused() {
+        for (tag, pass_1, counts) in [
+            ("unviable-missed", "MissedMutant", [2, 1, 1, 0, 0]),
+            ("unviable-timeout", "Timeout", [2, 1, 0, 1, 0]),
+        ] {
+            let mut passes = passes_from_files(
+                tag,
+                &[
+                    record(
+                        counts,
+                        &[
+                            named(3, "every_run", "CaughtMutant"),
+                            named(7, "in_band", pass_1),
+                        ],
+                    ),
+                    record([1, 0, 0, 0, 1], &[named(7, "in_band", "Unviable")]),
+                ],
+            );
+            let second = passes.pop();
+            let first = passes.pop().expect("two records");
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = report(first, second, &run_ctx(Some(32), &[]), &mut out, &mut err);
+            let (out, err) = (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            );
+            assert_eq!((code, out.as_str()), (2, ""), "{pass_1}: {err}");
+            assert_eq!(
+                err,
+                "error: pass 2 called src/lib.rs:7:5: replace in_band with () unviable, but pass \
+                 1 built it and did not catch it, and a mutant pass 1 built cannot be unviable in \
+                 pass 2: pass 2's build failed for a reason outside the mutation (its scratch \
+                 copy, the disk, the toolchain), so its verdict is not one run's. Read as one, it \
+                 would put an unviable, which does not fail the run, in place of pass 1's uncaught \
+                 verdict, which does. Rerun with the same --master-seed under cargo-mutants \
+                 27.1.0, on a tree nothing edits meanwhile.\n",
+                "{pass_1}"
+            );
+        }
     }
 
     /// Review M3: a pass whose cargo-mutants died before writing its own record
