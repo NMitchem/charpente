@@ -562,6 +562,7 @@ fn read_events<E: Event>(
     let mut out = Vec::new();
     let mut from = 0;
     loop {
+        let at = from;
         let page: Vec<EventRow> = snap
             .scan_from(from, EVENTS_PAGE)
             .map_err(|e| format!("{who}: reading the event log from id {from}: {e}"))?;
@@ -586,7 +587,7 @@ fn read_events<E: Event>(
             }
             let undecodable = |detail: String| {
                 format!(
-                    "{who}: event \"{}\" row {id} does not decode: {detail} — it was written by a \
+                    "{who}: event \"{}\" row {id} does not decode: {detail}. It was written by a \
                      different shape of the event, through a change inside a type one of its \
                      fields holds, which the fingerprint cannot see (GUIDE §12), so read it with \
                      the type that wrote it; if no such type changed, the stored bytes are corrupt",
@@ -606,6 +607,13 @@ fn read_events<E: Event>(
         if page.len() < EVENTS_PAGE {
             return Ok(out);
         }
+        // A full page that left the cursor where it was would be read again
+        // forever: the cursor moves past every row read, matched or not.
+        assert!(
+            from > at,
+            "{who}: a full page of the event log from id {at} left the cursor at {from}; it must \
+             move past every row read, matched or not, or the read never ends"
+        );
     }
 }
 

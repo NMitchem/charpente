@@ -182,7 +182,13 @@ impl<'s> Drive<'s> {
     ///   again, in its original order, all at the tail's start: one whose
     ///   answer is `None`, or a 5xx whose body is fault fallout. A 4xx, or a
     ///   5xx whose body is not fault fallout (a handler's own error), is the
-    ///   app's answer and is not re-sent. The re-sent answers come back in
+    ///   app's answer and is not re-sent. The 5xx bound matters: fallout is
+    ///   read from the body's text ([`is_fault_fallout`]), so an app's own 400
+    ///   saying "the dose was injected twice" reads as fallout and is still
+    ///   not re-sent. The converse is the classifier's limit: an app's own
+    ///   5xx whose message holds one of the phrases it matches ("simulated",
+    ///   "injected", "poisoned", "close and re-open the database") is
+    ///   re-sent. The re-sent answers come back in
     ///   [`Recovered::resent`], apart from the phase's.
     ///
     /// `Ok(None)`: the run gave up, on a boot refused for durable corruption
@@ -197,7 +203,9 @@ impl<'s> Drive<'s> {
     /// - Any other failure to boot or to build the kernel: `the fault-free
     ///   tail could not boot: <error>`.
     /// - The tail's kernel stopped: `the fault-free tail's kernel stopped:
-    ///   <error>`, in the kernel's words.
+    ///   <error>`, in the kernel's words. A stop whose own text begins
+    ///   `kernel stopped: ` (a poisoned engine, a dead store handle) says it
+    ///   once.
     /// - An app that declares a host the workload registered no model for:
     ///   the missing-remote text [`Drive::faulted_phase`] gives.
     ///
@@ -241,9 +249,11 @@ impl<'s> Drive<'s> {
             source.push_at(start, phase.requests[i].clone());
         }
         let answers = source.answers();
-        kernel
-            .run(&mut source)
-            .map_err(|e| format!("the fault-free tail's kernel stopped: {e}"))?;
+        kernel.run(&mut source).map_err(|e| {
+            let text = e.to_string();
+            let words = text.strip_prefix("kernel stopped: ").unwrap_or(&text);
+            format!("the fault-free tail's kernel stopped: {words}")
+        })?;
         let mut resent = vec![None; phase.requests.len()];
         let answers = answers
             .lock()

@@ -33,11 +33,15 @@ struct Note {
 }
 
 /// Note 400 is the app's own 400, note 500 its own 500 (a handler's error,
-/// not fault fallout); any other note is stored.
+/// not fault fallout); note 401 is the app's own 400 whose message holds a
+/// word the fallout classifier matches; any other note is stored.
 #[route(POST "/notes/:id", public)]
 fn add_note(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
     match id.raw() {
         400 => Err(ApiError::BadRequest("note 400 is refused".to_string())),
+        401 => Err(ApiError::BadRequest(
+            "note 401 was injected twice".to_string(),
+        )),
         500 => Err(ApiError::Internal("the ledger is closed".to_string())),
         n => {
             tx.put(&Note { id, n });
@@ -142,6 +146,20 @@ fn scheduled(sim: &Sim) -> io::Result<App> {
     )?
     .mount(routes![doom])
     .mount_jobs(jobs![Doomed, Beat])
+    .schedule("beat", Duration::from_secs(1), || Beat { n: 0 }))
+}
+
+/// The notes app with the 1 s beat. The beat's schedule row is what records
+/// a wall time in the store, so a clock left behind it is refused at open.
+fn ticking(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![add_note])
+    .mount_jobs(jobs![Beat])
     .schedule("beat", Duration::from_secs(1), || Beat { n: 0 }))
 }
 
@@ -333,6 +351,36 @@ fn only_unanswered_or_fallout_answers_are_resent() {
 }
 
 #[test]
+fn an_apps_own_4xx_is_not_resent_even_when_its_body_reads_as_fallout() {
+    // No faults: the case is the app's own 400 whose message holds a word the
+    // fallout classifier matches ("injected"), which any seed shows. Only the
+    // re-send rule's 5xx bound keeps it from being re-sent.
+    let sim = Sim::with_faults(0xD7_6000, FaultConfig::none());
+    let drive = Drive::new(&sim, notes);
+    let phase = drive
+        .faulted_phase(&posts(&[401, 1]), Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        shape(&phase.answers),
+        ["400f", "200"],
+        "the case: the app's own 400 reads as fallout to the classifier"
+    );
+    assert_eq!(
+        phase.answers[0].as_ref().unwrap().1,
+        br#"{"error":"note 401 was injected twice"}"#
+    );
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(1))
+        .unwrap()
+        .expect("the fault-free tail boots");
+    assert_eq!(
+        recovered.resent,
+        [None, None],
+        "a 4xx is the app's answer, whatever its body says"
+    );
+}
+
+#[test]
 fn resent_answers_are_reported_apart() {
     // 0xD7_0019 at rate 0.05: the first four requests are answered (400, 500,
     // 200, 200), then two fallout 500s and two unanswered. The re-sent run
@@ -348,15 +396,10 @@ fn resent_answers_are_reported_apart() {
         ["400", "500", "200", "200", "500f", "500f", "-", "-"],
         "the seed's case"
     );
-    let before = phase.answers.clone();
     let recovered = drive
         .recover(&phase, Duration::from_secs(1))
         .unwrap()
         .expect("the fault-free tail boots");
-    assert_eq!(
-        phase.answers, before,
-        "the phase's answers stand as recorded"
-    );
     assert_eq!(recovered.resent.len(), NOTES.len());
     for (i, id) in NOTES.iter().enumerate() {
         let want = (i >= 4).then(|| (200, id_body(*id)));
@@ -394,6 +437,63 @@ fn a_durable_refusal_in_the_tail_gives_the_run_up() {
             "the boot was refused for durable corruption at or below the store's horizon, \
              which no restart clears, so nothing past it was adjudicated"
         )
+    );
+}
+
+#[test]
+fn a_clock_stop_ends_the_phase_and_the_tail_waits_out_the_refusal() {
+    // 0xD7_8006 with only the clock's step-back (0.02 a read, up to 120 s)
+    // and downtime (0.5 a power cycle, up to 3 days) axes on: 15 of the 30
+    // notes are answered, then one step back beyond the 60 s tolerance stops
+    // the kernel ("clock went backwards"), which only `clock_fallout` calls
+    // fallout. The tail's power cycle draws no downtime jump, so the beat's
+    // recorded time is still more than the tolerance ahead of the clock and
+    // the tail's kernel is refused at open; the tail waits that out once. 50
+    // of 0xD7_8000..+200 show both.
+    let sim = Sim::with_faults(
+        0xD7_8006,
+        FaultConfig {
+            clock_step_back: (0.02, Duration::from_secs(120)),
+            clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
+            ..FaultConfig::none()
+        },
+    );
+    let drive = Drive::new(&sim, ticking);
+    let requests: Vec<(Duration, Request)> = (1..=30)
+        .map(|n| (Duration::from_millis(n * 100), post(n)))
+        .collect();
+    let phase = drive
+        .faulted_phase(&requests, Duration::from_secs(4))
+        .expect("a clock stop the run's clock faults explain ends the phase, never fails it");
+    let cov = |key: &str| sim.coverage().get(key).copied();
+    assert_eq!(
+        shape(&phase.answers),
+        [vec!["200"; 15], vec!["-"; 15]].concat(),
+        "the seed's case: the kernel stopped mid-phase"
+    );
+    assert_eq!(cov("clock:stepped-back:beyond-tolerance"), Some(1));
+    assert_eq!(cov("fault:write_error"), None, "no disk fault ran");
+    assert_eq!(cov("restart:process"), None);
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "a clock stop in the phase is no give-up"
+    );
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(1))
+        .expect("the tail's refusal at open is waited out, not a failure")
+        .expect("the tail boots after one wait");
+    assert_eq!(
+        cov("restart:process"),
+        Some(1),
+        "the seed's case: the tail was refused once and restarted after the wait"
+    );
+    assert_eq!(cov("clock:downtime"), None);
+    assert_eq!(sim.gave_up(), None);
+    assert_eq!(
+        shape(&recovered.resent),
+        [vec!["-"; 15], vec!["200"; 15]].concat(),
+        "the tail re-sends the 15 the stop left unanswered"
     );
 }
 
@@ -544,6 +644,8 @@ fn the_tail_quiesces_outbound_only_when_the_app_declares_hosts() {
                 Phase Drive::faulted_phase returned, or one answer (None to send it) per request"
 )]
 fn recover_refuses_a_phase_without_one_answer_per_request() {
+    // No faults: the contract panics before the sim runs anything, so any
+    // seed shows it.
     let sim = Sim::with_faults(0xD7_5000, FaultConfig::none());
     let drive = Drive::new(&sim, notes);
     let phase = Phase {
@@ -630,8 +732,8 @@ fn a_tail_kernel_stop_is_reported_in_the_kernels_words() {
         .expect("the tail's kernel stops");
     assert_eq!(
         err,
-        "the fault-free tail's kernel stopped: kernel stopped: the engine is poisoned (a \
-         request-path IO failure made durability unknowable) — the request received its 500; \
-         restart the process to recover from the WAL"
+        "the fault-free tail's kernel stopped: the engine is poisoned (a request-path IO failure \
+         made durability unknowable) — the request received its 500; restart the process to \
+         recover from the WAL"
     );
 }

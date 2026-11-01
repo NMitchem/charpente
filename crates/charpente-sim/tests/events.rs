@@ -117,7 +117,7 @@ fn events_reads_past_one_page() {
 }
 
 /// The fix clause every "does not decode" error ends on (hard rule 5).
-const UNDECODABLE: &str = " — it was written by a different shape of the event, through a change inside a type one of its fields holds, which the fingerprint cannot see (GUIDE §12), so read it with the type that wrote it; if no such type changed, the stored bytes are corrupt";
+const UNDECODABLE: &str = ". It was written by a different shape of the event, through a change inside a type one of its fields holds, which the fingerprint cannot see (GUIDE §12), so read it with the type that wrote it; if no such type changed, the stored bytes are corrupt";
 
 /// A hand-written event type reading `Opened`'s rows: same name, so the
 /// reader selects them; `fingerprint` and decode are the knobs.
@@ -280,8 +280,9 @@ fn events_scoped_reads_on_when_a_full_page_ends_on_another_tenant() {
 /// A whole page of rows `events` skips, then one it reads. The cursor must
 /// advance past every row read, matched or not. A cursor that advanced only
 /// past matched rows would stay at 0 after this page and read the same full
-/// page again, forever: under that mutant this test HANGS rather than fails,
-/// so a run that never finishes is its red.
+/// page again, forever; `read_events` asserts the cursor moved after every
+/// full page, so under that mutant this test panics on that assertion
+/// instead of hanging.
 #[test]
 fn events_reads_on_past_a_whole_page_of_skipped_rows() {
     let mut db = open(0xE7E0_0007);
