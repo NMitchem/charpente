@@ -3388,18 +3388,19 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
 4. **Re-send what went unanswered.** Every request whose answer is `None`,
    or a 5xx whose body is fault fallout, is sent again at the tail's start. A
    4xx, or a handler's own 5xx, is the app's answer and is not re-sent.
-   A re-sent request takes effect at the tail's start, not at its offset, so
-   work its offset came before may already have run by then: a cancel drawn
-   ahead of a reminder's due time that went unanswered can land after the
-   reminder was sent. A check that judges when a request took effect judges a
-   re-sent one (`recovered.resent`) at the tail's start.
    Fallout is read from the body's text (`is_fault_fallout`), so a handler's
    own 5xx whose message reads as fallout ("injected", say) is re-sent too.
    The re-sent answers come back in `recovered.resent`, apart from the
    phase's, because a request that went unanswered may or may not have
    landed. So a claim about acked requests reads `phase.status(i) ==
    Some(200)`, and a check that wants the two merged merges them itself
-   (`examples/drawn_inputs.rs`).
+   (`examples/drawn_inputs.rs`). A re-sent request lands after everything the
+   faulted phase ran, not at its offset, so work its offset came before may
+   already have run by then: a cancel drawn ahead of a reminder's due time
+   that went unanswered can land after the reminder was sent. A check that
+   judges when a request took effect treats a re-sent one (a `Some` in
+   `recovered.resent`) as landing after the phase, since `Recovered` gives no
+   instant for the tail's start.
 
 **A route the tail re-sends must be safe to receive twice.** `Drive`
 re-sends, and a request that went unanswered may have landed, so its re-send
@@ -5060,11 +5061,11 @@ charpente test --mutants --file src/jobs.rs --test-package myapp
 ```
 
 `--test-package` names your app's package, so your own tests judge the mutants
-(outside charpente's own repository it is required, as `--file` is: without
-either, the verb exits 2 before running anything, naming the missing flags and
-your package; "Scope is part of the claim", below). This repository runs the
-verb through `scripts/mutants.sh`, its own wrapper for its own crates, which
-does not ship.
+(outside charpente's own repository it is required, as `--file` is: when
+either is missing, the verb exits 2 before running anything, naming the
+missing flags and your package; "Scope is part of the claim", below). This
+repository runs the verb through `scripts/mutants.sh`, its own wrapper for its
+own crates, which does not ship.
 
 A mutant reported **MISSED** is the finding. Worked example, from this repo's own
 fixture app — one job whose whole effect is a counter bump, and two properties

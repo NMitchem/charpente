@@ -129,8 +129,8 @@ const FIRST_RUNS_ENV: &str = "CHARPENTE_SIM_FIRST_RUNS";
 
 pub const USAGE: &str = "usage: charpente test --mutants [--file PATH]… [--re REGEX] \
 [--dir PATH] [--timeout SECS] [--jobs N] [--first-runs N] [--master-seed 0x…]\n\
-       --file PATH  a source file to mutate (repeatable; required outside charpente's own \
-workspace, where the default is the oracle-bearing set)\n\
+       --file PATH  a source file to mutate (repeatable; inside charpente's own workspace the \
+default is the oracle-bearing set; outside it, --file is required)\n\
        --re REGEX   only mutants whose description matches\n\
        --dir PATH   the workspace directory to run in (default: .)\n\
        --jobs N     cargo-mutants' parallelism (also CARGO_MUTANTS_JOBS); refused above 1 when \
@@ -368,8 +368,13 @@ fn unrewritten_path_refusal_in(meta: &serde_json::Value) -> Option<String> {
 /// charpente's own: outside its repository the default test packages' published
 /// suites do not build (0.4.0: 21 compile errors, and nothing named the fix)
 /// and the default files are not in the tree. `None` too when `meta` lacks the
-/// fields, as `unrewritten_path_refusal_in` reads it.
-fn outside_workspace_refusal(meta: &serde_json::Value, opts: &Opts) -> Option<String> {
+/// fields, as `unrewritten_path_refusal_in` reads it. The command it suggests
+/// is the run `args` asked for, so a paste keeps its `--dir` and its scope.
+fn outside_workspace_refusal(
+    meta: &serde_json::Value,
+    opts: &Opts,
+    args: &[String],
+) -> Option<String> {
     if !opts.files_defaulted && !opts.test_packages_defaulted {
         return None;
     }
@@ -416,24 +421,39 @@ fn outside_workspace_refusal(meta: &serde_json::Value, opts: &Opts) -> Option<St
         at_dir
             .or(only)
             .and_then(name)
-            .unwrap_or("<your package>")
-            .to_string()
+            .map_or_else(|| "<your package>".to_string(), shell_word)
     } else {
-        opts.test_packages.join(" --test-package ")
+        opts.test_packages
+            .iter()
+            .map(|p| shell_word(p))
+            .collect::<Vec<_>>()
+            .join(" --test-package ")
     };
     let files = if opts.files_defaulted {
         "--file <the file to mutate, such as src/jobs.rs>".to_string()
     } else {
         opts.files
             .iter()
-            .map(|f| format!("--file {f}"))
+            .map(|f| format!("--file {}", shell_word(f)))
             .collect::<Vec<_>>()
             .join(" ")
     };
+    // Every other flag given, in order; `parse` has checked that `args` is
+    // flag and value pairs. `--dir .` is the default, so it adds nothing.
+    let mut command = "charpente test --mutants".to_string();
+    for pair in args.chunks(2) {
+        if pair[0] == "--test-package" || pair[0] == "--file" || pair == ["--dir", "."] {
+            continue;
+        }
+        for word in pair {
+            command.push(' ');
+            command.push_str(&shell_word(word));
+        }
+    }
     Some(format!(
         "error: --mutants needs {missing} outside charpente's own workspace: {root} has no \
          member named charpente-core, so the verb's defaults do not exist here — {}. Run:\n  \
-         charpente test --mutants --test-package {pkg} {files}\n\
+         {command} --test-package {pkg} {files}\n\
          (GUIDE §8, \"Finding a one-sided property\")",
         reasons.join("; ")
     ))
@@ -560,25 +580,31 @@ fn sim_env(command: &mut Command, master_seed: u64, first_runs: Option<u64>) -> 
     }
 }
 
+/// `word` as a pasted command must spell it: bare when a shell would neither
+/// split nor expand it, else single-quoted, so a `--re` holding `.*` pastes
+/// whole.
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:,@+".contains(c))
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
 /// The command that reruns this mutation run: the flags given, in order, less
-/// any `--master-seed`, then `--master-seed` with the seed this run used. A
-/// value a shell would split or expand is single-quoted, so a `--re` holding
-/// `.*` pastes whole.
+/// any `--master-seed`, then `--master-seed` with the seed this run used, each
+/// word as `shell_word` spells it.
 fn rerun_line(args: &[String], master_seed: u64) -> String {
     let mut line = "rerun exactly this mutation run: charpente test --mutants".to_string();
     // `parse` has checked that `args` is flag and value pairs.
     for pair in args.chunks(2).filter(|pair| pair[0] != "--master-seed") {
         for word in pair {
             line.push(' ');
-            if !word.is_empty()
-                && word
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_./:,@+".contains(c))
-            {
-                line.push_str(word);
-            } else {
-                line.push_str(&format!("'{}'", word.replace('\'', r"'\''")));
-            }
+            line.push_str(&shell_word(word));
         }
     }
     line.push_str(&format!(" --master-seed {master_seed:#x}"));
@@ -613,7 +639,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     if let Some(refusal) = meta
         .as_ref()
-        .and_then(|meta| outside_workspace_refusal(meta, &opts))
+        .and_then(|meta| outside_workspace_refusal(meta, &opts, args))
     {
         eprintln!("{refusal}");
         return 2;
@@ -2624,14 +2650,25 @@ mod tests {
         (t, meta)
     }
 
+    /// The refusal `run` prints for `args` (the words after `--mutants`) over
+    /// `meta`.
+    fn refusal_for(meta: &serde_json::Value, args: &[String]) -> Option<String> {
+        let opts = parse(args).expect("parses");
+        outside_workspace_refusal(meta, &opts, args)
+    }
+
+    /// The refusal's suggested command: the line after `Run:`.
+    fn run_line(refusal: &str) -> &str {
+        refusal.lines().nth(1).expect("a line after Run:")
+    }
+
     #[test]
     #[allow(clippy::disallowed_methods)] // a scratch directory is edge tooling (DESIGN.md §1)
     fn outside_refusal_names_the_package_at_dir_in_a_multi_crate_app() {
         let (t, meta) = two_crate_app("at-dir");
         let dir = t.join("worker");
         std::fs::create_dir_all(&dir).expect("scratch dir");
-        let opts = parse(&["--dir".into(), display(&dir)]).expect("parses");
-        let refusal = outside_workspace_refusal(&meta, &opts).expect("refused");
+        let refusal = refusal_for(&meta, &["--dir".into(), display(&dir)]).expect("refused");
         let _ = std::fs::remove_dir_all(&t);
         assert!(refusal.contains("--test-package worker"), "{refusal}");
         assert!(!refusal.contains("--test-package api"), "{refusal}");
@@ -2645,17 +2682,102 @@ mod tests {
             .as_array_mut()
             .expect("packages")
             .push(serde_json::json!({"name": "charpente-core", "manifest_path": display(&core)}));
-        let opts = parse(&["--dir".into(), display(&t)]).expect("parses");
-        assert_eq!(outside_workspace_refusal(&meta, &opts), None);
+        assert_eq!(refusal_for(&meta, &["--dir".into(), display(&t)]), None);
     }
 
     #[test]
     fn outside_refusal_says_your_package_when_none_is_at_dir() {
         let (t, meta) = two_crate_app("none-at-dir");
-        let opts = parse(&["--dir".into(), display(&t)]).expect("parses");
-        let refusal = outside_workspace_refusal(&meta, &opts).expect("refused");
+        let refusal = refusal_for(&meta, &["--dir".into(), display(&t)]).expect("refused");
         assert!(
             refusal.contains("--test-package <your package>"),
+            "{refusal}"
+        );
+    }
+
+    /// The suggested command is the run the agent asked for plus what it
+    /// lacked: a paste that dropped `--dir` would run somewhere else, and one
+    /// that dropped `--re` or `--property` would widen the scope unasked.
+    #[test]
+    fn outside_refusals_command_keeps_every_flag_given() {
+        let (t, meta) = two_crate_app("flags");
+        let dir = display(&t.join("worker"));
+        let args = [
+            "--dir",
+            &dir,
+            "--re",
+            "add_note.*Ok",
+            "--property",
+            "acked",
+            "--timeout",
+            "60",
+            "--jobs",
+            "1",
+            "--first-runs",
+            "8",
+            "--master-seed",
+            "0xbeef",
+        ]
+        .map(String::from);
+        let refusal = refusal_for(&meta, &args).expect("refused");
+        assert_eq!(
+            run_line(&refusal),
+            format!(
+                "  charpente test --mutants --dir {} --re 'add_note.*Ok' --property acked \
+                 --timeout 60 --jobs 1 --first-runs 8 --master-seed 0xbeef --test-package worker \
+                 --file <the file to mutate, such as src/jobs.rs>",
+                shell_word(&dir)
+            ),
+            "{refusal}"
+        );
+        let refusal =
+            refusal_for(&meta, &["--dir", ".", "--re", "x"].map(String::from)).expect("refused");
+        assert_eq!(
+            run_line(&refusal),
+            "  charpente test --mutants --re x --test-package <your package> --file <the file to \
+             mutate, such as src/jobs.rs>",
+            "--dir . is the default and adds nothing: {refusal}"
+        );
+    }
+
+    #[test]
+    fn outside_refusal_renders_given_files_and_asks_only_for_the_package() {
+        let (t, meta) = two_crate_app("files");
+        let dir = display(&t.join("worker"));
+        let args = [
+            "--dir",
+            &dir,
+            "--file",
+            "src/lib.rs",
+            "--file",
+            "src/jobs.rs",
+        ]
+        .map(String::from);
+        let refusal = refusal_for(&meta, &args).expect("refused");
+        assert!(
+            refusal.starts_with("error: --mutants needs --test-package outside"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("without --file"), "{refusal}");
+        assert_eq!(
+            run_line(&refusal),
+            format!(
+                "  charpente test --mutants --dir {} --test-package worker --file src/lib.rs \
+                 --file src/jobs.rs",
+                shell_word(&dir)
+            ),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn outside_refusal_quotes_a_file_with_a_space() {
+        let (t, meta) = two_crate_app("quoted");
+        let dir = display(&t.join("worker"));
+        let args = ["--dir", &dir, "--file", "src/my jobs.rs"].map(String::from);
+        let refusal = refusal_for(&meta, &args).expect("refused");
+        assert!(
+            run_line(&refusal).ends_with(" --test-package worker --file 'src/my jobs.rs'"),
             "{refusal}"
         );
     }

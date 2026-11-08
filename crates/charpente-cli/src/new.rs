@@ -170,9 +170,11 @@ mod tests {
             .split('}')
             .next()
             .unwrap();
+        // One entry per line; the last may omit its comma (`$(,)?`).
         let n = block
             .lines()
-            .filter(|l| l.trim_end().ends_with(','))
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
             .count();
         let word = [
             "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",

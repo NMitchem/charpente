@@ -1892,7 +1892,8 @@ const APP_METADATA: &str = r#"{"workspace_root":"/nonexistent-app-ws","packages"
 /// Outside charpente's own workspace the verb's defaults name test packages
 /// and files that do not exist there (0.4.0: 21 compile errors and no named
 /// fix), so a run that leans on both is refused before the install probe,
-/// naming both flags, the package and the command.
+/// naming both flags, the package and the command: the run given (the
+/// helper's `--dir` and `--re`) plus the two flags it lacked.
 #[cfg(unix)]
 #[test]
 fn mutants_outside_charpentes_workspace_without_test_package_or_file_is_refused_naming_both() {
@@ -1902,12 +1903,20 @@ fn mutants_outside_charpentes_workspace_without_test_package_or_file_is_refused_
     for want in [
         "--mutants needs --test-package and --file outside charpente's own workspace",
         "/nonexistent-app-ws has no member named charpente-core",
-        "charpente test --mutants --test-package app --file <the file to mutate, such as \
-         src/jobs.rs>",
         "(GUIDE §8, \"Finding a one-sided property\")",
     ] {
         assert!(stderr.contains(want), "missing {want:?}; stderr:\n{stderr}");
     }
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.starts_with("  charpente test --mutants --dir /")
+                && l.ends_with(
+                    "/ws --re no-such-mutant-anywhere --test-package app --file <the file to \
+                 mutate, such as src/jobs.rs>"
+                )),
+        "the command keeps the run's --dir and --re; stderr:\n{stderr}"
+    );
     assert!(
         !recorded.iter().any(|l| l.starts_with("cargo mutants")),
         "the refusal comes before the install probe; the shim saw {recorded:?}"
@@ -1917,12 +1926,19 @@ fn mutants_outside_charpentes_workspace_without_test_package_or_file_is_refused_
 #[cfg(unix)]
 #[test]
 fn mutants_outside_charpentes_workspace_with_test_package_but_no_file_is_refused_naming_file() {
-    let (out, _) = run_mutants_with_metadata("file", APP_METADATA, &["--test-package", "app"]);
+    // `other` is not the metadata's only package, so the command can only
+    // have it from the flags given.
+    let (out, _) = run_mutants_with_metadata(
+        "file",
+        APP_METADATA,
+        &["--test-package", "other", "--test-package", "app"],
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
     for want in [
         "--mutants needs --file outside",
-        "--test-package app --file <the file to mutate, such as src/jobs.rs>",
+        " --test-package other --test-package app --file <the file to mutate, such as \
+         src/jobs.rs>",
     ] {
         assert!(stderr.contains(want), "missing {want:?}; stderr:\n{stderr}");
     }
