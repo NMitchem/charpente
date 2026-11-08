@@ -4,6 +4,7 @@
 
 ### Changed
 - **`charpente test --mutants` outside charpente's own workspace refuses a run that gives no `--test-package` or no `--file`, and names the command that works.** The verb's defaults are charpente's own. Without `--test-package` it judged every mutant with `charpente-core` and `charpente-sim`'s tests, whose published suites do not build outside this repository, so an agent running a plain `charpente test --mutants` in its app crate on 0.4.0 got 21 compile errors, and nothing said `--test-package` was the fix. Without `--file` it mutated `crates/charpente-core/src/log.rs` and `crates/charpente-sim/src/checks.rs`, which are not in an app's tree. When the workspace has no member named `charpente-core`, the verb now exits 2 before the install check, naming the missing flags, why each default does not exist there, your package (the one at `--dir`, else the workspace's only one) and the command to run. Inside charpente's repository nothing changes, and when `cargo metadata` fails the run goes on to cargo's own error as before. GUIDE §8 says so.
+- **GUIDE §8 says a request `Drive` re-sends takes effect at the tail's start, not at its offset, so a check that judges timing judges it there** (agent A found it through a sim failure).
 
 ### Fixed
 - **`charpente new`'s usage line says the scaffold has three sim properties.** It said two from 0.3.0, when the event check made three; a unit test now counts the template's checks.
