@@ -129,15 +129,16 @@ const FIRST_RUNS_ENV: &str = "CHARPENTE_SIM_FIRST_RUNS";
 
 pub const USAGE: &str = "usage: charpente test --mutants [--file PATH]… [--re REGEX] \
 [--dir PATH] [--timeout SECS] [--jobs N] [--first-runs N] [--master-seed 0x…]\n\
-       --file PATH  a source file to mutate (repeatable; default: the oracle-bearing set)\n\
+       --file PATH  a source file to mutate (repeatable; required outside charpente's own \
+workspace, where the default is the oracle-bearing set)\n\
        --re REGEX   only mutants whose description matches\n\
        --dir PATH   the workspace directory to run in (default: .)\n\
        --jobs N     cargo-mutants' parallelism (also CARGO_MUTANTS_JOBS); refused above 1 when \
 CARGO_TARGET_DIR is inherited\n\
-       --test-package NAME  whose tests judge the mutants (repeatable). Without this, \
-the verb judges every mutant with charpente-core and charpente-sim's tests — the default \
-target set's oracles — so a --file in any other crate must name its own package here, or \
-its mutants are judged by suites that never exercise them and all report MISSED.\n\
+       --test-package NAME  whose tests judge the mutants (repeatable). Required outside \
+charpente's own workspace. Inside it, the default is charpente-core and charpente-sim's tests \
+— the default target set's oracles — so a --file in any other crate must name its own package \
+here, or its mutants are judged by suites that never exercise them and all report MISSED.\n\
        --property NAME  judge the mutants with ONE sim property only — the way to ask \
 whether that property alone would notice. Without it every property runs, and one honest \
 sibling is enough to report a mutant CAUGHT.\n\
@@ -362,6 +363,82 @@ fn unrewritten_path_refusal_in(meta: &serde_json::Value) -> Option<String> {
         .find_map(|m| unrewritten_path_refusal(std::path::Path::new(m), &root))
 }
 
+/// The refusal for a run that leans on `--test-package`'s or `--file`'s default
+/// in a workspace with no `charpente-core` member, or `None`. The defaults are
+/// charpente's own: outside its repository the default test packages' published
+/// suites do not build (0.4.0: 21 compile errors, and nothing named the fix)
+/// and the default files are not in the tree. `None` too when `meta` lacks the
+/// fields, as `unrewritten_path_refusal_in` reads it.
+fn outside_workspace_refusal(meta: &serde_json::Value, opts: &Opts) -> Option<String> {
+    if !opts.files_defaulted && !opts.test_packages_defaulted {
+        return None;
+    }
+    let root = meta.get("workspace_root")?.as_str()?;
+    let packages = meta.get("packages")?.as_array()?;
+    fn name(p: &serde_json::Value) -> Option<&str> {
+        p.get("name")?.as_str()
+    }
+    if packages.iter().any(|p| name(p) == Some("charpente-core")) {
+        return None;
+    }
+    let missing = match (opts.test_packages_defaulted, opts.files_defaulted) {
+        (true, true) => "--test-package and --file",
+        (true, false) => "--test-package",
+        _ => "--file",
+    };
+    let mut reasons = Vec::new();
+    if opts.test_packages_defaulted {
+        reasons.push(format!(
+            "without --test-package it would judge every mutant with {}'s tests, and their \
+             published suites do not build outside charpente's repository",
+            DEFAULT_TEST_PACKAGES.join(" and ")
+        ));
+    }
+    if opts.files_defaulted {
+        reasons.push(format!(
+            "without --file it would mutate {}, which are not in this tree",
+            DEFAULT_TARGETS.join(" and ")
+        ));
+    }
+    let pkg = if opts.test_packages_defaulted {
+        let here = std::path::absolute(&opts.dir).ok();
+        let at_dir = packages.iter().find(|p| {
+            let parent = p
+                .get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|m| std::path::Path::new(m).parent());
+            parent.is_some() && parent == here.as_deref()
+        });
+        let only = match packages.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        };
+        at_dir
+            .or(only)
+            .and_then(name)
+            .unwrap_or("<your package>")
+            .to_string()
+    } else {
+        opts.test_packages.join(" --test-package ")
+    };
+    let files = if opts.files_defaulted {
+        "--file <the file to mutate, such as src/jobs.rs>".to_string()
+    } else {
+        opts.files
+            .iter()
+            .map(|f| format!("--file {f}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Some(format!(
+        "error: --mutants needs {missing} outside charpente's own workspace: {root} has no \
+         member named charpente-core, so the verb's defaults do not exist here — {}. Run:\n  \
+         charpente test --mutants --test-package {pkg} {files}\n\
+         (GUIDE §8, \"Finding a one-sided property\")",
+        reasons.join("; ")
+    ))
+}
+
 /// The verdict line for a baseline that failed because cargo-mutants' scratch
 /// copy ran out of disk, or `None` for any other failure. `log` is the baseline's log.
 fn out_of_disk_line(log: &str, tmp: &std::path::Path, tmpdir: Option<&str>) -> Option<String> {
@@ -531,6 +608,13 @@ pub fn run(args: &[String]) -> i32 {
 
     let meta = workspace_metadata(&opts.dir);
     if let Some(refusal) = meta.as_ref().and_then(unrewritten_path_refusal_in) {
+        eprintln!("{refusal}");
+        return 2;
+    }
+    if let Some(refusal) = meta
+        .as_ref()
+        .and_then(|meta| outside_workspace_refusal(meta, &opts))
+    {
         eprintln!("{refusal}");
         return 2;
     }
@@ -1438,8 +1522,13 @@ fn verdict(
 struct Opts {
     dir: String,
     files: Vec<String>,
+    /// `files` is `DEFAULT_TARGETS` because no `--file` was given.
+    files_defaulted: bool,
     res: Vec<String>,
     test_packages: Vec<String>,
+    /// `test_packages` is `DEFAULT_TEST_PACKAGES` because no `--test-package`
+    /// was given.
+    test_packages_defaulted: bool,
     property: Option<String>,
     timeout: Option<String>,
     jobs: Option<String>,
@@ -1509,10 +1598,12 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
         }
     }
 
-    if files.is_empty() {
+    let files_defaulted = files.is_empty();
+    if files_defaulted {
         files = DEFAULT_TARGETS.iter().map(|s| (*s).to_string()).collect();
     }
-    if test_packages.is_empty() {
+    let test_packages_defaulted = test_packages.is_empty();
+    if test_packages_defaulted {
         test_packages = DEFAULT_TEST_PACKAGES
             .iter()
             .map(|s| (*s).to_string())
@@ -1521,8 +1612,10 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
     Ok(Opts {
         dir,
         files,
+        files_defaulted,
         res,
         test_packages,
+        test_packages_defaulted,
         property,
         timeout,
         jobs,
@@ -2512,5 +2605,58 @@ mod tests {
     fn spread_is_one_splitmix64_step() {
         assert_eq!(spread(0), 0xe220_a839_7b1d_cdaf);
         assert_eq!(spread(0x9e37_79b9_7f4a_7c15), 0x6e78_9e6a_a1b9_65f4);
+    }
+
+    /// An app workspace `<tmp>/<tag>` with members `api` and `worker`, as
+    /// `cargo metadata` reports it. Returns `(<tmp>/<tag>, meta)`.
+    fn two_crate_app(tag: &str) -> (std::path::PathBuf, serde_json::Value) {
+        let t = std::env::temp_dir().join(format!(
+            "charpente-mutants-outside-{}-{tag}",
+            std::process::id()
+        ));
+        let meta = serde_json::json!({
+            "workspace_root": display(&t),
+            "packages": [
+                {"name": "api", "manifest_path": display(&t.join("api/Cargo.toml"))},
+                {"name": "worker", "manifest_path": display(&t.join("worker/Cargo.toml"))},
+            ],
+        });
+        (t, meta)
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a scratch directory is edge tooling (DESIGN.md §1)
+    fn outside_refusal_names_the_package_at_dir_in_a_multi_crate_app() {
+        let (t, meta) = two_crate_app("at-dir");
+        let dir = t.join("worker");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let opts = parse(&["--dir".into(), display(&dir)]).expect("parses");
+        let refusal = outside_workspace_refusal(&meta, &opts).expect("refused");
+        let _ = std::fs::remove_dir_all(&t);
+        assert!(refusal.contains("--test-package worker"), "{refusal}");
+        assert!(!refusal.contains("--test-package api"), "{refusal}");
+    }
+
+    #[test]
+    fn outside_refusal_is_none_inside_charpentes_workspace() {
+        let (t, mut meta) = two_crate_app("inside");
+        let core = t.join("crates/charpente-core/Cargo.toml");
+        meta["packages"]
+            .as_array_mut()
+            .expect("packages")
+            .push(serde_json::json!({"name": "charpente-core", "manifest_path": display(&core)}));
+        let opts = parse(&["--dir".into(), display(&t)]).expect("parses");
+        assert_eq!(outside_workspace_refusal(&meta, &opts), None);
+    }
+
+    #[test]
+    fn outside_refusal_says_your_package_when_none_is_at_dir() {
+        let (t, meta) = two_crate_app("none-at-dir");
+        let opts = parse(&["--dir".into(), display(&t)]).expect("parses");
+        let refusal = outside_workspace_refusal(&meta, &opts).expect("refused");
+        assert!(
+            refusal.contains("--test-package <your package>"),
+            "{refusal}"
+        );
     }
 }

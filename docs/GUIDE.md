@@ -5055,9 +5055,11 @@ charpente test --mutants --file src/jobs.rs --test-package myapp
 ```
 
 `--test-package` names your app's package, so your own tests judge the mutants
-(without it the verb uses charpente's own suites; "Scope is part of the claim",
-below). This repository runs the verb through `scripts/mutants.sh`, its own
-wrapper for its own crates, which does not ship.
+(outside charpente's own repository it is required, as `--file` is: without
+either, the verb exits 2 before running anything, naming the missing flags and
+your package; "Scope is part of the claim", below). This repository runs the
+verb through `scripts/mutants.sh`, its own wrapper for its own crates, which
+does not ship.
 
 A mutant reported **MISSED** is the finding. Worked example, from this repo's own
 fixture app — one job whose whole effect is a counter bump, and two properties
@@ -5125,10 +5127,11 @@ reported CAUGHT if *any* test in scope fails, so one honest sibling hides every
 one-sided property beside it. `--property NAME` judges the mutants by a single
 property — that is how you ask whether *that* property earns its place.
 Similarly `--test-package` decides which packages' suites are allowed to run;
-without this, the verb judges every mutant with `charpente-core` and
-`charpente-sim`'s tests — the default target set's oracles — so a `--file`
-in any other crate must name its own package here, or its mutants are
-judged by suites that never exercise them and all report MISSED.
+without this, inside charpente's own repository, the verb judges every mutant
+with `charpente-core` and `charpente-sim`'s tests — the default target set's
+oracles — so a `--file` in any other crate must name its own package here, or
+its mutants are judged by suites that never exercise them and all report
+MISSED.
 
 **Two results that are not findings.** `unviable` means the mutant did not
 compile. Sometimes your types rejected a plausible bug, which is the

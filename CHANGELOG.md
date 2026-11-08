@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+### Changed
+- **`charpente test --mutants` outside charpente's own workspace refuses a run that gives no `--test-package` or no `--file`, and names the command that works.** The verb's defaults are charpente's own. Without `--test-package` it judged every mutant with `charpente-core` and `charpente-sim`'s tests, whose published suites do not build outside this repository, so an agent running a plain `charpente test --mutants` in its app crate on 0.4.0 got 21 compile errors, and nothing said `--test-package` was the fix. Without `--file` it mutated `crates/charpente-core/src/log.rs` and `crates/charpente-sim/src/checks.rs`, which are not in an app's tree. When the workspace has no member named `charpente-core`, the verb now exits 2 before the install check, naming the missing flags, why each default does not exist there, your package (the one at `--dir`, else the workspace's only one) and the command to run. Inside charpente's repository nothing changes, and when `cargo metadata` fails the run goes on to cargo's own error as before. GUIDE §8 says so.
+
 ## 0.4.0 (2026-11-01)
 
 ### Breaking changes

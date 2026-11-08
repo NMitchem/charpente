@@ -708,10 +708,13 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
 /// `./target` is never created. CI does not install cargo-mutants, so the
 /// verb's own behaviour is pinned against a stand-in that fails the same way
 /// on demand. `extra` is appended to the verb's arguments. The scratch
-/// workspace holds three one-file crates, `pkg-a`, `pkg-b` and `app`, so a
-/// `--file` under any has a package the verb can read, and `cargo metadata`
-/// answers with the three: `app` alone declares the `sim_tests!` target, so
-/// `--test-package app` makes the run two passes. With `$SHIM_OUTCOMES` set,
+/// workspace holds five one-file crates, `pkg-a`, `pkg-b`, `app`,
+/// `charpente-core` and `charpente-sim`, so a `--file` under any has a package
+/// the verb can read, the workspace is charpente's own as far as the verb's
+/// defaults are concerned, and `cargo metadata` answers with the five (from
+/// `$SHIM_METADATA`, which `envs` may point elsewhere): `app` alone declares
+/// the `sim_tests!` target, so `--test-package app` makes the run two passes.
+/// With `$SHIM_OUTCOMES` set,
 /// `cargo mutants` copies that directory in as `<--output>/mutants.out`, the
 /// run record the verb then reads, moving an earlier one to `mutants.out.old`
 /// as the tool does; a call with `--iterate` (pass 2) copies
@@ -775,7 +778,7 @@ fn run_mutants_with_cargo_shim_in(
     let ws = scratch.join("ws");
     std::fs::create_dir_all(&bin).expect("shim bin dir");
     let mut packages = Vec::new();
-    for pkg in ["pkg-a", "pkg-b", "app"] {
+    for pkg in ["pkg-a", "pkg-b", "app", "charpente-core", "charpente-sim"] {
         std::fs::create_dir_all(ws.join(pkg).join("src")).expect("scratch crate");
         // `[lib]` first, with a name of its own, as a real manifest may: a
         // reader that takes the first `name` in the file gets the wrong one.
@@ -1860,6 +1863,117 @@ fn mutants_refuses_a_record_its_pass_did_not_write() {
         );
     }
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The shim run with `cargo metadata` answering `metadata`, written to a fresh
+/// file of its own.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch metadata is edge tooling (DESIGN.md §1)
+fn run_mutants_with_metadata(
+    tag: &str,
+    metadata: &str,
+    extra: &[&str],
+) -> (std::process::Output, Vec<String>) {
+    let path = std::env::temp_dir().join(format!(
+        "charpente-mutants-metadata-{}-{tag}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, metadata).expect("scratch metadata");
+    let run =
+        run_mutants_with_cargo_shim_in("0", "0", "0", extra, false, &[("SHIM_METADATA", &path)]);
+    let _ = std::fs::remove_file(&path);
+    run
+}
+
+/// An app's workspace: one member, `app`, and no `charpente-core`.
+#[cfg(unix)]
+const APP_METADATA: &str = r#"{"workspace_root":"/nonexistent-app-ws","packages":[{"name":"app","manifest_path":"/nonexistent-app-ws/app/Cargo.toml"}]}"#;
+
+/// Outside charpente's own workspace the verb's defaults name test packages
+/// and files that do not exist there (0.4.0: 21 compile errors and no named
+/// fix), so a run that leans on both is refused before the install probe,
+/// naming both flags, the package and the command.
+#[cfg(unix)]
+#[test]
+fn mutants_outside_charpentes_workspace_without_test_package_or_file_is_refused_naming_both() {
+    let (out, recorded) = run_mutants_with_metadata("both", APP_METADATA, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    for want in [
+        "--mutants needs --test-package and --file outside charpente's own workspace",
+        "/nonexistent-app-ws has no member named charpente-core",
+        "charpente test --mutants --test-package app --file <the file to mutate, such as \
+         src/jobs.rs>",
+        "(GUIDE §8, \"Finding a one-sided property\")",
+    ] {
+        assert!(stderr.contains(want), "missing {want:?}; stderr:\n{stderr}");
+    }
+    assert!(
+        !recorded.iter().any(|l| l.starts_with("cargo mutants")),
+        "the refusal comes before the install probe; the shim saw {recorded:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mutants_outside_charpentes_workspace_with_test_package_but_no_file_is_refused_naming_file() {
+    let (out, _) = run_mutants_with_metadata("file", APP_METADATA, &["--test-package", "app"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    for want in [
+        "--mutants needs --file outside",
+        "--test-package app --file <the file to mutate, such as src/jobs.rs>",
+    ] {
+        assert!(stderr.contains(want), "missing {want:?}; stderr:\n{stderr}");
+    }
+    assert!(
+        !stderr.contains("without --test-package"),
+        "--test-package was given, so it is not a reason; stderr:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mutants_outside_charpentes_workspace_with_both_flags_goes_ahead() {
+    let (out, recorded) = run_mutants_with_metadata(
+        "ahead",
+        APP_METADATA,
+        &[
+            "--test-package",
+            "app",
+            "--file",
+            "app/src/lib.rs",
+            "--timeout",
+            "60",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        recorded.iter().any(|l| l == "cargo mutants --version"),
+        "the run reaches the install probe; the shim saw {recorded:?}"
+    );
+    assert!(
+        !stderr.contains("has no member named charpente-core"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// When `cargo metadata` gives nothing the verb can read (a broken manifest),
+/// the verb cannot tell whose workspace this is, so it refuses nothing and the
+/// run goes on as before, to the next cargo command and cargo's own error.
+#[cfg(unix)]
+#[test]
+fn mutants_with_unreadable_metadata_keeps_cargos_own_error() {
+    let (out, recorded) = run_mutants_with_metadata("broken", "not json", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("has no member named charpente-core"),
+        "no refusal that blames the wrong thing; stderr:\n{stderr}"
+    );
+    assert!(
+        recorded.iter().any(|l| l == "cargo mutants --version"),
+        "the run goes on to the install probe; the shim saw {recorded:?}"
+    );
 }
 
 #[test]
