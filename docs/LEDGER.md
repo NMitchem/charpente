@@ -9715,3 +9715,27 @@ tallied from these tables.
   - `ci.yml` run `40504042875` on its pushed tip `7113e8f3`: success (2026-10-27);
   - the first nightly `edge-harness.yml` on that tip, run `40509742277`: success (2026-10-27), and every nightly since on it is green through `41315211563` (2026-11-01).
 - **Found by the smoke.** `charpente new`'s usage line still says the scaffold has "two sim properties" (`crates/charpente-cli/src/new.rs:11`), but the scaffold has written three since `0a06e5eb` (2026-10-25, the event check), so 0.3.0's binary carried the stale line too, and 0.4.0's still does. The fix goes on main for the next release, with a pin that counts the template's checks.
+
+## 2026-11-08 — the outside agents' 0.4.0 retest: three fixes, and 0.4.0's CI close-out
+
+- **The retest** (agents A and B, reports of 2026-11-06). Both re-ran their builds on 0.4.0 and both judged it better.
+  - Agent A re-ran its commitment-ledger build. Verified:
+    - the spent-App cron bug is unrepresentable (its old `cron_restart.rs` fails with E0599, no method `into_app`);
+    - the same-master-seed batch is identical to 0.3.0 (tested 162/186/173/168 of 256);
+    - red-green deletions of `tx.emit` and `tx.enqueue` still go red;
+    - a fresh docs-only appointment-reminder build is green;
+    - `charpente_sim::drive` removed the ledger build's dominant skip reason;
+    - its scoped mutants run: 19 total, 15 caught, 3 missed, 1 unviable.
+  - Agent A still found open: the relative-path dev-dependency refusal names the fix but the verb does not apply it, and Drive's re-send timing was undocumented (fixed by `856a0c0a`, below).
+  - Agent B verified the shrinker reaching a true minimum (30 draws shrank to 9), a check that tested nothing now failing the batch, the config dump gone from failure blocks, two-pass mutants working with `--test-package`, and a byte-identical master-seed rerun. It found plain `--mutants` in an app crate failing with 21 compile errors and no named fix (fixed by `de552d29`, below).
+- **The fixes.**
+  - `de552d29`: `charpente test --mutants` outside charpente's own workspace, with neither `--test-package` nor `--file`, is refused before the install check, naming the flags, the package at `--dir` and the command.
+  - `c6f39675`: `charpente new`'s usage line says three sim properties, and a unit test counts the template's `sim_tests!` entries so it cannot drift again (the stale line the 0.4.0 smoke found).
+  - `856a0c0a`: GUIDE §8 says a request Drive re-sends takes effect at the tail's start, so a check that judges timing judges it there. `961decb5` then removed an outside-tester credit from that CHANGELOG bullet.
+- **The gate**, run at `856a0c0a`: `cargo fmt --all --check` ok, `cargo clippy --workspace --all-targets -- -D warnings` ok, `cargo test --workspace --no-fail-fast` exit 0 with 104 of 104 `test result: ok`, 2229 passed, 64 ignored. `961decb5` on top changes only CHANGELOG.md, which no test reads.
+- **The launch demo.** Spec at `eb79df46` (`docs/superpowers/specs/2026-11-06-launch-demo-design.md`); plans at `ca14fe67` (`docs/superpowers/plans/2026-11-08-launch-demo-charpente-fixes.md` and `docs/superpowers/plans/2026-11-08-launch-demo-judge.md`).
+- **0.4.0's CI close-out**, owed since its entry:
+  - `ci.yml` run `41331921799` on `535bcbb9`: success;
+  - `ci.yml` run `41332202376` on `5d43d2f3`: success;
+  - the first nightly `edge-harness.yml` on the tip, run `41486954475` on `5d43d2f3` (2026-11-02): success, and every nightly since is green through `42488940352` (2026-11-08).
+  - The nightlies ran on `5d43d2f3`, whose diff over the published `535bcbb9` is records only (CHANGELOG, PLAN, README, LEDGER).
