@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub const USAGE: &str = "usage: charpente new <name>\n       \
        writes <name>/ with Cargo.toml, clippy.toml, .gitignore, src/lib.rs, src/main.rs and \
-       tests/sim.rs — one table, one route, one job, one event, and two sim properties";
+       tests/sim.rs — one table, one route, one job, one event, and three sim properties";
 
 const CARGO_TOML: &str = include_str!("../templates/Cargo.toml.tmpl");
 const CLIPPY_TOML: &str = include_str!("../templates/clippy.toml");
@@ -160,6 +160,28 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_counts_the_templates_sim_properties() {
+        let block = SIM_RS
+            .split("sim_tests! {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        let n = block
+            .lines()
+            .filter(|l| l.trim_end().ends_with(','))
+            .count();
+        let word = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        ][n];
+        assert!(
+            USAGE.contains(&format!("and {word} sim properties")),
+            "templates/sim.rs.tmpl declares {n} sim properties, but USAGE says otherwise:\n{USAGE}"
+        );
+    }
 
     #[test]
     fn dependency_version_is_major_minor_of_this_binary() {
