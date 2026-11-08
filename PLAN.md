@@ -274,7 +274,7 @@ that is a claim about charpente is in docs/BENCH.md or absent, and every other f
 cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
 the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, three from 0.3.0's oracle-density review, three from 0.3.0's rulings, one from 0.3.0's final review, one from 0.3.0's docs-only build, three from the 0.4.0 spec, two named for 0.5.0, ten from 0.4.0's testimony census, two from 0.4.0's docs-only build, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, three from 0.3.0's oracle-density review, three from 0.3.0's rulings, one from 0.3.0's final review, one from 0.3.0's docs-only build, three from the 0.4.0 spec, two named for 0.5.0, ten from 0.4.0's testimony census, two from 0.4.0's docs-only build, one from the outside agents' 0.4.0 retest, each with the trigger that reopens it
 
 **Shipped 2026-11-01: 0.4.0, the oracle as hard to get wrong as the app** (spec
 [docs/superpowers/specs/2026-10-28-0.4.0-design.md](docs/superpowers/specs/2026-10-28-0.4.0-design.md)),
@@ -326,9 +326,12 @@ open that no row covered, with the trigger the census wrote. None of the fifteen
 weighed as the seven that open the table were. A row whose trigger the record already meets
 says so in its trigger cell, with the evidence. That makes it eligible, not scheduled: a
 release names it, as 0.5.0 names the Dead row. Noah decides whether a row with a met
-trigger is scheduled, at the next milestone's planning. The last two rows came from 0.4.0's
-docs-only build (2026-11-01, review I4 and its fixes' report); that build is also testimony in the Dead, transaction
-time and first-credential rows, and it meets the trigger of the small-API-gaps row.
+trigger is scheduled, at the next milestone's planning. The two rows after the census's ten
+came from 0.4.0's docs-only build (2026-11-01, review I4 and its fixes' report); that build is also testimony in the Dead, transaction
+time and first-credential rows, and it meets the trigger of the small-API-gaps row. The
+last row came from the outside agents' retest on 0.4.0 (2026-11-08, agent A;
+[docs/LEDGER.md](docs/LEDGER.md), that date): the one finding the retest left open after
+its three fixes, given a row by the docs-only bar's rule (sub-project 3).
 
 | Item | Trigger |
 |---|---|
@@ -383,6 +386,7 @@ time and first-credential rows, and it meets the trigger of the small-API-gaps r
 | **Two GUIDE gaps, docs only** (testimony census P10): (a) §16 never says that the table `authorize` reads is global (`authorize` takes `&Tx`), so membership sits outside the type-level guarantee and only the app's properties check it (statuspage platform finding 10); (b) §4 never said that a hand-written struct `Codec` is its fields' codecs in declaration order, though its own `impl Codec for SendReceipt` relies on it, and GUIDE stated the rule only for `#[table]` rows, in §2 (invoicing FINDINGS); **(b) closed 2026-11-01** by the commit that edited §4 for 0.4.0's docs-only build | The next commit that edits §16 closes (a). |
 | **A shrinker retry that lowers a count when an item's deletion fails to keep** (0.4.0 docs-only build, review I4). Pass 1 deletes an item whole, but in a loop whose length is a drawn count the deletion leaves the count stale, and lowering the count alone drops the last item, so neither half of the joint move keeps alone and the shrink stalls: the build's shrunk `copies_are_never_set_aside_twice_or_beyond_stock` failure kept 64 draws and 7 holds where a 28-draw run with 2 holds fails the same check (review (e)). The retry: when an item's deletion fails to keep, try it again with the nearest earlier nonzero choice, the loop's count, lowered by one. GUIDE §8 now teaches a per-item "more" draw for loops whose later items matter; the scaffold and `drawn_inputs.rs` keep their count, since changing them moves recorded batches | A second build whose shrunk failure keeps items a smaller count would drop. |
 | **`examples/invoicing`'s two logins mint a session for a subject the request body names** (0.4.0 docs-only build, its fixes' report, concern 5) | `src/routes.rs:57-60` and `src/bin/tenant_node.rs:143-146` are `public` routes that pass a body field to `create_session`, the takeover GUIDE §5 forbids and the API page no longer shows. The first carries a "Demo only" comment and the second carries none. invoicing is `publish = false`, so no reader of the crates sees it, and the credential census walks only what ships. Making both routes `auth` moves invoicing's recorded batches and its `describe` golden once | The next commit that changes `examples/invoicing`'s routes, or a build or review that copies either login. |
+| **`charpente test --mutants` applies the relative-path dev-dependency rewrite in its own scratch copy instead of refusing** (the outside agents' 0.4.0 retest, agent A). cargo-mutants 27.1.0 rewrites relative paths only in `[dependencies]`, `[replace]` and `[patch]`, so a relative dev-, build- or target-dependency path outside the workspace root fails the copied baseline. Since 0.4.0 the verb refuses that layout before the install check, naming the manifest, the table, the dependency and the fix (an absolute path, or `[patch.crates-io]`). Agent A found that it names the fix but leaves applying it to the app | An adopter's own layout (not an eval checkout depending on a local charpente) hits the refusal, or a second build hand-edits its manifest to run the verb. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,

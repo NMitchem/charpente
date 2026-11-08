@@ -9726,10 +9726,10 @@ tallied from these tables.
     - a fresh docs-only appointment-reminder build is green;
     - `charpente_sim::drive` removed the ledger build's dominant skip reason;
     - its scoped mutants run: 19 total, 15 caught, 3 missed, 1 unviable.
-  - Agent A still found open: the relative-path dev-dependency refusal names the fix but the verb does not apply it, and Drive's re-send timing was undocumented (fixed by `856a0c0a`, below).
+  - Agent A still found open: the relative-path dev-dependency refusal names the fix but the verb does not apply it (a v1.x row, with its trigger), and Drive's re-send timing was undocumented (fixed by `856a0c0a`, below).
   - Agent B verified the shrinker reaching a true minimum (30 draws shrank to 9), a check that tested nothing now failing the batch, the config dump gone from failure blocks, two-pass mutants working with `--test-package`, and a byte-identical master-seed rerun. It found plain `--mutants` in an app crate failing with 21 compile errors and no named fix (fixed by `de552d29`, below).
 - **The fixes.**
-  - `de552d29`: `charpente test --mutants` outside charpente's own workspace, with neither `--test-package` nor `--file`, is refused before the install check, naming the flags, the package at `--dir` and the command.
+  - `de552d29`: `charpente test --mutants` outside charpente's own workspace, with either `--test-package` or `--file` missing, is refused before the install check, naming the flags, the package at `--dir` and the command.
   - `c6f39675`: `charpente new`'s usage line says three sim properties, and a unit test counts the template's `sim_tests!` entries so it cannot drift again (the stale line the 0.4.0 smoke found).
   - `856a0c0a`: GUIDE §8 says a request Drive re-sends takes effect at the tail's start, so a check that judges timing judges it there. `961decb5` then removed an outside-tester credit from that CHANGELOG bullet.
 - **The gate**, run at `856a0c0a`: `cargo fmt --all --check` ok, `cargo clippy --workspace --all-targets -- -D warnings` ok, `cargo test --workspace --no-fail-fast` exit 0 with 104 of 104 `test result: ok`, 2229 passed, 64 ignored. `961decb5` on top changes only CHANGELOG.md, which no test reads.
