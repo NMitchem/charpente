@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-06-launch-demo-design.md`, chiefly §5 (the judge, preregistration), §6 (the head-to-head and the rehearsal) and §11 (constraints). Two other documents are binding: the judge's own `README.md` (submission and honesty contracts, preregistration log) and the judge plan's ledger, `.superpowers/sdd/2026-11-08-launch-demo-judge/progress.md` (rulings J1–J52).
 
-**Where the work lives:** code in `~/Documents/GitHub/judge` (dir `h2h/`, plus Task 1 in `crates/judge`); run directories at `~/Documents/GitHub/h2h-<arm>-<n>/`, outside every repo, as earlier builds' were; the record in the judge repo at `rehearsal/2026-11-task0/`; the charpente-side record in `docs/LEDGER.md` and PLAN.md; the SDD ledger at `.superpowers/sdd/2026-11-09-launch-demo-rehearsal/progress.md`.
+**Where the work lives:** code in `~/Documents/GitHub/judge` (dir `h2h/`, plus Task 1 in `crates/judge`); run directories at `~/h2h-runs.noindex/h2h-<arm>-<n>/`, launch.sh's default root since R24 (the pilots before it ran under `~/Documents/GitHub/`), outside every repo; the record in the judge repo at `rehearsal/2026-11-task0/`; the charpente-side record in `docs/LEDGER.md` and PLAN.md; the SDD ledger at `.superpowers/sdd/2026-11-09-launch-demo-rehearsal/progress.md`.
 
 ## Global Constraints
 
@@ -525,7 +525,7 @@ Write each pilot's checks and outcome to the SDD ledger.
 ### Task 7: the freeze, then the charpente arm (controller)
 
 **Files:**
-- No code. Evidence goes into `~/Documents/GitHub/h2h-charpente-1*` and the SDD ledger.
+- No code. Evidence goes into `~/h2h-runs.noindex/h2h-charpente-1*` and the SDD ledger.
 
 - [ ] **Step 1: Freeze the judge**
   - The judge repo is clean, and `cargo test -p judge --lib && cargo test -p judge --test cli && cargo test -p judge --test brief_truth` gives three `test result: ok`.
@@ -540,12 +540,14 @@ Write each pilot's checks and outcome to the SDD ledger.
 
 Nothing else heavy should be running on Docker Desktop.
 
-Run (background): `H2H_DOCS_DIR=~/Documents/GitHub/h2h-docs-0.4.0 caffeinate -is bash h2h/launch.sh charpente 1`
+Run (background): `H2H_DOCS_DIR=~/Documents/GitHub/h2h-docs-0.4.0 caffeinate -is bash h2h/launch.sh charpente 1`, plus `H2H_API_KEY_FILE=<file>` if Noah chose API-key billing (final review C1; see the ledger). The host must show at least 100 GB free, or launch.sh refuses (R24).
 Expected: a `launch` event, then about 8 h of session, then `end` and `frozen`. The controller does not message, steer or resume the agent by hand. A stall in the harness itself is recorded and diagnosed, never answered inside the session.
 - [ ] **Step 4: Collect**
 
-Run: `bash h2h/collect.sh ~/Documents/GitHub/h2h-charpente-1 <judge repo>/rehearsal/2026-11-task0/charpente`
+Run: `bash h2h/collect.sh ~/h2h-runs.noindex/h2h-charpente-1 ~/h2h-runs.noindex/records/charpente-1`, outside the judge tree (R33): an untracked directory in the judge repo would make night 2's whole-tree preflight refuse.
 Expected: exit 0, and `launch.jsonl` ends `end`, `frozen`, `stopped`.
+
+Then tear the box down before night 2: `bash h2h/teardown.sh h2h-charpente-1` (R24). That frees its volume and leaves nothing of this arm on the VM disk for night 2's privileged box to mount.
 - [ ] **Step 5: Ledger**
 
 Record the start and end times, end reason, segments, resumes, `./box` call count (the `end` lines in `box.jsonl`), the agent's final message, and the denied hosts in `proxy.log`.
@@ -557,7 +559,7 @@ Record the start and end times, end reason, segments, resumes, `./box` call coun
 Same as Task 7's Steps 3–5 with `conventional`. Launch it once Task 7's collect has finished. It uses the same tag, images and budget. Its `launch` event must show the same `prereg_tag` commit and the same `model` as the charpente arm's, and the controller checks both before the collect.
 
 - [ ] **Step 1: Launch** — `caffeinate -is bash h2h/launch.sh conventional 1` (background)
-- [ ] **Step 2: Collect** into `rehearsal/2026-11-task0/conventional`
+- [ ] **Step 2: Collect** into `~/h2h-runs.noindex/records/conventional-1`, then `bash h2h/teardown.sh h2h-conventional-1`. With both nights done, copy each `~/h2h-runs.noindex/records/<arm>-1/` into `<judge repo>/rehearsal/2026-11-task0/<arm>/` (R33), so Tasks 9 to 12 find the record where they expect it.
 - [ ] **Step 3: Ledger**, as Task 7 Step 5, plus the two `launch` events' `prereg_tag` and `model` compared
 
 ---
@@ -572,12 +574,12 @@ Same as Task 7's Steps 3–5 with `conventional`. Launch it once Task 7's collec
 Run: `printf '0x%016x\n' $(od -An -N8 -tu8 /dev/urandom)`, then write the result to the SDD ledger before the first batch starts. The same master seed for both arms gives both the same fault schedules.
 - [ ] **Step 2: Smoke each target on the host**
 
-Run: `./target/release/judge check --task task0 --target ~/Documents/GitHub/h2h-<arm>-1.final/app > <record>/<arm>/check.txt`
+Run: `./target/release/judge check --task task0 --target ~/h2h-runs.noindex/h2h-<arm>-1.final/app > <record>/<arm>/check.txt`
 
 If it fails at `boots`, copy `<run>.final/app` into the `work/` directory of a fresh box, `h2h-diag-<arm>`, made by `mkbox.sh`, whose image cache starts empty. Run `judge-check` there, record its output beside `check.txt` as `check-fresh-box.txt`, and tear that box down. This is Review Focus 1. The batch runs whatever the smoke shows, because a deployment that does not start fails through the gate (spec §6).
 - [ ] **Step 3: Judge each arm, one batch at a time**
 
-Run: `caffeinate -is ./target/release/judge run --task task0 --target ~/Documents/GitHub/h2h-<arm>-1.final/app --runs 10 --master-seed <M> --out <record>/<arm>/judge > <record>/<arm>/judge.txt 2> <record>/<arm>/judge.err`, then record the exit code.
+Run: `caffeinate -is ./target/release/judge run --task task0 --target ~/h2h-runs.noindex/h2h-<arm>-1.final/app --runs 10 --master-seed <M> --out <record>/<arm>/judge > <record>/<arm>/judge.txt 2> <record>/<arm>/judge.err`, then record the exit code.
 Expected: a verdict line from the judge README's table, about 85 min per arm.
 - [ ] **Step 4: VOID and ERROR runs**
 
@@ -680,8 +682,8 @@ git add docs/LEDGER.md PLAN.md
 git commit -m "records: the launch demo's rehearsal — <one-clause result>, its platform findings' dispositions, and the go/no-go that is Noah's"
 ```
 - [ ] **Step 5: Tear down**
-  - Run `bash h2h/teardown.sh h2h-charpente-1` and the same for `h2h-conventional-1`, plus any `h2h-diag-*`.
-  - Copy each run dir's ungitted files to `~/Documents/GitHub/h2h-archive/`: the raw streams and `err` files, kept because the record holds only scrubbed copies.
+  - Run `bash h2h/teardown.sh` for any `h2h-diag-*` box; the arms' boxes went down after their collects (R24).
+  - Copy each run dir's ungitted files from `~/h2h-runs.noindex/` to `~/Documents/GitHub/h2h-archive/`: the raw streams and `err` files, kept because the record holds only scrubbed copies.
   - Record their sha256s in the SDD ledger.
 - [ ] **Step 6: The go/no-go packet. Stop here.** Report to Noah:
   - the scoreboard;
