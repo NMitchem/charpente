@@ -42,7 +42,7 @@
 1. **A deployment that works in its box but not on the judging host.** Examples: an image built by hand in the box with no `build:` section, a `build:` context outside `/work/app`, a bind mount to a box path. A reasonable reader expects the record to say whether a host `never_ready` is the agent's packaging or our move between the box and the host. Task 9 runs `judge check` on the host first. If it fails at `boots`, Task 9 runs `judge-check` in a fresh box with an empty image cache against a copy of the same tree, and records both.
 2. **The box's proxy variables reaching the deployment.** Docker's client config injects `HTTPS_PROXY` into every container in the box, so an email client that honours it (reqwest does, and so does axios) would send mail to squid. Squid refuses that, so the email step would fail in the box only. A reasonable agent expects `judge-check` in the box to behave as it does anywhere else. Task 3 runs the reference fixture, whose reqwest client honours proxy variables, through `judge-check` in the box, and requires `ok   email`.
 3. **The session dying mid-night, or the budget ending mid-command.** A reasonable reader expects the rule for both to be fixed and the same for both arms: an infrastructure error gets a fixed resume text at most 3 times, and the budget ends in a kill and then a frozen box. Task 4 pins both with a fake `claude`.
-4. **The account email surviving the scrub in another spelling:** JSON-escaped (`@`), URL-encoded (`%40`), or in other letter case. A reasonable reader expects a published transcript to contain none of them. Task 5's selftest feeds each spelling and requires the check to fail on any survivor.
+4. **The account email surviving the scrub in another spelling:** JSON-escaped (`\u0040`), URL-encoded (`%40`), or in other letter case. A reasonable reader expects a published transcript to contain none of them. Task 5's selftest feeds each spelling and requires the check to fail on any survivor.
 5. **Restricted mode's permission rules falling unevenly on the two stacks.** 0.4.0's builder had 12 Bash calls refused for a line starting with `#`, which every Rust attribute is. Restricted mode may also refuse writes to "tool-configuration files". A reasonable reader expects neither arm to be pushed into heredoc workarounds the other is spared. Task 6's pilot has each agent Write its manifest, compose file, Dockerfile and a `#`-led file, and requires no denial.
 
 ---
@@ -447,7 +447,7 @@ git commit -m "h2h: the launch — both arms' prompts word for word, an 8-hour d
 
 - [ ] **Step 1: Write the selftest**
 
-Its fixture run dir carries a fake account address `alex.example@mail.invalid`, written five ways: plain, uppercase, JSON-escaped `alex.example@mail.invalid`, URL-encoded `alex.example%40mail.invalid`, and inside a base64-free JSON string of a tool result. It also carries the home path `/Users/alexample`. The patterns file maps the address to `<operator-email>` and the home path to `/Users/operator`.
+Its fixture run dir carries a fake account address `alex.example@mail.invalid`, written five ways: plain, uppercase, JSON-escaped `alex.example\u0040mail.invalid`, URL-encoded `alex.example%40mail.invalid`, and inside a base64-free JSON string of a tool result. It also carries the home path `/Users/alexample`. The patterns file maps the address to `<operator-email>` and the home path to `/Users/operator`.
 
 | # | Case | Passes when |
 |---|---|---|
