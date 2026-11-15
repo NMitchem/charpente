@@ -81,6 +81,21 @@ fn free_addr() -> String {
         .to_string()
 }
 
+/// `N` distinct loopback addresses. Every listener is held until all are bound: calling
+/// `free_addr` N times in a row drops each listener before the next bind, so the kernel
+/// may hand the same port out twice and the second node dies on "Address already in use".
+fn free_addrs<const N: usize>() -> [String; N] {
+    let held: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind"))
+        .collect();
+    std::array::from_fn(|i| {
+        held[i]
+            .local_addr()
+            .expect("bound listener has an address")
+            .to_string()
+    })
+}
+
 /// Shared peer secret for Hunt 3's primary/follower pair — non-empty, since
 /// `Some("")` is a named config error (spec 2026-07-24 amendment).
 const SECRET: &str = "edge-harness-t13-secret";
@@ -887,10 +902,12 @@ fn hunt3_switchover_refuses_a_wrong_secret_then_hands_off_with_the_right_one() {
     let follower_data = temp_dir(&format!("{tag}-follower-data"));
 
     let result = (|| -> Result<(), String> {
-        let primary_addr = free_addr();
-        let primary_repl_addr = free_addr();
-        let follower_addr = free_addr();
-        let follower_repl_addr = free_addr();
+        let [
+            primary_addr,
+            primary_repl_addr,
+            follower_addr,
+            follower_repl_addr,
+        ] = free_addrs();
 
         let _primary = ChildNode::spawn(
             &bins.node,

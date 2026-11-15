@@ -58,12 +58,19 @@ fn temp_dir(tag: &str) -> PathBuf {
     ))
 }
 
-fn free_addr() -> String {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("loopback bind")
-        .local_addr()
-        .expect("bound listener has an address")
-        .to_string()
+/// `N` distinct loopback addresses. Every listener is held until all are bound: calling
+/// `free_addr` N times in a row drops each listener before the next bind, so the kernel
+/// may hand the same port out twice and the second node dies on "Address already in use".
+fn free_addrs<const N: usize>() -> [String; N] {
+    let held: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind"))
+        .collect();
+    std::array::from_fn(|i| {
+        held[i]
+            .local_addr()
+            .expect("bound listener has an address")
+            .to_string()
+    })
 }
 
 /// Shared peer secret for the primary/follower pair — replication T7's peer
@@ -415,10 +422,12 @@ fn run_oracle(
     let mut old_primary_restart: Option<ChildNode> = None;
 
     let result = (|| -> Result<RunStats, String> {
-        let primary_addr = free_addr();
-        let primary_repl_addr = free_addr();
-        let follower_addr = free_addr();
-        let follower_repl_addr = free_addr();
+        let [
+            primary_addr,
+            primary_repl_addr,
+            follower_addr,
+            follower_repl_addr,
+        ] = free_addrs();
 
         let mut primary = ChildNode::spawn(
             node_bin,
@@ -679,8 +688,7 @@ fn run_oracle(
         // ---- negative arm: restart the OLD primary as a follower of the --
         // ---- new one; its durable role file still says primary, so the --
         // ---- demote/re-seed refusal must print on stderr (role.rs).     --
-        let old_addr = free_addr();
-        let old_repl_addr = free_addr();
+        let [old_addr, old_repl_addr] = free_addrs();
         let expected_notice = format!(
             "role file says primary, but config says follower of {follower_repl_addr} — the \
              durable role file always wins over config, never the reverse; demoting a primary \
@@ -1047,10 +1055,12 @@ fn run_resurrection_oracle(
     let mut old_primary_restart: Option<ChildNode> = None;
 
     let result = (|| -> Result<(), String> {
-        let primary_addr = free_addr();
-        let primary_repl_addr = free_addr();
-        let follower_addr = free_addr();
-        let follower_repl_addr = free_addr();
+        let [
+            primary_addr,
+            primary_repl_addr,
+            follower_addr,
+            follower_repl_addr,
+        ] = free_addrs();
 
         let mut primary = ChildNode::spawn(
             node_bin,
@@ -1150,8 +1160,7 @@ fn run_resurrection_oracle(
         // ---- config — no attempted demote, unlike run_oracle's negative --
         // ---- arm. Fresh ports (same rationale as run_oracle: avoid a ----
         // ---- TIME_WAIT collision right after kill9), SAME data dir. ----
-        let old_addr = free_addr();
-        let old_repl_addr = free_addr();
+        let [old_addr, old_repl_addr] = free_addrs();
         // `mut`: Phase B waits on this node's own exit (`wait_exit`, spec
         // §5), which takes `&mut self`. Held here (not moved into
         // `old_primary_restart` until Phase B is done with it) so it can

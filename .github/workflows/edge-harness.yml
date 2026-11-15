@@ -63,7 +63,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A scheduled run on a commit the last green run already covered re-tests identical code;
+  # all it can find is runner drift or a flake, at a cost in Actions minutes. Skip it unless
+  # that green run is a week old, so drift still surfaces weekly. `workflow_dispatch` always
+  # runs.
+  changed:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=true
+          if [ "${{ github.event_name }}" = schedule ]; then
+            last=$(gh api "repos/${{ github.repository }}/actions/workflows/edge-harness.yml/runs?status=success&event=schedule&per_page=1" \
+              --jq '.workflow_runs[0] | "\(.head_sha) \(.created_at)"')
+            sha=${last% *}; at=${last#* }
+            if [ "$sha" = "${{ github.sha }}" ] && [ "$(date -d "$at" +%s)" -gt "$(date -d '7 days ago' +%s)" ]; then
+              run=false
+              echo "skipping: ${{ github.sha }} already green at $at"
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
   edge-harness:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
     runs-on: ubuntu-latest
     # The rig spawns real processes and can hang rather than fail. GitHub's default ceiling
     # is 360 minutes, which would let one wedged child burn six runner-hours before anyone
