@@ -536,13 +536,14 @@ fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
                 "--filter",
                 "orders_charge_once",
                 // 0.5.0 added the outage axis, and both seeds draw it (0x37c7…
-                // sees eleven refused calls, a re-call and one charge Dead
-                // since the fixture sends receipts; 0x4af3… makes no call, so
-                // it is inert). `--faults-off` replays each seed without it.
-                // The receipts' key draws can rename a universe in which an
-                // order became durable; 0x37c7… still shows the case it was
-                // chosen for, as the assertions below hold, and 0x4af3…
-                // enqueues nothing, so its universe is unchanged.
+                // sees eleven refused calls and one charge Dead under it, and
+                // no charge re-called; 0x4af3… makes no call, so it is
+                // inert). `--faults-off` replays each seed without it. The
+                // receipts can rename a universe in which an order became
+                // durable; 0x37c7… still shows the case it was chosen for, a
+                // charge's key re-called (the re-call key counts only charge
+                // keys), as the assertions below hold, and 0x4af3… enqueues
+                // nothing, so its universe is unchanged.
                 "--faults-off",
                 "outbound_outage",
             ])

@@ -2,11 +2,12 @@
 //! oracle 7, plan amendment A13): an order is created by a route, charged by
 //! an outbound job, and marked paid by `settle`. Kept out of sim-fixture and
 //! invoicing so their recorded batches and goldens never move (oracle 3).
-//! `POST /receipted-orders` also sends the order's receipt, on the default
-//! retry policy, which the sim drives to Dead (0.5.0 spec §7.3 a); the edge
-//! harness posts `/orders` only, so it never sees a receipt call.
+//! `POST /receipted-orders` also sends the order's receipt, 2 s later, on the
+//! default retry policy, which the sim drives to Dead (0.5.0 spec §7.3 a);
+//! the edge harness posts `/orders` only, so it never sees a receipt call.
 
 use std::io;
+use std::time::Duration;
 
 use charpente::core::io::{Disk, Entropy};
 use charpente::http::{ApiError, App, AppConfig};
@@ -112,11 +113,17 @@ pub fn create_order(tx: &mut Tx) -> Result<Id<Order>, ApiError> {
     place_order(tx)
 }
 
-/// `POST /orders`, with the order's receipt enqueued in the same transaction.
+/// `POST /orders`, with the order's receipt enqueued in the same transaction,
+/// due 2 s later. The sim's outage axis opens its window in the first two
+/// seconds of virtual time, and the sim places its orders at once, so a
+/// receipt sent at once made its first call before the window opened in 211
+/// of the 247 universes that drew one (1000 runs, master seed
+/// 0xae8b2f56ca4150bc), and was answered there unless another fault failed
+/// it. Due 2 s later, its first call lands inside the window in 240 of 246.
 #[route(POST "/receipted-orders", public)]
 pub fn create_receipted_order(tx: &mut Tx) -> Result<Id<Order>, ApiError> {
     let id = place_order(tx)?;
-    tx.enqueue(SendReceipt { order: id });
+    tx.enqueue_after(Duration::from_secs(2), SendReceipt { order: id });
     Ok(id)
 }
 

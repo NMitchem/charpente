@@ -87,6 +87,12 @@ impl WallHold {
         Ok(reading)
     }
 
+    /// The latest wall time handed out, read without the clock. `None` until
+    /// the first reading; a built kernel's hold took one at its open.
+    pub(crate) fn held(&self) -> Option<WallTime> {
+        self.held.map(|(wall, _)| wall)
+    }
+
     /// Raises `held` to `floor` (never lowers it), as of `mono`.
     fn seed(&mut self, floor: WallTime, mono: Instant) {
         match self.held {

@@ -36,17 +36,19 @@ use crate::outbound::no_model;
 
 /// How many times [`Drive::recover`]'s tail runs on past its horizon for
 /// outbound work that has not settled, before it fails the run by name
-/// (0.5.0 spec §5 E). An extension costs a wake-up per retry, not the retry's
-/// wait: a `retry(max = 12)` job through a 4 h outage takes 8, and two
-/// `on_dead` hooks that re-enqueue on every Dead through the same outage, on
-/// the default policy, take 96 (tests/drive.rs).
+/// (0.5.0 spec §5 E). An extension costs a wake-up, not the wait: while a
+/// drawn provider outage lasts, one reaches the outage's end. Through a 4 h
+/// outage a `retry(max = 12)` job takes 2, two `on_dead` chains on the
+/// default policy take 1, and a chain on a 63.5 s policy takes 2
+/// (tests/drive.rs).
 pub const TAIL_SETTLE_CAP: u32 = 256;
 
 /// The latest wall time an extension runs to: half the u64 nanosecond range,
 /// the year 2262. A retry whose doubling backoff saturated is due at the end
 /// of the range, where the platform's daily sweep has no next slot and the
 /// kernel stops on the overflow, so no run goes near it: the job stays
-/// Pending and the tail fails at the cap, by name.
+/// Pending, and once one extension has run to the limit the tail fails at
+/// once, by the cap's text, since another could reach no further.
 const SETTLE_LIMIT: u64 = u64::MAX / 2;
 
 /// Boots a step tries before it treats the boot as lost to fallout, as the
@@ -93,8 +95,11 @@ pub struct Recovered {
     /// The tail's kernel, which keeps its App: read the end state with
     /// `kernel.app().db().snapshot()` and its counters with `kernel.stats()`.
     pub kernel: Kernel,
-    /// The node's wall time when the tail ended, after its last extension:
-    /// the `at` that `checks::outbound_settles_by_horizon` judges at.
+    /// The wall time the tail stopped at, after its last extension: the
+    /// greater of the sim clock's reading and the kernel's held wall (the
+    /// latest wall time it handed out, seeded at its open from the store's
+    /// recorded time), the line the kernel judges due times by. The `at`
+    /// that `checks::outbound_settles_by_horizon` judges at.
     pub wall: WallTime,
     /// How many times the tail ran on past its horizon for outbound work, at
     /// most [`TAIL_SETTLE_CAP`]; 0 for an app that declares no host.
@@ -236,19 +241,22 @@ impl<'s> Drive<'s> {
     ///   "injected", "poisoned", "close and re-open the database") is
     ///   re-sent. The re-sent answers come back in
     ///   [`Recovered::resent`], apart from the phase's.
-    /// - **Settle.** For an app that declares hosts, the tail then runs on
-    ///   until every outbound job settles. After the run to `tail`, and
-    ///   after each extension, it reads the store and the node's wall time.
-    ///   It stops when every Pending outbound row is not yet due (no attempt
-    ///   made, due after that time: a delayed job or a later re-issue).
-    ///   Otherwise it runs again, as one extension, to the latest of those
-    ///   rows' due times (or now, when one is already due) plus its job's
-    ///   declared timeout plus 1 s, so a retry's wait costs a wake-up and the
-    ///   app never sizes `tail` to its retry policy. No extension runs past
-    ///   the year 2262. An app with no host is never extended.
-    ///   [`Recovered::extensions`] counts the extensions, and
-    ///   [`Recovered::wall`] is the wall time at the end, what
-    ///   `checks::outbound_settles_by_horizon` judges at.
+    /// - **Settle.** The tail then runs on until every outbound job settles.
+    ///   After the run to `tail`, and after each extension, it reads the
+    ///   store and the wall time the kernel judges due times by: the greater
+    ///   of the clock's reading and the kernel's held wall, which its open
+    ///   seeds from the store's recorded time. It stops when every Pending
+    ///   outbound row is not yet due (no attempt made, due after that time: a
+    ///   delayed job or a later re-issue). Otherwise it runs again, as one
+    ///   extension, as far as the most, over those rows, of the row's wait
+    ///   (to its due time; none once it is due) or the drawn outage's
+    ///   remaining length, whichever is longer, plus its job's declared
+    ///   timeout plus 1 s. So a retry's wait costs a wake-up, so does an
+    ///   outage, and the app never sizes `tail` to its retry policy. No
+    ///   extension runs past the year 2262. An app with no host has no
+    ///   outbound row and is never extended. [`Recovered::extensions`] counts
+    ///   the extensions, and [`Recovered::wall`] is the wall time it stopped
+    ///   at, what `checks::outbound_settles_by_horizon` judges at.
     /// - **Coverage.** Last, [`mark_dead_coverage`] marks `dead:<job>` once
     ///   per Dead row, for every app, so its sim can `require:` that a job's
     ///   Dead path ran.
@@ -278,7 +286,9 @@ impl<'s> Drive<'s> {
     ///   past its horizon and outbound job <id> ("<name>") is still Pending
     ///   at attempt <a> — an outbound job settles, retries to Dead, or waits
     ///   for a later due time; this one did none of them within the cap of
-    ///   256`, naming the first such job by id.
+    ///   256`, naming the first such job by id. The same text, with the
+    ///   count run, comes sooner when an extension has run to the year 2262
+    ///   and a job is still due past it.
     /// - A failed read of the store, after a run, in the store's words.
     /// - An app that declares a host the workload registered no model for:
     ///   the missing-remote text [`Drive::faulted_phase`] gives.
@@ -307,11 +317,11 @@ impl<'s> Drive<'s> {
                 sim.quiesce_outbound_faults();
             }
             match self.kernel(app, &hosts)? {
-                Ok(kernel) => Ok(Some((kernel, !hosts.is_empty()))),
+                Ok(kernel) => Ok(Some(kernel)),
                 Err(e) => Err(format!("{COULD_NOT_BOOT}: {e}")),
             }
         })?;
-        let Some((mut kernel, settles)) = booted else {
+        let Some(mut kernel) = booted else {
             return Ok(None);
         };
         let start = sim.now().as_nanos();
@@ -325,33 +335,35 @@ impl<'s> Drive<'s> {
         let answers = source.answers();
         kernel.run(&mut source).map_err(stopped)?;
         let mut extensions = 0;
-        // Only an app with hosts has outbound rows to wait for, so a hostless
-        // tail is never extended.
-        if settles {
-            loop {
-                let wall = sim.clock().wall();
-                let Some((reach, row)) = unsettled(kernel.app(), wall)? else {
-                    break;
-                };
-                if extensions == TAIL_SETTLE_CAP {
-                    return Err(format!(
-                        "Drive::recover: the tail ran {extensions} extensions past its horizon \
-                         and outbound job {} (\"{}\") is still Pending at attempt {} — an \
-                         outbound job settles, retries to Dead, or waits for a later due time; \
-                         this one did none of them within the cap of {TAIL_SETTLE_CAP}",
-                        row.id.raw(),
-                        row.name,
-                        row.attempts
-                    ));
-                }
-                extensions += 1;
-                let reach = reach.min(SETTLE_LIMIT.saturating_sub(wall.as_nanos()));
-                let horizon = sim.now().as_nanos().saturating_add(reach);
-                let mut source = SimSource::new(Box::new(sim.clock()), horizon);
-                kernel.run(&mut source).map_err(stopped)?;
+        let mut ran_to_limit = false;
+        let wall = loop {
+            // The kernel judges due times by its held wall, which its open
+            // seeds from the store's recorded time and so can sit above the
+            // clock's reading: "due" is judged at the greater of the two.
+            let clock = sim.clock().wall();
+            let wall = clock.max(kernel.wall_for_sim());
+            let Some((reach, row)) = unsettled(kernel.app(), wall, clock, outage_left(sim))? else {
+                break wall;
+            };
+            // An extension to the limit leaves no reach for the next one.
+            let limit = SETTLE_LIMIT.saturating_sub(clock.as_nanos());
+            if extensions == TAIL_SETTLE_CAP || (ran_to_limit && reach > limit) {
+                return Err(format!(
+                    "Drive::recover: the tail ran {extensions} extensions past its horizon and \
+                     outbound job {} (\"{}\") is still Pending at attempt {} — an outbound job \
+                     settles, retries to Dead, or waits for a later due time; this one did none \
+                     of them within the cap of {TAIL_SETTLE_CAP}",
+                    row.id.raw(),
+                    row.name,
+                    row.attempts
+                ));
             }
-        }
-        let wall = sim.clock().wall();
+            extensions += 1;
+            ran_to_limit = reach > limit;
+            let horizon = sim.now().as_nanos().saturating_add(reach.min(limit));
+            let mut source = SimSource::new(Box::new(sim.clock()), horizon);
+            kernel.run(&mut source).map_err(stopped)?;
+        };
         mark_dead_coverage(sim, kernel.app())?;
         let mut resent = vec![None; phase.requests.len()];
         let answers = answers
@@ -420,14 +432,21 @@ fn stopped(e: io::Error) -> String {
     format!("the fault-free tail's kernel stopped: {words}")
 }
 
-/// What keeps the tail running at the node's wall time `now`: its Pending
+/// What keeps the tail running at the wall time `now`: the app's Pending
 /// outbound rows, less those not yet due (no attempt made, due after `now`).
-/// Hands back the first such row by id, and how far past `now` the next run
-/// reaches, in nanoseconds: the most, over those rows, of the row's due time
-/// (or `now`, once it is due) plus its job's declared timeout plus 1 s, so
-/// the latest-due row's call has room to time out. `None` when no row keeps
+/// Hands back the first such row by id, and how far the next run reaches, in
+/// nanoseconds: the most, over those rows, of the row's wait (to its due
+/// time, measured from `clock`, the clock's reading; none once it is due) or
+/// the drawn outage's remaining length (`outage_left`), whichever is longer,
+/// plus its job's declared timeout plus 1 s, so the row's next call starts
+/// once both have passed and has room to time out. `None` when no row keeps
 /// it.
-fn unsettled(app: &App, now: WallTime) -> Result<Option<(u64, JobRow)>, String> {
+fn unsettled(
+    app: &App,
+    now: WallTime,
+    clock: WallTime,
+    outage_left: Duration,
+) -> Result<Option<(u64, JobRow)>, String> {
     const SLACK: Duration = Duration::from_secs(1);
     let snap = app.db().snapshot().map_err(|e| e.to_string())?;
     let mut reach: Option<u64> = None;
@@ -438,12 +457,23 @@ fn unsettled(app: &App, now: WallTime) -> Result<Option<(u64, JobRow)>, String> 
             continue;
         }
         let timeout = app.outbound_timeout_for_sim(&row.name).unwrap_or_default();
-        let wait = row.due_at.saturating_duration_since(now) + timeout + SLACK;
-        let wait = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+        let wait = row.due_at.saturating_duration_since(clock).max(outage_left);
+        let wait = u64::try_from((wait + timeout + SLACK).as_nanos()).unwrap_or(u64::MAX);
         reach = Some(reach.map_or(wait, |r| r.max(wait)));
         first.get_or_insert(row);
     }
     Ok(reach.zip(first))
+}
+
+/// Virtual time left in the universe's drawn provider outage
+/// (`FaultConfig::outbound_outage`): none when none was drawn (a length of
+/// zero) or once it has ended.
+fn outage_left(sim: &Sim) -> Duration {
+    let (start, length) = sim.world.cfg.outbound_outage;
+    if length.is_zero() {
+        return Duration::ZERO;
+    }
+    (start + length).saturating_sub(Duration::from_nanos(sim.now().as_nanos()))
 }
 
 /// `start` plus `offset` in virtual nanoseconds, saturating: a horizon past

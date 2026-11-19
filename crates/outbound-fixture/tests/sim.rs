@@ -4,7 +4,7 @@
 //! header, as `fake_remote` does, and records every call it applies, so a
 //! second charge for one order is seen where the money would move.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use charpente::View;
@@ -27,7 +27,10 @@ use outbound_fixture::{ChargeOrder, Order, SendReceipt};
 // (master seed 0x222517d092c8c3b7), so 64 universes miss it all with
 // probability about 1e-12 (1e-9 at a one-sided 1e-6 lower bound on the rate).
 // `dead:SendReceipt` is the receipt's Dead path, reached under a drawn
-// provider outage that outlasts the default retry policy (0.5.0 spec §7.3 a).
+// provider outage that outlasts the default retry policy (0.5.0 spec §7.3 a):
+// measured in 486 of 4096 universes (master seed 0x98622018132ac497), so 256
+// universes, a fresh `cargo test` batch, miss it all with probability about
+// 1e-14 (6e-12 at a one-sided 1e-6 lower bound on the rate, 9.6%).
 charpente_sim::sim_tests! {
     orders_charge_once require [
         "outbound:checked",
@@ -306,11 +309,19 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         );
     }
 
-    // The "once" above judged something only where one key reached the
-    // remote twice: a re-call after a lost reply, a deadline, or a restart.
+    // The "once" above judged something only where one charge's key reached
+    // the remote twice: a re-call after a lost reply, a deadline, or a
+    // restart. Only charge keys count, since "once" judges only charges.
+    let charge_keys: BTreeSet<[u8; 16]> = jobs
+        .iter()
+        .filter(|r| r.name == ChargeOrder::NAME)
+        .filter_map(|r| r.outbound_key)
+        .collect();
     let mut delivered: BTreeMap<IdempotencyKey, u32> = BTreeMap::new();
     for d in sim.outbound_deliveries() {
-        *delivered.entry(d.key).or_insert(0) += 1;
+        if charge_keys.contains(d.key.as_bytes()) {
+            *delivered.entry(d.key).or_insert(0) += 1;
+        }
     }
     if delivered.values().any(|n| *n > 1) {
         sim.cover("outbound-fixture:re-called");

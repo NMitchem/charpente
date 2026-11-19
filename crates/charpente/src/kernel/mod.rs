@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use charpente_core::db::{Db, MAX_BATCH, Refusal};
 use charpente_core::event::EventRow;
-use charpente_core::io::{Clock, Instant, ObjectStore, Outbound, OutboundWake};
+use charpente_core::io::{Clock, Instant, ObjectStore, Outbound, OutboundWake, WallTime};
 use charpente_core::table::View;
 
 use crate::archive::Archive;
@@ -1315,6 +1315,19 @@ impl Kernel {
 
     pub fn stats(&self) -> KernelStats {
         self.stats
+    }
+
+    /// The latest wall time this kernel handed out, read without the clock:
+    /// its hold, which never decreases, is seeded at open from the store's
+    /// recorded time, and so can sit above the clock's reading by up to the
+    /// clock tolerance. Every due time is judged against it, so the sim's
+    /// tail judges "due" at the greater of this and the clock
+    /// (`charpente_sim::drive`).
+    #[doc(hidden)]
+    pub fn wall_for_sim(&self) -> WallTime {
+        self.hold
+            .held()
+            .expect("invariant: a built kernel's wall hold took a reading at its open")
     }
 
     /// How many outbound calls are in flight.

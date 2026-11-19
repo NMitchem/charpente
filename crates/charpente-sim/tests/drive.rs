@@ -1346,8 +1346,9 @@ fn an_outage_window_is_closed_at_its_start_and_open_at_its_end() {
 //
 // 0.5.0 spec §5 E: once its horizon has passed, `recover` runs on until every
 // outbound job is Done, Dead or not yet due, under a cap. Every test here runs
-// under `FaultConfig::none()` with only the outage axis on, from virtual time
-// 0, so the seed only names the universe: nothing here draws a fault.
+// under `FaultConfig::none()`, at most with the outage axis or a fixed latency
+// on, from virtual time 0, so the seed only names the universe: nothing here
+// draws a fault.
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -1473,12 +1474,15 @@ fn the_tail_extends_until_retries_finish_or_die() {
         "the tail ran past the outage: {:?}",
         sim.now()
     );
-    // The tail's own 60 s run makes the attempt at 30 s. Then one extension
-    // a retry, at 90, 210, 450, 930, 1890, 3810, 7650 and 15 330 s, each run
-    // reaching its due time plus the 30 s timeout plus 1 s. Brief died at
-    // 450 s, inside the third.
+    // The tail's own 60 s run makes the attempt at 30 s. The outage lasts
+    // to 14 400 s, so the first extension reaches its end plus the 30 s
+    // timeout plus 1 s: the attempts at 90, 210, 450, 930, 1890, 3810 and
+    // 7650 s are refused inside it, and Brief dies at 450 s. Patient's next
+    // is due at 15 330 s, past that reach, so a second extension runs to it.
+    // Before the outage's end counted (0.5.0 Task 11 fix round 1, ruling
+    // R-12) this took 8, one a retry.
     assert_eq!(
-        recovered.extensions, 8,
+        recovered.extensions, 2,
         "far inside the cap of {TAIL_SETTLE_CAP}"
     );
     assert_eq!(
@@ -1630,14 +1634,227 @@ fn a_hook_that_reenqueues_on_every_dead_ends_with_the_outage() {
             .all(|d| d.at >= (4 * HOUR).as_nanos() as u64),
         "each chain ended with the outage, not before: {deliveries:?}"
     );
-    // Three extensions a 450 s link, for the 32 links both chains run in
-    // step: the chains end with the outage, inside the cap.
+    // One extension, to the outage's end plus the 30 s timeout plus 1 s:
+    // both chains run all 32 links inside it, and end with the outage. Before
+    // the outage's end counted (ruling R-12) this took 96, three a link.
     assert_eq!(
-        recovered.extensions, 96,
+        recovered.extensions, 1,
         "inside the cap of {TAIL_SETTLE_CAP}"
     );
     assert_eq!(keys_are_per_effect(&snap), Ok(()));
     assert_eq!(outbound_settles_by_horizon(&snap, recovered.wall), Ok(()));
+}
+
+/// outbound-fixture's `ChargeOrder` policy, eight attempts backing off 0.5 s
+/// doubling (63.5 s in all), each with a 2 s timeout, and a fresh job on
+/// every Dead: a link a minute through a 4 h outage.
+#[job(
+    global,
+    on_dead,
+    outbound = "hasty.test",
+    retry(max = 8, backoff = "500ms"),
+    timeout = "2s"
+)]
+struct Hasty {
+    n: u64,
+}
+
+impl Hasty {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(post_to(key, self.n)))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        settled("hasty.test", &reply)
+    }
+
+    fn on_dead(self, tx: &mut Tx, _dead: charpente::Dead<Self>) -> Result<(), JobError> {
+        tx.enqueue(Hasty { n: self.n + 1 });
+        Ok(())
+    }
+}
+
+#[route(POST "/hasty/:id", public)]
+fn start_hasty(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue(Hasty { n: id.raw() });
+    Ok(id)
+}
+
+fn hasty_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![start_hasty])
+    .mount_jobs(jobs![Hasty])
+    .outbound(Host::new("hasty.test")))
+}
+
+#[test]
+fn a_short_policy_chain_ends_with_the_outage_inside_the_cap() {
+    // Ruling R-12: while the drawn outage lasts, an extension reaches its
+    // end. Without that, each extension covers only the backoffs that fit in
+    // the 2 s timeout plus 1 s, about five a 63.5 s link, and this chain ran
+    // into the cap at link 52 of 227 (its job 52, at attempt 3).
+    let sim = Sim::with_faults(0xD7_0B05, outage(4 * HOUR));
+    let calls = Arc::new(AtomicU64::new(0));
+    sim.remote("hasty.test", Counting(Arc::clone(&calls)));
+    let drive = Drive::new(&sim, hasty_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/hasty/0"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(60))
+        .unwrap()
+        .expect("the fault-free tail boots");
+    let snap = recovered.kernel.app().db().snapshot().unwrap();
+    let chain = outbound_rows(&snap);
+    let (last, dead) = chain.split_last().expect("the chain has a link");
+    // Link k's eighth attempt is at 63.5 (k + 1) s, so links 0 to 225 die
+    // inside the 14 400 s outage, and link 226's eighth, at 14 414.5 s, is
+    // answered.
+    assert_eq!(dead.len(), 226, "links that died in the outage");
+    assert!(
+        dead.iter()
+            .all(|(_, status, attempts)| *status == JobStatus::Dead && *attempts == 8),
+        "every link before the last died after eight attempts"
+    );
+    assert_eq!(
+        last,
+        &("Hasty".to_string(), JobStatus::Done, 7),
+        "the last link: seven refused, then answered"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(
+        sim.outbound_deliveries()
+            .iter()
+            .all(|d| d.at >= (4 * HOUR).as_nanos() as u64),
+        "the chain ended with the outage, not before"
+    );
+    // The first extension reaches the outage's end plus 3 s, where link
+    // 226's eighth attempt is still 11.5 s off; the second runs to it.
+    assert_eq!(
+        recovered.extensions, 2,
+        "inside the cap of {TAIL_SETTLE_CAP}"
+    );
+    assert_eq!(sim.coverage().get("dead:Hasty"), Some(&226));
+    assert_eq!(outbound_settles_by_horizon(&snap, recovered.wall), Ok(()));
+}
+
+/// `Brief`, enqueued three days out.
+#[route(POST "/remind/:id", public)]
+fn remind_later(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue_after(Duration::from_secs(3 * 86_400), Brief { n: id.raw() });
+    Ok(id)
+}
+
+fn remind_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![remind_later])
+    .mount_jobs(jobs![Brief])
+    .outbound(Host::new("slow.test")))
+}
+
+#[test]
+fn a_delayed_outbound_job_is_not_waited_for() {
+    // 0xD7_0B06 with no faults at all: the case is the stop rule, which no
+    // fault touches. A row with no attempt made and a due time past the wall
+    // is not yet due, so the tail does not run three days to reach it.
+    let sim = Sim::with_faults(0xD7_0B06, FaultConfig::none());
+    let calls = Arc::new(AtomicU64::new(0));
+    sim.remote("slow.test", Counting(Arc::clone(&calls)));
+    let drive = Drive::new(&sim, remind_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/remind/1"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(60))
+        .unwrap()
+        .expect("the fault-free tail boots");
+    assert_eq!(
+        recovered.extensions, 0,
+        "a delayed row keeps nothing running"
+    );
+    let snap = recovered.kernel.app().db().snapshot().unwrap();
+    assert_eq!(
+        outbound_rows(&snap),
+        [("Brief".to_string(), JobStatus::Pending, 0)]
+    );
+    let row = snap.scan::<JobRow>().unwrap().remove(0);
+    assert!(
+        row.due_at.saturating_duration_since(recovered.wall) > Duration::from_secs(2 * 86_400),
+        "the row is due days after the tail ended: due {}, wall {}",
+        row.due_at,
+        recovered.wall
+    );
+    assert!(
+        sim.now().as_nanos() < Duration::from_secs(120).as_nanos() as u64,
+        "the tail stopped minutes in, not at the row's due time: {:?}",
+        sim.now()
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(outbound_settles_by_horizon(&snap, recovered.wall), Ok(()));
+}
+
+#[test]
+fn the_tail_judges_due_at_the_kernels_held_wall() {
+    // 0xD7_0B07 with no faults: the case is built. Each build stamps an API
+    // key 30 s ahead of the clock, inside the 60 s tolerance, so the tail's
+    // kernel opens without a refusal and holds its wall at the key's time,
+    // above the clock's reading for the whole 1 s tail. A job due in that
+    // gap is due to the kernel, so the tail judges at the hold (ruling R-14).
+    let sim = Sim::with_faults(0xD7_0B07, FaultConfig::none());
+    let ahead = Cell::new(0u64);
+    let drive = Drive::new(&sim, |sim: &Sim| {
+        let mut app = notes(sim)?;
+        ahead.set(sim.clock().wall().as_nanos() + 30_000_000_000);
+        app.transact_for_tests(|tx| {
+            tx.put(&ApiKey {
+                id: Id::from_raw(1),
+                key_hash: String::new(),
+                subject: "ahead".to_string(),
+                created_at: WallTime::from_nanos(ahead.get()),
+            });
+            Ok::<(), io::Error>(())
+        })
+        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        Ok(app)
+    });
+    let phase = Phase {
+        requests: vec![post(1)],
+        answers: vec![None],
+    };
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(1))
+        .unwrap()
+        .expect("a key inside the tolerance opens without a refusal");
+    assert_eq!(sim.coverage().get("restart:process"), None, "no wait-out");
+    assert_eq!(
+        recovered.wall,
+        WallTime::from_nanos(ahead.get()),
+        "the tail ended at the kernel's held wall"
+    );
+    assert!(
+        recovered.wall > sim.clock().wall(),
+        "the hold sits above the clock: {} against {}",
+        recovered.wall,
+        sim.clock().wall()
+    );
 }
 
 /// Never answers inside a call's 1 s timeout: every reply is drawn 20 s
@@ -1766,15 +1983,16 @@ fn a_tail_that_cannot_settle_fails_by_name_at_the_cap() {
     // the year 2262, so the clock never overflows and the kernel never spins
     // on a due time pinned at the range's end, and the tail still fails at
     // the cap, by name.
-    // Attempt 28's retry is due in the year 2281. The extension runs to the
-    // limit, and the 228 after it run nothing. Each still reads a store that
-    // by then holds the daily sweep's 86 000-odd Done rows, which is most of
-    // this test's time. Without the limit the kernel stops at the range's end
-    // on the sweep's overflow ("next slot after … overflows u64 nanos").
+    // Attempt 28's retry is due in the year 2281. The 28th extension runs
+    // to the limit, and a 29th could reach no further, so the tail fails
+    // there, by the cap's text (review M-2), rather than run 228 extensions
+    // that do nothing over a store of 86 000-odd daily sweep rows. Without
+    // the limit the kernel stops at the range's end on the sweep's overflow
+    // ("next slot after … overflows u64 nanos").
     let (sim, err) = never_settles(0xD7_0B04, "/doubling/1");
     assert_eq!(
         err,
-        "Drive::recover: the tail ran 256 extensions past its horizon and outbound job 0 \
+        "Drive::recover: the tail ran 28 extensions past its horizon and outbound job 0 \
          (\"Doubling\") is still Pending at attempt 28 — an outbound job settles, retries to \
          Dead, or waits for a later due time; this one did none of them within the cap of 256"
     );

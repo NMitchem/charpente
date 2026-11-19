@@ -3661,26 +3661,33 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    `recovered.resent`) as landing after the phase, since `Recovered` gives no
    instant for the tail's start.
 
-**The tail settles outbound work.** For an app that declares hosts, `recover`
-reads the store and the node's wall time after the run to `tail`. It stops
-when every Pending outbound row is not yet due: no attempt made, and a due
-time after that wall time, as a delayed job (§6) or a re-issue scheduled later
-is. Any other Pending outbound row extends the tail: the kernel runs again, to
-the latest such row's due time (or now, when one is already due) plus its
-job's declared timeout plus 1 s, and the store is read again. Idle virtual
-time costs a wake-up per retry, so a `retry(max = 12)` job through a 4 h
-outage takes eight extensions, not 17 hours of work, and no app sizes `tail`
-to its retry policy. An `on_dead` hook that enqueues a fresh job on every Dead,
-or re-issues at once, makes a chain that ends when the outage ends: two such
-chains on the default policy take 96 extensions through a 4 h outage. The
-extensions stop at `charpente_sim::drive::TAIL_SETTLE_CAP`, 256, with work
-still Pending, and the run fails by name (below). No extension runs past the
-year 2262, so a retry whose doubling backoff saturated stays Pending, and the
-run fails at the cap rather than at the end of the u64 nanosecond range, where
-the kernel stops on its daily sweep's overflow. An app with no host is
+**The tail settles outbound work.** After the run to `tail`, `recover` reads
+the store and the wall time the kernel judges due times by: the greater of the
+clock's reading and the kernel's held wall, which the kernel's open seeds from
+the store's recorded time, so it can sit up to the 60 s clock tolerance above
+the clock. It stops when every Pending outbound row is not yet due: no attempt
+made, and a due time after that wall time, as a delayed job (§6) or a re-issue
+scheduled later is. Any other Pending outbound row extends the tail: the
+kernel runs again, as far as the most, over those rows, of the row's wait (to
+its due time; none once it is due) or the drawn outage's remaining length,
+whichever is longer, plus its job's declared timeout plus 1 s, and the store
+is read again. Idle virtual time costs a wake-up, so a retry's wait costs at
+most one extension and so does a drawn outage, however long: through a 4 h
+outage a `retry(max = 12)` job takes two extensions, not 17 hours of work, and
+no app sizes `tail` to its retry policy. An `on_dead` hook that enqueues a fresh job
+on every Dead, or re-issues at once, makes a chain that ends when the outage
+ends: through a 4 h outage two such chains on the default policy take one
+extension, and one on `crates/outbound-fixture`'s `ChargeOrder` policy (eight
+attempts in 63.5 s) takes two. The extensions stop at
+`charpente_sim::drive::TAIL_SETTLE_CAP`, 256, with work still Pending, and the
+run fails by name (below). No extension runs past the year 2262: a retry whose
+doubling backoff saturated stays Pending, and once one extension has run to
+that limit the run fails at once, by the cap's text with the count it ran,
+rather than at the end of the u64 nanosecond range, where the kernel stops on
+its daily sweep's overflow. An app with no host has no outbound row, so it is
 never extended. `recovered.extensions` counts the extensions, and
-`recovered.wall` is the node's wall time when the tail ended, the time to
-pass `outbound_settles_by_horizon` ("The checkers", below).
+`recovered.wall` is the wall time the tail stopped at, the time to pass
+`outbound_settles_by_horizon` ("The checkers", below).
 
 **Coverage for a Dead path.** Last, `recover` calls `mark_dead_coverage`
 ("The checkers"), which marks `dead:<job>` once per Dead row, whatever the
@@ -3692,7 +3699,13 @@ the key, naming it, so a Dead path that the sim never exercised cannot read
 as tested. An outbound job on the default policy reaches Dead under the
 outage axis, which `charpente test --sim` draws in a quarter of runs, half
 of them long enough to exhaust the policy ("The outside world: remote
-models", below).
+models", below), but only where its calls land inside the window. The window
+opens in the first two seconds of virtual time, so a job called at once is
+often answered before it opens: the fixture enqueues its receipt 2 s after the
+order (`enqueue_after`), and measured `dead:SendReceipt` in 486 of 4096 runs,
+against 35 of 500 when the receipt was sent at once. Measure a required key's
+rate before you rely on it, and write the rate beside the `require`, as the
+fixture does: a fresh `cargo test` batch is 256 runs.
 
 **A route the tail re-sends must be safe to receive twice.** `Drive`
 re-sends, and a request that went unanswered may have landed, so its re-send
@@ -3740,16 +3753,23 @@ the run:
 - `the app calls <host>, but the workload registered no model for it — call
   sim.remote("<host>", …) before Drive::faulted_phase`, from either call.
 - The cap: the tail ran 256 extensions, and an outbound job is still Pending
-  and due. The text names the first such job by id:
+  and due. The text names the first such job by id. It comes sooner, with the
+  count the tail ran, once an extension has run to the year 2262 and the job
+  is still due past it:
 
 <!-- pinned -->
 ```text
 Drive::recover: the tail ran 256 extensions past its horizon and outbound job <id> ("<name>") is still Pending at attempt <a> — an outbound job settles, retries to Dead, or waits for a later due time; this one did none of them within the cap of 256
 ```
 
-A job still retrying after 256 extensions has a remote that never answers it
-in time and a policy that has not run out: a model that never answers, or a
-`max` in the thousands. Fix the model, or give the job a policy that ends.
+A drawn outage costs one extension however long it lasts, so the outage is
+never what reaches the cap. A job still retrying after 256 extensions has a
+remote that never answers it in time and a policy that has not run out (a model
+that never answers, or a `max` in the thousands), or an `on_dead` hook that
+starts a new link on every Dead against such a remote, so the chain never
+ends. Fix the model, or give the job, and the chain its hook makes, a policy
+that ends. A named job at attempt 0 was due and never dispatched, so it is a
+row the kernel lost, not the app's: report it with the run's seed.
 
 **When to drop below the helper.** `Drive` is one faulted phase and one tail.
 A workload with more than that builds it from the pieces this section and
@@ -3799,10 +3819,14 @@ ends. `Drive::recover` runs on until then, at most 256 extensions past
 past the last backoff and deadline of every job, and of every chain its
 `on_dead` hooks make, or loops as `recover` does. Then
 `outbound_settles_by_horizon(snap, at)` (below) checks that every outbound job
-due at `at`, the node's wall time when the tail ended, is Done or Dead, and
+due at `at`, the wall time the tail ended at, is Done or Dead, and
 `mark_dead_coverage` marks the Dead rows' `dead:<job>` keys. A hand driver
 reads `at` with `sim.clock().wall()` after its last run, and calls
-`mark_dead_coverage(sim, kernel.app())` itself.
+`mark_dead_coverage(sim, kernel.app())` itself. Read from the clock, `at` can
+sit below the wall the kernel holds, by up to the 60 s clock tolerance, when
+the tail opened over a store whose recorded time was ahead of the clock (after
+a clock refusal was waited out) and virtual time did not pass it, so a lost
+row due in that gap passes. `Drive::recover` judges at the greater of the two.
 
 A realtime workload's settle phase has the same need for a different fault. The
 subscriber-stall rate is the one fault axis the sim does not inject itself: a
@@ -4133,9 +4157,10 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   by then. It fails wherever a key carries two requests, or two jobs that are not
   Dead, which would send the effect twice. The error names both jobs and the key, and what differs.
 - `outbound_settles_by_horizon(snap: &Snapshot, at: WallTime) -> Result<(), String>`
-  — every outbound job due at `at` is Done or Dead. `at` is the node's wall
-  time when the tail ended: `recovered.wall` after `Drive::recover`, or
-  `sim.clock().wall()` read after a hand driver's last run. A Pending row with
+  — every outbound job due at `at` is Done or Dead. `at` is the wall time
+  the tail ended at: `recovered.wall` after `Drive::recover` (the greater of
+  the clock's reading and the kernel's held wall), or `sim.clock().wall()`
+  read after a hand driver's last run. A Pending row with
   no attempt made and a due time after `at` is not judged, since it is not yet
   due: a delayed job (§6) or a re-issue scheduled later. Every other Pending
   outbound row fails it, the first by id, as lost by the kernel: one due and

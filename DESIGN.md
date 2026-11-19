@@ -2170,11 +2170,13 @@ Charpente treats the coding agent as the primary developer persona:
   are their counts, so a workload that wipes a host's data reads them at the wipe and
   excuses a later refusal only by a fault since then. `charpente_sim::drive`'s
   `Drive::recover` tail is free of per-call faults, while a drawn provider outage runs
-  to its end, and for an app with hosts it runs on past its horizon until every
-  outbound job is Done, Dead or not yet due: each extension runs to the latest due row's
-  due time plus its job's timeout plus 1 s, so a retry's wait costs a wake-up, and
-  `TAIL_SETTLE_CAP` (256) extensions with work still due fail the run by name. It calls
-  `mark_dead_coverage` last (0.5.0 spec §5 E). Exit codes: 0 green, 1 sim failures,
+  to its end, and it runs on past its horizon until every outbound job is Done, Dead or
+  not yet due at the greater of the clock's reading and the kernel's held wall: each
+  extension runs as far as the most, over the rows still due, of the row's wait (to its
+  due time; none once it is due) or the drawn outage's remaining length, whichever is
+  longer, plus its job's declared timeout plus 1 s, so a retry's wait or an outage costs a
+  wake-up, and `TAIL_SETTLE_CAP` (256) extensions with work still due fail the run by
+  name. It calls `mark_dead_coverage` last (0.5.0 spec §5 E). Exit codes: 0 green, 1 sim failures,
   unmet coverage, or a check that tested nothing (every run skipped: a vacuous check fails
   the batch; a `--seed` replay of a skipped run exits 0), 2 build/usage/infrastructure
   error. The platform's own runners hold the same rule: a test in which every universe gave
