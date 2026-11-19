@@ -293,7 +293,7 @@ impl<'s> Drive<'s> {
     /// - An extension has run to the year 2262 (its reach met or passed the
     ///   limit) and an outbound job is still Pending and due:
     ///   `Drive::recover: outbound job <id> ("<name>") is still Pending at
-    ///   attempt <a>, due <due>, and the tail ran <n> extensions, the last to
+    ///   attempt <a>, due <due>, and the tail ran <n> extension<s>, the last to
     ///   the year 2262, past which it does not run — a due time that far out
     ///   means the job's retry backoff grew past the year 2262, so no run
     ///   reaches its next attempt; give the job a retry policy that ends, a
@@ -362,7 +362,7 @@ impl<'s> Drive<'s> {
             if ran_to_limit {
                 return Err(format!(
                     "Drive::recover: outbound job {} (\"{}\") is still Pending at attempt {}, \
-                     due {}, and the tail ran {extensions} extensions, the last to the year \
+                     due {}, and the tail ran {extensions} extension{}, the last to the year \
                      2262, past which it does not run — a due time that far out means the job's \
                      retry backoff grew past the year 2262, so no run reaches its next attempt; \
                      give the job a retry policy that ends, a retry(max = …) small enough that it \
@@ -370,7 +370,8 @@ impl<'s> Drive<'s> {
                     far.id.raw(),
                     far.name,
                     far.attempts,
-                    far.due_at
+                    far.due_at,
+                    if extensions == 1 { "" } else { "s" }
                 ));
             }
             if extensions == TAIL_SETTLE_CAP {

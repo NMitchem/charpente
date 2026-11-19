@@ -1089,10 +1089,10 @@ impl App {
 
     /// The one-request wrapper (group-commit T5, spec §1): a single-request
     /// group, staged then committed immediately — exactly `Db::transact`'s
-    /// "batch of one" reasoning, one level up. This is the whole dispatch
-    /// path most callers use; a kernel drain loop (T6) instead calls
-    /// `begin_group`/`stage_or_subscribe` directly to stage many requests
-    /// under one `commit`.
+    /// "batch of one" reasoning, one level up. The kernel does not call this:
+    /// it stages requests through `begin_group`/`stage_or_subscribe`, many
+    /// under one `commit`. This wrapper (and `handle`) is the seam for tests
+    /// and hand drivers.
     ///
     /// One behaviour change this task does NOT preserve, recorded because
     /// every other path here is byte-identical: opening the group takes the

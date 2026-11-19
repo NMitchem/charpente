@@ -757,8 +757,8 @@ kernel, `App::handle(request: Request) -> Response` runs one request, for a
 test, in a transaction with no time, and `App::handle_at(request, now)` gives
 it one (§7). Every request that reaches a matched route runs inside exactly one
 transaction: routing runs first (an unmatched request never opens one),
-then the session lookup and your handler run inside the same `db.transact`
-call covered in §4.
+then the session lookup and your handler run inside the transaction §4
+covers, the one the kernel opens for the request.
 
 ### The `#[route]` argument convention
 
@@ -3795,7 +3795,7 @@ row the kernel lost, not the app's: report it with the run's seed.
 
 <!-- pinned -->
 ```text
-Drive::recover: outbound job <id> ("<name>") is still Pending at attempt <a>, due <due>, and the tail ran <n> extensions, the last to the year 2262, past which it does not run — a due time that far out means the job's retry backoff grew past the year 2262, so no run reaches its next attempt; give the job a retry policy that ends, a retry(max = …) small enough that it reaches Dead
+Drive::recover: outbound job <id> ("<name>") is still Pending at attempt <a>, due <due>, and the tail ran <n> extension<s>, the last to the year 2262, past which it does not run — a due time that far out means the job's retry backoff grew past the year 2262, so no run reaches its next attempt; give the job a retry policy that ends, a retry(max = …) small enough that it reaches Dead
 ```
 
 **When to drop below the helper.** `Drive` is one faulted phase and one tail.

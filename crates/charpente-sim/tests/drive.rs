@@ -1978,7 +1978,7 @@ fn never_settles(seed: u64, path: &str) -> (Sim, String) {
         "stuck.test",
         Capped {
             calls: 0,
-            bound: 1_000,
+            bound: 4 * u64::from(TAIL_SETTLE_CAP),
         },
     );
     let drive = Drive::new(&sim, stuck_app);
@@ -2069,8 +2069,8 @@ fn a_tail_whose_reach_meets_the_limit_exactly_fails_after_one_extension() {
     assert_eq!(
         err,
         "Drive::recover: outbound job 0 (\"Doubling\") is still Pending at attempt 28, due \
-         2281-03-11T18:07:30.000Z, and the tail ran 1 extensions, the last to the year 2262, past which it does \
-         not run — a due time that far out means the job's retry backoff grew past the year \
+         2281-03-11T18:07:30.000Z, and the tail ran 1 extension, the last to the year 2262, past \
+         which it does not run — a due time that far out means the job's retry backoff grew past the year \
          2262, so no run reaches its next attempt; give the job a retry policy that ends, a \
          retry(max = …) small enough that it reaches Dead"
     );

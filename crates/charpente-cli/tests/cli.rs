@@ -2176,6 +2176,9 @@ fn a_baseline_that_timed_out_is_named_through_the_real_verb() {
         &[
             ("SHIM_OUTCOMES", missed.as_path()),
             ("SHIM_OUTCOMES_ITERATE", timed_out),
+            // The full-count timing run outlasts the quick one, so pass 2's
+            // derived --timeout differs from pass 1's.
+            ("SHIM_SLEEP_FULL", std::path::Path::new("5")),
         ],
         1,
         false,
