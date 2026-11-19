@@ -9739,3 +9739,29 @@ tallied from these tables.
   - `ci.yml` run `41332202376` on `5d43d2f3`: success;
   - the first nightly `edge-harness.yml` on the tip, run `41486954475` on `5d43d2f3` (2026-11-02): success, and every nightly since is green through `42488940352` (2026-11-08).
   - The nightlies ran on `5d43d2f3`, whose diff over the published `535bcbb9` is records only (CHANGELOG, PLAN, README, LEDGER).
+
+## 2026-11-19 — the launch demo's rehearsal
+
+- **What ran.** Task 0, a bookings service that emails a reminder before each booking, was built twice from one brief. The charpente arm used 0.4.0 from crates.io (packaged at `535bcbb9`), with the charpente docs. The conventional arm used TypeScript on Node 24 with Postgres 17 and graphile-worker, without them. Each build was then judged in 10 fault-injected runs of 7 min 50 s (kill -9, connection faults, an email provider that refuses, drops and goes out). The judge was the tag `prereg-rehearsal` (`1eb9f0d`), and both batches used master seed `0xa971e8fed7331e42`. The record is the judge repo's `0d9bc37`, `rehearsal/2026-11-task0/`.
+- **Builds.**
+  - charpente: 7645 s, 178 turns, 88 `./box` calls, one segment, finished.
+  - conventional: 3940 s, 129 turns, 71 `./box` calls, one segment, finished.
+- **Scoreboard.** Both arms: `judge result: PASS — 0 violations in 10 runs`, 0 of 10 runs with a violation, every class 0, every gate ok. On the five classes 0.5.0 does not touch (lost writes, duplicates, double apply, tenancy, auth) the gap is 0 against 0.
+- **The audit: no false positive in either arm.**
+  - `judge score` reproduces every run's verdict, totals and exercised triple. An independent jq scorer agrees, and both flag every class on mutated logs.
+  - Each arm took 43 kills, 84 connection drops, 43 partitions, 58 reply-loss windows, and 9 provider outages totalling 148.7 s.
+  - Timed classes: no `missing_effect` and no `effect_not_owed` in either arm.
+    - charpente: 199 emails more than 10 s late, all due inside a provider outage.
+    - conventional: 162 more than 10 s late, all due in the outage, and 162 more than 2.5 s late from a kill alone (at most 8.3 s).
+  - A judge observation that changed no verdict: Docker's clock-offset reading (`deploy.rs:372-387`) ranged −50 to +92 ms while the app's clock tracked the host's within a few ms.
+- **Testimony census** (`testimony.md`). "Production-ready" is unproven in both arms. Kill -9 durability and tenancy are right in both.
+  - charpente wrong: "drives the whole app in the simulator" (its edge server never runs in the sim); "memory stayed around 21 MiB" (it rose from 3 to 21); "outage emails within 1.6 s" (4.2–6.4 s under the judge).
+  - conventional wrong: its testing table's database row reports 0 failures where two of its three runs printed one.
+- **Platform findings** (charpente arm review, F1–F13; dispositions in the SDD ledger).
+  - Covered by 0.5.0: F3, two clocks (`tx.now()`); F4, hand-built timed never-abandoned delivery (`enqueue_at`, `on_dead`, the re-issue key, `tx.now()`); F11, a new job per unconfirmed send (`on_dead` with `reissue_after`).
+  - Fixed with 0.5.0: F5, `--mutants` was named on no first path. `ab9628ce` names it in the scaffold's next steps, the README and GUIDE §2. `ea92356e` gives the template a fourth property, so the advertised run on a fresh scaffold reports 0 missed where it had reported 1.
+  - New PLAN rows, triggered "fix red-first before the launch demo's public attempt" (ruling R43): F1, `#[route]` answers only 200; F2, no route reads a request header. They are outside 0.5.0's approved scope, and Noah can overrule that.
+  - Refused with reasons: F8, `Drive` takes a fixed script (GUIDE §8's hand driver is the documented path; a second build that hits it opens a row); F9, a credential on a public route is refused (the documented ladder).
+  - App findings, with no platform disposition: F6, F7, F10, F12, F13.
+- **Owed before the public attempt:** speed is unmeasured, and the F1 and F2 rows.
+- **Noah's:** the go/no-go, and the judge repo's name, remote and push.
