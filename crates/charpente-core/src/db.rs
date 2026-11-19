@@ -942,7 +942,12 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
             (true, true, false) => 13,
         });
         if due.is_some() {
-            out.push(u8::from(scope.is_some()) | (u8::from(okey.is_some()) << 1));
+            out.push(match (scope.is_some(), okey.is_some()) {
+                (false, false) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                (true, true) => 3,
+            });
         }
         encode_bytes(job.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
@@ -6485,6 +6490,12 @@ mod tests {
             }
             expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
             let bytes = encode_record(&effects);
+            // After the u32 count and the tag: one byte per (scope, okey)
+            // combination, each its own match arm in encode_record.
+            assert_eq!(
+                bytes[5], flags,
+                "the 0x0e flags byte for {scope:?}, {okey:?}"
+            );
             assert_eq!(bytes, expected, "flags {flags:#04x}");
             match &decode_record(&bytes).unwrap()[..] {
                 [
