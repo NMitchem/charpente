@@ -523,7 +523,7 @@ serialized as one record into a single ordered write-ahead log. Table state is t
 of applying the log. There is no other way to mutate state.
 
 **What a transaction cannot do:** await the network, read the wall clock directly (it reads
-`tx.now()`, the step's held wall reading: every route, job and cron tick in one kernel step
+`tx.now()`, the step's held wall reading: every route, job and job a schedule enqueued in one kernel step
 reads the one value the loop took at the step's start, so replaying the log replays it), generate ambient randomness (it gets seeded entropy),
 or spawn tasks. External effects are expressed as enqueued jobs that run *after* commit.
 

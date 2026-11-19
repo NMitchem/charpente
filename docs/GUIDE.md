@@ -2742,7 +2742,7 @@ runner.
 
 ### `tx.now()`: the step's time inside a transaction
 
-A route, a job and a cron tick can read the time of the step they run in:
+A route, a job, and a job a schedule enqueued can read the time of the step they run in:
 `tx.now()` returns a `WallTime`, the reading the kernel held at the start of
 that step (§7, "Clock errors"), the same value for every transaction the step
 serves. The log records no time for it, so replaying a seed replays the same
