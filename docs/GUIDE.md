@@ -2036,6 +2036,10 @@ job error: charpente: on_dead failed: <the rest of the app's text>
 A `last_error` begins `charpente: on_dead failed: ` only when a hook failed, so a
 check can trust the prefix. An app's own error text that begins that way is stored
 behind `job error: `, the second line above, on a retry and on a Dead mark alike.
+Only the prefix is a contract: the text after it is for people to read, and since
+neither error in it is escaped, code must not split it to get the job's error
+back. `charpente_sim::checks::dead_hooks_succeeded` reads the prefix and fails a
+sim run in which any hook failed (§8, "The checkers").
 
 A hook's `Err(JobError::Io)` is a platform fault, as it is from `run` (a refused read
 excepted), so it is not an attempt. Nothing commits, neither the Dead mark nor the
@@ -3836,7 +3840,7 @@ retry to the reading it was decided at.
 
 ### The checkers
 
-`charpente_sim::checks` ships seventeen functions: twelve reusable oracles, two
+`charpente_sim::checks` ships eighteen functions: thirteen reusable oracles, two
 typed event reads, and three idioms, one for a boot and two for a tail that waits out a clock
 refusal. Reach for these before hand-rolling the same logic a fourth time:
 
@@ -4017,6 +4021,22 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and a run past
   the last backoff and deadline. A job still Pending there was lost by the
   kernel.
+- `dead_hooks_succeeded(snap: &Snapshot) -> Result<(), String>` — no `on_dead`
+  hook failed (§6, "When the hook fails"). A failed hook's Dead mark commits
+  alone, with a `last_error` that begins `charpente: on_dead failed: `, so what
+  the hook was to do (tell someone, re-issue the effect) never happened. The
+  check reads that prefix from every Dead row in `snap` and fails on the first,
+  by id. The prefix is in the row, so it survives the drive's kernel swap and
+  every restart, as a counter in memory would not, and an app's own text that
+  begins with it is stored behind `job error: `, so app text neither trips the
+  check nor hides a failure from it. Call it on the recovered store at the end of
+  a run, beside the other end-state checks. A hook's `Err(JobError::App)`, panic
+  or refused transaction is the app's own deterministic bug, so a run in which
+  one happened fails, and never gives up. A hook's other `Err(JobError::Io)` is
+  not a failure: nothing commits, the job runs again, and no prefix is written.
+  `charpente new`'s scaffold calls it in its echo property, where it holds
+  until a job declares `on_dead`. Its failure names the job and quotes what
+  follows the prefix, the hook's error and then the job's (below).
 - `events::<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>` and
   `events_scoped::<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
   where E::Scope: Tenant` — the durable event log read as your own event
@@ -4079,11 +4099,20 @@ pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String>
 
 pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>
 
+pub fn dead_hooks_succeeded(snap: &Snapshot) -> Result<(), String>
+
 pub fn events<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>
 
 pub fn events_scoped<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
 where
     E::Scope: Tenant;
+```
+
+`dead_hooks_succeeded` fails with:
+
+<!-- pinned -->
+```text
+dead_hooks_succeeded: job <id> ("<name>") is Dead and its on_dead hook failed: <hook error> — the job's own last error: <job error> — the Dead mark committed alone, so what the hook was to do (tell someone, re-issue the effect) did not happen; fix the hook and replay this seed
 ```
 
 A worked `acked_implies_durable` example — a toy that writes one byte per

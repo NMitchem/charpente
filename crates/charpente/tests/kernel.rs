@@ -2165,10 +2165,27 @@ mod dead_hooks {
 
     /// Fails its one attempt; its hook writes a `Tombstone`, then fails as
     /// `kind` names: 0 an error, 1 a panic, 2 a write the `Schema` refuses, 3
-    /// a read it refuses.
+    /// a read it refuses, 4 an enqueue `Group::stage` refuses for its shape.
     #[job(global, on_dead, retry(max = 1))]
     pub struct Hapless {
         pub kind: u64,
+    }
+
+    /// `Hapless`'s name under another shape: a hand-written `impl Job` whose
+    /// enqueue, with `Hapless` mounted, is a `JobShapeRefusal`.
+    struct Impostor;
+
+    impl Codec for Impostor {
+        fn encode(&self, _out: &mut Vec<u8>) {}
+        fn decode(_input: &mut &[u8]) -> std::io::Result<Impostor> {
+            Ok(Impostor)
+        }
+    }
+
+    impl Job for Impostor {
+        const NAME: &'static str = "Hapless";
+        const FINGERPRINT: u64 = <Hapless as Job>::FINGERPRINT ^ 1;
+        type Scope = Unscoped;
     }
 
     impl Hapless {
@@ -2191,8 +2208,12 @@ mod dead_hooks {
                     });
                     Ok(())
                 }
-                _ => {
+                3 => {
                     tx.get::<tombstone_alias::Tombstone>(Id::from_raw(0))?;
+                    Ok(())
+                }
+                _ => {
+                    tx.enqueue(Impostor);
                     Ok(())
                 }
             }
@@ -2205,8 +2226,8 @@ mod dead_hooks {
         let mut app = hook_app(&sim, jobs![Hapless]);
         let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
         let db = app.db_for_tests();
-        // The two refusals' own texts, provoked outside any hook, so the pin
-        // below holds their composition exactly without copying either.
+        // The three refusals' own texts, provoked outside any hook, so the pin
+        // below holds their composition exactly without copying any.
         let write_refusal = {
             let mut group = db.begin_group().unwrap();
             let staged = group.stage(|tx| {
@@ -2229,11 +2250,29 @@ mod dead_hooks {
                     other.map(|row| row.is_some())
                 ),
             };
+        let shape_refusal = {
+            let mut group = db.begin_group().unwrap();
+            let staged = group.stage(|tx| {
+                tx.enqueue(Impostor);
+                Ok::<(), std::io::Error>(())
+            });
+            group.commit().map_err(|f| f.error).unwrap();
+            match staged {
+                Err(TxError::Io(e)) => {
+                    assert!(charpente_core::db::JobShapeRefusal::of(&e).is_some(), "{e}");
+                    e.to_string()
+                }
+                other => {
+                    panic!("an enqueue of Hapless's name under another shape is refused: {other:?}")
+                }
+            }
+        };
         for (kind, hook) in [
             (0, "the hook could not tell anyone".to_string()),
             (1, "on_dead panicked: hook bug: no one to tell".to_string()),
             (2, write_refusal),
             (3, read_refusal),
+            (4, shape_refusal),
         ] {
             enqueue(db, Hapless { kind });
             dispatcher.note_enqueued(db.drain_enqueued());

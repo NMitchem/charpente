@@ -1247,11 +1247,13 @@ fn stage_failure_record(
     } else {
         err
     };
-    // Every fallible step below (the job-row read, the failure-record
-    // stage) runs inside the one `group.stage` closure, so ANY Err exit
-    // comes back as this function's `Err`, and the caller restores its
+    // A platform fault from either stage below (a job-row read, or the
+    // hook's own `JobError::Io` other than a refused read) comes back as this
+    // function's `Err`, with nothing staged, and the caller restores its
     // due-set entry on it, as `run_due_into`'s sibling Io arm does: a
-    // Pending job is always in a set on return.
+    // Pending job is always in a set on return. A hook failure out of the
+    // first stage is not one of those: it goes on to the second stage, which
+    // commits the Dead mark alone.
     //
     // The retry-policy lookup is folded into the SAME stage as
     // the failure record (group-commit T7, C-2), rather than a
@@ -1264,6 +1266,9 @@ fn stage_failure_record(
     // also deletes one of the two `expect("row existed a moment
     // ago")` sites the old shape needed.
     let mut hook_ran = false;
+    // The attempt the hook's stage counted, which the Dead mark alone counts
+    // again if that stage is discarded.
+    let mut hook_attempts = 0;
     let staged = group.stage(|tx| -> Result<JobOutcome, FailureStage> {
         let mut row = tx
             .get_job(Id::from_raw(id), admission)?
@@ -1278,6 +1283,7 @@ fn stage_failure_record(
                 && let DeadStance::Hook(glue) = def.dead
             {
                 hook_ran = true;
+                hook_attempts = row.attempts;
                 // The tenant and the capability exactly as `run_due_into`
                 // hands them to `run`, and the record read from the row this
                 // stage marks, after its failure is on it.
@@ -1369,7 +1375,20 @@ fn stage_failure_record(
         let mut row = tx
             .get_job(Id::from_raw(id), admission)?
             .expect("row existed a moment ago");
+        assert_eq!(
+            row.status,
+            JobStatus::Pending,
+            "dispatcher invariant: job {id}'s Dead mark alone re-read its row as not Pending — \
+             the hook's stage was discarded whole, so the row reads as that stage read it; a \
+             stage staged between the two, or a hook stage that half-staged, changed it"
+        );
         row.attempts += 1;
+        assert_eq!(
+            row.attempts, hook_attempts,
+            "dispatcher invariant: job {id}'s Dead mark alone counts another attempt than its \
+             discarded hook stage counted — the two count the same one, so a stage staged \
+             between them, or a hook stage that half-staged, moved the row's attempts"
+        );
         row.status = JobStatus::Dead;
         row.last_error = Some(last_error);
         tx.settle_job(&row, admission);

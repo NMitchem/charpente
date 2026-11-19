@@ -2151,10 +2151,12 @@ Charpente treats the coding agent as the primary developer persona:
   for an enqueue that is not durable), `keys_are_per_job` (no two jobs carry one
   idempotency key, which a constant or data-derived key would produce) and
   `outbound_settles_by_horizon` (after a fault-free tail, every outbound job is Done or
-  Dead); and the two fire-time-marked axis companions `durable_corruption_fired` and
-  `dir_entry_loss_fired`, which excuse a shortfall only in universes where that fault
-  actually fired. `SimHost::durable_corruption_fired` and `SimHost::dir_entry_loss_fired`
-  are the same two scoped to a host, for a multi-node workload whose excuse must name the
+  Dead); `dead_hooks_succeeded` (no Dead row's `last_error` carries the prefix only a
+  failed `on_dead` hook's Dead mark writes); and the two fire-time-marked axis
+  companions `durable_corruption_fired` and `dir_entry_loss_fired`, which excuse a
+  shortfall only in universes where that fault actually fired.
+  `SimHost::durable_corruption_fired` and `SimHost::dir_entry_loss_fired` are the same
+  two scoped to a host, for a multi-node workload whose excuse must name the
   node the fault fired on, and `SimHost::durable_corruption_count`/`dir_entry_loss_count`
   are their counts, so a workload that wipes a host's data reads them at the wipe and
   excuses a later refusal only by a fault since then. Exit codes: 0 green, 1 sim failures,

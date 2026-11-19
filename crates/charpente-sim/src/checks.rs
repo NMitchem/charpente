@@ -8,8 +8,9 @@
 //! spec §10), and `clock_refused`, `clock_fallout` and `clock_reopens_after`
 //! with the sim's clock axes (0.3.0), and `wait_out_clock_refusal` once the
 //! tail loop that uses the last two had five copies (0.3.0), and `events` and
-//! `events_scoped` when sim tests kept decoding `EventRow` by hand (0.4.0) —
-//! more earn their way in the same way.
+//! `events_scoped` when sim tests kept decoding `EventRow` by hand (0.4.0), and
+//! `dead_hooks_succeeded` with the `on_dead` hook, whose failure leaves only a
+//! prefix in a Dead row (0.5.0) — more earn their way in the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use charpente_core::db::{Event, Tenant};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, IdempotencyKey, WallTime};
-use charpente_core::job::{JobRow, JobStatus};
+use charpente_core::job::{HOOK_FAILED, JobRow, JobStatus};
 use charpente_core::table::{Snapshot, View};
 
 use crate::Sim;
@@ -694,6 +695,40 @@ pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String> {
                 row.attempts
             ));
         }
+    }
+    Ok(())
+}
+
+/// No `on_dead` hook failed in `snap`, the recovered store (0.5.0 spec §5 C):
+/// no Dead row's `last_error` begins with `HOOK_FAILED`. A failed hook's
+/// Dead mark commits alone under that prefix, so what the hook was to do
+/// never happened, and the prefix is the durable evidence, read here through
+/// any number of restarts. Only the dispatcher writes it: an app's own text
+/// that begins with it is stored behind `job error: `, so app text can
+/// neither forge a failure here nor hide one. Fails on the first such row,
+/// by id. A hook's platform fault is not a failure, since the job re-runs.
+pub fn dead_hooks_succeeded(snap: &Snapshot) -> Result<(), String> {
+    for row in snap
+        .scan::<JobRow>()
+        .map_err(|e| format!("dead_hooks_succeeded: scanning the jobs: {e}"))?
+    {
+        if row.status != JobStatus::Dead {
+            continue;
+        }
+        let Some(rest) = row
+            .last_error
+            .as_deref()
+            .and_then(|e| e.strip_prefix(HOOK_FAILED))
+        else {
+            continue;
+        };
+        return Err(format!(
+            "dead_hooks_succeeded: job {} (\"{}\") is Dead and its on_dead hook failed: {rest} — \
+             the Dead mark committed alone, so what the hook was to do (tell someone, re-issue the \
+             effect) did not happen; fix the hook and replay this seed",
+            row.id.raw(),
+            row.name
+        ));
     }
     Ok(())
 }
@@ -1828,5 +1863,156 @@ mod tests {
                 .collect();
             assert!(fired.is_empty(), "{axis}: {fired:?}");
         }
+    }
+
+    /// What every job below fails with, at its one attempt.
+    const JOB_ERROR: &str = "the widget was upside down";
+
+    #[charpente::job(global, retain_dead, retry(max = 1))]
+    struct Kept {}
+
+    impl Kept {
+        fn run(self, _tx: &mut Tx) -> Result<(), charpente::kernel::JobError> {
+            Err(charpente::kernel::JobError::app(JOB_ERROR))
+        }
+    }
+
+    /// Its hook succeeds, doing nothing.
+    #[charpente::job(global, on_dead, retry(max = 1))]
+    struct Mourned {}
+
+    impl Mourned {
+        fn run(self, _tx: &mut Tx) -> Result<(), charpente::kernel::JobError> {
+            Err(charpente::kernel::JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(
+            self,
+            _tx: &mut Tx,
+            _dead: charpente::Dead<Self>,
+        ) -> Result<(), charpente::kernel::JobError> {
+            Ok(())
+        }
+    }
+
+    /// Its hook fails.
+    #[charpente::job(global, on_dead, retry(max = 1))]
+    struct Hapless {}
+
+    impl Hapless {
+        fn run(self, _tx: &mut Tx) -> Result<(), charpente::kernel::JobError> {
+            Err(charpente::kernel::JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(
+            self,
+            _tx: &mut Tx,
+            _dead: charpente::Dead<Self>,
+        ) -> Result<(), charpente::kernel::JobError> {
+            Err(charpente::kernel::JobError::app(
+                "the hook could not tell anyone",
+            ))
+        }
+    }
+
+    /// Its own error forges a hook failure's prefix.
+    #[charpente::job(global, retain_dead, retry(max = 1))]
+    struct Forger {}
+
+    impl Forger {
+        fn run(self, _tx: &mut Tx) -> Result<(), charpente::kernel::JobError> {
+            Err(charpente::kernel::JobError::App(format!(
+                "{HOOK_FAILED}a forged hook failure"
+            )))
+        }
+    }
+
+    /// An app on a fault-free sim with the four jobs above mounted, and a
+    /// dispatcher over them.
+    fn dead_jobs_app() -> (Sim, charpente::http::App, charpente::kernel::Dispatcher) {
+        // Fault-free, so the seed only names the universe.
+        let sim = Sim::with_faults(0x0dea_d000, crate::FaultConfig::none());
+        let mut app = charpente::http::App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            charpente::http::AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(charpente::jobs![Kept, Mourned, Hapless, Forger]);
+        let dispatcher = charpente::kernel::Dispatcher::new(app.take_job_defs_for_tests());
+        (sim, app, dispatcher)
+    }
+
+    /// Enqueues `job` and runs it to its Dead mark, which its one attempt
+    /// reaches; returns its row as the store then holds it.
+    fn run_to_dead(
+        app: &mut charpente::http::App,
+        dispatcher: &mut charpente::kernel::Dispatcher,
+        job: impl charpente_core::table::UnscopedJob,
+    ) -> JobRow {
+        let db = app.db_for_tests();
+        db.transact(|tx| {
+            tx.enqueue(job);
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let now = charpente::kernel::Now {
+            mono: charpente_core::io::Instant::from_nanos(0),
+            wall: WallTime::from_nanos(0),
+        };
+        let outcome = dispatcher.run_due(db, now).unwrap();
+        let charpente::kernel::JobOutcome::Dead { id, .. } = outcome else {
+            panic!("one attempt marks the job Dead: {outcome:?}");
+        };
+        let row = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+        row.into_iter().find(|r| r.id.raw() == id).unwrap()
+    }
+
+    /// A retained Dead, a hooked Dead whose hook succeeded, and an app error
+    /// that forges the prefix, stored defused: none is a hook failure.
+    #[test]
+    fn dead_hooks_succeeded_passes_a_retained_a_hooked_and_a_defused_dead() {
+        let (_sim, mut app, mut dispatcher) = dead_jobs_app();
+        let kept = run_to_dead(&mut app, &mut dispatcher, Kept {});
+        let mourned = run_to_dead(&mut app, &mut dispatcher, Mourned {});
+        let forged = run_to_dead(&mut app, &mut dispatcher, Forger {});
+        assert_eq!(
+            [kept, mourned, forged].map(|r| (r.status, r.last_error)),
+            [
+                (JobStatus::Dead, Some(JOB_ERROR.to_string())),
+                (JobStatus::Dead, Some(JOB_ERROR.to_string())),
+                (
+                    JobStatus::Dead,
+                    Some("job error: charpente: on_dead failed: a forged hook failure".to_string())
+                ),
+            ],
+            "three Dead rows, one of them carrying the prefix behind `job error: `"
+        );
+        let snap = app.db_for_tests().snapshot().unwrap();
+        assert_eq!(dead_hooks_succeeded(&snap), Ok(()));
+    }
+
+    /// A failed hook's Dead mark fails the check, which names the first such
+    /// job by id and its name, and quotes what follows the prefix.
+    #[test]
+    fn dead_hooks_succeeded_names_the_first_failed_hook() {
+        let (_sim, mut app, mut dispatcher) = dead_jobs_app();
+        run_to_dead(&mut app, &mut dispatcher, Kept {});
+        let failed = run_to_dead(&mut app, &mut dispatcher, Hapless {});
+        run_to_dead(&mut app, &mut dispatcher, Hapless {});
+        assert_eq!(failed.id.raw(), 1);
+        let snap = app.db_for_tests().snapshot().unwrap();
+        assert_eq!(
+            dead_hooks_succeeded(&snap),
+            Err(
+                "dead_hooks_succeeded: job 1 (\"Hapless\") is Dead and its on_dead hook failed: \
+                 the hook could not tell anyone — the job's own last error: the widget was upside \
+                 down — the Dead mark committed alone, so what the hook was to do (tell someone, \
+                 re-issue the effect) did not happen; fix the hook and replay this seed"
+                    .to_string()
+            )
+        );
     }
 }

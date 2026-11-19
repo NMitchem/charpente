@@ -71,8 +71,9 @@ use std::path::{Path, PathBuf};
 /// check lines, skipped reasons, result and rerun command (2026-10-25); 52 with
 /// the quick pass's closing line; 53 with the mutation run's package-split lines (2026-11-01);
 /// 54 with `#[job]`'s Dead-stance refusals (2026-11-19); 55 with a failed
-/// `on_dead` hook's `last_error` and its defused app text (2026-11-19).
-const PINNED_FLOOR: usize = 55;
+/// `on_dead` hook's `last_error` and its defused app text (2026-11-19); 56 with
+/// `dead_hooks_succeeded`'s failure (2026-11-19).
+const PINNED_FLOOR: usize = 56;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

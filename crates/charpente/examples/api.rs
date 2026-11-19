@@ -50,7 +50,7 @@ use charpente::{
 };
 use charpente_sim::checks::{
     FaultReason, acked_implies_durable, boot_through_fallout, calls_have_durable_jobs, classify,
-    clock_fallout, clock_refused, clock_reopens_after, dir_entry_loss_fired,
+    clock_fallout, clock_refused, clock_reopens_after, dead_hooks_succeeded, dir_entry_loss_fired,
     durable_corruption_fired, durable_refusal, events, events_scoped, is_fault_fallout,
     keys_are_per_job, outbound_settles_by_horizon, replays_identically, wait_out_clock_refusal,
 };
@@ -1115,6 +1115,9 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>, job: &JobRow) -> Result<
     calls_have_durable_jobs(sim, snap)?;
     keys_are_per_job(snap)?;
     outbound_settles_by_horizon(snap)?;
+    // No `on_dead` hook failed: no Dead row's `last_error` carries the prefix
+    // only a failed hook's Dead mark writes.
+    dead_hooks_succeeded(snap)?;
     // An outbound job's key, rebuilt from its row to find among the calls a
     // remote received.
     if let Some(raw) = job.outbound_key {
