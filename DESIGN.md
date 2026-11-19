@@ -513,9 +513,10 @@ invariants hold in release (hard rule 4):
    and draws no entropy for outbound: every existing app replays byte-for-byte, and every
    existing pinned seed names the same universe (the `Tail` arm's precedent above).
 
-The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
-`App::handle` directly; hyper only translates wire↔struct at the edge
-(`charpente::serve`) and feeds the single-threaded kernel loop.
+The HTTP kernel (`charpente::http`) lives inside the boundary — the sim feeds
+the single-threaded kernel loop (`charpente::kernel`) through a scripted
+`SimSource`; hyper only translates wire↔struct at the edge (`charpente::serve`)
+and feeds the same loop.
 
 ## 2. The write model: transactions as pure functions over a log **[IRREVERSIBLE]**
 

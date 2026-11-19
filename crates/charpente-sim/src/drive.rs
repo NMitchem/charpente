@@ -287,15 +287,18 @@ impl<'s> Drive<'s> {
     ///   past its horizon and outbound job <id> ("<name>") is still Pending
     ///   at attempt <a> — an outbound job settles, retries to Dead, or waits
     ///   for a later due time; this one did none of them within the cap of
-    ///   256`, naming the first such job by id.
+    ///   256, so fix the model of the host it calls, or give the job, and the
+    ///   chain its on_dead hook makes, a retry policy that ends`, naming the
+    ///   first such job by id.
     /// - An extension has run to the year 2262 (its reach met or passed the
     ///   limit) and an outbound job is still Pending and due:
     ///   `Drive::recover: outbound job <id> ("<name>") is still Pending at
     ///   attempt <a>, due <due>, and the tail ran <n> extensions, the last to
     ///   the year 2262, past which it does not run — a due time that far out
-    ///   means the job's retry backoff saturated, so no run reaches its next
-    ///   attempt; give the job a retry policy that ends, a retry(max = …)
-    ///   small enough that it reaches Dead`, naming the job due last.
+    ///   means the job's retry backoff grew past the year 2262, so no run
+    ///   reaches its next attempt; give the job a retry policy that ends, a
+    ///   retry(max = …) small enough that it reaches Dead`, naming the job due
+    ///   last.
     /// - A failed read of the store, after a run, in the store's words.
     /// - An app that declares a host the workload registered no model for:
     ///   the missing-remote text [`Drive::faulted_phase`] gives.
@@ -361,8 +364,9 @@ impl<'s> Drive<'s> {
                     "Drive::recover: outbound job {} (\"{}\") is still Pending at attempt {}, \
                      due {}, and the tail ran {extensions} extensions, the last to the year \
                      2262, past which it does not run — a due time that far out means the job's \
-                     retry backoff saturated, so no run reaches its next attempt; give the job a \
-                     retry policy that ends, a retry(max = …) small enough that it reaches Dead",
+                     retry backoff grew past the year 2262, so no run reaches its next attempt; \
+                     give the job a retry policy that ends, a retry(max = …) small enough that it \
+                     reaches Dead",
                     far.id.raw(),
                     far.name,
                     far.attempts,
@@ -375,7 +379,9 @@ impl<'s> Drive<'s> {
                     "Drive::recover: the tail ran {extensions} extensions past its horizon and \
                      outbound job {} (\"{}\") is still Pending at attempt {} — an outbound job \
                      settles, retries to Dead, or waits for a later due time; this one did none \
-                     of them within the cap of {TAIL_SETTLE_CAP}",
+                     of them within the cap of {TAIL_SETTLE_CAP}, so fix the model of the host it \
+                     calls, or give the job, and the chain its on_dead hook makes, a retry policy \
+                     that ends",
                     row.id.raw(),
                     row.name,
                     row.attempts

@@ -337,9 +337,12 @@ impl Default for AppConfig {
     }
 }
 
-/// The deterministic application kernel. Owns the `Db`; `handle` takes
-/// `&mut self`, so requests are serializable by construction. The sim drives
-/// `handle` directly; `crate::serve` feeds it from hyper in production.
+/// The deterministic application kernel. Owns the `Db`; every request path
+/// takes `&mut self`, so requests are serializable by construction. The
+/// kernel loop runs it (`begin_group`, then `StagedDispatch::stage_or_subscribe`):
+/// `crate::serve` feeds the loop from hyper in production, and the sim feeds
+/// it through a `SimSource`. `handle` runs one request outside the kernel,
+/// for a test.
 pub struct App {
     /// `Option` only so the replication reseed swap can `take` the `Db`, hand
     /// it to `Repl::run_seed` (which consumes and returns a rebuilt one), and

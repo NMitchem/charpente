@@ -2005,7 +2005,9 @@ fn a_tail_that_cannot_settle_fails_by_name_at_the_cap() {
         err,
         "Drive::recover: the tail ran 256 extensions past its horizon and outbound job 0 \
          (\"Stuck\") is still Pending at attempt 518 — an outbound job settles, retries to \
-         Dead, or waits for a later due time; this one did none of them within the cap of 256"
+         Dead, or waits for a later due time; this one did none of them within the cap of \
+         256, so fix the model of the host it calls, or give the job, and the chain its on_dead \
+         hook makes, a retry policy that ends"
     );
     // A due time doubling toward the end of the u64 range: no run goes past
     // the year 2262, so the clock never overflows and the kernel never spins
@@ -2024,8 +2026,8 @@ fn a_tail_that_cannot_settle_fails_by_name_at_the_cap() {
         "Drive::recover: outbound job 0 (\"Doubling\") is still Pending at attempt 28, due \
          2281-03-11T18:07:58.000Z, and the tail ran 28 extensions, the last to the year 2262, \
          past which it does not run — a due time that far out means the job's retry backoff \
-         saturated, so no run reaches its next attempt; give the job a retry policy that ends, \
-         a retry(max = …) small enough that it reaches Dead"
+         grew past the year 2262, so no run reaches its next attempt; give the job a retry \
+         policy that ends, a retry(max = …) small enough that it reaches Dead"
     );
     assert!(
         sim.true_wall().as_nanos() < u64::MAX / 2,
@@ -2068,9 +2070,9 @@ fn a_tail_whose_reach_meets_the_limit_exactly_fails_after_one_extension() {
         err,
         "Drive::recover: outbound job 0 (\"Doubling\") is still Pending at attempt 28, due \
          2281-03-11T18:07:30.000Z, and the tail ran 1 extensions, the last to the year 2262, past which it does \
-         not run — a due time that far out means the job's retry backoff saturated, so no run \
-         reaches its next attempt; give the job a retry policy that ends, a retry(max = …) \
-         small enough that it reaches Dead"
+         not run — a due time that far out means the job's retry backoff grew past the year \
+         2262, so no run reaches its next attempt; give the job a retry policy that ends, a \
+         retry(max = …) small enough that it reaches Dead"
     );
     // The one extension ran to the limit: the kernel's last step was the
     // daily sweep's last slot before the year 2262.

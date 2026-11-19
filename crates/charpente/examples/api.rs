@@ -494,9 +494,9 @@ mod attributes {
     }
 }
 
-/// `Tx`: a route's, a job's or a cron tick's transaction. It reads its own
-/// writes. It reaches unscoped tables only; a scoped table is behind
-/// `tx.scope::<Org>(..)` (`scoped_tx`).
+/// `Tx`: the transaction of a route, a job, or a job a schedule enqueued. It
+/// reads its own writes. It reaches unscoped tables only; a scoped table is
+/// behind `tx.scope::<Org>(..)` (`scoped_tx`).
 #[allow(clippy::too_many_arguments)]
 fn tx(
     tx: &mut Tx,

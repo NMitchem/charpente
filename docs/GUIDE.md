@@ -748,10 +748,14 @@ guarantee.
 
 ## 5. HTTP
 
-`App` owns the `Db` plus a router; `App::handle(request: Request) -> Response`
-is the whole surface — the sim drives `handle` directly, and
-`charpente::serve` is what feeds it from real hyper traffic in production.
-Every request that reaches a matched route runs inside exactly one
+`App` owns the `Db` plus a router, and the kernel loop runs it:
+`charpente::serve` decodes real hyper traffic and feeds the kernel ("Starting
+the server", below), and in sim a `SimSource` feeds the same kernel (§8,
+"Driving the whole app in a sim"). The kernel opens each request's transaction
+at its step's time, so a route's `tx.now()` reads that time. Outside the
+kernel, `App::handle(request: Request) -> Response` runs one request, for a
+test, in a transaction with no time, and `App::handle_at(request, now)` gives
+it one (§7). Every request that reaches a matched route runs inside exactly one
 transaction: routing runs first (an unmatched request never opens one),
 then the session lookup and your handler run inside the same `db.transact`
 call covered in §4.
@@ -1303,16 +1307,17 @@ places:
   With a 64-byte cap and a 65-byte body, the wire's 413 reads exactly:
   `"request body exceeds the 64-byte cap — raise AppConfig.body_cap or
   send less"`.
-- Inside the kernel (`App::handle` — what the sim drives directly, and
-  what `serve` calls after decoding), the same cap is checked again, but
-  only **after** routing succeeds: an oversized body sent to an unmatched
+- Inside the kernel (the dispatch every request takes: the kernel loop's,
+  fed by `serve` after decoding or by a `SimSource` in sim, and
+  `App::handle`'s in a test), the same cap is checked again, but only
+  **after** routing succeeds: an oversized body sent to an unmatched
   path 404s, not 413, since the router runs first. With the same 64/65
   numbers, this 413 reads: `"request body is 65 bytes but the cap is 64 —
   raise AppConfig.body_cap or send less"`.
 
-Apps exercised only through `App::handle` (sim tests, and anything built
-directly against the kernel) only ever see the second message — the wire
-check is production-only edge behavior.
+An app exercised without `serve` (in sim, through the kernel, or in a test
+through `App::handle`) only ever sees the second message — the wire check is
+production-only edge behavior.
 
 ```rust
 use charpente::http::AppConfig;
@@ -3170,8 +3175,8 @@ Everything in §1–§7 routes ambient IO through `Disk`, `Entropy`, and
 against one seed: a `u64` that determines virtual time, every entropy draw,
 and a fault matrix (write errors, sync errors, crashes between any two disk
 operations, torn writes). The whole app is what the simulator drives:
-requests through the same `App::handle` (§5), jobs and cron through the
-same kernel loop (§6–§7) production runs — see "Driving the whole app in a
+requests, jobs and cron through the same kernel loop (§5–§7) production
+runs — see "Driving the whole app in a
 sim" below. Your handlers run completely unmodified; nothing about your app
 becomes "testable" specially, because it was already built on the traits.
 The product's core promise: the same seed always produces the same
@@ -3688,7 +3693,7 @@ extension, and one on `crates/outbound-fixture`'s `ChargeOrder` policy (eight
 attempts in 63.5 s) takes two. The extensions stop at
 `charpente_sim::drive::TAIL_SETTLE_CAP`, 256, with work still Pending, and the
 run fails by name (below). No extension runs past the year 2262: a retry whose
-doubling backoff saturated stays Pending, and once one extension has run to
+doubling backoff grew past it stays Pending, and once one extension has run to
 that limit the run fails at once, by its own text naming the job's due time
 (below), rather than at the end of the u64 nanosecond range, where the kernel
 stops on its daily sweep's overflow. An app with no host has no outbound row,
@@ -3772,7 +3777,7 @@ the run:
 
 <!-- pinned -->
 ```text
-Drive::recover: the tail ran 256 extensions past its horizon and outbound job <id> ("<name>") is still Pending at attempt <a> — an outbound job settles, retries to Dead, or waits for a later due time; this one did none of them within the cap of 256
+Drive::recover: the tail ran 256 extensions past its horizon and outbound job <id> ("<name>") is still Pending at attempt <a> — an outbound job settles, retries to Dead, or waits for a later due time; this one did none of them within the cap of 256, so fix the model of the host it calls, or give the job, and the chain its on_dead hook makes, a retry policy that ends
 ```
 
 A drawn outage costs one extension however long it lasts, so the outage is
@@ -3790,7 +3795,7 @@ row the kernel lost, not the app's: report it with the run's seed.
 
 <!-- pinned -->
 ```text
-Drive::recover: outbound job <id> ("<name>") is still Pending at attempt <a>, due <due>, and the tail ran <n> extensions, the last to the year 2262, past which it does not run — a due time that far out means the job's retry backoff saturated, so no run reaches its next attempt; give the job a retry policy that ends, a retry(max = …) small enough that it reaches Dead
+Drive::recover: outbound job <id> ("<name>") is still Pending at attempt <a>, due <due>, and the tail ran <n> extensions, the last to the year 2262, past which it does not run — a due time that far out means the job's retry backoff grew past the year 2262, so no run reaches its next attempt; give the job a retry policy that ends, a retry(max = …) small enough that it reaches Dead
 ```
 
 **When to drop below the helper.** `Drive` is one faulted phase and one tail.
@@ -6164,9 +6169,9 @@ third (§5) is `AppConfig::body_cap` (default 1 MiB) rejecting an oversized
 request body — this is what fences the first assert from ever seeing raw
 network input; production also enforces the cap at the wire, before routing,
 with its own near-identical 413 text (`"request body exceeds the N-byte cap
-— raise AppConfig.body_cap or send less"`) — code exercised only through
-`App::handle` (sim tests included) only ever sees the kernel-layer message
-quoted above, since the wire check is a `charpente::serve`-only path.
+— raise AppConfig.body_cap or send less"`) — code exercised without `serve`
+(the sim's kernel and `App::handle` included) only ever sees the kernel-layer
+message quoted above, since the wire check is a `charpente::serve`-only path.
 
 ### Schema / replay mismatches (`charpente-core/src/db.rs`)
 

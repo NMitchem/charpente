@@ -2,8 +2,11 @@
 //! docs/superpowers/specs/2026-07-02-http-layer-design.md): typed requests,
 //! routing, decoding, sessions, and transact-wrapping — all inside the
 //! simulation boundary. The wire lives in `crate::serve` (hyper); this
-//! module never touches a socket. `App::handle(Request) -> Response` is the
-//! whole surface, which is exactly what the sim drives.
+//! module never touches a socket. The kernel loop (`crate::kernel`) runs
+//! every request through `App::begin_group` and
+//! `StagedDispatch::stage_or_subscribe`, fed by `crate::serve` in production
+//! and by a `SimSource` in sim; `App::handle(Request) -> Response` is the
+//! one-request path for a test.
 
 mod app;
 mod router;
