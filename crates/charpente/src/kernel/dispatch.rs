@@ -13,7 +13,7 @@ use charpente_core::db::{
     TableWriteRefusal, Tenant, TenantAdmission, Tx, TxError,
 };
 use charpente_core::io::{OutboundCall, OutboundReply, WallTime};
-use charpente_core::job::{DeadRecord, JobRow, JobStatus, RetryPolicy};
+use charpente_core::job::{DeadRecord, HOOK_FAILED, JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
 use super::clock::Now;
@@ -426,9 +426,10 @@ impl Dispatcher {
     /// Any other `Io` out of the attempt's `Group::stage` is a dispatcher invariant, not a
     /// return: it panics — the kernel stops — rather than reaching this
     /// signature. `Err` is a PLATFORM failure, one of three: an `Io` the
-    /// handler's own reads surfaced; the failure-record stage's own
-    /// read/IO error, once the handler attempt has already failed at the
-    /// App level; or one of the `NotPrimary`/`Verifying` BUG arms — a
+    /// handler's own reads surfaced; once the handler attempt has already
+    /// failed at the App level, the failure-record stage's own read/IO error
+    /// or an `on_dead` hook's `JobError::Io` (a refused read excepted, as for
+    /// the handler); or one of the `NotPrimary`/`Verifying` BUG arms — a
     /// job/cron transaction hitting either, which the write gate makes
     /// unreachable and which fail loudly rather than retry silently if the
     /// gate is ever wrong. Every one of these restores the heap entry to
@@ -450,20 +451,30 @@ impl Dispatcher {
     /// or not this returns `Err` — `Group`'s only non-panicking exit is
     /// `commit()`, and dropping a non-empty one panics by contract (C-1).
     ///
-    /// **One job calls `group.stage` up to TWICE, but nets at most ONE
+    /// **One job calls `group.stage` up to THREE times, but nets at most ONE
     /// record** (fix round M-4, cross-referenced from `kernel/mod.rs`'s
     /// batched job arm, which bounds `MAX_BATCH` on jobs run rather than
     /// records staged and needs this argument, not the request arm's
     /// poll-count one, to justify it). On an App-level rejection the FIRST
     /// stage (the handler attempt) nets ZERO records — `f`'s `Err` propagates
     /// out of `Group::stage` via `?` before it ever touches `self.records` —
-    /// and only the SECOND stage (the failure-record write below) nets one.
-    /// On success there is only the one stage, except for a declined outbound
-    /// call: its first stage (`call`'s) nets zero records and its second (the
-    /// Done mark) nets one; a decided call nets zero. Either way `stage`'s own
-    /// assert (`records.len() < MAX_BATCH`, checked BEFORE `f` runs) sees at
-    /// most `MAX_BATCH - 1` when a job's second stage runs, so a batch of
-    /// `MAX_BATCH` jobs can never push `group.len()` past `MAX_BATCH`.
+    /// and the SECOND (`stage_failure_record`'s: a backoff, or the Dead mark,
+    /// with an `on_dead` hook's writes in it) nets one. When that hook fails,
+    /// the second stage nets zero, by the same `Err` exit or by one of
+    /// `stage`'s refusals, which also return before `self.records` is
+    /// touched, and only the THIRD (the Dead mark alone) nets one; a hook's
+    /// other `JobError::Io` stops at the second, netting zero. On success
+    /// there is only the one stage, except for a declined outbound call: its
+    /// first stage (`call`'s) nets zero records and its second (the Done
+    /// mark) nets one; a decided call nets zero, and a refused one runs the
+    /// failure record's stages after `call`'s, at most three in all. So a
+    /// job's stages before its last net nothing, and `stage`'s own assert
+    /// (`records.len() < MAX_BATCH`, checked BEFORE `f` runs) sees at most
+    /// `MAX_BATCH - 1` whichever of a job's stages runs, so a batch of
+    /// `MAX_BATCH` jobs can never push `group.len()` past `MAX_BATCH`. The
+    /// outbound arm's `settle_into` (`settle`'s stage, then the failure
+    /// record's two) and `expire_into` (the failure record's two) hold to the
+    /// same bound by the same argument.
     pub fn run_due_into(&mut self, group: &mut Group, now: Now) -> io::Result<JobOutcome> {
         let (due_at, id, outbound) = self.next_due().expect("run_due called with an empty heap");
         assert!(
@@ -1183,9 +1194,42 @@ fn verifying_bug() -> io::Error {
     )
 }
 
+/// How the failure record's first stage ends without staging: its job-row
+/// read's own fault, or what the `on_dead` hook it ran answered (a panic
+/// arrives as `JobError::App`).
+enum FailureStage {
+    Io(io::Error),
+    Hook(JobError),
+}
+
+impl From<io::Error> for FailureStage {
+    fn from(e: io::Error) -> FailureStage {
+        FailureStage::Io(e)
+    }
+}
+
 /// Stages the failure record for one failed attempt: `attempts += 1`,
 /// `last_error`, then a backoff or `Dead`. It touches no due-set; the caller
 /// owns that bookkeeping, since an outbound job returns to a different set.
+///
+/// Every path to Dead through a failure record comes here: a pure job's last
+/// App failure, and an outbound job's refused or failed call, timeout,
+/// transport failure or failed settle. A job going Dead under
+/// `DeadStance::Hook` runs its hook in this stage, so the hook's effects and
+/// the Dead mark commit as one record (0.5.0 spec §5 C); an unregistered name
+/// has no `JobDef`, so no glue, and goes Dead unhooked. A hook failure (an
+/// `App` error, a panic, or one of the three refusals the run path counts as
+/// attempts) discards that stage whole, and a second stage commits the Dead
+/// mark alone, its `last_error` `HOOK_FAILED`, the hook's error, then the
+/// job's own. Any other `JobError::Io` from the hook is a platform fault, not
+/// an attempt, as everywhere else: nothing is staged, it comes back as `Err`,
+/// and the job re-dispatches after recovery, its hook running with the next
+/// failure record.
+///
+/// A `last_error` begins with `HOOK_FAILED` exactly when a hook failed, so an
+/// `err` that begins with it is the app's own text and is stored as
+/// `job error: <err>`: app text can neither forge nor hide the evidence a
+/// failed hook leaves (0.5.0 spec §5 C).
 fn stage_failure_record(
     defs: &BTreeMap<&'static str, JobDef>,
     group: &mut Group,
@@ -1194,6 +1238,15 @@ fn stage_failure_record(
     now: WallTime,
     err: String,
 ) -> io::Result<JobOutcome> {
+    // Minted before the group is borrowed mutably, as `run_due_into` mints
+    // its own. Every failure path reaches a hook through this one function,
+    // so each hands a `cross_tenant` job's hook its capability.
+    let cap = group.cross_tenant_cap();
+    let err = if err.starts_with(HOOK_FAILED) {
+        format!("job error: {err}")
+    } else {
+        err
+    };
     // Every fallible step below (the job-row read, the failure-record
     // stage) runs inside the one `group.stage` closure, so ANY Err exit
     // comes back as this function's `Err`, and the caller restores its
@@ -1210,17 +1263,51 @@ fn stage_failure_record(
     // the group overlay, where a bare snapshot would not. This
     // also deletes one of the two `expect("row existed a moment
     // ago")` sites the old shape needed.
-    let staged = group.stage(|tx| {
+    let mut hook_ran = false;
+    let staged = group.stage(|tx| -> Result<JobOutcome, FailureStage> {
         let mut row = tx
             .get_job(Id::from_raw(id), admission)?
             .expect("row existed a moment ago");
-        let retry = defs
-            .get(row.name.as_str())
-            .map_or(RetryPolicy::DEFAULT, |d| d.retry);
+        let def = defs.get(row.name.as_str());
+        let retry = def.map_or(RetryPolicy::DEFAULT, |d| d.retry);
         row.attempts += 1;
         row.last_error = Some(err.clone());
         let outcome = if row.attempts >= retry.max {
             row.status = JobStatus::Dead;
+            if let Some(def) = def
+                && let DeadStance::Hook(glue) = def.dead
+            {
+                hook_ran = true;
+                // The tenant and the capability exactly as `run_due_into`
+                // hands them to `run`, and the record read from the row this
+                // stage marks, after its failure is on it.
+                let scope = row.scope.map(|sid| JobScope {
+                    id: sid,
+                    admission,
+                    job: def.name,
+                    scope_type: def.scope_type,
+                    scope_name: def.scoped_by,
+                });
+                let record = DeadRecord::from_row(&row, admission);
+                match catch_unwind(AssertUnwindSafe(|| {
+                    glue(
+                        tx,
+                        &row.payload,
+                        record,
+                        def.cross_tenant.then_some(&cap),
+                        scope,
+                    )
+                })) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(FailureStage::Hook(e)),
+                    Err(payload) => {
+                        return Err(FailureStage::Hook(JobError::App(format!(
+                            "on_dead panicked: {}",
+                            panic_text(&*payload)
+                        ))));
+                    }
+                }
+            }
             JobOutcome::Dead {
                 id,
                 attempts: row.attempts,
@@ -1237,7 +1324,59 @@ fn stage_failure_record(
             }
         };
         tx.settle_job(&row, admission);
-        Ok::<_, io::Error>(outcome)
+        Ok(outcome)
+    });
+    let hook_err = match staged {
+        Ok(outcome) => return Ok(outcome),
+        Err(TxError::App(FailureStage::Io(e))) => return Err(e),
+        Err(TxError::NotPrimary { .. }) => return Err(not_primary_bug()),
+        Err(TxError::Verifying { .. }) => return Err(verifying_bug()),
+        // `Group::stage`'s two refusals, as on the run path: the hook's
+        // transaction enqueued a mounted job under another declaration, or
+        // wrote a table the `Schema` disagrees with. That is the hook's own
+        // deterministic bug, a hook failure. A record with no hook in it
+        // writes only its job's row, which `stage` never refuses.
+        Err(TxError::Io(e)) => {
+            assert!(
+                JobShapeRefusal::of(&e).is_some() || TableWriteRefusal::of(&e).is_some(),
+                "dispatcher invariant: Group::stage returned an io error that is neither its \
+                 job-shape nor its table-write refusal — classify it in dispatch before it \
+                 can reach a job: {e}"
+            );
+            assert!(
+                hook_ran,
+                "dispatcher invariant: Group::stage refused job {id}'s failure record, which \
+                 ran no on_dead hook — a record without one writes only its job's row, which \
+                 stage never refuses: {e}"
+            );
+            e.to_string()
+        }
+        Err(TxError::App(FailureStage::Hook(JobError::App(message)))) => message,
+        // A read the `Schema` refuses arrives through the hook's `?` as
+        // `JobError::Io`, as on the run path: the hook's own bug, a failure.
+        Err(TxError::App(FailureStage::Hook(JobError::Io(e))))
+            if TableReadRefusal::of(&e).is_some() =>
+        {
+            e.to_string()
+        }
+        Err(TxError::App(FailureStage::Hook(JobError::Io(e)))) => return Err(e),
+    };
+    // The hook's stage was discarded whole, its effects and the mark with it.
+    // The row reads as it did before that stage, so this one counts the same
+    // attempt and commits the Dead mark alone.
+    let last_error = format!("{HOOK_FAILED}{hook_err} — the job's own last error: {err}");
+    let staged = group.stage(|tx| {
+        let mut row = tx
+            .get_job(Id::from_raw(id), admission)?
+            .expect("row existed a moment ago");
+        row.attempts += 1;
+        row.status = JobStatus::Dead;
+        row.last_error = Some(last_error);
+        tx.settle_job(&row, admission);
+        Ok::<_, io::Error>(JobOutcome::Dead {
+            id,
+            attempts: row.attempts,
+        })
     });
     staged.map_err(flatten)
 }

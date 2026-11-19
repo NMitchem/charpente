@@ -2011,6 +2011,42 @@ The stance lives on the job's `JobDef` and in `describe` (`"dead": "on_dead"` or
 `"retain_dead"`, §13), never in its `FINGERPRINT`: changing a job's stance changes
 no stored shape, so its Pending rows keep running under the new one.
 
+**When the hook runs.** The dispatcher runs it in the transaction that marks the
+job Dead, so the hook's puts, deletes, enqueues and emits commit with the Dead mark
+as one record, or not at all. Whichever failure kills the job runs it: a pure job's
+last `Err(JobError::App)`, panic or refused transaction, and an outbound job's
+refused or failed `call`, timeout, transport failure or failed `settle` ("When a
+call fails" below). An outbound enqueue inside the hook mints its key there, as one
+inside `run` does. A row whose name is not in `jobs![...]` has no hook to run, so
+it goes Dead unhooked, with the "not registered" text above.
+
+**When the hook fails.** A hook failure is what counts as an attempt in `run`: the
+hook's `Err(JobError::App)`, its panic (absorbed as `on_dead panicked: <payload>`),
+or a transaction the `Schema` refuses (a read or a write of a table it does not
+register under that type, or an enqueue of a mounted job under another shape).
+Everything the hook wrote is discarded, and the Dead mark commits alone, with both
+errors in its `last_error`:
+
+<!-- pinned -->
+```text
+charpente: on_dead failed: <hook error> — the job's own last error: <job error>
+job error: charpente: on_dead failed: <the rest of the app's text>
+```
+
+A `last_error` begins `charpente: on_dead failed: ` only when a hook failed, so a
+check can trust the prefix. An app's own error text that begins that way is stored
+behind `job error: `, the second line above, on a retry and on a Dead mark alike.
+
+A hook's `Err(JobError::Io)` is a platform fault, as it is from `run` (a refused read
+excepted), so it is not an attempt. Nothing commits, neither the Dead mark nor the
+attempt that led to it. The error stops the kernel. After the restart the job runs
+again, and when that attempt fails too, the hook runs again with it.
+
+`Dispatcher::run_due`, the one-job wrapper a test drives the dispatcher with,
+stages into a `Db::begin_group` group, which cannot mint, so a hook's outbound
+enqueue there panics with the minting text "Outbound jobs" below describes. The
+kernel's own groups mint.
+
 ### Outbound jobs: calling the world after commit
 
 A job that calls an outside service over HTTP declares the host it calls with
@@ -2229,7 +2265,8 @@ including a write by another job in the same batch that `call` read. It waits
 for the reply outside any transaction, for at most `timeout`, and hands the
 reply to `settle`. An attempt below counts against `retry` the way a failed
 `run` does: `attempts` increments, `last_error` names the failure, and the job
-waits out its backoff or goes Dead. Every retry carries the job's key unchanged.
+waits out its backoff or goes Dead, running its `on_dead` hook if it declares one
+("What a job's Dead means" above). Every retry carries the job's key unchanged.
 
 | What happens | An attempt? | Result |
 |---|---|---|
@@ -5723,6 +5760,12 @@ the kernel thread — fix the panic like any other bug in `run`. The third: a
 passed to `App::mount_jobs` — usually a job type was renamed or removed
 without a matching change to old enqueued rows; add it back to the list, or
 accept that those rows are now permanently unreachable.
+
+An `on_dead` hook's failures land in the Dead row's `last_error` the same way
+(§6 "What a job's Dead means"): a panic in the hook as `on_dead panicked: <the
+panic payload>`, and every hook failure as `charpente: on_dead failed: <hook
+error> — the job's own last error: <job error>`, with the Dead mark committed
+alone.
 
 One more from the same file, `JobError::Io`'s own `Display` — not a
 rejection at all, the opposite: proof nothing was attempted, folded into

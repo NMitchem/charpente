@@ -1821,7 +1821,14 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   Done-mark atomically in one record: exactly-once state effects, structurally. `Err`
   aborts that transaction and a second commits the failure record — attempts, doubling
   backoff, Dead at the policy's `max`, last_error carried (typed `RetryPolicy` on the
-  `#[job]` item; handler panics are absorbed into the same path). At-least-once execution
+  `#[job]` item; handler panics are absorbed into the same path). An `on_dead` job's hook
+  runs inside the failure record that marks it Dead, so its effects and the Dead mark are
+  one record. A hook that fails (an App error, a panic, a refused transaction) is
+  discarded, and a third transaction commits the Dead mark alone, its `last_error`
+  beginning `HOOK_FAILED` and carrying both errors. An app's own error text that begins
+  with that prefix is stored behind `job error: `, so the prefix means a hook failed. A
+  hook's other `JobError::Io` commits nothing and is not an attempt (spec
+  2026-11-18-0.5.0 §5 C). At-least-once execution
   plus idempotency-key observability is the framing external effects need, and they now
   have it: a job declared `outbound = "<host>"` implements `call` (read-only, by type) and
   `settle` instead of `run`. The kernel makes the request between them, outside any

@@ -390,7 +390,7 @@ mod scoped_jobs {
 
     /// The operator path (spec §7): enqueue `job` inside `desk`, as a seed or
     /// an admin step would.
-    fn enqueue_in_desk<J: Job<Scope = Desk>>(db: &mut Db, desk: u64, job: J) {
+    pub(super) fn enqueue_in_desk<J: Job<Scope = Desk>>(db: &mut Db, desk: u64, job: J) {
         let mut group = db.begin_group().unwrap();
         let admission = group.tenant_admission();
         group
@@ -2030,6 +2030,675 @@ fn unregistered_job_name_fails_with_the_fix() {
         msg.contains("CountUp") && msg.contains("mount_jobs"),
         "{msg}"
     );
+}
+
+/// The Dead stance's run half (0.5.0 spec §5 C): a pure job's last failure
+/// runs its `on_dead` hook in the stage that commits the Dead mark, and a hook
+/// that fails leaves the mark alone, with both errors. tests/outbound.rs
+/// covers the outbound paths to Dead. Every sim here is fault-free, so each
+/// seed only names its universe (the 0xDEAD_00xx series).
+mod dead_hooks {
+    use super::scoped_jobs::{Desk, Filed, Stamp, enqueue_in_desk};
+    use super::*;
+    use charpente::kernel::DeadStance;
+    use charpente::outbound::{Call, IdempotencyKey, Reply};
+    use charpente::{CrossTenant, Dead, ScopedTx};
+    use charpente_core::job::{HOOK_FAILED, RetryPolicy};
+    use charpente_core::table::UnscopedJob;
+
+    /// What every job here fails with.
+    const JOB_ERROR: &str = "the widget was upside down";
+
+    /// What a hook wrote: the record it was handed.
+    #[table(global)]
+    pub struct Tombstone {
+        pub id: Id<Tombstone>,
+        pub attempts: u32,
+        pub error: String,
+    }
+
+    /// `Tombstone`'s twin under the same table name, which no `Schema` here
+    /// registers, so a read through it is a `TableReadRefusal`.
+    mod tombstone_alias {
+        use super::*;
+
+        #[table(global)]
+        pub struct Tombstone {
+            pub id: Id<Tombstone>,
+            pub attempts: u32,
+            pub error: String,
+        }
+    }
+
+    /// A table no `Schema` here registers, so a write to it is a
+    /// `TableWriteRefusal`.
+    #[table(global)]
+    pub struct Unmounted {
+        pub id: Id<Unmounted>,
+    }
+
+    fn hook_app(sim: &Sim, defs: Vec<JobDef>) -> App {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Tombstone>().table::<Filed>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(defs)
+    }
+
+    /// The records the log holds.
+    fn records(db: &Db) -> u64 {
+        db.last_applied().map_or(0, |seq| seq + 1)
+    }
+
+    fn enqueue(db: &mut Db, job: impl UnscopedJob) {
+        db.transact(|tx| {
+            tx.enqueue(job);
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    }
+
+    fn jobs_of(db: &Db) -> Vec<JobRow> {
+        db.snapshot().unwrap().scan::<JobRow>().unwrap()
+    }
+
+    /// Fails its one attempt; its hook writes the record it was handed.
+    #[job(global, on_dead, retry(max = 1))]
+    pub struct Mourned {
+        pub slot: u64,
+    }
+
+    impl Mourned {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            Err(JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+            tx.put(&Tombstone {
+                id: Id::from_raw(self.slot),
+                attempts: dead.attempts(),
+                error: dead.last_error().to_string(),
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_dead_hook_commits_its_writes_with_the_dead_mark() {
+        let sim = Sim::with_faults(0xDEAD_0001, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Mourned]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue(db, Mourned { slot: 4 });
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let before = records(db);
+        let outcome = dispatcher.run_due(db, at(0)).unwrap();
+        assert!(
+            matches!(outcome, JobOutcome::Dead { id: 0, attempts: 1 }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            records(db),
+            before + 1,
+            "the hook's write and the Dead mark are one record"
+        );
+        let row = jobs_of(db).remove(0);
+        assert_eq!(
+            (row.status, row.attempts, row.last_error.as_deref()),
+            (JobStatus::Dead, 1, Some(JOB_ERROR))
+        );
+        let stone = db
+            .snapshot()
+            .unwrap()
+            .get(Id::<Tombstone>::from_raw(4))
+            .unwrap()
+            .expect("the hook's write committed");
+        assert_eq!(
+            (stone.attempts, stone.error.as_str()),
+            (1, JOB_ERROR),
+            "the hook was handed the failure the row records"
+        );
+    }
+
+    /// Fails its one attempt; its hook writes a `Tombstone`, then fails as
+    /// `kind` names: 0 an error, 1 a panic, 2 a write the `Schema` refuses, 3
+    /// a read it refuses.
+    #[job(global, on_dead, retry(max = 1))]
+    pub struct Hapless {
+        pub kind: u64,
+    }
+
+    impl Hapless {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            Err(JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+            tx.put(&Tombstone {
+                id: Id::from_raw(self.kind),
+                attempts: dead.attempts(),
+                error: dead.last_error().to_string(),
+            });
+            match self.kind {
+                0 => Err(JobError::app("the hook could not tell anyone")),
+                1 => panic!("hook bug: no one to tell"),
+                2 => {
+                    tx.put(&Unmounted {
+                        id: Id::from_raw(0),
+                    });
+                    Ok(())
+                }
+                _ => {
+                    tx.get::<tombstone_alias::Tombstone>(Id::from_raw(0))?;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_dead_hook_leaves_the_mark_alone_with_both_errors() {
+        let sim = Sim::with_faults(0xDEAD_0002, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Hapless]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        // The two refusals' own texts, provoked outside any hook, so the pin
+        // below holds their composition exactly without copying either.
+        let write_refusal = {
+            let mut group = db.begin_group().unwrap();
+            let staged = group.stage(|tx| {
+                tx.put(&Unmounted {
+                    id: Id::from_raw(0),
+                });
+                Ok::<(), std::io::Error>(())
+            });
+            group.commit().map_err(|f| f.error).unwrap();
+            match staged {
+                Err(TxError::Io(e)) => e.to_string(),
+                other => panic!("a write to an unregistered table is refused: {other:?}"),
+            }
+        };
+        let read_refusal =
+            match db.transact(|tx| tx.get::<tombstone_alias::Tombstone>(Id::from_raw(0))) {
+                Err(TxError::App(e)) => e.to_string(),
+                other => panic!(
+                    "a read through the alias is refused: {:?}",
+                    other.map(|row| row.is_some())
+                ),
+            };
+        for (kind, hook) in [
+            (0, "the hook could not tell anyone".to_string()),
+            (1, "on_dead panicked: hook bug: no one to tell".to_string()),
+            (2, write_refusal),
+            (3, read_refusal),
+        ] {
+            enqueue(db, Hapless { kind });
+            dispatcher.note_enqueued(db.drain_enqueued());
+            let before = records(db);
+            let outcome = dispatcher.run_due(db, at(0)).unwrap();
+            assert!(
+                matches!(outcome, JobOutcome::Dead { attempts: 1, .. }),
+                "kind {kind}: {outcome:?}"
+            );
+            assert_eq!(
+                records(db),
+                before + 1,
+                "kind {kind}: the hook's stage was discarded and the mark alone is one record"
+            );
+            let row = jobs_of(db).remove(kind as usize);
+            assert_eq!(
+                (row.status, row.attempts, row.last_error),
+                (
+                    JobStatus::Dead,
+                    1,
+                    Some(format!(
+                        "charpente: on_dead failed: {hook} — the job's own last error: {JOB_ERROR}"
+                    ))
+                ),
+                "kind {kind}"
+            );
+        }
+        assert!(
+            db.snapshot()
+                .unwrap()
+                .scan::<Tombstone>()
+                .unwrap()
+                .is_empty(),
+            "no failed hook's write committed"
+        );
+    }
+
+    static FAULTING_RUNS: AtomicU64 = AtomicU64::new(0);
+    static FAULTING_HOOKS: AtomicU64 = AtomicU64::new(0);
+
+    /// Fails its one attempt; its hook's first run faults as a platform read
+    /// does, and every later one writes. Only the test below enqueues it, so
+    /// its counters are that test's.
+    #[job(global, on_dead, retry(max = 1))]
+    pub struct HookFaultsOnce {}
+
+    impl HookFaultsOnce {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            FAULTING_RUNS.fetch_add(1, Ordering::SeqCst);
+            Err(JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+            if FAULTING_HOOKS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(JobError::Io(std::io::Error::other(
+                    "simulated hook read fault (injected)",
+                )));
+            }
+            tx.put(&Tombstone {
+                id: Id::from_raw(0),
+                attempts: dead.attempts(),
+                error: dead.last_error().to_string(),
+            });
+            Ok(())
+        }
+    }
+
+    /// A hook's `JobError::Io` is a platform fault, as a handler's is: the
+    /// failure record never commits, the kernel stops, and the restarted node
+    /// runs the job again, whose next failure record runs the hook again.
+    #[test]
+    fn a_dead_hooks_platform_fault_is_not_an_attempt() {
+        let sim = Sim::with_faults(0xDEAD_0003, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![HookFaultsOnce]);
+        enqueue(app.db_for_tests(), HookFaultsOnce {});
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        let before = records(kernel.app().db());
+        let err = kernel
+            .run(&mut SimSource::new(Box::new(sim.clock()), 10 * SEC))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("simulated hook read fault"),
+            "{err}"
+        );
+        let db = kernel.app().db();
+        assert_eq!(records(db), before, "nothing committed");
+        let row = jobs_of(db).remove(0);
+        assert_eq!(
+            (row.status, row.attempts, row.last_error),
+            (JobStatus::Pending, 0, None),
+            "not an attempt: the job's own failure went unrecorded with the hook's"
+        );
+        assert_eq!(
+            (
+                FAULTING_RUNS.load(Ordering::SeqCst),
+                FAULTING_HOOKS.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+
+        drop(kernel);
+        sim.restart_process();
+        let mut kernel =
+            Kernel::new(hook_app(&sim, jobs![HookFaultsOnce]), Box::new(sim.clock())).unwrap();
+        kernel
+            .run(&mut SimSource::new(Box::new(sim.clock()), 20 * SEC))
+            .unwrap();
+        assert_eq!(
+            (
+                FAULTING_RUNS.load(Ordering::SeqCst),
+                FAULTING_HOOKS.load(Ordering::SeqCst)
+            ),
+            (2, 2),
+            "the job ran again, and so did its hook"
+        );
+        let db = kernel.app().db();
+        let row = jobs_of(db).remove(0);
+        assert_eq!(
+            (row.status, row.attempts, row.last_error.as_deref()),
+            (JobStatus::Dead, 1, Some(JOB_ERROR))
+        );
+        let stone = db
+            .snapshot()
+            .unwrap()
+            .get(Id::<Tombstone>::from_raw(0))
+            .unwrap()
+            .expect("the second hook run's write committed");
+        assert_eq!((stone.attempts, stone.error.as_str()), (1, JOB_ERROR));
+    }
+
+    /// Fails its one attempt in its desk; its hook files a note in the tenant
+    /// it was handed, naming that tenant.
+    #[job(scoped_by = Desk, on_dead, retry(max = 1))]
+    pub struct Misfiled {
+        pub n: u64,
+    }
+
+    impl Misfiled {
+        fn run(self, _tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+            Err(JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(
+            self,
+            tx: &mut ScopedTx<'_, '_, Desk>,
+            _dead: Dead<Self>,
+        ) -> Result<(), JobError> {
+            let desk = tx.scope().raw();
+            tx.put(&Filed {
+                id: Id::from_raw(self.n),
+                note: desk,
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_scoped_jobs_dead_hook_runs_in_its_tenant() {
+        let sim = Sim::with_faults(0xDEAD_0004, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Misfiled]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 7, Misfiled { n: 3 });
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let outcome = dispatcher.run_due(db, at(0)).unwrap();
+        assert!(
+            matches!(outcome, JobOutcome::Dead { attempts: 1, .. }),
+            "{outcome:?}"
+        );
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            snap.get_scoped::<Filed>(7, Id::from_raw(3))
+                .unwrap()
+                .map(|f| f.note),
+            Some(7),
+            "the hook wrote in desk 7, and was handed desk 7"
+        );
+        assert!(
+            snap.get_scoped::<Filed>(0, Id::from_raw(3))
+                .unwrap()
+                .is_none(),
+            "and not in tenant 0"
+        );
+        let row = jobs_of(db).remove(0);
+        assert_eq!(
+            (row.status, row.scope, row.last_error.as_deref()),
+            (JobStatus::Dead, Some(7), Some(JOB_ERROR))
+        );
+    }
+
+    /// Fails its one attempt; its hook fans a `Stamp` out to two desks, which
+    /// only the declared capability can do.
+    #[job(global, cross_tenant, on_dead, retry(max = 1))]
+    pub struct Rollup {}
+
+    impl Rollup {
+        fn run(self, _tx: &mut Tx, _cap: &CrossTenant) -> Result<(), JobError> {
+            Err(JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(
+            self,
+            tx: &mut Tx,
+            cap: &CrossTenant,
+            _dead: Dead<Self>,
+        ) -> Result<(), JobError> {
+            for desk in [2, 5] {
+                tx.enqueue_in(Id::<Desk>::from_raw(desk), Stamp { n: desk }, cap);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_cross_tenant_jobs_dead_hook_gets_its_capability() {
+        let sim = Sim::with_faults(0xDEAD_0005, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Rollup, Stamp]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue(db, Rollup {});
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let outcome = dispatcher.run_due(db, at(0)).unwrap();
+        assert!(
+            matches!(outcome, JobOutcome::Dead { attempts: 1, .. }),
+            "{outcome:?}"
+        );
+        let rows: Vec<(String, Option<u64>, JobStatus, Option<String>)> = jobs_of(db)
+            .into_iter()
+            .map(|r| (r.name, r.scope, r.status, r.last_error))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "Rollup".to_string(),
+                    None,
+                    JobStatus::Dead,
+                    Some(JOB_ERROR.to_string())
+                ),
+                ("Stamp".to_string(), Some(2), JobStatus::Pending, None),
+                ("Stamp".to_string(), Some(5), JobStatus::Pending, None),
+            ],
+            "the hook's fan-out committed with the Dead mark, one job in each desk it named"
+        );
+    }
+
+    /// Fails its one attempt and keeps its Dead row.
+    #[job(global, retain_dead, retry(max = 1))]
+    pub struct Kept {}
+
+    impl Kept {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            Err(JobError::app(JOB_ERROR))
+        }
+    }
+
+    /// `Kept`, and `Mourned` mounted as `retain_dead`: its type has a hook,
+    /// and the mounted stance is what dispatch reads.
+    #[test]
+    fn a_retain_dead_job_runs_no_hook() {
+        let sim = Sim::with_faults(0xDEAD_0006, FaultConfig::none());
+        let retained = JobDef {
+            dead: DeadStance::Retain,
+            ..<Mourned as JobEntry>::def()
+        };
+        let mut app = hook_app(&sim, vec![<Kept as JobEntry>::def(), retained]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue(db, Kept {});
+        enqueue(db, Mourned { slot: 1 });
+        dispatcher.note_enqueued(db.drain_enqueued());
+        for id in 0..2 {
+            let before = records(db);
+            let outcome = dispatcher.run_due(db, at(0)).unwrap();
+            assert!(
+                matches!(outcome, JobOutcome::Dead { id: got, attempts: 1 } if got == id),
+                "{outcome:?}"
+            );
+            assert_eq!(records(db), before + 1, "job {id}: the Dead mark alone");
+        }
+        for row in jobs_of(db) {
+            assert_eq!(
+                (row.status, row.attempts, row.last_error.as_deref()),
+                (JobStatus::Dead, 1, Some(JOB_ERROR)),
+                "{}",
+                row.name
+            );
+        }
+        assert!(
+            db.snapshot()
+                .unwrap()
+                .scan::<Tombstone>()
+                .unwrap()
+                .is_empty(),
+            "no hook ran"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_job_goes_dead_unhooked() {
+        let sim = Sim::with_faults(0xDEAD_0007, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Mourned]);
+        // Nothing registered: the row's name has no glue, so no hook either.
+        let mut dispatcher = Dispatcher::new(vec![]);
+        let db = app.db_for_tests();
+        enqueue(db, Mourned { slot: 6 });
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let mut now = 0;
+        let attempts = loop {
+            match dispatcher.run_due(db, at(now)).unwrap() {
+                JobOutcome::Retried { due_at, .. } => now = due_at.as_nanos(),
+                JobOutcome::Dead { attempts, .. } => break attempts,
+                other => panic!("an unregistered job fails every attempt: {other:?}"),
+            }
+        };
+        assert_eq!(
+            attempts,
+            RetryPolicy::DEFAULT.max,
+            "an unregistered name takes the default policy"
+        );
+        let row = jobs_of(db).remove(0);
+        assert_eq!(
+            (row.status, row.last_error.as_deref()),
+            (
+                JobStatus::Dead,
+                Some(
+                    "job \"Mourned\" is not registered — add it to the jobs![…] list passed to \
+                     App::mount_jobs (or this log outlived a renamed job type)"
+                )
+            )
+        );
+        assert!(
+            db.snapshot()
+                .unwrap()
+                .scan::<Tombstone>()
+                .unwrap()
+                .is_empty(),
+            "no hook ran"
+        );
+    }
+
+    /// Forges a hook failure in its own error; its hook records what the row
+    /// says, at its second attempt.
+    #[job(global, on_dead, retry(max = 2, backoff = "1s"))]
+    pub struct Forger {}
+
+    impl Forger {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            Err(JobError::App(format!("{HOOK_FAILED}a forged hook failure")))
+        }
+
+        fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+            tx.put(&Tombstone {
+                id: Id::from_raw(0),
+                attempts: dead.attempts(),
+                error: dead.last_error().to_string(),
+            });
+            Ok(())
+        }
+    }
+
+    /// The same forgery from a job with no hook, Dead at its first attempt.
+    #[job(global, retain_dead, retry(max = 1))]
+    pub struct KeptForger {}
+
+    impl KeptForger {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            Err(JobError::App(format!("{HOOK_FAILED}a forged hook failure")))
+        }
+    }
+
+    /// Review Focus 4: a `last_error` begins with the hook-failure prefix only
+    /// when a hook failed, so app text that begins with it is stored behind
+    /// `job error: `, on a retry and on a Dead mark, with a hook or without.
+    #[test]
+    fn an_app_error_that_looks_like_a_hook_failure_is_stored_defused() {
+        const DEFUSED: &str = "job error: charpente: on_dead failed: a forged hook failure";
+        let sim = Sim::with_faults(0xDEAD_0008, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Forger, KeptForger]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue(db, Forger {});
+        enqueue(db, KeptForger {});
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let JobOutcome::Retried { id: 0, due_at, .. } = dispatcher.run_due(db, at(0)).unwrap()
+        else {
+            panic!("Forger's first attempt retries");
+        };
+        assert_eq!(
+            jobs_of(db)[0].last_error.as_deref(),
+            Some(DEFUSED),
+            "a retry"
+        );
+        assert!(matches!(
+            dispatcher.run_due(db, at(0)).unwrap(),
+            JobOutcome::Dead { id: 1, .. }
+        ));
+        assert!(matches!(
+            dispatcher.run_due(db, at(due_at.as_nanos())).unwrap(),
+            JobOutcome::Dead { id: 0, .. }
+        ));
+        for row in jobs_of(db) {
+            assert_eq!(
+                (row.status, row.last_error.as_deref()),
+                (JobStatus::Dead, Some(DEFUSED)),
+                "{}",
+                row.name
+            );
+            assert!(!row.last_error.unwrap().starts_with(HOOK_FAILED));
+        }
+        let stone = db
+            .snapshot()
+            .unwrap()
+            .get(Id::<Tombstone>::from_raw(0))
+            .unwrap()
+            .expect("Forger's hook ran and succeeded");
+        assert_eq!(
+            stone.error, DEFUSED,
+            "the hook was handed the text the row stores"
+        );
+    }
+
+    /// Declines its call: an outbound job for a hook to enqueue.
+    #[job(global, retain_dead, outbound = "pay.test")]
+    pub struct Notify {}
+
+    impl Notify {
+        fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+            Ok(None)
+        }
+
+        fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+
+    /// Fails its one attempt; its hook enqueues an outbound `Notify`.
+    #[job(global, on_dead, retry(max = 1))]
+    pub struct Announced {}
+
+    impl Announced {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            Err(JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(self, tx: &mut Tx, _dead: Dead<Self>) -> Result<(), JobError> {
+            tx.enqueue(Notify {});
+            Ok(())
+        }
+    }
+
+    /// The kernel's groups mint, so a hook's outbound enqueue gets its key
+    /// there (tests/outbound.rs). `Dispatcher::run_due`'s group, from
+    /// `Db::begin_group`, cannot, and refuses the enqueue by its existing name.
+    #[test]
+    #[should_panic(expected = "Db::begin_group cannot mint")]
+    fn run_dues_group_refuses_a_hooks_outbound_enqueue_by_name() {
+        let sim = Sim::with_faults(0xDEAD_0009, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Announced, Notify]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue(db, Announced {});
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let _ = dispatcher.run_due(db, at(0));
+    }
 }
 
 use charpente::kernel::CronScheduler;

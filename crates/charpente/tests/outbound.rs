@@ -21,7 +21,7 @@ use charpente::kernel::{
     Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope, Kernel, Now, SimSource,
 };
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
-use charpente::{Id, ScopedTx, Tenant, Tx, job, jobs};
+use charpente::{Dead, Id, ScopedTx, Tenant, Tx, job, jobs};
 use charpente_sim::checks::{
     boot_through_fallout, calls_have_durable_jobs, durable_corruption_fired, is_fault_fallout,
     keys_are_per_job, outbound_settles_by_horizon,
@@ -1474,6 +1474,179 @@ fn an_oversized_reply_is_a_named_attempt() {
               answered, so it applied this call; raise the cap with Host::max_reply_bytes (the \
               retry carries the same idempotency key)"
         )
+    );
+}
+
+// ------------------------------------------- the Dead hook on each outbound path
+
+/// What `Doomed`'s hook was handed when its job went Dead.
+#[charpente::table(global)]
+struct Told {
+    id: charpente::Id<Told>,
+    attempts: u32,
+    error: String,
+    key: String,
+}
+
+/// Dead at its first failure on every outbound path (0.5.0 spec §5 C).
+/// `refuse` builds a call its `Host` entry refuses. Its hook records what the
+/// failure left and enqueues an outbound `Tell`, which mints a key of its own.
+#[job(global, on_dead, outbound = "pay.test", retry(max = 1), timeout = "2s")]
+struct Doomed {
+    refuse: bool,
+}
+
+impl Doomed {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        let path = if self.refuse { "/pay now" } else { "/pay" };
+        Ok(Some(
+            Call::post(path).header("idempotency-key", key.as_str()),
+        ))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 => Ok(()),
+            s => Err(JobError::app(format!("pay.test answered {s}"))),
+        }
+    }
+
+    fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+        tx.put(&Told {
+            id: charpente::Id::from_raw(0),
+            attempts: dead.attempts(),
+            error: dead.last_error().to_string(),
+            key: dead
+                .key()
+                .map(|k| k.as_str().to_string())
+                .unwrap_or_default(),
+        });
+        tx.enqueue(Tell {});
+        Ok(())
+    }
+}
+
+/// Declines its call, so it is Done without reaching the remote.
+#[job(global, retain_dead, outbound = "pay.test")]
+struct Tell {}
+
+impl Tell {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(None)
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// Runs one `Doomed` to 60 s under `cfg` against `remote`, and checks that its
+/// hook ran with the Dead mark that `error` ended it with, and that the hook's
+/// outbound enqueue minted a key of its own.
+fn a_dead_hook_ran(
+    seed: u64,
+    cfg: FaultConfig,
+    remote: impl charpente_sim::outbound::Remote,
+    refuse: bool,
+    error: &str,
+) {
+    let sim = Sim::with_faults(seed, cfg);
+    sim.remote("pay.test", remote);
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Told>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Doomed, Tell])
+    .outbound(Host::new("pay.test"));
+    app.transact_for_tests(|tx| {
+        tx.enqueue(Doomed { refuse });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let kernel = run_to(&sim, app, 60 * SEC);
+    let snap = kernel.app().db().snapshot().unwrap();
+    let rows = snap.scan::<JobRow>().unwrap();
+    assert_eq!(rows.len(), 2, "Doomed and the Tell its hook enqueued");
+    let (doomed, tell) = (&rows[0], &rows[1]);
+    assert_eq!(
+        (
+            doomed.name.as_str(),
+            doomed.status,
+            doomed.attempts,
+            doomed.last_error.as_deref()
+        ),
+        ("Doomed", JobStatus::Dead, 1, Some(error)),
+        "the hook succeeded, so the row keeps the job's own error"
+    );
+    let key = doomed.outbound_key.expect("Doomed is outbound");
+    let told = snap
+        .get(charpente::Id::<Told>::from_raw(0))
+        .unwrap()
+        .expect("the hook ran");
+    assert_eq!(
+        (told.attempts, told.error.as_str(), told.key.as_str()),
+        (1, error, IdempotencyKey::from_bytes(key).as_str()),
+        "the hook was handed the failure and the key every call carried"
+    );
+    assert_eq!((tell.name.as_str(), tell.status), ("Tell", JobStatus::Done));
+    assert!(
+        tell.outbound_key.is_some_and(|k| k != key),
+        "the hook's outbound enqueue minted a key of its own: {:?}",
+        tell.outbound_key
+    );
+    assert_eq!(kernel.stats().jobs_dead, 1);
+}
+
+#[test]
+fn a_refused_call_runs_the_dead_hook_whose_outbound_enqueue_mints() {
+    a_dead_hook_ran(
+        0x0DEA_0001,
+        FaultConfig::none(),
+        Recorder::new(),
+        true,
+        "outbound pay.test: the call's path \"/pay now\" holds ' ', which the edge cannot send \
+         verbatim — percent-encode it",
+    );
+}
+
+#[test]
+fn a_timeout_runs_the_dead_hook_whose_outbound_enqueue_mints() {
+    a_dead_hook_ran(
+        0x0DEA_0002,
+        faults(|c| c.outbound_lost_reply = 1.0),
+        Recorder::new(),
+        false,
+        "outbound pay.test: timed out after 2s — the remote may have applied this call; the \
+         retry carries the same idempotency key",
+    );
+}
+
+#[test]
+fn a_transport_failure_runs_the_dead_hook_whose_outbound_enqueue_mints() {
+    a_dead_hook_ran(
+        0x0DEA_0003,
+        faults(|c| c.outbound_refused = 1.0),
+        Recorder::new(),
+        false,
+        "outbound pay.test: connection refused — the call did not reach the remote",
+    );
+}
+
+#[test]
+fn a_settle_failure_runs_the_dead_hook_whose_outbound_enqueue_mints() {
+    a_dead_hook_ran(
+        0x0DEA_0004,
+        FaultConfig::none(),
+        from_fn(|_c: &OutboundCall| OutboundReply {
+            status: 503,
+            headers: vec![],
+            body: vec![],
+        }),
+        false,
+        "pay.test answered 503",
     );
 }
 

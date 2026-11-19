@@ -894,14 +894,16 @@ impl Kernel {
                 //
                 // Bounded by JOBS RUN, not by records staged: a job
                 // contributes at most one record but calls `stage` up to
-                // TWICE (its own attempt, then a separate failure-record
-                // transaction on an App rejection — see
-                // `Dispatcher::run_due_into`'s doc). Counting jobs run still
-                // bounds records at MAX_BATCH (each job nets ≤ 1 record),
-                // the same guarantee the request arm's poll-count bound
-                // gives by a different argument — this is NOT a repeat of
-                // that reasoning and is written down so the next reader
-                // does not assume it is.
+                // THREE times (its own attempt; then, on an App rejection,
+                // the failure record, which carries an `on_dead` hook's
+                // writes when the job goes Dead; then, when that hook fails,
+                // the Dead mark alone — see `Dispatcher::run_due_into`'s
+                // doc). Every stage but a job's last nets zero records, so
+                // counting jobs run still bounds records at MAX_BATCH (each
+                // job nets ≤ 1 record), the same guarantee the request arm's
+                // poll-count bound gives by a different argument — this is
+                // NOT a repeat of that reasoning and is written down so the
+                // next reader does not assume it is.
                 let mut group = self.app.begin_job_group(now.wall)?;
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {

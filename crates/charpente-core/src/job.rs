@@ -212,7 +212,10 @@ impl Row for JobRow {
 
 /// What a Dead row's `last_error` begins with when its `on_dead` hook failed:
 /// the Dead mark then commits alone, with the hook's error and the job's own
-/// after this prefix (GUIDE §6).
+/// after this prefix, as `charpente: on_dead failed: <hook's error> — the
+/// job's own last error: <job's error>` (GUIDE §6). A `last_error` begins
+/// with it only then: the dispatcher stores an app's error text that begins
+/// with it as `job error: <text>`.
 pub const HOOK_FAILED: &str = "charpente: on_dead failed: ";
 
 /// A job's failure as the dispatcher read it from the row going Dead, handed
