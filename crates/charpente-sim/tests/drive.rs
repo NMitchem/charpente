@@ -1111,12 +1111,16 @@ fn timed_universe(sim: &mut Sim) -> Result<(), String> {
             }
         }),
     );
-    // The largest offset any boot started with: within a process the offset
-    // only falls (step-backs), and a restart adds a downtime jump before the
-    // build, so no reading the kernel ever held carried more.
-    let widest = Cell::new(i64::MIN);
+    // (virtual boot instant, the offset the boot started with). Offsets peak
+    // at boots: a power cycle's downtime jump precedes the build and reads
+    // only step back, so the largest offset any reading up to an instant
+    // carried is the largest among the boots up to it. A jump from a later
+    // restart therefore does not loosen a note that arrived before it.
+    let boots = std::cell::RefCell::new(Vec::<(u64, i64)>::new());
     let drive = Drive::new(sim, |s: &Sim| {
-        widest.set(widest.get().max(s.clock().offset()));
+        boots
+            .borrow_mut()
+            .push((s.now().as_nanos(), s.clock().offset()));
         timed_app(s)
     });
     let mut r = Rng::new(sim.seed() ^ 0x71_3D);
@@ -1152,8 +1156,8 @@ fn timed_universe(sim: &mut Sim) -> Result<(), String> {
         .map(|r| (r.id.raw(), r.times))
         .collect();
     let noted = NOTED.with(|m| m.borrow().clone());
-    let arrivals = arrivals.lock().unwrap().clone();
     let deliveries = sim.outbound_deliveries();
+    let arrivals = arrivals.lock().unwrap().clone();
     assert_eq!(
         arrivals.len(),
         deliveries.len(),
@@ -1161,9 +1165,7 @@ fn timed_universe(sim: &mut Sim) -> Result<(), String> {
     );
     let mut first_arrival = std::collections::BTreeMap::new();
     for (n, d) in arrivals.iter().zip(&deliveries) {
-        first_arrival
-            .entry(*n)
-            .or_insert(d.at + charpente_sim::SIM_WALL_BASE_NANOS);
+        first_arrival.entry(*n).or_insert(d.at);
     }
     for &n in &booked {
         sim.cover("timed:checked");
@@ -1176,14 +1178,22 @@ fn timed_universe(sim: &mut Sim) -> Result<(), String> {
                 ran.get(&n)
             ));
         }
-        let true_run = first_arrival[&n] as i128;
-        let bound = i128::from(due) - i128::from(widest.get());
+        let at = first_arrival[&n];
+        let true_run = i128::from(at) + i128::from(charpente_sim::SIM_WALL_BASE_NANOS);
+        let peak = boots
+            .borrow()
+            .iter()
+            .filter(|&&(boot, _)| boot <= at)
+            .map(|&(_, offset)| offset)
+            .max()
+            .expect("a call arrives after the boot that sent it");
+        let bound = i128::from(due) - i128::from(peak);
         if true_run < bound {
             return Err(format!(
                 "note {n}'s timed job ran at true wall {true_run} ns, {} ns before its due time \
-                 {due} ns less the clock's widest offset {} ns",
+                 {due} ns less the clock's peak offset {} ns up to its arrival",
                 bound - true_run,
-                widest.get()
+                peak
             ));
         }
     }

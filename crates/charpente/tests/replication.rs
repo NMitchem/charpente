@@ -11824,6 +11824,61 @@ fn a_follower_applies_shipped_outbound_enqueues_with_the_primary_s_keys() {
     assert_eq!(raw(&f), raw(&p), "and the whole job rows, as stored");
 }
 
+/// 0.5.0 spec 7.4: the timed outbound form (tag 0x0e, due time and minted
+/// key together) crosses to a follower with both intact.
+#[test]
+fn a_follower_applies_a_shipped_timed_outbound_enqueue_with_its_due_time_and_key() {
+    let sim = Sim::with_faults(0x5A9E_0E0E, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    let mint = p.host.entropy();
+    let due = 1_800_000_000_123_456_789u64;
+    let db = p.db.as_mut().unwrap();
+    let mut group = db.begin_group_minting(&mint).unwrap();
+    group
+        .stage(|tx| {
+            tx.enqueue_at(
+                charpente_core::io::WallTime::from_nanos(due),
+                ShipCharge { n: 3 },
+            );
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    group.commit().map_err(|f| f.error).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+
+    let rows = |n: &Node| {
+        n.db.as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap()
+    };
+    let (pj, fj) = (rows(&p), rows(&f));
+    assert_eq!(pj.len(), 1, "the primary holds the one timed enqueue");
+    assert_eq!(
+        pj[0].due_at.as_nanos(),
+        due,
+        "the primary kept the due time"
+    );
+    assert!(pj[0].outbound_key.is_some(), "it minted a key");
+    assert_eq!(
+        (fj[0].due_at, fj[0].outbound_key),
+        (pj[0].due_at, pj[0].outbound_key),
+        "the follower holds the due time and the key"
+    );
+    let raw = |n: &Node| {
+        n.db.as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .scan_raw(JobRow::TABLE, false)
+            .unwrap()
+    };
+    assert_eq!(raw(&f), raw(&p), "and the whole job rows, as stored");
+}
+
 // ============================================================ clock floor
 //
 // 0.3.0 spec §5 B at promote: a node never hands out a wall time more than
@@ -12391,6 +12446,7 @@ fn timed_pair(sim: &Sim) -> (KNode, KNode, u64) {
     krun_until(sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
     let (on_p, on_f) = (timed_rows(&p), timed_rows(&f));
     assert_eq!(on_p.len(), 1, "one timed row on the primary: {on_p:?}");
+    assert_eq!(on_f.len(), 1, "one timed row on the follower: {on_f:?}");
     assert_eq!(
         on_f, on_p,
         "the follower holds the row with the same due_at, payload, key and status"
