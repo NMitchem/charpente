@@ -1345,10 +1345,10 @@ impl<'a> Tx<'a> {
     pub fn now(&self) -> WallTime {
         self.now.expect(
             "contract: tx.now() reads the transaction's time, and this transaction has none \
-             — the kernel gives every route, job, cron tick and Dead hook its step's time, \
-             but Db::transact and Db::begin_group carry none; pass one explicitly with \
-             Db::transact_at(now, f) or Group::set_now(now), or in a test \
-             App::transact_for_tests_at(now, f)",
+             — the kernel gives every route, job, job a schedule enqueued and Dead hook its \
+             step's time, but Db::transact, Db::begin_group and App::handle carry none; pass \
+             one explicitly with Db::transact_at(now, f), Group::set_now(now) or \
+             App::handle_at(request, now), or in a test App::transact_for_tests_at(now, f)",
         )
     }
 

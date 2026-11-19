@@ -471,7 +471,11 @@ fn transact_at_hands_its_time_to_the_closure() {
 
 #[test]
 #[should_panic(
-    expected = "contract: tx.now() reads the transaction's time, and this transaction has none"
+    expected = "contract: tx.now() reads the transaction's time, and this transaction has none \
+                — the kernel gives every route, job, job a schedule enqueued and Dead hook its \
+                step's time, but Db::transact, Db::begin_group and App::handle carry none; pass \
+                one explicitly with Db::transact_at(now, f), Group::set_now(now) or \
+                App::handle_at(request, now), or in a test App::transact_for_tests_at(now, f)"
 )]
 fn tx_now_without_a_time_source_is_refused_by_name() {
     let mut db = fresh_db(0x7A10_0003);
@@ -563,7 +567,11 @@ fn enqueue_after_saturates_instead_of_overflowing() {
 
 #[test]
 #[should_panic(
-    expected = "contract: tx.now() reads the transaction's time, and this transaction has none"
+    expected = "contract: tx.now() reads the transaction's time, and this transaction has none \
+                — the kernel gives every route, job, job a schedule enqueued and Dead hook its \
+                step's time, but Db::transact, Db::begin_group and App::handle carry none; pass \
+                one explicitly with Db::transact_at(now, f), Group::set_now(now) or \
+                App::handle_at(request, now), or in a test App::transact_for_tests_at(now, f)"
 )]
 fn enqueue_after_needs_a_time_source() {
     let mut db = fresh_db(0x7A30_0004);

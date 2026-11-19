@@ -521,7 +521,8 @@ fn tx(
     let _page: Vec<Note> = tx.scan_from(0, 100)?;
     // The step's held wall reading, the same for every transaction of one
     // kernel step. Panics by name on a bare `Db::transact` or `begin_group`,
-    // which carry none: see `Db::transact_at` and `Group::set_now`.
+    // or under `App::handle`, which carry none: see `Db::transact_at`,
+    // `Group::set_now` and `App::handle_at`.
     let _at: WallTime = tx.now();
     tx.put(&note);
     tx.delete(id);
@@ -674,9 +675,11 @@ fn app(sim: &Sim, oidc: OidcConfig) -> io::Result<()> {
     // The store. Whoever holds it reaches every tenant with no `authorize`.
     let _snap: Snapshot = app.db().snapshot()?;
     // One request with no kernel. A stream route answers 500 here: only a
-    // kernel serves a subscription. `now` is the Unix epoch.
+    // kernel serves a subscription. Sessions are judged at the Unix epoch,
+    // and the transaction carries no time, so `tx.now()` here panics.
     let _answer: Response = app.handle(Request::new(Method::Get, "/orgs/1/memos"));
-    // `handle` at a clock reading you choose, for a session-expiry test.
+    // `handle` at a clock reading you choose: sessions are judged at it, and
+    // it is the transaction's `tx.now()`.
     let _later: Response = app.handle_at(
         Request::new(Method::Post, "/logout"),
         WallTime::from_nanos(1),

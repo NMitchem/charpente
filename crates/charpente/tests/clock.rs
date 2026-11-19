@@ -2346,3 +2346,45 @@ fn tx_now_on_a_follower_read_route_is_the_followers_held_reading() {
     assert_ne!(got, 0, "the follower read the epoch");
     assert_eq!(got, expected.unwrap(), "not the follower's own reading");
 }
+
+fn now_app(seed: u64) -> App {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![now_route])
+}
+
+/// Review I-1: `App::handle` judges sessions at the epoch but gives its
+/// transaction no time, so a route's `tx.now()` there refuses by name rather
+/// than reading 1970 (spec §5 A).
+#[test]
+#[should_panic(
+    expected = "contract: tx.now() reads the transaction's time, and this transaction has none \
+                — the kernel gives every route, job, job a schedule enqueued and Dead hook its \
+                step's time, but Db::transact, Db::begin_group and App::handle carry none; pass \
+                one explicitly with Db::transact_at(now, f), Group::set_now(now) or \
+                App::handle_at(request, now), or in a test App::transact_for_tests_at(now, f)"
+)]
+fn a_route_calling_tx_now_through_app_handle_panics_by_name() {
+    let mut app = now_app(0xA7C1_0005);
+    let response = app.handle(Request::new(Method::Get, "/now"));
+    panic!(
+        "App::handle answered {} {} instead of refusing tx.now()",
+        response.status,
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// `App::handle_at` gives its transaction the `now` it is handed.
+#[test]
+fn a_route_calling_tx_now_through_app_handle_at_reads_its_now() {
+    let mut app = now_app(0xA7C1_0006);
+    let response = app.handle_at(Request::new(Method::Get, "/now"), wall(T0));
+    assert_eq!(response.status, 200);
+    assert_eq!(body_u64(&response.body), T0);
+}

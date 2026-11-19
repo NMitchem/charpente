@@ -768,6 +768,13 @@ impl App {
     /// `now` is the step's held wall reading: every transaction staged into
     /// the group reads it as `tx.now()`.
     pub fn begin_group(&mut self, now: WallTime) -> io::Result<(Group<'_>, StagedDispatch<'_>)> {
+        self.open_group(Some(now))
+    }
+
+    /// `begin_group`, with the group's time optional: `App::handle` opens
+    /// its group with none, so `tx.now()` there refuses by name rather than
+    /// read the epoch it judges sessions at (0.5.0 spec §5 A).
+    fn open_group(&mut self, now: Option<WallTime>) -> io::Result<(Group<'_>, StagedDispatch<'_>)> {
         let staged = StagedDispatch {
             router: &self.router,
             entropy: &*self.entropy,
@@ -780,7 +787,9 @@ impl App {
             .as_mut()
             .expect(DB_TAKEN)
             .begin_group_minting(&*self.entropy)?;
-        group.set_now(now);
+        if let Some(now) = now {
+            group.set_now(now);
+        }
         Ok((group, staged))
     }
 
@@ -949,7 +958,7 @@ impl App {
     /// refusing cannot mean "skip the commit"; refusing means the caller is
     /// told rather than left to discover a row it never asked for.
     ///
-    /// Three deliberate departures from a real request, all so the probe can
+    /// Four deliberate departures from a real request, all so the probe can
     /// reach EVERY stream route rather than only the trivially reachable
     /// ones: `auth` is not enforced (no credential is presented and none is
     /// demanded, so an `auth` stream route is probeable) — unless it opens a
@@ -958,13 +967,15 @@ impl App {
     /// quoting that 401. A `public(S)` route's admission is minted for the
     /// probe as it is for a request; each `:param` is
     /// fed the literal `"0"`, which parses for every `FromParam` the
-    /// platform ships (`u64`, `String`, `Id<T>`); and the fresh-token slot
-    /// is a fixed literal rather than an `Entropy` draw, so probing cannot
-    /// shift the app's entropy stream and perturb everything after it (hard
-    /// rule 1). A handler that rejects that synthetic input comes back as
-    /// `Err` naming the route and quoting what a request would receive, the
-    /// status and the envelope's message, never as a silently empty name
-    /// list.
+    /// platform ships (`u64`, `String`, `Id<T>`); the fresh-token slot is a
+    /// fixed literal rather than an `Entropy` draw, so probing cannot shift
+    /// the app's entropy stream and perturb everything after it (hard rule
+    /// 1); and the group's time is the Unix epoch rather than none, so a
+    /// subscribe handler that reads `tx.now()` is probed, reading 1970, where
+    /// `App::handle` would refuse it. A handler that rejects that synthetic
+    /// input comes back as `Err` naming the route and quoting what a request
+    /// would receive, the status and the envelope's message, never as a
+    /// silently empty name list.
     #[doc(hidden)]
     pub fn subscription_event_names(&mut self, route: &str) -> Result<Vec<&'static str>, String> {
         let Some(found) = self.router.routes().iter().find(|r| r.name == route) else {
@@ -1055,26 +1066,22 @@ impl App {
     /// `Response` outcome), and turns a `Subscribe` outcome into a 500 — an
     /// SSE route matched, but a bare caller has no sink to hand the tail.
     /// Only the kernel (`Kernel::step`, T5) has one, so only it should ever
-    /// see a `Handled::Subscribe`. Defaults `now` to the Unix epoch — every
+    /// see a `Handled::Subscribe`. Judges sessions at the Unix epoch — every
     /// current caller relies on this implicitly for sessions that outlive a
     /// single scenario; a test that must observe the expiry boundary calls
-    /// `handle_at` directly instead.
+    /// `handle_at` directly instead. Its transaction carries no time, so a
+    /// route's `tx.now()` (and so `enqueue_after`) panics by name here rather
+    /// than read 1970 (0.5.0 spec §5 A); `handle_at` carries one.
     pub fn handle(&mut self, request: Request) -> Response {
-        self.handle_at(request, WallTime::UNIX_EPOCH)
+        plain(self.dispatch(request, WallTime::UNIX_EPOCH, None))
     }
 
     /// `handle`, with the clock reading `handle_or_subscribe` needs made
     /// explicit — the seam a caller that tracks its own `now` (tests driving
-    /// session expiry) uses instead of the epoch default.
+    /// session expiry, or a route that reads `tx.now()`) uses instead of the
+    /// epoch default. The transaction reads `now` as `tx.now()`.
     pub fn handle_at(&mut self, request: Request, now: WallTime) -> Response {
-        match self.handle_or_subscribe(request, now) {
-            Handled::Response(response) => response,
-            Handled::Subscribe(_) => Response::error(
-                500,
-                "an SSE route matched App::handle, which has no sink to hand the tail — \
-                 subscribe requests must go through Kernel::run",
-            ),
-        }
+        plain(self.handle_or_subscribe(request, now))
     }
 
     /// The one-request wrapper (group-commit T5, spec §1): a single-request
@@ -1094,7 +1101,13 @@ impl App {
     /// every batched request's snapshot necessarily precedes its own routing
     /// — so it is named here rather than worked around.
     pub fn handle_or_subscribe(&mut self, request: Request, now: WallTime) -> Handled {
-        let (mut group, staged) = match self.begin_group(now) {
+        self.dispatch(request, now, Some(now))
+    }
+
+    /// `handle_or_subscribe`, with the transaction's time apart from the
+    /// session-judging `now`: `None` from `App::handle`.
+    fn dispatch(&mut self, request: Request, now: WallTime, tx_now: Option<WallTime>) -> Handled {
+        let (mut group, staged) = match self.open_group(tx_now) {
             Ok(pair) => pair,
             Err(e) => return Handled::Response(tx_error_response(TxError::Io(e))),
         };
@@ -1119,6 +1132,19 @@ impl App {
             // request arm shares the gap (its comment, and PLAN's v1.x row).
             Err(_) => handled,
         }
+    }
+}
+
+/// `App::handle`'s answer: a `Subscribe` outcome is a 500, since a bare
+/// caller has no sink to hand the tail.
+fn plain(handled: Handled) -> Response {
+    match handled {
+        Handled::Response(response) => response,
+        Handled::Subscribe(_) => Response::error(
+            500,
+            "an SSE route matched App::handle, which has no sink to hand the tail — \
+             subscribe requests must go through Kernel::run",
+        ),
     }
 }
 

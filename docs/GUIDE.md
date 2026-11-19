@@ -1075,7 +1075,8 @@ resolution never waits on it.
 `WallTime::UNIX_EPOCH`, so a session it mints expires `session_ttl` after 1970
 and reads as expired the moment a kernel presents it. When a kernel will present
 the credential, mint it through the kernel, or call `app.handle_at(request,
-clock.wall())` with the node's clock.
+clock.wall())` with the node's clock. `App::handle` carries no transaction time,
+so a route's `tx.now()` there panics by name (§7); `handle_at` carries one.
 
 ```rust
 use charpente::auth::{ApiKey, Via};
@@ -1655,7 +1656,7 @@ tx.enqueue_at(WallTime::from_nanos(deadline), Remind { invoice });  // at a time
 tx.enqueue_after(Duration::from_secs(7 * 24 * 3600), Remind { invoice });  // a delay after tx.now()
 ```
 
-`enqueue_after` is `tx.now()` plus the delay, so it refuses by name, as `tx.now()` does, in a transaction that has no time (a bare `Db::transact`). The sum saturates at the far future instead of overflowing: `Duration::MAX` is a job that stays Pending. A time already past is due at once. A tenant-scoped job takes the same two methods on its `ScopedTx`. There is no keyed and no cross-tenant timed variant yet. The due time travels in the log record (tag `0x0e`), so a replica or a replay holds the same time; a job enqueued without one is recorded exactly as before.
+`enqueue_after` is `tx.now()` plus the delay, so it refuses by name, as `tx.now()` does, in a transaction that has no time (a bare `Db::transact`, or a route under `App::handle`). The sum saturates at the far future instead of overflowing: `Duration::MAX` is a job that stays Pending. A time already past is due at once. A tenant-scoped job takes the same two methods on its `ScopedTx`. There is no keyed and no cross-tenant timed variant yet. The due time travels in the log record (tag `0x0e`), so a replica or a replay holds the same time; a job enqueued without one is recorded exactly as before.
 
 ### A job inside a tenant: `scoped_by`
 
@@ -2955,9 +2956,12 @@ frequent schedule tightens the bound: the store then holds a recent time, and
 a clock behind it by more than the tolerance is refused at open.
 
 `Db::transact` and `Db::begin_group` carry no time, and `tx.now()` in them
-panics by name; `App::handle_at` carries one. A test gives a transaction one
-with `Db::transact_at(now, f)`, `Group::set_now(now)` on a group from `Db::begin_group`, or `App::transact_for_tests_at(now, f)`;
-`App::begin_group` takes the time as its argument.
+panics by name. `App::handle` carries no transaction time either, so a route's
+`tx.now()` there panics by name, and `App::handle_at(request, now)` carries
+one. A test gives a transaction one with `Db::transact_at(now, f)`,
+`Group::set_now(now)` on a group from `Db::begin_group`, or
+`App::transact_for_tests_at(now, f)`; `App::begin_group` takes the time as its
+argument.
 
 ### Time-relative state: `tx.now()` and timed jobs
 
