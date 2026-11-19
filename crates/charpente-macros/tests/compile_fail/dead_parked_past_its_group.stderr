@@ -1,0 +1,31 @@
+error[E0521]: borrowed data escapes outside of method
+  --> tests/compile_fail/dead_parked_past_its_group.rs:23:10
+   |
+22 |     fn on_dead(self, _tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+   |                                    ----
+   |                                    |
+   |                                    `dead` is a reference that is only valid in the method body
+   |                                    has type `charpente::Dead<'1, Ping>`
+23 |         *PARKED.lock().unwrap() = Some(dead);
+   |          ^^^^^^^^^^^^^
+   |          |
+   |          `dead` escapes the method body here
+   |          argument requires that `'1` must outlive `'static`
+   |
+   = note: requirement occurs because of the type `std::sync::Mutex<std::option::Option<charpente::Dead<'_, Ping>>>`, which makes the generic argument `std::option::Option<charpente::Dead<'_, Ping>>` invariant
+   = note: the struct `std::sync::Mutex<T>` is invariant over the parameter `T`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0521]: borrowed data escapes outside of method
+  --> tests/compile_fail/dead_parked_past_its_group.rs:41:9
+   |
+40 |     fn on_dead(self, _tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+   |                                    ----
+   |                                    |
+   |                                    `dead` is a reference that is only valid in the method body
+   |                                    has type `charpente::Dead<'1, Pong>`
+41 |         KEPT.with(|kept| *kept.borrow_mut() = Some(dead));
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |         |
+   |         `dead` escapes the method body here
+   |         argument requires that `'1` must outlive `'static`

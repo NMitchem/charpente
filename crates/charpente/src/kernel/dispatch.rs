@@ -145,7 +145,7 @@ pub enum DeadStance {
 pub type DeadGlue = fn(
     &mut Tx,
     &[u8],
-    DeadRecord,
+    DeadRecord<'_>,
     Option<&CrossTenant<'_>>,
     Option<JobScope<'_>>,
 ) -> Result<(), JobError>;

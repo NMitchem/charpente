@@ -770,7 +770,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                         #name,
                         &mut ::charpente::Tx<'_>,
                         #cap_ty
-                        ::charpente::Dead<#name>,
+                        ::charpente::Dead<'_, #name>,
                     ) -> ::std::result::Result<(), ::charpente::kernel::JobError> = #name::on_dead;
                     on_dead(job, tx, #cap_arg dead)
                 },
@@ -781,7 +781,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                         #name,
                         &mut ::charpente::ScopedTx<'_, '_, #path>,
                         #cap_ty
-                        ::charpente::Dead<#name>,
+                        ::charpente::Dead<'_, #name>,
                     ) -> ::std::result::Result<(), ::charpente::kernel::JobError> = #name::on_dead;
                     on_dead(job, &mut tx, #cap_arg dead)
                 },
@@ -791,7 +791,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     fn __charpente_dead_glue(
                         tx: &mut ::charpente::Tx,
                         payload: &[u8],
-                        record: ::charpente::core::job::DeadRecord,
+                        record: ::charpente::core::job::DeadRecord<'_>,
                         cap: ::std::option::Option<&::charpente::CrossTenant<'_>>,
                         scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
                     ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {

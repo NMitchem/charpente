@@ -1969,7 +1969,10 @@ one record. A signature other than these is a type error, as `run`'s is (§9).
   was sent under, so the app can record it; `None` for a pure job, exactly.
 
 It is neither `Clone` nor `Codec`, and only the dispatcher makes one, from the row
-going Dead.
+going Dead. Like the `CrossTenant` token (§16), it borrows the dispatcher's group:
+its full type is `Dead<'_, J>`, which `Dead<Self>` elides as `&mut Tx` does, so a
+hook cannot move it into a `static` or a `thread_local!` that outlives the hook.
+That is a borrow error at compile time.
 
 ```rust
 use charpente::core::table::Id;
@@ -5597,7 +5600,7 @@ argument list didn't parse as `METHOD "/path"` to begin with. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
 the pattern and it's gone.
 
-### `#[job]` tenancy, retry-syntax, outbound and shape violations (`charpente-macros/src/job.rs`, compile time)
+### `#[job]` tenancy, Dead-stance, retry-syntax, outbound and shape violations (`charpente-macros/src/job.rs`, compile time)
 
 ```text
 `NotifySubscribers` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
@@ -5686,10 +5689,13 @@ error[E0308]: mismatched types
 ```
 
 The first is a job that declares `on_dead` and writes no hook: write `fn on_dead` with
-§6's signature, or declare `retain_dead` if nothing should happen. The second, with
-"expected fn pointer, found fn item", is a hook whose signature is not §6's: a scoped
-job's `on_dead` taking a bare `Tx`, which would otherwise write in no tenant, or a
-`cross_tenant` job's without `cap`. Its note prints the expected signature above yours.
+§6's signature, or declare `retain_dead` if nothing should happen. The second is a
+hook whose signature is not §6's: a scoped job's `on_dead` taking a bare `Tx`, which
+would otherwise write in no tenant (labelled "expected fn pointer, found fn item"), or a
+`cross_tenant` job's without `cap` ("incorrect number of function parameters"). Its
+note prints the expected signature above yours. A hook that moves its `Dead` into a
+`static` or a `thread_local!` is `error[E0521]: borrowed data escapes outside of
+method`: the `Dead` borrows the dispatcher's group.
 
 Three more, at job-dispatch time rather than macro-expansion time
 (`charpente/src/kernel/dispatch.rs` — covered behaviorally in §6's "Retry,
@@ -9213,8 +9219,9 @@ The shape of an app that uses it:
 - each route that opens a scope says who may: `auth` or `public`, where the
   membership check decides for each principal, or `public(Org)`, where every
   caller may by declaration (§5, "A route's stance").
-- `#[job(scoped_by = Org)]` on every job that acts inside one tenant, and
-  `#[job(global)]` on every job that belongs to none. A scoped job's `run`
+- `#[job(scoped_by = Org, …)]` on every job that acts inside one tenant, and
+  `#[job(global, …)]` on every job that belongs to none, each beside its Dead
+  stance, `on_dead` or `retain_dead` (§6). A scoped job's `run`
   receives the `ScopedTx` of the tenant it was enqueued from.
 - `#[event(scoped_by = Org)]` on every event that belongs to one tenant, and `#[event(global)]` on every event that belongs to none. A scoped event is emitted on its tenant's `ScopedTx`, and only that tenant's feed, built on the same handle, receives it (§11).
 

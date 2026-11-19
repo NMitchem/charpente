@@ -933,7 +933,9 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   §13): an `on_dead` job writes `fn on_dead(self, tx, dead: Dead<Self>)`, taking `run`'s
   transaction and capability, and `retain_dead` keeps the Dead row with its last error and
   runs nothing. The stance is on `JobDef` and in `describe`, never in `FINGERPRINT`, so
-  changing it changes no stored shape (spec 2026-11-18-0.5.0 §5 C). **Job rows are the
+  changing it changes no stored shape (spec 2026-11-18-0.5.0 §5 C). `Dead<'g, J>` and the
+  `DeadRecord<'g>` it opens from borrow what the dispatcher's `Group` borrows, as the two
+  capability tokens do, so a hook cannot park one past its group. **Job rows are the
   platform's to write and to read**, because the dispatcher opens
   the tenant a row carries without asking anyone: `JobRow`'s `Row::Scope` is the sealed
   `PlatformOwned`, so `Tx::put`/`Tx::delete` of one is an unsatisfied bound naming the

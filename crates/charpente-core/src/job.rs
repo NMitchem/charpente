@@ -220,7 +220,13 @@ pub const HOOK_FAILED: &str = "charpente: on_dead failed: ";
 /// one, and it takes a `TenantAdmission`, which only a `Group` mints, so no
 /// handler can. Neither `Clone` nor `Codec`: one Dead mark makes one record,
 /// and a record is never stored.
-pub struct DeadRecord {
+///
+/// It borrows what its admission's `Group` borrows, as `CrossTenant` and
+/// `TenantAdmission` do, so neither it nor the `Dead` it opens as can be
+/// parked in a `static` or a `thread_local!` past the hook it is handed to
+/// (`compile_fail/dead_parked_past_its_group.rs`): a `Dead` that outlived its
+/// group could outlive the timeline that holds its Dead row.
+pub struct DeadRecord<'g> {
     name: String,
     #[expect(
         dead_code,
@@ -238,9 +244,10 @@ pub struct DeadRecord {
     attempts: u32,
     last_error: String,
     outbound_key: Option<[u8; 16]>,
+    group: PhantomData<&'g ()>,
 }
 
-impl DeadRecord {
+impl<'g> DeadRecord<'g> {
     /// The record of `row`'s failure, read after the dispatcher counted the
     /// attempt and wrote its error on the row.
     ///
@@ -248,7 +255,7 @@ impl DeadRecord {
     ///
     /// When `row` records no failure (no attempt, or no `last_error`): a
     /// record is made from the failure that kills its job.
-    pub fn from_row(row: &JobRow, admission: &TenantAdmission<'_>) -> DeadRecord {
+    pub fn from_row(row: &JobRow, admission: &TenantAdmission<'g>) -> DeadRecord<'g> {
         let _ = admission;
         let Some(last_error) = &row.last_error else {
             panic!(
@@ -275,6 +282,7 @@ impl DeadRecord {
             attempts: row.attempts,
             last_error: last_error.clone(),
             outbound_key: row.outbound_key,
+            group: PhantomData,
         }
     }
 
@@ -284,7 +292,7 @@ impl DeadRecord {
     ///
     /// When `J` is not that job: another name, or another shape under the
     /// same name.
-    pub fn into_typed<J: Job>(self) -> Dead<J> {
+    pub fn into_typed<J: Job>(self) -> Dead<'g, J> {
         assert!(
             self.name == J::NAME && self.shape == Some(J::FINGERPRINT),
             "contract: a Dead record of job \"{}\" was opened as job \"{}\" — a Dead<J> carries \
@@ -302,13 +310,15 @@ impl DeadRecord {
 /// What an `on_dead` hook is handed beside its job: how many attempts it
 /// made, the error the last one ended with, and an outbound job's
 /// idempotency key, readable so the app can record it. Made only from its
-/// own job's `DeadRecord`. Neither `Clone` nor `Codec`.
-pub struct Dead<J> {
-    record: DeadRecord,
+/// own job's `DeadRecord`, whose group lifetime it keeps: a hook writes
+/// `Dead<Self>`, and cannot move it anywhere that outlives the hook. Neither
+/// `Clone` nor `Codec`.
+pub struct Dead<'g, J> {
+    record: DeadRecord<'g>,
     job: PhantomData<fn() -> J>,
 }
 
-impl<J> Dead<J> {
+impl<J> Dead<'_, J> {
     /// The attempts the job made, the last one included.
     pub fn attempts(&self) -> u32 {
         self.record.attempts
