@@ -10,12 +10,12 @@ use std::time::Duration;
 use charpente::auth::ApiKey;
 use charpente::core::io::CLOCK_TOLERANCE;
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
-use charpente::kernel::{CronRow, JobError};
+use charpente::kernel::{CronRow, JobError, SimSource};
 use charpente::{Id, Schema, Tx, View, job, jobs, route, routes, table};
 use charpente_core::io::{Disk, Entropy};
 use charpente_sim::drive::Drive;
-use charpente_sim::rng::Rng;
-use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
+use charpente_sim::rng::{Rng, splitmix64};
+use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with, sample_extended_fields};
 
 /// A fault-heavy workload; returns everything observable about the universe.
 fn trace(seed: u64) -> (u64, u64, Vec<u8>) {
@@ -153,10 +153,19 @@ fn probe_readings(sim: &Sim) -> Result<Option<Readings>, String> {
         })
         .collect();
     let phase = drive.faulted_phase(&requests, Duration::from_secs(12))?;
-    let Some(recovered) = drive.recover(&phase, Duration::from_secs(10))? else {
+    let Some(mut recovered) = drive.recover(&phase, Duration::from_secs(10))? else {
         return Ok(None);
     };
     let at_tail_boot = boot.get();
+    // A tail reading that does not wait on the schedule: under a kernel that
+    // ignored the floor the stored `next_due` keeps Beat from firing.
+    let now = sim.now().as_nanos();
+    let mut source = SimSource::new(Box::new(sim.clock()), now + 1_000_000_000);
+    source.push_at(now, Request::new(Method::Post, "/probe"));
+    recovered
+        .kernel
+        .run(&mut source)
+        .map_err(|e| e.to_string())?;
     let rows = recovered
         .kernel
         .app()
@@ -185,10 +194,20 @@ fn clock_axes_on(seed: u64, cfg: &mut FaultConfig) {
     cfg.clock_downtime = (0.5, Duration::from_secs(3 * 86_400));
 }
 
-/// 256 universes reach the downtime axis in well over 100 of them (the floor
-/// below is measured; downtime rolls at 0.5 on each power cycle).
 const TX_NOW_UNIVERSES: u64 = 256;
 const TX_NOW_DOWNTIME_FLOOR: u64 = 100;
+const TX_NOW_WENT_BACK_FLOOR: u64 = 10;
+const TX_NOW_UNCOMPARED_CEILING: u64 = 0;
+
+/// The config the runner derives for `seed` (`run_universe_with_adjust`), so a
+/// second `Sim` can be built that is the same universe.
+fn universe_config(seed: u64) -> FaultConfig {
+    let mut s = seed;
+    let mut cfg = FaultConfig::swarm(&mut Rng::new(splitmix64(&mut s)));
+    sample_extended_fields(seed, &mut cfg);
+    clock_axes_on(seed, &mut cfg);
+    cfg
+}
 
 #[test]
 fn tx_now_is_seed_stable_and_never_runs_backwards_within_a_process() {
@@ -197,7 +216,25 @@ fn tx_now_is_seed_stable_and_never_runs_backwards_within_a_process() {
         TX_NOW_UNIVERSES,
         clock_axes_on,
         |sim| {
-            let Some((faulted, tail, floor)) = probe_readings(sim)? else {
+            let first_run = probe_readings(sim)?;
+            let again = Sim::with_faults(sim.seed(), universe_config(sim.seed()));
+            let second_run = probe_readings(&again)?;
+            if first_run != second_run {
+                let flat = |r: &Option<Readings>| {
+                    r.as_ref().map_or(vec![], |(f, t, _)| {
+                        f.iter().chain(t).copied().collect::<Vec<_>>()
+                    })
+                };
+                let (a, b) = (flat(&first_run), flat(&second_run));
+                let i = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i));
+                return Err(format!(
+                    "two runs of one seed recorded different readings: reading {i:?} is {:?} \
+                     then {:?}",
+                    i.and_then(|i| a.get(i)),
+                    i.and_then(|i| b.get(i))
+                ));
+            }
+            let Some((faulted, tail, floor)) = first_run else {
                 return Ok(());
             };
             for (name, readings) in [("faulted process", &faulted), ("tail process", &tail)] {
@@ -208,37 +245,38 @@ fn tx_now_is_seed_stable_and_never_runs_backwards_within_a_process() {
                     ));
                 }
             }
-            if let (Some(&last), Some(&first)) = (faulted.last(), tail.first()) {
-                sim.cover("tx_now:restart-compared");
-                let bound = last.saturating_sub(floor) + CLOCK_TOLERANCE.as_nanos() as u64;
-                if last.saturating_sub(first) > bound {
-                    return Err(format!(
-                        "tx.now() after a restart read {first}, behind the previous process's \
-                         last reading {last} by {} ns; the bound is {bound} ns (that reading \
-                         less the store's recorded floor {floor}, plus CLOCK_TOLERANCE)",
-                        last - first
-                    ));
+            match (faulted.last(), tail.first()) {
+                (Some(&last), Some(&first)) => {
+                    sim.cover("tx_now:restart-compared");
+                    if first < last {
+                        sim.cover("tx_now:restart-went-back");
+                    }
+                    // The stated bound: the node holds the store's recorded floor
+                    // less CLOCK_TOLERANCE, so no reading may start below that.
+                    let tolerance = CLOCK_TOLERANCE.as_nanos() as u64;
+                    if first.saturating_add(tolerance) < floor {
+                        return Err(format!(
+                            "tx.now() after a restart read {first}, more than CLOCK_TOLERANCE \
+                             ({tolerance} ns) behind the store's recorded floor {floor}; the \
+                             previous process last read {last}, so it went back {} ns",
+                            last.saturating_sub(first)
+                        ));
+                    }
                 }
+                (Some(_), None) => sim.cover("tx_now:restart-uncompared"),
+                _ => {}
             }
             Ok(())
         },
-        require: ["clock:downtime", "tx_now:restart-compared"],
-        floor: [("clock:downtime", TX_NOW_DOWNTIME_FLOOR)]
+        require: [
+            "clock:downtime",
+            "tx_now:restart-compared",
+            "tx_now:restart-went-back"
+        ],
+        floor: [
+            ("clock:downtime", TX_NOW_DOWNTIME_FLOOR),
+            ("tx_now:restart-went-back", TX_NOW_WENT_BACK_FLOOR)
+        ],
+        ceiling: [("tx_now:restart-uncompared", TX_NOW_UNCOMPARED_CEILING)]
     );
-}
-
-/// Two runs of one seed record the same readings, clock axes on: the time a
-/// transaction holds is a function of the seed.
-#[test]
-fn tx_now_readings_replay_identically() {
-    // 0x7A_0001's universes, plus two more: every one boots through the clock axes.
-    for seed in [0x7A_0001u64, 0x7A_0002, 0x7A_0003] {
-        let run = || {
-            let mut cfg = FaultConfig::none();
-            clock_axes_on(seed, &mut cfg);
-            let sim = Sim::with_faults(seed, cfg);
-            probe_readings(&sim)
-        };
-        assert_eq!(run(), run(), "seed {seed:#x} recorded different readings");
-    }
 }
