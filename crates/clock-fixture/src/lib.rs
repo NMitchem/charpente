@@ -1,5 +1,5 @@
 //! The app the edge harness drives for restart-stable time (0.3.0 spec §5 B):
-//! a one-second schedule that bumps a `Ticks` row, a session route with a
+//! a one-second schedule that bumps a `Ticks` row, a delayed `Remind` job, a session route with a
 //! configurable TTL, and an OIDC verifier over a fixed test key. Its own crate
 //! so no other fixture's recorded batches or goldens move.
 
@@ -95,6 +95,48 @@ impl Tick {
     }
 }
 
+#[table(global)]
+pub struct Reminded {
+    pub id: Id<Reminded>,
+    pub count: u64,
+}
+
+/// The timed job: one `Reminded` increment, run once at its due time.
+#[job(global)]
+pub struct Remind {}
+
+impl Remind {
+    pub fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let id = Id::<Reminded>::from_raw(0);
+        let count = tx.get(id)?.map_or(0, |r| r.count);
+        tx.put(&Reminded {
+            id,
+            count: count + 1,
+        });
+        Ok(())
+    }
+}
+
+/// Enqueues a `Remind` `after_secs` from the transaction's time. The count is
+/// a path segment, not a query parameter: a route reads only its path.
+#[route(POST "/remind/:after_secs", public)]
+pub fn remind(tx: &mut Tx, after_secs: String) -> Result<String, ApiError> {
+    let secs: u64 = after_secs.parse().map_err(|_| {
+        ApiError::BadRequest(format!(
+            "after_secs must be a whole number of seconds, got {after_secs:?}"
+        ))
+    })?;
+    tx.enqueue_after(Duration::from_secs(secs), Remind {});
+    Ok(after_secs)
+}
+
+/// The `Reminded` count, as a decimal string.
+#[route(GET "/reminded", public)]
+pub fn reminded(tx: &mut Tx) -> Result<String, ApiError> {
+    let count = tx.get(Id::<Reminded>::from_raw(0))?.map_or(0, |r| r.count);
+    Ok(count.to_string())
+}
+
 #[route(POST "/login", public)]
 pub fn login(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_session(tx, "alice".to_string()))
@@ -124,15 +166,18 @@ pub fn build(
         session_ttl: session_ttl_secs * 1_000_000_000,
         ..AppConfig::default()
     };
-    Ok(
-        App::open(disk, Schema::new().table::<Ticks>(), entropy, config)?
-            .mount(routes![login, me, ticks])
-            .mount_jobs(jobs![Tick])
-            .schedule("tick", Duration::from_secs(1), || Tick {})
-            .with_oidc(OidcConfig {
-                issuer: ISSUER.into(),
-                audience: AUDIENCE.into(),
-                jwks_json: TEST_JWKS.into(),
-            }),
-    )
+    Ok(App::open(
+        disk,
+        Schema::new().table::<Ticks>().table::<Reminded>(),
+        entropy,
+        config,
+    )?
+    .mount(routes![login, me, ticks, remind, reminded])
+    .mount_jobs(jobs![Tick, Remind])
+    .schedule("tick", Duration::from_secs(1), || Tick {})
+    .with_oidc(OidcConfig {
+        issuer: ISSUER.into(),
+        audience: AUDIENCE.into(),
+        jwks_json: TEST_JWKS.into(),
+    }))
 }

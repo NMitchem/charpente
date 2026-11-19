@@ -977,3 +977,227 @@ fn a_kernel_stop_that_is_not_fallout_fails_the_faulted_phase_with_its_text() {
     );
     assert_eq!(err, "the test unplugged the disk");
 }
+
+/// Task 5 (0.5.0) (d): a timed job never runs before its due time in true
+/// time. The route enqueues at `tx.now() + d`; the job is outbound so that
+/// the run is seen from outside the kernel, which cannot reach the `Sim`: the
+/// remote model records which note each call is for, and the sim's delivery
+/// record gives the true time the call arrived (a call arrives after it
+/// started, so its arrival bounds the run from above).
+#[table(global)]
+struct Booked {
+    id: Id<Booked>,
+}
+
+#[table(global)]
+struct Ran {
+    id: Id<Ran>,
+    times: u64,
+}
+
+thread_local! {
+    /// Note number -> the due time (wall nanoseconds) its latest enqueue
+    /// meant. A universe runs on one thread, so this is that universe's.
+    static NOTED: std::cell::RefCell<std::collections::BTreeMap<u64, u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+#[job(
+    global,
+    outbound = "later.test",
+    retry(max = 8, backoff = "500ms"),
+    timeout = "2s"
+)]
+struct Timed {
+    n: u64,
+}
+
+impl Timed {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::post("/ran")
+                .header("idempotency-key", key.as_str())
+                .form(&[("n", self.n.to_string())]),
+        ))
+    }
+
+    fn settle(self, tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        if reply.status() != 200 {
+            return Err(JobError::app(format!(
+                "later.test answered {}",
+                reply.status()
+            )));
+        }
+        let id = Id::<Ran>::from_raw(self.n);
+        let times = tx.get(id).map_err(|e| JobError::app(e.to_string()))?;
+        tx.put(&Ran {
+            id,
+            times: times.map_or(0, |r| r.times) + 1,
+        });
+        Ok(())
+    }
+}
+
+/// Enqueues the timed job at `due` and notes the due time it was meant for.
+fn note_enqueued(tx: &mut Tx, n: u64, due: WallTime) {
+    tx.enqueue_at(due, Timed { n });
+    NOTED.with(|m| m.borrow_mut().insert(n, due.as_nanos()));
+}
+
+/// Idempotent per note: a re-sent request finds its marker and enqueues
+/// nothing, so a note has at most one job however often it is sent.
+#[route(POST "/later/:id/:ms", public)]
+fn later(tx: &mut Tx, id: Id<Booked>, ms: String) -> Result<Id<Booked>, ApiError> {
+    let n = id.raw();
+    let ms: u64 = ms
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("{ms} is not a number of milliseconds")))?;
+    if tx
+        .get(id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .is_none()
+    {
+        tx.put(&Booked { id });
+        let due = WallTime::from_nanos(tx.now().as_nanos() + ms * 1_000_000);
+        note_enqueued(tx, n, due);
+    }
+    Ok(id)
+}
+
+fn timed_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Booked>().table::<Ran>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![later])
+    .mount_jobs(jobs![Timed])
+    .outbound(Host::new("later.test")))
+}
+
+/// The clock axes on in every universe, as in determinism.rs, and a short
+/// outbound latency: the call's arrival then bounds the run closely enough
+/// to see a job run seconds early.
+fn timed_axes(seed: u64, cfg: &mut FaultConfig) {
+    let mut r = Rng::new(seed ^ 0x7A_C10C);
+    cfg.clock_skew = r.between(0, 120_000_000_000) as i64;
+    cfg.clock_step_back = (0.01, Duration::from_secs(120));
+    cfg.clock_downtime = (0.5, Duration::from_secs(3 * 86_400));
+    cfg.outbound_latency = (Duration::from_millis(1), Duration::from_millis(50));
+}
+
+const TIMED_UNIVERSES: u64 = 256;
+const TIMED_DOWNTIME_FLOOR: u64 = 100;
+
+fn timed_universe(sim: &mut Sim) -> Result<(), String> {
+    NOTED.with(|m| m.borrow_mut().clear());
+    // Which note each arriving call is for, in arrival order (the order of
+    // `sim.outbound_deliveries()`, which is pushed at the same step).
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let seen = arrivals.clone();
+    sim.remote(
+        "later.test",
+        charpente_sim::outbound::from_fn(move |call: &OutboundCall| {
+            let n = String::from_utf8_lossy(&call.body)
+                .strip_prefix("n=")
+                .and_then(|s| s.parse().ok())
+                .expect("the call's form body is n=<note>");
+            seen.lock().unwrap().push(n);
+            OutboundReply {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }
+        }),
+    );
+    // The largest offset any boot started with: within a process the offset
+    // only falls (step-backs), and a restart adds a downtime jump before the
+    // build, so no reading the kernel ever held carried more.
+    let widest = Cell::new(i64::MIN);
+    let drive = Drive::new(sim, |s: &Sim| {
+        widest.set(widest.get().max(s.clock().offset()));
+        timed_app(s)
+    });
+    let mut r = Rng::new(sim.seed() ^ 0x71_3D);
+    let requests: Vec<(Duration, Request)> = (1..=8u64)
+        .map(|n| {
+            let ms = r.between(500, 6_000);
+            (
+                Duration::from_millis(n * 100),
+                Request::new(Method::Post, format!("/later/{n}/{ms}")),
+            )
+        })
+        .collect();
+    let phase = drive.faulted_phase(&requests, Duration::from_secs(4))?;
+    let Some(recovered) = drive.recover(&phase, Duration::from_secs(200))? else {
+        return Ok(());
+    };
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
+        .map_err(|e| e.to_string())?;
+    let booked: Vec<u64> = snap
+        .scan::<Booked>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|b| b.id.raw())
+        .collect();
+    let ran: std::collections::BTreeMap<u64, u64> = snap
+        .scan::<Ran>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|r| (r.id.raw(), r.times))
+        .collect();
+    let noted = NOTED.with(|m| m.borrow().clone());
+    let arrivals = arrivals.lock().unwrap().clone();
+    let deliveries = sim.outbound_deliveries();
+    assert_eq!(
+        arrivals.len(),
+        deliveries.len(),
+        "contract: one delivery record per arrival"
+    );
+    let mut first_arrival = std::collections::BTreeMap::new();
+    for (n, d) in arrivals.iter().zip(&deliveries) {
+        first_arrival
+            .entry(*n)
+            .or_insert(d.at + charpente_sim::SIM_WALL_BASE_NANOS);
+    }
+    for &n in &booked {
+        sim.cover("timed:checked");
+        let due = *noted
+            .get(&n)
+            .ok_or_else(|| format!("note {n} is booked but its enqueue was never noted"))?;
+        if ran.get(&n) != Some(&1) {
+            return Err(format!(
+                "note {n}'s timed job ran {:?} times by the end of the tail, not exactly once",
+                ran.get(&n)
+            ));
+        }
+        let true_run = first_arrival[&n] as i128;
+        let bound = i128::from(due) - i128::from(widest.get());
+        if true_run < bound {
+            return Err(format!(
+                "note {n}'s timed job ran at true wall {true_run} ns, {} ns before its due time \
+                 {due} ns less the clock's widest offset {} ns",
+                bound - true_run,
+                widest.get()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_timed_job_never_runs_before_its_due_time_in_true_time() {
+    charpente_sim::run_universes_swarm_with!(
+        0x7A_5001,
+        TIMED_UNIVERSES,
+        timed_axes,
+        timed_universe,
+        require: ["clock:downtime", "timed:checked"],
+        floor: [("clock:downtime", TIMED_DOWNTIME_FLOOR)]
+    );
+}

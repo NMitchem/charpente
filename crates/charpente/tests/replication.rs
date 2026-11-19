@@ -5870,6 +5870,15 @@ fn put_widget(tx: &mut Tx, id: Id<Widget>) -> Result<Id<Widget>, ApiError> {
     Ok(id)
 }
 
+/// Two minutes out: far from anything a convergence loop advances to (a few
+/// virtual seconds), so the job is still Pending wherever a test looks before
+/// it, and near enough that the scheduler rounds to reach it fit the budget.
+#[route(POST "/remind/:id", public)]
+fn post_remind(tx: &mut Tx, id: Id<Tally>) -> Result<Id<Tally>, ApiError> {
+    tx.enqueue_after(Duration::from_secs(120), Bump { slot: id.raw() });
+    Ok(id)
+}
+
 #[route(GET "/widget/:id", public)]
 fn get_widget(tx: &mut Tx, id: Id<Widget>) -> Result<WireI64, ApiError> {
     Ok(WireI64(tx.get(id)?.ok_or(ApiError::NotFound)?.weight))
@@ -5991,7 +6000,7 @@ fn open_kernel(
         },
     )
     .map_err(|e| format!("App::open: {e}"))?
-    .mount(routes![put_widget, get_widget])
+    .mount(routes![put_widget, get_widget, post_remind])
     .mount_jobs(jobs![Bump])
     .schedule("tick", Duration::from_secs(1), || Bump { slot: 0 });
 
@@ -12308,4 +12317,175 @@ fn event_clone(e: &charpente_core::event::EventRow) -> charpente_core::event::Ev
     let mut b = Vec::new();
     charpente_core::table::Row::encode_row(e, &mut b);
     <charpente_core::event::EventRow as charpente_core::table::Row>::decode_row(&b).unwrap()
+}
+
+// ------------------- 0.5.0 Task 5: a timed job through switchover and failover
+
+const REMIND_SLOT: u64 = 1000;
+
+fn tally_of(node: &KNode, slot: u64) -> u64 {
+    let snap = node.kernel.as_ref().unwrap().app().db().snapshot().unwrap();
+    snap.get(Id::<Tally>::from_raw(slot))
+        .unwrap()
+        .map_or(0, |t: Tally| t.count)
+}
+
+/// The timed rows (a plain enqueue is due at `UNIX_EPOCH`; the schedule's are
+/// plain), each with every field the log carries.
+fn timed_rows(node: &KNode) -> Vec<TimedRow> {
+    let snap = node.kernel.as_ref().unwrap().app().db().snapshot().unwrap();
+    snap.scan::<JobRow>()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.due_at != charpente_core::io::WallTime::UNIX_EPOCH)
+        .map(|r| TimedRow {
+            due_at: r.due_at.as_nanos(),
+            payload: r.payload,
+            key: r.key,
+            outbound_key: r.outbound_key,
+            status: r.status,
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+struct TimedRow {
+    due_at: u64,
+    payload: Vec<u8>,
+    key: Option<String>,
+    outbound_key: Option<[u8; 16]>,
+    status: JobStatus,
+}
+
+/// A primary and a follower converged on a timed job's row. Returns the nodes
+/// and that row's due time.
+fn timed_pair(sim: &Sim) -> (KNode, KNode, u64) {
+    let horizon = 2 * 3600 * SEC_NANOS;
+    let mut p = spawn_kernel_node(
+        sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let mut f = spawn_kernel_node(
+        sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let (status, _) = drive_request(
+        sim,
+        &mut [&mut p, &mut f],
+        0,
+        Request::new(Method::Post, format!("/remind/{REMIND_SLOT}")),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    krun_until(sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
+    let (on_p, on_f) = (timed_rows(&p), timed_rows(&f));
+    assert_eq!(on_p.len(), 1, "one timed row on the primary: {on_p:?}");
+    assert_eq!(
+        on_f, on_p,
+        "the follower holds the row with the same due_at, payload, key and status"
+    );
+    let row = &on_f[0];
+    assert_eq!(row.status, JobStatus::Pending);
+    let mut payload = Vec::new();
+    charpente_core::table::Codec::encode(&Bump { slot: REMIND_SLOT }, &mut payload);
+    assert_eq!(row.payload, payload);
+    let due = row.due_at;
+    let now = sim.clock().wall().as_nanos();
+    assert!(
+        due >= now + 60 * SEC_NANOS,
+        "the due time is about two minutes out: due {due}, now {now}"
+    );
+    assert_eq!(
+        (tally_of(&p, REMIND_SLOT), tally_of(&f, REMIND_SLOT)),
+        (0, 0),
+        "nothing ran before the due time"
+    );
+    (p, f, due)
+}
+
+/// The new primary `new` (index `idx` in `nodes`) runs the job once, at its
+/// due time and not before, and not again afterwards.
+fn runs_once_at_its_due_time(sim: &Sim, nodes: &mut [&mut KNode], idx: usize, due: u64) {
+    krun_until(
+        sim,
+        nodes,
+        |ns| tally_of(ns[idx], REMIND_SLOT) == 1,
+        KBUDGET,
+    )
+    .unwrap();
+    let ran_at = sim.clock().wall().as_nanos();
+    assert!(
+        ran_at >= due && ran_at < due + 5 * SEC_NANOS,
+        "the job ran at {ran_at}, not within 5 s after its due time {due}"
+    );
+    let until = ran_at + 30 * SEC_NANOS;
+    krun_until(
+        sim,
+        nodes,
+        |_| sim.clock().wall().as_nanos() >= until,
+        KBUDGET,
+    )
+    .unwrap();
+    assert_eq!(
+        tally_of(nodes[idx], REMIND_SLOT),
+        1,
+        "the timed job ran again after it was Done"
+    );
+    let rows = timed_rows(nodes[idx]);
+    assert_eq!((rows.len(), rows[0].status), (1, JobStatus::Done));
+}
+
+#[test]
+fn a_timed_job_replicates_switches_over_and_fails_over_with_its_due_time() {
+    // Switchover: the row crossed to f with its due time (timed_pair), p hands
+    // over, and f, the new primary, runs it.
+    let sim = Sim::with_faults(0x5A9E_0705, FaultConfig::none());
+    let (mut p, mut f, due) = timed_pair(&sim);
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl_kernel(&sim, &mut [&mut p, &mut f], &mut cli, KBUDGET).unwrap();
+    assert!(matches!(reply, Msg::CtrlOk { .. }), "switchover: {reply:?}");
+    assert!(f.kernel.as_ref().unwrap().is_primary());
+    assert_eq!(
+        tally_of(&p, REMIND_SLOT) + tally_of(&f, REMIND_SLOT),
+        0,
+        "the handover ran nothing"
+    );
+    runs_once_at_its_due_time(&sim, &mut [&mut p, &mut f], 1, due);
+    assert_eq!(
+        tally_of(&p, REMIND_SLOT),
+        1,
+        "the old primary, now a follower, holds the one run"
+    );
+
+    // Failover: the primary is gone without a drain; f is promoted and runs it.
+    let sim = Sim::with_faults(0x5A9E_0706, FaultConfig::none());
+    let (mut p, mut f, due) = timed_pair(&sim);
+    p.host.crash_now();
+    drop(p.kernel.take());
+    f.flipped = true;
+    let mut cli = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    let reply = drive_ctrl_kernel(&sim, &mut [&mut f], &mut cli, KBUDGET).unwrap();
+    assert!(matches!(reply, Msg::CtrlOk { .. }), "promote: {reply:?}");
+    runs_once_at_its_due_time(&sim, &mut [&mut f], 0, due);
 }

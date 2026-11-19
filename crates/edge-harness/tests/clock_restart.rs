@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use edge_harness::child::{ChildNode, build_bins};
 use edge_harness::client::Http;
@@ -89,6 +89,57 @@ fn a_schedule_ticks_within_an_interval_after_a_restart() {
     assert!(
         after > base,
         "the 1 s schedule did not tick within 2.5 s of a restart: {base} at restart, {after} after (artifacts: {dir})"
+    );
+}
+
+fn reminded(http: &mut Http, dir: &str) -> u64 {
+    let resp = http
+        .get("/reminded")
+        .unwrap_or_else(|e| panic!("GET /reminded: {e} (artifacts: {dir})"));
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    assert_eq!(
+        resp.status, 200,
+        "GET /reminded: {body:?} (artifacts: {dir})"
+    );
+    body.trim_matches('"')
+        .parse()
+        .unwrap_or_else(|_| panic!("GET /reminded body {body:?} is not a count (artifacts: {dir})"))
+}
+
+#[test]
+#[ignore = "builds release binaries and drives real processes; run via scripts/edge-harness.sh"]
+fn a_timed_job_runs_after_a_restart_not_before_and_once() {
+    let (mut scenario, mut node, mut http) = start("clock-remind");
+    let dir = scenario.dir().display().to_string();
+    let posted = Instant::now();
+    let resp = http.post("/remind/3", "{}").expect("POST /remind");
+    assert_eq!(resp.status, 200, "POST /remind (artifacts: {dir})");
+    node.kill9(&mut scenario);
+    node.restart(&mut scenario).expect("restart");
+    // The restart takes under a second, so this read is well inside the 3 s.
+    let early = reminded(&mut http, &dir);
+    let early_at = posted.elapsed();
+    assert!(
+        early_at < Duration::from_secs(3),
+        "the early read came {early_at:?} after the POST, past the 3 s it must precede (artifacts: {dir})"
+    );
+    assert_eq!(
+        early, 0,
+        "the job ran {early_at:?} after the POST, before its 3 s (artifacts: {dir})"
+    );
+    sleep(Duration::from_secs(4).saturating_sub(posted.elapsed()));
+    let ran = reminded(&mut http, &dir);
+    assert_eq!(
+        ran,
+        1,
+        "the job did not run once by {:?} after the POST (artifacts: {dir})",
+        posted.elapsed()
+    );
+    sleep(Duration::from_secs(2));
+    let later = reminded(&mut http, &dir);
+    assert_eq!(
+        later, 1,
+        "the job ran again within two seconds of its run (artifacts: {dir})"
     );
 }
 
