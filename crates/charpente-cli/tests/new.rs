@@ -631,85 +631,46 @@ fn emitting_twice_turns_the_event_check_red_naming_the_route() {
     );
 }
 
-/// `tests/sim.rs` for a scaffold named `conflict`: note 5 posted with one body
-/// twice, then with another, in a fault-free world of the workload's own.
-const CONFLICT_SIM: &str = r##"use std::time::Duration;
-
-use charpente::http::{Method, Request};
-use charpente_sim::drive::Drive;
-use charpente_sim::{FaultConfig, Sim};
-use conflict::{NewNote, build_app};
-
-charpente_sim::sim_tests! {
-    a_reused_id_with_another_body_is_refused,
-}
-
-fn a_reused_id_with_another_body_is_refused(_: &mut Sim) -> Result<(), String> {
-    let sim = Sim::with_faults(1, FaultConfig::none());
-    let drive = Drive::new(&sim, |sim: &Sim| {
-        build_app(Box::new(sim.disk()), Box::new(sim.entropy()))
-    });
-    let post = |at: u64, body: &str| {
-        (
-            Duration::from_millis(at),
-            Request::new(Method::Post, "/notes/5").json(&NewNote {
-                body: body.to_string(),
-            }),
-        )
-    };
-    let phase = drive.faulted_phase(
-        &[post(0, "alpha"), post(1, "alpha"), post(2, "bravo")],
-        Duration::from_secs(1),
-    )?;
-    let got: Vec<Option<(u16, String)>> = phase
-        .answers
-        .iter()
-        .map(|a| a.as_ref().map(|(s, b)| (*s, String::from_utf8_lossy(b).into_owned())))
-        .collect();
-    let want = vec![
-        Some((200, "\"5\"".to_string())),
-        Some((200, "\"5\"".to_string())),
-        Some((
-            400,
-            r#"{"error":"note 5 already holds another body — a note is written once; post the new body under a new id"}"#
-                .to_string(),
-        )),
-    ];
-    if got != want {
-        return Err(format!("note 5 posted alpha, alpha, bravo was answered {got:?}"));
-    }
-    Ok(())
-}
-"##;
-
-/// The guard's other half: a POST that reuses a stored note's id with another
-/// body is a conflict, not a client's retry, and is refused naming the
-/// conflict and the fix (hard rule 5). The scaffold's own sim never reuses an
-/// id, so this replaces its `tests/sim.rs` with a workload that does.
+/// The guard's comparison, the mutant `charpente test --mutants` makes at
+/// `src/lib.rs:59:22`: with `==` turned into `!=`, a repeat of the stored body
+/// is refused and another body is answered as added. The fourth check posts
+/// note 1 twice with one body and once with another, and names the answer and
+/// the route. The other three judge no answer to a repeat, only the tail's end
+/// state, which the mutant leaves alone, so it passes them: before the fourth
+/// it survived the scaffold's advertised mutation run (rehearsal finding F5).
 #[test]
-// Writing the workload into the scaffold is edge tooling (DESIGN.md §1): the
-// rig setting up the test, not code the sim exercises.
-#[allow(clippy::disallowed_methods)]
-fn a_reused_note_id_with_another_body_is_refused_naming_the_conflict() {
-    let app = patched_scaffold("conflict");
-    std::fs::write(app.join("tests/sim.rs"), CONFLICT_SIM).unwrap();
-    let out = charpente()
-        .current_dir(&app)
-        .env("CARGO_TARGET_DIR", target_dir())
-        .args(["test", "--sim", "--runs", "1"])
-        .output()
-        .unwrap();
+fn turning_the_guards_eq_into_ne_turns_the_resend_check_red() {
+    let (_, out) = sim_with_line_replaced(
+        "noteq",
+        "        if note.body == body.body {\n",
+        "        if note.body != body.body {\n",
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stdout:\n{stdout}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    let block = failure_block(
+        &stdout,
+        "a_resent_note_changes_nothing_and_a_conflict_is_refused",
     );
     assert!(
-        stdout.contains("check a_reused_id_with_another_body_is_refused ... ok"),
-        "{stdout}"
+        block.contains(
+            "was answered 400 {\"error\":\"note 1 already holds another body — a note is \
+             written once; post the new body under a new id\"}, not 200 \"1\""
+        ) && block.contains(
+            " — a repeat of the stored body is answered 200 with its id, and another body is \
+             refused with a 400 (src/lib.rs, add_note)"
+        ),
+        "the check names the answer and the route:\n{block}"
     );
+    for other in [
+        "acked_note_survives_a_restart",
+        "acked_post_implies_the_echo_after_recovery",
+        "acked_post_implies_its_event_after_recovery",
+    ] {
+        assert!(
+            !stdout.contains(&format!("sim failure in {other}")),
+            "{other} judges no answer to a repeat, so the mutant passes it:\n{stdout}"
+        );
+    }
 }
 
 /// The scaffold's inputs vary: over the green batch at master seed 0x1, each
@@ -735,6 +696,7 @@ fn the_scaffold_draws_its_inputs() {
         "acked_note_survives_a_restart",
         "acked_post_implies_the_echo_after_recovery",
         "acked_post_implies_its_event_after_recovery",
+        "a_resent_note_changes_nothing_and_a_conflict_is_refused",
     ] {
         let line = stdout
             .lines()

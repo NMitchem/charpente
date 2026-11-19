@@ -178,7 +178,7 @@ charpente test --mutants --file src/lib.rs --test-package myapp   # every mutant
 ```
 
 Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the check `acked_post_implies_the_echo_after_recovery` goes FAILED with the inputs that break it, shrunk to a run no shrinking step can make smaller, and a command that replays them. That is the whole pitch.
-Delete the `tx.emit` line instead and the third goes red: the event commits with the note and the job.
+Delete the `tx.emit` line instead and the third goes red: the event commits with the note and the job. Turn `==` into `!=` in `add_note` and the fourth goes red: a re-sent POST is answered as added and changes nothing, and another body under the same id is refused. That is the mutant the `--mutants` run makes in `add_note`, and the fourth check is why it reports none missed.
 
 | Doc | What it is |
 |---|---|

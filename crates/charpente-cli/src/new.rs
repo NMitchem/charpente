@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub const USAGE: &str = "usage: charpente new <name>\n       \
        writes <name>/ with Cargo.toml, clippy.toml, .gitignore, src/lib.rs, src/main.rs and \
-       tests/sim.rs — one table, one route, one job, one event, and three sim properties";
+       tests/sim.rs — one table, one route, one job, one event, and four sim properties";
 
 const CARGO_TOML: &str = include_str!("../templates/Cargo.toml.tmpl");
 const CLIPPY_TOML: &str = include_str!("../templates/clippy.toml");

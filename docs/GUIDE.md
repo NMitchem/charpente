@@ -56,7 +56,7 @@ build-directory name, and an existing path, each by name.
 | `.gitignore` | `/target` and `/data` |
 | `src/lib.rs` | one table, one route, one job, one event, and `build_app` |
 | `src/main.rs` | `charpente::launch(...)` — one line (§13) |
-| `tests/sim.rs` | three properties in the give-up idiom (§8), their inputs drawn with `sim.input()` and the recovery judged in a fault-free tail |
+| `tests/sim.rs` | four properties in the give-up idiom (§8), their inputs drawn with `sim.input()` and the recovery judged in a fault-free tail |
 
 ### `Cargo.toml`
 
@@ -3716,7 +3716,12 @@ the same request with what the first one did, and change nothing:
 the scaffold's `add_note` a note already stored with the same body. A request
 that reuses the id with other content is a
 conflict, not a repeat: refuse it with a 4xx that names the conflict and the
-fix, as `add_note` does for a note that already holds another body. Key a
+fix, as `add_note` does for a note that already holds another body. Judge
+the answers, not only the end state: a guard whose `==` is turned into `!=`
+refuses the retry and answers the conflict as added, and leaves the store as
+it was, so the scaffold's three end-state checks pass it. Its fourth,
+`a_resent_note_changes_nothing_and_a_conflict_is_refused`, posts one note
+twice with one body and once with another and judges each answer. Key a
 state transition (a pickup, a cancel) by an id of its own, such as `PUT
 /pickups/:pickup_id` naming the hold in its body and stored as a row: under
 `POST /holds/:id/pickup` a retry of a pickup that landed and a fresh pickup of
@@ -5125,7 +5130,7 @@ A batch prints, on stderr before any run starts, the line that names its master
 seed, so a batch you kill still shows the seed that reruns it:
 
 ```text
-running 3 sim checks, 256 runs each, under random injected faults (master seed 0x0000000000000001)
+running 4 sim checks, 256 runs each, under random injected faults (master seed 0x0000000000000001)
 ```
 
 Its report, on stdout, has the shape of `cargo test`'s ("Giving up" above

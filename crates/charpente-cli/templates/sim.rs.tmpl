@@ -1,4 +1,4 @@
-//! Three properties, each honest: each asserts a claim that holds under ANY
+//! Four properties, each honest: each asserts a claim that holds under ANY
 //! fault schedule and gives up — rather than passing — in a run where
 //! injected faults stopped it before the claim could be tested (GUIDE §8).
 //! The notes, their bodies and their order are drawn with `sim.input()`, so a
@@ -19,7 +19,8 @@
 //!    a client that never saw its answer would.
 //!
 //! Run them: `charpente test --sim`. Watch one fail: delete the `tx.enqueue`
-//! line in `src/lib.rs` and run again. Delete `tx.emit` and the third goes red.
+//! line in `src/lib.rs` and run again. Delete `tx.emit` and the third goes red;
+//! turn `==` into `!=` in `add_note` and the fourth does.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -37,6 +38,7 @@ charpente_sim::sim_tests! {
     acked_note_survives_a_restart require ["restart"],
     acked_post_implies_the_echo_after_recovery require ["restart"],
     acked_post_implies_its_event_after_recovery require ["restart"],
+    a_resent_note_changes_nothing_and_a_conflict_is_refused require ["restart"],
 }
 
 /// The app on this run's disk. The drive calls it once per boot.
@@ -256,6 +258,96 @@ fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), Stri
                  the emit did not commit with the row"
             ));
         }
+    }
+    Ok(())
+}
+
+/// What `add_note` answers a POST that reuses note 1's id with another body.
+const REFUSED: &str = r#"{"error":"note 1 already holds another body — a note is written once; post the new body under a new id"}"#;
+
+/// A repeat changes nothing and a conflict is refused. Note 1 is posted three
+/// times in a drawn order, twice with one body and once with another: a
+/// client re-sending a POST it never saw answered, and one reusing the id.
+/// Whichever body landed first is the note's, through any crash. Each POST
+/// with it is answered 200 with the note's id, each with the other is refused
+/// with the route's 400, and no repeat adds a second `Echo` job or
+/// `NoteAdded` event. A POST's answer is the tail's if the tail re-sent it,
+/// else the phase's.
+///
+/// Turn `==` into `!=` in `add_note` and this goes red with a seed.
+fn a_resent_note_changes_nothing_and_a_conflict_is_refused(sim: &mut Sim) -> Result<(), String> {
+    let mut bodies = ["alpha", "alpha", "bravo"];
+    sim.input().shuffle("order", &mut bodies);
+    let requests: Vec<(Duration, Request)> = bodies
+        .iter()
+        .enumerate()
+        .map(|(at, body)| {
+            (
+                Duration::from_millis(at as u64),
+                Request::new(Method::Post, "/notes/1").json(&NewNote {
+                    body: body.to_string(),
+                }),
+            )
+        })
+        .collect();
+
+    let drive = Drive::new(sim, app);
+    let phase = drive.faulted_phase(&requests, Duration::from_secs(2))?;
+    let Some(recovered) = drive.recover(&phase, Duration::from_secs(60))? else {
+        return Ok(());
+    };
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
+        .map_err(|e| e.to_string())?;
+    let stored = snap
+        .get::<Note>(Id::from_raw(1))
+        .map_err(|e| e.to_string())?
+        .map(|note| note.body);
+    for (i, body) in bodies.iter().enumerate() {
+        let got = recovered.resent[i]
+            .as_ref()
+            .or(phase.answers[i].as_ref())
+            .map(|(status, bytes)| format!("{status} {}", String::from_utf8_lossy(bytes)));
+        let want = if stored.as_deref() == Some(*body) {
+            "200 \"1\"".to_string()
+        } else {
+            format!("400 {REFUSED}")
+        };
+        if got.as_ref() == Some(&want) {
+            continue;
+        }
+        // An acked note that media corruption cut leaves an answer the store
+        // no longer bears out (GUIDE §8, "Giving up"). Only that is excused.
+        if durable_corruption_fired(sim) {
+            sim.give_up(
+                "durable corruption fired, so an acked answer is excused",
+                "",
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "POST /notes/1 {body:?} was answered {}, not {want}, and note 1 holds {stored:?} — a \
+             repeat of the stored body is answered 200 with its id, and another body is refused \
+             with a 400 (src/lib.rs, add_note)",
+            got.as_deref().unwrap_or("nothing")
+        ));
+    }
+    let echoes = snap
+        .scan::<JobRow>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|job| job.name == "Echo")
+        .count();
+    let added = events::<NoteAdded>(&snap)?.len();
+    if echoes > 1 || added > 1 {
+        return Err(format!(
+            "exactly-once violated: note 1 has {echoes} Echo jobs and {added} NoteAdded events — \
+             a repeat of a stored note changes nothing, so it must not enqueue or emit again \
+             (src/lib.rs, add_note)"
+        ));
     }
     Ok(())
 }
