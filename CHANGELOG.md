@@ -39,7 +39,7 @@
 
 ### Fixed
 - **`charpente test --mutants` names a baseline that timed out at the pass's `--timeout`, and the fix.** cargo-mutants 27.1.0 bounds its unmutated baseline by the `--timeout` a pass gives it, and runs that baseline over the mutated file's own package. When the verb derived the timeout (5x its own timed `cargo test` over the test set) and the file's package took longer, the baseline read Timeout, and the verb's generic refusal said to fix the suite or rescope `--file`, away from the cause: 0.5.0's own mutation run met it on `kernel/mod.rs` under `--test-package charpente-sim`, a 69 s timeout against a 101 s `charpente` baseline. Now the run exits 2 with `error: the UNMUTATED baseline timed out at --timeout <t> (seconds), the timeout the verb derived as 5x its own timed `cargo test` over the test set — …`, whose fix is a larger `--timeout` or a `--test-package` set that includes the `--file`'s own package; under a `--timeout` the run was given it says so, and the fix is a larger one. Deriving the timeout from the file's package as well is a PLAN v1.x row.
-- **`charpente new`'s usage line says the scaffold has three sim properties.** It said two from 0.3.0, when the event check made three; a unit test now counts the template's checks.
+- **`charpente new`'s usage line counts the scaffold's sim properties: four in 0.5.0.** It said two from 0.3.0, when the event check made three, and the re-send check makes four; a unit test counts the template's checks.
 
 ## 0.4.0 (2026-11-01)
 

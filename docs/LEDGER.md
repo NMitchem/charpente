@@ -9765,3 +9765,48 @@ tallied from these tables.
   - App findings, with no platform disposition: F6, F7, F10, F12, F13.
 - **Owed before the public attempt:** speed is unmeasured, and the F1 and F2 rows.
 - **Noah's:** the go/no-go, and the judge repo's name, remote and push.
+
+## 2026-11-19 — 0.5.0 built: a transaction's own time, timed enqueue, a required Dead stance with a hook in the mark's commit, re-issue under the same key, and provider outages a sim can outlast
+
+**Why.** The agents' builds on 0.3.0 and 0.4.0 kept hand-writing three things the platform did not give them: a clock (two of three agents built one), work due later (a hand scheduler), and what a job's death means (a Dead row nobody acts on). The rehearsal's charpente arm (entry above) built all three by hand again. The PLAN rows named for 0.5.0 are shipped. Spec `docs/superpowers/specs/2026-11-18-0.5.0-design.md`, plan `docs/superpowers/plans/2026-11-19-0.5.0.md`, both approved by Noah 2026-11-19.
+
+- **What shipped** (CHANGELOG `## 0.5.0`):
+  - `tx.now()`: one held wall time per kernel step, no log record. A transaction with no time source (`Db::transact`, `App::handle`) refuses by name.
+  - `enqueue_at`/`enqueue_after`: tag `0x0e`. `PROTO_VERSION` 8, `MANIFEST_FORMAT` 5. A log with no timed enqueue is byte-identical to 0.4.0's.
+  - A required `on_dead | retain_dead` stance. The hook commits with the Dead mark, and a failed hook still commits the mark with durable evidence (`checks::dead_hooks_succeeded`).
+  - `reissue_at`/`reissue_after`: the dead job's own request, under its sent key, never drawn (`checks::keys_are_per_effect`).
+  - The sim's `outbound_outage` axis, and `Drive::recover`'s tail running until outbound work settles, so `require: dead:<Job>` is reachable.
+  - The scaffold, README and GUIDE §2 name `charpente test --mutants`. The scaffold gains a fourth property, and its advertised run reports 0 missed.
+- **Commits.** `6d259a6c..9f779c4c`, Tasks 1–12, then:
+  - the rehearsal's F5 (`ab9628ce`, `ea92356e`);
+  - the final review's fix wave (`246a8b78`, `6638a3e6`);
+  - mutation's tests (`299ec078`, `698b3c50`, `58035ac9`);
+  - its follow-ups (`40cc1aba`, `53015e7a`, `b54f403b`, `ca7d7acd`, `feb163ff`);
+  - a last round of review minors (`9f779c4c`).
+- **The gate at `9f779c4c`** (worktree `charpente-gate`): fmt 0, clippy `-D warnings` 0, and `cargo test --workspace --no-fail-fast` exit 0 with 104 of 104 `test result: ok`, 2326 passed, 0 failed, 65 ignored. Task 0's base at `6d259a6c` was 104 lines with 103 ok (a stale pinned replay, re-found). The edge harness (`scripts/edge-harness.sh`) exited 0 with 11 of 11 ok.
+- **Fresh seeds at `feb163ff`**, master `0x46be245b9b31dfff`, `--runs 2000`, all exit 0:
+  - sim-fixture: 6 checks, tested 1625–2000 of 2000;
+  - invoicing: 7 checks, 712–2000;
+  - outbound-fixture: 1924 of 2000;
+  - the scaffold: 4 checks, 1657–1989.
+
+  outbound-fixture's `--jobs 1` and `--jobs 8` JSON reports are byte-identical. `9f779c4c` on top changes texts, docs and tests only.
+- **Mutation** (cargo-mutants 27.1.0, every run `--jobs 1` with its `--test-package` named):
+  - The sweep over the ten targets 0.5.0 changed: 210 mutants, 151 caught, 47 unviable, 10 MISSED, 2 TIMEOUT.
+  - Nine survivors got tests, each shown red by hand.
+  - drive.rs stopped on a real off-by-one: a tail whose reach met the 2262 limit exactly ran one empty extension and miscounted. It is fixed, and its two timeouts got tests.
+  - One mutant is genuinely equivalent: the `0x0e` flags byte's `|` versus `^` on disjoint bits. Rather than add a third exclusion (CLAUDE.md: a third survivor is a property to write), the byte is now an exhaustive match, byte-identical. `.cargo/mutants.toml` still holds 2.
+  - The delta pass over the code changed after the sweep: 87 mutants, 2 MISSED, both now tested.
+  - The instrument's own finding: a baseline that timed out under the derived `--timeout` gave advice pointing away from the cause. Its refusal now names the timeout and the fix; deriving from both packages is a v1.x row.
+- **Reviews.** Every task was reviewed clean. The final whole-branch review (`6d259a6c..89e4c9d7`) found 0 Critical and 1 Important:
+  - The Important finding: `App::handle` handed `tx.now()` the Unix epoch, where the spec says a transaction with no time source is refused by name. The fix is red-first, `246a8b78`.
+  - It also found 9 Minor. One fix wave and a scoped re-review addressed them all.
+  - DECISIONS §14's "no other path copies one" stays as written; it is false for operator code and is Noah's to reword.
+- **Recorded batches.** Only the named steps moved them:
+  - S-a/S-b/S-c: the outage axis, `FAULT_AXES` 27, the JSON config;
+  - S-d: `describe`'s `dead`;
+  - S-e: two re-pinned check texts;
+  - S-f: outbound-fixture's `SendReceipt`, and the scaffold's fourth check.
+
+  Every other step ran the six-batch oracle at exit 0.
+- **Still owed before release:** the docs-only build (Task 15, attempt 1 launched 2026-11-19 at `9f779c4c`), then the push. The crates.io publish, the CHANGELOG date and the post-publish smoke are Noah's.
