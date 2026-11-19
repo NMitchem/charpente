@@ -2126,6 +2126,27 @@ mod dead_hooks {
         }
     }
 
+    /// Task 6 review M-4: a hand-built `JobDef`'s `dead_coverage` is
+    /// `"dead:"` and its name, the key a sim's `require:` names for its Dead
+    /// path, or the mount refuses it by name, before anything runs.
+    #[test]
+    #[should_panic(
+        expected = "contract: job \"Mourned\" was mounted with dead_coverage \"dead:mourned\" — \
+                    a JobDef's dead_coverage is \"dead:\" and its name, the coverage key \
+                    mark_dead_coverage marks for its Dead rows and a sim's require: names; fix: \
+                    build it from its #[job]'s def(), or set dead_coverage to \"dead:Mourned\""
+    )]
+    fn a_jobdef_whose_dead_coverage_is_not_dead_and_its_name_is_refused_at_mount() {
+        let sim = Sim::with_faults(0xDEAD_000A, FaultConfig::none());
+        let _ = hook_app(
+            &sim,
+            vec![JobDef {
+                dead_coverage: "dead:mourned",
+                ..<Mourned as JobEntry>::def()
+            }],
+        );
+    }
+
     #[test]
     fn a_dead_hook_commits_its_writes_with_the_dead_mark() {
         let sim = Sim::with_faults(0xDEAD_0001, FaultConfig::none());

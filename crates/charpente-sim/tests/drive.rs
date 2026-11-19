@@ -22,8 +22,11 @@ use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::JobError;
 use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, Schema, Snapshot, Tx, View, job, jobs, route, routes, table};
-use charpente_sim::checks::{clock_reopens_after, durable_corruption_fired, is_fault_fallout};
-use charpente_sim::drive::{Drive, Phase};
+use charpente_sim::checks::{
+    clock_reopens_after, durable_corruption_fired, is_fault_fallout, keys_are_per_effect,
+    outbound_settles_by_horizon,
+};
+use charpente_sim::drive::{Drive, Phase, TAIL_SETTLE_CAP};
 use charpente_sim::outbound::Remote;
 use charpente_sim::rng::Rng;
 use charpente_sim::{FaultConfig, Sim, SimDisk};
@@ -1337,4 +1340,447 @@ fn an_outage_window_is_closed_at_its_start_and_open_at_its_end() {
     );
     sim.clock().sleep(Duration::from_nanos(1));
     assert_eq!(try_call(4), Ok(200), "exactly the end");
+}
+
+// ------------------------------------------- the tail settles outbound work
+//
+// 0.5.0 spec §5 E: once its horizon has passed, `recover` runs on until every
+// outbound job is Done, Dead or not yet due, under a cap. Every test here runs
+// under `FaultConfig::none()` with only the outage axis on, from virtual time
+// 0, so the seed only names the universe: nothing here draws a fault.
+
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// No per-call fault, and every call to the app's one host refused from the
+/// universe's start for `length`.
+fn outage(length: Duration) -> FaultConfig {
+    FaultConfig {
+        outbound_outage: (Duration::ZERO, length),
+        ..FaultConfig::none()
+    }
+}
+
+fn post_to(key: &IdempotencyKey, n: u64) -> Call {
+    Call::post("/x")
+        .header("idempotency-key", key.as_str())
+        .form(&[("n", n.to_string())])
+}
+
+fn settled(host: &str, reply: &Reply) -> Result<(), JobError> {
+    match reply.status() {
+        200 => Ok(()),
+        s => Err(JobError::app(format!("{host} answered {s}"))),
+    }
+}
+
+/// Twelve attempts on the default 30 s backoff: past a 4 h outage, so it
+/// ends Done.
+#[job(global, retain_dead, outbound = "slow.test", retry(max = 12))]
+struct Patient {
+    n: u64,
+}
+
+impl Patient {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(post_to(key, self.n)))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        settled("slow.test", &reply)
+    }
+}
+
+/// The default policy, five attempts over 450 s: a 4 h outage exhausts it,
+/// so it ends Dead.
+#[job(global, retain_dead, outbound = "slow.test")]
+struct Brief {
+    n: u64,
+}
+
+impl Brief {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(post_to(key, self.n)))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        settled("slow.test", &reply)
+    }
+}
+
+#[route(POST "/slow/:id", public)]
+fn enqueue_slow(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue(Patient { n: id.raw() });
+    tx.enqueue(Brief { n: id.raw() });
+    Ok(id)
+}
+
+fn slow_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![enqueue_slow])
+    .mount_jobs(jobs![Patient, Brief])
+    .outbound(Host::new("slow.test")))
+}
+
+/// Each outbound row as (name, status, attempts), in id order.
+fn outbound_rows(snap: &Snapshot) -> Vec<(String, JobStatus, u32)> {
+    snap.scan::<JobRow>()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.outbound_key.is_some())
+        .map(|row| (row.name, row.status, row.attempts))
+        .collect()
+}
+
+#[test]
+fn the_tail_extends_until_retries_finish_or_die() {
+    let sim = Sim::with_faults(0xD7_0B01, outage(4 * HOUR));
+    let calls = Arc::new(AtomicU64::new(0));
+    sim.remote("slow.test", Counting(Arc::clone(&calls)));
+    let drive = Drive::new(&sim, slow_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/slow/1"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(60))
+        .unwrap()
+        .expect("the fault-free tail boots");
+    let snap = recovered.kernel.app().db().snapshot().unwrap();
+    assert_eq!(
+        outbound_rows(&snap),
+        [
+            ("Patient".to_string(), JobStatus::Done, 9),
+            ("Brief".to_string(), JobStatus::Dead, 5),
+        ],
+        "Patient's tenth call, at 15 330 s, is past the outage and answered; Brief's five \
+         are all refused"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "only Patient's last call got through"
+    );
+    assert!(
+        sim.now().as_nanos() >= (4 * HOUR).as_nanos() as u64,
+        "the tail ran past the outage: {:?}",
+        sim.now()
+    );
+    // The tail's own 60 s run makes the attempt at 30 s. Then one extension
+    // a retry, at 90, 210, 450, 930, 1890, 3810, 7650 and 15 330 s, each run
+    // reaching its due time plus the 30 s timeout plus 1 s. Brief died at
+    // 450 s, inside the third.
+    assert_eq!(
+        recovered.extensions, 8,
+        "far inside the cap of {TAIL_SETTLE_CAP}"
+    );
+    assert_eq!(
+        recovered.wall,
+        sim.true_wall(),
+        "no clock fault, so the node's wall is true time"
+    );
+    assert_eq!(outbound_settles_by_horizon(&snap, recovered.wall), Ok(()));
+    assert_eq!(sim.coverage().get("dead:Brief"), Some(&1));
+    assert_eq!(sim.coverage().get("dead:Patient"), None);
+}
+
+/// A pure job on the default policy fails once, so a hook-made chain must
+/// reach a remote to end; `n` counts the chain's links.
+#[job(global, on_dead, outbound = "chain.test")]
+struct Renew {
+    n: u64,
+}
+
+impl Renew {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(post_to(key, self.n)))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        settled("chain.test", &reply)
+    }
+
+    /// Review Focus 1: a fresh job, under a fresh key, on every Dead.
+    fn on_dead(self, tx: &mut Tx, _dead: charpente::Dead<Self>) -> Result<(), JobError> {
+        tx.enqueue(Renew { n: self.n + 1 });
+        Ok(())
+    }
+}
+
+/// The same chain made by re-issuing at once, as GUIDE §6's example does
+/// later: one key and one request down the chain, each link at attempt 0.
+#[job(global, on_dead, outbound = "chain.test")]
+struct Resend {
+    n: u64,
+}
+
+impl Resend {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(post_to(key, self.n)))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        settled("chain.test", &reply)
+    }
+
+    fn on_dead(self, tx: &mut Tx, dead: charpente::Dead<Self>) -> Result<(), JobError> {
+        tx.reissue_after(Duration::ZERO, dead);
+        Ok(())
+    }
+}
+
+#[route(POST "/chain/:id", public)]
+fn start_chains(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue(Renew { n: 0 });
+    tx.enqueue(Resend { n: id.raw() });
+    Ok(id)
+}
+
+fn chain_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![start_chains])
+    .mount_jobs(jobs![Renew, Resend])
+    .outbound(Host::new("chain.test")))
+}
+
+#[test]
+fn a_hook_that_reenqueues_on_every_dead_ends_with_the_outage() {
+    let sim = Sim::with_faults(0xD7_0B02, outage(4 * HOUR));
+    let calls = Arc::new(AtomicU64::new(0));
+    sim.remote("chain.test", Counting(Arc::clone(&calls)));
+    let drive = Drive::new(&sim, chain_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/chain/7"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let recovered = drive
+        .recover(&phase, Duration::from_secs(60))
+        .unwrap()
+        .expect("the fault-free tail boots");
+    let snap = recovered.kernel.app().db().snapshot().unwrap();
+    let rows = snap.scan::<JobRow>().unwrap();
+    for name in ["Renew", "Resend"] {
+        let chain: Vec<&JobRow> = rows.iter().filter(|r| r.name == name).collect();
+        let (last, dead) = chain.split_last().expect("the chain has a link");
+        assert_eq!(
+            last.status,
+            JobStatus::Done,
+            "{name}'s last link is answered"
+        );
+        assert!(
+            dead.iter()
+                .all(|r| r.status == JobStatus::Dead && r.attempts == 5),
+            "{name}: every link before the last died after five attempts"
+        );
+        // A link lasts 450 s: link k's fifth attempt is at 450 (k + 1) s, so
+        // links 0 to 30 die inside the 14 400 s outage, and link 31's fifth,
+        // at exactly 14 400 s, where the window opens again, is answered.
+        assert_eq!(dead.len(), 31, "{name}: links that died in the outage");
+        assert_eq!(
+            last.attempts, 4,
+            "{name}'s last link: four refused, then answered"
+        );
+        assert_eq!(
+            sim.coverage().get(format!("dead:{name}").as_str()),
+            Some(&31),
+            "{name}: one dead:<name> mark per Dead row"
+        );
+    }
+    let keys = |name: &str| -> std::collections::BTreeSet<[u8; 16]> {
+        rows.iter()
+            .filter(|r| r.name == name)
+            .map(|r| r.outbound_key.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        keys("Renew").len(),
+        32,
+        "every fresh link mints its own key"
+    );
+    assert_eq!(
+        keys("Resend").len(),
+        1,
+        "a re-issue keeps the dead job's key"
+    );
+    let deliveries = sim.outbound_deliveries();
+    assert_eq!(
+        deliveries.len(),
+        2,
+        "only each chain's last call got through"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert!(
+        deliveries
+            .iter()
+            .all(|d| d.at >= (4 * HOUR).as_nanos() as u64),
+        "each chain ended with the outage, not before: {deliveries:?}"
+    );
+    // Three extensions a 450 s link, for the 32 links both chains run in
+    // step: the chains end with the outage, inside the cap.
+    assert_eq!(
+        recovered.extensions, 96,
+        "inside the cap of {TAIL_SETTLE_CAP}"
+    );
+    assert_eq!(keys_are_per_effect(&snap), Ok(()));
+    assert_eq!(outbound_settles_by_horizon(&snap, recovered.wall), Ok(()));
+}
+
+/// Never answers inside a call's 1 s timeout: every reply is drawn 20 s
+/// after its call (10 s each way, below), and it would be a 503 anyway.
+struct Unanswering;
+
+impl Remote for Unanswering {
+    fn handle(&mut self, _call: &OutboundCall, _rng: &mut Rng) -> OutboundReply {
+        OutboundReply {
+            status: 503,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+}
+
+/// Retries without backoff, effectively forever: each attempt is a 1 s
+/// timeout, so virtual time moves and no due time grows.
+#[job(
+    global,
+    retain_dead,
+    outbound = "stuck.test",
+    retry(max = 4000000000, backoff = "0ms"),
+    timeout = "1s"
+)]
+struct Stuck {
+    n: u64,
+}
+
+impl Stuck {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(post_to(key, self.n)))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        settled("stuck.test", &reply)
+    }
+}
+
+/// `Stuck` on the default 30 s backoff: its doubling wait puts its due time
+/// past the year 2262 by its 29th attempt, and at the end of the u64 range
+/// soon after.
+#[job(
+    global,
+    retain_dead,
+    outbound = "stuck.test",
+    retry(max = 4000000000),
+    timeout = "1s"
+)]
+struct Doubling {
+    n: u64,
+}
+
+impl Doubling {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(post_to(key, self.n)))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        settled("stuck.test", &reply)
+    }
+}
+
+#[route(POST "/stuck/:id", public)]
+fn enqueue_stuck(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue(Stuck { n: id.raw() });
+    Ok(id)
+}
+
+#[route(POST "/doubling/:id", public)]
+fn enqueue_doubling(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue(Doubling { n: id.raw() });
+    Ok(id)
+}
+
+fn stuck_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![enqueue_stuck, enqueue_doubling])
+    .mount_jobs(jobs![Stuck, Doubling])
+    .outbound(Host::new("stuck.test")))
+}
+
+/// Runs `path` through a phase and the tail on a sim where every call is
+/// answered too late, and hands back the tail's error.
+fn never_settles(seed: u64, path: &str) -> (Sim, String) {
+    let sim = Sim::with_faults(
+        seed,
+        FaultConfig {
+            outbound_latency: (Duration::from_secs(10), Duration::from_secs(10)),
+            ..FaultConfig::none()
+        },
+    );
+    sim.remote("stuck.test", Unanswering);
+    let drive = Drive::new(&sim, stuck_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, path))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let err = drive
+        .recover(&phase, Duration::from_secs(5))
+        .err()
+        .expect("a job that never settles fails the tail");
+    drop(drive);
+    (sim, err)
+}
+
+#[test]
+fn a_tail_that_cannot_settle_fails_by_name_at_the_cap() {
+    // Two attempts an extension, each a 1 s timeout with no backoff.
+    let (_sim, err) = never_settles(0xD7_0B03, "/stuck/1");
+    assert_eq!(
+        err,
+        "Drive::recover: the tail ran 256 extensions past its horizon and outbound job 0 \
+         (\"Stuck\") is still Pending at attempt 518 — an outbound job settles, retries to \
+         Dead, or waits for a later due time; this one did none of them within the cap of 256"
+    );
+    // A due time doubling toward the end of the u64 range: no run goes past
+    // the year 2262, so the clock never overflows and the kernel never spins
+    // on a due time pinned at the range's end, and the tail still fails at
+    // the cap, by name.
+    // Attempt 28's retry is due in the year 2281. The extension runs to the
+    // limit, and the 228 after it run nothing. Each still reads a store that
+    // by then holds the daily sweep's 86 000-odd Done rows, which is most of
+    // this test's time. Without the limit the kernel stops at the range's end
+    // on the sweep's overflow ("next slot after … overflows u64 nanos").
+    let (sim, err) = never_settles(0xD7_0B04, "/doubling/1");
+    assert_eq!(
+        err,
+        "Drive::recover: the tail ran 256 extensions past its horizon and outbound job 0 \
+         (\"Doubling\") is still Pending at attempt 28 — an outbound job settles, retries to \
+         Dead, or waits for a later due time; this one did none of them within the cap of 256"
+    );
+    assert!(
+        sim.true_wall().as_nanos() < u64::MAX / 2,
+        "the tail stopped short of the year 2262: {}",
+        sim.true_wall()
+    );
 }

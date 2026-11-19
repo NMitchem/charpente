@@ -2,6 +2,9 @@
 //! oracle 7, plan amendment A13): an order is created by a route, charged by
 //! an outbound job, and marked paid by `settle`. Kept out of sim-fixture and
 //! invoicing so their recorded batches and goldens never move (oracle 3).
+//! `POST /receipted-orders` also sends the order's receipt, on the default
+//! retry policy, which the sim drives to Dead (0.5.0 spec §7.3 a); the edge
+//! harness posts `/orders` only, so it never sees a receipt call.
 
 use std::io;
 
@@ -69,6 +72,32 @@ impl ChargeOrder {
     }
 }
 
+/// The order's receipt, through the same provider on the default retry
+/// policy: five attempts backing off 30 s doubling (450 s in all), each with
+/// the default 30 s timeout. A provider outage that outlasts them takes it to
+/// Dead, which is what the sim requires to happen.
+#[job(global, retain_dead, outbound = "pay.fixture")]
+pub struct SendReceipt {
+    pub order: Id<Order>,
+}
+
+impl SendReceipt {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::post("/receipt")
+                .header("idempotency-key", key.as_str())
+                .form(&[("order", self.order.raw().to_string())]),
+        ))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 => Ok(()),
+            s => Err(JobError::app(format!("pay.fixture answered {s}"))),
+        }
+    }
+}
+
 /// `GET /orders/:id`'s answer.
 #[derive(Wire, Serialize, Deserialize)]
 pub struct OrderView {
@@ -80,6 +109,18 @@ pub struct OrderView {
 /// order and the job that charges it are durable together or not at all.
 #[route(POST "/orders", public)]
 pub fn create_order(tx: &mut Tx) -> Result<Id<Order>, ApiError> {
+    place_order(tx)
+}
+
+/// `POST /orders`, with the order's receipt enqueued in the same transaction.
+#[route(POST "/receipted-orders", public)]
+pub fn create_receipted_order(tx: &mut Tx) -> Result<Id<Order>, ApiError> {
+    let id = place_order(tx)?;
+    tx.enqueue(SendReceipt { order: id });
+    Ok(id)
+}
+
+fn place_order(tx: &mut Tx) -> Result<Id<Order>, ApiError> {
     let counter_id = Id::<IdCounter>::from_raw(0);
     let mut counter = tx.get(counter_id)?.unwrap_or(IdCounter {
         id: counter_id,
@@ -113,7 +154,7 @@ pub fn build(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> 
         entropy,
         AppConfig::default(),
     )?
-    .mount(routes![create_order, get_order])
-    .mount_jobs(jobs![ChargeOrder])
+    .mount(routes![create_order, create_receipted_order, get_order])
+    .mount_jobs(jobs![ChargeOrder, SendReceipt])
     .outbound(Host::new("pay.fixture").bearer_env("FIXTURE_PAY_KEY")))
 }

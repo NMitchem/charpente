@@ -52,9 +52,10 @@ use charpente_sim::checks::{
     FaultReason, acked_implies_durable, boot_through_fallout, calls_have_durable_jobs, classify,
     clock_fallout, clock_refused, clock_reopens_after, dead_hooks_succeeded, dir_entry_loss_fired,
     durable_corruption_fired, durable_refusal, events, events_scoped, is_fault_fallout,
-    keys_are_per_effect, outbound_settles_by_horizon, replays_identically, wait_out_clock_refusal,
+    keys_are_per_effect, mark_dead_coverage, outbound_settles_by_horizon, replays_identically,
+    wait_out_clock_refusal,
 };
-use charpente_sim::drive::{Drive, Phase, Recovered};
+use charpente_sim::drive::{Drive, Phase, Recovered, TAIL_SETTLE_CAP};
 use charpente_sim::object::SimObjectStore;
 use charpente_sim::outbound::{Delivered, Idempotent, Recorder, Remote, SimOutbound, from_fn};
 use charpente_sim::rng::Rng;
@@ -1107,8 +1108,17 @@ fn remotes(sim: &Sim) {
 
 /// `charpente_sim::checks`: the platform's oracles and its fault-fallout
 /// vocabulary. A test on `drive` uses the end-state ones; the boot and clock
-/// helpers are what `drive` runs.
-fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>, job: &JobRow) -> Result<(), String> {
+/// helpers are what `drive` runs. `app` is the tail kernel's
+/// (`recovered.kernel.app()`), `snap` its store, and `at` the node's wall
+/// when the tail ended (`recovered.wall`).
+fn checks(
+    sim: &mut Sim,
+    app: &App,
+    snap: &Snapshot,
+    at: WallTime,
+    org: Id<Org>,
+    job: &JobRow,
+) -> Result<(), String> {
     // Every durable event of type `E`, as the app's own type, in log order,
     // every page of the log. A row of another shape is an `Err` naming it.
     let _added: Vec<NoteAdded> = events::<NoteAdded>(snap)?;
@@ -1121,12 +1131,15 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>, job: &JobRow) -> Result<
     // The same, for a directory entry lost or brought back
     // (`dir_entry_loss`): a missing-segment refusal is excused only there.
     let _gap_excused: bool = dir_entry_loss_fired(sim);
-    // Outbound: every call carries a durable job's key; no two jobs share a
-    // key; and, after a fault-free tail past the last backoff, every
-    // outbound job is Done or Dead.
+    // Outbound: every call carries a durable job's key; a key carries one
+    // request; and, after the tail, every outbound job due at `at` is Done
+    // or Dead (one not yet due, with no attempt made, is not judged).
     calls_have_durable_jobs(sim, snap)?;
     keys_are_per_effect(snap)?;
-    outbound_settles_by_horizon(snap)?;
+    outbound_settles_by_horizon(snap, at)?;
+    // `dead:<job>` once per Dead row, for a `require:`. `Drive::recover`
+    // calls it itself; a hand driver calls it on its last kernel's App.
+    mark_dead_coverage(sim, app)?;
     // No `on_dead` hook failed: no Dead row's `last_error` carries the prefix
     // only a failed hook's Dead mark writes.
     dead_hooks_succeeded(snap)?;
@@ -1189,10 +1202,10 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>, job: &JobRow) -> Result<
     Ok(())
 }
 
-/// `charpente_sim::drive`: a faulted phase, a power cycle, and a fault-free
-/// tail that re-sends what went unanswered, in two calls. A check of an app
-/// under faults starts here (GUIDE §8, "A fault-free tail for an end-of-run
-/// check").
+/// `charpente_sim::drive`: a faulted phase, a power cycle, and a tail free of
+/// per-call faults that re-sends what went unanswered and runs on until its
+/// outbound work settles, in two calls. A check of an app under faults starts
+/// here (GUIDE §8, "A fault-free tail for an end-of-run check").
 fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
     // `sim_app` builds the app on the sim's disk, once per boot.
     let drive: Drive = Drive::new(sim, sim_app);
@@ -1219,8 +1232,10 @@ fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
     // Power-cycle, quiesce disk and clock faults (outbound too when the app
     // declares hosts), wait out a clock refusal, boot, re-send each request
     // with no answer or a fallout 5xx, and run `tail` past the boot so jobs,
-    // retries and cron drain. `Ok(None)`: the run gave up by name, so the
-    // check returns `Ok(())`.
+    // retries and cron drain. An app with hosts then runs on, at most
+    // `TAIL_SETTLE_CAP` extensions, until each outbound job is Done, Dead or
+    // not yet due. Last it marks `dead:<job>` per Dead row. `Ok(None)`: the
+    // run gave up by name, so the check returns `Ok(())`.
     let Some(recovered): Option<Recovered> = drive.recover(&phase, Duration::from_secs(30))? else {
         return Ok(());
     };
@@ -1231,6 +1246,11 @@ fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
     let _status: Option<u16> = recovered.status(0).or(phase.status(0));
     // Each re-send's `(status, body)`, by the index of the request it re-sent.
     let _resent: &Vec<Option<(u16, Vec<u8>)>> = &recovered.resent;
+    // The node's wall when the tail ended, what `outbound_settles_by_horizon`
+    // judges at, and how many extensions the tail ran for outbound work.
+    let _at: WallTime = recovered.wall;
+    let _extensions: u32 = recovered.extensions;
+    assert!(_extensions <= TAIL_SETTLE_CAP);
     let snap: Snapshot = recovered
         .kernel
         .app()

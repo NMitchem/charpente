@@ -1,13 +1,14 @@
 //! `charpente test --sim --dir crates/outbound-fixture` dogfoods this file:
-//! the fixture's `ChargeOrder` under each universe's faults, against a model
-//! of `pay.fixture` that dedupes by the `idempotency-key` header, as
-//! `fake_remote` does, and records every call it applies, so a second charge
-//! for one order is seen where the money would move.
+//! the fixture's `ChargeOrder` and `SendReceipt` under each universe's faults,
+//! against a model of `pay.fixture` that dedupes by the `idempotency-key`
+//! header, as `fake_remote` does, and records every call it applies, so a
+//! second charge for one order is seen where the money would move.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use charpente::View;
+use charpente::core::db::Job as _;
 use charpente::core::io::{Clock as _, Entropy as _, IdempotencyKey};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::Codec as _;
@@ -16,16 +17,23 @@ use charpente::kernel::{Kernel, SimSource};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
     boot_through_fallout, calls_have_durable_jobs, clock_fallout, clock_reopens_after,
-    durable_corruption_fired, is_fault_fallout, keys_are_per_effect, outbound_settles_by_horizon,
+    durable_corruption_fired, is_fault_fallout, keys_are_per_effect, mark_dead_coverage,
+    outbound_settles_by_horizon,
 };
 use charpente_sim::outbound::{Idempotent, Recorder};
-use outbound_fixture::{ChargeOrder, Order};
+use outbound_fixture::{ChargeOrder, Order, SendReceipt};
 
 // `re-called` is what makes "once" a claim: measured in 355 of 1024 universes
 // (master seed 0x222517d092c8c3b7), so 64 universes miss it all with
 // probability about 1e-12 (1e-9 at a one-sided 1e-6 lower bound on the rate).
+// `dead:SendReceipt` is the receipt's Dead path, reached under a drawn
+// provider outage that outlasts the default retry policy (0.5.0 spec §7.3 a).
 charpente_sim::sim_tests! {
-    orders_charge_once require ["outbound:checked", "outbound-fixture:re-called"],
+    orders_charge_once require [
+        "outbound:checked",
+        "outbound-fixture:re-called",
+        "dead:SendReceipt",
+    ],
 }
 
 const SEC: u64 = 1_000_000_000;
@@ -91,12 +99,13 @@ fn run(sim: &Sim, app: App, source: &mut SimSource) -> Result<Result<Kernel, Str
     }
 }
 
-/// Up to `ROUNDS` faulted rounds, each booting, posting three orders when the
-/// store holds none (a client retries orders that never became durable), and
-/// power-cycling at a drawn moment, a call possibly in flight. Then a
-/// fault-free tail past the last backoff. Properties: the three outbound
-/// checkers; the remote applied no order twice, and every Done charge's order
-/// exactly once; every order paid exactly when its charge is Done.
+/// Up to `ROUNDS` faulted rounds, each booting, posting three receipted orders
+/// when the store holds none (a client retries orders that never became
+/// durable), and power-cycling at a drawn moment, a call possibly in flight.
+/// Then a fault-free tail past the last backoff. Properties: the three
+/// outbound checkers; the remote applied no charge twice, and every Done
+/// charge's order exactly once; every order paid exactly when its charge is
+/// Done.
 fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
     sim.remote(
         "pay.fixture",
@@ -126,7 +135,10 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         match orders {
             Ok(orders) if orders.is_empty() => {
                 for i in 0..3 {
-                    source.push_at(start + i * SEC / 10, Request::new(Method::Post, "/orders"));
+                    source.push_at(
+                        start + i * SEC / 10,
+                        Request::new(Method::Post, "/receipted-orders"),
+                    );
                 }
             }
             Ok(_) => {}
@@ -141,8 +153,10 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         sim.restart();
     }
 
-    // The fault-free tail (GUIDE §8): 8 attempts back off 0.5 s doubling to
-    // 32 s (63.5 s in all), each with a 2 s deadline, well inside 600 s.
+    // The fault-free tail (GUIDE §8): the charge's 8 attempts back off 0.5 s
+    // doubling to 32 s (63.5 s in all), each with a 2 s deadline, and the
+    // receipt's 5 back off 30 s doubling to 240 s (450 s in all), each with a
+    // 30 s deadline, both inside 600 s.
     sim.quiesce_disk_faults();
     sim.quiesce_outbound_faults();
     sim.quiesce_clock_faults();
@@ -191,8 +205,12 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
     };
 
     let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
+    // The node's wall at the tail's end, what the settle check judges at. A
+    // hand driver marks the Dead rows itself, as `Drive::recover` does.
+    let at = sim.clock().wall();
+    mark_dead_coverage(sim, kernel.app())?;
     keys_are_per_effect(&snap)?;
-    outbound_settles_by_horizon(&snap)?;
+    outbound_settles_by_horizon(&snap, at)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         // One sim box's only loss window is media corruption: a bit flip at
         // the restart can cut an enqueue whose call already reached the
@@ -210,13 +228,13 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         return Err(e);
     }
 
-    // What the remote applied, per order. `Idempotent` hands its inner model
-    // only a key's first call, or every keyless one.
+    // What the remote applied, per order's charge. `Idempotent` hands its
+    // inner model only a key's first call, or every keyless one.
     let applied = sim.with_remote(
         "pay.fixture",
         |m: &Idempotent<Recorder>| -> Result<BTreeMap<u64, u32>, String> {
             let mut applied = BTreeMap::new();
-            for call in m.inner().calls() {
+            for call in m.inner().calls().iter().filter(|c| c.path == "/charge") {
                 let order = std::str::from_utf8(&call.body)
                     .ok()
                     .and_then(|body| body.strip_prefix("order="))
@@ -241,7 +259,7 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
 
     let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
     let mut charges = 0;
-    for row in jobs.iter().filter(|r| r.outbound_key.is_some()) {
+    for row in jobs.iter().filter(|r| r.name == ChargeOrder::NAME) {
         let job = ChargeOrder::decode(&mut &row.payload[..]).map_err(|e| e.to_string())?;
         let Some(order) = snap.get::<Order>(job.order).map_err(|e| e.to_string())? else {
             return Err(format!(
@@ -272,11 +290,18 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
         }
         charges += 1;
     }
+    let receipts = jobs.iter().filter(|r| r.name == SendReceipt::NAME).count();
+    if receipts != charges {
+        return Err(format!(
+            "the store holds {charges} charges but {receipts} receipts — POST \
+             /receipted-orders enqueues an order's charge and its receipt in one transaction"
+        ));
+    }
     if charges == 0 {
         return gave_up(
             sim,
             "outbound-fixture:gave-up:no-order",
-            "no POST /orders became durable, so no charge was adjudicated",
+            "no POST /receipted-orders became durable, so no charge was adjudicated",
             "",
         );
     }

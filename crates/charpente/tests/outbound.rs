@@ -784,6 +784,8 @@ fn a_pure_enqueue_of_a_job_mounted_outbound_is_refused_by_name() {
     let mut misrouted = <Charge as JobEntry>::def();
     misrouted.name = <ChargeAsPure as Job>::NAME;
     misrouted.fingerprint = <ChargeAsPure as Job>::FINGERPRINT;
+    // The mount holds a def's Dead coverage key to its name.
+    misrouted.dead_coverage = "dead:ChargeAsPure";
     let err = refused_enqueue(misrouted, |tx| tx.enqueue(ChargeAsPure { cents: 1 }));
     assert_eq!(
         err.to_string(),
@@ -820,6 +822,8 @@ fn a_row_without_a_key_never_reaches_an_outbound_def_s_run_glue() {
     let mut misrouted = <Charge as JobEntry>::def();
     misrouted.name = <ChargeAsPure as Job>::NAME;
     misrouted.fingerprint = <ChargeAsPure as Job>::FINGERPRINT;
+    // The mount holds a def's Dead coverage key to its name.
+    misrouted.dead_coverage = "dead:ChargeAsPure";
     let (mut app, mut d) = seeded_unmounted(&sim, vec![misrouted], |tx| {
         tx.enqueue(ChargeAsPure { cents: 1 })
     });
@@ -3310,7 +3314,7 @@ fn outbound_workload(sim: &mut Sim, v: Variant) -> Result<(), String> {
 
     let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
     keys_are_per_effect(&snap)?;
-    outbound_settles_by_horizon(&snap)?;
+    outbound_settles_by_horizon(&snap, sim.clock().wall())?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         // One sim box's only loss window is media corruption: a bit flip or
         // misdirected write on a WAL frame above the checkpoint horizon is cut

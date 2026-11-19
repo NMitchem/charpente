@@ -22,10 +22,12 @@
 //! 2. Faulted phase: the orders are placed under the run's faults, with the
 //!    sim's outbound handle, since the app declares a host. A fault ends the
 //!    phase, and the replies already sent stand.
-//! 3. Fault-free tail: a power cycle, the disk, clock and outbound faults
-//!    switched off, a clock refusal waited out, and the app booted again and
-//!    run to a horizon past every backoff and deadline. The gateway's own
-//!    switch is the workload's: it calms the gateway before the tail.
+//! 3. Tail, free of per-call faults (a drawn provider outage runs to its
+//!    end): a power cycle, the disk, clock and outbound faults switched off,
+//!    a clock refusal waited out, and the app booted again and run to a
+//!    horizon past every backoff and deadline, then on until every charge is
+//!    Done or Dead. The gateway's own switch is the workload's: it calms the
+//!    gateway before the tail.
 //! 4. Re-send: the tail places again every order the phase left unanswered,
 //!    as a client that never saw its answer would.
 
@@ -208,8 +210,9 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         .collect();
     let drive = Drive::new(sim, build_app);
     let phase = drive.faulted_phase(&requests, Duration::from_secs(3))?;
-    // The fault-free tail: eight attempts back off 0.5 s doubling to 32 s,
-    // each with a 2 s deadline, well inside the 600 s horizon.
+    // The tail: eight attempts back off 0.5 s doubling to 32 s, each with a
+    // 2 s deadline, well inside the 600 s horizon; `recover` would run on
+    // past it for a charge still due there.
     calm.store(true, Ordering::Relaxed);
     let Some(recovered) = drive.recover(&phase, Duration::from_secs(600))? else {
         return Ok(()); // given up by name
@@ -222,7 +225,7 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         .snapshot()
         .map_err(|e| e.to_string())?;
     keys_are_per_effect(&snap)?;
-    outbound_settles_by_horizon(&snap)?;
+    outbound_settles_by_horizon(&snap, recovered.wall)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         // Media corruption can cut an enqueue whose call already reached the
         // gateway; excused only where it fired, and as a skipped run.

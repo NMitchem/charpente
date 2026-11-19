@@ -2156,16 +2156,25 @@ Charpente treats the coding agent as the primary developer persona:
   for an enqueue that is not durable), `keys_are_per_effect` (a key carries exactly one
   request: equal names and payload bytes, at most one row not Dead, so only a re-issue from
   `on_dead` may copy one) and
-  `outbound_settles_by_horizon` (after a fault-free tail, every outbound job is Done or
-  Dead); `dead_hooks_succeeded` (no Dead row's `last_error` carries the prefix only a
-  failed `on_dead` hook's Dead mark writes); and the two fire-time-marked axis
+  `outbound_settles_by_horizon` (after the tail, every outbound job due at the wall time
+  it judges at is Done or Dead; a row with no attempt made and a later due time is not yet
+  due, and not judged); `dead_hooks_succeeded` (no Dead row's `last_error` carries the
+  prefix only a failed `on_dead` hook's Dead mark writes); `mark_dead_coverage` (marks
+  `dead:<job>` once per Dead row, so a sim can `require:` that a job's Dead path ran); and
+  the two fire-time-marked axis
   companions `durable_corruption_fired` and `dir_entry_loss_fired`, which excuse a
   shortfall only in universes where that fault actually fired.
   `SimHost::durable_corruption_fired` and `SimHost::dir_entry_loss_fired` are the same
   two scoped to a host, for a multi-node workload whose excuse must name the
   node the fault fired on, and `SimHost::durable_corruption_count`/`dir_entry_loss_count`
   are their counts, so a workload that wipes a host's data reads them at the wipe and
-  excuses a later refusal only by a fault since then. Exit codes: 0 green, 1 sim failures,
+  excuses a later refusal only by a fault since then. `charpente_sim::drive`'s
+  `Drive::recover` tail is free of per-call faults, while a drawn provider outage runs
+  to its end, and for an app with hosts it runs on past its horizon until every
+  outbound job is Done, Dead or not yet due: each extension runs to the latest due row's
+  due time plus its job's timeout plus 1 s, so a retry's wait costs a wake-up, and
+  `TAIL_SETTLE_CAP` (256) extensions with work still due fail the run by name. It calls
+  `mark_dead_coverage` last (0.5.0 spec §5 E). Exit codes: 0 green, 1 sim failures,
   unmet coverage, or a check that tested nothing (every run skipped: a vacuous check fails
   the batch; a `--seed` replay of a skipped run exits 0), 2 build/usage/infrastructure
   error. The platform's own runners hold the same rule: a test in which every universe gave

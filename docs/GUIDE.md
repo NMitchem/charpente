@@ -3635,12 +3635,15 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    and the answers already recorded stand. `phase.answers[i]` is request
    `i`'s `(status, body)`, or `None` when it went unanswered;
    `phase.status(i)` is its status.
-3. **A fault-free tail.** `recover` power-cycles (`sim.restart()`),
-   quiesces the disk and clock faults, and the outbound faults when the app
-   declares hosts. It waits out a clock refusal, boots, and runs the kernel to
-   `tail` past the instant it booted, so due jobs, retries and cron drain. A
-   remote model's own switches, such as `modelled_remote`'s `calm`, stay in
-   your code: flip them between the two calls.
+3. **A tail free of per-call faults; a drawn provider outage runs to its
+   end.** `recover` power-cycles (`sim.restart()`), quiesces the disk and
+   clock faults, and the outbound faults when the app declares hosts. A drawn
+   `outbound_outage` is not a roll, so it refuses its host until its own end.
+   It waits out a clock refusal, boots, and runs the kernel to `tail` past the
+   instant it booted, so due jobs, retries and cron drain, then on until the
+   app's outbound work settles (below). A remote model's own switches, such
+   as `modelled_remote`'s `calm`, stay in your code: flip them between the two
+   calls.
 4. **Re-send what went unanswered.** Every request whose answer is `None`,
    or a 5xx whose body is fault fallout, is sent again at the tail's start. A
    4xx, or a handler's own 5xx, is the app's answer and is not re-sent.
@@ -3657,6 +3660,39 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    judges when a request took effect treats a re-sent one (a `Some` in
    `recovered.resent`) as landing after the phase, since `Recovered` gives no
    instant for the tail's start.
+
+**The tail settles outbound work.** For an app that declares hosts, `recover`
+reads the store and the node's wall time after the run to `tail`. It stops
+when every Pending outbound row is not yet due: no attempt made, and a due
+time after that wall time, as a delayed job (§6) or a re-issue scheduled later
+is. Any other Pending outbound row extends the tail: the kernel runs again, to
+the latest such row's due time (or now, when one is already due) plus its
+job's declared timeout plus 1 s, and the store is read again. Idle virtual
+time costs a wake-up per retry, so a `retry(max = 12)` job through a 4 h
+outage takes eight extensions, not 17 hours of work, and no app sizes `tail`
+to its retry policy. An `on_dead` hook that enqueues a fresh job on every Dead,
+or re-issues at once, makes a chain that ends when the outage ends: two such
+chains on the default policy take 96 extensions through a 4 h outage. The
+extensions stop at `charpente_sim::drive::TAIL_SETTLE_CAP`, 256, with work
+still Pending, and the run fails by name (below). No extension runs past the
+year 2262, so a retry whose doubling backoff saturated stays Pending, and the
+run fails at the cap rather than at the end of the u64 nanosecond range, where
+the kernel stops on its daily sweep's overflow. An app with no host is
+never extended. `recovered.extensions` counts the extensions, and
+`recovered.wall` is the node's wall time when the tail ended, the time to
+pass `outbound_settles_by_horizon` ("The checkers", below).
+
+**Coverage for a Dead path.** Last, `recover` calls `mark_dead_coverage`
+("The checkers"), which marks `dead:<job>` once per Dead row, whatever the
+job's stance: `dead:SendReceipt` for a `SendReceipt` job. Require it to hold
+that the job's Dead path ran, as `crates/outbound-fixture`'s sim does:
+`orders_charge_once require ["outbound:checked", "outbound-fixture:re-called",
+"dead:SendReceipt"]`. A batch in which no run takes the job to Dead fails on
+the key, naming it, so a Dead path that the sim never exercised cannot read
+as tested. An outbound job on the default policy reaches Dead under the
+outage axis, which `charpente test --sim` draws in a quarter of runs, half
+of them long enough to exhaust the policy ("The outside world: remote
+models", below).
 
 **A route the tail re-sends must be safe to receive twice.** `Drive`
 re-sends, and a request that went unanswered may have landed, so its re-send
@@ -3703,6 +3739,17 @@ the run:
 - `the fault-free tail's kernel stopped: <error>`, in the kernel's words.
 - `the app calls <host>, but the workload registered no model for it — call
   sim.remote("<host>", …) before Drive::faulted_phase`, from either call.
+- The cap: the tail ran 256 extensions, and an outbound job is still Pending
+  and due. The text names the first such job by id:
+
+<!-- pinned -->
+```text
+Drive::recover: the tail ran 256 extensions past its horizon and outbound job <id> ("<name>") is still Pending at attempt <a> — an outbound job settles, retries to Dead, or waits for a later due time; this one did none of them within the cap of 256
+```
+
+A job still retrying after 256 extensions has a remote that never answers it
+in time and a policy that has not run out: a model that never answers, or a
+`max` in the thousands. Fix the model, or give the job a policy that ends.
 
 **When to drop below the helper.** `Drive` is one faulted phase and one tail.
 A workload with more than that builds it from the pieces this section and
@@ -3735,17 +3782,27 @@ not fallout to classify. Network and object-store faults are untouched, and a
 restart still power-cycles: unsynced writes and directory entries collapse under
 the crash model as usual (`crash_apply`, `crash_torn`, `dir_entry_loss`).
 
-An outbound workload's tail needs the outbound half as well.
-`sim.quiesce_outbound_faults()` ends the five outbound fault axes for the rest of
-the run: no call started after it is refused, lost, throttled or slowed, or
+An outbound workload's tail needs the outbound half as well: the tail is free
+of per-call faults, and a drawn provider outage runs to its end.
+`sim.quiesce_outbound_faults()` ends the five outbound fault axes for the rest
+of the run: no call started after it is refused, lost, throttled or slowed, or
 loses its reply by chance. A drawn `outbound_outage` is not a roll and runs to
 its own end, so calls to its host are refused after the quiesce until then.
-Each skipped roll draws nothing, so a run that never calls
-it replays exactly as before. Latency stays, since it is not a fault, and a
-request already in flight keeps the fate it drew. Call both, then run past the
-last backoff and deadline. From there, outside an outage's window, every call
-reaches its remote and its reply comes back, so every outbound job settles or
-retries to Dead, which is what `outbound_settles_by_horizon` (below) checks.
+Each skipped roll draws nothing, so a run that never calls it replays exactly
+as before. Latency stays, since it is not a fault, and a request already in
+flight keeps the fate it drew. Call both, then run until the outbound work
+settles. Outside an outage's window every call reaches its remote and its
+reply comes back, so an outbound job that is due settles or retries to Dead,
+and inside one its calls are refused until its retries run out or the window
+ends. `Drive::recover` runs on until then, at most 256 extensions past
+`tail` ("The tail settles outbound work", above). A hand driver runs its tail
+past the last backoff and deadline of every job, and of every chain its
+`on_dead` hooks make, or loops as `recover` does. Then
+`outbound_settles_by_horizon(snap, at)` (below) checks that every outbound job
+due at `at`, the node's wall time when the tail ended, is Done or Dead, and
+`mark_dead_coverage` marks the Dead rows' `dead:<job>` keys. A hand driver
+reads `at` with `sim.clock().wall()` after its last run, and calls
+`mark_dead_coverage(sim, kernel.app())` itself.
 
 A realtime workload's settle phase has the same need for a different fault. The
 subscriber-stall rate is the one fault axis the sim does not inject itself: a
@@ -4075,11 +4132,25 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   `on_dead` copies a key, together with its request, and the row it copies is Dead
   by then. It fails wherever a key carries two requests, or two jobs that are not
   Dead, which would send the effect twice. The error names both jobs and the key, and what differs.
-- `outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>` — every
-  outbound job is Done or Dead. Call it only after the fault-free tail:
-  `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and a run past
-  the last backoff and deadline. A job still Pending there was lost by the
-  kernel.
+- `outbound_settles_by_horizon(snap: &Snapshot, at: WallTime) -> Result<(), String>`
+  — every outbound job due at `at` is Done or Dead. `at` is the node's wall
+  time when the tail ended: `recovered.wall` after `Drive::recover`, or
+  `sim.clock().wall()` read after a hand driver's last run. A Pending row with
+  no attempt made and a due time after `at` is not judged, since it is not yet
+  due: a delayed job (§6) or a re-issue scheduled later. Every other Pending
+  outbound row fails it, the first by id, as lost by the kernel: one due and
+  never attempted, or a retry the tail did not run past. Call it only after
+  the tail: `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and
+  a run until the outbound work settles ("A fault-free tail", above).
+- `mark_dead_coverage(sim: &Sim, app: &App) -> Result<(), String>` — marks
+  `dead:<job>` once per Dead row in `app`'s store, whatever the job's stance,
+  so a sim can `require:` that a job's Dead path ran. `Drive::recover` calls
+  it last. A hand driver calls it once, after the tail, on its last kernel's
+  App (`kernel.app()`): the key is the job's `JobDef::dead_coverage`, which
+  the App keeps after the kernel takes its job definitions. It reads the
+  store and draws nothing, so a run in which nothing goes Dead marks nothing
+  and replays as before. A Dead row of a job the App does not mount has no
+  key and marks nothing. Its `Err` is a failed read of the store.
 - `dead_hooks_succeeded(snap: &Snapshot) -> Result<(), String>` — no `on_dead`
   hook failed (§6, "When the hook fails"). A failed hook's Dead mark commits
   alone, with a `last_error` that begins `charpente: on_dead failed: `, so what
@@ -4157,7 +4228,9 @@ pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String>
 
 pub fn keys_are_per_effect(snap: &Snapshot) -> Result<(), String>
 
-pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>
+pub fn outbound_settles_by_horizon(snap: &Snapshot, at: WallTime) -> Result<(), String>
+
+pub fn mark_dead_coverage(sim: &Sim, app: &App) -> Result<(), String>
 
 pub fn dead_hooks_succeeded(snap: &Snapshot) -> Result<(), String>
 
@@ -4175,6 +4248,16 @@ where
 keys_are_per_effect: jobs <a> and <b> carry the same idempotency key <key> but not the same request (their <name|payload> differs) — a key carries exactly one request; only a re-issue from on_dead copies a key, and it copies the request with it
 keys_are_per_effect: jobs <a> and <b> carry the same idempotency key <key> and neither is Dead — a key is copied only by a re-issue of a Dead job, so two live jobs under one key would send the effect twice
 ```
+
+`outbound_settles_by_horizon` fails with:
+
+<!-- pinned -->
+```text
+outbound_settles_by_horizon: job <id> ("<name>") is still Pending at <at> after the tail, at attempt <a>, due <due> — an outbound job that is due settles or retries to Dead; one that does neither was lost by the kernel
+```
+
+`<at>` and `<due>` are RFC 3339 times. A due time of `1970-01-01T00:00:00.000Z`
+is a job enqueued to run at once.
 
 `dead_hooks_succeeded` fails with:
 
@@ -4653,8 +4736,10 @@ refused:
 
 `outbound_outage` is a window of virtual time, not a roll: it reads the
 sim's clock, draws nothing per call, and `quiesce_outbound_faults` does not
-end it, so an outage outlives the fault-free tail and runs to its drawn end.
-That is how a job reaches Dead in a sim. The host is the one the universe's
+end it, so an outage outlives the tail's quiesce and runs to its drawn end,
+and `Drive::recover`'s tail runs on until the jobs it refuses settle or go
+Dead. That is how a job reaches Dead in a sim, and `mark_dead_coverage` marks
+`dead:<job>` for each one it reaches. The host is the one the universe's
 first outbound call picks, from the hosts the app declares (the list given to
 `sim.outbound`) in name order. The window is refused as `outbound_refused` is, and takes its place
 in the precedence. A length of zero is off, and an app with no hosts makes
@@ -4816,7 +4901,8 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
     let phase = drive.faulted_phase(&requests, Duration::from_secs(30))?;
     // The tail's power cycle may find a call in flight; the job is still
     // Pending, and its next call carries the same key. 600 s is past every
-    // backoff and deadline, with room to spare.
+    // backoff and deadline, with room to spare; `recover` would run on past
+    // it for a receipt still due there.
     let Some(recovered) = drive.recover(&phase, Duration::from_secs(600))? else {
         return Ok(());
     };
@@ -4828,7 +4914,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         .snapshot()
         .map_err(|e| e.to_string())?;
     keys_are_per_effect(&snap)?;
-    outbound_settles_by_horizon(&snap)?;
+    outbound_settles_by_horizon(&snap, recovered.wall)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         if durable_corruption_fired(sim) {
             sim.give_up("media corruption cut an enqueue whose call was made", e);
@@ -4847,7 +4933,10 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
 Register it as `receipts_settle_under_faults require ["outbound:checked"]`. A
 run in which no order committed passes all three checkers having checked
 nothing, which is why the coverage key is marked only where an outbound job
-exists. The tail places again what the phase left unanswered, so such a run
+exists. `Drive::recover` marks `dead:SendReceipt` for each receipt it took
+to Dead, so `require ["outbound:checked", "dead:SendReceipt"]` also holds
+that the receipt's Dead path ran under the batch's outages. The tail places
+again what the phase left unanswered, so such a run
 is rare. `Drive`'s faulted phase is one kernel: under a swarm's `sync_error`,
 a kernel can poison early and `run` stops, leaving the rest of the phase's
 script for the tail. A workload that wants more of its work done under
@@ -5949,6 +6038,20 @@ tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`) yours
 (`App::open`/`Db::open` already register those). Fix in every case:
 register that name/type exactly once, and mint at most one credential per
 request.
+
+### A hand-built `JobDef`'s Dead coverage key (`charpente/src/http/app.rs`, mount time)
+
+<!-- pinned -->
+```text
+contract: job "<job>" was mounted with dead_coverage "<key>" — a JobDef's dead_coverage is "dead:" and its name, the coverage key mark_dead_coverage marks for its Dead rows and a sim's require: names; fix: build it from its #[job]'s def(), or set dead_coverage to "dead:<job>"
+```
+
+`#[job]` writes `JobDef::dead_coverage` as `"dead:"` and the job's name, so
+only a hand-built `JobDef` can disagree with its own name, and
+`App::mount_jobs` refuses it before anything runs. The key is what
+`charpente_sim::checks::mark_dead_coverage` marks for each Dead row of the job,
+and what a sim's `require:` names for its Dead path (§8, "Coverage for a Dead
+path").
 
 ### Call-site contract panics (`charpente-core/src/db.rs`, `charpente/src/prod.rs`, `charpente/src/kernel/cron.rs`)
 

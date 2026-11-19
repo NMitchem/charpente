@@ -72,8 +72,11 @@ use std::path::{Path, PathBuf};
 /// the quick pass's closing line; 53 with the mutation run's package-split lines (2026-11-01);
 /// 54 with `#[job]`'s Dead-stance refusals (2026-11-19); 55 with a failed
 /// `on_dead` hook's `last_error` and its defused app text (2026-11-19); 56 with
-/// `dead_hooks_succeeded`'s failure (2026-11-19).
-const PINNED_FLOOR: usize = 56;
+/// `dead_hooks_succeeded`'s failure (2026-11-19); 57 with `keys_are_per_effect`'s
+/// failures (2026-11-19); 60 with `Drive::recover`'s tail cap,
+/// `outbound_settles_by_horizon`'s failure and the hand-built `JobDef`'s
+/// Dead coverage refusal (2026-11-19).
+const PINNED_FLOOR: usize = 60;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

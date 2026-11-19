@@ -350,6 +350,9 @@ pub struct App {
     config: AppConfig,
     router: Router,
     job_defs: Vec<JobDef>,
+    /// What the sim still reads of each mounted job once a kernel has taken
+    /// `job_defs`: `dead_coverage_for_sim` and `outbound_timeout_for_sim`.
+    mounted_jobs: Vec<MountedJob>,
     /// Describe-only (TS-codegen spec §2). Delivery reads nothing here: an
     /// event reaches a subscriber through the encoder `Subscription::of::
     /// <Ev>()` captured statically at the subscribe site, registered or not.
@@ -371,6 +374,24 @@ pub struct App {
     /// events, through `note_tenant`, which refuses a second type under a
     /// seen `NAME` (tenancy-completion spec §4).
     tenants: BTreeMap<&'static str, (TypeId, &'static str)>,
+}
+
+/// One mounted job, as `App::dead_coverage_for_sim` and
+/// `App::outbound_timeout_for_sim` read it after a kernel took its `JobDef`.
+struct MountedJob {
+    name: &'static str,
+    dead_coverage: &'static str,
+    timeout: Option<Duration>,
+}
+
+impl MountedJob {
+    fn of(def: &JobDef) -> MountedJob {
+        MountedJob {
+            name: def.name,
+            dead_coverage: def.dead_coverage,
+            timeout: def.outbound.as_ref().map(|o| o.timeout),
+        }
+    }
 }
 
 impl App {
@@ -409,6 +430,7 @@ impl App {
             entropy,
             config,
             router: Router::new(),
+            mounted_jobs: vec![MountedJob::of(&sweep)],
             job_defs: vec![sweep],
             // No platform events to seed: the built-in surface emits none.
             event_defs: Vec::new(),
@@ -552,6 +574,19 @@ impl App {
                 "job \"{}\" registered twice — each #[job] type is mounted once",
                 def.name
             );
+            // `#[job]` emits `concat!("dead:", <name>)`, so only a hand-built
+            // `JobDef` can disagree (Task 6 review M-4).
+            assert!(
+                def.dead_coverage.strip_prefix("dead:") == Some(def.name),
+                "contract: job \"{}\" was mounted with dead_coverage \"{}\" — a JobDef's \
+                 dead_coverage is \"dead:\" and its name, the coverage key mark_dead_coverage \
+                 marks for its Dead rows and a sim's require: names; fix: build it from its \
+                 #[job]'s def(), or set dead_coverage to \"dead:{}\"",
+                def.name,
+                def.dead_coverage,
+                def.name
+            );
+            self.mounted_jobs.push(MountedJob::of(&def));
             self.job_defs.push(def);
         }
         self.db_mut().register_job_shapes(&shapes);
@@ -822,6 +857,29 @@ impl App {
 
     pub(crate) fn take_job_defs(&mut self) -> Vec<JobDef> {
         std::mem::take(&mut self.job_defs)
+    }
+
+    /// `"dead:<job>"`, the coverage key for a Dead row of `job`, when this
+    /// App mounted it; `None` for any other name. It outlives the kernel's
+    /// take of the job defs, so `charpente_sim::checks::mark_dead_coverage`
+    /// reads it from the kernel's App at the end of a run.
+    #[doc(hidden)]
+    pub fn dead_coverage_for_sim(&self, job: &str) -> Option<&'static str> {
+        self.mounted_jobs
+            .iter()
+            .find(|m| m.name == job)
+            .map(|m| m.dead_coverage)
+    }
+
+    /// The declared timeout of an outbound `job` this App mounted; `None`
+    /// for a pure job or any other name. It outlives the kernel's take of the
+    /// job defs, for `charpente_sim::drive::Drive::recover`'s settle loop.
+    #[doc(hidden)]
+    pub fn outbound_timeout_for_sim(&self, job: &str) -> Option<Duration> {
+        self.mounted_jobs
+            .iter()
+            .find(|m| m.name == job)
+            .and_then(|m| m.timeout)
     }
 
     /// Test-only equivalent of `take_job_defs` — integration tests cannot see

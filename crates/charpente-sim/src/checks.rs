@@ -10,11 +10,13 @@
 //! tail loop that uses the last two had five copies (0.3.0), and `events` and
 //! `events_scoped` when sim tests kept decoding `EventRow` by hand (0.4.0), and
 //! `dead_hooks_succeeded` with the `on_dead` hook, whose failure leaves only a
-//! prefix in a Dead row (0.5.0) — more earn their way in the same way.
+//! prefix in a Dead row, and `mark_dead_coverage` once a sim could reach Dead
+//! and `require:` that it did (0.5.0) — more earn their way in the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use charpente::http::App;
 use charpente_core::db::{Event, Tenant};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, IdempotencyKey, WallTime};
@@ -707,23 +709,52 @@ pub fn keys_are_per_effect(snap: &Snapshot) -> Result<(), String> {
     Ok(())
 }
 
-/// After a fault-free tail long enough for every retry, every outbound job is
-/// Done or Dead (spec §10). Call it only after `quiesce_disk_faults`,
-/// `quiesce_outbound_faults`, and a run past the last backoff and deadline.
-pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String> {
+/// After the tail, every outbound job that is due at `at` is Done or Dead
+/// (spec §10; 0.5.0 spec §5 E). `at` is the node's wall time at the end of
+/// the tail: `Recovered::wall` after `Drive::recover`, or
+/// `sim.clock().wall()` read after a hand driver's last run. A Pending row
+/// with no attempt made and a due time after `at` is not judged: a delayed
+/// enqueue, or a re-issue scheduled later, is not yet due. Every other
+/// Pending outbound row fails, the first by id. Call it only after
+/// `quiesce_disk_faults`, `quiesce_outbound_faults`, and a run until the
+/// outbound work settles, which `Drive::recover` makes.
+pub fn outbound_settles_by_horizon(snap: &Snapshot, at: WallTime) -> Result<(), String> {
     for row in snap
         .scan::<JobRow>()
         .map_err(|e| format!("outbound_settles_by_horizon: scanning the jobs: {e}"))?
     {
-        if row.outbound_key.is_some() && row.status == JobStatus::Pending {
+        let not_yet_due = row.attempts == 0 && row.due_at > at;
+        if row.outbound_key.is_some() && row.status == JobStatus::Pending && !not_yet_due {
             return Err(format!(
-                "outbound_settles_by_horizon: job {} (\"{}\") is still Pending after the \
-                 fault-free tail, at attempt {} — an outbound job settles or retries to Dead; one \
-                 that does neither was lost by the kernel",
+                "outbound_settles_by_horizon: job {} (\"{}\") is still Pending at {at} after the \
+                 tail, at attempt {}, due {} — an outbound job that is due settles or retries \
+                 to Dead; one that does neither was lost by the kernel",
                 row.id.raw(),
                 row.name,
-                row.attempts
+                row.attempts,
+                row.due_at
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Marks `dead:<job>`, the job's `JobDef::dead_coverage`, once per Dead row
+/// in `app`'s store, whatever the job's stance, so a sim can `require:` that
+/// a job's Dead path ran (0.5.0 spec §5 E). `Drive::recover` calls it last;
+/// a hand driver calls it once, on the App of its last kernel
+/// (`kernel.app()`), after the tail. It reads the store and draws nothing,
+/// so a run in which nothing goes Dead marks nothing and replays as before. A
+/// Dead row of a job this App does not mount has no key, and marks nothing.
+/// Its `Err` is a failed read of the store, in the store's own words.
+pub fn mark_dead_coverage(sim: &Sim, app: &App) -> Result<(), String> {
+    let snap = app.db().snapshot().map_err(|e| e.to_string())?;
+    for row in snap.scan::<JobRow>().map_err(|e| e.to_string())? {
+        if row.status != JobStatus::Dead {
+            continue;
+        }
+        if let Some(key) = app.dead_coverage_for_sim(&row.name) {
+            sim.cover(key);
         }
     }
     Ok(())
@@ -1984,10 +2015,96 @@ mod tests {
     fn outbound_settles_by_horizon_names_a_stuck_job() {
         let (_sim, db) = jobs_with_keys(&[[1; 16]]); // Pending
         let snap = db.snapshot().unwrap();
-        let err = outbound_settles_by_horizon(&snap).unwrap_err();
+        let err = outbound_settles_by_horizon(&snap, WallTime::from_nanos(1)).unwrap_err();
         assert!(
             err.starts_with("outbound_settles_by_horizon: job 0 (\"charge\") is still Pending"),
             "{err}"
+        );
+    }
+
+    /// One `Refund(7)` row per entry, laid out through the operator's
+    /// `settle_job` standing: row `i` has id `i`, key `[i; 16]` when it is
+    /// outbound (`true`) and none when it is not, and the entry's status,
+    /// attempts and due time.
+    fn rows_of(rows: &[(JobStatus, u32, WallTime, bool)]) -> (Sim, Db) {
+        let sim = Sim::with_faults(0x0c8, crate::FaultConfig::none());
+        let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx: &mut Tx| {
+                for (i, &(status, attempts, due_at, outbound)) in rows.iter().enumerate() {
+                    tx.settle_job(
+                        &JobRow {
+                            id: charpente_core::table::Id::from_raw(i as u64),
+                            name: Refund::NAME.into(),
+                            payload: vec![7],
+                            key: None,
+                            status,
+                            attempts,
+                            due_at,
+                            last_error: None,
+                            shape: Some(Refund::FINGERPRINT),
+                            scope: None,
+                            outbound_key: outbound.then_some([i as u8; 16]),
+                        },
+                        &admission,
+                    );
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().map_err(|f| f.error).unwrap();
+        (sim, db)
+    }
+
+    /// (f), 0.5.0 spec §7.3: a row not yet due at the time judged, no attempt
+    /// made and due after it (a delayed enqueue, a later re-issue), is not
+    /// judged. Every other Pending outbound row fails: one due and never
+    /// attempted (lost), one due exactly then, and a retry the tail did not
+    /// run past. A pure job's Pending row is never this check's.
+    #[test]
+    fn a_delayed_outbound_row_not_yet_due_passes_and_a_lost_one_fails() {
+        const SEC: u64 = 1_000_000_000;
+        let at = WallTime::from_nanos(1_000 * SEC);
+        let later = WallTime::from_nanos(4_600 * SEC);
+        let delayed = (JobStatus::Pending, 0, later, true);
+        let (_sim, db) = rows_of(&[
+            delayed,
+            (JobStatus::Done, 1, WallTime::UNIX_EPOCH, true),
+            (JobStatus::Dead, 5, WallTime::UNIX_EPOCH, true),
+            (JobStatus::Pending, 0, WallTime::UNIX_EPOCH, false),
+        ]);
+        assert_eq!(
+            outbound_settles_by_horizon(&db.snapshot().unwrap(), at),
+            Ok(())
+        );
+        // The epoch is "due now": an enqueue no attempt ever reached.
+        let (_sim, db) = rows_of(&[delayed, (JobStatus::Pending, 0, WallTime::UNIX_EPOCH, true)]);
+        assert_eq!(
+            outbound_settles_by_horizon(&db.snapshot().unwrap(), at),
+            Err(
+                "outbound_settles_by_horizon: job 1 (\"refund\") is still Pending at \
+                 1970-01-01T00:16:40.000Z after the tail, at attempt 0, due \
+                 1970-01-01T00:00:00.000Z — an outbound job that is due settles or retries \
+                 to Dead; one that does neither was lost by the kernel"
+                    .to_string()
+            )
+        );
+        let (_sim, db) = rows_of(&[(JobStatus::Pending, 0, at, true)]);
+        let err = outbound_settles_by_horizon(&db.snapshot().unwrap(), at).unwrap_err();
+        assert!(
+            err.contains(
+                "job 0 (\"refund\") is still Pending at 1970-01-01T00:16:40.000Z after \
+                 the tail, at attempt 0, due 1970-01-01T00:16:40.000Z —"
+            ),
+            "a row due exactly at the time judged is due: {err}"
+        );
+        let (_sim, db) = rows_of(&[(JobStatus::Pending, 2, later, true)]);
+        let err = outbound_settles_by_horizon(&db.snapshot().unwrap(), at).unwrap_err();
+        assert!(
+            err.contains("at attempt 2, due 1970-01-01T01:16:40.000Z —"),
+            "a retry due later is judged, since the tail did not run past it: {err}"
         );
     }
 
@@ -2154,6 +2271,67 @@ mod tests {
         );
         let snap = app.db_for_tests().snapshot().unwrap();
         assert_eq!(dead_hooks_succeeded(&snap), Ok(()));
+    }
+
+    /// Every Dead row marks its job's `dead:<name>` once, whatever its stance
+    /// and whether its hook failed. A row that is not Dead marks nothing, nor
+    /// does a Dead row of a job this App never mounted. The dispatcher took
+    /// the App's job defs, as a kernel does, so the labels outlive the take.
+    #[test]
+    fn mark_dead_coverage_marks_retained_and_hooked_deads() {
+        let (sim, mut app, mut dispatcher) = dead_jobs_app();
+        run_to_dead(&mut app, &mut dispatcher, Kept {});
+        run_to_dead(&mut app, &mut dispatcher, Mourned {});
+        run_to_dead(&mut app, &mut dispatcher, Mourned {});
+        let failed = run_to_dead(&mut app, &mut dispatcher, Hapless {});
+        assert!(
+            failed
+                .last_error
+                .is_some_and(|e| e.starts_with(HOOK_FAILED)),
+            "the case: a Dead row whose hook failed"
+        );
+        let db = app.db_for_tests();
+        db.transact(|tx| {
+            tx.enqueue(Kept {});
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx: &mut Tx| {
+                tx.settle_job(
+                    &JobRow {
+                        id: charpente_core::table::Id::from_raw(9),
+                        name: "Unmounted".into(),
+                        payload: Vec::new(),
+                        key: None,
+                        status: JobStatus::Dead,
+                        attempts: 1,
+                        due_at: WallTime::UNIX_EPOCH,
+                        last_error: None,
+                        shape: None,
+                        scope: None,
+                        outbound_key: None,
+                    },
+                    &admission,
+                );
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().map_err(|f| f.error).unwrap();
+        let dead_keys = |sim: &Sim| -> BTreeMap<&'static str, u64> {
+            sim.coverage()
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("dead:"))
+                .collect()
+        };
+        assert!(dead_keys(&sim).is_empty());
+        assert_eq!(mark_dead_coverage(&sim, &app), Ok(()));
+        assert_eq!(
+            dead_keys(&sim),
+            BTreeMap::from([("dead:Hapless", 1), ("dead:Kept", 1), ("dead:Mourned", 2)])
+        );
     }
 
     /// A failed hook's Dead mark fails the check, which names the first such
