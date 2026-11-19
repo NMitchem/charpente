@@ -581,6 +581,35 @@ fn enqueue_after_needs_a_time_source() {
     });
 }
 
+/// A scoped job's timed enqueue lands as `Tx`'s does: `ScopedTx::enqueue_at`
+/// at its time, `ScopedTx::enqueue_after` at the transaction's time plus the
+/// delay, each in the tenant the transaction opened.
+#[test]
+fn a_scoped_timed_enqueue_keeps_its_due_time_and_its_tenant() {
+    let mut db = fresh_db(0x7A30_0005);
+    let mut g = db.begin_group().expect("group");
+    g.set_now(WallTime::from_nanos(1_000));
+    let adm = g.tenant_admission();
+    g.stage(|tx| {
+        let mut scoped = tx.admit_scope(Id::<OrgA>::from_raw(4), &adm);
+        scoped.enqueue_at(WallTime::from_nanos(5_000), InOrgA);
+        scoped.enqueue_after(std::time::Duration::from_nanos(250), InOrgA);
+        Ok::<_, ()>(())
+    })
+    .expect("stage");
+    g.commit().map_err(|f| f.error).expect("commit");
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.due_at, r.scope))
+            .collect::<Vec<_>>(),
+        vec![
+            ("in_org_a", WallTime::from_nanos(5_000), Some(4)),
+            ("in_org_a", WallTime::from_nanos(1_250), Some(4)),
+        ]
+    );
+}
+
 // 0.5.0 Task 9: a re-issue resends the dead job's own request under its own key.
 
 /// An outbound job whose payload is one byte, so a copy of the request is told
