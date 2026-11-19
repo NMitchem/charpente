@@ -364,9 +364,12 @@ impl FaultConfig {
             );
         }
         assert!(
-            u64::try_from(self.outbound_outage.0.as_nanos()).is_ok()
-                && u64::try_from(self.outbound_outage.1.as_nanos()).is_ok(),
-            "FaultConfig.outbound_outage {:?} exceeds u64 nanoseconds",
+            self.outbound_outage
+                .0
+                .checked_add(self.outbound_outage.1)
+                .is_some_and(|end| u64::try_from(end.as_nanos()).is_ok()),
+            "FaultConfig.outbound_outage {:?} — its end (start + length) exceeds u64 nanoseconds \
+             (584 years); shorten the window",
             self.outbound_outage
         );
         assert!(
@@ -1624,6 +1627,9 @@ impl Sim {
                 return Err(io::Error::other(outbound::no_model(host)));
             }
         }
+        if guard.outbound.declared.is_none() {
+            guard.outbound.declared = Some(hosts.iter().map(|h| h.to_string()).collect());
+        }
         let handle = guard.outbound.next_handle;
         guard.outbound.next_handle += 1;
         Ok(outbound::SimOutbound {
@@ -1656,14 +1662,17 @@ impl Sim {
     }
 
     /// Ends outbound fault injection for the rest of this universe: the
-    /// fault-free tail's outbound half, beside `quiesce_disk_faults`. No call
-    /// started after this is refused, lost, throttled, slowed or loses its
-    /// reply, and each skipped roll draws nothing, so a universe that never
+    /// fault-free tail's outbound half, beside `quiesce_disk_faults`. No
+    /// per-call roll fires after this: no call started after it is refused,
+    /// lost, throttled, slowed or loses its reply by chance, and each skipped
+    /// roll draws nothing. A drawn `outbound_outage` is not a roll: it ends
+    /// at its own drawn time, not here, and refuses its host's calls until
+    /// then. A universe that never calls this is unchanged, so a universe that never
     /// calls this is unchanged. Latency stays, since it is not a fault, and a
     /// request already in flight keeps the fate it drew. For an outbound
-    /// settle check (`checks::outbound_settles_by_horizon`): from here every
-    /// call reaches its remote and its reply comes back, so every outbound job
-    /// settles or retries to Dead.
+    /// settle check (`checks::outbound_settles_by_horizon`): from here, with
+    /// no outage in its window, every call reaches its remote and its reply
+    /// comes back, so every outbound job settles or retries to Dead.
     pub fn quiesce_outbound_faults(&self) {
         self.world.lock().outbound.quiet = true;
     }
@@ -4653,6 +4662,89 @@ mod tests {
     /// `sample_extended_fields` (what every `run_universes_swarm!` suite
     /// calls) turns it on, and `app_config` does for some seeds and
     /// `--faults-off outbound_outage` turns it off again.
+    #[test]
+    #[should_panic(expected = "shorten the window")]
+    fn an_outage_window_past_u64_nanoseconds_is_refused() {
+        let mut cfg = FaultConfig::none();
+        cfg.outbound_outage = (Duration::from_nanos(u64::MAX), Duration::from_nanos(1));
+        cfg.validate();
+    }
+
+    /// The pick and the window draw from no per-call stream: with every
+    /// per-call fault and latency on, two declared hosts and the window set
+    /// after every call (its host may be either), each call's result,
+    /// delivery time and the coverage equal the outage-off run.
+    #[test]
+    fn the_outage_pick_draws_from_no_per_call_stream() {
+        use crate::outbound::{Remote, from_fn};
+        use charpente::core::io::{
+            HttpMethod, IdempotencyKey, Outbound, OutboundCall, OutboundReply,
+        };
+        fn run(
+            seed: u64,
+            outage: (Duration, Duration),
+        ) -> (Vec<String>, Vec<u64>, BTreeMap<&'static str, u64>) {
+            let mut cfg = FaultConfig::none();
+            cfg.outbound_refused = 0.2;
+            cfg.outbound_lost_request = 0.2;
+            cfg.outbound_lost_reply = 0.2;
+            cfg.outbound_throttle = 0.2;
+            cfg.outbound_slow = 0.2;
+            cfg.outbound_latency = (Duration::from_millis(1), Duration::from_millis(50));
+            cfg.outbound_outage = outage;
+            let sim = Sim::with_faults(seed, cfg);
+            let ok = |_: &OutboundCall| OutboundReply {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            fn model(f: impl Remote) -> impl Remote {
+                f
+            }
+            sim.remote("a.test", model(from_fn(ok)));
+            sim.remote("b.test", model(from_fn(ok)));
+            let ob = sim.outbound(&["a.test", "b.test"]).unwrap();
+            let mut results = Vec::new();
+            for n in 0..40u8 {
+                let host = if n % 2 == 0 { "a.test" } else { "b.test" };
+                ob.start(
+                    u64::from(n),
+                    OutboundCall {
+                        host,
+                        method: HttpMethod::Post,
+                        path: "/x".into(),
+                        headers: Vec::new(),
+                        body: vec![n],
+                        key: IdempotencyKey::from_bytes([n; 16]),
+                    },
+                )
+                .unwrap();
+                sim.clock().sleep(Duration::from_secs(1));
+                while let Some((t, r)) = ob.poll() {
+                    results.push(format!(
+                        "{t}:{:?}",
+                        r.map(|r| r.status).map_err(|e| e.kind())
+                    ));
+                }
+            }
+            sim.clock().sleep(Duration::from_secs(1000));
+            while let Some((t, r)) = ob.poll() {
+                results.push(format!(
+                    "{t}:{:?}",
+                    r.map(|r| r.status).map_err(|e| e.kind())
+                ));
+            }
+            let at = sim.outbound_deliveries().iter().map(|d| d.at).collect();
+            (results, at, sim.coverage())
+        }
+        for seed in 0..20u64 {
+            let off = run(seed, (Duration::ZERO, Duration::ZERO));
+            // The calls end by 40 s; the window opens at 5000 s.
+            let on = run(seed, (Duration::from_secs(5000), Duration::from_secs(60)));
+            assert_eq!(on, off, "seed {seed}");
+        }
+    }
+
     #[test]
     fn the_outage_axis_is_sampled_app_only() {
         let mut app_on = 0;

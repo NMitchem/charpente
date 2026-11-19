@@ -221,6 +221,9 @@ pub(crate) struct OutboundWorld {
     /// call and only when the axis is on.
     outage_pick: Rng,
     outage_host: Option<String>,
+    /// The hosts the app declared: `Sim::outbound`'s list at the world's
+    /// first call, which the outage's pick ranges over.
+    pub(crate) declared: Option<std::collections::BTreeSet<String>>,
 }
 
 impl OutboundWorld {
@@ -240,6 +243,7 @@ impl OutboundWorld {
             latency: keyed_stream(seed, "outbound-rt:latency"),
             outage_pick: keyed_stream(seed, "outbound_outage_host"),
             outage_host: None,
+            declared: None,
         }
     }
 
@@ -324,9 +328,12 @@ impl Outbound for SimOutbound {
         let (start, length) = cfg.outbound_outage;
         let outage = !length.is_zero() && {
             if outbound.outage_host.is_none() {
-                let n = outbound.models.len() as u64;
-                let pick = outbound.outage_pick.below(n) as usize;
-                outbound.outage_host = outbound.models.keys().nth(pick).cloned();
+                let hosts = outbound.declared.as_ref().expect("a call needs a handle");
+                let n = hosts.len() as u64;
+                if n > 0 {
+                    let pick = outbound.outage_pick.below(n) as usize;
+                    outbound.outage_host = hosts.iter().nth(pick).cloned();
+                }
             }
             let (start, end) = (start.as_nanos() as u64, (start + length).as_nanos() as u64);
             outbound.outage_host.as_deref() == Some(call.host) && (start..end).contains(&now)

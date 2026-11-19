@@ -1283,3 +1283,58 @@ fn an_outage_refuses_every_call_to_its_host_through_the_quiesce() {
     // Three refused calls (probe, after quiesce, late in the window).
     assert_eq!(sim.coverage().get("fault:outbound_outage"), Some(&3));
 }
+
+/// The window is [start, start + length): a call at exactly the start is
+/// refused, and one at exactly the end is answered.
+#[test]
+fn an_outage_window_is_closed_at_its_start_and_open_at_its_end() {
+    let mut cfg = FaultConfig::none();
+    cfg.outbound_outage = (Duration::from_secs(10), Duration::from_secs(60));
+    let sim = Sim::with_faults(0xD7_0A02, cfg);
+    sim.remote(
+        "a.test",
+        charpente_sim::outbound::from_fn(|_: &OutboundCall| OutboundReply {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }),
+    );
+    let ob = sim.outbound(&["a.test"]).unwrap();
+    let try_call = |n: u8| {
+        ob.start(
+            u64::from(n),
+            OutboundCall {
+                host: "a.test",
+                method: HttpMethod::Post,
+                path: "/x".into(),
+                headers: Vec::new(),
+                body: vec![n],
+                key: CallKey::from_bytes([n; 16]),
+            },
+        )
+        .unwrap();
+        ob.poll()
+            .expect("answers at once")
+            .1
+            .map(|r| r.status)
+            .map_err(|e| e.kind())
+    };
+    sim.clock()
+        .sleep(Duration::from_secs(10) - Duration::from_nanos(1));
+    assert_eq!(try_call(1), Ok(200), "one nanosecond before the start");
+    sim.clock().sleep(Duration::from_nanos(1));
+    assert_eq!(
+        try_call(2),
+        Err(io::ErrorKind::ConnectionRefused),
+        "exactly the start"
+    );
+    sim.clock()
+        .sleep(Duration::from_secs(60) - Duration::from_nanos(1));
+    assert_eq!(
+        try_call(3),
+        Err(io::ErrorKind::ConnectionRefused),
+        "one nanosecond before the end"
+    );
+    sim.clock().sleep(Duration::from_nanos(1));
+    assert_eq!(try_call(4), Ok(200), "exactly the end");
+}

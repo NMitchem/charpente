@@ -3738,11 +3738,13 @@ the crash model as usual (`crash_apply`, `crash_torn`, `dir_entry_loss`).
 An outbound workload's tail needs the outbound half as well.
 `sim.quiesce_outbound_faults()` ends the five outbound fault axes for the rest of
 the run: no call started after it is refused, lost, throttled or slowed, or
-loses its reply. Each skipped roll draws nothing, so a run that never calls
+loses its reply by chance. A drawn `outbound_outage` is not a roll and runs to
+its own end, so calls to its host are refused after the quiesce until then.
+Each skipped roll draws nothing, so a run that never calls
 it replays exactly as before. Latency stays, since it is not a fault, and a
 request already in flight keeps the fate it drew. Call both, then run past the
-last backoff and deadline. From there every call reaches its remote and its
-reply comes back, so every outbound job settles or retries to Dead, which is
+last backoff and deadline. From there, outside an outage's window, every call
+reaches its remote and its reply comes back, so every outbound job settles or retries to Dead, which is
 what `outbound_settles_by_horizon` (below) checks.
 
 A realtime workload's settle phase has the same need for a different fault. The
@@ -4653,8 +4655,8 @@ refused:
 sim's clock, draws nothing per call, and `quiesce_outbound_faults` does not
 end it, so an outage outlives the fault-free tail and runs to its drawn end.
 That is how a job reaches Dead in a sim. The host is the one the universe's
-first outbound call picks, from the hosts with a registered remote in name
-order. The window is refused as `outbound_refused` is, and takes its place
+first outbound call picks, from the hosts the app declares (the list given to
+`sim.outbound`) in name order. The window is refused as `outbound_refused` is, and takes its place
 in the precedence. A length of zero is off, and an app with no hosts makes
 no call, so the axis is inert there.
 

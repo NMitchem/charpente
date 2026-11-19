@@ -535,9 +535,10 @@ fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
                 seed,
                 "--filter",
                 "orders_charge_once",
-                // 0.5.0 added the outage axis, which 0x37c7… draws on (eight
-                // refused calls and no re-call); these seeds were found for
-                // the clock refusal, so the new axis is held off.
+                // 0.5.0 added the outage axis, and both seeds draw it (0x37c7…
+                // sees eight refused calls and no re-call; 0x4af3… makes no
+                // call, so it is inert). `--faults-off` replays each seed's
+                // pre-axis universe exactly, which keeps their provenance.
                 "--faults-off",
                 "outbound_outage",
             ])
