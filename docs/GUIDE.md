@@ -2760,8 +2760,8 @@ serves. The log records no time for it; a seed's replay reproduces the same
 reading. `tx.now()` is reachable through a tenant-scoped transaction too, and
 on a follower's read route it is the follower's own held reading.
 
-The bound on how late a timed job runs comes from the node's clock check. A node whose clock is behind
-by less than the time since the store's newest recorded time (an API key's
+The bound on how late a timed job runs comes from the node's clock check. A
+node whose clock is behind by less than the time since the store's newest recorded time (an API key's
 creation, or a schedule's last tick) plus `CLOCK_TOLERANCE` opens unnoticed.
 For an app with no keys and no schedule of its own, that leaves the daily
 session sweep: about 24 h plus 60 s. So a timed obligation built on `tx.now()`
@@ -2770,8 +2770,8 @@ frequent schedule tightens the bound: the store then holds a recent time, and
 a clock behind it by more than the tolerance is refused at open.
 
 `Db::transact` and `Db::begin_group` carry no time, and `tx.now()` in them
-panics by name; `App::handle_at` carries one. A test gives a transaction one with `Db::transact_at(now, f)`, `Group::set_now(now)` on a
-group from `Db::begin_group`, or `App::transact_for_tests_at(now, f)`;
+panics by name; `App::handle_at` carries one. A test gives a transaction one
+with `Db::transact_at(now, f)`, `Group::set_now(now)` on a group from `Db::begin_group`, or `App::transact_for_tests_at(now, f)`;
 `App::begin_group` takes the time as its argument.
 
 ### Time-relative state: `tx.now()` and timed jobs
@@ -2785,7 +2785,35 @@ enqueue (§6, "Due at a time") for an obligation that has to happen later.
 **A hold that expires seven days after it is placed.** Enqueue the expiry
 when the hold is placed, and let the job do the work when it is due:
 
-```rust,ignore
+```rust
+use charpente::core::table::Id;
+use charpente::http::ApiError;
+use charpente::kernel::JobError;
+use charpente::{Tx, View, job, route, table};
+use std::time::Duration;
+
+#[table(global)]
+struct Hold {
+    id: Id<Hold>,
+    released: bool,
+}
+
+#[job(global)]
+struct Expire {
+    hold: u64,
+}
+
+impl Expire {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let id = Id::<Hold>::from_raw(self.hold);
+        if let Some(mut hold) = tx.get(id)? {
+            hold.released = true;
+            tx.put(&hold);
+        }
+        Ok(())
+    }
+}
+
 #[route(POST "/holds/:id", public)]
 fn place_hold(tx: &mut Tx, id: Id<Hold>) -> Result<(), ApiError> {
     tx.put(&Hold { id, released: false });
@@ -2800,22 +2828,49 @@ dispatcher reaches seven days after the step that placed the hold, and a
 kernel that was down at that moment runs it once on restart.
 
 **Cancelling is declining.** There is no cancel API for a timed job, and none
-is needed. A booking's reminder reads committed state when it runs and
-declines when the booking was cancelled in the meantime; a job that returns
-`Ok` without acting is Done, so nothing retries it:
+is needed. A booking's reminder is an outbound job (§6), and its `call` reads
+committed state when the job is due: it returns `Ok(None)` when the booking was
+cancelled in the meantime, and a job whose `call` declines is Done, so nothing
+retries it and nothing is sent:
 
-```rust,ignore
+```rust
+use charpente::core::table::Id;
+use charpente::kernel::JobError;
+use charpente::outbound::{Call, IdempotencyKey, Reply};
+use charpente::{Tx, View, job, table};
+
+#[table(global)]
+struct Booking {
+    id: Id<Booking>,
+    cancelled: bool,
+}
+
+#[job(global, outbound = "mail.example")]
+struct Remind {
+    booking: u64,
+}
+
 impl Remind {
-    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
-        let Some(booking) = tx.get(self.booking)? else { return Ok(()) };
+    fn call(&self, tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        let Some(booking) = tx.get(Id::<Booking>::from_raw(self.booking))? else {
+            return Ok(None);
+        };
         if booking.cancelled {
-            return Ok(());
+            return Ok(None);
         }
-        // ... send the reminder
+        Ok(Some(
+            Call::post("/remind").header("idempotency-key", key.as_str()),
+        ))
+    }
+
+    fn settle(self, _tx: &mut Tx, _reply: Reply) -> Result<(), JobError> {
         Ok(())
     }
 }
 ```
+
+A pure job declines the same way by doing nothing: `Expire` above leaves a
+hold alone that was already released. §6 covers `call` returning `Ok(None)`.
 
 **Lateness.** A timed job runs at its due time or later, never early in the
 node's own frame. How late is the bound `tx.now()` states above: a node whose
@@ -2826,7 +2881,8 @@ node was down runs once at recovery rather than once per missed moment.
 **Recurring work.** `App::schedule`'s `make` closure takes no tick time. The
 job it builds reads `tx.now()` when it runs, like any other job, so a nightly
 sweep that needs "everything older than 30 days" computes the cutoff from
-`tx.now()` and queries for it. Cron's catch-up rule (above) still applies: a
+`tx.now()` and queries for it. An obligation tied to one row is a timed
+enqueue, not a sweep. Cron's catch-up rule (above) still applies: a
 tick after downtime runs the job once, never once per missed interval.
 
 An app that needs a real-world timestamp on a row (an audit log callers expect

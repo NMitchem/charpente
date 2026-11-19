@@ -3467,6 +3467,7 @@ fn a_timed_outbound_job_calls_at_its_due_time() {
     kernel.run(&mut source).unwrap();
     let (rows, _) = jobs_and_paid(&kernel);
     assert_eq!(rows[0].status, JobStatus::Pending);
+    let minted = IdempotencyKey::from_bytes(rows[0].outbound_key.unwrap());
     assert!(
         sim.outbound_deliveries().is_empty(),
         "called before it was due"
@@ -3478,5 +3479,12 @@ fn a_timed_outbound_job_calls_at_its_due_time() {
     assert_eq!((rows[0].status, paid), (JobStatus::Done, 1));
     let at: Vec<u64> = sim.outbound_deliveries().iter().map(|d| d.at).collect();
     assert_eq!(at.len(), 1);
-    assert!(at[0] >= 10 * SEC, "the call went out at {at:?}, before 10s");
+    assert!(
+        (10 * SEC..11 * SEC).contains(&at[0]),
+        "the call went out at {at:?}, not within a second of its 10s due time"
+    );
+    assert!(
+        sim.outbound_deliveries()[0].key == minted,
+        "the call carried a key other than the one minted at staging"
+    );
 }

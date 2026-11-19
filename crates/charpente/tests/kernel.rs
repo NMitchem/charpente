@@ -8085,6 +8085,8 @@ mod timed_jobs {
     use super::*;
     use std::time::Duration;
 
+    // Seeds 0x71ED_0001..0005 run fault-free (FaultConfig::none()), so they only
+    // key entropy; no batch depends on them.
     const SEC: u64 = 1_000_000_000;
 
     fn counter_app(seed: u64) -> (Sim, App) {
@@ -8172,7 +8174,9 @@ mod timed_jobs {
         .unwrap();
         let db = app.db_for_tests();
         assert_eq!(run_pending(&mut dispatcher, db, 105 * SEC), 0);
-        // The node goes down at t+5 s; a fresh dispatcher rebuilds at t+60 s.
+        // A restart modelled as a fresh dispatcher rebuilt from the same store at
+        // t+60 s; no crash or reopen happens here (the sim-crash and stock-binary
+        // versions are Task 5's).
         let mut reopened = Dispatcher::new(jobs![CountUp]);
         reopened.rebuild(&db.snapshot().unwrap()).unwrap();
         assert_eq!(run_pending(&mut reopened, db, 160 * SEC), 1);
