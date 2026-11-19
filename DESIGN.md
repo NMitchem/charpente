@@ -749,8 +749,13 @@ and a global emit stays `0x09` byte for byte; its `EventRow` carries the
 tenant as a trailing `scope`, absent for every other row. `0x0c`/`0x0d` are the
 outbound enqueues: `0x08`/`0x0a` plus a 16-byte idempotency key the staging node drew
 from its `Entropy` (outbound-effects spec §6). An older binary refuses them by name as
-unknown tags, so downgrading after an outbound enqueue is unsupported. `0x0e` is the next
-free tag. A binary that does not know a tag (older, or a later
+unknown tags, so downgrading after an outbound enqueue is unsupported. `0x0e
+[flags: u8][job][payload][key: Option<String>][shape: u64][scope: u64 if flags & 0x01][okey: [u8; 16] if flags & 0x02][due_at: u64 nanos]`
+is the timed enqueue (0.5), a job carrying its due wall time: flag `0x01` is scoped and `0x02` is
+outbound, and any other bit is refused by name. The scoped flag is presence, never the tenant's
+value, as for `0x0a`. An enqueue with no due time stays `0x08`/`0x0a`/`0x0c`/`0x0d` byte for byte,
+and an older binary refuses `0x0e` as an unknown tag, so downgrading after a timed enqueue is
+unsupported. `0x0f` is the next free tag. A binary that does not know a tag (older, or a later
 one it hasn't caught up to) refuses it by name rather than misreading a
 wider record.
 Table effects are the transaction's collapsed write set in (table, scope,
@@ -1531,11 +1536,11 @@ Vec<(u64, Vec<u8>)> }` (tag 5, unchanged since before tenant scoping), a scoped 
 rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
 older binary already expects); the receiving side checks the message against its own
 schema's word for that table and refuses a mismatch by name rather than importing a row
-under the wrong scope. `PROTO_VERSION` is 7 — it bumps when a release changes the shape or the meaning of
+under the wrong scope. `PROTO_VERSION` is 8 — it bumps when a release changes the shape or the meaning of
 anything a peer ships (0.3 changed no wire bytes; stored times moved to wall scale): tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
 made it 3, job tenancy's `0x0a` made it 4, event tenancy's `0x0b` made it 5, outbound
 effects' `0x0c`/`0x0d` (and `JobRow`'s outbound key tail) made it 6, 0.3's wall-time
-platform columns made it 7, and a `Hello` declaring any other version is refused by name,
+platform columns made it 7, 0.5's `0x0e` timed enqueue made it 8, and a `Hello` declaring any other version is refused by name,
 with the fix (a fresh follower running this release) in the text; nothing is migrated. The follower
 buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot
 replace a `Db` it only borrows, so the CALLER (the kernel arm, T8) runs

@@ -3482,7 +3482,7 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
 /// one past the timed enqueue's `0x0e`. This test's
 /// own doc comment predicted exactly this collision when it was written
 /// against tag 7 (Task 6b): "so this stays true whichever tag a later task (6c or
-/// beyond) claims next" — tag 14 is simply one past the highest tag any
+/// beyond) claims next" — tag 15 is simply one past the highest tag any
 /// mounted feature claims today (job tenancy's `0x0a` moved the fixture from
 /// 10 to 11, event tenancy's `0x0b` from 11 to 12, and outbound effects'
 /// `0x0c`/`0x0d` from 12 to 14, DESIGN §4, and the timed enqueue's `0x0e` from 14

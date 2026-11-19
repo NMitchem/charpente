@@ -78,31 +78,32 @@ pub struct JobRow {
     pub key: Option<String>,
     pub status: JobStatus,
     pub attempts: u32,
-    /// When the job is next due. `WallTime::UNIX_EPOCH` means due now: every
-    /// enqueue writes it, and only a retry moves it.
+    /// When the job is next due. `WallTime::UNIX_EPOCH` means due now: an
+    /// enqueue with no due time writes it, a timed enqueue (`0x0e`) writes its
+    /// own time, and a retry moves it.
     pub due_at: WallTime,
     /// The last failure's message (handler error or absorbed panic) — the
     /// dead-letter record's substance (hard rule 5).
     pub last_error: Option<String>,
     /// The enqueuing type's `Job::FINGERPRINT`, from the record's `0x08`,
-    /// `0x0a`, `0x0c` or `0x0d` tag; `None` for a row applied from a pre-shape
+    /// `0x0a`, `0x0c`, `0x0d` or `0x0e` tag; `None` for a row applied from a pre-shape
     /// `0x02` record. Encoded after `last_error` and only when `Some`, so a
     /// row written before this field existed decodes unchanged: `last_error`
     /// before it is tagged, and only `scope` and `outbound_key` below can
     /// follow it (payload-shapes spec §2, job-tenancy spec §6).
     pub shape: Option<u64>,
     /// The tenant a `#[job(scoped_by = …)]` job was enqueued in, from the
-    /// record's `0x0a` or `0x0d` tag. `None` for a `global` job (`0x08`,
+    /// record's `0x0a`, `0x0d` or `0x0e` (flag `0x01`) tag. `None` for a `global` job (`0x08`,
     /// `0x0c`) and for a row applied from a pre-shape record. Encoded after
     /// `shape`, and only when `Some`. A scoped row always has a shape, because
-    /// only `0x0a`/`0x0d` write a scope, so every row written before this field
+    /// only `0x0a`/`0x0d`/`0x0e` write a scope, and all carry the shape, so every row written before this field
     /// existed decodes unchanged. `Some(0)` is tenant 0: presence, not value
     /// (job-tenancy spec §6).
     pub scope: Option<u64>,
-    /// An outbound job's idempotency key, from the record's `0x0c`/`0x0d` tag
-    /// (outbound-effects spec §6). Encoded after `scope`, only when `Some`, so
+    /// An outbound job's idempotency key, from the record's `0x0c`/`0x0d` tag,
+    /// or `0x0e` with flag `0x02` (outbound-effects spec §6). Encoded after `scope`, only when `Some`, so
     /// every row written before it decodes unchanged. Requires a shape: only
-    /// `0x0c`/`0x0d` write one, and both carry the shape.
+    /// `0x0c`/`0x0d`/`0x0e` write one, and all carry the shape.
     pub outbound_key: Option<[u8; 16]>,
 }
 
