@@ -249,6 +249,7 @@ fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_th
         ws.join("crates/charpente-sim")
     ));
     std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+    pin_to_workspace_lock(&ws, &app);
 
     let target = target_dir();
     run_ok(
@@ -301,6 +302,7 @@ fn deleting_the_scaffolds_enqueue_turns_the_second_property_red_with_a_seed_that
         ws.join("crates/charpente-sim")
     ));
     std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+    pin_to_workspace_lock(&ws, &app);
 
     // README: "delete the `tx.enqueue` line in `src/lib.rs`".
     let lib = read(&app.join("src/lib.rs"));
@@ -441,6 +443,13 @@ fn the_emitted_clippy_toml_is_a_subset_of_the_workspace_fence() {
     }
 }
 
+/// A pinned replay depends on the resolved storage-engine version, so a patched
+/// scaffold resolves against the workspace's Cargo.lock, not crates.io's newest.
+#[allow(clippy::disallowed_methods)]
+fn pin_to_workspace_lock(ws: &Path, app: &Path) {
+    std::fs::copy(ws.join("Cargo.lock"), app.join("Cargo.lock")).unwrap();
+}
+
 /// A scaffold named `name`, its manifest patched to build against THIS
 /// workspace.
 // Rewriting the scaffold's manifest is edge tooling (DESIGN.md §1): the rig
@@ -459,6 +468,7 @@ fn patched_scaffold(name: &str) -> PathBuf {
         ws.join("crates/charpente-sim")
     ));
     std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+    pin_to_workspace_lock(&ws, &app);
     app
 }
 
@@ -746,6 +756,9 @@ fn the_scaffold_draws_its_inputs() {
 /// for that reason, by name, and the misdirected write that excuses it must
 /// have fired. A re-keyed fault stream that no longer reaches corruption
 /// fails here rather than passing quietly.
+// Seed chosen at the workspace Cargo.lock's versions (the patched scaffold builds against
+// it): `--runs 300` batches under master seeds 1..5, first excused skip with a misdirected
+// write fired (master 5).
 #[test]
 fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
     let app = patched_scaffold("pinned");
@@ -760,7 +773,7 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
             "--filter",
             "acked_post_implies_the_echo_after_recovery",
             "--seed",
-            "0x535bb998c76a02ae",
+            "0x48a1018f057f9dc9",
         ])
         .output()
         .unwrap();
@@ -791,7 +804,7 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
             "--filter",
             "acked_post_implies_the_echo_after_recovery",
             "--seed",
-            "0x535bb998c76a02ae",
+            "0x48a1018f057f9dc9",
         ])
         .output()
         .unwrap();
@@ -799,10 +812,10 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
     assert!(
         human.ends_with(
             "check acked_post_implies_the_echo_after_recovery ... skipped\n    skipped: durable \
-             corruption fired, so the acked enqueue is excused\n    fired:   clock:skewed: 1, \
-             crash:dropped: 2, fault:misdirected_write: 1, fault:write_error: 1, restart: 1\n\n\
+             corruption fired, so the acked enqueue is excused\n    fired:   crash:torn: 6, \
+             fault:misdirected_write: 1, fault:write_error: 1, restart: 1\n\n\
              sim result: nothing tested. 0 passed; 0 failed; 1 skipped, on seed \
-             0x535bb998c76a02ae.\n"
+             0x48a1018f057f9dc9.\n"
         ),
         "skipped for corruption, by name:\n{human}"
     );
