@@ -159,7 +159,9 @@ fn success_writes_exactly_six_files_and_names_them() {
         assert!(out.contains(rel), "stdout must list {rel}:\n{out}");
     }
     assert!(
-        out.contains("cargo clippy") && out.contains("charpente test --sim"),
+        out.contains("cargo clippy")
+            && out.contains("charpente test --sim")
+            && out.contains("charpente test --mutants --file src/lib.rs --test-package my-app"),
         "{out}"
     );
     // Exactly six: nothing else at the top level or under src/ and tests/.

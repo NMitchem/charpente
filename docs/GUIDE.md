@@ -35,13 +35,14 @@ Install the CLI once. The crate is `charpente-cli`; the binary it installs is `c
 cargo install charpente-cli
 ```
 
-Then scaffold an app and run its two gates:
+Then scaffold an app and run its gates:
 
 ```text
 charpente new myapp
 cd myapp
 cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app
 charpente test --sim                        # seeded fault-injection runs
+charpente test --mutants --file src/lib.rs --test-package myapp   # every mutant your properties miss
 ```
 
 `charpente new` writes six files and does nothing else — no `git init`, no build, no

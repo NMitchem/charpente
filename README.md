@@ -174,6 +174,7 @@ cargo install charpente-cli
 charpente new myapp && cd myapp
 cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app (no clippy? rustup component add clippy)
 charpente test --sim                        # seeded fault-injection runs
+charpente test --mutants --file src/lib.rs --test-package myapp   # every mutant your properties miss
 ```
 
 Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the check `acked_post_implies_the_echo_after_recovery` goes FAILED with the inputs that break it, shrunk to a run no shrinking step can make smaller, and a command that replays them. That is the whole pitch.
