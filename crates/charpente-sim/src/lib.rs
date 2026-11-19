@@ -1667,8 +1667,8 @@ impl Sim {
     /// lost, throttled, slowed or loses its reply by chance, and each skipped
     /// roll draws nothing. A drawn `outbound_outage` is not a roll: it ends
     /// at its own drawn time, not here, and refuses its host's calls until
-    /// then. A universe that never calls this is unchanged, so a universe that never
-    /// calls this is unchanged. Latency stays, since it is not a fault, and a
+    /// then. A universe that never calls this is unchanged.
+    /// Latency stays, since it is not a fault, and a
     /// request already in flight keeps the fate it drew. For an outbound
     /// settle check (`checks::outbound_settles_by_horizon`): from here, with
     /// no outage in its window, every call reaches its remote and its reply

@@ -3744,8 +3744,8 @@ Each skipped roll draws nothing, so a run that never calls
 it replays exactly as before. Latency stays, since it is not a fault, and a
 request already in flight keeps the fate it drew. Call both, then run past the
 last backoff and deadline. From there, outside an outage's window, every call
-reaches its remote and its reply comes back, so every outbound job settles or retries to Dead, which is
-what `outbound_settles_by_horizon` (below) checks.
+reaches its remote and its reply comes back, so every outbound job settles or
+retries to Dead, which is what `outbound_settles_by_horizon` (below) checks.
 
 A realtime workload's settle phase has the same need for a different fault. The
 subscriber-stall rate is the one fault axis the sim does not inject itself: a
