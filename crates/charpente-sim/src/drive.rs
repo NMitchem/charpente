@@ -47,9 +47,9 @@ pub const TAIL_SETTLE_CAP: u32 = 256;
 /// the year 2262. A retry whose doubling backoff saturated is due at the end
 /// of the range, where the platform's daily sweep has no next slot and the
 /// kernel stops on the overflow, so no run goes near it: the job stays
-/// Pending, and once one extension has run to the limit the tail fails at
-/// once, by its own text naming the row's due time, since another could
-/// reach no further.
+/// Pending, and once one extension has run to the limit (its reach met or
+/// passed it, to the nanosecond) the tail fails at once, by its own text
+/// naming the row's due time, since another could reach no further.
 const SETTLE_LIMIT: u64 = u64::MAX / 2;
 
 /// Boots a step tries before it treats the boot as lost to fallout, as the
@@ -288,13 +288,14 @@ impl<'s> Drive<'s> {
     ///   at attempt <a> — an outbound job settles, retries to Dead, or waits
     ///   for a later due time; this one did none of them within the cap of
     ///   256`, naming the first such job by id.
-    /// - An extension has run to the year 2262 and a job is still due past
-    ///   it: `Drive::recover: outbound job <id> ("<name>") is still Pending
-    ///   at attempt <a>, due <due>, and the tail ran <n> extensions, the last
-    ///   to the year 2262, past which it does not run — a due time that far
-    ///   out means the job's retry backoff saturated, so no run reaches its
-    ///   next attempt; give the job a retry policy that ends, a retry(max =
-    ///   …) small enough that it reaches Dead`, naming the job due last.
+    /// - An extension has run to the year 2262 (its reach met or passed the
+    ///   limit) and an outbound job is still Pending and due:
+    ///   `Drive::recover: outbound job <id> ("<name>") is still Pending at
+    ///   attempt <a>, due <due>, and the tail ran <n> extensions, the last to
+    ///   the year 2262, past which it does not run — a due time that far out
+    ///   means the job's retry backoff saturated, so no run reaches its next
+    ///   attempt; give the job a retry policy that ends, a retry(max = …)
+    ///   small enough that it reaches Dead`, naming the job due last.
     /// - A failed read of the store, after a run, in the store's words.
     /// - An app that declares a host the workload registered no model for:
     ///   the missing-remote text [`Drive::faulted_phase`] gives.
@@ -352,9 +353,10 @@ impl<'s> Drive<'s> {
             let Some(&(reach, ref far)) = due.iter().max_by_key(|(wait, _)| *wait) else {
                 break wall;
             };
-            // An extension to the limit leaves no reach for the next one.
+            // An extension to the limit leaves no reach for the next one, so
+            // the last one having run to it fails the tail whatever is due.
             let limit = SETTLE_LIMIT.saturating_sub(clock.as_nanos());
-            if ran_to_limit && reach > limit {
+            if ran_to_limit {
                 return Err(format!(
                     "Drive::recover: outbound job {} (\"{}\") is still Pending at attempt {}, \
                      due {}, and the tail ran {extensions} extensions, the last to the year \
@@ -380,7 +382,7 @@ impl<'s> Drive<'s> {
                 ));
             }
             extensions += 1;
-            ran_to_limit = reach > limit;
+            ran_to_limit = reach >= limit;
             let horizon = sim.now().as_nanos().saturating_add(reach.min(limit));
             let mut source = SimSource::new(Box::new(sim.clock()), horizon);
             kernel.run(&mut source).map_err(stopped)?;
@@ -499,4 +501,79 @@ fn outage_left(sim: &Sim) -> Duration {
 /// the end of virtual time is no horizon.
 fn after(start: u64, offset: Duration) -> u64 {
     start.saturating_add(u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use charpente::Schema;
+    use charpente::http::AppConfig;
+    use charpente::kernel::JobError;
+    use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
+
+    #[charpente::job(global, retain_dead, outbound = "due.test")]
+    struct Due {}
+
+    impl Due {
+        fn call(
+            &self,
+            _tx: &charpente::Tx,
+            _key: &IdempotencyKey,
+        ) -> Result<Option<Call>, JobError> {
+            Ok(Some(Call::post("/x")))
+        }
+
+        fn settle(self, _tx: &mut charpente::Tx, _reply: Reply) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+
+    /// A row with no attempt made keeps the tail running from the wall its
+    /// due time names: "not yet due" is due after the wall, never at it, as
+    /// the kernel reads a due time. Left out at its own instant, the row would
+    /// end the tail Pending with no attempt (the mutation sweep's 455:59).
+    #[test]
+    fn a_row_due_at_the_wall_keeps_the_tail_running() {
+        // Fault-free, so the seed only names the universe.
+        let sim = Sim::with_faults(0xD7_0B08, crate::FaultConfig::none());
+        let mut app = App::open(
+            Box::new(sim.disk()),
+            Schema::new(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(charpente::jobs![Due])
+        .outbound(Host::new("due.test"));
+        let due = WallTime::from_nanos(5_000_000_000);
+        app.transact_for_tests(|tx| {
+            tx.enqueue_at(due, Due {});
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+        let before = WallTime::from_nanos(due.as_nanos() - 1);
+        assert!(
+            unsettled(&app, before, before, Duration::ZERO)
+                .unwrap()
+                .is_empty(),
+            "a nanosecond before its due time the row is not yet due"
+        );
+        let rows = unsettled(&app, due, due, Duration::ZERO).unwrap();
+        let [(reach, row)] = &rows[..] else {
+            panic!(
+                "at its due time the row is due, and keeps the tail running: {} rows",
+                rows.len()
+            );
+        };
+        assert_eq!(
+            (row.name.as_str(), row.attempts, row.due_at),
+            ("Due", 0, due)
+        );
+        let timeout = app.outbound_timeout_for_sim("Due").unwrap();
+        assert_eq!(
+            *reach,
+            u64::try_from((timeout + Duration::from_secs(1)).as_nanos()).unwrap(),
+            "due now, it waits only its timeout and the slack"
+        );
+    }
 }

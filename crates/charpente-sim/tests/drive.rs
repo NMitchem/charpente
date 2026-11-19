@@ -1871,6 +1871,28 @@ impl Remote for Unanswering {
     }
 }
 
+/// `Unanswering`, counting the calls that reach it. The cap bounds the
+/// tail's work, so past `bound` calls the tail has run on without one, and
+/// the model stops the test with that rather than let it spin.
+struct Capped {
+    calls: u64,
+    bound: u64,
+}
+
+impl Remote for Capped {
+    fn handle(&mut self, call: &OutboundCall, rng: &mut Rng) -> OutboundReply {
+        self.calls += 1;
+        assert!(
+            self.calls <= self.bound,
+            "the tail made {} calls to {}, more than {TAIL_SETTLE_CAP} extensions of a \
+             never-settling job make: it did not stop at its cap",
+            self.calls,
+            call.host
+        );
+        Unanswering.handle(call, rng)
+    }
+}
+
 /// Retries without backoff, effectively forever: each attempt is a 1 s
 /// timeout, so virtual time moves and no due time grows.
 #[job(
@@ -1952,7 +1974,13 @@ fn never_settles(seed: u64, path: &str) -> (Sim, String) {
             ..FaultConfig::none()
         },
     );
-    sim.remote("stuck.test", Unanswering);
+    sim.remote(
+        "stuck.test",
+        Capped {
+            calls: 0,
+            bound: 1_000,
+        },
+    );
     let drive = Drive::new(&sim, stuck_app);
     let phase = drive
         .faulted_phase(
@@ -2004,4 +2032,47 @@ fn a_tail_that_cannot_settle_fails_by_name_at_the_cap() {
         "the tail stopped short of the year 2262: {}",
         sim.true_wall()
     );
+}
+
+/// An extension whose reach meets the limit to the nanosecond runs to the
+/// limit, so the tail fails after it, by the limit's text, without a second
+/// extension that could reach no further (R-21, the mutation sweep's 362:34).
+/// The universe is built, not searched: fault-free but for an outage on every
+/// call that ends 2 s (the 1 s timeout plus the 1 s slack) before the limit,
+/// so the one extension's reach, the outage's remaining length plus those
+/// 2 s, equals the limit exactly.
+#[test]
+fn a_tail_whose_reach_meets_the_limit_exactly_fails_after_one_extension() {
+    let end = u64::MAX / 2 - charpente_sim::SIM_WALL_BASE_NANOS - 2_000_000_000;
+    let sim = Sim::with_faults(
+        0xD7_0B05,
+        FaultConfig {
+            outbound_outage: (Duration::ZERO, Duration::from_nanos(end)),
+            ..FaultConfig::none()
+        },
+    );
+    sim.remote("stuck.test", Unanswering);
+    let drive = Drive::new(&sim, stuck_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/doubling/1"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let err = drive
+        .recover(&phase, Duration::from_secs(5))
+        .err()
+        .expect("a job due past the limit fails the tail");
+    assert_eq!(
+        err,
+        "Drive::recover: outbound job 0 (\"Doubling\") is still Pending at attempt 28, due \
+         2281-03-11T18:07:30.000Z, and the tail ran 1 extensions, the last to the year 2262, past which it does \
+         not run — a due time that far out means the job's retry backoff saturated, so no run \
+         reaches its next attempt; give the job a retry policy that ends, a retry(max = …) \
+         small enough that it reaches Dead"
+    );
+    // The one extension ran to the limit: the kernel's last step was the
+    // daily sweep's last slot before the year 2262.
+    assert_eq!(sim.true_wall().as_nanos(), 9_223_286_400_000_000_000);
 }

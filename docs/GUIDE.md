@@ -3784,9 +3784,9 @@ ends. Fix the model, or give the job, and the chain its hook makes, a policy
 that ends. A named job at attempt 0 was due and never dispatched, so it is a
 row the kernel lost, not the app's: report it with the run's seed.
 
-- The limit: an extension has run to the year 2262 and a job is still due
-  past it. The text names the job due last and its due time, and comes before
-  the cap:
+- The limit: an extension has run to the year 2262, its reach meeting or
+  passing the limit, and an outbound job is still Pending and due. The text
+  names the job due last and its due time, and comes before the cap:
 
 <!-- pinned -->
 ```text
