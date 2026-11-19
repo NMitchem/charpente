@@ -4188,6 +4188,165 @@ fn a_tick_that_applied_before_only_the_wal_was_poisoned_answers_ok_and_never_re_
     );
 }
 
+/// Fails the next `Disk::list` once armed. The WAL's segment GC lists its
+/// directory at every checkpoint, so under `latch_config` that is the cadence
+/// checkpoint's GC, after the store and the breadcrumb have persisted.
+struct OneShotListFaultDisk {
+    inner: charpente_sim::SimDisk,
+    armed: Arc<AtomicBool>,
+    fired: Arc<AtomicU64>,
+}
+
+impl charpente_core::io::Disk for OneShotListFaultDisk {
+    fn open(&self, path: &str) -> std::io::Result<Box<dyn charpente_core::io::File>> {
+        self.inner.open(path)
+    }
+
+    fn remove(&self, path: &str) -> std::io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            return Err(std::io::Error::other("simulated list failure"));
+        }
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> std::io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+/// One `Db::transact` that puts a `Counter` and answers 7, under
+/// `latch_config`'s checkpoint after every record, over `disk`, whose fault
+/// `armed` arms just before it.
+fn transact_over_a_fault(
+    sim: &Sim,
+    disk: Box<dyn charpente_core::io::Disk>,
+    armed: &AtomicBool,
+) -> (App, Result<u64, TxError<std::io::Error>>) {
+    let mut app = App::open(
+        disk,
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        latch_config(),
+    )
+    .unwrap();
+    let db = app.db_for_tests();
+    armed.store(true, Ordering::SeqCst);
+    let out = db.transact(|tx| {
+        tx.put(&Counter {
+            id: Id::from_raw(1),
+            hits: 1,
+        });
+        Ok::<u64, std::io::Error>(7)
+    });
+    (app, out)
+}
+
+/// `Db::transact`'s own arms of the rule the two tests above hold the
+/// kernel's wrappers to (its I-1 comment). Here the record reached the store,
+/// then the cadence checkpoint's store sync failed: the store latches, which
+/// `Db::store_failed()` reports, so the transaction keeps its `Ok`.
+#[test]
+fn db_transact_keeps_its_ok_when_a_store_latch_reports_its_checkpoint_failure() {
+    let sim = Sim::with_faults(0x60C0_0014, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let disk = Box::new(OneShotStoreSyncFaultDisk {
+        inner: sim.disk(),
+        store_path: latch_config().db.store_path.clone(),
+        armed: armed.clone(),
+        fired: fired.clone(),
+        reads: Arc::new(AtomicU64::new(0)),
+    });
+    let (mut app, out) = transact_over_a_fault(&sim, disk, &armed);
+    let db = app.db_for_tests();
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the store's sync must fail exactly once, in the transaction's own cadence checkpoint"
+    );
+    assert!(
+        db.store_failed(),
+        "the store latched, or this is not the arm under test"
+    );
+    assert!(matches!(out, Ok(7)), "{out:?}");
+    assert_eq!(
+        db.snapshot().unwrap().scan::<Counter>().unwrap().len(),
+        1,
+        "the record is durable"
+    );
+}
+
+/// The arm where the log reports it: the store and the breadcrumb
+/// checkpointed, then the WAL's segment GC failed. That poisons the log and
+/// latches no store, so `Db::poisoned()` alone reports the failure, and the
+/// transaction keeps its `Ok`.
+#[test]
+fn db_transact_keeps_its_ok_when_the_logs_poison_reports_its_checkpoint_failure() {
+    let sim = Sim::with_faults(0x60C0_0015, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let disk = Box::new(OneShotListFaultDisk {
+        inner: sim.disk(),
+        armed: armed.clone(),
+        fired: fired.clone(),
+    });
+    let (mut app, out) = transact_over_a_fault(&sim, disk, &armed);
+    let db = app.db_for_tests();
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the WAL's listing must fail exactly once, in the cadence checkpoint's GC"
+    );
+    assert!(
+        db.poisoned() && !db.store_failed(),
+        "the log poisoned and the store did not latch, or this is not the arm under test"
+    );
+    assert!(matches!(out, Ok(7)), "{out:?}");
+}
+
+/// The arm nothing else reports: the store checkpointed, then the horizon
+/// breadcrumb's sync failed. That poisons nothing and latches nothing, so
+/// `Db::transact` answers `Err`.
+#[test]
+fn db_transact_answers_err_when_nothing_else_reports_its_checkpoint_failure() {
+    let sim = Sim::with_faults(0x60C0_0016, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let disk = Box::new(OneShotStoreSyncFaultDisk {
+        inner: sim.disk(),
+        store_path: format!("{}.horizon", latch_config().db.store_path),
+        armed: armed.clone(),
+        fired: fired.clone(),
+        reads: Arc::new(AtomicU64::new(0)),
+    });
+    let (mut app, out) = transact_over_a_fault(&sim, disk, &armed);
+    let db = app.db_for_tests();
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the breadcrumb's sync must fail exactly once, in the transaction's own cadence \
+         checkpoint"
+    );
+    assert!(
+        !db.poisoned() && !db.store_failed(),
+        "a breadcrumb sync failure poisons nothing and latches nothing, or this is not the arm \
+         under test"
+    );
+    let err = out.expect_err(
+        "a checkpoint failure nothing else reports must reach the caller: swallowed, it freezes \
+         WAL GC and the breadcrumb with nobody told",
+    );
+    assert!(
+        format!("{err:?}").contains("simulated fsync failure"),
+        "{err:?}"
+    );
+}
+
 /// The third commit-failure arm. The tick's batch applied and the store
 /// checkpointed, then the horizon breadcrumb's sync failed. That write is raw
 /// `Disk` IO behind neither the WAL's guard nor the store's backend, so it
