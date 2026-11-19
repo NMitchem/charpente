@@ -2756,11 +2756,11 @@ runner.
 A route, a job, and a job a schedule enqueued can read the time of the step they run in:
 `tx.now()` returns a `WallTime`, the reading the kernel held at the start of
 that step (§7, "Clock errors"), the same value for every transaction the step
-serves. The log records no time for it, so replaying a seed replays the same
+serves. The log records no time for it; a seed's replay reproduces the same
 reading. `tx.now()` is reachable through a tenant-scoped transaction too, and
 on a follower's read route it is the follower's own held reading.
 
-The bound is the one that holds the node's clock. A node whose clock is behind
+The bound on how late a timed job runs comes from the node's clock check. A node whose clock is behind
 by less than the time since the store's newest recorded time (an API key's
 creation, or a schedule's last tick) plus `CLOCK_TOLERANCE` opens unnoticed.
 For an app with no keys and no schedule of its own, that leaves the daily
@@ -2769,87 +2769,69 @@ can run late by up to that much, and never early in the node's own frame. A
 frequent schedule tightens the bound: the store then holds a recent time, and
 a clock behind it by more than the tolerance is refused at open.
 
-Outside a kernel a transaction carries no time and `tx.now()` panics by name.
-A test gives it one with `Db::transact_at(now, f)`, `Group::set_now(now)` on a
+`Db::transact` and `Db::begin_group` carry no time, and `tx.now()` in them
+panics by name; `App::handle_at` carries one. A test gives a transaction one with `Db::transact_at(now, f)`, `Group::set_now(now)` on a
 group from `Db::begin_group`, or `App::transact_for_tests_at(now, f)`;
 `App::begin_group` takes the time as its argument.
 
-### A logical clock: reading "now" inside a transaction
+### Time-relative state: `tx.now()` and timed jobs
 
-§4 was explicit that a transaction closure receives only `&mut Tx` — no
-`Clock` reaches inside it. That is by design (a wall-clock read inside a
-transaction is exactly the ambient nondeterminism the platform exists to
-remove), but it leaves a real question open: how does an app express
-"overdue," or any other time-relative state, at all?
+A transaction receives only `&mut Tx`; no `Clock` reaches inside it, because a
+wall-clock read there is the ambient nondeterminism the platform exists to
+remove. "Overdue" and every other time-relative rule is expressed with the two
+things the platform does give you: `tx.now()` for a comparison, and a timed
+enqueue (§6, "Due at a time") for an obligation that has to happen later.
 
-There is no platform primitive for this in v0 — the pattern is to build
-one the same way cron itself is built: a singleton counter row, advanced
-by exactly one cron-ticked job, is the app's own logical clock. Because a
-cron tick is already one transaction, "what time is it" becomes an
-ordinary table read instead of a call to an ambient clock, and the clock
-inherits cron's catch-up rule (above) for free — a tick after downtime
-still advances the counter by exactly one step, never backfilling every
-missed interval. That suits "advance the current period" logic, but not a
-deadline: the counter takes one step for all the intervals a downtime
-missed, so it lags the wall clock by about the time the node was down, and a
-deadline built on it ("7 days after the hold") fires late by that much.
+**A hold that expires seven days after it is placed.** Enqueue the expiry
+when the hold is placed, and let the job do the work when it is due:
 
-```rust
-use charpente::core::table::Id;
-use charpente::http::{App, AppConfig};
-use charpente::kernel::JobError;
-use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, View, job, jobs, table};
-use std::time::Duration;
-
-/// Singleton row (fixed id 0): the app's own day counter. Nothing but
-/// `AdvanceDay::run` ever writes it, and it only ever adds one.
-#[table(global)]
-struct AppClock {
-    id: Id<AppClock>,
-    day: u64,
-}
-
-const APP_CLOCK_ID: u64 = 0;
-
-#[job(global)]
-struct AdvanceDay {}
-
-impl AdvanceDay {
-    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
-        let clock_id = Id::<AppClock>::from_raw(APP_CLOCK_ID);
-        let mut clock = tx.get(clock_id)?.unwrap_or(AppClock {
-            id: clock_id,
-            day: 0,
-        });
-        clock.day += 1;
-        tx.put(&clock);
-        // `clock.day` is now this transaction's only source of "today" —
-        // e.g. an invoice with `due_day <= clock.day` is overdue, computed
-        // from a table read, never from `SystemTime::now()`.
-        Ok(())
-    }
-}
-
-fn build_app(data_dir: &str) -> std::io::Result<App> {
-    Ok(App::open(
-        Box::new(ProdDisk::new(data_dir)?),
-        Schema::new().table::<AppClock>(),
-        Box::new(ProdEntropy::new()?),
-        AppConfig::default(),
-    )?
-    .mount_jobs(jobs![AdvanceDay])
-    .schedule("advance-day", Duration::from_secs(24 * 3600), || {
-        AdvanceDay {}
-    }))
+```rust,ignore
+#[route(POST "/holds/:id", public)]
+fn place_hold(tx: &mut Tx, id: Id<Hold>) -> Result<(), ApiError> {
+    tx.put(&Hold { id, released: false });
+    tx.enqueue_after(Duration::from_secs(7 * 24 * 3600), Expire { hold: id.raw() });
+    Ok(())
 }
 ```
 
-Any row that needs a "created at" in this same app-relative space stores
-the `AppClock` reading at write time (`clock.day`, read like any other
-row) rather than a timestamp. There is no wall-clock equivalent in v0 —
-an app that genuinely needs real-world timestamps (an audit log callers
-expect in UTC, say) has no sanctioned source for one yet.
+The hold and its expiry commit in one transaction, so there is never a hold
+without its expiry or an expiry without its hold. The job runs once the
+dispatcher reaches seven days after the step that placed the hold, and a
+kernel that was down at that moment runs it once on restart.
+
+**Cancelling is declining.** There is no cancel API for a timed job, and none
+is needed. A booking's reminder reads committed state when it runs and
+declines when the booking was cancelled in the meantime; a job that returns
+`Ok` without acting is Done, so nothing retries it:
+
+```rust,ignore
+impl Remind {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let Some(booking) = tx.get(self.booking)? else { return Ok(()) };
+        if booking.cancelled {
+            return Ok(());
+        }
+        // ... send the reminder
+        Ok(())
+    }
+}
+```
+
+**Lateness.** A timed job runs at its due time or later, never early in the
+node's own frame. How late is the bound `tx.now()` states above: a node whose
+clock was behind at open can hold a job back by up to the time since the
+store's newest recorded time plus `CLOCK_TOLERANCE`, and a job due while the
+node was down runs once at recovery rather than once per missed moment.
+
+**Recurring work.** `App::schedule`'s `make` closure takes no tick time. The
+job it builds reads `tx.now()` when it runs, like any other job, so a nightly
+sweep that needs "everything older than 30 days" computes the cutoff from
+`tx.now()` and queries for it. Cron's catch-up rule (above) still applies: a
+tick after downtime runs the job once, never once per missed interval.
+
+An app that needs a real-world timestamp on a row (an audit log callers expect
+in UTC, say) stores `tx.now().as_nanos()` in it; a seed's replay reproduces the
+same reading.
 
 ### Putting it together
 

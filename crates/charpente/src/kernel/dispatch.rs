@@ -333,14 +333,15 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Feeds jobs drained from `Db::drain_enqueued` (fresh enqueues are due
-    /// immediately: due_at `WallTime::UNIX_EPOCH`).
+    /// Feeds jobs drained from `Db::drain_enqueued`, each queued at its own
+    /// `due_at`: `WallTime::UNIX_EPOCH` for a plain enqueue (due at once), the
+    /// stated time for a timed one.
     pub fn note_enqueued(&mut self, enqueued: Vec<Enqueued>) {
         for e in enqueued {
             if e.outbound {
-                self.queue_outbound(WallTime::UNIX_EPOCH, e.id.raw());
+                self.queue_outbound(e.due_at, e.id.raw());
             } else {
-                self.due.insert((WallTime::UNIX_EPOCH, e.id.raw()));
+                self.due.insert((e.due_at, e.id.raw()));
             }
         }
     }

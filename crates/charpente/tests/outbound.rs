@@ -3444,3 +3444,39 @@ fn planted_trusting_settle_is_a_phantom_charge_with_a_recorded_seed() {
         honest.coverage()
     );
 }
+
+/// Task 4 (0.5.0): a timed outbound job's call starts at its due time. A
+/// route enqueues it while the kernel runs, so the live dispatcher (not
+/// `rebuild`) queues it.
+#[charpente::route(POST "/pay-later", public)]
+fn pay_later(tx: &mut Tx) -> Result<(), ApiError> {
+    tx.enqueue_after(Duration::from_secs(10), Pay { n: 0 });
+    Ok(())
+}
+
+#[test]
+fn a_timed_outbound_job_calls_at_its_due_time() {
+    use charpente::http::{Method, Request};
+    let sim = Sim::with_faults(0x71ED_0005, FaultConfig::none());
+    sim.remote("pay.test", Recorder::new());
+    let app = pay_app(&sim, Host::new("pay.test"), 0).mount(charpente::routes![pay_later]);
+    let outbound = sim.outbound(&app.outbound_hosts()).unwrap();
+    let mut kernel = Kernel::with_outbound(app, Box::new(sim.clock()), Box::new(outbound)).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), 9 * SEC);
+    source.push_at(0, Request::new(Method::Post, "/pay-later"));
+    kernel.run(&mut source).unwrap();
+    let (rows, _) = jobs_and_paid(&kernel);
+    assert_eq!(rows[0].status, JobStatus::Pending);
+    assert!(
+        sim.outbound_deliveries().is_empty(),
+        "called before it was due"
+    );
+    kernel
+        .run(&mut SimSource::new(Box::new(sim.clock()), 20 * SEC))
+        .unwrap();
+    let (rows, paid) = jobs_and_paid(&kernel);
+    assert_eq!((rows[0].status, paid), (JobStatus::Done, 1));
+    let at: Vec<u64> = sim.outbound_deliveries().iter().map(|d| d.at).collect();
+    assert_eq!(at.len(), 1);
+    assert!(at[0] >= 10 * SEC, "the call went out at {at:?}, before 10s");
+}

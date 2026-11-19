@@ -79,8 +79,8 @@ pub struct JobRow {
     pub status: JobStatus,
     pub attempts: u32,
     /// When the job is next due. `WallTime::UNIX_EPOCH` means due now: an
-    /// enqueue with no due time writes it, a timed enqueue (`0x0e`) writes its
-    /// own time, and a retry moves it.
+    /// enqueue writes it, a timed one (`0x0e`) with its due time, and a retry
+    /// moves it.
     pub due_at: WallTime,
     /// The last failure's message (handler error or absorbed panic) — the
     /// dead-letter record's substance (hard rule 5).

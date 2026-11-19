@@ -93,8 +93,8 @@ deadlines inside the process; it is never stored (no table codec exists for it) 
 nothing after a restart. `wall` is `WallTime`, UTC nanoseconds since the Unix epoch, for every
 time that is stored or compared with anything outside the process. Each node builds one
 `ProdClock` and clones it (same origin) to everything that reads time. The kernel reads both
-once per step (`kernel::Now`); a stored wall due time (a job's `due_at`, a schedule's
-`next_due`) becomes the loop's monotonic wake-up as `now.mono + (due - now.wall)`, recomputed
+once per step (`kernel::Now`); a stored wall due time (a job's `due_at`, which a timed enqueue sets
+and the live dispatcher queues at once, or a schedule's `next_due`) becomes the loop's monotonic wake-up as `now.mono + (due - now.wall)`, recomputed
 every step, so a wall-clock step moves a wake-up at the next step rather than freezing it.
 
 The wall half never runs backwards within a node. Every step's reading passes through a hold
@@ -524,7 +524,7 @@ of applying the log. There is no other way to mutate state.
 
 **What a transaction cannot do:** await the network, read the wall clock directly (it reads
 `tx.now()`, the step's held wall reading: every route, job and job a schedule enqueued in one kernel step
-reads the one value the loop took at the step's start, so replaying the log replays it), generate ambient randomness (it gets seeded entropy),
+reads the one value the loop took at the step's start, so a seed's replay reproduces it; the log carries no time), generate ambient randomness (it gets seeded entropy),
 or spawn tasks. External effects are expressed as enqueued jobs that run *after* commit.
 
 **Why.** Three properties fall out of this single decision:

@@ -8079,3 +8079,137 @@ fn request_clones_equal() {
     assert_eq!(copy.headers, request.headers);
     assert_eq!(copy.body, request.body);
 }
+
+/// Task 4 (0.5.0): the live dispatcher honours a timed enqueue's due time.
+mod timed_jobs {
+    use super::*;
+    use std::time::Duration;
+
+    const SEC: u64 = 1_000_000_000;
+
+    fn counter_app(seed: u64) -> (Sim, App) {
+        let sim = Sim::with_faults(seed, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Counter>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![CountUp]);
+        (sim, app)
+    }
+
+    fn run_pending(dispatcher: &mut Dispatcher, db: &mut Db, now: u64) -> usize {
+        let mut ran = 0;
+        loop {
+            dispatcher.note_enqueued(db.drain_enqueued());
+            if !dispatcher.has_due(wall(now)) {
+                return ran;
+            }
+            dispatcher.run_due(db, at(now)).unwrap();
+            ran += 1;
+        }
+    }
+
+    fn hits(db: &Db) -> u64 {
+        db.snapshot()
+            .unwrap()
+            .get(Id::<Counter>::from_raw(1))
+            .unwrap()
+            .map_or(0, |c| c.hits)
+    }
+
+    fn statuses(db: &Db) -> Vec<JobStatus> {
+        db.snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.status)
+            .collect()
+    }
+
+    #[test]
+    fn a_timed_job_runs_at_its_due_time_and_not_before() {
+        let (_sim, mut app) = counter_app(0x71ED_0001);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        app.transact_for_tests_at(wall(100 * SEC), |tx| {
+            tx.enqueue_after(Duration::from_secs(10), CountUp { slot: 1 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        let db = app.db_for_tests();
+        assert_eq!(run_pending(&mut dispatcher, db, 109 * SEC), 0);
+        assert_eq!(statuses(db), vec![JobStatus::Pending]);
+        assert_eq!(run_pending(&mut dispatcher, db, 111 * SEC), 1);
+        assert_eq!(run_pending(&mut dispatcher, db, 112 * SEC), 0);
+        assert_eq!((statuses(db), hits(db)), (vec![JobStatus::Done], 1));
+    }
+
+    #[test]
+    fn a_past_due_time_runs_at_once() {
+        let (_sim, mut app) = counter_app(0x71ED_0002);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        app.transact_for_tests_at(wall(100 * SEC), |tx| {
+            tx.enqueue_at(wall(5 * SEC), CountUp { slot: 1 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        let db = app.db_for_tests();
+        assert_eq!(run_pending(&mut dispatcher, db, 100 * SEC), 1);
+        assert_eq!(hits(db), 1);
+    }
+
+    #[test]
+    fn a_job_due_while_the_node_was_down_runs_once_at_recovery() {
+        let (_sim, mut app) = counter_app(0x71ED_0003);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        app.transact_for_tests_at(wall(100 * SEC), |tx| {
+            tx.enqueue_after(Duration::from_secs(10), CountUp { slot: 1 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        let db = app.db_for_tests();
+        assert_eq!(run_pending(&mut dispatcher, db, 105 * SEC), 0);
+        // The node goes down at t+5 s; a fresh dispatcher rebuilds at t+60 s.
+        let mut reopened = Dispatcher::new(jobs![CountUp]);
+        reopened.rebuild(&db.snapshot().unwrap()).unwrap();
+        assert_eq!(run_pending(&mut reopened, db, 160 * SEC), 1);
+        assert_eq!(run_pending(&mut reopened, db, 161 * SEC), 0);
+        assert_eq!((statuses(db), hits(db)), (vec![JobStatus::Done], 1));
+    }
+
+    #[charpente::route(POST "/hold-forever", public)]
+    fn hold_forever(tx: &mut Tx) -> Result<(), charpente::http::ApiError> {
+        tx.enqueue_after(Duration::MAX, CountUp { slot: 1 });
+        Ok(())
+    }
+
+    /// Enqueued by a route while the kernel runs, so the live dispatcher (not
+    /// `rebuild`) meets the far-future due time.
+    #[test]
+    fn a_job_due_at_the_end_of_time_stays_pending_without_overflow() {
+        use charpente::http::{Method, Request};
+        use charpente::kernel::{Kernel, SimSource};
+        let sim = Sim::with_faults(0x71ED_0004, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Counter>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(charpente::routes![hold_forever])
+        .mount_jobs(jobs![CountUp]);
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        let mut source = SimSource::new(Box::new(sim.clock()), 3 * 3600 * SEC);
+        source.push_at(0, Request::new(Method::Post, "/hold-forever"));
+        kernel.run(&mut source).unwrap();
+        let snap = kernel.app().db().snapshot().unwrap();
+        let rows = snap.scan::<JobRow>().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, JobStatus::Pending);
+        assert_eq!(rows[0].due_at, WallTime::from_nanos(u64::MAX));
+    }
+}
