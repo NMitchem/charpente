@@ -29,7 +29,7 @@ struct Incident {
     open: bool,
 }
 
-#[job(retry(max = 2, backoff = "1s"), scoped_by = Org)]
+#[job(retry(max = 2, backoff = "1s"), scoped_by = Org, retain_dead)]
 struct Notify {
     incident: u64,
 }
@@ -45,7 +45,7 @@ impl Notify {
     }
 }
 
-#[job(scoped_by = Org, cross_tenant)]
+#[job(scoped_by = Org, retain_dead, cross_tenant)]
 struct Tally {}
 
 impl Tally {
@@ -55,7 +55,7 @@ impl Tally {
     }
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Audit {}
 
 impl Audit {

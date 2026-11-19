@@ -5840,7 +5840,7 @@ struct Tally {
     count: u64,
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Bump {
     slot: u64,
 }

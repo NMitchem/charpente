@@ -5325,6 +5325,119 @@ impl Seeder {
 mod tests {
     use super::*;
 
+    // ------------------------------------------- the Dead record (0.5.0 §5 C)
+
+    /// Two hand-written jobs for `DeadRecord::into_typed`: `DeadPong` has
+    /// `DeadPing`'s shape under another name.
+    struct DeadPing;
+    struct DeadPong;
+
+    impl Codec for DeadPing {
+        fn encode(&self, _out: &mut Vec<u8>) {}
+        fn decode(_input: &mut &[u8]) -> io::Result<DeadPing> {
+            Ok(DeadPing)
+        }
+    }
+
+    impl Codec for DeadPong {
+        fn encode(&self, _out: &mut Vec<u8>) {}
+        fn decode(_input: &mut &[u8]) -> io::Result<DeadPong> {
+            Ok(DeadPong)
+        }
+    }
+
+    impl Job for DeadPing {
+        const NAME: &'static str = "Ping";
+        const FINGERPRINT: u64 = 0xD0_0D;
+        type Scope = crate::table::Unscoped;
+    }
+
+    impl Job for DeadPong {
+        const NAME: &'static str = "Pong";
+        const FINGERPRINT: u64 = 0xD0_0D;
+        type Scope = crate::table::Unscoped;
+    }
+
+    /// The row the dispatcher hands `from_row`: the attempt counted and its
+    /// error written, still Pending until the Dead mark settles it.
+    fn failed_ping() -> JobRow {
+        JobRow {
+            id: Id::from_raw(9),
+            name: "Ping".into(),
+            payload: vec![],
+            key: None,
+            status: crate::job::JobStatus::Pending,
+            attempts: 3,
+            due_at: WallTime::UNIX_EPOCH,
+            last_error: Some("the remote refused".into()),
+            shape: Some(0xD0_0D),
+            scope: None,
+            outbound_key: Some([7; 16]),
+        }
+    }
+
+    #[test]
+    fn a_dead_record_reads_the_failure_its_row_records() {
+        let admission = TenantAdmission(std::marker::PhantomData);
+        let mut row = failed_ping();
+        let dead = crate::job::DeadRecord::from_row(&row, &admission).into_typed::<DeadPing>();
+        assert_eq!(dead.attempts(), 3);
+        assert_eq!(dead.last_error(), "the remote refused");
+        assert_eq!(
+            dead.key(),
+            Some(crate::io::IdempotencyKey::from_bytes([7; 16]))
+        );
+        row.outbound_key = None;
+        let pure = crate::job::DeadRecord::from_row(&row, &admission).into_typed::<DeadPing>();
+        assert_eq!(pure.key(), None, "a pure job's row carries no key");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "contract: a Dead record of job \"Ping\" was opened as job \"Pong\" — a \
+                    Dead<J> carries the job it was made from; the glue #[job] generates opens it \
+                    as its own type"
+    )]
+    fn a_dead_record_opens_only_as_the_job_it_was_made_from() {
+        let admission = TenantAdmission(std::marker::PhantomData);
+        let _ =
+            crate::job::DeadRecord::from_row(&failed_ping(), &admission).into_typed::<DeadPong>();
+    }
+
+    /// Same name, another shape: the name alone does not open it.
+    #[test]
+    #[should_panic(expected = "contract: a Dead record of job \"Ping\" was opened as job \"Ping\"")]
+    fn a_dead_record_does_not_open_as_another_shape_of_its_name() {
+        let admission = TenantAdmission(std::marker::PhantomData);
+        let mut row = failed_ping();
+        row.shape = Some(0xD0_0E);
+        let _ = crate::job::DeadRecord::from_row(&row, &admission).into_typed::<DeadPing>();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "dispatcher invariant: job 9 (\"Ping\") has no last_error, but a Dead record \
+                    is made from the failure that kills its job"
+    )]
+    fn a_dead_record_is_made_from_a_recorded_failure() {
+        let admission = TenantAdmission(std::marker::PhantomData);
+        let mut row = failed_ping();
+        row.last_error = None;
+        let _ = crate::job::DeadRecord::from_row(&row, &admission);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "dispatcher invariant: job 9 (\"Ping\") has 0 attempts, but a Dead record is \
+                    made from a failed attempt"
+    )]
+    fn a_dead_record_is_made_from_a_counted_attempt() {
+        let admission = TenantAdmission(std::marker::PhantomData);
+        let mut row = failed_ping();
+        row.attempts = 0;
+        let _ = crate::job::DeadRecord::from_row(&row, &admission);
+    }
+
     /// Plan amendment A4, proved before `#[job]` calls `scoped_fingerprint`.
     /// Continuing a field fold over `#scoped_by\0` + NAME + `\0` reproduces
     /// the one-pass hash the macro computes today over the path's rendering,

@@ -1,0 +1,11 @@
+error: `on_dead` and `retain_dead` are two answers to one question — keep the one this job means
+ --> tests/compile_fail/job_with_both_dead_stances.rs:5:24
+  |
+5 | #[job(global, on_dead, retain_dead)]
+  |                        ^^^^^^^^^^^
+
+error: `on_dead` and `retain_dead` are two answers to one question — keep the one this job means
+ --> tests/compile_fail/job_with_both_dead_stances.rs:8:28
+  |
+8 | #[job(global, retain_dead, on_dead)]
+  |                            ^^^^^^^

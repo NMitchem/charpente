@@ -24,8 +24,8 @@ use charpente_core::table::Row;
 use crate::auth::sweep::SESSION_SWEEP_NAME;
 use crate::auth::{ApiKey, SessionSweep};
 use crate::http::{App, EmittedEvent, Route, RouteGlue, Session};
-use crate::kernel::JobDef;
 use crate::kernel::cron::{CronEntry, CronRow};
+use crate::kernel::{DeadStance, JobDef};
 use crate::wire::{TypeDef, TypeRegistry, TypeSchema};
 
 #[derive(Serialize)]
@@ -197,6 +197,9 @@ pub struct JobInfo {
     /// `#[job(…, outbound = "<host>")]`: the host and the kernel's deadline
     /// (outbound-effects spec §11); `None` for a pure job.
     pub outbound: Option<OutboundInfo>,
+    /// The job's Dead stance, `"on_dead"` or `"retain_dead"`, as its `#[job]`
+    /// declares it: the inventory of which jobs act when their retries run out.
+    pub dead: &'static str,
 }
 
 #[derive(Serialize)]
@@ -375,6 +378,10 @@ fn job_info(def: &JobDef) -> JobInfo {
             host: o.host,
             timeout_ms: u64::try_from(o.timeout.as_millis()).expect("a timeout fits u64 millis"),
         }),
+        dead: match def.dead {
+            DeadStance::Retain => "retain_dead",
+            DeadStance::Hook(_) => "on_dead",
+        },
     }
 }
 
@@ -504,13 +511,15 @@ pub fn to_human(c: &Contract) -> String {
         };
         writeln!(
             out,
-            "  {} max={} backoff_nanos={} scoped_by={} cross_tenant={} builtin={} {outbound}",
+            "  {} max={} backoff_nanos={} scoped_by={} cross_tenant={} builtin={} {outbound} \
+             dead={}",
             j.name,
             j.retry.max,
             j.retry.backoff_nanos,
             j.scoped_by.unwrap_or("none"),
             j.cross_tenant,
-            j.builtin
+            j.builtin,
+            j.dead
         )
         .unwrap();
     }

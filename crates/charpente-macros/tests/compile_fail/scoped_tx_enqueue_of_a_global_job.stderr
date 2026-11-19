@@ -9,8 +9,8 @@ error[E0271]: type mismatch resolving `<Audit as Job>::Scope == Org`
 note: expected this to be `Org`
   --> tests/compile_fail/scoped_tx_enqueue_of_a_global_job.rs:23:1
    |
-23 | #[job(global)]
-   | ^^^^^^^^^^^^^^
+23 | #[job(global, retain_dead)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 note: required by a bound in `ScopedTx::<'_, 'a, S>::enqueue`
   --> $WORKSPACE/crates/charpente-core/src/db.rs
    |

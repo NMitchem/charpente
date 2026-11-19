@@ -1,0 +1,7 @@
+error: `Ping` declares no Dead stance — a job says what its Dead means. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `on_dead` if the app must act when the job's retries run out (the job then has `fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError>`, whose writes commit with the Dead mark), or `retain_dead` if the Dead row, kept with its last error, is all that should happen. Neither is the default.
+ --> tests/compile_fail/job_without_a_dead_stance.rs:8:1
+  |
+8 | #[job(global)]
+  | ^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)

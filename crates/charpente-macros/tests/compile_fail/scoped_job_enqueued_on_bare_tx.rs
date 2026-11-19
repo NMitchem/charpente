@@ -32,7 +32,7 @@ struct Incident {
     title: String,
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct NotifySubscribers {
     incident: u64,
 }

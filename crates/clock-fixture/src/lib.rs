@@ -80,7 +80,7 @@ pub struct Ticks {
     pub count: u64,
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 pub struct Tick {}
 
 impl Tick {
@@ -102,7 +102,7 @@ pub struct Reminded {
 }
 
 /// The timed job: one `Reminded` increment, run once at its due time.
-#[job(global)]
+#[job(global, retain_dead)]
 pub struct Remind {}
 
 impl Remind {

@@ -1,8 +1,8 @@
 error[E0599]: expected an `Fn<_>` closure, found `Charge`
  --> tests/compile_fail/outbound_run_instead_of_call.rs:7:1
   |
-7 | #[job(global, outbound = "api.stripe.com")]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected an `Fn<_>` closure, found `Charge`
+7 | #[job(global, retain_dead, outbound = "api.stripe.com")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected an `Fn<_>` closure, found `Charge`
 8 | struct Charge {}
   | ------------- associated function or constant `call` not found for this struct because it doesn't satisfy `Charge: Fn<_>`
   |
@@ -26,8 +26,8 @@ note: the trait `Fn` must be implemented
 error[E0599]: no associated function or constant named `settle` found for struct `Charge` in the current scope
  --> tests/compile_fail/outbound_run_instead_of_call.rs:7:1
   |
-7 | #[job(global, outbound = "api.stripe.com")]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `Charge`
+7 | #[job(global, retain_dead, outbound = "api.stripe.com")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `Charge`
 8 | struct Charge {}
   | ------------- associated function or constant `settle` not found for this struct
   |

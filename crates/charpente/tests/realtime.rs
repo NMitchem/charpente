@@ -5548,7 +5548,7 @@ fn enqueue_notify(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), Ap
 
 /// A scoped job's `run` holds `&mut ScopedTx`: its `tx.emit` is its tenant's
 /// event, and its `(**tx).emit` is a global one.
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct NotifyOrg {
     n: u64,
 }

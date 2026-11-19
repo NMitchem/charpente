@@ -4,7 +4,7 @@
 use charpente::kernel::JobError;
 use charpente::{Tx, job};
 
-#[job(global, outbound = "api.stripe.com")]
+#[job(global, retain_dead, outbound = "api.stripe.com")]
 struct Charge {}
 
 impl Charge {

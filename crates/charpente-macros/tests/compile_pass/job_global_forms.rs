@@ -5,7 +5,7 @@
 use charpente::kernel::JobError;
 use charpente::{CrossTenant, Tx, job};
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Plain {
     n: u64,
 }
@@ -17,7 +17,7 @@ impl Plain {
     }
 }
 
-#[job(retry(max = 2, backoff = "5s"), global)]
+#[job(retry(max = 2, backoff = "5s"), global, retain_dead)]
 struct RetryFirst {}
 
 impl RetryFirst {
@@ -26,7 +26,7 @@ impl RetryFirst {
     }
 }
 
-#[job(cross_tenant, global,)]
+#[job(cross_tenant, global, retain_dead,)]
 struct CapabilityFirst {}
 
 impl CapabilityFirst {

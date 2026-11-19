@@ -23,7 +23,7 @@ impl Tenant for Org {
     }
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct ApplyWindow {}
 
 impl ApplyWindow {

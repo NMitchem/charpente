@@ -1302,6 +1302,8 @@ mod tests {
             fingerprint: 0x7E57_0702,
             glue: noop_glue,
             outbound: None,
+            dead: crate::kernel::DeadStance::Retain,
+            dead_coverage: "dead:receipt",
         }]);
         let server = serve("127.0.0.1:0", app).unwrap();
         // A deadline before `wait`, whose join would otherwise block forever
@@ -1406,6 +1408,8 @@ mod tests {
             fingerprint: 0x7E57_0704,
             glue: cron_foreign_shape_glue,
             outbound: None,
+            dead: crate::kernel::DeadStance::Retain,
+            dead_coverage: "dead:receipt",
         }])
         .schedule("drift", std::time::Duration::from_millis(1), || {
             DriftedCronReceipt
@@ -2163,7 +2167,7 @@ mod tests {
         panic!("no completion within 5s");
     }
 
-    #[crate::job(global, outbound = "pay.test")]
+    #[crate::job(global, retain_dead, outbound = "pay.test")]
     struct ServeTestCharge {}
 
     impl ServeTestCharge {
@@ -2658,7 +2662,7 @@ mod tests {
         assert!(Refusal::of(&err).is_some(), "not a Refusal: {err}");
     }
 
-    #[crate::job(global, outbound = "ledger.test")]
+    #[crate::job(global, retain_dead, outbound = "ledger.test")]
     struct ServeTestLedger {}
 
     impl ServeTestLedger {
@@ -2817,7 +2821,7 @@ mod tests {
         );
     }
 
-    #[crate::job(global, outbound = "pay.test")]
+    #[crate::job(global, retain_dead, outbound = "pay.test")]
     struct ServeTestPing {}
 
     impl ServeTestPing {

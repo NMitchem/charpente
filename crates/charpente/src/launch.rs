@@ -492,7 +492,7 @@ mod tests {
         App::open(disk, Schema::new(), entropy, AppConfig::default())
     }
 
-    #[crate::job(global, outbound = "pay.test")]
+    #[crate::job(global, retain_dead, outbound = "pay.test")]
     struct LaunchTestCharge {}
 
     impl LaunchTestCharge {
@@ -582,6 +582,8 @@ mod tests {
             fingerprint: 0x7E57_0702, // the shape MOUNTED — different
             glue: noop_glue,
             outbound: None,
+            dead: crate::kernel::DeadStance::Retain,
+            dead_coverage: "dead:receipt",
         }]))
     }
 
@@ -1391,7 +1393,7 @@ mod tests {
         value: u64,
     }
 
-    #[job(global)]
+    #[job(global, retain_dead)]
     struct RestoreDeliver {
         slot: u64,
     }

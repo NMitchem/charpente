@@ -52,7 +52,7 @@ struct Counter {
     hits: u64,
 }
 
-#[job(global, retry(max = 3, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 3, backoff = "10s"))]
 struct CountUp {
     slot: u64,
 }
@@ -106,7 +106,7 @@ fn job_macro_derives_codec_name_retry_and_glue() {
     assert_eq!((counters[0].id.raw(), counters[0].hits), (4, 1));
 }
 
-#[job(global, retry(max = 2, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 2, backoff = "10s"))]
 struct AlwaysFails {}
 
 impl AlwaysFails {
@@ -115,7 +115,7 @@ impl AlwaysFails {
     }
 }
 
-#[job(global, retry(max = 2, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 2, backoff = "10s"))]
 struct Panics {}
 
 impl Panics {
@@ -130,7 +130,7 @@ mod receipt_v1 {
     use charpente::kernel::JobError;
     use charpente::{Tx, job};
 
-    #[job(global)]
+    #[job(global, retain_dead)]
     pub struct SendReceipt {
         pub invoice: u64,
     }
@@ -148,7 +148,7 @@ mod receipt_v2 {
     use charpente::{Tx, job};
 
     /// v1 plus a field.
-    #[job(global)]
+    #[job(global, retain_dead)]
     pub struct SendReceipt {
         pub invoice: u64,
         pub copies: u32,
@@ -193,7 +193,7 @@ mod receipt_v1_deferring {
         Id::from_raw(0)
     }
 
-    #[job(global, retry(max = 3, backoff = "2s"))]
+    #[job(global, retain_dead, retry(max = 3, backoff = "2s"))]
     pub struct SendReceipt {
         pub invoice: u64,
     }
@@ -295,7 +295,7 @@ mod scoped_jobs {
 
     /// Writes one row in its tenant. An even `n` also hands its tenant a
     /// scoped follow-up, keyed, and enqueues a global tally beside it.
-    #[job(scoped_by = Desk)]
+    #[job(scoped_by = Desk, retain_dead)]
     pub struct File {
         pub n: u64,
     }
@@ -315,7 +315,7 @@ mod scoped_jobs {
         }
     }
 
-    #[job(scoped_by = Desk)]
+    #[job(scoped_by = Desk, retain_dead)]
     pub struct Stamp {
         pub n: u64,
     }
@@ -330,7 +330,7 @@ mod scoped_jobs {
         }
     }
 
-    #[job(global)]
+    #[job(global, retain_dead)]
     pub struct Tally {
         pub n: u64,
     }
@@ -347,7 +347,7 @@ mod scoped_jobs {
 
     /// Always fails, naming the tenant its `run` was handed, so every
     /// attempt's `last_error` records which tenant that attempt ran in.
-    #[job(scoped_by = Desk, retry(max = 3, backoff = "1s"))]
+    #[job(scoped_by = Desk, retain_dead, retry(max = 3, backoff = "1s"))]
     pub struct Jam {
         pub n: u64,
     }
@@ -363,7 +363,7 @@ mod scoped_jobs {
     }
 
     /// The declared fan-out (spec §2 R5): one `File` into each desk it names.
-    #[job(global, cross_tenant)]
+    #[job(global, retain_dead, cross_tenant)]
     pub struct Sweep {}
 
     impl Sweep {
@@ -510,7 +510,7 @@ mod scoped_jobs {
 
     /// Reads its desk's row 1 through `filed_alias::Filed`, and fails on
     /// nothing else.
-    #[job(scoped_by = Desk, retry(max = 1, backoff = "1s"))]
+    #[job(scoped_by = Desk, retain_dead, retry(max = 1, backoff = "1s"))]
     pub struct PeeksFiled {}
 
     impl PeeksFiled {
@@ -674,7 +674,7 @@ mod scoped_jobs {
         use charpente::kernel::JobError;
         use charpente::{Tx, job};
 
-        #[job(global)]
+        #[job(global, retain_dead)]
         pub struct Reconcile {
             pub n: u64,
         }
@@ -693,7 +693,7 @@ mod scoped_jobs {
         use charpente::{ScopedTx, job};
 
         /// v1 with its tenancy changed, and nothing else.
-        #[job(scoped_by = Desk)]
+        #[job(scoped_by = Desk, retain_dead)]
         pub struct Reconcile {
             pub n: u64,
         }
@@ -1014,7 +1014,7 @@ mod scoped_jobs {
         use charpente::kernel::JobError;
         use charpente::{ScopedTx, job};
 
-        #[job(scoped_by = Desk)]
+        #[job(scoped_by = Desk, retain_dead)]
         pub struct File {
             pub n: u64,
         }
@@ -1177,7 +1177,7 @@ mod scoped_jobs {
         }
     }
 
-    #[job(scoped_by = billing::Org)]
+    #[job(scoped_by = billing::Org, retain_dead)]
     pub struct Invoice {
         pub n: u64,
     }
@@ -1368,7 +1368,7 @@ mod scoped_jobs {
         use charpente::kernel::JobError;
         use charpente::{ScopedTx, job};
 
-        #[job(scoped_by = Org)]
+        #[job(scoped_by = Org, retain_dead)]
         pub struct Report {
             pub n: u64,
         }
@@ -1388,7 +1388,7 @@ mod scoped_jobs {
         use charpente::kernel::JobError;
         use charpente::{ScopedTx, job};
 
-        #[job(scoped_by = Org)]
+        #[job(scoped_by = Org, retain_dead)]
         pub struct Report {
             pub n: u64,
         }
@@ -1547,7 +1547,7 @@ mod scoped_jobs {
         pub mod v1 {
             use super::*;
 
-            #[job(scoped_by = first::Org)]
+            #[job(scoped_by = first::Org, retain_dead)]
             pub struct Note {
                 pub n: u64,
             }
@@ -1563,7 +1563,7 @@ mod scoped_jobs {
         pub mod v2 {
             use super::*;
 
-            #[job(scoped_by = second::Org)]
+            #[job(scoped_by = second::Org, retain_dead)]
             pub struct Note {
                 pub n: u64,
             }
@@ -1613,7 +1613,7 @@ mod scoped_jobs {
 
     /// A `Board` job whose payload decodes exactly as `File`'s does, so its
     /// glue, swapped into `File`'s `JobDef`, runs a `File` row in `Board`.
-    #[job(scoped_by = Board)]
+    #[job(scoped_by = Board, retain_dead)]
     pub struct Pin {
         pub n: u64,
     }
@@ -1971,7 +1971,7 @@ fn panicking_handler_is_absorbed_into_the_retry_path() {
     );
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct ReadFaults {}
 
 impl ReadFaults {
@@ -3955,7 +3955,7 @@ fn crash_config() -> AppConfig {
     }
 }
 
-#[job(global, retry(max = 3, backoff = "5s"))]
+#[job(global, retain_dead, retry(max = 3, backoff = "5s"))]
 struct Flaky {
     roll: u64,
 }
@@ -5960,7 +5960,7 @@ fn an_enqueue_of_an_unmounted_job_type_keeps_the_not_registered_path() {
 
 /// A job whose handler still enqueues the v1 shape of a job name this binary
 /// mounts at v2.
-#[job(global, retry(max = 1, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 1, backoff = "10s"))]
 struct ForwardsReceipt {}
 
 impl ForwardsReceipt {
@@ -6066,7 +6066,7 @@ fn ledger_alias_refusal() -> String {
     )
 }
 
-#[job(global, retry(max = 1, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 1, backoff = "10s"))]
 struct WritesLedgerUnscoped {}
 
 impl WritesLedgerUnscoped {
@@ -6184,7 +6184,7 @@ struct Stray {
     n: u64,
 }
 
-#[job(global, retry(max = 1, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 1, backoff = "10s"))]
 struct WritesStray {}
 
 impl WritesStray {
@@ -6222,7 +6222,7 @@ mod invoice_b {
 }
 
 /// Two attempts, so its pin sees the refusal retried before it dead-letters.
-#[job(global, retry(max = 2, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 2, backoff = "10s"))]
 struct WritesOtherInvoice {}
 
 impl WritesOtherInvoice {
@@ -7108,7 +7108,7 @@ mod job_tenancy {
     /// Fails every attempt for a fifth of its nonces, so retries, and the
     /// death that ends them, run under the fault matrix. Hands a third of its
     /// nonces a scoped follow-up.
-    #[job(scoped_by = Shop, retry(max = 2, backoff = "1s"))]
+    #[job(scoped_by = Shop, retain_dead, retry(max = 2, backoff = "1s"))]
     struct Fulfil {
         marker: u64,
     }
@@ -7132,7 +7132,7 @@ mod job_tenancy {
         }
     }
 
-    #[job(scoped_by = Shop)]
+    #[job(scoped_by = Shop, retain_dead)]
     struct Notify {
         marker: u64,
     }
@@ -7147,7 +7147,7 @@ mod job_tenancy {
         }
     }
 
-    #[job(scoped_by = Shop)]
+    #[job(scoped_by = Shop, retain_dead)]
     struct Restock {
         marker: u64,
     }
@@ -7164,7 +7164,7 @@ mod job_tenancy {
 
     /// The declared fan-out (spec §2 R5), on cron: one `Restock` into each
     /// shop holding an order, naming the shop the order was found under.
-    #[job(global, cross_tenant)]
+    #[job(global, retain_dead, cross_tenant)]
     struct Sweep {}
 
     impl Sweep {

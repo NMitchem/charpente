@@ -28,6 +28,7 @@ pub struct IdCounter {
 
 #[job(
     global,
+    retain_dead,
     outbound = "pay.fixture",
     retry(max = 8, backoff = "500ms"),
     timeout = "2s"

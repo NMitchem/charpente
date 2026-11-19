@@ -2347,7 +2347,7 @@ fn open_south_lead(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
     Ok(WireU64(1))
 }
 
-#[job(scoped_by = twins::south::Org)]
+#[job(scoped_by = twins::south::Org, retain_dead)]
 struct Nurture {
     n: u64,
 }
@@ -2386,7 +2386,7 @@ fn open_alpha_note(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
     Ok(WireU64(1))
 }
 
-#[job(scoped_by = wrapped::Wrap<wrapped::Alpha>)]
+#[job(scoped_by = wrapped::Wrap<wrapped::Alpha>, retain_dead)]
 struct AlphaDigest {
     n: u64,
 }

@@ -94,7 +94,7 @@ fn probe_route(tx: &mut Tx) -> Result<(), ApiError> {
 }
 
 /// What the one-second schedule enqueues: a reading from a job's step.
-#[job(global)]
+#[job(global, retain_dead)]
 struct Beat {}
 
 impl Beat {

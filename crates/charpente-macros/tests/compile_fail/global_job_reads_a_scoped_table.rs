@@ -29,7 +29,7 @@ struct Invoice {
     total: u32,
 }
 
-#[job(global, cross_tenant, retry(max = 10, backoff = "1m"))]
+#[job(global, retain_dead, cross_tenant, retry(max = 10, backoff = "1m"))]
 struct Rollup {}
 
 impl Rollup {

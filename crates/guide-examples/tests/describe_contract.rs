@@ -149,6 +149,7 @@ use charpente::{Tx, job, jobs};
 
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "1s"),
     timeout = "2s"

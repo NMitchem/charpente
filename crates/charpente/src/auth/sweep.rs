@@ -28,7 +28,7 @@ pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(86_400);
 /// whose platform tables have another shape, so a Pending sweep of another
 /// shape never meets the job-shape refusal, whose fixes an app author could
 /// not apply to the platform's own job. Within a minor they never change.
-#[job(global)]
+#[job(global, retain_dead)]
 pub struct SessionSweep {
     pub before: WallTime,
 }

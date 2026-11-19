@@ -10,7 +10,7 @@ struct Org {
     name: String,
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct File {
     n: u64,
 }

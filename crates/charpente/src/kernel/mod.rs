@@ -11,7 +11,8 @@ mod tail;
 pub use clock::Now;
 pub use cron::{CronRow, CronScheduler};
 pub use dispatch::{
-    CallGlue, Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope, OutboundDef, SettleGlue,
+    CallGlue, DeadGlue, DeadStance, Dispatcher, JobDef, JobEntry, JobError, JobOutcome, JobScope,
+    OutboundDef, SettleGlue,
 };
 pub use tail::{
     ERROR_FRAME, EventFrame, EventSink, RESHAPED_FRAME, SimSink, SimSinkHandle, SinkStatus,

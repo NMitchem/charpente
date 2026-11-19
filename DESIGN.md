@@ -928,7 +928,12 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   (`ScopedTx::enqueue`) or by a declared fan-out (`Tx::enqueue_in` with a `CrossTenant`).
   `Tx::enqueue` and cron take `global` jobs only, and a scoped job at either is an
   unsatisfied bound whose text names the fix. Enqueue sites and handler signatures are
-  checked against each other (spec 2026-09-27-job-tenancy §5). **Job rows are the
+  checked against each other (spec 2026-09-27-job-tenancy §5). Every job also declares
+  what its Dead means, `on_dead` or `retain_dead`, and neither is the default (DECISIONS
+  §13): an `on_dead` job writes `fn on_dead(self, tx, dead: Dead<Self>)`, taking `run`'s
+  transaction and capability, and `retain_dead` keeps the Dead row with its last error and
+  runs nothing. The stance is on `JobDef` and in `describe`, never in `FINGERPRINT`, so
+  changing it changes no stored shape (spec 2026-11-18-0.5.0 §5 C). **Job rows are the
   platform's to write and to read**, because the dispatcher opens
   the tenant a row carries without asking anyone: `JobRow`'s `Row::Scope` is the sealed
   `PlatformOwned`, so `Tx::put`/`Tx::delete` of one is an unsatisfied bound naming the
@@ -1998,7 +2003,8 @@ Charpente treats the coding agent as the primary developer persona:
   `#[event(scoped_by = Org)]` event and `null` for a global one; an app key is a call-site
   filter, so the contract lists no keys)**, jobs (name, retry policy, **`scoped_by`, the
   `NAME` of the tenant type a job acts in, or `null`**, `cross_tenant`, **`outbound`:
-  `null`, or `{ host, timeout_ms }` for a job declared `outbound = "<host>"`**), cron
+  `null`, or `{ host, timeout_ms }` for a job declared `outbound = "<host>"`**, **`dead`,
+  the job's Dead stance, `"on_dead"` or `"retain_dead"`**), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
   **`outbound_hosts`, one entry per declared `Host` with the names of its credential

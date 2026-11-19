@@ -20,7 +20,7 @@ impl Tenant for Org {
     }
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Audit {}
 
 impl Audit {

@@ -32,7 +32,7 @@ struct Window {
     applied: bool,
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct ApplyWindow {
     window: u64,
 }
@@ -47,7 +47,7 @@ impl ApplyWindow {
     }
 }
 
-#[job(cross_tenant, global)]
+#[job(cross_tenant, global, retain_dead)]
 struct MaintenanceSweep {}
 
 impl MaintenanceSweep {

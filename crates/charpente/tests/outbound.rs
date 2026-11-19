@@ -31,6 +31,7 @@ use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "1s"),
     timeout = "2s"
@@ -58,7 +59,7 @@ impl Charge {
 
 /// The same fields as a pure job: its fingerprint is `Charge`'s before the
 /// outbound fold (`fingerprint::compute` hashes fields, not the struct name).
-#[job(global)]
+#[job(global, retain_dead)]
 struct ChargeAsPure {
     cents: u64,
 }
@@ -69,7 +70,7 @@ impl ChargeAsPure {
     }
 }
 
-#[job(global, outbound = "mail.test")]
+#[job(global, retain_dead, outbound = "mail.test")]
 struct Mail {}
 
 impl Mail {
@@ -118,7 +119,7 @@ impl Tenant for Org {
 
 /// The `scoped_by` form: `call` reads through its tenant's `&ScopedTx`, and
 /// `settle` writes through its `&mut ScopedTx`.
-#[job(scoped_by = Org, outbound = "pay.test")]
+#[job(scoped_by = Org, retain_dead, outbound = "pay.test")]
 struct ChargeInOrg {
     cents: u64,
 }
@@ -141,7 +142,7 @@ impl ChargeInOrg {
     }
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct ChargeInOrgAsPure {
     cents: u64,
 }
@@ -207,7 +208,8 @@ mod describe_hosts {
       "outbound": {
         "host": "pay.test",
         "timeout_ms": 2000
-      }
+      },
+      "dead": "retain_dead"
     },
 "#;
 
@@ -247,7 +249,7 @@ mod describe_hosts {
         assert!(json.contains(CHARGE_JOB), "{json}");
         assert!(json.contains(HOSTS_JSON), "{json}");
         let human = to_human(&c);
-        assert!(human.contains("  Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000\n"), "{human}");
+        assert!(human.contains("  Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000 dead=retain_dead\n"), "{human}");
         assert!(
             human.contains(
                 "cron:\n  charpente.session_sweep interval_nanos=86400000000000 builtin=true\n\
@@ -324,6 +326,7 @@ struct Gate {
 
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "1s"),
     timeout = "2s"
@@ -528,7 +531,7 @@ fn a_refused_call_is_an_attempt_naming_the_rule() {
     );
 }
 
-#[job(global, outbound = "pay.test")]
+#[job(global, retain_dead, outbound = "pay.test")]
 struct Leaky {}
 
 impl Leaky {
@@ -572,7 +575,7 @@ fn seeded(
     (app, d)
 }
 
-#[job(global, outbound = "pay.test")]
+#[job(global, retain_dead, outbound = "pay.test")]
 struct Boom {}
 
 impl Boom {
@@ -611,7 +614,7 @@ fn a_call_panic_is_an_attempt_with_the_call_panicked_prefix() {
     );
 }
 
-#[job(global, outbound = "pay.test")]
+#[job(global, retain_dead, outbound = "pay.test")]
 struct Probe {
     answer: u64,
 }
@@ -854,7 +857,7 @@ fn a_row_with_a_key_never_reaches_a_pure_def() {
     eprintln!("the misroute did not stop dispatch: {outcome:?}");
 }
 
-#[job(global, outbound = "pay.test")]
+#[job(global, retain_dead, outbound = "pay.test")]
 struct ReadFaults {}
 
 impl ReadFaults {
@@ -907,7 +910,7 @@ mod gate_alias {
     }
 }
 
-#[job(global, outbound = "pay.test")]
+#[job(global, retain_dead, outbound = "pay.test")]
 struct ReadsAlias {}
 
 impl ReadsAlias {
@@ -981,7 +984,7 @@ mod scoped_call {
         cents: u64,
     }
 
-    #[job(scoped_by = Org, outbound = "pay.test")]
+    #[job(scoped_by = Org, retain_dead, outbound = "pay.test")]
     struct ChargeInvoice {
         invoice: charpente::Id<Invoice>,
     }
@@ -1096,7 +1099,7 @@ mod mint_paths {
     const JOB: u64 = 1;
     const CRON: u64 = 2;
 
-    #[job(global, outbound = "pay.test")]
+    #[job(global, retain_dead, outbound = "pay.test")]
     pub struct Minted {
         pub via: u64,
     }
@@ -1111,7 +1114,7 @@ mod mint_paths {
         }
     }
 
-    #[job(global)]
+    #[job(global, retain_dead)]
     pub struct Relay {}
 
     impl Relay {
@@ -1218,6 +1221,7 @@ struct Paid {
 /// must be discarded. Used by every §7 row below.
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "500ms"),
     timeout = "2s"
@@ -1626,6 +1630,7 @@ struct Receipt {
 /// Keeps the reply's body, as a `settle` that records the remote's receipt.
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 1, backoff = "1s"),
     timeout = "2s"
@@ -1764,7 +1769,7 @@ fn a_call_never_starts_when_its_group_commit_fails() {
     );
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct OpenGate {}
 
 impl OpenGate {
@@ -2064,6 +2069,7 @@ mod scoped_outbound {
 
     #[job(
         scoped_by = Shop,
+        retain_dead,
         outbound = "pay.test",
         retry(max = 3, backoff = "500ms"),
         timeout = "2s"
@@ -2200,7 +2206,7 @@ fn cron_enqueues_an_outbound_job_with_a_minted_key() {
 
 mod shape_v1 {
     use super::*;
-    #[job(global)]
+    #[job(global, retain_dead)]
     pub struct Settle {
         pub n: u64,
     }
@@ -2213,7 +2219,7 @@ mod shape_v1 {
 
 mod shape_v2 {
     use super::*;
-    #[job(global, outbound = "pay.test")]
+    #[job(global, retain_dead, outbound = "pay.test")]
     pub struct Settle {
         pub n: u64,
     }
@@ -2268,6 +2274,7 @@ fn a_job_gaining_outbound_is_refused_while_old_rows_are_pending() {
 
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 1, backoff = "1s"),
     timeout = "1s"
@@ -2386,6 +2393,7 @@ fn a_completion_left_behind_the_last_flight_goes_with_the_gate() {
 /// anything else: §7's "settle returns `Err(Io)`" row.
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "500ms"),
     timeout = "2s"
@@ -2520,6 +2528,7 @@ const ENQUEUES_FOREIGN_SHAPE: u64 = 3;
 /// Writes an `Effect`, then fails the way its `mode` names.
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 1, backoff = "1s"),
     timeout = "2s"
@@ -2751,7 +2760,7 @@ fn a_start_error_is_an_immediate_attempt_not_a_timeout() {
 
 /// A plain job that always fails: its failure records are a job's, never
 /// an outbound one's.
-#[job(global, retry(max = 2, backoff = "1s"))]
+#[job(global, retain_dead, retry(max = 2, backoff = "1s"))]
 struct PlainFails {}
 
 impl PlainFails {
@@ -2954,6 +2963,7 @@ enum Variant {
 /// a lost reply (or a crash, or a timeout) is applied again.
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "500ms"),
     timeout = "2s"
@@ -2976,6 +2986,7 @@ impl PayKeyless {
 /// the remote never applied.
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "500ms"),
     timeout = "2s"

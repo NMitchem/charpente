@@ -31,7 +31,7 @@ pub struct NoteAdded {
 
 /// The job: runs after commit, off the durable queue, and marks the note
 /// echoed. Its effect is a row change, so a sim property can pin it.
-#[job(global)]
+#[job(global, retain_dead)]
 pub struct Echo {
     pub note: Id<Note>,
 }

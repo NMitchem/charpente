@@ -1,0 +1,5 @@
+error: `on_dead` given twice — write it once
+ --> tests/compile_fail/job_on_dead_twice.rs:5:24
+  |
+5 | #[job(global, on_dead, on_dead)]
+  |                        ^^^^^^^

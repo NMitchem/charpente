@@ -69,8 +69,9 @@ use std::path::{Path, PathBuf};
 /// kernel's clock stop and its open/promote refusal (2026-10-23); 50 with the
 /// kernel's clock-stalled stop (2026-10-25); 51 with a pinned sim batch's
 /// check lines, skipped reasons, result and rerun command (2026-10-25); 52 with
-/// the quick pass's closing line; 53 with the mutation run's package-split lines (2026-11-01).
-const PINNED_FLOOR: usize = 53;
+/// the quick pass's closing line; 53 with the mutation run's package-split lines (2026-11-01);
+/// 54 with `#[job]`'s Dead-stance refusals (2026-11-19).
+const PINNED_FLOOR: usize = 54;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

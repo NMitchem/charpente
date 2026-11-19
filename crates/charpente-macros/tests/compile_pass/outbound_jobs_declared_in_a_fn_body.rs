@@ -27,7 +27,7 @@ impl Tenant for Org {
 }
 
 fn main() {
-    #[job(global)]
+    #[job(global, retain_dead)]
     struct Tidy {
         n: u64,
     }
@@ -39,7 +39,7 @@ fn main() {
         }
     }
 
-    #[job(scoped_by = Org, outbound = "api.stripe.com")]
+    #[job(scoped_by = Org, retain_dead, outbound = "api.stripe.com")]
     struct Charge {
         cents: u64,
     }

@@ -52,7 +52,7 @@ struct SystemNotice {
     n: WireU64,
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct Notify {
     incident: u64,
 }

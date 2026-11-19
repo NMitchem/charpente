@@ -5,9 +5,11 @@
 //! at apply — deterministic across replay.
 
 use std::io;
+use std::marker::PhantomData;
 use std::time::Duration;
 
-use crate::io::WallTime;
+use crate::db::{Job, TenantAdmission};
+use crate::io::{IdempotencyKey, WallTime};
 use crate::table::{Codec, Id, IndexDef, Row};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -205,6 +207,122 @@ impl Row for JobRow {
             scope,
             outbound_key,
         })
+    }
+}
+
+/// What a Dead row's `last_error` begins with when its `on_dead` hook failed:
+/// the Dead mark then commits alone, with the hook's error and the job's own
+/// after this prefix (GUIDE §6).
+pub const HOOK_FAILED: &str = "charpente: on_dead failed: ";
+
+/// A job's failure as the dispatcher read it from the row going Dead, handed
+/// to the glue an `on_dead` job's `#[job]` generates. Only `from_row` makes
+/// one, and it takes a `TenantAdmission`, which only a `Group` mints, so no
+/// handler can. Neither `Clone` nor `Codec`: one Dead mark makes one record,
+/// and a record is never stored.
+pub struct DeadRecord {
+    name: String,
+    #[expect(
+        dead_code,
+        reason = "the re-issue from on_dead copies the dead job's own payload bytes; nothing \
+                  reads them before it"
+    )]
+    payload: Vec<u8>,
+    shape: Option<u64>,
+    #[expect(
+        dead_code,
+        reason = "the re-issue from on_dead stays in the tenant its record names; nothing reads \
+                  it before it"
+    )]
+    scope: Option<u64>,
+    attempts: u32,
+    last_error: String,
+    outbound_key: Option<[u8; 16]>,
+}
+
+impl DeadRecord {
+    /// The record of `row`'s failure, read after the dispatcher counted the
+    /// attempt and wrote its error on the row.
+    ///
+    /// # Panics
+    ///
+    /// When `row` records no failure (no attempt, or no `last_error`): a
+    /// record is made from the failure that kills its job.
+    pub fn from_row(row: &JobRow, admission: &TenantAdmission<'_>) -> DeadRecord {
+        let _ = admission;
+        let Some(last_error) = &row.last_error else {
+            panic!(
+                "dispatcher invariant: job {} (\"{}\") has no last_error, but a Dead record is \
+                 made from the failure that kills its job — the dispatcher writes the failure \
+                 on the row before it builds the record",
+                row.id.raw(),
+                row.name
+            );
+        };
+        assert!(
+            row.attempts >= 1,
+            "dispatcher invariant: job {} (\"{}\") has 0 attempts, but a Dead record is made \
+             from a failed attempt — the dispatcher counts the attempt before it builds the \
+             record",
+            row.id.raw(),
+            row.name
+        );
+        DeadRecord {
+            name: row.name.clone(),
+            payload: row.payload.clone(),
+            shape: row.shape,
+            scope: row.scope,
+            attempts: row.attempts,
+            last_error: last_error.clone(),
+            outbound_key: row.outbound_key,
+        }
+    }
+
+    /// Opens the record as the job it was made from.
+    ///
+    /// # Panics
+    ///
+    /// When `J` is not that job: another name, or another shape under the
+    /// same name.
+    pub fn into_typed<J: Job>(self) -> Dead<J> {
+        assert!(
+            self.name == J::NAME && self.shape == Some(J::FINGERPRINT),
+            "contract: a Dead record of job \"{}\" was opened as job \"{}\" — a Dead<J> carries \
+             the job it was made from; the glue #[job] generates opens it as its own type",
+            self.name,
+            J::NAME
+        );
+        Dead {
+            record: self,
+            job: PhantomData,
+        }
+    }
+}
+
+/// What an `on_dead` hook is handed beside its job: how many attempts it
+/// made, the error the last one ended with, and an outbound job's
+/// idempotency key, readable so the app can record it. Made only from its
+/// own job's `DeadRecord`. Neither `Clone` nor `Codec`.
+pub struct Dead<J> {
+    record: DeadRecord,
+    job: PhantomData<fn() -> J>,
+}
+
+impl<J> Dead<J> {
+    /// The attempts the job made, the last one included.
+    pub fn attempts(&self) -> u32 {
+        self.record.attempts
+    }
+
+    /// The error the last attempt ended with.
+    pub fn last_error(&self) -> &str {
+        &self.record.last_error
+    }
+
+    /// The key every call of an outbound job was sent under; `None` for a
+    /// pure job, exactly.
+    pub fn key(&self) -> Option<IdempotencyKey> {
+        self.record.outbound_key.map(IdempotencyKey::from_bytes)
     }
 }
 

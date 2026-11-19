@@ -58,6 +58,7 @@ struct Order {
 
 #[job(
     global,
+    retain_dead,
     outbound = "pay.example",
     retry(max = 8, backoff = "500ms"),
     timeout = "2s"

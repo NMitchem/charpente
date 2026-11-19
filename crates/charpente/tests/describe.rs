@@ -130,7 +130,7 @@ fn widget_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscri
         .cursor(cursor))
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Ping {
     n: u64,
 }
@@ -449,7 +449,8 @@ const GOLDEN: &str = r#"{
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": true,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     },
     {
       "name": "Ping",
@@ -460,7 +461,8 @@ const GOLDEN: &str = r#"{
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": false,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     }
   ],
   "cron": [
@@ -1171,7 +1173,7 @@ fn org_ledger(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError>
 /// The job half of the same declaration (spec §3): a background rollup that
 /// enumerates every tenant declares the capability exactly as a route does,
 /// and its `run` takes the token the dispatcher minted.
-#[job(global, cross_tenant)]
+#[job(global, retain_dead, cross_tenant)]
 struct Rollup {
     day: u64,
 }
@@ -1185,7 +1187,7 @@ impl Rollup {
 
 /// A job that acts inside one org (job-tenancy spec §5): `describe` names
 /// the scope it acts in.
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct Reconcile {
     day: u64,
 }
@@ -1330,9 +1332,9 @@ fn to_human_carries_public_scope_and_scoped_by() {
         "  GET /admin/plain name=admin_plain auth=false public_scope=none cross_tenant=false \
          stream=false\n",
         "  Reconcile max=5 backoff_nanos=30000000000 scoped_by=Org cross_tenant=false \
-         builtin=false outbound=none\n",
+         builtin=false outbound=none dead=retain_dead\n",
         "  Rollup max=5 backoff_nanos=30000000000 scoped_by=none cross_tenant=true \
-         builtin=false outbound=none\n",
+         builtin=false outbound=none dead=retain_dead\n",
     ] {
         assert!(out.contains(line), "missing {line:?} in:\n{out}");
     }
@@ -1394,7 +1396,7 @@ fn workspace_ledger(tx: &mut Tx, ctx: &Ctx) -> Result<WireU64, ApiError> {
     Ok(WireU64(tx.scope().raw()))
 }
 
-#[job(scoped_by = renamed::Org)]
+#[job(scoped_by = renamed::Org, retain_dead)]
 struct Audit {
     day: u64,
 }
@@ -1521,4 +1523,89 @@ fn to_human_carries_the_scoped_flag() {
         .find(|l| l.trim_start().starts_with("Widget "))
         .unwrap_or_else(|| panic!("no Widget table line in:\n{out}"));
     assert!(widget_line.contains(" scoped=false "), "{widget_line}");
+}
+
+/// Two jobs identical but for their Dead stance (0.5.0 spec §5 C): one says
+/// `on_dead` and writes the hook, the other says `retain_dead`. Each is
+/// mounted by its own app, since they share a `NAME`.
+mod hooked {
+    use charpente::kernel::JobError;
+    use charpente::{Dead, Tx, job};
+
+    #[job(global, on_dead)]
+    pub struct Ping {
+        pub n: u64,
+    }
+
+    impl Ping {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            let _ = self.n;
+            Ok(())
+        }
+
+        fn on_dead(self, _tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+            let _ = (self.n, dead.attempts());
+            Ok(())
+        }
+    }
+}
+
+mod kept {
+    use charpente::kernel::JobError;
+    use charpente::{Tx, job};
+
+    #[job(global, retain_dead)]
+    pub struct Ping {
+        pub n: u64,
+    }
+
+    impl Ping {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            let _ = self.n;
+            Ok(())
+        }
+    }
+}
+
+fn stance_app(seed: u64, defs: Vec<charpente::kernel::JobDef>) -> App {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(defs)
+}
+
+/// The stance is not part of a job's shape (0.5.0 spec §3): changing it
+/// changes no stored byte, so it must not change `FINGERPRINT`, or every
+/// Pending row of a job that changed stance would be refused at startup as
+/// a foreign shape. `describe` is where the stance is read, in both of its
+/// renderings, and the platform's own sweep declares `retain_dead`.
+#[test]
+fn the_dead_stance_is_not_part_of_a_jobs_shape() {
+    use charpente_core::db::Job;
+    assert_eq!(
+        <hooked::Ping as Job>::FINGERPRINT,
+        <kept::Ping as Job>::FINGERPRINT
+    );
+    for (seed, defs, stance) in [
+        (0x2EC2_00D1, jobs![hooked::Ping], "on_dead"),
+        (0x2EC2_00D2, jobs![kept::Ping], "retain_dead"),
+    ] {
+        let c = stance_app(seed, defs).describe();
+        let dead: Vec<(&str, &str)> = c.jobs.iter().map(|j| (j.name, j.dead)).collect();
+        assert_eq!(
+            dead,
+            vec![("SessionSweep", "retain_dead"), ("Ping", stance)]
+        );
+        let out = charpente::describe::to_human(&c);
+        let line = format!(
+            "  Ping max=5 backoff_nanos=30000000000 scoped_by=none cross_tenant=false \
+             builtin=false outbound=none dead={stance}\n"
+        );
+        assert!(out.contains(&line), "missing {line:?} in:\n{out}");
+    }
 }

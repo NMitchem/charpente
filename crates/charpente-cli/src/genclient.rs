@@ -377,6 +377,7 @@ mod contract {
         cross_tenant: bool,
         builtin: bool,
         outbound: Option<OutboundInfo>,
+        dead: String,
     }
 
     #[derive(Deserialize)]
@@ -535,6 +536,7 @@ mod contract {
                 host: leak(o.host),
                 timeout_ms: o.timeout_ms,
             }),
+            dead: leak(j.dead),
         }
     }
 
@@ -692,7 +694,8 @@ mod tests {
       ],
       "jobs": [{ "name": "SendMail", "retry": { "max": 3, "backoff_nanos": 1000 },
                  "scoped_by": "Org", "cross_tenant": true, "builtin": false,
-                 "outbound": { "host": "mail.test", "timeout_ms": 30000 } }],
+                 "outbound": { "host": "mail.test", "timeout_ms": 30000 },
+                 "dead": "on_dead" }],
       "cron": [{ "name": "charpente.session_sweep", "interval_nanos": 60000000000,
                  "builtin": true }],
       "outbound_hosts": [{ "host": "mail.test", "env": ["MAIL_TOKEN"], "injects": ["x-mail-token"],

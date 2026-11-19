@@ -1565,20 +1565,23 @@ beside every enqueue; a Pending job is decoded only by a binary whose
 
 A job says which tenancy it has, and neither is the default: `#[job(global)]`
 belongs to no tenant, and `#[job(scoped_by = Org)]` acts inside one (below, and
-§16). A bare `#[job]` is a compile error naming both. Either form takes
+§16). A bare `#[job]` is a compile error naming both. A job also says what its
+Dead means, `on_dead` or `retain_dead`, and neither of those is the default either
+("What a job's Dead means" below): `#[job(global, retain_dead)]` is the shortest
+job there is. Every form takes
 `RetryPolicy::DEFAULT` (5 attempts, 30s base backoff), and adding `retry(max =
 <int>, backoff = "<n><unit>")` overrides either or both. `backoff` is a bare
 number plus a unit, one of `ms`, `s`, `m`, `h`. The words `global` or
-`scoped_by`, `cross_tenant` (§16), `retry(...)`, and `outbound = "<host>"` with
-its optional `timeout = "<n><unit>"` ("Outbound jobs" below) may come in any
-order, each at most once.
+`scoped_by`, `on_dead` or `retain_dead`, `cross_tenant` (§16), `retry(...)`, and
+`outbound = "<host>"` with its optional `timeout = "<n><unit>"` ("Outbound jobs"
+below) may come in any order, each at most once.
 
 ```rust
 use charpente::core::job::RetryPolicy;
 use charpente::kernel::JobError;
 use charpente::{Job, Tx, job};
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Basic {}
 
 impl Basic {
@@ -1587,7 +1590,7 @@ impl Basic {
     }
 }
 
-#[job(global, retry(max = 3, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 3, backoff = "10s"))]
 struct Custom {}
 
 impl Custom {
@@ -1625,7 +1628,7 @@ struct Counter {
     hits: u64,
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct CountUp {
     slot: u64,
 }
@@ -1705,7 +1708,7 @@ struct Mailer {
     sent: u64,
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct SendReceipt {
     invoice: u64,
 }
@@ -1805,7 +1808,7 @@ struct Counter {
     hits: u64,
 }
 
-#[job(global, retry(max = 3, backoff = "10s"))]
+#[job(global, retain_dead, retry(max = 3, backoff = "10s"))]
 struct CountUp {
     slot: u64,
 }
@@ -1868,7 +1871,7 @@ struct Invoice {
     finalized: bool,
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct SendReminder {
     invoice: u64,
 }
@@ -1919,7 +1922,8 @@ the message, and:
   than overflowing at absurd attempt counts) — the policy's configured base
   `backoff` is attempt 1's wait.
 - if `attempts >= retry.max`: status becomes Dead. Dead rows are retained,
-  with `last_error` as the record of what killed them.
+  with `last_error` as the record of what killed them. What else happens is
+  the job's Dead stance (next subsection).
 
 On `Err(JobError::Io(e))` — a platform fault the handler's own reads
 surfaced, or one from the transaction machinery itself — none of this
@@ -1936,6 +1940,73 @@ One more failure mode: if a `JobRow`'s `name` isn't in the `jobs![...]` list
 type — it fails the same way as a handler rejection, with: `"job
 \"<name>\" is not registered — add it to the jobs![…] list passed to
 App::mount_jobs (or this log outlived a renamed job type)"`.
+
+### What a job's Dead means: `on_dead` or `retain_dead`
+
+Every `#[job]` says what its Dead means, and neither answer is the default: a job
+that names neither is a compile error naming both (§9). `retain_dead` is the
+behaviour above and nothing more: the Dead row stays, with its `last_error`, and
+nothing runs. `on_dead` is for a job whose retries running out must make something
+happen (telling the user, releasing a hold, recording the failure where the app
+reads it). It declares a hook you write, which `#[job]` no more derives than it
+derives `run`:
+
+```rust,ignore
+fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError>
+```
+
+The hook takes what `run` takes. A `scoped_by = Org` job's takes
+`tx: &mut ScopedTx<'_, '_, Org>`, in the tenant the job was enqueued in, and
+`cross_tenant` adds `cap: &CrossTenant` after `tx`. An outbound job writes the same
+hook beside `call` and `settle`. The hook's writes commit with the Dead mark, as
+one record. A signature other than these is a type error, as `run`'s is (§9).
+
+`Dead<J>` (`charpente::Dead`) is what the failure left:
+
+- `dead.attempts()`: the attempts the job made, the last one included.
+- `dead.last_error()`: the error the last attempt ended with.
+- `dead.key()`: for an outbound job, the `IdempotencyKey` every one of its calls
+  was sent under, so the app can record it; `None` for a pure job, exactly.
+
+It is neither `Clone` nor `Codec`, and only the dispatcher makes one, from the row
+going Dead.
+
+```rust
+use charpente::core::table::Id;
+use charpente::kernel::JobError;
+use charpente::{Dead, Tx, job, table};
+
+#[table(global)]
+struct ExportFailure {
+    id: Id<ExportFailure>,
+    attempts: u32,
+    error: String,
+}
+
+#[job(global, on_dead, retry(max = 3, backoff = "10s"))]
+struct Export {
+    batch: u64,
+}
+
+impl Export {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Err(JobError::app("the export target refused the batch"))
+    }
+
+    fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+        tx.put(&ExportFailure {
+            id: Id::from_raw(self.batch),
+            attempts: dead.attempts(),
+            error: dead.last_error().to_string(),
+        });
+        Ok(())
+    }
+}
+```
+
+The stance lives on the job's `JobDef` and in `describe` (`"dead": "on_dead"` or
+`"retain_dead"`, §13), never in its `FINGERPRINT`: changing a job's stance changes
+no stored shape, so its Pending rows keep running under the new one.
 
 ### Outbound jobs: calling the world after commit
 
@@ -1954,6 +2025,7 @@ use charpente::{Tx, job};
 
 #[job(
     global,
+    retain_dead,
     outbound = "pay.test",
     retry(max = 3, backoff = "1s"),
     timeout = "2s"
@@ -1979,7 +2051,7 @@ impl Charge {
     }
 }
 
-#[job(global, outbound = "mail.test")]
+#[job(global, retain_dead, outbound = "mail.test")]
 struct Mail {}
 
 impl Mail {
@@ -2412,6 +2484,18 @@ one every job meets once, and the next three are its neighbours:
 `scoped_by` given twice — write it once
 ```
 
+The second every job meets once too, right after the first: a job that names its
+tenancy and not what its Dead means ("What a job's Dead means" above). Its
+neighbours refuse both stances at once and either one twice:
+
+<!-- pinned -->
+```text
+`<job>` declares no Dead stance — a job says what its Dead means. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `on_dead` if the app must act when the job's retries run out (the job then has `fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError>`, whose writes commit with the Dead mark), or `retain_dead` if the Dead row, kept with its last error, is all that should happen. Neither is the default.
+`on_dead` and `retain_dead` are two answers to one question — keep the one this job means
+`on_dead` given twice — write it once
+`retain_dead` given twice — write it once
+```
+
 A `scoped_by` job enqueued where no tenant is named — `tx.enqueue` on a bare `Tx`, or
 `App::schedule` — is an unsatisfied bound, and rustc prints this note with your job and
 scope in place of `<job>` and `<scope>` (§16 shows it rendered):
@@ -2433,26 +2517,28 @@ The rest are about the attribute's syntax and the struct's shape:
 // a word the attribute does not recognise
 #[job(bogus)]
 struct Foo {}
-// "a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`,
-//  `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m, h),
-//  and `outbound = \"<host>\"` with an optional `timeout = \"<n><unit>\"`, in
-//  any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff =
-//  \"10s\"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org,
+// "a job declares `global` or `scoped_by = <Type>` and one of `on_dead` /
+//  `retain_dead`, and may add `cross_tenant`, `retry(max = <int>, backoff =
+//  \"<n><unit>\")` (unit is one of ms, s, m, h), and `outbound = \"<host>\"`
+//  with an optional `timeout = \"<n><unit>\"`, in any order — e.g.
+//  `#[job(scoped_by = Org, retain_dead, retry(max = 3, backoff = \"10s\"))]`,
+//  `#[job(global, cross_tenant, on_dead)]` or `#[job(scoped_by = Org, on_dead,
 //  outbound = \"api.stripe.com\", timeout = \"30s\")]`"
 
 // backoff with no unit suffix
-#[job(global, retry(max = 3, backoff = "10"))]
+#[job(global, retain_dead, retry(max = 3, backoff = "10"))]
 struct Bar {}
 // "backoff \"10\" has no unit — a job declares `global` or `scoped_by =
-//  <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff =
-//  \"<n><unit>\")` (unit is one of ms, s, m, h), and `outbound = \"<host>\"`
-//  with an optional `timeout = \"<n><unit>\"`, in any order — e.g.
-//  `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]`,
-//  `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound =
-//  \"api.stripe.com\", timeout = \"30s\")]`"
+//  <Type>` and one of `on_dead` / `retain_dead`, and may add `cross_tenant`,
+//  `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m, h),
+//  and `outbound = \"<host>\"` with an optional `timeout = \"<n><unit>\"`, in
+//  any order — e.g. `#[job(scoped_by = Org, retain_dead, retry(max = 3,
+//  backoff = \"10s\"))]`, `#[job(global, cross_tenant, on_dead)]` or
+//  `#[job(scoped_by = Org, on_dead, outbound = \"api.stripe.com\", timeout =
+//  \"30s\")]`"
 
 // enums and unions cannot be job payloads
-#[job(global)]
+#[job(global, retain_dead)]
 enum Baz {
     A,
 }
@@ -2492,7 +2578,7 @@ struct DigestState {
     sent: u64,
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct SendDigest {}
 
 impl SendDigest {
@@ -2530,7 +2616,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Schema, Tx, job};
 use std::time::Duration;
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Tick {}
 
 impl Tick {
@@ -2600,7 +2686,7 @@ struct Window {
 }
 
 /// Acts inside one org, the one the sweep named when it fanned this out.
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct ApplyWindow {
     window: u64,
 }
@@ -2616,7 +2702,7 @@ impl ApplyWindow {
 }
 
 /// Reads every org's windows and fans one `ApplyWindow` into each window's org.
-#[job(global, cross_tenant)]
+#[job(global, retain_dead, cross_tenant)]
 struct MaintenanceSweep {}
 
 impl MaintenanceSweep {
@@ -2798,7 +2884,7 @@ struct Hold {
     released: bool,
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct Expire {
     hold: u64,
 }
@@ -2845,7 +2931,7 @@ struct Booking {
     cancelled: bool,
 }
 
-#[job(global, outbound = "mail.example")]
+#[job(global, retain_dead, outbound = "mail.example")]
 struct Remind {
     booking: u64,
 }
@@ -2920,7 +3006,7 @@ struct NoteBody {
     text: String,
 }
 
-#[job(global)]
+#[job(global, retain_dead)]
 struct SendDigest {}
 
 impl SendDigest {
@@ -4090,7 +4176,7 @@ struct Counter {
 
 // A job payload never crosses HTTP, so it has no `Wire` requirement — this
 // stays a bare `u64`.
-#[job(global)]
+#[job(global, retain_dead)]
 struct CountUp {
     slot: u64,
 }
@@ -4491,6 +4577,7 @@ struct Receipt {
 
 #[job(
     global,
+    retain_dead,
     outbound = "mail.example",
     retry(max = 3, backoff = "1s"),
     timeout = "5s"
@@ -5514,19 +5601,23 @@ the pattern and it's gone.
 
 ```text
 `NotifySubscribers` declares no tenancy — a job says which. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `scoped_by = Org` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+`NotifySubscribers` declares no Dead stance — a job says what its Dead means. Add one of these to its `#[job(…)]`, keeping any arguments it already has: `on_dead` if the app must act when the job's retries run out (the job then has `fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError>`, whose writes commit with the Dead mark), or `retain_dead` if the Dead row, kept with its last error, is all that should happen. Neither is the default.
 `global` and `scoped_by = Org` on one job — a job is one or the other; drop one
+`on_dead` and `retain_dead` are two answers to one question — keep the one this job means
 `global` given twice — write it once
 `scoped_by` given twice — write it once
+`on_dead` given twice — write it once
+`retain_dead` given twice — write it once
 `cross_tenant` given twice — write it once
 `retry(...)` given twice — write it once
 `outbound` given twice — write it once
 `timeout` given twice — write it once
-a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
-backoff "10" has no unit — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
-unknown retry field `jitter` — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+a job declares `global` or `scoped_by = <Type>` and one of `on_dead` / `retain_dead`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retain_dead, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant, on_dead)]` or `#[job(scoped_by = Org, on_dead, outbound = "api.stripe.com", timeout = "30s")]`
+backoff "10" has no unit — a job declares `global` or `scoped_by = <Type>` and one of `on_dead` / `retain_dead`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retain_dead, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant, on_dead)]` or `#[job(scoped_by = Org, on_dead, outbound = "api.stripe.com", timeout = "30s")]`
+unknown retry field `jitter` — a job declares `global` or `scoped_by = <Type>` and one of `on_dead` / `retain_dead`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retain_dead, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant, on_dead)]` or `#[job(scoped_by = Org, on_dead, outbound = "api.stripe.com", timeout = "30s")]`
 `max` given twice — write it once
 `backoff` given twice — write it once
-backoff "12xs": "12x" is not a whole number — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant)]` or `#[job(scoped_by = Org, outbound = "api.stripe.com", timeout = "30s")]`
+backoff "12xs": "12x" is not a whole number — a job declares `global` or `scoped_by = <Type>` and one of `on_dead` / `retain_dead`, and may add `cross_tenant`, `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), and `outbound = "<host>"` with an optional `timeout = "<n><unit>"`, in any order — e.g. `#[job(scoped_by = Org, retain_dead, retry(max = 3, backoff = "10s"))]`, `#[job(global, cross_tenant, on_dead)]` or `#[job(scoped_by = Org, on_dead, outbound = "api.stripe.com", timeout = "30s")]`
 backoff "99999999999999h" is longer than u64::MAX nanoseconds (about 584 years), the longest duration the kernel's clock can count — give a shorter backoff
 outbound = "https://api.stripe.com": the host carries a scheme — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
 outbound = "api.stripe.com:443": the host carries a port — a host is a bare DNS name like "api.stripe.com"; where it resolves is the operator's (--outbound-base, GUIDE §5)
@@ -5539,8 +5630,10 @@ timeout "0s" would cancel every call before the remote could answer — give a p
 #[job] needs named fields — `Baz` must be a braced struct
 ```
 
-The first is the one every job meets: a job declares its tenancy, and a bare `#[job]`
-names both answers. The next seven refuse a word given twice or both tenancies at once.
+The first two are the ones every job meets: a job declares its tenancy, and a bare
+`#[job]` names both answers; then it declares what its Dead means, and a job that names
+its tenancy alone hears both of those. The next ten refuse both tenancies or both
+stances at once, or a word given twice.
 Anything else the attribute does not recognise hits the accepted-forms message, which
 lists every word; so does `outbound` written without its `= "<host>"`. Three of the lines
 after it are that message with more specific context prepended: a backoff string missing
@@ -5584,6 +5677,19 @@ fourth, with "expected fn pointer, found fn item", is a method whose signature i
 §6's: a `call` taking `&mut Tx`, or a scoped job's `call` or `settle` taking a bare
 `Tx`, which would otherwise read or write in no tenant. Its note prints the expected
 signature above yours.
+
+An `on_dead` job's hook is refused by rustc the same way. For a job named `Ping`:
+
+```text
+error[E0599]: no associated function or constant named `on_dead` found for struct `Ping` in the current scope
+error[E0308]: mismatched types
+```
+
+The first is a job that declares `on_dead` and writes no hook: write `fn on_dead` with
+§6's signature, or declare `retain_dead` if nothing should happen. The second, with
+"expected fn pointer, found fn item", is a hook whose signature is not §6's: a scoped
+job's `on_dead` taking a bare `Tx`, which would otherwise write in no tenant, or a
+`cross_tenant` job's without `cap`. Its note prints the expected signature above yours.
 
 Three more, at job-dispatch time rather than macro-expansion time
 (`charpente/src/kernel/dispatch.rs` — covered behaviorally in §6's "Retry,
@@ -7492,7 +7598,7 @@ a global event (§11, "An event's tenancy").
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, migration chain, and whether it's tenant-scoped),
 every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, by that tenant type's `NAME`, whether it declared `cross_tenant`, whether it's an SSE stream),
-every registered event (name, payload type, and the tenant it belongs to if it is `scoped_by` — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`, and its `outbound` host and `timeout_ms`, or `null` for a pure job), every cron entry
+every registered event (name, payload type, and the tenant it belongs to if it is `scoped_by` — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, by its `NAME`, whether it declared `cross_tenant`, its `outbound` host and `timeout_ms`, or `null` for a pure job, and its Dead stance as `dead`, `"on_dead"` or `"retain_dead"` — §6), every cron entry
 (name, interval), every declared `Host` as `outbound_hosts` (the host, the variable NAMES it reads, the header names those fill, and its two caps; never a value — §6), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
@@ -8332,7 +8438,8 @@ memorizing a list:
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": true,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     },
     {
       "name": "SendReceipt",
@@ -8343,7 +8450,8 @@ memorizing a list:
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": false,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     },
     {
       "name": "SendOverdueReminder",
@@ -8354,7 +8462,8 @@ memorizing a list:
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": false,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     },
     {
       "name": "AdvanceDay",
@@ -8365,7 +8474,8 @@ memorizing a list:
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": false,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     }
   ],
   "cron": [
@@ -8424,7 +8534,8 @@ job on `pay.test` and declares `Host::new("pay.test").bearer_env("PAY_KEY")
       "outbound": {
         "host": "pay.test",
         "timeout_ms": 2000
-      }
+      },
+      "dead": "retain_dead"
     }
 ```
 
@@ -8451,7 +8562,7 @@ host with no credentials prints `env=none injects=none`, and a `basic_env` host
 joins its two variables with a comma):
 
 ```text
-  Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000
+  Charge max=3 backoff_nanos=1000000000 scoped_by=none cross_tenant=false builtin=false outbound=pay.test timeout_ms=2000 dead=retain_dead
 ...
 outbound_hosts:
   pay.test env=PAY_KEY injects=authorization max_request_bytes=1048576 max_reply_bytes=1048576
@@ -9530,7 +9641,7 @@ fn admin_revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
 
 /// The job half of the same declaration: `run` takes the token after `tx`.
 /// The flag composes with `retry(...)` — they share one attribute.
-#[job(global, cross_tenant, retry(max = 2, backoff = "5s"))]
+#[job(global, retain_dead, cross_tenant, retry(max = 2, backoff = "5s"))]
 struct Rollup {
     day: u64,
 }
@@ -9591,7 +9702,7 @@ Five properties make this a capability rather than an escape hatch:
       params=[...] request=... response=... error=... emits=[]
   ...
   jobs:
-    Rollup max=2 backoff_nanos=5000000000 scoped_by=none cross_tenant=true builtin=false outbound=none
+    Rollup max=2 backoff_nanos=5000000000 scoped_by=none cross_tenant=true builtin=false outbound=none dead=retain_dead
   ```
 
   (Each route prints a second, indented line of type info, and the dump also

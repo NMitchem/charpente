@@ -1,7 +1,8 @@
-//! `#[job(global | scoped_by = Org[, cross_tenant][, retry(max = N, backoff = "30s")][, outbound = "api.stripe.com"[, timeout = "30s"]])]`,
-//! the words in any order, each at most once, and exactly one of `global` /
-//! `scoped_by` (DESIGN.md §6, specs 2026-07-02-queue-cron-design.md,
-//! 2026-09-27-job-tenancy-design.md §5 and 2026-10-13-outbound-effects-design.md §5):
+//! `#[job(global | scoped_by = Org, on_dead | retain_dead[, cross_tenant][, retry(max = N, backoff = "30s")][, outbound = "api.stripe.com"[, timeout = "30s"]])]`,
+//! the words in any order, each at most once, exactly one of `global` /
+//! `scoped_by` and exactly one of `on_dead` / `retain_dead` (DESIGN.md §6,
+//! specs 2026-07-02-queue-cron-design.md, 2026-09-27-job-tenancy-design.md §5,
+//! 2026-10-13-outbound-effects-design.md §5 and 2026-11-18-0.5.0-design.md §5 C):
 //! turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
 //! the id: a job payload has no primary key), `impl Job` carrying the name,
@@ -10,8 +11,8 @@
 //! `scoped_by` job, and continued again by `charpente_core::db::outbound_fingerprint`
 //! for an outbound one), the scope type and the retry policy, and the
 //! `JobEntry` glue `jobs![]` collects; an outbound job's `JobDef` carries its
-//! `call`/`settle` glue in `outbound`. Errors name the accepted forms (hard
-//! rule 5).
+//! `call`/`settle` glue in `outbound`, and an `on_dead` job's carries its hook
+//! glue in `dead`. Errors name the accepted forms (hard rule 5).
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -19,11 +20,13 @@ use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Error, Fields, Ident, LitInt, LitStr, Token, parenthesized};
 
-const ACCEPTED_FORMS: &str = "a job declares `global` or `scoped_by = <Type>`, and may add \
-     `cross_tenant`, `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m, h), \
-     and `outbound = \"<host>\"` with an optional `timeout = \"<n><unit>\"`, in any order — e.g. \
-     `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]`, `#[job(global, cross_tenant)]` \
-     or `#[job(scoped_by = Org, outbound = \"api.stripe.com\", timeout = \"30s\")]`";
+const ACCEPTED_FORMS: &str = "a job declares `global` or `scoped_by = <Type>` and one of \
+     `on_dead` / `retain_dead`, and may add `cross_tenant`, \
+     `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m, h), and \
+     `outbound = \"<host>\"` with an optional `timeout = \"<n><unit>\"`, in any order — e.g. \
+     `#[job(scoped_by = Org, retain_dead, retry(max = 3, backoff = \"10s\"))]`, \
+     `#[job(global, cross_tenant, on_dead)]` or \
+     `#[job(scoped_by = Org, on_dead, outbound = \"api.stripe.com\", timeout = \"30s\")]`";
 
 // ---------------------------------------------------------------- args
 
@@ -31,6 +34,14 @@ const ACCEPTED_FORMS: &str = "a job declares `global` or `scoped_by = <Type>`, a
 pub(crate) enum Tenancy {
     Global,
     ScopedBy(syn::Path),
+}
+
+/// A job's answer to "what does its Dead mean" (0.5.0 spec §5 C).
+pub(crate) enum Stance {
+    /// `on_dead`: the job writes `fn on_dead`, run with its Dead mark.
+    Hook,
+    /// `retain_dead`: the Dead row is kept with its last error, and nothing runs.
+    Retain,
 }
 
 pub(crate) struct JobArgs {
@@ -49,6 +60,10 @@ pub(crate) struct JobArgs {
     /// `timeout = "<n><unit>"`, refused without `outbound`; `expand` gives an
     /// outbound job that wrote none the 30 s default.
     pub timeout_millis: Option<u64>,
+    /// `on_dead` or `retain_dead`. `None` only while parsing: `expand` refuses
+    /// a job that gave neither, by name, right after the tenancy refusal
+    /// (DECISIONS §13: a required choice, never a default).
+    pub dead: Option<Stance>,
 }
 
 impl Default for JobArgs {
@@ -60,6 +75,7 @@ impl Default for JobArgs {
             tenancy: None,
             outbound: None,
             timeout_millis: None,
+            dead: None,
         }
     }
 }
@@ -99,6 +115,8 @@ enum JobArg {
     Retry(proc_macro2::Span, Vec<RetryField>),
     Outbound(proc_macro2::Span, LitStr),
     Timeout(proc_macro2::Span, LitStr),
+    OnDead(proc_macro2::Span),
+    RetainDead(proc_macro2::Span),
 }
 
 impl Parse for JobArg {
@@ -118,6 +136,8 @@ impl Parse for JobArg {
                 Ok(JobArg::ScopedBy(ident.span(), path))
             }
             "cross_tenant" => Ok(JobArg::CrossTenant(ident.span())),
+            "on_dead" => Ok(JobArg::OnDead(ident.span())),
+            "retain_dead" => Ok(JobArg::RetainDead(ident.span())),
             "retry" => {
                 // Peeked, so `retry` without its parentheses gets the house
                 // message rather than syn's "expected parentheses".
@@ -155,6 +175,8 @@ impl Parse for JobArgs {
         let mut retry: Option<Vec<RetryField>> = None;
         let mut outbound_lit: Option<LitStr> = None;
         let mut timeout_lit: Option<LitStr> = None;
+        let mut on_dead: Option<proc_macro2::Span> = None;
+        let mut retain_dead: Option<proc_macro2::Span> = None;
         while !input.is_empty() {
             match input.parse::<JobArg>()? {
                 JobArg::Global(span) => {
@@ -201,6 +223,27 @@ impl Parse for JobArgs {
                         return Err(Error::new(span, "`timeout` given twice — write it once"));
                     }
                     timeout_lit = Some(lit);
+                }
+                JobArg::OnDead(span) => {
+                    if on_dead.is_some() {
+                        return Err(Error::new(span, "`on_dead` given twice — write it once"));
+                    }
+                    if retain_dead.is_some() {
+                        return Err(Error::new(span, BOTH_STANCES));
+                    }
+                    on_dead = Some(span);
+                }
+                JobArg::RetainDead(span) => {
+                    if retain_dead.is_some() {
+                        return Err(Error::new(
+                            span,
+                            "`retain_dead` given twice — write it once",
+                        ));
+                    }
+                    if on_dead.is_some() {
+                        return Err(Error::new(span, BOTH_STANCES));
+                    }
+                    retain_dead = Some(span);
                 }
             }
             if input.is_empty() {
@@ -287,9 +330,18 @@ impl Parse for JobArgs {
             },
             outbound: outbound_lit.map(|lit| lit.value()),
             timeout_millis,
+            dead: match (on_dead, retain_dead) {
+                (Some(_), _) => Some(Stance::Hook),
+                (None, Some(_)) => Some(Stance::Retain),
+                (None, None) => None,
+            },
         })
     }
 }
+
+/// `on_dead` and `retain_dead` on one job, reported at whichever came second.
+const BOTH_STANCES: &str =
+    "`on_dead` and `retain_dead` are two answers to one question — keep the one this job means";
 
 /// `"10s"` -> 10_000, `"500ms"` -> 500, `"5m"` -> 300_000, `"2h"` -> 7_200_000.
 /// Checked in order `ms, s, m, h` — `ms` first, since it also ends in `s`.
@@ -412,6 +464,21 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                  acts inside one tenant (it is enqueued from inside that tenant's scope, and its \
                  `run` receives that tenant's `ScopedTx`), or `global` if it belongs to no \
                  tenant (the only kind cron can schedule). Neither is the default."
+            ),
+        ));
+    };
+    // After the tenancy refusal, so a bare `#[job]` hears about tenancy
+    // first; spanned at the attribute for the same reason.
+    let Some(stance) = &args.dead else {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "`{name_str}` declares no Dead stance — a job says what its Dead means. Add one \
+                 of these to its `#[job(…)]`, keeping any arguments it already has: `on_dead` if \
+                 the app must act when the job's retries run out (the job then has `fn \
+                 on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError>`, whose \
+                 writes commit with the Dead mark), or `retain_dead` if the Dead row, kept with \
+                 its last error, is all that should happen. Neither is the default."
             ),
         ));
     };
@@ -676,6 +743,69 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         }
     };
 
+    // The hook is bound through a fn pointer for the run glue's reason: a
+    // scoped job's `on_dead` taking a bare `Tx` would compile under a method
+    // call and run in no tenant (`compile_fail/scoped_job_on_dead_takes_bare_tx.rs`).
+    // The record is opened as this type before anything else, so a record
+    // handed to the wrong glue stops at `into_typed`'s contract.
+    let (dead_glue, dead_def) = match stance {
+        Stance::Retain => (
+            quote! {},
+            quote! { ::charpente::kernel::DeadStance::Retain },
+        ),
+        Stance::Hook => {
+            let (cap_ty, cap_arg, cap_unused) = if cross_tenant {
+                (
+                    quote! { &::charpente::CrossTenant<'_>, },
+                    quote! { #cap_expect, },
+                    quote! {},
+                )
+            } else {
+                (quote! {}, quote! {}, quote! { let _ = cap; })
+            };
+            let call = match tenancy {
+                Tenancy::Global => quote! {
+                    let _ = scope; // a global job is handed no tenant
+                    let on_dead: fn(
+                        #name,
+                        &mut ::charpente::Tx<'_>,
+                        #cap_ty
+                        ::charpente::Dead<#name>,
+                    ) -> ::std::result::Result<(), ::charpente::kernel::JobError> = #name::on_dead;
+                    on_dead(job, tx, #cap_arg dead)
+                },
+                Tenancy::ScopedBy(path) => quote! {
+                    let scope = #scope_expect;
+                    let mut tx = scope.open::<#path>(tx);
+                    let on_dead: fn(
+                        #name,
+                        &mut ::charpente::ScopedTx<'_, '_, #path>,
+                        #cap_ty
+                        ::charpente::Dead<#name>,
+                    ) -> ::std::result::Result<(), ::charpente::kernel::JobError> = #name::on_dead;
+                    on_dead(job, &mut tx, #cap_arg dead)
+                },
+            };
+            (
+                quote! {
+                    fn __charpente_dead_glue(
+                        tx: &mut ::charpente::Tx,
+                        payload: &[u8],
+                        record: ::charpente::core::job::DeadRecord,
+                        cap: ::std::option::Option<&::charpente::CrossTenant<'_>>,
+                        scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
+                    ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
+                        #cap_unused
+                        let dead = record.into_typed::<#name>();
+                        let job = __charpente_decode(payload)?;
+                        #call
+                    }
+                },
+                quote! { ::charpente::kernel::DeadStance::Hook(__charpente_dead_glue) },
+            )
+        }
+    };
+
     Ok(quote! {
         #input
 
@@ -733,6 +863,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                 }
 
                 #outbound_glues
+                #dead_glue
                 ::charpente::kernel::JobDef {
                     name: <#name as ::charpente::core::db::Job>::NAME,
                     retry: <#name as ::charpente::core::db::Job>::RETRY,
@@ -747,6 +878,8 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     fingerprint: <#name as ::charpente::core::db::Job>::FINGERPRINT,
                     glue: __charpente_job_glue,
                     outbound: #outbound_def,
+                    dead: #dead_def,
+                    dead_coverage: ::std::concat!("dead:", #name_str),
                 }
             }
         }

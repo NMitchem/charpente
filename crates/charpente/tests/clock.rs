@@ -110,7 +110,7 @@ fn enqueue_flaky(tx: &mut Tx) -> Result<(), ApiError> {
 
 /// Fails every attempt, so each run past the first is a retry at the
 /// `due_at` its predecessor's failure record set.
-#[job(global, retry(max = 4, backoff = "2s"))]
+#[job(global, retain_dead, retry(max = 4, backoff = "2s"))]
 struct Flaky {}
 
 impl Flaky {
@@ -120,7 +120,7 @@ impl Flaky {
 }
 
 /// What the one-second schedule enqueues.
-#[job(global)]
+#[job(global, retain_dead)]
 struct Beat {}
 
 impl Beat {
@@ -2131,7 +2131,7 @@ struct Stamp {
 }
 
 /// Records the time its transaction read, under its own slot.
-#[job(global)]
+#[job(global, retain_dead)]
 struct Mark {
     slot: u64,
 }

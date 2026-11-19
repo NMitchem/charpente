@@ -36,7 +36,7 @@ impl Tenant for Team {
     }
 }
 
-#[job(scoped_by = Team)]
+#[job(scoped_by = Team, retain_dead)]
 struct Rebuild {}
 
 impl Rebuild {

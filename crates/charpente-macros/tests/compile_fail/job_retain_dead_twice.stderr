@@ -1,0 +1,5 @@
+error: `retain_dead` given twice — write it once
+ --> tests/compile_fail/job_retain_dead_twice.rs:4:28
+  |
+4 | #[job(global, retain_dead, retain_dead)]
+  |                            ^^^^^^^^^^^

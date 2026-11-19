@@ -110,7 +110,7 @@ fn id_body(id: u64) -> Vec<u8> {
 
 /// Always fails, so its retries must run out in the tail: a job the tail
 /// carries to Dead.
-#[job(global, retry(max = 3, backoff = "1s"))]
+#[job(global, retain_dead, retry(max = 3, backoff = "1s"))]
 struct Doomed {
     note: Id<Note>,
 }
@@ -122,7 +122,7 @@ impl Doomed {
 }
 
 /// The 1 s schedule's job.
-#[job(global)]
+#[job(global, retain_dead)]
 struct Beat {
     n: u64,
 }
@@ -168,6 +168,7 @@ fn ticking(sim: &Sim) -> io::Result<App> {
 /// One mail per note, to a declared host.
 #[job(
     global,
+    retain_dead,
     outbound = "mail.example",
     retry(max = 8, backoff = "500ms"),
     timeout = "2s"
@@ -1004,6 +1005,7 @@ thread_local! {
 
 #[job(
     global,
+    retain_dead,
     outbound = "later.test",
     retry(max = 8, backoff = "500ms"),
     timeout = "2s"

@@ -6,7 +6,7 @@ use charpente::kernel::JobError;
 use charpente::outbound::{Call, IdempotencyKey, Reply};
 use charpente::{Tx, job};
 
-#[job(global, outbound = "api.stripe.com")]
+#[job(global, retain_dead, outbound = "api.stripe.com")]
 struct Charge {}
 
 impl Charge {

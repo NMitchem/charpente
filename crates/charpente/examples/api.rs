@@ -111,8 +111,8 @@ mod attributes {
     use charpente::outbound::{Call, IdempotencyKey, Reply};
     use charpente::wire::WireU64;
     use charpente::{
-        CrossTenant, Id, Scoped, ScopedTx, Subscribe, Tenant, Tx, View, Wire, event, job, route,
-        row_shape, table,
+        CrossTenant, Dead, Id, Scoped, ScopedTx, Subscribe, Tenant, Tx, View, Wire, event, job,
+        route, row_shape, table,
     };
     use serde::{Deserialize, Serialize};
 
@@ -228,8 +228,10 @@ mod attributes {
 
     // `retry(max = N, backoff = "<n><unit>")`, unit `ms`, `s`, `m` or `h`:
     // `max` attempts in all (default 5), the wait doubling from `backoff`
-    // (default 30s); then the job is Dead.
-    #[job(global, retry(max = 3, backoff = "10s"))]
+    // (default 30s); then the job is Dead. Every job says what its Dead
+    // means, and neither is the default: `on_dead` (write the hook below)
+    // or `retain_dead` (the row is kept with its last error; nothing runs).
+    #[job(global, on_dead, retry(max = 3, backoff = "10s"))]
     pub struct Reindex {}
 
     impl Reindex {
@@ -241,10 +243,20 @@ mod attributes {
             let _notes: Vec<Note> = tx.scan()?;
             Ok(())
         }
+
+        // `on_dead`'s hook: `run`'s arguments plus `dead`, last. Its writes
+        // commit with the Dead mark. `key` is `Some` for an outbound job: the
+        // key every one of its calls was sent under.
+        fn on_dead(self, _tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+            let _attempts: u32 = dead.attempts();
+            let _error: &str = dead.last_error();
+            let _key: Option<IdempotencyKey> = dead.key();
+            Ok(())
+        }
     }
 
     // Runs inside the tenant it was enqueued in, so `run` takes its `ScopedTx`.
-    #[job(scoped_by = Org)]
+    #[job(scoped_by = Org, retain_dead)]
     pub struct Notify {
         pub memo: Id<Memo>,
     }
@@ -258,7 +270,7 @@ mod attributes {
 
     // `cross_tenant`: `run` is handed the capability after `tx`, the token
     // `across_tenants` and `enqueue_in` take.
-    #[job(global, cross_tenant)]
+    #[job(global, retain_dead, cross_tenant)]
     pub struct Rollup {}
 
     impl Rollup {
@@ -276,7 +288,7 @@ mod attributes {
     // and `settle` in place of `run`. `timeout` bounds the wait for the
     // reply (default 30s) and needs `outbound`; `cross_tenant` beside it is
     // refused.
-    #[job(scoped_by = Org, outbound = "pay.example", timeout = "5s")]
+    #[job(scoped_by = Org, retain_dead, outbound = "pay.example", timeout = "5s")]
     pub struct Charge {
         pub cents: u64,
     }

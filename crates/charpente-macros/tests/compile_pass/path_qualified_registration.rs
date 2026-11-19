@@ -18,7 +18,7 @@ mod jobs {
     use charpente::kernel::JobError;
     use charpente::{Tx, job};
 
-    #[job(global)]
+    #[job(global, retain_dead)]
     pub struct Tick {}
 
     impl Tick {

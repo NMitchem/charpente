@@ -43,7 +43,7 @@ struct Invoice {
     state: InvoiceState,
 }
 
-#[job(scoped_by = Org)]
+#[job(scoped_by = Org, retain_dead)]
 struct SendReceipt {
     invoice: Id<Invoice>,
 }

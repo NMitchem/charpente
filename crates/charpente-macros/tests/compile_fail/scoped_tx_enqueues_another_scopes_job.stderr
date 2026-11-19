@@ -9,7 +9,7 @@ error[E0271]: type mismatch resolving `<Rebuild as Job>::Scope == Org`
 note: expected this to be `Org`
   --> tests/compile_fail/scoped_tx_enqueues_another_scopes_job.rs:39:19
    |
-39 | #[job(scoped_by = Team)]
+39 | #[job(scoped_by = Team, retain_dead)]
    |                   ^^^^
 note: required by a bound in `ScopedTx::<'_, 'a, S>::enqueue`
   --> $WORKSPACE/crates/charpente-core/src/db.rs

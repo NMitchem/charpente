@@ -1,0 +1,9 @@
+error[E0599]: no associated function or constant named `on_dead` found for struct `Ping` in the current scope
+ --> tests/compile_fail/job_on_dead_without_the_method.rs:7:1
+  |
+7 | #[job(global, on_dead)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `Ping`
+8 | struct Ping {
+  | ----------- associated function or constant `on_dead` not found for this struct
+  |
+  = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)

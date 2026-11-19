@@ -80,7 +80,7 @@ fn feed(
     Ok(Subscription::of::<MemoNoted>().cursor(cursor))
 }
 
-#[job(global, cross_tenant)]
+#[job(global, retain_dead, cross_tenant)]
 struct Sweep {}
 
 impl Sweep {
@@ -92,7 +92,7 @@ impl Sweep {
     }
 }
 
-#[job(scoped_by = Org, cross_tenant)]
+#[job(scoped_by = Org, retain_dead, cross_tenant)]
 struct Touch {
     n: u64,
 }

@@ -13,7 +13,7 @@ use charpente_core::db::{
     TableWriteRefusal, Tenant, TenantAdmission, Tx, TxError,
 };
 use charpente_core::io::{OutboundCall, OutboundReply, WallTime};
-use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
+use charpente_core::job::{DeadRecord, JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
 use super::clock::Now;
@@ -118,7 +118,37 @@ pub struct JobDef {
     /// disagrees with it; dispatch's misroute guards stop the kernel on a row
     /// already on disk that does.
     pub outbound: Option<OutboundDef>,
+    /// `#[job(…, on_dead)]` or `#[job(…, retain_dead)]`: what this job's Dead
+    /// means, a required choice with no default (DECISIONS §13). Not part of
+    /// `fingerprint`: a stance changes no stored byte, so a Pending row stays
+    /// this binary's to run when its job changes stance. `describe` lists it.
+    pub dead: DeadStance,
+    /// `"dead:<name>"`, the coverage label for a Dead row of this job;
+    /// `#[job]` emits it as a literal.
+    pub dead_coverage: &'static str,
 }
+
+/// A job's Dead stance (`JobDef::dead`).
+#[derive(Clone, Copy)]
+pub enum DeadStance {
+    /// `retain_dead`: the Dead row, kept with its `last_error`, is all that
+    /// happens.
+    Retain,
+    /// `on_dead`: the job's hook, run in the stage that commits its Dead mark.
+    Hook(DeadGlue),
+}
+
+/// The glue `#[job(…, on_dead)]` generates: open the record as the job's own
+/// type, decode the payload, and call the job's `on_dead` with them, in the
+/// job's tenant for a scoped job and with the capability for a
+/// `cross_tenant` one, as `JobGlue` calls `run`.
+pub type DeadGlue = fn(
+    &mut Tx,
+    &[u8],
+    DeadRecord,
+    Option<&CrossTenant<'_>>,
+    Option<JobScope<'_>>,
+) -> Result<(), JobError>;
 
 /// The glue signature `#[job]` generates: decode the payload, call the
 /// payload's `run`, hand back its verdict. Named, like `http::Glue`, so the

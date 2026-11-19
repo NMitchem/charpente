@@ -714,7 +714,8 @@ const GOLDEN: &str = r#"{
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": true,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     },
     {
       "name": "SendReceipt",
@@ -725,7 +726,8 @@ const GOLDEN: &str = r#"{
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": false,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     },
     {
       "name": "SendOverdueReminder",
@@ -736,7 +738,8 @@ const GOLDEN: &str = r#"{
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": false,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     },
     {
       "name": "AdvanceDay",
@@ -747,7 +750,8 @@ const GOLDEN: &str = r#"{
       "scoped_by": null,
       "cross_tenant": false,
       "builtin": false,
-      "outbound": null
+      "outbound": null,
+      "dead": "retain_dead"
     }
   ],
   "cron": [

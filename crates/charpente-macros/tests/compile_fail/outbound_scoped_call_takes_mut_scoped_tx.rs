@@ -22,7 +22,7 @@ impl Tenant for Org {
     }
 }
 
-#[job(scoped_by = Org, outbound = "api.stripe.com")]
+#[job(scoped_by = Org, retain_dead, outbound = "api.stripe.com")]
 struct Charge {}
 
 impl Charge {
