@@ -4742,6 +4742,51 @@ mod tests {
         }
     }
 
+    /// A world whose first handle declared no host gives the outage nothing to
+    /// pick: inside its window a call to a modelled host is answered and no
+    /// call is covered as an outage.
+    #[test]
+    fn an_outage_over_no_declared_host_refuses_no_call() {
+        use crate::outbound::{Remote, from_fn};
+        use charpente::core::io::{
+            HttpMethod, IdempotencyKey, Outbound, OutboundCall, OutboundReply,
+        };
+        fn model(f: impl Remote) -> impl Remote {
+            f
+        }
+        let mut cfg = FaultConfig::none();
+        cfg.outbound_outage = (Duration::ZERO, Duration::from_secs(60));
+        let sim = Sim::with_faults(1, cfg);
+        sim.remote(
+            "a.test",
+            model(from_fn(|_: &OutboundCall| OutboundReply {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })),
+        );
+        let ob = sim.outbound(&[]).unwrap();
+        ob.start(
+            0,
+            OutboundCall {
+                host: "a.test",
+                method: HttpMethod::Post,
+                path: "/x".into(),
+                headers: Vec::new(),
+                body: Vec::new(),
+                key: IdempotencyKey::from_bytes([0; 16]),
+            },
+        )
+        .unwrap();
+        sim.clock().sleep(Duration::from_secs(1));
+        let mut results = Vec::new();
+        while let Some((_, r)) = ob.poll() {
+            results.push(r.map(|r| r.status).map_err(|e| e.kind()));
+        }
+        assert_eq!(results, [Ok(200)], "the call inside the window");
+        assert_eq!(sim.coverage().get("fault:outbound_outage"), None);
+    }
+
     /// The axis is app-only: neither `FaultConfig::swarm` nor
     /// `sample_extended_fields` (what every `run_universes_swarm!` suite
     /// calls) turns it on, and `app_config` does for some seeds and
@@ -5195,6 +5240,9 @@ mod tests {
         cfg.clock_downtime = (0.0, Duration::from_secs(3 * 86_400));
         assert!(!axis_on(&cfg, "clock_step_back"));
         assert!(!axis_on(&cfg, "clock_downtime"));
+        // An outage of length 0 cannot fire, whatever its start.
+        cfg.outbound_outage = (Duration::from_secs(1), Duration::ZERO);
+        assert!(!axis_on(&cfg, "outbound_outage"));
     }
 
     #[test]
