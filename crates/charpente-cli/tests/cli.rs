@@ -245,7 +245,7 @@ fn the_repro_flags_refuse_by_name_and_run_nothing() {
              object_delete_error, conn_drop, net_spike, subscriber_stall, outbound_refused, \
              outbound_lost_request, outbound_lost_reply, outbound_throttle, outbound_slow, \
              outbound_latency, disk_latency, net_latency, clock_skew, clock_step_back, \
-             clock_downtime",
+             clock_downtime, outbound_outage",
         ),
         // An unset `--inputs "$HEX"` must not replay all zeros.
         (
@@ -535,6 +535,11 @@ fn a_clock_refusal_in_the_outbound_fixtures_tail_is_waited_out() {
                 seed,
                 "--filter",
                 "orders_charge_once",
+                // 0.5.0 added the outage axis, which 0x37c7… draws on (eight
+                // refused calls and no re-call); these seeds were found for
+                // the clock refusal, so the new axis is held off.
+                "--faults-off",
+                "outbound_outage",
             ])
             .args(["--format", "json", "--dir", &outbound_fixture_dir()])
             .output()

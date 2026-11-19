@@ -143,6 +143,13 @@ pub struct FaultConfig {
     /// the largest jump. Virtual time does not move; only that host's wall
     /// reading does.
     pub clock_downtime: (f64, Duration),
+    /// A provider outage: (start, length) in virtual time since the universe
+    /// began, during which every call to one host is refused
+    /// (`fault:outbound_outage`). A length of zero is off. The host is chosen
+    /// at the universe's first outbound call, from the hosts with a
+    /// registered remote in name order. It reads virtual time, never rolls,
+    /// and ignores `Sim::quiesce_outbound_faults`, so it outlives a tail.
+    pub outbound_outage: (Duration, Duration),
 }
 
 const CORRUPTION_SCOPE_DEFAULT: &str = "wal/";
@@ -177,6 +184,7 @@ impl Default for FaultConfig {
             clock_skew: 0,
             clock_step_back: (0.0, Duration::ZERO),
             clock_downtime: (0.0, Duration::ZERO),
+            outbound_outage: (Duration::ZERO, Duration::ZERO),
         }
     }
 }
@@ -211,6 +219,7 @@ impl FaultConfig {
             clock_skew: 0,
             clock_step_back: (0.0, Duration::ZERO),
             clock_downtime: (0.0, Duration::ZERO),
+            outbound_outage: (Duration::ZERO, Duration::ZERO),
         }
     }
 
@@ -300,6 +309,7 @@ impl FaultConfig {
             clock_skew: 0,
             clock_step_back: (0.0, Duration::ZERO),
             clock_downtime: (0.0, Duration::ZERO),
+            outbound_outage: (Duration::ZERO, Duration::ZERO),
         };
         cfg.validate(); // a sampler that produces an invalid config is a harness bug
         cfg
@@ -353,6 +363,12 @@ impl FaultConfig {
                 "FaultConfig.{name}'s largest size {max:?} exceeds i64 nanoseconds"
             );
         }
+        assert!(
+            u64::try_from(self.outbound_outage.0.as_nanos()).is_ok()
+                && u64::try_from(self.outbound_outage.1.as_nanos()).is_ok(),
+            "FaultConfig.outbound_outage {:?} exceeds u64 nanoseconds",
+            self.outbound_outage
+        );
         assert!(
             self.crash_apply + self.crash_torn <= 1.0,
             "FaultConfig: crash_apply + crash_torn must not exceed 1 (the rest is the drop probability)"
@@ -513,6 +529,26 @@ fn sample_clock_fields(seed: u64, cfg: &mut FaultConfig) {
         (0.5, Duration::from_secs(3 * 86_400))
     } else {
         (0.0, Duration::ZERO)
+    };
+}
+
+/// The provider-outage axis, on in a quarter of runs from its own keyed
+/// stream, so no existing field moves (`the_outage_axis_moves_no_existing_draw`).
+/// Called by `app_config` only. The start is uniform in the first two seconds of
+/// virtual time; the length is 60 s or 300 s (the default retry policy
+/// survives them) or 1800 s or 4 h (it is exhausted). The host is drawn later,
+/// at the first outbound call, from `keyed_stream(seed, "outbound_outage_host")`.
+fn sample_outage_field(seed: u64, cfg: &mut FaultConfig) {
+    const LENGTHS: [u64; 4] = [60, 300, 1800, 4 * 3600];
+    let mut r = keyed_stream(seed, "outbound_outage");
+    cfg.outbound_outage = if r.chance(0.25) {
+        let start = r.between(0, 2_000_000_000);
+        (
+            Duration::from_nanos(start),
+            Duration::from_secs(LENGTHS[r.below(4) as usize]),
+        )
+    } else {
+        (Duration::ZERO, Duration::ZERO)
     };
 }
 
@@ -3046,6 +3082,7 @@ fn app_config(seed: u64, faults_off: &[&'static str]) -> FaultConfig {
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
     sample_extended_fields(seed, &mut cfg);
     sample_clock_fields(seed, &mut cfg);
+    sample_outage_field(seed, &mut cfg);
     for field in faults_off {
         turn_off(&mut cfg, field);
     }
@@ -3095,7 +3132,7 @@ pub(crate) fn run_app_universe(
 /// `corruption_scope`, which scopes two axes rather than being one. The
 /// harness's `--faults-off` names these, and its shrinker turns them off in
 /// this order (`fault_axes_are_every_field_but_the_scope`).
-pub(crate) const FAULT_AXES: [&str; 26] = [
+pub(crate) const FAULT_AXES: [&str; 27] = [
     "write_error",
     "sync_error",
     "crash_apply",
@@ -3122,6 +3159,7 @@ pub(crate) const FAULT_AXES: [&str; 26] = [
     "clock_skew",
     "clock_step_back",
     "clock_downtime",
+    "outbound_outage",
 ];
 
 /// Whether the axis `field` is on in `cfg`: it could fire, and turning it off
@@ -3133,6 +3171,7 @@ pub(crate) fn axis_on(cfg: &FaultConfig, field: &str) -> bool {
     let never_fires = match field {
         "clock_step_back" => cfg.clock_step_back.0 == 0.0,
         "clock_downtime" => cfg.clock_downtime.0 == 0.0,
+        "outbound_outage" => cfg.outbound_outage.1.is_zero(),
         _ => false,
     };
     let mut off = cfg.clone();
@@ -3172,6 +3211,7 @@ fn turn_off(cfg: &mut FaultConfig, field: &str) {
         "clock_skew" => cfg.clock_skew = 0,
         "clock_step_back" => cfg.clock_step_back = (0.0, Duration::ZERO),
         "clock_downtime" => cfg.clock_downtime = (0.0, Duration::ZERO),
+        "outbound_outage" => cfg.outbound_outage = NONE,
         _ => panic!("faults_off names \"{field}\", which is no FaultConfig fault axis"),
     }
 }
@@ -4568,6 +4608,73 @@ mod tests {
         }
     }
 
+    /// The outage axis samples from its own keyed stream after everything
+    /// else, so every other field is the same with and without it, and it is
+    /// on in a quarter of seeds with one of the four lengths.
+    #[test]
+    fn the_outage_axis_moves_no_existing_draw() {
+        let mut on = 0u32;
+        let mut lengths = std::collections::BTreeSet::new();
+        for seed in 0..1_000u64 {
+            let mut s = seed;
+            let cfg_seed = splitmix64(&mut s);
+            let mut without = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+            sample_extended_fields(seed, &mut without);
+            sample_clock_fields(seed, &mut without);
+            let mut with = without.clone();
+            sample_outage_field(seed, &mut with);
+            with.validate();
+            let (start, len) = with.outbound_outage;
+            if !len.is_zero() {
+                on += 1;
+                lengths.insert(len.as_secs());
+                assert!(
+                    start <= Duration::from_secs(2),
+                    "seed {seed}: start {start:?}"
+                );
+            } else {
+                assert!(start.is_zero(), "seed {seed}: off carries a start");
+            }
+            with.outbound_outage = (Duration::ZERO, Duration::ZERO);
+            assert_eq!(format!("{with:?}"), format!("{without:?}"), "seed {seed}");
+        }
+        assert!(
+            (200..=300).contains(&on),
+            "outage was on in {on} of 1000 seeds"
+        );
+        assert_eq!(
+            lengths.into_iter().collect::<Vec<_>>(),
+            [60, 300, 1800, 14_400],
+            "all four lengths are drawn"
+        );
+    }
+
+    /// The axis is app-only: neither `FaultConfig::swarm` nor
+    /// `sample_extended_fields` (what every `run_universes_swarm!` suite
+    /// calls) turns it on, and `app_config` does for some seeds and
+    /// `--faults-off outbound_outage` turns it off again.
+    #[test]
+    fn the_outage_axis_is_sampled_app_only() {
+        let mut app_on = 0;
+        for seed in 0..300u64 {
+            let mut s = seed;
+            let mut cfg = FaultConfig::swarm(&mut Rng::new(splitmix64(&mut s)));
+            sample_extended_fields(seed, &mut cfg);
+            assert!(
+                cfg.outbound_outage.1.is_zero(),
+                "seed {seed}: a platform config"
+            );
+            let app = app_config(seed, &[]);
+            app_on += u32::from(!app.outbound_outage.1.is_zero());
+            let off = app_config(seed, &["outbound_outage"]);
+            assert!(off.outbound_outage.1.is_zero(), "seed {seed}");
+        }
+        assert!(
+            app_on > 0,
+            "app_config never turned the outage on in 300 seeds"
+        );
+    }
+
     /// Spec §4, at the universe: with the clock axes turned off, an app run
     /// decides exactly as the harness did before them (`run_universe`) —
     /// same outcome, coverage, message and every other config field. With
@@ -4601,6 +4708,7 @@ mod tests {
             cfg.clock_skew = 0;
             cfg.clock_step_back = (0.0, Duration::ZERO);
             cfg.clock_downtime = (0.0, Duration::ZERO);
+            cfg.outbound_outage = (Duration::ZERO, Duration::ZERO);
             format!("{cfg:?}")
         };
         let app = |seed: u64, faults_off: &[&'static str]| -> Seen {
@@ -4672,6 +4780,7 @@ mod tests {
             cfg.clock_skew = 0;
             cfg.clock_step_back = (0.0, Duration::ZERO);
             cfg.clock_downtime = (0.0, Duration::ZERO);
+            cfg.outbound_outage = (Duration::ZERO, Duration::ZERO);
             format!("{cfg:?}")
         };
         let mut fired: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -4972,6 +5081,7 @@ mod tests {
             clock_skew: 1,
             clock_step_back: (0.1, ms),
             clock_downtime: (0.1, ms),
+            outbound_outage: (ms, ms),
         };
         for axis in FAULT_AXES {
             assert!(

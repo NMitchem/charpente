@@ -1213,3 +1213,73 @@ fn a_timed_job_never_runs_before_its_due_time_in_true_time() {
         floor: [("clock:downtime", TIMED_DOWNTIME_FLOOR)]
     );
 }
+
+/// An outage refuses every call to its one host for its whole window, whether
+/// or not the tail has quiesced the outbound faults, and the host answers
+/// again when the window ends. Two hosts, so the one that is refused is the
+/// drawn one and the other is the control. Seed 0xD7_0A01 is arbitrary: the
+/// test finds the drawn host by probing during the window and asserts it is
+/// exactly one of the two.
+#[test]
+fn an_outage_refuses_every_call_to_its_host_through_the_quiesce() {
+    fn call(host: &'static str, n: u8) -> OutboundCall {
+        OutboundCall {
+            host,
+            method: HttpMethod::Post,
+            path: "/x".into(),
+            headers: Vec::new(),
+            body: vec![n],
+            key: CallKey::from_bytes([n; 16]),
+        }
+    }
+    let ok = |_: &OutboundCall| OutboundReply {
+        status: 200,
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    let mut cfg = FaultConfig::none();
+    // Window: [10 s, 70 s) of virtual time.
+    cfg.outbound_outage = (Duration::from_secs(10), Duration::from_secs(60));
+    let sim = Sim::with_faults(0xD7_0A01, cfg);
+    sim.remote("a.test", charpente_sim::outbound::from_fn(ok));
+    sim.remote("b.test", charpente_sim::outbound::from_fn(ok));
+    let ob = sim.outbound(&["a.test", "b.test"]).unwrap();
+    // One call; Ok(status) or the transport error's kind.
+    let try_call = |host: &'static str, n: u8| -> Result<u16, io::ErrorKind> {
+        ob.start(u64::from(n), call(host, n)).unwrap();
+        let (token, result) = ob
+            .poll()
+            .expect("a fault-free-latency call completes at once");
+        assert_eq!(token, u64::from(n));
+        result.map(|r| r.status).map_err(|e| e.kind())
+    };
+    // Before the window: both hosts answer. (The pick happens at this call.)
+    assert_eq!(try_call("a.test", 1), Ok(200));
+    assert_eq!(try_call("b.test", 2), Ok(200));
+    sim.clock().sleep(Duration::from_secs(20));
+    let during: Vec<_> = ["a.test", "b.test"]
+        .into_iter()
+        .map(|h| (h, try_call(h, 3)))
+        .collect();
+    let refused: Vec<_> = during.iter().filter(|(_, r)| r.is_err()).collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "exactly the drawn host is refused: {during:?}"
+    );
+    let (down, _) = *refused[0];
+    let up = if down == "a.test" { "b.test" } else { "a.test" };
+    assert_eq!(refused[0].1, Err(io::ErrorKind::ConnectionRefused));
+    assert_eq!(try_call(up, 4), Ok(200));
+    // The tail's quiesce ends every roll, and the outage goes on.
+    sim.quiesce_outbound_faults();
+    assert_eq!(try_call(down, 5), Err(io::ErrorKind::ConnectionRefused));
+    sim.clock().sleep(Duration::from_secs(40));
+    assert_eq!(try_call(down, 6), Err(io::ErrorKind::ConnectionRefused));
+    assert_eq!(try_call(up, 7), Ok(200));
+    // Past the window's end it answers again.
+    sim.clock().sleep(Duration::from_secs(20));
+    assert_eq!(try_call(down, 8), Ok(200));
+    // Three refused calls (probe, after quiesce, late in the window).
+    assert_eq!(sim.coverage().get("fault:outbound_outage"), Some(&3));
+}

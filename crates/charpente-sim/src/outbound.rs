@@ -217,6 +217,10 @@ pub(crate) struct OutboundWorld {
     throttle: Rng,
     slow: Rng,
     latency: Rng,
+    /// The host the outage refuses, drawn at the universe's first outbound
+    /// call and only when the axis is on.
+    outage_pick: Rng,
+    outage_host: Option<String>,
 }
 
 impl OutboundWorld {
@@ -234,6 +238,8 @@ impl OutboundWorld {
             throttle: keyed_stream(seed, "outbound-rt:throttle"),
             slow: keyed_stream(seed, "outbound-rt:slow"),
             latency: keyed_stream(seed, "outbound-rt:latency"),
+            outage_pick: keyed_stream(seed, "outbound_outage_host"),
+            outage_host: None,
         }
     }
 
@@ -313,6 +319,18 @@ impl Outbound for SimOutbound {
             "{}",
             no_model(call.host)
         );
+        // The outage is a window of virtual time on one host, not a roll: it
+        // draws nothing per call and ignores `quiet`, so it outlives a tail.
+        let (start, length) = cfg.outbound_outage;
+        let outage = !length.is_zero() && {
+            if outbound.outage_host.is_none() {
+                let n = outbound.models.len() as u64;
+                let pick = outbound.outage_pick.below(n) as usize;
+                outbound.outage_host = outbound.models.keys().nth(pick).cloned();
+            }
+            let (start, end) = (start.as_nanos() as u64, (start + length).as_nanos() as u64);
+            outbound.outage_host.as_deref() == Some(call.host) && (start..end).contains(&now)
+        };
         // Every axis rolls once per call, whatever the others decide, so
         // turning one on or off moves no other axis's draw. A draw that only
         // its own axis's roll gates (the throttle's status, the slow think
@@ -345,8 +363,12 @@ impl Outbound for SimOutbound {
         };
         let reply_lost = !outbound.quiet && outbound.lost_reply.chance(cfg.outbound_lost_reply);
         let mut cover = |key| *coverage.entry(key).or_insert(0) += 1;
-        let fate = if refused {
-            cover("fault:outbound_refused");
+        let fate = if outage || refused {
+            cover(if outage {
+                "fault:outbound_outage"
+            } else {
+                "fault:outbound_refused"
+            });
             Fate::Short {
                 at: Some(now),
                 result: Some(Err(io::Error::new(

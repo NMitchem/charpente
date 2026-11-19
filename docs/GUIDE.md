@@ -4647,6 +4647,16 @@ refused:
 | `outbound_lost_reply` | the call, applied | silence, then its deadline: the ambiguous case | `fault:outbound_lost_reply` |
 | `outbound_throttle` | nothing (overloaded) | a 429 or 503 | `fault:outbound_throttle` |
 | `outbound_latency` `(min, max)` and `outbound_slow` | the call, late | a reply late, or past the deadline (the LLM tail) | `fault:outbound_slow`; latency has none |
+| `outbound_outage` `(start, length)` | nothing | every call to one host refused for the window, `ConnectionRefused`, through the tail's quiesce | `fault:outbound_outage` |
+
+`outbound_outage` is a window of virtual time, not a roll: it reads the
+sim's clock, draws nothing per call, and `quiesce_outbound_faults` does not
+end it, so an outage outlives the fault-free tail and runs to its drawn end.
+That is how a job reaches Dead in a sim. The host is the one the universe's
+first outbound call picks, from the hosts with a registered remote in name
+order. The window is refused as `outbound_refused` is, and takes its place
+in the precedence. A length of zero is off, and an app with no hosts makes
+no call, so the axis is inert there.
 
 `outbound_latency` is a one-way range, drawn once for the request and once
 for the reply, and a throttle answers after twice the request's draw.
@@ -4672,6 +4682,14 @@ sampled values are unchanged:
 | `outbound_throttle` | on with chance 0.25, at 0 to 0.099 |
 | `outbound_slow` | on with chance 0.25, at 0 to 0.049 |
 | `outbound_latency` | `(0, max)`, with max one of 0, 10 ms, 200 ms or 2 s, each with chance 0.25 |
+
+`outbound_outage` is not in a swarm sample. `charpente test --sim` draws it
+from its own stream (`outbound_outage`) after the clock axes, and a
+`run_universes_swarm!` suite never turns it on:
+
+| Field | App-harness sample |
+|---|---|
+| `outbound_outage` | on with chance 0.25; the start uniform in the first 2 s of virtual time; the length one of 60 s, 300 s, 1800 s or 4 h. The default policy (5 attempts, a 30 s doubling backoff, a 30 s timeout) survives the first two and is exhausted by the last two |
 
 ### Calling the outside world in a sim
 
@@ -4902,7 +4920,8 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   `object_delete_error`, `conn_drop`, `net_spike`, `subscriber_stall`,
   `outbound_refused`, `outbound_lost_request`, `outbound_lost_reply`,
   `outbound_throttle`, `outbound_slow`, `outbound_latency`, `disk_latency`,
-  `net_latency`, `clock_skew`, `clock_step_back` and `clock_downtime`. The
+  `net_latency`, `clock_skew`, `clock_step_back`, `clock_downtime` and
+  `outbound_outage`. The
   seed's config is sampled first and these are turned off after, so every
   other field is the seed's own. A name that is not an axis is a usage error
   that lists them.

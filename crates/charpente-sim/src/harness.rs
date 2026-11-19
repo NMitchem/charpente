@@ -1688,12 +1688,15 @@ fn config_json(cfg: &FaultConfig, out: &mut String) {
     ));
     out.push_str(&format!(
         ",\"clock_skew\":{},\"clock_step_back\":{{\"chance\":{},\"max_ns\":{}}},\
-         \"clock_downtime\":{{\"chance\":{},\"max_ns\":{}}}}}",
+         \"clock_downtime\":{{\"chance\":{},\"max_ns\":{}}},\
+         \"outbound_outage\":{{\"start_ns\":{},\"length_ns\":{}}}}}",
         cfg.clock_skew,
         cfg.clock_step_back.0,
         cfg.clock_step_back.1.as_nanos(),
         cfg.clock_downtime.0,
         cfg.clock_downtime.1.as_nanos(),
+        cfg.outbound_outage.0.as_nanos(),
+        cfg.outbound_outage.1.as_nanos(),
     ));
 }
 
@@ -2251,6 +2254,7 @@ mod tests {
             clock_skew: 41_207_118_532,
             clock_step_back: (0.0, Duration::ZERO),
             clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
+            outbound_outage: (Duration::ZERO, Duration::ZERO),
         };
         let mut failure = Failure {
             test: "receipts_exactly_once",
@@ -2513,6 +2517,7 @@ mod tests {
             clock_skew: -73_000_000_000,
             clock_step_back: (0.012, Duration::from_secs(120)),
             clock_downtime: (0.5, Duration::from_secs(3 * 86_400)),
+            outbound_outage: (Duration::ZERO, Duration::ZERO),
         };
         let mut json = String::new();
         config_json(&cfg, &mut json);
@@ -4655,7 +4660,7 @@ mod tests {
             [],
             "every failure shrinks to [0, 1]; these stopped above it (seed, choices, replays)"
         );
-        assert_eq!(replays, 3505, "the replays the 105 shrinks spent in all");
+        assert_eq!(replays, 3538, "the replays the 105 shrinks spent in all");
     }
 
     /// Draws three items of three draws each, `p`, `q` and `r` in 0..=9, and
@@ -4711,8 +4716,9 @@ mod tests {
         let shrunk = shrink(&test, SEED, &first);
         assert_eq!(
             (shrunk.choices.as_slice(), shrunk.replays),
-            (&[1, 0, 0, 2, 2, 2][..], 66),
-            "the same run as without the retry, which spends 65 replays; faults off {:?}",
+            (&[1, 0, 0, 2, 2, 2][..], 67),
+            "the same run as without the retry, which spends 66 replays (one more than before \
+             the outage axis, which seed 0x1 draws on and the shrinker turns off); faults off {:?}",
             shrunk.faults_off
         );
     }
@@ -4731,7 +4737,7 @@ mod tests {
             [],
             "every failure shrinks to [0, 1]; these stopped above it (seed, choices, replays)"
         );
-        assert_eq!(replays, 3610, "the replays the 178 shrinks spent in all");
+        assert_eq!(replays, 3654, "the replays the 178 shrinks spent in all");
     }
 
     #[test]
@@ -4803,7 +4809,7 @@ mod tests {
              object_delete_error, conn_drop, net_spike, subscriber_stall, outbound_refused, \
              outbound_lost_request, outbound_lost_reply, outbound_throttle, outbound_slow, \
              outbound_latency, disk_latency, net_latency, clock_skew, clock_step_back, \
-             clock_downtime"
+             clock_downtime, outbound_outage"
         );
         assert_eq!(
             parse(&["--seed", "0x1", "--faults-off", "corruption_scope"]).unwrap_err(),
