@@ -4347,6 +4347,68 @@ fn db_transact_answers_err_when_nothing_else_reports_its_checkpoint_failure() {
     );
 }
 
+/// `App::handle`'s own arm of the rule: its one-request group answers 500
+/// only for a commit failure that invalidates the request's record
+/// (`App::dispatch`'s match guard). Here `POST /bump/1`'s record reached the
+/// store before the cadence checkpoint failed, at the store's sync (the store
+/// latches) and at the breadcrumb's (nothing poisons or latches, and this
+/// path, unlike `Db::transact`, reports it to no one: dispatch's comment and
+/// PLAN's v1.x row). Either way the route's answer stands (0.5.0's delta
+/// mutation run, app.rs 1128:29: the guard replaced with `true` answered both
+/// 500).
+#[test]
+fn app_handle_keeps_its_answer_when_the_checkpoint_fails_after_the_record_reached_the_store() {
+    let store = latch_config().db.store_path.clone();
+    for (seed, path, latched) in [
+        (0x60C0_0017, store.clone(), true),
+        (0x60C0_0018, format!("{store}.horizon"), false),
+    ] {
+        let sim = Sim::with_faults(seed, FaultConfig::none());
+        let armed = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicU64::new(0));
+        let mut app = App::open(
+            Box::new(OneShotStoreSyncFaultDisk {
+                inner: sim.disk(),
+                store_path: path.clone(),
+                armed: armed.clone(),
+                fired: fired.clone(),
+                reads: Arc::new(AtomicU64::new(0)),
+            }),
+            Schema::new().table::<Counter>(),
+            Box::new(sim.entropy()),
+            latch_config(),
+        )
+        .unwrap()
+        .mount(routes![bump_count]);
+        armed.store(true, Ordering::SeqCst);
+        let response = app.handle(Request::new(Method::Post, "/bump/1"));
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "{path}: the sync must fail exactly once, in the request's own cadence checkpoint"
+        );
+        let db = app.db_for_tests();
+        assert_eq!(
+            (db.store_failed(), db.poisoned()),
+            (latched, latched),
+            "{path}: the store latches only for its own sync, or this is not the arm under test"
+        );
+        assert_eq!(
+            (
+                response.status,
+                String::from_utf8_lossy(&response.body).into_owned()
+            ),
+            (200, "\"1\"".to_string()),
+            "{path}: the record reached the store, so the route's answer stands"
+        );
+        assert_eq!(
+            db.snapshot().unwrap().scan::<Counter>().unwrap().len(),
+            1,
+            "{path}: the record is durable"
+        );
+    }
+}
+
 /// The third commit-failure arm. The tick's batch applied and the store
 /// checkpointed, then the horizon breadcrumb's sync failed. That write is raw
 /// `Disk` IO behind neither the WAL's guard nor the store's backend, so it

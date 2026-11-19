@@ -2090,6 +2090,99 @@ fn a_failed_baselines_log_is_named_through_the_real_verb() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// R-22 through the real verb: a baseline the tool reports as Timeout names
+/// the timeout that pass gave it and the fix, at each of the verb's three
+/// passes: a single pass, pass 1 and pass 2 of a run over an app. 0.5.0's
+/// delta mutation run found the unit test blind to the pass's own timeout
+/// (`PassTimeout::of` returning `None` survived it), which would leave every
+/// real run on the generic "Fix the suite" text.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // scratch records are edge tooling (DESIGN.md §1)
+#[test]
+fn a_baseline_that_timed_out_is_named_through_the_real_verb() {
+    let base =
+        std::env::temp_dir().join(format!("charpente-mutants-timedout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let timed_out = base.join("timed-out");
+    std::fs::create_dir_all(&timed_out).expect("record dir");
+    std::fs::write(
+        timed_out.join("outcomes.json"),
+        r#"{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{"scenario":"Baseline","summary":"Timeout"}]}"#,
+    )
+    .expect("outcomes");
+    let missed = pass_record(
+        &base,
+        "first",
+        [1, 0, 1, 0, 0],
+        &[("3:5: replace every_run", "MissedMutant")],
+    );
+    // `call` is which `cargo mutants` call's --timeout the refusal names, and
+    // `given` whether the run passed one.
+    let check = |args: &[&str], envs: &[(&str, &std::path::Path)], call: usize, given: bool| {
+        let (out, recorded) = run_mutants_with_cargo_shim_in("0", "0", "0", args, false, envs);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr:\n{stderr}");
+        let pass = recorded
+            .iter()
+            .filter(|l| l.starts_with("cargo mutants --output"))
+            .nth(call)
+            .unwrap_or_else(|| panic!("{args:?}: no cargo-mutants call {call}: {recorded:?}"));
+        let timeout = pass
+            .split_once("--timeout ")
+            .map(|(_, rest)| rest.split(' ').next().unwrap())
+            .unwrap_or_else(|| panic!("{args:?}: no --timeout reached the tool: {pass}"));
+        let (what, fix) = if given {
+            assert_eq!(timeout, "60", "{args:?}");
+            (
+                "the timeout this run was given",
+                "Pass a larger --timeout, one the --file's own package's `cargo test` finishes \
+                 inside.",
+            )
+        } else {
+            (
+                "the timeout the verb derived as 5x its own timed `cargo test` over the test set",
+                "Pass a larger --timeout, or a --test-package set that includes the --file's own \
+                 package, so the derived timeout covers its baseline.",
+            )
+        };
+        let at = format!(
+            "error: the UNMUTATED baseline timed out at --timeout {timeout} (seconds), {what} \
+             \u{2014} "
+        );
+        let last = stderr.lines().last().unwrap_or_default();
+        assert!(
+            last.starts_with(&at) && last.ends_with(fix),
+            "{args:?}: the refusal must name the pass's --timeout {timeout} and the fix; \
+             stderr:\n{stderr}"
+        );
+    };
+    let timed_out = timed_out.as_path();
+    let one = ["--file", "pkg-a/src/lib.rs", "--test-package", "pkg-b"];
+    check(&one, &[("SHIM_OUTCOMES", timed_out)], 0, false);
+    let given = [
+        "--file",
+        "pkg-a/src/lib.rs",
+        "--test-package",
+        "pkg-b",
+        "--timeout",
+        "60",
+    ];
+    check(&given, &[("SHIM_OUTCOMES", timed_out)], 0, true);
+    let app = ["--file", "pkg-a/src/lib.rs", "--test-package", "app"];
+    check(&app, &[("SHIM_OUTCOMES", timed_out)], 0, false);
+    check(
+        &app,
+        &[
+            ("SHIM_OUTCOMES", missed.as_path()),
+            ("SHIM_OUTCOMES_ITERATE", timed_out),
+        ],
+        1,
+        false,
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A scratch workspace at `<tmp>/<tag>/ws` with a sibling `<tmp>/<tag>/outside` crate;
 /// `app_manifest_tail` is appended to the member `app`'s manifest. Returns `(base, ws)`.
 #[cfg(unix)]
