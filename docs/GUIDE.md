@@ -2740,6 +2740,29 @@ wall-clock speed — §8 shows the machinery (a scripted kernel under virtual
 time, in "Driving the whole app in a sim") and `charpente test --sim`, the
 runner.
 
+### `tx.now()`: the step's time inside a transaction
+
+A route, a job and a cron tick can read the time of the step they run in:
+`tx.now()` returns a `WallTime`, the reading the kernel held at the start of
+that step (§7, "Clock errors"), the same value for every transaction the step
+serves. The log records no time for it, so replaying a seed replays the same
+reading. `tx.now()` is reachable through a tenant-scoped transaction too, and
+on a follower's read route it is the follower's own held reading.
+
+The bound is the one that holds the node's clock. A node whose clock is behind
+by less than the time since the store's newest recorded time (an API key's
+creation, or a schedule's last tick) plus `CLOCK_TOLERANCE` opens unnoticed.
+For an app with no keys and no schedule of its own, that leaves the daily
+session sweep: about 24 h plus 60 s. So a timed obligation built on `tx.now()`
+can run late by up to that much, and never early in the node's own frame. A
+frequent schedule tightens the bound: the store then holds a recent time, and
+a clock behind it by more than the tolerance is refused at open.
+
+Outside a kernel a transaction carries no time and `tx.now()` panics by name.
+A test gives it one with `Db::transact_at(now, f)`, `Group::set_now(now)` on a
+group from `Db::begin_group`, or `App::transact_for_tests_at(now, f)`;
+`App::begin_group` takes the time as its argument.
+
 ### A logical clock: reading "now" inside a transaction
 
 §4 was explicit that a transaction closure receives only `&mut Tx` — no

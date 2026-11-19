@@ -56,7 +56,7 @@ use std::io;
 
 use crate::engine::{Engine, StateMachine, SubmitFailure};
 use crate::event::EventRow;
-use crate::io::{Disk, Entropy, File};
+use crate::io::{Disk, Entropy, File, WallTime};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
@@ -1246,6 +1246,9 @@ pub struct Tx<'a> {
     /// The `Schema` the `Group` stages against: a read checks its
     /// `Row` type against the one registered for its table (amendment A18).
     schema: &'a Schema,
+    /// The step's held wall reading, handed in by the caller (the kernel arm's
+    /// `Now`, `Db::transact_at`, `Group::set_now`); core never reads a clock.
+    now: Option<WallTime>,
 }
 
 impl<'a> Tx<'a> {
@@ -1262,7 +1265,20 @@ impl<'a> Tx<'a> {
             group: None,
             effects: TxEffects::default(),
             opened_scope: None,
+            now: None,
         }
+    }
+
+    /// The step's held wall reading: every transaction in one kernel step
+    /// reads the same time. Panics by name when the transaction has none.
+    pub fn now(&self) -> WallTime {
+        self.now.expect(
+            "contract: tx.now() reads the transaction's time, and this transaction has none \
+             — the kernel gives every route, job, cron tick and Dead hook its step's time, \
+             but Db::transact and Db::begin_group carry none; pass one explicitly with \
+             Db::transact_at(now, f) or Group::set_now(now), or in a test \
+             App::transact_for_tests_at(now, f)",
+        )
     }
 
     /// Stages a row on an UNSCOPED table. `R: WritableRow` is the write
@@ -3598,7 +3614,26 @@ impl Db {
         &mut self,
         f: impl FnOnce(&mut Tx) -> Result<T, E>,
     ) -> Result<T, TxError<E>> {
+        self.transact_with(None, f)
+    }
+
+    /// `transact` with the transaction's time in hand, so `tx.now()` reads
+    /// `now` rather than panicking.
+    pub fn transact_at<T, E>(
+        &mut self,
+        now: WallTime,
+        f: impl FnOnce(&mut Tx) -> Result<T, E>,
+    ) -> Result<T, TxError<E>> {
+        self.transact_with(Some(now), f)
+    }
+
+    fn transact_with<T, E>(
+        &mut self,
+        now: Option<WallTime>,
+        f: impl FnOnce(&mut Tx) -> Result<T, E>,
+    ) -> Result<T, TxError<E>> {
         let mut g = self.begin_group().map_err(TxError::Io)?;
+        g.now = now;
         let out = g.stage(f)?;
         // `applied` is consulted through the SAME rule the kernel's batched
         // tail uses (`CommitFailure::invalidates`), not discarded. A lone
@@ -3646,6 +3681,7 @@ impl Db {
             records: Vec::new(),
             staged_adoptions: BTreeSet::new(),
             mint: None,
+            now: None,
             db: self,
         })
     }
@@ -4520,6 +4556,8 @@ pub struct Group<'a> {
     /// `Db::begin_group`, whose `stage` panics on one by name (a contract
     /// violation: the caller must use a minting group).
     mint: Option<&'a dyn Entropy>,
+    /// Handed to every `Tx` this group stages; see `Tx::now`.
+    now: Option<WallTime>,
     db: &'a mut Db,
 }
 
@@ -4551,6 +4589,16 @@ impl Drop for Group<'_> {
 }
 
 impl<'a> Group<'a> {
+    /// Gives every transaction this group stages its step's time (`tx.now()`).
+    pub fn set_now(&mut self, now: WallTime) {
+        assert!(
+            self.records.is_empty() && self.now.is_none(),
+            "contract: Group::set_now is called once, before the group's first stage — every \
+             transaction in a group reads the same time"
+        );
+        self.now = Some(now);
+    }
+
     /// Runs `f` against the group's snapshot plus every write staged into
     /// the group so far — read-your-own-writes across the whole batch, not
     /// just within one transaction (spec §2). On `Ok` with at least one
@@ -4595,6 +4643,7 @@ impl<'a> Group<'a> {
         let (out, mut effects) = {
             let mut tx = Tx::over(&self.snapshot, &self.db.engine.machine().schema);
             tx.group = Some(&self.overlay);
+            tx.now = self.now;
             let out = f(&mut tx).map_err(TxError::App)?;
             (out, tx.effects)
         };

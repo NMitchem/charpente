@@ -119,7 +119,13 @@ be tighter, but it is a new field or record in the log, which changes the log fo
 pinned seed's byte counts; the recovered bound costs neither. Its price: the bound is only as
 recent as the last key or tick, and a clock behind by less than the time since then plus
 `CLOCK_TOLERANCE` opens unnoticed; that is also how long a session that expired just before a
-restart or failover can resolve again.
+restart or failover can resolve again. `tx.now()` hands a transaction the same held reading,
+so the bound carries to it: a node whose clock is behind by less than the time since the
+store's newest recorded time (an API key's creation, or a schedule's last tick) plus
+`CLOCK_TOLERANCE` opens unnoticed, and an app with no keys and no schedule of its own still
+has the daily session sweep, which makes the figure about 24 h plus 60 s. A timed obligation
+an app builds on `tx.now()` can therefore run late by up to that much, never early in the
+node's own frame.
 
 The simulator implements all of it with one seed driving: latency distributions, virtual
 time (a simulated year of heartbeats runs in seconds), and the fault matrix — injected
@@ -516,8 +522,9 @@ reads tables, writes tables, enqueues jobs, and emits events. On success, its ef
 serialized as one record into a single ordered write-ahead log. Table state is the result
 of applying the log. There is no other way to mutate state.
 
-**What a transaction cannot do:** await the network, read the wall clock directly (it gets
-the transaction's logical timestamp), generate ambient randomness (it gets seeded entropy),
+**What a transaction cannot do:** await the network, read the wall clock directly (it reads
+`tx.now()`, the step's held wall reading: every route, job and cron tick in one kernel step
+reads the one value the loop took at the step's start, so replaying the log replays it), generate ambient randomness (it gets seeded entropy),
 or spawn tasks. External effects are expressed as enqueued jobs that run *after* commit.
 
 **Why.** Three properties fall out of this single decision:

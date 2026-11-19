@@ -182,7 +182,7 @@ fn app_with_op_counter(seed: u64) -> (App, OpCounts) {
 fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
     let (mut app, counts) = app_with_op_counter(0x60C0_0007);
     let before = counts.appends() + counts.syncs();
-    let (mut g, staged) = app.begin_group().expect("group");
+    let (mut g, staged) = app.begin_group(WallTime::UNIX_EPOCH).expect("group");
     let handled = staged.stage_or_subscribe(
         &mut g,
         Request::new(Method::Post, "/hit/1"),
@@ -211,7 +211,7 @@ fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
 #[should_panic(expected = "staged record(s) never committed")]
 fn a_staged_group_dropped_without_commit_panics() {
     let (mut app, _counts) = app_with_op_counter(0x60C0_000A);
-    let (mut g, staged) = app.begin_group().expect("group");
+    let (mut g, staged) = app.begin_group(WallTime::UNIX_EPOCH).expect("group");
     let _ = staged.stage_or_subscribe(
         &mut g,
         Request::new(Method::Post, "/hit/1"),

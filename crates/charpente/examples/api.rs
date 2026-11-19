@@ -504,6 +504,10 @@ fn tx(
     let _labelled: Vec<Note> = tx.scan_by("label", &"urgent".to_string())?;
     // Rows with `id >= from_id`, at most `limit`: page from the last id + 1.
     let _page: Vec<Note> = tx.scan_from(0, 100)?;
+    // The step's held wall reading, the same for every transaction of one
+    // kernel step. Panics by name on a bare `Db::transact` or `begin_group`,
+    // which carry none: see `Db::transact_at` and `Group::set_now`.
+    let _at: WallTime = tx.now();
     tx.put(&note);
     tx.delete(id);
     // A `global` job; a `scoped_by` one does not compile on a bare `Tx`. An
@@ -658,10 +662,24 @@ fn app(sim: &Sim, oidc: OidcConfig) -> io::Result<()> {
         Response::error(404, "not found"),
         Response::sse_headers(),
     ];
+    // A transaction's time, `tx.now()`: the kernel's step reading for a route,
+    // job or cron tick. A group from `Db::begin_group` carries none until
+    // `set_now`; `transact_at` is a lone transaction with one. Both are for
+    // tests; `App::begin_group` below sets it from its argument.
+    let mut own: Group = app.db_for_tests().begin_group()?;
+    own.set_now(WallTime::from_nanos(1));
+    let _own_now: Result<WallTime, TxError<ApiError>> =
+        own.stage(|tx: &mut Tx| -> Result<WallTime, ApiError> { Ok(tx.now()) });
+    let _ = own.commit();
+    let _at: Result<WallTime, TxError<ApiError>> = app.db_for_tests().transact_at(
+        WallTime::from_nanos(1),
+        |tx: &mut Tx| -> Result<WallTime, ApiError> { Ok(tx.now()) },
+    );
     // Many requests staged into one group and committed with one sync, as
     // the kernel batches them. A non-empty `Group` that is dropped, not
     // committed, panics.
-    let (mut group, dispatch): (Group, StagedDispatch) = app.begin_group()?;
+    let (mut group, dispatch): (Group, StagedDispatch) =
+        app.begin_group(WallTime::from_nanos(1))?;
     // One request, routed and staged. Each stage sees every earlier stage's
     // writes; none is durable before `commit`.
     let _staged: Handled = dispatch.stage_or_subscribe(

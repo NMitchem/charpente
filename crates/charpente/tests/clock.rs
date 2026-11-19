@@ -44,14 +44,18 @@ use charpente::kernel::{
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
-use charpente::{Db, Job, Schema, Tx, View, job, jobs, route, routes};
+use charpente::{Db, Job, Schema, Tx, View, job, jobs, route, routes, table};
 use charpente_core::io::{CLOCK_TOLERANCE, Clock, Instant, Net, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
+use charpente_core::table::Id;
 use charpente_sim::rng::{Rng, splitmix64};
 use charpente_sim::{
     FaultConfig, SIM_WALL_BASE_NANOS, Sim, SimClock, SimDisk, SimEntropy, SimHost,
     run_universes_swarm_with,
 };
+
+mod support;
+use support::SteeredClock;
 
 const SEC: u64 = 1_000_000_000;
 const TOL: u64 = CLOCK_TOLERANCE.as_nanos() as u64;
@@ -92,6 +96,12 @@ fn mint_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_api_key(tx, "alice"))
 }
 
+/// The transaction's time, as a number: what `tx.now()` read.
+#[route(GET "/now", public)]
+fn now_route(tx: &mut Tx) -> Result<String, ApiError> {
+    Ok(tx.now().as_nanos().to_string())
+}
+
 #[route(POST "/flaky", public)]
 fn enqueue_flaky(tx: &mut Tx) -> Result<(), ApiError> {
     tx.enqueue(Flaky {});
@@ -129,7 +139,7 @@ fn open_app(disk: SimDisk, entropy: SimEntropy) -> std::io::Result<App> {
             ..AppConfig::default()
         },
     )?
-    .mount(routes![login, me, mint_key, enqueue_flaky])
+    .mount(routes![login, me, mint_key, enqueue_flaky, now_route])
     .mount_jobs(jobs![Flaky, Beat])
     .schedule(BEAT, Duration::from_nanos(BEAT_EVERY), || Beat {}))
 }
@@ -309,6 +319,8 @@ enum Ask {
     Me(usize),
     Key,
     Flaky,
+    /// `GET /now`, asked only by the `tx.now()` follower test.
+    Now,
 }
 
 enum End {
@@ -491,6 +503,7 @@ fn request(ask: Ask, tokens: &[String]) -> Request {
             .header("Authorization", format!("Bearer {}", tokens[i])),
         Ask::Key => Request::new(Method::Post, "/key"),
         Ask::Flaky => Request::new(Method::Post, "/flaky"),
+        Ask::Now => Request::new(Method::Get, "/now"),
     }
 }
 
@@ -685,8 +698,8 @@ fn answer(
             events.push(Event::Present { read, token, seen });
             Ok(())
         }
-        Ask::Flaky if status == 200 => Ok(()),
-        Ask::Flaky => Err(unexpected()),
+        Ask::Flaky | Ask::Now if status == 200 => Ok(()),
+        Ask::Flaky | Ask::Now => Err(unexpected()),
     }
 }
 
@@ -2107,4 +2120,229 @@ fn an_uptime_clock_fails_the_ttl_and_stall_properties_by_name() {
         )),
         "{stall}"
     );
+}
+
+// ------------------------------------------------- tx.now() (0.5.0 spec §5 A)
+
+#[table(global)]
+struct Stamp {
+    id: Id<Stamp>,
+    at: u64,
+}
+
+/// Records the time its transaction read, under its own slot.
+#[job(global)]
+struct Mark {
+    slot: u64,
+}
+
+impl Mark {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        tx.put(&Stamp {
+            id: Id::from_raw(self.slot),
+            at: tx.now().as_nanos(),
+        });
+        Ok(())
+    }
+}
+
+#[route(POST "/mark", public)]
+fn enqueue_mark(tx: &mut Tx) -> Result<(), ApiError> {
+    tx.enqueue(Mark { slot: 1 });
+    Ok(())
+}
+
+/// The cron-enqueued job's slot; the route's is 1.
+const CRON_SLOT: u64 = 2;
+/// A held wall reading well inside any tolerance of a fresh store.
+const T0: u64 = 1_000 * SEC;
+
+fn stamp_kernel(sim: &Sim) -> (Kernel, support::WallSteer) {
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Stamp>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![now_route, enqueue_mark])
+    .mount_jobs(jobs![Mark])
+    .schedule("stamp", Duration::from_secs(15), || Mark {
+        slot: CRON_SLOT,
+    });
+    let (clock, steer) = SteeredClock::new(sim.clock(), WallTime::from_nanos(T0));
+    (Kernel::new(app, Box::new(clock)).unwrap(), steer)
+}
+
+fn body_u64(body: &[u8]) -> u64 {
+    std::str::from_utf8(body)
+        .unwrap()
+        .trim_matches('"')
+        .parse()
+        .unwrap_or_else(|e| panic!("the body {body:?} is not a number: {e}"))
+}
+
+/// A route's `tx.now()` is the wall its step held, not the epoch and not a
+/// fresh read: the clock is steered to a new value before each step and the
+/// answer names that value.
+#[test]
+fn a_route_reads_its_steps_wall_time() {
+    let sim = Sim::with_faults(0xA7C1_0001, FaultConfig::none());
+    let (mut kernel, steer) = stamp_kernel(&sim);
+    for (i, wall) in [T0 + 7 * SEC, T0 + 19 * SEC].into_iter().enumerate() {
+        let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+        let responses = source.responses();
+        source.push_at(0, Request::new(Method::Get, "/now"));
+        steer.set(WallTime::from_nanos(wall));
+        for _ in 0..8 {
+            kernel.step(&mut source).unwrap();
+            if !responses.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        let (status, body) = responses.lock().unwrap()[0].clone();
+        assert_eq!(status, 200, "request {i}");
+        assert_eq!(body_u64(&body), wall, "request {i} read another time");
+    }
+}
+
+/// One step serves a batch under one reading: a clock that moves on every
+/// read still hands both requests the same time.
+#[test]
+fn two_requests_in_one_step_read_one_time() {
+    struct Ticking(SimClock, std::sync::atomic::AtomicU64);
+    impl Clock for Ticking {
+        fn now(&self) -> Instant {
+            self.0.now()
+        }
+        fn wall(&self) -> WallTime {
+            let n = self.1.fetch_add(SEC, std::sync::atomic::Ordering::SeqCst);
+            WallTime::from_nanos(T0 + n)
+        }
+        fn sleep(&self, d: Duration) {
+            self.0.sleep(d);
+        }
+    }
+    let sim = Sim::with_faults(0xA7C1_0002, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![now_route]);
+    let mut kernel = Kernel::new(
+        app,
+        Box::new(Ticking(sim.clock(), std::sync::atomic::AtomicU64::new(0))),
+    )
+    .unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    let responses = source.responses();
+    source.push_at(0, Request::new(Method::Get, "/now"));
+    source.push_at(0, Request::new(Method::Get, "/now"));
+    for _ in 0..8 {
+        kernel.step(&mut source).unwrap();
+        if responses.lock().unwrap().len() >= 2 {
+            break;
+        }
+    }
+    let got = responses.lock().unwrap().clone();
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        body_u64(&got[0].1),
+        body_u64(&got[1].1),
+        "two requests of one step read two times"
+    );
+    assert_eq!(kernel.stats().requests, 2);
+}
+
+/// A job enqueued by a route and one enqueued by a cron tick each record the
+/// time of the step that ran them. The clock is steered to a new value
+/// before every step; a row that appears after a step must hold exactly
+/// that step's value.
+#[test]
+fn a_job_and_a_cron_enqueued_job_read_their_steps_time() {
+    let sim = Sim::with_faults(0xA7C1_0003, FaultConfig::none());
+    let (mut kernel, steer) = stamp_kernel(&sim);
+    let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    source.push_at(0, Request::new(Method::Post, "/mark"));
+    let mut seen: BTreeMap<u64, u64> = BTreeMap::new();
+    for i in 1..=60u64 {
+        let wall = T0 + i * 10 * SEC;
+        steer.set(WallTime::from_nanos(wall));
+        kernel.step(&mut source).unwrap();
+        let rows = kernel
+            .app()
+            .db()
+            .snapshot()
+            .unwrap()
+            .scan::<Stamp>()
+            .unwrap();
+        for row in rows {
+            if seen.insert(row.id.raw(), row.at).is_none() {
+                assert_eq!(
+                    row.at,
+                    wall,
+                    "slot {} was written by the step held at {wall} but read {}",
+                    row.id.raw(),
+                    row.at
+                );
+            }
+        }
+        if seen.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        seen.keys().copied().collect::<Vec<_>>(),
+        vec![1, CRON_SLOT],
+        "both the route's job and the cron's job ran"
+    );
+}
+
+/// Review Focus 2: a follower's read route reads the follower's own held
+/// reading, neither refused for want of a time nor the epoch.
+#[test]
+fn tx_now_on_a_follower_read_route_is_the_followers_held_reading() {
+    let sim = Sim::with_faults(0xA7C1_0004, FaultConfig::none());
+    let mut p = Node::new(&sim, "p", "p:1", Role::Primary);
+    let mut f = Node::new(
+        &sim,
+        "f",
+        "f:1",
+        Role::Follower {
+            primary: "p:1".to_string(),
+        },
+    );
+    assert!(open_replicated(&sim, &mut p).unwrap());
+    assert!(open_replicated(&sim, &mut f).unwrap());
+    let until = sim.now().as_nanos() + 60 * SEC;
+    let converged = |n: &[&mut Node]| {
+        n[1].last_applied().is_some() && n[0].last_applied() == n[1].last_applied()
+    };
+    assert_eq!(
+        drive(&sim, &mut [&mut p, &mut f], until, converged).unwrap(),
+        Some(true)
+    );
+    assert!(
+        !f.kernel.as_ref().unwrap().app().db().writes_allowed(),
+        "the node under test is a follower"
+    );
+    f.asked.push(Ask::Now);
+    f.source
+        .push_at(sim.now().as_nanos(), request(Ask::Now, &[]));
+    let mut expected = None;
+    for _ in 0..50 {
+        round(&sim, &mut [&mut p, &mut f], u64::MAX).unwrap();
+        if !f.responses.lock().unwrap().is_empty() {
+            expected = f.reads.lock().unwrap().last().map(|r| r.kernel);
+            break;
+        }
+    }
+    let (status, body) = f.responses.lock().unwrap()[0].clone();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let got = body_u64(&body);
+    assert_ne!(got, 0, "the follower read the epoch");
+    assert_eq!(got, expected.unwrap(), "not the follower's own reading");
 }

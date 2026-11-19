@@ -625,6 +625,7 @@ impl Dispatcher {
     pub fn run_due(&mut self, db: &mut Db, now: Now) -> io::Result<JobOutcome> {
         let (due_at, id, outbound) = self.next_due().expect("run_due called with an empty heap");
         let mut group = db.begin_group()?;
+        group.set_now(now.wall);
         let result = self.run_due_into(&mut group, now);
         // Sampled BEFORE commit (which `mem::take`s the group's records):
         // `run_due_into`'s `Ok` stages exactly one record for

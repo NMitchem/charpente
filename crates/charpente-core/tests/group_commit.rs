@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use charpente_core::db::{Db, DbConfig, Job, Schema, TxError};
-use charpente_core::io::{Disk, File};
+use charpente_core::io::{Disk, File, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::table::{Codec, Id, IndexDef, Row, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
@@ -443,4 +443,58 @@ fn the_dispatchers_job_read_sees_a_settle_staged_earlier_in_its_batch() {
         "a job read inside a batch must see the settle an earlier stage of that batch made"
     );
     g.commit().expect("commit");
+}
+
+// 0.5.0 Task 1: `tx.now()`. These live here rather than in db.rs's `mod tests`,
+// which cannot build a `Db` (see the header).
+
+#[test]
+fn tx_now_reads_the_groups_time() {
+    let mut db = fresh_db(0x7A10_0001);
+    let mut g = db.begin_group().expect("group");
+    g.set_now(WallTime::from_nanos(7));
+    for _ in 0..2 {
+        let seen = g.stage(|tx| Ok::<_, ()>(tx.now())).expect("stage");
+        assert_eq!(seen, WallTime::from_nanos(7));
+    }
+    g.commit().expect("commit");
+}
+
+#[test]
+fn transact_at_hands_its_time_to_the_closure() {
+    let mut db = fresh_db(0x7A10_0002);
+    let seen = db
+        .transact_at(WallTime::from_nanos(41), |tx| Ok::<_, ()>(tx.now()))
+        .expect("transact_at");
+    assert_eq!(seen, WallTime::from_nanos(41));
+}
+
+#[test]
+#[should_panic(
+    expected = "contract: tx.now() reads the transaction's time, and this transaction has none"
+)]
+fn tx_now_without_a_time_source_is_refused_by_name() {
+    let mut db = fresh_db(0x7A10_0003);
+    let _ = db.transact(|tx| {
+        tx.now();
+        Ok::<_, ()>(())
+    });
+}
+
+#[test]
+#[should_panic(
+    expected = "contract: Group::set_now is called once, before the group's first stage"
+)]
+fn set_now_after_a_stage_is_refused() {
+    let mut db = fresh_db(0x7A10_0004);
+    let mut g = db.begin_group().expect("group");
+    g.stage(|tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(1),
+            count: 1,
+        });
+        Ok::<_, ()>(())
+    })
+    .expect("stage");
+    g.set_now(WallTime::from_nanos(1));
 }

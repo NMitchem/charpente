@@ -209,6 +209,7 @@ impl CronScheduler {
             .map(|(entry, due)| (entry.name, *due))
             .expect("tick called with nothing due");
         let mut group = db.begin_group()?;
+        group.set_now(now);
         let result = self.tick_into(&mut group, now);
         // Sampled BEFORE commit (which `mem::take`s the group's records) —
         // see `Dispatcher::run_due`'s identical comment.

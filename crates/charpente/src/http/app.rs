@@ -729,7 +729,10 @@ impl App {
     /// shared field borrows split cleanly here, where `self.db_mut()`
     /// would re-borrow all of `*self` and poison the split. See the T5
     /// pre-flight's finding G for the failure this shape exists to avoid.
-    pub fn begin_group(&mut self) -> io::Result<(Group<'_>, StagedDispatch<'_>)> {
+    ///
+    /// `now` is the step's held wall reading: every transaction staged into
+    /// the group reads it as `tx.now()`.
+    pub fn begin_group(&mut self, now: WallTime) -> io::Result<(Group<'_>, StagedDispatch<'_>)> {
         let staged = StagedDispatch {
             router: &self.router,
             entropy: &*self.entropy,
@@ -737,11 +740,12 @@ impl App {
             oidc: self.oidc.as_deref(),
         };
         // Not `self.db_mut()` — see the doc above.
-        let group = self
+        let mut group = self
             .db
             .as_mut()
             .expect(DB_TAKEN)
             .begin_group_minting(&*self.entropy)?;
+        group.set_now(now);
         Ok((group, staged))
     }
 
@@ -749,12 +753,15 @@ impl App {
     /// amendment A9): a job, a cron tick or a `settle` can enqueue an
     /// outbound job, whose key is drawn from this app's entropy. Field
     /// projections, as in `begin_group`, so the borrows split.
-    pub(crate) fn begin_job_group(&mut self) -> io::Result<Group<'_>> {
+    pub(crate) fn begin_job_group(&mut self, now: WallTime) -> io::Result<Group<'_>> {
         let entropy = &*self.entropy;
-        self.db
+        let mut group = self
+            .db
             .as_mut()
             .expect(DB_TAKEN)
-            .begin_group_minting(entropy)
+            .begin_group_minting(entropy)?;
+        group.set_now(now);
+        Ok(group)
     }
 
     /// Test-only: one minting transaction — `Db::transact` refuses an
@@ -765,7 +772,29 @@ impl App {
         &mut self,
         f: impl FnOnce(&mut Tx) -> Result<T, E>,
     ) -> Result<T, TxError<E>> {
-        let mut group = self.begin_job_group().map_err(TxError::Io)?;
+        let entropy = &*self.entropy;
+        let mut group = self
+            .db
+            .as_mut()
+            .expect(DB_TAKEN)
+            .begin_group_minting(entropy)
+            .map_err(TxError::Io)?;
+        let out = group.stage(f)?;
+        group
+            .commit()
+            .map_err(|failure| TxError::Io(failure.error))?;
+        Ok(out)
+    }
+
+    /// `transact_for_tests` with the transaction's time in hand, so a test
+    /// body can call `tx.now()`.
+    #[doc(hidden)]
+    pub fn transact_for_tests_at<T, E>(
+        &mut self,
+        now: WallTime,
+        f: impl FnOnce(&mut Tx) -> Result<T, E>,
+    ) -> Result<T, TxError<E>> {
+        let mut group = self.begin_job_group(now).map_err(TxError::Io)?;
         let out = group.stage(f)?;
         group
             .commit()
@@ -901,7 +930,7 @@ impl App {
         let declares_cross_tenant = found.cross_tenant;
         let declared = Declared::of(found);
         let (mut group, _) = self
-            .begin_group()
+            .begin_group(WallTime::UNIX_EPOCH)
             .map_err(|e| format!("route `{route}`: the probe could not open a group: {e}"))?;
         let cap = declares_cross_tenant.then(|| group.cross_tenant_cap());
         let stance = declared.admitted(&group);
@@ -1007,7 +1036,7 @@ impl App {
     /// every batched request's snapshot necessarily precedes its own routing
     /// — so it is named here rather than worked around.
     pub fn handle_or_subscribe(&mut self, request: Request, now: WallTime) -> Handled {
-        let (mut group, staged) = match self.begin_group() {
+        let (mut group, staged) = match self.begin_group(now) {
             Ok(pair) => pair,
             Err(e) => return Handled::Response(tx_error_response(TxError::Io(e))),
         };

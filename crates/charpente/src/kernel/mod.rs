@@ -750,7 +750,7 @@ impl Kernel {
                 // would kill the node before `self.pending` is even taken,
                 // leaving that request unanswered and escaping `run` with a
                 // raw `io::Error` that names neither contract nor fix.
-                let (mut group, staged) = match self.app.begin_group() {
+                let (mut group, staged) = match self.app.begin_group(now.wall) {
                     Ok(pair) => pair,
                     Err(e) => {
                         let (_, reply) = self.pending.take().expect("checked above");
@@ -901,7 +901,7 @@ impl Kernel {
                 // gives by a different argument — this is NOT a repeat of
                 // that reasoning and is written down so the next reader
                 // does not assume it is.
-                let mut group = self.app.begin_job_group()?;
+                let mut group = self.app.begin_job_group(now.wall)?;
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {
                     while self.dispatcher.has_due(now.wall) && drained < MAX_BATCH {
@@ -1002,7 +1002,7 @@ impl Kernel {
                 // asymmetry someone "cleans up" later not knowing it was
                 // deliberate — do not measure this arm and report a
                 // disappointing number as a regression.
-                let mut group = self.app.begin_job_group()?;
+                let mut group = self.app.begin_job_group(now.wall)?;
                 let mut drained = 0usize;
                 let drain = (|| -> io::Result<()> {
                     while self.cron.has_due(now.wall) && drained < MAX_BATCH {
@@ -1136,7 +1136,7 @@ impl Kernel {
                 );
                 // One group, commit once, commit-then-bubble: the job arm's
                 // shape, for the job arm's reason (C-1).
-                let mut group = self.app.begin_job_group()?;
+                let mut group = self.app.begin_job_group(now.wall)?;
                 let mut drained = 0usize;
                 let late_at_start = self.stats.outbound_late;
                 let mut cancels = Vec::new();

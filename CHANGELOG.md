@@ -2,9 +2,15 @@
 
 ## 0.5.0 (unreleased)
 
+### Breaking changes
+- **`App::begin_group` takes the step's `WallTime`.** `App::begin_group(now)` (and the crate-private job group) hands every transaction staged into the group its `tx.now()`; a caller passes the time it already holds, `handle_at`'s `now` or a kernel arm's `now.wall`. A test that calls `begin_group()` on an App adds one, `WallTime::UNIX_EPOCH` if it has none in hand.
+
 ### Changed
 - **`charpente test --mutants` outside charpente's own workspace refuses a run that gives no `--test-package` or no `--file`, and names the command that works.** The verb's defaults are charpente's own. Without `--test-package` it judged every mutant with `charpente-core` and `charpente-sim`'s tests, whose published suites do not build outside this repository, so an agent running a plain `charpente test --mutants` in its app crate on 0.4.0 got 21 compile errors, and nothing said `--test-package` was the fix. Without `--file` it mutated `crates/charpente-core/src/log.rs` and `crates/charpente-sim/src/checks.rs`, which are not in an app's tree. When the workspace has no member named `charpente-core`, the verb now exits 2 before the install check, naming the missing flags, why each default does not exist there, your package (the one at `--dir`, else the workspace's only one) and the command to run, which keeps every flag given and adds the missing ones. Inside charpente's repository nothing changes, and when `cargo metadata` fails the run goes on to cargo's own error as before. GUIDE §8 says so.
 - **GUIDE §8 says a request `Drive` re-sends takes effect at the tail's start, not at its offset, so a check that judges timing treats it as landing after the faulted phase.**
+
+### Added
+- **`tx.now()`: a transaction reads its step's held wall time.** Every route, job and cron tick in one kernel step reads the one `WallTime` the loop held at the step's start, through `Tx::now` (and a tenant-scoped transaction's deref), with no change to any log record. On a follower's read route it is the follower's own held reading. `Db::transact` and `Db::begin_group` carry no time and `tx.now()` there panics by name; `Db::transact_at(now, f)`, `Group::set_now(now)` and the hidden `App::transact_for_tests_at(now, f)` give one. A node whose clock is behind by less than the time since the store's newest recorded time plus `CLOCK_TOLERANCE` opens unnoticed, about 24 h plus 60 s for an app with no keys and no schedule of its own, so a timed obligation can run late by that much. DESIGN §1 and §2 and GUIDE §7 state it.
 
 ### Fixed
 - **`charpente new`'s usage line says the scaffold has three sim properties.** It said two from 0.3.0, when the event check made three; a unit test now counts the template's checks.
