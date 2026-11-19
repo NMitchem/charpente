@@ -2463,6 +2463,76 @@ mod dead_hooks {
         );
     }
 
+    /// Fails its one attempt in its desk; its hook re-issues it a minute on.
+    #[job(scoped_by = Desk, on_dead, retry(max = 1))]
+    pub struct Redriven {
+        pub n: u64,
+    }
+
+    impl Redriven {
+        fn run(self, _tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+            Err(JobError::app(JOB_ERROR))
+        }
+
+        fn on_dead(
+            self,
+            tx: &mut ScopedTx<'_, '_, Desk>,
+            dead: Dead<Self>,
+        ) -> Result<(), JobError> {
+            tx.reissue_after(std::time::Duration::from_secs(60), dead);
+            Ok(())
+        }
+    }
+
+    /// Review Focus 3: a scoped job's hook re-issues, and the new job carries
+    /// the tenant and runs in it, so it dies in desk 7 again and re-issues
+    /// again from there.
+    #[test]
+    fn a_scoped_jobs_reissue_stays_in_its_tenant() {
+        let sim = Sim::with_faults(0xDEAD_0009, FaultConfig::none());
+        let mut app = hook_app(&sim, jobs![Redriven]);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 7, Redriven { n: 3 });
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let minute = 60_000_000_000;
+        for round in 0..2 {
+            let outcome = dispatcher.run_due(db, at(round * minute)).unwrap();
+            assert!(
+                matches!(outcome, JobOutcome::Dead { attempts: 1, .. }),
+                "round {round}: {outcome:?}"
+            );
+            dispatcher.note_enqueued(db.drain_enqueued());
+        }
+        let rows = jobs_of(db);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.status, r.scope, r.due_at, r.payload.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    JobStatus::Dead,
+                    Some(7),
+                    WallTime::UNIX_EPOCH,
+                    rows[0].payload.clone()
+                ),
+                (
+                    JobStatus::Dead,
+                    Some(7),
+                    wall(minute),
+                    rows[0].payload.clone()
+                ),
+                (
+                    JobStatus::Pending,
+                    Some(7),
+                    wall(2 * minute),
+                    rows[0].payload.clone()
+                ),
+            ],
+            "each Dead re-issues into desk 7, a minute later, with the one payload"
+        );
+    }
+
     /// Fails its one attempt; its hook fans a `Stamp` out to two desks, which
     /// only the declared capability can do.
     #[job(global, cross_tenant, on_dead, retry(max = 1))]

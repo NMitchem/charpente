@@ -2148,8 +2148,9 @@ Charpente treats the coding agent as the primary developer persona:
   `acked_implies_durable` (the request-level ack-durability property, generalized for app
   workloads); the three outbound checkers: `calls_have_durable_jobs` (every call that
   reached a remote carries the key of a job in the recovered store, so a call never fires
-  for an enqueue that is not durable), `keys_are_per_job` (no two jobs carry one
-  idempotency key, which a constant or data-derived key would produce) and
+  for an enqueue that is not durable), `keys_are_per_effect` (a key carries exactly one request: equal names and payload bytes, at
+  most one row not Dead, so a constant or data-derived key fails and only a re-issue from
+  `on_dead` may copy one) and
   `outbound_settles_by_horizon` (after a fault-free tail, every outbound job is Done or
   Dead); `dead_hooks_succeeded` (no Dead row's `last_error` carries the prefix only a
   failed `on_dead` hook's Dead mark writes); and the two fire-time-marked axis

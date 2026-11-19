@@ -3,7 +3,7 @@
 //! its way in when the durable-corruption fault axes landed (segment-mgmt
 //! T5), `boot_through_fallout` when `Db::open` stopped absorbing an
 //! injected fault inside the table store's open (follow-up 21), and
-//! `calls_have_durable_jobs`, `keys_are_per_job` and
+//! `calls_have_durable_jobs`, `keys_are_per_effect` and
 //! `outbound_settles_by_horizon` with outbound effects (outbound-effects
 //! spec §10), and `clock_refused`, `clock_fallout` and `clock_reopens_after`
 //! with the sim's clock axes (0.3.0), and `wait_out_clock_refusal` once the
@@ -653,26 +653,56 @@ pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String>
     Ok(())
 }
 
-/// No two jobs carry one idempotency key (spec §10): it catches two jobs
-/// sharing a key, which a constant or data-derived key produces.
-pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String> {
-    let mut seen: BTreeMap<[u8; 16], u64> = BTreeMap::new();
+/// A key carries exactly one request (0.5.0 spec §5 D, DECISIONS §14): every
+/// row that holds one has the same name and the same payload bytes, and at
+/// most one of them is not Dead. A constant or data-derived key puts two
+/// requests under one; two live rows under a key would send the effect twice.
+/// Only a re-issue from `on_dead` copies a key, together with its request, and
+/// the row it copies is Dead by then.
+pub fn keys_are_per_effect(snap: &Snapshot) -> Result<(), String> {
+    struct Held {
+        first: JobRow,
+        live: Option<u64>,
+    }
+    let mut seen: BTreeMap<[u8; 16], Held> = BTreeMap::new();
     for row in snap
         .scan::<JobRow>()
-        .map_err(|e| format!("keys_are_per_job: scanning the jobs: {e}"))?
+        .map_err(|e| format!("keys_are_per_effect: scanning the jobs: {e}"))?
     {
         let Some(key) = row.outbound_key else {
             continue;
         };
-        if let Some(first) = seen.insert(key, row.id.raw()) {
+        let live = (row.status != JobStatus::Dead).then(|| row.id.raw());
+        let Some(held) = seen.get_mut(&key) else {
+            seen.insert(key, Held { first: row, live });
+            continue;
+        };
+        let differs = if held.first.name != row.name {
+            Some("name")
+        } else if held.first.payload != row.payload {
+            Some("payload")
+        } else {
+            None
+        };
+        if let Some(differs) = differs {
             return Err(format!(
-                "keys_are_per_job: jobs {first} and {} carry the same idempotency key {} — keys \
-                 are minted per enqueue at staging; a key computed from job data or a constant \
-                 repeats",
+                "keys_are_per_effect: jobs {} and {} carry the same idempotency key {} but not the \
+                 same request (their {differs} differs) — a key carries exactly one request; \
+                 only a re-issue from on_dead copies a key, and it copies the request with it",
+                held.first.id.raw(),
                 row.id.raw(),
                 IdempotencyKey::from_bytes(key).as_str()
             ));
         }
+        if let (Some(a), Some(b)) = (held.live, live) {
+            return Err(format!(
+                "keys_are_per_effect: jobs {a} and {b} carry the same idempotency key {} and \
+                 neither is Dead — a key is copied only by a re-issue of a Dead job, so two \
+                 live jobs under one key would send the effect twice",
+                IdempotencyKey::from_bytes(key).as_str()
+            ));
+        }
+        held.live = held.live.or(live);
     }
     Ok(())
 }
@@ -1746,8 +1776,24 @@ mod tests {
         const OUTBOUND: bool = true;
     }
 
+    struct Refund(u8);
+    impl Codec for Refund {
+        fn encode(&self, out: &mut Vec<u8>) {
+            out.push(self.0);
+        }
+        fn decode(input: &mut &[u8]) -> std::io::Result<Refund> {
+            Ok(Refund(u8::decode(input)?))
+        }
+    }
+    impl Job for Refund {
+        const NAME: &'static str = "refund";
+        const FINGERPRINT: u64 = outbound_fingerprint(0x7E57_0C0D);
+        type Scope = Unscoped;
+        const OUTBOUND: bool = true;
+    }
+
     /// Hands out `keys` in order, so a test can give two jobs one key, as a
-    /// constant or data-derived key would: what `keys_are_per_job` catches.
+    /// constant or data-derived key would: what `keys_are_per_effect` catches.
     struct Scripted(std::cell::RefCell<Vec<[u8; 16]>>);
     impl Entropy for Scripted {
         fn fill(&self, buf: &mut [u8]) {
@@ -1785,19 +1831,75 @@ mod tests {
         }
     }
 
+    /// Two jobs under one key that are the same request and both live: the
+    /// second failure text.
     #[test]
-    fn keys_are_per_job_names_both_jobs_and_the_key() {
+    fn keys_are_per_effect_names_two_live_jobs_under_one_key() {
         let (_sim, db) = jobs_with_keys(&[[1; 16], [2; 16], [1; 16]]);
         let snap = db.snapshot().unwrap();
         assert_eq!(
-            keys_are_per_job(&snap),
+            keys_are_per_effect(&snap),
             Err(
-                "keys_are_per_job: jobs 0 and 2 carry the same idempotency key \
-                 01010101010101010101010101010101 — keys are minted per enqueue at staging; a \
-                 key computed from job data or a constant repeats"
+                "keys_are_per_effect: jobs 0 and 2 carry the same idempotency key \
+                 01010101010101010101010101010101 and neither is Dead — a key is copied only \
+                 by a re-issue of a Dead job, so two live jobs under one key would send the \
+                 effect twice"
                     .to_string()
             )
         );
+    }
+
+    /// One row per distinct key passes.
+    #[test]
+    fn keys_are_per_effect_passes_distinct_keys() {
+        let (_sim, db) = jobs_with_keys(&[[1; 16], [2; 16], [3; 16]]);
+        assert_eq!(keys_are_per_effect(&db.snapshot().unwrap()), Ok(()));
+    }
+
+    /// Two requests under one key: the first failure text, naming which part
+    /// of the request differs, and it is checked before liveness (both rows
+    /// here are Pending).
+    #[test]
+    fn keys_are_per_effect_names_a_key_carrying_two_requests() {
+        let sim = Sim::with_faults(0x0c5, crate::FaultConfig::none());
+        let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+        let mint = Scripted(std::cell::RefCell::new(vec![[4; 16]; 3]));
+        let mut group = db.begin_group_minting(&mint).unwrap();
+        group
+            .stage(|tx: &mut Tx| {
+                tx.enqueue(Refund(1));
+                tx.enqueue(Refund(2));
+                tx.enqueue(Charge);
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().map_err(|f| f.error).unwrap();
+        let snap = db.snapshot().unwrap();
+        assert_eq!(
+            keys_are_per_effect(&snap),
+            Err(
+                "keys_are_per_effect: jobs 0 and 1 carry the same idempotency key \
+                 04040404040404040404040404040404 but not the same request (their payload \
+                 differs) — a key carries exactly one request; only a re-issue from on_dead \
+                 copies a key, and it copies the request with it"
+                    .to_string()
+            )
+        );
+        // Without the second Refund the name is what differs.
+        let sim = Sim::with_faults(0x0c6, crate::FaultConfig::none());
+        let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+        let mint = Scripted(std::cell::RefCell::new(vec![[4; 16]; 2]));
+        let mut group = db.begin_group_minting(&mint).unwrap();
+        group
+            .stage(|tx: &mut Tx| {
+                tx.enqueue(Refund(1));
+                tx.enqueue(Charge);
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().map_err(|f| f.error).unwrap();
+        let err = keys_are_per_effect(&db.snapshot().unwrap()).unwrap_err();
+        assert!(err.contains("(their name differs)"), "{err}");
     }
 
     #[test]

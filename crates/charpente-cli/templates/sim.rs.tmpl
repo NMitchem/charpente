@@ -145,7 +145,8 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
 ///
 /// It also fails a run in which a job's `on_dead` hook failed
 /// (`dead_hooks_succeeded`, GUIDE §8). `Echo` is `retain_dead` and has no
-/// hook, so that holds until a job here declares one.
+/// hook, so this passes trivially until a job here declares `on_dead`; from
+/// then on it fails any run in which that hook failed.
 ///
 /// Delete `tx.enqueue` in `src/lib.rs`, or make `Echo::run` do nothing, and
 /// this goes red with a seed.

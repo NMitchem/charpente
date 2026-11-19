@@ -24,7 +24,7 @@ use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Dead, Id, ScopedTx, Tenant, Tx, job, jobs};
 use charpente_sim::checks::{
     boot_through_fallout, calls_have_durable_jobs, durable_corruption_fired, is_fault_fallout,
-    keys_are_per_job, outbound_settles_by_horizon,
+    keys_are_per_effect, outbound_settles_by_horizon,
 };
 use charpente_sim::outbound::{Idempotent, Recorder, from_fn};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
@@ -3309,7 +3309,7 @@ fn outbound_workload(sim: &mut Sim, v: Variant) -> Result<(), String> {
     let kernel = run_round(sim, app, horizon)?.ok_or("the fault-free tail's kernel stopped")?;
 
     let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
-    keys_are_per_job(&snap)?;
+    keys_are_per_effect(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         // One sim box's only loss window is media corruption: a bit flip or
@@ -3671,4 +3671,168 @@ fn a_timed_outbound_job_calls_at_its_due_time() {
         sim.outbound_deliveries()[0].key == minted,
         "the call carried a key other than the one minted at staging"
     );
+}
+
+// ------------------------------------------------ a re-issue resends the same request
+
+/// Pays `/pay/{n}` under its key, and on Dead re-issues itself a minute on
+/// (0.5.0 spec §5 D). One attempt, so every lost reply is a Dead.
+#[job(global, on_dead, outbound = "pay.test", retry(max = 1), timeout = "2s")]
+struct Redrive {
+    n: u64,
+}
+
+impl Redrive {
+    fn call(&self, _tx: &Tx, key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(
+            Call::post(format!("/pay/{}", self.n)).header("idempotency-key", key.as_str()),
+        ))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 => Ok(()),
+            s => Err(JobError::app(format!("pay.test answered {s}"))),
+        }
+    }
+
+    fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+        tx.reissue_after(Duration::from_secs(60), dead);
+        Ok(())
+    }
+}
+
+/// Keeps every request that reaches it, in delivery order, and answers 200.
+struct Tap {
+    seen: Vec<OutboundCall>,
+}
+
+impl charpente_sim::outbound::Remote for Tap {
+    fn handle(&mut self, call: &OutboundCall, _rng: &mut charpente_sim::rng::Rng) -> OutboundReply {
+        self.seen.push(call.clone());
+        OutboundReply {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        }
+    }
+}
+
+fn redrive_app(sim: &Sim, enqueue: bool) -> App {
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![Redrive])
+    .outbound(Host::new("pay.test"));
+    if enqueue {
+        app.transact_for_tests(|tx| {
+            tx.enqueue(Redrive { n: 1 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    }
+    app
+}
+
+fn redrive_sim(seed: u64) -> Sim {
+    let sim = Sim::with_faults(seed, faults(|c| c.outbound_lost_reply = 1.0));
+    sim.remote("pay.test", Tap { seen: vec![] });
+    sim
+}
+
+fn tapped(sim: &Sim) -> Vec<OutboundCall> {
+    sim.outbound_deliveries(); // runs the deliveries due by now
+    sim.with_remote("pay.test", |t: &Tap| t.seen.clone())
+}
+
+/// Every reply is lost, so each attempt times out, the job goes Dead and its
+/// hook re-issues it. Returns the rows after `horizon`.
+fn redrive_chain(seed: u64, horizon: u64) -> (Sim, Vec<JobRow>) {
+    let sim = redrive_sim(seed);
+    let kernel = run_to(&sim, redrive_app(&sim, true), horizon);
+    let snap = kernel.app().db().snapshot().unwrap();
+    keys_are_per_effect(&snap).unwrap();
+    (sim, snap.scan::<JobRow>().unwrap())
+}
+
+/// (c) C's planted double fire. The first call reaches the remote and its
+/// reply is lost, the job dies, and its hook re-issues it: the re-issue calls
+/// with the same key and the same request, and a remote that honours keys
+/// applies the effect once. Timeline B is a failover that lost the Dead
+/// record: the same seed gives the same minted key, the original is
+/// re-dispatched after a restart and calls again. Both timelines' requests go
+/// to one model, which applies once and answers no 409.
+///
+/// Pinned: 0x0DEA_00D9 puts the first call at t=0, before the 0.5 s stop.
+#[test]
+fn reissue_plants_no_double_fire() {
+    let seed = 0x0DEA_00D9;
+    let (sim_a, rows) = redrive_chain(seed, 200 * SEC);
+    let a = tapped(&sim_a);
+    assert!(
+        rows.len() >= 3 && a.len() >= 3,
+        "the chain re-issued: {} rows, {} calls",
+        rows.len(),
+        a.len()
+    );
+    let key = |c: &OutboundCall| {
+        c.headers
+            .iter()
+            .find(|(n, _)| n == "idempotency-key")
+            .cloned()
+    };
+    assert!(a.iter().all(|c| key(c) == key(&a[0]) && c.path == "/pay/1"));
+
+    // Timeline B: stopped with the call in flight, so no Dead record exists.
+    let sim_b = redrive_sim(seed);
+    drop(run_to(&sim_b, redrive_app(&sim_b, true), SEC / 2));
+    sim_b.restart();
+    drop(run_to(&sim_b, redrive_app(&sim_b, false), 30 * SEC));
+    let b = tapped(&sim_b);
+    assert!(b.len() >= 2, "the original called again after the restart");
+    assert_eq!(
+        key(&b[0]),
+        key(&a[0]),
+        "the same seed minted the same key in both timelines"
+    );
+
+    let mut model = Idempotent::header("idempotency-key", Recorder::new());
+    let mut rng = charpente_sim::rng::Rng::new(0);
+    use charpente_sim::outbound::Remote as _;
+    for call in a.iter().chain(&b) {
+        let status = model.handle(call, &mut rng).status;
+        assert_eq!(
+            status, 200,
+            "a 409 would be a key under two requests: {call:?}"
+        );
+    }
+    assert_eq!(
+        model.inner().calls().len(),
+        1,
+        "the effect was applied once across both timelines"
+    );
+}
+
+/// A re-issued job that dies again hands its own `Dead`, which re-issues
+/// again: one key, one name, one payload down the chain, and the checker
+/// passes on it with one live row at the end.
+#[test]
+fn a_reissued_job_that_dies_again_keeps_its_key_and_request() {
+    let (_sim, rows) = redrive_chain(0x0DEA_00DA, 200 * SEC);
+    let dead = rows.iter().filter(|r| r.status == JobStatus::Dead).count();
+    assert!(
+        dead >= 3,
+        "dead again and again: {dead} Dead of {} rows",
+        rows.len()
+    );
+    assert!(
+        rows.iter().all(|r| (&r.name, &r.payload, r.outbound_key)
+            == (&rows[0].name, &rows[0].payload, rows[0].outbound_key)),
+        "the chain's rows differ in name, payload or key"
+    );
+    assert!(rows[0].outbound_key.is_some());
 }

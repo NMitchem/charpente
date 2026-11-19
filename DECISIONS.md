@@ -428,7 +428,7 @@ boundary and every injected fault stops at its door; and **a call effect recorde
 the transaction** (`tx.call`), because the request freezes at commit, its body rides the
 WAL, and storing a reply rebuilds `settle` anyway. **Keys are platform-minted** from
 `Entropy` at staging and recorded in the enqueue effect, because keys derived from ids
-collide across the DECISIONS §6 loss window's diverged timelines. Reopen if: an app needs
+collide across the DECISIONS §6 loss window's diverged timelines. A re-issue from `on_dead` copies a minted key together with its request (the dead job's own name and payload bytes), within the timeline that holds the Dead row; it never derives a key, and no other path copies one. Reopen if: an app needs
 an effect whose request cannot be decided from committed state plus its payload, or a
 protocol that is not request/response.
 

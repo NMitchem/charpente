@@ -43,7 +43,7 @@ use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::{Id, Schema, Tx, View, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_job,
+    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_effect,
     outbound_settles_by_horizon,
 };
 use charpente_sim::drive::Drive;
@@ -125,11 +125,11 @@ fn build_app(sim: &Sim) -> std::io::Result<App> {
 // The remote's side is not exactly-once. `settle` commits at most once, so
 // the app's state stays exactly-once, but a remote that ignores the key may
 // apply a retry twice; this gateway dedupes, so the claim below holds. The
-// minted key belongs to one job: an effect the app may enqueue again (a
-// redrive, a re-issued step) is a new job with a new key, so its call must
-// send an id of the effect itself, as `order=<id>` does here. Platform
-// support for a re-issued job that keeps its effect's key is planned for
-// 0.5.0 (PLAN).
+// minted key belongs to one job and its redrives: `tx.reissue_after` from the
+// job's own `on_dead` resends the same request under the same key. An effect
+// the app enqueues again any other way (a route, a cron tick, another job) is
+// a new job with a new key, so its call must send an id of the effect itself,
+// as `order=<id>` does here.
 
 /// The gateway. It answers 503 one request in five until the workload calms
 /// it, and a request it accepts is applied once per idempotency key: a repeat
@@ -221,7 +221,7 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         .db()
         .snapshot()
         .map_err(|e| e.to_string())?;
-    keys_are_per_job(&snap)?;
+    keys_are_per_effect(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         // Media corruption can cut an enqueue whose call already reached the

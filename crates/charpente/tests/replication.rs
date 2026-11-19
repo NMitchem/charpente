@@ -11879,6 +11879,141 @@ fn a_follower_applies_a_shipped_timed_outbound_enqueue_with_its_due_time_and_key
     assert_eq!(raw(&f), raw(&p), "and the whole job rows, as stored");
 }
 
+/// A mounted outbound job, so the new primary's dispatcher can call it.
+#[job(global, retain_dead, outbound = "pay.test")]
+struct ShipCall {
+    n: u64,
+}
+
+impl ShipCall {
+    fn call(
+        &self,
+        _tx: &Tx,
+        key: &charpente::outbound::IdempotencyKey,
+    ) -> Result<Option<charpente::outbound::Call>, charpente::kernel::JobError> {
+        Ok(Some(
+            charpente::outbound::Call::post(format!("/ship/{}", self.n))
+                .header("idempotency-key", key.as_str()),
+        ))
+    }
+
+    fn settle(
+        self,
+        _tx: &mut Tx,
+        _reply: charpente::outbound::Reply,
+    ) -> Result<(), charpente::kernel::JobError> {
+        Ok(())
+    }
+}
+
+/// 0.5.0 spec 7.4: a re-issue ships as a timed enqueue carrying the dead job's
+/// payload, the key its calls were sent under and its due time, and after a
+/// graceful switchover the new primary calls once, under that same key.
+///
+/// Pinned: the key `[0x9A; 16]` is what no entropy draw gives, so a mint at
+/// staging or at apply would show.
+#[test]
+fn a_reissue_replicates_and_switches_over_with_its_key_payload_and_due_time() {
+    use charpente::core::job::{DeadRecord, JobRow, JobStatus};
+    use charpente::kernel::{Dispatcher, JobEntry, JobOutcome, Now};
+    let sim = Sim::with_faults(0x5A9E_0E0F, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    let due = 1_800_000_000_123_456_789u64;
+    let key = [0x9A; 16];
+    let mut payload = Vec::new();
+    ShipCall { n: 3 }.encode(&mut payload);
+    let failed = JobRow {
+        id: Id::from_raw(0),
+        name: ShipCall::NAME.into(),
+        payload: payload.clone(),
+        key: None,
+        status: JobStatus::Pending,
+        attempts: 1,
+        due_at: charpente_core::io::WallTime::UNIX_EPOCH,
+        last_error: Some("the remote did not answer".into()),
+        shape: Some(ShipCall::FINGERPRINT),
+        scope: None,
+        outbound_key: Some(key),
+    };
+    let mut group = p.db.as_mut().unwrap().begin_group().unwrap();
+    let dead = DeadRecord::from_row(&failed, &group.tenant_admission()).into_typed::<ShipCall>();
+    group
+        .stage(|tx| {
+            tx.reissue_at(charpente_core::io::WallTime::from_nanos(due), dead);
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    group.commit().map_err(|f| f.error).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+
+    let rows = |n: &Node| {
+        n.db.as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap()
+    };
+    let (pj, fj) = (rows(&p), rows(&f));
+    assert_eq!(pj.len(), 1, "one re-issue, the Dead row is not in this log");
+    assert_eq!(
+        (&pj[0].payload, pj[0].outbound_key, pj[0].due_at.as_nanos()),
+        (&payload, Some(key), due),
+        "the primary holds the dead job's request, key and due time"
+    );
+    assert_eq!(
+        (&fj[0].payload, fj[0].outbound_key, fj[0].due_at.as_nanos()),
+        (&payload, Some(key), due),
+        "and so does the follower"
+    );
+    let raw = |n: &Node| {
+        n.db.as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .scan_raw(JobRow::TABLE, false)
+            .unwrap()
+    };
+    assert_eq!(raw(&f), raw(&p), "byte for byte, as stored");
+
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert!(matches!(reply, Msg::CtrlOk { .. }), "{reply:?}");
+
+    let mut d = Dispatcher::new(vec![<ShipCall as JobEntry>::def()])
+        .with_outbound(vec![charpente::outbound::Host::new("pay.test")], 64);
+    let db = f.db.as_mut().unwrap();
+    d.rebuild(&db.snapshot().unwrap()).unwrap();
+    let mut group = db.begin_group().unwrap();
+    let now = Now {
+        mono: charpente_core::io::Instant::ZERO,
+        wall: charpente_core::io::WallTime::from_nanos(due),
+    };
+    assert!(matches!(
+        d.run_due_into(&mut group, now).unwrap(),
+        JobOutcome::Calling { id: 0, .. }
+    ));
+    group.commit().map_err(|f| f.error).unwrap();
+    let starts = d.take_starts();
+    assert_eq!(starts.len(), 1, "the new primary calls once");
+    assert_eq!(
+        (starts[0].1.path.as_str(), starts[0].1.key.as_bytes()),
+        ("/ship/3", &key),
+        "the dead job's own request, under the key it was sent under"
+    );
+}
+
 // ============================================================ clock floor
 //
 // 0.3.0 spec §5 B at promote: a node never hands out a wall time more than

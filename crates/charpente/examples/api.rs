@@ -45,14 +45,14 @@ use charpente::kernel::{
 use charpente::outbound::Host;
 use charpente::repl::Repl;
 use charpente::{
-    CrossTenant, Id, Schema, Scoped, ScopedTx, Snapshot, Subscribe, TenantAdmission, Tx, TxError,
-    View, events, jobs, routes,
+    CrossTenant, Dead, Id, Schema, Scoped, ScopedTx, Snapshot, Subscribe, TenantAdmission, Tx,
+    TxError, View, events, jobs, routes,
 };
 use charpente_sim::checks::{
     FaultReason, acked_implies_durable, boot_through_fallout, calls_have_durable_jobs, classify,
     clock_fallout, clock_refused, clock_reopens_after, dead_hooks_succeeded, dir_entry_loss_fired,
     durable_corruption_fired, durable_refusal, events, events_scoped, is_fault_fallout,
-    keys_are_per_job, outbound_settles_by_horizon, replays_identically, wait_out_clock_refusal,
+    keys_are_per_effect, outbound_settles_by_horizon, replays_identically, wait_out_clock_refusal,
 };
 use charpente_sim::drive::{Drive, Phase, Recovered};
 use charpente_sim::object::SimObjectStore;
@@ -246,7 +246,8 @@ mod attributes {
 
         // `on_dead`'s hook: `run`'s arguments plus `dead`, last. Its writes
         // commit with the Dead mark. `key` is `Some` for an outbound job: the
-        // key every one of its calls was sent under.
+        // key every one of its calls was sent under. `tx.reissue_at` and
+        // `tx.reissue_after` (`tx`) consume `dead` to resend the job.
         fn on_dead(self, _tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
             let _attempts: u32 = dead.attempts();
             let _error: &str = dead.last_error();
@@ -506,6 +507,7 @@ fn tx(
     cap: &CrossTenant,
     admission: &TenantAdmission,
     job: &JobRow,
+    dead: Dead<Reindex>,
 ) -> Result<(), ApiError> {
     let id = note.id;
     // `View`'s four reads (`use charpente::View`), in id order. A scoped row
@@ -532,6 +534,16 @@ fn tx(
     // Due at a wall time, or a delay after `tx.now()`; a past time is due at once.
     tx.enqueue_at(WallTime::from_nanos(1_000), Reindex {});
     tx.enqueue_after(Duration::from_secs(60), Reindex {});
+    // Only from an `on_dead` hook, consuming its `Dead`: resends the dead
+    // job's own payload as a new Pending job, in its tenant, and an outbound
+    // job's under the key its calls were sent under (a different request is
+    // a new job with a new key). Due at a wall time, or a delay after
+    // `tx.now()`.
+    if _at > WallTime::UNIX_EPOCH {
+        tx.reissue_at(_at, dead);
+    } else {
+        tx.reissue_after(Duration::from_secs(60), dead);
+    }
     // Fan-out into one tenant, from a route or job that declared
     // `cross_tenant`: the job runs as if enqueued inside `org`.
     tx.enqueue_in::<Org>(org, Notify { memo }, cap);
@@ -1113,7 +1125,7 @@ fn checks(sim: &mut Sim, snap: &Snapshot, org: Id<Org>, job: &JobRow) -> Result<
     // key; and, after a fault-free tail past the last backoff, every
     // outbound job is Done or Dead.
     calls_have_durable_jobs(sim, snap)?;
-    keys_are_per_job(snap)?;
+    keys_are_per_effect(snap)?;
     outbound_settles_by_horizon(snap)?;
     // No `on_dead` hook failed: no Dead row's `last_error` carries the prefix
     // only a failed hook's Dead mark writes.

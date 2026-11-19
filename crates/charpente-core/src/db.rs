@@ -1627,6 +1627,78 @@ impl<'a> Tx<'a> {
         self.push_enqueue(None, None, Some(at), job);
     }
 
+    /// From an `on_dead` hook: resends the dead job's own request as a new
+    /// Pending job due at `at`: its name, payload bytes and shape, and for an
+    /// outbound job the key every call of the dead job was sent under, copied
+    /// and never drawn, so a remote that honours keys applies the effect once
+    /// whichever timeline calls first (DECISIONS §14). It takes no payload
+    /// and no key: it consumes the `Dead`, so one Dead makes one re-issue, and
+    /// a re-issued job that dies again hands its own `Dead` with the same key.
+    /// A pure job's re-issue carries no key. The record is the timed enqueue
+    /// (tag `0x0e`).
+    ///
+    /// # Panics
+    ///
+    /// For a scoped record, unless this transaction opened that tenant: it
+    /// is re-issued from its own `on_dead`, whose `ScopedTx` is that tenant.
+    pub fn reissue_at<J: Job>(&mut self, at: WallTime, dead: crate::job::Dead<'_, J>) {
+        let record = dead.record;
+        let scope = record.scope.map(|id| {
+            let opened = self
+                .opened_scope
+                .filter(|o| o.0 == TypeId::of::<J::Scope>() && o.3 == id);
+            let Some(opened) = opened else {
+                panic!(
+                    "contract: a re-issue of scoped job \"{}\" must stay in tenant {id}, the \
+                     one its Dead record names \u{2014} re-issue it from its own on_dead, whose \
+                     ScopedTx is that tenant",
+                    J::NAME
+                );
+            };
+            EnqueuedTenant {
+                id,
+                scope_type: opened.0,
+                scope_name: opened.1,
+            }
+        });
+        assert_eq!(
+            record.outbound_key.is_some(),
+            J::OUTBOUND,
+            "contract: a Dead record of job \"{}\" has OUTBOUND = {} but {} a key \u{2014} the \
+             record is made from the row of this job, which carries a key exactly when it is \
+             outbound",
+            J::NAME,
+            J::OUTBOUND,
+            if record.outbound_key.is_some() {
+                "carries"
+            } else {
+                "lacks"
+            }
+        );
+        self.effects.enqueues.push(Enqueue {
+            job: J::NAME,
+            payload: record.payload,
+            key: None,
+            shape: J::FINGERPRINT,
+            scope,
+            outbound: J::OUTBOUND,
+            okey: record.outbound_key,
+            due: Some(at),
+        });
+    }
+
+    /// `reissue_at` for `delay` after this transaction's time (`tx.now()`,
+    /// which refuses with its own text when the transaction has none). The
+    /// due time saturates at the far future.
+    pub fn reissue_after<J: Job>(
+        &mut self,
+        delay: std::time::Duration,
+        dead: crate::job::Dead<'_, J>,
+    ) {
+        let at = self.due_after(delay);
+        self.reissue_at(at, dead);
+    }
+
     fn due_after(&self, delay: std::time::Duration) -> WallTime {
         let delay = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
         WallTime::from_nanos(self.now().as_nanos().saturating_add(delay))
@@ -5035,7 +5107,13 @@ impl<'a> Group<'a> {
         // Outbound-effects spec §6: minted at staging, and only for an
         // outbound enqueue, so a group that stages none draws nothing (§4
         // invariant 6) and every existing universe keeps its entropy stream.
-        for enqueue in effects.enqueues.iter_mut().filter(|e| e.outbound) {
+        // A re-issue arrives with its key (`Tx::reissue_at`), which is copied,
+        // so it draws nothing and a group that cannot mint stages it (§5 D).
+        for enqueue in effects
+            .enqueues
+            .iter_mut()
+            .filter(|e| e.outbound && e.okey.is_none())
+        {
             let mint = self.mint.unwrap_or_else(|| {
                 panic!(
                     "contract: job \"{}\" is outbound, so its enqueue needs an idempotency key \

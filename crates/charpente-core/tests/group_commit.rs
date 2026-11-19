@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use charpente_core::db::{Db, DbConfig, Job, Schema, TxError};
-use charpente_core::io::{Disk, File, WallTime};
-use charpente_core::job::{JobRow, JobStatus};
+use charpente_core::io::{Disk, Entropy, File, WallTime};
+use charpente_core::job::{DeadRecord, JobRow, JobStatus};
 use charpente_core::table::{Codec, Id, IndexDef, Row, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -569,6 +569,186 @@ fn enqueue_after_needs_a_time_source() {
     let mut db = fresh_db(0x7A30_0004);
     let _ = db.transact(|tx| {
         tx.enqueue_after(std::time::Duration::from_secs(1), Ping);
+        Ok::<_, ()>(())
+    });
+}
+
+// 0.5.0 Task 9: a re-issue resends the dead job's own request under its own key.
+
+/// An outbound job whose payload is one byte, so a copy of the request is told
+/// from a fresh one.
+struct Charge(u8);
+
+impl Codec for Charge {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(self.0);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<Charge> {
+        Ok(Charge(u8::decode(input)?))
+    }
+}
+
+impl Job for Charge {
+    const NAME: &'static str = "charge";
+    const FINGERPRINT: u64 = charpente_core::db::outbound_fingerprint(0x7E57_0C0C);
+    type Scope = Unscoped;
+    const OUTBOUND: bool = true;
+}
+
+/// Counts what a minting group draws.
+struct CountingEntropy(std::sync::atomic::AtomicU32);
+
+impl Entropy for CountingEntropy {
+    fn fill(&self, buf: &mut [u8]) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        buf.fill(0xEE);
+    }
+}
+
+/// The row the dispatcher hands `DeadRecord::from_row` for a failed `Charge`.
+fn failed_charge(payload: u8, key: Option<[u8; 16]>, scope: Option<u64>) -> JobRow {
+    JobRow {
+        id: Id::from_raw(9),
+        name: Charge::NAME.into(),
+        payload: vec![payload],
+        key: None,
+        status: JobStatus::Pending,
+        attempts: 3,
+        due_at: WallTime::UNIX_EPOCH,
+        last_error: Some("the remote refused".into()),
+        shape: Some(Charge::FINGERPRINT),
+        scope,
+        outbound_key: key,
+    }
+}
+
+/// The record is the timed enqueue with the dead job's own name, payload
+/// bytes, shape and key, due when asked, and nothing was drawn.
+#[test]
+fn a_reissue_stages_the_dead_jobs_own_request_under_its_key() {
+    let mut db = fresh_db(0x7A30_0009);
+    let entropy = CountingEntropy(Default::default());
+    let mut g = db.begin_group_minting(&entropy).expect("group");
+    let dead = DeadRecord::from_row(
+        &failed_charge(0x5A, Some([7; 16]), None),
+        &g.tenant_admission(),
+    )
+    .into_typed::<Charge>();
+    g.stage(|tx| {
+        tx.reissue_at(WallTime::from_nanos(77), dead);
+        Ok::<_, ()>(())
+    })
+    .expect("stage");
+    g.commit().map_err(|f| f.error).expect("commit");
+    assert_eq!(
+        entropy.0.load(Ordering::SeqCst),
+        0,
+        "a supplied key draws no Entropy"
+    );
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        (
+            &*row.name,
+            &row.payload[..],
+            row.outbound_key,
+            row.due_at,
+            row.shape,
+            row.scope
+        ),
+        (
+            "charge",
+            &[0x5A][..],
+            Some([7; 16]),
+            WallTime::from_nanos(77),
+            Some(Charge::FINGERPRINT),
+            None
+        )
+    );
+    assert_eq!(row.status, JobStatus::Pending);
+}
+
+/// A supplied key needs no mint, so a group that cannot mint stages a
+/// re-issue (spec §5 D: the loop skips a supplied key). The same group
+/// refuses a fresh outbound enqueue by name, next test: the loop skips only a
+/// key that is already there.
+#[test]
+fn a_reissue_stages_in_a_group_that_cannot_mint() {
+    let mut db = fresh_db(0x7A30_000A);
+    let mut g = db.begin_group().expect("group");
+    g.set_now(WallTime::from_nanos(1_000));
+    let dead = DeadRecord::from_row(
+        &failed_charge(1, Some([3; 16]), None),
+        &g.tenant_admission(),
+    )
+    .into_typed::<Charge>();
+    g.stage(|tx| {
+        tx.reissue_after(std::time::Duration::from_secs(60), dead);
+        Ok::<_, ()>(())
+    })
+    .expect("a supplied key needs no mint");
+    g.commit().map_err(|f| f.error).expect("commit");
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(
+        (rows[0].outbound_key, rows[0].due_at),
+        (Some([3; 16]), WallTime::from_nanos(1_000 + 60_000_000_000))
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "contract: job \"charge\" is outbound, so its enqueue needs an idempotency key"
+)]
+fn a_fresh_outbound_enqueue_in_a_group_that_cannot_mint_still_panics() {
+    let mut db = fresh_db(0x7A30_000B);
+    let mut g = db.begin_group().expect("group");
+    let _ = g.stage(|tx| {
+        tx.enqueue(Charge(1));
+        Ok::<_, ()>(())
+    });
+}
+
+/// A pure job's re-issue carries no key, since it never had one: a delayed
+/// re-enqueue of its payload.
+#[test]
+fn a_pure_jobs_reissue_carries_no_key() {
+    let mut db = fresh_db(0x7A30_000C);
+    let mut g = db.begin_group().expect("group");
+    let mut row = failed_charge(0, None, None);
+    row.name = Ping::NAME.into();
+    row.shape = Some(Ping::FINGERPRINT);
+    let dead = DeadRecord::from_row(&row, &g.tenant_admission()).into_typed::<Ping>();
+    g.stage(|tx| {
+        tx.reissue_at(WallTime::from_nanos(5), dead);
+        Ok::<_, ()>(())
+    })
+    .expect("stage");
+    g.commit().map_err(|f| f.error).expect("commit");
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(
+        (rows[0].outbound_key, rows[0].due_at),
+        (None, WallTime::from_nanos(5))
+    );
+}
+
+/// A scoped record re-issues only inside the tenant it names: this `Tx`
+/// opened none.
+#[test]
+#[should_panic(
+    expected = "contract: a re-issue of scoped job \"ping\" must stay in tenant 4, the one its \
+                Dead record names \u{2014} re-issue it from its own on_dead, whose ScopedTx is \
+                that tenant"
+)]
+fn a_scoped_record_reissues_only_inside_its_tenant() {
+    let mut db = fresh_db(0x7A30_000D);
+    let mut g = db.begin_group().expect("group");
+    let mut row = failed_charge(0, None, Some(4));
+    row.name = Ping::NAME.into();
+    row.shape = Some(Ping::FINGERPRINT);
+    let dead = DeadRecord::from_row(&row, &g.tenant_admission()).into_typed::<Ping>();
+    let _ = g.stage(|tx| {
+        tx.reissue_at(WallTime::from_nanos(5), dead);
         Ok::<_, ()>(())
     });
 }

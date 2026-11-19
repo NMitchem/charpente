@@ -16,7 +16,7 @@ use charpente::kernel::{Kernel, SimSource};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
     boot_through_fallout, calls_have_durable_jobs, clock_fallout, clock_reopens_after,
-    durable_corruption_fired, is_fault_fallout, keys_are_per_job, outbound_settles_by_horizon,
+    durable_corruption_fired, is_fault_fallout, keys_are_per_effect, outbound_settles_by_horizon,
 };
 use charpente_sim::outbound::{Idempotent, Recorder};
 use outbound_fixture::{ChargeOrder, Order};
@@ -191,7 +191,7 @@ fn orders_charge_once(sim: &mut Sim) -> Result<(), String> {
     };
 
     let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
-    keys_are_per_job(&snap)?;
+    keys_are_per_effect(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         // One sim box's only loss window is media corruption: a bit flip at

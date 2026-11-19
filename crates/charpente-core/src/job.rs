@@ -230,23 +230,13 @@ pub const HOOK_FAILED: &str = "charpente: on_dead failed: ";
 /// (`compile_fail/dead_parked_past_its_group.rs`): a `Dead` that outlived its
 /// group could outlive the timeline that holds its Dead row.
 pub struct DeadRecord<'g> {
-    name: String,
-    #[expect(
-        dead_code,
-        reason = "the re-issue from on_dead copies the dead job's own payload bytes; nothing \
-                  reads them before it"
-    )]
-    payload: Vec<u8>,
-    shape: Option<u64>,
-    #[expect(
-        dead_code,
-        reason = "the re-issue from on_dead stays in the tenant its record names; nothing reads \
-                  it before it"
-    )]
-    scope: Option<u64>,
+    pub(crate) name: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) shape: Option<u64>,
+    pub(crate) scope: Option<u64>,
     attempts: u32,
     last_error: String,
-    outbound_key: Option<[u8; 16]>,
+    pub(crate) outbound_key: Option<[u8; 16]>,
     group: PhantomData<&'g ()>,
 }
 
@@ -317,7 +307,7 @@ impl<'g> DeadRecord<'g> {
 /// `Dead<Self>`, and cannot move it anywhere that outlives the hook. Neither
 /// `Clone` nor `Codec`.
 pub struct Dead<'g, J> {
-    record: DeadRecord<'g>,
+    pub(crate) record: DeadRecord<'g>,
     job: PhantomData<fn() -> J>,
 }
 

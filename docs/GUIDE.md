@@ -2051,6 +2051,52 @@ stages into a `Db::begin_group` group, which cannot mint, so a hook's outbound
 enqueue there panics with the minting text "Outbound jobs" below describes. The
 kernel's own groups mint.
 
+**Re-issuing a dead job.** A hook that wants the job's effect to happen again
+consumes its `Dead` to resend the dead job's own request:
+
+```rust,ignore
+tx.reissue_at(at: WallTime, dead)           // due at `at`
+tx.reissue_after(delay: Duration, dead)     // `tx.now()` plus `delay`, saturating
+```
+
+The new job is Pending, due at that time, with the dead job's name, payload bytes
+and shape, in the dead job's tenant. An outbound job's re-issue carries the key
+every call of the dead job was sent under, copied from the Dead record and drawn
+from no entropy, so a remote that honours keys sees one effect. A pure job's
+re-issue carries no key, since it never had one. It takes no payload and no key
+value: a different request is a new job with a new key (§6, "Outbound jobs"), and
+one `Dead` makes one re-issue. A re-issued job that dies again hands its own
+`Dead`, and a hook that re-issues again keeps one key and one request down the
+chain. A scoped job re-issues from its own hook, whose `ScopedTx` is its tenant:
+a record that names a tenant this transaction did not open panics with
+`contract: a re-issue of scoped job "<name>" must stay in tenant <id>, the one its
+Dead record names`. The record is the timed enqueue (tag `0x0e`) with its key
+supplied, so a follower and a promoted node hold the same row.
+`charpente_sim::checks::keys_are_per_effect` holds the rule in a sim run (§8, "The
+checkers").
+
+```rust
+use charpente::kernel::JobError;
+use charpente::{Dead, Tx, job};
+use std::time::Duration;
+
+#[job(global, on_dead, retry(max = 3, backoff = "10s"))]
+struct Resend {
+    batch: u64,
+}
+
+impl Resend {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Err(JobError::app("the target refused the batch"))
+    }
+
+    fn on_dead(self, tx: &mut Tx, dead: Dead<Self>) -> Result<(), JobError> {
+        tx.reissue_after(Duration::from_secs(3600), dead);
+        Ok(())
+    }
+}
+```
+
 ### Outbound jobs: calling the world after commit
 
 A job that calls an outside service over HTTP declares the host it calls with
@@ -2152,11 +2198,15 @@ body, so a remote that honours it applies a repeated request once. It is not
 `enqueue_keyed`'s app key.
 
 The minted key belongs to one job and covers that job's retries and
-re-dispatches. An effect the app may enqueue more than once, a redrive after
-Dead or a re-issued step, is a new job with a new key. So its `call` must send
-an id of the effect itself, a field of the payload, or a remote that honours
-keys applies the effect twice. Platform support for a re-issued job that keeps
-its effect's key is planned for 0.5.0 (PLAN).
+re-dispatches. A redrive from the job's own `on_dead` hook, `tx.reissue_at` or
+`tx.reissue_after` ("Re-issuing a dead job" above), resends the same request under
+the same key: it copies the dead job's name, payload bytes and key, and never draws
+one, so a remote that honours keys applies the effect once even if a failover
+leaves one timeline re-dispatching the original while another calls the re-issue.
+Any other re-issue, an effect the app enqueues again from a route, a cron tick or
+another job, is a new job with a new key. So its `call` must send an id of the
+effect itself, a field of the payload, or a remote that honours keys applies the
+effect twice.
 
 Because the key is drawn as the enqueue is staged, an outbound job is enqueued
 only in a transaction the platform opens: a route's, a job's or a cron tick's.
@@ -4013,9 +4063,13 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   call was already made, and then this check fails. Route a failure through
   `durable_corruption_fired` and give the run up where it fired, never
   pass it, the same rule as any acked-durability shortfall.
-- `keys_are_per_job(snap: &Snapshot) -> Result<(), String>` — no two jobs carry
-  one idempotency key. It catches two jobs sharing a key, which a constant or
-  data-derived key produces, and the error names both jobs and the key.
+- `keys_are_per_effect(snap: &Snapshot) -> Result<(), String>` — a key carries
+  exactly one request. Every row that holds one has the same name and the same
+  payload bytes, and at most one of them is not Dead: only a re-issue from
+  `on_dead` copies a key, together with its request, and the row it copies is Dead
+  by then. It catches a key two requests share, which a constant or data-derived
+  key produces, and two live jobs under one key, which would send the effect
+  twice. The error names both jobs and the key, and what differs.
 - `outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>` — every
   outbound job is Done or Dead. Call it only after the fault-free tail:
   `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and a run past
@@ -4034,8 +4088,9 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   or refused transaction is the app's own deterministic bug, so a run in which
   one happened fails, and never gives up. A hook's other `Err(JobError::Io)` is
   not a failure: nothing commits, the job runs again, and no prefix is written.
-  `charpente new`'s scaffold calls it in its echo property, where it holds
-  until a job declares `on_dead`. Its failure names the job and quotes what
+  `charpente new`'s scaffold calls it in its echo property, where it passes
+  trivially until a job declares `on_dead`; from then on it fails any run in which
+  that hook failed. Its failure names the job and quotes what
   follows the prefix, the hook's error and then the job's (below).
 - `events::<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>` and
   `events_scoped::<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
@@ -4095,7 +4150,7 @@ pub fn acked_implies_durable(
 
 pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String>
 
-pub fn keys_are_per_job(snap: &Snapshot) -> Result<(), String>
+pub fn keys_are_per_effect(snap: &Snapshot) -> Result<(), String>
 
 pub fn outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>
 
@@ -4106,6 +4161,14 @@ pub fn events<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>
 pub fn events_scoped<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
 where
     E::Scope: Tenant;
+```
+
+`keys_are_per_effect` fails with one of:
+
+<!-- pinned -->
+```text
+keys_are_per_effect: jobs <a> and <b> carry the same idempotency key <key> but not the same request (their <name|payload> differs) — a key carries exactly one request; only a re-issue from on_dead copies a key, and it copies the request with it
+keys_are_per_effect: jobs <a> and <b> carry the same idempotency key <key> and neither is Dead — a key is copied only by a re-issue of a Dead job, so two live jobs under one key would send the effect twice
 ```
 
 `dead_hooks_succeeded` fails with:
@@ -4630,7 +4693,7 @@ use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{
-    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_job,
+    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_effect,
     outbound_settles_by_horizon,
 };
 use charpente_sim::drive::Drive;
@@ -4741,7 +4804,7 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         .db()
         .snapshot()
         .map_err(|e| e.to_string())?;
-    keys_are_per_job(&snap)?;
+    keys_are_per_effect(&snap)?;
     outbound_settles_by_horizon(&snap)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         if durable_corruption_fired(sim) {
