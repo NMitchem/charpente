@@ -1970,8 +1970,10 @@ one record. A signature other than these is a type error, as `run`'s is (§9).
 - `dead.key()`: for an outbound job, the `IdempotencyKey` every one of its calls
   was sent under, so the app can record it; `None` for a pure job, exactly.
 
-It is neither `Clone` nor `Codec`, and only the dispatcher makes one, from the row
-going Dead. Like the `CrossTenant` token (§16), it borrows the dispatcher's group:
+It is neither `Clone` nor `Codec`. The dispatcher makes one from the row going
+Dead, and no handler or job can make one; operator code holding a `Group` can,
+by `settle_job`'s standing ("Re-issuing a dead job", below). Like the
+`CrossTenant` token (§16), it borrows the dispatcher's group:
 its full type is `Dead<'_, J>`, which `Dead<Self>` elides as `&mut Tx` does, so a
 hook cannot move it into a `static` or a `thread_local!` that outlives the hook.
 That is a borrow error at compile time.
@@ -3687,10 +3689,10 @@ attempts in 63.5 s) takes two. The extensions stop at
 `charpente_sim::drive::TAIL_SETTLE_CAP`, 256, with work still Pending, and the
 run fails by name (below). No extension runs past the year 2262: a retry whose
 doubling backoff saturated stays Pending, and once one extension has run to
-that limit the run fails at once, by the cap's text with the count it ran,
-rather than at the end of the u64 nanosecond range, where the kernel stops on
-its daily sweep's overflow. An app with no host has no outbound row, so it is
-never extended. `recovered.extensions` counts the extensions, and
+that limit the run fails at once, by its own text naming the job's due time
+(below), rather than at the end of the u64 nanosecond range, where the kernel
+stops on its daily sweep's overflow. An app with no host has no outbound row,
+so it is never extended. `recovered.extensions` counts the extensions, and
 `recovered.wall` is the wall time the tail stopped at, the time to pass
 `outbound_settles_by_horizon` ("The checkers", below).
 
@@ -3701,8 +3703,11 @@ that the job's Dead path ran, as `crates/outbound-fixture`'s sim does:
 `orders_charge_once require ["outbound:checked", "outbound-fixture:re-called",
 "dead:SendReceipt"]`. A batch in which no run takes the job to Dead fails on
 the key, naming it, so a Dead path that the sim never exercised cannot read
-as tested. An outbound job on the default policy reaches Dead under the
-outage axis, which `charpente test --sim` draws in a quarter of runs, half
+as tested. The tail extends only for outbound work, so a pure `on_dead` job
+whose retries outlast `tail` is bounded by `tail` as before: size `tail` to
+its policy before you require its `dead:` key. An outbound job on the default
+policy reaches Dead under the outage axis, which `charpente test --sim` draws
+in a quarter of runs, half
 of them long enough to exhaust the policy ("The outside world: remote
 models", below), but only where its calls land inside the window. The window
 opens in the first two seconds of virtual time, so a job called at once is
@@ -3763,9 +3768,7 @@ the run:
 - `the app calls <host>, but the workload registered no model for it — call
   sim.remote("<host>", …) before Drive::faulted_phase`, from either call.
 - The cap: the tail ran 256 extensions, and an outbound job is still Pending
-  and due. The text names the first such job by id. It comes sooner, with the
-  count the tail ran, once an extension has run to the year 2262 and the job
-  is still due past it:
+  and due. The text names the first such job by id:
 
 <!-- pinned -->
 ```text
@@ -3780,6 +3783,15 @@ starts a new link on every Dead against such a remote, so the chain never
 ends. Fix the model, or give the job, and the chain its hook makes, a policy
 that ends. A named job at attempt 0 was due and never dispatched, so it is a
 row the kernel lost, not the app's: report it with the run's seed.
+
+- The limit: an extension has run to the year 2262 and a job is still due
+  past it. The text names the job due last and its due time, and comes before
+  the cap:
+
+<!-- pinned -->
+```text
+Drive::recover: outbound job <id> ("<name>") is still Pending at attempt <a>, due <due>, and the tail ran <n> extensions, the last to the year 2262, past which it does not run — a due time that far out means the job's retry backoff saturated, so no run reaches its next attempt; give the job a retry policy that ends, a retry(max = …) small enough that it reaches Dead
+```
 
 **When to drop below the helper.** `Drive` is one faulted phase and one tail.
 A workload with more than that builds it from the pieces this section and
@@ -6096,6 +6108,11 @@ contract: an `enqueue_keyed` app key names the job's external identity — it ca
 Disk paths are relative flat names like "wal/000001.log" — got "<path>"
 cron schedule "<name>": interval <duration> exceeds u64 nanos (~584 years) — pick a smaller interval
 contract: job "<job>" is outbound, so its enqueue needs an idempotency key drawn from the node's Entropy, and this group has none — Db::transact and Db::begin_group cannot mint; enqueue it from a route, a job or cron (the App's groups mint), or in a test through App::transact_for_tests
+contract: tx.now() reads the transaction's time, and this transaction has none — the kernel gives every route, job, job a schedule enqueued and Dead hook its step's time, but Db::transact, Db::begin_group and App::handle carry none; pass one explicitly with Db::transact_at(now, f), Group::set_now(now) or App::handle_at(request, now), or in a test App::transact_for_tests_at(now, f)
+contract: Group::set_now is called once, before the group's first stage — every transaction in a group reads the same time
+contract: a re-issue of scoped job "<job>" must stay in tenant <id>, the one its Dead record names — re-issue it from its own on_dead, whose ScopedTx is that tenant
+contract: a Dead record of job "<job>" <names|lacks> a tenant, but a scoped job carries its tenant and a global one none — the record is made from the row of this job, so reaching here is a platform bug; make it from the job's own row (`DeadRecord::from_row` inside the dispatcher, or a hand-built row that matches the job's tenancy)
+contract: a Dead record of job "<job>" has OUTBOUND = <outbound> but <carries|lacks> a key — the record is made from the row of this job, which carries a key exactly when it is outbound; make it from that job's own row, so a pure job's record has no key and an outbound job's has its minted one
 ```
 
 The first (§4, §6) is `tx.enqueue_keyed(key, job)` handed an empty `key` —
@@ -6112,7 +6129,16 @@ returned `Ok`. The fourth (§6) is an outbound job enqueued inside `Db::transact
 or `Db::begin_group`, which have no entropy to draw its idempotency key from:
 enqueue it from a route, a job or a cron tick, stage it through
 `Db::begin_group_minting` in code that opens its own group, or seed it in a
-test through `App::transact_for_tests`.
+test through `App::transact_for_tests`. The fifth (§7) is `tx.now()`, or
+`enqueue_after` or `reissue_after`, in a transaction that has no time; fix:
+give it a time with one of the calls the text names. The sixth (§7) is
+`Group::set_now` called twice or after a stage: call it once, right after
+opening the group.
+The last three are `tx.reissue_at`/`reissue_after` (§6, "Re-issuing a dead
+job"): a scoped job re-issued from a transaction that did not open its tenant
+(re-issue it from its own `on_dead`), and a `Dead` whose record disagrees with
+its job's tenancy or `OUTBOUND`, which only a record built from a hand-built
+`JobRow` can carry (build it from the job's own row).
 
 ### Record and body size limits (`charpente-core/src/db.rs`, `charpente-core/src/log.rs`, `charpente/src/http/app.rs`)
 
@@ -6249,7 +6275,7 @@ sharding and no multi-master — that stance is fixed.
 
 ### A peer from another release is refused
 
-Every `Hello` carries the wire protocol version (`PROTO_VERSION`, 7 in 0.3). A peer
+Every `Hello` carries the wire protocol version (`PROTO_VERSION`, 8 in 0.5). A peer
 declaring another one is refused at `Hello`, by name, before a frame ships:
 
 <!-- pinned -->
@@ -9297,7 +9323,7 @@ the prefix and the generation.
 
 ### A bucket from another release is refused
 
-The manifest carries a `format` (`MANIFEST_FORMAT`, 3 in 0.3) that tracks the charpente
+The manifest carries a `format` (`MANIFEST_FORMAT`, 5 in 0.5) that tracks the charpente
 minor. `restore` and an archiving node that adopts a prefix both refuse a manifest with another
 format, or with none (a 0.2 bucket), and the archive stops rather than write over it (the node keeps serving):
 

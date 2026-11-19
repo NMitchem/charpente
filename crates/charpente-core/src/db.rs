@@ -1649,7 +1649,7 @@ impl<'a> Tx<'a> {
             record.scope.is_some(),
             TypeId::of::<J::Scope>() != TypeId::of::<crate::table::Unscoped>(),
             "contract: a Dead record of job \"{}\" {} a tenant, but a scoped job carries its \
-             tenant and a global one none \u{2014} the record is made from the row of this job, so \
+             tenant and a global one none — the record is made from the row of this job, so \
              reaching here is a platform bug; make it from the job's own row (`DeadRecord::from_row` \
              inside the dispatcher, or a hand-built row that matches the job's tenancy)",
             J::NAME,
@@ -1666,7 +1666,7 @@ impl<'a> Tx<'a> {
             let Some(opened) = opened else {
                 panic!(
                     "contract: a re-issue of scoped job \"{}\" must stay in tenant {id}, the \
-                     one its Dead record names \u{2014} re-issue it from its own on_dead, whose \
+                     one its Dead record names — re-issue it from its own on_dead, whose \
                      ScopedTx is that tenant",
                     J::NAME
                 );
@@ -1680,7 +1680,7 @@ impl<'a> Tx<'a> {
         assert_eq!(
             record.outbound_key.is_some(),
             J::OUTBOUND,
-            "contract: a Dead record of job \"{}\" has OUTBOUND = {} but {} a key \u{2014} the \
+            "contract: a Dead record of job \"{}\" has OUTBOUND = {} but {} a key — the \
              record is made from the row of this job, which carries a key exactly when it is \
              outbound; make it from that job's own row, so a pure job's record has no key and an \
              outbound job's has its minted one",

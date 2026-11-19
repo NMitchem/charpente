@@ -696,9 +696,10 @@ fn app(sim: &Sim, oidc: OidcConfig) -> io::Result<()> {
         Response::sse_headers(),
     ];
     // A transaction's time, `tx.now()`: the kernel's step reading for a route,
-    // job or cron tick. A group from `Db::begin_group` carries none until
-    // `set_now`; `transact_at` is a lone transaction with one. Both are for
-    // tests; `App::begin_group` below sets it from its argument.
+    // a job, or a job a schedule enqueued. A group from `Db::begin_group`
+    // carries none until `set_now`; `transact_at` is a lone transaction with
+    // one. Both are for tests; `App::begin_group` below sets it from its
+    // argument.
     let mut own: Group = app.db_for_tests().begin_group()?;
     own.set_now(WallTime::from_nanos(1));
     let _own_now: Result<WallTime, TxError<ApiError>> =

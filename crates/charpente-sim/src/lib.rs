@@ -146,9 +146,10 @@ pub struct FaultConfig {
     /// A provider outage: (start, length) in virtual time since the universe
     /// began, during which every call to one host is refused
     /// (`fault:outbound_outage`). A length of zero is off. The host is chosen
-    /// at the universe's first outbound call, from the hosts with a
-    /// registered remote in name order. It reads virtual time, never rolls,
-    /// and ignores `Sim::quiesce_outbound_faults`, so it outlives a tail.
+    /// at the universe's first outbound call, from the hosts the app
+    /// declares (the first `Sim::outbound` call's), in name order. It reads
+    /// virtual time, never rolls, and ignores `Sim::quiesce_outbound_faults`,
+    /// so it outlives a tail.
     pub outbound_outage: (Duration, Duration),
 }
 
@@ -4658,10 +4659,6 @@ mod tests {
         );
     }
 
-    /// The axis is app-only: neither `FaultConfig::swarm` nor
-    /// `sample_extended_fields` (what every `run_universes_swarm!` suite
-    /// calls) turns it on, and `app_config` does for some seeds and
-    /// `--faults-off outbound_outage` turns it off again.
     #[test]
     #[should_panic(expected = "shorten the window")]
     fn an_outage_window_past_u64_nanoseconds_is_refused() {
@@ -4745,6 +4742,10 @@ mod tests {
         }
     }
 
+    /// The axis is app-only: neither `FaultConfig::swarm` nor
+    /// `sample_extended_fields` (what every `run_universes_swarm!` suite
+    /// calls) turns it on, and `app_config` does for some seeds and
+    /// `--faults-off outbound_outage` turns it off again.
     #[test]
     fn the_outage_axis_is_sampled_app_only() {
         let mut app_on = 0;

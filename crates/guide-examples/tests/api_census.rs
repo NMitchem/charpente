@@ -62,7 +62,8 @@
 //!   `Delivered`, `OutboundCall`, `OutboundReply`, `FaultReason`, `TxError`,
 //!   `Phase`'s and `Recovered`'s fields, and the glue `routes!`, `jobs!` and
 //!   `events!` build (`Route`, `JobDef`, `EventDef`), with the `DeadRecord`
-//!   an `on_dead` job's glue opens, which only the dispatcher makes. `CrossTenant` and
+//!   an `on_dead` job's glue opens, which the dispatcher makes (operator code
+//!   holding a `Group` can too; no handler or job can). `CrossTenant` and
 //!   `TenantAdmission` have no methods.
 
 // Walking the repo's sources is build tooling outside the deterministic

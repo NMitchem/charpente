@@ -75,8 +75,9 @@ use std::path::{Path, PathBuf};
 /// `dead_hooks_succeeded`'s failure (2026-11-19); 57 with `keys_are_per_effect`'s
 /// failures (2026-11-19); 60 with `Drive::recover`'s tail cap,
 /// `outbound_settles_by_horizon`'s failure and the hand-built `JobDef`'s
-/// Dead coverage refusal (2026-11-19).
-const PINNED_FLOOR: usize = 60;
+/// Dead coverage refusal (2026-11-19); 61 with the tail's 2262 limit
+/// (2026-11-19).
+const PINNED_FLOOR: usize = 61;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

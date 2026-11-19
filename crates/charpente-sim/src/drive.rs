@@ -48,7 +48,8 @@ pub const TAIL_SETTLE_CAP: u32 = 256;
 /// of the range, where the platform's daily sweep has no next slot and the
 /// kernel stops on the overflow, so no run goes near it: the job stays
 /// Pending, and once one extension has run to the limit the tail fails at
-/// once, by the cap's text, since another could reach no further.
+/// once, by its own text naming the row's due time, since another could
+/// reach no further.
 const SETTLE_LIMIT: u64 = u64::MAX / 2;
 
 /// Boots a step tries before it treats the boot as lost to fallout, as the
@@ -286,9 +287,14 @@ impl<'s> Drive<'s> {
     ///   past its horizon and outbound job <id> ("<name>") is still Pending
     ///   at attempt <a> — an outbound job settles, retries to Dead, or waits
     ///   for a later due time; this one did none of them within the cap of
-    ///   256`, naming the first such job by id. The same text, with the
-    ///   count run, comes sooner when an extension has run to the year 2262
-    ///   and a job is still due past it.
+    ///   256`, naming the first such job by id.
+    /// - An extension has run to the year 2262 and a job is still due past
+    ///   it: `Drive::recover: outbound job <id> ("<name>") is still Pending
+    ///   at attempt <a>, due <due>, and the tail ran <n> extensions, the last
+    ///   to the year 2262, past which it does not run — a due time that far
+    ///   out means the job's retry backoff saturated, so no run reaches its
+    ///   next attempt; give the job a retry policy that ends, a retry(max =
+    ///   …) small enough that it reaches Dead`, naming the job due last.
     /// - A failed read of the store, after a run, in the store's words.
     /// - An app that declares a host the workload registered no model for:
     ///   the missing-remote text [`Drive::faulted_phase`] gives.
@@ -342,12 +348,27 @@ impl<'s> Drive<'s> {
             // clock's reading: "due" is judged at the greater of the two.
             let clock = sim.clock().wall();
             let wall = clock.max(kernel.wall_for_sim());
-            let Some((reach, row)) = unsettled(kernel.app(), wall, clock, outage_left(sim))? else {
+            let due = unsettled(kernel.app(), wall, clock, outage_left(sim))?;
+            let Some(&(reach, ref far)) = due.iter().max_by_key(|(wait, _)| *wait) else {
                 break wall;
             };
             // An extension to the limit leaves no reach for the next one.
             let limit = SETTLE_LIMIT.saturating_sub(clock.as_nanos());
-            if extensions == TAIL_SETTLE_CAP || (ran_to_limit && reach > limit) {
+            if ran_to_limit && reach > limit {
+                return Err(format!(
+                    "Drive::recover: outbound job {} (\"{}\") is still Pending at attempt {}, \
+                     due {}, and the tail ran {extensions} extensions, the last to the year \
+                     2262, past which it does not run — a due time that far out means the job's \
+                     retry backoff saturated, so no run reaches its next attempt; give the job a \
+                     retry policy that ends, a retry(max = …) small enough that it reaches Dead",
+                    far.id.raw(),
+                    far.name,
+                    far.attempts,
+                    far.due_at
+                ));
+            }
+            if extensions == TAIL_SETTLE_CAP {
+                let row = &due[0].1;
                 return Err(format!(
                     "Drive::recover: the tail ran {extensions} extensions past its horizon and \
                      outbound job {} (\"{}\") is still Pending at attempt {} — an outbound job \
@@ -434,23 +455,22 @@ fn stopped(e: io::Error) -> String {
 
 /// What keeps the tail running at the wall time `now`: the app's Pending
 /// outbound rows, less those not yet due (no attempt made, due after `now`).
-/// Hands back the first such row by id, and how far the next run reaches, in
-/// nanoseconds: the most, over those rows, of the row's wait (to its due
-/// time, measured from `clock`, the clock's reading; none once it is due) or
-/// the drawn outage's remaining length (`outage_left`), whichever is longer,
-/// plus its job's declared timeout plus 1 s, so the row's next call starts
-/// once both have passed and has room to time out. `None` when no row keeps
-/// it.
+/// Hands back each such row, in id order, with how far a run must reach for
+/// it, in nanoseconds: the row's wait (to its due time, measured from
+/// `clock`, the clock's reading; none once it is due) or the drawn outage's
+/// remaining length (`outage_left`), whichever is longer, plus its job's
+/// declared timeout plus 1 s, so the row's next call starts once both have
+/// passed and has room to time out. The next run reaches the most of these.
+/// Empty when no row keeps it.
 fn unsettled(
     app: &App,
     now: WallTime,
     clock: WallTime,
     outage_left: Duration,
-) -> Result<Option<(u64, JobRow)>, String> {
+) -> Result<Vec<(u64, JobRow)>, String> {
     const SLACK: Duration = Duration::from_secs(1);
     let snap = app.db().snapshot().map_err(|e| e.to_string())?;
-    let mut reach: Option<u64> = None;
-    let mut first = None;
+    let mut due = Vec::new();
     for row in snap.scan::<JobRow>().map_err(|e| e.to_string())? {
         let not_yet_due = row.attempts == 0 && row.due_at > now;
         if row.outbound_key.is_none() || row.status != JobStatus::Pending || not_yet_due {
@@ -459,10 +479,9 @@ fn unsettled(
         let timeout = app.outbound_timeout_for_sim(&row.name).unwrap_or_default();
         let wait = row.due_at.saturating_duration_since(clock).max(outage_left);
         let wait = u64::try_from((wait + timeout + SLACK).as_nanos()).unwrap_or(u64::MAX);
-        reach = Some(reach.map_or(wait, |r| r.max(wait)));
-        first.get_or_insert(row);
+        due.push((wait, row));
     }
-    Ok(reach.zip(first))
+    Ok(due)
 }
 
 /// Virtual time left in the universe's drawn provider outage

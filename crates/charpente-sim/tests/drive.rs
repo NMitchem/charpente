@@ -1981,20 +1981,23 @@ fn a_tail_that_cannot_settle_fails_by_name_at_the_cap() {
     );
     // A due time doubling toward the end of the u64 range: no run goes past
     // the year 2262, so the clock never overflows and the kernel never spins
-    // on a due time pinned at the range's end, and the tail still fails at
-    // the cap, by name.
+    // on a due time pinned at the range's end, and the tail still fails by
+    // name.
     // Attempt 28's retry is due in the year 2281. The 28th extension runs
     // to the limit, and a 29th could reach no further, so the tail fails
-    // there, by the cap's text (review M-2), rather than run 228 extensions
-    // that do nothing over a store of 86 000-odd daily sweep rows. Without
-    // the limit the kernel stops at the range's end on the sweep's overflow
-    // ("next slot after … overflows u64 nanos").
+    // there, by the limit's own text naming the due time and the fix (final
+    // review M-2), rather than run 228 extensions that do nothing over a
+    // store of 86 000-odd daily sweep rows. Without the limit the kernel
+    // stops at the range's end on the sweep's overflow ("next slot after …
+    // overflows u64 nanos").
     let (sim, err) = never_settles(0xD7_0B04, "/doubling/1");
     assert_eq!(
         err,
-        "Drive::recover: the tail ran 28 extensions past its horizon and outbound job 0 \
-         (\"Doubling\") is still Pending at attempt 28 — an outbound job settles, retries to \
-         Dead, or waits for a later due time; this one did none of them within the cap of 256"
+        "Drive::recover: outbound job 0 (\"Doubling\") is still Pending at attempt 28, due \
+         2281-03-11T18:07:58.000Z, and the tail ran 28 extensions, the last to the year 2262, \
+         past which it does not run — a due time that far out means the job's retry backoff \
+         saturated, so no run reaches its next attempt; give the job a retry policy that ends, \
+         a retry(max = …) small enough that it reaches Dead"
     );
     assert!(
         sim.true_wall().as_nanos() < u64::MAX / 2,
