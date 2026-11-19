@@ -3762,10 +3762,13 @@ fn redrive_chain(seed: u64, horizon: u64) -> (Sim, Vec<JobRow>) {
 /// (c) C's planted double fire. The first call reaches the remote and its
 /// reply is lost, the job dies, and its hook re-issues it: the re-issue calls
 /// with the same key and the same request, and a remote that honours keys
-/// applies the effect once. Timeline B is a failover that lost the Dead
-/// record: the same seed gives the same minted key, the original is
-/// re-dispatched after a restart and calls again. Both timelines' requests go
-/// to one model, which applies once and answers no 409.
+/// applies the effect once. Timeline B is a same-seed twin power-cycled
+/// before its Dead record was written, standing in for a survivor whose log
+/// ends there (it is not a failover: no follower, no promotion): the same
+/// seed gives the same minted key, and the original is re-dispatched after
+/// the restart and calls again. B's post-restart calls are compared with A's
+/// re-issue calls by key and path, and both timelines' requests go to one
+/// model, which applies once and answers no 409.
 ///
 /// Pinned: 0x0DEA_00D9 puts the first call at t=0, before the 0.5 s stop.
 #[test]
@@ -3785,7 +3788,17 @@ fn reissue_plants_no_double_fire() {
             .find(|(n, _)| n == "idempotency-key")
             .cloned()
     };
-    assert!(a.iter().all(|c| key(c) == key(&a[0]) && c.path == "/pay/1"));
+    let seen = |calls: &[OutboundCall]| {
+        calls
+            .iter()
+            .map(|c| (key(c), c.path.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        a.iter().all(|c| key(c) == key(&a[0]) && c.path == "/pay/1"),
+        "every call of A, the original and each re-issue, carries one key and one path: {:?}",
+        seen(&a)
+    );
 
     // Timeline B: stopped with the call in flight, so no Dead record exists.
     let sim_b = redrive_sim(seed);
@@ -3798,6 +3811,14 @@ fn reissue_plants_no_double_fire() {
         key(&b[0]),
         key(&a[0]),
         "the same seed minted the same key in both timelines"
+    );
+    assert!(
+        b[1..]
+            .iter()
+            .all(|c| (key(c), &c.path) == (key(&a[1]), &a[1].path)),
+        "B's re-dispatch of the original and A's re-issue differ in key or path: B {:?}, A {:?}",
+        seen(&b[1..]),
+        seen(&a[1..])
     );
 
     let mut model = Idempotent::header("idempotency-key", Recorder::new());

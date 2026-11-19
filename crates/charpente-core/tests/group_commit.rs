@@ -17,7 +17,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use charpente_core::db::{Db, DbConfig, Job, Schema, TxError};
+use charpente_core::db::{Db, DbConfig, Job, Schema, Tenant, Tx, TxError};
 use charpente_core::io::{Disk, Entropy, File, WallTime};
 use charpente_core::job::{DeadRecord, JobRow, JobStatus};
 use charpente_core::table::{Codec, Id, IndexDef, Row, Unscoped, View};
@@ -611,7 +611,7 @@ fn failed_charge(payload: u8, key: Option<[u8; 16]>, scope: Option<u64>) -> JobR
         id: Id::from_raw(9),
         name: Charge::NAME.into(),
         payload: vec![payload],
-        key: None,
+        key: Some("order-7".into()),
         status: JobStatus::Pending,
         attempts: 3,
         due_at: WallTime::UNIX_EPOCH,
@@ -667,6 +667,11 @@ fn a_reissue_stages_the_dead_jobs_own_request_under_its_key() {
         )
     );
     assert_eq!(row.status, JobStatus::Pending);
+    assert_eq!(
+        row.key.as_deref(),
+        Some("order-7"),
+        "the dead row's enqueue_keyed key is carried"
+    );
 }
 
 /// A supplied key needs no mint, so a group that cannot mint stages a
@@ -732,21 +737,136 @@ fn a_pure_jobs_reissue_carries_no_key() {
     );
 }
 
-/// A scoped record re-issues only inside the tenant it names: this `Tx`
-/// opened none.
+/// Two tenant types and a scoped job in each, for the cross-tenant branch of
+/// the scoped contract.
+struct OrgA;
+struct OrgB;
+
+impl Tenant for OrgA {
+    const NAME: &'static str = "OrgA";
+    type Who = ();
+    type Error = ();
+    fn authorize(_tx: &Tx<'_>, _who: &(), _scope: Id<OrgA>) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+impl Tenant for OrgB {
+    const NAME: &'static str = "OrgB";
+    type Who = ();
+    type Error = ();
+    fn authorize(_tx: &Tx<'_>, _who: &(), _scope: Id<OrgB>) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+struct InOrgA;
+
+impl Codec for InOrgA {
+    fn encode(&self, _out: &mut Vec<u8>) {}
+    fn decode(_input: &mut &[u8]) -> io::Result<InOrgA> {
+        Ok(InOrgA)
+    }
+}
+
+impl Job for InOrgA {
+    const NAME: &'static str = "in_org_a";
+    const FINGERPRINT: u64 = 0x7E57_00A0;
+    type Scope = OrgA;
+}
+
+/// A record of `InOrgA` naming tenant 4, re-issued from a `Tx` that opened
+/// `opened` (the tenant type and id) and no other: the panic text, or `None`
+/// when the re-issue staged.
+fn reissue_in_org_a_from(
+    seed: u64,
+    open: impl FnOnce(&mut Tx<'_>, &charpente_core::db::TenantAdmission<'_>),
+) -> bool {
+    let mut db = fresh_db(seed);
+    let mut g = db.begin_group().expect("group");
+    let adm = g.tenant_admission();
+    let mut row = failed_charge(0, None, Some(4));
+    row.name = InOrgA::NAME.into();
+    row.shape = Some(InOrgA::FINGERPRINT);
+    row.key = None;
+    let dead = DeadRecord::from_row(&row, &adm).into_typed::<InOrgA>();
+    let staged = g
+        .stage(|tx| {
+            open(tx, &adm);
+            tx.reissue_at(WallTime::from_nanos(5), dead);
+            Ok::<_, ()>(())
+        })
+        .is_ok();
+    g.commit().map_err(|f| f.error).expect("commit");
+    staged
+}
+
+const CROSS_TENANT: &str = "contract: a re-issue of scoped job \"in_org_a\" must stay in tenant 4";
+
+/// Its tenant matches: the re-issue stages (the control for the two below).
+#[test]
+fn a_scoped_record_reissues_inside_the_tenant_it_names() {
+    assert!(reissue_in_org_a_from(0x7A30_000E, |tx, adm| {
+        let _ = tx.admit_scope(Id::<OrgA>::from_raw(4), adm);
+    }));
+}
+
+/// Review M1: a `Tx` that opened tenant 5 of the right type refuses a record
+/// naming 4.
+#[test]
+#[should_panic(expected = "contract: a re-issue of scoped job \"in_org_a\" must stay in tenant 4")]
+fn a_scoped_record_does_not_reissue_into_another_tenant_this_tx_opened() {
+    let _ = CROSS_TENANT;
+    reissue_in_org_a_from(0x7A30_000F, |tx, adm| {
+        let _ = tx.admit_scope(Id::<OrgA>::from_raw(5), adm);
+    });
+}
+
+/// Review M1: the same id under another scope type is another tenant.
+#[test]
+#[should_panic(expected = "contract: a re-issue of scoped job \"in_org_a\" must stay in tenant 4")]
+fn a_scoped_record_does_not_reissue_into_the_same_id_of_another_scope_type() {
+    reissue_in_org_a_from(0x7A30_0010, |tx, adm| {
+        let _ = tx.admit_scope(Id::<OrgB>::from_raw(4), adm);
+    });
+}
+
+/// A `Tx` that opened no tenant refuses a scoped record.
+#[test]
+#[should_panic(expected = "contract: a re-issue of scoped job \"in_org_a\" must stay in tenant 4")]
+fn a_scoped_record_does_not_reissue_from_a_tx_that_opened_no_tenant() {
+    reissue_in_org_a_from(0x7A30_0013, |_, _| {});
+}
+
+/// Review M2 (hard rule 4): a record whose tenancy contradicts its job's is a
+/// named refusal, not a scoped job without a tenant.
 #[test]
 #[should_panic(
-    expected = "contract: a re-issue of scoped job \"ping\" must stay in tenant 4, the one its \
-                Dead record names \u{2014} re-issue it from its own on_dead, whose ScopedTx is \
-                that tenant"
+    expected = "contract: a Dead record of job \"in_org_a\" lacks a tenant, but a scoped job"
 )]
-fn a_scoped_record_reissues_only_inside_its_tenant() {
-    let mut db = fresh_db(0x7A30_000D);
+fn a_scoped_job_whose_record_names_no_tenant_is_refused() {
+    let mut db = fresh_db(0x7A30_0011);
     let mut g = db.begin_group().expect("group");
-    let mut row = failed_charge(0, None, Some(4));
-    row.name = Ping::NAME.into();
-    row.shape = Some(Ping::FINGERPRINT);
-    let dead = DeadRecord::from_row(&row, &g.tenant_admission()).into_typed::<Ping>();
+    let mut row = failed_charge(0, None, None);
+    row.name = InOrgA::NAME.into();
+    row.shape = Some(InOrgA::FINGERPRINT);
+    let dead = DeadRecord::from_row(&row, &g.tenant_admission()).into_typed::<InOrgA>();
+    let _ = g.stage(|tx| {
+        tx.reissue_at(WallTime::from_nanos(5), dead);
+        Ok::<_, ()>(())
+    });
+}
+
+/// Review M3: an outbound job's record with no key is refused, naming the fix.
+#[test]
+#[should_panic(
+    expected = "contract: a Dead record of job \"charge\" has OUTBOUND = true but lacks a key \u{2014} the record is made from the row of this job, which carries a key exactly when it is outbound; make it from that job's own row"
+)]
+fn an_outbound_record_without_its_key_is_refused() {
+    let mut db = fresh_db(0x7A30_0012);
+    let mut g = db.begin_group().expect("group");
+    let dead = DeadRecord::from_row(&failed_charge(1, None, None), &g.tenant_admission())
+        .into_typed::<Charge>();
     let _ = g.stage(|tx| {
         tx.reissue_at(WallTime::from_nanos(5), dead);
         Ok::<_, ()>(())

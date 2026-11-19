@@ -1849,6 +1849,66 @@ mod tests {
         );
     }
 
+    /// One `Refund(7)` row per status, all under key `[5; 16]`, written
+    /// through the operator's `settle_job` standing so a chain of re-issues
+    /// can be laid out without a kernel: row `i` has id `i`.
+    fn chain_of(statuses: &[JobStatus]) -> (Sim, Db) {
+        let sim = Sim::with_faults(0x0c7, crate::FaultConfig::none());
+        let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx: &mut Tx| {
+                for (i, status) in statuses.iter().enumerate() {
+                    tx.settle_job(
+                        &JobRow {
+                            id: charpente_core::table::Id::from_raw(i as u64),
+                            name: Refund::NAME.into(),
+                            payload: vec![7],
+                            key: None,
+                            status: *status,
+                            attempts: 0,
+                            due_at: charpente_core::io::WallTime::UNIX_EPOCH,
+                            last_error: None,
+                            shape: Some(Refund::FINGERPRINT),
+                            scope: None,
+                            outbound_key: Some([5; 16]),
+                        },
+                        &admission,
+                    );
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().map_err(|f| f.error).unwrap();
+        (sim, db)
+    }
+
+    /// A chain of re-issues: Dead, Dead, then one Pending under one key and
+    /// one request passes.
+    #[test]
+    fn keys_are_per_effect_passes_a_chain_of_dead_rows_and_one_pending() {
+        let (_sim, db) = chain_of(&[JobStatus::Dead, JobStatus::Dead, JobStatus::Pending]);
+        assert_eq!(keys_are_per_effect(&db.snapshot().unwrap()), Ok(()));
+    }
+
+    /// Pending, Dead, Pending: the Dead row between does not clear the first
+    /// live one, so the pair is named (pins `held.live` carrying across rows).
+    #[test]
+    fn keys_are_per_effect_remembers_a_live_row_across_a_dead_one() {
+        let (_sim, db) = chain_of(&[JobStatus::Pending, JobStatus::Dead, JobStatus::Pending]);
+        assert_eq!(
+            keys_are_per_effect(&db.snapshot().unwrap()),
+            Err(
+                "keys_are_per_effect: jobs 0 and 2 carry the same idempotency key \
+                 05050505050505050505050505050505 and neither is Dead — a key is copied only \
+                 by a re-issue of a Dead job, so two live jobs under one key would send the \
+                 effect twice"
+                    .to_string()
+            )
+        );
+    }
+
     /// One row per distinct key passes.
     #[test]
     fn keys_are_per_effect_passes_distinct_keys() {

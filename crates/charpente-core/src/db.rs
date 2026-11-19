@@ -788,7 +788,8 @@ struct Enqueue {
     /// `J::OUTBOUND`, set by `push_enqueue`.
     outbound: bool,
     /// The idempotency key, drawn by `Group::stage` just before the record is
-    /// encoded. `Some` exactly when `outbound`; `encode_record` asserts it.
+    /// encoded (a re-issue's is copied from its Dead record, not drawn).
+    /// `Some` exactly when `outbound`; `encode_record` asserts it.
     okey: Option<[u8; 16]>,
     /// The wall time the job is due, `Some` selects tag `0x0e`.
     due: Option<WallTime>,
@@ -1634,8 +1635,9 @@ impl<'a> Tx<'a> {
     /// whichever timeline calls first (DECISIONS §14). It takes no payload
     /// and no key: it consumes the `Dead`, so one Dead makes one re-issue, and
     /// a re-issued job that dies again hands its own `Dead` with the same key.
-    /// A pure job's re-issue carries no key. The record is the timed enqueue
-    /// (tag `0x0e`).
+    /// A pure job's re-issue carries no key. It carries the dead row's app key
+    /// (`enqueue_keyed`'s), which is never deduped on. The record is the timed
+    /// enqueue (tag `0x0e`).
     ///
     /// # Panics
     ///
@@ -1643,6 +1645,20 @@ impl<'a> Tx<'a> {
     /// is re-issued from its own `on_dead`, whose `ScopedTx` is that tenant.
     pub fn reissue_at<J: Job>(&mut self, at: WallTime, dead: crate::job::Dead<'_, J>) {
         let record = dead.record;
+        assert_eq!(
+            record.scope.is_some(),
+            TypeId::of::<J::Scope>() != TypeId::of::<crate::table::Unscoped>(),
+            "contract: a Dead record of job \"{}\" {} a tenant, but a scoped job carries its \
+             tenant and a global one none \u{2014} the record is made from the row of this job, so \
+             reaching here is a platform bug; make it from the job's own row (`DeadRecord::from_row` \
+             inside the dispatcher, or a hand-built row that matches the job's tenancy)",
+            J::NAME,
+            if record.scope.is_some() {
+                "names"
+            } else {
+                "lacks"
+            }
+        );
         let scope = record.scope.map(|id| {
             let opened = self
                 .opened_scope
@@ -1666,7 +1682,8 @@ impl<'a> Tx<'a> {
             J::OUTBOUND,
             "contract: a Dead record of job \"{}\" has OUTBOUND = {} but {} a key \u{2014} the \
              record is made from the row of this job, which carries a key exactly when it is \
-             outbound",
+             outbound; make it from that job's own row, so a pure job's record has no key and an \
+             outbound job's has its minted one",
             J::NAME,
             J::OUTBOUND,
             if record.outbound_key.is_some() {
@@ -1678,7 +1695,7 @@ impl<'a> Tx<'a> {
         self.effects.enqueues.push(Enqueue {
             job: J::NAME,
             payload: record.payload,
-            key: None,
+            key: record.key,
             shape: J::FINGERPRINT,
             scope,
             outbound: J::OUTBOUND,
@@ -3862,8 +3879,9 @@ impl Db {
     /// order — the append→sync→apply discipline of a lone transaction,
     /// N-wide, and apply stays strictly after sync either way.
     ///
-    /// The group cannot mint: staging an outbound enqueue (`Job::OUTBOUND`)
-    /// into it panics by name. `Db::begin_group_minting` opens one that can,
+    /// The group cannot mint: staging a fresh outbound enqueue (`Job::OUTBOUND`)
+    /// into it panics by name (a re-issue's key is copied from its Dead
+    /// record, not drawn, so it stages). `Db::begin_group_minting` opens one that can,
     /// and a test can use `App::transact_for_tests`.
     pub fn begin_group(&mut self) -> io::Result<Group<'_>> {
         let snapshot = self.engine.machine().store.snapshot()?;

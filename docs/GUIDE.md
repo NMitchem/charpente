@@ -2047,8 +2047,9 @@ attempt that led to it. The error stops the kernel. After the restart the job ru
 again, and when that attempt fails too, the hook runs again with it.
 
 `Dispatcher::run_due`, the one-job wrapper a test drives the dispatcher with,
-stages into a `Db::begin_group` group, which cannot mint, so a hook's outbound
-enqueue there panics with the minting text "Outbound jobs" below describes. The
+stages into a `Db::begin_group` group, which cannot mint, so a hook's fresh outbound
+enqueue there panics with the minting text "Outbound jobs" below describes (a
+re-issue's key is copied from its Dead record, not drawn, so it stages). The
 kernel's own groups mint.
 
 **Re-issuing a dead job.** A hook that wants the job's effect to happen again
@@ -2060,14 +2061,16 @@ tx.reissue_after(delay: Duration, dead)     // `tx.now()` plus `delay`, saturati
 ```
 
 The new job is Pending, due at that time, with the dead job's name, payload bytes
-and shape, in the dead job's tenant. An outbound job's re-issue carries the key
+and shape, and its `enqueue_keyed` app key (never deduped on), in the dead job's
+tenant. An outbound job's re-issue carries the key
 every call of the dead job was sent under, copied from the Dead record and drawn
 from no entropy, so a remote that honours keys sees one effect. A pure job's
 re-issue carries no key, since it never had one. It takes no payload and no key
 value: a different request is a new job with a new key (§6, "Outbound jobs"), and
 one `Dead` makes one re-issue. A re-issued job that dies again hands its own
 `Dead`, and a hook that re-issues again keeps one key and one request down the
-chain. A scoped job re-issues from its own hook, whose `ScopedTx` is its tenant:
+chain. Operator code holding a `Group` can build a record, by `settle_job`'s
+standing; no handler or job can. A scoped job re-issues from its own hook, whose `ScopedTx` is its tenant:
 a record that names a tenant this transaction did not open panics with
 `contract: a re-issue of scoped job "<name>" must stay in tenant <id>, the one its
 Dead record names`. The record is the timed enqueue (tag `0x0e`) with its key
@@ -2210,8 +2213,9 @@ effect twice.
 
 Because the key is drawn as the enqueue is staged, an outbound job is enqueued
 only in a transaction the platform opens: a route's, a job's or a cron tick's.
-`Db::transact` and `Db::begin_group` (§4) cannot mint, and an outbound enqueue
-inside either panics with a contract message (§9). Code that opens its own group
+`Db::transact` and `Db::begin_group` (§4) cannot mint, and a fresh outbound enqueue
+inside either panics with a contract message (§9); a re-issue's key is copied from
+its Dead record, not drawn, so it stages there. Code that opens its own group
 stages through `Db::begin_group_minting` instead, and a test seeds an outbound job
 through `App::transact_for_tests`, which the message names.
 
@@ -4067,9 +4071,8 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   exactly one request. Every row that holds one has the same name and the same
   payload bytes, and at most one of them is not Dead: only a re-issue from
   `on_dead` copies a key, together with its request, and the row it copies is Dead
-  by then. It catches a key two requests share, which a constant or data-derived
-  key produces, and two live jobs under one key, which would send the effect
-  twice. The error names both jobs and the key, and what differs.
+  by then. It fails wherever a key carries two requests, or two jobs that are not
+  Dead, which would send the effect twice. The error names both jobs and the key, and what differs.
 - `outbound_settles_by_horizon(snap: &Snapshot) -> Result<(), String>` — every
   outbound job is Done or Dead. Call it only after the fault-free tail:
   `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and a run past

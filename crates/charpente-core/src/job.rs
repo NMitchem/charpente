@@ -221,8 +221,9 @@ pub const HOOK_FAILED: &str = "charpente: on_dead failed: ";
 /// A job's failure as the dispatcher read it from the row going Dead, handed
 /// to the glue an `on_dead` job's `#[job]` generates. Only `from_row` makes
 /// one, and it takes a `TenantAdmission`, which only a `Group` mints, so no
-/// handler can. Neither `Clone` nor `Codec`: one Dead mark makes one record,
-/// and a record is never stored.
+/// handler can: operator code holding a `Group` can build a record, by
+/// `Tx::settle_job`'s standing, and no handler or job can. Neither `Clone` nor
+/// `Codec`: one Dead mark makes one record, and a record is never stored.
 ///
 /// It borrows what its admission's `Group` borrows, as `CrossTenant` and
 /// `TenantAdmission` do, so neither it nor the `Dead` it opens as can be
@@ -234,6 +235,8 @@ pub struct DeadRecord<'g> {
     pub(crate) payload: Vec<u8>,
     pub(crate) shape: Option<u64>,
     pub(crate) scope: Option<u64>,
+    /// The row's `enqueue_keyed` app key, carried by a re-issue.
+    pub(crate) key: Option<String>,
     attempts: u32,
     last_error: String,
     pub(crate) outbound_key: Option<[u8; 16]>,
@@ -243,6 +246,11 @@ pub struct DeadRecord<'g> {
 impl<'g> DeadRecord<'g> {
     /// The record of `row`'s failure, read after the dispatcher counted the
     /// attempt and wrote its error on the row.
+    ///
+    /// The row is the caller's, and a re-issue copies its key and request.
+    /// Operator code holding a `Group` can build a record, by `Tx::settle_job`'s
+    /// standing, which already writes any `JobRow` wholesale; no handler or
+    /// job can, since none holds the `TenantAdmission`.
     ///
     /// # Panics
     ///
@@ -272,6 +280,7 @@ impl<'g> DeadRecord<'g> {
             payload: row.payload.clone(),
             shape: row.shape,
             scope: row.scope,
+            key: row.key.clone(),
             attempts: row.attempts,
             last_error: last_error.clone(),
             outbound_key: row.outbound_key,

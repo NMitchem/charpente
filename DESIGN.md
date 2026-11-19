@@ -750,7 +750,8 @@ chosen by presence and never by the tenant's value, so tenant 0 is `0x0b` too
 and a global emit stays `0x09` byte for byte; its `EventRow` carries the
 tenant as a trailing `scope`, absent for every other row. `0x0c`/`0x0d` are the
 outbound enqueues: `0x08`/`0x0a` plus a 16-byte idempotency key the staging node drew
-from its `Entropy` (outbound-effects spec §6). An older binary refuses them by name as
+from its `Entropy` (outbound-effects spec §6; a re-issue's is copied from its Dead
+record, not drawn). An older binary refuses them by name as
 unknown tags, so downgrading after an outbound enqueue is unsupported. `0x0e
 [flags: u8][job][payload][key: Option<String>][shape: u64][scope: u64 if flags & 0x01][okey: [u8; 16] if flags & 0x02][due_at: u64 nanos]`
 is the timed enqueue (0.5), a job carrying its due wall time: flag `0x01` is scoped and `0x02` is
@@ -1655,7 +1656,10 @@ the world saw an effect the surviving timeline has no record of. Nothing short o
 synchronous replication closes that, and DECISIONS §6 chose asynchronous replication. The
 minted key bounds the rest: an enqueue that shipped without its Done mark is re-called
 with the same key, and one that never shipped cannot collide with anything the new
-timeline mints. A node that restarts in a
+timeline mints. A re-issue from `on_dead` copies the dead job's key with its request
+(name, payload bytes, app key), so a survivor that re-dispatches the original and the
+old primary's re-issue call one request under one key. Operator code holding a `Group`
+can build a Dead record, by `settle_job`'s standing; no handler or job can. A node that restarts in a
 durable `HandingOff(to)` stays write-stopped and resolves against `to`: a probe `Hello`
 answered as a primary demotes it to `Follower(to)` (a diverged refusal is the operator's
 re-seed signal, surfaced as the step error); `to` unreachable or not-yet-primary keeps it
@@ -1833,7 +1837,8 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   have it: a job declared `outbound = "<host>"` implements `call` (read-only, by type) and
   `settle` instead of `run`. The kernel makes the request between them, outside any
   transaction, through the `Outbound` IO trait. The idempotency key is minted from
-  `Entropy` at staging and recorded in the enqueue effect, so a retry, a restart and a
+  `Entropy` at staging (a re-issue's is copied from its Dead record) and recorded in the
+  enqueue effect, so a retry, a restart and a
   follower's replay all carry the same one. GUIDE §6 is the app-facing account. Every enqueue records the payload type's
   structural fingerprint (§3). A scoped job's fingerprint also carries its tenant
   type's `NAME`, so moving a job between `global` and `scoped_by`, or to a tenant type of
@@ -2148,8 +2153,8 @@ Charpente treats the coding agent as the primary developer persona:
   `acked_implies_durable` (the request-level ack-durability property, generalized for app
   workloads); the three outbound checkers: `calls_have_durable_jobs` (every call that
   reached a remote carries the key of a job in the recovered store, so a call never fires
-  for an enqueue that is not durable), `keys_are_per_effect` (a key carries exactly one request: equal names and payload bytes, at
-  most one row not Dead, so a constant or data-derived key fails and only a re-issue from
+  for an enqueue that is not durable), `keys_are_per_effect` (a key carries exactly one
+  request: equal names and payload bytes, at most one row not Dead, so only a re-issue from
   `on_dead` may copy one) and
   `outbound_settles_by_horizon` (after a fault-free tail, every outbound job is Done or
   Dead); `dead_hooks_succeeded` (no Dead row's `last_error` carries the prefix only a

@@ -11910,7 +11910,9 @@ impl ShipCall {
 /// payload, the key its calls were sent under and its due time, and after a
 /// graceful switchover the new primary calls once, under that same key.
 ///
-/// Pinned: the key `[0x9A; 16]` is what no entropy draw gives, so a mint at
+/// The Dead row is stood in for by operator standing: a hand-built `JobRow`
+/// handed to `DeadRecord::from_row` through the group's own admission. The key
+/// `[0x9A; 16]` is chosen so no entropy draw could equal it, so a mint at
 /// staging or at apply would show.
 #[test]
 fn a_reissue_replicates_and_switches_over_with_its_key_payload_and_due_time() {
