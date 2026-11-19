@@ -3047,6 +3047,31 @@ fn hello_declaring_protocol_version_5_is_refused_by_name() {
     }
 }
 
+/// PROTO_VERSION 8 (0.5): a 0.4 binary speaks 7 and cannot read the `0x0e` timed
+/// enqueue, so it is refused at Hello by name rather than at its first timed record.
+#[test]
+fn hello_declaring_protocol_version_7_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_0007 ^ 7, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: 7,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest: 0,
+        },
+    )
+    .unwrap();
+    match reply {
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(7)),
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+
 /// PROTO_VERSION 7 (0.3): a 0.2 binary speaks 6 and carries `u64` times in the
 /// platform tables, so it is refused at Hello by name, with the fix in the text
 /// (DECISIONS §15).
@@ -3453,19 +3478,20 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
 /// Task 1's dangling World-A obligation, discharged (tenant-scoping Task 6b,
 /// Step 4): "a follower on an older binary refuses [a wider record] by
 /// name." No genuinely older binary runs in-process, so the oracle is a
-/// follower fed a tag THIS binary does not know either — tag 14 (`0x0e`),
-/// one past outbound effects' `0x0d` (scoped outbound enqueue). This test's
+/// follower fed a tag THIS binary does not know either — tag 15 (`0x0f`),
+/// one past the timed enqueue's `0x0e`. This test's
 /// own doc comment predicted exactly this collision when it was written
 /// against tag 7 (Task 6b): "so this stays true whichever tag a later task (6c or
 /// beyond) claims next" — tag 14 is simply one past the highest tag any
 /// mounted feature claims today (job tenancy's `0x0a` moved the fixture from
 /// 10 to 11, event tenancy's `0x0b` from 11 to 12, and outbound effects'
-/// `0x0c`/`0x0d` from 12 to 14, DESIGN §4). Proves the
+/// `0x0c`/`0x0d` from 12 to 14, DESIGN §4, and the timed enqueue's `0x0e` from 14
+/// to 15). Proves the
 /// unknown-tag refusal is wired through the REAL `apply_shipped` path, not
 /// just `decode_record`'s own unit test (`db::tests::decode_refuses_unknown_
 /// tags`) — and, like the sibling test above, that it refuses the WHOLE
 /// batch: two good records ship in the same `Frames` batch ahead of the
-/// tag-14 one, and neither must land.
+/// tag-15 one, and neither must land.
 #[test]
 fn a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name() {
     let sim = Sim::with_faults(0x6B00_0004, FaultConfig::none());
@@ -3486,11 +3512,11 @@ fn a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by
     }
     let mut frames = db_a.read_log(0, usize::MAX).unwrap();
     assert_eq!(frames.len(), 2);
-    frames.push((2, vec![1u8, 0, 0, 0, 14]));
+    frames.push((2, vec![1u8, 0, 0, 0, 15]));
 
     let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), make_schema()).unwrap();
     let err = db_b.apply_shipped(&frames).unwrap_err();
-    assert!(err.to_string().contains("unknown effect tag 14"), "{err}");
+    assert!(err.to_string().contains("unknown effect tag 15"), "{err}");
     assert_eq!(
         db_b.last_applied(),
         None,
@@ -12259,8 +12285,8 @@ fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move(
     assert_eq!(
         got,
         (
-            7,
-            3,
+            8,
+            5,
             "0100000000000000010000006a010000000701010000006b00020000000000000000000000000900000000000000030000000000000005050505050505050505050505050505".to_string(),
             "01000000000000000400000000000000010000006500010000000809000000000000000300000000000000".to_string(),
             "0100000000000000010000007402000000cdab00000000000001010000000000000002000000000000000103000000".to_string()

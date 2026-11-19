@@ -517,6 +517,9 @@ fn tx(
     // The key is the app's label, carried on the job's row: never
     // deduplicated on, and not the outbound idempotency key.
     tx.enqueue_keyed("nightly", Reindex {});
+    // Due at a wall time, or a delay after `tx.now()`; a past time is due at once.
+    tx.enqueue_at(WallTime::from_nanos(1_000), Reindex {});
+    tx.enqueue_after(Duration::from_secs(60), Reindex {});
     // Fan-out into one tenant, from a route or job that declared
     // `cross_tenant`: the job runs as if enqueued inside `org`.
     tx.enqueue_in::<Org>(org, Notify { memo }, cap);
@@ -561,6 +564,8 @@ fn scoped_tx(tx: &mut ScopedTx<'_, '_, Org>, memo: Memo) -> Result<(), ApiError>
     // A scoped job, run in this tenant.
     tx.enqueue(Notify { memo: id });
     tx.enqueue_keyed("memo-saved", Notify { memo: id });
+    tx.enqueue_at(WallTime::from_nanos(1_000), Notify { memo: id });
+    tx.enqueue_after(Duration::from_secs(60), Notify { memo: id });
     // A `global` event or job goes through the deref: `(*tx)` on an owned
     // `ScopedTx`, `(**tx)` on a `&mut ScopedTx` as here.
     (**tx).emit(NoteAdded {

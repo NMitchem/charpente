@@ -1642,6 +1642,17 @@ impl CountUp {
 }
 ```
 
+### Due at a time
+
+A job normally runs as soon as the dispatcher reaches it. To hold it until a wall time, enqueue it with one:
+
+```rust,ignore
+tx.enqueue_at(WallTime::from_nanos(deadline), Remind { invoice });  // at a time
+tx.enqueue_after(Duration::from_secs(7 * 24 * 3600), Remind { invoice });  // a delay after tx.now()
+```
+
+`enqueue_after` is `tx.now()` plus the delay, so it refuses by name, as `tx.now()` does, in a transaction that has no time (a bare `Db::transact`). The sum saturates at the far future instead of overflowing: `Duration::MAX` is a job that stays Pending. A time already past is due at once. A tenant-scoped job takes the same two methods on its `ScopedTx`. There is no keyed and no cross-tenant timed variant yet. The due time travels in the log record (tag `0x0e`), so a replica or a replay holds the same time; a job enqueued without one is recorded exactly as before.
+
 ### A job inside a tenant: `scoped_by`
 
 A job that acts inside one tenant says so, and then it runs in the tenant it was

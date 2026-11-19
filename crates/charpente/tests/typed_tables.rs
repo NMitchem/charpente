@@ -1069,15 +1069,39 @@ fn jobs_materialize_with_counter_ids_in_order() {
     let (_sim, store) = quiet_store();
     store
         .apply(0, |w| {
-            w.materialize_job("send_receipt", b"invoice-10", None, None, None, None)?;
-            w.materialize_job("audit", b"", Some("k:1"), None, None, None)?;
+            w.materialize_job(
+                "send_receipt",
+                b"invoice-10",
+                None,
+                None,
+                None,
+                None,
+                charpente_core::io::WallTime::UNIX_EPOCH,
+            )?;
+            w.materialize_job(
+                "audit",
+                b"",
+                Some("k:1"),
+                None,
+                None,
+                None,
+                charpente_core::io::WallTime::UNIX_EPOCH,
+            )?;
             Ok(())
         })
         .unwrap();
     store
         .apply(1, |w| {
-            w.materialize_job("audit", b"x", None, None, None, None)
-                .map(|_| ())
+            w.materialize_job(
+                "audit",
+                b"x",
+                None,
+                None,
+                None,
+                None,
+                charpente_core::io::WallTime::UNIX_EPOCH,
+            )
+            .map(|_| ())
         })
         .unwrap();
 

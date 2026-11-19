@@ -12,6 +12,8 @@
 ### Added
 - **`tx.now()`: a transaction reads its step's held wall time.** Every route, job and job a schedule enqueued in one kernel step reads the one `WallTime` the loop held at the step's start, through `Tx::now` (and a tenant-scoped transaction's deref), with no change to any log record. On a follower's read route it is the follower's own held reading. `Db::transact` and `Db::begin_group` carry no time and `tx.now()` there panics by name; `Db::transact_at(now, f)`, `Group::set_now(now)` and the hidden `App::transact_for_tests_at(now, f)` give one. A node whose clock is behind by less than the time since the store's newest recorded time plus `CLOCK_TOLERANCE` opens unnoticed, about 24 h plus 60 s for an app with no keys and no schedule of its own, so a timed obligation can run late by that much. DESIGN §1 and §2 and GUIDE §7 state it.
 
+- **`tx.enqueue_at(at, job)` and `tx.enqueue_after(delay, job)` carry a job's due time in the log (record tag `0x0e`).** `enqueue_after` is `tx.now()` plus the delay, saturating at the far future, and refuses by name where `tx.now()` does. A past time is due at once. `ScopedTx` has both; there is no keyed or cross-tenant timed variant yet. The time reaches `JobRow.due_at` and `Enqueued.due_at` (`Db::drain_enqueued`), and `Store::materialize_job` gains a `due_at` argument. An enqueue without a due time is recorded byte for byte as in 0.4.0. `PROTO_VERSION` is 8 and `MANIFEST_FORMAT` is 5, so a 0.4 peer or archive is refused by name. The dispatcher honouring the time is the next change; GUIDE §6 "Due at a time".
+
 ### Fixed
 - **`charpente new`'s usage line says the scaffold has three sim properties.** It said two from 0.3.0, when the event check made three; a unit test now counts the template's checks.
 

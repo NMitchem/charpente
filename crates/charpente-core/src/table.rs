@@ -1623,7 +1623,10 @@ impl Writer<'_> {
     /// ids are deterministic across replay. Platform apply-path surface.
     /// `scope` is the record's tenant for a scoped job (`0x0a`/`0x0d`), and
     /// `outbound_key` its minted idempotency key for an outbound one
-    /// (`0x0c`/`0x0d`), each carried into the row unchanged.
+    /// (`0x0c`/`0x0d`), each carried into the row unchanged. `due_at` is the
+    /// timed enqueue's (`0x0e`) due time, the epoch for every other tag.
+    // One argument per column of the record the row is built from.
+    #[allow(clippy::too_many_arguments)]
     pub fn materialize_job(
         &mut self,
         name: &str,
@@ -1632,6 +1635,7 @@ impl Writer<'_> {
         shape: Option<u64>,
         scope: Option<u64>,
         outbound_key: Option<[u8; 16]>,
+        due_at: crate::io::WallTime,
     ) -> io::Result<u64> {
         let mut meta = self.txn.open_table(META).map_err(redb_err)?;
         let id = meta
@@ -1650,7 +1654,7 @@ impl Writer<'_> {
                 key: key.map(str::to_string),
                 status: crate::job::JobStatus::Pending,
                 attempts: 0,
-                due_at: crate::io::WallTime::UNIX_EPOCH,
+                due_at,
                 last_error: None,
                 shape,
                 scope,

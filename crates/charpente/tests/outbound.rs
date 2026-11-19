@@ -1613,6 +1613,7 @@ fn a_job_in_flight_is_never_queued_again() {
     d.note_enqueued(vec![Enqueued {
         id: charpente::Id::from_raw(0),
         outbound: true,
+        due_at: WallTime::UNIX_EPOCH,
     }]);
 }
 

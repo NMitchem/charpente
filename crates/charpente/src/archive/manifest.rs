@@ -88,9 +88,9 @@ pub struct SegmentRef {
 }
 
 /// The manifest layout this release reads and writes. It tracks the charpente
-/// minor (0.3 writes 3): a bucket written by another release is refused by
+/// minor (0.5 writes 5): a bucket written by another release is refused by
 /// name, never migrated (DECISIONS §15).
-pub const MANIFEST_FORMAT: u32 = 3;
+pub const MANIFEST_FORMAT: u32 = 5;
 
 /// The archive's generation pointer (spec §2).
 #[derive(Debug, Clone, PartialEq, Eq)]

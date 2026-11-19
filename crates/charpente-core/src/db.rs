@@ -21,12 +21,18 @@
 //! outbound enqueue, and `0x0d` the same with `[scope: u64 le]` before `okey`,
 //! for a job declared `outbound`, its idempotency key minted at staging
 //! (outbound-effects spec §6) — strings and byte fields length-prefixed per
-//! the `Codec` layout; `0x0e` is the next free tag. `0x02`/`0x03` (the same
+//! the `Codec` layout. `0x0e [flags: u8][job][payload][key: Option<String>]
+//! [shape: u64 le][scope: u64 le if flags & 0x01][okey: 16 bytes if flags &
+//! 0x02][due_at: u64 le nanos]` is a timed enqueue, a job carrying the wall
+//! time it is due (0.5.0 spec §5 B); flags `0x01` = scoped and `0x02` =
+//! outbound, any other bit refused by name. An enqueue with no due time is
+//! still `0x08`/`0x0a`/`0x0c`/`0x0d`, byte for byte as 0.4.0 wrote it, so
+//! a log that times nothing is unchanged; `0x0f` is the next free tag. `0x02`/`0x03` (the same
 //! without the shape) still decode, with the shape unknown, and are never
 //! written — `TxEffects` holds a bare shape, so a shapeless enqueue or emit
 //! cannot be represented.
-//! `0x05`/`0x06`/`0x07`, `0x0a`, `0x0b` and `0x0d` are the ONLY tags that
-//! carry a scope. A table effect's is chosen by the table's own
+//! `0x05`/`0x06`/`0x07`, `0x0a`, `0x0b`, `0x0d` and `0x0e` (when its scoped
+//! flag is set) are the ONLY tags that carry a scope. A table effect's is chosen by the table's own
 //! `Row::Scope`, not by the scope value (tenant 0 is a legal tenant, so a
 //! scoped table's records always use `0x05`/`0x06`/`0x07`, never
 //! `0x00`/`0x01`/`0x04`, even at scope 0). A scoped enqueue is `0x0a`
@@ -723,8 +729,10 @@ enum Effect {
         key: Option<String>,
         shape: Option<u64>,
         scope: Option<u64>,
-        // `Some` exactly for `0x0c`/`0x0d`.
+        // `Some` exactly for `0x0c`/`0x0d`, and for `0x0e` with its outbound flag.
         outbound_key: Option<[u8; 16]>,
+        // `Some` exactly for `0x0e`, the timed enqueue; `None` rows are due at once.
+        due_at: Option<WallTime>,
     },
     // `scope`: `Some` exactly for `0x0b`, the scoped emit (tenancy-completion
     // spec §6) — presence, not value, as for `Enqueue` above.
@@ -782,6 +790,8 @@ struct Enqueue {
     /// The idempotency key, drawn by `Group::stage` just before the record is
     /// encoded. `Some` exactly when `outbound`; `encode_record` asserts it.
     okey: Option<[u8; 16]>,
+    /// The wall time the job is due, `Some` selects tag `0x0e`.
+    due: Option<WallTime>,
 }
 
 /// The tenant a scoped job was enqueued in: the id the record carries, and
@@ -913,6 +923,7 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         scope,
         outbound,
         okey,
+        due,
     } in &effects.enqueues
     {
         assert_eq!(
@@ -922,12 +933,16 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
              {} — Group::stage mints every outbound enqueue's key before encoding",
             if okey.is_some() { "present" } else { "absent" }
         );
-        out.push(match (scope.is_some(), okey.is_some()) {
-            (false, false) => 8,
-            (true, false) => 10,
-            (false, true) => 12,
-            (true, true) => 13,
+        out.push(match (scope.is_some(), okey.is_some(), due.is_some()) {
+            (_, _, true) => 14,
+            (false, false, false) => 8,
+            (true, false, false) => 10,
+            (false, true, false) => 12,
+            (true, true, false) => 13,
         });
+        if due.is_some() {
+            out.push(u8::from(scope.is_some()) | (u8::from(okey.is_some()) << 1));
+        }
         encode_bytes(job.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
@@ -937,6 +952,9 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         }
         if let Some(okey) = okey {
             out.extend_from_slice(okey);
+        }
+        if let Some(due) = due {
+            due.as_nanos().encode(&mut out);
         }
     }
     for Emit {
@@ -998,6 +1016,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 shape: None,
                 scope: None,
                 outbound_key: None,
+                due_at: None,
             },
             3 => Effect::Emit {
                 event: String::decode(input)?,
@@ -1035,6 +1054,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 shape: Some(u64::decode(input)?),
                 scope: None,
                 outbound_key: None,
+                due_at: None,
             },
             9 => Effect::Emit {
                 event: String::decode(input)?,
@@ -1050,6 +1070,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 shape: Some(u64::decode(input)?),
                 scope: Some(u64::decode(input)?),
                 outbound_key: None,
+                due_at: None,
             },
             11 => Effect::Emit {
                 event: String::decode(input)?,
@@ -1065,6 +1086,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 shape: Some(u64::decode(input)?),
                 scope: None,
                 outbound_key: Some(decode_outbound_key(input)?),
+                due_at: None,
             },
             13 => Effect::Enqueue {
                 job: String::decode(input)?,
@@ -1073,7 +1095,55 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 shape: Some(u64::decode(input)?),
                 scope: Some(u64::decode(input)?),
                 outbound_key: Some(decode_outbound_key(input)?),
+                due_at: None,
             },
+            14 => {
+                let flags = u8::decode(input)?;
+                if flags & !0x03 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "record decode: a timed enqueue (0x0e) carries flag bits {:#04x} \
+                             this binary does not know — this log was written by a newer \
+                             record format; upgrade the binary or restore the old one",
+                            flags & !0x03
+                        ),
+                    ));
+                }
+                let job = String::decode(input)?;
+                let payload = Vec::<u8>::decode(input)?;
+                let key = Option::<String>::decode(input)?;
+                let shape = Some(u64::decode(input)?);
+                let scope = if flags & 0x01 != 0 {
+                    Some(u64::decode(input)?)
+                } else {
+                    None
+                };
+                let outbound_key = if flags & 0x02 != 0 {
+                    Some(decode_outbound_key(input)?)
+                } else {
+                    None
+                };
+                let Some((due, rest)) = input.split_first_chunk::<8>() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "record decode: a timed enqueue (0x0e) ends before its 8-byte due \
+                             time; restore from a replica or backup. {RESTORE_IS_A_RESEED}"
+                        ),
+                    ));
+                };
+                *input = rest;
+                Effect::Enqueue {
+                    job,
+                    payload,
+                    key,
+                    shape,
+                    scope,
+                    outbound_key,
+                    due_at: Some(WallTime::from_nanos(u64::from_le_bytes(*due))),
+                }
+            }
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1496,6 +1566,7 @@ impl<'a> Tx<'a> {
         &mut self,
         scope: Option<(u64, &'static str)>,
         key: Option<String>,
+        due: Option<WallTime>,
         job: J,
     ) {
         assert_eq!(
@@ -1528,6 +1599,7 @@ impl<'a> Tx<'a> {
             }),
             outbound: J::OUTBOUND,
             okey: None,
+            due,
         });
     }
 
@@ -1536,7 +1608,28 @@ impl<'a> Tx<'a> {
     /// tenant, and a bare `Tx` names none (`NoJobTenant`'s note says where to
     /// enqueue it instead).
     pub fn enqueue<J: UnscopedJob>(&mut self, job: J) {
-        self.push_enqueue(None, None, job);
+        self.push_enqueue(None, None, None, job);
+    }
+
+    /// Enqueues a `global` job due at `at`: the dispatcher does not run it
+    /// before that wall time, and a time already past is due at once. The
+    /// record is the timed enqueue (tag `0x0e`). There is no keyed or
+    /// cross-tenant timed variant yet.
+    pub fn enqueue_at<J: UnscopedJob>(&mut self, at: WallTime, job: J) {
+        self.push_enqueue(None, None, Some(at), job);
+    }
+
+    /// `enqueue_at` for `delay` after this transaction's time (`tx.now()`,
+    /// so it refuses with `now()`'s text when the transaction has none). The
+    /// due time saturates at the far future rather than overflowing.
+    pub fn enqueue_after<J: UnscopedJob>(&mut self, delay: std::time::Duration, job: J) {
+        let at = self.due_after(delay);
+        self.push_enqueue(None, None, Some(at), job);
+    }
+
+    fn due_after(&self, delay: std::time::Duration) -> WallTime {
+        let delay = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
+        WallTime::from_nanos(self.now().as_nanos().saturating_add(delay))
     }
 
     /// Enqueues with a key: the app's own identity for the job, carried on
@@ -1545,7 +1638,7 @@ impl<'a> Tx<'a> {
     /// deterministic boundary the key means nothing — exactly-once state effects
     /// are structural, so the platform neither indexes nor dedupes on it.
     pub fn enqueue_keyed<J: UnscopedJob>(&mut self, key: impl Into<String>, job: J) {
-        self.push_enqueue(None, Some(key.into()), job);
+        self.push_enqueue(None, Some(key.into()), None, job);
     }
 
     /// The declared fan-out (job-tenancy spec §2 R5): enqueues a scoped job
@@ -1566,7 +1659,7 @@ impl<'a> Tx<'a> {
         cap: &CrossTenant<'_>,
     ) {
         let CrossTenant(_) = cap;
-        self.push_enqueue(Some((scope.raw(), S::NAME)), None, job);
+        self.push_enqueue(Some((scope.raw(), S::NAME)), None, None, job);
     }
 
     /// The one body of the emit family (tenancy-completion spec §6). `scope`
@@ -2358,7 +2451,26 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         S: Tenant,
     {
         let scope = (self.scope.raw(), S::NAME);
-        self.tx.push_enqueue(Some(scope), None, job);
+        self.tx.push_enqueue(Some(scope), None, None, job);
+    }
+
+    /// `Tx::enqueue_at` for a job scoped by this tenant's type.
+    pub fn enqueue_at<J: Job<Scope = S>>(&mut self, at: WallTime, job: J)
+    where
+        S: Tenant,
+    {
+        let scope = (self.scope.raw(), S::NAME);
+        self.tx.push_enqueue(Some(scope), None, Some(at), job);
+    }
+
+    /// `Tx::enqueue_after` for a job scoped by this tenant's type.
+    pub fn enqueue_after<J: Job<Scope = S>>(&mut self, delay: std::time::Duration, job: J)
+    where
+        S: Tenant,
+    {
+        let at = self.tx.due_after(delay);
+        let scope = (self.scope.raw(), S::NAME);
+        self.tx.push_enqueue(Some(scope), None, Some(at), job);
     }
 
     /// `enqueue`, with `Tx::enqueue_keyed`'s app key: carried on the job's
@@ -2368,7 +2480,8 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         S: Tenant,
     {
         let scope = (self.scope.raw(), S::NAME);
-        self.tx.push_enqueue(Some(scope), Some(key.into()), job);
+        self.tx
+            .push_enqueue(Some(scope), Some(key.into()), None, job);
     }
 }
 
@@ -2581,6 +2694,9 @@ fn merge_overlay_all_scopes<R: Row>(
 pub struct Enqueued {
     pub id: Id<JobRow>,
     pub outbound: bool,
+    /// The row's due time: the record's for a timed enqueue (`0x0e`), the
+    /// epoch for every older tag.
+    pub due_at: WallTime,
 }
 
 /// The state machine the engine drives: decodes effect records and applies
@@ -2778,7 +2894,9 @@ impl StateMachine for TableMachine {
                         shape,
                         scope,
                         outbound_key,
+                        due_at,
                     } => {
+                        let due_at = due_at.unwrap_or(WallTime::UNIX_EPOCH);
                         let id = w.materialize_job(
                             job,
                             payload,
@@ -2786,10 +2904,12 @@ impl StateMachine for TableMachine {
                             *shape,
                             *scope,
                             *outbound_key,
+                            due_at,
                         )?;
                         new_ids.push(Enqueued {
                             id: Id::from_raw(id),
                             outbound: outbound_key.is_some(),
+                            due_at,
                         });
                     }
                     Effect::Emit {
@@ -5523,6 +5643,7 @@ mod tests {
             scope: None,
             outbound: false,
             okey: None,
+            due: None,
         });
         effects.emits.push(Emit {
             event: "invoice_finalized",
@@ -5562,6 +5683,7 @@ mod tests {
                     shape: Some(0x5E4D),
                     scope: None,
                     outbound_key: None,
+                    due_at: None,
                 },
                 Effect::Emit {
                     event: "invoice_finalized".into(),
@@ -5663,6 +5785,7 @@ mod tests {
             scope: None,
             outbound: false,
             okey: None,
+            due: None,
         });
         effects.enqueues.push(Enqueue {
             job: "ping",
@@ -5672,6 +5795,7 @@ mod tests {
             scope: None,
             outbound: false,
             okey: None,
+            due: None,
         });
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
@@ -5684,6 +5808,7 @@ mod tests {
                     shape: Some(0x5E4D),
                     scope: None,
                     outbound_key: None,
+                    due_at: None,
                 },
                 Effect::Enqueue {
                     job: "ping".into(),
@@ -5692,6 +5817,7 @@ mod tests {
                     shape: Some(0x9196),
                     scope: None,
                     outbound_key: None,
+                    due_at: None,
                 },
             ]
         );
@@ -5720,6 +5846,7 @@ mod tests {
                     shape: None,
                     scope: None,
                     outbound_key: None,
+                    due_at: None,
                 },
                 Effect::Emit {
                     event: "pong".into(),
@@ -5745,6 +5872,7 @@ mod tests {
             scope: None,
             outbound: false,
             okey: None,
+            due: None,
         });
         effects.emits.push(Emit {
             event: "pong",
@@ -5773,6 +5901,7 @@ mod tests {
                     shape: Some(0x0102_0304_0506_0708),
                     scope: None,
                     outbound_key: None,
+                    due_at: None,
                 },
                 Effect::Emit {
                     event: "pong".into(),
@@ -5807,6 +5936,7 @@ mod tests {
             }),
             outbound: false,
             okey: None,
+            due: None,
         });
         effects.enqueues.push(Enqueue {
             job: "ping",
@@ -5816,6 +5946,7 @@ mod tests {
             scope: None,
             outbound: false,
             okey: None,
+            due: None,
         });
         assert_eq!(
             encode_record(&effects),
@@ -5838,6 +5969,7 @@ mod tests {
                     shape: Some(0x0102_0304_0506_0708),
                     scope: Some(0),
                     outbound_key: None,
+                    due_at: None,
                 },
                 Effect::Enqueue {
                     job: "ping".into(),
@@ -5846,6 +5978,7 @@ mod tests {
                     shape: Some(0x0102_0304_0506_0708),
                     scope: None,
                     outbound_key: None,
+                    due_at: None,
                 },
             ]
         );
@@ -6085,14 +6218,147 @@ mod tests {
         assert!(Refusal::of(&err).is_some(), "{err}");
     }
 
-    /// `0x0e`, the next free tag: `0x0d` is the scoped outbound enqueue.
+    /// `0x0f`, the next free tag: `0x0e` is the timed enqueue.
     #[test]
     fn decode_refuses_unknown_tags() {
         let mut out = Vec::new();
         1u32.encode(&mut out);
-        out.push(14);
+        out.push(15);
         let err = decode_record(&out).unwrap_err();
-        assert!(err.to_string().contains("unknown effect tag 14"), "{err}");
+        assert!(err.to_string().contains("unknown effect tag 15"), "{err}");
+    }
+
+    fn timed(scope: Option<u64>, okey: Option<[u8; 16]>, due: u64) -> Enqueue {
+        Enqueue {
+            job: "Nudge",
+            payload: vec![0xAB],
+            key: Some("k".into()),
+            shape: 0x1122_3344_5566_7788,
+            scope: scope.map(|id| EnqueuedTenant {
+                id,
+                scope_type: TypeId::of::<()>(),
+                scope_name: "Org",
+            }),
+            outbound: okey.is_some(),
+            okey,
+            due: Some(WallTime::from_nanos(due)),
+        }
+    }
+
+    /// `0x0e [flags][job][payload][key][shape][scope?][okey?][due_at]`, byte-pinned
+    /// for all four flag combinations, and the round trip decodes `due_at`.
+    #[test]
+    fn timed_enqueues_record_tag_0x0e_with_their_flags_and_due_time() {
+        let cases = [
+            (None, None, 0x00u8),
+            (Some(9u64), None, 0x01),
+            (None, Some([7u8; 16]), 0x02),
+            (Some(9), Some([7; 16]), 0x03),
+        ];
+        for (scope, okey, flags) in cases {
+            let mut effects = TxEffects::default();
+            effects
+                .enqueues
+                .push(timed(scope, okey, 0x0102_0304_0506_0708));
+            let mut expected = Vec::new();
+            1u32.encode(&mut expected);
+            expected.push(0x0e);
+            expected.push(flags);
+            encode_bytes(b"Nudge", &mut expected);
+            encode_bytes(&[0xAB], &mut expected);
+            Some("k".to_string()).encode(&mut expected);
+            0x1122_3344_5566_7788u64.encode(&mut expected);
+            if let Some(scope) = scope {
+                scope.encode(&mut expected);
+            }
+            if let Some(okey) = okey {
+                expected.extend_from_slice(&okey);
+            }
+            expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+            let bytes = encode_record(&effects);
+            assert_eq!(bytes, expected, "flags {flags:#04x}");
+            match &decode_record(&bytes).unwrap()[..] {
+                [
+                    Effect::Enqueue {
+                        scope: s,
+                        outbound_key,
+                        due_at,
+                        ..
+                    },
+                ] => {
+                    assert_eq!((*s, *outbound_key), (scope, okey), "flags {flags:#04x}");
+                    assert_eq!(*due_at, Some(WallTime::from_nanos(0x0102_0304_0506_0708)));
+                }
+                other => panic!("expected one enqueue, got {} effects", other.len()),
+            }
+        }
+    }
+
+    /// A due time of `None` keeps today's tags and bytes: one of each of
+    /// `0x08`, `0x0a`, `0x0c` and `0x0d`, pinned as 0.4.0 wrote them.
+    #[test]
+    fn an_enqueue_without_a_due_time_is_byte_identical_to_0_4_0() {
+        for (scope, okey, tag) in [
+            (None, None, 0x08u8),
+            (Some(9u64), None, 0x0a),
+            (None, Some([7u8; 16]), 0x0c),
+            (Some(9), Some([7; 16]), 0x0d),
+        ] {
+            let mut enqueue = timed(scope, okey, 0);
+            enqueue.due = None;
+            let mut effects = TxEffects::default();
+            effects.enqueues.push(enqueue);
+            let mut expected = Vec::new();
+            1u32.encode(&mut expected);
+            expected.push(tag);
+            encode_bytes(b"Nudge", &mut expected);
+            encode_bytes(&[0xAB], &mut expected);
+            Some("k".to_string()).encode(&mut expected);
+            0x1122_3344_5566_7788u64.encode(&mut expected);
+            if let Some(scope) = scope {
+                scope.encode(&mut expected);
+            }
+            if let Some(okey) = okey {
+                expected.extend_from_slice(&okey);
+            }
+            assert_eq!(encode_record(&effects), expected, "tag {tag:#04x}");
+            match &decode_record(&expected).unwrap()[..] {
+                [Effect::Enqueue { due_at, .. }] => assert_eq!(*due_at, None),
+                _ => panic!("expected one enqueue"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_timed_enqueue_with_unknown_flag_bits_is_refused_by_name() {
+        let mut out = Vec::new();
+        1u32.encode(&mut out);
+        out.push(0x0e);
+        out.push(0x04);
+        let err = decode_record(&out).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "record decode: a timed enqueue (0x0e) carries flag bits 0x04 this binary does \
+                 not know \u{2014} this log was written by a newer record format"
+            ),
+            "{err}"
+        );
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    }
+
+    #[test]
+    fn a_torn_timed_enqueue_is_a_named_decode_error() {
+        let mut effects = TxEffects::default();
+        effects.enqueues.push(timed(None, None, 5));
+        let mut bytes = encode_record(&effects);
+        bytes.truncate(bytes.len() - 3);
+        let err = decode_record(&bytes).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("record decode: a timed enqueue (0x0e) ends before its 8-byte due time"),
+            "{err}"
+        );
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
     }
 
     /// Outbound-effects spec §6: `0x0c` is `0x08` plus the 16 key bytes, and
@@ -6108,6 +6374,7 @@ mod tests {
             scope: None,
             outbound: true,
             okey: Some([7; 16]),
+            due: None,
         });
         effects.enqueues.push(Enqueue {
             job: "Charge",
@@ -6121,6 +6388,7 @@ mod tests {
             }),
             outbound: true,
             okey: Some([0xEE; 16]),
+            due: None,
         });
         let bytes = encode_record(&effects);
         let mut expected = Vec::new();

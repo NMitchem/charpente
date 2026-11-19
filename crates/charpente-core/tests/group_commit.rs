@@ -498,3 +498,77 @@ fn set_now_after_a_stage_is_refused() {
     .expect("stage");
     g.set_now(WallTime::from_nanos(1));
 }
+
+// 0.5.0 Task 3: the timed enqueue (tag 0x0e).
+
+#[test]
+fn a_timed_enqueue_materializes_its_due_time() {
+    let mut db = fresh_db(0x7A30_0001);
+    db.transact(|tx| {
+        tx.enqueue(Ping);
+        tx.enqueue_at(WallTime::from_nanos(5_000), Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("transact");
+    let drained = db.drain_enqueued();
+    assert_eq!(
+        drained.iter().map(|e| e.due_at).collect::<Vec<_>>(),
+        vec![WallTime::UNIX_EPOCH, WallTime::from_nanos(5_000)],
+        "an untimed enqueue is due at the epoch, a timed one at its time"
+    );
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.due_at).collect::<Vec<_>>(),
+        vec![WallTime::UNIX_EPOCH, WallTime::from_nanos(5_000)]
+    );
+}
+
+#[test]
+fn enqueue_after_adds_the_delay_to_the_transactions_time() {
+    let mut db = fresh_db(0x7A30_0002);
+    db.transact_at(WallTime::from_nanos(1_000), |tx| {
+        tx.enqueue_after(std::time::Duration::from_nanos(250), Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("transact_at");
+    assert_eq!(db.drain_enqueued()[0].due_at, WallTime::from_nanos(1_250));
+}
+
+/// Review Focus 5: a delay centuries out saturates; it neither panics nor wraps
+/// to a time in the past, and the job stays Pending.
+#[test]
+fn enqueue_after_saturates_instead_of_overflowing() {
+    let mut db = fresh_db(0x7A30_0003);
+    db.transact_at(WallTime::from_nanos(u64::MAX - 1), |tx| {
+        tx.enqueue_after(std::time::Duration::from_nanos(10), Ping);
+        tx.enqueue_after(std::time::Duration::MAX, Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("transact_at");
+    let drained = db.drain_enqueued();
+    assert_eq!(drained[0].due_at, WallTime::from_nanos(u64::MAX));
+    assert_eq!(drained[1].due_at, WallTime::from_nanos(u64::MAX));
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert!(rows.iter().all(|r| r.status == JobStatus::Pending));
+    db.transact_at(WallTime::from_nanos(0), |tx| {
+        tx.enqueue_after(std::time::Duration::MAX, Ping);
+        Ok::<_, ()>(())
+    })
+    .expect("transact_at");
+    assert_eq!(
+        db.drain_enqueued()[0].due_at,
+        WallTime::from_nanos(u64::MAX)
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "contract: tx.now() reads the transaction's time, and this transaction has none"
+)]
+fn enqueue_after_needs_a_time_source() {
+    let mut db = fresh_db(0x7A30_0004);
+    let _ = db.transact(|tx| {
+        tx.enqueue_after(std::time::Duration::from_secs(1), Ping);
+        Ok::<_, ()>(())
+    });
+}
