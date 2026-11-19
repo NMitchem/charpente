@@ -765,7 +765,8 @@ pub fn run(args: &[String]) -> i32 {
             Ok(code) => code,
             Err(code) => return code,
         };
-        return match read_pass(&outcomes, code, before.as_deref(), &mut stderr) {
+        let bound = PassTimeout::of(&opts, timeout.as_deref());
+        return match read_pass(&outcomes, code, before.as_deref(), bound, &mut stderr) {
             Ok(only) => report(only, None, &run, &mut stdout, &mut stderr),
             Err(code) => code,
         };
@@ -838,7 +839,8 @@ pub fn run(args: &[String]) -> i32 {
         Ok(code) => code,
         Err(code) => return code,
     };
-    let first = match read_pass(&outcomes, code, before.as_deref(), &mut stderr) {
+    let bound = PassTimeout::of(&opts, quick_timeout.as_deref());
+    let first = match read_pass(&outcomes, code, before.as_deref(), bound, &mut stderr) {
         Ok(first) => first,
         Err(code) => return code,
     };
@@ -865,7 +867,14 @@ pub fn run(args: &[String]) -> i32 {
         Ok(code) => code,
         Err(code) => return code,
     };
-    match read_pass(&outcomes, code, first.start_time.as_deref(), &mut stderr) {
+    let bound = PassTimeout::of(&opts, full_timeout.as_deref());
+    match read_pass(
+        &outcomes,
+        code,
+        first.start_time.as_deref(),
+        bound,
+        &mut stderr,
+    ) {
         Ok(second) => report(first, Some(second), &run, &mut stdout, &mut stderr),
         Err(code) => code,
     }
@@ -1155,6 +1164,52 @@ fn parse_outcomes(text: &str, path: &str) -> Result<Outcomes, String> {
     })
 }
 
+/// The `--timeout` one pass ran under, which cargo-mutants 27.1.0 also bounds
+/// its unmutated baseline by: one the verb derived from its own timing of the
+/// test set (`pass_timeout`), or the one the run was given.
+#[derive(Clone, Copy)]
+enum PassTimeout<'a> {
+    Derived(&'a str),
+    Given(&'a str),
+}
+
+impl<'a> PassTimeout<'a> {
+    /// `None` when the pass passed no `--timeout`: cargo-mutants then sets its
+    /// own from its baseline, and bounds the baseline by none.
+    fn of(opts: &Opts, timeout: Option<&'a str>) -> Option<Self> {
+        let t = timeout?;
+        Some(match opts.timeout {
+            Some(_) => Self::Given(t),
+            None => Self::Derived(t),
+        })
+    }
+}
+
+/// The error for an unmutated baseline that timed out at the pass's own
+/// `--timeout`. A derived one times the test set, and the baseline runs the
+/// mutated file's package, so the fix is a larger timeout or a test set that
+/// holds that package (R-22; deriving from both is a PLAN row).
+fn timed_out_baseline(timeout: PassTimeout, where_: &str) -> String {
+    match timeout {
+        PassTimeout::Derived(t) => format!(
+            "error: the UNMUTATED baseline timed out at --timeout {t} (seconds), the timeout the \
+             verb derived as 5x its own timed `cargo test` over the test set — cargo-mutants \
+             27.1.0 bounds its baseline by the same --timeout but runs it over the mutated \
+             file's own package, which can take longer than 5x the set; no mutant result from \
+             this run means anything, and every counter in {where_} reads zero regardless. Pass \
+             a larger --timeout, or a --test-package set that includes the --file's own package, \
+             so the derived timeout covers its baseline."
+        ),
+        PassTimeout::Given(t) => format!(
+            "error: the UNMUTATED baseline timed out at --timeout {t} (seconds), the timeout this \
+             run was given — cargo-mutants 27.1.0 bounds its baseline by it, and runs that \
+             baseline over the mutated file's own package; no mutant result from this run means \
+             anything, and every counter in {where_} reads zero regardless. Pass a larger \
+             --timeout, one the --file's own package's `cargo test` finishes inside."
+        ),
+    }
+}
+
 /// Reads one pass's record and turns every "nothing was measured" shape into a
 /// loud failure, written to `err`, whose exit code is the `Err`. The tool's
 /// exit code is NOT consulted for the verdict — it is 0 both for a clean sweep
@@ -1170,6 +1225,7 @@ fn read_pass(
     path: &std::path::Path,
     code: Option<i32>,
     before: Option<&str>,
+    timeout: Option<PassTimeout>,
     err: &mut dyn std::io::Write,
 ) -> Result<Outcomes, i32> {
     // Reading cargo-mutants' own run record is edge tooling, outside the
@@ -1229,6 +1285,19 @@ fn read_pass(
         )
     }) {
         writeln!(err, "{line}").expect("failed printing to stderr");
+        return Err(2);
+    }
+    if let Some(timeout) = timeout
+        && o.outcomes
+            .iter()
+            .any(|x| matches!(x.scenario, Scenario::Baseline) && x.summary == "Timeout")
+    {
+        writeln!(
+            err,
+            "{}",
+            timed_out_baseline(timeout, &path.display().to_string())
+        )
+        .expect("failed printing to stderr");
         return Err(2);
     }
     let v = verdict(
@@ -1681,7 +1750,7 @@ mod tests {
     /// of that one pass: the exit code, stdout and stderr.
     fn one_pass_report(path: &std::path::Path, code: Option<i32>) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = match read_pass(path, code, None, &mut err) {
+        let code = match read_pass(path, code, None, None, &mut err) {
             Ok(only) => report(only, None, &run_ctx(None, &["app"]), &mut out, &mut err),
             Err(code) => code,
         };
@@ -2003,6 +2072,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// R-22: cargo-mutants bounds its unmutated baseline by the pass's
+    /// `--timeout`, and runs it over the mutated file's own package, which a
+    /// timeout the verb derived from the test set may not cover (0.5.0's
+    /// mutation run: kernel/mod.rs under charpente-sim, a 69 s timeout and a
+    /// 101 s charpente baseline). The refusal names the timeout and the fix,
+    /// not the suite. A pass with no `--timeout` of its own keeps the generic
+    /// text: cargo-mutants then bounds its baseline by none.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_baseline_that_timed_out_names_the_timeout_and_the_fix() {
+        let dir = std::env::temp_dir().join(format!("charpente-timedout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("outcomes.json");
+        std::fs::write(
+            &path,
+            r#"{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,
+            "outcomes":[{"scenario":"Baseline","summary":"Timeout"}]}"#,
+        )
+        .expect("outcomes");
+        let refusal = |timeout| {
+            let mut err = Vec::new();
+            let read = read_pass(&path, Some(4), None, timeout, &mut err);
+            assert_eq!(read.err(), Some(2));
+            String::from_utf8(err).unwrap()
+        };
+        assert_eq!(
+            refusal(Some(PassTimeout::Derived("69"))),
+            format!(
+                "error: the UNMUTATED baseline timed out at --timeout 69 (seconds), the timeout \
+                 the verb derived as 5x its own timed `cargo test` over the test set \u{2014} \
+                 cargo-mutants 27.1.0 bounds its baseline by the same --timeout but runs it over \
+                 the mutated file's own package, which can take longer than 5x the set; no \
+                 mutant result from this run means anything, and every counter in {} reads zero \
+                 regardless. Pass a larger --timeout, or a --test-package set that includes the \
+                 --file's own package, so the derived timeout covers its baseline.\n",
+                path.display()
+            )
+        );
+        assert_eq!(
+            refusal(Some(PassTimeout::Given("600"))),
+            format!(
+                "error: the UNMUTATED baseline timed out at --timeout 600 (seconds), the timeout \
+                 this run was given \u{2014} cargo-mutants 27.1.0 bounds its baseline by it, and \
+                 runs that baseline over the mutated file's own package; no mutant result from \
+                 this run means anything, and every counter in {} reads zero regardless. Pass a \
+                 larger --timeout, one the --file's own package's `cargo test` finishes \
+                 inside.\n",
+                path.display()
+            )
+        );
+        assert!(
+            refusal(None).starts_with("error: the UNMUTATED baseline was not green (Timeout) — "),
+            "a pass with no timeout of its own keeps the generic text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn zero_mutants_is_not_a_clean_run() {
         let v = verdict(
@@ -2279,7 +2405,7 @@ mod tests {
                 std::fs::create_dir_all(path.parent().unwrap()).expect("scratch");
                 std::fs::write(&path, text).expect("record");
                 let mut err = Vec::new();
-                read_pass(&path, Some(0), None, &mut err)
+                read_pass(&path, Some(0), None, None, &mut err)
                     .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&err)))
             })
             .collect();
@@ -2516,6 +2642,7 @@ mod tests {
             &path,
             Some(1),
             Some("2026-11-01T05:04:18.099487Z"),
+            None,
             &mut err,
         );
         assert_eq!(read.err(), Some(2));
@@ -2530,8 +2657,15 @@ mod tests {
         );
         let mut err = Vec::new();
         assert!(
-            read_pass(&path, Some(0), Some("2026-11-01T05:04:31.54708Z"), &mut err).is_ok()
-                && read_pass(&path, Some(0), None, &mut err).is_ok(),
+            read_pass(
+                &path,
+                Some(0),
+                Some("2026-11-01T05:04:31.54708Z"),
+                None,
+                &mut err
+            )
+            .is_ok()
+                && read_pass(&path, Some(0), None, None, &mut err).is_ok(),
             "{}",
             String::from_utf8_lossy(&err)
         );

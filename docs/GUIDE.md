@@ -5759,7 +5759,7 @@ rather than turning it loose on a whole workspace. It needs the pinned tool:
 (`cargo mutants --version`) before its own test runs, so a machine without it
 exits 2 with that install line rather than after them.
 
-Three failures of cargo-mutants' unmutated baseline are named instead of left to a
+Four failures of cargo-mutants' unmutated baseline are named instead of left to a
 generic "baseline was not green". cargo-mutants builds in a scratch copy of the
 workspace under the temp dir, and 27.1.0 rewrites a relative `path` only in
 `[dependencies]`, `[replace]` and `[patch]`. So before the install check the verb
@@ -5775,7 +5775,12 @@ build of the workspace. And a baseline red because a sim check tested nothing
 its setup so runs reach it, or scope `--property` to a check that runs. The
 verb names it the same way when its own `cargo test` is the baseline that
 went red, the timing run or the full-count run before two passes, and prints
-that run's output above the error.
+that run's output above the error. And a baseline that timed out at the pass's
+own `--timeout` names that timeout: cargo-mutants bounds its baseline by it and
+runs the baseline over the mutated file's own package, which a timeout the verb
+derived from the test set need not cover (a `--file` in one crate judged by
+another crate's tests). Pass a larger `--timeout`, or a `--test-package` set
+that includes the `--file`'s own package.
 
 ### A note on the edge harness (platform dev tooling, not app surface)
 
