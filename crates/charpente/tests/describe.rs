@@ -164,7 +164,7 @@ fn fixture_app() -> App {
 }
 
 const GOLDEN: &str = r#"{
-  "charpente_version": "0.4.0",
+  "charpente_version": "0.5.0",
   "tables": [
     {
       "name": "ApiKey",

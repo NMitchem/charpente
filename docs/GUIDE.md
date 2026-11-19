@@ -76,11 +76,11 @@ edition = "2024"
 rust-version = "1.99"
 
 [dependencies]
-charpente = "0.4"
+charpente = "0.5"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-charpente-sim = "0.4"
+charpente-sim = "0.5"
 
 [[test]]
 name = "sim"
@@ -8048,7 +8048,7 @@ memorizing a list:
 
 ```json
 {
-  "charpente_version": "0.4.0",
+  "charpente_version": "0.5.0",
   "tables": [
     {
       "name": "ApiKey",
@@ -9890,6 +9890,81 @@ compiles only where an `Org` tenant is named: its `emit` on a `ScopedTx<Org>`, a
 feed from the same handle. So a tenant's event cannot be emitted into no tenant, a global
 feed cannot name one, and a hand-written event cannot claim another tenant type's shape,
 except by that computed collision. §11 shows each refusal.
+
+### A scoped job's Dead hook tells the tenant
+
+A `scoped_by = Org` job's `on_dead` (§6, "What a job's Dead means") receives the
+job's tenant's `ScopedTx`, so the hook's writes stay inside the tenant the job was
+enqueued in, and commit with the Dead mark as one record. A hook that writes a
+scoped row the tenant's own routes read tells that tenant's user, and no other
+tenant sees it:
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::ApiError;
+use charpente::kernel::JobError;
+use charpente::{Dead, Id, ScopedTx, Tenant, Tx, job, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    const NAME: &'static str = "Org";
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("org:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
+                "not a member of org {}",
+                scope.raw()
+            )))
+        }
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Notice {
+    id: Id<Notice>,
+    text: String,
+}
+
+#[job(scoped_by = Org, on_dead, retry(max = 3, backoff = "10s"))]
+struct Import {
+    batch: u64,
+}
+
+impl Import {
+    fn run(self, _tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+        Err(JobError::app("the import source refused the batch"))
+    }
+
+    fn on_dead(
+        self,
+        tx: &mut ScopedTx<'_, '_, Org>,
+        dead: Dead<Self>,
+    ) -> Result<(), JobError> {
+        tx.put(&Notice {
+            id: Id::from_raw(self.batch),
+            text: format!(
+                "import {} gave up after {} attempts: {}",
+                self.batch,
+                dead.attempts(),
+                dead.last_error()
+            ),
+        });
+        Ok(())
+    }
+}
+```
+
+The tenant's route reads `Notice` through its own `ScopedTx` as any scoped row.
+A hook that re-issues (§6, "Re-issuing a dead job") stays in the tenant too: the
+re-issued job carries it.
 
 ### Reading across every tenant: the `cross_tenant` capability
 
