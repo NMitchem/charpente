@@ -29,8 +29,8 @@ pub struct NoteAdded {
     pub note: Id<Note>,
 }
 
-/// The job: runs after commit, off the durable queue, and marks the note
-/// echoed. Its effect is a row change, so a sim property can pin it.
+/// The job: marks the note echoed after commit; a sim property pins it.
+/// retain_dead: `run` has no App error, so its Dead row means a platform fault.
 #[job(global, retain_dead)]
 pub struct Echo {
     pub note: Id<Note>,

@@ -3799,8 +3799,9 @@ closure runs on every boot. The row's `key_hash` is
 `charpente::auth::hash_token(raw)`. Its `created_at` is recorded time (§7,
 "Clock errors"): a node will not open while its clock is more than 60 s behind
 the newest key's `created_at`, and otherwise hands out no time before it, so
-seed it no later than the sim's start. Seed `WallTime::UNIX_EPOCH`: a clock
-skewed behind true time reads before the start itself.
+seed it no later than the sim's start. `WallTime::UNIX_EPOCH` is always safe:
+the epoch is below every clock reading, so the seeded key is never ahead of
+the node.
 
 `recover` gives `Ok(None)` when the run gave up by name, on a boot refused for
 durable corruption and on nothing else. Return `Ok(())` then. Its errors fail

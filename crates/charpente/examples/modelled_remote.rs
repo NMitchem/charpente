@@ -58,6 +58,8 @@ struct Order {
     paid: bool,
 }
 
+// retain_dead: this example only shows the remote; an app that must tell someone a charge
+// was given up declares `on_dead` (GUIDE §6).
 #[job(
     global,
     retain_dead,
