@@ -1,0 +1,9 @@
+a311159 Cargo.lock: pin the registry versions the app was proved against
+de1bbed FINDINGS.md: friction ledger, sim output and the full --mutants report
+560d7c4 tests/sim.rs: make the given-up-then-retried charge a case the sim reaches
+0a02904 tests/sim.rs: repeat and conflict probes for every id-keyed write
+007e3b8 src/lib.rs: refuse a charge that finds another period renewing
+b3c8f03 tests/sim.rs: excuse answer mismatches only where media corruption fired
+d1a2e3f tests/sim.rs: seven properties under the full fault matrix
+5e287ef src/lib.rs: workspaces, plans, customers, subscriptions and renewals
+e4bb1d3 Scaffold renewly with charpente new

@@ -1,0 +1,4 @@
+833ee0d Cargo.toml, clippy.toml, .gitignore, src/main.rs: charpente new scaffold
+133dfb9 FINDINGS.md: friction ledger, first entries
+e56ccd0 src/lib.rs: signup route mints the first owner credential
+90cecb9 src: workspaces, plans, subscriptions, renewal and give-up jobs
