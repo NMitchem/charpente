@@ -118,6 +118,14 @@ error: use of a disallowed method `std::time::SystemTime::now`
    = note: ambient wall clock — use the Clock trait (DESIGN.md §1)
 ```
 
+The Clock trait is `charpente::core::io::Clock`, beside `Entropy`, `Disk` and
+`Net` in the same module. A handler or a job never needs it, since it reads the
+time with `tx.now()` (§7). A sim workload that calls `sim.clock().wall()` does,
+because `wall` is the trait's method: `use charpente::core::io::Clock;`.
+DESIGN.md ships with charpente's repository, not with the crate, so where a
+fence reason says "DESIGN.md §1", this section and §4's "What a transaction
+cannot do" are the shipped equivalent.
+
 It is the platform's own fence (its CLAUDE.md hard rule 1) minus the entries
 that guard platform internals, and a test keeps it a subset. Where a real
 edge needs ambient IO — the production `Disk` your `main` mounts — the
@@ -187,7 +195,11 @@ plus one lookup function per `#[index]` field.
 - Every other field's type must implement `Codec` — charpente's own
   deterministic, versionless (v0) encoding, not serde. `Codec` is
   implemented for `u8`/`u16`/`u32`/`u64`/`i8`/`i16`/`i32`/`i64`, `bool`,
-  `String`, `Vec<u8>`, `Option<T> where T: Codec`, and `Id<T>` for any `T`.
+  `String`, `Vec<u8>`, `Option<T> where T: Codec`, `Id<T>` for any `T`, and
+  `WallTime` (`charpente::core::io::WallTime`, stored as its `u64`
+  nanoseconds). `WallTime` is not `Wire`, so a body, response or event field
+  carries one as `WireU64(t.as_nanos())`, and `WallTime::from_nanos(w.0)`
+  reads it back.
   A field type that isn't `Codec` fails as an ordinary trait-bound error at
   the macro's generated encode/decode code, not a custom message.
 - Fields encode and decode **in declaration order** — reordering fields
@@ -755,7 +767,9 @@ the server", below), and in sim a `SimSource` feeds the same kernel (§8,
 at its step's time, so a route's `tx.now()` reads that time. Outside the
 kernel, `App::handle(request: Request) -> Response` runs one request, for a
 test, in a transaction with no time, and `App::handle_at(request, now)` gives
-it one (§7). Every request that reaches a matched route runs inside exactly one
+it one (§7). A `Response`'s fields are public: `status: u16`, `headers:
+BTreeMap<String, String>` and `body: Vec<u8>`. Every request that reaches a
+matched route runs inside exactly one
 transaction: routing runs first (an unmatched request never opens one),
 then the session lookup and your handler run inside the transaction §4
 covers, the one the kernel opens for the request.
@@ -858,9 +872,9 @@ identifiers in scope — `routes![handlers::create_note]` works exactly like
 
 `Request`'s shape (what a handler ultimately runs against, one layer down):
 `method: Method`, `path: String`, `query: BTreeMap<String, String>`,
-`headers: BTreeMap<String, String>` (keys lowercased), `body: Vec<u8>`.
-`query` is parsed from the URL's `?...` suffix at construction; a plain
-`#[route]` handler still has no argument-convention access to it (only
+`headers: BTreeMap<String, String>` (keys lowercased), `body: Vec<u8>`. It
+is `Clone`. `query` is parsed from the URL's `?...` suffix at construction; a
+plain `#[route]` handler still has no argument-convention access to it (only
 `#[route(SSE ...)]`'s platform-extracted resume cursor reads it today).
 
 ### Returning rows from a route: storage shape vs. wire shape
@@ -980,7 +994,8 @@ String`, `expires_at: WallTime`) and `ApiKey` (`id: Id<ApiKey>`, `#[index]
 key_hash: String`, `subject: String`, `created_at: WallTime`) — both inside the
 commit point, so a login or a minted key is a durable, replicated
 transaction like any other. **Only the hash is ever stored:**
-`token_hash`/`key_hash` are lowercase-hex SHA-256 of the raw credential; the
+`token_hash`/`key_hash` are lowercase-hex SHA-256 of the raw credential, which
+`charpente::auth::hash_token(raw: &str) -> String` computes; the
 raw string exists only in the response that mints it and never reaches disk
 (a sim property scans every durable file in the run and proves it).
 
@@ -1588,6 +1603,7 @@ use charpente::core::job::RetryPolicy;
 use charpente::kernel::JobError;
 use charpente::{Job, Tx, job};
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead)]
 struct Basic {}
 
@@ -1597,6 +1613,7 @@ impl Basic {
     }
 }
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead, retry(max = 3, backoff = "10s"))]
 struct Custom {}
 
@@ -1635,6 +1652,7 @@ struct Counter {
     hits: u64,
 }
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead)]
 struct CountUp {
     slot: u64,
@@ -1715,6 +1733,7 @@ struct Mailer {
     sent: u64,
 }
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(scoped_by = Org, retain_dead)]
 struct SendReceipt {
     invoice: u64,
@@ -1815,6 +1834,7 @@ struct Counter {
     hits: u64,
 }
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead, retry(max = 3, backoff = "10s"))]
 struct CountUp {
     slot: u64,
@@ -1878,6 +1898,7 @@ struct Invoice {
     finalized: bool,
 }
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead)]
 struct SendReminder {
     invoice: u64,
@@ -1953,8 +1974,13 @@ App::mount_jobs (or this log outlived a renamed job type)"`.
 Every `#[job]` says what its Dead means, and neither answer is the default: a job
 that names neither is a compile error naming both (§9). `retain_dead` is the
 behaviour above and nothing more: the Dead row stays, with its `last_error`, and
-nothing runs. `on_dead` is for a job whose retries running out must make something
-happen (telling the user, releasing a hold, recording the failure where the app
+nothing runs. A `retain_dead` job says in one line, as a comment on the job, why
+its Dead row is enough, so a reviewer can check the claim:
+`// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it`,
+or `// retain_dead: the next tick enqueues the next one`. A job whose expected
+failures (an `Err(JobError::App)`, an outage) leave someone waiting or a promise
+unkept has no such line to write. `on_dead` is for a job whose retries running
+out must make something happen (telling the user, releasing a hold, recording the failure where the app
 reads it). It declares a hook you write, which `#[job]` no more derives than it
 derives `run`:
 
@@ -2124,6 +2150,7 @@ use charpente::kernel::JobError;
 use charpente::outbound::{Call, IdempotencyKey, Reply};
 use charpente::{Tx, job};
 
+// retain_dead: nothing in this app waits on the charge, so its row and last error are the record
 #[job(
     global,
     retain_dead,
@@ -2152,6 +2179,7 @@ impl Charge {
     }
 }
 
+// retain_dead: call sends nothing, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead, outbound = "mail.test")]
 struct Mail {}
 
@@ -2685,6 +2713,7 @@ struct DigestState {
     sent: u64,
 }
 
+// retain_dead: a missed digest is not owed; the next tick enqueues the next one
 #[job(global, retain_dead)]
 struct SendDigest {}
 
@@ -2723,6 +2752,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Schema, Tx, job};
 use std::time::Duration;
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead)]
 struct Tick {}
 
@@ -2793,6 +2823,7 @@ struct Window {
 }
 
 /// Acts inside one org, the one the sweep named when it fanned this out.
+// retain_dead: the hourly sweep fans it out again while its window is unapplied
 #[job(scoped_by = Org, retain_dead)]
 struct ApplyWindow {
     window: u64,
@@ -2809,6 +2840,7 @@ impl ApplyWindow {
 }
 
 /// Reads every org's windows and fans one `ApplyWindow` into each window's org.
+// retain_dead: the next hourly tick sweeps again
 #[job(global, retain_dead, cross_tenant)]
 struct MaintenanceSweep {}
 
@@ -2994,6 +3026,7 @@ struct Hold {
     released: bool,
 }
 
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead)]
 struct Expire {
     hold: u64,
@@ -3041,6 +3074,7 @@ struct Booking {
     cancelled: bool,
 }
 
+// retain_dead: a reminder lost to an outage owes the booking nothing, and the row records it
 #[job(global, retain_dead, outbound = "mail.example")]
 struct Remind {
     booking: u64,
@@ -3116,6 +3150,7 @@ struct NoteBody {
     text: String,
 }
 
+// retain_dead: a missed digest is not owed; the next tick enqueues the next one
 #[job(global, retain_dead)]
 struct SendDigest {}
 
@@ -3656,8 +3691,9 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    app's outbound work settles (below). A remote model's own switches, such
    as `modelled_remote`'s `calm`, stay in your code: flip them between the two
    calls.
-4. **Re-send what went unanswered.** Every request whose answer is `None`,
-   or a 5xx whose body is fault fallout, is sent again at the tail's start. A
+4. **Re-send what went unanswered.** The requests whose answer is `None`,
+   or a 5xx whose body is fault fallout, are sent again at the tail's start,
+   in their order in the list. A
    4xx, or a handler's own 5xx, is the app's answer and is not re-sent.
    Fallout is read from the body's text (`is_fault_fallout`), so a handler's
    own 5xx whose message reads as fallout ("injected", say) is re-sent too.
@@ -3718,7 +3754,13 @@ models", below), but only where its calls land inside the window. The window
 opens in the first two seconds of virtual time, so a job called at once is
 often answered before it opens: the fixture enqueues its receipt 2 s after the
 order (`enqueue_after`), and measured `dead:SendReceipt` in 486 of 4096 runs,
-against 35 of 500 when the receipt was sent at once. Measure a required key's
+against 35 of 500 when the receipt was sent at once. Two consequences follow.
+The window has ended by 2 s + 4 h of virtual time in every run, so work due
+after that, such as a renewal a day out, never meets an outage. And a call
+lands before the window opens only when it is made in the run's first two
+seconds, ahead of the drawn start, so "a call landed, then the host went away"
+is rare. A sim cannot place the window today: PLAN.md's v1.x row "An outage a
+sim can place" holds that open question. Measure a required key's
 rate before you rely on it, and write the rate beside the `require`, as the
 fixture does: a fresh `cargo test` batch is 256 runs.
 
@@ -3753,7 +3795,12 @@ the faulted phase, where fewer get acked and more runs give up: so write the
 fixtures (an `ApiKey` row in §5's storage form, whose raw key the requests
 present, and the rows a claim only reads) in the closure `Drive::new` takes,
 through `App::transact_for_tests`, each only when it is absent, since the
-closure runs on every boot.
+closure runs on every boot. The row's `key_hash` is
+`charpente::auth::hash_token(raw)`. Its `created_at` is recorded time (§7,
+"Clock errors"): a node will not open while its clock is more than 60 s behind
+the newest key's `created_at`, and otherwise hands out no time before it, so
+seed it no later than the sim's start. Seed `WallTime::UNIX_EPOCH`: a clock
+skewed behind true time reads before the start itself.
 
 `recover` gives `Ok(None)` when the run gave up by name, on a boot refused for
 durable corruption and on nothing else. Return `Ok(())` then. Its errors fail
@@ -3931,8 +3978,10 @@ A workload reads two times. `sim.now()` is virtual time, the one dimension every
 host shares; `SimSource` horizons and `push_at` times are on it. A clock's
 `wall()` (`sim.clock()`, or a host's `host.clock()`) is the wall time a node
 sees: `sim.true_wall()` (virtual time plus 2026-01-01T00:00:00Z) plus that
-clock's offset. `charpente test --sim` puts three faults on the offset, each on
-in a quarter of runs, from its own stream:
+clock's offset. `wall` is a method of the `charpente::core::io::Clock` trait, so
+a workload that reads it has `use charpente::core::io::Clock;`.
+`charpente test --sim` puts three faults on the offset, each on in a quarter of
+runs, from its own stream:
 
 | Axis (`FaultConfig` field) | What it does | Coverage key |
 |---|---|---|
@@ -4448,6 +4497,7 @@ struct Counter {
 
 // A job payload never crosses HTTP, so it has no `Wire` requirement — this
 // stays a bare `u64`.
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead)]
 struct CountUp {
     slot: u64,
@@ -4830,6 +4880,10 @@ from its own stream (`outbound_outage`) after the clock axes, and a
 |---|---|
 | `outbound_outage` | on with chance 0.25; the start uniform in the first 2 s of virtual time; the length one of 60 s, 300 s, 1800 s or 4 h. The default policy (5 attempts, a 30 s doubling backoff, a 30 s timeout) survives the first two and is exhausted by the last two |
 
+So no outage reaches work due after 2 s + 4 h of virtual time, and a call that
+lands before the window opens is rare ("Coverage for a Dead path" above, and
+PLAN.md's v1.x row "An outage a sim can place").
+
 ### Calling the outside world in a sim
 
 An app with an outbound job is driven the way "Driving the whole app in a sim"
@@ -4867,6 +4921,7 @@ struct Receipt {
     sent: bool,
 }
 
+// retain_dead: an unsent receipt leaves no Receipt row, and the Dead row says why
 #[job(
     global,
     retain_dead,
@@ -9758,7 +9813,12 @@ impl<S> ScopedTx<'_, '_, S> {
     pub fn delete<R: Row<Scope = S>>(&mut self, id: Id<R>);
     pub fn emit<Ev: Event<Scope = S>>(&mut self, event: Ev);                          // records this tenant — §11
     pub fn emit_keyed<Ev: Event<Scope = S>>(&mut self, key: impl Into<String>, event: Ev);
+    pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J);                             // runs in this tenant — §6
+    pub fn enqueue_at<J: Job<Scope = S>>(&mut self, at: WallTime, job: J);
+    pub fn enqueue_after<J: Job<Scope = S>>(&mut self, delay: Duration, job: J);
+    pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J);
 }
+// `tx.now()` is `Tx::now`, reached through the deref (below).
 ```
 
 `use charpente::Subscribe;` adds `tx.subscription::<Ev>()`, the tenant feed (§11).
@@ -10056,6 +10116,7 @@ fn admin_revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
 
 /// The job half of the same declaration: `run` takes the token after `tx`.
 /// The flag composes with `retry(...)` — they share one attribute.
+// retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
 #[job(global, retain_dead, cross_tenant, retry(max = 2, backoff = "5s"))]
 struct Rollup {
     day: u64,

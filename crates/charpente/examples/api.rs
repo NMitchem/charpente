@@ -231,7 +231,8 @@ mod attributes {
     // `max` attempts in all (default 5), the wait doubling from `backoff`
     // (default 30s); then the job is Dead. Every job says what its Dead
     // means, and neither is the default: `on_dead` (write the hook below)
-    // or `retain_dead` (the row is kept with its last error; nothing runs).
+    // or `retain_dead` (the row is kept with its last error; nothing runs;
+    // a one-line comment on the job says why that is enough).
     #[job(global, on_dead, retry(max = 3, backoff = "10s"))]
     pub struct Reindex {}
 
@@ -258,6 +259,7 @@ mod attributes {
     }
 
     // Runs inside the tenant it was enqueued in, so `run` takes its `ScopedTx`.
+    // retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
     #[job(scoped_by = Org, retain_dead)]
     pub struct Notify {
         pub memo: Id<Memo>,
@@ -272,6 +274,7 @@ mod attributes {
 
     // `cross_tenant`: `run` is handed the capability after `tx`, the token
     // `across_tenants` and `enqueue_in` take.
+    // retain_dead: run has no App error, so only a bug reaches Dead, and the row reports it
     #[job(global, retain_dead, cross_tenant)]
     pub struct Rollup {}
 
@@ -290,6 +293,7 @@ mod attributes {
     // and `settle` in place of `run`. `timeout` bounds the wait for the
     // reply (default 30s) and needs `outbound`; `cross_tenant` beside it is
     // refused.
+    // retain_dead: nothing on this page waits on the charge, so its row and last error are the record
     #[job(scoped_by = Org, retain_dead, outbound = "pay.example", timeout = "5s")]
     pub struct Charge {
         pub cents: u64,
