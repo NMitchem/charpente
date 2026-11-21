@@ -1,6 +1,7 @@
 # The launch tape: one double charge, caught in a second
 
-Status: draft for Noah's approval, 2026-11-20, with his answers folded in (§9). Drafted after
+Status: approved by Noah 2026-11-20 ("write it up"), with his answers folded in (§9). Plan:
+[docs/superpowers/plans/2026-11-20-launch-tape.md](../plans/2026-11-20-launch-tape.md). Drafted after
 the launch demo's rehearsal came out 0 against 0
 (`.superpowers/sdd/2026-11-09-launch-demo-rehearsal/go-no-go.md`), with Noah's pointer to
 retrace's demo as the model.
