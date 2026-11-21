@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-11-21)
 
 ### Breaking changes
 - **`charpente test --sim`'s human report says less where it repeated itself, and calls an injected fault injected.** `--format json` keeps its shape and fields; of the changes below only the durable-refusal skip reason reaches it, as the text of `skipped_reasons[].reason`, since that reason is one `give_up` string in both formats. A script that matched any of these lines must match the new text or read the JSON. GUIDE §8.
