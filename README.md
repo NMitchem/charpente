@@ -4,7 +4,7 @@ A Rust backend in one binary: server, database, jobs and auth. It comes with a s
 runs your routes, jobs and data through crashes, lost replies and outages, and every failure
 replays from its seed.
 
-You, or your coding agent, write the app as Rust. `charpente test --sim` runs it hundreds of
+You, or your coding agent, write the app in Rust. `charpente test --sim` runs it hundreds of
 times under injected faults and checks the properties you wrote after every run.
 
 https://github.com/user-attachments/assets/9dd78104-beee-4ed8-aab7-5a6c4075be9f
@@ -81,8 +81,8 @@ an injected fault kept the client from hearing that it succeeded. A client that 
 sends again, so the POST arrived a second time. `place_order` ran again: `tx.put` stored the order
 again, and `tx.enqueue` added a second `Charge`. Each job carries its own idempotency key, so the
 gateway, which dedupes on that key, took two charges. A test that sends each order once never
-meets this. It takes a commit, a fault that hides it from the client and a re-send, in that order:
-the simulator injects the fault, and its recovery step re-sends what got no answer or a fault's
+meets this bug, which takes a commit, then a fault that hides it from the client, then a re-send.
+The simulator injects the fault, and its recovery step re-sends what got no answer or a fault's
 error reply, as a client would.
 
 The bug needs both halves of `place_order` as written: `tx.put` is an upsert, and the enqueue
@@ -134,21 +134,21 @@ charpente test --sim              # every check, under injected faults, each run
 charpente test --mutants --file src/lib.rs --test-package myapp   # each mutant in src/lib.rs that no check catches
 ```
 
-Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the second check,
-`acked_post_implies_the_echo_after_recovery`, fails with the inputs that break it, shrunk to a
-run no shrinking step can make smaller, and a command that replays it. `test --mutants` runs
-cargo-mutants (`cargo install cargo-mutants --version 27.1.0 --locked`), which replaces function
-bodies and swaps operators but never deletes a statement, so a deleted line like that `tx.enqueue`
-is one to try by hand. If clippy is missing, `rustup component add clippy`.
-[docs/GUIDE.md][guide] is the full guide; §8 covers both test verbs.
+Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again. The second check,
+`acked_post_implies_the_echo_after_recovery`, fails and prints the inputs that break it, shrunk
+until no shrinking step can make the run smaller, and a command that replays it. `test --mutants`
+runs cargo-mutants (`cargo install cargo-mutants --version 27.1.0 --locked`), which replaces
+function bodies and swaps operators but never deletes a statement, so a deleted line like that
+`tx.enqueue` is one to try by hand. If clippy is missing, `rustup component add clippy`.
+[docs/GUIDE.md][guide] is the full guide, and §8 covers both test verbs.
 
 ## How it works
 
 An app is a Rust crate that links charpente, and the two compile into one binary that serves
 HTTP and keeps its data in one directory. Tables, routes, jobs and events are Rust types, so a
 change to a table that breaks a route is a compile error. A route runs as one transaction: its
-writes, the jobs it enqueues and the events it emits commit together, as one record in one log,
-or not at all, and it can't await the network. A job that calls the outside world, like `Charge`,
+writes, the jobs it enqueues and the events it emits commit together as one record in one log,
+or not at all. A route can't await the network. A job that calls the outside world, like `Charge`,
 makes its request after the commit, under an idempotency key charpente mints. Table state, the
 job queue, realtime feeds and followers are all built from that log. The core does no IO of its
 own: disk, network, clock and randomness come through traits with a production implementation
@@ -163,7 +163,7 @@ are on crates.io. These are the limits you'll hit first:
 
 - It runs on one primary. Writes go through one ordered log on one machine, and followers replay
   it for reads and failover. There is no sharding, and there won't be ([DESIGN.md][design]
-  §5). One machine's ceiling is its disk's durable write rate; [docs/BENCH.md][bench] has
+  §5). One machine's ceiling is its disk's durable write rate. [docs/BENCH.md][bench] has
   what has been measured, on a dev laptop only.
 - Apps are written in Rust, and there is no SQL interface: queries are typed Rust calls. charpente
   can generate a TypeScript client for the front end ([docs/GUIDE.md][guide] §14).
@@ -183,12 +183,12 @@ are on crates.io. These are the limits you'll hit first:
 
 | Doc | What it is |
 |---|---|
-| [MANIFESTO.md][manifesto] | Why this exists — the agent-era argument |
+| [MANIFESTO.md][manifesto] | Why this exists: the agent-era argument |
 | [DESIGN.md][design] | Architecture: the deterministic core, write model, typed surface, simulation |
-| [PLAN.md][plan] | Milestones (M0–M3), what waits until after launch, risks, non-goals |
-| [docs/GUIDE.md][guide] | How to build an app — agent-first, every runnable example compile-gated |
-| [docs/BENCH.md][bench] | Measured numbers, method first — dev hardware |
-| [examples/invoicing][invoicing] | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
+| [PLAN.md][plan] | Milestones (M0 through M3), what waits until after launch, risks, non-goals |
+| [docs/GUIDE.md][guide] | How to build an app, written for agents first, with every runnable example compile-gated |
+| [docs/BENCH.md][bench] | Measured numbers, method first, on dev hardware |
+| [examples/invoicing][invoicing] | The M0 demo, built by an agent from the docs alone (DEMO.md and FINDINGS.md) |
 
 [double-charge]: https://github.com/NMitchem/charpente/tree/main/examples/double-charge
 [demo.rs]: https://github.com/NMitchem/charpente/blob/main/crates/charpente-cli/tests/demo.rs
