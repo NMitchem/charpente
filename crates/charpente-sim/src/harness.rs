@@ -1783,7 +1783,9 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
                 );
                 continue;
             }
-            let never = match c.passed + c.failed {
+            // `c.failed` is 0 here (the arm above continued), so `passed`
+            // alone says whether any run tested the check.
+            let never = match c.passed {
                 0 => " — never tested: every run was skipped",
                 _ => "",
             };
@@ -2054,21 +2056,49 @@ fn human_failure_block(f: &Failure) -> String {
         block.push_str(&format!("  inputs: {}\n", inputs.join(", ")));
     }
     if let Some(s) = &f.shrunk {
+        let count = |n: usize, noun: &str| match n {
+            1 => format!("1 {noun}"),
+            _ => format!("{n} {noun}s"),
+        };
+        let replays = count(s.replays as usize, "replay");
         if s.smaller {
-            // The axes' names are in the repro's `--faults-off`.
-            let (from, off) = (f.drawn.len(), s.faults_off.len());
-            block.push_str(&format!(
-                "  shrunk: {from} input{} to {}, {off} fault{} off, in {} replays\n",
-                if from == 1 { "" } else { "s" },
-                s.drawn.len(),
-                if off == 1 { "" } else { "s" },
-                s.replays
-            ));
+            // What shrank, in words. A shrink that kept the draw count and
+            // lowered a value names the value: a count pair (`1 input to 1`)
+            // would read as nothing shrank. The axes' names are in the
+            // repro's `--faults-off`.
+            let mut changes = Vec::new();
+            if f.drawn.len() != s.drawn.len() {
+                let to = s.drawn.len();
+                changes.push(format!("{} to {to}", count(f.drawn.len(), "input")));
+            } else if f.drawn != s.drawn {
+                let changed: Vec<_> = f
+                    .drawn
+                    .iter()
+                    .zip(&s.drawn)
+                    .filter(|(a, b)| a != b)
+                    .collect();
+                if changed.len() <= 2 && changed.iter().all(|((a, _), (b, _))| a == b) {
+                    changes.extend(
+                        changed
+                            .iter()
+                            .map(|((name, a), (_, b))| format!("{name} {a} to {b}")),
+                    );
+                } else {
+                    changes.push(format!("{} changed", count(changed.len(), "input")));
+                }
+            }
+            if !s.faults_off.is_empty() {
+                changes.push(format!("{} off", count(s.faults_off.len(), "fault")));
+            }
+            if changes.is_empty() {
+                // Every kept run is smaller than the best before it, by its
+                // choices or by one more axis off. No axis is off, so its
+                // choices shrank, and they drew the same inputs.
+                changes.push("the same inputs from smaller choices".to_string());
+            }
+            block.push_str(&format!("  shrunk: {}, in {replays}\n", changes.join(", ")));
         } else {
-            block.push_str(&format!(
-                "  shrunk: nothing smaller fails, in {} replays\n",
-                s.replays
-            ));
+            block.push_str(&format!("  shrunk: nothing smaller fails, in {replays}\n"));
         }
         if !same_failure(&s.message, &f.message) {
             block.push_str(&format!("  before shrinking: {}\n", f.message));
@@ -2427,16 +2457,17 @@ mod tests {
         assert_eq!(line(&block, "  before shrinking: "), Some(first), "{block}");
     }
 
-    /// The shrink line counts in words: inputs from the first failure's to the
-    /// shrunk run's, and the axes turned off, singular at 1. The axes' names
-    /// are the repro's `--faults-off`.
+    /// When the draw count changed, the shrink line counts in words: inputs
+    /// from the first failure's to the shrunk run's, and the axes turned off
+    /// when any were, singular at 1. The axes' names are the repro's
+    /// `--faults-off`.
     #[test]
     fn the_shrink_line_counts_inputs_and_faults_off_in_words() {
         for (from, to, off, want) in [
             (3, 2, 2, "3 inputs to 2, 2 faults off, in 10 replays"),
-            (1, 1, 5, "1 input to 1, 5 faults off, in 10 replays"),
             (2, 1, 1, "2 inputs to 1, 1 fault off, in 10 replays"),
-            (0, 0, 0, "0 inputs to 0, 0 faults off, in 10 replays"),
+            (1, 0, 0, "1 input to 0, in 10 replays"),
+            (0, 1, 3, "0 inputs to 1, 3 faults off, in 10 replays"),
         ] {
             let block = human_failure_block(&shrunk_from("fails", "fails", from, to, off));
             assert_eq!(line(&block, "  shrunk: "), Some(want), "{block}");
@@ -2447,6 +2478,88 @@ mod tests {
                 "{block}"
             );
         }
+    }
+
+    /// The shrink line names what shrank. With the draw count unchanged it
+    /// names each value that fell, so a lowered input never reads as `1 input
+    /// to 1`; it leaves out what did not change (equal inputs, no axis off),
+    /// and it never prints an empty list of changes.
+    #[test]
+    fn the_shrink_line_names_what_shrank() {
+        let drawn = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|&(n, v)| (n, v.to_string())).collect()
+        };
+        let orders = |v| drawn(&[("orders", v)]);
+        let receipts = drawn(&[("key", "812"), ("key", "77"), ("order", "[1, 0]")]);
+        for (first, shrunk, off, replays, want) in [
+            // The demo's shape: one draw, its value lowered.
+            (
+                orders("61"),
+                orders("48"),
+                6,
+                13,
+                "orders 61 to 48, 6 faults off, in 13 replays",
+            ),
+            // Two values lowered, name for name; equal draws are not named.
+            (
+                receipts.clone(),
+                drawn(&[("key", "3"), ("key", "5"), ("order", "[1, 0]")]),
+                0,
+                1,
+                "key 812 to 3, key 77 to 5, in 1 replay",
+            ),
+            // More than two lowered: counted.
+            (
+                receipts.clone(),
+                drawn(&[("key", "3"), ("key", "5"), ("order", "[0, 1]")]),
+                1,
+                10,
+                "3 inputs changed, 1 fault off, in 10 replays",
+            ),
+            // The names do not line up: counted, even for one.
+            (
+                drawn(&[("key", "3"), ("lab", "2")]),
+                drawn(&[("key", "3"), ("amount", "2")]),
+                0,
+                4,
+                "1 input changed, in 4 replays",
+            ),
+            // The same inputs: only the axes turned off.
+            (
+                orders("48"),
+                orders("48"),
+                6,
+                13,
+                "6 faults off, in 13 replays",
+            ),
+            // The same inputs and no axis off: the choices shrank.
+            (
+                orders("48"),
+                orders("48"),
+                0,
+                4,
+                "the same inputs from smaller choices, in 4 replays",
+            ),
+        ] {
+            let mut failure = shrunk_from("fails", "fails", 0, 0, off);
+            failure.drawn = first;
+            let s = failure.shrunk.as_mut().unwrap();
+            s.drawn = shrunk;
+            s.replays = replays;
+            let block = human_failure_block(&failure);
+            assert_eq!(line(&block, "  shrunk: "), Some(want), "{block}");
+        }
+
+        // Nothing smaller failed: one replay is singular there too.
+        let mut failure = shrunk_from("fails", "fails", 1, 1, 0);
+        let s = failure.shrunk.as_mut().unwrap();
+        (s.smaller, s.replays) = (false, 1);
+        let block = human_failure_block(&failure);
+        assert_eq!(
+            line(&block, "  shrunk: "),
+            Some("nothing smaller fails, in 1 replay"),
+            "{block}"
+        );
     }
 
     // -------------------------------------------------------------- run()
@@ -3589,12 +3702,8 @@ mod tests {
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, "always_fails");
         // Every axis that was on, one replay each; the repro below names them
-        // in field order.
-        let want = format!(
-            "0 inputs to 0, {} faults off, in {} replays",
-            axes.len(),
-            axes.len()
-        );
+        // in field order. It drew nothing, so the line names no inputs.
+        let want = format!("{} faults off, in {} replays", axes.len(), axes.len());
         assert_eq!(line(block, "  shrunk: "), Some(want.as_str()), "{block}");
         // The human block carries no config line; the JSON record keeps it.
         assert!(!block.contains("  config:"), "{block}");
@@ -3743,7 +3852,10 @@ mod tests {
         let block = first_block(&out, check);
         let replays: u32 = line(block, "  shrunk: ")
             .and_then(|l| l.strip_prefix("nothing smaller fails, in "))
-            .and_then(|l| l.strip_suffix(" replays"))
+            .and_then(|l| {
+                l.strip_suffix(" replays")
+                    .or_else(|| l.strip_suffix(" replay"))
+            })
             .unwrap_or_else(|| panic!("{block}"))
             .parse()
             .unwrap();
@@ -3849,10 +3961,8 @@ mod tests {
             &axes,
         );
         let n = axes.len();
-        let want = format!(
-            "0 inputs to 0, {n} fault{} off, in {n} replays",
-            if n == 1 { "" } else { "s" }
-        );
+        let s = if n == 1 { "" } else { "s" };
+        let want = format!("{n} fault{s} off, in {n} replay{s}");
         assert_eq!(line(block, "  shrunk: "), Some(want.as_str()), "{block}");
         let repro = line(block, "  repro:  ").unwrap();
         assert!(

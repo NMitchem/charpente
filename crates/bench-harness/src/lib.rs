@@ -60,7 +60,8 @@ impl Bump {
     }
 }
 
-/// The canonical write transaction, README-shaped: get + put + enqueue + emit.
+/// The canonical write transaction, a route's whole write path: get + put +
+/// enqueue + emit.
 #[route(POST "/hit/:id", public)]
 pub fn hit(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
     let raw = id.raw() % SLOTS;

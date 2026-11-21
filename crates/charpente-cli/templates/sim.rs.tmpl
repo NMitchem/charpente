@@ -123,7 +123,10 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
             // Acked-but-lost is excused ONLY where the harness injected durable
             // corruption into this run (GUIDE §8, "Giving up").
             Ok(None) if durable_corruption_fired(sim) => {
-                sim.give_up("durable corruption fired, so the acked row is excused", "");
+                sim.give_up(
+                    "injected durable corruption fired, so the acked row is excused",
+                    "",
+                );
                 return Ok(());
             }
             Ok(None) => return Err(format!("acked note {id} lost across a crash")),
@@ -180,7 +183,7 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
         // exactly-once violation below fails even where corruption fired.
         if durable_corruption_fired(sim) {
             sim.give_up(
-                "durable corruption fired, so the acked enqueue is excused",
+                "injected durable corruption fired, so the acked enqueue is excused",
                 "",
             );
             return Ok(());
@@ -248,7 +251,7 @@ fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), Stri
         if seen == 0 {
             if durable_corruption_fired(sim) {
                 sim.give_up(
-                    "durable corruption fired, so the acked event is excused",
+                    "injected durable corruption fired, so the acked event is excused",
                     "",
                 );
                 return Ok(());
@@ -323,7 +326,7 @@ fn a_resent_note_changes_nothing_and_a_conflict_is_refused(sim: &mut Sim) -> Res
         // no longer bears out (GUIDE §8, "Giving up"). Only that is excused.
         if durable_corruption_fired(sim) {
             sim.give_up(
-                "durable corruption fired, so an acked answer is excused",
+                "injected durable corruption fired, so an acked answer is excused",
                 "",
             );
             return Ok(());

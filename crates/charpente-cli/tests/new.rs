@@ -775,9 +775,9 @@ fn the_echo_checks_false_red_seed_replays_as_a_corruption_give_up() {
     let human = String::from_utf8_lossy(&human.stdout);
     assert!(
         human.ends_with(
-            "check acked_post_implies_the_echo_after_recovery ... skipped\n    skipped: durable \
-             corruption fired, so the acked enqueue is excused\n    fired:   crash:torn: 6, \
-             fault:misdirected_write: 1, fault:write_error: 1, restart: 1\n\n\
+            "check acked_post_implies_the_echo_after_recovery ... skipped\n    skipped: injected \
+             durable corruption fired, so the acked enqueue is excused\n    fired:   \
+             crash:torn: 6, fault:misdirected_write: 1, fault:write_error: 1, restart: 1\n\n\
              sim result: nothing tested. 0 passed; 0 failed; 1 skipped, on seed \
              0x48a1018f057f9dc9.\n"
         ),

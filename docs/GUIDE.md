@@ -5321,22 +5321,30 @@ in order:
   the failure path discarded coverage entirely — docs/LEDGER.md 2026-09-07.)
 - `inputs` is every `sim.input()` draw the run made, by name, in draw order
   ("Drawing inputs" above). A run that drew nothing has no `inputs:` line.
-- `shrunk` says how far shrinking got: how many inputs the first failure
-  drew and how many the shrunk run drew, counted as the `inputs:` line lists
-  them; how many fault axes it turned off (`0 faults off` when it needed them
-  all), which `repro:`'s `--faults-off` names; and how many runs it replayed.
-  The shrunk run can draw more than the first: a fault turned off can let a
-  loop run longer. `shrunk: nothing smaller fails, in N replays`
-  means no smaller run failed the check, so the block is the first failure's
-  own and its repro is the seed alone.
+- `shrunk` says what shrinking changed, and then how many runs it replayed
+  (`in 87 replays`, `in 1 replay`). First the inputs. When the shrunk run
+  drew another number of them than the first failure, it gives both counts,
+  as the `inputs:` line lists them (`3 inputs to 2`); the shrunk run can draw
+  more than the first, since a fault turned off can let a loop run longer.
+  When it drew as many, it names each input whose value changed, from the
+  first failure's value to the shrunk run's (`orders 71 to 48`), or counts
+  them (`3 inputs changed`) when more than two changed or the names at the
+  same places differ. Then how many fault axes it turned off
+  (`2 faults off`), which `repro:`'s `--faults-off` names. Either part is left
+  out when nothing in it changed, and a shrink that changed neither, lowering
+  only choices that drew the same inputs, says
+  `the same inputs from smaller choices`.
+  `shrunk: nothing smaller fails, in N replays` means no smaller run failed
+  the check, so the block is the first failure's own and its repro is the seed
+  alone.
 - `before shrinking` is the first failure's message, printed only when the
   shrunk run failed the check with another failure: the two messages still
   differ once every run of digits in each reads as one `#`. A shrink that only
   lowered an id, a count or a key found the failure the batch first found, so
   the line is left out; `--format json`'s `first_message` keeps the first
   message whenever the two differ at all. Here the first failure was a receipt
-  never done and the shrunk one a receipt done twice, so it prints (a slipped
-  shrink, below).
+  never done and the shrunk one a receipt hit twice and done once, so it
+  prints (a slipped shrink, below).
 - `repro` is not advice, it **is** the reproduction: paste that exact line
   and the same run happens again, byte for byte. `--seed` replays a literal
   seed; `--inputs` appears only when the shrunk run's choices are not the

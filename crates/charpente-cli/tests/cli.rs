@@ -106,8 +106,16 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
         .find("  repro:  ")
         .expect("a block ends with its repro line");
     let block = &rest[..repro_at + rest[repro_at..].find('\n').unwrap() + 1];
-    assert!(block.contains("\n  shrunk: 0 inputs to 0, "), "{block}");
-    assert!(!block.contains(", 0 faults off, "), "{block}");
+    // It drew nothing, so the shrink line names only the axes turned off.
+    let shrunk = block
+        .lines()
+        .find_map(|l| l.strip_prefix("  shrunk: "))
+        .unwrap_or_else(|| panic!("{block}"));
+    let (off, rest) = shrunk
+        .split_once(" fault")
+        .unwrap_or_else(|| panic!("{block}"));
+    assert!(off.parse::<usize>().is_ok_and(|n| n > 0), "{block}");
+    assert!(rest.contains(" off, in "), "{block}");
     assert!(!block.contains("\n  inputs:"), "it drew nothing: {block}");
     let repro: Vec<&str> = block[repro_at..]
         .trim_start()

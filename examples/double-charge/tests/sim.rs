@@ -22,9 +22,11 @@ use charpente_sim::drive::Drive;
 use double_charge::{Charge, Order, build_app};
 use gateway::Gateway;
 
-// `fault:outbound_lost_reply` is what makes "once" a claim: a lost reply is
-// the only way a charge is sent twice, so a batch that never lost a reply
-// would pass a double charge.
+// `fault:outbound_lost_reply` loses the gateway's reply to a charge, and the
+// job calls again under the same key. The gateway dedupes on that key, so a
+// lost gateway reply never charges twice: a second charge needs a second
+// `Charge` job, that is, a second placement. Requiring the fault makes the
+// key's dedupe part of what a green batch tested.
 charpente_sim::sim_tests! {
     each_order_is_charged_once require ["fault:outbound_lost_reply", "outbound:checked"],
 }
@@ -95,8 +97,8 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
             .count();
         if placed > 1 {
             return Err(format!(
-                "order {order} charged twice: its POST was sent again after a lost reply and \
-                 placed the order again; answer an order that is already stored"
+                "order {order} charged twice: its POST was sent again after a fault hid its \
+                 success and placed the order again; answer an order that is already stored"
             ));
         }
         return Err(format!(

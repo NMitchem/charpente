@@ -35,9 +35,10 @@ measures an app, not the platform's limit).
 
 ### The workload
 
-The **canonical transaction** is the README's shape: get one row, mutate it, put
-it back, enqueue one job, emit one event. The job handler is a no-op state
-transition — but its Done-mark still commits a transaction, which is the point.
+The **canonical transaction** covers a route's whole write path: get one row,
+mutate it, put it back, enqueue one job, emit one event. The job handler is a
+no-op state transition — but its Done-mark still commits a transaction, which
+is the point.
 
 Two write metrics are always reported together, because reporting either alone
 invites flattering double-counting in one direction or the other:

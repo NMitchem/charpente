@@ -13,7 +13,8 @@ times under injected faults and checks the properties you wrote after every run.
 
 [`examples/double-charge`][double-charge] is an order API with one table, one route and
 one job. `POST /orders/:id` stores an order and enqueues a `Charge` job, which calls a payment
-gateway, `pay.example`, after the commit. This is the route:
+gateway, `pay.example`, after the commit. In the simulator the gateway is a model, the demo's
+`tests/gateway`. This is the route:
 
 ```rust
 #[route(POST "/orders/:id", public)]
@@ -42,11 +43,11 @@ simulator's run:
 $ charpente test --sim --master-seed 0x434841524745
 running 1 sim check, 256 runs each, under random injected faults (master seed 0x0000434841524745)
 
-sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a lost reply and placed the order again; answer an order that is already stored
+sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a fault hid its success and placed the order again; answer an order that is already stored
   seed:   0x82eac71fbdeda9de
   fired:  boot:booted-after-retry: 1, boot:retried: 2, crash:applied: 1, fault:outbound_lost_reply: 1, fault:sync_error: 3, outbound:completed: 51, restart: 1, restart:process: 2
   inputs: orders=48
-  shrunk: 1 input to 1, 6 faults off, in 13 replays
+  shrunk: orders 71 to 48, 6 faults off, in 13 replays
   repro:  charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
 
 skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
@@ -64,7 +65,7 @@ faults, and it fails the same way:
 ```console
 $ charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
 
-sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a lost reply and placed the order again; answer an order that is already stored
+sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a fault hid its success and placed the order again; answer an order that is already stored
   seed:   0x82eac71fbdeda9de
   fired:  boot:booted-after-retry: 1, boot:retried: 2, crash:applied: 1, fault:outbound_lost_reply: 1, fault:sync_error: 3, outbound:completed: 51, restart: 1, restart:process: 2
   inputs: orders=48
@@ -76,12 +77,13 @@ sim result: FAILED. 0 passed; 1 failed; 0 skipped, on seed 0x82eac71fbdeda9de wi
 ```
 
 The first `POST /orders/9` committed the order and its `Charge` job in one transaction, and then
-an injected fault lost the reply. A client that gets no answer sends again, so the POST arrived a
-second time. `place_order` ran again: `tx.put` stored the order again, and `tx.enqueue` added a
-second `Charge`. Each job carries its own idempotency key, so the gateway, which dedupes on that
-key, took two charges. A test that sends each order once never meets this. It takes a commit, a
-lost reply and a re-send, in that order: the simulator injects the fault, and its recovery step
-re-sends what went unanswered, as a client would.
+an injected fault kept the client from hearing that it succeeded. A client that hears no success
+sends again, so the POST arrived a second time. `place_order` ran again: `tx.put` stored the order
+again, and `tx.enqueue` added a second `Charge`. Each job carries its own idempotency key, so the
+gateway, which dedupes on that key, took two charges. A test that sends each order once never
+meets this. It takes a commit, a fault that hides it from the client and a re-send, in that order:
+the simulator injects the fault, and its recovery step re-sends what got no answer or a fault's
+error reply, as a client would.
 
 The bug needs both halves of `place_order` as written: `tx.put` is an upsert, and the enqueue
 after it runs every time. A route that `INSERT`s on the client's id would refuse the second POST
@@ -111,8 +113,8 @@ charpente test --sim --master-seed 0x434841524745
 The first run builds the demo and its dependencies before it prints anything. The demo pins
 charpente 0.6.0, which printed the output above, and the master seed fixes every run in the
 batch, so you get the same output. Leave out `--master-seed` and the batch draws a master seed of
-its own: the order and the seed change, and `demo.rs` checks that other master seeds fail the
-same check with the same fix.
+its own: the order number and the seed change, and `demo.rs` checks that other master seeds fail
+the same check with the same fix.
 
 ## Install
 
@@ -157,8 +159,7 @@ the details.
 ## Limits
 
 charpente is a technical preview. [CHANGELOG.md][changelog] dates each release once its crates
-are on crates.io (the newest dated section was `0.5.0` when this line was written). These are the
-limits you'll hit first:
+are on crates.io. These are the limits you'll hit first:
 
 - It runs on one primary. Writes go through one ordered log on one machine, and followers replay
   it for reads and failover. There is no sharding, and there won't be ([DESIGN.md][design]
@@ -186,7 +187,7 @@ limits you'll hit first:
 | [DESIGN.md][design] | Architecture: the deterministic core, write model, typed surface, simulation |
 | [PLAN.md][plan] | Milestones (M0–M3), what waits until after launch, risks, non-goals |
 | [docs/GUIDE.md][guide] | How to build an app — agent-first, every runnable example compile-gated |
-| [docs/BENCH.md][bench] | Measured numbers, method first — dev hardware, honestly labeled as not the launch claim |
+| [docs/BENCH.md][bench] | Measured numbers, method first — dev hardware |
 | [examples/invoicing][invoicing] | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
 
 [double-charge]: https://github.com/NMitchem/charpente/tree/main/examples/double-charge

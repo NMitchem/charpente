@@ -1,6 +1,7 @@
 //! Layer 4 (spec §2, §4): real HTTP/1.1 keep-alive load against a spawned
-//! child binary — the number the README claim is about. Closed-loop, with
-//! coordinated-omission and client-saturation disclosed in the artifact.
+//! child binary — the end-to-end number, server and HTTP included.
+//! Closed-loop, with coordinated-omission and client-saturation disclosed in
+//! the artifact.
 //! Edge tooling outside the deterministic core (DESIGN §1).
 //!
 //! This module keeps the child process, the thread pool, the Heartbeat and
