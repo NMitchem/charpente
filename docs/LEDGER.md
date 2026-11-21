@@ -9822,6 +9822,7 @@ tallied from these tables.
   - `charpente new smokeapp` writes `charpente = "0.5"` and `charpente-sim = "0.5"`.
   - `cargo clippy --all-targets -- -D warnings` exits 0.
   - `charpente test --sim` exits 0: `sim result: ok. 4 passed; 0 failed`, tested 217, 256, 221 and 253 of 256, master `0x306e233d70580ce9`.
+  - The same five steps on rustup's `stable` once updated, rustc 1.100.0 (the toolchain a new user gets), all exit 0, with no new clippy lint on the scaffold.
 - **Records.**
   - CHANGELOG's heading is dated `0.5.0 (2026-11-20)`.
   - PLAN reads "Shipped 2026-11-20: 0.5.0".
