@@ -827,8 +827,9 @@ this buys is amortization: N transactions, one fsync (docs/BENCH.md).
 
 **Ack-after-durable survives group commit by construction.** `stage` never appends, every
 reply is held until `commit` returns, and apply stays strictly after sync. So no participant
-is ever acked for a record that is not durable, and the reverse error, a 200 for something
-not durable, remains impossible.
+is ever acked for a record that is not durable: a 200 for something not durable stays
+impossible. The opposite case can happen: a record can be durable without any client having
+been acked for it.
 
 The batch is not durability-atomic. A batch large enough to straddle a segment boundary
 takes an extra barrier inside `Wal::append`, which calls `rotate`, which opens with
