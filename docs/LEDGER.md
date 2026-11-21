@@ -9810,3 +9810,20 @@ tallied from these tables.
 
   Every other step ran the six-batch oracle at exit 0.
 - **Still owed before release:** the docs-only build (Task 15, attempt 1 launched 2026-11-19 at `9f779c4c`), then the push. The crates.io publish, the CHANGELOG date and the post-publish smoke are Noah's.
+
+## 2026-11-20 — 0.5.0 published to crates.io
+
+- **The push.** `392b03ca..0127f59e`, 46 commits: the docs-only build's record (`e0a8795b`, `b5177b3c`), GUIDE's answers to its questions (`14322ecd`), and the scaffold's and `modelled_remote`'s one-line `retain_dead` reasons (`0127f59e`). Every commit is authored by the GitHub noreply address and carries no trailer; the pushed diff holds no private address. `ci.yml` run `44647412380` on `0127f59e`: success (`check`, `ts-client`).
+- **The publish.** Noah ran `cargo publish --workspace` at `0127f59e`. Its verify step built all six packaged crates, and `charpente-core`, `charpente-macros`, `charpente`, `charpente-sim`, `charpente-tsgen` and `charpente-cli` 0.5.0 are on crates.io. A `--dry-run` at the same commit had exited 0 first.
+- **The registry smoke** (spec §7 item 8). It ran in an empty directory outside any repo, with no cargo config and `CARGO_TARGET_DIR` unset, so every crate came from crates.io (`Cargo.lock`: 101 `source` lines, all `registry+https://github.com/rust-lang/crates.io-index`).
+  - The first attempt ran under rustup's default here, `stable` at 1.95.0, and `cargo install` refused by name: `charpente-cli 0.5.0` requires rustc 1.99 or newer. That is the declared `rust-version`, the same floor 0.4.0 shipped with, so it is the machine's stale channel and not a release defect. The smoke reran with `RUSTUP_TOOLCHAIN=1.99.0`.
+  - `cargo install charpente-cli --version 0.5.0 --locked` exits 0.
+  - `charpente --version` prints `charpente 0.5.0`.
+  - `charpente new smokeapp` writes `charpente = "0.5"` and `charpente-sim = "0.5"`.
+  - `cargo clippy --all-targets -- -D warnings` exits 0.
+  - `charpente test --sim` exits 0: `sim result: ok. 4 passed; 0 failed`, tested 217, 256, 221 and 253 of 256, master `0x306e233d70580ce9`.
+- **Records.**
+  - CHANGELOG's heading is dated `0.5.0 (2026-11-20)`.
+  - PLAN reads "Shipped 2026-11-20: 0.5.0".
+  - README names `0.5.0` as the newest dated section.
+  - The GitHub release `v0.5.0` is a draft; publishing it, which creates the tag, is Noah's.

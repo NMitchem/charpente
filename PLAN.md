@@ -281,7 +281,7 @@ the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `clai
 from three outside agents' builds on 0.3.0: no second kernel on a spent App, a check that
 tested nothing fails, a library helper for the recovery code every app pastes, a shrinker
 that deletes whole items, a mutation run that fits a session, typed event reads, and the
-API on one compiled page. **Shipped: 0.5.0 (unreleased), what apps build because the platform does
+API on one compiled page. **Shipped 2026-11-20: 0.5.0, what apps build because the platform does
 not:** a hook committed with a job's Dead mark (the Dead row below, its trigger met by the
 third agent's build, 2026-10-29), a transaction's own time (two of the three agents built
 a clock by hand), and a re-issued job that keeps its effect's key. Their rows landed with
