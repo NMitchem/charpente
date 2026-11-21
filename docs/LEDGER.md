@@ -9936,3 +9936,18 @@ tallied from these tables.
   - The tester's own order route made the double-charge mistake, and the simulator caught it.
 - **The report's no-viable-mutant gap, checked.** The report flagged five `log.rs` functions without a viable mutant. The one that carries a guarantee is `Wal::guard`, which poisons the WAL after any IO error. A hand mutation that never sets the poison flag failed 43 tests across 11 binaries: the named poison properties, core's `engine.rs:242` assertion, and charpente-sim's `wal`, `drive` and `determinism` suites. The gap is a mutation-generation limit, not a missing oracle.
 - **Its open recommendations:** mutation-test the dead-job and outbound paths (`db.rs`, `job.rs`, `checks.rs`); a structured category in JSON skip reasons (a 0.7.0 change); release tags (none existed); a low-disk test note.
+
+## 2026-11-21 — every release tagged
+
+The outside stress test found no git tags. Each release is now tagged at the commit its crates were packaged from. The commits come from the `sha1` in each published crate's `.cargo_vcs_info.json`, as docs.rs serves it. None is marked dirty, each is on `main`, and each carries its version in `Cargo.toml` on its CHANGELOG date:
+
+| tag | commit | source agreement |
+|---|---|---|
+| `v0.1.0` | `a8e9ec9f` | LEDGER 2026-10-10 ("at `a8e9ec9`") |
+| `v0.2.0` | `f6eb65b6` | LEDGER 2026-10-22's close-out ("from f6eb65b6") |
+| `v0.3.0` | `7113e8f3` | first recorded here. LEDGER never named it, and its 0.4.0 entry listed "close out 0.3.0's publish" as owed. It is the base of 0.4.0's pushed range `7113e8f3..535bcbb9` |
+| `v0.4.0` | `535bcbb9` | LEDGER 2026-11-01 ("at `535bcbb9`") |
+| `v0.5.0` | `0127f59e` | LEDGER 2026-11-20 ("at `0127f59e`") |
+| `v0.6.0` | `a1772343` | LEDGER 2026-11-21, and the outside tester's pin |
+
+The tags are annotated (`charpente <version>`). `v0.6.0` carries the GitHub release, which holds the video and CHANGELOG's 0.6.0 section. The v0.5.0 draft release was deleted, and its tag stays.
