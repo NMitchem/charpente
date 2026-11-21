@@ -95,10 +95,14 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The files agents copy, by path from `root`: every `.rs` example in
-/// `crates/charpente/examples/` and every template `charpente new` renders.
+/// `crates/charpente/examples/`, the launch demo's tests and every template
+/// `charpente new` renders.
 fn copied_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
     walk(&root.join("crates/charpente/examples"), &mut files);
+    // The launch demo's tests (`tests/sim.rs`, `tests/once.rs`, the gateway
+    // model) are what the video shows and what a reader copies.
+    walk(&root.join("examples/double-charge/tests"), &mut files);
     files.retain(|p| p.extension().is_some_and(|x| x == "rs"));
     // Every template is rendered into the app `charpente new` writes,
     // whatever its extension (`lib.rs` is one).
@@ -120,6 +124,8 @@ fn no_example_or_scaffold_template_drives_recovery_by_hand() {
         "crates/charpente/examples/modelled_remote.rs",
         "crates/charpente/examples/restart_under_faults.rs",
         "crates/charpente-cli/templates/sim.rs.tmpl",
+        "examples/double-charge/tests/sim.rs",
+        "examples/double-charge/tests/once.rs",
     ] {
         assert!(
             files.iter().any(|f| f == want),

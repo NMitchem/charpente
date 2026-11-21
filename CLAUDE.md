@@ -62,7 +62,7 @@ item with the trigger that reopens it.
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
   charpente-sim: crash_recovery/determinism/drive/events/net_partition/wal; charpente-cli: cli/ctl/
-  describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
+  demo/describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/clock_restart/failover/hunts/outbound/
   realtime_resume/smoke/tenant_wire/unopenable_store; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
   ts-fixture-app: drift/samples; guide-examples: api_census/claims_census/describe_contract/doc_inventory/doc_truth/driver_census/guide_ships/hook_census/mutants_exclusions; sim-fixture: sim; merge-fixture: sim;
@@ -188,6 +188,12 @@ item with the trigger that reopens it.
   output.
 - `examples/invoicing` — the M0 demo app, agent-built from docs alone (DEMO.md,
   FINDINGS.md).
+- `examples/double-charge` — the launch tape's order API, shipped with its bug (a re-sent
+  POST places an order again, so a lost reply charges twice). It is OUTSIDE the workspace
+  (its own empty `[workspace]`) because it is what a stranger copies: it depends on
+  `charpente = "=0.6.0"` from crates.io, which resolves nowhere before the publish. Build and
+  test it only through `crates/charpente-cli/tests/demo.rs`'s patched copy, which pins it red
+  under master seed 0x434841524745 and green with `place_order`'s three guard lines restored.
 
 ## Hard rules (the guarantees are the product)
 
