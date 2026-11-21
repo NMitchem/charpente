@@ -314,3 +314,65 @@ fn the_demos_repro_line_replays_its_failure() {
     assert_eq!(out.status.code(), Some(1), "{repro}:\n{replay}");
     assert_eq!(failure(&replay), failure(&stdout));
 }
+
+/// The value of `key = "…"` on the first line of `toml` that starts with it.
+fn quoted_value(toml: &str, key: &str) -> String {
+    let prefix = format!("{key} = \"");
+    toml.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("no `{key} = \"…\"` line in:\n{toml}"))
+        .to_string()
+}
+
+/// README's `## {heading}` section, up to the next `## `.
+fn readme_section<'a>(readme: &'a str, heading: &str) -> &'a str {
+    let start = readme
+        .find(&format!("\n## {heading}\n"))
+        .unwrap_or_else(|| panic!("README.md has no `## {heading}` section"))
+        + 1;
+    let rest = &readme[start..];
+    rest.find("\n## ").map_or(rest, |end| &rest[..end])
+}
+
+/// README is the crates.io page of `charpente` and `charpente-cli`, read
+/// before the reader has a toolchain. On 2026-11-20 rustup's `stable` on a
+/// machine that had not updated was 1.95, and `cargo install charpente-cli`
+/// refused by name, so Install names the Rust the demo declares and the
+/// update. The example's quoted output came from the release the demo pins,
+/// and README says which.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn readme_names_the_demos_rust_version_and_its_release() {
+    let ws = workspace();
+    let read = |rel: &str| std::fs::read_to_string(ws.join(rel)).unwrap();
+    let readme = read("README.md");
+    let demo = read("examples/double-charge/Cargo.toml");
+    let rust = quoted_value(&demo, "rust-version");
+    assert_eq!(
+        rust,
+        quoted_value(&read("Cargo.toml"), "rust-version"),
+        "examples/double-charge/Cargo.toml declares another rust-version than the workspace's"
+    );
+    let install = readme_section(&readme, "Install");
+    for want in [
+        format!("Rust {rust} or newer"),
+        "rustup update stable".into(),
+    ] {
+        assert!(
+            install.contains(&want),
+            "README.md's Install section must say {want:?}: the demo declares rust-version \
+             {rust}, and cargo refuses the install by name on an older toolchain\n{install}"
+        );
+    }
+    let pin = quoted_value(&demo, "charpente");
+    let release = pin
+        .strip_prefix('=')
+        .unwrap_or_else(|| panic!("the demo pins charpente exactly (`=x.y.z`), not {pin:?}"));
+    let example = readme_section(&readme, "Example: a double charge");
+    assert!(
+        example.contains(&format!("charpente {release}")),
+        "README.md's example must name `charpente {release}`, the release \
+         examples/double-charge pins and its quoted output came from\n{example}"
+    );
+}

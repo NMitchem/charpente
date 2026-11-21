@@ -59,32 +59,16 @@ const WORD_FIGURES: &[&str] = &[
 
 /// `(doc, figure as written, the docs/BENCH.md text that carries it)`. The
 /// figure must occur in the doc; the BENCH text must occur in BENCH.md.
-const CLAIMS: &[(&str, &str, &str)] = &[
-    (
-        "README.md",
-        "215 durable records/sec",
-        "| device | durable appends/sec (WAL op shape) | **215** |",
-    ),
-    (
-        "README.md",
-        "215/sec",
-        "| device | durable appends/sec (WAL op shape) | **215** |",
-    ),
-    (
-        "README.md",
-        "~215 durable records/sec",
-        "| device | durable appends/sec (WAL op shape) | **215** |",
-    ),
-    ("README.md", "~31×", "it recovers up to ~31x"),
-    ("README.md", "~31x", "it recovers up to ~31x"),
-];
+// Empty since the README rewrite of 2026-11-20 (0.6.0): README quotes no
+// performance number and points at docs/BENCH.md instead. A figure README
+// gains from BENCH.md gets its row back here.
+const CLAIMS: &[(&str, &str, &str)] = &[];
 
 /// `(figure as written, why it is not a claim about charpente)`. Every entry
 /// must still occur in a doc — a stale entry is an error, the way a `pinned`
 /// marker that pins nothing is. Raise `EXEMPT_COUNT` in the same commit that
 /// adds one, and say why there.
 const EXEMPT: &[(&str, &str)] = &[
-    ("3am page", "an idiom for a pager alert, not a time"),
     ("runtime 500", "an HTTP status code, not a measurement"),
     ("seventy years", "the span of software history; rhetorical"),
     (
@@ -101,22 +85,29 @@ const EXEMPT: &[(&str, &str)] = &[
         "MANIFESTO §7; rhetorical, was \"99.9%\"",
     ),
     (
-        "Thousands of seeded runs per night",
-        "README guarantee 3: the sim's scale, substantiated by the recorded 10,000-universe batch \
-         in the Status section below (seed-bearing) and the ledger, 2026-07-07",
-    ),
-    (
         "thousands of seeded universes per night",
-        "MANIFESTO §6: the same statement in the same words",
+        "MANIFESTO §6: the sim's scale, substantiated by the recorded 10,000-universe batch \
+         (master seed 0x483e230baed4922b, the ledger, 2026-07-07)",
     ),
     (
         "thousands of times",
         "MANIFESTO §9: the wager's restatement of that record; rhetorical",
     ),
     (
-        "2026-10-launch-run",
-        "the launch-run record's directory name, a year and month that README's Status links; \
-         not a figure about charpente",
+        "hundreds of times",
+        "README's opening: the default batch, 256 runs per check, which the startup line README \
+         quotes prints; a default, not a measurement",
+    ),
+    (
+        "Rust 1.99 or newer",
+        "README's Install: the toolchain floor the crates declare (rust-version), held equal to \
+         examples/double-charge's and the workspace's by demo.rs's readme test; a requirement, \
+         not a measurement",
+    ),
+    (
+        "0.6.0",
+        "the release README's example names, the one examples/double-charge pins and its quoted \
+         output came from (demo.rs's readme test); a version, not a measurement",
     ),
 ];
 const EXEMPT_COUNT: usize = 13;

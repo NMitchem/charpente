@@ -279,13 +279,13 @@ fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_th
     );
 }
 
-/// README's "Try it", red half: delete the scaffold's `tx.enqueue` and
+/// README's "Use", red half: delete the scaffold's `tx.enqueue` and
 /// `charpente test --sim` goes red on the second property with a seed, and
-/// the seed replays. README calls this the whole pitch; until the launch-run
-/// spec (2026-10-06, §5) nothing ran it, and the e2e test above proves only
-/// the green half. The master seed fixes the batch, and the assertions name
-/// the reason (ack-durability), so a re-keyed fault stream that still fails
-/// for this reason keeps the pin meaningful.
+/// the seed replays. Until the launch-run spec (2026-10-06, §5) nothing ran
+/// it, and the e2e test above proves only the green half. The master seed
+/// fixes the batch, and the assertions name the reason (ack-durability), so a
+/// re-keyed fault stream that still fails for this reason keeps the pin
+/// meaningful.
 #[test]
 // Rewriting the scaffold's manifest and src/lib.rs is edge tooling
 // (DESIGN.md §1): the rig making README's edit, not code the sim exercises.

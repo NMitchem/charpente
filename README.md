@@ -1,184 +1,183 @@
 # charpente
 
-**The load-bearing frame for the whole backend.**
+A Rust backend in one binary: server, database, jobs and auth. It comes with a simulator that
+runs your routes, jobs and data through crashes, lost replies and outages, and every failure
+replays from its seed.
 
-*Une charpente* is the timber frame of a building — the one structure everything else hangs
-off. Charpente is a Rust platform where one statically-linked binary *is* the entire
-backend: the HTTP server, the database, the job queue, the cron scheduler, the realtime
-event feed, and auth. An application is a Rust crate that links against the platform and
-compiles into it. Deployment is one binary and one data directory.
+You, or your coding agent, write the app as Rust. `charpente test --sim` runs it hundreds of
+times under injected faults and checks the properties you wrote after every run.
 
-There is no Postgres to provision. No Redis to babysit. No queue service, no outbox table,
-no sidecar collector, no serialization boundary between "services." One process, one commit
-point, one log.
+<!-- video: added after the 0.6.0 publish -->
 
-## The three guarantees
+## Example: a double charge
 
-1. **Typed end-to-end.** Schema, queries, routes, jobs, events, and wire types are all Rust
-   types checked at compile time — a schema change that breaks a query is a compile error,
-   not a 3am page; config is a typed struct with no startup validation yet.
-
-2. **One commit point.** State changes, job enqueues, and realtime events commit in the
-   same transaction. The dual-write bug class — outbox gaps, ghost webhooks, "the row
-   updated but the event never fired" — does not exist here, structurally.
-
-3. **Deterministic simulation.** `charpente test --sim` runs your *entire application* —
-   HTTP, storage, queue, time, network — inside a deterministic simulator with seeded fault
-   injection: torn writes, crashes at arbitrary commit points, partitions, clock skew.
-   Thousands of seeded runs per night; every failure reproducible from its seed.
-
-## What it looks like
+[`examples/double-charge`](examples/double-charge) is an order API with one table, one route and
+one job. `POST /orders/:id` stores an order and enqueues a `Charge` job, which calls a payment
+gateway, `pay.example`, after the commit. This is the route:
 
 ```rust
-#[table(global)]
-struct Org {
-    id: Id<Org>,
-    name: String,
-}
-
-#[table(scoped_by = Org)]
-struct Invoice {
-    id: Id<Invoice>,
-    amount_cents: i64,
-    state: InvoiceState,
-}
-
-#[job(scoped_by = Org, retain_dead)]
-struct SendReceipt {
-    invoice: Id<Invoice>,
-}
-
-#[event(scoped_by = Org)]
-struct InvoiceFinalized {
-    invoice: Id<Invoice>,
-}
-
-#[route(POST "/orgs/:org/invoices/:id/finalize", auth)]
-fn finalize(tx: &mut Tx, org: Id<Org>, id: Id<Invoice>, ctx: &Ctx) -> Result<Invoice, ApiError> {
-    let mut tx = tx.scope::<Org>(org, ctx)?;                // the one auditable line
-    let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;   // typed row, no SQL string
-    inv.state = InvoiceState::Final;
-    tx.put(&inv);
-    tx.enqueue(SendReceipt { invoice: id });   // job enqueued IN the same transaction; it runs in this org
-    tx.emit(InvoiceFinalized { invoice: id }); // realtime event, same transaction; only this org's feed receives it
-    Ok(inv)
+#[route(POST "/orders/:id", public)]
+pub fn place_order(tx: &mut Tx, id: Id<Order>) -> Result<Id<Order>, ApiError> {
+    tx.put(&Order { id, paid: false });
+    tx.enqueue(Charge { order: id });
+    Ok(id)
 }
 ```
 
-Note what's absent: no connection pool, no ORM session, no message-broker client, no
-`await` on a network hop between your logic and your data. The transaction is a pure
-function over state; external effects (the receipt email) run post-commit via the durable
-queue, exactly-once-observable via idempotency keys. Note also what's declared: the route
-says `auth`, the table says which tenant owns its rows, the job says it acts inside that
-tenant, the event says which tenant's feed carries it, and a route, table, job or event
-that says none of this does not compile.
+It is missing three lines: the ones that answer an order that is already stored. Of the checks
+you would run on it, only the simulator says no:
 
-## Why now
+| Check | What it says |
+|---|---|
+| `cargo build` | It compiles. |
+| `cargo clippy --all-targets -- -D warnings` | No warnings, with the app's deny-list of clocks, randomness and raw IO in force. |
+| `cargo test --test once` | It passes. Each order is posted once, with no faults, and each is charged once. |
+| `charpente test --sim` | `order 9 charged twice`, with the seed that replays it and the fix. |
 
-AI agents write expert-level systems code cheaply. That collapsed two assumptions this
-industry was built on:
+Each row is checked by a test in
+[`crates/charpente-cli/tests/demo.rs`](crates/charpente-cli/tests/demo.rs). This is the
+simulator's run:
 
-- **"A database/queue/server is a team-sized effort, so compose vendors."** It isn't
-  anymore. The five-service SaaS stack was an artifact of team boundaries, not physics.
-- **"Frameworks exist to save humans typing."** Agents don't need typing saved. They need
-  *oracles* — fast, precise, mechanical feedback. The framework that wins the agent era is
-  the one that is the best reviewer, not the best autocomplete.
+```console
+$ charpente test --sim --master-seed 0x434841524745
+running 1 sim check, 256 runs each, under random injected faults (master seed 0x0000434841524745)
 
-Charpente is a framework designed for that world: maximally compile-time-checked, honest
-about effects, deterministic by construction, and introspectable by machines. Read
-[MANIFESTO.md](MANIFESTO.md) for the full argument.
+sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a lost reply and placed the order again; answer an order that is already stored
+  seed:   0x82eac71fbdeda9de
+  fired:  boot:booted-after-retry: 1, boot:retried: 2, crash:applied: 1, fault:outbound_lost_reply: 1, fault:sync_error: 3, outbound:completed: 51, restart: 1, restart:process: 2
+  inputs: orders=48
+  shrunk: 1 input to 1, 6 faults off, in 13 replays
+  repro:  charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
 
-## Scaling stance (read this before objecting)
+skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
+  each_order_is_charged_once — 8 runs; it failed, so only --format json lists their reasons
 
-One big box, replicated. Writes flow through a single ordered log applied by a
-deterministic state machine; the log ships to followers for read scaling and failover.
-There is no sharding story and there will not be one. With no network hop between app and
-data, one box's ceiling is its disk's durable write rate, not a network round trip. What
-charpente measures today is 215 durable records/sec per connection on a dev laptop under
-`F_FULLFSYNC`, and up to ~31× that under group commit where the queue is deep enough to
-fill a batch ([docs/BENCH.md](docs/BENCH.md)). No bare-metal run exists; this paragraph is
-resized when one lands. You will not outgrow one box before you can afford to build
-something bespoke, and pretending otherwise is how platforms die building a worse Spanner
-instead of a better SQLite.
+check each_order_is_charged_once ... FAILED  (248 tested over 49 distinct inputs: 28 failed; 8 skipped)
 
-Measured, an uncontended commit costs one durable fsync, which puts it at the device's fsync
-rate — 215/sec on a dev laptop under `F_FULLFSYNC`. Group commit amortizes that fsync across
-a batch once requests actually queue, which is worth a great deal on a device this slow to
-sync and less on a faster one. See [docs/BENCH.md](docs/BENCH.md) for the method, the
-numbers, and the conditioning that has to travel with them.
+sim result: FAILED. 0 passed; 1 failed. Runs tested: 248 of 256.
+rerun exactly this batch: charpente test --sim --master-seed 0x434841524745
+```
 
-## Status
+The `repro:` line replays the batch's first failure on its own, with smaller inputs and fewer
+faults, and it fails the same way:
 
-**M1 shipped (2026-07-27).** M0 built the sim-first core: a segmented
-checksummed WAL, typed tables on redb, transactions with one commit point
-across state/queue/events, the HTTP kernel, queue + cron, and `charpente
-test --sim` — the deterministic simulator with seeded fault injection this
-whole platform is staked on. A docs-only agent then built
-[`examples/invoicing`](examples/invoicing) from these documents alone, with
-zero framework patches, and it runs green over 10,000 seeded
-fault-injection runs (master seed `0x483e230baed4922b`;
-[docs/LEDGER.md](docs/LEDGER.md), 2026-07-07). The
-dual-write bug class the second guarantee above claims to delete
-structurally is demonstrated, caught, and reverted at
-[examples/invoicing/DEMO.md](examples/invoicing/DEMO.md).
+```console
+$ charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
 
-M1 made it a platform: replication with promotable followers and manual
-failover, realtime SSE with exact `Last-Event-ID` resume, auth (sessions,
-API keys, static-JWKS OIDC), schema migrations as log records, `charpente
-describe`, and a black-box edge harness that drives stock binaries over
-real TCP with `kill -9` and TCP-proxy fault injection.
+sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a lost reply and placed the order again; answer an order that is already stored
+  seed:   0x82eac71fbdeda9de
+  fired:  boot:booted-after-retry: 1, boot:retried: 2, crash:applied: 1, fault:outbound_lost_reply: 1, fault:sync_error: 3, outbound:completed: 51, restart: 1, restart:process: 2
+  inputs: orders=48
+  repro:  charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
 
-**M2 closed 2026-09-13; M3 — launch — shipped 2026-10-10.** M2 shipped six sub-projects,
-dropped one, and reclassified the rest to after launch with the trigger that reopens each
-([PLAN.md](PLAN.md)). M3 was the finish line before this went public. charpente went to
-crates.io as `0.1.0`, and a stranger given only this README installed it, scaffolded an app,
-and reached a red sim with a seed that replays
-([docs/experiments/2026-10-launch-run](docs/experiments/2026-10-launch-run/)).
-[CHANGELOG.md](CHANGELOG.md) records every release since, and dates each one after its
-crates are on crates.io (the newest dated section was `0.5.0` when this line was written).
-A third docs-only agent build passed review with zero Criticals the platform should have
-caught. Every number in this file is measured or gone. The first two of
-M2's sub-projects — an honest benchmark harness and primary-side group commit — have their
-numbers in [docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`:
-one connection costs one durable fsync per transaction, ~215 durable records/sec on that
-hardware — the figure the scaling paragraph above states — and group commit amortizes that
-fsync across a batch, worth up to ~31x where the queue is deep enough to fill one and
-nothing at all at one connection. No bare-metal Linux run exists; PLAN.md's after-launch
-table carries it. The object-storage archive has since shipped, unmeasured — BENCH.md
-carries nothing about it. It ships one generation at a time to a bucket: a full logical
-snapshot plus the sealed WAL segments that continue it, held by a retention pin that
-yields to the primary rather than growing the log until it fills the disk, and `charpente
-restore` rebuilds a data directory from what is there ([docs/GUIDE.md](docs/GUIDE.md)
-§15). `serve::backup` is still a different thing — a promotable hot standby, not a
-snapshot shipper. A TypeScript client generator has since shipped too
-([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no WebSocket transport — and so has
-tenant scoping, where a tenant is a typed key prefix enforced by the compiler rather than
-a `where` clause anyone can forget ([docs/GUIDE.md](docs/GUIDE.md) §16), and since
-2026-09-16 the platform asks: a route says `auth`, `public` or `public(Org)`, a table, a
-job and an event say `scoped_by` or `global`, and none is a default.
+check each_order_is_charged_once ... FAILED
 
-Outbound effects have shipped. A job declared `outbound = "<host>"` decides an HTTP
-request after commit, in a read-only `call`. The kernel makes the request outside any
-transaction with a platform-minted idempotency key, and `settle` commits the reply's
-consequences together with the Done mark as one record. The simulator injects the outside
-world's faults: refused, lost request, lost reply, throttled, slow
-([docs/GUIDE.md](docs/GUIDE.md) §6, §8).
+sim result: FAILED. 0 passed; 1 failed; 0 skipped, on seed 0x82eac71fbdeda9de with the given inputs, with faults off: crash_torn, object_put_error, object_get_error, outbound_refused, disk_latency, net_latency.
+```
 
-What is *not* built, so you don't have to go looking: no blob store, no WebSockets, and on
-the outbound side no `HTTP/2`, proxies, request signing (AWS `SigV4`) or streaming replies.
+The first `POST /orders/9` committed the order and its `Charge` job in one transaction, and then
+an injected fault lost the reply. A client that gets no answer sends again, so the POST arrived a
+second time. `place_order` ran again: `tx.put` stored the order again, and `tx.enqueue` added a
+second `Charge`. Each job carries its own idempotency key, so the gateway, which dedupes on that
+key, took two charges. A test that sends each order once never meets this. It takes a commit, a
+lost reply and a re-send, in that order: the simulator injects the fault, and its recovery step
+re-sends what went unanswered, as a client would.
 
-## Try it
+The bug needs both halves of `place_order` as written: `tx.put` is an upsert, and the enqueue
+after it runs every time. A route that `INSERT`s on the client's id would refuse the second POST
+with a unique violation, roll back its job and charge once. The same double charge happens
+wherever a create upserts or mints its id on the server, but not every way of writing this route
+has it.
 
-```text
+The fix is the three missing lines, at the top of `place_order` (`tx.get` also needs `View` in
+the `use charpente::{…}` line):
+
+```rust
+if tx.get(id)?.is_some() {
+    return Ok(id);
+}
+```
+
+With them back, the same command passes.
+
+To run it yourself, [install the CLI](#install), then:
+
+```sh
+git clone https://github.com/NMitchem/charpente
+cd charpente/examples/double-charge
+charpente test --sim --master-seed 0x434841524745
+```
+
+The first run builds the demo and its dependencies before it prints anything. The demo pins
+charpente 0.6.0, which printed the output above, and the master seed fixes every run in the
+batch, so you get the same output. Leave out `--master-seed` and the batch draws a master seed of
+its own: the order and the seed change, and `demo.rs` checks that other master seeds fail the
+same check with the same fix.
+
+## Install
+
+```sh
 cargo install charpente-cli
-charpente new myapp && cd myapp
-cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app (no clippy? rustup component add clippy)
-charpente test --sim                        # seeded fault-injection runs
-charpente test --mutants --file src/lib.rs --test-package myapp   # every mutant your properties miss
 ```
 
-Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the check `acked_post_implies_the_echo_after_recovery` goes FAILED with the inputs that break it, shrunk to a run no shrinking step can make smaller, and a command that replays them. That is the whole pitch.
-Delete the `tx.emit` line instead and the third goes red: the event commits with the note and the job. Turn `==` into `!=` in `add_note` and the fourth goes red: a re-sent POST is answered as added and changes nothing, and another body under the same id is refused. That is the mutant the `--mutants` run makes in `add_note`, and the fourth check is why it reports none missed.
+You'll need Rust 1.99 or newer. If cargo refuses the install because charpente-cli needs a newer
+rustc, run `rustup update stable` and install again.
+
+## Use
+
+```sh
+charpente new myapp && cd myapp   # one table, route, job and event, and a sim with four checks
+cargo clippy --all-targets -- -D warnings   # the deny-list: no clocks, randomness or raw IO in app code
+charpente test --sim              # every check, under injected faults, each run from its own seed
+charpente test --mutants --file src/lib.rs --test-package myapp   # each edit to src/lib.rs that no check notices
+```
+
+Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the second check,
+`acked_post_implies_the_echo_after_recovery`, fails with the inputs that break it, shrunk to a
+run no shrinking step can make smaller, and a command that replays it. `test --mutants` needs
+cargo-mutants (`cargo install cargo-mutants --version 27.1.0 --locked`). If clippy is missing,
+`rustup component add clippy`. [docs/GUIDE.md](docs/GUIDE.md) is the full guide; §8 covers both
+test verbs.
+
+## How it works
+
+An app is a Rust crate that links charpente, and the two compile into one binary that serves
+HTTP and keeps its data in one directory. Tables, routes, jobs and events are Rust types, so a
+change to a table that breaks a route is a compile error. A route runs as one transaction: its
+writes, the jobs it enqueues and the events it emits commit together, as one record in one log,
+or not at all, and it can't await the network. A job that calls the outside world, like `Charge`,
+makes its request after the commit, under an idempotency key charpente mints. Table state, the
+job queue, realtime feeds and followers are all built from that log. The core does no IO of its
+own: disk, network, clock and randomness come through traits with a production implementation
+and a simulated one. The simulated ones run from one seed, so a run's crashes, torn writes, lost
+replies and clock jumps happen the same way every time it replays. [DESIGN.md](DESIGN.md) has
+the details.
+
+## Limits
+
+charpente is a technical preview. [CHANGELOG.md](CHANGELOG.md) dates each release once its crates
+are on crates.io (the newest dated section was `0.5.0` when this line was written). These are the
+limits you'll hit first:
+
+- It runs on one primary. Writes go through one ordered log on one machine, and followers replay
+  it for reads and failover. There is no sharding, and there won't be ([DESIGN.md](DESIGN.md)
+  §5). One machine's ceiling is its disk's durable write rate; [docs/BENCH.md](docs/BENCH.md) has
+  what has been measured, on a dev laptop only.
+- Apps are written in Rust, and there is no SQL interface: queries are typed Rust calls. charpente
+  can generate a TypeScript client for the front end ([docs/GUIDE.md](docs/GUIDE.md) §14).
+- The simulator drives your app's kernel, not its socket. The HTTP server (`charpente::serve`,
+  hyper over TCP) never runs in it. charpente's own behaviour on the wire, such as a `kill -9` or
+  a dropped connection, is tested by a separate rig that runs the real binary, with no seed to
+  replay ([docs/GUIDE.md](docs/GUIDE.md) §8).
+- The simulator finds only what your checks check. The demo's check counts the charges per order.
+- A `#[route]` answers `200` on success and can't read a request header yet, so the demo uses
+  the client's order id where a real API might take an `Idempotency-Key` header. Both are rows
+  in [PLAN.md](PLAN.md)'s after-launch table.
+- There is no blob store and no WebSocket transport, and outbound calls have no `HTTP/2`,
+  proxies, request signing or streaming replies.
+- It's for new backends. Porting an existing app is not a goal ([MANIFESTO.md](MANIFESTO.md) §8).
+
+## Docs
 
 | Doc | What it is |
 |---|---|
@@ -188,10 +187,3 @@ Delete the `tx.emit` line instead and the third goes red: the event commits with
 | [docs/GUIDE.md](docs/GUIDE.md) | How to build an app — agent-first, every runnable example compile-gated |
 | [docs/BENCH.md](docs/BENCH.md) | Measured numbers, method first — dev hardware, honestly labeled as not the launch claim |
 | [examples/invoicing](examples/invoicing) | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
-
-## Non-goals
-
-- Horizontal sharding / infinite scale
-- SQL as the primary query interface (a read-only Postgres-wire endpoint comes later, for BI tools)
-- Porting existing apps (charpente is for greenfield backends, which agents mint daily)
-- Microservice interop patterns (if you want a service mesh, this is not your platform)
