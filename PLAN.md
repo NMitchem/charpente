@@ -64,10 +64,10 @@ wire oracle is 15 `#[ignore]`d tests that `cargo test --workspace` skips, so fro
 2026-07-27 until 2026-09-05 it ran only when a human ran `scripts/edge-harness.sh`. It
 now runs nightly and on demand (`.github/workflows/edge-harness.yml`). It is still not a
 per-push gate, by choice: MANIFESTO §6's cadence for expensive fault work is per night.
-That job runs 34 ignored tests, not 15: the 15 wire scenarios in `crates/edge-harness/
-tests/` plus 19 real-disk/real-process unit tests under its `src/` that `--ignored` also
-picks up and `cargo test --workspace` also skipped. The first runner execution, on
-2026-09-05 (run 33974865000), was green: 34/34 in 3m28s.
+That job runs 34 ignored tests, not 15: the 15 wire scenarios in
+`crates/edge-harness/tests/` plus 19 real-disk/real-process unit tests under its `src/` that
+`--ignored` also picks up and `cargo test --workspace` also skipped. The first runner
+execution, on 2026-09-05 (run 33974865000), was green: 34/34 in 3m28s.
 
 ## M2: The moat deepens [closed 2026-09-13: six shipped, one dropped, the rest reclassified]
 
@@ -307,7 +307,7 @@ DECISIONS §14). Its exit criterion 5 (spec §16), the docs-only build, was met 
 signed by Noah 2026-10-14 (record
 [docs/experiments/2026-10-outbound/](docs/experiments/2026-10-outbound/);
 [docs/LEDGER.md](docs/LEDGER.md), 2026-10-14, "the outbound docs-only build"). What it
-refused or left unproven became the seven outbound rows near the end of this table.
+refused or left unproven became the seven outbound rows that follow the tenancy rows.
 Spec §15 refused the first five, plan amendment A19 pinned oracle 2's switchover row at
 the write gate rather than through a two-node rig (the sixth), and the seventh is a
 node-wiring gap. Each reopens on the first app that needs it. The five rows after them
@@ -316,11 +316,13 @@ came from that build's own record
 gaps its review found in the outbound oracles (I3, I4, I1), and two are credential facts
 its testimony and review surfaced (the id, I5's revocation). The row after them is the
 outbound client's compile reading. Spec §16 exit criterion 7 asked BENCH.md to carry it,
-and the one attempt was refused (2026-10-15), so it is owed.
+and the one attempt was refused (2026-10-15), so it is owed. The eight rows after it came
+from 0.3.0: its oracle-density review (three), its rulings (three), its final review and
+its docs-only build.
 
 0.4.0's records (2026-11-01) added fifteen rows. Three sit beside the rows they belong
 with: the enum `Codec` derive beside the deep fingerprint, and the two rows named for 0.5.0
-beside the Dead row. The rest close the table. Two are non-goals of the 0.4.0 spec (§2):
+beside the Dead row. The rest follow the 0.3.0 rows. Two are non-goals of the 0.4.0 spec (§2):
 the state-machine declaration, with the spec's trigger, and properties derived from an
 app's shape, with the spec's trigger and a second channel beside it (its row says why). The
 ten after them come from 0.4.0's testimony census, which went back over every finding a
@@ -332,10 +334,12 @@ eligible, not scheduled: a release names it, as 0.5.0 names the Dead row. Noah d
 whether a row with a met trigger is scheduled, at the next milestone's planning. The two
 rows after the census's ten came from 0.4.0's docs-only build (2026-11-01, review I4 and
 its fixes' report). That build is also testimony in the Dead, transaction time and
-first-credential rows, and it meets the trigger of the small-API-gaps row. The last row
-came from the outside agents' retest on 0.4.0 (2026-11-08, agent A;
+first-credential rows, and it meets the trigger of the small-API-gaps row. The row after
+those two came from the outside agents' retest on 0.4.0 (2026-11-08, agent A;
 [docs/LEDGER.md](docs/LEDGER.md), that date): the one finding the retest left open after
-its three fixes, given a row by the docs-only bar's rule (sub-project 3).
+its three fixes, given a row by the docs-only bar's rule (sub-project 3). The six rows after
+it came from 0.5.0's reviews (two), the launch demo's rehearsal (two), 0.5.0's mutation run
+and 0.5.0's docs-only build.
 
 | Item | Trigger |
 |---|---|
