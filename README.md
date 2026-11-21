@@ -11,7 +11,7 @@ times under injected faults and checks the properties you wrote after every run.
 
 ## Example: a double charge
 
-[`examples/double-charge`](examples/double-charge) is an order API with one table, one route and
+[`examples/double-charge`][double-charge] is an order API with one table, one route and
 one job. `POST /orders/:id` stores an order and enqueues a `Charge` job, which calls a payment
 gateway, `pay.example`, after the commit. This is the route:
 
@@ -35,7 +35,7 @@ you would run on it, only the simulator says no:
 | `charpente test --sim` | `order 9 charged twice`, with the seed that replays it and the fix. |
 
 Each row is checked by a test in
-[`crates/charpente-cli/tests/demo.rs`](crates/charpente-cli/tests/demo.rs). This is the
+[`crates/charpente-cli/tests/demo.rs`][demo.rs]. This is the
 simulator's run:
 
 ```console
@@ -129,15 +129,16 @@ rustc, run `rustup update stable` and install again.
 charpente new myapp && cd myapp   # one table, route, job and event, and a sim with four checks
 cargo clippy --all-targets -- -D warnings   # the deny-list: no clocks, randomness or raw IO in app code
 charpente test --sim              # every check, under injected faults, each run from its own seed
-charpente test --mutants --file src/lib.rs --test-package myapp   # each edit to src/lib.rs that no check notices
+charpente test --mutants --file src/lib.rs --test-package myapp   # each mutant in src/lib.rs that no check catches
 ```
 
 Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the second check,
 `acked_post_implies_the_echo_after_recovery`, fails with the inputs that break it, shrunk to a
-run no shrinking step can make smaller, and a command that replays it. `test --mutants` needs
-cargo-mutants (`cargo install cargo-mutants --version 27.1.0 --locked`). If clippy is missing,
-`rustup component add clippy`. [docs/GUIDE.md](docs/GUIDE.md) is the full guide; §8 covers both
-test verbs.
+run no shrinking step can make smaller, and a command that replays it. `test --mutants` runs
+cargo-mutants (`cargo install cargo-mutants --version 27.1.0 --locked`), which replaces function
+bodies and swaps operators but never deletes a statement, so a deleted line like that `tx.enqueue`
+is one to try by hand. If clippy is missing, `rustup component add clippy`.
+[docs/GUIDE.md][guide] is the full guide; §8 covers both test verbs.
 
 ## How it works
 
@@ -150,40 +151,50 @@ makes its request after the commit, under an idempotency key charpente mints. Ta
 job queue, realtime feeds and followers are all built from that log. The core does no IO of its
 own: disk, network, clock and randomness come through traits with a production implementation
 and a simulated one. The simulated ones run from one seed, so a run's crashes, torn writes, lost
-replies and clock jumps happen the same way every time it replays. [DESIGN.md](DESIGN.md) has
+replies and clock jumps happen the same way every time it replays. [DESIGN.md][design] has
 the details.
 
 ## Limits
 
-charpente is a technical preview. [CHANGELOG.md](CHANGELOG.md) dates each release once its crates
+charpente is a technical preview. [CHANGELOG.md][changelog] dates each release once its crates
 are on crates.io (the newest dated section was `0.5.0` when this line was written). These are the
 limits you'll hit first:
 
 - It runs on one primary. Writes go through one ordered log on one machine, and followers replay
-  it for reads and failover. There is no sharding, and there won't be ([DESIGN.md](DESIGN.md)
-  §5). One machine's ceiling is its disk's durable write rate; [docs/BENCH.md](docs/BENCH.md) has
+  it for reads and failover. There is no sharding, and there won't be ([DESIGN.md][design]
+  §5). One machine's ceiling is its disk's durable write rate; [docs/BENCH.md][bench] has
   what has been measured, on a dev laptop only.
 - Apps are written in Rust, and there is no SQL interface: queries are typed Rust calls. charpente
-  can generate a TypeScript client for the front end ([docs/GUIDE.md](docs/GUIDE.md) §14).
+  can generate a TypeScript client for the front end ([docs/GUIDE.md][guide] §14).
 - The simulator drives your app's kernel, not its socket. The HTTP server (`charpente::serve`,
   hyper over TCP) never runs in it. charpente's own behaviour on the wire, such as a `kill -9` or
   a dropped connection, is tested by a separate rig that runs the real binary, with no seed to
-  replay ([docs/GUIDE.md](docs/GUIDE.md) §8).
+  replay ([docs/GUIDE.md][guide] §8).
 - The simulator finds only what your checks check. The demo's check counts the charges per order.
 - A `#[route]` answers `200` on success and can't read a request header yet, so the demo uses
   the client's order id where a real API might take an `Idempotency-Key` header. Both are rows
-  in [PLAN.md](PLAN.md)'s after-launch table.
+  in [PLAN.md][plan]'s after-launch table.
 - There is no blob store and no WebSocket transport, and outbound calls have no `HTTP/2`,
   proxies, request signing or streaming replies.
-- It's for new backends. Porting an existing app is not a goal ([MANIFESTO.md](MANIFESTO.md) §8).
+- It's for new backends. Porting an existing app is not a goal ([MANIFESTO.md][manifesto] §8).
 
 ## Docs
 
 | Doc | What it is |
 |---|---|
-| [MANIFESTO.md](MANIFESTO.md) | Why this exists — the agent-era argument |
-| [DESIGN.md](DESIGN.md) | Architecture: the deterministic core, write model, typed surface, simulation |
-| [PLAN.md](PLAN.md) | Milestones (M0–M3), what waits until after launch, risks, non-goals |
-| [docs/GUIDE.md](docs/GUIDE.md) | How to build an app — agent-first, every runnable example compile-gated |
-| [docs/BENCH.md](docs/BENCH.md) | Measured numbers, method first — dev hardware, honestly labeled as not the launch claim |
-| [examples/invoicing](examples/invoicing) | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
+| [MANIFESTO.md][manifesto] | Why this exists — the agent-era argument |
+| [DESIGN.md][design] | Architecture: the deterministic core, write model, typed surface, simulation |
+| [PLAN.md][plan] | Milestones (M0–M3), what waits until after launch, risks, non-goals |
+| [docs/GUIDE.md][guide] | How to build an app — agent-first, every runnable example compile-gated |
+| [docs/BENCH.md][bench] | Measured numbers, method first — dev hardware, honestly labeled as not the launch claim |
+| [examples/invoicing][invoicing] | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
+
+[double-charge]: https://github.com/NMitchem/charpente/tree/main/examples/double-charge
+[demo.rs]: https://github.com/NMitchem/charpente/blob/main/crates/charpente-cli/tests/demo.rs
+[guide]: https://github.com/NMitchem/charpente/blob/main/docs/GUIDE.md
+[design]: https://github.com/NMitchem/charpente/blob/main/DESIGN.md
+[changelog]: https://github.com/NMitchem/charpente/blob/main/CHANGELOG.md
+[bench]: https://github.com/NMitchem/charpente/blob/main/docs/BENCH.md
+[plan]: https://github.com/NMitchem/charpente/blob/main/PLAN.md
+[manifesto]: https://github.com/NMitchem/charpente/blob/main/MANIFESTO.md
+[invoicing]: https://github.com/NMitchem/charpente/tree/main/examples/invoicing
