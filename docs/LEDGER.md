@@ -9894,3 +9894,20 @@ tallied from these tables.
   - Task 8: registry smoke, dates, the demo's lock, GOLDEN from a fresh clone.
   - Task 9: the tape.
   - Task 10: the video link.
+
+## 2026-11-21 — 0.6.0 published to crates.io
+
+- **The push.** Noah pushed `e750a520..a1772343`, 16 commits. CI run 44922602445 passed (`check`, `ts-client`).
+- **The publish.** Noah ran `cargo publish --workspace` at `a1772343`. Its verify step built all six packaged crates, and `charpente-core`, `charpente-macros`, `charpente`, `charpente-sim`, `charpente-tsgen` and `charpente-cli` 0.6.0 are on crates.io.
+- **The registry smoke.** It ran in an empty directory outside any repo, with no cargo config and `CARGO_TARGET_DIR` unset, so every crate came from crates.io (the scaffold's `Cargo.lock`: 101 `source` lines, all `registry+https://github.com/rust-lang/crates.io-index`). These steps exit 0 on rustc 1.99.0, installing to a scratch root, and on rustup's `stable`, rustc 1.100.0:
+  - `cargo install charpente-cli --version 0.6.0 --locked`.
+  - `charpente --version`, which prints `charpente 0.6.0`.
+  - `charpente new smokeapp`, which writes `charpente = "0.6"` and `charpente-sim = "0.6"`.
+  - `cargo clippy --all-targets -- -D warnings`.
+  - `charpente test --sim`: 4 passed under master `0xfad485847b69b16f` on 1.99, and 4 passed under master `0xd65aed02510dda59` on 1.100.
+- **The demo's `Cargo.lock`** (`efb73ee5`). It was seeded from the workspace lock, not generated, so its versions are the ones GOLDEN was produced under. The first resolve against crates.io locked only charpente's four crates and kept every other version: 101 packages, 100 registry sources, redb 4.3.0. A fresh `cargo generate-lockfile` would have picked redb 4.6.0.
+- **The demo from a fresh clone.** A clone of `efb73ee5` was run with the CLI installed from crates.io, on the repo's pinned rustc 1.99.0:
+  - `charpente test --sim --master-seed 0x434841524745` exits 1. Its stderr plus stdout is byte-identical to README's first quoted block, 1212 bytes. demo.rs holds that block to GOLDEN and to the stderr startup line.
+  - The printed `repro:` line exits 1. Its output is byte-identical to README's second block, 878 bytes, with nothing on stderr.
+- **Records.** CHANGELOG's heading is dated `0.6.0 (2026-11-21)`. README no longer names a newest dated section (the final fix wave dropped that line), and 0.6.0 ships no PLAN row, so nothing else needed a date.
+- **Still owed:** the tape (`docs/demo/double-charge.tape`), and the video link in README once Noah uploads the render.
