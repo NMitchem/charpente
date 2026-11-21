@@ -7,7 +7,7 @@ replays from its seed.
 You, or your coding agent, write the app as Rust. `charpente test --sim` runs it hundreds of
 times under injected faults and checks the properties you wrote after every run.
 
-<!-- video: added after the 0.6.0 publish -->
+https://github.com/user-attachments/assets/9dd78104-beee-4ed8-aab7-5a6c4075be9f
 
 ## Example: a double charge
 

@@ -17,7 +17,7 @@
 //! `EXEMPT` entry (not a claim about charpente, with the reason, under a
 //! pinned count, like `mutants_exclusions.rs`). Structural digits — list
 //! markers, numbered headings, `§` refs, milestone labels, dates, a bare
-//! year, `hard rule N`, anything in backticks or a code fence — are blanked
+//! year, `hard rule N`, a URL, anything in backticks or a code fence — are blanked
 //! before the scan; they are not claims, and an entry each would be noise.
 //!
 //! Lines are scanned in pairs joined by a space, so a phrase wrapped across a
@@ -139,7 +139,7 @@ fn is_digit(c: char) -> bool {
     c.is_ascii_digit()
 }
 
-/// Blanks structural digit uses in one line: backtick spans, a list marker
+/// Blanks structural digit uses in one line: backtick spans, URLs, a list marker
 /// or numbered heading at the start, `dddd-dd-dd` dates, a bare `20dd`
 /// year, `§N`, `MN`, and `hard rule N`. Length is preserved so spans stay
 /// aligned with the original line.
@@ -152,6 +152,21 @@ fn strip_structure(chars: &mut [char]) {
         {
             blank(chars, i, i + j + 2);
             i += j + 2;
+            continue;
+        }
+        i += 1;
+    }
+    // A URL's digits are an address, never a figure; a link's text is still scanned.
+    let mut i = 0;
+    while i < n {
+        let head: String = chars[i..n.min(i + 8)].iter().collect();
+        if head.starts_with("https://") || head.starts_with("http://") {
+            let mut j = i;
+            while j < n && !chars[j].is_whitespace() && !matches!(chars[j], ')' | '>') {
+                j += 1;
+            }
+            blank(chars, i, j);
+            i = j;
             continue;
         }
         i += 1;
@@ -448,7 +463,9 @@ fn the_scan_sees_wrapped_word_figures_and_skips_structure() {
                 (master seed `0x1`)\n\
                 costs about\n\
                 $20,000 per run\n\
-                handles thousands of requests\n";
+                handles thousands of requests\n\
+                https://github.com/user-attachments/assets/9dd78104-beee-4ed8\n\
+                [the run](https://x.dev/runs/42) was ~12x\n";
     let doc = Doc::parse(text);
     let f = doc.figures();
     let texts: Vec<&str> = f.iter().map(|f| f.text.as_str()).collect();
@@ -459,7 +476,8 @@ fn the_scan_sees_wrapped_word_figures_and_skips_structure() {
             "hundreds of thousands",
             "10,000",
             "$20,000",
-            "thousands of"
+            "thousands of",
+            "~12x"
         ]
     );
     assert_eq!(
@@ -468,9 +486,10 @@ fn the_scan_sees_wrapped_word_figures_and_skips_structure() {
             f[1].line_no,
             f[2].line_no,
             f[3].line_no,
-            f[4].line_no
+            f[4].line_no,
+            f[5].line_no
         ),
-        (3, 4, 6, 9, 10)
+        (3, 4, 6, 9, 10, 12)
     );
     assert!(doc.seed_bearing(&f[2]));
     assert!(!doc.seed_bearing(&f[0]));
