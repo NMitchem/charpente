@@ -86,8 +86,10 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
     (
         "thousands of seeded universes per night",
-        "MANIFESTO §6: the sim's scale, substantiated by the recorded 10,000-universe batch \
-         (master seed 0x483e230baed4922b, the ledger, 2026-07-07)",
+        "MANIFESTO §6: the cadence is .github/workflows/sim-nightly.yml — every night, each app \
+         fixture's and a scaffold's checks at 10,000 runs per check under a fresh master seed, and \
+         every pinned sim property re-based to a fresh base (validated locally before it landed, \
+         the ledger, 2026-11-21)",
     ),
     (
         "thousands of times",

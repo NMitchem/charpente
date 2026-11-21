@@ -1,0 +1,86 @@
+name: sim-nightly
+
+# WHY THIS EXISTS. MANIFESTO §6 says fault injection "runs thousands of seeded universes per
+# night". Per-push CI does not do that: `cargo test --workspace` runs every sim suite at its
+# pinned base seed, so each push replays the same universes. charpente-sim's own comment on
+# CHARPENTE_BASE_SEED names the trap ("only ever examines the same N universes while reading
+# as though it examined the space"), and LEDGER 2026-09-07 records two realtime properties
+# that passed at their pinned base and failed at 5 of 11 others. A pinned base is the right
+# per-push gate (fast, and a red push is the push's fault); this job is the exploration:
+# every night, a base seed and a master seed nobody has run before.
+#
+# WHAT A RED NIGHT MEANS. A universe no one had run fails. The job summary names tonight's
+# base and master seeds, and each failure prints its own one-command repro:
+#   - a workspace suite: `CHARPENTE_BASE_SEED=<base> cargo test -p <crate> --test <file>`,
+#     or the single universe's `CHARPENTE_SEED=0x…` line it prints;
+#   - an app batch: the `repro:` line, or `charpente test --sim --dir <app> --runs 10000
+#     --master-seed <master>` for the whole batch.
+# CLAUDE.md hard rule 3 applies: the failing seed goes into the regression suite with the fix.
+# Under a re-base, floors, ceilings and requires are skipped (they are rates measured at the
+# pinned base); each property's own assertions are what run.
+#
+# WHICH APPS. The fixtures whose batches are green by design (sim-fixture, invoicing,
+# outbound-fixture) and a fresh `charpente new` scaffold built against this checkout's crates.
+# merge-fixture and examples/double-charge are left out: each is red by design, a victim
+# pinned red by its own tests.
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workspace-rebased:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Must equal rust-toolchain.toml's channel; ci.yml says why rust-src is installed.
+          toolchain: 1.99.0
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Draw tonight's base seed
+        run: |
+          base=0x$(od -An -N8 -tx8 /dev/urandom | tr -d ' \n')
+          echo "BASE=$base" >> "$GITHUB_ENV"
+          echo "workspace sim suites re-based to \`$base\`: replay with \`CHARPENTE_BASE_SEED=$base cargo test --workspace --no-fail-fast --test '*'\`" >> "$GITHUB_STEP_SUMMARY"
+      # Integration targets only: every pinned property lives in a `tests/` file, while
+      # charpente-sim's own runner self-tests (lib unit tests, still run per push) assert the
+      # un-rebased mode (floors and requires enforced), which a re-base switches off by design.
+      - name: Every sim suite at tonight's base
+        run: CHARPENTE_BASE_SEED="$BASE" cargo test --workspace --no-fail-fast --test '*'
+
+  app-batches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Draw tonight's master seed
+        run: |
+          master=0x$(od -An -N8 -tx8 /dev/urandom | tr -d ' \n')
+          echo "MASTER=$master" >> "$GITHUB_ENV"
+          echo "app batches under master seed \`$master\`: replay one with \`charpente test --sim --dir <app> --runs 10000 --master-seed $master\`" >> "$GITHUB_STEP_SUMMARY"
+      - run: cargo build -p charpente-cli
+      - name: A scaffold built against this checkout
+        run: |
+          cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/target/debug/charpente" new myapp
+          printf '\n[patch.crates-io]\ncharpente = { path = "%s/crates/charpente" }\ncharpente-sim = { path = "%s/crates/charpente-sim" }\n' \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE" >> myapp/Cargo.toml
+      - name: Each app's batch, 10000 runs per check
+        run: |
+          fail=0
+          for dir in crates/sim-fixture examples/invoicing crates/outbound-fixture "$RUNNER_TEMP/myapp"; do
+            echo "::group::$dir"
+            ./target/debug/charpente test --sim --dir "$dir" --runs 10000 --master-seed "$MASTER" || fail=1
+            echo "::endgroup::"
+          done
+          exit "$fail"
