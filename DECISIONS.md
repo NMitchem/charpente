@@ -283,7 +283,7 @@ cannot be handed to code expecting one tenant's data without a visible `.map`. I
 to `unsafe` than to a feature flag: a named construct where the obligation visibly moves,
 not a switch that turns the checker off. Nothing about `ScopedTx` weakens when it exists;
 there is no mode, no config key, and no build flag on the scoped path — which is precisely
-what "optional guarantees are no guarantees" targets.
+what MANIFESTO §8's refusal of switchable guarantees targets.
 
 **It is also the thing that makes the audit mechanical.** Because the capability is
 declared on the route rather than discovered in a function body, `charpente describe`
