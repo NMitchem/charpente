@@ -430,8 +430,9 @@ and storing a reply rebuilds `settle` anyway. **Keys are platform-minted** from 
 at staging and recorded in the enqueue effect, because keys derived from ids collide
 across the DECISIONS §6 loss window's diverged timelines. A re-issue from `on_dead` copies
 a minted key together with its request (the dead job's own name and payload bytes), within
-the timeline that holds the Dead row; it never derives a key, and no other path copies
-one. Reopen if: an app needs an effect whose request cannot be decided from committed
+the timeline that holds the Dead row; it never derives a key, and no other path in app code
+copies one: no handler or job can build that record, while operator code holding a `Group`
+can, through `settle_job`, by the standing §12 gives whoever holds the `Db`. Reopen if: an app needs an effect whose request cannot be decided from committed
 state plus its payload, or a protocol that is not request/response.
 
 ## 15. charpente's own APIs and formats change in place (2026-10-22)
