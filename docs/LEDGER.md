@@ -9864,3 +9864,33 @@ tallied from these tables.
   - Task 8: the registry smoke, the demo's `Cargo.lock`, and GOLDEN byte for byte from a fresh clone with the published CLI.
   - Task 9: the tape.
   - Task 10: the video link in README.
+
+## 2026-11-21 — the launch tape's evidence, final review and fix wave
+
+**Why.** Plan Task 6: before Noah pushes and publishes 0.6.0, the release candidate gets the workspace gate, fresh seeds, mutation over the format functions, a whole-branch review on the strongest model, and one fix wave. Its README freezes on crates.io and its red output goes on camera, so the review read both as a stranger would.
+
+- **Final whole-branch review** (`347f5311..4f284a26`): ready with fixes; nothing Critical, four Important. All four are fixed in `52840853`:
+  - The shrink line counted named inputs, so the demo printed `shrunk: 1 input to 1` above a repro that carries `--inputs 00`: the input's value had shrunk. The line now names what shrank (`shrunk: orders 71 to 48, 6 faults off, in 13 replays`). It drops a part when nothing in it changed, and says `replay` at one.
+  - The demo's message said the POST "was sent again after a lost reply". `charpente_sim::drive` re-sends a request answered with a fault-fallout 5xx as well as one with no answer, so the check cannot tell the two apart. It now says "after a fault hid its success", and README's prose says the same.
+  - Nothing tied README's two quoted runs to the code. demo.rs now asserts both blocks byte for byte, and refuses by name when the demo's `=` pins and the workspace version drift apart. Without that refusal, the next minor bump would quietly test crates.io's 0.6.0 instead of the workspace.
+  - Task 8 would have generated the demo's lock fresh, which picks redb 4.6.0, but GOLDEN was produced under the workspace lock's 4.3.0. Task 8 now seeds the demo's lock from the workspace lock and checks redb.
+- **Smaller fixes in the same commit.** The scaffold's four give-up reasons say "injected durable corruption". CHANGELOG states which JSON text changed. The demo's README calls the three lines missing. docs/BENCH.md and bench-harness no longer name the old README. GUIDE's "done twice" is fixed, and so are README's nits. An equivalent mutant is gone: `write_human` matched on `c.passed + c.failed` where `c.failed` is 0, and now matches on `c.passed`.
+- **Corrections to the entry above.** The demo's shrink line now reads `orders 71 to 48` and its message "after a fault hid its success". The frame is unchanged: the master seed's output takes 19 of 20 rows. The 32-seed table still holds, because the longer headline is 186 to 188 characters for order numbers up to 999, still two rows.
+- **Evidence at `52840853`** (worktrees `charpente-gate` and `charpente-mut`):
+  - The workspace gate passes 105 of 105 `test result: ok`, and fmt and clippy `-D warnings` are clean. The edge harness passes 11 of 11.
+  - Fresh master seed `0x28fa1c7c1079c6f6`, `--runs 1000`: sim-fixture passes 6 of 6, invoicing 7 of 7, outbound-fixture 1 of 1 and the scaffold 4 of 4, all exit 0. outbound-fixture's JSON is byte-identical under `--jobs 1` and `--jobs 8`.
+  - Mutation over `human_failure_block|same_failure|write_human` (`--test-package charpente-sim`): 62 mutants, 62 caught.
+  - `cargo publish --workspace --dry-run` exits 0 with all six crates verified at 0.6.0.
+  - The same runs before the fix wave, at `4f284a26` (fresh master seed `0xf3231dbd98819380`), were green too, except that mutation left 1 of 56 MISSED: the equivalent mutant above.
+- **Calls the controller made** (Noah may rework them):
+  - The startup line keeps the zero-padded master seed. The codebase displays seeds with 16 hex digits and writes them unpadded in commands.
+  - "Lost reply" stays where it describes the bug class, since a lost reply is one way to charge twice. Only the per-failure message changed.
+  - The shipped examples' give-up reasons keep plain "durable corruption fired". Only the scaffold a new user runs changed.
+- **Noah's:**
+  - MANIFESTO §6 says "the entire application runs inside a simulator", but README's Limits says, correctly, that the HTTP server never runs in it.
+  - claims_census's exemption for MANIFESTO's "per night" rests on one 10,000-run batch, and no nightly sim job exists.
+- **Still owed:**
+  - Task 7, Noah's: push, CI, `cargo publish --workspace`.
+  - Task 8: registry smoke, dates, the demo's lock, GOLDEN from a fresh clone.
+  - Task 9: the tape.
+  - Task 10: the video link.
