@@ -85,7 +85,10 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
     }
     if let Some((order, _)) = per_order.iter().find(|(_, n)| **n > 1) {
         // Two Charge jobs for one order mean the route placed it twice; one job
-        // applied twice is a re-call that carried no key.
+        // applied twice is a re-call that carried no key. That branch is
+        // unreachable here because `Charge::call` always sends the
+        // idempotency-key header (src/lib.rs); it stays so the message is
+        // truthful if the demo is edited.
         let placed = charges
             .iter()
             .filter(|(_, job)| job.order.raw() == *order)

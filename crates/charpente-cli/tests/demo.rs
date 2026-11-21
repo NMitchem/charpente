@@ -23,7 +23,8 @@ const FRAME_ROWS: usize = 20;
 const FRAME_COLS: usize = 103;
 
 /// The batch's full stdout under MASTER: the block README quotes and the tape
-/// shows. It moves only with a named cause (the harness's red output, the
+/// shows. It starts with a newline because stdout does (the failure block
+/// opens with one), so nobody trims it. It moves only with a named cause (the harness's red output, the
 /// demo's own message, or the seed's universe), never to make this test pass.
 const GOLDEN: &str = r"
 sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a lost reply and placed the order again; answer an order that is already stored
@@ -247,36 +248,49 @@ fn the_demo_builds_lints_clean_and_passes_a_single_send_test() {
     cargo_ok(&app, &["test", "--test", "once"]);
 }
 
-fn master_stdout(name: &str) -> (Demo, String) {
+fn master_batch(name: &str) -> (Demo, String, String) {
     let app = patched_demo(name);
     let out = batch(&app, MASTER);
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8(out.stdout).unwrap();
-    (app, stdout)
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    (app, stdout, stderr)
 }
 
 #[test]
 fn the_demos_red_block_fits_the_tapes_frame() {
     let _lock = one_at_a_time();
-    let (_app, stdout) = master_stdout("frame");
-    let rows = wrapped_rows(&stdout, FRAME_COLS);
+    let (_app, stdout, stderr) = master_batch("frame");
+    // The terminal shows both streams, the startup line (stderr) first.
+    let rows = wrapped_rows(&stderr, FRAME_COLS) + wrapped_rows(&stdout, FRAME_COLS);
     assert!(
         rows <= FRAME_ROWS,
-        "{rows} rows at {FRAME_COLS} columns, over the tape's {FRAME_ROWS}:\n{stdout}"
+        "{rows} rows at {FRAME_COLS} columns, over the tape's {FRAME_ROWS}:\nstderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn the_demos_stderr_is_exactly_the_startup_line() {
+    let _lock = one_at_a_time();
+    let (_app, _stdout, stderr) = master_batch("stderr");
+    assert_eq!(
+        stderr,
+        "running 1 sim check, 256 runs each, under random injected faults (master seed \
+         0x0000434841524745)\n"
     );
 }
 
 #[test]
 fn the_demos_red_block_is_pinned_whole() {
     let _lock = one_at_a_time();
-    let (_app, stdout) = master_stdout("golden");
+    let (_app, stdout, _) = master_batch("golden");
     assert_eq!(stdout, GOLDEN);
 }
 
 #[test]
 fn the_demos_repro_line_replays_its_failure() {
     let _lock = one_at_a_time();
-    let (app, stdout) = master_stdout("repro");
+    let (app, stdout, _) = master_batch("repro");
     let failure = |text: &str| {
         text.lines()
             .find(|l| l.starts_with("sim failure in "))
