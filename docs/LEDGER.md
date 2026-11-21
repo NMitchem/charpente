@@ -9911,3 +9911,28 @@ tallied from these tables.
   - The printed `repro:` line exits 1. Its output is byte-identical to README's second block, 878 bytes, with nothing on stderr.
 - **Records.** CHANGELOG's heading is dated `0.6.0 (2026-11-21)`. README no longer names a newest dated section (the final fix wave dropped that line), and 0.6.0 ships no PLAN row, so nothing else needed a date.
 - **Still owed:** the tape (`docs/demo/double-charge.tape`), and the video link in README once Noah uploads the render.
+
+## 2026-11-21 — after the 0.6.0 publish: the tape, the nightly sim, an outside stress test
+
+- **The tape.**
+  - v1 (`7dd1a4ea`) ran the batch and its replay, and Noah found it hard to follow: an endpoint failed, then it was replayed. Nothing on screen said what was at stake, and neither the code nor its passing test appeared. The replay only impresses a viewer who already knows the faults are random.
+  - v2 (`eaae7ec6`, 42.7 s) tells it as a story. A caption states the stakes. Then come the six-line route, `cargo test --test once` passing, the simulator under the same rule going red, a caption saying what happened, `git diff -U1` with the three-line fix, and the same run green.
+  - The master seed is set off camera, so the visible command is the bare `charpente test --sim`. Every master seed demo.rs measured fails the same check, and the output prints the seed.
+  - Noah uploaded it, and README carries it (`d3f6a27e`).
+- **claims_census blanks URLs.** The video URL's hex digits read as figures. A URL is an address, not a claim, so the census now blanks it as structure, while a link's text is still scanned. With the blanking disabled, both the unit test and the README scan go red.
+- **DECISIONS §14** (`c3ec62f2`). "No other path copies one" now reads "no other path in app code", and names the operator exception §12 already grants and GUIDE §6 already states. It is a precision edit, not a reversal.
+- **The nightly sim** (`.github/workflows/sim-nightly.yml`). MANIFESTO §6 says fault injection "runs thousands of seeded universes per night", but no nightly sim job existed. 37 of the workspace's 45 property sites pass an explicit base (36 `run_universes_swarm_with!`, 1 `run_universes_from!`) and replay the same universes on every push. The other 8, and the app harnesses under `cargo test`, draw an ambient base each run. The job runs every night with fresh seeds:
+  - every integration target with `CHARPENTE_BASE_SEED` set to a fresh base;
+  - sim-fixture, invoicing, outbound-fixture and a fresh scaffold at `--runs 10000` under a fresh master seed.
+- **Validated before it landed:**
+  - Workspace at base `0x4f3b028bcb78053e`: every sim property held. The only reds were 5 of charpente-sim's own runner self-tests, lib unit tests that assert the mode a re-base switches off. So the job runs integration targets only, which is where every pinned property lives.
+  - The exact job command at base `0x5efd0fdecfc79399`: 70 of 70 binaries green, 482 s.
+  - App batches under master `0x96c167a2136aca22` at 10,000 runs per check: sim-fixture 6 of 6, invoicing 7 of 7, outbound-fixture 1 of 1, scaffold 4 of 4. That is 180,000 runs in about 4 minutes.
+  - claims_census's "per night" entry now cites the workflow.
+- **An outside stress test of 0.6.0** (another agent's report, read 2026-11-21). It found no charpente defect:
+  - The 0.5.0 suite reproduced on Linux: 104 binaries, 2326 passed.
+  - `log.rs` mutation: 113 mutants, 106 caught, 0 missed, 7 unviable.
+  - An adversarial on_dead app held across 6,076 Dead rows.
+  - The tester's own order route made the double-charge mistake, and the simulator caught it.
+- **The report's no-viable-mutant gap, checked.** The report flagged five `log.rs` functions without a viable mutant. The one that carries a guarantee is `Wal::guard`, which poisons the WAL after any IO error. A hand mutation that never sets the poison flag failed 43 tests across 11 binaries: the named poison properties, core's `engine.rs:242` assertion, and charpente-sim's `wal`, `drive` and `determinism` suites. The gap is a mutation-generation limit, not a missing oracle.
+- **Its open recommendations:** mutation-test the dead-job and outbound paths (`db.rs`, `job.rs`, `checks.rs`); a structured category in JSON skip reasons (a 0.7.0 change); release tags (none existed); a low-disk test note.
