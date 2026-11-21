@@ -1,8 +1,9 @@
 # The launch tape: one double charge, caught in a second
 
-Status: draft for Noah's review, 2026-11-20. Drafted after the launch demo's rehearsal came out
-0 against 0 (`.superpowers/sdd/2026-11-09-launch-demo-rehearsal/go-no-go.md`), with Noah's
-pointer to retrace's demo as the model.
+Status: draft for Noah's approval, 2026-11-20, with his answers folded in (§9). Drafted after
+the launch demo's rehearsal came out 0 against 0
+(`.superpowers/sdd/2026-11-09-launch-demo-rehearsal/go-no-go.md`), with Noah's pointer to
+retrace's demo as the model.
 
 ## 1. Intent
 
@@ -113,16 +114,19 @@ Anti-goals (each would make this a failure even if it worked):
   runs by default, which is the trimmed output the anti-goals refuse.
 - Trim on camera. Refused above.
 
-**What the table compares against** (retrace: what running it again, lldb and ASan each say).
-Noah's to decide (§9). My pick changed after the builder check.
-- **(my pick) Rows from the demo app only, each measured:** a test that sends each order once
-  passes, the sim with faults off passes, and the sim with faults charges twice. It claims
-  nothing about other stacks, so nobody can call it a strawman, and it shows the bug needs a
-  lost reply.
-- The tests a backend developer would write on a conventional stack, run for real. Stronger if
-  it holds up, but how the port is written decides whether it even has the bug (§2), the tests
-  would be agent-written, and the row-selection rule must be fixed before anything runs. It is
-  a second build, with Postgres in containers.
+**What the table compares** (retrace: what running it again, lldb and ASan each say). Settled
+from MANIFESTO, 2026-11-20.
+- **(chosen) What says no to this code, measured on the demo app:** `cargo build` compiles,
+  `cargo clippy -- -D warnings` is clean, and a test that posts each order once passes.
+  `charpente test --sim` says order N was charged twice and gives the seed and the fix. This is
+  MANIFESTO §3's argument applied to one bug: the framework that wins is the one that says
+  *no* fastest and most precisely, and "a reproducible simulation failure with a seed beats a
+  flaky staging repro". It is §6's split too. Types are the oracle for business logic's shape,
+  and the simulator is the oracle for how it behaves under faults, which is where this bug
+  lives. Every row is the reader's own first tools, with no claim about another stack.
+- (refused) The tests a developer would write on a conventional stack, run for real. MANIFESTO
+  §8: "Porting a Postgres app here misses the point." And how the port is written decides
+  whether it even has the bug (§2).
 
 ## 5. The tape
 
@@ -232,10 +236,12 @@ These go or move to their own docs: the etymology, "The three guarantees", "Why 
 
 ## 8. Order of work
 
+0. The records of §9.1: PLAN's F1/F2 triggers, and the launch demo spec's status line.
 1. The demo app, `examples/double-charge/`, with the bug, its sim property and the workspace
    test that pins its red block.
 2. The output cleanup, red first, with GUIDE §8.
-3. The table's rows, measured (§9).
+3. The table's rows, each measured on the demo app (§4): build, clippy, a test that posts each
+   order once, and the sim.
 4. The README rewrite, before the publish, because README is the crates.io page for
    `charpente` and `charpente-cli` (`readme = "../../README.md"`). Its quoted output is
    generated at the release commit, which is the same code crates.io will get, and the
@@ -249,14 +255,17 @@ These go or move to their own docs: the etymology, "The three guarantees", "Why 
 alongside it. Both touch `charpente-sim`, and a recorded batch that moves must have one named
 cause. The demo's exact pin keeps its seed replaying when that row lands (my call).
 
-## 9. Noah's to decide
+## 9. Decided
 
-1. **The head-to-head.** Does this tape replace it as the launch's lead? If so, the
-   rehearsal's result becomes a supporting paragraph, or a later post, and F1/F2 (PLAN rows
-   triggered "before the public attempt") go back to ordinary rows.
-2. **The table.** Measured against a conventional stack, or rows from charpente only (§4)?
-3. **The look.** Reuse retrace's tape theme for a shared look across your projects, or give
-   charpente its own colors. My call is to reuse it.
+1. **The tape replaces the head-to-head as the launch's lead** (Noah, 2026-11-20). As a
+   result:
+   - PLAN's F1/F2 rows lose their "before the launch demo's public attempt" trigger and go
+     back to ordinary v1.x rows.
+   - The launch demo spec's status line records that its head-to-head no longer leads.
+   - README carries no rehearsal paragraph. Its 0-against-0 result is material for a later
+     post (my call).
+2. **The table compares what says no, not stacks** (§4, settled from MANIFESTO §3, §6 and §8).
+3. **The look:** the tape reuses retrace's theme, so Noah's projects share one look (my call).
 
 ## 10. Left to the builder
 
