@@ -1,7 +1,9 @@
 # The launch demo: an open judge for agent-built backends
 
 Status: approved by Noah 2026-11-08. Brainstormed in conversation 2026-11-06. The judge
-repo's name and the launch signals (§10, §12) are still his to set.
+repo's name and the launch signals (§10, §12) are still his to set. On 2026-11-20 Noah chose
+the launch tape ([2026-11-20-launch-tape-design.md](2026-11-20-launch-tape-design.md)) to lead the launch in
+place of this spec's head-to-head, after the rehearsal scored both stacks 0 violations.
 
 ## 1. Intent
 

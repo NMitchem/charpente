@@ -131,9 +131,10 @@ from MANIFESTO, 2026-11-20.
 
 ## 5. The tape
 
-A `vhs` tape, `docs/demo/double-charge.tape`, rendered to GIF and MP4 next to it. It follows
-retrace's `.superpowers/sdd/2026-11-17-hnprep/visits.tape` (in `~/Documents/GitHub/retrace`):
-1600×900, Menlo 26, 35 ms typing, narration typed as `#` comments, and setup done off camera
+A `vhs` tape, `docs/demo/double-charge.tape`. Its GIF and MP4 renders stay out of git (amended
+2026-11-20): Noah uploads the MP4, as retrace's were. It follows retrace's
+`.superpowers/sdd/2026-11-17-hnprep/visits.tape` (in `~/Documents/GitHub/retrace`): 1600×900,
+Menlo 22 (retrace uses 26; see §6), 35 ms typing, narration typed as `#` comments, and setup done off camera
 (clone, warm build) behind `Hide`. The tape's header says every line is real output from the
 released crates.
 
@@ -164,9 +165,11 @@ The video is uploaded through GitHub's web UI as a user attachment, as retrace's
 
 The acceptance test is the tape's frame. The whole red output of `charpente test --sim` on the
 demo app, failure first, fits one 1600×900 frame at the tape's settings, without scrolling the
-failure off. By estimate that frame holds about 23 rows of 94 columns, and the tape types two
-lines first. The builder confirms the real budget by rendering a frame. Today the output is 19
-lines, which wrap to 31 rows at 94 columns, and its longest line is 314 characters.
+failure off. Measured 2026-11-20 by rendering test frames (amended): at retrace's Menlo 26 the frame
+holds 19 rows of 90 columns, too few for an honest red block, and at Menlo 22 it holds 23 rows of
+103 columns, prompt included. The tape types a comment and a command before the output and ends
+on a prompt, so the red output gets at most 20 rows at 103 columns. Today the output is 19 lines,
+which wrap to 31 rows at 94 columns, and its longest line is 314 characters.
 
 The fit is a gate for the tape's seed: its block is pinned whole. It is also measured over 32
 other master seeds, with the worst row count recorded in the ledger. The cleanup's rules are
