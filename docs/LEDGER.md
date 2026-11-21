@@ -9828,3 +9828,39 @@ tallied from these tables.
   - PLAN reads "Shipped 2026-11-20: 0.5.0".
   - README names `0.5.0` as the newest dated section.
   - The GitHub release `v0.5.0` is a draft; publishing it, which creates the tag, is Noah's.
+
+## 2026-11-20 — the launch tape, built
+
+**Why.** The launch demo's rehearsal scored both stacks 0 violations, so it can't lead an announcement. retrace's launch led with one real bug on a terminal tape, and Noah pointed at it as the model. Spec `docs/superpowers/specs/2026-11-20-launch-tape-design.md` (approved by Noah 2026-11-20), plan `docs/superpowers/plans/2026-11-20-launch-tape.md`. Tasks 0–5 are built; the publish and the tape are not.
+
+- **Commits** (`347f5311..431ccbf0`, then this entry):
+  - Task 0, the decision's records: `427029e3` (PLAN's F1/F2 rows lose the public-attempt trigger; the launch demo spec says the tape leads; the tape spec carries the measured frame).
+  - Task 1, versions to 0.6.0: `6b8c5166`, and `10385b44` (describe's goldens).
+  - Task 2, `examples/double-charge` with its bug, pinned red and green: `3a1fc5b3`.
+  - Task 3, the red output cleaned up (`before shrinking:` only when the failure changed, the shrink line in words, a failed check's skips on one line, injected faults called injected): `d754d34b`.
+  - Task 4, the red block pinned whole and to the frame: `40d0c9b1`, and `2e2a0c94` (the frame counts the stderr startup line too).
+  - Task 5, README in retrace's shape: `431ccbf0`.
+- **The demo's pinned facts** (`crates/charpente-cli/tests/demo.rs`, a copy patched to the workspace's crates):
+  - Under master seed `0x434841524745`: exit 1, 248 tested, 28 failed, 8 skipped, of 256 runs. The first failure is order 9 charged twice, seed `0x82eac71fbdeda9de`, shrunk from 1 input to 1 with 6 faults off in 13 replays. Its stdout is pinned byte for byte (`GOLDEN`), and its stderr is the one startup line.
+  - The tape's frame is 23 rows x 103 columns at Menlo 22, which leaves 20 rows for the output. The master seed's output takes 19 (1 stderr row and 18 stdout rows). Task 2's output before the cleanup took 21 rows of stdout alone.
+  - The printed repro line replays the same failure. README quotes its output, run by hand on a patched copy at `2e2a0c94`: exit 1, the same failure block with no shrink line, and `sim result: FAILED. 0 passed; 1 failed; 0 skipped, on seed 0x82eac71fbdeda9de with the given inputs, with faults off: …`.
+  - Red under master seeds `0x1` to `0x8`, each with the same check and the same fix. Green with the three lines restored: 248 tested, 0 failed, 8 skipped under the same master seed.
+  - `cargo fmt --check`, `cargo build`, `cargo clippy --all-targets -- -D warnings` and `cargo test --test once` all pass on the buggy demo.
+- **The frame over 32 other master seeds** (Task 4's fix round, `0x1` to `0x20`, rows of stderr plus stdout at 103 columns). It is a measurement, not a gate, since the tape uses the master seed above. Every batch exited 1, and each printed a one-line stderr.
+
+  | rows | batches |
+  |---|---|
+  | 18 | 1 |
+  | 19 | 9 |
+  | 20 | 15 |
+  | 21 | 7 (`0x4`, `0x6`, `0xa`, `0x12`, `0x18`, `0x1d`, `0x1e`) |
+
+  So 7 of 32 overflow the 20-row frame by one row; the tape's seed fits with a row to spare.
+- **Gates.** Workspace gate (worktree `charpente-gate`): at `10385b44`, 104 of 104 `test result: ok`; at `d754d34b`, 105 of 105 (104 and `demo`), with fmt and clippy `-D warnings` clean. The six-batch JSON oracle (`oracle5.sh`) exited 0 after every task, t0 to t5. At `431ccbf0`: `demo` 9 of 9 passed, `guide-examples` 11 of 11 `test result: ok`, fmt 0, clippy `-D warnings` 0.
+- **README** (Task 5). It opens with what charpente is in two sentences. The example follows: the route without its guard, a table of what says no to it (build, clippy and `cargo test --test once` pass; the sim names the double charge with the seed and the fix), both outputs verbatim, and why the bug needs an upsert followed by an unconditional enqueue. Then Install, Use, How it works and Limits, and the docs table. Limits says the HTTP server never runs in the sim (the rehearsal's testimony census). The opening says the sim runs "your routes, jobs and data", not "the whole app", which is the phrase the census found wrong. README quotes no performance number, so `claims_census.rs`'s `CLAIMS` is empty. The new demo test holds Install to the demo's `rust-version` (1.99) and the example to the release it pins.
+- **Still owed:**
+  - Task 6, the controller's evidence: the workspace gate, fresh seeds, mutation over the harness's format functions, the final review and the `cargo publish --dry-run`.
+  - Task 7, Noah's: the push and the publish.
+  - Task 8: the registry smoke, the demo's `Cargo.lock`, and GOLDEN byte for byte from a fresh clone with the published CLI.
+  - Task 9: the tape.
+  - Task 10: the video link in README.
