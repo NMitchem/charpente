@@ -61,7 +61,10 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
     outbound_settles_by_horizon(&snap, recovered.wall)?;
     if let Err(e) = calls_have_durable_jobs(sim, &snap) {
         if durable_corruption_fired(sim) {
-            sim.give_up("durable corruption cut an enqueue after its call", e);
+            sim.give_up(
+                "injected corruption cut an enqueue after its call reached the gateway",
+                e,
+            );
             return Ok(());
         }
         return Err(e);
@@ -81,9 +84,21 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         *per_order.entry(*order).or_insert(0) += 1;
     }
     if let Some((order, _)) = per_order.iter().find(|(_, n)| **n > 1) {
+        // Two Charge jobs for one order mean the route placed it twice; one job
+        // applied twice is a re-call that carried no key.
+        let placed = charges
+            .iter()
+            .filter(|(_, job)| job.order.raw() == *order)
+            .count();
+        if placed > 1 {
+            return Err(format!(
+                "order {order} charged twice: its POST was sent again after a lost reply and \
+                 placed the order again; answer an order that is already stored"
+            ));
+        }
         return Err(format!(
-            "order {order} charged twice: its POST was sent again after a lost reply and placed \
-             the order again; answer an order that is already stored"
+            "order {order} charged twice: a re-call carried no idempotency key the gateway could \
+             dedupe on"
         ));
     }
     let mut judged = 0;

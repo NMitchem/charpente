@@ -5,6 +5,7 @@
 //! workspace and `=0.6.0` resolves nowhere before the publish, so it is built
 //! only as a patched copy, as `new.rs` builds the scaffold.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
@@ -16,6 +17,30 @@ const FIX: &str = "answer an order that is already stored";
 // copies building at once overwrite each other's binary. The tests take this
 // lock for their whole body and so run one at a time.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+// The tape's terminal is 23 rows x 103 columns with 20 rows for the output.
+const FRAME_ROWS: usize = 20;
+const FRAME_COLS: usize = 103;
+
+/// The batch's full stdout under MASTER: the block README quotes and the tape
+/// shows. It moves only with a named cause (the harness's red output, the
+/// demo's own message, or the seed's universe), never to make this test pass.
+const GOLDEN: &str = r"
+sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a lost reply and placed the order again; answer an order that is already stored
+  seed:   0x82eac71fbdeda9de
+  fired:  boot:booted-after-retry: 1, boot:retried: 2, crash:applied: 1, fault:outbound_lost_reply: 1, fault:sync_error: 3, outbound:completed: 51, restart: 1, restart:process: 2
+  inputs: orders=48
+  shrunk: 1 input to 1, 6 faults off, in 13 replays
+  repro:  charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
+
+skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
+  each_order_is_charged_once — 8 runs; it failed, so only --format json lists their reasons
+
+check each_order_is_charged_once ... FAILED  (248 tested over 49 distinct inputs: 28 failed; 8 skipped)
+
+sim result: FAILED. 0 passed; 1 failed. Runs tested: 248 of 256.
+rerun exactly this batch: charpente test --sim --master-seed 0x434841524745
+";
 
 const GUARD: &str = "    if tx.get(id)?.is_some() {\n        return Ok(id);\n    }\n";
 
@@ -34,6 +59,31 @@ fn charpente() -> Command {
 
 fn one_at_a_time() -> MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A patched copy of the demo, removed when its test is done.
+struct Demo(PathBuf);
+
+impl Deref for Demo {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Demo {
+    #[allow(clippy::disallowed_methods)]
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Terminal rows `text` takes at `cols` columns: each line counts
+/// max(1, ceil(chars / cols)), in `char`s.
+fn wrapped_rows(text: &str, cols: usize) -> usize {
+    text.lines()
+        .map(|line| line.chars().count().div_ceil(cols).max(1))
+        .sum()
 }
 
 fn workspace() -> PathBuf {
@@ -75,7 +125,7 @@ fn copy_dir(from: &Path, to: &Path) {
 /// resolved against the workspace's lock (a pinned replay depends on the
 /// resolved storage-engine version).
 #[allow(clippy::disallowed_methods)]
-fn patched_demo(name: &str) -> PathBuf {
+fn patched_demo(name: &str) -> Demo {
     let dir = std::env::temp_dir().join(format!("charpente-demo-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let ws = workspace();
@@ -87,8 +137,12 @@ fn patched_demo(name: &str) -> PathBuf {
         ws.join("crates/charpente-sim")
     ));
     std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
-    std::fs::copy(ws.join("Cargo.lock"), dir.join("Cargo.lock")).unwrap();
-    dir
+    std::fs::write(
+        dir.join("Cargo.lock"),
+        std::fs::read(ws.join("Cargo.lock")).unwrap(),
+    )
+    .unwrap();
+    Demo(dir)
 }
 
 fn batch(app: &Path, master: &str) -> Output {
@@ -187,7 +241,62 @@ fn restoring_the_three_lines_turns_the_demo_green() {
 fn the_demo_builds_lints_clean_and_passes_a_single_send_test() {
     let _lock = one_at_a_time();
     let app = patched_demo("lint");
+    cargo_ok(&app, &["fmt", "--check"]);
     cargo_ok(&app, &["build"]);
     cargo_ok(&app, &["clippy", "--all-targets", "--", "-D", "warnings"]);
     cargo_ok(&app, &["test", "--test", "once"]);
+}
+
+fn master_stdout(name: &str) -> (Demo, String) {
+    let app = patched_demo(name);
+    let out = batch(&app, MASTER);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    (app, stdout)
+}
+
+#[test]
+fn the_demos_red_block_fits_the_tapes_frame() {
+    let _lock = one_at_a_time();
+    let (_app, stdout) = master_stdout("frame");
+    let rows = wrapped_rows(&stdout, FRAME_COLS);
+    assert!(
+        rows <= FRAME_ROWS,
+        "{rows} rows at {FRAME_COLS} columns, over the tape's {FRAME_ROWS}:\n{stdout}"
+    );
+}
+
+#[test]
+fn the_demos_red_block_is_pinned_whole() {
+    let _lock = one_at_a_time();
+    let (_app, stdout) = master_stdout("golden");
+    assert_eq!(stdout, GOLDEN);
+}
+
+#[test]
+fn the_demos_repro_line_replays_its_failure() {
+    let _lock = one_at_a_time();
+    let (app, stdout) = master_stdout("repro");
+    let failure = |text: &str| {
+        text.lines()
+            .find(|l| l.starts_with("sim failure in "))
+            .unwrap_or_else(|| panic!("no failure line:\n{text}"))
+            .to_string()
+    };
+    let repro = stdout
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("repro:"))
+        .expect("the batch prints a repro line")
+        .trim();
+    let args: Vec<&str> = repro.split_whitespace().collect();
+    assert_eq!(args[0], "charpente", "{repro}");
+    let out = charpente()
+        .current_dir(&*app)
+        .env("CARGO_TARGET_DIR", target_dir())
+        .args(&args[1..])
+        .output()
+        .unwrap();
+    let replay = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{repro}:\n{replay}");
+    assert_eq!(failure(&replay), failure(&stdout));
 }
