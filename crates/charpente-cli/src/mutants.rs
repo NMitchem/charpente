@@ -2032,7 +2032,8 @@ mod tests {
              (target/debug/deps/sim-0123456789abcdef)\n\
              running 2 sim checks, 256 runs each, under random injected faults (master seed 0x1)\n\
              \n\
-             skipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
+             skipped runs hit an injected fault before reaching the check, so they prove nothing \
+             either way:\n\
              \x20 note_survives — never tested: every run was skipped\n\
              \x20   256  no POST /notes became durable (first: --seed 0x2)\n\
              \n\

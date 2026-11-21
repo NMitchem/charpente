@@ -440,8 +440,8 @@ fn a_durable_refusal_in_the_tail_gives_the_run_up() {
     assert_eq!(
         sim.gave_up(),
         Some(
-            "the boot was refused for durable corruption at or below the store's horizon, \
-             which no restart clears, so nothing past it was adjudicated"
+            "the boot was refused: injected corruption reached durable data at or below the \
+             store's horizon, which no restart clears, so nothing past it was adjudicated"
         )
     );
 }

@@ -529,8 +529,8 @@ pub fn durable_refusal(sim: &Sim, text: &str) -> Result<bool, String> {
     }
     sim.cover("boot:durable-refusal");
     sim.give_up(
-        "the boot was refused for durable corruption at or below the store's horizon, which no \
-         restart clears, so nothing past it was adjudicated",
+        "the boot was refused: injected corruption reached durable data at or below the store's \
+         horizon, which no restart clears, so nothing past it was adjudicated",
         text,
     );
     Ok(true)
@@ -1621,7 +1621,7 @@ mod tests {
             .gave_up()
             .expect("a durable refusal gives the universe up at once");
         assert!(
-            reason.contains("refused for durable corruption"),
+            reason.starts_with("the boot was refused: injected corruption reached durable data"),
             "under its own name: {reason}"
         );
         assert!(
@@ -1707,8 +1707,8 @@ mod tests {
             .expect("an excused refusal gives the universe up");
         assert!(
             reason.starts_with(
-                "the boot was refused for durable corruption at or below the store's horizon, \
-                 which no restart clears"
+                "the boot was refused: injected corruption reached durable data at or below the \
+                 store's horizon, which no restart clears"
             ),
             "{reason}"
         );

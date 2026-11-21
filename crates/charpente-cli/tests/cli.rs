@@ -106,11 +106,9 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
         .find("  repro:  ")
         .expect("a block ends with its repro line");
     let block = &rest[..repro_at + rest[repro_at..].find('\n').unwrap() + 1];
-    assert!(
-        block.contains("\n  shrunk: 0 draws to 0, faults off: "),
-        "{block}"
-    );
-    assert!(!block.contains("inputs"), "it drew nothing: {block}");
+    assert!(block.contains("\n  shrunk: 0 inputs to 0, "), "{block}");
+    assert!(!block.contains(", 0 faults off, "), "{block}");
+    assert!(!block.contains("\n  inputs:"), "it drew nothing: {block}");
     let repro: Vec<&str> = block[repro_at..]
         .trim_start()
         .strip_prefix("repro:  ")
@@ -331,7 +329,7 @@ fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
     assert_eq!(
         String::from_utf8_lossy(&human.stdout),
         r#"
-skipped runs hit a fault before reaching the check, so they prove nothing either way:
+skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
     10  Db::open after the crash never booted in 8 boots (first: --seed 0x553274161bbf8475)
      2  the write was never acked, so durability has nothing to prove (first: --seed 0x70d29b6c7d22528d)

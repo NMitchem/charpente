@@ -2,6 +2,13 @@
 
 ## 0.6.0 (unreleased)
 
+### Breaking changes
+- **`charpente test --sim`'s human report says less where it repeated itself, and calls an injected fault injected.** `--format json` is unchanged. A script that matched any of these lines must match the new text or read the JSON. GUIDE §8.
+  - `before shrinking:` prints only when the shrunk run failed with another failure: its message still differs from the first's once every run of digits in each reads as one `#`. A shrink that only lowered an id, a count or a key found the failure the batch first found, and the line repeated the whole message for it. JSON's `first_message` still appears whenever the two messages differ at all.
+  - The shrink line counts in words: `shrunk: 3 inputs to 2, 2 faults off, in 87 replays`, singular at 1. It listed the axes turned off (`faults off: bit_flip, read_error`); the repro's `--faults-off` names them, as it did.
+  - A check with a failed run gives its skipped runs one line in place of their reasons: `<check> — <n> runs; it failed, so only --format json lists their reasons`. Its failure block is what to read. A check with no failed run, an untested one included, keeps its reasons and the untested fix line. The block's header is `skipped runs hit an injected fault before reaching the check, so they prove nothing either way:`.
+  - The skip reason for a boot refused at the durable horizon (`checks::durable_refusal`, and so `boot_through_fallout` and `Drive::recover`) says the corruption was injected: `the boot was refused: injected corruption reached durable data at or below the store's horizon, which no restart clears, so nothing past it was adjudicated`. It read `the boot was refused for durable corruption …`, which a reader took for charpente corrupting data.
+
 ## 0.5.0 (2026-11-20)
 
 ### Breaking changes

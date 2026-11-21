@@ -1722,9 +1722,10 @@ const REASONS_SHOWN: usize = 8;
 
 /// The batch in `cargo test`'s shape (GUIDE §8 "Reading a batch"): one block
 /// per failing check, the unmet coverage requirements, the skipped runs'
-/// reasons, the checks that draw nothing, a line per check, the result, and
-/// the command that reruns the batch. The check lines sit directly above the
-/// result, so a tail of the output carries every check's counts.
+/// reasons (a failed check's on one line), the checks that draw nothing, a
+/// line per check, the result, and the command that reruns the batch. The
+/// check lines sit directly above the result, so a tail of the output carries
+/// every check's counts.
 fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
     if let Some(replay) = &batch.replay {
         return write_replay(batch, replay, out);
@@ -1760,11 +1761,26 @@ fn write_human(batch: &Batch, out: &mut dyn std::io::Write) {
     if batch.checks.iter().any(|c| !c.skipped.is_empty()) {
         let _ = writeln!(
             out,
-            "\nskipped runs hit a fault before reaching the check, so they prove nothing either \
-             way:"
+            "\nskipped runs hit an injected fault before reaching the check, so they prove \
+             nothing either way:"
         );
         for (o, c) in report.outcomes.iter().zip(&batch.checks) {
             if c.skipped.is_empty() {
+                continue;
+            }
+            // A failed check's failure block is what to read; its reasons
+            // matter where nothing failed, and above all where nothing tested.
+            if c.failed > 0 {
+                let runs: u64 = c.skipped.iter().map(|(_, n, _)| n).sum();
+                let (noun, reasons) = match runs {
+                    1 => ("run", "its reason"),
+                    _ => ("runs", "their reasons"),
+                };
+                let _ = writeln!(
+                    out,
+                    "  {} — {runs} {noun}; it failed, so only --format json lists {reasons}",
+                    o.test,
+                );
                 continue;
             }
             let never = match c.passed + c.failed {
@@ -2017,9 +2033,9 @@ fn failure_run(f: &Failure) -> FailureRun<'_> {
 /// The failure block (GUIDE §8 "Reading a failure"). A batch prints one per
 /// failing check: its first failure, shrunk, with a `shrunk:` line saying how
 /// it shrank and a `before shrinking:` line when the shrunk run failed with
-/// another message; its repro replays the shrunk run. The check's other
-/// failures get no block, only the count on its line. A `--seed` replay
-/// prints its own run.
+/// another failure (`same_failure`); its repro replays the shrunk run. The
+/// check's other failures get no block, only the count on its line. A
+/// `--seed` replay prints its own run.
 fn human_failure_block(f: &Failure) -> String {
     let shown = failure_run(f);
     let mut block = format!(
@@ -2039,14 +2055,13 @@ fn human_failure_block(f: &Failure) -> String {
     }
     if let Some(s) = &f.shrunk {
         if s.smaller {
-            let off = match s.faults_off.is_empty() {
-                true => "none".to_string(),
-                false => s.faults_off.join(", "),
-            };
+            // The axes' names are in the repro's `--faults-off`.
+            let (from, off) = (f.drawn.len(), s.faults_off.len());
             block.push_str(&format!(
-                "  shrunk: {} draws to {}, faults off: {off}, in {} replays\n",
-                f.drawn.len(),
+                "  shrunk: {from} input{} to {}, {off} fault{} off, in {} replays\n",
+                if from == 1 { "" } else { "s" },
                 s.drawn.len(),
+                if off == 1 { "" } else { "s" },
                 s.replays
             ));
         } else {
@@ -2055,7 +2070,7 @@ fn human_failure_block(f: &Failure) -> String {
                 s.replays
             ));
         }
-        if s.message != f.message {
+        if !same_failure(&s.message, &f.message) {
             block.push_str(&format!("  before shrinking: {}\n", f.message));
         }
     }
@@ -2075,6 +2090,26 @@ fn human_failure_block(f: &Failure) -> String {
         repro(f.test, f.seed, shown.inputs, shown.faults_off)
     ));
     block
+}
+
+/// Whether two failure messages are one failure: equal once every run of
+/// ASCII digits in each reads `#`. A shrink lowers ids, counts and keys, and a
+/// message that differs only there is the failure the batch first found.
+fn same_failure(a: &str, b: &str) -> bool {
+    let shape = |s: &str| {
+        let mut out = String::with_capacity(s.len());
+        let mut in_digits = false;
+        for c in s.chars() {
+            match (c.is_ascii_digit(), in_digits) {
+                (true, true) => {}
+                (true, false) => out.push('#'),
+                (false, _) => out.push(c),
+            }
+            in_digits = c.is_ascii_digit();
+        }
+        out
+    };
+    shape(a) == shape(b)
 }
 
 /// The command that replays one run: its check, its seed, and the inputs and
@@ -2261,7 +2296,7 @@ mod tests {
             seed: 0x8bee_1752_811a_e873,
             config: config.clone(),
             coverage: BTreeMap::from([("fault:crash", 2)]),
-            message: "exactly-once violated: hits 3, done 1 for key 812".to_string(),
+            message: "exactly-once violated: key 812 was acked and never done".to_string(),
             drawn: vec![
                 ("key", "812".into()),
                 ("key", "77".into()),
@@ -2284,16 +2319,16 @@ mod tests {
         };
         // The binding copy, line for line: each label padded so the values
         // align, `inputs:` because the run drew, `before shrinking:` because the
-        // shrink slipped to another message, and a repro that replays the shrunk
-        // run.
+        // shrink turned a lost receipt into a double one, another failure, and a
+        // repro that replays the shrunk run.
         assert_eq!(
             human_failure_block(&failure),
             "\nsim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3\n\
                  \x20 seed:   0x8bee1752811ae873\n\
                  \x20 fired:  fault:dir-entry: 3, restart: 7\n\
                  \x20 inputs: key=3, order=[1, 0]\n\
-                 \x20 shrunk: 3 draws to 2, faults off: bit_flip, read_error, in 87 replays\n\
-                 \x20 before shrinking: exactly-once violated: hits 3, done 1 for key 812\n\
+                 \x20 shrunk: 3 inputs to 2, 2 faults off, in 87 replays\n\
+                 \x20 before shrinking: exactly-once violated: key 812 was acked and never done\n\
                  \x20 repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873 --inputs 03c801 --faults-off bit_flip,read_error\n"
         );
 
@@ -2313,7 +2348,7 @@ mod tests {
         });
         assert_eq!(
             human_failure_block(&failure),
-            "\nsim failure in receipts_exactly_once: exactly-once violated: hits 3, done 1 for key 812\n\
+            "\nsim failure in receipts_exactly_once: exactly-once violated: key 812 was acked and never done\n\
                  \x20 seed:   0x8bee1752811ae873\n\
                  \x20 fired:  fault:crash: 2\n\
                  \x20 inputs: key=812, key=77, order=[1, 0]\n\
@@ -2325,6 +2360,93 @@ mod tests {
         failure.drawn.clear();
         failure.shrunk.as_mut().unwrap().drawn.clear();
         assert!(!human_failure_block(&failure).contains("inputs:"));
+    }
+
+    /// A first failure that drew `from` inputs and failed with `first`, shrunk
+    /// to `to` inputs with `off` axes turned off, failing with `shrunk`.
+    fn shrunk_from(first: &str, shrunk: &str, from: usize, to: usize, off: usize) -> Failure {
+        let drawn = |n: usize| vec![("key", "3".to_string()); n];
+        Failure {
+            test: "receipts_exactly_once",
+            seed: 0x8bee_1752_811a_e873,
+            config: FaultConfig::none(),
+            coverage: BTreeMap::new(),
+            message: first.to_string(),
+            drawn: drawn(from),
+            inputs: None,
+            faults_off: Vec::new(),
+            shrunk: Some(Shrunk {
+                choices: Vec::new(),
+                faults_off: FAULT_AXES[..off].to_vec(),
+                drawn: drawn(to),
+                message: shrunk.to_string(),
+                coverage: BTreeMap::new(),
+                config: FaultConfig::none(),
+                replays: 10,
+                replay_inputs: false,
+                smaller: true,
+            }),
+            not_shrunk: false,
+        }
+    }
+
+    /// A shrink that only lowered an id, a count or a key found the failure
+    /// the batch first found, so the block does not repeat it.
+    #[test]
+    fn a_shrink_that_changes_only_numbers_prints_no_before_line() {
+        let first = "hits 3, done 1 for key 812";
+        let block = human_failure_block(&shrunk_from(first, "hits 2, done 1 for key 3", 3, 2, 2));
+        assert!(
+            block.starts_with("\nsim failure in receipts_exactly_once: hits 2, done 1 for key 3\n"),
+            "the headline is the shrunk run's: {block}"
+        );
+        assert!(!block.contains("before shrinking"), "{block}");
+        assert!(!block.contains(first), "{block}");
+        // Each run of digits is one `#`, so numbers of any length match, and a
+        // number where the other message has none, or a word, does not.
+        assert!(same_failure("key 3 of 12", "key 812 of 4"));
+        assert!(!same_failure(
+            "order 9 charged twice",
+            "order charged twice"
+        ));
+        assert!(!same_failure("hits 3", "hits x"));
+    }
+
+    /// A shrink that turned the failure into another one keeps the first.
+    #[test]
+    fn a_shrink_that_changes_the_failure_prints_the_before_line() {
+        let first = "exactly-once violated: hits 3, done 1 for key 812";
+        let shrunk = "ack-durability violated: key 3 was acked and is gone after a restart";
+        let block = human_failure_block(&shrunk_from(first, shrunk, 3, 2, 2));
+        assert!(
+            block.starts_with(&format!(
+                "\nsim failure in receipts_exactly_once: {shrunk}\n"
+            )),
+            "{block}"
+        );
+        assert_eq!(line(&block, "  before shrinking: "), Some(first), "{block}");
+    }
+
+    /// The shrink line counts in words: inputs from the first failure's to the
+    /// shrunk run's, and the axes turned off, singular at 1. The axes' names
+    /// are the repro's `--faults-off`.
+    #[test]
+    fn the_shrink_line_counts_inputs_and_faults_off_in_words() {
+        for (from, to, off, want) in [
+            (3, 2, 2, "3 inputs to 2, 2 faults off, in 10 replays"),
+            (1, 1, 5, "1 input to 1, 5 faults off, in 10 replays"),
+            (2, 1, 1, "2 inputs to 1, 1 fault off, in 10 replays"),
+            (0, 0, 0, "0 inputs to 0, 0 faults off, in 10 replays"),
+        ] {
+            let block = human_failure_block(&shrunk_from("fails", "fails", from, to, off));
+            assert_eq!(line(&block, "  shrunk: "), Some(want), "{block}");
+            let repro = line(&block, "  repro:  ").unwrap();
+            assert_eq!(
+                repro.split_once(" --faults-off ").map(|(_, axes)| axes),
+                (off > 0).then(|| FAULT_AXES[..off].join(",")).as_deref(),
+                "{block}"
+            );
+        }
     }
 
     // -------------------------------------------------------------- run()
@@ -2882,7 +3004,7 @@ mod tests {
         let (_, out) = run_to_string(&tests, &["--runs", "6", "--master-seed", "0x1234"]);
         let first = batch_seeds(0x1234, 12)[6];
         let block = format!(
-            "\nskipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
+            "\nskipped runs hit an injected fault before reaching the check, so they prove nothing either way:\n\
              \x20 always_gives_up — never tested: every run was skipped\n\
              \x20   6  the fixture always gives up (first: --seed {first:#x})\n\
              {UNTESTED_FIX}\n\
@@ -2895,7 +3017,7 @@ mod tests {
         let tests = [sim_test("skips_two_ways", skips_two_ways)];
         let (code, out) = run_to_string(&tests, &["--runs", "32", "--master-seed", "0x1234"]);
         assert!(
-            out.contains("\nskipped runs hit a fault before reaching the check")
+            out.contains("\nskipped runs hit an injected fault before reaching the check")
                 && out.contains("\nsim result: ok. 1 passed; 0 failed. "),
             "non-vacuous: runs skipped and the check was tested: {out}"
         );
@@ -3384,10 +3506,22 @@ mod tests {
     }
 
     /// `two_far_apart` with its draw count in the message, so a shrink that
-    /// draws fewer slips to another message (Review Focus 5).
+    /// draws fewer changes the message's number (Review Focus 5): JSON keeps
+    /// the first message, and the human block, for which only a number
+    /// changed, does not (`same_failure`).
     fn two_far_apart_after_n(sim: &mut Sim) -> Result<(), String> {
         match far_apart(sim) {
             Some(n) => Err(format!("after {n} draws, two are 500 or more apart")),
+            None => Ok(()),
+        }
+    }
+
+    /// `two_far_apart` whose message says which draw broke it, the second or
+    /// a later one, so a shrink to two draws turns one failure into another.
+    fn two_far_apart_second_or_later(sim: &mut Sim) -> Result<(), String> {
+        match far_apart(sim) {
+            Some(2) => Err("the second draw is 500 or more from the first".into()),
+            Some(_) => Err("a later draw is 500 or more from an earlier one".into()),
             None => Ok(()),
         }
     }
@@ -3403,13 +3537,14 @@ mod tests {
         // reads past the end of its choices.
         assert_eq!(line(block, "  inputs: "), Some("n=500, n=0"), "{block}");
         let shrunk = line(block, "  shrunk: ").unwrap_or_else(|| panic!("{block}"));
-        let (from, rest) = shrunk.split_once(" draws to ").unwrap();
+        let (from, rest) = shrunk.split_once(" inputs to ").unwrap();
         assert!(
             from.parse::<usize>().unwrap() > 2,
             "non-vacuous: the first failure drew more than it needed: {block}"
         );
         // `{to}` counts the draws the `inputs:` line lists.
-        assert!(rest.starts_with("2, faults off: "), "{block}");
+        assert!(rest.starts_with("2, "), "{block}");
+        assert!(rest.contains(" off, in "), "{block}");
         assert!(rest.ends_with(" replays"), "{block}");
         assert_eq!(
             line(block, "  before shrinking: "),
@@ -3453,10 +3588,11 @@ mod tests {
         let (code, out) = run_to_string(&tests, &["--runs", "1", "--master-seed", &master]);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, "always_fails");
-        // Every axis that was on, in field order, one replay each.
+        // Every axis that was on, one replay each; the repro below names them
+        // in field order.
         let want = format!(
-            "0 draws to 0, faults off: {}, in {} replays",
-            axes.join(", "),
+            "0 inputs to 0, {} faults off, in {} replays",
+            axes.len(),
             axes.len()
         );
         assert_eq!(line(block, "  shrunk: "), Some(want.as_str()), "{block}");
@@ -3519,29 +3655,62 @@ mod tests {
         // Non-vacuous: the faults the shrink turned off changed how many
         // draws the loop made, so the replay ran past the first run's choices.
         let shrunk = line(block, "  shrunk: ").unwrap_or_else(|| panic!("{block}"));
-        let (from, rest) = shrunk.split_once(" draws to ").unwrap();
-        assert_ne!(from, rest.split_once(',').unwrap().0, "{block}");
+        let (from, rest) = shrunk.split_once(" input").unwrap();
+        let to = rest
+            .split_once(" to ")
+            .unwrap()
+            .1
+            .split_once(',')
+            .unwrap()
+            .0;
+        assert_ne!(
+            from.parse::<usize>().unwrap(),
+            to.parse::<usize>().unwrap(),
+            "{block}"
+        );
         assert_eq!(replay(&tests, block, check), unshrunk(block));
     }
 
     #[test]
     fn a_slipped_shrink_prints_the_first_message_and_replays_the_shrunk_one() {
-        let check = "two_far_apart_after_n";
-        let tests = [sim_test(check, two_far_apart_after_n)];
-        let (code, out) = run_to_string(&tests, &["--runs", "4", "--master-seed", "0x5400"]);
+        let flags = ["--runs", "4", "--master-seed", "0x5400"];
+        // A shrink that changed only the message's number found the same
+        // failure, so the block does not repeat it. Non-vacuous: JSON keeps
+        // the first message, which differs.
+        let same = "two_far_apart_after_n";
+        let tests = [sim_test(same, two_far_apart_after_n)];
+        let (code, out) = run_to_string(&tests, &flags);
+        assert_eq!(code, 1, "{out}");
+        let block = first_block(&out, same);
+        assert!(
+            block.starts_with(&format!(
+                "sim failure in {same}: after 2 draws, two are 500 or more apart\n"
+            )),
+            "{block}"
+        );
+        assert_eq!(line(block, "  before shrinking: "), None, "{block}");
+        let (_, json) = run_to_string(&tests, &[&flags[..], &["--format", "json"]].concat());
+        assert!(
+            json.contains("\"message\":\"after 2 draws, two are 500 or more apart\"")
+                && json.contains("\"first_message\":\"after "),
+            "{json}"
+        );
+
+        // A shrink that turned the failure into another one prints the first.
+        let check = "two_far_apart_second_or_later";
+        let tests = [sim_test(check, two_far_apart_second_or_later)];
+        let (code, out) = run_to_string(&tests, &flags);
         assert_eq!(code, 1, "{out}");
         let block = first_block(&out, check);
-        let shrunk = "after 2 draws, two are 500 or more apart";
+        let shrunk = "the second draw is 500 or more from the first";
         assert!(
             block.starts_with(&format!("sim failure in {check}: {shrunk}\n")),
             "the headline is the shrunk run's own message: {block}"
         );
-        let first = line(block, "  before shrinking: ")
-            .unwrap_or_else(|| panic!("a slipped shrink prints the first message: {block}"));
-        assert_ne!(first, shrunk, "{block}");
-        assert!(
-            first.ends_with(" draws, two are 500 or more apart"),
-            "{block}"
+        assert_eq!(
+            line(block, "  before shrinking: "),
+            Some("a later draw is 500 or more from an earlier one"),
+            "a slipped shrink prints the first message: {block}"
         );
         let replayed = replay(&tests, block, check);
         assert!(
@@ -3644,7 +3813,7 @@ mod tests {
     }
 
     /// A clock axis sampled with a chance of 0 cannot fire whatever its size,
-    /// so the shrink spends no replay on it and `faults off:` never lists it.
+    /// so the shrink spends no replay on it and `--faults-off` never lists it.
     /// Master 0x24 is the first whose one run samples `clock_step_back` with a
     /// chance of 0 and a size above 0 (found by scanning up from 0).
     #[test]
@@ -3679,12 +3848,17 @@ mod tests {
             seed,
             &axes,
         );
+        let n = axes.len();
         let want = format!(
-            "0 draws to 0, faults off: {}, in {} replays",
-            axes.join(", "),
-            axes.len()
+            "0 inputs to 0, {n} fault{} off, in {n} replays",
+            if n == 1 { "" } else { "s" }
         );
         assert_eq!(line(block, "  shrunk: "), Some(want.as_str()), "{block}");
+        let repro = line(block, "  repro:  ").unwrap();
+        assert!(
+            repro.ends_with(&format!(" --faults-off {}", axes.join(","))),
+            "{block}"
+        );
         assert_eq!(replay(&tests, block, "always_fails"), unshrunk(block));
     }
 
@@ -4841,7 +5015,7 @@ mod tests {
             out,
             format!(
                 "\n\
-             skipped runs hit a fault before reaching the check, so they prove nothing either way:\n\
+             skipped runs hit an injected fault before reaching the check, so they prove nothing either way:\n\
              \x20 always_gives_up — never tested: every run was skipped\n\
              \x20   6  the fixture always gives up (first: --seed {first:#x})\n\
              {UNTESTED_FIX}\n\
@@ -4897,7 +5071,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {text:?}:\n{out}"))
         };
         let failure = at("\nsim failure in fails_skips_or_passes: ");
-        let reasons = at("\nskipped runs hit a fault before reaching the check");
+        let reasons = at("\nskipped runs hit an injected fault before reaching the check");
         assert!(
             failure < reasons && reasons < out.len() - tail.len(),
             "the failure block, then the skipped runs, then the tail:\n{out}"
@@ -5055,8 +5229,8 @@ mod tests {
         assert!(reasons[0].1 >= 100 && reasons[7].1 < 100, "{reasons:?}");
         let width = reasons[0].1.to_string().len();
         let mut want = String::from(
-            "\nskipped runs hit a fault before reaching the check, so they prove nothing either \
-             way:\n  gives_up_twelve_ways — never tested: every run was skipped\n",
+            "\nskipped runs hit an injected fault before reaching the check, so they prove nothing \
+             either way:\n  gives_up_twelve_ways — never tested: every run was skipped\n",
         );
         for (reason, n, first) in &reasons[..8] {
             want.push_str(&format!(
@@ -5159,6 +5333,63 @@ mod tests {
             }
             _ => Ok(()),
         }
+    }
+
+    /// A failed check's skipped runs are one line: its failure is what to
+    /// read, and `--format json` keeps every reason. A check with no failed
+    /// run keeps its reasons, and an untested one its fix line, since there
+    /// the reasons are what to read.
+    #[test]
+    fn a_failed_checks_skips_condense_and_an_untested_checks_do_not() {
+        // The launch demo's check name, so the line is measured at its width.
+        let failing = "each_order_is_charged_once";
+        let tests = [
+            sim_test(failing, fails_skips_or_passes),
+            sim_test("always_gives_up", always_gives_up),
+        ];
+        let batch = run_batch(&[&tests[0], &tests[1]], 0x1234, 24, None, 1, true);
+        let c = &batch.checks[0];
+        let skipped: u64 = c.skipped.iter().map(|(_, n, _)| n).sum();
+        assert!(c.failed > 0 && skipped > 1, "non-vacuous: {c:?}");
+        let (code, out) = run_to_string(&tests, &["--runs", "24", "--master-seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        let first = batch_seeds(0x1234, 48)[24];
+        let condensed = format!(
+            "  {failing} — {skipped} runs; it failed, so only --format json lists their reasons"
+        );
+        let want = format!(
+            "\nskipped runs hit an injected fault before reaching the check, so they prove nothing \
+             either way:\n\
+             {condensed}\n\
+             \x20 always_gives_up — never tested: every run was skipped\n\
+             \x20   24  the fixture always gives up (first: --seed {first:#x})\n\
+             {UNTESTED_FIX}\n\n"
+        );
+        assert!(out.contains(&want), "want:\n{want}\nout:\n{out}");
+        assert!(!out.contains("one past a multiple of 3"), "{out}");
+        // The launch tape's frame is 103 columns wide.
+        assert!(condensed.chars().count() <= 103, "{condensed}");
+
+        // One skipped run is singular.
+        fn skips_its_first_run_and_fails_the_rest(sim: &mut Sim) -> Result<(), String> {
+            if sim.seed() == batch_seeds(0x1234, 1)[0] {
+                sim.give_up("the first run", "");
+                return Ok(());
+            }
+            Err("a later run".into())
+        }
+        let tests = [sim_test(
+            "skips_once",
+            skips_its_first_run_and_fails_the_rest,
+        )];
+        let (code, out) = run_to_string(&tests, &["--runs", "3", "--master-seed", "0x1234"]);
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains(
+                "\n  skips_once — 1 run; it failed, so only --format json lists its reason\n"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

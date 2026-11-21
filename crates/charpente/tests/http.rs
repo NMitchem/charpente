@@ -1622,7 +1622,8 @@ fn a_durable_refusal_at_a_round_boot_gives_up_at_once_by_name() {
     let detail = sim.gave_up_detail().unwrap_or_default();
     assert!(
         reason.contains(
-            "the boot was refused for durable corruption at or below the store's horizon"
+            "the boot was refused: injected corruption reached durable data at or below the \
+             store's horizon"
         ) && detail.contains("at-or-below the store's durable horizon"),
         "seed {SEED:#x} must give up for the refusal, carrying its text: {reason}: {detail}"
     );
@@ -1655,7 +1656,8 @@ fn a_durable_refusal_at_the_final_recovery_ends_it_at_once_by_name() {
         .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
     assert!(
         reason.starts_with(
-            "the boot was refused for durable corruption at or below the store's horizon"
+            "the boot was refused: injected corruption reached durable data at or below the \
+             store's horizon"
         ),
         "seed {SEED:#x} must give up for the refusal, at once: {reason}"
     );

@@ -1144,7 +1144,8 @@ fn a_durable_refusal_at_the_final_recovery_ends_it_at_once_by_name() {
         .unwrap_or_else(|| panic!("seed {SEED:#x}: a durable refusal must give up, not pass"));
     assert!(
         reason.starts_with(
-            "the boot was refused for durable corruption at or below the store's horizon"
+            "the boot was refused: injected corruption reached durable data at or below the \
+             store's horizon"
         ),
         "seed {SEED:#x} must give up for the refusal, at once: {reason}"
     );

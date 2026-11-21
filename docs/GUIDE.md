@@ -3572,12 +3572,15 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
 Every batch states, check by check, how many runs tested the check and, when any
 were skipped, how many and why. A check with nothing skipped shows no skipped
 count and is left out of the reasons block, and a batch that skipped nothing
-prints no reasons block at all. This is a pinned batch of `crates/sim-fixture`,
+prints no reasons block at all. A check with a failed run gives its skipped runs
+one line instead of their reasons, since its failure block is the thing to read:
+`<check> — <n> runs; it failed, so only --format json lists their reasons`. This
+is a pinned batch of `crates/sim-fixture`,
 `charpente test --sim --runs 64 --master-seed 0x5eed --filter counter_roundtrip`:
 
 <!-- pinned -->
 ```text
-skipped runs hit a fault before reaching the check, so they prove nothing either way:
+skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
   counter_roundtrip
     10  Db::open after the crash never booted in 8 boots (first: --seed 0x553274161bbf8475)
      2  the write was never acked, so durability has nothing to prove (first: --seed 0x70d29b6c7d22528d)
@@ -3604,7 +3607,7 @@ prints the run's reason and detail, and exits 0. This is the harness's own
 fixture pair, a check that passes and one that always gives up, over six runs:
 
 ```text
-skipped runs hit a fault before reaching the check, so they prove nothing either way:
+skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
   always_gives_up — never tested: every run was skipped
     6  the fixture always gives up (first: --seed 0x3071c63893f2dcbd)
 a check that tested nothing proves nothing, so the batch fails: the reasons above say where its runs stopped. Raise --runs, change the setup until runs reach the check (charpente_sim::drive runs the faulted phase, the recovery and the re-sends), or delete the check.
@@ -5170,7 +5173,8 @@ charpente test --sim [--runs N] [--seed 0x…] [--master-seed 0x…] \
   not_shrunk, replays, repro}`, with `config` carrying every fault axis. A
   check's first failure is the one a batch shrinks: its `inputs` are
   `{name, value}` pairs of the shrunk run, `message` is the shrunk run's,
-  `first_message` appears only when the shrink slipped to another message,
+  `first_message` appears only when the shrunk run's message differs from the
+  first failure's, if only in a number,
   `replays` counts the candidates tried and `repro` replays the shrunk run.
   With shrinking off (under `charpente test --mutants`, "The timeout follows
   the scope too" below) it is its own run instead, with `not_shrunk` saying
@@ -5229,6 +5233,9 @@ and counts beside the verdict. In order:
   0x…)`. With `--filter <check>`, that seed replays a run that skipped for that
   reason and prints its detail. A check that
   tested nothing is headed `— never tested: every run was skipped`. A check
+  with a failed run lists no reasons: its one line counts its skipped runs and
+  says `--format json` lists their reasons, because its failure block above
+  is what to read. A check
   lists at most eight reasons and counts the rest on one line; `\n`, `\r` and
   `\t` in a reason print as those two-character escapes, so every reason stays
   on one line. When a check tested nothing, one line follows the reasons,
@@ -5288,8 +5295,8 @@ sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for 
   seed:   0x8bee1752811ae873
   fired:  fault:dir-entry: 3, restart: 7
   inputs: key=3, order=[1, 0]
-  shrunk: 3 draws to 2, faults off: bit_flip, read_error, in 87 replays
-  before shrinking: exactly-once violated: hits 3, done 1 for key 812
+  shrunk: 3 inputs to 2, 2 faults off, in 87 replays
+  before shrinking: exactly-once violated: key 812 was acked and never done
   repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873 --inputs 03c801 --faults-off bit_flip,read_error
 ```
 
@@ -5316,13 +5323,20 @@ in order:
   ("Drawing inputs" above). A run that drew nothing has no `inputs:` line.
 - `shrunk` says how far shrinking got: how many inputs the first failure
   drew and how many the shrunk run drew, counted as the `inputs:` line lists
-  them; the fault axes it turned off (`none` when it needed them all); and
-  how many runs it replayed. The shrunk run can draw more than the first: a
-  fault turned off can let a loop run longer. `shrunk: nothing smaller fails, in N replays`
+  them; how many fault axes it turned off (`0 faults off` when it needed them
+  all), which `repro:`'s `--faults-off` names; and how many runs it replayed.
+  The shrunk run can draw more than the first: a fault turned off can let a
+  loop run longer. `shrunk: nothing smaller fails, in N replays`
   means no smaller run failed the check, so the block is the first failure's
   own and its repro is the seed alone.
-- `before shrinking` is the first failure's message, printed only when the shrunk run
-  failed the check with another one (a slipped shrink, below).
+- `before shrinking` is the first failure's message, printed only when the
+  shrunk run failed the check with another failure: the two messages still
+  differ once every run of digits in each reads as one `#`. A shrink that only
+  lowered an id, a count or a key found the failure the batch first found, so
+  the line is left out; `--format json`'s `first_message` keeps the first
+  message whenever the two differ at all. Here the first failure was a receipt
+  never done and the shrunk one a receipt done twice, so it prints (a slipped
+  shrink, below).
 - `repro` is not advice, it **is** the reproduction: paste that exact line
   and the same run happens again, byte for byte. `--seed` replays a literal
   seed; `--inputs` appears only when the shrunk run's choices are not the
@@ -5373,7 +5387,7 @@ keeps nothing:
    recorded choice pass;
 4. turn off each fault axis that is on, one at a time, in `FaultConfig` field
    order. An axis is on when it could fire: a clock axis whose chance is 0 is
-   off whatever its size, so `faults off:` never lists it;
+   off whatever its size, so `--faults-off` never lists it;
 5. lower equal choices together: for each nonzero value two or more choices
    hold, set all of them to 0 and then search them down toward 0 as one value,
    so a failure that needs the same entity drawn twice (the same lab, the same
@@ -5418,8 +5432,9 @@ on stdout, written once every shrink has finished.
 **A slipped shrink.** Any failure of the same check counts, so the shrunk run
 can fail it for another reason than the first did. The headline is then the
 shrunk run's own message, `before shrinking:` keeps the original, and `repro:` replays the
-shrunk run. The original is the seed alone: drop `--inputs` and `--faults-off`
-from the repro. When the two messages name different bugs, fix the one the
+shrunk run. A message that changed only in its numbers is not another reason,
+so it prints no `before shrinking:`. The original is the seed alone: drop
+`--inputs` and `--faults-off` from the repro. When the two messages name different bugs, fix the one the
 repro shows, then rerun the batch.
 
 ### Re-basing a pinned property: `CHARPENTE_BASE_SEED`
