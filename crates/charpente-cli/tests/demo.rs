@@ -2,7 +2,7 @@
 //! re-sent POST places an order again, so a lost reply charges twice), and
 //! these tests pin it red under fixed master seeds and green once the three
 //! guard lines of `place_order` are restored. The demo is outside the
-//! workspace and `=0.6.0` resolves nowhere before the publish, so it is built
+//! workspace and `=0.7.0` resolves nowhere before the publish, so it is built
 //! only as a patched copy, as `new.rs` builds the scaffold.
 
 use std::ops::Deref;

@@ -111,7 +111,7 @@ charpente test --sim --master-seed 0x434841524745
 ```
 
 The first run builds the demo and its dependencies before it prints anything. The demo pins
-charpente 0.6.0, which printed the output above, and the master seed fixes every run in the
+charpente 0.7.0; charpente 0.6.0 printed the output above, and the master seed fixes every run in the
 batch, so you get the same output. Leave out `--master-seed` and the batch draws a master seed of
 its own: the order number and the seed change, and `demo.rs` checks that other master seeds fail
 the same check with the same fix.

@@ -107,12 +107,17 @@ const EXEMPT: &[(&str, &str)] = &[
          not a measurement",
     ),
     (
+        "0.7.0",
+        "the release README's example names: the one examples/double-charge pins (demo.rs's \
+         readme test); a version, not a measurement",
+    ),
+    (
         "0.6.0",
-        "the release README's example names, the one examples/double-charge pins and its quoted \
-         output came from (demo.rs's readme test); a version, not a measurement",
+        "the release whose run README's example quotes (the red output above the pin); a version, \
+         not a measurement",
     ),
 ];
-const EXEMPT_COUNT: usize = 13;
+const EXEMPT_COUNT: usize = 14;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
