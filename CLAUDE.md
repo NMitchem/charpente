@@ -191,7 +191,7 @@ item with the trigger that reopens it.
 - `examples/double-charge` — the launch tape's order API, shipped with its bug (a re-sent
   POST places an order again, so a lost reply charges twice). It is OUTSIDE the workspace
   (its own empty `[workspace]`) because it is what a stranger copies: it depends on
-  `charpente = "=0.6.0"` from crates.io, which resolves nowhere before the publish. Build and
+  `charpente = "=0.7.0"` from crates.io, which resolves nowhere before the publish. Build and
   test it only through `crates/charpente-cli/tests/demo.rs`'s patched copy, which pins it red
   under master seed 0x434841524745 and green with `place_order`'s three guard lines restored.
 
