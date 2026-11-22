@@ -1,6 +1,6 @@
 # Retry-safe writes
 
-Status: design, 2026-11-22, revision 2. Noah chose the contract ("every write carries an
+Status: design, 2026-11-22, revision 3. Noah chose the contract ("every write carries an
 order number, and charpente throws away repeats", option 1 of the 2026-11-22 twin
 discussion) and handed the rest over ("you have autonomy"). The choices marked *(call)* are
 the designer's. This is step 1 of two. Step 2, the fault-free twin
@@ -17,6 +17,23 @@ source:
   panic the kernel.
 - DECISIONS §6's loss window loses acked records, not unacked ones.
 - `demo.rs` and the scaffold pin today's double-apply.
+
+Revision 3 records the calls made while planning (`docs/superpowers/plans/2026-11-22-retry-safe-writes.md`):
+- **The wire refusal sits in `stage_or_subscribe`.** The edge's conversion
+  (`to_kernel_request`) runs on the network thread, which has no router. It marks the
+  request as from the wire, and the kernel refuses after matching and before the
+  `fresh_token` draw, so a refused request draws nothing.
+- **One 400 text** covers missing, malformed and non-ASCII ids. The edge drops a non-ASCII
+  header before charpente sees it.
+- **The row id** is the first 8 bytes of a SHA-256 over the length-prefixed principal, route
+  and id. A slot collision is refused by name, since it is rare but reachable at scale.
+- **`PROTO_VERSION` 9 and `MANIFEST_FORMAT` 6.** Platform tables sit outside the schema
+  digest, so the digests alone would let a 0.6.0 follower fail mid-replay.
+- **The sweep** is the kernel's eighth ready source: hourly, at most 4096 rows a step.
+- **The scaffold keeps its guard.** Its first branch was retry safety, which the platform now
+  provides, and its second is write-once, which is app semantics.
+- **README keeps 0.6.0's red runs** as labelled history and adds 0.7.0's green run, pinned.
+  Reframing the lead stays Noah's call.
 
 ## 1. Why
 
@@ -173,17 +190,19 @@ Each write route's entry gains `intent`: `"Idempotency-Key"`, or the declared he
 
 ## 5. What changes for existing artifacts
 
-- **The scaffold.** `charpente new`'s `add_note` drops its retry guard, because the platform
-  now does that job. `tests/new.rs`'s
-  `deleting_the_retry_guard_turns_the_echo_check_red_on_a_resend` becomes a pin that the
-  scaffold has no guard and its echo check stays green under `Drive`'s re-sends.
+- **The scaffold.** `charpente new`'s `add_note` keeps its guard (revision 3): re-sends are
+  the platform's now, and a second body under one note id is still the app's to refuse.
+  `tests/new.rs`'s `deleting_the_retry_guard_turns_the_echo_check_red_on_a_resend` becomes a
+  pin that deleting the guard leaves the echo check green under `Drive`'s re-sends and loses
+  only the conflict refusal.
 - **double-charge** pins `=0.6.0` on crates.io, so its published story is unchanged. On the
   workspace, the patched copy that `demo.rs` builds stops double charging. `demo.rs`'s
   red-run pins (`master_batch`'s exit 1, `GOLDEN`, `STARTUP`, the frame fit, the repro
   replay) and README's two quoted runs (`demo.rs:316`, `:349`) can't hold.
   - *(call)* The example becomes the 0.7.0 story: the same six-line route, the same re-send,
-    and the platform answering it, with the guard lines gone. `demo.rs` pins that run, and
-    README's two quoted runs are replaced with it.
+    and the platform answering it, with the guard lines gone. `demo.rs` pins that run. README
+    keeps its two 0.6.0 runs as labelled, unpinned history and adds the 0.7.0 run, pinned
+    (revision 3).
   - README's launch video stays, captioned as 0.6.0.
 - **Flag for Noah.** README's lead now tells a story about a bug 0.7.0 makes impossible.
   The factual update above keeps README true. Whether the lead should change is his call.
