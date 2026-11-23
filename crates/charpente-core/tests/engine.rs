@@ -23,7 +23,8 @@ use charpente_core::db::{
 };
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::event::EventRow;
-use charpente_core::io::{Disk, Entropy, File};
+use charpente_core::intent::{IntentReply, IntentRow};
+use charpente_core::io::{Disk, Entropy, File, WallTime};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
@@ -471,17 +472,19 @@ fn an_ordinary_table_is_unscoped_by_default() {
     assert_unscoped::<Widget>();
 }
 
-/// The platform's three tables share the scope that seals them
-/// (tenancy-completion spec §3). A type-level pin: it stops compiling, not
-/// running, if one of them goes back to `Unscoped`. The refusal an app meets
-/// is pinned by the `job_row_*`, `event_row_*` and `schema_version_*`
-/// compile-fail fixtures in `charpente-macros`.
+/// The platform's four tables share the scope that seals them
+/// (tenancy-completion spec §3, retry-safe-writes spec §4.2). A type-level
+/// pin: it stops compiling, not running, if one of them goes back to
+/// `Unscoped`. The refusal an app meets is pinned by the `job_row_*`,
+/// `event_row_*`, `schema_version_*` and `intent_row_*` compile-fail fixtures
+/// in `charpente-macros`.
 #[test]
 fn the_platform_tables_are_platform_owned() {
     fn assert_platform<R: Row<Scope = PlatformOwned>>() {}
     assert_platform::<JobRow>();
     assert_platform::<EventRow>();
     assert_platform::<SchemaVersion>();
+    assert_platform::<IntentRow>();
 }
 
 /// The platform's tables are read through a `Snapshot` and nothing else
@@ -500,6 +503,7 @@ fn a_platform_row_is_read_through_a_snapshot() {
     assert_readable::<JobRow>();
     assert_readable::<EventRow>();
     assert_readable::<SchemaVersion>();
+    assert_readable::<IntentRow>();
 }
 
 // `scoped_key`'s ordering property is pinned by `table.rs`'s own
@@ -4558,4 +4562,375 @@ fn a_frame_corrupted_after_its_ack_is_refused_at_read_back_naming_the_restore_wi
              restore this node from a replica or backup. {RESTORE_IS_A_RESEED} (DESIGN §2)"
         )
     );
+}
+
+// ------------------------------- retry-safe writes: the sealed intents table
+
+/// One row of `charpente.intents` with every field set apart from its id's,
+/// so a field the codec drops or swaps shows in the round trip.
+fn intent_row(id: u64, committed_at: u64, reply: IntentReply) -> IntentRow {
+    IntentRow {
+        id: Id::from_raw(id),
+        intent: format!("order-{id}-attempt"),
+        principal: Some(format!("user:{id}")),
+        route: "POST /orders/:id".to_string(),
+        fingerprint: [id as u8 ^ 0x5a; 32],
+        committed_at: WallTime::from_nanos(committed_at),
+        status: 201,
+        reply,
+    }
+}
+
+/// Every `IntentReply` variant, a public route's row (no principal) among
+/// them, staged through a `Group`'s `IntentAccess`, committed, and read back
+/// after a crash-restart, so reopening replays each row from the log through
+/// the codec rather than reading the materialized store.
+#[test]
+fn an_intent_row_round_trips_through_the_log_and_a_reopen() {
+    let sim = Sim::with_faults(0x1D7E_0001, FaultConfig::none());
+    let kept = intent_row(
+        1,
+        1_700_000_000_000_000_000,
+        IntentReply::Kept {
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("location".to_string(), "/orders/9".to_string()),
+            ],
+            body: br#"{"id":9}"#.to_vec(),
+        },
+    );
+    let credential = IntentRow {
+        principal: None,
+        status: 200,
+        ..intent_row(2, 1_700_000_000_000_000_001, IntentReply::Credential)
+    };
+    let too_large = IntentRow {
+        status: 202,
+        ..intent_row(
+            u64::MAX,
+            u64::MAX,
+            IntentReply::TooLarge {
+                bytes: 65_537 + (1 << 40),
+            },
+        )
+    };
+    let empty_kept = intent_row(
+        3,
+        0,
+        IntentReply::Kept {
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
+    );
+    let rows = [kept, credential, too_large, empty_kept];
+
+    // The codec alone first. Apply decodes a row and stores it re-encoded, so
+    // a decode that a second pass undoes (two fields swapped) would come back
+    // intact through the log and the reopen below.
+    for row in &rows {
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        assert_eq!(IntentRow::decode_row(&bytes).unwrap(), *row);
+        bytes.push(0);
+        assert_eq!(
+            IntentRow::decode_row(&bytes).unwrap_err().to_string(),
+            "row decode: 1 trailing byte(s) after an IntentRow's reply, which ends the row — the \
+             stored row is corrupt"
+        );
+    }
+
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    for row in &rows {
+        group
+            .stage(|tx| -> Result<(), io::Error> {
+                tx.put_intent(row, &access);
+                Ok(())
+            })
+            .unwrap();
+    }
+    group.commit().unwrap();
+
+    sim.restart();
+    drop(db);
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    for row in &rows {
+        let back = group.stage(|tx| tx.get_intent(row.id, &access)).unwrap();
+        assert_eq!(back.as_ref(), Some(row), "row {:?} after a reopen", row.id);
+    }
+    let absent = group
+        .stage(|tx| tx.get_intent(Id::from_raw(4), &access))
+        .unwrap();
+    assert_eq!(absent, None, "an id never put reads as no row");
+    group.commit().unwrap();
+}
+
+/// `Group::stage` reads through the group's overlay, so a second copy of a
+/// request staged in the same batch finds the first copy's record before
+/// either commits (spec §3, "The request path").
+#[test]
+fn a_later_stage_in_one_group_sees_an_earlier_stages_intent() {
+    let sim = Sim::with_faults(0x1D7E_0002, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let row = intent_row(7, 5, IntentReply::Credential);
+
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    let before = group.stage(|tx| tx.get_intent(row.id, &access)).unwrap();
+    assert_eq!(before, None, "nothing is recorded before the first stage");
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            tx.put_intent(&row, &access);
+            Ok(())
+        })
+        .unwrap();
+    let seen = group.stage(|tx| tx.get_intent(row.id, &access)).unwrap();
+    assert_eq!(
+        seen.as_ref(),
+        Some(&row),
+        "a later stage of the same group must see the record an earlier stage staged"
+    );
+    group.commit().unwrap();
+}
+
+/// The request path records an intent only beside another effect (spec
+/// §4.2): a read leaves `has_effects` false, and the first write turns it.
+#[test]
+fn has_effects_turns_true_at_the_first_write_and_not_before() {
+    let sim = Sim::with_faults(0x1D7E_0003, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Widget>(),
+    )
+    .unwrap();
+    let row = intent_row(8, 5, IntentReply::Credential);
+
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            assert!(!tx.has_effects(), "a fresh transaction has staged nothing");
+            assert_eq!(tx.get_intent(row.id, &access)?, None);
+            assert!(tx.get::<Widget>(Id::from_raw(1))?.is_none());
+            assert!(!tx.has_effects(), "a read is not an effect");
+            tx.put(&Widget {
+                id: Id::from_raw(1),
+                n: 1,
+            });
+            assert!(tx.has_effects(), "the first write is an effect");
+            Ok(())
+        })
+        .unwrap();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            assert!(
+                !tx.has_effects(),
+                "the next transaction starts with nothing staged, whatever the group holds"
+            );
+            tx.delete::<Widget>(Id::from_raw(1));
+            assert!(tx.has_effects(), "a delete is an effect");
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+}
+
+/// The retention sweep's read: the ids of rows committed strictly before a
+/// time, at most `limit` of them, over the store, the group's overlay and the
+/// transaction's own, with a staged delete hiding its row.
+#[test]
+fn intents_committed_before_returns_only_older_ids_and_honours_the_limit() {
+    let sim = Sim::with_faults(0x1D7E_0004, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    // Ids out of time order, so neither order can stand in for the other.
+    let at_1 = intent_row(30, 1, IntentReply::Credential);
+    let at_2 = intent_row(10, 2, IntentReply::Credential);
+    let at_3 = intent_row(20, 3, IntentReply::Credential);
+    let deleted = intent_row(40, 1, IntentReply::Credential);
+
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            tx.put_intent(&at_1, &access);
+            tx.put_intent(&deleted, &access);
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            tx.put_intent(&at_2, &access);
+            tx.delete_intent(deleted.id, &access);
+            Ok(())
+        })
+        .unwrap();
+    let (older, one, none) = group
+        .stage(|tx| -> Result<_, io::Error> {
+            tx.put_intent(&at_3, &access);
+            Ok((
+                tx.intents_committed_before(WallTime::from_nanos(3), 10, &access)?,
+                tx.intents_committed_before(WallTime::from_nanos(3), 1, &access)?,
+                tx.intents_committed_before(WallTime::from_nanos(1), 10, &access)?,
+            ))
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    assert_eq!(
+        older,
+        vec![at_2.id, at_1.id],
+        "the two rows committed before t=3, from the store and the group's overlay, in id \
+         order; the row at t=3 is not older than t=3, and the deleted row is gone"
+    );
+    assert_eq!(one.len(), 1, "a limit of 1 returns exactly one id: {one:?}");
+    assert!(
+        older.contains(&one[0]),
+        "the one id is an older row's: {one:?}"
+    );
+    assert_eq!(none, Vec::new(), "no row was committed before t=1");
+}
+
+#[test]
+fn delete_intent_removes_the_row() {
+    let sim = Sim::with_faults(0x1D7E_0005, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let row = intent_row(9, 5, IntentReply::Credential);
+
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            tx.put_intent(&row, &access);
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            assert!(
+                tx.get_intent(row.id, &access)?.is_some(),
+                "the row committed"
+            );
+            tx.delete_intent(row.id, &access);
+            assert_eq!(
+                tx.get_intent(row.id, &access)?,
+                None,
+                "a transaction reads its own delete"
+            );
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    sim.restart();
+    drop(db);
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    let back = group.stage(|tx| tx.get_intent(row.id, &access)).unwrap();
+    group.commit().unwrap();
+    assert_eq!(back, None, "the delete replays from the log");
+}
+
+/// `Db::open` registers `IntentRow` itself, so `seed_schema` strips it and a
+/// `Seeder` adds it back: a seeded follower or a restored archive carries the
+/// record, and `Seeder::new` over a schema from `seed_schema` does not trip
+/// the duplicate-registration assert.
+#[test]
+fn the_seeder_imports_intents_and_seed_schema_strips_them() {
+    let row = intent_row(
+        11,
+        5,
+        IntentReply::Kept {
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: b"placed".to_vec(),
+        },
+    );
+    let primary_sim = Sim::with_faults(0x1D7E_0006, FaultConfig::none());
+    let mut primary = Db::open(
+        Box::new(primary_sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Widget>(),
+    )
+    .unwrap();
+    let mut group = primary.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            tx.put_intent(&row, &access);
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    assert!(
+        primary.table_names().contains(&IntentRow::TABLE),
+        "Db::open registers the intents table: {:?}",
+        primary.table_names()
+    );
+    let seed_schema = primary.seed_schema();
+    assert_eq!(
+        seed_schema.table_names(),
+        vec![Widget::TABLE],
+        "seed_schema strips every table Db::open adds, the intents table among them"
+    );
+    assert_eq!(seed_schema.table_meta(IntentRow::TABLE), None);
+    let exported = primary
+        .snapshot()
+        .unwrap()
+        .scan_raw(IntentRow::TABLE, false)
+        .unwrap();
+    assert_eq!(exported.len(), 1, "the primary's export holds the one row");
+
+    let follower_sim = Sim::with_faults(0x1D7E_0007, FaultConfig::none());
+    let mut seeder = Seeder::new(
+        Box::new(follower_sim.disk()),
+        DbConfig::default(),
+        seed_schema,
+    )
+    .unwrap();
+    assert!(
+        !seeder.table_scoped(IntentRow::TABLE).unwrap(),
+        "the seeder imports the intents table, unscoped"
+    );
+    seeder.rows(IntentRow::TABLE, &exported).unwrap();
+    let mut follower = seeder.finish(0, 0, 0, 0).unwrap();
+    let mut group = follower.begin_group().unwrap();
+    let access = group.intent_access();
+    let back = group.stage(|tx| tx.get_intent(row.id, &access)).unwrap();
+    group.commit().unwrap();
+    assert_eq!(
+        back.as_ref(),
+        Some(&row),
+        "the seeded follower holds the row"
+    );
+}
+
+/// Negative space at the codec: the request path refuses any id outside 1 to
+/// 255 visible ASCII bytes before it looks one up, so a row carrying one was
+/// never checked, and storing it would let a re-send match on bytes the wire
+/// never accepts.
+#[test]
+#[should_panic(
+    expected = "IntentRow 12: the intent id \"two words\" is not 1 to 255 visible ASCII bytes \
+                (0x21..=0x7e) — the request path refuses any other id before it looks one up, so \
+                a row holding one was never checked"
+)]
+fn an_intent_row_with_an_unchecked_id_is_refused_at_encode() {
+    let row = IntentRow {
+        intent: "two words".to_string(),
+        ..intent_row(12, 5, IntentReply::Credential)
+    };
+    row.encode_row(&mut Vec::new());
 }

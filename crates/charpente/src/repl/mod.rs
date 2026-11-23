@@ -53,8 +53,11 @@ pub mod witnesses;
 /// row's longer tail, which its decoder calls corrupt. 0.3's wall-time columns
 /// (`WallTime` in the platform tables) make it 7: a 0.2 peer is refused at
 /// Hello by name, never migrated (DECISIONS §15). 0.5's `0x0e` timed enqueue, a job
-/// carrying its due time, makes it 8.
-pub const PROTO_VERSION: u8 = 8;
+/// carrying its due time, makes it 8. 0.7's platform table `charpente.intents`, which
+/// seeding ships like the other platform tables and a 0.6 follower's schema does not
+/// register, makes it 9, so a 0.6 peer is refused at Hello by name rather than at its
+/// first intent row.
+pub const PROTO_VERSION: u8 = 9;
 
 /// The hard ceiling on one encoded `Msg` on the wire: one `MAX_RECORD_BYTES`
 /// frame (16 MiB) plus envelope overhead (spec Global Constraints).

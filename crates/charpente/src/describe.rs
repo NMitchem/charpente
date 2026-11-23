@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use charpente_core::db::{Job, TableDescription};
 use charpente_core::event::EventRow;
+use charpente_core::intent::IntentRow;
 use charpente_core::job::JobRow;
 use charpente_core::migration::SchemaVersion;
 use charpente_core::table::Row;
@@ -318,10 +319,10 @@ fn table_info(t: TableDescription) -> TableInfo {
 }
 
 /// The exact platform-owned table set: `Session`/`ApiKey`/`CronRow`
-/// (`App::open`) plus `charpente.jobs`/`charpente.events`/`SchemaVersion`
-/// (`Db::open`) — keyed on each Row's own `TABLE` const, never a typed-in
-/// string literal, so a rename of any platform table can't silently drift
-/// out of sync with this list.
+/// (`App::open`) plus `charpente.jobs`/`charpente.events`/`SchemaVersion`/
+/// `charpente.intents` (`Db::open`) — keyed on each Row's own `TABLE` const,
+/// never a typed-in string literal, so a rename of any platform table can't
+/// silently drift out of sync with this list.
 fn is_builtin_table(name: &str) -> bool {
     name == Session::TABLE
         || name == ApiKey::TABLE
@@ -329,6 +330,7 @@ fn is_builtin_table(name: &str) -> bool {
         || name == JobRow::TABLE
         || name == EventRow::TABLE
         || name == SchemaVersion::TABLE
+        || name == IntentRow::TABLE
 }
 
 fn route_info(route: &Route) -> RouteInfo {

@@ -14,6 +14,7 @@ help: the trait `Row` is not implemented for `NotATable`
    = help: the following other types implement trait `Row`:
              CronRow
              EventRow
+             IntentRow
              JobRow
              SchemaVersion
              charpente::auth::ApiKey

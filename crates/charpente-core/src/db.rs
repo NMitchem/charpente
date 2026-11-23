@@ -62,6 +62,7 @@ use std::io;
 
 use crate::engine::{Engine, StateMachine, SubmitFailure};
 use crate::event::EventRow;
+use crate::intent::IntentRow;
 use crate::io::{Disk, Entropy, File, WallTime};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
@@ -649,10 +650,10 @@ impl Schema {
     }
 
     /// Drops one table's ops. Used only by `Db::into_seeder` to strip the
-    /// platform-owned registrations — `JobRow`, `EventRow`, `SchemaVersion`
-    /// (`Db::open` always adds all three) — before handing the schema to a
-    /// fresh `Seeder`, which re-adds them itself; without this, that would
-    /// hit `table`'s own duplicate-registration assert.
+    /// platform-owned registrations — `JobRow`, `EventRow`, `SchemaVersion`,
+    /// `IntentRow` (`Db::open` always adds all four) — before handing the
+    /// schema to a fresh `Seeder`, which re-adds them itself; without this,
+    /// that would hit `table`'s own duplicate-registration assert.
     pub(crate) fn remove(&mut self, table: &'static str) {
         self.tables.remove(table);
     }
@@ -1191,22 +1192,25 @@ fn decode_outbound_key(input: &mut &[u8]) -> io::Result<[u8; 16]> {
 // ---------------------------------------------------------------- tx
 
 /// The tables only the platform writes, by name: the job queue, the event
-/// log and the migration record. Each one's own type is refused by
-/// `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a record's
-/// effect by TABLE NAME, so any other `Row` whose `TABLE` borrows one of
-/// these would write rows the platform trusts: the dispatcher a job's
+/// log, the migration record and the intents record. Each one's own type is
+/// refused by `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a
+/// record's effect by TABLE NAME, so any other `Row` whose `TABLE` borrows
+/// one of these would write rows the platform trusts: the dispatcher a job's
 /// tenant, every subscription its feed, the migration gate a table's
-/// version. The app-facing writes (`Tx::put`/`delete`, `ScopedTx::put`/
-/// `delete`) refuse such a type in a `const` block. That refusal is a
-/// post-monomorphization error: `cargo build` and `cargo test` report it at
-/// the app's call site, and `cargo check`, which never monomorphizes, does
-/// not. No binary that performs the write can be built. Sealing another
+/// version, the request path a re-sent write's reply. The app-facing writes
+/// (`Tx::put`/`delete`, `ScopedTx::put`/`delete`) refuse such a type in a
+/// `const` block. That refusal is a post-monomorphization error: `cargo
+/// build` and `cargo test` report it at the app's call site, and `cargo
+/// check`, which never monomorphizes, does not. No binary that performs the
+/// write can be built. Sealing another
 /// platform table is its name here, its `type Scope = PlatformOwned`, and an
-/// arm of its own in `refuse_platform_table` and under `AppWritable`.
-const PLATFORM_TABLES: [&str; 3] = [
+/// arm of its own in `refuse_platform_table`, `refuse_platform_read`, and
+/// under `AppWritable` and `ScopeReadableBy`.
+const PLATFORM_TABLES: [&str; 4] = [
     JobRow::TABLE,
     EventRow::TABLE,
     crate::migration::SchemaVersion::TABLE,
+    IntentRow::TABLE,
 ];
 
 /// Which of `PLATFORM_TABLES` `table` names, by index, or `None` for a table
@@ -1258,6 +1262,13 @@ const fn refuse_platform_table(table: &str) {
              own, and change a table's version by declaring it (`#[table(version = N)]` with \
              its `TableMigration`), which the kernel migrates at startup"
         ),
+        Some(3) => panic!(
+            "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+             writes — intent rows are the platform's, and app code cannot write them: only the \
+             request path writes one, in the transaction of the write it records, because a \
+             re-sent request is answered from it; give this table a name of its own, and keep \
+             what a handler records in a table of the app's own"
+        ),
         Some(_) => panic!(
             "PLATFORM_TABLES names a table refuse_platform_table has no text for — give it an \
              arm of its own"
@@ -1292,6 +1303,12 @@ const fn refuse_platform_read(table: &str) {
              — a transaction does not read the platform's tables, because the record is the \
              migration gate's own state; give this table a name of its own, and read the record \
              through `db.snapshot()` from code that holds the `Db`"
+        ),
+        Some(3) => panic!(
+            "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+             writes — intent rows are the platform's, and app code cannot read them: the record \
+             holds every principal's stored replies; give this table a name of its own, and read \
+             the record through `db.snapshot()` from code that holds the `Db`"
         ),
         Some(_) => panic!(
             "PLATFORM_TABLES names a table refuse_platform_read has no text for — give it an arm \
@@ -1364,8 +1381,9 @@ impl<'a> Tx<'a> {
     /// Scoped writes go through `put_in` (or, in an app, `ScopedTx::put`).
     ///
     /// The same bound refuses a platform row (`JobRow`, `EventRow`,
-    /// `SchemaVersion`), and the `const` block refuses any other row type
-    /// whose `TABLE` borrows a platform table's name (`PLATFORM_TABLES`).
+    /// `SchemaVersion`, `IntentRow`), and the `const` block refuses any other
+    /// row type whose `TABLE` borrows a platform table's name
+    /// (`PLATFORM_TABLES`).
     pub fn put<R: WritableRow>(&mut self, row: &R) {
         const { refuse_platform_table(R::TABLE) };
         let mut bytes = Vec::new();
@@ -1468,9 +1486,107 @@ impl<'a> Tx<'a> {
         self.get_any(id)
     }
 
+    /// The request path's read of an intent record (retry-safe-writes spec
+    /// §4.2): this transaction's writes, then the group's, then the snapshot,
+    /// as `View::get` reads, so a second copy of a request staged in the same
+    /// group finds the first copy's record. `View` refuses `IntentRow` on a
+    /// `Tx` at compile time, because the record holds every principal's
+    /// stored replies; this is the one door, and it takes an `IntentAccess`,
+    /// which only a `Group` mints and no handler or job holds.
+    pub fn get_intent(
+        &self,
+        id: Id<IntentRow>,
+        access: &IntentAccess<'_>,
+    ) -> io::Result<Option<IntentRow>> {
+        let IntentAccess(_) = access;
+        self.get_any(id)
+    }
+
+    /// Stages an intent record, in this transaction, beside the write it
+    /// records. `Tx::put` refuses `IntentRow` at compile time; this is `put`'s
+    /// body without that bound, behind an `IntentAccess`. It records its type
+    /// in `written_as` as `put` does, so `Group::stage` holds it to the
+    /// registered `IntentRow` like any other write.
+    pub fn put_intent(&mut self, row: &IntentRow, access: &IntentAccess<'_>) {
+        let IntentAccess(_) = access;
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        self.effects.written_as.insert((
+            IntentRow::TABLE,
+            std::any::type_name::<IntentRow>(),
+            false,
+            TypeId::of::<IntentRow>(),
+        ));
+        self.effects
+            .overlay
+            .entry(IntentRow::TABLE)
+            .or_default()
+            .insert((UNSCOPED, row.id.raw()), Some(bytes));
+    }
+
+    /// `put_intent`'s tombstone: the retention sweep's delete (spec §4.4).
+    pub fn delete_intent(&mut self, id: Id<IntentRow>, access: &IntentAccess<'_>) {
+        let IntentAccess(_) = access;
+        self.effects.written_as.insert((
+            IntentRow::TABLE,
+            std::any::type_name::<IntentRow>(),
+            false,
+            TypeId::of::<IntentRow>(),
+        ));
+        self.effects
+            .overlay
+            .entry(IntentRow::TABLE)
+            .or_default()
+            .insert((UNSCOPED, id.raw()), None);
+    }
+
+    /// The retention sweep's read (spec §4.4): the ids, in id order, of at
+    /// most `limit` intent records whose `committed_at` is strictly before
+    /// `before`, over the snapshot, the group's writes and this
+    /// transaction's, as `View::scan` merges them.
+    pub fn intents_committed_before(
+        &self,
+        before: WallTime,
+        limit: usize,
+        access: &IntentAccess<'_>,
+    ) -> io::Result<Vec<Id<IntentRow>>> {
+        let IntentAccess(_) = access;
+        let mut merged: BTreeMap<u64, IntentRow> = BTreeMap::new();
+        for row in self.snapshot.scan_any::<IntentRow>()? {
+            merged.insert(row.id.raw(), row);
+        }
+        merge_overlay_rows(
+            &mut merged,
+            self.group.and_then(|g| g.get(IntentRow::TABLE)),
+            UNSCOPED,
+            0,
+        )?;
+        merge_overlay_rows(
+            &mut merged,
+            self.effects.overlay.get(IntentRow::TABLE),
+            UNSCOPED,
+            0,
+        )?;
+        Ok(merged
+            .into_values()
+            .filter(|row| row.committed_at < before)
+            .map(|row| row.id)
+            .take(limit)
+            .collect())
+    }
+
+    /// Whether this transaction has staged anything its commit would record:
+    /// a put or delete, an enqueue, an emit, or a migration write. A read is
+    /// not one. A first write's schema-version adoption row is added by
+    /// `Group::stage` after the transaction returns, so it never counts here.
+    pub fn has_effects(&self) -> bool {
+        !self.effects.is_empty()
+    }
+
     /// `View::get`'s read without `View`'s bounds: this transaction's own
     /// writes, then the group's, then the snapshot. Private: `View::get`
-    /// (after its refusals) and `Tx::get_job` are its only callers.
+    /// (after its refusals), `Tx::get_job` and `Tx::get_intent` are its only
+    /// callers.
     fn get_any<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
         match self
             .effects
@@ -1839,10 +1955,10 @@ fn merge_overlay_rows<R: Row>(
         } else {
             // Negative space (hard rule 4): an unscoped table's overlay is
             // written only by `Tx::put`/`Tx::delete` (both `R: WritableRow`),
-            // `Tx::settle_job`, `Tx::put_schema_version` and the SchemaVersion
-            // adoption row, all of which stage `UNSCOPED`. A skip here would turn
-            // a staging bug into a
-            // silently missing row instead of a loud one.
+            // `Tx::settle_job`, `Tx::put_schema_version`, the SchemaVersion
+            // adoption row and `Tx::put_intent`/`Tx::delete_intent`, all of
+            // which stage `UNSCOPED`. A skip here would turn a staging bug
+            // into a silently missing row instead of a loud one.
             assert_eq!(
                 entry_scope,
                 UNSCOPED,
@@ -2669,6 +2785,32 @@ impl<'a> Group<'a> {
     /// `cross_tenant_cap` does, for the same reason.
     pub fn tenant_admission(&self) -> TenantAdmission<'a> {
         TenantAdmission(std::marker::PhantomData)
+    }
+}
+
+/// Proof that the platform's request staging, its retention sweep, or the
+/// operator reaches `charpente.intents`: the argument of `Tx::get_intent`,
+/// `Tx::put_intent`, `Tx::delete_intent` and `Tx::intents_committed_before`
+/// (retry-safe-writes spec §4.2, §4.4). The record holds every principal's
+/// stored replies, and a re-sent request is answered from it without running,
+/// so a row app code could write would answer a request that never ran.
+///
+/// Sealed exactly as `TenantAdmission` is: its field is private,
+/// `Group::intent_access` is the only constructor, and a handler holds
+/// `&mut Tx` and `&Ctx`, never a `Group`, so no app code reads or writes the
+/// record. Operator code that holds a `Group` can, by `Tx::settle_job`'s
+/// standing: whoever holds the `Db` already holds the store (ruling R48).
+///
+/// Tied to its `Group` and not `Clone`, as `TenantAdmission` is.
+pub struct IntentAccess<'g>(std::marker::PhantomData<&'g ()>);
+
+impl<'a> Group<'a> {
+    /// Mints the access `Tx`'s intent methods take. The only constructor;
+    /// see `IntentAccess`. Borrows what the group borrows, as
+    /// `tenant_admission` does, so a caller mints it and then stages in the
+    /// same group.
+    pub fn intent_access(&self) -> IntentAccess<'a> {
+        IntentAccess(std::marker::PhantomData)
     }
 }
 
@@ -3523,13 +3665,14 @@ impl Db {
     /// checkpointed store replays from the horizon, so there a breadcrumb
     /// past the store refuses too.
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
-        // The jobs, events, and schema-versions tables are platform-owned; an
-        // app registering any itself hits the existing duplicate-registration
-        // assert.
+        // The jobs, events, schema-versions and intents tables are
+        // platform-owned; an app registering any itself hits the existing
+        // duplicate-registration assert.
         let schema = schema
             .table::<JobRow>()
             .table::<EventRow>()
-            .table::<crate::migration::SchemaVersion>();
+            .table::<crate::migration::SchemaVersion>()
+            .table::<IntentRow>();
         let store = match Store::open(&*disk, &cfg.store_path) {
             Ok(store) => store,
             Err(e) => {
@@ -4708,9 +4851,9 @@ impl Db {
     /// Deconstructs a live `Db` into a `Seeder` over the same disk — the seed
     /// path's producer side (DESIGN §5): an app rebuilding a follower's state
     /// in-process from its own primary's snapshot. The recovered schema
-    /// already carries `JobRow`/`EventRow`/`SchemaVersion` (`Db::open` adds
-    /// all three on the way in); `Schema::remove` strips them back off so
-    /// `Seeder::new` doesn't double-register any.
+    /// already carries `JobRow`/`EventRow`/`SchemaVersion`/`IntentRow`
+    /// (`Db::open` adds all four on the way in); `Schema::remove` strips them
+    /// back off so `Seeder::new` doesn't double-register any.
     pub fn into_seeder(self) -> io::Result<Seeder> {
         let schema = self.seed_schema();
         let (wal, machine) = self.engine.into_parts();
@@ -4720,9 +4863,9 @@ impl Db {
     }
 
     /// This `Db`'s schema as a `Seeder` wants it: the caller's registrations,
-    /// with the three the platform adds at `open` (`JobRow`, `EventRow`,
-    /// `SchemaVersion`) stripped, because `Seeder::new` re-adds all three
-    /// itself and `Schema::table` asserts on a duplicate.
+    /// with the four the platform adds at `open` (`JobRow`, `EventRow`,
+    /// `SchemaVersion`, `IntentRow`) stripped, because `Seeder::new` re-adds
+    /// all four itself and `Schema::table` asserts on a duplicate.
     ///
     /// Public because a `Seeder` is not always built from the `Db` that owns
     /// the schema: `charpente restore` rebuilds a directory from an archive,
@@ -4734,6 +4877,7 @@ impl Db {
         schema.remove(JobRow::TABLE);
         schema.remove(EventRow::TABLE);
         schema.remove(crate::migration::SchemaVersion::TABLE);
+        schema.remove(IntentRow::TABLE);
         schema
     }
 }
@@ -5308,17 +5452,17 @@ pub struct Seeder {
     disk: Box<dyn Disk>,
     cfg: DbConfig,
     schema: Schema,        // the caller's schema, passed to Db::open at finish
-    import_schema: Schema, // schema + JobRow + EventRow + SchemaVersion, used to decode/import rows
+    import_schema: Schema, // schema + the four platform tables, used to decode/import rows
     store: Store,
 }
 
 impl Seeder {
-    /// `schema` must NOT include `JobRow`/`EventRow`/`SchemaVersion` —
-    /// `Seeder` registers all three itself (mirroring `Db::open`), so a
-    /// schema already carrying any (e.g. one recovered from a live `Db` via
-    /// `into_seeder`) would double-register. Discards any store file,
-    /// horizon breadcrumb, and `wal/` segments already at `disk`, dir-
-    /// barriered — seeding always replaces a timeline, never merges into
+    /// `schema` must NOT include `JobRow`/`EventRow`/`SchemaVersion`/
+    /// `IntentRow` — `Seeder` registers all four itself (mirroring
+    /// `Db::open`), so a schema already carrying any (e.g. one recovered from
+    /// a live `Db` via `into_seeder`) would double-register. Discards any
+    /// store file, horizon breadcrumb, and `wal/` segments already at `disk`,
+    /// dir-barriered — seeding always replaces a timeline, never merges into
     /// one. The breadcrumb must go too: left behind, a stale breadcrumb from
     /// a higher-numbered prior timeline sharing this disk (e.g. a demoted
     /// primary re-seeded in place) would survive into the freshly seeded
@@ -5341,7 +5485,8 @@ impl Seeder {
             .clone()
             .table::<JobRow>()
             .table::<EventRow>()
-            .table::<crate::migration::SchemaVersion>();
+            .table::<crate::migration::SchemaVersion>()
+            .table::<IntentRow>();
         Ok(Seeder {
             disk,
             cfg,
@@ -5660,12 +5805,23 @@ mod tests {
                  migrates at startup"
             )
         );
+        assert_eq!(
+            refusal_text(refuse_platform_table, "charpente.intents").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+                 writes — intent rows are the platform's, and app code cannot write them: only \
+                 the request path writes one, in the transaction of the write it records, \
+                 because a re-sent request is answered from it; give this table a name of its \
+                 own, and keep what a handler records in a table of the app's own"
+            )
+        );
         for table in [
             "Invoice",
             "charpente",
             "charpente.job",
             "charpente.jobs2",
             "charpente.event",
+            "charpente.intent",
             "Charpente.Jobs",
             "",
         ] {
@@ -5710,10 +5866,20 @@ mod tests {
                  and read the record through `db.snapshot()` from code that holds the `Db`"
             )
         );
+        assert_eq!(
+            refusal_text(refuse_platform_read, "charpente.intents").as_deref(),
+            Some(
+                "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+                 writes — intent rows are the platform's, and app code cannot read them: the \
+                 record holds every principal's stored replies; give this table a name of its \
+                 own, and read the record through `db.snapshot()` from code that holds the `Db`"
+            )
+        );
         for table in [
             "Invoice",
             "charpente.jobs2",
             "charpente.event",
+            "charpente.intents2",
             "Charpente.Events",
             "",
         ] {

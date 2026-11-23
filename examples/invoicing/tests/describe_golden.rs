@@ -39,9 +39,9 @@ fn the_invoicing_events_fingerprints_do_not_move() {
     assert_eq!(<ReceiptSent as Event>::FINGERPRINT, 0x133d_31e7_fc9e_acca);
 }
 
-// 13 tables (7 app: AppClock, Customer, IdCounter, Invoice, LineItem,
-// Receipt, Reminder; 6 builtin: ApiKey, CronRow, Session, charpente.events,
-// charpente.jobs, charpente.schema_versions), 12 routes (build_app's
+// 14 tables (7 app: AppClock, Customer, IdCounter, Invoice, LineItem,
+// Receipt, Reminder; 7 builtin: ApiKey, CronRow, Session, charpente.events,
+// charpente.intents, charpente.jobs, charpente.schema_versions), 12 routes (build_app's
 // `routes_macro![...]` list, in registration order), 2 events (task 6:
 // build_app's `events_macro![InvoiceFinalized, ReceiptSent]`, rendered in
 // event-NAME order — invoice_finalized, receipt_sent — not registration
@@ -164,6 +164,15 @@ const GOLDEN: &str = r#"{
     },
     {
       "name": "charpente.events",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "scoped": false,
+      "builtin": true
+    },
+    {
+      "name": "charpente.intents",
       "version": 1,
       "fingerprint": null,
       "indexes": [],

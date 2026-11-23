@@ -7,8 +7,9 @@ error[E0277]: `JobRow` is one of the platform's tables, and a transaction does n
    |                      required by a bound introduced by this call
    |
    = help: the trait `ScopeReadableBy<Tx<'_>, JobRow>` is not implemented for `charpente::charpente_core::table::PlatformOwned`
-   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`), the migration record (`SchemaVersion`) and the intents record (`IntentRow`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
                db.snapshot()?.scan::<JobRow>()?
+   = note: the intents record holds every principal's stored replies, and the request path answers a re-sent write from it before any handler runs
    = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
 help: the trait `ScopeReadableBy<V, R>` is conditionally implemented for `charpente::charpente_core::table::PlatformOwned`
   --> $WORKSPACE/crates/charpente-core/src/table.rs
@@ -42,6 +43,7 @@ error[E0277]: `JobRow` rows are the platform's, and app code cannot write them
                tx.enqueue_in::<Org>(scope, job, cap);
    = note: event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
    = note: schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
+   = note: intent rows are the platform's: only the request path writes one, in the transaction of the write it records, because a re-sent request is answered from it without running — charpente records each write route's reply itself, so there is nothing to write; a handler that remembers an id of its own keeps it in a table of the app's own
 help: the trait `AppWritable<R>` is implemented for `Unscoped`
   --> $WORKSPACE/crates/charpente-core/src/table.rs
    |

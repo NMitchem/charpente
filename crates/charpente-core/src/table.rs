@@ -306,9 +306,11 @@ pub struct Unscoped;
 
 /// The scope marker of the platform's tables: `charpente.jobs`, whose rows
 /// the dispatcher trusts for a job's tenant (job-tenancy spec §6),
-/// `charpente.events`, which every subscription's feed is read from, and
+/// `charpente.events`, which every subscription's feed is read from,
 /// `charpente.schema_versions`, which the migration gate trusts for each
-/// table's version (tenancy-completion spec §3). Keyed like `Unscoped`, by
+/// table's version (tenancy-completion spec §3), and `charpente.intents`,
+/// which the request path answers a re-sent write from (retry-safe-writes
+/// spec §4.2). Keyed like `Unscoped`, by
 /// bare id. What it withholds is the transaction. `Tx::put`/`Tx::delete`
 /// bound `R: WritableRow`, which a row of this scope fails, by name.
 /// `View`'s reads bound `R: ReadableBy<Self>`, which it meets for `Snapshot`
@@ -317,13 +319,14 @@ pub struct Unscoped;
 /// writes one:
 /// the enqueue family and the dispatcher's `Tx::settle_job` a job row, apply
 /// an event row, first-write adoption and `Tx::put_schema_version` a
-/// schema-version row.
+/// schema-version row, and `Tx::put_intent`/`Tx::delete_intent`, behind a
+/// `Group`'s `IntentAccess`, an intent row.
 ///
 /// `#[doc(hidden)]` so rustc's "the trait is implemented for" hint under
 /// `NoTenant`'s diagnostic keeps naming `Unscoped` alone: this is not a
 /// scope an app table can take. Sealing another platform table is its
 /// `type Scope = PlatformOwned`, its name in `db.rs`'s `PLATFORM_TABLES`,
-/// and its own text there and under `AppWritable`.
+/// and its own text there and under `AppWritable` and `ScopeReadableBy`.
 #[doc(hidden)]
 pub struct PlatformOwned;
 
@@ -510,10 +513,12 @@ impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
 /// subscription's feed is read from them, so a forged one reaches another
 /// tenant's subscriber. Schema-version rows are the platform's because the
 /// migration gate trusts them, so a forged one skips a table's migration
-/// (tenancy-completion spec §3). One bound refuses all three row types, and
-/// rustc cannot pick a note by type, so the diagnostic carries one note per
-/// table, each naming its own. SEALED by `AppOwned`, which only `Unscoped`
-/// carries.
+/// (tenancy-completion spec §3). Intent rows are the platform's because the
+/// request path answers a re-sent write from them without running it, so a
+/// forged one answers a request that never ran (retry-safe-writes spec
+/// §4.2). One bound refuses all four row types, and rustc cannot pick a note
+/// by type, so the diagnostic carries one note per table, each naming its
+/// own. SEALED by `AppOwned`, which only `Unscoped` carries.
 #[diagnostic::on_unimplemented(
     message = "`{R}` rows are the platform's, and app code cannot write them",
     label = "`{R}` is written only by the platform",
@@ -534,7 +539,12 @@ impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
             `Db::migrate_schema` write one, because the migration gate trusts them for each \
             table's version and a migration's resume point — to change a table's version, \
             declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel \
-            migrates at startup"
+            migrates at startup",
+    note = "intent rows are the platform's: only the request path writes one, in the \
+            transaction of the write it records, because a re-sent request is answered from it \
+            without running — charpente records each write route's reply itself, so there is \
+            nothing to write; a handler that remembers an id of its own keeps it in a table of \
+            the app's own"
 )]
 pub trait AppWritable<R>: sealed::AppOwned {}
 
@@ -672,11 +682,14 @@ impl<Ev: crate::db::Event> UnscopedEvent for Ev where Ev::Scope: NoEventTenant<E
 #[diagnostic::on_unimplemented(
     message = "`{R}` is one of the platform's tables, and a transaction does not read it",
     label = "`{R}` is read through `Db::snapshot`, never through a transaction",
-    note = "the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and \
-            the migration record (`SchemaVersion`) — are the platform's own state, and the \
-            first two hold every tenant's rows, so neither a handler nor a job reads them; \
-            code that holds the `Db` reads them through a snapshot:\n    \
+    note = "the platform's tables — the job queue (`JobRow`), the event log (`EventRow`), the \
+            migration record (`SchemaVersion`) and the intents record (`IntentRow`) — are the \
+            platform's own state, and the first two hold every tenant's rows, so neither a \
+            handler nor a job reads them; code that holds the `Db` reads them through a \
+            snapshot:\n    \
             db.snapshot()?.scan::<{R}>()?",
+    note = "the intents record holds every principal's stored replies, and the request path \
+            answers a re-sent write from it before any handler runs",
     note = "a route that shows a job's progress or an event's history reads a table of the \
             app's own, written in the same transaction as the enqueue or the emit, or \
             subscribes to the events"
@@ -723,10 +736,10 @@ impl<R: Row, V: ?Sized> ReadableBy<V> for R where R::Scope: ScopeReadableBy<V, R
 ///
 /// Every method also bounds `R: ReadableBy<Self>`, which an app's own table
 /// meets for every reader, and a platform table (`JobRow`, `EventRow`,
-/// `SchemaVersion`) for `Snapshot` alone: a transaction does not read the
-/// platform's tables (tenancy-completion spec §3). `Tx` reads its snapshot
-/// through `Snapshot`'s crate-private `get_any` and its siblings, which carry
-/// no `ReadableBy` bound, rather than through this trait.
+/// `SchemaVersion`, `IntentRow`) for `Snapshot` alone: a transaction does not
+/// read the platform's tables (tenancy-completion spec §3). `Tx` reads its
+/// snapshot through `Snapshot`'s crate-private `get_any` and its siblings,
+/// which carry no `ReadableBy` bound, rather than through this trait.
 pub trait View {
     fn get<R: UnscopedRow + ReadableBy<Self>>(&self, id: Id<R>) -> io::Result<Option<R>>;
 

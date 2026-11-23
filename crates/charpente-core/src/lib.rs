@@ -7,6 +7,7 @@ pub mod crc;
 pub mod db;
 pub mod engine;
 pub mod event;
+pub mod intent;
 pub mod io;
 pub mod job;
 pub mod log;

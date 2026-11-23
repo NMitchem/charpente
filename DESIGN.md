@@ -1000,8 +1000,15 @@ platform is a single dependency (plus `serde` for your own wire types, GUIDE §1
   named in `PLATFORM_TABLES`, so an app can forge neither an event into a tenant's feed nor
   a table's version past its migration. Apply writes an event row from an emit effect, and
   the migration executor writes schema-version rows through the crate-private
-  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. No app code reads any
-  of the three through a transaction either (spec 2026-09-30-tenancy-completion §3).
+  `Tx::put_schema_version`, whose record is the one `tx.put` wrote. The intents record
+  (`charpente.intents`, `IntentRow`), which the request path answers a re-sent write from
+  without running it, is the fourth `PlatformOwned` table in `PLATFORM_TABLES` (spec
+  2026-11-22-retry-safe-writes §4.2): a forged row would answer a request that never ran.
+  Its one door is `Tx::get_intent`/`put_intent`/`delete_intent`/
+  `intents_committed_before`, each taking an `IntentAccess` that only a `Group` mints, as
+  `TenantAdmission` is; `put_intent` records its type in `written_as` like `tx.put`. No app
+  code reads any of the four through a transaction either (spec
+  2026-09-30-tenancy-completion §3).
   `View`'s reads bound `R: ReadableBy<Self>`, which a platform table meets for a `Snapshot`
   alone. A hand-written `Row` borrowing one of the names, scoped or not, fails to build at
   each reachable read, on a `Tx`, a `ScopedTx` or an `across_tenants` scan. The
@@ -1493,12 +1500,13 @@ after every table has landed.
   whose platform tables (`Session`, `ApiKey`, `CronRow`, fingerprinted like an app's) have
   another shape, a peer whose `Hello` declares another `PROTO_VERSION`, and an archive
   bucket whose manifest `format` is not `MANIFEST_FORMAT` (or is absent). The hand-written
-  platform tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`) have
-  no data-directory detector: a 0.2 directory is refused because `CronRow` (always recorded:
-  the session-sweep cron) changed shape in the same release. A release that changes one of
-  them must bump both constants and also give the directory a detector, either by gating the
-  table (a named step) or by changing it with a fingerprinted platform table. New manifest
-  fields go after `format`, so an older binary still reaches the refusal.
+  platform tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`,
+  `charpente.intents`) have no data-directory detector: a 0.2 directory is refused because
+  `CronRow` (always recorded: the session-sweep cron) changed shape in the same release. A
+  release that changes one of them must bump both constants and also give the directory a
+  detector, either by gating the table (a named step) or by changing it with a
+  fingerprinted platform table. New manifest fields go after `format`, so an older binary
+  still reaches the refusal.
 - **Backup (M2, built):** log segments plus a periodic snapshot to object storage,
   Litestream-style but built in, not an add-on. Two distinct things exist, and they stay
   distinct. `serve::backup` (`crates/charpente/src/serve.rs`) is a replication-only node
@@ -1628,14 +1636,15 @@ scoping). A scoped table batches into
 rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
 older binary already expects. The receiving side checks the message against its own schema's
 word for that table and refuses a mismatch by name instead of importing a row under the
-wrong scope. `PROTO_VERSION` is 8. It bumps when a release changes the shape or the meaning
+wrong scope. `PROTO_VERSION` is 9. It bumps when a release changes the shape or the meaning
 of anything a peer ships (0.3 changed no wire bytes; stored times moved to wall scale).
 Tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags made it 3, job
 tenancy's `0x0a` made it 4, event tenancy's `0x0b` made it 5, outbound effects'
 `0x0c`/`0x0d` (and `JobRow`'s outbound key tail) made it 6, 0.3's wall-time platform columns
-made it 7, and 0.5's `0x0e` timed enqueue made it 8. A `Hello` declaring any other version
-is refused by name, with the fix (a fresh follower running this release) in the text.
-Nothing is migrated.
+made it 7, 0.5's `0x0e` timed enqueue made it 8, and 0.7's platform table
+`charpente.intents`, which seeding ships and a 0.6 schema does not register, made it 9. A
+`Hello` declaring any other version is refused by name, with the fix (a fresh follower
+running this release) in the text. Nothing is migrated.
 
 The follower buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed`.
 `Repl::step` cannot replace a `Db` it only borrows, so the caller (the kernel arm, T8) runs

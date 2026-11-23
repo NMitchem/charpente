@@ -152,6 +152,15 @@ const GOLDEN: &str = r#"{
       "builtin": true
     },
     {
+      "name": "charpente.intents",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "scoped": false,
+      "builtin": true
+    },
+    {
       "name": "charpente.jobs",
       "version": 1,
       "fingerprint": null,

@@ -220,6 +220,15 @@ const GOLDEN: &str = r#"{
       "builtin": true
     },
     {
+      "name": "charpente.intents",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "scoped": false,
+      "builtin": true
+    },
+    {
       "name": "charpente.jobs",
       "version": 1,
       "fingerprint": null,
@@ -690,6 +699,7 @@ fn builtin_flags_mark_exactly_the_platform_tables_jobs_and_cron() {
     use charpente::kernel::CronRow;
     use charpente_core::db::Job;
     use charpente_core::event::EventRow;
+    use charpente_core::intent::IntentRow;
     use charpente_core::job::JobRow;
     use charpente_core::migration::SchemaVersion;
     use charpente_core::table::Row;
@@ -710,6 +720,7 @@ fn builtin_flags_mark_exactly_the_platform_tables_jobs_and_cron() {
         JobRow::TABLE,
         EventRow::TABLE,
         SchemaVersion::TABLE,
+        IntentRow::TABLE,
     ];
     expected_tables.sort_unstable();
     assert_eq!(builtin_tables, expected_tables);

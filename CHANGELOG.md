@@ -2,6 +2,12 @@
 
 ## 0.7.0 (unreleased)
 
+### Breaking changes
+- **`Db::open` registers a fourth platform table, `charpente.intents`, and `PROTO_VERSION` and `MANIFEST_FORMAT` move.** The table (`charpente::core::intent::IntentRow`) is the record of answered writes that a re-sent write is answered from. It is sealed as the job queue, the event log and the migration record are: `tx.put`, `tx.delete`, `tx.get` and `tx.scan` of an `IntentRow` do not compile, a hand-written `Row` whose `TABLE` is `"charpente.intents"` fails to build at each write and read the binary can reach, and registering `IntentRow` yourself hits the duplicate-registration panic. A transaction reaches it only through an `IntentAccess`, which `Group::intent_access` alone mints (`Tx::get_intent`, `put_intent`, `delete_intent`, `intents_committed_before`); code that holds the `Db` reads it through `db.snapshot()`. rustc's notes for a platform-table read or write now name it, so their text changed; `describe` lists it with `"builtin": true`; replication seeding and archives carry it. `PROTO_VERSION` is 9 (was 8) and `MANIFEST_FORMAT` is 6 (was 5), so a 0.6 peer or archive reader is refused by name. Downgrading is unsupported: a 0.6 binary refuses a 0.7 data directory whose log still holds an intent record, as a log record naming a table its Schema does not include. DESIGN §3 and §5, GUIDE §3, §6, §10, §13, §15 and §16.
+
+### Added
+- **`Tx::has_effects()` says whether a transaction has staged anything its commit would record**: a put or delete, an enqueue, an emit or a migration write. A read is not one, and a first write's schema-version row, which `Group::stage` adds after the transaction returns, never counts.
+
 ## 0.6.0 (2026-11-21)
 
 ### Breaking changes

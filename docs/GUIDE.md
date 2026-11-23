@@ -441,12 +441,12 @@ fn open(data_dir: &str) -> std::io::Result<Db> {
 
 Registering the same table type twice is a contract panic ("Schema: table
 \"Counter\" registered twice — register each #[table] type once").
-`Db::open` registers three tables of its own before yours — the job queue
-`charpente.jobs`, the event log `charpente.events` and the migration record
-`charpente.schema_versions` — so registering any of them yourself hits the same
-panic. They are the platform's: no app code reads or writes one (§6, "Job rows are
-the platform's"; §16, "Where the guarantee stops"), and code that holds the `Db` reads
-them through `db.snapshot()`.
+`Db::open` registers four tables of its own before yours — the job queue
+`charpente.jobs`, the event log `charpente.events`, the migration record
+`charpente.schema_versions` and the intents record `charpente.intents` — so
+registering any of them yourself hits the same panic. They are the platform's: no app
+code reads or writes one (§6, "Job rows are the platform's"; §16, "Where the guarantee
+stops"), and code that holds the `Db` reads them through `db.snapshot()`.
 
 `DbConfig` names the WAL's directory and segment rotation size, and the
 table store's file name:
@@ -1780,13 +1780,15 @@ queue holds every tenant's payloads, so no app code reads one either: `tx.get`, 
 `tx.put` and `tx.delete` of a `JobRow` do not compile, and §8's oracles read the queue
 through `db.snapshot()` (the read's text is in §16, "Where the guarantee stops"). Only the
 enqueue family creates a job row, and only the dispatcher settles one. There is no
-app-side cancel either: a job runs until it is Done or Dead. The platform's two other
+app-side cancel either: a job runs until it is Done or Dead. The platform's three other
 tables are sealed the same way, against reads and writes. The event log (`EventRow`, §11) is what
 every subscription's feed is read from, so only an emit writes an event row. The
 migration record (`SchemaVersion`, §12) is what the migration gate trusts for each table's
-version, so only a table's first write and `Db::migrate_schema` write one. rustc prints
-this for a write of any of the three, with your row type in place of `<row>`, and one note
-per table, since one bound refuses all three:
+version, so only a table's first write and `Db::migrate_schema` write one. The intents
+record (`IntentRow`) is what the request path answers a re-sent write from without running
+it, so only the request path writes one. rustc prints this for a write of any of the four,
+with your row type in place of `<row>`, and one note per table, since one bound refuses
+all four:
 
 <!-- pinned -->
 ```text
@@ -1800,10 +1802,11 @@ or from a `cross_tenant` route or job, naming the tenant:
     tx.enqueue_in::<Org>(scope, job, cap);
 event rows are the platform's: only an emit writes one, because every subscription's feed is read from them — to publish an event, emit it with `tx.emit(event)`, or, inside a tenant, with `emit` on the `ScopedTx` of the tenant it belongs to
 schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point — to change a table's version, declare it with `#[table(version = N)]` and its `TableMigration`, and the kernel migrates at startup
+intent rows are the platform's: only the request path writes one, in the transaction of the write it records, because a re-sent request is answered from it without running — charpente records each write route's reply itself, so there is nothing to write; a handler that remembers an id of its own keeps it in a table of the app's own
 ```
 
 The seal is on the table's name as well as its type, because apply routes a write by
-table name. A hand-written `Row` whose `TABLE` is one of the three names fails to build
+table name. A hand-written `Row` whose `TABLE` is one of the four names fails to build
 at each write the binary can reach, and rustc names the call site and the table. It is a
 post-monomorphization error, so `cargo build` and `cargo test` report it, and `cargo
 check` does not:
@@ -1813,6 +1816,7 @@ check` does not:
 this Row's TABLE is "charpente.jobs", the platform's job queue — job rows are the platform's: only the enqueue family writes one, because the dispatcher runs a job in the tenant its row names; give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)
 this Row's TABLE is "charpente.events", the platform's event log — event rows are the platform's: only an emit writes one, because every subscription's feed is read from them; give this table a name of its own, and publish an event by emitting it (`tx.emit`, or `emit` on the `ScopedTx` of the tenant it belongs to)
 this Row's TABLE is "charpente.schema_versions", the platform's migration record — schema-version rows are the platform's: only a table's first write and `Db::migrate_schema` write one, because the migration gate trusts them for each table's version and a migration's resume point; give this table a name of its own, and change a table's version by declaring it (`#[table(version = N)]` with its `TableMigration`), which the kernel migrates at startup
+this Row's TABLE is "charpente.intents", the platform's record of answered writes — intent rows are the platform's, and app code cannot write them: only the request path writes one, in the transaction of the write it records, because a re-sent request is answered from it; give this table a name of its own, and keep what a handler records in a table of the app's own
 ```
 
 ### Registering jobs: `jobs![...]` and `mount_jobs`
@@ -6170,7 +6174,8 @@ one pre-transaction entropy draw, so a request that mints a second credential
 of either kind panics. The fourth (§3) is `Schema::table::<R>()` — called
 twice for the same `#[table]` type when building the `Schema` passed to
 `Db::open`, including registering `Session`, `ApiKey`, or one of the platform's
-tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`) yourself
+tables (`charpente.jobs`, `charpente.events`, `charpente.schema_versions`,
+`charpente.intents`) yourself
 (`App::open`/`Db::open` already register those). Fix in every case:
 register that name/type exactly once, and mint at most one credential per
 request.
@@ -6364,7 +6369,7 @@ sharding and no multi-master — that stance is fixed.
 
 ### A peer from another release is refused
 
-Every `Hello` carries the wire protocol version (`PROTO_VERSION`, 8 in 0.5). A peer
+Every `Hello` carries the wire protocol version (`PROTO_VERSION`, 9 in 0.7). A peer
 declaring another one is refused at `Hello`, by name, before a frame ships:
 
 <!-- pinned -->
@@ -7972,10 +7977,10 @@ or restore an archive written by this release.
 
 The fix is the text's: start from an empty data directory and re-create the state from your
 own source of truth, or restore an archive this release wrote. The platform's `charpente.jobs`,
-`charpente.events` and `charpente.schema_versions` tables are not fingerprinted (they are
-hand-written `Row`s), so they have no data-directory detector: a 0.2 directory is refused
-because `CronRow` (always recorded: the session-sweep cron) changed shape in the same
-release. A release that changes one of them must bump `PROTO_VERSION` and `MANIFEST_FORMAT`
+`charpente.events`, `charpente.schema_versions` and `charpente.intents` tables are not
+fingerprinted (they are hand-written `Row`s), so they have no data-directory detector: a 0.2
+directory is refused because `CronRow` (always recorded: the session-sweep cron) changed
+shape in the same release. A release that changes one of them must bump `PROTO_VERSION` and `MANIFEST_FORMAT`
 and give the directory a detector, by gating the table or changing it with a fingerprinted
 platform table. The two other refusals are in §10 and §15.
 
@@ -8164,9 +8169,9 @@ actually carries — not a per-variant union of its Rust shape, and not `OidcRej
 (which `ApiError::Oidc` wraps at the Rust level but never puts on the wire, so it does
 not appear in `"types"` at all; see "`ApiError` and status mapping" below); 4 jobs (3 of the
 app's own plus the platform's built-in session sweep); 2 cron entries (the app's daily
-overdue-check plus the platform's built-in session sweep schedule); 13 tables (7 of the
-app's own plus 6 platform tables: `Session`, `ApiKey`, `CronRow`, and the three untyped
-internal tables backing jobs, events, and schema versions). Every `"builtin": true`
+overdue-check plus the platform's built-in session sweep schedule); 14 tables (7 of the
+app's own plus 7 platform tables: `Session`, `ApiKey`, `CronRow`, and the four untyped
+internal tables backing jobs, events, schema versions and intents). Every `"builtin": true`
 entry above is a table, job, or cron entry the platform itself registers, not app
 code — this is how an agent tells its own surface apart from the platform's without
 memorizing a list:
@@ -8286,6 +8291,15 @@ memorizing a list:
     },
     {
       "name": "charpente.events",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "scoped": false,
+      "builtin": true
+    },
+    {
+      "name": "charpente.intents",
       "version": 1,
       "fingerprint": null,
       "indexes": [],
@@ -9412,8 +9426,8 @@ the prefix and the generation.
 
 ### A bucket from another release is refused
 
-The manifest carries a `format` (`MANIFEST_FORMAT`, 5 in 0.5) that tracks the charpente
-minor. `restore` and an archiving node that adopts a prefix both refuse a manifest with another
+The manifest carries a `format` (`MANIFEST_FORMAT`, 6 in 0.7) that moves when a release
+changes what an archive holds. `restore` and an archiving node that adopts a prefix both refuse a manifest with another
 format, or with none (a 0.2 bucket), and the archive stops rather than write over it (the node keeps serving):
 
 <!-- pinned -->
@@ -9963,8 +9977,9 @@ error[E0277]: `JobRow` is one of the platform's tables, and a transaction does n
 12 |     let jobs = tx.scan::<JobRow>()?;
    |                   ----   ^^^^^^ `JobRow` is read through `Db::snapshot`, never through a transaction
    |
-   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+   = note: the platform's tables — the job queue (`JobRow`), the event log (`EventRow`), the migration record (`SchemaVersion`) and the intents record (`IntentRow`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
                db.snapshot()?.scan::<JobRow>()?
+   = note: the intents record holds every principal's stored replies, and the request path answers a re-sent write from it before any handler runs
    = note: a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
 ```
 
@@ -10277,17 +10292,19 @@ whoever holds the data directory: an operator, not a request.
 
 **It covers the platform's own tables too.** The job queue (`JobRow`) holds every tenant's
 job payloads and the tenant each job runs in, the event log (`EventRow`) holds every
-tenant's events, and the migration record (`SchemaVersion`) is the migration gate's own
-state. No app code reads or writes one through a transaction, whether a handler's or a
-job's, on a bare `Tx` or through a `ScopedTx`'s deref (§6). rustc prints this for a read of any of the
-three, with your row type in place of `<row>`:
+tenant's events, the migration record (`SchemaVersion`) is the migration gate's own
+state, and the intents record (`IntentRow`) holds every principal's stored replies. No app
+code reads or writes one through a transaction, whether a handler's or a job's, on a bare
+`Tx` or through a `ScopedTx`'s deref (§6). rustc prints this for a read of any of the
+four, with your row type in place of `<row>`:
 
 <!-- pinned -->
 ```text
 `<row>` is one of the platform's tables, and a transaction does not read it
 `<row>` is read through `Db::snapshot`, never through a transaction
-the platform's tables — the job queue (`JobRow`), the event log (`EventRow`) and the migration record (`SchemaVersion`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
+the platform's tables — the job queue (`JobRow`), the event log (`EventRow`), the migration record (`SchemaVersion`) and the intents record (`IntentRow`) — are the platform's own state, and the first two hold every tenant's rows, so neither a handler nor a job reads them; code that holds the `Db` reads them through a snapshot:
     db.snapshot()?.scan::<<row>>()?
+the intents record holds every principal's stored replies, and the request path answers a re-sent write from it before any handler runs
 a route that shows a job's progress or an event's history reads a table of the app's own, written in the same transaction as the enqueue or the emit, or subscribes to the events
 ```
 
@@ -10296,10 +10313,12 @@ transaction as the enqueue or the emit and scoped like any other, or, for a live
 `Subscription` (§11). Operator code reads the platform's tables through `db.snapshot()`, as
 §8's oracles do, since whoever holds the `Db` holds every tenant already. The one
 transaction that reads a job row is the dispatcher's own: `Tx::get_job` takes the
-`TenantAdmission` only a `Group` mints, which no handler or job holds.
+`TenantAdmission` only a `Group` mints, which no handler or job holds. The intents record's
+one door is the same shape: `Tx::get_intent`, `put_intent`, `delete_intent` and
+`intents_committed_before` take an `IntentAccess`, which only a `Group` mints.
 
 The read seal is on the table's name as well as its type, as the write seal is. A
-hand-written `Row` whose `TABLE` is one of the three names, scoped or not, fails to build at
+hand-written `Row` whose `TABLE` is one of the four names, scoped or not, fails to build at
 each read the binary can reach, on a bare `Tx`, a `ScopedTx` or an `across_tenants` scan,
 reported by `cargo build` and not `cargo check`:
 
@@ -10308,6 +10327,7 @@ reported by `cargo build` and not `cargo check`:
 this Row's TABLE is "charpente.jobs", the platform's job queue — a transaction does not read the platform's tables, because the queue holds every tenant's job payloads and the tenant each one runs in; give this table a name of its own, and read the queue through `db.snapshot()` from code that holds the `Db`
 this Row's TABLE is "charpente.events", the platform's event log — a transaction does not read the platform's tables, because the log holds every tenant's events; give this table a name of its own, and read the log through `db.snapshot()` from code that holds the `Db`, or subscribe to its events
 this Row's TABLE is "charpente.schema_versions", the platform's migration record — a transaction does not read the platform's tables, because the record is the migration gate's own state; give this table a name of its own, and read the record through `db.snapshot()` from code that holds the `Db`
+this Row's TABLE is "charpente.intents", the platform's record of answered writes — intent rows are the platform's, and app code cannot read them: the record holds every principal's stored replies; give this table a name of its own, and read the record through `db.snapshot()` from code that holds the `Db`
 ```
 
 **Sessions and API keys are the app's own.** `Session` and `ApiKey` (§5) are ordinary

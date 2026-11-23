@@ -3072,6 +3072,32 @@ fn hello_declaring_protocol_version_7_is_refused_by_name() {
     }
 }
 
+/// PROTO_VERSION 9 (0.7): a 0.6 binary speaks 8, and its schema does not register
+/// the platform table `charpente.intents`, which seeding ships, so it is refused at
+/// Hello by name rather than at its first intent row.
+#[test]
+fn hello_declaring_protocol_version_8_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_0006 ^ 8, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: 8,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest: 0,
+        },
+    )
+    .unwrap();
+    match reply {
+        Msg::Refuse { message } => assert_eq!(message, stale_peer_refusal(8)),
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+
 /// PROTO_VERSION 7 (0.3): a 0.2 binary speaks 6 and carries `u64` times in the
 /// platform tables, so it is refused at Hello by name, with the fix in the text
 /// (DECISIONS §15).
@@ -12395,21 +12421,23 @@ fn a_follower_far_behind_its_store_refuses_to_open_by_name() {
     }
 }
 
-/// No fingerprint guards `charpente.jobs`, `charpente.events` or
-/// `charpente.schema_versions` (hand-written `Row`s), so a data directory
-/// written under another shape of one of them is NOT refused at open. This
-/// pins their shape beside `PROTO_VERSION`: a change here must bump both
-/// constants and give the directory a detector (DECISIONS §15).
+/// No fingerprint guards `charpente.jobs`, `charpente.events`,
+/// `charpente.schema_versions` or `charpente.intents` (hand-written `Row`s),
+/// so a data directory written under another shape of one of them is NOT
+/// refused at open. This pins their shape beside `PROTO_VERSION`: a change
+/// here must bump both constants and give the directory a detector
+/// (DECISIONS §15).
 #[test]
 fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move() {
     use charpente_core::event::EventRow;
+    use charpente_core::intent::{IntentReply, IntentRow};
     use charpente_core::io::WallTime;
     use charpente_core::job::{JobRow, JobStatus};
     use charpente_core::table::Row;
 
     // Exhaustive and typed, no `..`: adding, removing or retyping a field of
-    // any of the three rows is a compile error HERE, which names this test and
-    // the rule above.
+    // any of the four rows, or a variant of `IntentReply`, is a compile error
+    // HERE, which names this test and the rule above.
     let job = JobRow {
         id: Id::from_raw(1),
         name: "j".to_string(),
@@ -12470,6 +12498,47 @@ fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move(
         migrating_through: _through,
         migrating_to: _to,
     }: SchemaVersion = sv.clone();
+    let intent = |id: u64, principal: Option<&str>, status: u16, reply: IntentReply| IntentRow {
+        id: Id::from_raw(id),
+        intent: "k".to_string(),
+        principal: principal.map(str::to_string),
+        route: "POST /r".to_string(),
+        fingerprint: [6; 32],
+        committed_at: WallTime::from_nanos(2),
+        status,
+        reply,
+    };
+    let kept = intent(
+        1,
+        Some("p"),
+        201,
+        IntentReply::Kept {
+            headers: vec![("h".to_string(), "v".to_string())],
+            body: vec![9],
+        },
+    );
+    let credential = intent(2, None, 200, IntentReply::Credential);
+    let too_large = intent(3, Some("p"), 202, IntentReply::TooLarge { bytes: 65_537 });
+    let IntentRow {
+        id: _id4,
+        intent: _intent,
+        principal: _principal,
+        route: _route,
+        fingerprint: _fingerprint4,
+        committed_at: _committed_at,
+        status: _status4,
+        reply: _reply,
+    }: IntentRow = kept.clone();
+    for row in [&kept, &credential, &too_large] {
+        match &row.reply {
+            IntentReply::Kept {
+                headers: _,
+                body: _,
+            }
+            | IntentReply::Credential
+            | IntentReply::TooLarge { bytes: _ } => {}
+        }
+    }
 
     let hex = |row: &dyn Fn(&mut Vec<u8>)| {
         let mut b = Vec::new();
@@ -12482,20 +12551,27 @@ fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move(
         hex(&|b| job.encode_row(b)),
         hex(&|b| event.encode_row(b)),
         hex(&|b| sv.encode_row(b)),
+        hex(&|b| kept.encode_row(b)),
+        hex(&|b| credential.encode_row(b)),
+        hex(&|b| too_large.encode_row(b)),
     );
     assert_eq!(
         got,
         (
-            8,
-            5,
+            9,
+            6,
             "0100000000000000010000006a010000000701010000006b00020000000000000000000000000900000000000000030000000000000005050505050505050505050505050505".to_string(),
             "01000000000000000400000000000000010000006500010000000809000000000000000300000000000000".to_string(),
-            "0100000000000000010000007402000000cdab00000000000001010000000000000002000000000000000103000000".to_string()
+            "0100000000000000010000007402000000cdab00000000000001010000000000000002000000000000000103000000".to_string(),
+            "0100000000000000010000006b01010000007007000000504f5354202f7206060606060606060606060606060606060606060606060606060606060606060200000000000000c9000001000000010000006801000000760100000009".to_string(),
+            "0200000000000000010000006b0007000000504f5354202f7206060606060606060606060606060606060606060606060606060606060606060200000000000000c80001".to_string(),
+            "0300000000000000010000006b01010000007007000000504f5354202f7206060606060606060606060606060606060606060606060606060606060606060200000000000000ca00020100010000000000".to_string()
         ),
-        "no fingerprint guards charpente.jobs, charpente.events or charpente.schema_versions, \
-         so a stale data directory is NOT refused at open when one of them changes; the fix is \
-         to bump PROTO_VERSION and MANIFEST_FORMAT and give the directory a detector, by gating \
-         the table or changing it with a fingerprinted platform table (DECISIONS §15)"
+        "no fingerprint guards charpente.jobs, charpente.events, charpente.schema_versions or \
+         charpente.intents, so a stale data directory is NOT refused at open when one of them \
+         changes; the fix is to bump PROTO_VERSION and MANIFEST_FORMAT and give the directory a \
+         detector, by gating the table or changing it with a fingerprinted platform table \
+         (DECISIONS §15)"
     );
 }
 

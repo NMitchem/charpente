@@ -87,10 +87,12 @@ pub struct SegmentRef {
     pub end_seq: u64,
 }
 
-/// The manifest layout this release reads and writes. It tracks the charpente
-/// minor (0.5 writes 5): a bucket written by another release is refused by
-/// name, never migrated (DECISIONS §15).
-pub const MANIFEST_FORMAT: u32 = 5;
+/// The manifest layout this release reads and writes: a bucket written by
+/// another release is refused by name, never migrated (DECISIONS §15). It
+/// moves when a release changes what an archive holds: 0.5 writes 5 (the
+/// timed enqueue), and 0.7 writes 6, because its archives carry the platform
+/// table `charpente.intents`, which a 0.6 restore's schema does not register.
+pub const MANIFEST_FORMAT: u32 = 6;
 
 /// The archive's generation pointer (spec §2).
 #[derive(Debug, Clone, PartialEq, Eq)]

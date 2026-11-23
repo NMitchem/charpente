@@ -1,0 +1,184 @@
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.intents", the platform's record of answered writes — intent rows are the platform's, and app code cannot write them: only the request path writes one, in the transaction of the write it records, because a re-sent request is answered from it; give this table a name of its own, and keep what a handler records in a table of the app's own
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::put::<Replies>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(3) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+  | |              writes — intent rows are the platform's, and app code cannot write them: only the \
+  | |              request path writes one, in the transaction of the write it records, because a \
+  | |              re-sent request is answered from it; give this table a name of its own, and keep \
+  | |              what a handler records in a table of the app's own"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::put::<Replies>`
+  --> tests/compile_fail/intent_row_table_name_borrowed.rs:81:5
+   |
+81 | /     tx.put(&Replies {
+82 | |         id: row,
+83 | |         bytes: Vec::new(),
+84 | |     });
+   | |______^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.intents", the platform's record of answered writes — intent rows are the platform's, and app code cannot write them: only the request path writes one, in the transaction of the write it records, because a re-sent request is answered from it; give this table a name of its own, and keep what a handler records in a table of the app's own
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::Tx::<'_>::delete::<Replies>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(3) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+  | |              writes — intent rows are the platform's, and app code cannot write them: only the \
+  | |              request path writes one, in the transaction of the write it records, because a \
+  | |              re-sent request is answered from it; give this table a name of its own, and keep \
+  | |              what a handler records in a table of the app's own"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Tx::<'_>::delete::<Replies>`
+  --> tests/compile_fail/intent_row_table_name_borrowed.rs:85:5
+   |
+85 |     tx.delete::<Replies>(Id::from_raw(row.raw() + 1));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.intents", the platform's record of answered writes — intent rows are the platform's, and app code cannot read them: the record holds every principal's stored replies; give this table a name of its own, and read the record through `db.snapshot()` from code that holds the `Db`
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `<charpente::Tx<'_> as charpente::View>::get::<Replies>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_read`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(3) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+  | |              writes — intent rows are the platform's, and app code cannot read them: the record \
+  | |              holds every principal's stored replies; give this table a name of its own, and read \
+  | |              the record through `db.snapshot()` from code that holds the `Db`"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_read(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn <Tx<'_> as View>::get::<Replies>`
+  --> tests/compile_fail/intent_row_table_name_borrowed.rs:91:18
+   |
+91 |     let _reply = tx.get(row)?;
+   |                  ^^^^^^^^^^^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.intents", the platform's record of answered writes — intent rows are the platform's, and app code cannot write them: only the request path writes one, in the transaction of the write it records, because a re-sent request is answered from it; give this table a name of its own, and keep what a handler records in a table of the app's own
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::put::<OrgReplies>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(3) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+  | |              writes — intent rows are the platform's, and app code cannot write them: only the \
+  | |              request path writes one, in the transaction of the write it records, because a \
+  | |              re-sent request is answered from it; give this table a name of its own, and keep \
+  | |              what a handler records in a table of the app's own"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::put::<OrgReplies>`
+   --> tests/compile_fail/intent_row_table_name_borrowed.rs:98:5
+    |
+ 98 | /     tx.put(&OrgReplies {
+ 99 | |         id: row,
+100 | |         bytes: Vec::new(),
+101 | |     });
+    | |______^
+
+error[E0080]: evaluation panicked: this Row's TABLE is "charpente.intents", the platform's record of answered writes — intent rows are the platform's, and app code cannot write them: only the request path writes one, in the transaction of the write it records, because a re-sent request is answered from it; give this table a name of its own, and keep what a handler records in a table of the app's own
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `charpente::ScopedTx::<'_, '_, Org>::delete::<OrgReplies>::{constant#0}` failed inside this call
+  |
+note: inside `db::refuse_platform_table`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |           Some(3) => panic!(
+  |  ____________________-
+  | |             "this Row's TABLE is \"charpente.intents\", the platform's record of answered \
+  | |              writes — intent rows are the platform's, and app code cannot write them: only the \
+  | |              request path writes one, in the transaction of the write it records, because a \
+  | |              re-sent request is answered from it; give this table a name of its own, and keep \
+  | |              what a handler records in a table of the app's own"
+  | |         ),
+  | |_________- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/charpente-core/src/db.rs
+  |
+  |         const { refuse_platform_table(R::TABLE) };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn ScopedTx::<'_, '_, Org>::delete::<OrgReplies>`
+   --> tests/compile_fail/intent_row_table_name_borrowed.rs:102:5
+    |
+102 |     tx.delete::<OrgReplies>(Id::from_raw(row.raw() + 1));
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

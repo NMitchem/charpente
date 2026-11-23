@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use charpente::archive::Archive;
 use charpente::auth::{OidcConfig, Principal};
-use charpente::core::db::{CommitFailure, Group};
+use charpente::core::db::{CommitFailure, Group, IntentAccess};
+use charpente::core::intent::IntentRow;
 use charpente::core::io::{
     Disk, Entropy, IdempotencyKey, Instant, ObjectStore, OutboundCall, OutboundReply, WallTime,
 };
@@ -513,6 +514,8 @@ fn tx(
     admission: &TenantAdmission,
     job: &JobRow,
     dead: Dead<Reindex>,
+    intents: &IntentAccess,
+    intent: &IntentRow,
 ) -> Result<(), ApiError> {
     let id = note.id;
     // `View`'s four reads (`use charpente::View`), in id order. A scoped row
@@ -528,6 +531,9 @@ fn tx(
     // or under `App::handle`, which carry none: see `Db::transact_at`,
     // `Group::set_now` and `App::handle_at`.
     let _at: WallTime = tx.now();
+    // Whether this transaction has staged a put, delete, enqueue, emit or
+    // migration write yet; a read is not one.
+    let _wrote: bool = tx.has_effects();
     tx.put(&note);
     tx.delete(id);
     // A `global` job; a `scoped_by` one does not compile on a bare `Tx`. An
@@ -571,6 +577,17 @@ fn tx(
     let _admitted: Id<Org> = tx.admit_scope::<Org>(org, admission).scope();
     let _row: Option<JobRow> = tx.get_job(job.id, admission)?;
     tx.settle_job(job, admission);
+    // The platform's record of answered writes: these take an `IntentAccess`,
+    // which only a `Group` mints (`group.intent_access()`), so no handler or
+    // job can call them. A read sees this transaction's writes, then the
+    // group's, then the store.
+    let _answered: Option<IntentRow> = tx.get_intent(intent.id, intents)?;
+    tx.put_intent(intent, intents);
+    tx.delete_intent(intent.id, intents);
+    // The ids, in id order, of at most `limit` records committed strictly
+    // before a time: the retention sweep's read.
+    let _expired: Vec<Id<IntentRow>> =
+        tx.intents_committed_before(WallTime::from_nanos(1), 4096, intents)?;
     Ok(())
 }
 
@@ -733,6 +750,8 @@ fn app(sim: &Sim, oidc: OidcConfig) -> io::Result<()> {
     // handed and `admit_scope` takes.
     let _cap: CrossTenant = group.cross_tenant_cap();
     let _admission: TenantAdmission = group.tenant_admission();
+    // The only constructor of the token `Tx`'s intent methods take.
+    let _intents: IntentAccess = group.intent_access();
     // Records awaiting `commit`: a stage that returned `Err` or wrote
     // nothing adds none.
     let _records: usize = group.len();

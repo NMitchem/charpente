@@ -1891,13 +1891,14 @@ fn the_manifest_carries_the_snapshots_real_frontier_never_a_placeholder() {
     // which is the very function `manifest_bytes` derives this list from
     // (ruling 24 — an oracle built from the function it polices cannot
     // catch that function being wrong). This fixture registers `Rec`; the
-    // other three are the platform-owned tables `Db::open` adds, and they
+    // other four are the platform-owned tables `Db::open` adds, and they
     // are here because they carry state restore needs.
     assert_eq!(
         m.tables,
         vec![
             "Rec".to_string(),
             "charpente.events".to_string(),
+            "charpente.intents".to_string(),
             "charpente.jobs".to_string(),
             "charpente.schema_versions".to_string(),
         ],
@@ -7511,11 +7512,28 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 237 | 238 |
 /// | `CONV_SCOPED_CHAINED_FLOOR` | 161 | 168 |
 ///
+/// **Re-set 2026-11-22** for retry-safe writes' `charpente.intents`, the
+/// fourth table `Db::open` registers. One more table, empty here, is one more
+/// step of the snapshot walk and one more `scan_raw_from` in every
+/// verification (`logical_rows_checked` sweeps `db.table_names()`), so it
+/// re-keys the unscoped base, where `chained` fell 176 -> 175 in two
+/// identical batches; `restored`,
+/// `restored_substantial` and `run:skipped` held, and the scoped base read
+/// its floors exactly. By GUIDE §8's re-key rule, over the same 11 fresh bases
+/// (`0x1D7E_A001`..`0x1D7E_A00B`), the parent (6dd98155) reads `chained` mean
+/// 173.45, sd 5.30, and this tree 173.45, sd 5.07, a difference of 0.00
+/// against a Welch standard error of 2.21, so no decay; `restored` (242.36)
+/// and `restored_substantial` (234.64) means are equal too.
+///
+/// | floor | was | now |
+/// |---|---|---|
+/// | `CONV_CHAINED_FLOOR` | 176 | 175 |
+///
 /// `restored_substantial` can exceed `restored`: it is covered once the
 /// manifest's frontier is known, before the restore and its verification run.
 const CONV_RESTORED_FLOOR: u64 = 238;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 236;
-const CONV_CHAINED_FLOOR: u64 = 176;
+const CONV_CHAINED_FLOOR: u64 = 175;
 
 /// `archive_converges_with_a_scoped_table`'s own base and floors. Separate
 /// numbers because they are rates against a different workload — one extra row
@@ -9762,8 +9780,9 @@ mod fs_object_store {
 }
 
 /// Another release's bucket is refused by name at restore and at adoption
-/// (DECISIONS §15): a 0.2 manifest has no `format` field (found = none), and a
-/// future one declares another number.
+/// (DECISIONS §15): a 0.2 manifest has no `format` field (found = none), a 0.6
+/// one declares 5, whose archives lack `charpente.intents`, and another
+/// release's declares another number.
 #[test]
 fn a_manifest_without_a_format_is_refused_at_restore_and_adopt() {
     let expect = |found: &str| {
@@ -9788,7 +9807,11 @@ fn a_manifest_without_a_format_is_refused_at_restore_and_adopt() {
     let mut legacy = manifest(MANIFEST_FORMAT).encode();
     legacy.truncate(legacy.len() - 8);
     legacy.extend_from_slice(&crc32(&legacy).to_le_bytes());
-    for (bytes, found) in [(legacy, "none"), (manifest(2).encode(), "2")] {
+    for (bytes, found) in [
+        (legacy, "none"),
+        (manifest(2).encode(), "2"),
+        (manifest(5).encode(), "5"),
+    ] {
         // restore
         let (_db, store, _arc) = archive_fixture();
         plant(&store, &[(manifest_key(PREFIX), bytes.clone())]);
