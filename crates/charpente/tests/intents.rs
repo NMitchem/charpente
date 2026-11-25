@@ -1116,11 +1116,11 @@ const SWEEP_OPENS: u32 = 16;
 const SWEEP_STOPS: u32 = 16;
 
 // The coverage the checks mark, each at most once per universe.
-/// A boot in the faulted span, after an injected fault fired, found a
-/// write's record gone, as the sweep may take it: the sweep deleted under
-/// faults.
+/// The sweep deleted a record in a life that met an injected fault between
+/// its open and its end: the sweep deleted under faults.
 const SWEPT_UNDER_FAULTS: &str = "intent:swept-under-faults";
-/// A life ended in a power cycle before a record it committed aged out.
+/// A power cycle came before a record committed in the life it ended aged
+/// out.
 const POWER_CYCLE_BEFORE_AGE_OUT: &str = "intent:power-cycle-before-age-out";
 /// A re-send was answered from a record that had aged out by its commit
 /// before the node's latest open, which alone still kept it.
@@ -1134,10 +1134,15 @@ const RAN_AGAIN_AFTER_AGE_OUT: &str = "intent:ran-again-after-age-out";
 const AGED_OUT_IN_SETTLE: &str = "intent:aged-out-in-settle";
 
 /// The swarm's sampled disk axes less its two durable-corruption axes, plus
-/// the clock axes. A bit flip or a misdirected write cuts an acked suffix at
-/// recovery (`checks::durable_corruption_fired`): excused loss of a write or
-/// of its record, which is what this property must not excuse, and those
-/// axes have their own suites. The downtime jump is the case the open term
+/// the clock axes. A bit flip or a misdirected write cuts the log back at
+/// recovery, but to a consistent prefix: a write and its record share one
+/// frame, so a cut can drop both, never one, and the safety and atomicity
+/// checks would hold. Only the end's ack check would have to excuse a cut
+/// acked write (`checks::durable_corruption_fired`). The axes are off for the
+/// house's reason instead: a property that judges something else leaves them
+/// to their own suites, as clock.rs's `clock_axes` and charpente-core's
+/// `the_store_never_outruns_the_log_across_process_restarts_and_power_cycles`
+/// do. The downtime jump is the case the open term
 /// exists for, so it is on in three universes of four; step-backs are on
 /// in half, at clock.rs's rates, and their sizes and the skew's span
 /// `CLOCK_TOLERANCE`. Drawn from a stream keyed by the universe's seed
@@ -1242,15 +1247,18 @@ fn fallout(sim: &Sim, text: &str) -> bool {
     is_fault_fallout(text) || clock_fallout(sim, text)
 }
 
-/// Whether a disk, crash or clock fault has fired in this universe yet.
-fn fault_fired(sim: &Sim) -> bool {
-    sim.coverage().iter().any(|(key, &n)| {
-        n > 0
-            && (key.starts_with("fault:")
+/// How many disk, crash or clock faults have fired in this universe so far.
+fn faults_fired(sim: &Sim) -> u64 {
+    sim.coverage()
+        .iter()
+        .filter(|(key, _)| {
+            key.starts_with("fault:")
                 || key.starts_with("crash:")
-                || *key == "clock:stepped-back"
-                || *key == "clock:downtime")
-    })
+                || **key == "clock:stepped-back"
+                || **key == "clock:downtime"
+        })
+        .map(|(_, &n)| n)
+        .sum()
 }
 
 /// A supervisor's restart after a failed open: a power cycle when the disk
@@ -1264,11 +1272,29 @@ fn reboot(sim: &Sim) {
 }
 
 /// One life of the node, in the kernel's walls: the one it opened at, and
-/// the latest any of its steps read.
+/// the latest any of its steps read. And the faults fired by its open and by
+/// its end, whether the sweep deleted a record in it, and the clock's wall
+/// at the first power cycle after it.
 struct Life {
     open: u64,
     end: u64,
-    power_cycled: bool,
+    faults_at_open: u64,
+    faults_at_end: Option<u64>,
+    swept: bool,
+    power_cycle: Option<u64>,
+}
+
+impl Life {
+    fn opened(sim: &Sim, open: u64) -> Life {
+        Life {
+            open,
+            end: open,
+            faults_at_open: faults_fired(sim),
+            faults_at_end: None,
+            swept: false,
+            power_cycle: None,
+        }
+    }
 }
 
 /// An answer, at the wall of the step that gave it.
@@ -1294,6 +1320,8 @@ struct Commit {
 enum Check {
     /// A boot in the faulted span, before its kernel is built.
     Boot,
+    /// After a step of a life, in the faulted span or the settle.
+    Step,
     /// The settle's boot.
     Settle,
     /// The end of the settle.
@@ -1305,30 +1333,36 @@ struct Rig {
     lives: Vec<Life>,
     answers: Vec<Answer>,
     marks: BTreeSet<&'static str>,
+    /// The intent ids the store held at the latest check whose read
+    /// succeeded.
+    held: BTreeSet<String>,
 }
 
 impl Rig {
     /// A power cycle or a process restart, after a life.
     fn restart(&mut self, sim: &Sim, power: bool) {
         if power {
-            sim.restart();
+            let wall = sim.clock().wall().as_nanos();
             if let Some(life) = self.lives.last_mut() {
-                life.power_cycled = true;
+                life.power_cycle.get_or_insert(wall.max(life.end));
             }
+            sim.restart();
         } else {
             sim.restart_process();
         }
     }
 
     /// Whether a record committed at wall `at` in life `from` stayed inside
-    /// its retention up to wall `until` in life `to`: no life since its
-    /// commit read a wall at or past `max(at, that life's open) +
-    /// INTENT_RETENTION`, so no sweep may have taken it.
+    /// its retention up to wall `until` in life `to`, by the kernel's own
+    /// rule: a sweep at wall `W` in a life opened at `O` deletes it only once
+    /// `W >= O + INTENT_RETENTION` (it waits a retention after the open) and
+    /// `W > at + INTENT_RETENTION` (its bound is strict). So it is live while
+    /// no life since its commit read such a wall.
     fn live(&self, at: u64, from: usize, to: usize, until: u64) -> bool {
         (from..=to).all(|i| {
             let life = &self.lives[i];
             let latest = if i == to { until } else { life.end };
-            at.max(life.open) + DAY > latest
+            latest < life.open + DAY || latest <= at + DAY
         })
     }
 
@@ -1373,7 +1407,11 @@ impl Rig {
             .and_then(|snap| Ok((snap.scan::<Hit>()?, snap.scan::<IntentRow>()?)));
         let (hits, rows) = match read {
             Ok(store) => store,
-            Err(e) if at == Check::Boot && is_fault_fallout(&e.to_string()) => return Ok(0),
+            Err(e)
+                if matches!(at, Check::Boot | Check::Step) && is_fault_fallout(&e.to_string()) =>
+            {
+                return Ok(0);
+            }
             Err(e) => return Err(format!("reading the store: {e}")),
         };
         let commits = self.commits(&hits)?;
@@ -1445,10 +1483,20 @@ impl Rig {
                     wt(end)
                 ));
             }
-            if at == Check::Boot && fault_fired(sim) {
-                self.marks.insert(SWEPT_UNDER_FAULTS);
+            // Held at the last read and gone now, its hit kept: the sweep
+            // took it, in the latest life, since nothing else deletes one.
+            if self.held.contains(intent) {
+                self.lives[last].swept = true;
             }
         }
+        // A deletion is seen at the read after it, which may be the next
+        // boot's, so a life is judged once it has ended and been read since.
+        if self.lives.last().is_some_and(|life| {
+            life.swept && life.faults_at_end.is_some_and(|f| f > life.faults_at_open)
+        }) {
+            self.marks.insert(SWEPT_UNDER_FAULTS);
+        }
+        self.held = recorded.iter().map(|intent| intent.to_string()).collect();
         if at == Check::End {
             self.check_end(sim, &commits, &rows)?;
         }
@@ -1534,7 +1582,8 @@ impl Rig {
 
         let cycled = commits.values().flatten().any(|run| {
             let life = &self.lives[run.life];
-            life.power_cycled && run.at + DAY > life.end
+            life.power_cycle
+                .is_some_and(|cycle| run.at.max(life.open) + DAY > cycle)
         });
         if cycled {
             self.marks.insert(POWER_CYCLE_BEFORE_AGE_OUT);
@@ -1569,11 +1618,7 @@ fn open_node(sim: &Sim, rig: &mut Rig, at: Check) -> Result<Option<Kernel>, Stri
             Ok(mut kernel) => match kernel.app_mut_for_tests().db_for_tests().migrate_schema() {
                 Ok(()) => {
                     let open = kernel.wall_for_sim().as_nanos();
-                    rig.lives.push(Life {
-                        open,
-                        end: open,
-                        power_cycled: false,
-                    });
+                    rig.lives.push(Life::opened(sim, open));
                     return Ok(Some(kernel));
                 }
                 Err(e) => e.to_string(),
@@ -1602,15 +1647,17 @@ fn open_node(sim: &Sim, rig: &mut Rig, at: Check) -> Result<Option<Kernel>, Stri
 /// Steps `kernel` until nothing is left inside virtual time `horizon`, or
 /// until it stops, sending each `(at, write)` at its virtual time, and
 /// records each answer at the wall of the step that gave it and the life's
-/// latest wall. Returns how many of `asks` the life took (all of them unless
-/// it stopped, else those due by then) and the stop's text.
+/// latest wall. Checks the store after every step (`Check::Step`), so a
+/// record the sweep took early is caught at the step that took it. Returns
+/// how many of `asks` the life took (all of them unless it stopped, else
+/// those due by then) and the stop's text.
 fn run_life(
     sim: &Sim,
     rig: &mut Rig,
     kernel: &mut Kernel,
     asks: &[(u64, usize)],
     horizon: u64,
-) -> (usize, Option<String>) {
+) -> Result<(usize, Option<String>), String> {
     let life = rig.lives.len() - 1;
     let mut source = SimSource::new(Box::new(sim.clock()), horizon);
     for &(at, write) in asks {
@@ -1636,6 +1683,7 @@ fn run_life(
             }
         }
         drop(slots);
+        rig.check(sim, kernel.app(), Check::Step)?;
         match step {
             Ok(Step::Worked) => {}
             Ok(Step::Idle { deadline }) => {
@@ -1646,19 +1694,20 @@ fn run_life(
             Err(e) => break Some(e.to_string()),
         }
     };
+    rig.lives[life].faults_at_end = Some(faults_fired(sim));
     let now = sim.now().as_nanos();
     let taken = match stop {
         None => asks.len(),
         Some(_) => asks.iter().take_while(|&&(at, _)| at <= now).count(),
     };
-    (taken, stop)
+    Ok((taken, stop))
 }
 
 /// The planned lives under the universe's faults, each reopened through
 /// every stop, then a fault-free settle that re-sends every write once,
 /// writes a few fresh ones, and runs past every record's age-out and an
-/// interval. The store is checked at
-/// every boot, and the store and every answer at the end (`Rig::check`).
+/// interval. The store is checked at every boot and after every step, and
+/// the store and every answer at the end (`Rig::check`).
 fn sweep_universe(sim: &mut Sim) -> Result<(), String> {
     let mut rng = Rng::new(sim.seed() ^ 0x1D7E_5EED);
     let (plan, writes) = plan(&mut rng);
@@ -1678,7 +1727,7 @@ fn sweep_universe(sim: &mut Sim) -> Result<(), String> {
             if rng.chance(0.3) {
                 sim.crash_disk_after(rng.between(20, 800));
             }
-            let (taken, stop) = run_life(sim, &mut rig, &mut kernel, &asks, horizon);
+            let (taken, stop) = run_life(sim, &mut rig, &mut kernel, &asks, horizon)?;
             asks.drain(..taken);
             drop(kernel);
             let Some(stop) = stop else {
@@ -1737,14 +1786,14 @@ fn sweep_universe(sim: &mut Sim) -> Result<(), String> {
     );
     let reach = (latest - open).max(6 * HOUR);
     let horizon = start + reach + DAY + INTERVAL + 10 * MIN;
-    let (_, mut stop) = run_life(sim, &mut rig, &mut kernel, &asks, horizon);
+    let (_, mut stop) = run_life(sim, &mut rig, &mut kernel, &asks, horizon)?;
     if stop.is_none() {
         // Once more at the horizon itself, so the latest wall the node read,
         // which liveness is judged at, is the horizon's, not that of the last
         // step before the kernel parked.
         let wait = horizon.saturating_sub(sim.now().as_nanos());
         sim.clock().sleep(Duration::from_nanos(wait));
-        stop = run_life(sim, &mut rig, &mut kernel, &[], horizon).1;
+        stop = run_life(sim, &mut rig, &mut kernel, &[], horizon)?.1;
     }
     if let Some(stop) = stop {
         return Err(format!("the fault-free settle's kernel stopped: {stop}"));
@@ -1766,9 +1815,11 @@ fn sweep_universe(sim: &mut Sim) -> Result<(), String> {
 /// age-out. Its checks:
 ///
 /// - **Safety**, from outside: a write's re-send runs again, adding a hit,
-///   only once the record its last run left may have aged out, that is once
-///   the node read a wall at or past `max(committed_at, its latest open) +
-///   INTENT_RETENTION`. And a write's record is never gone before then.
+///   only once the record its last run left may have aged out by the
+///   kernel's own rule (`Rig::live`): once a life since its commit read a
+///   wall at or past its open + `INTENT_RETENTION` and past `committed_at +
+///   INTENT_RETENTION`. And a write's record is never gone before then,
+///   checked at every boot and after every step.
 /// - **Liveness**: after the settle, no record is held an interval past its
 ///   age-out.
 /// - **Atomicity**: every record is its write's latest run's, at the same
@@ -2045,11 +2096,7 @@ fn backlog_universe(sim: &mut Sim) -> Result<(), String> {
             break;
         };
         let open = kernel.wall_for_sim().as_nanos();
-        backlog.lives.push(Life {
-            open,
-            end: open,
-            power_cycled: false,
-        });
+        backlog.lives.push(Life::opened(sim, open));
         let horizon = sim.now().as_nanos() + DAY + 2 * HOUR;
         let (stop, full, left) = run_backlog_life(
             sim,
@@ -2090,11 +2137,7 @@ fn backlog_universe(sim: &mut Sim) -> Result<(), String> {
         return Ok(());
     };
     let open = kernel.wall_for_sim().as_nanos();
-    backlog.lives.push(Life {
-        open,
-        end: open,
-        power_cycled: false,
-    });
+    backlog.lives.push(Life::opened(sim, open));
     let horizon = sim.now().as_nanos() + (latest.max(open) - open) + DAY + INTERVAL + MIN;
     let (stop, _, _) = run_backlog_life(
         sim,
