@@ -68,6 +68,7 @@ pub fn fixture_contract() -> Contract {
                 public_scope: None,
                 cross_tenant: false,
                 stream: false,
+                intent: None,
                 params: vec![
                     ParamInfo {
                         name: "org_id",
@@ -91,6 +92,7 @@ pub fn fixture_contract() -> Contract {
                 public_scope: None,
                 cross_tenant: false,
                 stream: false,
+                intent: None,
                 params: Vec::new(),
                 request: Some(TypeSchema::Ref("CustomerNew")),
                 response: TypeSchema::Ref("CustomerView"),
@@ -105,6 +107,7 @@ pub fn fixture_contract() -> Contract {
                 public_scope: None,
                 cross_tenant: false,
                 stream: false,
+                intent: None,
                 params: vec![ParamInfo {
                     name: "id",
                     schema: TypeSchema::Id("Widget"),
@@ -127,6 +130,7 @@ pub fn fixture_contract() -> Contract {
                 public_scope: None,
                 cross_tenant: false,
                 stream: true,
+                intent: None,
                 params: Vec::new(),
                 request: None,
                 response: TypeSchema::Null,
@@ -153,6 +157,7 @@ pub fn fixture_contract() -> Contract {
                 public_scope: None,
                 cross_tenant: false,
                 stream: true,
+                intent: None,
                 params: Vec::new(),
                 request: None,
                 response: TypeSchema::Null,

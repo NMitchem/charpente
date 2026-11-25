@@ -256,6 +256,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [],
       "request": {
         "Ref": "CreateWidget"
@@ -276,6 +277,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [],
       "request": null,
       "response": {
@@ -296,6 +298,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [
         {
           "name": "org",
@@ -325,6 +328,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": true,
+      "intent": null,
       "params": [],
       "request": null,
       "response": "Null",
@@ -1619,4 +1623,41 @@ fn the_dead_stance_is_not_part_of_a_jobs_shape() {
         );
         assert!(out.contains(&line), "missing {line:?} in:\n{out}");
     }
+}
+
+/// A webhook route keyed by its sender's id header (retry-safe writes, §4.1).
+/// Mounted only by the test below, so the pinned golden stays the fixture's.
+#[route(POST "/hooks/widget", public, intent = header("X-Event-Id"))]
+fn widget_hook(tx: &mut Tx, body: CreateWidget) -> Result<WidgetView, ApiError> {
+    create_widget(tx, body)
+}
+
+#[test]
+fn describe_names_the_intent_header_of_each_write_route() {
+    let sim = Sim::with_faults(0x2EC2_0002, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Widget>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![
+        create_widget,
+        list_widgets,
+        widget_feed,
+        widget_hook
+    ]);
+    let intent = |name: &str| {
+        app.describe()
+            .routes
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("no route {name}"))
+            .intent
+    };
+    assert_eq!(intent("create_widget"), Some("Idempotency-Key"));
+    assert_eq!(intent("list_widgets"), None);
+    assert_eq!(intent("widget_feed"), None);
+    assert_eq!(intent("widget_hook"), Some("X-Event-Id"));
 }

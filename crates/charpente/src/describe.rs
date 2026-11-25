@@ -100,6 +100,10 @@ pub struct RouteInfo {
     /// makes that audit an inventory.
     pub cross_tenant: bool,
     pub stream: bool,
+    /// The header a write route reads its intent id from: `Idempotency-Key`,
+    /// or the sender's header a webhook route declared with
+    /// `intent = header("…")`. `None` for a GET and an SSE route.
+    pub intent: Option<&'static str>,
     pub params: Vec<ParamInfo>,
     /// `None` for routes with no JSON body.
     pub request: Option<TypeSchema>,
@@ -342,6 +346,8 @@ fn route_info(route: &Route) -> RouteInfo {
         public_scope: route.public_scope.map(|s| s.name),
         cross_tenant: route.cross_tenant,
         stream: matches!(route.glue, RouteGlue::Sse(_)),
+        intent: crate::http::intent::is_write(route)
+            .then(|| crate::http::intent::header_name(route)),
         params: route
             .params
             .iter()

@@ -543,6 +543,7 @@ fn a_stream_route_with_a_path_param_takes_it_before_opts() {
         public_scope: None,
         cross_tenant: false,
         stream: true,
+        intent: None,
         params: vec![ParamInfo {
             name: "org_id",
             schema: TypeSchema::String,
@@ -656,6 +657,7 @@ fn a_stream_routes_union_name_colliding_with_a_wire_type_panics_by_name() {
         public_scope: None,
         cross_tenant: false,
         stream: true,
+        intent: None,
         params: Vec::new(),
         request: None,
         response: TypeSchema::Null,
@@ -700,6 +702,7 @@ fn plain_route(name: &'static str, pattern: &'static str) -> RouteInfo {
         public_scope: None,
         cross_tenant: false,
         stream: false,
+        intent: None,
         params: Vec::new(),
         request: None,
         response: TypeSchema::Null,

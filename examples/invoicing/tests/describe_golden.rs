@@ -208,6 +208,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [],
       "request": "String",
       "response": "String",
@@ -224,6 +225,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -251,6 +253,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [
         {
           "name": "id",
@@ -276,6 +279,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [],
       "request": null,
       "response": {
@@ -296,6 +300,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -323,6 +328,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [
         {
           "name": "id",
@@ -348,6 +354,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [],
       "request": null,
       "response": {
@@ -368,6 +375,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -393,6 +401,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -418,6 +427,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": true,
+      "intent": null,
       "params": [],
       "request": null,
       "response": "Null",
@@ -434,6 +444,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [],
       "request": null,
       "response": "String",
@@ -450,6 +461,7 @@ const GOLDEN: &str = r#"{
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",

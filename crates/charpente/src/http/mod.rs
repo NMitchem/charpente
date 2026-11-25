@@ -9,7 +9,7 @@
 //! one-request path for a test.
 
 mod app;
-mod intent;
+pub(crate) mod intent;
 mod router;
 
 pub use app::{App, AppConfig, Ctx, Handled, Session, StagedDispatch};

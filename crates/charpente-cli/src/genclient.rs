@@ -288,6 +288,7 @@ mod contract {
         public_scope: Option<String>,
         cross_tenant: bool,
         stream: bool,
+        intent: Option<String>,
         params: Vec<ParamInfo>,
         request: Option<TypeSchema>,
         response: TypeSchema,
@@ -485,6 +486,7 @@ mod contract {
             public_scope: r.public_scope.map(leak),
             cross_tenant: r.cross_tenant,
             stream: r.stream,
+            intent: r.intent.map(leak),
             params: r
                 .params
                 .into_iter()
@@ -645,12 +647,12 @@ mod tests {
       ],
       "routes": [
         { "method": "POST", "pattern": "/widgets/:id", "name": "create_widget",
-          "auth": true, "public_scope": null, "stream": false, "cross_tenant": false,
+          "auth": true, "public_scope": null, "stream": false, "intent": "Idempotency-Key", "cross_tenant": false,
           "params": [{ "name": "id", "schema": { "Id": "Widget" } }],
           "request": { "Ref": "CreateWidget" }, "response": { "Ref": "WidgetView" },
           "error": "String", "emits": [] },
         { "method": "GET", "pattern": "/feed", "name": "feed", "auth": false,
-          "public_scope": "Org", "stream": true, "cross_tenant": true,
+          "public_scope": "Org", "stream": true, "intent": null, "cross_tenant": true,
           "params": [], "request": null, "response": "Null",
           "error": "String",
           "emits": [{ "event": "widget_added", "payload": "WidgetAdded" }] }

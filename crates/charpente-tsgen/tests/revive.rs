@@ -67,6 +67,7 @@ fn route(name: &'static str, response: TypeSchema, error: TypeSchema) -> RouteIn
         public_scope: None,
         cross_tenant: false,
         stream: false,
+        intent: None,
         params: Vec::new(),
         request: None,
         response,
@@ -864,6 +865,7 @@ fn a_payload_reached_only_through_a_stream_routes_emits_gets_a_function_and_a_ca
     };
     c.routes.push(RouteInfo {
         stream: true,
+        intent: None,
         emits: vec![EmittedEvent {
             event: "invoice_paid",
             payload: "InvoicePaid",

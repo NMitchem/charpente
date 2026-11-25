@@ -1490,6 +1490,11 @@ fn delivery_settled(tx: &mut Tx, id: Id<Delivery>, status: String) -> Result<(),
 }
 ```
 
+This example is an unauthenticated `public` write, and a handler cannot yet read
+the sender's signature header (PLAN.md's after-launch row "A `#[route]` that
+reads a request header"), so it is not a verified payment webhook: do not copy it
+as one.
+
 Everything in this section holds with `X-Event-Id` in `Idempotency-Key`'s
 place: a delivery re-sent under one event id is answered once, a delivery
 with none is refused with the 400 naming `X-Event-Id`, and the route ignores
@@ -1513,7 +1518,10 @@ this request already committed under <header> `<id>`, and its reply was <n> byte
 - **400**: the id is empty, over 255 bytes, or holds a space, a control
   character or a non-ASCII byte, or the request came over the wire with no
   id at all. The server's edge drops a header value holding a non-ASCII byte,
-  so such an id arrives as missing, and one text covers every case. It is
+  so such an id arrives as missing, and one text covers every case. (Any other
+  control byte or DEL never reaches charpente: the HTTP parser admits only a
+  tab, a space, `0x21`..`0x7e` and `0x80`..`0xff` in a header value, so
+  hyper answers its own bare 400 first.) It is
   refused before the request draws anything, and nothing runs.
 - **422**: the id was already used for a different request. The client
   reused an id, and is told so rather than handed another request's reply.
@@ -8538,6 +8546,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [],
       "request": "String",
       "response": "String",
@@ -8554,6 +8563,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -8581,6 +8591,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [
         {
           "name": "id",
@@ -8606,6 +8617,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [],
       "request": null,
       "response": {
@@ -8626,6 +8638,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -8653,6 +8666,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [
         {
           "name": "id",
@@ -8678,6 +8692,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": null,
       "params": [],
       "request": null,
       "response": {
@@ -8698,6 +8713,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -8723,6 +8739,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -8748,6 +8765,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": true,
+      "intent": null,
       "params": [],
       "request": null,
       "response": "Null",
@@ -8764,6 +8782,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [],
       "request": null,
       "response": "String",
@@ -8780,6 +8799,7 @@ memorizing a list:
       "public_scope": null,
       "cross_tenant": false,
       "stream": false,
+      "intent": "Idempotency-Key",
       "params": [
         {
           "name": "id",
@@ -9145,6 +9165,11 @@ including field order — and `crates/charpente-cli/tests/describe.rs` cross-che
 running `charpente describe --dir examples/invoicing --format json` renders the same
 bytes. `human` format renders the same information as fixed-width lines instead of JSON,
 starting with a `tables:` header.)
+
+Each route carries `intent`: the header a write route reads its intent id from
+(§5), `"Idempotency-Key"` unless the route declared `intent = header("…")`, and
+`null` for a GET and an SSE route, which never read one. The generated client
+(§14) reads it to know which header to send. The human format does not print it.
 
 ### Outbound jobs and hosts in the contract
 
