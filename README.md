@@ -25,19 +25,18 @@ pub fn place_order(tx: &mut Tx, id: Id<Order>) -> Result<Id<Order>, ApiError> {
 }
 ```
 
-It is missing three lines: the ones that answer an order that is already stored. Of the checks
-you would run on it, only the simulator says no:
+It has no lines that answer an order that is already stored. Under charpente 0.6.0, of the
+checks you would run on it, only the simulator said no:
 
 | Check | What it says |
 |---|---|
 | `cargo build` | It compiles. |
 | `cargo clippy --all-targets -- -D warnings` | No warnings, with the app's deny-list of clocks, randomness and raw IO in force. |
 | `cargo test --test once` | It passes. Each order is posted once, with no faults, and each is charged once. |
-| `charpente test --sim` | `order 9 charged twice`, with the seed that replays it and the fix. |
+| `charpente test --sim` | Under 0.6.0, `order 9 charged twice`, with the seed that replays it and the fix. Under 0.7.0 it passes (below). |
 
-Each row is checked by a test in
-[`crates/charpente-cli/tests/demo.rs`][demo.rs]. This is the
-simulator's run:
+The first three rows, and the 0.7.0 run below, are checked by tests in
+[`crates/charpente-cli/tests/demo.rs`][demo.rs]. charpente 0.6.0 printed this simulator run:
 
 ```console
 $ charpente test --sim --master-seed 0x434841524745
@@ -59,8 +58,8 @@ sim result: FAILED. 0 passed; 1 failed. Runs tested: 248 of 256.
 rerun exactly this batch: charpente test --sim --master-seed 0x434841524745
 ```
 
-The `repro:` line replays the batch's first failure on its own, with smaller inputs and fewer
-faults, and it fails the same way:
+Under 0.6.0 the `repro:` line replayed the batch's first failure on its own, with smaller inputs
+and fewer faults, and it failed the same way. charpente 0.6.0 printed:
 
 ```console
 $ charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
@@ -85,14 +84,12 @@ meets this bug, which takes a commit, then a fault that hides it from the client
 The simulator injects the fault, and its recovery step re-sends what got no answer or a fault's
 error reply, as a client would.
 
-The bug needs both halves of `place_order` as written: `tx.put` is an upsert, and the enqueue
-after it runs every time. A route that `INSERT`s on the client's id would refuse the second POST
-with a unique violation, roll back its job and charge once. The same double charge happens
-wherever a create upserts or mints its id on the server, but not every way of writing this route
-has it.
-
-The fix is the three missing lines, at the top of `place_order` (`tx.get` also needs `View` in
-the `use charpente::{…}` line):
+Under 0.6.0 the bug needed both halves of `place_order` as written: `tx.put` is an upsert, and the
+enqueue after it runs every time. A route that `INSERT`s on the client's id would have refused the
+second POST with a unique violation, rolled back its job and charged once. The same double charge
+happened wherever a create upserted or minted its id on the server, but not every way of writing
+this route had it. The fix was three lines at the top of `place_order` (`tx.get` also needs `View`
+in the `use charpente::{…}` line):
 
 ```rust
 if tx.get(id)?.is_some() {
@@ -100,7 +97,25 @@ if tx.get(id)?.is_some() {
 }
 ```
 
-With them back, the same command passes.
+With them, the same command passed.
+
+Under 0.7.0 the route as shown, with no guard, passes. `Drive`, the simulator's recovery step,
+re-sends each write with the `Idempotency-Key` it first carried, and the kernel answers that copy
+from the record of the first reply without running `place_order` again:
+
+```console
+$ charpente test --sim --master-seed 0x434841524745
+running 1 sim check, 256 runs each, under random injected faults (master seed 0x0000434841524745)
+
+skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
+  each_order_is_charged_once
+    8  the boot was refused: injected corruption reached durable data at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xe89246396f6a95eb)
+
+check each_order_is_charged_once ... ok  (248 tested over 49 distinct inputs, 8 skipped)
+
+sim result: ok. 1 passed; 0 failed. Runs tested: 248 of 256.
+rerun exactly this batch: charpente test --sim --master-seed 0x434841524745
+```
 
 To run it yourself, [install the CLI](#install), then:
 
@@ -111,10 +126,9 @@ charpente test --sim --master-seed 0x434841524745
 ```
 
 The first run builds the demo and its dependencies before it prints anything. The demo pins
-charpente 0.7.0; charpente 0.6.0 printed the output above, and the master seed fixes every run in the
+charpente 0.7.0, which printed the green run above, and the master seed fixes every run in the
 batch, so you get the same output. Leave out `--master-seed` and the batch draws a master seed of
-its own: the order number and the seed change, and `demo.rs` checks that other master seeds fail
-the same check with the same fix.
+its own, and `demo.rs` checks that other master seeds pass too.
 
 ## Install
 

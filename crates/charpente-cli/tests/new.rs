@@ -585,34 +585,83 @@ const ADD_NOTE_GUARD: &str = "    if let Some(note) = tx.get(id)? {
     }
 ";
 
-/// The route's retry guard: the sim's tail re-sends a POST the faulted phase
-/// left unanswered, and a note whose first send landed anyway must not be
-/// put, enqueued and emitted a second time. Without the guard the echo check
-/// finds two Echo jobs for one note and names the route as the cause. Found
-/// when the scaffold moved onto `charpente_sim::drive` (0.4.0, named step N3):
-/// 5 runs of the batch at master seed 0x1 failed this way, one of them seed
-/// 0x6f623889546ec486.
+/// The route's guard, now that charpente answers a re-sent POST from its
+/// record (GUIDE §5, "Retry-safe writes"). `Drive` re-sends each note under the
+/// `Idempotency-Key` its first copy carried, so with the guard gone the echo
+/// check stays green: what the guard still holds is a note to one body. The
+/// fourth check posts note 1 three times, each POST under its own key, twice
+/// with one body and once with another, and names the body answered as added
+/// where the conflict's 400 was due. Until 0.7.0 the same deletion turned the
+/// echo check red on a re-send (0.4.0, named step N3: 5 runs of the batch at
+/// master seed 0x1 failed, one of them seed 0x6f623889546ec486).
 #[test]
-fn deleting_the_retry_guard_turns_the_echo_check_red_on_a_resend() {
+fn deleting_the_guard_leaves_resends_to_the_platform_but_loses_the_conflict_refusal() {
     let (_, out) = sim_with_line_deleted("noguard", ADD_NOTE_GUARD);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    assert!(
+        stdout.lines().any(|l| {
+            l.starts_with("check acked_post_implies_the_echo_after_recovery ")
+                && l.contains(" ok  (")
+        }),
+        "the echo check stays green, since charpente answers the tail's re-sends:\n{stdout}"
+    );
+    let block = failure_block(
+        &stdout,
+        "a_resent_note_changes_nothing_and_a_conflict_is_refused",
+    );
+    assert!(
+        block.contains(
+            "was answered 200 \"1\", not 400 {\"error\":\"note 1 already holds another body — a \
+             note is written once; post the new body under a new id\"}"
+        ) && block.contains(
+            " — a repeat of the stored body is answered 200 with its id, and another body is \
+             refused with a 400 (src/lib.rs, add_note)"
+        ),
+        "the fourth check names the conflict that went unrefused:\n{block}"
+    );
+    assert!(
+        !block.contains("exactly-once violated"),
+        "it names the conflict, not a duplicate:\n{block}"
+    );
+    for other in [
+        "acked_note_survives_a_restart",
+        "acked_post_implies_the_echo_after_recovery",
+        "acked_post_implies_its_event_after_recovery",
+    ] {
+        assert!(
+            !stdout.contains(&format!("sim failure in {other}")),
+            "{other} posts each note once, so the guard is never reached:\n{stdout}"
+        );
+    }
+}
+
+/// The echo check's duplicate, which the guard's deletion reached until 0.7.0:
+/// two `Echo` jobs for one note now name the route enqueueing more than once
+/// in one add, not a re-send, which charpente answers from its record.
+#[test]
+fn enqueueing_twice_turns_the_echo_check_red_naming_the_route() {
+    let enqueue = "    tx.enqueue(Echo { note: id });\n";
+    let (_, out) = sim_with_line_replaced("twoenqueues", enqueue, &enqueue.repeat(2));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
     let block = failure_block(&stdout, "acked_post_implies_the_echo_after_recovery");
     assert!(
         block.contains("exactly-once violated: note ")
             && block.contains(
-                " Echo jobs — it was added twice, so it is echoed twice: a re-sent POST /notes/"
-            )
-            && block
-                .contains(" whose first send landed must not enqueue again (src/lib.rs, add_note)"),
+                " has 2 Echo jobs — the route enqueued it more than once in one add: each note is \
+                 posted once, and charpente answers its re-send from the record without running \
+                 the route (src/lib.rs, add_note)"
+            ),
         "the echo check names the route as the cause:\n{block}"
     );
 }
 
 /// The event check's other half: an acked note whose `NoteAdded` is in the
 /// log more than once names the route, as the echo check's duplicate does,
-/// and not the platform's commit. The tail never re-sends an acked note, so
-/// the edit that reaches it is a route that emits twice for one note.
+/// and not the platform's commit. The tail never re-sends an acked note, and
+/// charpente answers a re-sent one from its record, so the edit that reaches
+/// it is a route that emits twice for one note.
 #[test]
 fn emitting_twice_turns_the_event_check_red_naming_the_route() {
     let emit = "    tx.emit(NoteAdded { note: id });\n";
@@ -623,9 +672,9 @@ fn emitting_twice_turns_the_event_check_red_naming_the_route() {
     assert!(
         block.contains("exactly-once violated: note ")
             && block.contains(
-                " has 2 NoteAdded events — the route emitted it more than once: a note emits \
-                 once, when it is first added, and a repeat of a stored note must not emit again \
-                 (src/lib.rs, add_note)"
+                " has 2 NoteAdded events — the route emitted it more than once in one add: each \
+                 note is posted once, and charpente answers its re-send from the record without \
+                 running the route (src/lib.rs, add_note)"
             ),
         "the event check names the route as the cause:\n{block}"
     );
@@ -634,8 +683,8 @@ fn emitting_twice_turns_the_event_check_red_naming_the_route() {
 /// The guard's comparison, the mutant `charpente test --mutants` makes at
 /// `src/lib.rs:59:22`: with `==` turned into `!=`, a repeat of the stored body
 /// is refused and another body is answered as added. The fourth check posts
-/// note 1 twice with one body and once with another, and names the answer and
-/// the route. The other three judge no answer to a repeat, only the tail's end
+/// note 1 twice with one body and once with another, each POST under its own
+/// key, so each one reaches the route, and names the answer and the route. The other three judge no answer to a repeat, only the tail's end
 /// state, which the mutant leaves alone, so it passes them: before the fourth
 /// it survived the scaffold's advertised mutation run (rehearsal finding F5).
 #[test]

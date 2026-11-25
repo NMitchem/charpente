@@ -869,6 +869,10 @@ struct State {
     /// then on, and each skipped roll draws nothing. False for the whole of
     /// every universe that never calls it.
     clock_faults_off: bool,
+    /// How many intent ids `Sim::next_intent` has handed out in this
+    /// universe. A counter, not a stream: each id is drawn from a keyed
+    /// stream of its own, so stamping moves no other draw.
+    intents: u64,
 }
 
 impl State {
@@ -1192,6 +1196,7 @@ impl Sim {
                     outbound: outbound::OutboundWorld::new(seed),
                     wall: WallClock::new(seed, "wall", skew),
                     clock_faults_off: false,
+                    intents: 0,
                 }),
             }),
         }
@@ -1212,6 +1217,22 @@ impl Sim {
     /// what its model stand-in returns, never the real model's behaviour.
     pub fn input(&self) -> Input<'_> {
         Input { sim: self }
+    }
+
+    /// The next intent id `Drive` stamps a write with (GUIDE §8): the hex of
+    /// 16 bytes from `keyed_stream(seed, "intent:drive:<n>")`, where n counts
+    /// the ids this universe has handed out. Each id has a stream of its own,
+    /// so stamping moves no fault, input or entropy draw, and two `Sim`s on
+    /// one seed hand out the same ids in the same order.
+    pub(crate) fn next_intent(&self) -> String {
+        let n = {
+            let mut g = self.world.lock();
+            g.intents += 1;
+            g.intents - 1
+        };
+        let mut bytes = [0u8; 16];
+        keyed_stream(self.seed(), &format!("intent:drive:{n}")).fill(&mut bytes);
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Feeds `choices` to later `input()` draws in order, then 0s.

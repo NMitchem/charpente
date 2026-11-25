@@ -1,3 +1,3 @@
-An order API whose re-sent POST charges the customer twice, and the one command that catches it.
-Run `charpente test --sim` in this directory: it goes red with a seed, and the seed replays.
-Fix it by answering an order that is already stored (the three lines missing from `place_order`), and the run goes green.
+An order API with no guard for an order that is already stored. Under charpente 0.6.0 a re-sent POST charged the customer twice, and `charpente test --sim` caught it with a seed.
+Under 0.7.0 the simulator re-sends each order with the `Idempotency-Key` it first carried, and charpente answers a copy whose first send landed from its record, without placing the order again.
+Run `charpente test --sim` in this directory: the same route, with no guard, goes green.

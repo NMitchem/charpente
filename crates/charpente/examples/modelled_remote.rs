@@ -29,7 +29,8 @@
 //!    Done or Dead. The gateway's own switch is the workload's: it calms the
 //!    gateway before the tail.
 //! 4. Re-send: the tail places again every order the phase left unanswered,
-//!    as a client that never saw its answer would.
+//!    as a client that never saw its answer would, under the
+//!    `Idempotency-Key` its first copy carried.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -94,16 +95,18 @@ impl Charge {
     }
 }
 
-/// Puts the order and enqueues its charge in one transaction. An order that
-/// is already stored is answered as placed and changes nothing: a client
-/// re-sends an order it never saw answered, as the drive's tail does, and an
-/// order whose first send landed before its answer was lost must not get a
-/// second charge under a fresh key. The request is the order's id alone, so
-/// a repeat is always the same request; a route whose request carries data
-/// refuses other data under a stored id (GUIDE §8, "A route the tail re-sends
-/// must be safe to receive twice"). Delete the three lines of the guard and
-/// `-- --master-seed 0xf931428f591be3a4` fails 22 of 242 tested runs
-/// (`--seed 0x74e75093966cb76d`, shrunk to `orders=48`).
+/// Puts the order and enqueues its charge in one transaction. A re-sent POST
+/// does not run this twice: the drive's tail re-sends an order under the
+/// `Idempotency-Key` its first copy carried, and charpente answers a copy
+/// whose first send landed from its record (GUIDE §5, "Retry-safe writes").
+/// The guard is for a second POST of a stored order under a new key, a client
+/// placing the same order again: it is answered as placed and changes
+/// nothing, so the order gets no second charge. The request is the order's id
+/// alone, so a repeat is always the same request; a route whose request
+/// carries data refuses other data under a stored id (GUIDE §8, "A re-sent
+/// write is answered once"). This batch posts each order once, so it passes
+/// without the guard: until 0.7.0 deleting it failed 22 of 242 tested runs at
+/// `-- --master-seed 0xf931428f591be3a4`.
 #[route(POST "/orders/:id", public)]
 fn place_order(tx: &mut Tx, id: Id<Order>) -> Result<Id<Order>, ApiError> {
     if tx.get(id)?.is_some() {
@@ -261,9 +264,9 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         if placed > 1 {
             return Err(format!(
                 "double charge: pay.example applied order {order} {n} times, and the store holds \
-                 {placed} Charge jobs for it — the order was placed twice (a re-sent POST \
-                 /orders/{order} whose first send landed), so each call carried its own job's \
-                 key: make place_order answer an order that is already stored"
+                 {placed} Charge jobs for it — the order was placed twice, so each call \
+                 carried its own job's key: make place_order answer an order that is already \
+                 stored"
             ));
         }
         return Err(format!(

@@ -1,5 +1,5 @@
 //! The same app with no faults and each order posted once: charged once.
-//! Green on the buggy app too, which is why only the sim sees the bug.
+//! Green under 0.6.0 too, where only the sim saw a re-sent POST charge twice.
 
 mod gateway;
 

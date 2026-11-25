@@ -2078,3 +2078,235 @@ fn a_tail_whose_reach_meets_the_limit_exactly_fails_after_one_extension() {
     // daily sweep's last slot before the year 2262.
     assert_eq!(sim.true_wall().as_nanos(), 9_223_286_400_000_000_000);
 }
+
+/// The one tally row: how many times `POST /tally/:n` applied, over every n.
+#[table(global)]
+struct Tally {
+    id: Id<Tally>,
+    count: u64,
+}
+
+/// One row per n that `POST /tally/:n` applied, under the client's own id n:
+/// how many times it applied.
+#[table(global)]
+struct Seen {
+    id: Id<Seen>,
+    times: u64,
+}
+
+/// Retry-unsafe on purpose: every run adds one to the tally, so a re-send the
+/// platform does not recognise counts twice.
+#[route(POST "/tally/:n", public)]
+fn tally(tx: &mut Tx, n: Id<Seen>) -> Result<Id<Seen>, ApiError> {
+    let one = Id::<Tally>::from_raw(1);
+    let internal = |e: io::Error| ApiError::Internal(e.to_string());
+    let count = tx.get(one).map_err(internal)?.map_or(0, |t| t.count) + 1;
+    tx.put(&Tally { id: one, count });
+    let times = tx.get(n).map_err(internal)?.map_or(0, |s| s.times) + 1;
+    tx.put(&Seen { id: n, times });
+    Ok(n)
+}
+
+fn tally_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Tally>().table::<Seen>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![tally]))
+}
+
+const TALLY_UNIVERSES: u64 = 256;
+
+/// Twelve POSTs under the run's faults, then the tail, which re-sends what went
+/// unanswered. Every request is a distinct write, so the tally must equal the
+/// number of requests answered 200 in the phase or the tail.
+fn tally_universe(sim: &mut Sim) -> Result<(), String> {
+    // The n's the latest boot found applied: the tail's boot is the last.
+    let landed = std::cell::RefCell::new(Vec::<u64>::new());
+    let drive = Drive::new(sim, |s: &Sim| {
+        let app = tally_app(s)?;
+        let seen = app.db().snapshot()?.scan::<Seen>()?;
+        *landed.borrow_mut() = seen.iter().map(|s| s.id.raw()).collect();
+        Ok(app)
+    });
+    let requests: Vec<(Duration, Request)> = (1..=12u64)
+        .map(|n| {
+            (
+                Duration::from_millis(n),
+                Request::new(Method::Post, format!("/tally/{n}")),
+            )
+        })
+        .collect();
+    let phase = drive.faulted_phase(&requests, Duration::from_secs(1))?;
+    let Some(recovered) = drive.recover(&phase, Duration::from_secs(1))? else {
+        return Ok(());
+    };
+    let snap = recovered
+        .kernel
+        .app()
+        .db()
+        .snapshot()
+        .map_err(|e| e.to_string())?;
+    let got = snap
+        .get::<Tally>(Id::from_raw(1))
+        .map_err(|e| e.to_string())?
+        .map_or(0, |t| t.count);
+    let want = (0..requests.len())
+        .filter(|&i| phase.status(i) == Some(200) || recovered.status(i) == Some(200))
+        .count() as u64;
+    for i in 0..requests.len() {
+        let n = i as u64 + 1;
+        if recovered.status(i).is_some() && landed.borrow().contains(&n) {
+            sim.cover("tally:resent-landed");
+        }
+    }
+    // The tally and the Seen rows commit together, so a Seen row applied
+    // twice is the double apply, which nothing excuses.
+    let seen = snap.scan::<Seen>().map_err(|e| e.to_string())?;
+    if let Some(twice) = seen.iter().find(|s| s.times > 1) {
+        return Err(format!(
+            "tally is {got} but {want} distinct writes landed: a re-sent POST /tally/{} \
+             applied twice",
+            twice.id.raw()
+        ));
+    }
+    // The tail answers every re-send, a replay included, so each write ends
+    // answered 200 somewhere; a 4xx here is the kernel refusing a stamp.
+    if let Some(i) = (0..requests.len())
+        .find(|&i| phase.status(i) != Some(200) && recovered.status(i) != Some(200))
+    {
+        return Err(format!(
+            "POST /tally/{} was answered {:?} in the phase and {:?} in the tail, not 200: \
+             each write is its own intent and ends answered once",
+            i + 1,
+            phase.status(i),
+            recovered.status(i)
+        ));
+    }
+    // A shortfall is an acked write lost, excused only where durable
+    // corruption fired: the cut reverts the store to a prefix
+    // (`checks::durable_corruption_fired`).
+    if got < want && durable_corruption_fired(sim) {
+        sim.cover("tally:loss-excused");
+        return Ok(());
+    }
+    if got != want {
+        return Err(format!(
+            "tally is {got} but {want} distinct writes landed, and none applied twice: the \
+             Seen rows are {:?}",
+            seen.iter().map(|s| s.id.raw()).collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+}
+
+/// A write whose reply was lost lands once, however `Drive` re-sends it: the
+/// tail's re-send carries the intent id the phase's copy carried, so the
+/// kernel answers it from the record (GUIDE §5, "Retry-safe writes"). The
+/// requirement is the case this oracle exists for: a re-send of a write the
+/// tail's boot found already applied.
+#[test]
+fn a_resent_write_applies_once_under_drive() {
+    charpente_sim::run_universes_swarm!(
+        TALLY_UNIVERSES,
+        tally_universe,
+        require: ["tally:resent-landed"]
+    );
+}
+
+/// Seed `0x9fd85b51a6bbe687`, the universe `a_resent_write_applies_once_under_drive`
+/// failed on before `Drive` stamped its writes: "tally is 13 but 12 distinct
+/// writes landed: a re-sent POST /tally/1 applied twice". Write errors answer
+/// all twelve of the phase's requests with a fallout 500, but the crash
+/// applies POST /tally/1's commit, so the tail's boot finds it applied and the
+/// tail re-sends it with the rest. Unstamped, the re-send ran again; stamped,
+/// the kernel answers it from the record.
+#[test]
+fn the_universe_that_double_applied_before_stamping_applies_once() {
+    const SEED: u64 = 0x9fd8_5b51_a6bb_e687;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+    if let Err(e) = tally_universe(&mut sim) {
+        panic!("seed {SEED:#x}: {e}");
+    }
+    let coverage = sim.coverage();
+    assert_eq!(
+        coverage.get("tally:resent-landed").copied(),
+        Some(1),
+        "the seed's case: the tail re-sends one write its boot found applied: {coverage:?}"
+    );
+    assert_eq!(
+        coverage.get("tally:loss-excused"),
+        None,
+        "the tally equals the writes answered 200, with nothing excused"
+    );
+    assert_eq!(sim.gave_up(), None, "the universe reached a verdict");
+}
+
+/// `faulted_phase` stamps before the boot, once per write: a POST without an
+/// `Idempotency-Key` gets 32 hex digits, each its own, a GET and a POST that
+/// names its own id are sent as given, and two `Sim`s on one seed stamp the
+/// same ids. Seed 0xD7_0000 at rate 0.3 loses every boot of the phase
+/// (`boot:exhausted`, as in
+/// `a_first_boot_lost_to_fallout_still_reaches_the_tail_and_resends_everything`),
+/// so the requests it hands back are the ones `recover` re-sends.
+#[test]
+fn faulted_phase_stamps_each_write_before_the_boot_and_leaves_gets_and_named_ids() {
+    let requests = || {
+        [
+            post(1),
+            Request::new(Method::Get, "/notes/2"),
+            post(3).intent("mine"),
+            post(4),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| (Duration::from_millis(i as u64), r))
+        .collect::<Vec<_>>()
+    };
+    let stamped = |seed: u64| {
+        let sim = Sim::with_faults(seed, disk_faults(0.3));
+        let phase = Drive::new(&sim, notes)
+            .faulted_phase(&requests(), Duration::from_secs(1))
+            .unwrap();
+        let boots_lost = sim.coverage().get("boot:exhausted").copied();
+        let keys: Vec<Option<String>> = phase
+            .requests
+            .iter()
+            .map(|r| r.headers.get("idempotency-key").cloned())
+            .collect();
+        (boots_lost, phase.answers.iter().all(Option::is_none), keys)
+    };
+    let (boots_lost, empty, keys) = stamped(0xD7_0000);
+    assert_eq!(
+        (boots_lost, empty),
+        (Some(1), true),
+        "the seed's case: every boot of the phase lost to fallout"
+    );
+    let hex = |k: &Option<String>| {
+        k.as_ref()
+            .is_some_and(|k| k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    assert!(
+        hex(&keys[0]) && hex(&keys[3]),
+        "each POST is stamped: {keys:?}"
+    );
+    assert_ne!(keys[0], keys[3], "each write gets its own id");
+    assert_eq!(keys[1], None, "a GET is sent as given");
+    assert_eq!(
+        keys[2].as_deref(),
+        Some("mine"),
+        "a write that names its id keeps it"
+    );
+    assert_eq!(
+        stamped(0xD7_0000).2,
+        keys,
+        "a second Sim on the seed stamps the same ids"
+    );
+    assert_ne!(stamped(0xD7_0001).2[0], keys[0], "another seed, other ids");
+}

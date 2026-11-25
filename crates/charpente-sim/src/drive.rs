@@ -24,7 +24,7 @@ use std::time::Duration;
 use charpente::core::io::{Clock as _, WallTime};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::View as _;
-use charpente::http::{App, Request};
+use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 
 use crate::Sim;
@@ -75,7 +75,8 @@ pub struct Drive<'s> {
 /// What the faulted phase sent and what came back, request by request.
 #[derive(Clone)]
 pub struct Phase {
-    /// The requests, in the order given, without their offsets.
+    /// The requests, in the order given, without their offsets, each write
+    /// carrying the intent id the phase sent it with.
     pub requests: Vec<Request>,
     /// `answers[i]` is `requests[i]`'s own `(status, body)`, or `None` when
     /// it went unanswered: the phase ended on fault fallout first, or the
@@ -138,6 +139,15 @@ impl<'s> Drive<'s> {
     /// it). The kernel runs until nothing is left inside `horizon` of that
     /// start, or until fault fallout stops it.
     ///
+    /// - **Intent ids.** Before anything boots, every write (any method but
+    ///   GET) that carries no `Idempotency-Key` is given one, 16 random bytes
+    ///   in hex from a stream of its own, so no fault, input or entropy draw
+    ///   moves. [`Phase::requests`] holds the stamped copies, and
+    ///   [`Drive::recover`] re-sends those, so a re-sent write carries the id
+    ///   its first copy carried and the kernel answers it from the record
+    ///   when that copy committed (GUIDE §5, "Retry-safe writes"). A write
+    ///   that names its own id keeps it; a route that reads its id from
+    ///   another header needs the workload to set that header.
     /// - **Boot.** The app is booted with [`boot_through_fallout`], up to
     ///   eight boots, restarting between them as a supervisor would. A first
     ///   boot that never gets past fallout gives an empty phase, every
@@ -183,6 +193,13 @@ impl<'s> Drive<'s> {
              requests closer"
         );
         let sim = self.sim;
+        // Stamped once, before the boot: the phase sends these copies, an
+        // empty phase hands them back, and `recover` re-sends from
+        // `phase.requests`, so every copy of a write carries one intent id.
+        let requests: Vec<(Duration, Request)> = requests
+            .iter()
+            .map(|(at, r)| (*at, self.stamp(r.clone())))
+            .collect();
         let mut phase = Phase {
             requests: requests.iter().map(|(_, r)| r.clone()).collect(),
             answers: vec![None; requests.len()],
@@ -192,7 +209,7 @@ impl<'s> Drive<'s> {
         };
         let start = sim.now().as_nanos();
         let mut source = SimSource::new(Box::new(sim.clock()), after(start, horizon));
-        for (at, request) in requests {
+        for (at, request) in &requests {
             source.push_at(after(start, *at), request.clone());
         }
         let answers = source.answers();
@@ -408,6 +425,17 @@ impl<'s> Drive<'s> {
             wall,
             extensions,
         }))
+    }
+
+    /// A write (any method but GET) without an `Idempotency-Key` gets one
+    /// from [`Sim::next_intent`]; a GET, or a write that names its own id,
+    /// is sent as given.
+    fn stamp(&self, request: Request) -> Request {
+        if request.method == Method::Get || request.headers.contains_key("idempotency-key") {
+            return request;
+        }
+        let id = self.sim.next_intent();
+        request.intent(id)
     }
 
     fn fallout(&self, text: &str) -> bool {

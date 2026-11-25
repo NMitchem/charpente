@@ -47,11 +47,11 @@ impl Echo {
 }
 
 /// Three effects, one commit: the row, the job and the event all become
-/// true together or not at all. There is no way to split them. A note is
-/// written once. The same note again is answered as added and changes
-/// nothing: a client re-sends a POST it never saw answered, as the sim's tail
-/// does, and a note whose first send landed must not be echoed or announced
-/// twice. The same id with another body is a conflict, refused with a 400.
+/// true together or not at all. There is no way to split them. A re-sent
+/// POST carries its first copy's `Idempotency-Key`, and charpente answers it
+/// from the record without running this route (GUIDE §5). The guard holds a
+/// note to one body: a new POST of a stored note with that body changes
+/// nothing, and another body is a conflict, refused with a 400.
 // `public`: the scaffold has no principals yet — GUIDE §5 (Sessions) is where `auth` starts.
 #[route(POST "/notes/:id", public)]
 fn add_note(tx: &mut Tx, id: Id<Note>, body: NewNote) -> Result<Id<Note>, ApiError> {

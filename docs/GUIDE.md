@@ -1401,8 +1401,9 @@ handle it the same way: a blind retry is safe where the write carries an
 intent id, which the platform answers once ("Retry-safe writes", next), or
 where the operation is idempotent in your own schema. Nothing else dedupes,
 and §6 is explicit that an `enqueue_keyed` key is carried, not indexed. A sim's
-fault-free tail re-sends such a request too, so a route it reaches must be
-safe to receive twice (§8, "A fault-free tail for an end-of-run check"). After the
+fault-free tail re-sends such a request too, under the intent id its first
+copy carried, so it is answered once (§8, "A fault-free tail for an end-of-run
+check"). After the
 restart, the honest way to learn what happened is to read the state back
 rather than infer it from the status code.
 
@@ -1413,8 +1414,9 @@ it sends the write again. charpente answers that copy from a record instead
 of running the write twice. The contract: a request to a write route (`POST`,
 `PUT`, `PATCH` or `DELETE`, never `SSE`) that carries an `Idempotency-Key`
 header applies at most once under that key, and every later copy gets the
-first copy's reply back. In a test or a hand driver, `Request::intent(id)`
-sets the header:
+first copy's reply back. `charpente_sim::drive` stamps one on each write it
+sends, and its re-send carries the same one (§8). In a test or a hand driver,
+`Request::intent(id)` sets the header:
 
 ```rust
 use charpente::http::{Method, Request};
@@ -3448,7 +3450,7 @@ and jobs.
 | Example | File, in the `charpente` crate | It shows |
 |---|---|---|
 | `drawn_inputs` | `examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them and merges the tail's re-sent answers into its judgement, and a `require` on a key the check marks when it judged something |
-| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch flipped between the faulted phase and the tail, a route safe to receive twice, and the three outbound checkers |
+| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch flipped between the faulted phase and the tail, a route that answers an order already stored as placed, and the three outbound checkers |
 | `restart_under_faults` | `examples/restart_under_faults.rs` | the recovery drive's four steps over a power cycle, a claim about the faulted phase's acks only, and a `require ["restart"]` |
 
 All three drive the app with `charpente_sim::drive` ("A fault-free tail for an
@@ -3777,7 +3779,11 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    the phase: it is the crash under test, never a give-up and never a skip,
    and the answers already recorded stand. `phase.answers[i]` is request
    `i`'s `(status, body)`, or `None` when it went unanswered;
-   `phase.status(i)` is its status.
+   `phase.status(i)` is its status. Before the boot, `faulted_phase` gives
+   each write (any method but GET) that carries no `Idempotency-Key` one of
+   its own, 16 bytes in hex from a stream keyed to the run's seed, so no
+   fault, input or entropy draw moves. `phase.requests` holds the stamped
+   copies.
 3. **A tail free of per-call faults; a drawn provider outage runs to its
    end.** `recover` power-cycles (`sim.restart()`), quiesces the disk and
    clock faults, and the outbound faults when the app declares hosts. A drawn
@@ -3789,7 +3795,10 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    calls.
 4. **Re-send what went unanswered.** The requests whose answer is `None`,
    or a 5xx whose body is fault fallout, are sent again at the tail's start,
-   in their order in the list. A
+   in their order in the list, each the stamped copy with the
+   `Idempotency-Key` the phase sent it under. A re-sent write whose first copy
+   committed is answered from the record of its first reply, and the route
+   does not run again (§5, "Retry-safe writes"). A
    4xx, or a handler's own 5xx, is the app's answer and is not re-sent.
    Fallout is read from the body's text (`is_fault_fallout`), so a handler's
    own 5xx whose message reads as fallout ("injected", say) is re-sent too.
@@ -3860,29 +3869,39 @@ sim can place" holds that open question. Measure a required key's
 rate before you rely on it, and write the rate beside the `require`, as the
 fixture does: a fresh `cargo test` batch is 256 runs.
 
-**A route the tail re-sends must be safe to receive twice.** `Drive`
-re-sends, and a request that went unanswered may have landed, so its re-send
-is the second delivery a production client's retry makes. Answer a repeat of
-the same request with what the first one did, and change nothing:
-`modelled_remote`'s `place_order` answers an order that is already stored, and
-the scaffold's `add_note` a note already stored with the same body. A request
-that reuses the id with other content is a
-conflict, not a repeat: refuse it with a 4xx that names the conflict and the
-fix, as `add_note` does for a note that already holds another body. Judge
-the answers, not only the end state: a guard whose `==` is turned into `!=`
-refuses the retry and answers the conflict as added, and leaves the store as
-it was, so the scaffold's three end-state checks pass it. Its fourth,
-`a_resent_note_changes_nothing_and_a_conflict_is_refused`, posts one note
-twice with one body and once with another and judges each answer. Key a
-state transition (a pickup, a cancel) by an id of its own, such as `PUT
-/pickups/:pickup_id` naming the hold in its body and stored as a row: under
-`POST /holds/:id/pickup` a retry of a pickup that landed and a fresh pickup of
-a hold already picked up are the same bytes, while with its own id a repeat
-finds its row and answers alike and a new pickup of a hold no longer waiting
-is refused. A route
-that fails this is an app defect the re-send found, and its check goes red
-with a seed. Fix the route: dropping below the helper to skip the re-send
-hides the defect.
+**A re-sent write is answered once.** A request that went unanswered may
+have landed, so `Drive`'s re-send is the second delivery a production
+client's retry makes, and it carries the `Idempotency-Key` its first copy
+carried, as that retry would. charpente answers it from the record of the
+first reply (§5, "Retry-safe writes"), so a route needs no guard against
+`Drive`'s re-sends. Three cases are still the workload's or the route's:
+- **A hand-built re-send** (a `SimSource` you push to, or `App::handle`) is
+  recognised only when it carries the first copy's id: build both copies with
+  `Request::intent` and one id. A copy with no id runs again.
+- **A route that reads its id from its sender's header** (a webhook's
+  `intent = header(...)`, §5) ignores `Idempotency-Key`, which is all `Drive`
+  stamps, so the workload sets that header on each request, as the sender
+  would.
+- **Two ids are two intents,** even with the same body. A route whose rows
+  are written once answers a second request for a stored row with what the
+  first did and changes nothing, and refuses one with other content with a
+  4xx that names the conflict and the fix: the scaffold's `add_note` answers
+  a note already stored with the same body and refuses another body, and
+  `modelled_remote`'s `place_order` answers an order already stored. Judge the
+  answers, not only the end state: a guard whose `==` is turned into `!=`
+  refuses the repeat and answers the conflict as added, and leaves the store
+  as it was, so the scaffold's three end-state checks pass it. Its fourth,
+  `a_resent_note_changes_nothing_and_a_conflict_is_refused`, posts one note
+  twice with one body and once with another, each POST under its own key, and
+  judges each answer. A state transition (a pickup, a cancel) can be keyed by
+  the row it moves: under `POST /holds/:id/pickup` a retry of a pickup that
+  landed carries its first copy's key and is answered from the record, and a
+  fresh pickup of a hold already picked up carries a new key and reaches the
+  route, which refuses a hold that is no longer waiting.
+
+A route that fails a case its check sends is an app defect, and the check
+goes red with a seed. Fix the route: dropping below the helper hides the
+defect.
 
 **Seed fixtures in the build closure, not in the phase.** A `Drive` phase is a
 fixed request list, so a key one request mints cannot feed a later one, and
@@ -3958,7 +3977,8 @@ cannot take the re-send is not a reason to drop below it: fix the route
 - treat a crash in the faulted phase as the crash under test, not a skip;
 - quiesce before the tail boots, and wait out a clock refusal;
 - give up only on a durable refusal;
-- re-send in the tail what went unanswered, to routes safe to receive twice.
+- give each write an intent id (`Request::intent`) before the phase sends
+  it, and re-send in the tail what went unanswered as that same copy.
 
 A check that runs at the end of a run — a checkpoint, a graceful close, a
 byte comparison of two nodes' files — does IO, and the run's
@@ -4529,11 +4549,12 @@ cron multiplexed on one loop — is just as drivable, because the loop itself
 sim test runs the identical loop code against a scripted timeline.
 `charpente_sim::drive` runs that loop through the four steps of "A fault-free
 tail for an end-of-run check" above, and the example below is built on it.
-Its tail re-sends what went unanswered, so every route a workload sends must
-be safe to receive twice (that section, "A route the tail re-sends must be
-safe to receive twice"). `hit` below takes the re-send by design: it counts
-landings, and both of its invariants are stated over jobs, so a hit that
-lands twice is two Done jobs and two hits.
+Its tail re-sends what went unanswered, each write under the
+`Idempotency-Key` the faulted phase stamped it with, so a re-sent hit whose
+first copy committed is answered from its record and lands once (that
+section, "A re-sent write is answered once"). `hit` below has no guard: each
+of its three requests is an intent of its own, and both of its invariants are
+stated over jobs.
 
 **Requests** are built with the public builder: `Request::new(Method::Post,
 "/hit")`, then `.header(key, value)` (keys are lowercased for you) and
@@ -4541,7 +4562,10 @@ lands twice is two Done jobs and two hits.
 session token (§5) the same way production traffic does:
 `.header("authorization", format!("Bearer {token}"))`. `Drive::faulted_phase`
 takes each with the offset it arrives at, counted from the instant the app
-booted.
+booted, and stamps each write that carries no `Idempotency-Key` with one of
+its own; `.intent(id)` sets it by hand. A route that reads its id from its
+sender's header (§5, `intent = header(...)`) gets nothing from the stamp, so
+the workload sets that header itself, as the sender would.
 
 **The end state.** `recovered.kernel` is the tail's kernel, which keeps its
 `App`. `kernel.app().db().snapshot()` reads the durable end-state, and
@@ -4618,10 +4642,9 @@ struct HitBody {
     slot: WireU64,
 }
 
-// Takes the tail's re-send by design: a hit that lands twice is two jobs, and
-// the invariants below count jobs. A route whose property is exactly-once
-// answers a row that already landed instead (GUIDE §8, "A route the tail
-// re-sends must be safe to receive twice").
+// No guard: the tail re-sends a hit under the key its first copy carried, and
+// charpente answers one that landed from its record, so a hit lands once
+// (GUIDE §8, "A re-sent write is answered once"). The invariants count jobs.
 #[route(POST "/hit", public)]
 fn hit(tx: &mut Tx, body: HitBody) -> Result<WireU64, ApiError> {
     tx.enqueue(CountUp { slot: body.slot.0 });
@@ -4743,6 +4766,9 @@ below the helper" above):
   the same replies by slot, one per `push_at` in push order: slot `i` is the
   `i`-th push's own `(status, body)`, and `None` until that request is
   answered, so a run that stopped says which requests it never reached.
+  `SimSource` stamps nothing: a write you push carries the intent id you gave
+  it (`Request::intent`), and a copy you push again is answered from the
+  record only under the first copy's id.
 - **`Kernel::new(app, Box::new(sim.clock()))`** consumes the mounted `App`
   (upserting cron rows and rebuilding the job due-heap — §6, §7);
   `kernel.run(&mut source)` then serves scripted requests at their virtual

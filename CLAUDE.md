@@ -188,12 +188,15 @@ item with the trigger that reopens it.
   output.
 - `examples/invoicing` — the M0 demo app, agent-built from docs alone (DEMO.md,
   FINDINGS.md).
-- `examples/double-charge` — the launch tape's order API, shipped with its bug (a re-sent
-  POST places an order again, so a lost reply charges twice). It is OUTSIDE the workspace
+- `examples/double-charge` — the launch tape's order API, whose `place_order` has no guard
+  for an order already stored: under 0.6.0 a re-sent POST placed the order again, so a lost
+  reply charged twice, and from 0.7.0 `Drive`'s re-send carries its first copy's
+  `Idempotency-Key` and is answered from the record. It is OUTSIDE the workspace
   (its own empty `[workspace]`) because it is what a stranger copies: it depends on
   `charpente = "=0.7.0"` from crates.io, which resolves nowhere before the publish. Build and
-  test it only through `crates/charpente-cli/tests/demo.rs`'s patched copy, which pins it red
-  under master seed 0x434841524745 and green with `place_order`'s three guard lines restored.
+  test it only through `crates/charpente-cli/tests/demo.rs`'s patched copy, which pins it
+  green under master seed 0x434841524745 and README's 0.6.0 repro seed (0x82eac71fbdeda9de)
+  passing.
 
 ## Hard rules (the guarantees are the product)
 

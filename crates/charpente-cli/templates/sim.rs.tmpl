@@ -16,7 +16,9 @@
 //!    refusal waited out, and the app booted again and run for a minute, so
 //!    every due job drains.
 //! 4. Re-send: the tail posts again every note the phase left unanswered, as
-//!    a client that never saw its answer would.
+//!    a client that never saw its answer would, under the `Idempotency-Key`
+//!    its first copy carried, so charpente answers a note that landed from its
+//!    record and the route does not run again.
 //!
 //! Run them: `charpente test --sim`. Watch one fail: delete the `tx.enqueue`
 //! line in `src/lib.rs` and run again. Delete `tx.emit` and the third goes red;
@@ -145,8 +147,9 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
 ///   too, and one of theirs must not make up for an acked note's.
 /// - Exactly-once: the notes marked `echoed` number exactly the `Echo` jobs
 ///   that are Done — a job's effect and its Done mark commit as one record.
-///   Each add enqueues one `Echo` in the note's own record, so two for one
-///   note mean the route added it twice, a cause told apart first.
+///   Each note is posted once and charpente answers its re-send from the
+///   record, so two `Echo` jobs for one note mean the route enqueued more
+///   than one in one add, a cause told apart first.
 ///
 /// It also fails a run in which a job's `on_dead` hook failed
 /// (`dead_hooks_succeeded`, GUIDE §8). `Echo` is `retain_dead` and has no
@@ -195,8 +198,8 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
     }
     if let Some((note, jobs)) = per_note.iter().find(|(_, jobs)| **jobs > 1) {
         return Err(format!(
-            "exactly-once violated: note {note} has {jobs} Echo jobs — it was added twice, so it is echoed twice: \
-             a re-sent POST /notes/{note} whose first send landed must not enqueue again (src/lib.rs, add_note)"
+            "exactly-once violated: note {note} has {jobs} Echo jobs — the route enqueued it more than once in one add: \
+             each note is posted once, and charpente answers its re-send from the record without running the route (src/lib.rs, add_note)"
         ));
     }
     let done = echo_jobs
@@ -221,7 +224,8 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
 /// An acked POST implies its realtime event: each acked note's `NoteAdded`
 /// is in the durable event log exactly once after recovery — the log a
 /// subscriber's resume reads. None means the emit did not commit with the
-/// row; more than one means the route emitted it again for the same note.
+/// row; more than one means the route emitted it more than once in one add,
+/// since charpente answers a re-sent POST without running the route.
 /// Delete `tx.emit` in `src/lib.rs` and this goes red with a seed.
 fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), String> {
     let Some((recovered, acked)) = post_then_crash(sim)? else {
@@ -244,8 +248,8 @@ fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), Stri
         let seen = added.iter().filter(|e| e.note.raw() == *id).count();
         if seen > 1 {
             return Err(format!(
-                "exactly-once violated: note {id} has {seen} NoteAdded events — the route emitted it more than once: \
-                 a note emits once, when it is first added, and a repeat of a stored note must not emit again (src/lib.rs, add_note)"
+                "exactly-once violated: note {id} has {seen} NoteAdded events — the route emitted it more than once in one add: \
+                 each note is posted once, and charpente answers its re-send from the record without running the route (src/lib.rs, add_note)"
             ));
         }
         if seen == 0 {
@@ -269,8 +273,10 @@ fn acked_post_implies_its_event_after_recovery(sim: &mut Sim) -> Result<(), Stri
 const REFUSED: &str = r#"{"error":"note 1 already holds another body — a note is written once; post the new body under a new id"}"#;
 
 /// A repeat changes nothing and a conflict is refused. Note 1 is posted three
-/// times in a drawn order, twice with one body and once with another: a
-/// client re-sending a POST it never saw answered, and one reusing the id.
+/// times in a drawn order, twice with one body and once with another, each
+/// POST a request of its own under its own `Idempotency-Key`: a client
+/// posting a note again, and one reusing the id. A re-sent copy of one POST
+/// is charpente's to answer, not the route's.
 /// Whichever body landed first is the note's, through any crash. Each POST
 /// with it is answered 200 with the note's id, each with the other is refused
 /// with the route's 400, and no repeat adds a second `Echo` job or
@@ -348,7 +354,7 @@ fn a_resent_note_changes_nothing_and_a_conflict_is_refused(sim: &mut Sim) -> Res
     if echoes > 1 || added > 1 {
         return Err(format!(
             "exactly-once violated: note 1 has {echoes} Echo jobs and {added} NoteAdded events — \
-             a repeat of a stored note changes nothing, so it must not enqueue or emit again \
+             another POST of a stored note changes nothing, so it must not enqueue or emit again \
              (src/lib.rs, add_note)"
         ));
     }

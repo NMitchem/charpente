@@ -1,7 +1,10 @@
-//! `examples/double-charge` — the launch tape's app. It ships with a bug (a
-//! re-sent POST places an order again, so a lost reply charges twice), and
-//! these tests pin it red under fixed master seeds and green once the three
-//! guard lines of `place_order` are restored. The demo is outside the
+//! `examples/double-charge` — the launch tape's app. Its `place_order` has no
+//! guard for an order that is already stored, so under 0.6.0 a re-sent POST
+//! placed the order again and a lost reply charged twice; README keeps that
+//! run as history. From 0.7.0 `Drive` re-sends each write under the
+//! `Idempotency-Key` it first carried and the kernel answers it from its
+//! record, so these tests pin the batch green under fixed master seeds, and
+//! the seed README quotes from 0.6.0 passing. The demo is outside the
 //! workspace and `=0.7.0` resolves nowhere before the publish, so it is built
 //! only as a patched copy, as `new.rs` builds the scaffold.
 
@@ -11,7 +14,6 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 
 const MASTER: &str = "0x434841524745";
-const FIX: &str = "answer an order that is already stored";
 // Every copy is a workspace root of its own named `double-charge`, so cargo
 // gives all of them one artifact hash in the shared target directory; two
 // copies building at once overwrite each other's binary. The tests take this
@@ -27,29 +29,21 @@ const FRAME_COLS: usize = 103;
 const STARTUP: &str = "running 1 sim check, 256 runs each, under random injected faults (master \
                        seed 0x0000434841524745)\n";
 
-/// The batch's full stdout under MASTER: the block README quotes and the tape
-/// shows. It starts with a newline because stdout does (the failure block
+/// The batch's full stdout under MASTER: the green block README quotes under
+/// 0.7.0. It starts with a newline because stdout does (the skipped-runs block
 /// opens with one), so nobody trims it. It moves only with a named cause (the
-/// harness's red output, the demo's own message, or the seed's universe),
-/// never to make this test pass, and README's quoted run moves with it.
+/// harness's output, the demo's own check, or the seed's universe), never to
+/// make this test pass, and README's quoted run moves with it.
 const GOLDEN: &str = r"
-sim failure in each_order_is_charged_once: order 9 charged twice: its POST was sent again after a fault hid its success and placed the order again; answer an order that is already stored
-  seed:   0x82eac71fbdeda9de
-  fired:  boot:booted-after-retry: 1, boot:retried: 2, crash:applied: 1, fault:outbound_lost_reply: 1, fault:sync_error: 3, outbound:completed: 51, restart: 1, restart:process: 2
-  inputs: orders=48
-  shrunk: orders 71 to 48, 6 faults off, in 13 replays
-  repro:  charpente test --sim --filter each_order_is_charged_once --seed 0x82eac71fbdeda9de --inputs 00 --faults-off crash_torn,object_put_error,object_get_error,outbound_refused,disk_latency,net_latency
-
 skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
-  each_order_is_charged_once — 8 runs; it failed, so only --format json lists their reasons
+  each_order_is_charged_once
+    8  the boot was refused: injected corruption reached durable data at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xe89246396f6a95eb)
 
-check each_order_is_charged_once ... FAILED  (248 tested over 49 distinct inputs: 28 failed; 8 skipped)
+check each_order_is_charged_once ... ok  (248 tested over 49 distinct inputs, 8 skipped)
 
-sim result: FAILED. 0 passed; 1 failed. Runs tested: 248 of 256.
+sim result: ok. 1 passed; 0 failed. Runs tested: 248 of 256.
 rerun exactly this batch: charpente test --sim --master-seed 0x434841524745
 ";
-
-const GUARD: &str = "    if tx.get(id)?.is_some() {\n        return Ok(id);\n    }\n";
 
 // Process spawning is edge tooling (DESIGN.md §1): this file drives the built
 // binary as a real subprocess. The CHARPENTE_SIM_* variables are removed so a
@@ -148,7 +142,7 @@ fn patched_demo(name: &str) -> Demo {
             "examples/double-charge/Cargo.toml pins {krate} {pin:?}, but the workspace is \
              {version}, so the copy would build against crates.io instead of this workspace. \
              Bump the demo's charpente and charpente-sim pins together with the workspace \
-             version, then re-pin GOLDEN and README's two quoted runs from a real run."
+             version, then re-pin GOLDEN and README's quoted green run from a real run."
         );
     }
     let dir = std::env::temp_dir().join(format!("charpente-demo-{name}-{}", std::process::id()));
@@ -194,75 +188,34 @@ fn cargo_ok(app: &Path, args: &[&str]) {
     );
 }
 
+/// The demo's route has no guard, and the batch is green: every re-sent
+/// order carries its first copy's key, so one that landed is answered from
+/// the record and `place_order` does not run again.
 #[test]
-fn the_demo_charges_an_order_twice_and_names_the_fix() {
+fn the_demo_answers_each_resent_order_once() {
     let _lock = one_at_a_time();
-    let app = patched_demo("red");
-    let out = batch(&app, MASTER);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "stdout:\n{stdout}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let (_app, stdout, _) = master_batch("green");
     for want in [
-        "sim failure in each_order_is_charged_once: ",
-        "charged twice",
-        FIX,
+        "check each_order_is_charged_once ... ok  (",
+        "sim result: ok.",
     ] {
         assert!(stdout.contains(want), "missing {want:?}:\n{stdout}");
     }
 }
 
 #[test]
-fn the_demo_goes_red_under_other_master_seeds() {
+fn the_demo_stays_green_under_other_master_seeds() {
     let _lock = one_at_a_time();
     let app = patched_demo("others");
     for n in 1..=8 {
         let out = batch(&app, &format!("0x{n:x}"));
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(out.status.code(), Some(1), "master 0x{n:x}:\n{stdout}");
-        let start = stdout
-            .find("sim failure in ")
-            .unwrap_or_else(|| panic!("master 0x{n:x} names no failure:\n{stdout}"));
-        let first = &stdout[start..];
-        let headline = first.lines().next().unwrap();
+        assert_eq!(out.status.code(), Some(0), "master 0x{n:x}:\n{stdout}");
         assert!(
-            headline.starts_with("sim failure in each_order_is_charged_once: "),
-            "master 0x{n:x}: the first failure is another check:\n{stdout}"
-        );
-        // The headline, not a `before shrinking:` line under it.
-        assert!(
-            headline.contains(FIX),
-            "master 0x{n:x}: the headline names no fix:\n{stdout}"
+            stdout.contains("sim result: ok."),
+            "master 0x{n:x}:\n{stdout}"
         );
     }
-}
-
-#[test]
-#[allow(clippy::disallowed_methods)]
-fn restoring_the_three_lines_turns_the_demo_green() {
-    let _lock = one_at_a_time();
-    let app = patched_demo("green");
-    let lib = std::fs::read_to_string(app.join("src/lib.rs")).unwrap();
-    let head = "pub fn place_order(tx: &mut Tx, id: Id<Order>) -> Result<Id<Order>, ApiError> {\n";
-    assert_eq!(lib.matches(head).count(), 1);
-    let lib = lib.replacen(head, &format!("{head}{GUARD}"), 1).replacen(
-        "use charpente::{Id, Schema, Tx,",
-        "use charpente::{Id, Schema, Tx, View,",
-        1,
-    );
-    std::fs::write(app.join("src/lib.rs"), lib).unwrap();
-    let out = batch(&app, MASTER);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stdout:\n{stdout}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(stdout.contains("sim result: ok."), "{stdout}");
 }
 
 #[test]
@@ -278,14 +231,18 @@ fn the_demo_builds_lints_clean_and_passes_a_single_send_test() {
 fn master_batch(name: &str) -> (Demo, String, String) {
     let app = patched_demo(name);
     let out = batch(&app, MASTER);
-    assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     (app, stdout, stderr)
 }
 
 #[test]
-fn the_demos_red_block_fits_the_tapes_frame() {
+fn the_demos_output_fits_the_tapes_frame() {
     let _lock = one_at_a_time();
     let (_app, stdout, stderr) = master_batch("frame");
     // The terminal shows both streams, the startup line (stderr) first.
@@ -304,7 +261,7 @@ fn the_demos_stderr_is_exactly_the_startup_line() {
 }
 
 #[test]
-fn the_demos_red_block_is_pinned_whole() {
+fn the_demos_output_is_pinned_whole() {
     let _lock = one_at_a_time();
     let (_app, stdout, _) = master_batch("golden");
     assert_eq!(stdout, GOLDEN);
@@ -322,37 +279,51 @@ fn readme_quotes_the_demos_batch_whole() {
     );
 }
 
+/// The `repro:` command README quotes from 0.6.0's red run. Its universe still
+/// meets the faults that charged order 9 twice: the fault keys of the `fired:`
+/// line README quotes from 0.6.0, with one completed outbound call fewer (50,
+/// where that line reads 51). Now the re-sent POST is answered from the
+/// record, so the run reaches a verdict and passes.
+const REPRO_0_6_0: &str = "charpente test --sim --filter each_order_is_charged_once --seed \
+                           0x82eac71fbdeda9de --inputs 00 --faults-off \
+                           crash_torn,object_put_error,object_get_error,outbound_refused,\
+                           disk_latency,net_latency";
+
 #[test]
-fn the_demos_repro_line_replays_its_failure() {
+fn the_seed_readme_quotes_from_0_6_0_now_passes() {
     let _lock = one_at_a_time();
-    let (app, stdout, _) = master_batch("repro");
-    let failure = |text: &str| {
-        text.lines()
-            .find(|l| l.starts_with("sim failure in "))
-            .unwrap_or_else(|| panic!("no failure line:\n{text}"))
-            .to_string()
-    };
-    let repro = stdout
-        .lines()
-        .find_map(|l| l.trim_start().strip_prefix("repro:"))
-        .expect("the batch prints a repro line")
-        .trim();
-    let args: Vec<&str> = repro.split_whitespace().collect();
-    assert_eq!(args[0], "charpente", "{repro}");
-    let out = charpente()
-        .current_dir(&*app)
-        .env("CARGO_TARGET_DIR", target_dir())
-        .args(&args[1..])
-        .output()
-        .unwrap();
-    let replay = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(1), "{repro}:\n{replay}");
-    assert_eq!(failure(&replay), failure(&stdout));
-    // README quotes this replay whole, under the command typed.
-    let quoted = format!("$ {repro}\n{replay}");
     assert!(
-        readme_example().contains(&quoted),
-        "README.md's example must quote the repro's replay as it runs, from a real run:\n{quoted}"
+        readme_example().contains(&format!("$ {REPRO_0_6_0}\n")),
+        "README.md's example quotes 0.6.0's repro command as typed:\n{REPRO_0_6_0}"
+    );
+    let app = patched_demo("repro");
+    let args: Vec<&str> = REPRO_0_6_0.split_whitespace().collect();
+    let replay = |extra: &[&str]| {
+        charpente()
+            .current_dir(&*app)
+            .env("CARGO_TARGET_DIR", target_dir())
+            .args(&args[1..])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let out = replay(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{REPRO_0_6_0}:\n{stdout}");
+    assert!(
+        stdout
+            .contains("sim result: ok. 1 passed; 0 failed; 0 skipped, on seed 0x82eac71fbdeda9de"),
+        "the replay reaches a verdict, not a skip:\n{stdout}"
+    );
+    let json = replay(&["--format", "json"]);
+    let report = String::from_utf8_lossy(&json.stdout);
+    assert!(
+        report.contains(
+            "\"coverage\":{\"boot:booted-after-retry\":1,\"boot:retried\":2,\"crash:applied\":1,\
+             \"fault:outbound_lost_reply\":1,\"fault:sync_error\":3,\"outbound:checked\":1,\
+             \"outbound:completed\":50,\"restart\":1,\"restart:process\":2}"
+        ),
+        "the seed still meets 0.6.0's faults, with one completed call fewer:\n{report}"
     );
 }
 
@@ -387,8 +358,8 @@ fn readme_section<'a>(readme: &'a str, heading: &str) -> &'a str {
 /// before the reader has a toolchain. On 2026-11-20 rustup's `stable` on a
 /// machine that had not updated was 1.95, and `cargo install charpente-cli`
 /// refused by name, so Install names the Rust the demo declares and the
-/// update. The example's quoted output came from the release the demo pins,
-/// and README says which.
+/// update. The example's pinned run came from the release the demo pins, and
+/// README says which, as it labels the runs it keeps from 0.6.0.
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn readme_names_the_demos_rust_version_and_its_release() {
@@ -421,6 +392,6 @@ fn readme_names_the_demos_rust_version_and_its_release() {
     assert!(
         example.contains(&format!("charpente {release}")),
         "README.md's example must name `charpente {release}`, the release \
-         examples/double-charge pins and its quoted output came from\n{example}"
+         examples/double-charge pins and its pinned run came from\n{example}"
     );
 }

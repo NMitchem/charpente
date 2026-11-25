@@ -108,13 +108,14 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
     (
         "0.7.0",
-        "the release README's example names: the one examples/double-charge pins (demo.rs's \
-         readme test); a version, not a measurement",
+        "the release README's example names: the one examples/double-charge pins and whose \
+         green run README quotes (demo.rs's readme tests pin both); a version, not a measurement",
     ),
     (
         "0.6.0",
-        "the release whose run README's example quotes (the red output above the pin); a version, \
-         not a measurement",
+        "the release whose two red runs README's example keeps as labelled, unpinned history \
+         (0.7.0 passes the same seed: demo.rs's the_seed_readme_quotes_from_0_6_0_now_passes); a \
+         version, not a measurement",
     ),
 ];
 const EXEMPT_COUNT: usize = 14;

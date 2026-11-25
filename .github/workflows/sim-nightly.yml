@@ -21,8 +21,9 @@ name: sim-nightly
 #
 # WHICH APPS. The fixtures whose batches are green by design (sim-fixture, invoicing,
 # outbound-fixture) and a fresh `charpente new` scaffold built against this checkout's crates.
-# merge-fixture and examples/double-charge are left out: each is red by design, a victim
-# pinned red by its own tests.
+# merge-fixture is left out: it is red by design, a victim pinned red by its own tests.
+# examples/double-charge is left out too: it depends on charpente from crates.io, not this
+# checkout, and crates/charpente-cli/tests/demo.rs pins its patched copy's batch green.
 
 on:
   schedule:
