@@ -95,10 +95,17 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
             .iter()
             .filter(|(_, job)| job.order.raw() == *order)
             .count();
+        // This workload posts each order once, and a re-send carries its
+        // first copy's Idempotency-Key, which charpente answers from its
+        // record. A second placement is a second POST of the order under a
+        // new key, or charpente running a re-sent write again.
         if placed > 1 {
             return Err(format!(
-                "order {order} charged twice: its POST was sent again after a fault hid its \
-                 success and placed the order again; answer an order that is already stored"
+                "order {order} charged twice: it was placed twice, and each placing enqueued \
+                 its own charge. A re-sent POST carries its first copy's Idempotency-Key and is \
+                 answered from its record, so either a second POST of this order came under a \
+                 new key (answer an order that is already stored), or charpente ran a re-sent \
+                 write again, a platform defect to report with this seed"
             ));
         }
         return Err(format!(

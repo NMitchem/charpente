@@ -7,12 +7,15 @@
 //! `charpente test --sim`. In a charpente checkout: `cargo run -p charpente
 //! --example modelled_remote`, with any flag after `--` (`-- --master-seed 0x…`).
 //!
-//! A drawn 48 to 96 orders are placed under the run's faults, the process is
-//! power-cycled, and a fault-free tail lets every charge settle. The claim:
-//! the gateway applies no order twice, and an order is paid exactly when its
-//! job is Done. Delete the idempotency key from `charge`'s call and
-//! the gateway sees a fresh key on every retry, so a lost reply charges twice
-//! and the run goes red (GUIDE §8, "The outside world: remote models").
+//! A drawn 48 to 96 orders are placed under the run's faults, and a drawn one
+//! of them is placed again, under a new key, as a client placing it twice
+//! would. The process is power-cycled, and a fault-free tail lets every charge
+//! settle. The claim: the gateway applies no order twice, and an order is
+//! paid exactly when its job is Done. Delete the idempotency key from
+//! `charge`'s call and the gateway sees a fresh key on every retry, so a lost
+//! reply charges twice and the run goes red (GUIDE §8, "The outside world:
+//! remote models"). Delete `place_order`'s guard and the second placing
+//! enqueues a second charge, and the run goes red too.
 //!
 //! `charpente_sim::drive` runs the four steps (GUIDE §8, "A fault-free tail
 //! for an end-of-run check"):
@@ -104,9 +107,9 @@ impl Charge {
 /// nothing, so the order gets no second charge. The request is the order's id
 /// alone, so a repeat is always the same request; a route whose request
 /// carries data refuses other data under a stored id (GUIDE §8, "A re-sent
-/// write is answered once"). This batch posts each order once, so it passes
-/// without the guard: until 0.7.0 deleting it failed 22 of 242 tested runs at
-/// `-- --master-seed 0xf931428f591be3a4`.
+/// write is answered once"). The workload places one order twice, so the
+/// guard is what stops its second charge: `charpente-cli`'s `demo.rs` runs
+/// this file with the guard deleted and pins the run red.
 #[route(POST "/orders/:id", public)]
 fn place_order(tx: &mut Tx, id: Id<Order>) -> Result<Id<Order>, ApiError> {
     if tx.get(id)?.is_some() {
@@ -193,6 +196,7 @@ charpente_sim::sim_tests! {
 
 fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
     let orders = sim.input().between("orders", 48, 96);
+    let again = sim.input().between("again", 1, orders);
     let calm = Arc::new(AtomicBool::new(false));
     sim.remote(
         "pay.example",
@@ -203,12 +207,16 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         },
     );
 
-    // The faulted phase: post the orders 20 ms apart and run past the first
-    // retries; the tail's power cycle may find a charge in flight.
+    // The faulted phase: post the orders 20 ms apart, then order `again` a
+    // second time, and run past the first retries; the tail's power cycle may
+    // find a charge in flight. `Drive` stamps each POST with a key of its own,
+    // so the second placing is a new write, not a re-send.
     let requests: Vec<(Duration, Request)> = (1..=orders)
-        .map(|id| {
+        .chain([again])
+        .enumerate()
+        .map(|(i, id)| {
             (
-                Duration::from_millis(id * 20),
+                Duration::from_millis((i as u64 + 1) * 20),
                 Request::new(Method::Post, format!("/orders/{id}")),
             )
         })

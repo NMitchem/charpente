@@ -194,6 +194,24 @@ impl Parse for RouteArgs {
                         ),
                     ));
                 }
+                // The id is stored raw in the record of answered writes, so
+                // a credential header's value would sit on disk as it was
+                // sent (DESIGN §8). A sender's event id is never one.
+                if ["authorization", "proxy-authorization", "cookie"]
+                    .iter()
+                    .any(|credential| value.eq_ignore_ascii_case(credential))
+                {
+                    return Err(Error::new(
+                        name.span(),
+                        format!(
+                            "`intent = header(\"{value}\")` names a credential header: charpente \
+                             stores a write's intent id raw in its record of answered writes, \
+                             and a credential must never reach disk (DESIGN §8) — a webhook \
+                             names its sender's event-id header, such as \
+                             `intent = header(\"X-Event-Id\")`, never a credential header"
+                        ),
+                    ));
+                }
                 intent = Some(name);
             } else {
                 return Err(Error::new(flag.span(), FLAGS));
@@ -1024,4 +1042,51 @@ fn result_args(ty: &Type) -> Option<(&Type, &Type)> {
 
 fn last_segment_is(ty: &Type, ident: &str) -> bool {
     matches!(ty, Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == ident))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RouteArgs;
+
+    /// Each credential header is refused whatever its case, and only those
+    /// three: a name that merely contains one is a header of its own.
+    /// `compile_fail/route_intent_credential_header.rs` pins the refusal end
+    /// to end.
+    #[test]
+    fn intent_refuses_each_credential_header_in_any_case() {
+        let parse = |name: &str| {
+            syn::parse_str::<RouteArgs>(&format!(
+                r#"POST "/hooks/pay", public, intent = header("{name}")"#
+            ))
+        };
+        for name in [
+            "authorization",
+            "Authorization",
+            "PROXY-AUTHORIZATION",
+            "Proxy-Authorization",
+            "cookie",
+            "COOKIE",
+        ] {
+            let Err(err) = parse(name) else {
+                panic!("`intent = header(\"{name}\")` must be refused");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`intent = header(\"{name}\")` names a credential header: charpente stores a \
+                     write's intent id raw in its record of answered writes, and a credential \
+                     must never reach disk (DESIGN §8) — a webhook names its sender's event-id \
+                     header, such as `intent = header(\"X-Event-Id\")`, never a credential header"
+                )
+            );
+        }
+        for name in [
+            "X-Event-Id",
+            "X-Cookie-Id",
+            "Authorization-Id",
+            "Set-Cookie",
+        ] {
+            assert!(parse(name).is_ok(), "`{name}` is not a credential header");
+        }
+    }
 }

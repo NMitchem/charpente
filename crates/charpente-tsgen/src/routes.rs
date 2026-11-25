@@ -111,6 +111,17 @@ pub(crate) fn param_args(r: &RouteInfo, trailing: &str) -> Vec<String> {
             p.name
         );
         assert!(
+            n != "newIntent" || r.intent.is_none(),
+            "emit_client: route `{}` (`{} {}`) has a path param `:{}` whose client argument is \
+             `newIntent`, which shadows the runtime's `newIntent()` that the generated write \
+             method calls to mint an intent when none is passed; rename the param in the route \
+             pattern and handler",
+            r.name,
+            r.method,
+            r.pattern,
+            p.name
+        );
+        assert!(
             n != trailing,
             "emit_client: route `{}` (`{} {}`) has a path param `:{}` whose client argument is \
              `{n}`, which collides with the `{trailing}` argument the generated method already \

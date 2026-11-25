@@ -794,3 +794,31 @@ fn a_path_param_named_intent_is_refused() {
     });
     emit_client(&c);
 }
+
+/// `new_intent` is `newIntent` in the client, which would shadow the runtime
+/// function the method calls when no intent is passed: `intent ??
+/// newIntent()` would call the string argument.
+#[test]
+#[should_panic(expected = "which shadows the runtime's `newIntent()`")]
+fn a_path_param_named_new_intent_is_refused() {
+    let mut c = fixture_contract();
+    c.routes.push(RouteInfo {
+        method: "POST",
+        pattern: "/things/:new_intent",
+        name: "make_thing",
+        auth: false,
+        public_scope: None,
+        cross_tenant: false,
+        stream: false,
+        intent: Some("Idempotency-Key"),
+        params: vec![ParamInfo {
+            name: "new_intent",
+            schema: TypeSchema::String,
+        }],
+        request: None,
+        response: TypeSchema::Null,
+        error: TypeSchema::Null,
+        emits: vec![],
+    });
+    emit_client(&c);
+}

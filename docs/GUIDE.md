@@ -1702,13 +1702,16 @@ first is the one every route meets once:
 ```
 
 `intent = header(...)` ("Retry-safe writes", above) is refused when it is
-written any other way, when its name is not a header name, on a route that
-reads, and when it is given twice:
+written any other way, when its name is not a header name, when it names a
+credential header (`Authorization`, `Proxy-Authorization` or `Cookie`, in any
+case: the id is stored raw in the record of answered writes, and a credential
+never reaches disk), on a route that reads, and when it is given twice:
 
 <!-- pinned -->
 ```text
 `intent` takes the header a sender's id arrives in: `intent = header("X-Event-Id")`
 `intent = header("<name>")` names no valid header: a header name is letters, digits and !#$%&'*+-.^_`|~
+`intent = header("<name>")` names a credential header: charpente stores a write's intent id raw in its record of answered writes, and a credential must never reach disk (DESIGN §8) — a webhook names its sender's event-id header, such as `intent = header("X-Event-Id")`, never a credential header
 `intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no intent
 `intent` given twice — write it once
 ```
@@ -3536,7 +3539,7 @@ and jobs.
 | Example | File, in the `charpente` crate | It shows |
 |---|---|---|
 | `drawn_inputs` | `examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them and merges the tail's re-sent answers into its judgement, and a `require` on a key the check marks when it judged something |
-| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch flipped between the faulted phase and the tail, a route that answers an order already stored as placed, and the three outbound checkers |
+| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch flipped between the faulted phase and the tail, a workload that places one order twice under two keys, a route that answers an order already stored as placed, and the three outbound checkers |
 | `restart_under_faults` | `examples/restart_under_faults.rs` | the recovery drive's four steps over a power cycle, a claim about the faulted phase's acks only, and a `require ["restart"]` |
 
 All three drive the app with `charpente_sim::drive` ("A fault-free tail for an
@@ -6179,6 +6182,7 @@ empty :param name in "/notes/:"
 write `#[route(METHOD "/path", auth | public | public(<Scope>))]` — e.g. #[route(GET "/notes/:id", auth)]
 `intent` takes the header a sender's id arrives in: `intent = header("X-Event-Id")`
 `intent = header("X Event Id")` names no valid header: a header name is letters, digits and !#$%&'*+-.^_`|~
+`intent = header("Cookie")` names a credential header: charpente stores a write's intent id raw in its record of answered writes, and a credential must never reach disk (DESIGN §8) — a webhook names its sender's event-id header, such as `intent = header("X-Event-Id")`, never a credential header
 `intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no intent
 `intent` given twice — write it once
 ```
@@ -6198,10 +6202,10 @@ declares one set, so a repeat is always a typo or a bad merge); the same
 event type appears twice inside one `emits(...)` list; the handler takes
 `self` (route handlers are free
 functions); a `:` segment has nothing after it; the macro's own
-argument list didn't parse as `METHOD "/path"` to begin with; and the four
+argument list didn't parse as `METHOD "/path"` to begin with; and the five
 `intent` refusals §5's "What `#[route]` rejects" pins: the word is not written
-`intent = header("…")`, its name is not a header name, it is on a GET or SSE
-route, or it is given twice. Every one of
+`intent = header("…")`, its name is not a header name, it names a credential
+header, it is on a GET or SSE route, or it is given twice. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
 the pattern and it's gone.
 
@@ -9411,7 +9415,9 @@ result = await api.createCustomer(id, body, intent);
 ```
 
 A GET or a stream sends no id. A write route whose path has a param named `intent` is
-refused at generation, since the method's own `intent` argument would collide with it.
+refused at generation, since the method's own `intent` argument would collide with it, and so
+is one named `new_intent`, whose argument `newIntent` would shadow the function the method
+calls to mint an id.
 
 **Absence is two different shapes, and the emitter answers them differently.** An
 `Option<WireI64>` field the server always writes a key for sends an explicit `null` when

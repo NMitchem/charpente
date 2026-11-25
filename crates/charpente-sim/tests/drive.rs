@@ -2254,10 +2254,10 @@ fn the_universe_that_double_applied_before_stamping_applies_once() {
     assert_eq!(sim.gave_up(), None, "the universe reached a verdict");
 }
 
-/// `faulted_phase` stamps before the boot, once per write: a POST without an
-/// `Idempotency-Key` gets 32 hex digits, each its own, a GET and a POST that
-/// names its own id are sent as given, and two `Sim`s on one seed stamp the
-/// same ids. Seed 0xD7_0000 at rate 0.3 loses every boot of the phase
+/// `faulted_phase` stamps before the boot, once per write: a POST, PUT, PATCH
+/// or DELETE without an `Idempotency-Key` gets 32 hex digits, each its own, a
+/// GET and a POST that names its own id are sent as given, and two `Sim`s on
+/// one seed stamp the same ids. Seed 0xD7_0000 at rate 0.3 loses every boot of the phase
 /// (`boot:exhausted`, as in
 /// `a_first_boot_lost_to_fallout_still_reaches_the_tail_and_resends_everything`),
 /// so the requests it hands back are the ones `recover` re-sends.
@@ -2269,6 +2269,9 @@ fn faulted_phase_stamps_each_write_before_the_boot_and_leaves_gets_and_named_ids
             Request::new(Method::Get, "/notes/2"),
             post(3).intent("mine"),
             post(4),
+            Request::new(Method::Put, "/notes/5"),
+            Request::new(Method::Patch, "/notes/6"),
+            Request::new(Method::Delete, "/notes/7"),
         ]
         .into_iter()
         .enumerate()
@@ -2298,11 +2301,17 @@ fn faulted_phase_stamps_each_write_before_the_boot_and_leaves_gets_and_named_ids
         k.as_ref()
             .is_some_and(|k| k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()))
     };
+    let writes = [0, 3, 4, 5, 6];
     assert!(
-        hex(&keys[0]) && hex(&keys[3]),
-        "each POST is stamped: {keys:?}"
+        writes.iter().all(|&i| hex(&keys[i])),
+        "each POST, PUT, PATCH and DELETE is stamped: {keys:?}"
     );
-    assert_ne!(keys[0], keys[3], "each write gets its own id");
+    let distinct: std::collections::BTreeSet<_> = writes.iter().map(|&i| &keys[i]).collect();
+    assert_eq!(
+        distinct.len(),
+        writes.len(),
+        "each write gets its own id: {keys:?}"
+    );
     assert_eq!(keys[1], None, "a GET is sent as given");
     assert_eq!(
         keys[2].as_deref(),

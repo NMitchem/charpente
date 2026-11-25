@@ -7,6 +7,11 @@
 //! the seed README quotes from 0.6.0 passing. The demo is outside the
 //! workspace and `=0.7.0` resolves nowhere before the publish, so it is built
 //! only as a patched copy, as `new.rs` builds the scaffold.
+//!
+//! The same copy also runs `charpente`'s shipped `examples/modelled_remote.rs`
+//! as its `tests/sim.rs`, with and without `place_order`'s guard: GUIDE §8
+//! cites that guard, and only a run of the example can show it is what stops
+//! a second charge.
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -400,5 +405,72 @@ fn readme_names_the_demos_rust_version_and_its_release() {
         example.contains(&format!("charpente {release}")),
         "README.md's example must name `charpente {release}`, the release \
          examples/double-charge pins and its pinned run came from\n{example}"
+    );
+}
+
+/// `place_order`'s guard in `charpente`'s `examples/modelled_remote.rs`, the
+/// lines that answer an order already stored.
+const MODELLED_REMOTE_GUARD: &str =
+    "    if tx.get(id)?.is_some() {\n        return Ok(id);\n    }\n";
+
+/// A run of `modelled_remote`'s batch with the guard deleted (master seed
+/// 0xf931428f591be3a4: 230 of 244 tested runs failed), shrunk. Its workload
+/// places order 1 twice, the second time under a new key.
+const MODELLED_REMOTE_REPRO: &str = "charpente test --sim --filter each_order_is_charged_once --seed \
+                                     0x120da7120f248458 --inputs 00 --faults-off \
+                                     sync_error,crash_torn,dir_entry_loss,bit_flip,\
+                                     misdirected_write,outbound_throttle,outbound_latency,\
+                                     disk_latency,net_latency";
+
+/// GUIDE §8 cites `modelled_remote`'s guard as what answers a second POST of
+/// a stored order under a new key. Its workload places one order twice, so
+/// deleting the guard charges that order twice: this seed fails with the
+/// placed-twice text, and passes with the guard in place.
+#[test]
+fn modelled_remotes_guard_is_what_stops_a_second_charge() {
+    let _lock = one_at_a_time();
+    #[allow(clippy::disallowed_methods)]
+    let example =
+        std::fs::read_to_string(workspace().join("crates/charpente/examples/modelled_remote.rs"))
+            .unwrap();
+    assert_eq!(
+        example.matches(MODELLED_REMOTE_GUARD).count(),
+        1,
+        "examples/modelled_remote.rs must hold place_order's guard exactly once, as \
+         MODELLED_REMOTE_GUARD spells it; if the guard was reworded, update the constant"
+    );
+    let app = patched_demo("modelled-remote");
+    let args: Vec<&str> = MODELLED_REMOTE_REPRO.split_whitespace().collect();
+    let replay = |sim_rs: &str| {
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(app.join("tests/sim.rs"), sim_rs).unwrap();
+        let out = charpente()
+            .current_dir(&*app)
+            .env("CARGO_TARGET_DIR", target_dir())
+            .args(&args[1..])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+
+    let (code, stdout) = replay(&example.replace(MODELLED_REMOTE_GUARD, ""));
+    assert_eq!(code, Some(1), "without the guard:\n{stdout}");
+    assert!(
+        stdout.contains(
+            "double charge: pay.example applied order 1 2 times, and the store holds 2 Charge \
+             jobs for it — the order was placed twice"
+        ),
+        "without the guard the second placing charges again:\n{stdout}"
+    );
+
+    let (code, stdout) = replay(&example);
+    assert_eq!(code, Some(0), "with the guard:\n{stdout}");
+    assert!(
+        stdout
+            .contains("sim result: ok. 1 passed; 0 failed; 0 skipped, on seed 0x120da7120f248458"),
+        "with the guard the seed reaches a verdict and passes:\n{stdout}"
     );
 }
