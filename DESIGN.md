@@ -549,6 +549,24 @@ outbound source's invariants hold in release (hard rule 4):
    and draws no entropy for outbound: every existing app replays byte-for-byte, and every
    existing pinned seed names the same universe (the `Tail` arm's precedent above).
 
+Retry-safe writes (spec `2026-11-22-retry-safe-writes-design.md` §4.4) add an eighth ready
+source, the intent sweep, which bounds the intents record (§2, §3). A record lives
+`INTENT_RETENTION` (24 hours) past the later of its commit and the node's latest open. An
+open is `Kernel::build`'s clock reading on a node that opens writable, or the reading taken
+where the write gate opens (`after_repl_step`: a promotion, a hand-off, the witness gate),
+since clients have just regained a primary either way. The sweep is kernel-run rather than
+an app job because it counts from that reading, which only the kernel holds. It is first due
+a full retention after an open, so its bound is never before the open, which the arm
+asserts. Each run deletes, in one group committed with the cron arm's commit-then-bubble
+shape, up to `INTENT_SWEEP_BATCH` (4096) records committed more than a retention before the
+step's wall time (`Tx::intents_committed_before`, which reads each row only as far as its
+`committed_at` and holds no reply). After a full batch the sweep is due again at once;
+otherwise it is due an `INTENT_SWEEP_INTERVAL` (1 hour) later, so a record outlives its
+retention by at most that. Like jobs and cron, it runs only while writable, and its due time
+joins the idle deadline the way theirs do. A kernel life shorter than a retention never sees
+it ready and draws as it did. A longer one adds an hourly step from its first day on, which
+is contended with the daily session sweep at each day's slot.
+
 The HTTP kernel (`charpente::http`) lives inside the boundary. The sim feeds the
 single-threaded kernel loop (`charpente::kernel`) through a scripted `SimSource`, and hyper
 only translates wire↔struct at the edge (`charpente::serve`) and feeds the same loop.
@@ -893,8 +911,10 @@ group overlay, so a repeat staged behind its first copy in one batch is answered
 copy's uncommitted record. That answer is a read of a sibling's write, so
 `CommitFailure::invalidates` fails both copies when the commit fails. The record keeps the
 reply's headers and body up to 64 KiB. For a larger reply, or one whose transaction minted
-a credential, it keeps the status and the reason, so no raw credential reaches it (§8) and
-no kept reply pushes a record past `MAX_RECORD_BYTES`. A malformed id is refused before the
+a credential, it keeps the status and the reason, so no raw credential reaches it (§8). The
+64 KiB bounds what a kept reply adds to its transaction's log record, not the record: a
+transaction already within 64 KiB of `MAX_RECORD_BYTES` can still be pushed over it by its
+kept reply, which trips `Group::stage`'s assert. A malformed id is refused before the
 request's `fresh_token` draw, so a refused request moves no entropy stream. So is a write that
 reached the wire with no id, with the same 400: `serve`'s edge conversion marks each request it
 builds as from the network (`Request`'s crate-private `wire`), and the kernel refuses there,
@@ -903,7 +923,10 @@ request handed to the kernel in process (`App::handle`, a `SimSource`) carries n
 and without an id it runs as it always has. A route names the header it reads its id from with
 `#[route(…, intent = header("…"))]`, for a webhook whose sender sends its own. The record's
 `committed_at` is the `now` the request path is handed: the step's time, or the epoch
-under `App::handle`, which has no time.
+under `App::handle`, which has no time. A record lives `INTENT_RETENTION` (24 hours) past
+the later of its `committed_at` and the node's latest open, and the kernel's intent sweep
+(§1) deletes older ones. The lookup ignores age, so a record the sweep has not reached still
+answers, and a re-send whose record was swept runs again.
 
 **The batch cap is a constant, not configuration.** `MAX_BATCH = 64` is asserted inside
 `Group::stage`, so the bound is enforced, and the kernel shares the constant rather than

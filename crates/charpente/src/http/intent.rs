@@ -21,7 +21,10 @@ pub(crate) const DEFAULT_HEADER: &str = "Idempotency-Key";
 
 /// The most a record keeps of a reply, headers plus body, in bytes. A larger
 /// reply keeps its status and its size, and a repeat is answered 409 (spec
-/// §4.3), so no stored reply can push a record past `MAX_RECORD_BYTES`.
+/// §4.3). This bounds what a kept reply adds to its transaction's log record,
+/// not the record: a transaction already within this of `MAX_RECORD_BYTES`
+/// can still be pushed over it by its kept reply, which trips
+/// `Group::stage`'s assert.
 pub(crate) const KEPT_REPLY_MAX: usize = 65_536;
 
 /// The header a replayed reply carries, so a client can tell an answer from

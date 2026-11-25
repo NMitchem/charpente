@@ -2075,8 +2075,11 @@ fn a_tail_whose_reach_meets_the_limit_exactly_fails_after_one_extension() {
          retry(max = …) small enough that it reaches Dead"
     );
     // The one extension ran to the limit: the kernel's last step was the
-    // daily sweep's last slot before the year 2262.
-    assert_eq!(sim.true_wall().as_nanos(), 9_223_286_400_000_000_000);
+    // intent sweep's last hourly slot before the year 2262
+    // (`INTENT_SWEEP_INTERVAL`), the latest of its schedules, under an hour
+    // short of the limit. Before that sweep existed it was the daily session
+    // sweep's last slot, 9_223_286_400_000_000_000.
+    assert_eq!(sim.true_wall().as_nanos(), 9_223_369_200_000_000_000);
 }
 
 /// The one tally row: how many times `POST /tally/:n` applied, over every n.

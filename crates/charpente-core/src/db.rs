@@ -1544,6 +1544,11 @@ impl<'a> Tx<'a> {
     /// most `limit` intent records whose `committed_at` is strictly before
     /// `before`, over the snapshot, the group's writes and this
     /// transaction's, as `View::scan` merges them.
+    ///
+    /// It holds no row: each is read only as far as its `committed_at`, and
+    /// the snapshot walk stops at `limit` matches, since a later one has a
+    /// larger id than all of them. Its memory is the two overlays plus
+    /// `limit` ids, never the table, whose kept replies run to 64 KiB each.
     pub fn intents_committed_before(
         &self,
         before: WallTime,
@@ -1551,28 +1556,44 @@ impl<'a> Tx<'a> {
         access: &IntentAccess<'_>,
     ) -> io::Result<Vec<Id<IntentRow>>> {
         let IntentAccess(_) = access;
-        let mut merged: BTreeMap<u64, IntentRow> = BTreeMap::new();
-        for row in self.snapshot.scan_any::<IntentRow>()? {
-            merged.insert(row.id.raw(), row);
-        }
-        merge_overlay_rows(
-            &mut merged,
+        // Each id an overlay holds is decided there, this transaction's
+        // entry over the group's, and the snapshot's row under it is skipped.
+        let mut staged: BTreeMap<u64, Option<&[u8]>> = BTreeMap::new();
+        let levels = [
             self.group.and_then(|g| g.get(IntentRow::TABLE)),
-            UNSCOPED,
-            0,
-        )?;
-        merge_overlay_rows(
-            &mut merged,
             self.effects.overlay.get(IntentRow::TABLE),
-            UNSCOPED,
-            0,
-        )?;
-        Ok(merged
-            .into_values()
-            .filter(|row| row.committed_at < before)
-            .map(|row| row.id)
-            .take(limit)
-            .collect())
+        ];
+        for (&(scope, id), entry) in levels.into_iter().flatten().flatten() {
+            // `merge_overlay_rows`'s negative space: `put_intent` and
+            // `delete_intent` stage `UNSCOPED` only.
+            assert_eq!(
+                scope,
+                UNSCOPED,
+                "table \"{}\" is not tenant-scoped but its overlay holds id {id} under scope \
+                 {scope} — Tx::put_intent/Tx::delete_intent stage UNSCOPED only",
+                IntentRow::TABLE
+            );
+            staged.insert(id, entry.as_deref());
+        }
+        let mut older = Vec::new();
+        for (&id, entry) in &staged {
+            if let Some(bytes) = entry
+                && IntentRow::committed_at_of(bytes)? < before
+            {
+                older.push(id);
+            }
+        }
+        let mut from_snapshot = 0;
+        self.snapshot.walk_raw::<IntentRow>(|id, bytes| {
+            if !staged.contains_key(&id) && IntentRow::committed_at_of(bytes)? < before {
+                older.push(id);
+                from_snapshot += 1;
+            }
+            Ok(from_snapshot < limit)
+        })?;
+        older.sort_unstable();
+        older.truncate(limit);
+        Ok(older.into_iter().map(Id::from_raw).collect())
     }
 
     /// Whether this transaction has staged anything its commit would record:

@@ -22,17 +22,30 @@ pub use tail::{
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use charpente_core::db::{Db, MAX_BATCH, Refusal};
 use charpente_core::event::EventRow;
+use charpente_core::intent::INTENT_RETENTION;
 use charpente_core::io::{Clock, Instant, ObjectStore, Outbound, OutboundWake, WallTime};
 use charpente_core::table::View;
 
 use crate::archive::Archive;
 use crate::http::{App, Handled, Request, Response, Subscription, io_failure_response};
 use crate::kernel::clock::{WallHold, recorded_wall_floor};
+use crate::kernel::dispatch::flatten;
 use crate::kernel::tail::Tail;
 use crate::repl::{REPL_TICK_NANOS, Repl};
+
+/// How long the intent sweep waits after a sweep that deleted less than a
+/// full batch (retry-safe-writes spec §4.4). Retention is a lower bound, so
+/// a row outlives its `INTENT_RETENTION` by up to this much.
+pub const INTENT_SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// The most intent records one sweep deletes, in one transaction. A sweep
+/// that deletes this many is due again at once, so a backlog drains in
+/// steps of bounded size rather than one step of the whole table.
+pub const INTENT_SWEEP_BATCH: usize = 4096;
 
 /// Delivers a response back to whoever is waiting on a request — a channel
 /// reply in production, a recorded `(status, body)` in the sim. `stream` is
@@ -121,6 +134,7 @@ enum Ready {
     Tail,
     Archive,
     Outbound,
+    IntentSweep,
 }
 
 /// The deterministic kernel: one `App`, one due-heap, one cron schedule, one
@@ -209,6 +223,17 @@ pub struct Kernel {
     /// an outbound job. Touched only while something is in flight, or to
     /// start a call a committed batch decided (invariant 6).
     outbound: Option<Box<dyn Outbound>>,
+    /// The wall time of this node's latest open (retry-safe-writes spec
+    /// §4.4): the reading `build` took, then the one taken wherever the write
+    /// gate opens (`after_repl_step`: a promotion, a hand-off, the witness
+    /// gate). An intent record lives `INTENT_RETENTION` past the later of its
+    /// commit and this, since clients have just regained a primary.
+    opened_at: WallTime,
+    /// When the intent sweep is next due: a full `INTENT_RETENTION` after an
+    /// open (`Kernel::opened`), then after each sweep at once or an
+    /// `INTENT_SWEEP_INTERVAL` later. `None` until the node is first open for
+    /// writes.
+    next_intent_sweep: Option<WallTime>,
 }
 
 /// Builds a `Kernel` from its parts (outbound-effects spec §4): a node that
@@ -364,7 +389,7 @@ impl Kernel {
         // them later would resurrect already-serviced jobs as duplicate heap
         // entries (found by the 120-ticks test, seed 0x650).
         let _ = app.db_mut().drain_enqueued();
-        Ok(Kernel {
+        let mut kernel = Kernel {
             app,
             dispatcher,
             cron,
@@ -386,7 +411,25 @@ impl Kernel {
             archive_stopped: false,
             archive_notice: None,
             outbound,
-        })
+            opened_at: wall,
+            next_intent_sweep: None,
+        };
+        // A node that opens shut sweeps nothing; its gate opening is its
+        // open (`after_repl_step`).
+        if was_writable {
+            kernel.opened(wall);
+        }
+        Ok(kernel)
+    }
+
+    /// Records an open at `wall` (retry-safe-writes spec §4.4): `build`'s
+    /// reading on a node that opens writable, or the reading where the write
+    /// gate opens. The intent sweep is first due a full `INTENT_RETENTION`
+    /// later, so a record committed before the open, however long before,
+    /// still answers a client that re-sends to the node it has just regained.
+    fn opened(&mut self, wall: WallTime) {
+        self.opened_at = wall;
+        self.next_intent_sweep = Some(self.opened_at + INTENT_RETENTION);
     }
 
     /// The event loop (DESIGN §1 same-shape rule): identical code under
@@ -503,7 +546,7 @@ impl Kernel {
                 self.dispatcher.push_completion(completion);
             }
         }
-        let mut ready = Vec::with_capacity(7);
+        let mut ready = Vec::with_capacity(8);
         if self.pending.is_some() {
             ready.push(Ready::Request);
         }
@@ -619,6 +662,15 @@ impl Kernel {
         if self.dispatcher.outbound_ready(mono) {
             ready.push(Ready::Outbound);
         }
+        // The eighth source (retry-safe-writes spec §4.4), appended last for
+        // the outbound source's reason. It is first due a full
+        // `INTENT_RETENTION` after an open, so a kernel life shorter than
+        // that never sees it ready, and its universes draw as they did.
+        // Kernel-run rather than an app job, because its bound needs the
+        // open reading only the kernel holds.
+        if writable && self.next_intent_sweep.is_some_and(|due| now.wall >= due) {
+            ready.push(Ready::IntentSweep);
+        }
         if ready.is_empty() {
             // An iteration that services nothing is still an iteration
             // the archive arm did not consume, so it releases the retry hold
@@ -627,11 +679,11 @@ impl Kernel {
             // re-check, and clearing it here would cost one archive step per
             // park forever.
             self.archive_retry_held = false;
-            // Gate the job/cron deadlines on `writable` too: a node with a
-            // due-but-gated job must not busy-spin on a deadline already in the
-            // past — the park tick (below) is what wakes it to re-check.
-            // Job and cron due times are wall times; each becomes a monotonic
-            // deadline afresh every step (`Now::deadline`).
+            // Gate the job/cron/sweep deadlines on `writable` too: a node with
+            // a due-but-gated job must not busy-spin on a deadline already in
+            // the past — the park tick (below) is what wakes it to re-check.
+            // Job, cron and sweep due times are wall times; each becomes a
+            // monotonic deadline afresh every step (`Now::deadline`).
             let mut deadline = [
                 writable
                     .then(|| self.dispatcher.next_deadline())
@@ -639,6 +691,10 @@ impl Kernel {
                     .map(|due| now.deadline(due)),
                 writable
                     .then(|| self.cron.next_deadline())
+                    .flatten()
+                    .map(|due| now.deadline(due)),
+                writable
+                    .then_some(self.next_intent_sweep)
                     .flatten()
                     .map(|due| now.deadline(due)),
                 self.repl
@@ -687,18 +743,22 @@ impl Kernel {
                 "kernel invariant: Kernel::step went Idle with a wake at {deadline:?}, not after \
                  now ({mono}; wall {:?}), so Kernel::run would spin without advancing time. The \
                  component that named it holds a deadline at or before now: job {:?} (writable \
-                 {writable}; a wall time), cron {:?} (a wall time), repl {:?}, outbound timeout \
+                 {writable}; a wall time), cron {:?} (a wall time), intent sweep {:?} (a wall \
+                 time), repl {:?}, outbound timeout \
                  {:?}, outbound wake {:?} with {} in flight. Fix the pair that disagrees so a \
                  component is ready whenever its own deadline has passed, or names only the \
                  future: job \
                  Dispatcher::has_due/next_deadline (kernel/dispatch.rs), cron \
-                 CronScheduler::has_due/next_deadline (kernel/cron.rs), repl Repl::has_work/next_deadline \
+                 CronScheduler::has_due/next_deadline (kernel/cron.rs), intent sweep \
+                 Kernel::step's Ready::IntentSweep push and next_intent_sweep (kernel/mod.rs), \
+                 repl Repl::has_work/next_deadline \
                  (repl/mod.rs), outbound timeout Dispatcher::outbound_ready/\
                  next_outbound_deadline (kernel/dispatch.rs), outbound wake the Outbound \
                  impl's poll/next_wake",
                 now.wall,
                 self.dispatcher.next_deadline(),
                 self.cron.next_deadline(),
+                self.next_intent_sweep,
                 self.repl.as_ref().and_then(|r| r.next_deadline(mono)),
                 self.dispatcher.next_outbound_deadline(),
                 (self.dispatcher.in_flight_len() > 0)
@@ -1226,6 +1286,56 @@ impl Kernel {
                     self.dispatcher.next_outbound_deadline(),
                 );
             }
+            Ready::IntentSweep => {
+                // Negative space (hard rule 4): the sweep deletes nothing
+                // until the node has been open a full retention, so its bound
+                // is never before the open, and a record committed before the
+                // open lives a full retention past it (spec §4.4).
+                assert!(
+                    writable && now.wall >= self.opened_at + INTENT_RETENTION,
+                    "kernel invariant: the intent sweep ran at {} on a node that opened at {} \
+                     (writable {writable}), before it had been open for INTENT_RETENTION \
+                     ({INTENT_RETENTION:?}) — it would delete a record a client that has just \
+                     regained this node can still re-send. Kernel::opened schedules the first \
+                     sweep a full retention after each open, and Kernel::step pushes \
+                     Ready::IntentSweep only while writable",
+                    now.wall,
+                    self.opened_at,
+                );
+                let before = now.wall.saturating_sub(INTENT_RETENTION);
+                // One group, commit once, commit-then-bubble: the cron arm's
+                // shape, for its reason (C-1).
+                let mut group = self.app.begin_job_group(now.wall)?;
+                let access = group.intent_access();
+                let sweep = group
+                    .stage(|tx| -> io::Result<usize> {
+                        let older =
+                            tx.intents_committed_before(before, INTENT_SWEEP_BATCH, &access)?;
+                        for &id in &older {
+                            tx.delete_intent(id, &access);
+                        }
+                        Ok(older.len())
+                    })
+                    .map_err(flatten);
+                match (sweep, group.commit()) {
+                    // A full batch may have left older records behind, so the
+                    // sweep is due again at once. Otherwise it is due an
+                    // interval later, so a record outlives its retention by
+                    // at most `INTENT_SWEEP_INTERVAL`.
+                    (Ok(swept), Ok(())) => {
+                        self.next_intent_sweep = Some(if swept == INTENT_SWEEP_BATCH {
+                            now.wall
+                        } else {
+                            now.wall + INTENT_SWEEP_INTERVAL
+                        });
+                    }
+                    // Any commit failure stops the kernel, as the cron arm's
+                    // does, for the same reason.
+                    (Ok(_), Err(failure)) => return Err(failure.error),
+                    (Err(e), Ok(())) => return Err(e),
+                    (Err(_), Err(failure)) => return Err(failure.error),
+                }
+            }
         }
         // Any serviced source may have enqueued (handlers can enqueue too), so
         // this runs after every branch above. A follower's shipped applies also
@@ -1244,7 +1354,7 @@ impl Kernel {
     /// name while a Pending job of a mounted type carries a foreign shape
     /// (`Kernel::build` checks that only on a writable node) or while this
     /// node's wall clock is more than `CLOCK_TOLERANCE` behind the latest time
-    /// its data directory recorded, and otherwise run the three pieces of
+    /// its data directory recorded, and otherwise run the four pieces of
     /// startup a non-writable node had to skip:
     ///
     /// - the schema gate (`Kernel::run` guards it on `writes_allowed()` and
@@ -1253,11 +1363,12 @@ impl Kernel {
     ///   `Ready::Cron` without it panics on the missing row),
     /// - the due-heap rebuild from the replicated store — the store's Pending
     ///   rows are the only truth, and `rebuild` only enqueues Pending ones, so
-    ///   a job the old primary already marked Done is never resurrected.
+    ///   a job the old primary already marked Done is never resurrected,
+    /// - the open the intent sweep's retention counts from (`Kernel::opened`).
     ///
     /// Keyed on the write gate, not the role: a witness-gated node's role is
     /// `Primary` from open, so the role edge this used to watch never fires
-    /// for it and all three would be skipped forever — silently, in the
+    /// for it and all four would be skipped forever — silently, in the
     /// migration's case. `do_promote` also runs the schema gate itself before
     /// acking the control verb; running it a second time here is a no-op walk
     /// over an already-current schema, and keeping both means neither call
@@ -1289,6 +1400,9 @@ impl Kernel {
             self.cron.upsert(self.app.db_mut(), wall)?;
             let snap = self.app.db_mut().snapshot()?;
             self.dispatcher.rebuild(&snap)?;
+            // A gate opening is an open: clients have just regained a
+            // primary (retry-safe-writes spec §4.4).
+            self.opened(wall);
         }
         self.was_writable = writable;
         Ok(())

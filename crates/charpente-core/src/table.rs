@@ -1965,6 +1965,28 @@ impl Snapshot {
         Ok(out)
     }
 
+    /// `scan_any`'s walk without its decode or its `Vec`: hands `visit` each
+    /// row's id and stored bytes in id order, and stops when it answers
+    /// `false`. For a read that needs one field of each row and must not
+    /// hold the table (`Tx::intents_committed_before`).
+    pub(crate) fn walk_raw<R: UnscopedRow>(
+        &self,
+        mut visit: impl FnMut(u64, &[u8]) -> io::Result<bool>,
+    ) -> io::Result<()> {
+        let rows = match self.txn.open_table(rows_def(R::TABLE)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(unscoped_open_err(R::TABLE, e)),
+        };
+        for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
+            let (id, value) = entry.map_err(redb_err)?;
+            if !visit(id.value(), value.value())? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn scan_by_any<R: UnscopedRow>(
         &self,
         index_name: &str,

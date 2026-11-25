@@ -3,19 +3,30 @@
 //! a write that carries an intent id is looked up in `charpente.intents`
 //! inside its own staged transaction, a repeat is answered from the record
 //! without running, and a fresh write's reply is recorded in the same
-//! transaction as its effects.
+//! transaction as its effects. The kernel's sweep (§4.4) bounds the record:
+//! a row lives `INTENT_RETENTION` past the later of its commit and the
+//! node's latest open, a process open or a promotion.
+
+use std::time::Duration;
 
 use charpente::auth::hash_token;
-use charpente::core::intent::{IntentReply, IntentRow};
+use charpente::core::intent::{INTENT_RETENTION, IntentReply, IntentRow};
 use charpente::http::{ApiError, App, AppConfig, Ctx, Handled, Method, Request, Response, Route};
-use charpente::kernel::{Kernel, SimSource};
+use charpente::kernel::{Kernel, SimSource, Step};
+use charpente::repl::protocol::{Msg, decode, encode};
+use charpente::repl::role::Role;
+use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, route, routes, table};
-use charpente_core::io::{Disk, WallTime};
+use charpente_core::io::{Clock, Disk, Entropy, Net, WallTime};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 
 const SEC: u64 = 1_000_000_000;
+const MIN: u64 = 60 * SEC;
+const HOUR: u64 = 60 * MIN;
+/// `INTENT_RETENTION`, in nanoseconds.
+const DAY: u64 = INTENT_RETENTION.as_nanos() as u64;
 
 // ------------------------------------------------------------------ app
 
@@ -105,15 +116,19 @@ fn intent_routes() -> Vec<Route> {
 
 fn intent_app(seed: u64) -> (Sim, App) {
     let sim = Sim::with_faults(seed, FaultConfig::none());
-    let app = App::open(
-        Box::new(sim.disk()),
+    let app = open_app(Box::new(sim.disk()), Box::new(sim.entropy()));
+    (sim, app)
+}
+
+fn open_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> App {
+    App::open(
+        disk,
         Schema::new().table::<Hit>(),
-        Box::new(sim.entropy()),
+        entropy,
         AppConfig::default(),
     )
     .unwrap()
-    .mount(intent_routes());
-    (sim, app)
+    .mount(intent_routes())
 }
 
 fn hits(app: &App) -> Vec<Hit> {
@@ -542,4 +557,296 @@ fn a_malformed_key_draws_no_entropy() {
     let (_sim, mut ran) = intent_app(seed);
     assert_eq!(ran.handle(hit(1, "a").intent("ok")).status, 200);
     assert_ne!(login(&mut ran), expected, "a request that ran drew nothing");
+}
+
+// ------------------------------------------------- retention and the sweep
+
+/// Runs `kernel` until virtual time `horizon`, with each request arriving at
+/// its virtual time, and returns each request's `(status, body)` in push
+/// order.
+fn run_kernel(
+    sim: &Sim,
+    kernel: &mut Kernel,
+    requests: Vec<(u64, Request)>,
+    horizon: u64,
+) -> Vec<(u16, String)> {
+    let mut source = SimSource::new(Box::new(sim.clock()), horizon);
+    for (at, request) in requests {
+        source.push_at(at, request);
+    }
+    let answers = source.answers();
+    kernel.run(&mut source).unwrap();
+    let answers = answers.lock().unwrap();
+    answers
+        .iter()
+        .map(|answer| {
+            let (status, body) = answer.clone().expect("every request was answered");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        })
+        .collect()
+}
+
+fn answered(status: u16, body: &str) -> (u16, String) {
+    (status, body.to_string())
+}
+
+/// The intent ids the record holds, sorted (rows sort by a hash of their
+/// key, not by commit).
+fn recorded(app: &App) -> Vec<String> {
+    let mut ids: Vec<String> = intents(app).into_iter().map(|row| row.intent).collect();
+    ids.sort();
+    ids
+}
+
+/// The lookup ignores age (spec §4.4), and the sweep waits a full retention
+/// after an open, so a re-send just after a power cycle that jumped the wall
+/// clock 3 days, the most the sim's clock-downtime axis jumps it, is answered
+/// from its record.
+#[test]
+fn a_resend_after_a_three_day_power_cycle_is_answered_from_its_record() {
+    let (sim, app) = intent_app(0x1D7E_3101);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let first = run_kernel(
+        &sim,
+        &mut kernel,
+        vec![(SEC, hit(1, "a").intent("k"))],
+        2 * SEC,
+    );
+    assert_eq!(first, [answered(200, "\"1\"")]);
+    let committed_at = intents(kernel.app())[0].committed_at;
+    drop(kernel);
+
+    sim.clock().sleep(Duration::from_secs(3 * 86_400));
+    sim.restart();
+    let app = open_app(Box::new(sim.disk()), Box::new(sim.entropy()));
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let opened_at = kernel.wall_for_sim();
+    assert!(
+        opened_at.saturating_duration_since(committed_at) >= Duration::from_secs(3 * 86_400),
+        "the reopen is 3 days after the commit: committed {committed_at}, opened {opened_at}"
+    );
+    let open = sim.now().as_nanos();
+    let again = run_kernel(
+        &sim,
+        &mut kernel,
+        vec![(open + SEC, hit(1, "a").intent("k"))],
+        open + 2 * SEC,
+    );
+    assert_eq!(
+        again, first,
+        "a re-send just after the reopen ran again instead of being answered from its record"
+    );
+    assert_eq!(
+        hits(kernel.app()).len(),
+        1,
+        "the re-send applied a second time"
+    );
+    let wall = kernel.wall_for_sim();
+    let replay = kernel
+        .app_mut_for_tests()
+        .handle_at(hit(1, "a").intent("k"), wall);
+    assert_eq!(replayed(&replay), Some("true"), "{}", body(&replay));
+}
+
+/// The sweep deletes nothing until the node has been open a full
+/// `INTENT_RETENTION`, then deletes rows committed more than that before the
+/// sweep runs, and keeps younger ones. A re-send whose row was swept runs
+/// again: the documented limit (GUIDE §5).
+#[test]
+fn the_sweep_waits_a_full_retention_after_open_then_drops_older_records() {
+    let (sim, app) = intent_app(0x1D7E_3102);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let opened_at = kernel.wall_for_sim();
+    // k1 commits at the open, k2 a minute short of a retention after it.
+    let first = run_kernel(
+        &sim,
+        &mut kernel,
+        vec![
+            (0, hit(1, "a").intent("k1")),
+            (DAY - MIN, hit(2, "b").intent("k2")),
+        ],
+        DAY - MIN,
+    );
+    assert_eq!(first, [answered(200, "\"1\""), answered(200, "\"2\"")]);
+    assert_eq!(
+        recorded(kernel.app()),
+        ["k1", "k2"],
+        "a minute short of a retention after the open, the record holds both"
+    );
+    let k1 = intents(kernel.app())
+        .into_iter()
+        .find(|row| row.intent == "k1")
+        .unwrap();
+    assert_eq!(k1.committed_at, opened_at, "k1 commits at the open");
+
+    // A sweep a retention after the open, and one an interval after that.
+    run_kernel(&sim, &mut kernel, Vec::new(), DAY + HOUR + MIN);
+    assert_eq!(sim.now().as_nanos(), DAY + HOUR, "the kernel's last step");
+    assert_eq!(
+        recorded(kernel.app()),
+        ["k2"],
+        "a retention and an hour after the open, k1 (committed at the open) is swept, and k2 \
+         (committed 61 minutes before this sweep) is kept"
+    );
+
+    let wall = kernel.wall_for_sim();
+    let app = kernel.app_mut_for_tests();
+    let rerun = app.handle_at(hit(1, "a").intent("k1"), wall);
+    assert_eq!(
+        (rerun.status, body(&rerun), replayed(&rerun)),
+        (200, "\"3\"".to_string(), None),
+        "a re-send whose record was swept runs again"
+    );
+    let replay = app.handle_at(hit(2, "b").intent("k2"), wall);
+    assert_eq!(
+        (replay.status, body(&replay), replayed(&replay)),
+        (200, "\"2\"".to_string(), Some("true")),
+        "a re-send whose record is younger than a retention is answered from it"
+    );
+    assert_eq!(hits(kernel.app()).len(), 3);
+}
+
+/// A sweep deletes at most `INTENT_SWEEP_BATCH` (4096) rows. After a full
+/// batch it is due again at once, so a backlog drains at one wall time
+/// rather than one batch an interval.
+#[test]
+fn a_full_batch_is_swept_again_without_waiting_an_interval() {
+    let (sim, mut app) = intent_app(0x1D7E_3103);
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), std::io::Error> {
+            for i in 1..=4097u64 {
+                tx.put_intent(
+                    &IntentRow {
+                        id: Id::from_raw(i),
+                        intent: format!("old-{i}"),
+                        principal: None,
+                        route: "POST /hits/:id".to_string(),
+                        fingerprint: [0; 32],
+                        committed_at: WallTime::from_nanos(SEC),
+                        status: 200,
+                        reply: IntentReply::Credential,
+                    },
+                    &access,
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    sim.clock().sleep(Duration::from_nanos(DAY));
+    let mut left = vec![intents(kernel.app()).len()];
+    while let Step::Worked = kernel.step(&mut source).unwrap() {
+        let now = intents(kernel.app()).len();
+        if left.last() != Some(&now) {
+            left.push(now);
+        }
+    }
+    assert_eq!(
+        left,
+        [4097, 1, 0],
+        "the rows left after each sweep: one full batch, then the last row, at one wall time"
+    );
+    assert_eq!(
+        sim.now().as_nanos(),
+        DAY,
+        "no time passed between the sweeps"
+    );
+}
+
+/// A promotion counts as an open (spec §4.4): clients have just regained a
+/// primary. A node that was a follower for 12 hours, and then is promoted,
+/// keeps a 3-day-old record for a full retention past the promotion, and
+/// sweeps it after.
+#[test]
+fn a_promotion_restarts_the_retention_clock() {
+    let sim = Sim::with_faults(0x1D7E_3104, FaultConfig::none());
+    let host = sim.host("f");
+    // An earlier life of this node, as a single node, records k.
+    let app = open_app(Box::new(host.disk()), Box::new(host.entropy()));
+    let mut kernel = Kernel::new(app, Box::new(host.clock())).unwrap();
+    let first = run_kernel(
+        &sim,
+        &mut kernel,
+        vec![(SEC, hit(1, "a").intent("k"))],
+        2 * SEC,
+    );
+    assert_eq!(first, [answered(200, "\"1\"")]);
+    drop(kernel);
+
+    // Three days later it reopens as a follower, which sweeps nothing.
+    sim.clock().sleep(Duration::from_secs(3 * 86_400));
+    host.restart();
+    let mut app = open_app(Box::new(host.disk()), Box::new(host.entropy()));
+    let cfg = ReplConfig {
+        listen: Some("f:1".to_string()),
+        initial_role: Role::Follower {
+            primary: "p:1".to_string(),
+        },
+        peer_secret: None,
+        strict_witnesses: false,
+    };
+    let (repl, _) = Repl::open(
+        Box::new(host.net()),
+        Box::new(host.disk()),
+        cfg,
+        app.db_for_tests(),
+    )
+    .unwrap();
+    let mut kernel = Kernel::with_replication(app, Box::new(host.clock()), repl).unwrap();
+    assert!(!kernel.app().db().writes_allowed(), "it opens a follower");
+
+    // Promoted 12 hours after it opened, at `asked` or within the second
+    // after it.
+    sim.clock().sleep(Duration::from_nanos(12 * HOUR));
+    let asked = sim.now().as_nanos();
+    let ctrl = sim.host("cli").net().connect("f:1").unwrap();
+    ctrl.send(&encode(&Msg::CtrlPromote { secret: None }))
+        .unwrap();
+    run_kernel(&sim, &mut kernel, Vec::new(), asked + SEC);
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let n = ctrl
+        .recv(&mut buf)
+        .unwrap()
+        .expect("the promote was answered");
+    let reply = decode(&buf[..n]).unwrap();
+    assert!(matches!(reply, Msg::CtrlOk { .. }), "{reply:?}");
+    assert!(kernel.app().db().writes_allowed(), "the promote opened it");
+
+    let again = run_kernel(
+        &sim,
+        &mut kernel,
+        vec![(asked + SEC, hit(1, "a").intent("k"))],
+        asked + 2 * SEC,
+    );
+    assert_eq!(
+        again, first,
+        "a re-send just after the promotion ran again instead of being answered from its record"
+    );
+
+    sim.clock().sleep(Duration::from_nanos(
+        asked + DAY - MIN - sim.now().as_nanos(),
+    ));
+    run_kernel(&sim, &mut kernel, Vec::new(), asked + DAY - MIN + SEC);
+    assert_eq!(
+        recorded(kernel.app()),
+        ["k"],
+        "a minute short of a retention after the promotion, and a retention and 12 hours \
+         after the follower opened, the record is kept"
+    );
+
+    sim.clock().sleep(Duration::from_nanos(
+        asked + DAY + MIN - sim.now().as_nanos(),
+    ));
+    run_kernel(&sim, &mut kernel, Vec::new(), asked + DAY + MIN + SEC);
+    assert_eq!(
+        recorded(kernel.app()),
+        Vec::<String>::new(),
+        "a retention after the promotion, the sweep deleted the 3-day-old record"
+    );
 }

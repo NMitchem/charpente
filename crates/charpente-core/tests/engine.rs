@@ -4798,6 +4798,57 @@ fn intents_committed_before_returns_only_older_ids_and_honours_the_limit() {
     assert_eq!(none, Vec::new(), "no row was committed before t=1");
 }
 
+/// The transaction's own writes decide the ids they hold, as the sweep's
+/// delete-then-read in one transaction needs: a staged put of an older row
+/// joins the result, a staged delete removes its row, and a staged put that
+/// makes a stored row younger removes it, with `limit` applied after the
+/// merge, so the store's rows that the staged ones displace do not count
+/// against it.
+#[test]
+fn intents_committed_before_reads_the_transactions_own_writes() {
+    let sim = Sim::with_faults(0x1D7E_0008, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            for id in [10, 20, 30, 40] {
+                tx.put_intent(&intent_row(id, 1, IntentReply::Credential), &access);
+            }
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    let (two, all) = group
+        .stage(|tx| -> Result<_, io::Error> {
+            tx.put_intent(&intent_row(5, 1, IntentReply::Credential), &access);
+            tx.delete_intent(Id::from_raw(10), &access);
+            tx.put_intent(&intent_row(20, 3, IntentReply::Credential), &access);
+            Ok((
+                tx.intents_committed_before(WallTime::from_nanos(2), 2, &access)?,
+                tx.intents_committed_before(WallTime::from_nanos(2), 10, &access)?,
+            ))
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    let ids = |ids: Vec<Id<IntentRow>>| ids.into_iter().map(|id| id.raw()).collect::<Vec<_>>();
+    assert_eq!(
+        ids(all),
+        [5, 30, 40],
+        "the staged older row 5 joins; the staged delete of 10 and the staged put that makes 20 \
+         younger than t=2 remove them"
+    );
+    assert_eq!(
+        ids(two),
+        [5, 30],
+        "the first two of those, in id order: 10 and 20, displaced, do not use up the limit"
+    );
+}
+
 #[test]
 fn delete_intent_removes_the_row() {
     let sim = Sim::with_faults(0x1D7E_0005, FaultConfig::none());

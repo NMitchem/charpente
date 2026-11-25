@@ -112,23 +112,14 @@ impl Row for IntentRow {
 
     fn decode_row(bytes: &[u8]) -> io::Result<IntentRow> {
         let input = &mut &bytes[..];
-        let id = Id::decode(input)?;
-        let intent = String::decode(input)?;
-        let principal = Option::<String>::decode(input)?;
-        let route = String::decode(input)?;
-        let Some((fingerprint, rest)) = input.split_first_chunk::<32>() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "row decode: an IntentRow's 32-byte fingerprint has {} bytes left — schema \
-                     drift or corruption",
-                    input.len()
-                ),
-            ));
-        };
-        let fingerprint = *fingerprint;
-        *input = rest;
-        let committed_at = WallTime::decode(input)?;
+        let Head {
+            id,
+            intent,
+            principal,
+            route,
+            fingerprint,
+            committed_at,
+        } = Head::decode(input)?;
         let status = u16::decode(input)?;
         let reply = match u8::decode(input)? {
             0 => {
@@ -172,6 +163,55 @@ impl Row for IntentRow {
             committed_at,
             status,
             reply,
+        })
+    }
+}
+
+impl IntentRow {
+    /// A stored row's `committed_at`, read without decoding the reply after
+    /// it. The retention sweep's scan reads only this of each row, so it
+    /// never holds a kept body (spec §4.4).
+    pub(crate) fn committed_at_of(bytes: &[u8]) -> io::Result<WallTime> {
+        Ok(Head::decode(&mut &bytes[..])?.committed_at)
+    }
+}
+
+/// A row's fields before its status, in stored order: the one copy of that
+/// layout `decode_row` and `committed_at_of` share.
+struct Head {
+    id: Id<IntentRow>,
+    intent: String,
+    principal: Option<String>,
+    route: String,
+    fingerprint: [u8; 32],
+    committed_at: WallTime,
+}
+
+impl Head {
+    fn decode(input: &mut &[u8]) -> io::Result<Head> {
+        let id = Id::decode(input)?;
+        let intent = String::decode(input)?;
+        let principal = Option::<String>::decode(input)?;
+        let route = String::decode(input)?;
+        let Some((fingerprint, rest)) = input.split_first_chunk::<32>() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "row decode: an IntentRow's 32-byte fingerprint has {} bytes left — schema \
+                     drift or corruption",
+                    input.len()
+                ),
+            ));
+        };
+        let fingerprint = *fingerprint;
+        *input = rest;
+        Ok(Head {
+            id,
+            intent,
+            principal,
+            route,
+            fingerprint,
+            committed_at: WallTime::decode(input)?,
         })
     }
 }

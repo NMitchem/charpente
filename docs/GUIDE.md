@@ -1536,12 +1536,27 @@ this request already committed under <header> `<id>`, and its reply was <n> byte
   request's id landed in this one's slot. It is rare, and it is refused by name
   rather than answered with the other request's reply.
 
-A kept reply stays on disk, in the record, for at least `INTENT_RETENTION`
-(24 hours, `charpente::core::intent`). So a route that returns a secret it
-keeps only hashed must mint it through `ctx.create_session` or
-`ctx.create_api_key`. Those two mints are what tell the request path to
-withhold the reply, and a secret minted any other way would sit in the
-record raw.
+**How long a record lasts.** A record lives `INTENT_RETENTION` (24 hours,
+`charpente::core::intent`) past the later of its commit and the node's latest
+open. An open is a process start, or any way a node becomes writable while it
+runs: a promotion, a switchover's hand-off, or the witness gate opening (§10).
+Counting from the open means a client that re-sends after an outage of any
+length is answered from the record for a full day after it regains a primary.
+The kernel deletes older records itself, in a sweep that is first due a full
+retention after the open. Each sweep deletes at most 4096 records
+(`charpente::kernel::INTENT_SWEEP_BATCH`), and runs again at once after a full
+batch, else an hour later (`INTENT_SWEEP_INTERVAL`), so a record can outlive
+its retention by up to an hour. The lookup itself ignores age: a record the
+sweep has not reached still answers. A re-send that arrives after its record
+was swept is a new request. It runs again, and its write applies a second
+time, so a client that may re-send later than that needs the write to be
+idempotent in your own schema (above).
+
+A kept reply stays on disk, in the record, at least that long. So a route
+that returns a secret it keeps only hashed must mint it through
+`ctx.create_session` or `ctx.create_api_key`. Those two mints are what tell
+the request path to withhold the reply, and a secret minted any other way
+would sit in the record raw.
 
 A copy staged in the same batch as its first copy (group commit, above) reads
 the first copy's record through the batch's shared view and is answered from

@@ -1162,9 +1162,9 @@ fn not_registered(name: &str) -> String {
     )
 }
 
-/// A job or cron stage's `TxError` as the `io::Error` its caller returns: the
-/// stage's own error, or the BUG text for a write gate the kernel never runs
-/// dispatch or cron behind.
+/// A job, cron or intent-sweep stage's `TxError` as the `io::Error` its
+/// caller returns: the stage's own error, or the BUG text for a write gate the
+/// kernel never runs dispatch, cron or the sweep behind.
 pub(super) fn flatten(e: TxError<io::Error>) -> io::Error {
     match e {
         TxError::App(e) | TxError::Io(e) => e,
@@ -1175,18 +1175,19 @@ pub(super) fn flatten(e: TxError<io::Error>) -> io::Error {
 
 fn not_primary_bug() -> io::Error {
     io::Error::other(
-        "BUG: a job/cron transaction hit NotPrimary — the kernel must not run \
-         dispatch or cron on a follower (DESIGN §5)",
+        "BUG: a job/cron/intent-sweep transaction hit NotPrimary — the kernel must \
+         not run dispatch, cron or the intent sweep on a follower (DESIGN §5)",
     )
 }
 
 fn verifying_bug() -> io::Error {
     io::Error::other(
-        "BUG: a job/cron transaction hit Verifying — the kernel must not run \
-         dispatch or cron on a node whose witness gate is still shut (M2 \
-         sub-project 0b). The guard that makes this unreachable is \
-         writes_allowed(): Kernel::build's cron.upsert, the \
-         Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema all \
+        "BUG: a job/cron/intent-sweep transaction hit Verifying — the kernel must \
+         not run dispatch, cron or the intent sweep on a node whose witness gate \
+         is still shut (M2 sub-project 0b). The guard that makes this unreachable \
+         is writes_allowed(): Kernel::build's cron.upsert, the \
+         Ready::Job/Ready::Cron/Ready::IntentSweep pushes, and Kernel::run's \
+         migrate_schema all \
          check it, and after_repl_step re-runs the skipped work when the gate \
          opens. Reaching here means one of those checks was weakened back to a \
          role test — a verifying node is a Role::Primary, so is_primary() does \
