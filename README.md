@@ -9,6 +9,8 @@ times under injected faults and checks the properties you wrote after every run.
 
 https://github.com/user-attachments/assets/9dd78104-beee-4ed8-aab7-5a6c4075be9f
 
+The video shows charpente 0.6.0's run of the example below.
+
 ## Example: a double charge
 
 [`examples/double-charge`][double-charge] is an order API with one table, one route and
@@ -101,7 +103,11 @@ With them, the same command passed.
 
 Under 0.7.0 the route as shown, with no guard, passes. `Drive`, the simulator's recovery step,
 re-sends each write with the `Idempotency-Key` it first carried, and the kernel answers that copy
-from the record of the first reply without running `place_order` again:
+from the record of the first reply without running `place_order` again. charpente dedupes the
+re-sends of one write, not two writes: a second POST of the same order under a new key still
+places it again and charges it twice. The generated client mints a fresh key on each call unless
+you pass the first call's key to retry it, so a route that must answer a repeated order keeps the
+guard. This batch only re-sends, so it is green:
 
 ```console
 $ charpente test --sim --master-seed 0x434841524745

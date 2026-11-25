@@ -13004,6 +13004,73 @@ fn resend_failover_universe(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
+/// GUIDE §5: a follower answers a copy whose record it holds from that record,
+/// as the primary would, since the answer writes nothing; a write it holds no
+/// record for reaches the handler and gets the 421.
+#[test]
+fn a_follower_answers_a_copy_whose_record_it_holds_and_refuses_a_new_write() {
+    let sim = Sim::with_faults(0x1D7E_FA20, FaultConfig::none());
+    let horizon = 100 * SEC_NANOS;
+    let mut p = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let mut f = spawn_kernel_node(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let first = send_keyed(&sim, &mut [&mut p, &mut f]).unwrap();
+    assert_eq!(first.0, 200, "the primary commits the keyed write");
+    krun_until(&sim, &mut [&mut p, &mut f], kconverged, KBUDGET).unwrap();
+    assert_eq!(
+        held_of_keyed_write(&f).unwrap(),
+        (1, true),
+        "f holds the write"
+    );
+
+    let mut nodes = [&mut f, &mut p];
+    let again = drive_request(&sim, &mut nodes, 0, keyed_widget(), KBUDGET).unwrap();
+    assert_eq!(
+        again, first,
+        "the follower answers the copy with the first reply"
+    );
+    let kernel = f.kernel.as_mut().unwrap();
+    let wall = kernel.wall_for_sim();
+    let copy = kernel.app_mut_for_tests().handle_at(keyed_widget(), wall);
+    assert_eq!(
+        (
+            copy.status,
+            copy.headers.get("idempotent-replayed").map(String::as_str)
+        ),
+        (200, Some("true")),
+        "the follower's answer comes from the record"
+    );
+    assert_eq!(
+        held_of_keyed_write(&f).unwrap(),
+        (1, true),
+        "and ran nothing"
+    );
+
+    let fresh = Request::new(Method::Post, "/widget/8").intent("widget-8-attempt");
+    let (status, body) = drive_request(&sim, &mut [&mut f, &mut p], 0, fresh, KBUDGET).unwrap();
+    assert_eq!(
+        status,
+        421,
+        "a write the follower holds no record for gets the 421: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 /// The swarm's axes with media corruption off (`no_media_corruption`) and
 /// each disk error rate capped at 1%. The property's subject is what the
 /// follower holds when it is promoted, which the crashes, reboots, stream

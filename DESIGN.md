@@ -922,7 +922,8 @@ docs/GUIDE.md §5: a 500 never promises rejection, only absence of confirmation.
 **Retry-safe writes (0.7, spec 2026-11-22-retry-safe-writes §4.2).** A write route's
 request that carries an intent id (`Idempotency-Key`) is looked up in the intents record
 (§3) inside its own staged transaction, after auth. A repeat is answered from the record
-without running its handler, so it stages nothing and costs no log record. A fresh write
+without running its handler, so it stages nothing and costs no log record, and a follower
+that holds the record answers it the same way rather than with its 421 (§5). A fresh write
 that staged an effect records its reply in the same transaction, so the record commits with
 the write it records or not at all, and there is no second commit point. A write that
 changed nothing records nothing (`Tx::has_effects`), and a handler's `Err` drops the record
@@ -1960,8 +1961,9 @@ fourth ready source (§1), and `run`/`step` are split so the park belongs to the
 Three edges in `charpente::serve` expose it.
 `serve_replicated(addr, app, repl_disk, repl_cfg)` mirrors `serve`, except that the kernel
 thread opens `Repl` (durable role on `repl_disk`, wire on `ProdNet`) and runs
-`with_replication`. A follower answers writes with 421 and reads from its replicated copy,
-and a primary ships. A startup role/config mismatch prints to stderr, and config never
+`with_replication`. A follower answers writes with 421 (a copy of a write whose intent
+record it holds is answered from the record, §2) and reads from its replicated copy, and a
+primary ships. A startup role/config mismatch prints to stderr, and config never
 overrides the durable role. `backup(app, repl_disk, repl_cfg)` runs the same kernel on the
 current thread against an `EmptySource` (no HTTP edge, no requests): a node that only
 follows and keeps a promotable copy. `archive(app, store, cfg)` (M2) runs against the same

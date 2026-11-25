@@ -122,7 +122,7 @@ Anti-goals:
   path the request staging owns, which handlers cannot reach. The builder designs that core
   API: for example, a capability minted from the `Group`.
 - **The row.** Each row holds:
-  - the raw intent id, the principal (subject, or none on a public route) and the route
+  - the raw intent id, the principal (subject, or none when no credential resolves) and the route
     pattern;
   - a key that hashes all three, so two principals or two routes never share an intent;
   - the request's fingerprint (method, path, body);
@@ -148,9 +148,13 @@ Anti-goals:
 - **The body is stored** when it is at most 64 KiB *(call)* and the transaction minted no
   credential (`Ctx` records a minted session or API key).
 - **Otherwise the row keeps the status and a reason.** A repeat then gets a 409 that says
-  the request already committed, gives the reason ("its reply carried a credential, which
-  charpente shows once" or "its reply was too large to keep"), and tells the client to send
-  a new request with a new id. DESIGN §8 is unchanged, and its oracle stays green.
+  the request already committed and gives the reason, with its fix:
+  - a credential: "its reply carried a credential, which charpente shows once: send a new
+    request under a new <header> to get a new one";
+  - too large: "its reply was <n> bytes, over the 65536 charpente keeps: read the result
+    with a GET".
+
+  DESIGN §8 is unchanged, and its oracle stays green.
 
 ### 4.4 Retention
 

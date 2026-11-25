@@ -38,7 +38,8 @@ pub struct IntentRow {
     pub id: Id<IntentRow>,
     /// The raw id the client sent.
     pub intent: String,
-    /// The authenticated subject, `None` on a public route.
+    /// The authenticated subject, `None` when no credential resolves (a
+    /// credential presented on a public route still resolves to one).
     pub principal: Option<String>,
     /// The route's method and pattern, as `"POST /orders/:id"`.
     pub route: String,

@@ -1438,9 +1438,10 @@ and the record both happen inside the request's own transaction (§4), after
 the auth ladder runs:
 
 - The record lives in `charpente.intents`, a platform table no handler reads
-  or writes (§3). Its key covers the authenticated subject (none on a public
-  route), the route's method and pattern, and the id, so two callers or two
-  routes that pick the same id are two intents.
+  or writes (§3). Its key covers the authenticated subject (none when no
+  credential resolves; a credential sent to a `public` route still resolves),
+  the route's method and pattern, and the id, so two callers or two routes
+  that pick the same id are two intents.
 - With no record under that key, your handler runs. If it returns `Ok` and
   its transaction changed something, its reply is recorded in the same
   transaction, so the record commits with the write or not at all.
@@ -1456,6 +1457,12 @@ true, so a handler that only read runs again on every copy, costs no log
 record, and still answers on a follower. A handler that returns `Err` records
 nothing either, because its whole transaction is dropped, so its copy runs
 again too.
+
+A follower answers a copy whose record it holds from that record, as the
+primary would: the replayed 200, or the 409 or 422 the record decides, rather
+than its 421 (§10). Answering from the record writes nothing, so it needs no
+primary. A write whose record the follower does not hold, because it is new or
+the follower has not yet applied it, reaches the handler and gets the 421.
 
 A write that reaches the server without the header is refused with the 400
 below, and nothing runs. The refusal comes before the auth ladder and before
@@ -1553,15 +1560,17 @@ left ages out, but no sooner than an hour after this sweep
 record can outlive its retention by up to an hour on this node's clock. A
 record carried over from an old primary whose clock ran ahead can outlive it by
 that skew as well. A sweep that leaves the record empty is next due a full
-retention later, so an idle node sweeps once a day. The lookup itself ignores age: a record the
-sweep has not reached still answers. A re-send that arrives after its record
+retention later, so an idle node sweeps once a day. The lookup itself ignores
+age: a record the sweep has not reached still answers. A re-send that arrives after its record
 was swept is a new request. It runs again, and its write applies a second
 time, so a client that may re-send later than that needs the write to be
 idempotent in your own schema (above).
 
-A kept reply stays on disk, in the record, at least that long. So a route
-that returns a secret it keeps only hashed must mint it through
-`ctx.create_session` or `ctx.create_api_key`. Those two mints are what tell
+A kept reply stays on disk, in the record, at least that long. A node keeps
+about a day of write replies, each up to 64 KiB, so size its disk for a day of
+your writes' replies. And since a reply is kept, a route that returns a secret
+it keeps only hashed must mint it through `ctx.create_session` or
+`ctx.create_api_key`. Those two mints are what tell
 the request path to withhold the reply, and a secret minted any other way
 would sit in the record raw.
 
@@ -1628,6 +1637,17 @@ fn main() -> std::io::Result<()> {
     // stopped kernel and restart it (no graceful shutdown in v0).
     std::process::exit(server.wait());
 }
+```
+
+Every write over the wire carries an intent id ("Retry-safe writes", above),
+so a bare `curl -X POST` is refused with the 400 and nothing runs. Send the
+header, and the same id again on a retry of that write:
+
+```text
+$ curl -X POST localhost:8080/notes/1 -d '{"text":"hi"}'
+{"error":"`POST /notes/:id` needs an Idempotency-Key header, 1 to 255 visible ASCII characters: charpente answers a re-sent write once (GUIDE §5). The generated client sends one; a webhook route names its sender's id header with `intent = header(...)`."}
+$ curl -X POST localhost:8080/notes/1 -H 'Idempotency-Key: note-1-first' -d '{"text":"hi"}'
+"1"
 ```
 
 An app whose jobs call outside services (§6) gets its HTTP client from the
@@ -6732,7 +6752,9 @@ primary-host:9090; retry there (the request was not committed)
 ```
 
 A read-only transaction (no effects) commits on a follower unchanged, so GET
-routes work everywhere.
+routes work everywhere. So does a copy of a write whose intent record the
+follower holds: it is answered from the record and writes nothing (§5,
+"Retry-safe writes").
 
 ### What a restarting primary does
 
