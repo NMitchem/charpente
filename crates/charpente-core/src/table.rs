@@ -1432,6 +1432,7 @@ impl Store {
     /// since this handle opened. Only the intent sweep's reads walk an index,
     /// so this is what they have read; a test pins the sweep's cost with it
     /// (`Db::index_entries_walked`).
+    #[doc(hidden)]
     pub fn index_entries_walked(&self) -> u64 {
         self.walked.load(Ordering::Relaxed)
     }

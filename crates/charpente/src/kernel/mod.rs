@@ -237,11 +237,13 @@ pub struct Kernel {
     /// open (`Kernel::opened`), then as the `Ready::IntentSweep` arm sets it
     /// after each sweep. `None` until the node is first open for writes.
     next_intent_sweep: Option<WallTime>,
-    /// The last id the latest intent sweep deleted, while that sweep was a
-    /// full batch and so due again at once; `None` otherwise. The next sweep
-    /// must not find it older than its bound again, or the deletes did not
-    /// land and the sweep would run at one instant forever.
-    full_sweep_through: Option<Id<IntentRow>>,
+    /// The last record (id and `committed_at`) the latest intent sweep
+    /// deleted, while that sweep was a full batch and so due again at once;
+    /// `None` otherwise. The next sweep must not find that same record older
+    /// than its bound again, or the deletes did not land and the sweep would
+    /// run at one instant forever. A re-sent intent re-committed under the
+    /// same id carries a newer `committed_at` and is another record.
+    full_sweep_through: Option<(Id<IntentRow>, WallTime)>,
 }
 
 /// Builds a `Kernel` from its parts (outbound-effects spec §4): a node that
@@ -1321,10 +1323,10 @@ impl Kernel {
                 let mut group = self.app.begin_job_group(now.wall)?;
                 let access = group.intent_access();
                 let sweep = group
-                    .stage(|tx| -> io::Result<(Vec<Id<IntentRow>>, Option<WallTime>)> {
+                    .stage(|tx| -> io::Result<_> {
                         let older =
                             tx.intents_committed_before(before, INTENT_SWEEP_BATCH, &access)?;
-                        for &id in &older {
+                        for &(id, _) in &older {
                             tx.delete_intent(id, &access);
                         }
                         // Read after the deletes, which this transaction's
@@ -1349,15 +1351,16 @@ impl Kernel {
                         if let Some(through) = self.full_sweep_through.take() {
                             assert!(
                                 !older.contains(&through),
-                                "kernel invariant: an intent sweep at {} found record {} older \
-                                 than its bound {before} again, though the full batch the sweep \
+                                "kernel invariant: an intent sweep at {} found record {} \
+                                 (committed at {}) older than its bound {before} again, though the full batch the sweep \
                                  before it committed had deleted it — those deletes did not \
                                  land, so the sweep would run again at this instant forever. \
                                  Fix how a delete of `charpente.intents` applies (Writer::delete, \
                                  which removes the row and its committed_at index entry) or how \
                                  Tx::intents_committed_before reads the index",
                                 now.wall,
-                                through.raw(),
+                                through.0.raw(),
+                                through.1,
                             );
                         }
                         let swept = older.len();

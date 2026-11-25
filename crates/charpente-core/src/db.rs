@@ -1540,8 +1540,8 @@ impl<'a> Tx<'a> {
             .insert((UNSCOPED, id.raw()), None);
     }
 
-    /// The retention sweep's read (spec §4.4): the ids of at most `limit`
-    /// intent records whose `committed_at` is strictly before `before`,
+    /// The retention sweep's read (spec §4.4): each id, with its `committed_at`,
+    /// of at most `limit` intent records whose `committed_at` is strictly before `before`,
     /// oldest first (ties by id), over the snapshot, the group's writes and
     /// this transaction's, as `View::scan` merges them.
     ///
@@ -1557,7 +1557,7 @@ impl<'a> Tx<'a> {
         before: WallTime,
         limit: usize,
         access: &IntentAccess<'_>,
-    ) -> io::Result<Vec<Id<IntentRow>>> {
+    ) -> io::Result<Vec<(Id<IntentRow>, WallTime)>> {
         let IntentAccess(_) = access;
         let staged = self.staged_intents();
         let mut older = Vec::new();
@@ -1587,7 +1587,10 @@ impl<'a> Tx<'a> {
             })?;
         older.sort_unstable();
         older.truncate(limit);
-        Ok(older.into_iter().map(|(_, id)| Id::from_raw(id)).collect())
+        Ok(older
+            .into_iter()
+            .map(|(at, id)| (Id::from_raw(id), at))
+            .collect())
     }
 
     /// The retention sweep's other read (spec §4.4): the earliest

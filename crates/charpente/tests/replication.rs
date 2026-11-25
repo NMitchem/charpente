@@ -12666,7 +12666,7 @@ fn timed_pair(sim: &Sim) -> (KNode, KNode, u64) {
     )
     .unwrap();
     assert_eq!(status, 200);
-    krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET).unwrap();
+    krun_until(sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
     let (on_p, on_f) = (timed_rows(&p), timed_rows(&f));
     assert_eq!(on_p.len(), 1, "one timed row on the primary: {on_p:?}");
     assert_eq!(on_f.len(), 1, "one timed row on the follower: {on_f:?}");
@@ -12957,9 +12957,19 @@ fn resend_failover_universe(sim: &mut Sim) -> Result<(), String> {
     let replayed = copy.headers.get("idempotent-replayed").map(String::as_str);
     let (last, _) = held_of_keyed_write(&f)?;
 
+    if by_reseed && !record {
+        // The window needs a commit acked and not shipped; here f had caught
+        // up (kconverged) before p crashed, so nothing was left unshipped.
+        return Err(format!(
+            "f joined by reseed and converged with p before p crashed, so it must hold the \
+             write, its job and its record of `{RESENT_INTENT}`: DECISIONS §6's loss window \
+             does not apply to a follower that had caught up, yet f holds {before} bump(s) for \
+             widget {RESENT_SLOT} and no intent record, so seeding dropped the write"
+        ));
+    }
     if !record {
         // DECISIONS §6: a commit the old primary acked and had not shipped is
-        // lost at failover. The re-send is a new request on f's timeline: it
+        // lost at failover (the stream variant only). The re-send is a new request on f's timeline: it
         // runs once there, and its record answers the copy after it.
         sim.cover("repl:resend-in-loss-window");
         return if (again.0, after, copy.status, replayed, last) == (200, 1, 200, Some("true"), 1) {

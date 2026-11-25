@@ -567,7 +567,9 @@ or the first one it keeps, and reads no row. After a full batch the sweep is due
 once. Otherwise it reads the earliest `committed_at` left (`Tx::earliest_intent_committed_at`:
 the first index entry its own deletes do not hide) and is due when that record ages out: the
 nanosecond after its `committed_at` plus a retention, since the bound is strict. So a step
-reads the records it deletes plus one or two more entries and a seek, never the table, and a
+reads index entries, never the table: a full batch reads each record it deletes once, and a
+short sweep reads each twice (once to find it, once past it for the earliest left) plus two
+more, so about twice the deletes plus two, and a seek each time. A
 backlog of any size drains at that cost per record. The sweep is due no sooner than
 `INTENT_SWEEP_INTERVAL` (1 hour) after this sweep, though. Under steady writes a record ages
 out every few milliseconds, and a sweep each time would commit a log record for every one or
@@ -1078,8 +1080,8 @@ platform is a single dependency (plus `serde` for your own wire types, GUIDE §1
   `TenantAdmission` is; `put_intent` records its type in `written_as` like `tx.put`. The
   request path puts a row in the transaction of the write the row records (§2, "Retry-safe
   writes"), and a row's id is the first 8 bytes of a SHA-256 over the length-prefixed
-  principal, route and intent id. It is the one platform table with an index, on
-  `committed_at`, which the retention sweep reads oldest first (§1). No app
+  principal, route and intent id. It is the one of the four `PlatformOwned` tables with an
+  index, on `committed_at`, which the retention sweep reads oldest first (§1). No app
   code reads any of the four through a transaction either (spec
   2026-09-30-tenancy-completion §3).
   `View`'s reads bound `R: ReadableBy<Self>`, which a platform table meets for a `Snapshot`

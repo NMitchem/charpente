@@ -794,6 +794,36 @@ fn a_full_batch_is_swept_again_without_waiting_an_interval() {
     );
 }
 
+/// The sweep's progress check names the record, not only its id: a client
+/// re-sends the last-deleted intent between a full batch and the next sweep
+/// (the same id, a newer `committed_at`) and the clock then jumps past the
+/// new record's retention with no open. That record is older than the next
+/// bound, legitimately, so the kernel must sweep it rather than call it a
+/// delete that did not land.
+#[test]
+fn a_recommitted_id_is_not_a_delete_that_did_not_land() {
+    let (sim, mut app) = intent_app(0x1D7E_3108);
+    stage_intents(
+        &mut app,
+        (1..=4097u64).map(|i| (i, WallTime::from_nanos(SEC))),
+    );
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    sim.clock().sleep(Duration::from_nanos(DAY));
+    while intents(kernel.app()).len() != 1 {
+        assert!(matches!(kernel.step(&mut source).unwrap(), Step::Worked));
+    }
+    // Ids 1..=4096 went, 4096 last. The client re-sends it: a new record.
+    let now = sim.clock().wall();
+    stage_intents(kernel.app_mut_for_tests(), [(4096, now)]);
+    sim.clock().sleep(Duration::from_nanos(2 * DAY));
+    while !matches!(kernel.step(&mut source).unwrap(), Step::Idle { .. }) {}
+    assert!(
+        intents(kernel.app()).is_empty(),
+        "the re-committed record, a retention old by the next sweep, was swept with the last one"
+    );
+}
+
 /// Stages each `(id, committed_at)` straight into the record, as its own row.
 fn stage_intents(app: &mut App, rows: impl IntoIterator<Item = (u64, WallTime)>) {
     let db = app.db_for_tests();

@@ -4677,7 +4677,7 @@ fn an_intent_row_round_trips_through_the_log_and_a_reopen() {
         })
         .unwrap();
     assert_eq!(
-        older.iter().map(|id| id.raw()).collect::<Vec<_>>(),
+        older.iter().map(|(id, _)| id.raw()).collect::<Vec<_>>(),
         [3, 1, 2],
         "after a reopen the index orders the rows by committed_at: 0, then 1.7e18, then one \
          nanosecond later"
@@ -4851,13 +4851,13 @@ fn intents_committed_before_returns_only_older_ids_and_honours_the_limit() {
 
     assert_eq!(
         older,
-        vec![at_1.id, at_2.id],
+        vec![(at_1.id, at_1.committed_at), (at_2.id, at_2.committed_at)],
         "the two rows committed before t=3, from the store and the group's overlay, oldest \
          first; the row at t=3 is not older than t=3, and the deleted row is gone"
     );
     assert_eq!(
         one,
-        vec![at_1.id],
+        vec![(at_1.id, at_1.committed_at)],
         "a limit of 1 returns the oldest row, though its id is the larger"
     );
     assert_eq!(none, Vec::new(), "no row was committed before t=1");
@@ -4900,7 +4900,9 @@ fn intents_committed_before_reads_the_transactions_own_writes() {
         .unwrap();
     group.commit().unwrap();
 
-    let ids = |ids: Vec<Id<IntentRow>>| ids.into_iter().map(|id| id.raw()).collect::<Vec<_>>();
+    let ids = |ids: Vec<(Id<IntentRow>, WallTime)>| {
+        ids.into_iter().map(|(id, _)| id.raw()).collect::<Vec<_>>()
+    };
     assert_eq!(
         ids(all),
         [5, 30, 40],
