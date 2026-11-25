@@ -1011,7 +1011,7 @@ const OPEN_TERM_HELD: &str = "intent:open-term-held";
 const HELD_PAST_A_SWEEP: &str = "intent:held-past-a-sweep";
 /// A write ran again once its record could have aged out.
 const RAN_AGAIN_AFTER_AGE_OUT: &str = "intent:ran-again-after-age-out";
-/// The settle's sweeps emptied a record that held rows when it opened.
+/// The settle's sweeps took every record, the faulted span's and its own.
 const AGED_OUT_IN_SETTLE: &str = "intent:aged-out-in-settle";
 
 /// The swarm's sampled disk axes less its two durable-corruption axes, plus
@@ -1536,8 +1536,9 @@ fn run_life(
 }
 
 /// The planned lives under the universe's faults, each reopened through
-/// every stop, then a fault-free settle that re-sends every write once and
-/// runs past every record's age-out and an interval. The store is checked at
+/// every stop, then a fault-free settle that re-sends every write once,
+/// writes a few fresh ones, and runs past every record's age-out and an
+/// interval. The store is checked at
 /// every boot, and the store and every answer at the end (`Rig::check`).
 fn sweep_universe(sim: &mut Sim) -> Result<(), String> {
     let mut rng = Rng::new(sim.seed() ^ 0x1D7E_5EED);
@@ -1600,15 +1601,36 @@ fn sweep_universe(sim: &mut Sim) -> Result<(), String> {
         .iter()
         .map(|row| row.committed_at.as_nanos())
         .fold(open, u64::max);
+    // Every write once more at the settle's start, and one to three fresh
+    // ones over its first six hours, so every settle holds records that age
+    // out at different times and its sweeps have to chain to take them all.
     let start = sim.now().as_nanos();
-    let asks: Vec<(u64, usize)> = (0..writes).map(|write| (start, write)).collect();
-    let horizon = start + (latest - open) + DAY + INTERVAL + 10 * MIN;
-    let (_, stop) = run_life(sim, &mut rig, &mut kernel, &asks, horizon);
+    let mut asks: Vec<(u64, usize)> = (0..writes).map(|write| (start, write)).collect();
+    let mut fresh: Vec<u64> = (0..rng.between(1, 3))
+        .map(|_| rng.between(MIN, 6 * HOUR))
+        .collect();
+    fresh.sort_unstable();
+    asks.extend(
+        fresh
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| (start + at, writes + i)),
+    );
+    let reach = (latest - open).max(6 * HOUR);
+    let horizon = start + reach + DAY + INTERVAL + 10 * MIN;
+    let (_, mut stop) = run_life(sim, &mut rig, &mut kernel, &asks, horizon);
+    if stop.is_none() {
+        // Once more at the horizon itself, so the latest wall the node read,
+        // which liveness is judged at, is the horizon's, not that of the last
+        // step before the kernel parked.
+        let wait = horizon.saturating_sub(sim.now().as_nanos());
+        sim.clock().sleep(Duration::from_nanos(wait));
+        stop = run_life(sim, &mut rig, &mut kernel, &[], horizon).1;
+    }
     if let Some(stop) = stop {
         return Err(format!("the fault-free settle's kernel stopped: {stop}"));
     }
-    let left = rig.check(sim, kernel.app(), Check::End)?;
-    if !rows.is_empty() && left == 0 {
+    if rig.check(sim, kernel.app(), Check::End)? == 0 {
         rig.marks.insert(AGED_OUT_IN_SETTLE);
     }
     for mark in &rig.marks {
