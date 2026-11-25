@@ -881,6 +881,24 @@ implementation of that rule (`CommitFailure::invalidates`) is shared by `Db::tra
 there were three copies of it. The rule's client-facing half is a named contract in
 docs/GUIDE.md §5: a 500 never promises rejection, only absence of confirmation.
 
+**Retry-safe writes (0.7, spec 2026-11-22-retry-safe-writes §4.2).** A write route's
+request that carries an intent id (`Idempotency-Key`) is looked up in the intents record
+(§3) inside its own staged transaction, after auth. A repeat is answered from the record
+without running its handler, so it stages nothing and costs no log record. A fresh write
+that staged an effect records its reply in the same transaction, so the record commits with
+the write it records or not at all, and there is no second commit point. A write that
+changed nothing records nothing (`Tx::has_effects`), and a handler's `Err` drops the record
+with every other effect, so a copy of either runs again. `Group::stage` reads through the
+group overlay, so a repeat staged behind its first copy in one batch is answered from that
+copy's uncommitted record. That answer is a read of a sibling's write, so
+`CommitFailure::invalidates` fails both copies when the commit fails. The record keeps the
+reply's headers and body up to 64 KiB. For a larger reply, or one whose transaction minted
+a credential, it keeps the status and the reason, so no raw credential reaches it (§8) and
+no kept reply pushes a record past `MAX_RECORD_BYTES`. A malformed id is refused before the
+request's `fresh_token` draw, so a refused request moves no entropy stream. The record's
+`committed_at` is the `now` the request path is handed: the step's time, or the epoch
+under `App::handle`, which has no time.
+
 **The batch cap is a constant, not configuration.** `MAX_BATCH = 64` is asserted inside
 `Group::stage`, so the bound is enforced, and the kernel shares the constant rather than
 duplicating it as a literal. `DbConfig` carries operator-facing policy. A batch bound is
@@ -1006,7 +1024,10 @@ platform is a single dependency (plus `serde` for your own wire types, GUIDE §1
   2026-11-22-retry-safe-writes §4.2): a forged row would answer a request that never ran.
   Its one door is `Tx::get_intent`/`put_intent`/`delete_intent`/
   `intents_committed_before`, each taking an `IntentAccess` that only a `Group` mints, as
-  `TenantAdmission` is; `put_intent` records its type in `written_as` like `tx.put`. No app
+  `TenantAdmission` is; `put_intent` records its type in `written_as` like `tx.put`. The
+  request path puts a row in the transaction of the write the row records (§2, "Retry-safe
+  writes"), and a row's id is the first 8 bytes of a SHA-256 over the length-prefixed
+  principal, route and intent id. No app
   code reads any of the four through a transaction either (spec
   2026-09-30-tenancy-completion §3).
   `View`'s reads bound `R: ReadableBy<Self>`, which a platform table meets for a `Snapshot`

@@ -544,6 +544,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                         <#err_ty as ::charpente::wire::Wire>::register(reg);
                     },
                     emits: &[],
+                    intent: ::std::option::Option::None,
                 }
             }
         }
@@ -919,6 +920,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                         #(#emit_registers)*
                     },
                     emits: &[#(#emit_names),*],
+                    intent: ::std::option::Option::None,
                 }
             }
         }

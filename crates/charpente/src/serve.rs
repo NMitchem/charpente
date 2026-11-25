@@ -1597,6 +1597,7 @@ mod tests {
             error: || <ApiError as Wire>::reference(),
             register_types: |_| {},
             emits: &[],
+            intent: None,
         }]);
 
         let server = serve("127.0.0.1:0", app).unwrap();
@@ -1675,6 +1676,7 @@ mod tests {
                 error: || <ApiError as Wire>::reference(),
                 register_types: |_| {},
                 emits: &[],
+                intent: None,
             },
             Route {
                 method: Method::Get,
@@ -1690,6 +1692,7 @@ mod tests {
                 error: || <ApiError as Wire>::reference(),
                 register_types: |_| {},
                 emits: &[],
+                intent: None,
             },
         ]
     }
@@ -1837,6 +1840,7 @@ mod tests {
             error: || <ApiError as Wire>::reference(),
             register_types: |_| {},
             emits: &[],
+            intent: None,
         }]);
 
         let server = serve("127.0.0.1:0", app).unwrap();
@@ -1927,6 +1931,7 @@ mod tests {
                 error: || <ApiError as Wire>::reference(),
                 register_types: |_| {},
                 emits: &[],
+                intent: None,
             },
             Route {
                 method: Method::Get,
@@ -1942,6 +1947,7 @@ mod tests {
                 error: || <ApiError as Wire>::reference(),
                 register_types: |_| {},
                 emits: &[],
+                intent: None,
             },
         ]
     }

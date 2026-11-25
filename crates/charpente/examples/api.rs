@@ -793,6 +793,10 @@ fn kernel(
         start + 2_000_000,
         Request::new(Method::Put, "/notes/1")
             .header("authorization", "Bearer <token>")
+            // The write's `Idempotency-Key`: a copy that carries the same id
+            // is answered from the first reply's record, without running
+            // (GUIDE §5, "Retry-safe writes").
+            .intent("put-note-1")
             .json(&serde_json::json!({ "text": "hi", "label": "urgent" })),
     );
     // Upper case only, and no `SSE`: a stream route is requested with `GET`.

@@ -1397,13 +1397,102 @@ confirmation.** What that means in practice:
   observed committed state is not invalidated by a later sibling's failure.
 
 Operationally this is the same epistemic class as any `TxError::Io`, so
-handle it the same way: a blind retry is safe only where the operation is
-idempotent in your own schema — the platform does not dedupe for you, and
-§6 is explicit that an `enqueue_keyed` key is carried, not indexed. A sim's
+handle it the same way: a blind retry is safe where the write carries an
+intent id, which the platform answers once ("Retry-safe writes", next), or
+where the operation is idempotent in your own schema. Nothing else dedupes,
+and §6 is explicit that an `enqueue_keyed` key is carried, not indexed. A sim's
 fault-free tail re-sends such a request too, so a route it reaches must be
 safe to receive twice (§8, "A fault-free tail for an end-of-run check"). After the
 restart, the honest way to learn what happened is to read the state back
 rather than infer it from the status code.
+
+### Retry-safe writes
+
+A client that loses a write's reply cannot tell whether the write landed, so
+it sends the write again. charpente answers that copy from a record instead
+of running the write twice. The contract: a request to a write route (`POST`,
+`PUT`, `PATCH` or `DELETE`, never `SSE`) that carries an `Idempotency-Key`
+header applies at most once under that key, and every later copy gets the
+first copy's reply back. In a test or a hand driver, `Request::intent(id)`
+sets the header:
+
+```rust
+use charpente::http::{Method, Request};
+
+fn place_order(order: u64, attempt: &str) -> Request {
+    Request::new(Method::Post, format!("/orders/{order}"))
+        .json(&"two widgets")
+        .intent(attempt)
+}
+```
+
+The id is 1 to 255 visible ASCII characters (bytes 0x21 to 0x7e). The lookup
+and the record both happen inside the request's own transaction (§4), after
+the auth ladder runs:
+
+- The record lives in `charpente.intents`, a platform table no handler reads
+  or writes (§3). Its key covers the authenticated subject (none on a public
+  route), the route's method and pattern, and the id, so two callers or two
+  routes that pick the same id are two intents.
+- With no record under that key, your handler runs. If it returns `Ok` and
+  its transaction changed something, its reply is recorded in the same
+  transaction, so the record commits with the write or not at all.
+- With a record of the same request, your handler does not run. The answer is
+  the first reply's status, headers and body, plus the header
+  `idempotent-replayed: true`. "The same request" means the same method,
+  path, query and body; the record stores a SHA-256 of them, not the body.
+  Headers are not part of it.
+
+A write that changed nothing records nothing. The request path asks
+`tx.has_effects()` after your handler returns and records only when it is
+true, so a handler that only read runs again on every copy, costs no log
+record, and still answers on a follower. A handler that returns `Err` records
+nothing either, because its whole transaction is dropped, so its copy runs
+again too.
+
+A request without the header runs as it always has. GET and SSE routes never
+read it, so a GET handler that writes is outside this contract and runs again
+on every copy.
+
+The answers that are not a replay, where `<method> <pattern>` is the route's
+and `<header>` is `Idempotency-Key`:
+
+<!-- pinned -->
+```text
+`<method> <pattern>` needs an <header> header, 1 to 255 visible ASCII characters: charpente answers a re-sent write once (GUIDE §5). The generated client sends one; a webhook route names its sender's id header with `intent = header(...)`.
+<header> `<id>` was already used for a different request to `<method> <pattern>`: send this request under a new <header>.
+this request already committed under <header> `<id>`, and its reply carried a credential, which charpente shows once: send a new request under a new <header> to get a new one.
+this request already committed under <header> `<id>`, and its reply was <n> bytes, over the 65536 charpente keeps: read the result with a GET.
+<header> `<id>` shares a record slot with another request's id: send this request under a new <header>.
+```
+
+- **400**: the id is empty, over 255 bytes, or holds a space, a control
+  character or a non-ASCII byte. It is refused before the request draws
+  anything, and nothing runs.
+- **422**: the id was already used for a different request. The client
+  reused an id, and is told so rather than handed another request's reply.
+- **409, a credential**: the first copy minted a session or an API key
+  (`ctx.create_session` or `ctx.create_api_key`, above). The raw token exists
+  only in that first reply (DESIGN §8), so the record keeps the status and
+  not the body.
+- **409, too large**: the first reply was over 64 KiB, headers and body
+  together, which is how `<n>` counts it too. The record keeps the status and
+  the size. Read the result back with a GET.
+- **409, a shared slot**: the record's key is 8 bytes of a hash, and another
+  request's id landed in this one's slot. It is rare, and it is refused by name
+  rather than answered with the other request's reply.
+
+A kept reply stays on disk, in the record, for at least `INTENT_RETENTION`
+(24 hours, `charpente::core::intent`). So a route that returns a secret it
+keeps only hashed must mint it through `ctx.create_session` or
+`ctx.create_api_key`. Those two mints are what tell the request path to
+withhold the reply, and a secret minted any other way would sit in the
+record raw.
+
+A copy staged in the same batch as its first copy (group commit, above) reads
+the first copy's record through the batch's shared view and is answered from
+it. If that batch's commit then fails, both copies get the 500: the copy's
+answer came from a record that no durable copy holds.
 
 ### Starting the server
 
@@ -6256,6 +6345,14 @@ with its own near-identical 413 text (`"request body exceeds the N-byte cap
 — raise AppConfig.body_cap or send less"`) — code exercised without `serve`
 (the sim's kernel and `App::handle` included) only ever sees the kernel-layer
 message quoted above, since the wire check is a `charpente::serve`-only path.
+
+### A write route's intent id (`charpente/src/http/intent.rs`, request time)
+
+The 400 for a malformed `Idempotency-Key`, the 422 for an id reused on a
+different request, and the three 409s (a copy of a committed write whose reply
+carried a credential or was over 64 KiB, and an id whose record slot another
+request's id holds) are quoted, each with what it means, in §5's "Retry-safe
+writes".
 
 ### Schema / replay mismatches (`charpente-core/src/db.rs`)
 

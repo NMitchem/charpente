@@ -71,6 +71,11 @@ pub struct Route {
     /// in declaration order. Empty for non-stream routes, and for a stream
     /// route that has not adopted the declaration.
     pub emits: &'static [EmittedEvent],
+    /// The header a write route reads its intent id from (retry-safe writes,
+    /// spec §4.1): `None` for `Idempotency-Key`, `Some` for a route that
+    /// names its sender's own. Read by `stage_or_subscribe`, which answers a
+    /// re-sent write from the record of its first reply.
+    pub intent: Option<&'static str>,
 }
 
 /// One event a stream route declares with `emits(Ev, …)`, carrying BOTH names
@@ -300,6 +305,7 @@ mod tests {
             error: || <ApiError as crate::wire::Wire>::reference(),
             register_types: |_| {},
             emits: &[],
+            intent: None,
         }
     }
 

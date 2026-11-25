@@ -21,6 +21,7 @@ use crate::auth::{
     ApiKey, AuthReject, OidcConfig, OidcVerifier, Presented, Principal, Via, hash_token, resolve,
 };
 use crate::describe::EventDef;
+use crate::http::intent::{self, Decision};
 use crate::http::router::{PublicScope, RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
@@ -1186,6 +1187,14 @@ impl<'a> StagedDispatch<'a> {
     /// (`ctx.create_session` is the obvious case), and `Group::stage`'s
     /// empty-effects check — not a special case here — is what makes a
     /// typical read-only subscribe cost no record.
+    ///
+    /// A write route's request that carries an intent id (`Idempotency-Key`,
+    /// or the route's declared header) is looked up in `charpente.intents`
+    /// inside its own staged transaction, after `build_ctx`: a repeat is
+    /// answered from the record without running the handler, and a fresh
+    /// write that staged an effect records its reply beside it (retry-safe
+    /// writes, spec §4.2). `now` is the record's `committed_at`: the
+    /// kernel's step time, or the epoch under `App::handle`, which has none.
     pub fn stage_or_subscribe(
         &self,
         group: &mut Group,
@@ -1223,6 +1232,10 @@ impl<'a> StagedDispatch<'a> {
         // admission is minted from the `Group`, which a handler never holds
         // (job-tenancy spec §4).
         let stance = Declared::of(route).admitted(group);
+        // And the request path's door to the intents record, for the same
+        // reason: a handler that could read the record could forge an answer
+        // (retry-safe writes, spec §4.2).
+        let access = group.intent_access();
         let glue = route.glue;
         let cursor = match glue {
             RouteGlue::Sse(_) => match extract_cursor(&request) {
@@ -1230,6 +1243,25 @@ impl<'a> StagedDispatch<'a> {
                 Err(response) => return Handled::Response(response),
             },
             RouteGlue::Http(_) => None,
+        };
+        // A write's intent id (spec §4.1), read before the `fresh_token` draw
+        // so a malformed one is refused having drawn nothing. A GET or SSE
+        // route never reads one. With no id the write runs as it always has.
+        let header = intent::header_name(route);
+        let write_intent = if intent::is_write(route) {
+            match intent::presented(&request, route) {
+                intent::Presented::Malformed => {
+                    return Handled::Response(intent::malformed(route));
+                }
+                intent::Presented::Valid(id) => Some((
+                    id,
+                    format!("{} {}", route.method.name(), route.pattern),
+                    intent::fingerprint(&request),
+                )),
+                intent::Presented::Absent => None,
+            }
+        } else {
+            None
         };
 
         let mut fresh = [0u8; 32];
@@ -1253,7 +1285,54 @@ impl<'a> StagedDispatch<'a> {
                         cap,
                         stance,
                     )?;
-                    glue(tx, &ctx, &captures, &request.body)
+                    let Some((id, route_name, fingerprint)) = &write_intent else {
+                        return glue(tx, &ctx, &captures, &request.body);
+                    };
+                    // Looked up and recorded in this transaction (spec §4.2):
+                    // the record commits with the write it records or not at
+                    // all, and a repeat staged behind its first copy in the
+                    // same group finds the first copy's record through the
+                    // group overlay, so `CommitFailure::invalidates` fails
+                    // both when the commit fails.
+                    let principal = ctx.principal().map(Principal::subject);
+                    let found =
+                        tx.get_intent(intent::row_id(principal, route_name, id), &access)?;
+                    let decision = intent::decide(
+                        found.as_ref(),
+                        header,
+                        id,
+                        principal,
+                        route_name,
+                        fingerprint,
+                    );
+                    if let Decision::Answer(response) = decision {
+                        // Negative space: an answer from the record runs no
+                        // handler, so a repeat stages nothing and costs no
+                        // record.
+                        assert!(
+                            !tx.has_effects(),
+                            "`{route_name}`: a write answered from its intent record staged an \
+                             effect — the replay path runs no handler, so only `build_ctx` could \
+                             have written, and it must only read"
+                        );
+                        return Ok(response);
+                    }
+                    let response = glue(tx, &ctx, &captures, &request.body)?;
+                    // A write that changed nothing has nothing to repeat: it
+                    // records nothing and costs no log record (spec §4.2).
+                    if tx.has_effects() {
+                        let row = intent::record(
+                            id,
+                            principal,
+                            route_name,
+                            *fingerprint,
+                            now,
+                            &response,
+                            ctx.created.get(),
+                        );
+                        tx.put_intent(&row, &access);
+                    }
+                    Ok(response)
                 });
                 Handled::Response(result.unwrap_or_else(tx_error_response))
             }

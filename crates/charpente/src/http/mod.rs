@@ -9,6 +9,7 @@
 //! one-request path for a test.
 
 mod app;
+mod intent;
 mod router;
 
 pub use app::{App, AppConfig, Ctx, Handled, Session, StagedDispatch};
@@ -104,6 +105,15 @@ impl Request {
     pub fn header(mut self, key: &str, value: impl Into<String>) -> Request {
         self.headers.insert(key.to_ascii_lowercase(), value.into());
         self
+    }
+
+    /// Sets the write's intent id (`Idempotency-Key`): a re-send that carries
+    /// the first copy's id is answered from the record of its first reply
+    /// instead of running again (GUIDE §5, "Retry-safe writes"). A route that
+    /// names its sender's header reads that one instead; set it with
+    /// `header`.
+    pub fn intent(self, id: impl Into<String>) -> Request {
+        self.header("Idempotency-Key", id)
     }
 
     pub fn json(mut self, value: &impl serde::Serialize) -> Request {
