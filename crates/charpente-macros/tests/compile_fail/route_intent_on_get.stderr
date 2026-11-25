@@ -1,5 +1,11 @@
 error: `intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no intent
- --> tests/compile_fail/route_intent_on_get.rs:9:51
-  |
-9 | #[route(GET "/hooks/pay", public, intent = header("X-Event-Id"))]
-  |                                                   ^^^^^^^^^^^^
+  --> tests/compile_fail/route_intent_on_get.rs:14:51
+   |
+14 | #[route(GET "/hooks/pay", public, intent = header("X-Event-Id"))]
+   |                                                   ^^^^^^^^^^^^
+
+error: `intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no intent
+  --> tests/compile_fail/route_intent_on_get.rs:20:52
+   |
+20 | #[route(SSE "/hooks/feed", public, intent = header("X-Event-Id"))]
+   |                                                    ^^^^^^^^^^^^
