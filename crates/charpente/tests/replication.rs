@@ -12666,7 +12666,7 @@ fn timed_pair(sim: &Sim) -> (KNode, KNode, u64) {
     )
     .unwrap();
     assert_eq!(status, 200);
-    krun_until(sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
+    krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET).unwrap();
     let (on_p, on_f) = (timed_rows(&p), timed_rows(&f));
     assert_eq!(on_p.len(), 1, "one timed row on the primary: {on_p:?}");
     assert_eq!(on_f.len(), 1, "one timed row on the follower: {on_f:?}");
@@ -12767,4 +12767,280 @@ fn a_timed_job_replicates_switches_over_and_fails_over_with_its_due_time() {
     let reply = drive_ctrl_kernel(&sim, &mut [&mut f], &mut cli, KBUDGET).unwrap();
     assert!(matches!(reply, Msg::CtrlOk { .. }), "promote: {reply:?}");
     runs_once_at_its_due_time(&sim, &mut [&mut f], 0, due);
+}
+
+// ------------------- retry-safe writes: a re-send after failover
+
+/// The widget the keyed write puts, and the id its client sends it under.
+const RESENT_SLOT: u64 = 7;
+const RESENT_INTENT: &str = "widget-7-attempt";
+
+fn keyed_widget() -> Request {
+    Request::new(Method::Post, format!("/widget/{RESENT_SLOT}")).intent(RESENT_INTENT)
+}
+
+/// What `node` holds of the keyed write: its `Bump` jobs for the widget
+/// (`put_widget` enqueues one each time it runs) and whether it holds the
+/// write's intent record. The write, its job and its record commit as one
+/// record, so a node holds all of them or none.
+fn held_of_keyed_write(node: &KNode) -> Result<(usize, bool), String> {
+    let db = node.kernel.as_ref().ok_or("node has no kernel")?.app().db();
+    let snap = db.snapshot().map_err(|e| e.to_string())?;
+    let mut bumps = 0;
+    for job in snap
+        .scan::<JobRow>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|j| j.name == "Bump")
+    {
+        if u64::decode(&mut &job.payload[..]).map_err(|e| e.to_string())? == RESENT_SLOT {
+            bumps += 1;
+        }
+    }
+    let record = snap
+        .scan::<charpente_core::intent::IntentRow>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|row| row.intent == RESENT_INTENT);
+    Ok((bumps, record))
+}
+
+/// Sends the keyed write to `nodes[0]` until it is answered with anything but
+/// a 5xx, as a client retries a write whose reply it lost or saw fail, under
+/// the same id. Here a lost reply is a reboot that took the request with it,
+/// and a 5xx is fault fallout (a failed sync, a refused read).
+fn send_keyed(sim: &Sim, nodes: &mut [&mut KNode]) -> Result<(u16, Vec<u8>), String> {
+    for _ in 0..8 {
+        match drive_request_answered(sim, nodes, 0, keyed_widget(), KBUDGET)? {
+            Some(answer) if answer.0 < 500 => return Ok(answer),
+            _ => {}
+        }
+    }
+    sim.cover("repl:inconclusive:resend-unanswered");
+    Err(format!(
+        "{INCONCLUSIVE}: eight sends of the keyed write to {} got no answer or a 5xx",
+        nodes[0].name
+    ))
+}
+
+/// A keyed write commits on the primary. The follower gets it by stream (it
+/// follows from the start, and the primary crashes a drawn 0 to 30 rounds
+/// after the ack) or by reseed (it joins after the primary compacted its log
+/// past the write, so a snapshot seeds it). The primary crashes undrained, the
+/// follower is promoted, and the client re-sends under the same id.
+fn resend_failover_universe(sim: &mut Sim) -> Result<(), String> {
+    let mut state = sim.seed() ^ 0x1D7E_FA11;
+    let mut rng = charpente_sim::rng::Rng::new(charpente_sim::rng::splitmix64(&mut state));
+    let by_reseed = rng.chance(0.5);
+    let horizon = 200 * SEC_NANOS;
+    let p_cfg = if by_reseed {
+        seeding_db_cfg()
+    } else {
+        no_gc_cfg()
+    };
+    let mut p = spawn_kernel_node(sim, "p", primary_cfg("p:1"), p_cfg, horizon, true)?;
+    let mut f = if by_reseed {
+        None
+    } else {
+        Some(spawn_kernel_node(
+            sim,
+            "f",
+            follower_cfg("f:1", "p:1"),
+            no_gc_cfg(),
+            horizon,
+            true,
+        )?)
+    };
+
+    let first = {
+        let mut nodes: Vec<&mut KNode> = std::iter::once(&mut p).chain(f.as_mut()).collect();
+        send_keyed(sim, &mut nodes)?
+    };
+    if first.0 != 200 {
+        return Err(format!(
+            "the keyed write was answered {} {} on a primary that never ran it",
+            first.0,
+            String::from_utf8_lossy(&first.1)
+        ));
+    }
+
+    let mut f = match f {
+        Some(mut f) => {
+            for _ in 0..rng.below(31) {
+                if !kernel_round(sim, &mut [&mut p, &mut f])? {
+                    break;
+                }
+            }
+            f
+        }
+        None => {
+            // Unkeyed writes until p's log is compacted past the keyed one,
+            // so a follower that joins now cannot be shipped it.
+            for id in 100..112u64 {
+                // Any answer, or none: a lost filler only means one write
+                // fewer toward the compaction the reseed check confirms.
+                drive_request_answered(
+                    sim,
+                    &mut [&mut p],
+                    0,
+                    Request::new(Method::Post, format!("/widget/{id}")),
+                    KBUDGET,
+                )?;
+            }
+            let mut f = spawn_kernel_node(
+                sim,
+                "f",
+                follower_cfg("f:1", "p:1"),
+                no_gc_cfg(),
+                horizon,
+                true,
+            )?;
+            match krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET) {
+                Ok(()) => {}
+                Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+                // A reboot mid-seed left f holding part of p's timeline, and
+                // p has since compacted past it: the refusal Design B owes a
+                // follower below the retained base, whose remedy is a
+                // deliberate re-seed from a fresh data dir.
+                Err(e) if is_diverged_behind(&e) => {
+                    sim.cover("repl:inconclusive:resend-joiner-refused-behind");
+                    return Err(format!(
+                        "{INCONCLUSIVE}: the joining follower fell below p's retained base: {e}"
+                    ));
+                }
+                Err(e) if e.starts_with("kernel stall") || e.starts_with("kernel budget") => {
+                    sim.cover("repl:inconclusive:resend-reseed-not-converged");
+                    return Err(format!(
+                        "{INCONCLUSIVE}: the joining follower did not converge: {e}"
+                    ));
+                }
+                Err(e) => return Err(format!("the joining follower: {e}")),
+            }
+            f
+        }
+    };
+
+    // p dies without a drain, and f is promoted.
+    p.host.crash_now();
+    f.flipped = true;
+    let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None })?;
+    match drive_ctrl_kernel(sim, &mut [&mut f], &mut cli, KBUDGET)? {
+        Msg::CtrlOk { .. } => {}
+        other => return Err(format!("promoting f was refused: {other:?}")),
+    }
+    // Read after the promotion: what f holds now is what answers the re-send.
+    // A follower that never compacts its own log starts it at 0 unless a
+    // snapshot seeded it.
+    let f_db = f.kernel.as_ref().ok_or("f has no kernel")?.app().db();
+    let seeded = f_db.log_base() > 0;
+    if by_reseed && !seeded {
+        sim.cover("repl:inconclusive:resend-not-seeded");
+        return Err(format!(
+            "{INCONCLUSIVE}: the joining follower replayed p's log from 0, so it was not seeded"
+        ));
+    }
+    let (before, record) = held_of_keyed_write(&f)?;
+    if (before, record) != (0, false) && (before, record) != (1, true) {
+        return Err(format!(
+            "f holds {before} bump(s) for widget {RESENT_SLOT} and {} the intent record of \
+             `{RESENT_INTENT}`: the write, its job and its record commit as one record, so a node \
+             holds all of them once or none",
+            if record { "holds" } else { "does not hold" }
+        ));
+    }
+
+    let again = send_keyed(sim, &mut [&mut f])?;
+    let (after, _) = held_of_keyed_write(&f)?;
+    let kernel = f.kernel.as_mut().ok_or("f has no kernel")?;
+    let wall = kernel.wall_for_sim();
+    let copy = kernel.app_mut_for_tests().handle_at(keyed_widget(), wall);
+    let replayed = copy.headers.get("idempotent-replayed").map(String::as_str);
+    let (last, _) = held_of_keyed_write(&f)?;
+
+    if !record {
+        // DECISIONS §6: a commit the old primary acked and had not shipped is
+        // lost at failover. The re-send is a new request on f's timeline: it
+        // runs once there, and its record answers the copy after it.
+        sim.cover("repl:resend-in-loss-window");
+        return if (again.0, after, copy.status, replayed, last) == (200, 1, 200, Some("true"), 1) {
+            Ok(())
+        } else {
+            Err(format!(
+                "inside DECISIONS §6's loss window f never held the write, so its re-send must \
+                 run once on f's timeline and the next copy be answered from that run's record: \
+                 the re-send answered {} {}, {after} bump(s) after it, then a copy answered {} \
+                 with idempotent-replayed {replayed:?}, {last} bump(s) after that",
+                again.0,
+                String::from_utf8_lossy(&again.1),
+                copy.status
+            ))
+        };
+    }
+    if again != first || (after, last) != (1, 1) {
+        return Err(format!(
+            "f held the record of `{RESENT_INTENT}` (by {}) when it was promoted, so the re-send \
+             must be answered from it and run nothing: the first send answered {} {}, the re-send \
+             {} {}, and f held 1 bump for widget {RESENT_SLOT} before it, {after} after, {last} \
+             after one more copy",
+            if seeded { "reseed" } else { "stream" },
+            first.0,
+            String::from_utf8_lossy(&first.1),
+            again.0,
+            String::from_utf8_lossy(&again.1)
+        ));
+    }
+    if (copy.status, replayed) != (200, Some("true")) {
+        return Err(format!(
+            "a copy of `{RESENT_INTENT}` on the promoted f was answered {} with \
+             idempotent-replayed {replayed:?}, not 200 from the record",
+            copy.status
+        ));
+    }
+    sim.cover(if seeded {
+        "repl:resend-replayed-by-reseed"
+    } else {
+        "repl:resend-replayed-by-stream"
+    });
+    Ok(())
+}
+
+/// The swarm's axes with media corruption off (`no_media_corruption`) and
+/// each disk error rate capped at 1%. The property's subject is what the
+/// follower holds when it is promoted, which the crashes, reboots, stream
+/// drops and lag of the swarm all move. A disk error storm (the swarm draws up
+/// to 15% a call) only gives a universe up, after thousands of recoveries: one
+/// such universe took 84 s.
+fn resend_axes(_seed: u64, cfg: &mut FaultConfig) {
+    no_media_corruption(cfg);
+    cfg.write_error = cfg.write_error.min(0.01);
+    cfg.sync_error = cfg.sync_error.min(0.01);
+    cfg.read_error = cfg.read_error.min(0.01);
+}
+
+/// Retry-safe writes across a failover (final review I1; hard rule 3). A
+/// write's record commits in its transaction, and replication ships, seeds
+/// and replays it like any row, so a follower that holds the write holds its
+/// record: once promoted, it answers the client's re-send from the record
+/// (the first reply, `idempotent-replayed: true`) and the write runs once.
+/// Both ways a follower gets it are required, by stream and by a snapshot
+/// reseed. DECISIONS §6's loss window, an acked write the old primary had not
+/// shipped, is the documented exception and is excused by name
+/// (`repl:resend-in-loss-window`): the re-send then runs once on the new
+/// timeline.
+#[test]
+fn a_resend_after_failover_is_answered_from_the_record_the_follower_holds() {
+    run_universes_swarm_with!(
+        0x1D7E_FA00,
+        64,
+        resend_axes,
+        |sim: &mut Sim| {
+            let r = resend_failover_universe(sim);
+            finish_universe(sim, r)
+        },
+        require: [
+            "repl:resend-replayed-by-stream",
+            "repl:resend-replayed-by-reseed",
+            "repl:resend-in-loss-window",
+        ]
+    );
 }
