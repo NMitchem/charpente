@@ -25,8 +25,8 @@ pub const INTENT_RETENTION: Duration = Duration::from_secs(86_400);
 /// principal's stored replies and a forged row would answer a request that
 /// never ran. Only a `Group`'s `IntentAccess` reaches it inside a
 /// transaction (`Tx::get_intent`, `put_intent`, `delete_intent`,
-/// `intents_committed_before`). Code that holds the `Db` reads it through a
-/// snapshot.
+/// `intents_committed_before`, `earliest_intent_committed_at`). Code that
+/// holds the `Db` reads it through a snapshot.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IntentRow {
     pub id: Id<IntentRow>,

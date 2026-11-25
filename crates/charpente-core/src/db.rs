@@ -1556,25 +1556,7 @@ impl<'a> Tx<'a> {
         access: &IntentAccess<'_>,
     ) -> io::Result<Vec<Id<IntentRow>>> {
         let IntentAccess(_) = access;
-        // Each id an overlay holds is decided there, this transaction's
-        // entry over the group's, and the snapshot's row under it is skipped.
-        let mut staged: BTreeMap<u64, Option<&[u8]>> = BTreeMap::new();
-        let levels = [
-            self.group.and_then(|g| g.get(IntentRow::TABLE)),
-            self.effects.overlay.get(IntentRow::TABLE),
-        ];
-        for (&(scope, id), entry) in levels.into_iter().flatten().flatten() {
-            // `merge_overlay_rows`'s negative space: `put_intent` and
-            // `delete_intent` stage `UNSCOPED` only.
-            assert_eq!(
-                scope,
-                UNSCOPED,
-                "table \"{}\" is not tenant-scoped but its overlay holds id {id} under scope \
-                 {scope} — Tx::put_intent/Tx::delete_intent stage UNSCOPED only",
-                IntentRow::TABLE
-            );
-            staged.insert(id, entry.as_deref());
-        }
+        let staged = self.staged_intents();
         let mut older = Vec::new();
         for (&id, entry) in &staged {
             if let Some(bytes) = entry
@@ -1594,6 +1576,59 @@ impl<'a> Tx<'a> {
         older.sort_unstable();
         older.truncate(limit);
         Ok(older.into_iter().map(Id::from_raw).collect())
+    }
+
+    /// The retention sweep's other read (spec §4.4): the earliest
+    /// `committed_at` of any intent record, over the snapshot, the group's
+    /// writes and this transaction's, or `None` when none remains. The sweep
+    /// reads it after staging its deletes, to set its next due time.
+    ///
+    /// Like `intents_committed_before` it holds no row and reads each only as
+    /// far as its `committed_at`. It walks the whole table, since row ids are
+    /// hashes and say nothing of age, so its memory is the overlays alone.
+    pub fn earliest_intent_committed_at(
+        &self,
+        access: &IntentAccess<'_>,
+    ) -> io::Result<Option<WallTime>> {
+        let IntentAccess(_) = access;
+        let staged = self.staged_intents();
+        let mut earliest: Option<WallTime> = None;
+        for bytes in staged.values().flatten() {
+            let at = IntentRow::committed_at_of(bytes)?;
+            earliest = Some(earliest.map_or(at, |e| e.min(at)));
+        }
+        self.snapshot.walk_raw::<IntentRow>(|id, bytes| {
+            if !staged.contains_key(&id) {
+                let at = IntentRow::committed_at_of(bytes)?;
+                earliest = Some(earliest.map_or(at, |e| e.min(at)));
+            }
+            Ok(true)
+        })?;
+        Ok(earliest)
+    }
+
+    /// The intent entries the overlays hold, this transaction's over the
+    /// group's: each id they decide, with its row's bytes or `None` for a
+    /// delete. The sweep's reads skip the snapshot's row under each.
+    fn staged_intents(&self) -> BTreeMap<u64, Option<&[u8]>> {
+        let mut staged = BTreeMap::new();
+        let levels = [
+            self.group.and_then(|g| g.get(IntentRow::TABLE)),
+            self.effects.overlay.get(IntentRow::TABLE),
+        ];
+        for (&(scope, id), entry) in levels.into_iter().flatten().flatten() {
+            // `merge_overlay_rows`'s negative space: `put_intent` and
+            // `delete_intent` stage `UNSCOPED` only.
+            assert_eq!(
+                scope,
+                UNSCOPED,
+                "table \"{}\" is not tenant-scoped but its overlay holds id {id} under scope \
+                 {scope} — Tx::put_intent/Tx::delete_intent stage UNSCOPED only",
+                IntentRow::TABLE
+            );
+            staged.insert(id, entry.as_deref());
+        }
+        staged
     }
 
     /// Whether this transaction has staged anything its commit would record:
@@ -2811,10 +2846,11 @@ impl<'a> Group<'a> {
 
 /// Proof that the platform's request staging, its retention sweep, or the
 /// operator reaches `charpente.intents`: the argument of `Tx::get_intent`,
-/// `Tx::put_intent`, `Tx::delete_intent` and `Tx::intents_committed_before`
-/// (retry-safe-writes spec §4.2, §4.4). The record holds every principal's
-/// stored replies, and a re-sent request is answered from it without running,
-/// so a row app code could write would answer a request that never ran.
+/// `Tx::put_intent`, `Tx::delete_intent`, `Tx::intents_committed_before` and
+/// `Tx::earliest_intent_committed_at` (retry-safe-writes spec §4.2, §4.4).
+/// The record holds every principal's stored replies, and a re-sent request
+/// is answered from it without running, so a row app code could write would
+/// answer a request that never ran.
 ///
 /// Sealed exactly as `TenantAdmission` is: its field is private,
 /// `Group::intent_access` is the only constructor, and a handler holds

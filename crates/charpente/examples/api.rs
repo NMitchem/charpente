@@ -603,6 +603,9 @@ fn tx(
     // before a time: the retention sweep's read.
     let _expired: Vec<Id<IntentRow>> =
         tx.intents_committed_before(WallTime::from_nanos(1), 4096, intents)?;
+    // The earliest `committed_at` left, `None` for an empty record: the
+    // sweep's read for when it is next due.
+    let _oldest: Option<WallTime> = tx.earliest_intent_committed_at(intents)?;
     Ok(())
 }
 

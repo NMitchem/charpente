@@ -2075,11 +2075,14 @@ fn a_tail_whose_reach_meets_the_limit_exactly_fails_after_one_extension() {
          retry(max = …) small enough that it reaches Dead"
     );
     // The one extension ran to the limit: the kernel's last step was the
-    // intent sweep's last hourly slot before the year 2262
-    // (`INTENT_SWEEP_INTERVAL`), the latest of its schedules, under an hour
-    // short of the limit. Before that sweep existed it was the daily session
-    // sweep's last slot, 9_223_286_400_000_000_000.
-    assert_eq!(sim.true_wall().as_nanos(), 9_223_369_200_000_000_000);
+    // intent sweep's last slot before the year 2262, the latest of its
+    // schedules. The POST's record committed at the open, so the first sweep,
+    // a retention later, left it (the bound is strict) and the minimum gap
+    // (`INTENT_SWEEP_INTERVAL`) set the next an hour on. That one emptied the
+    // record, and an empty record sweeps once a day, an hour after each of
+    // the daily session sweep's slots. Before the intent sweep existed the
+    // last step was the session sweep's last slot, 9_223_286_400_000_000_000.
+    assert_eq!(sim.true_wall().as_nanos(), 9_223_290_000_000_000_000);
 }
 
 /// The one tally row: how many times `POST /tally/:n` applied, over every n.

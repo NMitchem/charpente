@@ -29,7 +29,8 @@ Revision 3 records the calls made while planning (`docs/superpowers/plans/2026-1
   and id. A slot collision is refused by name, since it is rare but reachable at scale.
 - **`PROTO_VERSION` 9 and `MANIFEST_FORMAT` 6.** Platform tables sit outside the schema
   digest, so the digests alone would let a 0.6.0 follower fail mid-replay.
-- **The sweep** is the kernel's eighth ready source: hourly, at most 4096 rows a step.
+- **The sweep** is the kernel's eighth ready source: due when the oldest record ages out, no
+  sooner than an hour after the last sweep that left rows; at most 4096 rows a step.
 - **The scaffold keeps its guard.** Its first branch was retry safety, which the platform now
   provides, and its second is write-once, which is app semantics.
 - **README keeps 0.6.0's red runs** as labelled history and adds 0.7.0's green run, pinned.

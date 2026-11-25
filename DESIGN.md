@@ -560,12 +560,22 @@ a full retention after an open, so its bound is never before the open, which the
 asserts. Each run deletes, in one group committed with the cron arm's commit-then-bubble
 shape, up to `INTENT_SWEEP_BATCH` (4096) records committed more than a retention before the
 step's wall time (`Tx::intents_committed_before`, which reads each row only as far as its
-`committed_at` and holds no reply). After a full batch the sweep is due again at once;
-otherwise it is due an `INTENT_SWEEP_INTERVAL` (1 hour) later, so a record outlives its
-retention by at most that. Like jobs and cron, it runs only while writable, and its due time
-joins the idle deadline the way theirs do. A kernel life shorter than a retention never sees
-it ready and draws as it did. A longer one adds an hourly step from its first day on, which
-is contended with the daily session sweep at each day's slot.
+`committed_at` and holds no reply). After a full batch the sweep is due again at once.
+Otherwise it reads the earliest `committed_at` left (`Tx::earliest_intent_committed_at`) and
+is due when that record ages out: the nanosecond after its `committed_at` plus a retention,
+since the bound is strict. It is due no sooner than `INTENT_SWEEP_INTERVAL` (1 hour) after
+this sweep, though. Under steady writes a record ages out every few milliseconds, and a sweep
+each time would walk the whole table (row ids are hashes, so neither read can stop early) and
+commit a delete record each time, where an interval keeps deletes batched. So a record
+outlives its retention by at most an hour. A sweep that leaves the record empty is due a full
+retention later, since nothing committed from then on can age out sooner, so an idle node
+sweeps once a day. The arm asserts that a sweep short of a full batch left no record older
+than its bound and set its next due time after now: a sweep due again at its own instant
+would delete nothing and step forever without time passing. Like jobs and cron, it runs only
+while writable, and its due time joins the idle deadline the way theirs do. A kernel life
+shorter than a retention never sees it ready and draws as it did. A longer one adds about one
+step a day, more while records remain, and in a first life an empty record's sweeps share the
+daily session sweep's slots, so the two are contended there.
 
 The HTTP kernel (`charpente::http`) lives inside the boundary. The sim feeds the
 single-threaded kernel loop (`charpente::kernel`) through a scripted `SimSource`, and hyper
@@ -1052,7 +1062,8 @@ platform is a single dependency (plus `serde` for your own wire types, GUIDE §1
   without running it, is the fourth `PlatformOwned` table in `PLATFORM_TABLES` (spec
   2026-11-22-retry-safe-writes §4.2): a forged row would answer a request that never ran.
   Its one door is `Tx::get_intent`/`put_intent`/`delete_intent`/
-  `intents_committed_before`, each taking an `IntentAccess` that only a `Group` mints, as
+  `intents_committed_before`/`earliest_intent_committed_at`, each taking an `IntentAccess`
+  that only a `Group` mints, as
   `TenantAdmission` is; `put_intent` records its type in `written_as` like `tx.put`. The
   request path puts a row in the transaction of the write the row records (§2, "Retry-safe
   writes"), and a row's id is the first 8 bytes of a SHA-256 over the length-prefixed

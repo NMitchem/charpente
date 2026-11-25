@@ -18,7 +18,7 @@ use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, route, routes, table};
-use charpente_core::io::{Clock, Disk, Entropy, Net, WallTime};
+use charpente_core::io::{Clock, Disk, Entropy, Instant, Net, WallTime};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 
@@ -679,7 +679,9 @@ fn the_sweep_waits_a_full_retention_after_open_then_drops_older_records() {
         .unwrap();
     assert_eq!(k1.committed_at, opened_at, "k1 commits at the open");
 
-    // A sweep a retention after the open, and one an interval after that.
+    // A sweep a retention after the open, which k1 (exactly a retention old)
+    // survives, and one an interval after that: k1 ages out the nanosecond
+    // after the first, and a sweep that leaves records waits an interval.
     run_kernel(&sim, &mut kernel, Vec::new(), DAY + HOUR + MIN);
     assert_eq!(sim.now().as_nanos(), DAY + HOUR, "the kernel's last step");
     assert_eq!(
@@ -708,7 +710,7 @@ fn the_sweep_waits_a_full_retention_after_open_then_drops_older_records() {
 
 /// A sweep deletes at most `INTENT_SWEEP_BATCH` (4096) rows. After a full
 /// batch it is due again at once, so a backlog drains at one wall time
-/// rather than one batch an interval.
+/// rather than one batch a sweep interval.
 #[test]
 fn a_full_batch_is_swept_again_without_waiting_an_interval() {
     let (sim, mut app) = intent_app(0x1D7E_3103);
@@ -757,6 +759,109 @@ fn a_full_batch_is_swept_again_without_waiting_an_interval() {
         DAY,
         "no time passed between the sweeps"
     );
+}
+
+/// A sweep that leaves the record empty is next due a full retention later,
+/// since a record committed from then on cannot age out sooner, so an idle
+/// node sweeps once a day. A record committed in between is still deleted
+/// the nanosecond after it ages out, not on the daily cadence.
+#[test]
+fn an_empty_table_schedules_the_next_sweep_a_full_retention_out() {
+    let (sim, app) = intent_app(0x1D7E_3105);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    sim.clock().sleep(Duration::from_nanos(DAY));
+    let parked = loop {
+        if let Step::Idle { deadline } = kernel.step(&mut source).unwrap() {
+            break deadline;
+        }
+    };
+    assert_eq!(
+        parked.map(Instant::as_nanos),
+        Some(2 * DAY),
+        "after the first sweep found the record empty, the kernel parks for a full retention: \
+         nothing, the next sweep included, is due sooner (the platform's daily session sweep is \
+         due then too)"
+    );
+
+    let committed = DAY + 6 * HOUR;
+    run_kernel(
+        &sim,
+        &mut kernel,
+        vec![(committed, hit(1, "a").intent("k"))],
+        committed + DAY,
+    );
+    assert_eq!(
+        recorded(kernel.app()),
+        ["k"],
+        "a retention after its commit, to the nanosecond, the record is not yet older"
+    );
+    assert_eq!(
+        sim.now().as_nanos(),
+        2 * DAY,
+        "the kernel's last step was the sweep the empty record scheduled, which found k young"
+    );
+    run_kernel(&sim, &mut kernel, Vec::new(), committed + DAY + SEC);
+    assert_eq!(
+        recorded(kernel.app()),
+        Vec::<String>::new(),
+        "the sweep due the nanosecond after k aged out deleted it"
+    );
+    assert_eq!(sim.now().as_nanos(), committed + DAY + 1);
+}
+
+/// A sweep that leaves records is next due when the oldest left ages out:
+/// the nanosecond after its `committed_at + INTENT_RETENTION`, since the
+/// bound is strict, so the record exactly at that time is deleted by that
+/// sweep and time moves on rather than re-running it at one instant. And no
+/// sooner than `INTENT_SWEEP_INTERVAL` after the last sweep, so a record that
+/// ages out a minute after another waits for the next interval.
+#[test]
+fn a_sweep_is_due_when_the_oldest_record_ages_out_but_an_interval_apart() {
+    let (sim, app) = intent_app(0x1D7E_3106);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    // The first sweep, at DAY, finds the record empty and is next due at
+    // 2·DAY, which finds a and b young.
+    let a = DAY + 6 * HOUR;
+    let b = a + MIN;
+    run_kernel(
+        &sim,
+        &mut kernel,
+        vec![(a, hit(1, "a").intent("a")), (b, hit(2, "b").intent("b"))],
+        a + DAY,
+    );
+    assert_eq!(
+        recorded(kernel.app()),
+        ["a", "b"],
+        "a retention after a's commit, to the nanosecond, a is not yet older"
+    );
+
+    run_kernel(&sim, &mut kernel, Vec::new(), a + DAY + SEC);
+    assert_eq!(
+        recorded(kernel.app()),
+        ["b"],
+        "the sweep due the nanosecond after a aged out deleted it"
+    );
+    assert_eq!(
+        sim.now().as_nanos(),
+        a + DAY + 1,
+        "that sweep ran once and time moved on: it was not due again at its own instant"
+    );
+
+    run_kernel(&sim, &mut kernel, Vec::new(), b + DAY + SEC);
+    assert_eq!(
+        recorded(kernel.app()),
+        ["b"],
+        "b aged out a minute after a, but the sweep that left it waits an interval"
+    );
+
+    run_kernel(&sim, &mut kernel, Vec::new(), a + DAY + HOUR + SEC);
+    assert_eq!(
+        recorded(kernel.app()),
+        Vec::<String>::new(),
+        "an interval after the sweep that deleted a, b is gone"
+    );
+    assert_eq!(sim.now().as_nanos(), a + DAY + 1 + HOUR);
 }
 
 /// A promotion counts as an open (spec §4.4): clients have just regained a

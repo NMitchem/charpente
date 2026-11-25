@@ -4849,6 +4849,89 @@ fn intents_committed_before_reads_the_transactions_own_writes() {
     );
 }
 
+/// The sweep's next-due read: the earliest `committed_at` over the store, the
+/// group's overlay and the transaction's own, each overlay deciding the ids
+/// it holds, and `None` once no record remains.
+#[test]
+fn earliest_intent_committed_at_reads_both_overlays() {
+    let sim = Sim::with_faults(0x1D7E_0009, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    let empty = group
+        .stage(|tx| tx.earliest_intent_committed_at(&access))
+        .unwrap();
+    for (id, at) in [(10, 5), (20, 3), (30, 7)] {
+        group
+            .stage(|tx| -> Result<(), io::Error> {
+                tx.put_intent(&intent_row(id, at, IntentReply::Credential), &access);
+                Ok(())
+            })
+            .unwrap();
+    }
+    group.commit().unwrap();
+
+    let at = |nanos| Some(WallTime::from_nanos(nanos));
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    let stored = group
+        .stage(|tx| tx.earliest_intent_committed_at(&access))
+        .unwrap();
+    // The group's overlay: the store's earliest row deleted, an older one put.
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            tx.delete_intent(Id::from_raw(20), &access);
+            tx.put_intent(&intent_row(50, 4, IntentReply::Credential), &access);
+            Ok(())
+        })
+        .unwrap();
+    let grouped = group
+        .stage(|tx| tx.earliest_intent_committed_at(&access))
+        .unwrap();
+    // The transaction's own: the group's earliest row deleted, then a store
+    // row made the oldest.
+    let deleted = group
+        .stage(|tx| -> Result<_, io::Error> {
+            tx.delete_intent(Id::from_raw(50), &access);
+            tx.earliest_intent_committed_at(&access)
+        })
+        .unwrap();
+    let older = group
+        .stage(|tx| -> Result<_, io::Error> {
+            tx.put_intent(&intent_row(30, 1, IntentReply::Credential), &access);
+            tx.earliest_intent_committed_at(&access)
+        })
+        .unwrap();
+    let gone = group
+        .stage(|tx| -> Result<_, io::Error> {
+            for id in [10, 30] {
+                tx.delete_intent(Id::from_raw(id), &access);
+            }
+            tx.earliest_intent_committed_at(&access)
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    assert_eq!(empty, None, "an empty record has no earliest row");
+    assert_eq!(stored, at(3), "row 20, from the store");
+    assert_eq!(
+        grouped,
+        at(4),
+        "the group's delete hides row 20 and its row 50 is older than the store's others"
+    );
+    assert_eq!(
+        deleted,
+        at(5),
+        "the transaction's delete hides the group's row 50, leaving row 10"
+    );
+    assert_eq!(
+        older,
+        at(1),
+        "the transaction's put makes row 30 the oldest"
+    );
+    assert_eq!(gone, None, "every row deleted: none remains");
+}
+
 #[test]
 fn delete_intent_removes_the_row() {
     let sim = Sim::with_faults(0x1D7E_0005, FaultConfig::none());
