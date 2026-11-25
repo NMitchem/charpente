@@ -36,6 +36,7 @@ pub const RESERVED: &[&str] = &[
     "SubscribeOptions",
     "UndeclaredEvent",
     "UnknownEvent",
+    "newIntent",
     "reviveInt64",
     "sseValue",
 ];
@@ -213,6 +214,15 @@ export interface SubscribeOptions<Ev> {
   signal?: AbortSignal | undefined;
 }
 
+// A fresh intent id: 16 random bytes as 32 lowercase hex characters. A write
+// sent twice under one id is answered once (GUIDE §5); pass the id back to a
+// route's `intent` argument to retry the same write.
+export function newIntent(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
 export class ApiBase {
   constructor(protected baseUrl: string, protected token?: string) {}
 
@@ -231,10 +241,14 @@ export class ApiBase {
     method: string,
     path: string,
     body?: unknown,
+    intent?: [string, string],
   ): Promise<Result<T, E>> {
     const res = await fetch(this.baseUrl + path, {
       method,
-      headers: this.headers(body !== undefined),
+      headers: {
+        ...this.headers(body !== undefined),
+        ...(intent === undefined ? {} : { [intent[0]]: intent[1] }),
+      },
       // A conditional spread rather than `body: body === undefined ?
       // undefined : …`. `RequestInit.body` is declared `?: BodyInit | null`,
       // and under `exactOptionalPropertyTypes` a `?:` member refuses an

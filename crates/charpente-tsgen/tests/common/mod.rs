@@ -92,7 +92,7 @@ pub fn fixture_contract() -> Contract {
                 public_scope: None,
                 cross_tenant: false,
                 stream: false,
-                intent: None,
+                intent: Some("Idempotency-Key"),
                 params: Vec::new(),
                 request: Some(TypeSchema::Ref("CustomerNew")),
                 response: TypeSchema::Ref("CustomerView"),
@@ -107,7 +107,7 @@ pub fn fixture_contract() -> Contract {
                 public_scope: None,
                 cross_tenant: false,
                 stream: false,
-                intent: None,
+                intent: Some("Idempotency-Key"),
                 params: vec![ParamInfo {
                     name: "id",
                     schema: TypeSchema::Id("Widget"),

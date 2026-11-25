@@ -205,7 +205,9 @@ fn a_path_param_carries_its_wire_type_not_a_bare_string() {
 fn a_pattern_with_no_params_stays_a_plain_string_literal() {
     let ts = emit_client(&fixture_contract());
     assert!(
-        ts.contains(r#"this.request<CustomerView, ApiError>("POST", "/customers", body)"#),
+        ts.contains(
+            r#"this.request<CustomerView, ApiError>("POST", "/customers", body, ["idempotency-key", intent ?? newIntent()])"#
+        ),
         "{ts}"
     );
 }
@@ -722,4 +724,73 @@ fn method_body(ts: &str, name: &str) -> String {
     let rest = &ts[start..];
     let end = rest.find("\n  }").expect("a method must close") + 4;
     rest[..end].to_string()
+}
+
+#[test]
+fn a_write_route_takes_an_optional_intent_and_sends_it() {
+    let ts = emit_client(&fixture_contract());
+    assert!(
+        ts.contains("async createCustomer(body: CustomerNew, intent?: string)"),
+        "{ts}"
+    );
+    assert!(
+        ts.contains(
+            r#"this.request<CustomerView, ApiError>("POST", "/customers", body, ["idempotency-key", intent ?? newIntent()])"#
+        ),
+        "{ts}"
+    );
+}
+
+#[test]
+fn a_get_route_takes_no_intent() {
+    let ts = emit_client(&fixture_contract());
+    let m = method_body(&ts, "getOrgWidget");
+    assert!(!m.contains("intent") && !m.contains("newIntent"), "{m}");
+}
+
+#[test]
+fn a_bodyless_write_passes_undefined_for_the_body_then_the_intent() {
+    let ts = emit_client(&fixture_contract());
+    let m = method_body(&ts, "deleteWidget");
+    assert!(m.contains("intent?: string"), "{m}");
+    assert!(
+        m.contains(r#", undefined, ["idempotency-key", intent ?? newIntent()])"#),
+        "{m}"
+    );
+}
+
+#[test]
+fn a_webhook_route_sends_its_declared_header() {
+    let mut c = fixture_contract();
+    c.routes[1].intent = Some("X-Event-Id");
+    let ts = emit_client(&c);
+    assert!(
+        ts.contains(r#"["x-event-id", intent ?? newIntent()]"#),
+        "{ts}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "collides with the `intent` argument")]
+fn a_path_param_named_intent_is_refused() {
+    let mut c = fixture_contract();
+    c.routes.push(RouteInfo {
+        method: "POST",
+        pattern: "/things/:intent",
+        name: "make_thing",
+        auth: false,
+        public_scope: None,
+        cross_tenant: false,
+        stream: false,
+        intent: Some("Idempotency-Key"),
+        params: vec![ParamInfo {
+            name: "intent",
+            schema: TypeSchema::String,
+        }],
+        request: None,
+        response: TypeSchema::Null,
+        error: TypeSchema::Null,
+        emits: vec![],
+    });
+    emit_client(&c);
 }

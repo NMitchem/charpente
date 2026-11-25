@@ -9382,10 +9382,30 @@ A route whose response and error carry no `Int64` anywhere keeps the plain one-l
 `return this.request(...)` — nothing extra is emitted for the common case:
 
 ```ts
-async createCustomer(id: CustomerId, body: CreateCustomerBody): Promise<Result<CustomerView, ApiError>> {
-  return this.request<CustomerView, ApiError>("POST", `/customers/${encodeURIComponent(id)}`, body);
+async createCustomer(id: CustomerId, body: CreateCustomerBody, intent?: string): Promise<Result<CustomerView, ApiError>> {
+  return this.request<CustomerView, ApiError>("POST", `/customers/${encodeURIComponent(id)}`, body, ["idempotency-key", intent ?? newIntent()]);
 }
 ```
+
+**Every write sends an intent id.** A `POST`, `PUT`, `PATCH` or `DELETE` method takes a trailing
+optional `intent?: string` and sends it as the route's id header (`Idempotency-Key`, or the
+header a webhook route declares with `intent = header(...)`), minting a fresh `newIntent()`
+(16 random bytes as 32 lowercase hex characters) when you pass none. A call that passes
+nothing is a new write each time. To retry one write, make the id once and pass it on every
+attempt, so the server answers a copy of a write that committed with the first reply
+(GUIDE §5):
+
+```ts
+import { newIntent } from "./generated/client";
+
+const intent = newIntent();
+let result = await api.createCustomer(id, body, intent);
+// The reply was lost: send the same write again under the same id.
+result = await api.createCustomer(id, body, intent);
+```
+
+A GET or a stream sends no id. A write route whose path has a param named `intent` is
+refused at generation, since the method's own `intent` argument would collide with it.
 
 **Absence is two different shapes, and the emitter answers them differently.** An
 `Option<WireI64>` field the server always writes a key for sends an explicit `null` when

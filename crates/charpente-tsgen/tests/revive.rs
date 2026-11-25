@@ -781,7 +781,9 @@ fn a_type_with_no_int64_anywhere_gets_the_plain_one_line_return() {
     let ts = emit_client(&fixture_contract());
     let m = method_body(&ts, "createCustomer");
     assert!(
-        m.contains(r#"return this.request<CustomerView, ApiError>("POST", "/customers", body);"#),
+        m.contains(
+            r#"return this.request<CustomerView, ApiError>("POST", "/customers", body, ["idempotency-key", intent ?? newIntent()]);"#
+        ),
         "CustomerView carries no Int64 -- this method must be byte-for-byte the plain shape: {m}"
     );
     assert!(!ts.contains("function reviveCustomerView"), "{ts}");

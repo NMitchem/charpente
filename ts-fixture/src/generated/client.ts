@@ -268,6 +268,15 @@ export interface SubscribeOptions<Ev> {
   signal?: AbortSignal | undefined;
 }
 
+// A fresh intent id: 16 random bytes as 32 lowercase hex characters. A write
+// sent twice under one id is answered once (GUIDE §5); pass the id back to a
+// route's `intent` argument to retry the same write.
+export function newIntent(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
 export class ApiBase {
   constructor(protected baseUrl: string, protected token?: string) {}
 
@@ -286,10 +295,14 @@ export class ApiBase {
     method: string,
     path: string,
     body?: unknown,
+    intent?: [string, string],
   ): Promise<Result<T, E>> {
     const res = await fetch(this.baseUrl + path, {
       method,
-      headers: this.headers(body !== undefined),
+      headers: {
+        ...this.headers(body !== undefined),
+        ...(intent === undefined ? {} : { [intent[0]]: intent[1] }),
+      },
       // A conditional spread rather than `body: body === undefined ?
       // undefined : …`. `RequestInit.body` is declared `?: BodyInit | null`,
       // and under `exactOptionalPropertyTypes` a `?:` member refuses an
@@ -559,8 +572,8 @@ function revivePayment(v: Payment): Payment {
 
 export class Api extends ApiBase {
   /** Requires a session token: call `setToken` first. */
-  async createCustomer(id: CustomerId, body: CreateCustomerBody): Promise<Result<CustomerView, ApiError>> {
-    return this.request<CustomerView, ApiError>("POST", `/customers/${encodeURIComponent(id)}`, body);
+  async createCustomer(id: CustomerId, body: CreateCustomerBody, intent?: string): Promise<Result<CustomerView, ApiError>> {
+    return this.request<CustomerView, ApiError>("POST", `/customers/${encodeURIComponent(id)}`, body, ["idempotency-key", intent ?? newIntent()]);
   }
 
   async getInvoice(id: InvoiceId): Promise<Result<InvoiceView, ApiError>> {
@@ -573,13 +586,13 @@ export class Api extends ApiBase {
     return r.ok ? { ok: true, data: (r.data).map((x0) => reviveInvoiceView(x0)) } : { ok: false, error: r.error };
   }
 
-  async adjustInvoice(id: InvoiceId, body: AdjustInvoiceBody): Promise<Result<InvoiceView, ApiError>> {
-    const r = await this.request<InvoiceView, ApiError>("POST", `/invoices/${encodeURIComponent(id)}/adjust`, body);
+  async adjustInvoice(id: InvoiceId, body: AdjustInvoiceBody, intent?: string): Promise<Result<InvoiceView, ApiError>> {
+    const r = await this.request<InvoiceView, ApiError>("POST", `/invoices/${encodeURIComponent(id)}/adjust`, body, ["idempotency-key", intent ?? newIntent()]);
     return r.ok ? { ok: true, data: reviveInvoiceView(r.data) } : { ok: false, error: r.error };
   }
 
-  async withdrawInvoice(id: InvoiceId): Promise<Result<InvoiceView, LimitExceeded>> {
-    const r = await this.request<InvoiceView, LimitExceeded>("POST", `/invoices/${encodeURIComponent(id)}/withdraw`);
+  async withdrawInvoice(id: InvoiceId, intent?: string): Promise<Result<InvoiceView, LimitExceeded>> {
+    const r = await this.request<InvoiceView, LimitExceeded>("POST", `/invoices/${encodeURIComponent(id)}/withdraw`, undefined, ["idempotency-key", intent ?? newIntent()]);
     return r.ok ? { ok: true, data: reviveInvoiceView(r.data) } : { ok: false, error: reviveLimitExceeded(r.error) };
   }
 
@@ -593,8 +606,8 @@ export class Api extends ApiBase {
     return r.ok ? { ok: true, data: reviveCostNode(r.data) } : { ok: false, error: r.error };
   }
 
-  async deleteWidget(id: WidgetId): Promise<Result<null, ApiError>> {
-    return this.request<null, ApiError>("DELETE", `/widgets/${encodeURIComponent(id)}`);
+  async deleteWidget(id: WidgetId, intent?: string): Promise<Result<null, ApiError>> {
+    return this.request<null, ApiError>("DELETE", `/widgets/${encodeURIComponent(id)}`, undefined, ["idempotency-key", intent ?? newIntent()]);
   }
 
   /** Requires a session token: call `setToken` first. */

@@ -20,6 +20,8 @@ export interface RecordedCall {
   url: string;
   method: string;
   body: BodyInit | null | undefined;
+  /** The request headers `ApiBase` set, as the plain object it passed. */
+  headers: Record<string, string>;
 }
 
 export interface Stubbed {
@@ -36,6 +38,7 @@ function install(respond: (init: RequestInit | undefined) => Promise<Response>):
       url: String(input),
       method: init?.method ?? "GET",
       body: init?.body,
+      headers: { ...(init?.headers as Record<string, string> | undefined) },
     });
     return respond(init);
   }) as typeof fetch;

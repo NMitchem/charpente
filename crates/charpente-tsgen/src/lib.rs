@@ -110,6 +110,7 @@ mod tests {
                 "export class ",
                 "export abstract class ",
                 "export interface ",
+                "export function ",
                 "export enum ",
                 "export const enum ",
                 "function ",

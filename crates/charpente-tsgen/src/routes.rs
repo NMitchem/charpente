@@ -101,6 +101,16 @@ pub(crate) fn param_args(r: &RouteInfo, trailing: &str) -> Vec<String> {
     for p in &r.params {
         let n = camel(p.name);
         assert!(
+            n != "intent" || r.intent.is_none(),
+            "emit_client: route `{}` (`{} {}`) has a path param `:{}` whose client argument is \
+             `intent`, which collides with the `intent` argument the generated write method \
+             already takes; rename the param in the route pattern and handler",
+            r.name,
+            r.method,
+            r.pattern,
+            p.name
+        );
+        assert!(
             n != trailing,
             "emit_client: route `{}` (`{} {}`) has a path param `:{}` whose client argument is \
              `{n}`, which collides with the `{trailing}` argument the generated method already \
@@ -196,6 +206,21 @@ pub(crate) fn emit_methods(c: &Contract) -> String {
         // keys `content-type: application/json` off `body !== undefined`, so
         // forwarding an absent body would announce a body it does not send.
         let body = if r.request.is_some() { ", body" } else { "" };
+        // A write's id header rides in `request`'s fourth argument; a bodyless
+        // write holds the body slot with `undefined` so it still sends no
+        // `content-type`.
+        let tail = match r.intent {
+            Some(h) => {
+                args.push("intent?: string".to_string());
+                let body = if r.request.is_some() {
+                    "body"
+                } else {
+                    "undefined"
+                };
+                format!(", {body}, [{:?}, intent ?? newIntent()]", h.to_lowercase())
+            }
+            None => body.to_string(),
+        };
         if r.auth {
             out.push_str(AUTH_DOC);
         }
@@ -217,14 +242,14 @@ pub(crate) fn emit_methods(c: &Contract) -> String {
         if ok_expr.is_none() && err_expr.is_none() {
             let _ = writeln!(
                 out,
-                "    return this.request<{ok}, {err}>({:?}, {}{body});",
+                "    return this.request<{ok}, {err}>({:?}, {}{tail});",
                 r.method,
                 path_expr(r)
             );
         } else {
             let _ = writeln!(
                 out,
-                "    const r = await this.request<{ok}, {err}>({:?}, {}{body});",
+                "    const r = await this.request<{ok}, {err}>({:?}, {}{tail});",
                 r.method,
                 path_expr(r)
             );
