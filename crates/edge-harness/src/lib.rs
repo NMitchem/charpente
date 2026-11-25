@@ -62,6 +62,6 @@ pub mod proxy;
 pub mod scenario;
 
 pub use child::{Bins, ChildNode, build_bins};
-pub use client::{Http, HttpResponse, SseFrame, SseTail};
+pub use client::{Http, HttpResponse, SseFrame, SseTail, fresh_intent};
 pub use proxy::TcpProxy;
 pub use scenario::Scenario;

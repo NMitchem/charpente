@@ -83,6 +83,7 @@ fn open_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> {
             attributes::put_note,
             attributes::relabel_note,
             attributes::delete_note,
+            attributes::note_hook,
             attributes::login,
             attributes::mint_key,
             attributes::logout,
@@ -385,6 +386,20 @@ mod attributes {
     fn delete_note(tx: &mut Tx, id: Id<Note>) -> Result<(), ApiError> {
         tx.delete(id);
         tx.emit(NoteDeleted { id });
+        Ok(())
+    }
+
+    // A write route (POST, PUT, PATCH, DELETE) is answered once per intent
+    // id: a copy sent under its first copy's `Idempotency-Key` gets the
+    // first reply back, and over the wire a write with no id is refused 400.
+    // A webhook reads its sender's id from the header it names instead.
+    #[route(POST "/hooks/notes/:id", public, intent = header("X-Event-Id"))]
+    fn note_hook(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<(), ApiError> {
+        tx.put(&Note {
+            id,
+            text: body.text,
+            label: body.label,
+        });
         Ok(())
     }
 

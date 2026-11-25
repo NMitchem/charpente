@@ -1,0 +1,5 @@
+error: `intent` takes the header a sender's id arrives in: `intent = header("X-Event-Id")`
+  --> tests/compile_fail/route_intent_not_header.rs:11:45
+   |
+11 | #[route(POST "/hooks/pay", public, intent = "X-Event-Id")]
+   |                                             ^^^^^^^^^^^^

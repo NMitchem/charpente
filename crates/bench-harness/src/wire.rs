@@ -29,7 +29,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::SLOTS;
-use crate::client::Conn;
+use crate::client::{Conn, fresh_intent};
 use crate::device;
 use crate::measure::{Heartbeat, process_cpu};
 use crate::report::WireReport;
@@ -97,7 +97,8 @@ impl Target {
             // bench-app mounts no auth, so there is nothing to carry.
             Target::BenchApp => Ok(Vec::new()),
             Target::Invoicing => {
-                let (status, body) = conn.request("POST", "/login", &[], b"\"bench\"")?;
+                let (status, body) =
+                    conn.request("POST", "/login", &[], Some(&fresh_intent()), b"\"bench\"")?;
                 if status != 200 {
                     return Err(io::Error::other(format!(
                         "invoicing login failed with {status}: {}",
@@ -125,7 +126,13 @@ impl Target {
         match self {
             Target::BenchApp => {
                 let id = ids.fetch_add(1, Ordering::Relaxed) % SLOTS;
-                conn.request("POST", &format!("/hit/{id}"), headers, b"")
+                conn.request(
+                    "POST",
+                    &format!("/hit/{id}"),
+                    headers,
+                    Some(&fresh_intent()),
+                    b"",
+                )
             }
             Target::Invoicing => {
                 // create_customer refuses an existing id, so ids never wrap:
@@ -138,6 +145,7 @@ impl Target {
                     "POST",
                     &format!("/customers/{id}"),
                     headers,
+                    Some(&fresh_intent()),
                     b"{\"name\":\"Bench Load\",\"email\":\"bench@example.com\"}",
                 )
             }
@@ -316,7 +324,7 @@ pub fn sweep(
 /// quiet one.
 fn read_server_syncs(addr: &str) -> Option<u64> {
     let mut conn = crate::client::Conn::connect(addr).ok()?;
-    let (status, body) = conn.request("GET", "/__syncs", &[], b"").ok()?;
+    let (status, body) = conn.request("GET", "/__syncs", &[], None, b"").ok()?;
     if status != 200 {
         return None;
     }

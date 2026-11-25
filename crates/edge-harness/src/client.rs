@@ -7,12 +7,17 @@
 //! decodes hyper's chunked framing by hand, mirroring `serve.rs`'s own test
 //! helpers. `Http` carries a session cookie (`charpente_session`, the same
 //! name `crates/charpente/src/http/app.rs` checks) so a scenario can log in
-//! once and reuse the session across requests.
+//! once and reuse the session across requests. Every `POST` carries an
+//! `Idempotency-Key`, since charpente's wire refuses a write without one:
+//! `post` a fresh one per logical write, `post_as` the first copy's on a
+//! re-send.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Every client call gets a bound (review finding I3): this crate ships
 /// `pause` (SIGSTOP), whose entire purpose is to make a node stop responding
@@ -300,6 +305,26 @@ fn read_one_chunk(reader: &mut BufReader<TcpStream>) -> Result<ChunkRead, ChunkE
     Ok(ChunkRead::Chunk(data))
 }
 
+/// A fresh intent id for one logical write, unique across this process and
+/// any other: the pid, the wall clock at first use, and a count. So two
+/// clients, or two tests against one data dir, never share one, and a node
+/// never answers one write with another's reply.
+pub fn fresh_intent() -> String {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static STARTED: OnceLock<u128> = OnceLock::new();
+    let started = *STARTED.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock reads after the epoch")
+            .as_nanos()
+    });
+    format!(
+        "edge-{:x}-{started:x}-{:x}",
+        std::process::id(),
+        COUNT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// A client bound to one node address. Not thread-safe (one connection at a
 /// time) and not meant to be — scenarios drive one client per logical actor.
 pub struct Http {
@@ -330,12 +355,29 @@ impl Http {
         self.bearer = Some(token.into());
     }
 
+    /// `POST` as a new logical write, under a fresh `Idempotency-Key`
+    /// (`fresh_intent`): charpente's wire refuses a write with none (GUIDE
+    /// §5, "Retry-safe writes"). A re-send of a write the caller may already
+    /// have landed goes through `post_as` with its first copy's key instead,
+    /// so charpente answers it once.
     pub fn post(&mut self, path: &str, body: &str) -> io::Result<HttpResponse> {
-        self.request("POST", path, Some(body.as_bytes()))
+        self.post_as(path, body, Some(&fresh_intent()))
+    }
+
+    /// `POST` under `intent`, sent as `Idempotency-Key`: a re-send carries
+    /// its first copy's. `None` sends no key, which the wire refuses with a
+    /// 400 naming the route.
+    pub fn post_as(
+        &mut self,
+        path: &str,
+        body: &str,
+        intent: Option<&str>,
+    ) -> io::Result<HttpResponse> {
+        self.request("POST", path, Some(body.as_bytes()), intent)
     }
 
     pub fn get(&mut self, path: &str) -> io::Result<HttpResponse> {
-        self.request("GET", path, None)
+        self.request("GET", path, None, None)
     }
 
     fn request(
@@ -343,6 +385,7 @@ impl Http {
         method: &str,
         path: &str,
         body: Option<&[u8]>,
+        intent: Option<&str>,
     ) -> io::Result<HttpResponse> {
         let mut stream = connect_with_timeout(&self.addr, CLIENT_TIMEOUT)?;
         stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
@@ -354,6 +397,11 @@ impl Http {
         }
         if let Some(bearer) = &self.bearer {
             head.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+        }
+        // Written as its UTF-8 bytes: a key holding a non-ASCII byte reaches
+        // the node as one, which is what a test of that refusal needs.
+        if let Some(intent) = intent {
+            head.push_str(&format!("Idempotency-Key: {intent}\r\n"));
         }
         if let Some(body) = body {
             head.push_str("Content-Type: application/json\r\n");
@@ -486,6 +534,21 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.header("content-type"), Some("application/json"));
         assert_eq!(response.body, b"\"hello\"");
+    }
+
+    /// Every `post` is a new logical write, so no two keys may collide, and
+    /// each must be one charpente accepts: 1 to 255 visible ASCII bytes.
+    #[test]
+    fn fresh_intents_are_distinct_and_valid_ids() {
+        let keys: Vec<String> = (0..1000).map(|_| fresh_intent()).collect();
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len());
+        for key in &keys {
+            assert!(
+                (1..=255).contains(&key.len()) && key.bytes().all(|b| (0x21..=0x7e).contains(&b)),
+                "{key:?}"
+            );
+        }
     }
 
     #[test]

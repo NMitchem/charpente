@@ -1,0 +1,5 @@
+error: `intent = header("X Event Id")` names no valid header: a header name is letters, digits and !#$%&'*+-.^_`|~
+  --> tests/compile_fail/route_intent_bad_header.rs:11:52
+   |
+11 | #[route(POST "/hooks/pay", public, intent = header("X Event Id"))]
+   |                                                    ^^^^^^^^^^^^

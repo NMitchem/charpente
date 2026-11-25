@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use edge_harness::{ChildNode, Http, Scenario, TcpProxy, build_bins};
+use edge_harness::{ChildNode, Http, Scenario, TcpProxy, build_bins, fresh_intent};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -123,6 +123,113 @@ fn smoke_single_node_serves_and_survives_restart() {
     );
     eprintln!("scenario script: {}", script.display());
 
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&scenario_root);
+}
+
+/// The 400 invoicing's `POST /customers/:id` answers a write that reaches
+/// the wire without a valid `Idempotency-Key` (hard rule 5: byte-exact).
+const CUSTOMERS_NEEDS_A_KEY: &str = "{\"error\":\"`POST /customers/:id` needs an \
+    Idempotency-Key header, 1 to 255 visible ASCII characters: charpente answers a re-sent \
+    write once (GUIDE §5). The generated client sends one; a webhook route names its sender's \
+    id header with `intent = header(...)`.\"}";
+
+/// Retry-safe writes at the wire, over real TCP against a stock binary
+/// (spec 2026-11-22-retry-safe-writes §4.1): a write with no key, a key over
+/// 255 bytes, and a key holding a non-ASCII byte (which the edge drops, so
+/// it arrives as missing) are each refused with the one 400 and run
+/// nothing. A key sent twice runs once: the copy is answered with the first
+/// reply, marked replayed, where running again would have been the app's
+/// own 400 ("customer 1 already exists"). The record is durable, so the copy
+/// a client sends after the node dies (`kill -9`) and comes back is
+/// answered the same way.
+#[test]
+#[ignore]
+fn a_write_without_a_key_is_refused_and_a_resent_key_is_answered_once() {
+    let bins = build_bins().expect("build_bins");
+    let scenario_root = temp_dir("intent-scenario-root");
+    std::fs::create_dir_all(&scenario_root).expect("scenario root dir");
+    let mut scenario = Scenario::new(
+        &scenario_root,
+        "a_write_without_a_key_is_refused_and_a_resent_key_is_answered_once",
+    )
+    .expect("Scenario::new");
+    let data_dir = temp_dir("intent-data");
+    let node_addr = free_addr();
+    let args = vec![
+        "--addr".to_string(),
+        node_addr.clone(),
+        "--data-dir".to_string(),
+        data_dir.to_str().unwrap().to_string(),
+    ];
+    let mut node = ChildNode::spawn(&bins.node, &args, &mut scenario).expect("spawn node");
+    let mut http = Http::new(&node_addr);
+    let text = |body: &[u8]| String::from_utf8_lossy(body).into_owned();
+
+    let login = http.post("/login", "\"edge-tester\"").expect("login");
+    assert_eq!(login.status, 200, "login: {}", text(&login.body));
+    http.set_session(login.as_json_string().expect("a JSON string token"));
+
+    let path = "/customers/1";
+    let body = r#"{"name":"Ada Lovelace","email":"ada@example.com"}"#;
+    let too_long = "k".repeat(256);
+    for (what, key) in [
+        ("no key", None),
+        ("a 256-byte key", Some(too_long.as_str())),
+        ("a key with a non-ASCII byte", Some("caf\u{e9}")),
+    ] {
+        let refused = http.post_as(path, body, key).expect(what);
+        assert_eq!(
+            (refused.status, text(&refused.body)),
+            (400, CUSTOMERS_NEEDS_A_KEY.to_string()),
+            "{what}"
+        );
+        scenario.record(format!("POST {path} with {what}: 400, the copy byte-exact"));
+    }
+    let listed = http.get("/customers").expect("list customers");
+    assert_eq!(
+        (listed.status, text(&listed.body)),
+        (200, "[]".to_string()),
+        "a refused write ran"
+    );
+
+    let key = fresh_intent();
+    let first = http.post_as(path, body, Some(&key)).expect("first copy");
+    assert_eq!(first.status, 200, "first copy: {}", text(&first.body));
+    assert_eq!(first.header("idempotent-replayed"), None);
+    let again = http.post_as(path, body, Some(&key)).expect("second copy");
+    assert_eq!(
+        (again.status, text(&again.body)),
+        (200, text(&first.body)),
+        "the second copy under one key must get the first reply back"
+    );
+    assert_eq!(again.header("idempotent-replayed"), Some("true"));
+    scenario.record(format!(
+        "POST {path} twice under one key: 200 both, the second replayed"
+    ));
+
+    node.kill9(&mut scenario);
+    node.restart(&mut scenario).expect("restart node");
+    let after = http
+        .post_as(path, body, Some(&key))
+        .expect("copy after restart");
+    assert_eq!(
+        (after.status, text(&after.body)),
+        (200, text(&first.body)),
+        "a copy sent after kill -9 and a restart must get the first reply back"
+    );
+    assert_eq!(after.header("idempotent-replayed"), Some("true"));
+    scenario.record("the same key after kill9 + restart: replayed");
+
+    let listed = http.get("/customers").expect("list customers");
+    assert_eq!(
+        (listed.status, text(&listed.body)),
+        (200, format!("[{}]", text(&first.body))),
+        "three copies under one key must leave one customer"
+    );
+
+    let script = scenario.dump().expect("scenario dump");
+    eprintln!("scenario script: {}", script.display());
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&scenario_root);
 }

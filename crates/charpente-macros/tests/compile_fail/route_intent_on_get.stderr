@@ -1,0 +1,5 @@
+error: `intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no intent
+ --> tests/compile_fail/route_intent_on_get.rs:9:51
+  |
+9 | #[route(GET "/hooks/pay", public, intent = header("X-Event-Id"))]
+  |                                                   ^^^^^^^^^^^^

@@ -1,6 +1,7 @@
-//! `#[route(METHOD "/path/:param", auth | public | public(Scope)[, cross_tenant][, emits(Ev, …)])]`
-//! (DESIGN.md §3, specs 2026-07-02-http-layer,
-//! 2026-08-20-ts-client-codegen §2 and 2026-08-30-tenant-scoping §3):
+//! `#[route(METHOD "/path/:param", auth | public | public(Scope)[, cross_tenant][, emits(Ev, …)]
+//! [, intent = header("…")])]` (DESIGN.md §3, specs 2026-07-02-http-layer,
+//! 2026-08-20-ts-client-codegen §2, 2026-08-30-tenant-scoping §3 and
+//! 2026-11-22-retry-safe-writes §4.1):
 //! validates the handler signature against the path and emits typed
 //! extraction glue plus a `RouteDef` marker struct. The argument convention
 //! — `tx`, one arg per `:param` by name in path order, at most one JSON body
@@ -41,6 +42,10 @@ pub(crate) struct RouteArgs {
     /// is every non-stream route and any stream route that has not adopted
     /// the declaration.
     emits: Vec<Ident>,
+    /// `intent = header("…")` — the header a webhook route reads its intent
+    /// id from, its sender's own (retry-safe writes spec §4.1). `None` reads
+    /// `Idempotency-Key`. Refused on a GET or SSE route in `expand`.
+    intent: Option<LitStr>,
 }
 
 impl Parse for RouteArgs {
@@ -63,6 +68,7 @@ impl Parse for RouteArgs {
         let mut public_scope: Option<syn::Path> = None;
         let mut cross_tenant = false;
         let mut emits: Vec<Ident> = Vec::new();
+        let mut intent: Option<LitStr> = None;
         while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
             let flag: Ident = input.parse().map_err(|e| Error::new(e.span(), FLAGS))?;
@@ -151,6 +157,44 @@ impl Parse for RouteArgs {
                     }
                     emits.push(name);
                 }
+            } else if flag == "intent" {
+                if intent.is_some() {
+                    return Err(Error::new(
+                        flag.span(),
+                        "`intent` given twice — write it once",
+                    ));
+                }
+                // Each step's error is the house form, spanned at what broke
+                // it: syn's own ("expected `=`", "expected parentheses")
+                // name no fix (hard rule 5). The paren is peeked, as
+                // `emits` does, since `parenthesized!` returns syn's text.
+                let form = |e: Error| Error::new(e.span(), INTENT_FORM);
+                input.parse::<Token![=]>().map_err(form)?;
+                let source: Ident = input.parse().map_err(form)?;
+                if source != "header" || !input.peek(syn::token::Paren) {
+                    return Err(Error::new(source.span(), INTENT_FORM));
+                }
+                let content;
+                parenthesized!(content in input);
+                let name: LitStr = content.parse().map_err(form)?;
+                if !content.is_empty() {
+                    return Err(content.error(INTENT_FORM));
+                }
+                // RFC 9110's token: the bytes a header name is made of. A
+                // name outside it is one no request can carry, so the route
+                // would refuse every write with a 400 its sender cannot fix.
+                let value = name.value();
+                let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+                if value.is_empty() || !value.bytes().all(tchar) {
+                    return Err(Error::new(
+                        name.span(),
+                        format!(
+                            "`intent = header(\"{value}\")` names no valid header: a header name \
+                             is letters, digits and !#$%&'*+-.^_`|~"
+                        ),
+                    ));
+                }
+                intent = Some(name);
             } else {
                 return Err(Error::new(flag.span(), FLAGS));
             }
@@ -166,6 +210,7 @@ impl Parse for RouteArgs {
             public_scope,
             cross_tenant,
             emits,
+            intent,
         })
     }
 }
@@ -174,11 +219,18 @@ impl Parse for RouteArgs {
 /// that can reach it (a non-identifier token, and an identifier that isn't
 /// one of the flags) so they cannot drift apart. Pinned by
 /// `docs/GUIDE.md`'s error catalog (hard rule 5).
-const FLAGS: &str = "a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant` or \
-                     `emits(Ev, …)` — write `#[route(GET \"/path\", auth)]`, \
+const FLAGS: &str = "a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant`, \
+                     `emits(Ev, …)` or `intent = header(\"…\")` — write \
+                     `#[route(GET \"/path\", auth)]`, \
                      `#[route(GET \"/path\", public)]`, \
-                     `#[route(GET \"/orgs/:org/status\", public(Org))]`, or \
-                     `#[route(SSE \"/path\", emits(NoteAdded, NoteRemoved))]`";
+                     `#[route(GET \"/orgs/:org/status\", public(Org))]`, \
+                     `#[route(SSE \"/path\", emits(NoteAdded, NoteRemoved))]`, or \
+                     `#[route(POST \"/hooks/pay\", public, intent = header(\"X-Event-Id\"))]`";
+
+/// `intent` written as anything but `intent = header("<name>")`, the one
+/// source of a webhook's id in v1 (retry-safe writes spec §4.1).
+const INTENT_FORM: &str =
+    "`intent` takes the header a sender's id arrives in: `intent = header(\"X-Event-Id\")`";
 
 /// A route answers "who reaches this handler" once. Shared by the two
 /// branches that can see both flags so the wording cannot drift.
@@ -277,6 +329,17 @@ pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> 
             "emits(...) applies to SSE routes only — a plain route returns one response, \
              not a stream of events; drop emits(...), or change this route's method to `SSE`, \
              keeping its path and flags",
+        ));
+    }
+    // An SSE route registers as a GET (`expand_sse`), and the request path
+    // reads no intent on either, so the word would be dropped in silence.
+    if let Some(header) = &args.intent
+        && (args.method == "GET" || args.method == "SSE")
+    {
+        return Err(Error::new(
+            header.span(),
+            "`intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no \
+             intent",
         ));
     }
     if args.method == "SSE" {
@@ -463,6 +526,10 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
     let public_scope = public_scope_tokens(&args);
     let cross_tenant = args.cross_tenant;
     let pattern_lit = &args.path;
+    let intent = match &args.intent {
+        Some(header) => quote! { ::std::option::Option::Some(#header) },
+        None => quote! { ::std::option::Option::None },
+    };
 
     let ok_ty = result_ok_type(&func.sig.output)?;
     let err_ty = result_err_type(&func.sig.output)?;
@@ -544,7 +611,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                         <#err_ty as ::charpente::wire::Wire>::register(reg);
                     },
                     emits: &[],
-                    intent: ::std::option::Option::None,
+                    intent: #intent,
                 }
             }
         }

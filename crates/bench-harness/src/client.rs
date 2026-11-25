@@ -7,9 +7,17 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A fresh intent id for one logical write, distinct across this process:
+/// every point runs against a fresh child and data dir, so a count is enough.
+pub fn fresh_intent() -> String {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    format!("bench-{:x}", COUNT.fetch_add(1, Ordering::Relaxed))
+}
 
 pub struct Conn {
     reader: BufReader<TcpStream>,
@@ -29,11 +37,16 @@ impl Conn {
         })
     }
 
+    /// One request on this connection. `intent`, when given, is sent as
+    /// `idempotency-key`: charpente's wire refuses a write without one
+    /// (GUIDE §5, "Retry-safe writes"), and this client never re-sends, so
+    /// each write takes a `fresh_intent`.
     pub fn request(
         &mut self,
         method: &str,
         path: &str,
         headers: &[(String, String)],
+        intent: Option<&str>,
         body: &[u8],
     ) -> io::Result<(u16, Vec<u8>)> {
         let mut req = format!(
@@ -42,6 +55,9 @@ impl Conn {
         );
         for (k, v) in headers {
             req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        if let Some(intent) = intent {
+            req.push_str(&format!("idempotency-key: {intent}\r\n"));
         }
         req.push_str("\r\n");
         let mut bytes = req.into_bytes();

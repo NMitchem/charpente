@@ -186,9 +186,9 @@ are on crates.io. These are the limits you'll hit first:
   a dropped connection, is tested by a separate rig that runs the real binary, with no seed to
   replay ([docs/GUIDE.md][guide] §8).
 - The simulator finds only what your checks check. The demo's check counts the charges per order.
-- A `#[route]` answers `200` on success and can't read a request header yet, so the demo uses
-  the client's order id where a real API might take an `Idempotency-Key` header. Both are rows
-  in [PLAN.md][plan]'s after-launch table.
+- A `#[route]` answers `200` on success and its handler can't read a request header yet. The
+  platform reads one itself: a write's `Idempotency-Key`, which it needs to answer a re-sent
+  write once. Both are rows in [PLAN.md][plan]'s after-launch table.
 - There is no blob store and no WebSocket transport, and outbound calls have no `HTTP/2`,
   proxies, request signing or streaming replies.
 - It's for new backends. Porting an existing app is not a goal ([MANIFESTO.md][manifesto] §8).

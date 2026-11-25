@@ -769,7 +769,8 @@ kernel, `App::handle(request: Request) -> Response` runs one request, for a
 test, in a transaction with no time, and `App::handle_at(request, now)` gives
 it one (§7). A `Response`'s fields are public: `status: u16`, `headers:
 BTreeMap<String, String>` and `body: Vec<u8>`. Every request that reaches a
-matched route runs inside exactly one
+matched route, and is not refused first for its body's size or its intent id
+(below), runs inside exactly one
 transaction: routing runs first (an unmatched request never opens one),
 then the session lookup and your handler run inside the transaction §4
 covers, the one the kernel opens for the request.
@@ -1414,9 +1415,13 @@ it sends the write again. charpente answers that copy from a record instead
 of running the write twice. The contract: a request to a write route (`POST`,
 `PUT`, `PATCH` or `DELETE`, never `SSE`) that carries an `Idempotency-Key`
 header applies at most once under that key, and every later copy gets the
-first copy's reply back. `charpente_sim::drive` stamps one on each write it
-sends, and its re-send carries the same one (§8). In a test or a hand driver,
-`Request::intent(id)` sets the header:
+first copy's reply back. The lookup runs after the auth ladder, so a copy
+whose credential no longer resolves (a revoked or expired session, a deleted
+API key) gets the ladder's 401, not the replay. Over the wire, a write must
+carry the header: `charpente::serve` refuses one without it (below), so every
+real client is under the contract. `charpente_sim::drive` stamps one on each
+write it sends, and its re-send carries the same one (§8). In a test or a
+hand driver, `Request::intent(id)` sets the header:
 
 ```rust
 use charpente::http::{Method, Request};
@@ -1452,12 +1457,49 @@ record, and still answers on a follower. A handler that returns `Err` records
 nothing either, because its whole transaction is dropped, so its copy runs
 again too.
 
-A request without the header runs as it always has. GET and SSE routes never
+A write that reaches the server without the header is refused with the 400
+below, and nothing runs. The refusal comes before the auth ladder and before
+the request draws anything, so on a follower it also comes before the 421
+(§10). Only `charpente::serve`'s edge marks a request as from the network. A
+request handed to the kernel in process (`App::handle`, or a `SimSource` in a
+sim, §8) without the header runs as it always has. GET and SSE routes never
 read it, so a GET handler that writes is outside this contract and runs again
 on every copy.
 
+**A webhook names its sender's header.** A sender that retries its own
+deliveries, such as a payment provider, puts its event id in a header of its
+own and never sends `Idempotency-Key`. The route names that header with
+`intent = header("…")`, and reads the id from there instead:
+
+```rust
+use charpente::http::ApiError;
+use charpente::{Id, Tx, route, table};
+
+#[table(global)]
+pub struct Delivery {
+    pub id: Id<Delivery>,
+    pub status: String,
+}
+
+// The provider re-sends a delivery until it sees a 200, under the same
+// `X-Event-Id` each time.
+#[route(POST "/hooks/deliveries/:id", public, intent = header("X-Event-Id"))]
+fn delivery_settled(tx: &mut Tx, id: Id<Delivery>, status: String) -> Result<(), ApiError> {
+    tx.put(&Delivery { id, status });
+    Ok(())
+}
+```
+
+Everything in this section holds with `X-Event-Id` in `Idempotency-Key`'s
+place: a delivery re-sent under one event id is answered once, a delivery
+with none is refused with the 400 naming `X-Event-Id`, and the route ignores
+`Idempotency-Key`. The name must be one a request can carry (letters, digits
+and ``!#$%&'*+-.^_`|~``), and only a write route takes the word ("What
+`#[route]` rejects", below). A sim workload sets that header itself, since
+`Drive` stamps only `Idempotency-Key` (§8).
+
 The answers that are not a replay, where `<method> <pattern>` is the route's
-and `<header>` is `Idempotency-Key`:
+and `<header>` is `Idempotency-Key`, or the header the route names:
 
 <!-- pinned -->
 ```text
@@ -1469,8 +1511,10 @@ this request already committed under <header> `<id>`, and its reply was <n> byte
 ```
 
 - **400**: the id is empty, over 255 bytes, or holds a space, a control
-  character or a non-ASCII byte. It is refused before the request draws
-  anything, and nothing runs.
+  character or a non-ASCII byte, or the request came over the wire with no
+  id at all. The server's edge drops a header value holding a non-ASCII byte,
+  so such an id arrives as missing, and one text covers every case. It is
+  refused before the request draws anything, and nothing runs.
 - **422**: the id was already used for a different request. The client
   reused an id, and is told so rather than handed another request's reply.
 - **409, a credential**: the first copy minted a session or an API key
@@ -1625,6 +1669,18 @@ first is the one every route meets once:
 `<handler>` declares neither `auth` nor `public` — a route says which callers reach it. Add one of these to the flags of its `#[route(<method> "<path>", …)]`, keeping any it already has: `auth` to require a principal (`ctx.principal()` is `Some`), `public` to serve anonymous callers, or `public(Org)` to also let every caller act inside the `Org` tenant it opens. None is the default.
 `auth` and `public` on one route — a route is one or the other; drop one
 `public` given twice — write it once
+```
+
+`intent = header(...)` ("Retry-safe writes", above) is refused when it is
+written any other way, when its name is not a header name, on a route that
+reads, and when it is given twice:
+
+<!-- pinned -->
+```text
+`intent` takes the header a sender's id arrives in: `intent = header("X-Event-Id")`
+`intent = header("<name>")` names no valid header: a header name is letters, digits and !#$%&'*+-.^_`|~
+`intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no intent
+`intent` given twice — write it once
 ```
 
 The rest are about the handler's shape:
@@ -3798,7 +3854,8 @@ let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
    in their order in the list, each the stamped copy with the
    `Idempotency-Key` the phase sent it under. A re-sent write whose first copy
    committed is answered from the record of its first reply, and the route
-   does not run again (§5, "Retry-safe writes"). A
+   does not run again (§5, "Retry-safe writes"), or with §5's 409 when that
+   reply minted a credential or was over 64 KiB. A
    4xx, or a handler's own 5xx, is the app's answer and is not re-sent.
    Fallout is read from the body's text (`is_fault_fallout`), so a handler's
    own 5xx whose message reads as fallout ("injected", say) is re-sent too.
@@ -3874,10 +3931,16 @@ have landed, so `Drive`'s re-send is the second delivery a production
 client's retry makes, and it carries the `Idempotency-Key` its first copy
 carried, as that retry would. charpente answers it from the record of the
 first reply (§5, "Retry-safe writes"), so a route needs no guard against
-`Drive`'s re-sends. Three cases are still the workload's or the route's:
+`Drive`'s re-sends. The record keeps only the status of a reply that minted
+a credential or was over 64 KiB, so a re-send of such a write that landed
+gets §5's 409 instead: a workload that logs in through a route under `Drive`
+can see it on a re-sent login. Three cases are still the workload's or the
+route's:
 - **A hand-built re-send** (a `SimSource` you push to, or `App::handle`) is
   recognised only when it carries the first copy's id: build both copies with
-  `Request::intent` and one id. A copy with no id runs again.
+  `Request::intent` and one id. A copy with no id runs again here, in
+  process. Over the wire, `charpente::serve` refuses a write with no id
+  (§5).
 - **A route that reads its id from its sender's header** (a webhook's
   `intent = header(...)`, §5) ignores `Idempotency-Key`, which is all `Drive`
   stamps, so the workload sets that header on each request, as the sender
@@ -4769,7 +4832,9 @@ below the helper" above):
   answered, so a run that stopped says which requests it never reached.
   `SimSource` stamps nothing: a write you push carries the intent id you gave
   it (`Request::intent`), and a copy you push again is answered from the
-  record only under the first copy's id.
+  record only under the first copy's id. A write you push with no id runs,
+  as any in-process request does; over the wire, `charpente::serve` refuses
+  one with no id (§5).
 - **`Kernel::new(app, Box::new(sim.clock()))`** consumes the mounted `App`
   (upserting cron rows and rebuilding the job due-heap — §6, §7);
   `kernel.run(&mut source)` then serves scripted requests at their virtual
@@ -6069,7 +6134,7 @@ this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
 unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id", auth)]
-a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, `#[route(GET "/orgs/:org/status", public(Org))]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant`, `emits(Ev, …)` or `intent = header("…")` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, `#[route(GET "/orgs/:org/status", public(Org))]`, `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`, or `#[route(POST "/hooks/pay", public, intent = header("X-Event-Id"))]`
 `public(...)` names exactly one tenant scope type — write `public(Org)`, or plain `public` if anonymous callers enter no tenant here
 emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...), or change this route's method to `SSE`, keeping its path and flags
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
@@ -6082,6 +6147,10 @@ emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, N
 #[route] handlers are free functions — no `self`
 empty :param name in "/notes/:"
 write `#[route(METHOD "/path", auth | public | public(<Scope>))]` — e.g. #[route(GET "/notes/:id", auth)]
+`intent` takes the header a sender's id arrives in: `intent = header("X-Event-Id")`
+`intent = header("X Event Id")` names no valid header: a header name is letters, digits and !#$%&'*+-.^_`|~
+`intent` is for a write route (POST, PUT, PATCH or DELETE); a GET route carries no intent
+`intent` given twice — write it once
 ```
 
 §5's "What `#[route]` rejects" pins the first three and walks through the
@@ -6089,7 +6158,8 @@ next three with full examples. The rest, in order: the path literal
 doesn't start with `/`; the method name isn't one of
 `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path isn't a string literal
 at all (e.g. a `const`); a flag after the path is none of `auth`, `public`,
-`public(<Scope>)`, `cross_tenant`, `emits(...)`; `public(...)` names no scope
+`public(<Scope>)`, `cross_tenant`, `emits(...)`, `intent = header(...)`;
+`public(...)` names no scope
 type, or more than one; `emits(...)` is on a route that isn't a
 stream (only an SSE route has events to declare — see §11); `emits()` names
 nothing at all; `emits` was written without its parentheses; `auth` or
@@ -6097,8 +6167,11 @@ nothing at all; `emits` was written without its parentheses; `auth` or
 declares one set, so a repeat is always a typo or a bad merge); the same
 event type appears twice inside one `emits(...)` list; the handler takes
 `self` (route handlers are free
-functions); a `:` segment has nothing after it; and the macro's own
-argument list didn't parse as `METHOD "/path"` to begin with. Every one of
+functions); a `:` segment has nothing after it; the macro's own
+argument list didn't parse as `METHOD "/path"` to begin with; and the four
+`intent` refusals §5's "What `#[route]` rejects" pins: the word is not written
+`intent = header("…")`, its name is not a header name, it is on a GET or SSE
+route, or it is given twice. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
 the pattern and it's gone.
 
@@ -6379,7 +6452,9 @@ message quoted above, since the wire check is a `charpente::serve`-only path.
 
 ### A write route's intent id (`charpente/src/http/intent.rs`, request time)
 
-The 400 for a malformed `Idempotency-Key`, the 422 for an id reused on a
+The 400 for a malformed `Idempotency-Key` (or the header a webhook route
+names with `intent = header(...)`), which is also what a write that reaches
+`charpente::serve` with no id gets, the 422 for an id reused on a
 different request, and the three 409s (a copy of a committed write whose reply
 carried a credential or was over 64 KiB, and an id whose record slot another
 request's id holds) are quoted, each with what it means, in §5's "Retry-safe

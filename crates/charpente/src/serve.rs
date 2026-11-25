@@ -672,6 +672,12 @@ async fn to_kernel_request(
         None => req.uri().path().to_string(),
     };
     let mut request = Request::new(method, raw_path);
+    // The kernel refuses a wire write with no intent id, naming its route
+    // (retry-safe writes spec §4.1); naming the route takes the router,
+    // which this thread does not hold.
+    request.wire = true;
+    // A value holding a non-ASCII byte fails `to_str` and is dropped here, so
+    // an intent id holding one arrives as missing and gets the same 400.
     for (name, value) in req.headers() {
         if let Ok(v) = value.to_str() {
             request
@@ -1181,6 +1187,7 @@ impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for 
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::http::{ApiError, AppConfig, Ctx, Cursor, Route, RouteGlue, Session, Subscription};
@@ -1708,13 +1715,20 @@ mod tests {
     }
 
     fn http1(addr: &str, method: &str, path: &str) -> String {
+        http1_with(addr, method, path, &[])
+    }
+
+    /// `http1`, with headers. A value is written as its UTF-8 bytes, so a
+    /// non-ASCII one reaches hyper as obs-text.
+    fn http1_with(addr: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
+        let mut head =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
         let mut stream = std::net::TcpStream::connect(addr).expect("connect");
-        stream
-            .write_all(
-                format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
-            )
-            .expect("request write");
+        stream.write_all(head.as_bytes()).expect("request write");
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("response read");
         response
@@ -1773,7 +1787,12 @@ mod tests {
         .unwrap();
 
         // The primary commits the write (200 only after the WAL sync).
-        let response = http1(&server_p.local_addr(), "POST", "/rows/7");
+        let response = http1_with(
+            &server_p.local_addr(),
+            "POST",
+            "/rows/7",
+            &[("Idempotency-Key", "row-7")],
+        );
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         // The follower converges: poll until the replicated row reads back.
@@ -1791,13 +1810,23 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        // A write on the follower is refused 421 naming the primary.
-        let response = http1(&server_f.local_addr(), "POST", "/rows/9");
+        // A write on the follower is refused 421 naming the primary. It
+        // carries a key: a keyless wire write is the 400 before it stages.
+        let response = http1_with(
+            &server_f.local_addr(),
+            "POST",
+            "/rows/9",
+            &[("Idempotency-Key", "row-9")],
+        );
         assert!(response.starts_with("HTTP/1.1 421"), "{response}");
         assert!(
             response.contains(&repl_p),
             "the 421 must name the primary's address ({repl_p}): {response}"
         );
+        // GUIDE §5: the wire's refusal of a keyless write comes first, on a
+        // follower as anywhere.
+        let response = http1(&server_f.local_addr(), "POST", "/rows/9");
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
 
         std::fs::remove_dir_all(root_p).unwrap();
         std::fs::remove_dir_all(root_f).unwrap();
@@ -1860,6 +1889,227 @@ mod tests {
             "the 413 body must name the cap and the fix — got: {response}"
         );
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---------------------------------- intent ids on the wire (retry-safe writes)
+
+    /// `ProdEntropy`, counting its draws.
+    struct CountingEntropy {
+        inner: ProdEntropy,
+        draws: Arc<AtomicUsize>,
+    }
+
+    impl Entropy for CountingEntropy {
+        fn fill(&self, buf: &mut [u8]) {
+            self.draws.fetch_add(1, Ordering::SeqCst);
+            self.inner.fill(buf);
+        }
+    }
+
+    /// `routes` served over loopback by an app whose entropy counts its draws.
+    fn intent_server(
+        tag: &str,
+        routes: Vec<Route>,
+    ) -> (Server, std::path::PathBuf, Arc<AtomicUsize>) {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-{tag}-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        let draws = Arc::new(AtomicUsize::new(0));
+        let app = App::open(
+            Box::new(ProdDisk::new(&root).unwrap()),
+            Schema::new(),
+            Box::new(CountingEntropy {
+                inner: ProdEntropy::new().unwrap(),
+                draws: draws.clone(),
+            }),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(routes);
+        (serve("127.0.0.1:0", app).unwrap(), root, draws)
+    }
+
+    /// What follows the blank line of a raw HTTP/1.1 response.
+    fn body_of(response: &str) -> &str {
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_else(|| panic!("no blank line in {response:?}"))
+    }
+
+    /// The 400 the smoke app's `POST /rows/:id` answers a wire write that
+    /// presents no valid `Idempotency-Key` (hard rule 5: byte-exact).
+    const ROWS_NEEDS_A_KEY: &str = "{\"error\":\"`POST /rows/:id` needs an Idempotency-Key \
+        header, 1 to 255 visible ASCII characters: charpente answers a re-sent write once (GUIDE \
+        §5). The generated client sends one; a webhook route names its sender's id header with \
+        `intent = header(...)`.\"}";
+
+    /// Retry-safe writes (spec §4.1): a write that reaches the wire with no
+    /// intent id is refused by name, before the request path's `fresh_token`
+    /// draw, so it costs nothing and runs nothing.
+    #[test]
+    fn a_wire_write_without_a_key_is_refused_before_any_draw() {
+        let (server, root, draws) = intent_server("intent-refusal", smoke_routes());
+        let addr = server.local_addr();
+        // A GET answered first: the kernel is serving, and whatever it drew
+        // to get there is behind the count below.
+        let warm = http1(&addr, "GET", "/rows/7");
+        assert!(warm.starts_with("HTTP/1.1 404"), "{warm}");
+
+        let before = draws.load(Ordering::SeqCst);
+        let refused = http1(&addr, "POST", "/rows/7");
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        assert_eq!(body_of(&refused), ROWS_NEEDS_A_KEY);
+        assert_eq!(
+            draws.load(Ordering::SeqCst),
+            before,
+            "the refused write drew entropy"
+        );
+        let unwritten = http1(&addr, "GET", "/rows/7");
+        assert!(
+            unwritten.starts_with("HTTP/1.1 404"),
+            "the refused write ran: {unwritten}"
+        );
+
+        // Naming the route needs a match: a write to no route is the
+        // router's 404, as it always was.
+        let unrouted = http1(&addr, "POST", "/nope");
+        assert!(unrouted.starts_with("HTTP/1.1 404"), "{unrouted}");
+
+        // The control: the same write with a key reaches the draw, so the
+        // count above could have moved.
+        let before = draws.load(Ordering::SeqCst);
+        let ran = http1_with(&addr, "POST", "/rows/7", &[("Idempotency-Key", "k7")]);
+        assert!(ran.starts_with("HTTP/1.1 200"), "{ran}");
+        assert!(
+            draws.load(Ordering::SeqCst) > before,
+            "a write that ran drew nothing, so the counter sees no draw at all"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A read names no intent: the wire asks a GET for none.
+    #[test]
+    fn a_wire_get_needs_no_key() {
+        let (server, root, _) = intent_server("intent-get", smoke_routes());
+        let addr = server.local_addr();
+        let put = http1_with(&addr, "POST", "/rows/3", &[("Idempotency-Key", "k3")]);
+        assert!(put.starts_with("HTTP/1.1 200"), "{put}");
+        let read = http1(&addr, "GET", "/rows/3");
+        assert!(read.starts_with("HTTP/1.1 200"), "{read}");
+        assert_eq!(body_of(&read), "\"replicated\"");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// In process (`App::handle`, a sim's `SimSource`) is not the wire: a
+    /// write without an id runs as it always has (spec §2's non-goal), every
+    /// time it is sent.
+    #[test]
+    fn an_in_process_write_without_a_key_runs_as_before() {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-intent-in-process-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        let mut app = App::open(
+            Box::new(ProdDisk::new(&root).unwrap()),
+            Schema::new(),
+            Box::new(ProdEntropy::new().unwrap()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(vec![hook_route(None)]);
+        for runs in 1..=2u64 {
+            let reply = app.handle(Request::new(Method::Post, "/hooks/4"));
+            assert_eq!(
+                (
+                    reply.status,
+                    String::from_utf8_lossy(&reply.body).into_owned()
+                ),
+                (200, runs.to_string()),
+            );
+            assert!(!reply.headers.contains_key("idempotent-replayed"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Counts its own runs in a row, so a reply says which run produced it.
+    fn hook_glue(
+        tx: &mut Tx,
+        _ctx: &Ctx,
+        captures: &[String],
+        _body: &[u8],
+    ) -> Result<Response, ApiError> {
+        let id: u64 = captures[0].parse().expect("hook tests send numeric ids");
+        let runs = match tx.get(Id::<Session>::from_raw(id))? {
+            Some(row) => row.subject.parse::<u64>().expect("a hook row counts runs") + 1,
+            None => 1,
+        };
+        tx.put(&Session {
+            id: Id::from_raw(id),
+            token_hash: format!("hook-{id}"),
+            subject: runs.to_string(),
+            expires_at: charpente_core::io::WallTime::from_nanos(u64::MAX),
+        });
+        Ok(Response::json(200, &runs))
+    }
+
+    /// `POST /hooks/:id`, reading its intent id from `intent`'s header, or
+    /// `Idempotency-Key` when `None`.
+    fn hook_route(intent: Option<&'static str>) -> Route {
+        Route {
+            method: Method::Post,
+            pattern: "/hooks/:id",
+            auth: false,
+            public_scope: None,
+            cross_tenant: false,
+            name: "hook",
+            glue: RouteGlue::Http(hook_glue),
+            params: &[],
+            request: None,
+            response: || TypeSchema::Null,
+            error: || <ApiError as Wire>::reference(),
+            register_types: |_| {},
+            emits: &[],
+            intent,
+        }
+    }
+
+    /// A webhook route keys a write by its sender's id header, and only by
+    /// that: `Idempotency-Key` alone is refused, naming the declared header.
+    #[test]
+    fn a_webhook_route_reads_its_declared_header() {
+        let (server, root, _) =
+            intent_server("intent-webhook", vec![hook_route(Some("X-Event-Id"))]);
+        let addr = server.local_addr();
+        let first = http1_with(&addr, "POST", "/hooks/5", &[("X-Event-Id", "evt_1")]);
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert_eq!(body_of(&first), "1");
+        let again = http1_with(&addr, "POST", "/hooks/5", &[("X-Event-Id", "evt_1")]);
+        assert!(again.starts_with("HTTP/1.1 200"), "{again}");
+        assert!(
+            again.contains("\r\nidempotent-replayed: true\r\n"),
+            "{again}"
+        );
+        assert_eq!(body_of(&again), "1", "the repeat ran: {again}");
+
+        let wrong = http1_with(&addr, "POST", "/hooks/5", &[("Idempotency-Key", "k5")]);
+        assert!(wrong.starts_with("HTTP/1.1 400"), "{wrong}");
+        assert_eq!(
+            body_of(&wrong),
+            "{\"error\":\"`POST /hooks/:id` needs an X-Event-Id header, 1 to 255 visible ASCII \
+             characters: charpente answers a re-sent write once (GUIDE §5). The generated \
+             client sends one; a webhook route names its sender's id header with `intent = \
+             header(...)`.\"}"
+        );
+        let next = http1_with(&addr, "POST", "/hooks/5", &[("X-Event-Id", "evt_2")]);
+        assert_eq!(body_of(&next), "2", "the refused write ran: {next}");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2048,9 +2298,9 @@ mod tests {
         );
 
         // Two emits, each its own short-lived connection.
-        let r1 = http1(&addr, "POST", "/emit/1");
+        let r1 = http1_with(&addr, "POST", "/emit/1", &[("Idempotency-Key", "emit-1")]);
         assert!(r1.starts_with("HTTP/1.1 200"), "{r1}");
-        let r2 = http1(&addr, "POST", "/emit/2");
+        let r2 = http1_with(&addr, "POST", "/emit/2", &[("Idempotency-Key", "emit-2")]);
         assert!(r2.starts_with("HTTP/1.1 200"), "{r2}");
 
         let mut pending = String::new();
@@ -2072,7 +2322,7 @@ mod tests {
 
         // A third emit while nobody is subscribed — the tail that would
         // have missed it is dead; a resuming client must not be.
-        let r3 = http1(&addr, "POST", "/emit/3");
+        let r3 = http1_with(&addr, "POST", "/emit/3", &[("Idempotency-Key", "emit-3")]);
         assert!(r3.starts_with("HTTP/1.1 200"), "{r3}");
 
         // Reconnect with Last-Event-ID: exactly the third event arrives.

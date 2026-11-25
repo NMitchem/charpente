@@ -80,6 +80,11 @@ pub struct Request {
     pub query: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// Whether this request arrived over the network: set by `serve`'s edge
+    /// conversion alone, so no app or sim builds one. A wire write that
+    /// presents no intent id is refused (retry-safe writes spec §4.1); an
+    /// in-process caller's runs as it always has (spec §2).
+    pub(crate) wire: bool,
 }
 
 impl Request {
@@ -99,6 +104,7 @@ impl Request {
             query,
             headers: BTreeMap::new(),
             body: Vec::new(),
+            wire: false,
         }
     }
 

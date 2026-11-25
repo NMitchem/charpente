@@ -1246,11 +1246,18 @@ impl<'a> StagedDispatch<'a> {
         };
         // A write's intent id (spec §4.1), read before the `fresh_token` draw
         // so a malformed one is refused having drawn nothing. A GET or SSE
-        // route never reads one. With no id the write runs as it always has.
+        // route never reads one. A write that reached the wire with no id is
+        // refused the same way, with the same text: every real client passes
+        // through the wire, so the contract holds for each of them. In
+        // process (`App::handle`, a `SimSource`), a write with no id runs as
+        // it always has (spec §2).
         let header = intent::header_name(route);
         let write_intent = if intent::is_write(route) {
             match intent::presented(&request, route) {
                 intent::Presented::Malformed => {
+                    return Handled::Response(intent::malformed(route));
+                }
+                intent::Presented::Absent if request.wire => {
                     return Handled::Response(intent::malformed(route));
                 }
                 intent::Presented::Valid(id) => Some((

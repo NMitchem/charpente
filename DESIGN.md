@@ -895,7 +895,13 @@ copy's uncommitted record. That answer is a read of a sibling's write, so
 reply's headers and body up to 64 KiB. For a larger reply, or one whose transaction minted
 a credential, it keeps the status and the reason, so no raw credential reaches it (§8) and
 no kept reply pushes a record past `MAX_RECORD_BYTES`. A malformed id is refused before the
-request's `fresh_token` draw, so a refused request moves no entropy stream. The record's
+request's `fresh_token` draw, so a refused request moves no entropy stream. So is a write that
+reached the wire with no id, with the same 400: `serve`'s edge conversion marks each request it
+builds as from the network (`Request`'s crate-private `wire`), and the kernel refuses there,
+after routing, because naming the route takes the router the edge thread does not hold. A
+request handed to the kernel in process (`App::handle`, a `SimSource`) carries no such mark,
+and without an id it runs as it always has. A route names the header it reads its id from with
+`#[route(…, intent = header("…"))]`, for a webhook whose sender sends its own. The record's
 `committed_at` is the `now` the request path is handed: the step's time, or the epoch
 under `App::handle`, which has no time.
 

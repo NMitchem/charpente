@@ -238,7 +238,9 @@ pub(crate) fn record(
     }
 }
 
-/// The 400 for a write whose id header is not 1 to 255 visible ASCII bytes.
+/// The 400 for a write whose id header is not 1 to 255 visible ASCII bytes,
+/// or that reached the wire with none: one text for both, since the edge
+/// drops a non-ASCII value before the kernel can tell it from a missing one.
 pub(crate) fn malformed(route: &Route) -> Response {
     let header = header_name(route);
     Response::error(

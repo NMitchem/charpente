@@ -1,0 +1,5 @@
+error: `intent` given twice — write it once
+  --> tests/compile_fail/route_intent_twice.rs:13:5
+   |
+13 |     intent = header("Stripe-Event-Id")
+   |     ^^^^^^
