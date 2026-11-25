@@ -2,7 +2,9 @@
 // is no owned token to keep beyond the request or group that minted it. A
 // handler is handed `&CrossTenant`: `cap.clone()` only copies the reference,
 // so it is not a token of the handler's own. Operator code holds an owned
-// `TenantAdmission` and cannot copy it either.
+// `TenantAdmission` and cannot copy it either, nor the `IntentAccess` the
+// request path mints to reach the intents record (retry-safe-writes spec
+// §4.2).
 use charpente::http::ApiError;
 use charpente::wire::WireU64;
 use charpente::{CrossTenant, Db, Tx, route};
@@ -21,6 +23,13 @@ fn copy_the_admission(db: &mut Db) -> std::io::Result<()> {
     group.commit().map_err(|failure| failure.error)
 }
 
+fn copy_the_intent_access(db: &mut Db) -> std::io::Result<()> {
+    let group = db.begin_group()?;
+    let access = group.intent_access();
+    let _copy = access.clone();
+    group.commit().map_err(|failure| failure.error)
+}
+
 fn main() {
-    let _ = copy_the_admission;
+    let _ = (copy_the_admission, copy_the_intent_access);
 }

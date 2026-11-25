@@ -1,0 +1,25 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile_fail/intent_access_cannot_be_forged.rs:18:40
+   |
+18 |     let reply = tx.get_intent(intent, &IntentAccess(PhantomData))?;
+   |                                        ^^^^^^^^^^^^
+   |
+   = note: a struct named `IntentAccess` exists in another namespace
+note: constructor is not visible here due to private fields
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   | pub struct IntentAccess<'g>(std::marker::PhantomData<&'g ()>);
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile_fail/intent_access_cannot_be_forged.rs:23:25
+   |
+23 |     tx.put_intent(row, &IntentAccess(PhantomData));
+   |                         ^^^^^^^^^^^^
+   |
+   = note: a struct named `IntentAccess` exists in another namespace
+note: constructor is not visible here due to private fields
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   | pub struct IntentAccess<'g>(std::marker::PhantomData<&'g ()>);
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field

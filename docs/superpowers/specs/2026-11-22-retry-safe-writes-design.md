@@ -84,10 +84,11 @@ Anti-goals:
 - **DECISIONS §12 and §13.** The record is sealed like `PLATFORM_TABLES` (`db.rs:1206`).
   Retry safety is always on, which §13's reopen clause covers. The one choice, a webhook's id
   source, is a route word with a compile-fail pin.
-- **DECISIONS §15.** No compatibility. A 0.6.0 data directory, follower or archive reader
-  meets the new table with a named refusal: the builder bumps `PROTO_VERSION` and
-  `MANIFEST_FORMAT`, or shows the existing schema digests already refuse. Every workload
-  that writes re-pins its seeds, and each pin's recorded reason is checked.
+- **DECISIONS §15.** No compatibility. A 0.6.0 follower and a 0.6.0 archive reader are
+  refused by name: `PROTO_VERSION` is 9 and `MANIFEST_FORMAT` is 6. A 0.6.0 binary refuses
+  a 0.7.0 data directory only while its log holds an intent record. After a checkpoint it
+  opens the directory and ignores the table, which §15 accepts, since no downgrade is owed.
+  Every workload that writes re-pins its seeds, and each pin's recorded reason is checked.
 - **Hard rule 6.** These docs change in the same commits: GUIDE §5, §8 and §13, DESIGN (the
   request path and platform tables), the TS client's docs, and CHANGELOG 0.7.0. README is
   covered in §5.
@@ -215,8 +216,10 @@ Each write route's entry gains `intent`: `"Idempotency-Key"`, or the declared he
 4. The wire refusal, `intent = header(...)`, its compile-fail pin, and `describe`.
 5. Retention and the kernel sweep, with a property that crosses a clock-downtime jump.
 6. The TS client.
-7. The format and version bumps, with refusals for a 0.6.0 data directory, follower and
-   archive.
+7. The format and version bumps: a 0.6.0 follower and archive reader are refused by name
+   (`PROTO_VERSION` 9, `MANIFEST_FORMAT` 6). A 0.6.0 binary refuses a 0.7.0 data directory
+   only while its log holds an intent record, and after a checkpoint opens it and ignores
+   the table, which DECISIONS §15 accepts (no downgrade owed).
 8. The scaffold, double-charge, `demo.rs`, README, GUIDE, DESIGN and CHANGELOG.
 
 The evidence bar is the workspace suite green and counted, plus the app batches (sim-fixture,
