@@ -62,7 +62,7 @@ use std::io;
 
 use crate::engine::{Engine, StateMachine, SubmitFailure};
 use crate::event::EventRow;
-use crate::intent::IntentRow;
+use crate::intent::{COMMITTED_AT_INDEX, IntentRow};
 use crate::io::{Disk, Entropy, File, WallTime};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
@@ -1540,15 +1540,18 @@ impl<'a> Tx<'a> {
             .insert((UNSCOPED, id.raw()), None);
     }
 
-    /// The retention sweep's read (spec §4.4): the ids, in id order, of at
-    /// most `limit` intent records whose `committed_at` is strictly before
-    /// `before`, over the snapshot, the group's writes and this
-    /// transaction's, as `View::scan` merges them.
+    /// The retention sweep's read (spec §4.4): the ids of at most `limit`
+    /// intent records whose `committed_at` is strictly before `before`,
+    /// oldest first (ties by id), over the snapshot, the group's writes and
+    /// this transaction's, as `View::scan` merges them.
     ///
-    /// It holds no row: each is read only as far as its `committed_at`, and
-    /// the snapshot walk stops at `limit` matches, since a later one has a
-    /// larger id than all of them. Its memory is the two overlays plus
-    /// `limit` ids, never the table, whose kept replies run to 64 KiB each.
+    /// It reads the snapshot through `IntentRow`'s `committed_at` index,
+    /// oldest entry first, and stops at `limit` matches or at the first entry
+    /// not older than `before`, whichever comes first. It reads no stored
+    /// row, so its cost is the entries it returns, the overlays' entries, and
+    /// one more, plus redb's seek to the first entry: never the table. Its
+    /// memory is the two overlays plus `limit` ids, and it never holds a kept
+    /// reply, which runs to 64 KiB.
     pub fn intents_committed_before(
         &self,
         before: WallTime,
@@ -1559,23 +1562,32 @@ impl<'a> Tx<'a> {
         let staged = self.staged_intents();
         let mut older = Vec::new();
         for (&id, entry) in &staged {
-            if let Some(bytes) = entry
-                && IntentRow::committed_at_of(bytes)? < before
-            {
-                older.push(id);
+            if let Some(bytes) = entry {
+                let at = IntentRow::committed_at_of(bytes)?;
+                if at < before {
+                    older.push((at, id));
+                }
             }
         }
+        // An overlay decides every id it holds, so the snapshot's entry for
+        // one is skipped and does not count against `limit`: the overlays'
+        // matches are all in `older` already.
         let mut from_snapshot = 0;
-        self.snapshot.walk_raw::<IntentRow>(|id, bytes| {
-            if !staged.contains_key(&id) && IntentRow::committed_at_of(bytes)? < before {
-                older.push(id);
-                from_snapshot += 1;
-            }
-            Ok(from_snapshot < limit)
-        })?;
+        self.snapshot
+            .walk_index::<IntentRow>(COMMITTED_AT_INDEX, |key, id| {
+                let at = IntentRow::committed_at_of_key(key)?;
+                if at >= before {
+                    return Ok(false);
+                }
+                if !staged.contains_key(&id) {
+                    older.push((at, id));
+                    from_snapshot += 1;
+                }
+                Ok(from_snapshot < limit)
+            })?;
         older.sort_unstable();
         older.truncate(limit);
-        Ok(older.into_iter().map(Id::from_raw).collect())
+        Ok(older.into_iter().map(|(_, id)| Id::from_raw(id)).collect())
     }
 
     /// The retention sweep's other read (spec §4.4): the earliest
@@ -1583,9 +1595,10 @@ impl<'a> Tx<'a> {
     /// writes and this transaction's, or `None` when none remains. The sweep
     /// reads it after staging its deletes, to set its next due time.
     ///
-    /// Like `intents_committed_before` it holds no row and reads each only as
-    /// far as its `committed_at`. It walks the whole table, since row ids are
-    /// hashes and say nothing of age, so its memory is the overlays alone.
+    /// The snapshot's earliest is the first entry of `IntentRow`'s
+    /// `committed_at` index that no overlay decides, so it reads the entries
+    /// the overlays hide (the sweep's own deletes, which are the oldest) and
+    /// one more. Like `intents_committed_before` it reads no stored row.
     pub fn earliest_intent_committed_at(
         &self,
         access: &IntentAccess<'_>,
@@ -1597,13 +1610,15 @@ impl<'a> Tx<'a> {
             let at = IntentRow::committed_at_of(bytes)?;
             earliest = Some(earliest.map_or(at, |e| e.min(at)));
         }
-        self.snapshot.walk_raw::<IntentRow>(|id, bytes| {
-            if !staged.contains_key(&id) {
-                let at = IntentRow::committed_at_of(bytes)?;
+        self.snapshot
+            .walk_index::<IntentRow>(COMMITTED_AT_INDEX, |key, id| {
+                if staged.contains_key(&id) {
+                    return Ok(true);
+                }
+                let at = IntentRow::committed_at_of_key(key)?;
                 earliest = Some(earliest.map_or(at, |e| e.min(at)));
-            }
-            Ok(true)
-        })?;
+                Ok(false)
+            })?;
         Ok(earliest)
     }
 
@@ -4124,6 +4139,15 @@ impl Db {
     /// holds the store, with the operator's standing.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
         self.engine.machine().store.snapshot()
+    }
+
+    /// How many index entries this node's reads have walked since it opened
+    /// (`Store::index_entries_walked`): the intent sweep's, the only reads
+    /// that walk an index. Not for apps: a test pins the sweep's cost with it,
+    /// since no result of the sweep shows how much of the record it read.
+    #[doc(hidden)]
+    pub fn index_entries_walked(&self) -> u64 {
+        self.engine.machine().store.index_entries_walked()
     }
 
     /// This node's store write-transaction schedule digest

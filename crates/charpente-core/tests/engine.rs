@@ -4665,7 +4665,71 @@ fn an_intent_row_round_trips_through_the_log_and_a_reopen() {
         .stage(|tx| tx.get_intent(Id::from_raw(4), &access))
         .unwrap();
     assert_eq!(absent, None, "an id never put reads as no row");
+    // The sweep's reads walk the `committed_at` index, which the replay
+    // rebuilt with the rows: oldest first, the latest row (at u64::MAX, which
+    // nothing is older than) left out.
+    let (older, earliest) = group
+        .stage(|tx| -> Result<_, io::Error> {
+            Ok((
+                tx.intents_committed_before(WallTime::from_nanos(u64::MAX), 10, &access)?,
+                tx.earliest_intent_committed_at(&access)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        older.iter().map(|id| id.raw()).collect::<Vec<_>>(),
+        [3, 1, 2],
+        "after a reopen the index orders the rows by committed_at: 0, then 1.7e18, then one \
+         nanosecond later"
+    );
+    assert_eq!(earliest, Some(WallTime::UNIX_EPOCH));
     group.commit().unwrap();
+}
+
+/// `decode_row` refuses a stored row whose intent id `encode_row` would
+/// have refused to write: empty, over 255 bytes, or holding a byte outside
+/// 0x21..=0x7e. A log or store that holds one is corrupt, and replaying it
+/// is refused by name rather than panicking the node.
+#[test]
+fn decode_row_refuses_an_intent_id_the_request_path_never_records() {
+    let row = IntentRow {
+        intent: "k".to_string(),
+        ..intent_row(5, 7, IntentReply::Credential)
+    };
+    let mut valid = Vec::new();
+    row.encode_row(&mut valid);
+    // The id's 8 bytes, then "k" as a 4-byte length and its byte.
+    let after_intent = &valid[8 + 4 + 1..];
+    for (bad, shown) in [
+        (String::new(), "\"\"".to_string()),
+        ("k".repeat(256), format!("{:?}", "k".repeat(256))),
+        ("k\u{7f}".to_string(), "\"k\\u{7f}\"".to_string()),
+        ("k k".to_string(), "\"k k\"".to_string()),
+    ] {
+        let mut bytes = Vec::new();
+        row.id.encode(&mut bytes);
+        bad.encode(&mut bytes);
+        bytes.extend_from_slice(after_intent);
+        let err = IntentRow::decode_row(&bytes).expect_err("a bad id must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "row decode: IntentRow 5's intent id {shown} is not 1 to 255 visible ASCII \
+                 bytes (0x21..=0x7e) — the request path refuses any other id before it records \
+                 one, so the stored row is corrupt"
+            )
+        );
+    }
+    let mut longest = Vec::new();
+    row.id.encode(&mut longest);
+    "~".repeat(255).encode(&mut longest);
+    longest.extend_from_slice(after_intent);
+    assert_eq!(
+        IntentRow::decode_row(&longest).unwrap().intent,
+        "~".repeat(255),
+        "255 bytes of 0x7e is the longest, highest id the request path records"
+    );
 }
 
 /// `Group::stage` reads through the group's overlay, so a second copy of a
@@ -4740,8 +4804,9 @@ fn has_effects_turns_true_at_the_first_write_and_not_before() {
 }
 
 /// The retention sweep's read: the ids of rows committed strictly before a
-/// time, at most `limit` of them, over the store, the group's overlay and the
-/// transaction's own, with a staged delete hiding its row.
+/// time, oldest first, at most `limit` of them (the oldest), over the store,
+/// the group's overlay and the transaction's own, with a staged delete hiding
+/// its row.
 #[test]
 fn intents_committed_before_returns_only_older_ids_and_honours_the_limit() {
     let sim = Sim::with_faults(0x1D7E_0004, FaultConfig::none());
@@ -4786,14 +4851,14 @@ fn intents_committed_before_returns_only_older_ids_and_honours_the_limit() {
 
     assert_eq!(
         older,
-        vec![at_2.id, at_1.id],
-        "the two rows committed before t=3, from the store and the group's overlay, in id \
-         order; the row at t=3 is not older than t=3, and the deleted row is gone"
+        vec![at_1.id, at_2.id],
+        "the two rows committed before t=3, from the store and the group's overlay, oldest \
+         first; the row at t=3 is not older than t=3, and the deleted row is gone"
     );
-    assert_eq!(one.len(), 1, "a limit of 1 returns exactly one id: {one:?}");
-    assert!(
-        older.contains(&one[0]),
-        "the one id is an older row's: {one:?}"
+    assert_eq!(
+        one,
+        vec![at_1.id],
+        "a limit of 1 returns the oldest row, though its id is the larger"
     );
     assert_eq!(none, Vec::new(), "no row was committed before t=1");
 }
@@ -4845,7 +4910,8 @@ fn intents_committed_before_reads_the_transactions_own_writes() {
     assert_eq!(
         ids(two),
         [5, 30],
-        "the first two of those, in id order: 10 and 20, displaced, do not use up the limit"
+        "the first two of those, oldest first and then by id: 10 and 20, displaced, do not use \
+         up the limit"
     );
 }
 

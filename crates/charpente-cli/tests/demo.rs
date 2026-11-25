@@ -37,7 +37,8 @@ const STARTUP: &str = "running 1 sim check, 256 runs each, under random injected
 const GOLDEN: &str = r"
 skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
   each_order_is_charged_once
-    8  the boot was refused: injected corruption reached durable data at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xe89246396f6a95eb)
+    7  the boot was refused: injected corruption reached durable data at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xe89246396f6a95eb)
+    1  injected corruption cut an enqueue after its call reached the gateway (first: --seed 0x11c23979e56d3608)
 
 check each_order_is_charged_once ... ok  (248 tested over 49 distinct inputs, 8 skipped)
 
@@ -282,8 +283,14 @@ fn readme_quotes_the_demos_batch_whole() {
 /// The `repro:` command README quotes from 0.6.0's red run. Its universe still
 /// meets the faults that charged order 9 twice: the fault keys of the `fired:`
 /// line README quotes from 0.6.0, with one completed outbound call fewer (50,
-/// where that line reads 51). Now the re-sent POST is answered from the
-/// record, so the run reaches a verdict and passes.
+/// where that line reads 51). Since the intents record keeps an index on
+/// `committed_at`, each record's put also writes an index entry, so the
+/// store's writes, which the disk faults are drawn over, are not 0.6.0's: the
+/// run also meets a fourth sync error and a crash that dropped an unsynced
+/// write (`crash:dropped`). With `Drive`'s stamping removed, so that no
+/// record is written, it fails with `order 9 charged twice` and that `fired:`
+/// line exactly (checked by hand, 2026-11-25). Now the re-sent POST is
+/// answered from the record, so the run reaches a verdict and passes.
 const REPRO_0_6_0: &str = "charpente test --sim --filter each_order_is_charged_once --seed \
                            0x82eac71fbdeda9de --inputs 00 --faults-off \
                            crash_torn,object_put_error,object_get_error,outbound_refused,\
@@ -320,8 +327,8 @@ fn the_seed_readme_quotes_from_0_6_0_now_passes() {
     assert!(
         report.contains(
             "\"coverage\":{\"boot:booted-after-retry\":1,\"boot:retried\":2,\"crash:applied\":1,\
-             \"fault:outbound_lost_reply\":1,\"fault:sync_error\":3,\"outbound:checked\":1,\
-             \"outbound:completed\":50,\"restart\":1,\"restart:process\":2}"
+             \"crash:dropped\":1,\"fault:outbound_lost_reply\":1,\"fault:sync_error\":4,\
+             \"outbound:checked\":1,\"outbound:completed\":50,\"restart\":1,\"restart:process\":2}"
         ),
         "the seed still meets 0.6.0's faults, with one completed call fewer:\n{report}"
     );

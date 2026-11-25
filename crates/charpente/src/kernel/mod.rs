@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use charpente_core::db::{Db, MAX_BATCH, Refusal};
 use charpente_core::event::EventRow;
-use charpente_core::intent::INTENT_RETENTION;
+use charpente_core::intent::{INTENT_RETENTION, IntentRow};
 use charpente_core::io::{Clock, Instant, ObjectStore, Outbound, OutboundWake, WallTime};
-use charpente_core::table::View;
+use charpente_core::table::{Id, View};
 
 use crate::archive::Archive;
 use crate::http::{App, Handled, Request, Response, Subscription, io_failure_response};
@@ -40,9 +40,10 @@ use crate::repl::{REPL_TICK_NANOS, Repl};
 /// The least time from an intent sweep that leaves records behind to the
 /// next (retry-safe-writes spec §4.4). The next is due when the oldest
 /// record left ages out, but no sooner than this: under steady writes a
-/// record ages out every few milliseconds, and a sweep each time would walk
-/// the whole table (ids are hashes, not ages) and commit a record each time.
-/// So a record can outlive its `INTENT_RETENTION` by up to this much.
+/// record ages out every few milliseconds, and a sweep each time would
+/// commit a log record for every one or two deletes. So a record can
+/// outlive its `INTENT_RETENTION` by up to this much, measured on this
+/// node's clock.
 pub const INTENT_SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
 
 /// The most intent records one sweep deletes, in one transaction. A sweep
@@ -236,6 +237,11 @@ pub struct Kernel {
     /// open (`Kernel::opened`), then as the `Ready::IntentSweep` arm sets it
     /// after each sweep. `None` until the node is first open for writes.
     next_intent_sweep: Option<WallTime>,
+    /// The last id the latest intent sweep deleted, while that sweep was a
+    /// full batch and so due again at once; `None` otherwise. The next sweep
+    /// must not find it older than its bound again, or the deletes did not
+    /// land and the sweep would run at one instant forever.
+    full_sweep_through: Option<Id<IntentRow>>,
 }
 
 /// Builds a `Kernel` from its parts (outbound-effects spec §4): a node that
@@ -415,6 +421,7 @@ impl Kernel {
             outbound,
             opened_at: wall,
             next_intent_sweep: None,
+            full_sweep_through: None,
         };
         // A node that opens shut sweeps nothing; its gate opening is its
         // open (`after_repl_step`).
@@ -432,6 +439,10 @@ impl Kernel {
     fn opened(&mut self, wall: WallTime) {
         self.opened_at = wall;
         self.next_intent_sweep = Some(self.opened_at + INTENT_RETENTION);
+        // A full batch before the gate shut is a retention behind the next
+        // sweep, which may find its last id recorded again since, older than
+        // its bound by then.
+        self.full_sweep_through = None;
     }
 
     /// The event loop (DESIGN §1 same-shape rule): identical code under
@@ -1310,7 +1321,7 @@ impl Kernel {
                 let mut group = self.app.begin_job_group(now.wall)?;
                 let access = group.intent_access();
                 let sweep = group
-                    .stage(|tx| -> io::Result<(usize, Option<WallTime>)> {
+                    .stage(|tx| -> io::Result<(Vec<Id<IntentRow>>, Option<WallTime>)> {
                         let older =
                             tx.intents_committed_before(before, INTENT_SWEEP_BATCH, &access)?;
                         for &id in &older {
@@ -1323,63 +1334,119 @@ impl Kernel {
                         } else {
                             None
                         };
-                        Ok((older.len(), earliest))
+                        Ok((older, earliest))
                     })
                     .map_err(flatten);
+                let records = |n: usize| if n == 1 { "record" } else { "records" };
                 match (sweep, group.commit()) {
-                    // A full batch may have left older records behind, so the
-                    // sweep is due again at once.
-                    (Ok((INTENT_SWEEP_BATCH, _)), Ok(())) => {
-                        self.next_intent_sweep = Some(now.wall);
-                    }
-                    (Ok((swept, earliest)), Ok(())) => {
-                        let next = match earliest {
-                            // Any record committed from here on has a
-                            // `committed_at` of at least now, so none can
-                            // age out sooner than a retention from now.
-                            None => now.wall + INTENT_RETENTION,
-                            // Due when the oldest record left ages out: the
-                            // bound is strict, so that is the nanosecond
-                            // after its retention ends. But no sooner than an
-                            // interval from now, so deletes stay batched.
-                            Some(earliest) => {
-                                // Negative space (hard rule 4): a sweep short
-                                // of a full batch deleted every record older
-                                // than its bound, so none it left is older.
-                                // With the open assertion above, that puts
-                                // `earliest` at or after the open, so the
-                                // open needs no term of its own here.
-                                assert!(
-                                    earliest >= before,
-                                    "kernel invariant: an intent sweep at {} deleted {swept} \
-                                     records, fewer than a full batch ({INTENT_SWEEP_BATCH}), \
-                                     yet left one committed at {earliest}, before its bound \
-                                     {before} — Tx::intents_committed_before and \
-                                     Tx::earliest_intent_committed_at disagree on which records \
-                                     the transaction holds",
-                                    now.wall,
-                                );
-                                (earliest + INTENT_RETENTION + Duration::from_nanos(1))
-                                    .max(now.wall + INTENT_SWEEP_INTERVAL)
-                            }
-                        };
-                        // Negative space (hard rule 4): a sweep that leaves
-                        // nothing older behind must not be due again at this
-                        // instant, or it would run again, delete nothing, and
-                        // Kernel::step would return Worked forever without
-                        // time passing.
-                        assert!(
-                            next > now.wall,
-                            "kernel invariant: an intent sweep at {} deleted {swept} records, \
-                             fewer than a full batch ({INTENT_SWEEP_BATCH}), and set the next \
-                             one due at {next}, not after now — it would run again at once and \
-                             find nothing to delete, forever. The oldest record left ages out \
-                             the nanosecond after its committed_at + INTENT_RETENTION, since the \
-                             bound is strict, and the next sweep is at least \
-                             INTENT_SWEEP_INTERVAL away",
-                            now.wall,
-                        );
-                        self.next_intent_sweep = Some(next);
+                    (Ok((older, earliest)), Ok(())) => {
+                        // Negative space (hard rule 4): the sweep before this
+                        // one was a full batch, committed, and due again at
+                        // once. Its deletes landed only if none of its records
+                        // is still older than the bound: one found again means
+                        // this sweep re-deletes the same batch at this instant,
+                        // forever.
+                        if let Some(through) = self.full_sweep_through.take() {
+                            assert!(
+                                !older.contains(&through),
+                                "kernel invariant: an intent sweep at {} found record {} older \
+                                 than its bound {before} again, though the full batch the sweep \
+                                 before it committed had deleted it — those deletes did not \
+                                 land, so the sweep would run again at this instant forever. \
+                                 Fix how a delete of `charpente.intents` applies (Writer::delete, \
+                                 which removes the row and its committed_at index entry) or how \
+                                 Tx::intents_committed_before reads the index",
+                                now.wall,
+                                through.raw(),
+                            );
+                        }
+                        let swept = older.len();
+                        if swept == INTENT_SWEEP_BATCH {
+                            // A full batch may have left older records
+                            // behind, so the sweep is due again at once.
+                            self.full_sweep_through = older.last().copied();
+                            self.next_intent_sweep = Some(now.wall);
+                        } else {
+                            let next = match earliest {
+                                // Any record committed from here on has a
+                                // `committed_at` of at least now, so none can
+                                // age out sooner than a retention from now.
+                                None => now.wall + INTENT_RETENTION,
+                                // Due when the oldest record left ages out:
+                                // the bound is strict, so that is the
+                                // nanosecond after its retention ends. But no
+                                // sooner than an interval from now, so deletes
+                                // stay batched.
+                                Some(earliest) => {
+                                    // Negative space (hard rule 4): a sweep
+                                    // short of a full batch deleted every
+                                    // record older than its bound, so none it
+                                    // left is older. With the open assertion
+                                    // above, that puts `earliest` at or after
+                                    // the open, so the open needs no term of
+                                    // its own here.
+                                    assert!(
+                                        earliest >= before,
+                                        "kernel invariant: an intent sweep at {} found {swept} \
+                                         {} older than its bound {before}, fewer than a full \
+                                         batch ({INTENT_SWEEP_BATCH}), and deleted them, yet the \
+                                         oldest record it left was committed at {earliest}, \
+                                         before that bound — either \
+                                         Tx::intents_committed_before and \
+                                         Tx::earliest_intent_committed_at disagree on which \
+                                         records the transaction holds, or the arm's delete loop \
+                                         missed an id the read returned",
+                                        now.wall,
+                                        records(swept),
+                                    );
+                                    // A record a node commits has its step's
+                                    // wall time, so no node commits one this
+                                    // close to the end of time.
+                                    let ages_out = earliest
+                                        .as_nanos()
+                                        .checked_add(INTENT_RETENTION.as_nanos() as u64 + 1)
+                                        .ok_or_else(|| {
+                                            io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                Refusal(format!(
+                                                    "refusing to schedule the intent sweep: \
+                                                     `charpente.intents` holds a record \
+                                                     committed at {earliest} ({} ns), which no \
+                                                     node's clock reads, so its retention ends \
+                                                     past the last time this node can count \
+                                                     to. The request path stamps a record with \
+                                                     its step's wall time, so this one was \
+                                                     written some other way, or the store is \
+                                                     corrupt: restore this node from a replica \
+                                                     or backup",
+                                                    earliest.as_nanos()
+                                                )),
+                                            )
+                                        })?;
+                                    WallTime::from_nanos(ages_out)
+                                        .max(now.wall + INTENT_SWEEP_INTERVAL)
+                                }
+                            };
+                            // Negative space (hard rule 4): a sweep that
+                            // leaves nothing older behind must not be due
+                            // again at this instant, or it would run again,
+                            // delete nothing, and Kernel::step would return
+                            // Worked forever without time passing.
+                            assert!(
+                                next > now.wall,
+                                "kernel invariant: an intent sweep at {} found {swept} {} \
+                                 older than its bound, fewer than a full batch \
+                                 ({INTENT_SWEEP_BATCH}), and set the next one due at {next}, \
+                                 not after now — it would run again at once and find nothing \
+                                 to delete, forever. The oldest record left ages out the \
+                                 nanosecond after its committed_at + INTENT_RETENTION, since the \
+                                 bound is strict, and the next sweep is at least \
+                                 INTENT_SWEEP_INTERVAL away",
+                                now.wall,
+                                records(swept),
+                            );
+                            self.next_intent_sweep = Some(next);
+                        }
                     }
                     // Any commit failure stops the kernel, as the cron arm's
                     // does, for the same reason.

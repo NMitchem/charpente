@@ -19,6 +19,7 @@ use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, route, routes, table};
+use charpente_core::db::Refusal;
 use charpente_core::io::{Clock, Disk, Entropy, Instant, Net, WallTime};
 use charpente_core::table::Id;
 use charpente_sim::checks::{
@@ -768,21 +769,139 @@ fn a_full_batch_is_swept_again_without_waiting_an_interval() {
     let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
     sim.clock().sleep(Duration::from_nanos(DAY));
     let mut left = vec![intents(kernel.app()).len()];
+    let parked = loop {
+        match kernel.step(&mut source).unwrap() {
+            Step::Worked => {
+                let now = intents(kernel.app()).len();
+                if left.last() != Some(&now) {
+                    left.push(now);
+                }
+            }
+            Step::Idle { deadline } => break deadline,
+        }
+    };
+    assert_eq!(
+        left,
+        [4097, 1, 0],
+        "the rows left after each sweep: one full batch, then the last row, with no idle \
+         between them"
+    );
+    assert_eq!(
+        parked.map(Instant::as_nanos),
+        Some(2 * DAY),
+        "the sweep that took the last row ran at the first one's wall, a retention after the \
+         open, and left the record empty, so the next is due a retention after that"
+    );
+}
+
+/// Stages each `(id, committed_at)` straight into the record, as its own row.
+fn stage_intents(app: &mut App, rows: impl IntoIterator<Item = (u64, WallTime)>) {
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let access = group.intent_access();
+    group
+        .stage(|tx| -> Result<(), std::io::Error> {
+            for (id, at) in rows {
+                tx.put_intent(&backlog_row(id, at), &access);
+            }
+            Ok(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+}
+
+/// A record of a write that minted a credential, so it keeps no body.
+fn backlog_row(id: u64, at: WallTime) -> IntentRow {
+    IntentRow {
+        id: Id::from_raw(id),
+        intent: format!("k{id}"),
+        principal: None,
+        route: "POST /hits/:id".to_string(),
+        fingerprint: [0; 32],
+        committed_at: at,
+        status: 200,
+        reply: IntentReply::Credential,
+    }
+}
+
+/// A sweep step costs the records it deletes, not the table (final review
+/// C1): it reads `charpente.intents`'s `committed_at` index from the oldest
+/// entry and stops at the first young one, so draining 4097 aged records
+/// from among 10_000 younger ones reads about 4097 entries. A walk in id
+/// order, which is hash order, re-reads every young row below where it stops
+/// on every step and the whole table to find the earliest: about 34_000 rows
+/// here, and quadratic in the write rate on a loaded node.
+#[test]
+fn a_sweep_reads_the_records_it_deletes_not_the_table() {
+    let (sim, mut app) = intent_app(0x1D7E_3107);
+    let young = WallTime::from_nanos(sim.clock().wall().as_nanos() + HOUR);
+    let mut state = 0x1D7E_3107;
+    let rows: Vec<(u64, WallTime)> = (0..14_097)
+        .map(|i| {
+            let at = if i < 4_097 {
+                WallTime::from_nanos(SEC)
+            } else {
+                young
+            };
+            (splitmix64(&mut state), at)
+        })
+        .collect();
+    stage_intents(&mut app, rows);
+
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    sim.clock().sleep(Duration::from_nanos(DAY));
+    let walked = kernel.app().db().index_entries_walked();
+    let mut left = vec![intents(kernel.app()).len()];
     while let Step::Worked = kernel.step(&mut source).unwrap() {
         let now = intents(kernel.app()).len();
         if left.last() != Some(&now) {
             left.push(now);
         }
     }
+    let walked = kernel.app().db().index_entries_walked() - walked;
     assert_eq!(
         left,
-        [4097, 1, 0],
-        "the rows left after each sweep: one full batch, then the last row, at one wall time"
+        [14_097, 10_001, 10_000],
+        "a full batch of 4096 aged records, then the last one, and every young one kept"
     );
+    assert!(
+        (4_097..=2 * 4_097).contains(&walked),
+        "the sweeps that deleted 4097 records read {walked} index entries: at least one per \
+         record deleted, and at most twice that, never the 10_000 young ones each step"
+    );
+}
+
+/// A record whose retention would end past what a `WallTime` can hold, which
+/// no node commits (the request path stamps its step's wall), stops the
+/// kernel at the sweep that reads it with a named refusal, rather than
+/// panicking in every sweep.
+#[test]
+fn a_record_whose_retention_overflows_the_clock_is_refused_by_name() {
+    let (sim, mut app) = intent_app(0x1D7E_3108);
+    let at = WallTime::from_nanos(u64::MAX - HOUR);
+    stage_intents(&mut app, [(7, at)]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), u64::MAX);
+    sim.clock().sleep(Duration::from_nanos(DAY));
+    let stop = loop {
+        match kernel.step(&mut source) {
+            Ok(Step::Worked) => {}
+            Ok(Step::Idle { .. }) => panic!("the sweep parked instead of refusing"),
+            Err(e) => break e,
+        }
+    };
+    assert!(Refusal::of(&stop).is_some(), "a named refusal: {stop}");
     assert_eq!(
-        sim.now().as_nanos(),
-        DAY,
-        "no time passed between the sweeps"
+        stop.to_string(),
+        format!(
+            "refusing to schedule the intent sweep: `charpente.intents` holds a record \
+             committed at {at} ({} ns), which no node's clock reads, so its retention ends past \
+             the last time this node can count to. The request path stamps a record with its \
+             step's wall time, so this one was written some other way, or the store is corrupt: \
+             restore this node from a replica or backup",
+            u64::MAX - HOUR
+        )
     );
 }
 
@@ -1671,5 +1790,356 @@ fn the_intent_sweep_never_drops_a_live_record_under_faults() {
             "clock:downtime",
             "fault:crash",
         ]
+    );
+}
+
+// ------------------------------- a backlog drained in batches, under faults
+
+/// The backlog property's base, pinned like `SWEEP_BASE`;
+/// `CHARPENTE_BASE_SEED` re-bases it.
+const BACKLOG_BASE: u64 = 0x1D7E_BA00;
+const BACKLOG_UNIVERSES: u64 = 32;
+/// Lives the faulted phase runs, at most, before the settle.
+const BACKLOG_LIVES: u32 = 6;
+/// `INTENT_SWEEP_BATCH`.
+const BATCH: usize = charpente::kernel::INTENT_SWEEP_BATCH;
+
+/// A life stopped, under a crash or a disk fault, after one of its sweeps
+/// had committed a full batch and before the aged records were all gone.
+const STOPPED_BETWEEN_BATCHES: &str = "intent:stopped-between-batches";
+/// A life after such a stop committed a full batch of what was left.
+const RESUMED_THE_BATCHES: &str = "intent:resumed-the-batches";
+
+/// The swarm's disk axes less its two durable-corruption axes, for
+/// `sweep_axes`' reason, with write and read errors at most one operation in
+/// a thousand, and no clock axis: the open term under the clock's jumps is
+/// the property above's. A boot replays the whole backlog into the store, a
+/// few hundred page writes, and at the swarm's rates of up to 15% almost no
+/// boot gets through.
+fn backlog_axes(_seed: u64, cfg: &mut FaultConfig) {
+    cfg.bit_flip = 0.0;
+    cfg.misdirected_write = 0.0;
+    cfg.write_error = cfg.write_error.min(0.001);
+    cfg.read_error = cfg.read_error.min(0.001);
+    cfg.clock_skew = 0;
+    cfg.clock_step_back = (0.0, Duration::ZERO);
+    cfg.clock_downtime = (0.0, Duration::ZERO);
+}
+
+/// The records a backlog universe stages, as `(id, committed_at)`, and the
+/// node's lives since.
+struct Backlog {
+    rows: Vec<(u64, u64)>,
+    lives: Vec<Life>,
+}
+
+impl Backlog {
+    /// The kernel's rule, exactly: a sweep at wall `W` in a life opened at
+    /// `O` deletes a record committed at `c` only once `W >= O +
+    /// INTENT_RETENTION` (it waits a retention after an open) and `W > c +
+    /// INTENT_RETENTION` (its bound is strict). So a record is live while no
+    /// life since it was staged read such a wall.
+    fn live(&self, at: u64) -> bool {
+        self.lives
+            .iter()
+            .all(|life| life.end < life.open + DAY || life.end <= at + DAY)
+    }
+
+    /// Checks the store: every live record is held. Returns how many records
+    /// committed before `aged_before` it holds, or `None` when an injected
+    /// fault stopped the read.
+    fn check(&self, app: &App, aged_before: u64) -> Result<Option<usize>, String> {
+        let rows = match app.db().snapshot().and_then(|s| s.scan::<IntentRow>()) {
+            Ok(rows) => rows,
+            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+            Err(e) => return Err(format!("reading the store: {e}")),
+        };
+        let held: BTreeSet<u64> = rows.iter().map(|row| row.id.raw()).collect();
+        for &(id, at) in &self.rows {
+            if !held.contains(&id) && self.live(at) {
+                let life = self.lives.last().expect("a check follows a staging");
+                return Err(format!(
+                    "record {id}, committed_at {}, is gone though it is live: the latest life \
+                     opened at {} and read {}, and no life since the record was staged read a \
+                     wall at or past its open + INTENT_RETENTION and past committed_at + \
+                     INTENT_RETENTION — a sweep deleted a live record",
+                    wt(at),
+                    wt(life.open),
+                    wt(life.end)
+                ));
+            }
+        }
+        Ok(Some(
+            rows.iter()
+                .filter(|row| row.committed_at.as_nanos() < aged_before)
+                .count(),
+        ))
+    }
+}
+
+/// Boots the node's app through fault fallout. `None` when every boot met
+/// fallout.
+fn boot_app(sim: &Sim) -> Result<Option<App>, String> {
+    for _ in 0..SWEEP_OPENS {
+        let booted = boot_through_fallout(
+            sim,
+            SWEEP_BOOTS,
+            |text| fallout(sim, text),
+            || try_open_app(Box::new(sim.disk()), Box::new(sim.entropy())),
+        )
+        .map_err(|e| format!("a boot failed, and no injected fault explains it: {e}"))?;
+        if booted.is_some() || sim.gave_up().is_some() {
+            return Ok(booted);
+        }
+        reboot(sim);
+    }
+    Ok(None)
+}
+
+/// Stages the backlog through fault fallout, a few hundred records a group:
+/// a put is idempotent, so a group an injected fault stopped is staged again
+/// after a reboot, and a committed one is durable. `false` when the faults
+/// stopped it too often.
+fn stage_backlog(sim: &Sim, rows: &[(u64, u64)]) -> Result<bool, String> {
+    let mut app = None;
+    let mut chunks = rows.chunks(512).peekable();
+    for _ in 0..4 * SWEEP_OPENS * (rows.len() / 512 + 1) as u32 {
+        let Some(chunk) = chunks.peek() else {
+            return Ok(true);
+        };
+        if app.is_none() {
+            app = boot_app(sim)?;
+            if app.is_none() {
+                return Ok(false);
+            }
+        }
+        let db = app.as_mut().expect("booted").db_for_tests();
+        let committed = db.begin_group().and_then(|mut group| {
+            let access = group.intent_access();
+            group
+                .stage(|tx| -> std::io::Result<()> {
+                    for &(id, at) in chunk.iter() {
+                        tx.put_intent(&backlog_row(id, wt(at)), &access);
+                    }
+                    Ok(())
+                })
+                .expect("staging puts reads nothing, so it cannot fail");
+            group.commit().map_err(|failure| failure.error)
+        });
+        match committed {
+            Ok(()) => {
+                chunks.next();
+            }
+            Err(e) if fallout(sim, &e.to_string()) => {
+                app = None;
+                reboot(sim);
+            }
+            Err(e) => return Err(format!("staging the backlog: {e}")),
+        }
+    }
+    Ok(chunks.peek().is_none())
+}
+
+/// Boots the node and builds its kernel through fault fallout, checking the
+/// store at each boot. `None` when every attempt met fallout.
+fn boot_backlog(sim: &Sim, backlog: &Backlog, aged_before: u64) -> Result<Option<Kernel>, String> {
+    for _ in 0..SWEEP_OPENS {
+        let Some(app) = boot_app(sim)? else {
+            return Ok(None);
+        };
+        backlog.check(&app, aged_before)?;
+        let text = match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(mut kernel) => match kernel.app_mut_for_tests().db_for_tests().migrate_schema() {
+                Ok(()) => return Ok(Some(kernel)),
+                Err(e) => e.to_string(),
+            },
+            Err(e) => e.to_string(),
+        };
+        if !fallout(sim, &text) {
+            return Err(format!(
+                "the node did not open, and no injected fault explains it: {text}"
+            ));
+        }
+        reboot(sim);
+    }
+    Ok(None)
+}
+
+/// One life: steps the kernel to virtual time `horizon` or until it stops,
+/// checking the store after every step, and when `crash` arms a crash after
+/// a full batch half the time. Returns the stop's text, whether a full batch
+/// committed, and the aged records the last good read held.
+fn run_backlog_life(
+    sim: &Sim,
+    rng: &mut Rng,
+    backlog: &mut Backlog,
+    kernel: &mut Kernel,
+    (horizon, aged_before, crash): (u64, u64, bool),
+) -> Result<(Option<String>, bool, Option<usize>), String> {
+    let life = backlog.lives.len() - 1;
+    let mut source = SimSource::new(Box::new(sim.clock()), horizon);
+    let mut aged = None;
+    let mut full = false;
+    let stop = loop {
+        let step = kernel.step(&mut source);
+        let wall = kernel.wall_for_sim().as_nanos();
+        backlog.lives[life].end = backlog.lives[life].end.max(wall);
+        if let Some(left) = backlog.check(kernel.app(), aged_before)? {
+            if aged.is_some_and(|before: usize| before >= left + BATCH) {
+                // A full batch landed: maybe a crash before the next.
+                if crash && !full && rng.chance(0.7) {
+                    sim.crash_disk_after(rng.below(6));
+                }
+                full = true;
+            }
+            aged = Some(left);
+        }
+        match step {
+            Ok(Step::Worked) => {}
+            Ok(Step::Idle { deadline }) => {
+                if let Wake::Shutdown = source.wait_until(deadline) {
+                    break None;
+                }
+            }
+            Err(e) => break Some(e.to_string()),
+        }
+    };
+    Ok((stop, full, aged))
+}
+
+/// Two to three full batches of records aged out at the first sweep, among
+/// younger ones that age out over the following two days, staged straight
+/// into the record. Then lives under the universe's disk faults, a crash
+/// armed after a full batch in half of them, each reopened through its stop,
+/// then a fault-free settle past every record's age-out.
+fn backlog_universe(sim: &mut Sim) -> Result<(), String> {
+    let mut rng = Rng::new(sim.seed() ^ 0x1D7E_BAC1);
+    let base = sim.clock().wall().as_nanos();
+    let aged = 3 * BATCH + rng.between(1, 512) as usize;
+    let young = rng.between(50, 200) as usize;
+    let mut state = sim.seed() ^ 0x01D7_E1D5;
+    let rows: Vec<(u64, u64)> = (0..aged + young)
+        .map(|i| {
+            let at = if i < aged {
+                base - rng.between(DAY, 3 * DAY)
+            } else {
+                base + rng.below(6 * HOUR)
+            };
+            (splitmix64(&mut state), at)
+        })
+        .collect();
+    let latest = rows.iter().map(|&(_, at)| at).max().expect("rows");
+    let mut backlog = Backlog {
+        rows,
+        lives: Vec::new(),
+    };
+    if !stage_backlog(sim, &backlog.rows)? {
+        sim.give_up("the backlog never committed", "");
+        return Ok(());
+    }
+
+    let mut marks = BTreeSet::new();
+    let mut stopped = false;
+    for _ in 0..BACKLOG_LIVES {
+        let Some(mut kernel) = boot_backlog(sim, &backlog, base)? else {
+            break;
+        };
+        let open = kernel.wall_for_sim().as_nanos();
+        backlog.lives.push(Life {
+            open,
+            end: open,
+            power_cycled: false,
+        });
+        let horizon = sim.now().as_nanos() + DAY + 2 * HOUR;
+        let (stop, full, left) = run_backlog_life(
+            sim,
+            &mut rng,
+            &mut backlog,
+            &mut kernel,
+            (horizon, base, true),
+        )?;
+        drop(kernel);
+        if full && stopped {
+            marks.insert(RESUMED_THE_BATCHES);
+        }
+        let Some(stop) = stop else {
+            break;
+        };
+        if !fallout(sim, &stop) {
+            return Err(format!(
+                "the kernel stopped, and no injected fault explains it: {stop}"
+            ));
+        }
+        if full && left.is_some_and(|n| n > 0) {
+            marks.insert(STOPPED_BETWEEN_BATCHES);
+            stopped = true;
+        }
+        if sim.disk_crashed() || rng.chance(0.5) {
+            sim.restart();
+        } else {
+            sim.restart_process();
+        }
+    }
+
+    // The settle: a power cycle, then no injected fault, past every record's
+    // age-out and an interval.
+    sim.restart();
+    sim.quiesce_disk_faults();
+    let Some(mut kernel) = boot_backlog(sim, &backlog, base)? else {
+        sim.give_up("the fault-free settle never booted", "");
+        return Ok(());
+    };
+    let open = kernel.wall_for_sim().as_nanos();
+    backlog.lives.push(Life {
+        open,
+        end: open,
+        power_cycled: false,
+    });
+    let horizon = sim.now().as_nanos() + (latest.max(open) - open) + DAY + INTERVAL + MIN;
+    let (stop, _, _) = run_backlog_life(
+        sim,
+        &mut rng,
+        &mut backlog,
+        &mut kernel,
+        (horizon, base, false),
+    )?;
+    if let Some(stop) = stop {
+        return Err(format!("the fault-free settle's kernel stopped: {stop}"));
+    }
+    let held = intents(kernel.app()).len();
+    if held != 0 {
+        return Err(format!(
+            "the settle ran an interval past every record's age-out (its open {}, the latest \
+             committed_at {}), and the sweep left {held} of {} records: it never finished",
+            wt(open),
+            wt(latest),
+            backlog.rows.len()
+        ));
+    }
+    for mark in marks {
+        sim.cover(mark);
+    }
+    Ok(())
+}
+
+/// The sweep's multi-batch path under injected faults (hard rule 3; final
+/// review, ledger line 129). Each universe stages two to three full batches
+/// of aged records among younger ones, then runs the node under the swarm's
+/// disk faults, with a crash armed after a full batch in half of its lives,
+/// and settles free of faults. Its checks:
+///
+/// - **Safety**, after every step and at every boot: no record is gone while
+///   it is live by the kernel's own rule (`Backlog::live`), so a crash or a
+///   failed commit between batches deletes nothing live, and a reopen's open
+///   term holds the rest a further retention.
+/// - **Liveness**: the settle's sweeps finish the backlog, aged and young.
+#[test]
+fn a_backlog_drains_in_batches_through_crashes_without_dropping_a_live_record() {
+    run_universes_swarm_with!(
+        BACKLOG_BASE,
+        BACKLOG_UNIVERSES,
+        backlog_axes,
+        backlog_universe,
+        require: [STOPPED_BETWEEN_BATCHES, RESUMED_THE_BATCHES, "fault:crash"]
     );
 }

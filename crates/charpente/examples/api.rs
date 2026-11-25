@@ -599,8 +599,9 @@ fn tx(
     let _answered: Option<IntentRow> = tx.get_intent(intent.id, intents)?;
     tx.put_intent(intent, intents);
     tx.delete_intent(intent.id, intents);
-    // The ids, in id order, of at most `limit` records committed strictly
-    // before a time: the retention sweep's read.
+    // The ids, oldest first, of at most `limit` records committed strictly
+    // before a time: the retention sweep's read, through the record's
+    // `committed_at` index.
     let _expired: Vec<Id<IntentRow>> =
         tx.intents_committed_before(WallTime::from_nanos(1), 4096, intents)?;
     // The earliest `committed_at` left, `None` for an empty record: the

@@ -1545,11 +1545,15 @@ length is answered from the record for a full day after it regains a primary.
 The kernel deletes older records itself, in a sweep that is first due a full
 retention after the open. Each sweep deletes at most 4096 records
 (`charpente::kernel::INTENT_SWEEP_BATCH`), and runs again at once after a full
-batch. Otherwise it is next due when the oldest record left ages out, but no
-sooner than an hour after this sweep (`INTENT_SWEEP_INTERVAL`), so deletes stay
-batched under steady writes and a record can outlive its retention by up to an
-hour. A sweep that leaves the record empty is next due a full retention later,
-so an idle node sweeps once a day. The lookup itself ignores age: a record the
+batch. It reads the record oldest first, through an index on `committed_at`,
+and stops at the first record it keeps, so a sweep costs the records it deletes
+and not the size of the record. Otherwise it is next due when the oldest record
+left ages out, but no sooner than an hour after this sweep
+(`INTENT_SWEEP_INTERVAL`), so deletes stay batched under steady writes and a
+record can outlive its retention by up to an hour on this node's clock. A
+record carried over from an old primary whose clock ran ahead can outlive it by
+that skew as well. A sweep that leaves the record empty is next due a full
+retention later, so an idle node sweeps once a day. The lookup itself ignores age: a record the
 sweep has not reached still answers. A re-send that arrives after its record
 was swept is a new request. It runs again, and its write applies a second
 time, so a client that may re-send later than that needs the write to be
@@ -8531,7 +8535,9 @@ memorizing a list:
       "name": "charpente.intents",
       "version": 1,
       "fingerprint": null,
-      "indexes": [],
+      "indexes": [
+        "committed_at"
+      ],
       "migrations": [],
       "scoped": false,
       "builtin": true

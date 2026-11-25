@@ -777,6 +777,9 @@ pub struct Store {
     /// Rolling digest of this handle's write-transaction schedule — see
     /// `write_schedule`.
     schedule: AtomicU64,
+    /// Index entries `Snapshot::walk_index` has handed a visitor, over every
+    /// snapshot of this handle — see `index_entries_walked`.
+    walked: Arc<AtomicU64>,
 }
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("charpente.meta");
@@ -1271,6 +1274,7 @@ impl Store {
             db,
             latch,
             schedule: AtomicU64::new(SCHEDULE_SEED),
+            walked: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1420,7 +1424,16 @@ impl Store {
     pub fn snapshot(&self) -> io::Result<Snapshot> {
         Ok(Snapshot {
             txn: self.db.begin_read().map_err(redb_err)?,
+            walked: self.walked.clone(),
         })
+    }
+
+    /// How many index entries `Snapshot::walk_index` has handed a visitor
+    /// since this handle opened. Only the intent sweep's reads walk an index,
+    /// so this is what they have read; a test pins the sweep's cost with it
+    /// (`Db::index_entries_walked`).
+    pub fn index_entries_walked(&self) -> u64 {
+        self.walked.load(Ordering::Relaxed)
     }
 
     /// Applies raw exported rows with NO seq or `next_job_id`/`next_event_id`
@@ -1930,6 +1943,8 @@ fn index_def(name: &str) -> TableDefinition<'_, &'static [u8], ()> {
 
 pub struct Snapshot {
     txn: redb::ReadTransaction,
+    /// The store handle's count, shared — see `Store::index_entries_walked`.
+    walked: Arc<AtomicU64>,
 }
 
 /// `View`'s four reads without its `ReadableBy` bound, crate-private: the
@@ -1965,22 +1980,52 @@ impl Snapshot {
         Ok(out)
     }
 
-    /// `scan_any`'s walk without its decode or its `Vec`: hands `visit` each
-    /// row's id and stored bytes in id order, and stops when it answers
-    /// `false`. For a read that needs one field of each row and must not
-    /// hold the table (`Tx::intents_committed_before`).
-    pub(crate) fn walk_raw<R: UnscopedRow>(
+    /// Hands `visit` each entry of `R`'s index `index_name` as its key and
+    /// its row's id, in the index's order (key, then id) from the first, and
+    /// stops when it answers `false`. It reads no row, so a visitor that
+    /// stops at the first key it does not want reads only the entries before
+    /// it and that one (`Tx::intents_committed_before`, whose keys are
+    /// times). Each entry handed over counts in `Store::index_entries_walked`.
+    pub(crate) fn walk_index<R: UnscopedRow>(
         &self,
-        mut visit: impl FnMut(u64, &[u8]) -> io::Result<bool>,
+        index_name: &str,
+        mut visit: impl FnMut(&[u8], u64) -> io::Result<bool>,
     ) -> io::Result<()> {
-        let rows = match self.txn.open_table(rows_def(R::TABLE)) {
-            Ok(rows) => rows,
+        let index = R::INDEXES
+            .iter()
+            .find(|i| i.name == index_name)
+            .unwrap_or_else(|| panic!("no index named \"{index_name}\" on table {}", R::TABLE));
+        let name = index_table_name(index);
+        let table = match self.txn.open_table(index_def(&name)) {
+            Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(e) => return Err(unscoped_open_err(R::TABLE, e)),
+            Err(e) => return Err(redb_err(e)),
         };
-        for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
-            let (id, value) = entry.map_err(redb_err)?;
-            if !visit(id.value(), value.value())? {
+        for entry in table.iter().map_err(redb_err)? {
+            let (entry_key, _) = entry.map_err(redb_err)?;
+            let bytes = entry_key.value();
+            // `index_entry`'s layout: the key's length (u32, little-endian),
+            // the key, the id (u64, big-endian).
+            let key = bytes
+                .split_first_chunk::<4>()
+                .and_then(|(len, rest)| {
+                    let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
+                    (rest.len() == len.checked_add(8)?).then(|| rest.split_at(len))
+                })
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "index decode: an entry of \"{name}\" is {} bytes, which no key \
+                             length it states fits — the store is corrupt",
+                            bytes.len()
+                        ),
+                    )
+                })?;
+            let (key, id) = key;
+            let id = u64::from_be_bytes(id.try_into().expect("split_at left the 8 id bytes"));
+            self.walked.fetch_add(1, Ordering::Relaxed);
+            if !visit(key, id)? {
                 break;
             }
         }

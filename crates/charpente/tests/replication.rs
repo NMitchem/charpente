@@ -12426,7 +12426,10 @@ fn a_follower_far_behind_its_store_refuses_to_open_by_name() {
 /// so a data directory written under another shape of one of them is NOT
 /// refused at open. This pins their shape beside `PROTO_VERSION`: a change
 /// here must bump both constants and give the directory a detector
-/// (DECISIONS §15).
+/// (DECISIONS §15). The shape includes `charpente.intents`' one index, its
+/// name and its key: a store whose entries were written under another key
+/// would hand the retention sweep records out of time order, and one with no
+/// entries would never sweep its records.
 #[test]
 fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move() {
     use charpente_core::event::EventRow;
@@ -12554,6 +12557,11 @@ fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move(
         hex(&|b| kept.encode_row(b)),
         hex(&|b| credential.encode_row(b)),
         hex(&|b| too_large.encode_row(b)),
+        IntentRow::INDEXES
+            .iter()
+            .map(|i| i.name)
+            .collect::<Vec<_>>(),
+        hex(&|b| (IntentRow::INDEXES[0].key)(&kept, b)),
     );
     assert_eq!(
         got,
@@ -12565,11 +12573,13 @@ fn the_unfingerprinted_platform_rows_keep_their_shape_until_both_constants_move(
             "0100000000000000010000007402000000cdab00000000000001010000000000000002000000000000000103000000".to_string(),
             "0100000000000000010000006b01010000007007000000504f5354202f7206060606060606060606060606060606060606060606060606060606060606060200000000000000c9000001000000010000006801000000760100000009".to_string(),
             "0200000000000000010000006b0007000000504f5354202f7206060606060606060606060606060606060606060606060606060606060606060200000000000000c80001".to_string(),
-            "0300000000000000010000006b01010000007007000000504f5354202f7206060606060606060606060606060606060606060606060606060606060606060200000000000000ca00020100010000000000".to_string()
+            "0300000000000000010000006b01010000007007000000504f5354202f7206060606060606060606060606060606060606060606060606060606060606060200000000000000ca00020100010000000000".to_string(),
+            vec!["committed_at"],
+            "0000000000000002".to_string()
         ),
         "no fingerprint guards charpente.jobs, charpente.events, charpente.schema_versions or \
-         charpente.intents, so a stale data directory is NOT refused at open when one of them \
-         changes; the fix is to bump PROTO_VERSION and MANIFEST_FORMAT and give the directory a \
+         charpente.intents (its rows or its committed_at index), so a stale data directory is \
+         NOT refused at open when one of them changes; the fix is to bump PROTO_VERSION and MANIFEST_FORMAT and give the directory a \
          detector, by gating the table or changing it with a fingerprinted platform table \
          (DECISIONS §15)"
     );

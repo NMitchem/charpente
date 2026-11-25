@@ -175,7 +175,9 @@ const GOLDEN: &str = r#"{
       "name": "charpente.intents",
       "version": 1,
       "fingerprint": null,
-      "indexes": [],
+      "indexes": [
+        "committed_at"
+      ],
       "migrations": [],
       "scoped": false,
       "builtin": true

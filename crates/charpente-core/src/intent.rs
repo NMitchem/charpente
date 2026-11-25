@@ -27,6 +27,12 @@ pub const INTENT_RETENTION: Duration = Duration::from_secs(86_400);
 /// transaction (`Tx::get_intent`, `put_intent`, `delete_intent`,
 /// `intents_committed_before`, `earliest_intent_committed_at`). Code that
 /// holds the `Db` reads it through a snapshot.
+///
+/// The store keeps one index on it, `COMMITTED_AT_INDEX`, which orders the
+/// rows by `committed_at`, so the retention sweep reads the oldest rows
+/// first and stops at the first young one (spec §4.4). Its entries are
+/// derived in the store transaction that applies each row's put or delete,
+/// as every table's are, so an entry and its row commit together.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IntentRow {
     pub id: Id<IntentRow>,
@@ -69,7 +75,10 @@ pub enum IntentReply {
 impl Row for IntentRow {
     type Scope = crate::table::PlatformOwned;
     const TABLE: &'static str = "charpente.intents";
-    const INDEXES: &'static [IndexDef<IntentRow>] = &[];
+    const INDEXES: &'static [IndexDef<IntentRow>] = &[IndexDef {
+        name: COMMITTED_AT_INDEX,
+        key: |row, out| out.extend_from_slice(&row.committed_at.as_nanos().to_be_bytes()),
+    }];
 
     fn id(&self) -> Id<IntentRow> {
         self.id
@@ -167,12 +176,33 @@ impl Row for IntentRow {
     }
 }
 
+/// The name of `IntentRow`'s one index: its `committed_at`, big-endian, so
+/// the store's byte order over the entries is time order (spec §4.4).
+pub(crate) const COMMITTED_AT_INDEX: &str = "committed_at";
+
 impl IntentRow {
-    /// A stored row's `committed_at`, read without decoding the reply after
-    /// it. The retention sweep's scan reads only this of each row, so it
-    /// never holds a kept body (spec §4.4).
+    /// A staged row's `committed_at`, read without decoding the reply after
+    /// it. The retention sweep decodes no stored row: it reads the index for
+    /// those, and only the overlays' rows this far, so it never holds a kept
+    /// body (spec §4.4).
     pub(crate) fn committed_at_of(bytes: &[u8]) -> io::Result<WallTime> {
         Ok(Head::decode(&mut &bytes[..])?.committed_at)
+    }
+
+    /// The `committed_at` a `COMMITTED_AT_INDEX` entry's key holds.
+    pub(crate) fn committed_at_of_key(key: &[u8]) -> io::Result<WallTime> {
+        let nanos: [u8; 8] = key.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "index decode: an entry of {}'s \"{COMMITTED_AT_INDEX}\" index has a {}-byte \
+                     key, where a committed_at is 8 — the store is corrupt",
+                    IntentRow::TABLE,
+                    key.len()
+                ),
+            )
+        })?;
+        Ok(WallTime::from_nanos(u64::from_be_bytes(nanos)))
     }
 }
 
@@ -191,6 +221,21 @@ impl Head {
     fn decode(input: &mut &[u8]) -> io::Result<Head> {
         let id = Id::decode(input)?;
         let intent = String::decode(input)?;
+        // `encode_row`'s assertion, as a refusal: a row replayed from a log
+        // or a store that holds another id was never checked, and must be
+        // refused by name rather than panic the node that reads it.
+        if !(1..=255).contains(&intent.len()) || !intent.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "row decode: IntentRow {}'s intent id {intent:?} is not 1 to 255 visible \
+                     ASCII bytes (0x21..=0x7e) — the request path refuses any other id before \
+                     it records one, so the stored row is corrupt",
+                    id.raw()
+                ),
+            ));
+        }
         let principal = Option::<String>::decode(input)?;
         let route = String::decode(input)?;
         let Some((fingerprint, rest)) = input.split_first_chunk::<32>() else {
