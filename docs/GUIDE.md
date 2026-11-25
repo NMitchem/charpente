@@ -3970,9 +3970,10 @@ supervisor loop inside the phase, a script that reads one phase's answers to
 build the next, several nodes, a check between the phase and the tail, and a
 check that reads the frames an SSE subscriber received (`source.sinks()`):
 `Drive` hands back neither phase's source, so it exposes no frames. §11's
-"Testing a tail in sim" builds its source by hand to read them. A route that
-cannot take the re-send is not a reason to drop below it: fix the route
-(above). Keep each step's rule as `Drive` has it:
+"Testing a tail in sim" builds its source by hand to read them. A re-send
+that reaches a route twice, a GET that writes (§5) or a write sent without its
+route's declared id header, is not a reason to drop below the helper: fix the
+route or the workload (above). Keep each step's rule as `Drive` has it:
 - use the fallout filter in every step;
 - treat a crash in the faulted phase as the crash under test, not a skip;
 - quiesce before the tail boots, and wait out a clock refusal;
@@ -5087,9 +5088,11 @@ struct OrderBody {
 #[route(POST "/order", public)]
 fn order(tx: &mut Tx, body: OrderBody) -> Result<WireU64, ApiError> {
     let id: Id<Receipt> = Id::from_raw(body.order.0);
-    // The tail re-sends an order the phase left unanswered: one that landed
-    // anyway is answered as placed, with no second receipt. The request is
-    // the order's id alone, so a repeat is always the same request.
+    // The tail's re-send carries the Idempotency-Key its first copy carried,
+    // and charpente answers one that landed from its record, so it never
+    // reaches here. The guard is for a second POST of a stored order under a
+    // new key: it is answered as placed, with no second receipt. The request
+    // is the order's id alone, so a repeat is always the same request.
     if tx.get(id)?.is_some() {
         return Ok(body.order);
     }
@@ -5174,7 +5177,9 @@ faults drops below the helper and runs the phase as a supervisor loop: restart
 the process (`sim.restart_process()`, or `sim.restart()` once
 `sim.disk_crashed()`), boot through `boot_through_fallout`, build a fresh
 handle and kernel, and re-send in a new `SimSource` every request the last one
-left unanswered, until the phase's time is up. Read that from the last
+left unanswered, each the same copy under the intent id it was first sent with
+(`Request::intent`, "A re-sent write is answered once" above), until the
+phase's time is up. Read that from the last
 source's `answers()`, slot by slot, by the rule `Drive` applies: a `None`
 slot, or a 5xx whose body is fault fallout
 (`is_fault_fallout(t) || clock_fallout(sim, t)`). A 4xx, or a handler's own
