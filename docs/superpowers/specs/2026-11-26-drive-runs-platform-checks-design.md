@@ -53,8 +53,10 @@ says), `recover` reads one snapshot of the tail kernel's store and runs:
   one.
 - `calls_have_durable_jobs(sim, &snap)`: every call that reached a remote carries a durable
   job's key. When it fails and `durable_corruption_fired(sim)` holds, `recover` gives the
-  universe up with `sim.give_up`, under a reason naming the cut enqueue, and returns
-  `Ok(None)`, as it does for its other give-ups. Otherwise it returns the check's `Err`.
+  universe up with `sim.give_up("injected corruption cut an enqueue after its call reached
+  the remote", <the check's text>)` and returns `Ok(None)`, as it does for its other
+  give-ups. Otherwise it returns the check's `Err`. *(Revised while planning: the reason is
+  pinned here because the double-charge GOLDEN and README quote it; see Evidence.)*
 - `dead_hooks_succeeded(&snap)` *(call: in; Noah approved)*. A hook that returns `Err`
   leaves the job Dead and its compensation undone. An app that means to skip the
   compensation returns `Ok`, so no business outcome becomes unreachable.
@@ -88,18 +90,23 @@ condition the check tests (`checks.rs`), so after `recover` it cannot fail. Its 
   that breaks the rule fails through `recover` alone, with the check's text, and its test
   calls no check. Deleting that check's call in `recover` makes the test fail, which proves
   the wiring is what catches it.
-- **The give-up.** A seed where durable corruption cut an enqueue whose call already reached
-  the remote is given up by `recover`, not failed. If no such seed is found, say so and
-  keep the branch tested by a constructed case.
-- **No universe moves.** The double-charge patched copy's GOLDEN and every recorded batch
-  stay byte-identical. A change there means the checks drew something, and that is a bug in
-  this change, not a re-pin.
+- **The give-up.** The double-charge GOLDEN already names a natural seed for it:
+  `0x11c23979e56d3608` under master `0x434841524745`, where injected corruption cut an
+  enqueue after its call reached the gateway, and the app gave the run up itself. After
+  this change `recover` gives that same universe up first. A constructed case (an orphan
+  call plus a corruption mark) also pins the branch in `charpente-sim`'s own tests.
+- **No universe moves.** Every recorded batch stays byte-identical, with one named
+  exception *(revised while planning)*: in the double-charge GOLDEN
+  (`crates/charpente-cli/tests/demo.rs`) and README's quote of it (`README.md:119`), the
+  give-up line for `0x11c23979e56d3608` carries `recover`'s reason in place of the app's
+  own ("…reached the remote" for "…reached the gateway"). Its count, its first seed and
+  every other line stay the same. Any other change means the checks drew something, and
+  that is a bug in this change, not a re-pin.
 - The workspace suite green by count, fmt and clippy clean, and `charpente test --sim` over
   fresh master seeds for sim-fixture, invoicing, outbound-fixture, a fresh scaffold and the
   double-charge copy, with the seed recorded.
 
 ## Left to the builder
 
-- The give-up reason's exact text.
 - Whether `recover` reads one snapshot for all three checks or each check reads its own.
 - The `tests/drive.rs` assertions noted above.
