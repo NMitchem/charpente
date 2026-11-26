@@ -1,6 +1,53 @@
 # The fault-free twin
 
-Status: **paused**, 2026-11-22, revision 2. Noah chose the direction and handed the rest
+Status: **parked**, 2026-11-26, after the review below. PLAN's after-launch table carries
+it with the trigger that reopens it. Revision 2, after the review, stays as the record of
+what was tried.
+
+## The 2026-11-26 review
+
+Noah asked for the approach to be checked from the top, because each review round had
+added an excuse, and hard rule 2 names that pattern. Three findings came out of it.
+
+**1. Revision 2 compares against the wrong run.** It switches every fault off, outbound
+errors and latency included. An app may react to those on purpose. It may release a hold
+when payment is not confirmed in time, approve small orders while a fraud service is down,
+or tell a customer at once that a charge failed on a 503. Each of those makes the faulted
+outcome differ from the fault-free one, so revision 2 fails an app for a business
+decision. An oracle stricter than the real contract also teaches an agent to hide logic
+from it. Every excuse in §5.4 and every open question in §12 traces back to this.
+
+**2. A reference that needs no excuses.** Remove only the faults the platform promises to
+hide: crashes, power loss, torn writes, lost replies and re-sends, failover, and partitions
+between client and server. Replay everything the app observed as the faulted run saw it:
+each logical request once, in the order it committed, each transaction's clock reading,
+and each remote reply, errors and outages included. The two end states must then be
+byte-identical. The only exceptions are the loss windows already documented (DESIGN §2's
+cut acked frame, DECISIONS §6's failover window). Remote errors, latency and deadlines are the
+app's policy, and the oracle has no say over them. Matching the two runs may need job ids
+and outbound keys derived from their cause instead of drawn.
+
+**3. Its value does not cover its cost yet.** 0.7.0 makes the spike's one catch, the double
+charge, impossible by construction. What is left for the twin is a fault the platform
+failed to hide, and app state kept outside what the app observes. Two fresh agents with no
+part in this discussion reviewed it as the user it is for, an agent building an app on
+charpente, and both said to park it. A twin red is usually charpente's bug, which the
+app's author can neither fix nor switch off, and a red nobody can attribute teaches the
+agent to reshape the app until the red goes away. The cheaper step comes first: `Drive`
+runs the platform checks itself, so an app no longer has to remember to call them.
+
+If it is revived:
+- It runs over charpente's own fixture apps, in CI and nightly, as the platform's
+  regression oracle, and stays out of an app author's inner loop.
+- A red names the first transaction that diverged (the request or job, and its intent
+  id), what it read in each run, the fault that fired before it, and whether the app or
+  the platform wrote the value that differs.
+- A re-spike comes first, and any false red is a perturbation to remove at its source,
+  never an excuse to add.
+
+## Revision 2 (2026-11-22)
+
+Status then: **paused**, 2026-11-22, revision 2. Noah chose the direction and handed the rest
 over ("you have autonomy"). The choices marked *(call)* are the designer's. This is step 2
 of two. It builds on step 1, retry-safe writes (`2026-11-22-retry-safe-writes-design.md`),
 whose intent records tell the twin which requests committed.
