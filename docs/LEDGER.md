@@ -9951,3 +9951,60 @@ The outside stress test found no git tags. Each release is now tagged at the com
 | `v0.6.0` | `a1772343` | LEDGER 2026-11-21, and the outside tester's pin |
 
 The tags are annotated (`charpente <version>`). `v0.6.0` carries the GitHub release, which holds the video and CHANGELOG's 0.6.0 section. The v0.5.0 draft release was deleted, and its tag stays.
+
+## 2026-11-25 — retry-safe writes (0.7.0, unreleased), built
+
+**Why.** Noah chose the contract on 2026-11-22: every write carries an intent id, and charpente throws away repeats. That is step 1 of the fault-free twin (`docs/superpowers/specs/2026-11-22-fault-free-twin-design.md`), which stays paused until a re-spike on top of this step. Spec: `docs/superpowers/specs/2026-11-22-retry-safe-writes-design.md` (revision 3). Plan: `docs/superpowers/plans/2026-11-22-retry-safe-writes.md`, nine tasks run subagent-driven in the worktree `charpente-rsw`, branch `retry-safe-writes`, `f2f8a7d1..0883dcdb`, plus the commit that adds this entry.
+
+- **What landed.**
+  - A write route (POST, PUT, PATCH or DELETE, not SSE) reads an intent id from `Idempotency-Key`, or from the header a webhook route names with `#[route(..., intent = header("X-Event-Id"))]`. The kernel looks the id up in the request's own staged transaction, after auth. A repeat is answered from the stored reply, marked `idempotent-replayed: true`, and the handler does not run. A fresh write's reply is recorded in the same transaction when the write had effects.
+  - The same id on a different request is refused with a 422. A reply that minted a credential, or one over 64 KiB, is not kept, and a repeat of it gets a 409. A write that reaches the wire with no id is refused with a 400, before any entropy is drawn. `App::handle` and `SimSource` are not refused.
+  - The records live in a sealed core table, `charpente.intents`. A transaction reaches it only through an `IntentAccess` that a `Group` mints. `PROTO_VERSION` is 9 and `MANIFEST_FORMAT` is 6.
+  - The kernel deletes a record 24 hours after the later of its commit and the node's latest open. The sweep reads an index on `committed_at`, oldest first, so a step costs the records it deletes.
+  - `charpente_sim::drive` stamps every write it sends, so a recovery re-send applies once. `describe` names each write route's intent header. The generated TS client sends an id on every write.
+- **Red first (hard rule 3).** Drive stamping was written against `a_resent_write_applies_once_under_drive`, red at seed `0x9fd85b51a6bbe687` ("tally is 13 but 12 distinct writes landed"). That seed is pinned as a replay test.
+- **The double-charge example is green under 0.7.0** with its guard still missing. Its patched copy in `charpente-cli/tests/demo.rs` has a new GOLDEN, and README keeps 0.6.0's red run as labelled history. A second POST of the same order under a new key still places it twice, and README says so.
+- **Final whole-branch review** (opus, `f2f8a7d1..3e72e93f`): ready with fixes. It found one Critical and one Important.
+  - Critical: the sweep cost grew with the square of the write rate. Row ids are hashes, so each batch walked the table from id 0. The Task 7 ruling against a `committed_at` index had assumed one walk per sweep. That ruling is reversed: `2d42da2c` adds the index, and `a_sweep_reads_the_records_it_deletes_not_the_table` reads 4,100 index entries where the old walk read 34,098.
+  - Important: nothing re-sent a write to a promoted follower. `27ed419d` adds a seeded property with two variants, the follower holding the record by stream or by reseed. DECISIONS §6's loss window is excused by name in the stream variant only.
+  - The fix wave, `2d42da2c..b03e65ae`, re-reviewed clean. A small cleanup round, `0883dcdb`, re-reviewed clean too. It made the full-batch progress assert compare `(id, committed_at)`, which changed `Tx::intents_committed_before` to return pairs.
+- **Evidence at `0883dcdb`:**
+  - The workspace suite passes 109 of 109 binaries (106 `test result: ok`, 3 `sim result: ok`). fmt and clippy `-D warnings` are clean.
+  - Fresh master seed `0x42850b26632cc815`, `--runs 500`, every check passed:
+
+    | App | Checks | Tested runs |
+    |---|---|---|
+    | sim-fixture | 6 of 6 | |
+    | invoicing | 7 of 7 | `overdue_reminders_over_months` 193 of 500 |
+    | outbound-fixture | 1 of 1 | 483 |
+    | a fresh `charpente new` scaffold | 4 of 4 | |
+    | the double-charge example's patched copy | 1 of 1 | 478 over 49 distinct inputs |
+
+  - Fresh bases, 6 of each:
+    - the backlog property: 6 of 6;
+    - Task 9a's faulted sweep property: 6 of 6;
+    - the failover re-send property: 6 of 6.
+  - The edge rig (`scripts/edge-harness.sh`) passes 11 of 11 binaries and 47 tests.
+  - ts-fixture: `npm ci`, the type check and 26 of 26 tests pass, and `check-client` reports no drift.
+  - Mutation over `crates/charpente/src/http/intent.rs` (`--test-package charpente`, master seed `0x3d9b03b88202defb`) catches 26 of 26 viable mutants, with 9 unviable. The verb reported 25 of 25: a cargo-mutants worker died with "No space left on device" and `is_write -> bool with true` was never judged. That mutant was then proved by hand, red in six tests including `serve::tests::a_wire_get_needs_no_key`. `row_id` and `malformed` have no viable mutant. Their unit tests pin them directly.
+- **Found: the mutation instrument reports a short run as green.** When a cargo-mutants worker dies mid-run, `outcomes.json` records `total_mutants` as the number it judged (34), not the number it found (35). `charpente test --mutants` reads that file and checks the disk only in the baseline's log, so it printed `34 total — 25 caught, 0 missed` and exited 0 with a mutant never judged. It should compare the count `cargo mutants --list` gives with the count judged, and exit 2 naming each lost mutant. Not fixed here: it is outside this step.
+- **Calls the controller made** (Noah may rework them). Each says what it costs if wrong.
+  - Implementers ran per-package suites in the foreground, and the controller ran the workspace suite. Cost if wrong: one extra run per task.
+  - Spec §3 now says exactly what a 0.6.0 binary refuses: a log that still holds an intent record. No detector was built for a checkpointed directory, because DECISIONS §15 owes no downgrade.
+  - The sweep's schedule:
+    - first due a full retention after an open;
+    - after a full batch of 4096, due again at once;
+    - when the table is empty, due a retention later;
+    - otherwise, when the oldest record ages out, but no sooner than an hour after the last sweep.
+
+    A plain hourly sweep cost invoicing tested runs, and pure age-out scheduling livelocked.
+  - Task 7's missing faulted test became Task 9a's property, under hard rule 3.
+  - Two items were parked:
+    - M3: a kept reply can push a transaction already near `MAX_RECORD_BYTES` over the limit. It belongs to the existing near-cap class.
+    - M9: a wall-clock jump from suspend and resume is not treated as an open, so records can age out early for a client that slept through it.
+  - Main pins `=0.7.0` before the publish, as `6b8c5166` did for 0.6.0. Cost if wrong: a stranger who clones main before the publish cannot build the double-charge example.
+- **Noah's:**
+  - README's lead and video show the 0.6.0 bug that 0.7.0 makes impossible. Only the caption changed, to say the video is 0.6.0's run. Whether to reframe the lead, the video and `docs/demo/double-charge.tape` is open. The tape's header is now partly false.
+  - docs/BENCH.md's wire numbers predate intent rows. Each keyed write now writes a record and an index entry, so the wire write path and the sweep over a large table need measuring before any 0.7.0 figure is quoted.
+  - The publish. The double-charge example's `Cargo.lock` needs refreshing from the published crates, as 0.6.0's Task 8 did.
+  - The twin's re-spike on top of this step (worktree `charpente-twin-spike`, uncommitted). Its design doc §12 lists seven open questions.

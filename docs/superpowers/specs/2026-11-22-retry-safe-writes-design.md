@@ -1,6 +1,6 @@
 # Retry-safe writes
 
-Status: design, 2026-11-22, revision 3. Noah chose the contract ("every write carries an
+Status: built 2026-11-25 (LEDGER 2026-11-25); designed 2026-11-22, revision 3. Noah chose the contract ("every write carries an
 order number, and charpente throws away repeats", option 1 of the 2026-11-22 twin
 discussion) and handed the rest over ("you have autonomy"). The choices marked *(call)* are
 the designer's. This is step 1 of two. Step 2, the fault-free twin
