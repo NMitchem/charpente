@@ -141,5 +141,5 @@ Charpente bets that within a few years most backends will be written by agents a
 by people, and that those people will choose platforms the way they once chose CI systems:
 by how reliably the machine catches the machine's mistakes. The framework that wins then
 will be the one that can tell a person: *every path through this system has been executed,
-under fault, thousands of times, and judged against promises its builder could not edit.
-Here is the seed to prove it, and beside it is what no promise covers.*
+under fault, thousands of times. Here is the seed to prove it, what was judged against
+promises its builder could not edit, and what no promise covers.*
