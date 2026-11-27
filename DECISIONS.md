@@ -455,3 +455,103 @@ seconds and every parallel API is a second surface to keep true; and **migration
 platform state between releases**, because each one is a code path that runs once per
 adopter, under no oracle the sim exercises daily. Reopen if: an adopter's data cannot be
 re-created from its own source of truth and must cross a charpente minor.
+
+**Reopened 2026-11-26 (Noah): from 1.0.0, data and unfinished work are carried.** (Noah's
+own hand: the road-to-1.0 spec, `docs/superpowers/specs/2026-11-26-road-to-1-0-design.md`,
+§7 D1 and §12.) The condition above waits for an adopter, and charpente has none, so Noah's
+decision meets it instead: §16 puts data that survives every upgrade into 1.0's goal. Until
+1.0.0, nothing in this entry changes. From 1.0.0, data that release or any later one wrote
+crosses every later charpente release, along with the app's unfinished work. That covers
+every platform table (sessions, keys, cron rows, jobs, events, intents, schema versions),
+the log, and archive buckets. Data written by any 0.x release or release candidate does not
+reach 1.0.0, and downgrades stay refused by name. The API half of this entry is unchanged:
+APIs change in place, a break arrives as a compile error that names the fix, and there are
+no parallel APIs. Nothing is decided here about how API breaks are numbered after 1.0.
+Platform migrations were rejected above because each one is "a code path that runs once per
+adopter, under no oracle the sim exercises daily". Snapshot rehearsal answers that, because
+the upgrade path then runs in the sim, on snapshots, before every release. Both are 1.0
+work (§16), and neither is built yet.
+
+## 16. 1.0 is accepting an agent's change without reading it (2026-11-26)
+
+1.0 is defined by one goal, decided by Noah on 2026-11-26 in the road-to-1.0 spec
+(`docs/superpowers/specs/2026-11-26-road-to-1-0-design.md`):
+
+> An outside team can hand one consequential workflow to agents, let them change it many
+> times, and accept each change without reading the code. charpente gives them a verdict
+> anyone can re-check, saying which of the team's promises were checked, how strongly, and
+> what nothing checked. Their data and unfinished work survive every charpente upgrade.
+
+In one line: accept an agent's change without reading it, and keep the business you already
+have. Its parts are ranked. The verdict, judged against promises the building agent cannot
+edit, is the point. Rehearsing a change on a copy of real data is what makes the verdict
+mean something. Data surviving upgrades is the price of entry (§15's annotation), because
+no team trusts a workflow to a platform that refuses last month's data. The full experiment
+is the proof.
+
+When M3 closed, the bet was that simulation and compile-time contracts make an agent's
+backend trustworthy. Renewly, 0.5.0's docs-only build, passed all seven of its checks and
+caught every viable mutant, but no check read the amount charged, so a plan billed at ten
+times its price would have passed (`docs/experiments/2026-11-0.5.0-docs-only/README.md`,
+R4). The launch demo's rehearsal tied a conventional TypeScript and Postgres stack
+(docs/LEDGER.md, 2026-11-19). The agent writes both the code and the checks that judge it,
+and nothing outside the agent says what was never checked. charpente closes that loop for
+the platform, through compile errors and `charpente_sim::checks`, and 1.0 is the milestone
+that closes it for an app's business logic. Noah's call is that the frontier has moved and
+charpente buys in, so decisions made for the earlier frontier change where they stand in
+the way, as §15 does.
+
+A consequential workflow is any workflow with both of two properties. A mistake costs
+someone, since a wrong answer that costs nothing needs no verdict. And something outside
+the app can say whether the mistake happened: a processor's settlement record, a receipt, a
+seat map, an access log. That second property is what makes a promise checkable at all.
+Billing, selling something scarce (seats, slots, inventory), deciding who may see or do
+what, obligations with deadlines, and orders and fulfillment all qualify. Workflows where
+nobody can state what "right" means, such as ranking, recommendation or UI, are out.
+MANIFESTO §8's scope still holds: greenfield backends, one box. Money is the first proving
+ground, because it leaves independent records. It does not set the scope, and the 1.0 gate
+tests two domains so the framework can't end up shaped to payments.
+
+The work goes in order C: a small baseline early, and the full experiment as the gate. It
+builds the cheap verdict pieces and F1 (PLAN.md's row for a `#[route]` that answers a
+status other than 200), runs a small baseline experiment, builds the rest in an order the
+baseline can change, and then runs the full experiment as 1.0's exit. The cost is a second
+experiment run. Agent compute is cheap at Renewly's rate, and the hidden checks written for
+the baseline are reused. The baseline keeps the buy-in honest, because it measures the
+thesis before most of 1.0 is built. Rejected: **A, build then prove** (every 1.0 piece
+first, then the experiment as the gate), because a losing thesis would show only after a
+month or two of building; and **B, prove then build** (the experiment first, on 0.7.0 plus
+F1, with the losses picking the features), because it measures a charpente that has none of
+the 1.0 pieces, so it may only repeat the rehearsal's tie. The four stages and their exit
+criteria are in PLAN.md's 1.0 section.
+
+1.0 requires charpente to meet the predictions it registered before the full experiment ran
+(Noah, 2026-11-26). That experiment covers two domains (billing, and one that allocates
+something scarce, such as appointment slots), both arms (charpente and a conventional
+stack), hidden checks the builders never see, and, partway through, a policy change, a
+provider discrepancy and a charpente upgrade with work pending (spec §6, stage 4). Its
+record is published whatever it shows. On a miss, the work fixes what the record found and
+the experiment runs once more. If the rerun misses too, the work stops and the goal reopens
+(below). 1.0 does not ship on a miss, and the experiment does not run a third time.
+
+Refused here: an agent manager, a merge queue and a hosted control plane. Other projects
+can manage the agents, and charpente owns the verdict those managers read. The hosted
+control plane stays off the roadmap, as PLAN.md already says. Proving app code (Lean,
+Verus, extraction) and replaying recorded production requests wait on two new
+trigger-gated rows in PLAN.md, "Proving app code" and "Replaying recorded production
+requests". An MCP or agent tool surface generated from `describe` waits on its existing
+row, the agent-integration contract, which keeps its trigger. A multi-threaded kernel stays
+rejected by §6, and docs/BENCH.md's per-phase attribution of a batched commit does not show
+the kernel loop as the bottleneck §6 waits for. The fault-free twin stays parked
+(2026-11-26), and its PLAN.md row stays. API stability is out as well: APIs still change in
+place (§15 and its annotation).
+
+Reopen if:
+- the full experiment misses its registered predictions twice. This reopens the goal in
+  spec §2, and the condition is Noah's (2026-11-26).
+- the baseline (stage 2) or the full experiment (stage 4) finds a class of promise that
+  teams need checked and that lacks one of the two properties. This reopens the definition
+  in spec §3 (proposed, not Noah's own hand).
+- the baseline (stage 2) can't be run for its stated cost, for example because hidden
+  checks can't be written in a sensible amount of Noah's time. This reopens order C (spec
+  §5): the work falls back to A, and the gate stays (proposed, not Noah's own hand).
