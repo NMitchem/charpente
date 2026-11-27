@@ -10137,3 +10137,55 @@ Noah the same day. Plan commit `0fa8aa90`.
     `dead_hooks_succeeded`, which it does (Task 2 used the plan's dictated text); and
     `calls_have_durable_jobs`'s rustdoc and GUIDE checker-list entry do not yet say a failed
     hook outranks its give-up.
+
+## 2026-11-26 — the road to 1.0, decided
+
+A docs-only pass. Spec: `docs/superpowers/specs/2026-11-26-road-to-1-0-design.md` (`b2c48266`),
+plan `565aacab`. No code changed.
+
+- **What Noah decided.**
+  - The goal: an outside team can hand one consequential workflow to agents, let them change
+    it many times, and accept each change without reading the code. charpente gives them a
+    verdict anyone can re-check, saying which promises were checked, how strongly, and what
+    nothing checked. Their data and unfinished work survive every upgrade. In one line:
+    accept an agent's change without reading it, and keep the business you already have.
+  - The definition: 1.0 is that goal, and the experiment is its proof.
+  - Order C: build the cheap verdict pieces, run a small baseline experiment, build the rest
+    in an order the baseline can change, then run the full experiment as the gate.
+  - The gate and stopping rule: 1.0 requires charpente to meet the predictions registered
+    before the full experiment. One rerun is allowed. A second miss stops the work and
+    reopens the goal.
+  - The data promise starts at 1.0.0. Data written by any 0.x release or release candidate
+    does not reach 1.0.0, and downgrades stay unsupported. APIs still change in place.
+  - How API breaks are numbered after 1.0 is left out. No document says.
+- **Where it came from.**
+  - Two outside agents reviewed charpente against Noah's essay and the "2027 bets"
+    artifact.
+  - Claude checked their repo claims, and two were wrong. One agent reversed the order of
+    Renewly's 1-in-1953 planted double charge: 1953 runs came before the builder's workload
+    change and 4 of 256 after. A "72% of the commit window is disk sync" figure is not in
+    `docs/BENCH.md`, which has the WAL sync at about 40%. Both agents' double-charge framing
+    also predated 0.7.0's retry-safe writes.
+  - Claude checked the Waterloo verification page for the Alpöge proof and OpenAI's
+    Navier–Stokes page. Both matched what the agents cited.
+  - The spec's §10 holds the evidence that survived the check.
+- **What changed.**
+  - DECISIONS: §15 annotated (data carried from 1.0.0), §16 added (the goal): `e9b92245`.
+  - MANIFESTO §6, §8 and §9, and the census exemption "1.0" (`EXEMPT_COUNT` 15):
+    `4c7d263d`, `e5351925`, `cb90e716`.
+  - PLAN: the 1.0 milestone, rows it takes on marked in place, two new rows, two risks:
+    `9a1bf786`. Then `3801ab3b`: GUIDE's row references now say "after-launch" and DESIGN's
+    status line follows the retitled table.
+  - README: "Where it's going", the Limits line on data before 1.0, the route bullet, and a
+    CHANGELOG 0.7.0 `### Changed` bullet: `9e0352d0`. Then `94e4eba2`: the Docs table's PLAN
+    row.
+  - CLAUDE.md: a fifth consequence, the "framework is the reviewer" bullet (types judge
+    shape, promises judge values), "What this is" and "Current state": `1f8f7268`.
+  - Every data-promise statement in DECISIONS, MANIFESTO, PLAN, README and CLAUDE.md was read
+    side by side and agrees: it starts at 1.0.0, 0.x data does not reach it, it covers data
+    and unfinished work, and APIs still change in place.
+- **Gates.** At `1f8f7268`: `cargo test -p guide-examples --no-fail-fast` exits 0 with 11
+  `test result: ok` lines, 0 FAILED, 48 tests passed, the same 11 and 48 as the baseline
+  at `565aacab`. `cargo test -p charpente-cli --test demo readme` passes (1 ok line, 3
+  tests). `cargo fmt --all --check` exits 0. Clippy and the workspace suite were not rerun:
+  nothing but docs and one census exemption changed.
