@@ -93,9 +93,9 @@ Charpente replaces the human review that no longer happens with machine verifica
   any two writes, torn pages, partitions and clock skew. FoundationDB and TigerBeetle proved
   the technique finds the bugs that take a decade to surface in production. Charpente makes
   it the default for ordinary application code.
-- **Promises the builder can't edit.** The business states its promises as checks.
-  Charpente keeps those checks apart from the code the agent writes, names their version in
-  every verdict, and reports what no promise judged.
+- **Promises the builder can't edit.** Charpente is building this for 1.0. The business
+  states its promises as checks, and charpente keeps those checks apart from the code the
+  agent writes, names their version in every verdict, and reports what no promise judged.
 - **Constraints as features.** Inside a transaction you can't await the network. That will
   feel alien if you expect Express-style "await anything anywhere," and it's deliberate:
   effects are explicit and ordered, so the simulator can run them. A programming model that
@@ -142,4 +142,4 @@ by people, and that those people will choose platforms the way they once chose C
 by how reliably the machine catches the machine's mistakes. The framework that wins then
 will be the one that can tell a person: *every path through this system has been executed,
 under fault, thousands of times, and judged against promises its builder could not edit.
-Here is the seed to prove it, and here is what nothing judged.*
+Here is the seed to prove it, and beside it is what no promise covers.*
