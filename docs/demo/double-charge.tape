@@ -5,8 +5,8 @@
 # (`cargo install charpente-cli`), run on a clone of this repository; nothing is edited. Off
 # camera: the clone, a warm build, and the fix's edit, which `git diff` then shows on screen whole.
 # The master seed is set off camera (CHARPENTE_SIM_MASTER_SEED) so the render matches README's
-# quoted run; the shown command is the bare one a reader types, and every master seed demo.rs
-# measured fails the same check.
+# quoted run; the shown command is the bare one a reader types, and under 0.6.0 every master
+# seed demo.rs measured failed the same check. Under 0.7.0 the same route passes (README).
 
 Output double-charge.gif
 Output double-charge.mp4

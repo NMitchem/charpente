@@ -4491,8 +4491,10 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   call was already made, and then this check fails. Such a failure gives the
   run up where durable corruption fired, never passes it, the same rule as
   any acked-durability shortfall. `Drive::recover` runs it after the tail,
-  and gives that run up itself; a hand driver calls it, and routes a failure
-  through `durable_corruption_fired`.
+  and gives that run up itself, unless an `on_dead` hook also failed in it:
+  a failure outranks a give-up, so that run fails on `dead_hooks_succeeded`.
+  A hand driver calls it, and routes a failure through
+  `durable_corruption_fired`.
 - `keys_are_per_effect(snap: &Snapshot) -> Result<(), String>` — a key carries
   exactly one request. Every row that holds one has the same name and the same
   payload bytes, and at most one of them is not Dead: only a re-issue from
