@@ -457,7 +457,7 @@ adopter, under no oracle the sim exercises daily. Reopen if: an adopter's data c
 re-created from its own source of truth and must cross a charpente minor.
 
 **Reopened 2026-11-26 (Noah): from 1.0.0, data and unfinished work are carried.** (Noah's
-own hand: the road-to-1.0 spec, `docs/superpowers/specs/2026-11-26-road-to-1-0-design.md`,
+decision: the road-to-1.0 spec, `docs/superpowers/specs/2026-11-26-road-to-1-0-design.md`,
 §7 D1 and §12.) The condition above waits for an adopter, and charpente has none, so Noah's
 decision meets it instead: §16 puts data that survives every upgrade into 1.0's goal. Until
 1.0.0, nothing in this entry changes. From 1.0.0, data that release or any later one wrote
@@ -501,7 +501,7 @@ that closes it for an app's business logic. Noah's call is that the frontier has
 charpente buys in, so decisions made for the earlier frontier change where they stand in
 the way, as §15 does.
 
-A consequential workflow is any workflow with both of two properties. A mistake costs
+A consequential workflow is any workflow with both properties. A mistake costs
 someone, since a wrong answer that costs nothing needs no verdict. And something outside
 the app can say whether the mistake happened: a processor's settlement record, a receipt, a
 seat map, an access log. That second property is what makes a promise checkable at all.

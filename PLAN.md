@@ -582,8 +582,8 @@ sells not having to operate it.
 | Single-writer throughput ceiling | Overrated | No network hop between logic and data; TigerBeetle/Redis-class evidence; publish honest benchmarks early |
 | Greenfield-only adoption | Accepted | Agents mint greenfield backends daily; distribution rides agent preference (MANIFESTO §3), not migration |
 | Convex/PocketBase move into the quadrant | Watch | Neither has determinism or Rust's compile-time oracle; DST-from-day-one is a multi-year retrofit for them, and that is the moat |
-| The thesis loses the experiment | Real; three models agreeing is not evidence | 1.0's baseline (stage 2) measures the thesis early, with its predictions registered before it runs; each experiment's record is published whatever it shows; the full experiment gets one rerun, and a second miss reopens the goal (DECISIONS §16) |
-| The data promise taxes every release | Real from 1.0.0 | The sim rehearses each release's upgrade path on snapshots before the release ships, so no one has to run it by hand |
+| The thesis loses the experiment | Real; three models agreeing (two outside agents' reviews and Claude's) is not evidence | 1.0's baseline (stage 2) measures the thesis early, with its predictions registered before it runs; each experiment's record is published whatever it shows; the full experiment gets one rerun, and a second miss reopens the goal (DECISIONS §16) |
+| The data promise taxes every release | Real from 1.0.0 | The sim will rehearse each release's upgrade path on snapshots before the release ships, so no one has to run it by hand |
 
 ## Non-goals (permanent)
 
