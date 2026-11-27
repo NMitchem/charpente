@@ -10141,7 +10141,7 @@ Noah the same day. Plan commit `0fa8aa90`.
 ## 2026-11-26 — the road to 1.0, decided
 
 A docs-only pass. Spec: `docs/superpowers/specs/2026-11-26-road-to-1-0-design.md` (`b2c48266`),
-plan `565aacab`. No code changed.
+plan `565aacab`. No product code changed.
 
 - **What Noah decided.**
   - The goal: an outside team can hand one consequential workflow to agents, let them change
@@ -10149,12 +10149,13 @@ plan `565aacab`. No code changed.
     verdict anyone can re-check, saying which promises were checked, how strongly, and what
     nothing checked. Their data and unfinished work survive every upgrade. In one line:
     accept an agent's change without reading it, and keep the business you already have.
-  - The definition: 1.0 is that goal, and the experiment is its proof.
+  - The definition of a consequential workflow: a mistake costs someone, and something
+    outside the app can say whether it happened.
   - Order C: build the cheap verdict pieces, run a small baseline experiment, build the rest
     in an order the baseline can change, then run the full experiment as the gate.
   - The gate and stopping rule: 1.0 requires charpente to meet the predictions registered
-    before the full experiment. One rerun is allowed. A second miss stops the work and
-    reopens the goal.
+    before the full experiment. The record is published on a miss, and one rerun is
+    allowed. A second miss stops the work and reopens the goal.
   - The data promise starts at 1.0.0. Data written by any 0.x release or release candidate
     does not reach 1.0.0, and downgrades stay unsupported. APIs still change in place.
   - How API breaks are numbered after 1.0 is left out. No document says.
@@ -10162,12 +10163,12 @@ plan `565aacab`. No code changed.
   - Two outside agents reviewed charpente against Noah's essay and the "2027 bets"
     artifact.
   - Claude checked their repo claims, and two were wrong. One agent reversed the order of
-    Renewly's 1-in-1953 planted double charge: 1953 runs came before the builder's workload
-    change and 4 of 256 after. A "72% of the commit window is disk sync" figure is not in
+    Renewly's planted double charge: 1 of 1953 tested runs before the builder's workload
+    change, 4 of 256 after. A "72% of the commit window is disk sync" figure is not in
     `docs/BENCH.md`, which has the WAL sync at about 40%. Both agents' double-charge framing
     also predated 0.7.0's retry-safe writes.
-  - Claude checked the Waterloo verification page for the Alpöge proof and OpenAI's
-    Navier–Stokes page. Both matched what the agents cited.
+  - Claude checked the outside sources the agents cited for the Alpöge proof and the
+    Navier–Stokes result, and they matched what the agents said.
   - The spec's §10 holds the evidence that survived the check.
 - **What changed.**
   - DECISIONS: §15 annotated (data carried from 1.0.0), §16 added (the goal): `e9b92245`.
@@ -10181,8 +10182,8 @@ plan `565aacab`. No code changed.
     row.
   - CLAUDE.md: a fifth consequence, the "framework is the reviewer" bullet (types judge
     shape, promises judge values), "What this is" and "Current state": `1f8f7268`.
-  - Every data-promise statement in DECISIONS, MANIFESTO, PLAN, README and CLAUDE.md was read
-    side by side and agrees: it starts at 1.0.0, 0.x data does not reach it, it covers data
+  - Every data-promise statement in DECISIONS, MANIFESTO, PLAN and README was read side by
+    side and agrees: it starts at 1.0.0, 0.x data does not reach it, it covers data
     and unfinished work, and APIs still change in place.
 - **Gates.** At `1f8f7268`: `cargo test -p guide-examples --no-fail-fast` exits 0 with 11
   `test result: ok` lines, 0 FAILED, 48 tests passed, the same 11 and 48 as the baseline
