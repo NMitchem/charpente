@@ -53,9 +53,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "charpente"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1445ba8b1a0889e8a39a05caeebc41b8e569045795e31397fed2ae7694714f8a"
+checksum = "cad3dec1092cdd5e2f40c1822d7ed3990391a3c4913baaae373618ded337a7bb"
 dependencies = [
  "base64ct",
  "charpente-core",
@@ -76,9 +76,9 @@ dependencies = [
 
 [[package]]
 name = "charpente-core"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4d4d9088a11e3f0ddeedefc4bb54eb0084b7561012f36b3ffcfeb006423414a"
+checksum = "171ce0e235c6aa5fb6af25069214e1fdf26b9a0247b3ea7e9f17fb4b1643e0cd"
 dependencies = [
  "redb",
  "serde",
@@ -86,9 +86,9 @@ dependencies = [
 
 [[package]]
 name = "charpente-macros"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8955eccb126b79178b6fa18b46fd3514aefdecc771da2eaf17cd305ae59f4f6b"
+checksum = "abb01d5ae889fb55567a38370fcc67281939d050290ce5f7ee110f5ae9ec834b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -97,9 +97,9 @@ dependencies = [
 
 [[package]]
 name = "charpente-sim"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e74cfcb77219013144bc5253d8bc85a846e0dccffceb3cdce8000e36f24778ad"
+checksum = "29c659bbca43d9e248b6a36a6f8018110add34369a89b0d878f370126f84f9ca"
 dependencies = [
  "charpente",
  "charpente-core",
