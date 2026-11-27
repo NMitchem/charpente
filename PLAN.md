@@ -278,7 +278,159 @@ that is a claim about charpente is in docs/BENCH.md or absent, and every other f
 cites its source or carries no digits (held by `claims_census`). All three are met: (a) by
 the launch run's real attempt on 2026-10-10, (b) on 2026-09-24, and (c) by `claims_census`.
 
-## After launch (v1.x): five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, three from 0.3.0's oracle-density review, three from 0.3.0's rulings, one from 0.3.0's final review, one from 0.3.0's docs-only build, three from the 0.4.0 spec, two named for 0.5.0, two from 0.5.0's reviews, ten from 0.4.0's testimony census, two from 0.4.0's docs-only build, one from the outside agents' 0.4.0 retest, two from the launch demo's rehearsal, one from 0.5.0's mutation run, one from 0.5.0's docs-only build, one from the retry-safe-writes spec, one from the fault-free twin's review, each with the trigger that reopens it
+## 1.0: Accept an agent's change without reading it [defined 2026-11-26]
+
+**Goal:** An outside team can hand one consequential workflow to agents, let them change it
+many times, and accept each change without reading the code. charpente gives them a verdict
+anyone can re-check, saying which of the team's promises were checked, how strongly, and
+what nothing checked. Their data and unfinished work survive every charpente upgrade. In
+one line: accept an agent's change without reading it, and keep the business you already
+have.
+
+A consequential workflow is one where a mistake costs someone, and where something outside
+the app can say whether the mistake happened: a processor's settlement record, a receipt, a
+seat map, an access log. Billing, selling something scarce, deciding who may see or do
+what, obligations with deadlines, and orders and fulfillment all qualify, while ranking,
+recommendation and UI, where nobody can state what "right" means, do not.
+
+When M3 closed, the bet was that simulation and compile-time contracts make an agent's
+backend trustworthy. Two records since then show where that bet stops. Renewly, 0.5.0's
+docs-only build, passed all seven of its checks and caught every viable mutant, and no
+check read the amount charged, so a plan billed at ten times its price would have passed
+(`docs/experiments/2026-11-0.5.0-docs-only/README.md`, R4). The launch demo's rehearsal
+tied a conventional TypeScript and Postgres stack, with no violations on either side
+(docs/LEDGER.md, 2026-11-19). The agent writes both the code and the checks that judge it,
+and nothing outside the agent says what was never checked. charpente closes that loop for
+the platform, through compile errors and `charpente_sim::checks`, and 1.0 is the milestone
+that closes it for an app's business logic. The spec
+([docs/superpowers/specs/2026-11-26-road-to-1-0-design.md](docs/superpowers/specs/2026-11-26-road-to-1-0-design.md))
+holds the evidence, and DECISIONS §16 records the goal, the order of the work, and what
+reopens each.
+
+The thesis schedules 1.0, as it scheduled M0 to M3. Each row 1.0 takes on from the
+trigger-gated table below is named here and marked there, and every other row still waits
+for its trigger. The sizes are estimates from the repo's own pace. Each stage ships as
+ordinary 0.x minors, and nothing waits for a 1.0 tag except the tag.
+
+**Stage 1: the verdict** (about one to two weeks).
+
+- **A verdict file.** `charpente test --sim --format json` and `charpente test --mutants`
+  write one machine-readable record, bound to what will deploy. At minimum it holds a
+  format version; hashes of the source tree, the built binary and the check sources (stage
+  3 turns the last into the promise pack's hash); the master seed; each check's tested,
+  failed and skipped counts, with reasons; every excused run, with the excuse that excused
+  it; every fence exception, meaning each `allow` of a `disallowed_methods` or
+  `disallowed_types` lint in the app's source; and the mutation summary, including each
+  function with no viable mutant and whether it was argued. The repro line stays the one
+  command that replays a failure.
+- **Close the ways a builder can weaken its own oracle unnoticed.** A function with no
+  viable mutant fails the run unless the app argues it, one rationale per entry, the way
+  `.cargo/mutants.toml` works for charpente. That was Renewly's `Charge::plan`: the verb
+  named it, and the bar still counted as met. Fence exceptions are listed in the verdict
+  and in the human report. GUIDE §8's rule that `durable_corruption_fired` may excuse a
+  give-up, never wrong data, gets enforced, which takes on the row "Mechanical
+  enforcement of GUIDE §8's rule…". Its trigger is met: three apps have been found
+  breaking the rule. How the platform tells a give-up from an excused wrong answer is this
+  item's open design question.
+- **F1: a `#[route]` that answers a status other than 200, and a typed conflict.** This
+  takes on the row "A `#[route]` that answers a status other than 200" (the rehearsal's
+  review F1). The rehearsal's charpente arm hand-built all seven routes because of it,
+  which inflated its build time. It is public API and gets its own spec, as the row says.
+  F2, the row "A `#[route]` that reads a request header", joins this stage only if stage
+  2's brief needs it.
+- **The NEIGHBORS.md sweep.** The file says to check quarterly, and it was last checked
+  2026-07-02. One outside agent claims a neighbor has gained a simulation runtime, which
+  would flip a row, and README's positioning depends on the answer.
+
+**Stage 2: the baseline** (a few weeks of wall clock, mostly Noah's time). It gets its own
+experiment spec, with its predictions registered before the run, as the rehearsal's were
+(the judge's tag `prereg-rehearsal`). Its shape is fixed:
+
+- two arms: charpente at its current release, and the rehearsal's conventional stack
+  (TypeScript, Node, Postgres, graphile-worker), with the same model and the same brief;
+- one domain, subscription billing, against a payment provider that keeps its own record;
+- about 20 increments applied one after another to one growing app: new features, policy
+  changes, a provider discrepancy;
+- hidden checks in the judge repo, written outside the builders' sessions and reviewed by
+  Noah. The builders never see them, and the judge drives real binaries over the wire with
+  real faults, as in the rehearsal;
+- measured per increment: escaped violations (a hidden check fails), whether the builder's
+  own checks would have caught each escape, wall time and compute cost, and Noah's
+  minutes, including the time spent writing hidden checks.
+
+Its output is a ranked list of escape classes. That list sets stage 3's order and can
+promote a candidate into it.
+
+**Stage 3: build** (several releases, in the order stage 2 sets). The default order:
+
+1. **An outage a sim can place.** This takes on the row of that name, whose trigger is met
+   and which calls itself "the next oracle-density item". It moves every recorded batch
+   that draws an outage, so it gets its own spec.
+2. **Promise packs.** An app's promises live in their own crate, which reaches the app only
+   through its public contract: routes, `describe`, and outbound effects as the sim records
+   them. The verdict names the pack's hash, so a change to the pack shows on every run. Who
+   may change it is the adopter's process. charpente's part is making a change impossible
+   to hide.
+3. **Snapshot rehearsal.** A sim universe boots from a restored store with its pending work
+   (jobs, timed enqueues, Dead rows, intents, sessions, schedules) and runs a candidate
+   binary forward under faults. It needs a way to preload the sim's `Disk` and
+   `ObjectStore` from an archive, a sim clock that starts at the store's recorded time,
+   checks that judge relative to the snapshot's state (today's app checks assume an empty
+   start), and an answer for production data in a test rig, which is a privacy question.
+   It also covers two changes developed concurrently: the verdict runs on the merged
+   candidate.
+4. **The upgrade promise.** DECISIONS §15 flips (its 2026-11-26 annotation): from 1.0.0,
+   data and unfinished work cross every charpente release. Every release carries an
+   upgrade path, and the sim rehearses it on snapshots, using item 3, before the release
+   ships. This takes on the rows "Gating the hand-written platform tables" (0.3.0 ruling
+   R6) and "A clean stop for a `launch` or `serve` node, or an upgrade-barrier text a
+   launch node can follow" (trigger met). Its spec decides whether a replicated pair
+   upgrades one node at a time, which would hold the replication protocol's `PROTO_VERSION`
+   across releases, and weighs the rows "A deep fingerprint" and "A commit-time shape
+   lock". Data written by any 0.x release or release candidate does not reach 1.0.0. The
+   path is rehearsed between two release candidates before 1.0.0 ships, so the first
+   release that makes the promise has already carried data across a release once.
+   Downgrades stay unsupported.
+
+Stage 2 can promote any of these candidates into this stage:
+
+- a report of the output fields no check reads, built by perturbing values the app sends
+  out or returns. It is R4's oracle and has no row. It is unproven and may not work,
+  because an outbound `Call` body is raw bytes;
+- rules enforced on every commit, through the row "A state-machine declaration";
+- properties derived from an app's shape, the row "Properties the framework derives from
+  an app's shape";
+- mutants that delete a statement, the row "Mutants that delete a statement".
+
+**Stage 4: the gate.** Its work is the five exit criteria below, the last of them the full
+experiment.
+
+**Exit criteria:** 1.0 ships when all five hold.
+
+1. The verdict file carries everything stage 1 lists plus the promise pack's hash, and
+   someone outside the project reproduces one verdict from the release artifacts alone.
+2. A promise-pack change shows in the verdict, pinned by a test that edits a pack and
+   expects the hash to move.
+3. Snapshot rehearsal runs a candidate binary from a restored store with pending work,
+   under faults, judged relative to the snapshot.
+4. A store written by the previous release candidate, holding pending jobs, outbound jobs
+   with minted keys, timed enqueues, intents, sessions and schedules, crosses to the next
+   one. This is proven in the sim on snapshots, and on the edge harness with `kill -9`
+   during the upgrade. Stage 3's upgrade promise calls for this rehearsal between release
+   candidates, and the promise itself starts at 1.0.0.
+5. The full experiment has run: two domains (billing, plus a scarce-allocation one such as
+   appointment slots), both arms, about 50 increments, hidden checks, and, partway through,
+   a policy change, a provider discrepancy and a charpente upgrade with work pending. Its
+   record is published whatever it shows. 1.0 requires charpente to meet the predictions
+   registered before the run (Noah, 2026-11-26). If it misses, the record is published,
+   the work fixes what the record found, and the experiment runs once more. If the rerun
+   misses too, the work stops and the goal reopens (DECISIONS §16). 1.0 does not ship on a
+   miss, and the experiment does not run a third time.
+
+What 1.0 leaves out, and why, is in DECISIONS §16. Two of those items wait on the last two
+rows of the table below.
+
+## After launch (trigger-gated): five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, one from M3's job-tenancy fix, two from M3's tenancy completion, seven from outbound effects, five from the outbound docs-only build, one from the outbound client's compile reading, three from 0.3.0's oracle-density review, three from 0.3.0's rulings, one from 0.3.0's final review, one from 0.3.0's docs-only build, three from the 0.4.0 spec, two named for 0.5.0, two from 0.5.0's reviews, ten from 0.4.0's testimony census, two from 0.4.0's docs-only build, one from the outside agents' 0.4.0 retest, two from the launch demo's rehearsal, one from 0.5.0's mutation run, one from 0.5.0's docs-only build, one from the retry-safe-writes spec, one from the fault-free twin's review, two from the road-to-1.0 spec, each with the trigger that reopens it
 
 **Shipped 2026-11-01: 0.4.0, the oracle as hard to get wrong as the app** (spec
 [docs/superpowers/specs/2026-10-28-0.4.0-design.md](docs/superpowers/specs/2026-10-28-0.4.0-design.md)),
@@ -342,7 +494,12 @@ it came from 0.5.0's reviews (two), the launch demo's rehearsal (two), 0.5.0's m
 and 0.5.0's docs-only build.
 The row after them came from the retry-safe-writes spec (2026-11-22, its §2), which leaves
 a GET handler that writes outside the contract. The row after it came from the fault-free
-twin's review (2026-11-26), which parked the twin instead of building it.
+twin's review (2026-11-26), which parked the twin instead of building it. A row whose
+trigger cell opens "In 1.0" is 1.0 work: the 1.0 section above schedules it, and it no
+longer waits on its trigger. A row whose trigger ends "Or stage 2 promotes it" can also be
+pulled into 1.0 by its baseline (stage 2). The last two rows come from the road-to-1.0 spec
+([docs/superpowers/specs/2026-11-26-road-to-1-0-design.md](docs/superpowers/specs/2026-11-26-road-to-1-0-design.md),
+§4), which leaves both out of 1.0.
 
 | Item | Trigger |
 |---|---|
@@ -354,9 +511,9 @@ twin's review (2026-11-26), which parked the twin instead of building it.
 | **Design C timeline epoch** (DECISIONS §6's sharpening step short of consensus) | The first loss-window finding that the bounded, named window does not cover. |
 | **Bare-metal Linux BENCH run** (owed since 2026-08-15) | A Linux box Noah runs docs/BENCH.md's protocol on. It resizes README's one-primary limit, which since 2026-11-20 points at docs/BENCH.md's laptop figures and says they are all that has been measured. |
 | **Versioned migrations for event and job payloads** (payload-shapes spec §8, approach B) | The first app that needs exact resume, or a Pending job, to survive a shape change it cannot express as a new type. |
-| **A deep fingerprint**: every `Codec` type carries its own shape constant, so a new variant on a nested enum changes the fingerprint of every table and payload that holds it | The first nested-type change that misdecodes in a real app or a docs-only build. |
+| **A deep fingerprint**: every `Codec` type carries its own shape constant, so a new variant on a nested enum changes the fingerprint of every table and payload that holds it | The first nested-type change that misdecodes in a real app or a docs-only build. Or stage 2 promotes it. |
 | **A derive for an enum's `Codec`** (0.4.0 spec §2). Today GUIDE §2 teaches a hand-written tag table, where a misnumbered tag compiles | The first misnumbered tag found in a docs-only build or a review. A derive that numbers tags by declaration order makes reordering variants a silent format change, which is the deep fingerprint's problem (the row above), so the two are weighed together. |
-| **A commit-time shape lock**: a committed fingerprint file plus a check verb | The first shape change that reaches a deploy unnoticed. Apps on the generated TS client already get a CI signal for event payload changes from `check-client`'s staleness diff. |
+| **A commit-time shape lock**: a committed fingerprint file plus a check verb | The first shape change that reaches a deploy unnoticed. Apps on the generated TS client already get a CI signal for event payload changes from `check-client`'s staleness diff. Or stage 2 promotes it. |
 | **`enqueue_keyed_in`**: a keyed declared fan-out (job-tenancy spec §12) | The first fan-out whose job needs an external idempotency key. `enqueue_in` and `ScopedTx::enqueue_keyed` both exist; the keyed fan-out is the one combination deferred. |
 | **A cross-tenant subscription**: one feed over every tenant's events (tenancy-completion spec §12) | The first app that needs a feed across tenants. It arrives as a declared capability `describe` lists (DECISIONS §11), the shape `cross_tenant` already gives reads. |
 | **A tenant's own jobs and events, read through `ScopedTx`**, for a job-status or activity view (tenancy-completion spec §12) | The first app with a job-status or activity view. Until then an app keeps its own table of what it enqueued and emitted, and the platform's tables stay the operator's. |
@@ -371,7 +528,7 @@ twin's review (2026-11-26), which parked the twin instead of building it.
 | **Dead reachable in the sim, and a hook or documented path for an outbound job that goes Dead** (review I4) | The first app that must act on an outbound effect it gave up on. `outbound_settles_by_horizon` rightly counts Dead as settled (spec §10), but no universe reaches Dead, and an app has no documented way to notice one. **Shipped in 0.5.0.** Met 2026-10-29 by the third outside agent's build on 0.3.0 (C, an agent runtime; 0.4.0 spec §1 item 12): a Dead job is invisible to an app, since no hook fires and an app cannot read `JobRow`, so C built a watchdog and a redrive, about a third of its jobs code, and asked for a hook when a job goes Dead. 0.4.0's docs-only build (holdqueue, 2026-11-01) is further testimony: its ready notification goes Dead after about 68 minutes of notify outage and the patron is never told, because nothing an app can see marks the job Dead (review I5). 0.5.0 ships the `on_dead` hook, required stance and all, and a sim universe reaches Dead. |
 | **A transaction's own time**: a deterministic `tx.now()` (0.4.0 spec §1 item 12 and §2; agents A and C) | **Shipped in 0.5.0.** `tx.now()` and the timed enqueues carry it, and holdqueue's T4 ask (no time inside a transaction and no delayed job) is met. Two of the three outside agents on 0.3.0 (A's commitment ledger, C's agent runtime) each built a logical clock by hand, an `AppClock` row advanced by cron, because a transaction has no time, and C asked for a deterministic `tx.now()`. The M0 invoicing build did the same (`examples/invoicing/FINDINGS.md`), as did the helpdesk and statuspage builds, and 0.4.0's docs-only build (holdqueue, 2026-11-01), whose cron-advanced clock drives a 7-day hold expiry that fires late by every downtime, since a catch-up tick advances it one step (review T4, T13; GUIDE §7 now says so). It was expected to share the stored wall reading's cost (0.3.0 ruling R3, below), a new log record that changes the log format and every pinned seed's byte counts. The shipped `tx.now()` records no time in the log (a seed's replay reproduces the held reading), and only a timed enqueue's due time is a new record (`0x0e`). |
 | **A re-issued job that keeps its effect's key**: a caller-chosen key on enqueue (0.4.0 spec §1 item 9; agent C) | **Shipped in 0.5.0** (`tx.reissue_at` and `tx.reissue_after`, from an `on_dead` hook). The minted outbound key belongs to one job and covers its retries and re-dispatches, so an effect enqueued twice (a redrive after Dead, a re-issued step) sends two keys, and a remote that honours keys applies it twice. C planted this same double fire, and the sim caught it. GUIDE §6 now says a re-issue is a new job with a new key, so its `call` must send an id of the effect itself. The platform half lands with the Dead hook, whose redrive is the re-issue that needs it. |
-| **Mechanical enforcement of GUIDE §8's rule that `durable_corruption_fired` may excuse a give-up, never wrong data** (review I1) | The second app found routing a consistency or isolation oracle's failure through `durable_corruption_fired`. Today the rule is stated in prose and enforced by nothing, so only a review or a mutation proof finds one. **Trigger met** (0.4.0's testimony census, 2026-10-31): the statuspage build's review I-5 (2026-09-24) found its app's `expect` excusing a cross-org 200 under `durable_corruption_fired`, and the outbound build's triage app, found by its review's mutation run (I1, 2026-10-14), was the second. Trigger met: renewly, 0.5.0's docs-only build, 2026-11-19 (review R1), the third app. |
+| **Mechanical enforcement of GUIDE §8's rule that `durable_corruption_fired` may excuse a give-up, never wrong data** (review I1) | **In 1.0, stage 1.** The second app found routing a consistency or isolation oracle's failure through `durable_corruption_fired`. Today the rule is stated in prose and enforced by nothing, so only a review or a mutation proof finds one. **Trigger met** (0.4.0's testimony census, 2026-10-31): the statuspage build's review I-5 (2026-09-24) found its app's `expect` excusing a cross-org 200 under `durable_corruption_fired`, and the outbound build's triage app, found by its review's mutation run (I1, 2026-10-14), was the second. Trigger met: renewly, 0.5.0's docs-only build, 2026-11-19 (review R1), the third app. |
 | **Credential row ids drawn independently of the secret** (testimony row 12) | The first app that must show a key's or session's id to someone other than its holder. Today a `Session`'s or `ApiKey`'s id is the first 64 bits of its secret's draw (GUIDE §5). |
 | **Revocation that ends what a credential minted** (review I5) | The first app whose revoke must also end the sessions and keys minted by a request that presented the revoked credential. Today revoking a key ends that key alone (GUIDE §5), so a session traded for it stays live until it expires. |
 | **The outbound client's clean-build compile delta** (owed since 2026-10-15; spec §16 exit 7; docs/BENCH.md, "Compile latency of the outbound client (2026-10-15)", refused with no delta published) | Either an instrument change that lands for its own stated reason, which is what lets `scripts/compile-bench.sh` start again, or a clean build reported as an adoption cost. The refused run (sha 3b9529cb, handler-body `Unstable`) stays attempt 1 and is never re-rolled, and no gate moves to unblock it. |
@@ -379,14 +536,14 @@ twin's review (2026-11-26), which parked the twin instead of building it.
 | **An agent-integration contract (MCP tools) generated from `describe`** | The first app whose consumer is an agent calling it as tools. |
 | **One outbound job over several declared hosts** | The first app where duplicated outbound jobs cause a defect, not only boilerplate. |
 | **A stored wall reading** (0.3.0 ruling R3), which tightens the across-restart bound from the time since the store's latest recorded time plus `CLOCK_TOLERANCE` to the tolerance alone | An adopter whose timed obligations, or whose sessions, must not run late across a backwards clock step at restart. Today the open-time bound is recovered from times the store already holds (DESIGN §1), because a stored reading is a new log record that changes the log format and every pinned seed's byte counts. |
-| **Gating the hand-written platform tables** (`charpente.jobs`, `.events` and `.schema_versions`) as a named step (0.3.0 ruling R6) | The first release that changes one of them. Today they have no data-directory detector (DESIGN §5, "Deploy"), because gating them adds an adoption record to the first job or event write of every run, which moves every recorded batch. |
+| **Gating the hand-written platform tables** (`charpente.jobs`, `.events` and `.schema_versions`) as a named step (0.3.0 ruling R6) | **In 1.0, stage 3.** The first release that changes one of them. Today they have no data-directory detector (DESIGN §5, "Deploy"), because gating them adds an adoption record to the first job or event write of every run, which moves every recorded batch. |
 | **A pair search that does not wait for a quiet round** (0.3.0 ruling R39), such as trying the pairs of adjacent positions first | A shrunk run reported from a real app, not a probe, that a pair of equal choices would have lowered further. Today the pairs of equal choices wait for a round in which everything else kept nothing (GUIDE §8 "Shrinking a failure"), so a stall only a pair can leave, among 24 other draws, ends on the budget with every draw still at the pair's value (27 choices of 5 in 500 replays), where trying the pairs in every round reached the minimum in about 430 (0.3.0's round-5 review, m-b at n=24). Trying them in every round is what left fault axes on and a fault-coupled input high, which misdirects the fix. |
 | **The request arm stops on a checkpoint failure nothing else reports** (0.3.0 final review, M1), as `Db::transact` answers `Err` and the job and cron arms stop | The first node observed with WAL GC stalled by a repeating checkpoint failure. Today a request batch whose records reached the store keeps its 200s when the horizon breadcrumb's sync then fails, which poisons and latches nothing, and no one is told until the next job or cron commit stops the node, at most a day on a node that serves only requests. Stopping at once moved six of `crates/charpente/tests/realtime.rs`'s swarm properties and pinned universes (2026-10-25), so it lands with their re-measurement. |
 | **A worked first-credential example, and a sanctioned way for deploy-time configuration to reach a handler** (0.3.0 docs-only build, review (e) and its deploy-configuration row; ruling R48) | A second app that needs either. The 0.3.0 docs-only build's app minted its first operator key from `PRICEWATCH_OPERATOR_SECRET`, read once at start into a set-once `static` (a `OnceLock`) that its route compares against. The route mints one key per request and its effect is its writes, which the log carries, but the `static` is state the hard-rule fence cannot see. GUIDE §5 sanctions minting a first credential in prose and works no example, and shows no way for deploy configuration to reach a route, so a set-once static is the only way today and nothing says whether it is sanctioned. **Trigger met** (0.4.0's testimony census, 2026-10-31): three builds before this one each had to invent a first credential, the helpdesk (FINDINGS), the statuspage (review I-2) and the outbound triage app (review Minor 1, testimony T5), so pricewatch was the fourth app to need it. 0.4.0's docs-only build (holdqueue, 2026-11-01) is the fifth: its `POST /operator` is trust on first use (review T2, I8). Trigger met: renewly, 0.5.0's docs-only build, 2026-11-19 (finding 15, review R2), the sixth build to need one. |
-| **A state-machine declaration**: an app declares its states and the transitions between them as a table the framework holds it to (0.4.0 spec §2; agent A's sixth ask) | A docs-only build's mutation run misses a mutant in a state transition's match, or its review finds a Critical a declared transition table would have refused. Every app so far hand-writes one: invoicing, the helpdesk, statuspage, and A's commitment ledger with its five-state lifecycle. |
-| **Properties the framework derives from an app's shape**, such as an event-proof check for every route that emits (0.4.0 spec §2; agent A's second ask, its template half). It is the strongest answer to "who writes the oracle", and too large for 0.4.0 | A docs-only build's mutation run misses a mutant that removes a `tx.enqueue` or `tx.emit`, or its review or hand pass deletes one and its suite stays green. The spec's wording names only the mutation run, and that channel is narrow, not closed: cargo-mutants 27.1.0 never deletes a statement, so it removes such a call only by replacing the whole body of a function whose effect the call is, when it can build that function's return value (GUIDE §8), as for a helper that only emits and returns `Ok(())`. 0.4.0's records added the second channel so that a deletion inside a larger function, such as a handler's, fires it too; the instrument half of that gap is the statement-deletion row below. Deleting either in A's app went red (0.4.0 spec §1), so it has not fired. |
-| **Mutants that delete a statement**: a write, an enqueue, an emit, a scope line or a request header, beside cargo-mutants' body and operator replacements (testimony census P1: statuspage C-2 and platform finding 10, outbound review Minor 11 and I2, the 0.3.0 docs-only build's hand deletions H1-H5). Today cargo-mutants 27.1.0 never deletes a statement (GUIDE §8): it removes one only by replacing the whole body of a function whose effect it is, so every build hand-mutates the rest of its writes, and "0 missed" says nothing about a write inside a larger function, such as a handler's | A docs-only build's review or hand pass deletes a write, enqueue, emit, scope line or header in a file `charpente test --mutants` reported clean, and the app's suite stays green. The gap is shown, though this wording has not fired: statuspage's review (C-2, 2026-09-24) deleted `create_operator`'s scope line and rewrote four write routes to `tx.open_scope::<Org>(org, None)?`, and the batch on the same master seed stayed byte-identical; none of `operators.rs`'s 22 mutants removes that line, but that build's mutation run covered four other files, so `operators.rs` was never reported clean. |
-| **A clean stop for a `launch` or `serve` node, or an upgrade-barrier text a launch node can follow** (testimony census P2: statuspage platform finding 3). The barrier says to run the previous binary once to a clean shutdown, and GUIDE §12 says a clean exit always checkpoints, but a `launch` node has no clean exit ("no graceful shutdown in v0", GUIDE §5) and the platform handles no signal. The remedy that works, a traffic-free boot of the previous binary (recovery checkpoints), is written only in `db.rs` | The first version-bumped deploy that the upgrade barrier refuses. **Trigger met** (the census): statuspage hit it on its own v2 upgrade (its FINDINGS, 2026-09-21), and against hard rule 5 the error named a fix the documented production shape cannot perform. |
+| **A state-machine declaration**: an app declares its states and the transitions between them as a table the framework holds it to (0.4.0 spec §2; agent A's sixth ask) | A docs-only build's mutation run misses a mutant in a state transition's match, or its review finds a Critical a declared transition table would have refused. Every app so far hand-writes one: invoicing, the helpdesk, statuspage, and A's commitment ledger with its five-state lifecycle. Or stage 2 promotes it. |
+| **Properties the framework derives from an app's shape**, such as an event-proof check for every route that emits (0.4.0 spec §2; agent A's second ask, its template half). It is the strongest answer to "who writes the oracle", and too large for 0.4.0 | A docs-only build's mutation run misses a mutant that removes a `tx.enqueue` or `tx.emit`, or its review or hand pass deletes one and its suite stays green. The spec's wording names only the mutation run, and that channel is narrow, not closed: cargo-mutants 27.1.0 never deletes a statement, so it removes such a call only by replacing the whole body of a function whose effect the call is, when it can build that function's return value (GUIDE §8), as for a helper that only emits and returns `Ok(())`. 0.4.0's records added the second channel so that a deletion inside a larger function, such as a handler's, fires it too; the instrument half of that gap is the statement-deletion row below. Deleting either in A's app went red (0.4.0 spec §1), so it has not fired. Or stage 2 promotes it. |
+| **Mutants that delete a statement**: a write, an enqueue, an emit, a scope line or a request header, beside cargo-mutants' body and operator replacements (testimony census P1: statuspage C-2 and platform finding 10, outbound review Minor 11 and I2, the 0.3.0 docs-only build's hand deletions H1-H5). Today cargo-mutants 27.1.0 never deletes a statement (GUIDE §8): it removes one only by replacing the whole body of a function whose effect it is, so every build hand-mutates the rest of its writes, and "0 missed" says nothing about a write inside a larger function, such as a handler's | A docs-only build's review or hand pass deletes a write, enqueue, emit, scope line or header in a file `charpente test --mutants` reported clean, and the app's suite stays green. The gap is shown, though this wording has not fired: statuspage's review (C-2, 2026-09-24) deleted `create_operator`'s scope line and rewrote four write routes to `tx.open_scope::<Org>(org, None)?`, and the batch on the same master seed stayed byte-identical; none of `operators.rs`'s 22 mutants removes that line, but that build's mutation run covered four other files, so `operators.rs` was never reported clean. Or stage 2 promotes it. |
+| **A clean stop for a `launch` or `serve` node, or an upgrade-barrier text a launch node can follow** (testimony census P2: statuspage platform finding 3). The barrier says to run the previous binary once to a clean shutdown, and GUIDE §12 says a clean exit always checkpoints, but a `launch` node has no clean exit ("no graceful shutdown in v0", GUIDE §5) and the platform handles no signal. The remedy that works, a traffic-free boot of the previous binary (recovery checkpoints), is written only in `db.rs` | **In 1.0, stage 3.** The first version-bumped deploy that the upgrade barrier refuses. **Trigger met** (the census): statuspage hit it on its own v2 upgrade (its FINDINGS, 2026-09-21), and against hard rule 5 the error named a fix the documented production shape cannot perform. |
 | **The counter pattern's two hazards, and a per-scope id primitive** (testimony census P3: invoicing FINDINGS; statuspage review I-3 and platform finding 6; outbound review Minor 2). GUIDE §2's one `#[table(global)]` counter row shares one id space across tenants, so any id a public route returns counts every tenant's writes, and a single-node corruption cut rewinds the counter and re-mints ids, so a stale client id names a different row. GUIDE §16 still says "Ids stay globally unique" | Doc half: the next commit that edits GUIDE §2 or §16 states both hazards, shows a scoped counter, and qualifies "globally unique"; two builds, statuspage and the outbound triage app, have already found the side channel. Primitive half: the first adopter whose clients hold ids across a single-node corruption cut, or that must not reveal volume through ids. |
 | **Per-tenant event cursors**, so a public feed reveals no other tenant's event or commit volume (testimony census P4: statuspage platform finding 11, the platform floor under its review's I-3). Today a cursor is a global `<id>.<seq>` (GUIDE §11), and a tenant's tail skips other tenants' rows without renumbering them | The first app that must not reveal one tenant's activity volume to another through a public feed. Per-tenant numbering is a new log-record shape that moves every pinned seed (0.3.0 ruling R3's cost). |
 | **`replays_identically` over the universe's own fault config, with an inner give-up reaching the batch** (testimony census P5: the helpdesk's F2, second consequence; statuspage review M-3; outbound review Minor 9). Today it builds two `Sim::new` worlds under `FaultConfig::default()`, so a replay property never replays its universe's swarm or outbound faults, and a give-up inside the workload lands on an inner world: statuspage counted verdicts in which both inner runs gave up and compared `None == None` | A determinism defect that a swarm- or outbound-faulted universe shows and a default-fault replay does not, found by a `--master-seed` double run, a review or an adopter. |
@@ -400,12 +557,14 @@ twin's review (2026-11-26), which parked the twin instead of building it.
 | **`charpente test --mutants` applies the relative-path dev-dependency rewrite in its own scratch copy instead of refusing** (the outside agents' 0.4.0 retest, agent A). cargo-mutants 27.1.0 rewrites relative paths only in `[dependencies]`, `[replace]` and `[patch]`, so a relative dev-, build- or target-dependency path outside the workspace root fails the copied baseline. Since 0.4.0 the verb refuses that layout before the install check, naming the manifest, the table, the dependency and the fix (an absolute path, or `[patch.crates-io]`). Agent A found that it names the fix but leaves applying it to the app | An adopter's own layout (not an eval checkout depending on a local charpente) hits the refusal, or a second build hand-edits its manifest to run the verb. |
 | **A hand driver's settle check judged at the kernel's held wall** (0.5.0's reviews) | The first hand-driven app whose tail opens over a store recorded ahead of its clock. A hand driver passes the clock's wall as `at`, which leaves a window of at most 60 s in which a lost attempt-0 row passes the settle check. `Drive` judges "due" at the kernel's held wall, so only a hand driver is open. |
 | **A bound on steps per virtual instant** (0.5.0's reviews) | The first app or sim run seen spinning at one instant. A zero-backoff job under an outage whose `on_dead` re-enqueues at once never lets virtual time advance. It is the class of a job that re-enqueues itself immediately, which predates 0.5.0. |
-| **A `#[route]` that answers a status other than 200** (the launch demo's rehearsal, review F1). `#[route]`'s glue answers 200 on `Ok` (GUIDE §5), and `ApiError` maps to 400, 401, 404 and 500 only. The task's brief asks for a 201 on a create and a 409 on a conflicting key or transition, so the charpente arm hand-built all seven routes as `Route` structs GUIDE never documents, each parsing its own body: `describe` reports a `Null` response for every one, and the typed surface, the oracle for the HTTP layer, is gone | The first adopter whose API needs it. Until 2026-11-20 this read "fix red-first before the launch demo's public attempt" (ruling R43), because the rehearsal's brief asks for a 201 and a 409; the launch tape (spec 2026-11-20) replaced that attempt as the launch's lead (Noah, 2026-11-20). A declared success status and a typed conflict on `#[route]` are public API and get their own spec. |
-| **A `#[route]` that reads a request header** (the launch demo's rehearsal, review F2). A `Request` carries its headers, but neither a `#[route]` handler nor a hand-built `Glue` can reach them. The brief mandates an `Idempotency-Key` header, so the charpente arm ran a second hyper server in front of the kernel (`edge.rs`, 179 lines, the fence lifted for the module) that lifts the header into the body. It sits in the binary crate, outside every sim oracle, and its `SystemTime::now()` was the second clock behind review F3 | The first adopter whose API needs it. Until 2026-11-20 this read "fix red-first before the launch demo's public attempt" (ruling R43), because the rehearsal's brief sends its key as a header; the launch tape (spec 2026-11-20) replaced that attempt as the launch's lead (Noah, 2026-11-20). Since 0.7.0 the platform reads a write's `Idempotency-Key` itself, and `intent = header("…")` lets a webhook route name its sender's id header, so neither the tape's `Idempotency-Key` version of the double charge nor a webhook's id waits on this row; a handler that reads any other header still does. One shape is a declared header argument typed like a path param, listed by the `describe` contract and drawn by the sim. |
+| **A `#[route]` that answers a status other than 200** (the launch demo's rehearsal, review F1). `#[route]`'s glue answers 200 on `Ok` (GUIDE §5), and `ApiError` maps to 400, 401, 404 and 500 only. The task's brief asks for a 201 on a create and a 409 on a conflicting key or transition, so the charpente arm hand-built all seven routes as `Route` structs GUIDE never documents, each parsing its own body: `describe` reports a `Null` response for every one, and the typed surface, the oracle for the HTTP layer, is gone | **In 1.0, stage 1.** The first adopter whose API needs it. Until 2026-11-20 this read "fix red-first before the launch demo's public attempt" (ruling R43), because the rehearsal's brief asks for a 201 and a 409; the launch tape (spec 2026-11-20) replaced that attempt as the launch's lead (Noah, 2026-11-20). A declared success status and a typed conflict on `#[route]` are public API and get their own spec. |
+| **A `#[route]` that reads a request header** (the launch demo's rehearsal, review F2). A `Request` carries its headers, but neither a `#[route]` handler nor a hand-built `Glue` can reach them. The brief mandates an `Idempotency-Key` header, so the charpente arm ran a second hyper server in front of the kernel (`edge.rs`, 179 lines, the fence lifted for the module) that lifts the header into the body. It sits in the binary crate, outside every sim oracle, and its `SystemTime::now()` was the second clock behind review F3 | The first adopter whose API needs it. Until 2026-11-20 this read "fix red-first before the launch demo's public attempt" (ruling R43), because the rehearsal's brief sends its key as a header; the launch tape (spec 2026-11-20) replaced that attempt as the launch's lead (Noah, 2026-11-20). Since 0.7.0 the platform reads a write's `Idempotency-Key` itself, and `intent = header("…")` lets a webhook route name its sender's id header, so neither the tape's `Idempotency-Key` version of the double charge nor a webhook's id waits on this row; a handler that reads any other header still does. One shape is a declared header argument typed like a path param, listed by the `describe` contract and drawn by the sim. Or stage 2 promotes it. |
 | **`charpente test --mutants` derives its `--timeout` from the `--file`'s package as well as the test set** (0.5.0's mutation run, its instrument finding; ruling R-22). cargo-mutants 27.1.0 bounds its unmutated baseline by the `--timeout` a pass gives it and runs that baseline over the mutated file's own package, while the verb derives the timeout as 5x its timed `cargo test` over the test set. On `kernel/mod.rs` under `--test-package charpente-sim` that was 69 s against a 101 s `charpente` baseline, which read Timeout. Since 0.5.0 the refusal names the timeout and the fix (a larger `--timeout`, or a test set that includes the file's package); the verb does not yet time the file's package and derive from the larger | The first cross-package run that pays a baseline timeout. The scaffold's advertised run (one package, the file's) derives no timeout, so it cannot meet it. |
-| **An outage a sim can place** (0.5.0's docs-only build, finding 10): the outage opens at a drawn k-th outbound call to its host, k drawn, instead of at a drawn instant in the first 2 s, so every app with a host composes "a call landed, then the host went away" at its own time scale, in the tail and in whole-day obligations too. The alternative is a start drawn over the run's span. It stays drawn: an app-settable window is refused, because a drawn fault the app cannot steer is what keeps the oracle honest, and a window the app sets is one it can choose to avoid. Today `charpente test --sim` draws the start uniform in the first 2 s of virtual time and the length at most 4 h (GUIDE §8), so work due after 2 s + 4 h never meets an outage, and a call lands before the window opens only when it is made in the run's first two seconds | **Trigger met** (the 0.5.0 docs-only build, 2026-11-19): renewly's planted per-job-key double charge was met in 1 of 1953 tested runs, and its builder added a product field (`startedSecsAgo`, a subscription imported part-way through its period) to reach the window. It needs a spec, because it moves every outage-drawing recorded batch. It is the next oracle-density item. |
+| **An outage a sim can place** (0.5.0's docs-only build, finding 10): the outage opens at a drawn k-th outbound call to its host, k drawn, instead of at a drawn instant in the first 2 s, so every app with a host composes "a call landed, then the host went away" at its own time scale, in the tail and in whole-day obligations too. The alternative is a start drawn over the run's span. It stays drawn: an app-settable window is refused, because a drawn fault the app cannot steer is what keeps the oracle honest, and a window the app sets is one it can choose to avoid. Today `charpente test --sim` draws the start uniform in the first 2 s of virtual time and the length at most 4 h (GUIDE §8), so work due after 2 s + 4 h never meets an outage, and a call lands before the window opens only when it is made in the run's first two seconds | **In 1.0, stage 3.** **Trigger met** (the 0.5.0 docs-only build, 2026-11-19): renewly's planted per-job-key double charge was met in 1 of 1953 tested runs, and its builder added a product field (`startedSecsAgo`, a subscription imported part-way through its period) to reach the window. It needs a spec, because it moves every outage-drawing recorded batch. It is the next oracle-density item. |
 | **Refuse a GET handler that writes** (the retry-safe-writes spec, §2). A write route's copy is answered once from the intents record, but a GET route never reads an `Idempotency-Key`, so a GET handler that writes runs again on every copy, and GUIDE §5 says so. One shape: `stage_or_subscribe` refuses a GET whose transaction has effects, by name, and drops them, with the same `Tx::has_effects` the record asks. It is a breaking change for any app whose GET writes, so it waits for evidence that one does | The first adopter, build or sim run found writing from a GET handler, or a write a re-sent GET applied twice. |
 | **The fault-free twin** (its spec, `docs/superpowers/specs/2026-11-22-fault-free-twin-design.md`, and the 2026-11-26 review at its top). Each passing `Drive` universe runs a second time with only the faults the platform promises to hide removed (crashes, power loss, torn writes, lost replies and re-sends, failover, partitions between client and server). Everything the app observed is replayed as the faulted run saw it: each logical request once, in the order it committed, each transaction's clock reading, and each remote reply, errors and outages included. The two end states must be byte-identical. It would catch a hidden fault that changes an outcome, which no listed check names. It is parked because it costs about 2.3x CPU per batch and weeks to build, and no bug is known that only it catches. If it is built, it runs over charpente's own fixture apps in CI and nightly, and a red names the first transaction that diverged and whether the app or the platform wrote the value that differs | A recorded seed in which the platform checks (`charpente_sim::checks`) and the app's own checks all pass and a fault-free comparison fails. Deriving job ids and outbound keys from their cause, if that lands for its own reasons, shortens the build. |
+| **Proving app code** (Lean, Verus, extraction; the road-to-1.0 spec §4) | An escape class found in 1.0's stage 2 or 4 that sampling missed and that a proof, or an exhaustive check of a declared state machine, would have caught. |
+| **Replaying recorded production requests** (the same spec §4) | A production discrepancy that snapshot rehearsal can't reproduce without the requests that caused it. |
 
 **Hosted control plane: off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,
@@ -423,6 +582,8 @@ sells not having to operate it.
 | Single-writer throughput ceiling | Overrated | No network hop between logic and data; TigerBeetle/Redis-class evidence; publish honest benchmarks early |
 | Greenfield-only adoption | Accepted | Agents mint greenfield backends daily; distribution rides agent preference (MANIFESTO §3), not migration |
 | Convex/PocketBase move into the quadrant | Watch | Neither has determinism or Rust's compile-time oracle; DST-from-day-one is a multi-year retrofit for them, and that is the moat |
+| The thesis loses the experiment | Real; three models agreeing is not evidence | 1.0's baseline (stage 2) measures the thesis early, with its predictions registered before it runs; each experiment's record is published whatever it shows; the full experiment gets one rerun, and a second miss reopens the goal (DECISIONS §16) |
+| The data promise taxes every release | Real from 1.0.0 | The sim rehearses each release's upgrade path on snapshots before the release ships, so no one has to run it by hand |
 
 ## Non-goals (permanent)
 
